@@ -754,6 +754,107 @@ def test_build_tls_context_loads_client_cert(tmp_path: Any) -> None:
     assert ctx.verify_mode.name == "CERT_REQUIRED"
 
 
+def _make_ca_and_crl(dir_path: Any) -> str:
+    """A CA bundled with its own fresh CRL -- the shape harden_crl_check loads. Synthetic, no PHI."""
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    now = datetime.datetime.now(datetime.UTC)
+    day = datetime.timedelta(days=1)
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-syslog-ca")])
+    ca = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - day)
+        .not_valid_after(now + 365 * day)
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    crl = (
+        x509.CertificateRevocationListBuilder()
+        .issuer_name(ca.subject)
+        .last_update(now - 2 * day)
+        .next_update(now + 30 * day)
+        .sign(key, hashes.SHA256())
+    )
+    path = dir_path / "syslog_ca_and_crl.pem"
+    path.write_bytes(
+        ca.public_bytes(serialization.Encoding.PEM) + crl.public_bytes(serialization.Encoding.PEM)
+    )
+    return str(path)
+
+
+def test_build_tls_context_checks_revocation_when_a_crl_is_configured(tmp_path: Any) -> None:
+    # BACKLOG #299: the syslog forwarder builds its own context and resolves no trust anchor, so
+    # [tls].crl_file never reaches it and it needed its own knob. Asserted on the context the handler
+    # really wraps the socket with, not on the setting.
+    import ssl
+
+    from messagefoundry.logging_setup import _build_tls_context
+
+    bundle = _make_ca_and_crl(tmp_path)
+    ctx = _build_tls_context(
+        SyslogForward(host="siem.example.org", protocol="tls", tls_ca_file=bundle, tls_verify=True)
+    )
+    assert not (ctx.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF)  # NEGATIVE CONTROL: no CRL, no flag
+    checked = _build_tls_context(
+        SyslogForward(
+            host="siem.example.org",
+            protocol="tls",
+            tls_ca_file=bundle,
+            tls_verify=True,
+            tls_crl_file=bundle,
+        )
+    )
+    assert checked.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+    assert checked.cert_store_stats()["crl"] >= 1
+
+
+def test_build_tls_context_ignores_a_crl_on_the_verify_off_arm(tmp_path: Any) -> None:
+    # tls_verify=false is CERT_NONE: there is no chain to check a CRL against, and setting the flag
+    # would refuse every collector while claiming a check -- the "configured control that does nothing,
+    # loudly" failure inverted. The opt-out arm stays exactly what it was.
+    import ssl
+
+    from messagefoundry.logging_setup import _build_tls_context
+
+    ctx = _build_tls_context(
+        SyslogForward(
+            host="siem.example.org",
+            protocol="tls",
+            tls_verify=False,
+            tls_crl_file=_make_ca_and_crl(tmp_path),
+        )
+    )
+    assert ctx.verify_mode == ssl.CERT_NONE
+    assert not (ctx.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF)
+
+
+def test_a_missing_syslog_crl_refuses_at_construction(tmp_path: Any) -> None:
+    # Fail-closed, like every other CRL path: a configured-but-absent CRL must not degrade to "no
+    # revocation checking".
+    from messagefoundry.logging_setup import _build_tls_context
+
+    with pytest.raises(ValueError, match="does not exist"):
+        _build_tls_context(
+            SyslogForward(
+                host="siem.example.org",
+                protocol="tls",
+                tls_ca_file=_make_ca_and_crl(tmp_path),
+                tls_verify=True,
+                tls_crl_file=str(tmp_path / "absent.pem"),
+            )
+        )
+
+
 def test_build_syslog_handler_selects_tls_and_wires_context(
     tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1556,3 +1657,33 @@ def test_a_tab_survives_the_real_scrub_and_a_newline_does_not() -> None:
     assert "\t" in scrubbed, "the tab was escaped; a log line lost its benign whitespace"
     assert "\n" not in scrubbed, "a real newline survived; one record can now forge a second line"
     assert scrubbed == "before\tafter\\nnext"
+
+
+# --- BACKLOG #1572: the installed chain must scrub a CUSTOM-delimiter body --------------------------
+
+#: The same realistic vector as ``_PHI_RAW``, with the delimiters the message DECLARES rather than the
+#: defaults: ``*`` field, ``$`` component, ``@`` repetition, ``#`` escape, ``%`` subcomponent. Synthetic
+#: identifiers only (PHI.md §9). Before #1572 the redactor recognised only ``| ^ ~ &``, so nothing here
+#: matched and every identifier reached the sink; a deploying site with a custom-delimiter feed would
+#: have logged them whenever a Router or Handler raised carrying the body.
+_PHI_RAW_CUSTOM_DELIMS = (
+    "MSH*$@#%*A*B*C*D*20260101**ADT$A01*MSG1*P*2.5.1\rPID*1**Z9998887$$$H$MR**DOE$JANE*19800101*M\r"
+)
+
+
+def test_the_installed_chain_scrubs_a_custom_delimiter_body() -> None:
+    """End to end through the chain ``_install_phi_filters`` builds, not through ``redact`` alone.
+
+    The unit coverage lives in ``tests/test_redaction.py``; this arm exists because the acceptance
+    criterion names the final logging chain, and because the filters run in an order a unit test cannot
+    see -- ``RedactionFilter`` renders ``exc_info`` into ``exc_text`` for the passes behind it."""
+    try:
+        raise ValueError(f"cannot transform {_PHI_RAW_CUSTOM_DELIMS}")
+    except ValueError:
+        rec = logging.LogRecord(
+            "mefor.demo", logging.ERROR, __file__, 1, "transform worker failed", (), sys.exc_info()
+        )
+    out = "\n".join(_production_lines(rec))
+    for identifier in ("Z9998887", "DOE", "JANE"):
+        assert identifier not in out, f"{identifier!r} reached the sink through the installed chain"
+    assert "ValueError" in out and "cannot transform" in out  # type + non-PHI context kept

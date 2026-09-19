@@ -14,6 +14,7 @@ reports.
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from contextlib import nullcontext
@@ -21,6 +22,7 @@ from pathlib import Path
 
 import pytest
 
+from scripts.docs import asvs_residual_lint
 from scripts.docs.asvs_residual_lint import (
     CITATION,
     Citation,
@@ -475,3 +477,108 @@ def test_the_empty_file_a_refused_generation_leaves_behind_is_not_a_baseline(
     assert main([str(good), "--baseline", str(baseline)]) == 2, (
         "an empty baseline must refuse like a missing one, not grandfather nothing in silence"
     )
+
+
+# --------------------------------------------------------------------------------------------
+# The tool's own docstring is held to the rule the tool enforces (BACKLOG #1205).
+#
+# The shipped docstring asserted a bare `file:line` citation about this tree and called it correct.
+# The line had moved, so the tool built to refuse a stale citation carried one of its own, in the
+# paragraph that justifies the tool. These screen the docstring so that cannot recur.
+#
+# SCOPE RULE, written down because an over-firing guard whose false positives leave no trace
+# drifts. The screen reads the MODULE DOCSTRING only, and reports only a citation whose path token,
+# read relative to the repo root, names an existing file. It DELIBERATELY EXCLUDES:
+#   * a citation whose path does not resolve here -- a bare basename, or a path in another repo.
+#     This checkout cannot read the line such a citation names, so any verdict on it is a guess;
+#   * every line outside the docstring, so a comment recording history keeps saying what it said.
+# --------------------------------------------------------------------------------------------
+
+# A repo-relative path in prose: at least one `/`, a known extension, and no `<>`, so the usage
+# block's `<scorecard.toml>` placeholders are not mistaken for files.
+PROSE_PATH = re.compile(
+    r"(?<![\w<./-])([\w][\w.-]*(?:/[\w.-]+)+\.(?:py|toml|md|yml|yaml|txt|lock|ini|cfg))(?![\w/-])"
+)
+
+# The one demonstration the docstring makes about engine code, cited by SYMBOL rather than by line.
+DEMONSTRATED_SYMBOL = "instance_exposed"
+DEMONSTRATED_FILE = "messagefoundry/__main__.py"
+
+
+def module_docstring() -> str:
+    doc = asvs_residual_lint.__doc__
+    assert doc, "the module lost its docstring, which is the subject of every test below"
+    return doc
+
+
+def resolvable_line_citations(text: str) -> list[tuple[str, str]]:
+    """Each ``path:line`` in ``text`` that resolves here, paired with the line it actually names."""
+    found: list[tuple[str, str]] = []
+    for path_text, lineno_text in CITATION.findall(text):
+        target = REPO_ROOT / path_text
+        if not target.is_file():
+            continue
+        lineno = int(lineno_text)
+        lines = target.read_text(encoding="utf-8").splitlines()
+        actual = lines[lineno - 1].strip() if 1 <= lineno <= len(lines) else "(past end of file)"
+        found.append((f"{path_text}:{lineno}", actual))
+    return found
+
+
+def test_the_tools_own_docstring_cites_no_resolvable_line_number() -> None:
+    """A line number is a navigation aid, never evidence -- including in this tool's own voice.
+
+    The tool's whole design is that a citation is identified by file and never by line, because a
+    line number decays on the next edit above it. A docstring asserting one as correct would decay
+    the same way, and nothing would report it.
+    """
+    cited = resolvable_line_citations(module_docstring())
+    assert not cited, (
+        "the module docstring asserts a bare file:line citation about this tree, which is the very "
+        "claim the tool refuses to let into the record. Cite the symbol instead. Found: "
+        + "; ".join(f"{where} now reads {actual!r}" for where, actual in cited)
+    )
+
+
+def test_the_docstring_names_engine_paths_and_every_one_of_them_exists() -> None:
+    """Positive control on real data: a screen that resolves nothing passes trivially, forever."""
+    paths = sorted(set(PROSE_PATH.findall(module_docstring())))
+    assert paths, "found no repo path in the docstring, so this screen examined nothing"
+    assert DEMONSTRATED_FILE in paths, (
+        f"expected the demonstration to still name {DEMONSTRATED_FILE}; found {paths}"
+    )
+    missing = [p for p in paths if not (REPO_ROOT / p).is_file()]
+    assert not missing, f"the docstring names paths that do not exist here: {missing}"
+
+
+def test_the_docstrings_demonstration_symbol_resolves_where_it_says_it_does() -> None:
+    """The replacement form is checkable, which a line number was not.
+
+    The docstring cites a symbol in a named file and says it is that file's only assignment of the
+    name. Both halves are read here, so a rename or a second assignment reds this rather than
+    quietly making the paragraph false.
+    """
+    doc = module_docstring()
+    assert DEMONSTRATED_SYMBOL in doc and DEMONSTRATED_FILE in doc, (
+        "the docstring no longer makes the demonstration claim this test pins -- re-point the test "
+        "at what it claims now, rather than deleting the check"
+    )
+    body = (REPO_ROOT / DEMONSTRATED_FILE).read_text(encoding="utf-8")
+    assignments = re.findall(rf"^\s*{DEMONSTRATED_SYMBOL}\s*=[^=]", body, re.MULTILINE)
+    assert len(assignments) == 1, (
+        f"{DEMONSTRATED_FILE} assigns {DEMONSTRATED_SYMBOL} {len(assignments)} times, so the "
+        "docstring's 'the file's only assignment' claim no longer holds"
+    )
+
+
+@pytest.mark.parametrize(
+    ("why", "text", "fires"),
+    [
+        ("a resolvable citation must be reported", f"see ``{DEMONSTRATED_FILE}:1``", True),
+        ("a path that does not resolve here is out of scope", "see ``no/such/thing.py:1``", False),
+        ("a path with no line number is not a citation", f"see ``{DEMONSTRATED_FILE}``", False),
+    ],
+)
+def test_the_citation_screen_both_fires_and_stays_silent(why: str, text: str, fires: bool) -> None:
+    """Paired arms. One that must fire catches a dead screen; two that must not catch over-reach."""
+    assert bool(resolvable_line_citations(text)) is fires, why

@@ -28,10 +28,13 @@ pass is read-only (``ruff check .``, ``ruff format --check .``), but CLAUDE.md s
 ``ruff format .`` is not. And ruff was never the only tool at stake: the same free re-resolution
 reaches at least mypy and pytest, and nothing in ``.pre-commit-config.yaml`` pins either.
 
-WHY A TEXT TEST. Nothing in the suite can run ``new.ps1`` — it creates a git worktree and a venv, which
+WHY A TEXT TEST. Nothing in the suite can run ``ensure-venv.ps1`` — it creates a git worktree and a venv, which
 is minutes of I/O and mutates the repo's worktree list. The invariant that actually matters is a
 property of the COMMAND, so it is asserted against the command. That is the same posture as
 ``tests/test_ci_venv_pinning.py``, which pins workflow install lines no test can execute either.
+
+THE DECLARATION MOVED, 2026-09-16: the install line is now ``scripts/worktree/ensure-venv.ps1``'s and
+``new.ps1`` calls that script. See that script's header for why. What this test asserts is unchanged.
 """
 
 from __future__ import annotations
@@ -40,7 +43,7 @@ import re
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parents[1]
-_NEW_PS1 = _REPO / "scripts" / "worktree" / "new.ps1"
+_VENV_PS1 = _REPO / "scripts" / "worktree" / "ensure-venv.ps1"
 _CI = _REPO / ".github" / "workflows" / "ci.yml"
 _CONSTRAINTS = _REPO / "constraints.lock"
 
@@ -59,13 +62,13 @@ def _code_lines(path: Path) -> list[str]:
 
 
 def test_new_worktree_installs_against_the_constraint_lock() -> None:
-    """The fix itself: every editable project install in new.ps1 pins to constraints.lock."""
-    installs = [ln for ln in _code_lines(_NEW_PS1) if _EDITABLE_PROJECT_INSTALL.search(ln)]
+    """The fix itself: every editable project install in ensure-venv.ps1 pins to constraints.lock."""
+    installs = [ln for ln in _code_lines(_VENV_PS1) if _EDITABLE_PROJECT_INSTALL.search(ln)]
 
     # Non-vacuity. If the provisioning is restructured away, fail loudly rather than pass by finding
     # nothing to check — the failure mode that turns a guard into decoration.
     assert installs, (
-        f'{_NEW_PS1.name} no longer contains an editable project install (`pip install -e ".[...]"`). '
+        f'{_VENV_PS1.name} no longer contains an editable project install (`pip install -e ".[...]"`). '
         "If provisioning moved, re-point this guard at wherever it went."
     )
     unconstrained = [ln.strip() for ln in installs if "--constraint" not in ln]
@@ -82,14 +85,14 @@ def test_new_worktree_installs_against_the_constraint_lock() -> None:
     )
 
 
-def test_the_constraint_file_new_ps1_names_actually_exists() -> None:
+def test_the_constraint_file_the_bootstrap_names_actually_exists() -> None:
     """A pin at a path that does not exist fails the install outright — on a developer's first run.
 
     Cheap to assert, and it is the difference between this change working and it being a typo that
     nobody notices until someone creates a worktree.
     """
     assert _CONSTRAINTS.is_file(), (
-        f"{_NEW_PS1.name} passes `--constraint constraints.lock`, but {_CONSTRAINTS} does not exist. "
+        f"{_VENV_PS1.name} passes `--constraint constraints.lock`, but {_CONSTRAINTS} does not exist. "
         "Either the export path moved (see the DEP-1 step in security.yml) or the flag is wrong."
     )
     body = _CONSTRAINTS.read_text(encoding="utf-8")
@@ -101,10 +104,10 @@ def test_the_constraint_file_new_ps1_names_actually_exists() -> None:
     )
 
 
-def test_new_ps1_matches_the_posture_ci_documents() -> None:
+def test_the_bootstrap_matches_the_posture_ci_documents() -> None:
     """CI is the reference. If it stops constraining, this guard is enforcing a stale rule.
 
-    Asserted in this direction on purpose: the point is not "new.ps1 contains a flag", it is
+    Asserted in this direction on purpose: the point is not "ensure-venv.ps1 contains a flag", it is
     "developer provisioning agrees with CI provisioning". Should CI ever move off constraints.lock,
     this fails and forces the two to be reconciled deliberately rather than drifting apart again.
     """
@@ -117,6 +120,7 @@ def test_new_ps1_matches_the_posture_ci_documents() -> None:
     assert not ci_unconstrained, (
         "ci.yml has an editable project install without --constraint:\n  "
         + "\n  ".join(ci_unconstrained)
-        + "\nIf that is deliberate, new.ps1's constraint is now enforcing a rule CI no longer follows; "
+        + "\nIf that is deliberate, ensure-venv.ps1's constraint is now enforcing a rule CI no longer "
+        "follows; "
         "reconcile the two in one change."
     )

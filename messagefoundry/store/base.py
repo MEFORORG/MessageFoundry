@@ -839,6 +839,17 @@ class QueueStore(StoreLifecycle, Protocol):
         :meth:`dead_letter_missing_destinations`; call once at startup. Returns the rows killed."""
         ...
 
+    async def dead_letter_missing_inbounds(
+        self, valid_names: set[str], now: float | None = None
+    ) -> int:
+        """Dead-letter non-terminal **channel-keyed** rows (ingress, routed, response) whose
+        ``channel_id`` left the registry — a removed inbound for which no router, transform or
+        re-ingress worker is spawned and whose lane no dispatcher claims. The third startup sweep
+        beside :meth:`dead_letter_missing_destinations` and :meth:`dead_letter_missing_handlers`;
+        call once at startup. ``valid_names`` is the WHOLE deployment's inbound names (an engine
+        shard's own ``registry.inbound`` is only its slice). Returns the rows killed."""
+        ...
+
     # --- process-in-place dedup ledger (ADR 0129, BACKLOG #142) --------------
     async def is_file_processed(self, *, channel_id: str, file_key: str) -> bool:
         """True iff the leave-in-place (``after_read='leave'``) source ``channel_id`` already ingested
@@ -1520,9 +1531,25 @@ class AuditStore(Protocol):
         operation: str,
         params: str,
         requester: str,
+        requester_user_id: str,
         requested_at: float,
         expires_at: float | None,
-    ) -> None: ...
+    ) -> None:
+        """Persist a high-value action awaiting a distinct second approver (dual-control, 2.3.5).
+
+        ``requester_user_id`` is the **authorization key** and ``requester`` is the display label
+        (BACKLOG #1540). :meth:`~messagefoundry.api.approvals.ApprovalGate.approve` is the source of
+        record for why the name cannot serve as the key; this is the store-side contract that follows
+        from it, and every backend's schema comment points here rather than restating it:
+
+        * ``requester_user_id`` is **required on every call**. No caller legitimately lacks it, and a
+          row written without one can never be approved.
+        * The column is declared **nullable** on all three backends, so the ``ALTER`` lands on a
+          pre-existing table. It is **not** backfilled: after a rename the stored name may belong to
+          somebody else, so resolving it to an id would key the refusal on the wrong person -- the
+          exact error the column exists to remove.
+        * A NULL is therefore refused **fail closed** at approve time, never fallen back from."""
+        ...
 
     async def get_pending_approval(self, approval_id: str) -> Row | None: ...
 

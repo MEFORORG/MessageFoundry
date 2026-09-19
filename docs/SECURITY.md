@@ -1700,12 +1700,15 @@ offer.
 `[security].allowed_client_networks` is a pre-auth network
 gate that applies to **every** pathway equally, so it is a note here rather than a column.
 
-**Lockout asymmetry and control coverage (ASVS 6.1.3 / 6.3.4).** The engine's per-account lockout
-protects **Local** accounts only, and only the password and TOTP/recovery legs **feed** it; WebAuthn
-assertion failures deliberately do not (signatures are not guessable secrets, and a flaky authenticator
+**Lockout asymmetry and control coverage (ASVS 6.1.3 / 6.3.4).** Only the **Local** password and
+TOTP/recovery legs **feed** the engine's per-account lockout, but the lock they set is **enforced
+wherever a pathway reaches an engine account row, directory accounts included** — `verify_mfa` and
+`finish_webauthn_assertion` never filtered on `auth_provider`, and since BACKLOG #1638 a Kerberos or
+OIDC sign-in refuses a locked mirror row before it completes; WebAuthn
+assertion failures deliberately do not **feed** it (signatures are not guessable secrets, and a flaky authenticator
 must not lock an account) — **but an already-locked account IS refused at the assertion leg before any
 verification** (`finish_webauthn_assertion` checks `locked_until` first and audits
-`auth.webauthn_failed` with `reason=locked`), so the lock is *enforced* across every local factor even
+`auth.webauthn_failed` with `reason=locked`), so the lock is *enforced* across every factor leg even
 though only two legs feed it. Neither fed nor enforced on `POST /me/reauth` or
 `POST /me/password` — which now matters more, because since the AD sign-in was retired the step-up
 re-auth route is the **only** place an AD password is still bound, and it is covered by a per-actor
@@ -1971,7 +1974,18 @@ inherited from another caller. It is surfaced on `GET /audit` and in the `audit:
 **Tamper-evidence (AUDIT-INTEGRITY).** Each `audit_log` row carries a `row_hash` that chains the
 previous row's hash with this row's content (SHA-256), so deleting, editing, or reordering any row is
 detectable. Verify the chain with `messagefoundry audit-verify` — exit 0 means at least that no
-surviving row was edited or reordered. It does **not** mean nothing was removed: deleting the *newest*
+surviving row was edited or reordered. **A scheduled job reads the exit code and nothing else, so
+these four are kept distinct:** `0` a clean walk over at least one row, `1` a broken chain, `2` the
+path is not an audit database, and `3` a clean walk over an **empty** log. Exit 2 covers at least an
+absent path, a zero-byte file, a file carrying no `audit_log` table, and a path that is not a SQLite
+database at all — the verifier refuses each rather than creating or migrating the evidence it was
+asked to check, and it opens read-only so it cannot write to that file either way. It never spends
+`1` on any of them, because `1` is reserved for a chain that was read and found broken. Exit 3
+exists because "there was nothing to verify" is not a
+pass; pass `--allow-empty` to accept it as one on an instance that has not logged anything yet, or
+pass an expected anchor of `0:`, which asserts the same thing and is checked. `audit-anchor` keeps
+exit 0 on an empty log — sealing a fresh instance as `0:` is the point of it — but refuses the same
+non-audit-database paths. It does **not** mean nothing was removed: deleting the *newest*
 rows leaves a prefix that still chains cleanly, so a bare verify is clean after a tail-truncation. For
 that, snapshot `messagefoundry audit-anchor` (`COUNT:HEAD`) and pass it back as `messagefoundry
 audit-verify --expected-anchor`. It is an exact point-in-time seal, which fixes what it is for: it

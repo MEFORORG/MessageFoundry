@@ -62,6 +62,22 @@ All notable changes to MessageFoundry are documented here. The format follows
   and BACKLOG #1279.
 
 ### Changed
+- **Setting `[integrity].fail_closed_on_drift` on an editable install now says so at startup, and two
+  claims about startup attestation are corrected.** An install that declares itself editable is exempt
+  from attestation by design, so a dev checkout is never bricked. That exemption silently cancels the
+  fail-closed opt-in, and the code path returned with no log, no audit row and no alert -- so a first
+  deployment that opted into hard enforcement on an editable install would have started with its
+  tripwire disarmed and nothing in the boot log to read. It now logs a WARNING naming the reason. **This
+  reports a misconfiguration; it closes no hole** -- an actor who can write the virtual environment can
+  plant the editable marker or rewrite the check in the same single write. AC-12's exemption is
+  unchanged: still no refusal, no audit row, no alert, and silence under the default alert-only posture.
+  Two ADR 0041 D3 claims were false in the shipped code and are narrowed rather than left standing: the
+  non-editable hash-locked wheel is a **recommended** production default, not an enforced one (nothing
+  in the engine refuses an editable install), and attestation runs **at startup only** -- there is no
+  on-demand surface, no `attest` CLI subcommand and no API route. ADR 0041 D3 also now records the
+  resolution of the baseline's trust domain: the wheel's own `RECORD` stays the baseline, no runtime
+  out-of-domain anchor is adopted, and the control detects an *inconsistent* in-place edit and not a
+  *consistent* one. (BACKLOG #1679)
 - **An Active Directory login is now identified by the directory's immutable id, not by
   `sAMAccountName`.** A directory frees a deleted account's name and may reissue it to a different
   person. The engine resolved an AD principal by that name, so a recycle without a matching
@@ -125,6 +141,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   on every ordinary boot. For continuous coverage of a live engine the off-box log forward / tee remains
   the control, and `[integrity].audit_verify_on_start` is unchanged — it is a bare walk and stays blind
   to a truncated tail. ([BACKLOG #328](docs/BACKLOG.md))
+- **The advisory `raise-fstring` lint in `messagefoundry check` now reads three more spellings of the
+  same risk.** It matched only an f-string, so `raise ValueError("bad " + x)`, the `%` form and
+  `.format(...)` carried an interpolated message past it — the identical free-text PHI payload, in the
+  spellings an author is most likely to reach for after an f-string. It now shares the predicate the
+  ADR 0144 lookup lint already used, so the two cannot drift on what counts as interpolation. A
+  deploying site's existing config dir may therefore report hits it did not report before: the check
+  is advisory and still only ever prints, so it cannot block the gate, and its detail names a file and
+  line, never the message text. The check keeps the name `raise-fstring`. It stays a nudge rather
+  than a boundary: it reads only the first positional argument of the `raise`, so a message assigned
+  to a local first, passed as a keyword or a later positional, or wrapped in a call is still
+  unflagged. ([BACKLOG #1676](docs/BACKLOG.md))
 
 ### Changed
 - **An API request body with an unknown or misspelled key is now refused with HTTP 422 instead of
@@ -317,6 +344,23 @@ All notable changes to MessageFoundry are documented here. The format follows
   and every such read was already audited. ([BACKLOG #324](docs/BACKLOG.md))
 
 ### Fixed
+- **`audit-verify` accepted a zero-byte database, wrote a schema into it, and reported a clean chain
+  of nothing.** The existing guard on `audit-verify`, `audit-anchor` and `rekey-audit` only asked
+  whether the `--db` path *existed*. A zero-byte file exists and is a valid, empty SQLite database —
+  what a `touch` in an install script, a failed copy or a log-rotation mistake leaves behind — so it
+  walked past the guard, `open_store` migrated 372,736 bytes of schema **into the file that was
+  meant to be the evidence**, and the command printed `OK: verified 0 audit row(s)` and exited 0. A
+  scheduled compliance job reads the exit code, so a first deployment with one would have reported
+  OK forever while the real audit log went unchecked. All three subcommands now probe the path over
+  a **read-only** SQLite handle before the store opens — it can neither create the file nor migrate
+  it — and exit **2** when there is no `audit_log` table, naming which of absent, zero-byte or
+  not-a-database it found.
+  **`audit-verify` also splits "verified nothing" out of its success code:** a clean walk over an
+  empty log is now exit **3**, and `--allow-empty` (new) turns that back into 0, as does an expected
+  anchor of `0:`, which asserts emptiness and is checked. Exit 1 stays a BROKEN CHAIN, so a job can
+  no longer read an empty log as detected tamper. `audit-anchor` keeps exit 0 on a real store whose
+  log is legitimately empty — sealing a fresh instance as `0:` is a supported workflow — and refuses
+  only the non-audit-database paths. ([BACKLOG #1669](docs/BACKLOG.md))
 - **`verify --smoke self` reported PASS on a synthetic message the config would have dropped.**
   `smoke_self` failed only on `DryRunResult.error`, which `dry_run` sets for a parse failure, a
   strict-validation failure or a Router/Handler raise. `UNROUTED` (the Router selected no handler) and

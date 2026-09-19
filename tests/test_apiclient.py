@@ -15,7 +15,7 @@ import json
 import pathlib
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import httpx
@@ -66,21 +66,24 @@ def test_loopback_http_constructs() -> None:
 def test_request_maps_non_2xx_to_apierror(monkeypatch: pytest.MonkeyPatch) -> None:
     client = EngineClient("http://127.0.0.1:8765")
 
-    class _Resp:
-        status_code = 500
-        headers: dict[str, str] = {}
-        text = "boom"
-        reason_phrase = "Server Error"
-
-        def json(self) -> dict[str, object]:
-            return {"detail": "kaboom"}
-
     # `_request` builds the request (so the #1047 length bound can measure the RESOLVED url) and
     # dispatches it through `send`, so `send` is the transport seam a stub replaces.
-    monkeypatch.setattr(client._http, "send", lambda *a, **k: _Resp())
+    #
+    # A REAL httpx.Response, not a duck-typed stand-in: since BACKLOG #1577 the reply is dispatched
+    # with `stream=True` and drained through `_buffer_bounded`, so the seam has to answer with
+    # something that streams and closes. A hand-rolled object with four attributes cannot, and one
+    # that could would be re-implementing httpx inside the test.
+    def _send(request: httpx.Request, *args: object, **kwargs: object) -> httpx.Response:
+        return httpx.Response(500, json={"detail": "kaboom"}, request=request)
+
+    monkeypatch.setattr(client._http, "send", _send)
     with pytest.raises(ApiError) as excinfo:
         client.health()
     assert excinfo.value.status == 500
+    assert "kaboom" in str(excinfo.value), (
+        "the engine's own detail must survive the bounded read -- `_error_detail` reads the body, "
+        "and it now reads a buffered copy rather than the live stream"
+    )
 
 
 def test_decode_helpers_map_bad_body_to_apierror() -> None:
@@ -658,3 +661,224 @@ def test_cluster_stepdown_keeps_the_engine_status_for_the_caller_to_branch_on(st
         client.close()
     assert caught.value.status == status
     assert f"engine says {status}" in str(caught.value)
+
+
+# --- ASVS 15.2.2 (BACKLOG #1577): the client's own bound on a REPLY body --------------------------
+#
+# `_request` used to dispatch with `self._http.send(request)`, which reads the reply to EOF. Every
+# one of the client's public methods went through it, and so did the `for_polling()` clone the
+# console's background threads use. The fix streams the reply and stops reading past the ceiling.
+#
+# These tests drive the REAL transport seam (`httpx.Client(transport=...)`) rather than stubbing
+# `send`, because part of the claim under test is that `send` is called with `stream=True`. A stub
+# returning an already-buffered response could not tell a streaming bound from a read-then-check.
+
+
+class _CountingStream(httpx.SyncByteStream):
+    """A reply body of ``count`` chunks that records how many were actually pulled, and whether the
+    stream was closed. The pull count is the evidence: a bound that reads to EOF and then measures
+    pulls every chunk, and a bound enforced on the stream stops early."""
+
+    def __init__(self, chunk: bytes, count: int) -> None:
+        self._chunk = chunk
+        self._count = count
+        self.yielded = 0
+        self.closed = False
+
+    def __iter__(self) -> Iterator[bytes]:
+        for _ in range(self._count):
+            self.yielded += 1
+            yield self._chunk
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _StreamTransport(httpx.BaseTransport):
+    """Answers every request with ``status`` and a streaming (never pre-buffered) body."""
+
+    def __init__(self, stream: _CountingStream, status: int = 200) -> None:
+        self._stream = stream
+        self._status = status
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            self._status,
+            headers={"content-type": "application/json"},
+            stream=self._stream,
+        )
+
+
+def _client_streaming(stream: _CountingStream, status: int = 200) -> EngineClient:
+    client = EngineClient("http://127.0.0.1:8765")
+    client._http.close()
+    client._http = httpx.Client(
+        base_url="http://127.0.0.1:8765", transport=_StreamTransport(stream, status)
+    )
+    return client
+
+
+def test_apiclient_refuses_a_reply_over_the_response_bound(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The bound FIRES, and it fires ON THE STREAM.
+
+    Two assertions, and the second is the one that matters. Raising proves the reply was refused;
+    the pull count proves it was refused WITHOUT buffering the rest, which is the whole point of the
+    item -- a client that read 64 MiB and then complained would pass the first assertion alone.
+
+    The ceiling is monkeypatched down so the test costs kilobytes. That is sound because `_request`
+    reads `MAX_RESPONSE_BYTES` as a module global at call time, not as a default argument bound at
+    import; the shipped value is pinned separately by the arithmetic test below.
+
+    Mutation: drop `stream=True` from the `send` in `_request`. Red: `yielded` is 10, not 2 -- the
+    whole body was read before anything measured it."""
+    from messagefoundry.apiclient import client as client_module
+
+    monkeypatch.setattr(client_module, "MAX_RESPONSE_BYTES", 4096)
+    stream = _CountingStream(b"a" * 4096, count=10)
+    client = _client_streaming(stream)
+    try:
+        with pytest.raises(ApiError, match="over the 4096-byte response limit"):
+            client.health()
+    finally:
+        client.close()
+
+    assert stream.yielded == 2, (
+        f"the read pulled {stream.yielded} of 10 chunks; a bound enforced on the stream stops at "
+        "the first chunk that crosses the ceiling, so 10 means the body was read to EOF first"
+    )
+    assert stream.closed, "the refusal leaked the connection instead of releasing it to the pool"
+
+
+def test_apiclient_still_reads_a_reply_at_the_bound(monkeypatch: pytest.MonkeyPatch) -> None:
+    """NEGATIVE CONTROL. Without it, a client that refused EVERY reply would pass the test above.
+
+    The body is exactly the ceiling -- the largest size that must still be accepted. Nothing is
+    truncated: the decoded model carries the whole padding back."""
+    from messagefoundry.apiclient import client as client_module
+
+    monkeypatch.setattr(client_module, "MAX_RESPONSE_BYTES", 4096)
+    padding = "v" * (4096 - len(json.dumps({"status": "ok", "version": ""}).encode()))
+    body = json.dumps({"status": "ok", "version": padding}).encode()
+    assert len(body) == 4096, "the control is only a control if the body sits exactly on the bound"
+
+    stream = _CountingStream(body, count=1)
+    client = _client_streaming(stream)
+    try:
+        health = client.health()
+    finally:
+        client.close()
+    assert health.status == "ok"
+    assert health.version == padding, "a body at the bound came back truncated"
+    assert stream.closed
+
+
+@pytest.mark.parametrize(
+    ("status", "count"),
+    [(200, 1), (500, 1), (200, 10)],
+    ids=["success", "engine_error", "over_the_bound"],
+)
+def test_apiclient_releases_the_connection_on_every_exit(
+    monkeypatch: pytest.MonkeyPatch, status: int, count: int
+) -> None:
+    """Every path out of the bounded read closes the response.
+
+    This is the failure mode that would not show up as a test failure anywhere else: a leaked pooled
+    connection surfaces as the console's background poll HANGING on an exhausted pool, minutes
+    later, under load. `_request` has three exits after `send` -- the MFA retry, the step-up retry,
+    and the `>= 400` raise through `_error_detail` (which reads the body itself) -- and the fix
+    collapses them to one release point by buffering before any of them branch.
+
+    Mutation: move `streaming.close()` out of `_buffer_bounded`'s `finally`. Red: the
+    over-the-bound arm reports an unreleased connection."""
+    from messagefoundry.apiclient import client as client_module
+
+    monkeypatch.setattr(client_module, "MAX_RESPONSE_BYTES", 4096)
+    stream = _CountingStream(b'{"status": "ok"}'.ljust(4096, b" "), count=count)
+    client = _client_streaming(stream, status=status)
+    try:
+        with contextlib.suppress(ApiError):
+            client.health()
+    finally:
+        client.close()
+    assert stream.closed, "this exit leaked the connection"
+
+
+def test_apiclient_response_bound_clears_the_worst_case_escape() -> None:
+    r"""The SIZE of the ceiling, pinned against the arithmetic that chose it.
+
+    `GET /messages/{id}` answers with a `MessageDetail` whose `raw` field carries the whole message
+    body JSON-escaped. Worst-case `\uXXXX` escaping costs 6 bytes per source byte, so a message at
+    the engine's own 16 MiB ceiling can come back as roughly 96 MiB of JSON. Reusing that 16 MiB
+    here -- the obvious move, and what `transports/bounded_read.py` does for an egress reply --
+    would make this client refuse a reply describing a message the engine was configured to accept.
+    Both halves are the property: the bound must clear the worst case, and it must exist.
+
+    Mutation: set `MAX_RESPONSE_BYTES = DEFAULT_MAX_MESSAGE_BYTES`. Red: the first assertion names
+    both numbers."""
+    from messagefoundry.apiclient.client import MAX_RESPONSE_BYTES
+    from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
+
+    worst_case = DEFAULT_MAX_MESSAGE_BYTES * 6
+    bound = MAX_RESPONSE_BYTES
+    assert bound >= worst_case, (
+        f"the response bound is {bound} but a {DEFAULT_MAX_MESSAGE_BYTES}-byte message JSON-escapes "
+        f"to at most {worst_case}; this ceiling would refuse a legitimate GET /messages/<id> for a "
+        "message the engine accepted"
+    )
+    assert bound < worst_case * 4, (
+        "the bound has drifted so far past the case it was sized for that it is no longer a bound"
+    )
+
+
+def test_request_is_the_only_place_the_client_dispatches_to_the_transport() -> None:
+    """Frozen (AST): the bound lives in `_request`, so `_request` has to stay the only dispatch.
+
+    `_request` is the right seam -- it already carries the two REQUEST bounds, and a transport-level
+    wrapper would bake "materialize the whole body in memory" into a client that may one day want to
+    stream a support bundle to disk under a different rule. But that choice is only safe while
+    nothing bypasses it: a future method written as `self._http.get(...)` would be unbounded again,
+    and the ~75 public methods that DO go through `_request` would go on passing their own tests.
+
+    Scoped to `self._http` on purpose. A bare verb match would fire on `response.json().get(...)` in
+    `_error_detail`, which is a dict read, not a dispatch.
+
+    Mutation: add `self._http.get("/x")` to any method. Red: the method and line are named."""
+    import ast
+
+    from messagefoundry.apiclient import client as client_module
+
+    tree = ast.parse(pathlib.Path(client_module.__file__).read_text(encoding="utf-8"))
+    allowed = {
+        node
+        for fn in ast.walk(tree)
+        if isinstance(fn, ast.FunctionDef) and fn.name == "_request"
+        for node in ast.walk(fn)
+    }
+    verbs = {
+        "get",
+        "post",
+        "put",
+        "patch",
+        "delete",
+        "head",
+        "options",
+        "request",
+        "stream",
+        "send",
+    }
+
+    for node in ast.walk(tree):
+        if node in allowed or not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        dispatches = (
+            isinstance(func, ast.Attribute)
+            and func.attr in verbs
+            and isinstance(func.value, ast.Attribute)
+            and func.value.attr == "_http"
+        )
+        assert not dispatches, (
+            f"apiclient/client.py line {node.lineno} dispatches `self._http."
+            f"{func.attr if isinstance(func, ast.Attribute) else '?'}(...)` outside `_request`, "
+            "so it bypasses the MAX_RESPONSE_BYTES bound"
+        )

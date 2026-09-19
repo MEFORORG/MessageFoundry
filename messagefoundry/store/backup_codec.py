@@ -33,6 +33,15 @@ decoder requires it, so a truncation that drops the tail frame is detected as a 
 silently accepted. The frame counter is **monotonic from 0**, re-derived on decode, so a frame replayed
 out of order authenticates against the wrong counter and fails the tag.
 
+**Every attacker-declared length is bounded BEFORE the read it drives.** ``hdrlen`` and each frame's
+``ctlen`` are uint32 fields in a plaintext, as-yet-unauthenticated prefix, so a reader that hands them
+straight to ``read()`` allocates whatever an attacker put there — before key matching, and before any
+GCM tag has authenticated anything at all. :data:`MAX_HEADER_BYTES` bounds the first;
+:data:`MAX_CHUNK_SIZE` bounds the declared ``chunk_size``, which is in turn what makes the per-frame
+bound in :func:`decrypt_stream` a real limit instead of a self-referential one. The cumulative
+plaintext ceiling belongs to the caller (``decrypt_stream(..., max_plaintext_bytes=...)``), because the
+budget it expresses lives a layer up in ``pipeline/`` and ``store/`` may not import that.
+
 The codec is **synchronous + streaming** (file-in → file-out, ``chunk_size`` at a time): the
 :class:`~messagefoundry.pipeline.dr_backup.BackupRunner` runs it in a worker thread
 (``asyncio.to_thread``), never on the event loop and never loading the whole store into one buffer.
@@ -61,6 +70,25 @@ _TAG_BYTES = 16  # AES-GCM authentication tag (appended to the ciphertext by AES
 #: Default plaintext chunk size (1 MiB). Fixed per-archive (recorded in the header); a large-but-bounded
 #: chunk keeps the per-frame overhead (nonce + tag + length) negligible while bounding peak memory.
 DEFAULT_CHUNK_SIZE = 1024 * 1024
+
+#: Hard ceiling on the attacker-declared ``hdrlen`` that precedes the JSON header. That length is the
+#: FIRST attacker-controlled allocation any reader of a ``.mfbak`` makes -- it is consumed before the
+#: key_id is known, so before key matching and before any frame's GCM tag authenticates anything. The
+#: writer's header is well under 100 bytes (pinned by ``test_writer_header_stays_far_under_the_cap``),
+#: so 4096 leaves room for a future additive field while keeping that allocation small.
+MAX_HEADER_BYTES = 4096
+#: Hard ceiling on the attacker-declared ``chunk_size`` in the header.
+#:
+#: **This is not a read site.** It is the ceiling that makes the per-frame bound in
+#: :func:`decrypt_stream` mean anything. A frame check written as ``ctlen <= header.chunk_size +
+#: _TAG_BYTES`` is defeated outright by declaring ``chunk_size = 0xFFFFFFFF``, because the header is
+#: plaintext and is not authenticated until the FIRST FRAME's tag is checked -- which happens only
+#: after that frame has already been read into memory. Bounding ``chunk_size`` at parse time is what
+#: converts the frame bound from self-referential into a real limit.
+#:
+#: The writer only ever emits :data:`DEFAULT_CHUNK_SIZE` (1 MiB) and there is no operator knob, so
+#: 64 MiB sits far above anything this build produces.
+MAX_CHUNK_SIZE = 64 * 1024 * 1024
 
 _U32 = struct.Struct("<I")
 _U64 = struct.Struct("<Q")
@@ -152,8 +180,11 @@ def encrypt_stream(
 
     _validate_key(key)
     size = chunk_size or DEFAULT_CHUNK_SIZE
-    if size <= 0:
-        raise BackupCodecError("chunk_size must be > 0")
+    # The upper half is not defensive, it is a closure check: read_header refuses a chunk_size over
+    # MAX_CHUNK_SIZE, so a writer allowed to exceed it would produce an archive THIS BUILD'S OWN
+    # READER rejects -- an unreadable backup discovered at restore time, which is the worst moment.
+    if not 0 < size <= MAX_CHUNK_SIZE:
+        raise BackupCodecError(f"chunk_size must be in 1..{MAX_CHUNK_SIZE} bytes (got {size})")
     kid = key_fingerprint(key)
     header = ArchiveHeader(
         format_version=FORMAT_VERSION, alg=ALG_AES_256_GCM, key_id=kid, chunk_size=size
@@ -221,6 +252,14 @@ def read_header(src: BinaryIO) -> ArchiveHeader:
             f"unsupported .mfbak format version {version}; this build reads version {FORMAT_VERSION}"
         )
     (hdrlen,) = _U32.unpack(_read_exact(src, _U32.size, "header length"))
+    # BEFORE the read, not inside _read_exact: that helper also serves the 6-byte magic and the
+    # 12-byte nonce, whose lengths are ours and fixed. Only the call sites fed an ATTACKER-DECLARED
+    # uint32 need a bound, and the bound each one needs is different.
+    if hdrlen > MAX_HEADER_BYTES:
+        raise BackupCodecError(
+            f"malformed .mfbak header (declared length {hdrlen} exceeds the {MAX_HEADER_BYTES}-byte "
+            "maximum)"
+        )
     header_bytes = _read_exact(src, hdrlen, "header")
     try:
         obj = json.loads(header_bytes)
@@ -241,8 +280,13 @@ def read_header(src: BinaryIO) -> ArchiveHeader:
         raise BackupCodecError(
             f"unsupported .mfbak archive algorithm {header.alg!r}; this build supports AES-256-GCM only"
         )
-    if header.chunk_size <= 0:
-        raise BackupCodecError("malformed .mfbak header (chunk_size must be > 0)")
+    # See MAX_CHUNK_SIZE: this bound is what stops a declared 4 GiB chunk_size from licensing a 4 GiB
+    # frame read further down, while the header carrying it is still unauthenticated.
+    if not 0 < header.chunk_size <= MAX_CHUNK_SIZE:
+        raise BackupCodecError(
+            f"malformed .mfbak header (chunk_size must be in 1..{MAX_CHUNK_SIZE} bytes, got "
+            f"{header.chunk_size})"
+        )
     return header
 
 
@@ -254,14 +298,23 @@ def archive_key_id(path: str | Path) -> str:
         return read_header(fh).key_id
 
 
-def decrypt_stream(src: BinaryIO, dst: BinaryIO, key: bytes) -> ArchiveHeader:
+def decrypt_stream(
+    src: BinaryIO, dst: BinaryIO, key: bytes, *, max_plaintext_bytes: int | None = None
+) -> ArchiveHeader:
     """Decrypt the ``.mfbak`` stream ``src`` into the plaintext (tar) stream ``dst`` under ``key``,
     returning the parsed header. Re-derives the monotonic frame counter and requires the AAD-bound
     ``final`` terminator, so a reordered/dropped/truncated/appended chunk or a tampered header **fails
     the GCM tag** (``BackupCodecError``). Fail-closed: nothing decrypts unless every frame authenticates.
 
     Raises :class:`BackupKeyMismatch` when the header ``key_id`` does not match ``key`` — checked first,
-    so a wrong key is a clean early error, not an opaque tag failure."""
+    so a wrong key is a clean early error, not an opaque tag failure.
+
+    ``max_plaintext_bytes`` caps the CUMULATIVE plaintext written to ``dst`` (``None`` = uncapped). It is
+    a **caller-supplied parameter and not a constant of this module**, deliberately: the ceiling a
+    restore wants is the restore's own extract budget, which lives one layer up in ``pipeline/``, and
+    ``store/`` may not import ``pipeline/`` — the dependency direction is one-way. Reaching upward for
+    that constant would invert it; re-declaring the same number down here would fork it. The bound is
+    checked BEFORE each write, so an over-cap archive never lands a byte past the ceiling."""
     from cryptography.exceptions import InvalidTag
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -275,13 +328,24 @@ def decrypt_stream(src: BinaryIO, dst: BinaryIO, key: bytes) -> ArchiveHeader:
         )
     header_digest = hashlib.sha256(header.to_json_bytes()).digest()
     aes = AESGCM(key)
+    # AESGCM appends EXACTLY _TAG_BYTES to a chunk of at most chunk_size, so this bound is exact and
+    # holds no slack. The min() is redundant WHILE read_header caps chunk_size, and it is kept anyway:
+    # it makes this read's bound provable from the line itself rather than from a check twenty lines
+    # away, so the frame read stays bounded even if that check is ever loosened or moved.
+    max_ctlen = min(header.chunk_size, MAX_CHUNK_SIZE) + _TAG_BYTES
     frame_index = 0
+    written = 0
     saw_final = False
     while True:
         nonce = _read_exact(src, _NONCE_BYTES, "frame nonce")
         (ctlen,) = _U32.unpack(_read_exact(src, _U32.size, "frame length"))
-        if ctlen < _TAG_BYTES:
-            raise BackupCodecError("malformed .mfbak frame (ciphertext shorter than the GCM tag)")
+        # Both halves BEFORE the read: a declared length is rejected rather than allocated, and this
+        # is still pre-authentication -- ct has no tag checked against it until aes.decrypt below.
+        if not _TAG_BYTES <= ctlen <= max_ctlen:
+            raise BackupCodecError(
+                f"malformed .mfbak frame (declared ciphertext length {ctlen} outside "
+                f"{_TAG_BYTES}..{max_ctlen} for a {header.chunk_size}-byte chunk)"
+            )
         ct = _read_exact(src, ctlen, "frame ciphertext")
         # We don't know up front whether this is the final frame, so try the final-flag AAD first
         # (the common case for the last frame) and fall back to the non-final AAD. Exactly one matches
@@ -302,7 +366,13 @@ def decrypt_stream(src: BinaryIO, dst: BinaryIO, key: bytes) -> ArchiveHeader:
                 f"authentication failed on frame {frame_index} (corrupt/tampered/truncated archive, "
                 "or the wrong key)"
             )
+        if max_plaintext_bytes is not None and written + len(plaintext) > max_plaintext_bytes:
+            raise BackupCodecError(
+                f"the .mfbak archive decrypts to more than the caller's {max_plaintext_bytes}-byte "
+                f"plaintext ceiling (stopped at frame {frame_index})"
+            )
         dst.write(plaintext)
+        written += len(plaintext)
         if this_final:
             saw_final = True
             break
