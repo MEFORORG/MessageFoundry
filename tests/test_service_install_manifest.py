@@ -339,67 +339,6 @@ def _invoke_nssm_arms(tmp_path: Path) -> dict[str, str]:
     return parsed
 
 
-def _dud(tmp_path: Path) -> Path:
-    """A file that EXISTS and cannot be executed -- a present but unrunnable nssm.
-
-    Not a missing path, which is a different failure: an absent file raises
-    CommandNotFoundException, which IS terminating, so it can never reach an exit-code check. A
-    present-but-unrunnable one is the shape that gets past it.
-    """
-    dud = tmp_path / f"dud-nssm-{uuid.uuid4().hex}.txt"
-    dud.write_text("not an executable\n", encoding="ascii")
-    return dud
-
-
-def test_a_failed_launch_is_not_read_as_the_previous_commands_exit_code(tmp_path: Path) -> None:
-    """THE FAIL-OPEN THE EXIT-CODE CHECK HAD UNTIL IT CLEARED $LASTEXITCODE FIRST (BACKLOG #1558).
-
-    $LASTEXITCODE is session-wide and a failed LAUNCH never writes it, so it keeps whatever the
-    previous native command left. Measured 2026-09-18 under ``$ErrorActionPreference = 'Stop'``, on
-    PowerShell 7.6.6 AND Windows PowerShell 5.1.26100: invoking a present-but-unrunnable file threw
-    NOTHING -- the error is non-terminating on both hosts -- and left $LASTEXITCODE at the 0 from the
-    command before it. So `if ($LASTEXITCODE -ne 0)` was False and Invoke-Nssm returned as though
-    nssm had configured the service. A guard that cannot fail, in the same function the row added it
-    to.
-
-    The stale 0 is left by a REAL successful child process, not assigned, because an assignment would
-    not establish that the engine leaves the variable alone across a failed launch.
-    """
-    assert _SCRIPT is not None
-    ok = _nssm_stub(tmp_path / "nssm-ok", message="nssm: fine", exit_code=0)
-    dud = _dud(tmp_path)
-    body = rf"""
-  $NssmPath = {_psq(str(ok))}
-  Invoke-Nssm set MessageFoundry AppThrottle 5000
-  $seeded = $LASTEXITCODE
-  $NssmPath = {_psq(str(dud))}
-  $threw = $false
-  $message = ''
-  try {{ Invoke-Nssm set MessageFoundry AppStdout 'C:\logs\service.out.log' }}
-  catch {{ $threw = $true; $message = $_.Exception.Message }}
-  [pscustomobject]@{{ seeded = "$seeded"; threw = $threw; message = $message }} |
-    ConvertTo-Json -Depth 4 -Compress
-"""
-    got = json.loads(
-        _ok(_extract(_SCRIPT, ["Invoke-Nssm"], body), tmp_path).strip().splitlines()[-1]
-    )
-    assert got["seeded"] == "0", (
-        "CONTROL FAILED: the success stub did not leave $LASTEXITCODE at 0, so a stale 0 was never "
-        f"in place and the arm below proves nothing about reading one; got {got['seeded']!r}"
-    )
-    assert got["threw"], (
-        "nssm could not be launched and Invoke-Nssm returned SUCCESS, because it read the 0 left by "
-        "the previous call. The service would be registered with none of the settings applied."
-    )
-    assert "AppStdout" in got["message"], (
-        f"the failure must still name the subcommand that did not run; got {got['message']!r}"
-    )
-    assert "(exit )" not in got["message"] and "exit )" not in got["message"], (
-        "the message renders the absent exit code as a blank; say that there was no exit code "
-        f"instead: {got['message']!r}"
-    )
-
-
 def test_nssm_failure_message_redacts_the_service_account_password(tmp_path: Path) -> None:
     """The password never reaches the throw, the rendered record, or the $Error entry."""
     arms = _invoke_nssm_arms(tmp_path)
@@ -499,14 +438,12 @@ def _stop_arms(
     nssm_exit: int | None,
     states: list[str],
     timeout: int = 1,
-    dud: bool = False,
 ) -> dict:
     """Run Stop-ServiceAndConfirm with Get-Service and Stop-Service shadowed.
 
     ``states`` is what the shadowed Get-Service reports on successive calls (the last value repeats);
     an empty list means the service is absent. ``nssm_exit`` of None runs the no-nssm branch, which
-    is uninstall-service.ps1's third stop site. ``dud`` points -NssmPath at a present-but-unrunnable
-    file and seeds $LASTEXITCODE with a real 0 first, which is the failed-launch arm.
+    is uninstall-service.ps1's third stop site.
     """
     assert _SCRIPT is not None
     stub = _nssm_stub(
@@ -514,17 +451,8 @@ def _stop_arms(
         message="nssm: stop reported a problem",
         exit_code=nssm_exit if nssm_exit is not None else 0,
     )
-    if dud:
-        # A REAL successful child process, so the stale 0 the helper must not read was left by the
-        # engine rather than assigned -- an assignment would not show that a failed launch leaves
-        # the variable alone. The control doubles as that seed: it ends on a genuine 0.
-        prelude = _stub_control(_nssm_stub(tmp_path / "seed", message="seed", exit_code=0), 0)
-        stub = _dud(tmp_path)
-    elif nssm_exit is not None:
-        prelude = _stub_control(stub, nssm_exit)
-    else:
-        prelude = ""  # the SCM branch runs no nssm at all
-    nssm_arg = _psq(str(stub)) if nssm_exit is not None or dud else "''"
+    prelude = _stub_control(stub, nssm_exit) if nssm_exit is not None else ""
+    nssm_arg = _psq(str(stub)) if nssm_exit is not None else "''"
     states_ps = "@(" + ", ".join(_psq(s) for s in states) + ")"
     body = (
         prelude
@@ -583,28 +511,6 @@ def test_a_nonzero_nssm_exit_is_no_longer_swallowed(tmp_path: Path) -> None:
     joined = " ".join(arms["warnings"])
     assert "3" in joined and "nssm stop" in joined, (
         f"a non-zero `nssm stop` exit must be surfaced, not swallowed; warnings were {arms['warnings']}"
-    )
-
-
-def test_a_stop_whose_nssm_never_launched_falls_back_instead_of_reading_a_stale_zero(
-    tmp_path: Path,
-) -> None:
-    """THE SAME FAIL-OPEN AS THE Invoke-Nssm ARM, on the stop path.
-
-    A present-but-unrunnable nssm writes a NON-terminating error on both hosts, so the catch does not
-    fire, and it leaves $LASTEXITCODE at the previous command's 0. The helper then warned about
-    nothing and let the confirm loop decide -- which reads Stopped here and returns True, so the
-    caller is told a stop succeeded that was never issued. The stop must go through the SCM instead.
-    """
-    arms = _stop_arms(tmp_path, nssm_exit=None, states=["Stopped"], dud=True)
-    assert arms["stopServiceCalls"] == 1, (
-        "nssm never ran, so the stop never happened; the SCM fallback must issue it (got "
-        f"{arms['stopServiceCalls']} Stop-Service calls)"
-    )
-    joined = " ".join(arms["warnings"])
-    assert joined, "a stop that did not run must say so; nothing was warned"
-    assert "exited  " not in joined, (
-        f"the absent exit code is rendered as a blank rather than named: {arms['warnings']}"
     )
 
 
@@ -697,6 +603,89 @@ def test_every_stop_service_call_lives_inside_the_helper(tmp_path: Path) -> None
         assert not stray, (
             f"{path.name} calls Stop-Service outside {_STOP_FN} at line(s) "
             f"{[c['line'] for c in stray]} -- that stop is neither checked nor confirmed"
+        )
+
+
+def test_every_nssm_exit_code_is_read_from_a_cleared_variable(tmp_path: Path) -> None:
+    """$LASTEXITCODE must be cleared before each nssm call, and a $null one treated as a failure.
+
+    A STATIC guard, and the reason it is static is worth writing down, because the behavioural
+    version of it was built first and had to be withdrawn.
+
+    $LASTEXITCODE is session-wide and a failed LAUNCH never writes it, so an exit-code check reads
+    whatever the previous native command left. Witnessing that needs a launch to fail while
+    execution CARRIES ON, and whether it does is host-dependent:
+
+      * Windows -- MEASURED 2026-09-18 on PowerShell 7.6.6 and Windows PowerShell 5.1.26100, with a
+        file carrying a PATHEXT extension whose content is not a PE image: the launch raises a
+        TERMINATING ApplicationFailedException. It never reaches the check, so the shape cannot be
+        built here at all.
+      * Linux -- OBSERVED on the ubuntu-latest CI leg of this branch: PowerShell resolved a
+        non-executable file, failed to start it, wrote a NON-terminating error, and ran straight on
+        to the exit-code check with $LASTEXITCODE never set. Every message rendered the code as an
+        empty string.
+
+    A FIRST ATTEMPT AT THE BEHAVIOURAL ARM MEASURED SOMETHING ELSE ENTIRELY. Its unrunnable file was
+    a ``.txt``; PowerShell handed a non-PATHEXT extension to the shell, which consulted the file
+    association and SUCCESSFULLY opened the registered editor. "Threw nothing, left $LASTEXITCODE
+    alone" was a successful ShellExecute wearing the costume of a failed launch -- and it would have
+    made the arm pass on a host where the guard does nothing. Hence: never give a stub or a dud an
+    extension that a desktop can open.
+
+    So the property is asserted where it is host-independent -- in the source. The drift test below
+    pins the two copies of the stop helper together, so checking the install copy covers both.
+    """
+    assert _SCRIPT is not None
+    # READ THE AST, NOT THE TEXT. Both helpers QUOTE the defective call in their own docstrings, so a
+    # string scan finds the explanation of the defect and reports the defect -- the same trap
+    # test_no_unchecked_stop_site_survives_in_either_script sidesteps by dropping comment tokens.
+    body = """
+  $fns = @($ast.FindAll({ $args[0] -is
+      [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | Where-Object {
+      $_.Name -in @('Invoke-Nssm', 'Stop-ServiceAndConfirm') })
+  @($fns | ForEach-Object {
+    $fn = $_
+    $calls = @($fn.FindAll({ $args[0] -is
+        [System.Management.Automation.Language.CommandAst] }, $true) | Where-Object {
+        $_.CommandElements.Count -gt 0 -and $_.CommandElements[0].Extent.Text -eq '$NssmPath' })
+    $clears = @($fn.FindAll({ $args[0] -is
+        [System.Management.Automation.Language.AssignmentStatementAst] }, $true) | Where-Object {
+        $_.Left.Extent.Text -eq '$global:LASTEXITCODE' -and $_.Right.Extent.Text -eq '$null' })
+    $nulls = @($fn.FindAll({ $args[0] -is
+        [System.Management.Automation.Language.BinaryExpressionAst] }, $true) | Where-Object {
+        $_.Left.Extent.Text -eq '$null' -and "$($_.Operator)" -eq 'Ieq' })
+    [pscustomobject]@{
+      name      = $fn.Name
+      callAt    = $(if ($calls.Count) { ($calls | ForEach-Object { $_.Extent.StartOffset } |
+                    Measure-Object -Minimum).Minimum } else { -1 })
+      clearsAt  = $(if ($clears.Count) { ($clears | ForEach-Object { $_.Extent.StartOffset } |
+                    Measure-Object -Minimum).Minimum } else { -1 })
+      testsNull = [bool]$nulls.Count
+    }
+  }) | ConvertTo-Json -Depth 4 -Compress
+"""
+    raw = _ok(_extract(_SCRIPT, [], body), tmp_path)
+    fns = json.loads(raw.strip().splitlines()[-1])
+    if isinstance(fns, dict):
+        fns = [fns]
+    seen = {f["name"] for f in fns}
+    assert seen == {"Invoke-Nssm", "Stop-ServiceAndConfirm"}, (
+        f"CONTROL FAILED: the search did not find both nssm callers, so a clean result here would "
+        f"mean nothing; found {sorted(seen)}"
+    )
+    for f in fns:
+        assert f["callAt"] >= 0, f"{f['name']} no longer invokes & $NssmPath -- re-aim this guard"
+        assert f["clearsAt"] >= 0, (
+            f"{f['name']} reads $LASTEXITCODE without clearing it first, so a failed launch is read "
+            "as the PREVIOUS command's exit code (BACKLOG #1558)"
+        )
+        assert f["clearsAt"] < f["callAt"], (
+            f"{f['name']} clears $LASTEXITCODE AFTER invoking nssm, which discards the code it was "
+            "about to check"
+        )
+        assert f["testsNull"], (
+            f"{f['name']} does not test for a $null exit code, so an absent one renders as a blank "
+            "-- 'failed (exit )' is what the ubuntu leg printed"
         )
 
 

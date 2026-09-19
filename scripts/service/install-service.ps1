@@ -567,14 +567,16 @@ function Invoke-Nssm {
       PowerShell 5.1.26100 (the host CI runs these scripts on) and on PowerShell 7.
 
       $LASTEXITCODE IS CLEARED FIRST, AND A MISSING ONE IS A FAILURE. It is a session-wide variable
-      that a failed LAUNCH never writes, so it holds the PREVIOUS native command's code - and reading
-      a stale 0 after nssm failed to start is this guard passing without being able to fail. Measured
-      2026-09-18 on PowerShell 7.6.6: after `& <path that cannot run>`, $LASTEXITCODE was still the 0
-      left by the command before it, so `$LASTEXITCODE -ne 0` was False. Whether the launch failure
-      is terminating varies by host and by why it failed (Windows raises CommandNotFoundException for
-      an absent file; the same call against a present-but-not-executable file on Linux writes a
-      non-terminating error and carries straight on), so the clear covers both without depending on
-      which one this host does.
+      that a failed LAUNCH never writes, so a check written after one reads whatever the PREVIOUS
+      native command left. Whether that is reachable depends on the host, and on Windows it is not:
+      measured 2026-09-18 on PowerShell 7.6.6 and Windows PowerShell 5.1.26100, a present-but-
+      unrunnable nssm.exe raises a TERMINATING ApplicationFailedException and this line is never
+      reached. On Linux it IS reachable - observed on this branch's ubuntu CI leg, where PowerShell
+      resolved a non-executable file, failed to start it, wrote a NON-terminating error, and ran
+      straight on to the check with $LASTEXITCODE never set.
+
+      So the clear buys two things on every host: the code reported is unambiguously the one THIS
+      call produced, and an absent one is named rather than printed as `failed (exit )`.
     #>
     param(
         # A trailing argument that must never reach a message, a transcript, or an $Error record.
@@ -617,15 +619,14 @@ function Stop-ServiceAndConfirm {
       $LASTEXITCODE is the true exit code on both hosts.
 
       AND A MISSING EXIT CODE IS NOT A ZERO. $LASTEXITCODE is session-wide and a failed LAUNCH never
-      writes it, so it holds whatever the PREVIOUS native command left. Reading a stale 0 after nssm
-      failed to start is this check passing without being able to fail - the same class of defect as
-      the empty catch it replaced. It is cleared first, and a $null afterwards means nssm never ran,
-      which is handled like the throw: warn, and stop through the SCM instead. Measured 2026-09-18 on
-      PowerShell 7.6.6: after `& <path that cannot run>` the variable still held the 0 from the
-      command before it. Whether the launch failure is even terminating varies - Windows raises
-      CommandNotFoundException for an absent file, while a present-but-not-executable file on Linux
-      writes a NON-terminating error and execution carries straight past the catch - so the clear
-      covers both rather than depending on which shape this host produces.
+      writes it, so a check written after one reads whatever the PREVIOUS native command left. The
+      catch above covers the hosts where such a failure is TERMINATING - measured 2026-09-18 on
+      PowerShell 7.6.6 and Windows PowerShell 5.1.26100, a present-but-unrunnable nssm.exe raises
+      ApplicationFailedException and lands there. It does NOT cover the hosts where the failure is
+      non-terminating: observed on this branch's ubuntu CI leg, where execution ran straight past the
+      catch with $LASTEXITCODE never set and the warning printed `exited ` with nothing after it. So
+      the variable is cleared first and a $null afterwards is treated as the catch treats a throw:
+      nssm did not run, say so, and stop through the SCM instead.
 
       THE RE-READ. An exit code is still not enough. `nssm stop` can exit 0 while the process is
       still shutting down - the engine drains connections for up to AppStopMethodConsole ms - and

@@ -55,15 +55,14 @@ function Stop-ServiceAndConfirm {
       $LASTEXITCODE is the true exit code on both hosts.
 
       AND A MISSING EXIT CODE IS NOT A ZERO. $LASTEXITCODE is session-wide and a failed LAUNCH never
-      writes it, so it holds whatever the PREVIOUS native command left. Reading a stale 0 after nssm
-      failed to start is this check passing without being able to fail - the same class of defect as
-      the empty catch it replaced. It is cleared first, and a $null afterwards means nssm never ran,
-      which is handled like the throw: warn, and stop through the SCM instead. Measured 2026-09-18 on
-      PowerShell 7.6.6: after `& <path that cannot run>` the variable still held the 0 from the
-      command before it. Whether the launch failure is even terminating varies - Windows raises
-      CommandNotFoundException for an absent file, while a present-but-not-executable file on Linux
-      writes a NON-terminating error and execution carries straight past the catch - so the clear
-      covers both rather than depending on which shape this host produces.
+      writes it, so a check written after one reads whatever the PREVIOUS native command left. The
+      catch above covers the hosts where such a failure is TERMINATING - measured 2026-09-18 on
+      PowerShell 7.6.6 and Windows PowerShell 5.1.26100, a present-but-unrunnable nssm.exe raises
+      ApplicationFailedException and lands there. It does NOT cover the hosts where the failure is
+      non-terminating: observed on this branch's ubuntu CI leg, where execution ran straight past the
+      catch with $LASTEXITCODE never set and the warning printed `exited ` with nothing after it. So
+      the variable is cleared first and a $null afterwards is treated as the catch treats a throw:
+      nssm did not run, say so, and stop through the SCM instead.
 
       THE RE-READ. An exit code is still not enough. `nssm stop` can exit 0 while the process is
       still shutting down - the engine drains connections for up to AppStopMethodConsole ms - and
