@@ -23,7 +23,7 @@ from .._auth import (
     require_ui,
     require_ui_step_up,
 )
-from ._common import _form_pairs
+from ._common import UI_BODY_FILTER_RULES, FilterRefused, _form_pairs, check_filters
 
 # content-search (ADR 0046 #51): the search PAGE is step-up-gated (bulk-PHI decrypt), so register
 # it as an UNLOCK form — a stale step-up 303s to /ui/reauth and GET-redirects back to the fresh
@@ -85,6 +85,21 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             message_type=message_type or "",
             control_id=control_id or "",
         )
+        try:
+            # BACKLOG #1740: the four metadata filters, against the rules GET /messages/search
+            # declares. Checked HERE rather than in the GET route so both arms are covered by one
+            # call; on the POST arm SearchPresetCriteria has already applied the same four rules, so
+            # this never fires there. A direct handler call runs no request validation, which is why
+            # the GET arm had no rule at all.
+            check_filters(UI_BODY_FILTER_RULES["/ui/messages/search"], shared)
+        except FilterRefused as exc:
+            # BACKLOG #1025, as on the bare-form branch below: this arm returns before
+            # core.search_messages, which charges the per-actor read budget in its own body.
+            enforce_phi_read_pacing(request, identity)
+            return HTMLResponse(
+                pages.message_search(None, error=exc.message, presets=preset_list, **shared),
+                status_code=400,
+            )
         if not has_criteria:
             # BACKLOG #1025: this bare-form render returns WITHOUT reaching core.search_messages,
             # whose body charges the per-actor read budget. Charge here — only on the short-circuit
@@ -133,6 +148,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         identity: Identity = Depends(require_ui_step_up(Permission.MESSAGES_READ)),
         field_path: str | None = Query(None, max_length=32),
         target: str = Query("both", pattern="^(raw|summary|both)$"),
+        # The four below keep a plain `str` declaration and are checked in _render_search against
+        # _common.UI_BODY_FILTER_RULES (BACKLOG #1740). Annotating them would make FastAPI answer 422
+        # and throw the whole form away; this page's established refusal is a 400 re-render carrying
+        # the criteria back, which is what every other refusal on it already does.
         channel_id: str | None = Query(None, max_length=256),
         status_filter: str | None = Query(None, alias="status", max_length=64),
         message_type: str | None = Query(None, max_length=64),

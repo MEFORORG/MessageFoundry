@@ -10,6 +10,7 @@ from urllib.parse import parse_qsl
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
+from pydantic import TypeAdapter, ValidationError
 
 from messagefoundry.api._ui_seam import UiDeps
 from messagefoundry.api.models import (
@@ -17,6 +18,7 @@ from messagefoundry.api.models import (
     PendingApprovalResponse,
 )
 from messagefoundry.api.security import client_ip
+from messagefoundry.api.validation import ConnectionName
 from messagefoundry.auth import Identity, Permission
 
 from .. import pages
@@ -28,6 +30,24 @@ from .._auth import (
 )
 
 _log = logging.getLogger(__name__)
+
+#: The connection-name rule, as a standalone validator rather than a parameter annotation. The two
+#: bulk routes below read their names out of the POST BODY with ``parse_qsl``, so there is no FastAPI
+#: parameter to annotate and no automatic 422 to inherit (BACKLOG #1740).
+_CONNECTION_NAME: TypeAdapter[str] = TypeAdapter(ConnectionName)
+
+#: What a bulk outcome row says for a selection that is not a name this console could have rendered.
+#:
+#: Paired with a ``None`` target, so the row renders the fixed 'unrecognized selection' label, for
+#: the reason ``pages.decode_row_key`` already gives: a value that failed the rule did not come from
+#: the page, and reflecting it back would put unvetted input on the result table. The RESULT column
+#: still says which of the two refusals it was, so this is distinguishable from a malformed row key.
+#:
+#: What it costs, since it is a real cost: a connection registered under a name the API rule rejects
+#: is refused here without being named. The JSON control routes already refuse that name too, so it
+#: is uncontrollable through the API either way, and the console is not the surface that has to
+#: report it.
+_NOT_A_CONNECTION_NAME = "not applied: not a valid connection name"
 
 # L3b: the queue purge is step-up-gated, so register it in the write-action allow-list — this is
 # the first extension of the registry L0b introduced (the step-up re-auth may auto-retry the
@@ -90,6 +110,17 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 continue
             seen.add((role, name))
             try:
+                # BACKLOG #1740: the rule /connections/{name}/start declares for the same value. It
+                # has to be applied by hand here -- the name comes out of the POST body, so there is
+                # no parameter for FastAPI to refuse. An OUTCOME ROW rather than a raise: this is a
+                # capture-and-continue batch, and one bad selection must not abort the rest. After
+                # the dedupe, so a selection repeated N times is still one row whether it is valid
+                # or not.
+                _CONNECTION_NAME.validate_python(name)
+            except ValidationError:
+                outcomes.append((None, _NOT_A_CONNECTION_NAME))
+                continue
+            try:
                 # ADR 0150: `request` is the browser's (the console mounts in-process), so a
                 # per-channel denial names the operator's host, as the JSON and per-name console
                 # controls already do.
@@ -142,7 +173,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         request: Request,
         engine: Any = Depends(deps.get_engine),
         identity: Identity = Depends(require_ui_step_up(Permission.MESSAGES_PURGE)),
-        dest: list[str] | None = Query(None),
+        # Annotated, so FastAPI 422s before the handler runs (BACKLOG #1740). Every entry arrives
+        # from a checkbox this console rendered out of a live outbound name, so a refusal means a
+        # hand-built URL and there is no form to hand it back to.
+        dest: list[ConnectionName] | None = Query(None),
         scope: str = Query("all", max_length=8),
     ) -> HTMLResponse:
         # Step-up-unlock confirm page for the bulk purge. A channel-scoped user can't purge a
@@ -207,6 +241,16 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 continue
             seen_dest.add(value)
             try:
+                # BACKLOG #1740: the rule /connections/{name}/purge declares for the same value,
+                # applied by hand because the name rides the POST body. An outcome row, not a raise:
+                # this is a capture-and-continue batch, so one forged dest must not abort a purge the
+                # operator stepped up for. It also stops an unvetted body value being echoed onto the
+                # result table, which the raw append below used to do.
+                _CONNECTION_NAME.validate_python(value)
+            except ValidationError:
+                outcomes.append((None, _NOT_A_CONNECTION_NAME))
+                continue
+            try:
                 result = await core.purge_connection(
                     value,
                     Response(),
@@ -229,7 +273,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
 
     @app.post("/ui/connections/{name}/purge/{scope}")
     async def ui_purge_connection(
-        name: str,
+        # Annotated for the same reason as the three per-name controls in routes/core.py: the twin
+        # declares ConnectionName on this path segment, the console renders the name into the form
+        # action, and a hand-built URL is the only way to reach the 422 (BACKLOG #1740).
+        name: ConnectionName,
         scope: str,
         request: Request,
         engine: Any = Depends(deps.get_engine),
