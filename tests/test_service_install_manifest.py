@@ -249,7 +249,52 @@ def test_gmsa_preflight_and_logon_right_are_wired(monkeypatch: pytest.MonkeyPatc
 
 _SECRET = "hunter2-DO-NOT-LEAK-THIS"
 
-_NSSM_STUB = "@echo off\r\necho nssm: the service could not be configured 1>&2\r\nexit /b 3\r\n"
+
+def _nssm_stub(path_stem: Path, *, message: str, exit_code: int) -> Path:
+    """Write a stub nssm that prints ``message`` to stderr and exits ``exit_code``.
+
+    THE STUB MUST BE A REAL NATIVE COMMAND ON THE HOST RUNNING THE TEST, and a ``.cmd`` is not one
+    off Windows. These arms exist to read a genuine ``$LASTEXITCODE`` back from a genuine child
+    process, so a stub that cannot launch does not weaken the test -- it silently replaces it.
+
+    Measured 2026-09-18 on the ubuntu-latest CI leg, where a ``.cmd`` stub produced exactly that:
+    PowerShell resolved the path (the file exists), failed to start it, wrote a NON-terminating
+    error, and carried on to the exit-code check with $LASTEXITCODE never set. Every message under
+    test then rendered the code as an empty string -- ``failed (exit )``, ``exited  (its message is
+    above)`` -- and the two arms that assert a code is present failed while the two that assert
+    silence saw a warning. The scripts were right; the stub was not a command.
+
+    So: a batch file on Windows, a shebanged shell script with the execute bit everywhere else.
+    """
+    if sys.platform.startswith("win"):
+        stub = path_stem.with_suffix(".cmd")
+        stub.write_text(f"@echo off\r\necho {message} 1>&2\r\nexit /b {exit_code}\r\n", "ascii")
+        return stub
+    stub = path_stem.with_suffix(".sh")
+    stub.write_text(f"#!/bin/sh\necho '{message}' >&2\nexit {exit_code}\n", "ascii")
+    stub.chmod(0o755)
+    return stub
+
+
+def _stub_control(stub: Path, exit_code: int) -> str:
+    """Harness that proves the stub is a runnable native command BEFORE any arm relies on it.
+
+    A stub that cannot launch reads as a script defect, not as a harness defect, and that is how a
+    whole afternoon goes. This makes the instrument say so in its own words: an execute bit that did
+    not take, a noexec temp filesystem, a host with no shell.
+
+    It leaves $LASTEXITCODE at a real 0, deliberately. A STALE value is what the code under test must
+    not read, and 0 is the one value that would let a stale read look like success -- so if the clear
+    inside the function under test is ever dropped, the arms below fail rather than pass on this.
+    """
+    return (
+        f"  & {_psq(str(stub))}\n"
+        f"  if ($LASTEXITCODE -ne {exit_code}) {{ throw ("
+        f"'CONTROL FAILED: the nssm stub is not a runnable command on this host (expected exit "
+        f"{exit_code}, got [' + \"$LASTEXITCODE\" + ']). The arms below would then measure a failed "
+        f"LAUNCH rather than the exit code the script reads.') }}\n"
+        "  $global:LASTEXITCODE = 0\n"
+    )
 
 
 def _invoke_nssm_arms(tmp_path: Path) -> dict[str, str]:
@@ -259,9 +304,12 @@ def _invoke_nssm_arms(tmp_path: Path) -> dict[str, str]:
     record as the host renders it, the record's full property dump, and the $Error entry.
     """
     assert _SCRIPT is not None
-    stub = tmp_path / "nssm-stub.cmd"
-    stub.write_text(_NSSM_STUB, encoding="ascii")
-    body = rf"""
+    stub = _nssm_stub(
+        tmp_path / "nssm-stub", message="nssm: the service could not be configured", exit_code=3
+    )
+    body = (
+        _stub_control(stub, 3)
+        + rf"""
   $NssmPath = {_psq(str(stub))}
   $out = [ordered]@{{}}
   foreach ($arm in 'sensitive', 'ordinary') {{
@@ -285,9 +333,71 @@ def _invoke_nssm_arms(tmp_path: Path) -> dict[str, str]:
   }}
   $out | ConvertTo-Json -Depth 4 -Compress
 """
+    )
     raw = _ok(_extract(_SCRIPT, ["Invoke-Nssm"], body), tmp_path)
     parsed: dict[str, str] = json.loads(raw.strip().splitlines()[-1])
     return parsed
+
+
+def _dud(tmp_path: Path) -> Path:
+    """A file that EXISTS and cannot be executed -- a present but unrunnable nssm.
+
+    Not a missing path, which is a different failure: an absent file raises
+    CommandNotFoundException, which IS terminating, so it can never reach an exit-code check. A
+    present-but-unrunnable one is the shape that gets past it.
+    """
+    dud = tmp_path / f"dud-nssm-{uuid.uuid4().hex}.txt"
+    dud.write_text("not an executable\n", encoding="ascii")
+    return dud
+
+
+def test_a_failed_launch_is_not_read_as_the_previous_commands_exit_code(tmp_path: Path) -> None:
+    """THE FAIL-OPEN THE EXIT-CODE CHECK HAD UNTIL IT CLEARED $LASTEXITCODE FIRST (BACKLOG #1558).
+
+    $LASTEXITCODE is session-wide and a failed LAUNCH never writes it, so it keeps whatever the
+    previous native command left. Measured 2026-09-18 under ``$ErrorActionPreference = 'Stop'``, on
+    PowerShell 7.6.6 AND Windows PowerShell 5.1.26100: invoking a present-but-unrunnable file threw
+    NOTHING -- the error is non-terminating on both hosts -- and left $LASTEXITCODE at the 0 from the
+    command before it. So `if ($LASTEXITCODE -ne 0)` was False and Invoke-Nssm returned as though
+    nssm had configured the service. A guard that cannot fail, in the same function the row added it
+    to.
+
+    The stale 0 is left by a REAL successful child process, not assigned, because an assignment would
+    not establish that the engine leaves the variable alone across a failed launch.
+    """
+    assert _SCRIPT is not None
+    ok = _nssm_stub(tmp_path / "nssm-ok", message="nssm: fine", exit_code=0)
+    dud = _dud(tmp_path)
+    body = rf"""
+  $NssmPath = {_psq(str(ok))}
+  Invoke-Nssm set MessageFoundry AppThrottle 5000
+  $seeded = $LASTEXITCODE
+  $NssmPath = {_psq(str(dud))}
+  $threw = $false
+  $message = ''
+  try {{ Invoke-Nssm set MessageFoundry AppStdout 'C:\logs\service.out.log' }}
+  catch {{ $threw = $true; $message = $_.Exception.Message }}
+  [pscustomobject]@{{ seeded = "$seeded"; threw = $threw; message = $message }} |
+    ConvertTo-Json -Depth 4 -Compress
+"""
+    got = json.loads(
+        _ok(_extract(_SCRIPT, ["Invoke-Nssm"], body), tmp_path).strip().splitlines()[-1]
+    )
+    assert got["seeded"] == "0", (
+        "CONTROL FAILED: the success stub did not leave $LASTEXITCODE at 0, so a stale 0 was never "
+        f"in place and the arm below proves nothing about reading one; got {got['seeded']!r}"
+    )
+    assert got["threw"], (
+        "nssm could not be launched and Invoke-Nssm returned SUCCESS, because it read the 0 left by "
+        "the previous call. The service would be registered with none of the settings applied."
+    )
+    assert "AppStdout" in got["message"], (
+        f"the failure must still name the subcommand that did not run; got {got['message']!r}"
+    )
+    assert "(exit )" not in got["message"] and "exit )" not in got["message"], (
+        "the message renders the absent exit code as a blank; say that there was no exit code "
+        f"instead: {got['message']!r}"
+    )
 
 
 def test_nssm_failure_message_redacts_the_service_account_password(tmp_path: Path) -> None:
@@ -384,24 +494,41 @@ _STOP_FN = "Stop-ServiceAndConfirm"
 
 
 def _stop_arms(
-    tmp_path: Path, *, nssm_exit: int | None, states: list[str], timeout: int = 1
+    tmp_path: Path,
+    *,
+    nssm_exit: int | None,
+    states: list[str],
+    timeout: int = 1,
+    dud: bool = False,
 ) -> dict:
     """Run Stop-ServiceAndConfirm with Get-Service and Stop-Service shadowed.
 
     ``states`` is what the shadowed Get-Service reports on successive calls (the last value repeats);
     an empty list means the service is absent. ``nssm_exit`` of None runs the no-nssm branch, which
-    is uninstall-service.ps1's third stop site.
+    is uninstall-service.ps1's third stop site. ``dud`` points -NssmPath at a present-but-unrunnable
+    file and seeds $LASTEXITCODE with a real 0 first, which is the failed-launch arm.
     """
     assert _SCRIPT is not None
-    stub = tmp_path / f"nssm-stop-{uuid.uuid4().hex}.cmd"
-    stub.write_text(
-        "@echo off\r\necho nssm: stop reported a problem 1>&2\r\n"
-        f"exit /b {nssm_exit if nssm_exit is not None else 0}\r\n",
-        encoding="ascii",
+    stub = _nssm_stub(
+        tmp_path / f"nssm-stop-{uuid.uuid4().hex}",
+        message="nssm: stop reported a problem",
+        exit_code=nssm_exit if nssm_exit is not None else 0,
     )
-    nssm_arg = _psq(str(stub)) if nssm_exit is not None else "''"
+    if dud:
+        # A REAL successful child process, so the stale 0 the helper must not read was left by the
+        # engine rather than assigned -- an assignment would not show that a failed launch leaves
+        # the variable alone. The control doubles as that seed: it ends on a genuine 0.
+        prelude = _stub_control(_nssm_stub(tmp_path / "seed", message="seed", exit_code=0), 0)
+        stub = _dud(tmp_path)
+    elif nssm_exit is not None:
+        prelude = _stub_control(stub, nssm_exit)
+    else:
+        prelude = ""  # the SCM branch runs no nssm at all
+    nssm_arg = _psq(str(stub)) if nssm_exit is not None or dud else "''"
     states_ps = "@(" + ", ".join(_psq(s) for s in states) + ")"
-    body = rf"""
+    body = (
+        prelude
+        + rf"""
   $script:StopServiceCalls = 0
   $script:GetServiceCalls = 0
   $script:States = {states_ps}
@@ -432,6 +559,7 @@ def _stop_arms(
     getServiceCalls  = $script:GetServiceCalls
   }} | ConvertTo-Json -Depth 4 -Compress
 """
+    )
     raw = _ok(_extract(_SCRIPT, [_STOP_FN], body), tmp_path)
     parsed: dict = json.loads(raw.strip().splitlines()[-1])
     parsed["warnings"] = [w for w in (parsed.get("warnings") or []) if w]
@@ -455,6 +583,28 @@ def test_a_nonzero_nssm_exit_is_no_longer_swallowed(tmp_path: Path) -> None:
     joined = " ".join(arms["warnings"])
     assert "3" in joined and "nssm stop" in joined, (
         f"a non-zero `nssm stop` exit must be surfaced, not swallowed; warnings were {arms['warnings']}"
+    )
+
+
+def test_a_stop_whose_nssm_never_launched_falls_back_instead_of_reading_a_stale_zero(
+    tmp_path: Path,
+) -> None:
+    """THE SAME FAIL-OPEN AS THE Invoke-Nssm ARM, on the stop path.
+
+    A present-but-unrunnable nssm writes a NON-terminating error on both hosts, so the catch does not
+    fire, and it leaves $LASTEXITCODE at the previous command's 0. The helper then warned about
+    nothing and let the confirm loop decide -- which reads Stopped here and returns True, so the
+    caller is told a stop succeeded that was never issued. The stop must go through the SCM instead.
+    """
+    arms = _stop_arms(tmp_path, nssm_exit=None, states=["Stopped"], dud=True)
+    assert arms["stopServiceCalls"] == 1, (
+        "nssm never ran, so the stop never happened; the SCM fallback must issue it (got "
+        f"{arms['stopServiceCalls']} Stop-Service calls)"
+    )
+    joined = " ".join(arms["warnings"])
+    assert joined, "a stop that did not run must say so; nothing was warned"
+    assert "exited  " not in joined, (
+        f"the absent exit code is rendered as a blank rather than named: {arms['warnings']}"
     )
 
 
@@ -762,7 +912,9 @@ _windows_only = pytest.mark.skipif(
 )
 
 
-def _lockdown(tmp_path: Path, *, broad_ace: str | None, inherited: bool) -> dict:
+def _lockdown(
+    tmp_path: Path, *, broad_ace: str | None, inherited: bool, rights: str = "RX"
+) -> dict:
     """Apply Set-SecureDataDirAcl to a real directory and read the resulting DACL back.
 
     ``broad_ace`` is a well-known SID granted before the lockdown. ``inherited`` puts it on the
@@ -778,7 +930,7 @@ def _lockdown(tmp_path: Path, *, broad_ace: str | None, inherited: bool) -> dict
     (data / "logs").mkdir(parents=True)
     grant_target = str(parent) if inherited else str(data)
     pre = (
-        f"  & icacls {_psq(grant_target)} /grant '{broad_ace}:(OI)(CI)RX' | Out-Null\n"
+        f"  & icacls {_psq(grant_target)} /grant '{broad_ace}:(OI)(CI){rights}' | Out-Null\n"
         if broad_ace
         else ""
     )
@@ -868,6 +1020,46 @@ def test_a_broad_explicit_ace_is_stripped_too(tmp_path: Path, sid: str) -> None:
     )
     assert sid not in got["logSids"], (
         f"an EXPLICIT {name} ({sid}) ACE reached the log directory:\n{got['afterLogs']}"
+    )
+
+
+@_windows_only
+def test_an_explicit_owner_rights_ace_is_stripped_too(tmp_path: Path) -> None:
+    """OWNER RIGHTS (S-1-3-4), which removing CREATOR OWNER (S-1-3-0) does NOT cover.
+
+    CREATOR OWNER materializes into an ACE for the creating principal at creation time. OWNER RIGHTS
+    stays S-1-3-4 in the DACL and is evaluated against whoever owns the object at ACCESS time -- and
+    the owner moves: any Administrator can take ownership, and the service account owns every log
+    file it writes. So it is a standing grant to a moving target over a PHI sink.
+
+    THIS IS THE ACE THAT FAILED CI RATHER THAN A HYPOTHETICAL. Measured 2026-09-18 on windows-2022
+    and windows-2025: an explicit OWNER RIGHTS ACE survived ``/inheritance:r /grant:r`` with icacls
+    exiting 0, reached the logs directory beneath, and the read-back named it -- which is how the
+    residue warning, not this assertion, was the thing that went red.
+
+    (OI)(CI)F rather than the RX the arms above plant, and deliberately: an OWNER RIGHTS ACE REPLACES
+    the owner's implicit READ_CONTROL + WRITE_DAC with exactly what it grants, so an RX one takes
+    away the right to rewrite the DACL and the lockdown's own second icacls call then fails with
+    "Access is denied" (exit 5) on any host where the Administrators ACE is not in the running token.
+    F is strictly broader than RX, so it tests removal at least as hard without making the arm depend
+    on whether the test process happens to be elevated.
+    """
+    got = _lockdown(tmp_path, broad_ace="*S-1-3-4", inherited=False, rights="F")
+    assert "S-1-3-4" in got["beforeSids"], (
+        "CONTROL FAILED: the explicit OWNER RIGHTS (S-1-3-4) ACE was not on the directory before "
+        f"the lockdown ran:\n{got['before']}"
+    )
+    assert "S-1-3-4" not in got["sids"], (
+        f"an EXPLICIT OWNER RIGHTS (S-1-3-4) ACE survived Set-SecureDataDirAcl:\n{got['after']}"
+    )
+    assert "S-1-3-4" not in got["logSids"], (
+        f"OWNER RIGHTS reached the LOG directory, which is the PHI sink:\n{got['afterLogs']}"
+    )
+    assert "owner rights" not in got["after"].lower(), (
+        f"the NAME spelling of OWNER RIGHTS survives in the icacls output:\n{got['after']}"
+    )
+    assert got["warnings"] == [], (
+        f"OWNER RIGHTS must be REMOVED, not merely reported as residue; got {got['warnings']}"
     )
 
 

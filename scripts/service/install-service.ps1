@@ -157,12 +157,24 @@ function Set-SecureDataDirAcl {
     # Drop any EXPLICIT broad ACE the grant above left standing. Removing a SID that is not present
     # is a no-op and still exits 0, so the whole set goes in one call. Well-known SIDs, so this works
     # on non-English Windows (an English host prints "BUILTIN\Users"; a German one does not).
+    #
+    # OWNER RIGHTS (S-1-3-4) is in the set and CREATOR OWNER (S-1-3-0) does not cover it. CREATOR
+    # OWNER materializes into an ACE for the creating principal at creation time; OWNER RIGHTS stays
+    # S-1-3-4 in the DACL and is evaluated against whoever owns the object AT ACCESS TIME. The owner
+    # is not a fixed principal - any Administrator can take ownership, and the service account owns
+    # every log file it creates - so it is a standing grant to a moving target over a PHI sink.
+    # Measured 2026-09-18 on the CI windows-2022 and windows-2025 runners, and reproduced locally: an
+    # EXPLICIT OWNER RIGHTS ACE on the data dir came through `/inheritance:r /grant:r` untouched with
+    # icacls exiting 0, propagated to the logs directory beneath it, and only the read-back saw it.
+    # Removing the ACE does not lock the owner out: with no S-1-3-4 ACE constraining them, Windows
+    # falls back to the owner's implicit READ_CONTROL + WRITE_DAC.
     $broad = @(
         "*S-1-1-0",       # Everyone
         "*S-1-5-32-545",  # BUILTIN\Users
         "*S-1-5-11",      # Authenticated Users
         "*S-1-5-4",       # INTERACTIVE
         "*S-1-3-0",       # CREATOR OWNER
+        "*S-1-3-4",       # OWNER RIGHTS
         "*S-1-5-32-546",  # Guests
         "*S-1-5-7"        # ANONYMOUS LOGON
     )
@@ -553,6 +565,16 @@ function Invoke-Nssm {
       remaining-arguments parameter, PowerShell stops binding the unpositioned ones positionally, so
       `Invoke-Nssm set $ServiceName ...` still binds every token to $NssmArgs. Measured on Windows
       PowerShell 5.1.26100 (the host CI runs these scripts on) and on PowerShell 7.
+
+      $LASTEXITCODE IS CLEARED FIRST, AND A MISSING ONE IS A FAILURE. It is a session-wide variable
+      that a failed LAUNCH never writes, so it holds the PREVIOUS native command's code - and reading
+      a stale 0 after nssm failed to start is this guard passing without being able to fail. Measured
+      2026-09-18 on PowerShell 7.6.6: after `& <path that cannot run>`, $LASTEXITCODE was still the 0
+      left by the command before it, so `$LASTEXITCODE -ne 0` was False. Whether the launch failure
+      is terminating varies by host and by why it failed (Windows raises CommandNotFoundException for
+      an absent file; the same call against a present-but-not-executable file on Linux writes a
+      non-terminating error and carries straight on), so the clear covers both without depending on
+      which one this host does.
     #>
     param(
         # A trailing argument that must never reach a message, a transcript, or an $Error record.
@@ -565,8 +587,13 @@ function Invoke-Nssm {
     # Built BEFORE the call, from the non-secret arguments only.
     $shown = @($NssmArgs)
     if ($hasSecret) { $shown += '<redacted>' }
+    $global:LASTEXITCODE = $null
     if ($hasSecret) { & $NssmPath @NssmArgs $Secret } else { & $NssmPath @NssmArgs }
-    if ($LASTEXITCODE -ne 0) { throw "nssm $($shown -join ' ') failed (exit $LASTEXITCODE)" }
+    $exit = $LASTEXITCODE
+    if ($null -eq $exit) {
+        throw ("nssm $($shown -join ' ') failed (no exit code: '$NssmPath' did not run)")
+    }
+    if ($exit -ne 0) { throw "nssm $($shown -join ' ') failed (exit $exit)" }
 }
 
 # BEGIN Stop-ServiceAndConfirm (kept byte-identical with uninstall-service.ps1; guarded by
@@ -589,6 +616,17 @@ function Stop-ServiceAndConfirm {
       output goes to the operator instead of Out-Null, no redirection wraps the error stream, and
       $LASTEXITCODE is the true exit code on both hosts.
 
+      AND A MISSING EXIT CODE IS NOT A ZERO. $LASTEXITCODE is session-wide and a failed LAUNCH never
+      writes it, so it holds whatever the PREVIOUS native command left. Reading a stale 0 after nssm
+      failed to start is this check passing without being able to fail - the same class of defect as
+      the empty catch it replaced. It is cleared first, and a $null afterwards means nssm never ran,
+      which is handled like the throw: warn, and stop through the SCM instead. Measured 2026-09-18 on
+      PowerShell 7.6.6: after `& <path that cannot run>` the variable still held the 0 from the
+      command before it. Whether the launch failure is even terminating varies - Windows raises
+      CommandNotFoundException for an absent file, while a present-but-not-executable file on Linux
+      writes a NON-terminating error and execution carries straight past the catch - so the clear
+      covers both rather than depending on which shape this host produces.
+
       THE RE-READ. An exit code is still not enough. `nssm stop` can exit 0 while the process is
       still shutting down - the engine drains connections for up to AppStopMethodConsole ms - and
       the caller's next step (rewriting the configuration, or removing the registration) then runs
@@ -603,14 +641,21 @@ function Stop-ServiceAndConfirm {
     )
     if ($NssmPath) {
         $launched = $true
+        $global:LASTEXITCODE = $null
         try { & $NssmPath stop $ServiceName } catch {
             $launched = $false
             Write-Warning ("Could not run '$NssmPath' to stop '$ServiceName' " +
                 "($($_.Exception.Message)). Falling back to the SCM.")
             Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
         }
-        if ($launched -and $LASTEXITCODE -ne 0) {
-            Write-Warning ("nssm stop '$ServiceName' exited $LASTEXITCODE (its message is above). " +
+        $exit = $LASTEXITCODE
+        if ($launched -and $null -eq $exit) {
+            $launched = $false
+            Write-Warning ("'$NssmPath' left no exit code, so nssm never ran and '$ServiceName' was " +
+                "not stopped by it. Falling back to the SCM.")
+            Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+        } elseif ($launched -and $exit -ne 0) {
+            Write-Warning ("nssm stop '$ServiceName' exited $exit (its message is above). " +
                 "The service may still be running; the status is checked below.")
         }
     } else {

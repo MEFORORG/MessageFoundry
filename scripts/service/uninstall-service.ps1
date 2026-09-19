@@ -54,6 +54,17 @@ function Stop-ServiceAndConfirm {
       output goes to the operator instead of Out-Null, no redirection wraps the error stream, and
       $LASTEXITCODE is the true exit code on both hosts.
 
+      AND A MISSING EXIT CODE IS NOT A ZERO. $LASTEXITCODE is session-wide and a failed LAUNCH never
+      writes it, so it holds whatever the PREVIOUS native command left. Reading a stale 0 after nssm
+      failed to start is this check passing without being able to fail - the same class of defect as
+      the empty catch it replaced. It is cleared first, and a $null afterwards means nssm never ran,
+      which is handled like the throw: warn, and stop through the SCM instead. Measured 2026-09-18 on
+      PowerShell 7.6.6: after `& <path that cannot run>` the variable still held the 0 from the
+      command before it. Whether the launch failure is even terminating varies - Windows raises
+      CommandNotFoundException for an absent file, while a present-but-not-executable file on Linux
+      writes a NON-terminating error and execution carries straight past the catch - so the clear
+      covers both rather than depending on which shape this host produces.
+
       THE RE-READ. An exit code is still not enough. `nssm stop` can exit 0 while the process is
       still shutting down - the engine drains connections for up to AppStopMethodConsole ms - and
       the caller's next step (rewriting the configuration, or removing the registration) then runs
@@ -68,14 +79,21 @@ function Stop-ServiceAndConfirm {
     )
     if ($NssmPath) {
         $launched = $true
+        $global:LASTEXITCODE = $null
         try { & $NssmPath stop $ServiceName } catch {
             $launched = $false
             Write-Warning ("Could not run '$NssmPath' to stop '$ServiceName' " +
                 "($($_.Exception.Message)). Falling back to the SCM.")
             Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
         }
-        if ($launched -and $LASTEXITCODE -ne 0) {
-            Write-Warning ("nssm stop '$ServiceName' exited $LASTEXITCODE (its message is above). " +
+        $exit = $LASTEXITCODE
+        if ($launched -and $null -eq $exit) {
+            $launched = $false
+            Write-Warning ("'$NssmPath' left no exit code, so nssm never ran and '$ServiceName' was " +
+                "not stopped by it. Falling back to the SCM.")
+            Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+        } elseif ($launched -and $exit -ne 0) {
+            Write-Warning ("nssm stop '$ServiceName' exited $exit (its message is above). " +
                 "The service may still be running; the status is checked below.")
         }
     } else {
@@ -117,11 +135,19 @@ if (-not $stopped) {
 }
 
 Write-Host "Removing '$ServiceName'..."
+# $LASTEXITCODE IS CLEARED FIRST HERE TOO, and this is the site where a stale read costs most. A
+# failed LAUNCH never writes the variable, so it keeps the 0 the stop above just left behind, and the
+# check then passes and the script prints "Removed" over a registration that is still there. Unlike
+# the lockdown, where Get-BroadAclResidue reads the result back, nothing here re-reads: this exit
+# code is the ONLY evidence the removal happened, so it has to be this call's own.
+$global:LASTEXITCODE = $null
 if ($haveNssm) {
     & $NssmPath remove $ServiceName confirm
+    if ($null -eq $LASTEXITCODE) { throw "nssm remove did not run ('$NssmPath' left no exit code)" }
     if ($LASTEXITCODE -ne 0) { throw "nssm remove failed (exit $LASTEXITCODE)" }
 } else {
     & sc.exe delete $ServiceName | Out-Null
+    if ($null -eq $LASTEXITCODE) { throw "sc.exe delete did not run (it left no exit code)" }
     if ($LASTEXITCODE -ne 0) { throw "sc.exe delete failed (exit $LASTEXITCODE)" }
 }
 
