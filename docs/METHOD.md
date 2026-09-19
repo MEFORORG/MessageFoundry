@@ -396,3 +396,62 @@ it off on 2026-09-08, the workflow was disabled on the server that day, and it w
 2026-09-13 (BACKLOG #1490), because "unread" stopped being a state anything tracked.
 
 So say in your PR body what state you left it in. For now the prose is the signal.
+
+## Why four of these rules changed, recorded so nobody re-derives it
+
+This is history, not instruction. No rule fires from it. It moved here out of `CLAUDE.md` section 5,
+which every session loads in full, because it costs every reader and binds none of them.
+
+### Seat declaration: why it was retired is not recorded, and both available explanations fail
+
+**WHY IT WAS RETIRED IS NOT RECORDED, AND BOTH AVAILABLE EXPLANATIONS FAIL.** Written down so nobody
+re-derives them. `f0e1365bc` retired a section on the stated ground that four of its rules deadlock a
+one-turn Builder -- wait for a go, the ultracode gate, `/clear`, and ask before pushing. Declaring is
+not one of the four. The Builder section below says *"It CAN declare its own seat, through the Bash
+tool"*, measured the same day. And the retired rule's own stated purpose, feeding the fleet view,
+survives: `scripts/coord/fleet.ps1` is a live pure reader over the seats layer. **So treat the
+retirement as unexplained rather than as a judgement you would be overturning by declaring.**
+
+### The spawn grant: what this replaced, and the measurements behind it
+
+**THIS REPLACED A RULE READING "NO SEAT SPAWNS A SESSION ANY MORE, so the spawn grant binds
+nothing."** That was true when written and false by 2026-09-16, when the grant was measured present
+on all six config roots. It is named rather than deleted because a seat that read it did not try,
+rendered unable to spawn, and confirmed it -- the same self-confirming shape this section already
+records for seat declaration.
+
+**The grant's measurements are kept, not deleted, so nobody re-derives them and nobody mistakes this
+for a capability that was lost.** The grant is a rule matching `Bash(claude:*)` or
+`PowerShell(claude:*)` under `permissions.allow` in the `settings.json` of the config root named by
+`CLAUDE_CONFIG_DIR`. Measured 2026-09-02: `.claude-account-1` carries both and spawned a session,
+exit 0 in 38.8 seconds; every root measured that day without them was refused. Exit 0 alone does not
+prove a spawn worked, because a prompt swallowed by a list-taking flag exits 0 too (see the dispatch
+bullet below), so check what the child did. **What binds a Manager's workers instead is the
+tool-grant spelling, and the careful spelling is the broken one** -- same bullet.
+
+### The korus playbooks: the pointer moved and the thing it pointed at did not
+
+- **SUPERSEDED 2026-09-05, recorded rather than deleted because seats still quote it.** This line
+  named the `MessageFoundry-vault` primary's `roles/` folder (owner ruling, vault commit
+  `5e361756`).
+- **Name the ref, not the checkout.** The superseded line said a checkout, and its own next sentence
+  warned that a checkout is not a ref. Both halves were right and the first one won.
+- **What that costs, measured 2026-09-06.** The korus primary sat on a branch 15 commits ahead of
+  `origin/main` and 14 behind it. One seat's playbook was absent from its working tree and present
+  on `origin/main`.
+- **So a seat reading the folder finds no playbook for itself, and no error.** An `ls` of a directory
+  is not evidence that you have a file, and a missing file is the quietest failure in this list.
+- **The failure this cost is the one to carry forward.** A pointer and the thing it points at are
+  two edits, and nothing fails when only the first is made. The playbooks moved on 2026-09-04 and
+  this line was not changed until 2026-09-06, so every seat in between read a stale copy and no
+  gate reported it.
+
+### Auto-merge: the hazard kept, because nobody has measured it under a queue
+
+  **The hazard this bullet was written against is KEPT, not deleted, because nobody has measured it
+  under a queue.** It read, in full: *"Never arm auto-merge. Auto-merge fires on the head it saw, so
+  a later push is dropped: the PR reads MERGED, the branch stays alive, and nothing reports a
+  problem."* Whether a QUEUED entry does that when its branch is pushed underneath it is
+  **unmeasured** — what is measured on this repository is eviction and group rebuild, which is a
+  different event with a different cause. Until somebody watches a push land under a live entry, the
+  safe course is to dequeue before pushing, and the claim above must not be read as covering it.
