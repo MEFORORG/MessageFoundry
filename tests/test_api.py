@@ -735,15 +735,42 @@ async def test_status_log_metering_present_when_log_dir_set(engine: Engine, tmp_
     assert body["logs"]["disk_free_bytes"] > 0
 
 
-async def test_status_log_metering_graceful_when_dir_missing(
+async def test_status_log_metering_distinguishes_a_missing_dir_from_stdout_only(
     engine: Engine, tmp_path: Path
 ) -> None:
-    # A configured-but-missing log dir must not raise — the field comes back None.
-    app = create_app(engine, allow_no_auth=True, log_dir=str(tmp_path / "does_not_exist"))
+    """BACKLOG #1563: a configured-but-missing log dir must not raise — and must not come back as a
+    bare ``None`` either, because that is the stdout-only answer.
+
+    Reusing it here made a log directory that had VANISHED indistinguishable from an engine that was
+    deliberately never given one: the operator saw no log section in both cases. The section is now
+    present and names the configured path, with ``None`` in each field the probe could not measure.
+    ``None`` is "not measured"; ``0`` would be the different claim that the directory is empty."""
+    missing = tmp_path / "does_not_exist"
+    app = create_app(engine, allow_no_auth=True, log_dir=str(missing))
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         body = (await c.get("/status")).json()
-    assert body.get("logs") is None
+    assert body["logs"] is not None  # configured, so reported — never read as stdout-only
+    assert body["logs"]["path"] == str(missing)
+    assert body["logs"]["disk_free_bytes"] is None
+    assert body["logs"]["size_bytes"] is None
+
+
+async def test_status_log_metering_reports_a_real_empty_dir_as_zero_not_unmeasured(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """The other half of #1563's distinction: an existing, readable, EMPTY log dir measures 0 bytes
+    of files and a real free-space figure. Zero is a measurement and must stay spelled as ``0`` —
+    if this ever reports ``None`` the probe has started confusing "nothing there" with "did not
+    look", which is the defect in the opposite direction."""
+    log_dir = tmp_path / "empty_logs"
+    log_dir.mkdir()
+    app = create_app(engine, allow_no_auth=True, log_dir=str(log_dir))
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        body = (await c.get("/status")).json()
+    assert body["logs"]["size_bytes"] == 0
+    assert body["logs"]["disk_free_bytes"] is not None and body["logs"]["disk_free_bytes"] > 0
 
 
 async def test_status_update_field_absent_by_default(

@@ -93,7 +93,12 @@ def _derive_health(
     models (``None`` = that probe failed / not applicable), so it's unit-testable without an engine.
 
     - ``sysinfo is None``  → store unreachable → **down** (the strongest "unhealthy").
-    - disk free (DB drive, and log drive if metered) < 1 GiB → **down**, < 5 GiB → **warn**.
+    - disk free (DB drive, and log drive if metered) < 1 GiB → **down**, < 5 GiB → **warn**. A
+      measured 0 still alarms; an UNMEASURABLE drive (``disk_free_bytes is None``) is not compared,
+      because "I could not measure this" is not "this is full" (BACKLOG #1563).
+    - a configured log directory the engine could not measure at all → **warn**. Unlike the DB
+      figure, which is legitimately unmeasurable on a remote server backend, a null log figure has
+      only one cause: a path the operator configured that could not be read.
     - server DB connection pool saturated (``idle == 0``) → **warn**.
     - running on the DR failover box (``dr.active``) → **warn**; a clustered engine with no leader → **down**.
     - any deployed inbound that failed to start → **warn**, naming it (BACKLOG #1741).
@@ -124,10 +129,22 @@ def _derive_health(
         # nothing", it is still coming up.
         if eng.channels_total == 0 and eng.uptime_seconds > 0:
             issues.append((1, "no inbound connections deployed"))
-        frees = [("db", sysinfo.db.disk_free_bytes)]
+        frees: list[tuple[str, int | None]] = [("db", sysinfo.db.disk_free_bytes)]
         if sysinfo.logs is not None:
             frees.append(("logs", sysinfo.logs.disk_free_bytes))
         for label, free in frees:
+            if free is None:
+                # Unmeasurable (BACKLOG #1563), and what that MEANS differs by drive, so the two are
+                # not treated alike. A DB figure is None on the server backends as well, where the
+                # engine is not meant to see that disk at all -- it cannot tell "not applicable"
+                # from "the probe broke", so it claims nothing rather than pin a permanent warning
+                # on every healthy Postgres and SQL Server deployment. A LOG drive has no
+                # not-applicable case: the operator configured that path, so a null there is always
+                # a failed probe on a directory that should have been readable, and going quiet
+                # about it would just trade #1563's loud wrong answer for a silent one.
+                if label == "logs":
+                    issues.append((1, "log directory missing or unreadable"))
+                continue
             if free < _DISK_CRIT_BYTES:
                 issues.append((2, f"low disk ({label}): {free / 1024**3:.1f} GiB free"))
             elif free < _DISK_WARN_BYTES:

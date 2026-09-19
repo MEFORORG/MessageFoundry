@@ -12,6 +12,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Literal
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
 import httpx
@@ -1206,9 +1207,9 @@ _GIB = 1024**3
 
 
 def _sysinfo(
-    disk_free: int,
+    disk_free: int | None,
     *,
-    logs_free: int | None = None,
+    logs_free: int | None | Literal["unmeasured"] = None,
     pool_idle: int | None = None,
     channels: int = 2,
     channels_running: int | None = None,
@@ -1228,6 +1229,11 @@ def _sysinfo(
     A caller passing failures usually raises ``channels`` to cover them. That keeps the fixture
     self-consistent (channels_failed is a SUBSET of channels_stopped, never a fourth bucket) — it
     changes no assertion, because the rollup reads only total, failed, the names, and uptime.
+
+    ``logs_free`` carries all three log states in ONE argument (BACKLOG #1563), so the fixture
+    cannot express a contradiction: ``None`` = no log section at all (stdout-only), ``"unmeasured"``
+    = configured but the probe failed, an int = a measured figure. ``disk_free=None`` is the DB
+    drive's unmeasurable case. A ``0`` anywhere here is a real measured zero that must still alarm.
     """
     from messagefoundry.api.models import (
         DbInfo,
@@ -1241,6 +1247,12 @@ def _sysinfo(
     names = list(failed_names or [])
     failed = failed_count if failed_count is not None else len(names)
     running = channels_running if channels_running is not None else max(0, channels - failed)
+    if logs_free is None:
+        logs = None  # stdout-only: no log directory configured, so no section at all
+    elif logs_free == "unmeasured":
+        logs = LogInfo(path="l", size_bytes=None, disk_free_bytes=None)
+    else:
+        logs = LogInfo(path="l", size_bytes=1, disk_free_bytes=logs_free)
     return SystemStatus(
         engine=EngineInfo(
             version="0",
@@ -1262,9 +1274,7 @@ def _sysinfo(
             events=0,
             audit=0,
         ),
-        logs=None
-        if logs_free is None
-        else LogInfo(path="l", size_bytes=1, disk_free_bytes=logs_free),
+        logs=logs,
         pool=None
         if pool_idle is None
         else PoolInfo(
@@ -1297,6 +1307,84 @@ def test_derive_health_critical_on_very_low_disk() -> None:
 
     health, _ = _derive_health(_sysinfo(512 * 1024**2), None, None, None)  # 0.5 GiB free
     assert health == "down"
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "label"),
+    [({"disk_free": 0}, "db"), ({"disk_free": 50 * _GIB, "logs_free": 0}, "logs")],
+    ids=["db", "logs"],
+)
+def test_derive_health_still_critical_on_a_measured_zero_drive(
+    kwargs: dict[str, object], label: str
+) -> None:
+    """BACKLOG #1563's guard rail, and the reason the fix is not just "ignore falsy".
+
+    A drive the engine MEASURED at 0 bytes free is the real emergency this rule exists for, and it
+    must keep firing after unmeasurable values stop doing so. If either case ever goes green while
+    its unmeasurable twin below also goes green, the fix has silenced the alarm rather than
+    narrowing it. The reason names WHICH drive, so the operator knows which one to go and clear."""
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    health, reason = _derive_health(_sysinfo(**kwargs), None, None, None)  # type: ignore[arg-type]
+    assert health == "down"
+    assert reason == f"low disk ({label}): 0.0 GiB free"
+
+
+def test_derive_health_ignores_an_unmeasurable_db_disk() -> None:
+    """BACKLOG #1563: both server stores hardcoded ``disk_free_bytes=0`` to mean "I cannot see this
+    disk", and every threshold here read that as a full drive — so a healthy Postgres or SQL Server
+    deployment WOULD come up with the engine-health heart pinned critical and a tooltip reading
+    "low disk (db): 0.0 GiB free". The value is now ``None`` and is skipped, claiming nothing."""
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    assert _derive_health(_sysinfo(None), None, None, None) == ("ok", None)
+
+
+def test_derive_health_unmeasurable_disk_skips_only_itself() -> None:
+    """The skip is a ``continue``, not an early exit: an unmeasurable disk must not take the rest of
+    the rollup down with it. A server-backed engine with a failed inbound still warns and still
+    names the inbound — otherwise #1563's fix would have blinded the heart to everything else."""
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    health, reason = _derive_health(_sysinfo(None, failed_names=["IB_ACME_ADT"]), None, None, None)
+    assert health == "warn"
+    assert reason == "inbound IB_ACME_ADT failed to start"
+
+
+def test_derive_health_warns_on_an_unmeasurable_log_drive() -> None:
+    """A configured log directory the engine could not measure is a WARN, not a skip — the one place
+    the two unmeasurable cases part company.
+
+    The DB figure is legitimately null on a remote server backend, so the rollup cannot tell "not
+    applicable" from "the probe broke" and says nothing. A log directory has no not-applicable case:
+    the operator configured that path. Skipping it would have traded #1563's loud wrong answer for a
+    silent one, leaving a vanished log directory reading green forever."""
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    health, reason = _derive_health(_sysinfo(50 * _GIB, logs_free="unmeasured"), None, None, None)
+    assert health == "warn"
+    assert reason == "log directory missing or unreadable"
+
+
+def test_derive_health_ok_when_no_log_dir_is_configured() -> None:
+    """The control for the warn above: stdout-only (``logs is None``) is a deliberate configuration,
+    not a failed probe, and must stay silent. If this ever warns, the fix has started treating "the
+    operator wanted no log directory" as "the log directory is broken"."""
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    assert _derive_health(_sysinfo(50 * _GIB, logs_free=None), None, None, None) == ("ok", None)
+
+
+def test_bytes_renders_an_unmeasured_value_as_words_not_a_quantity() -> None:
+    """BACKLOG #1563, the on-screen half. The Engine Status page prints "Disk free" straight from
+    ``DbInfo``, so a server backend's unmeasurable figure must not fall through to "0 B" — an
+    operator reading that sees a disk emergency, when in fact nobody looked. A real zero still
+    renders as a quantity, because that one IS a measurement."""
+    from messagefoundry_webconsole.pages.monitoring import _bytes
+
+    assert _bytes(None) == "nothing measured"
+    assert _bytes(0) == "0 B"
+    assert _bytes(10 * 1024**3) == "10.0 GiB"
 
 
 def test_derive_health_down_when_store_unreachable() -> None:

@@ -479,27 +479,40 @@ def _log_storage(log_dir: str | None) -> LogInfo | None:
     """Meter the configured app-log directory (#50): its regular-file byte total (one level, non-
     recursive — supervisors like NSSM rotate flat into one dir) plus the free space on its filesystem,
     mirroring :class:`DbInfo`'s ``size_bytes`` / ``disk_free_bytes``. **Metadata only — no file
-    content is ever read** (no PHI). Returns ``None`` when no directory is configured (stdout-only) or
-    the directory is missing/unreadable, so ``/status`` degrades gracefully and never raises. Blocking
-    (``stat`` per entry + ``disk_usage``) — the caller runs it off the event loop."""
+    content is ever read** (no PHI). Blocking (``stat`` per entry + ``disk_usage``) — the caller runs
+    it off the event loop, and it never raises.
+
+    ``None`` means **no log directory is configured** (stdout-only), and nothing else. A configured
+    directory always yields a :class:`LogInfo`, with ``None`` in whichever half the probe could not
+    measure — the three states :class:`LogInfo` documents. Returning a bare ``None`` on a failed
+    probe made a MISSING log directory indistinguishable from an engine never asked to keep one.
+
+    The two halves are measured independently, because they fail independently: an unstattable mount
+    still lets the directory be walked, and an unreadable directory still sits on a stattable drive.
+    """
     if not log_dir:
-        return None
+        return None  # stdout-only: the one case that is genuinely "no log storage to report"
     path = Path(log_dir)
+    free: int | None
     try:
         free = shutil.disk_usage(path).free
     except OSError:
-        return None  # directory absent/unreadable → absent, never raise
-    total = 0
+        free = None  # unmeasurable, never 0 -- see DbStatus.disk_free_bytes (BACKLOG #1563)
+    # `walked` stays a plain int so the accumulation type-checks: assigning None in the handler
+    # below would otherwise widen the accumulator to `int | None` for the whole loop.
+    total: int | None
     try:
+        walked = 0
         with os.scandir(path) as entries:
             for entry in entries:
                 try:
                     if entry.is_file(follow_symlinks=False):
-                        total += entry.stat(follow_symlinks=False).st_size
+                        walked += entry.stat(follow_symlinks=False).st_size
                 except OSError:
                     continue  # a vanished/locked rotation file is skipped, not fatal
+        total = walked
     except OSError:
-        return None
+        total = None  # the directory itself could not be walked -- unknown size, not an empty one
     return LogInfo(path=str(path), size_bytes=total, disk_free_bytes=free)
 
 
