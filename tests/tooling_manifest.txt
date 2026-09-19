@@ -133,6 +133,7 @@ tests/test_serverdb_ci_coverage.py
 tests/test_session_context_presence.py
 tests/test_session_mail_held.py
 tests/test_session_mail.py
+tests/test_session_mail_watch_standdown.py
 tests/test_session_registry.py
 tests/test_setup_leak_gate_reports_source.py
 tests/test_shipped_line_endings_pinned.py
