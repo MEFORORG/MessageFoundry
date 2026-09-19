@@ -52,6 +52,7 @@ from messagefoundry.store.store import (
     ClaimedHeads,
     ClaimProcStatus,
     ConnectionEvent,
+    ConnectionEventWrite,
     ConnectionMetrics,
     DbStatus,
     LatencyHistogram,
@@ -1101,6 +1102,14 @@ class QueueStore(StoreLifecycle, Protocol):
         fail-soft, so a store error here can never wedge a listener or delivery lane."""
         ...
 
+    async def record_connection_events(self, events: Sequence[ConnectionEventWrite]) -> None:
+        """Append a burst of connection events in **one** transaction (BACKLOG #1731), each row
+        scrubbed, sealed and AAD-bound exactly as :meth:`record_connection_event` does it. The runner's
+        drainer calls this with whatever was already queued, so the cost is one commit per burst
+        rather than one per event. All-or-nothing: a failure writes none of the burst, and the caller
+        drops it fail-soft. An empty sequence writes nothing."""
+        ...
+
     async def list_connection_events(
         self,
         *,
@@ -1898,6 +1907,25 @@ class AuthStore(Protocol):
         """Bind a user's verified federated ``(issuer, sub)`` identity (BACKLOG #1015). Recorded on the
         first federated login so a later login whose reassignable username resolves to this account but
         carries a different subject is refused, not handed the account."""
+        ...
+
+    async def clear_user_federated_subject(self, user_id: str, *, now: float | None = None) -> int:
+        """Unbind a user's federated ``(issuer, sub)`` identity and revoke every live session the
+        account holds, in ONE transaction (BACKLOG #1474). Returns the number of sessions revoked.
+
+        The complement of :meth:`set_user_federated_subject`, which takes ``str`` for both halves and
+        so cannot spell "no binding". Both columns go NULL together, which puts the row back in the
+        state every AD account is in before its first federated login. ``auth_provider`` is left
+        alone on purpose: a federated account IS an AD row carrying an extra pair, so the unbound row
+        is still a directory account and the directory session sweep is still right for it.
+
+        **The two writes are not separable, and that is the contract.** A session issued under the old
+        binding is exactly what the unbind exists to stop. If the unbind committed and the revocation
+        did not, those sessions would outlive the identity that earned them, with the account
+        reporting itself unbound. So a failure in either statement rolls both back.
+
+        A missing user is a no-op returning 0; the caller decides whether that is an error.
+        """
         ...
 
     async def get_user_by_federated_subject(self, issuer: str, subject: str) -> UserRecord | None:

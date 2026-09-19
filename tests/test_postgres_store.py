@@ -932,6 +932,18 @@ async def test_directory_identity_store_contract(store) -> None:
     await _assert_directory_identity_contract(store)
 
 
+async def test_federated_unbind_store_contract(store) -> None:
+    """BACKLOG #1474 ``clear_user_federated_subject`` on the real Postgres backend.
+
+    The shared body is the one the SQLite and SQL Server suites run. What this leg executes that no
+    other does: the ``conn.transaction()`` block holding the two UPDATEs together, and the ``$1``
+    placeholders in both. Neither runs anywhere but here, so this is the first place they execute.
+    """
+    from tests._federated_unbind_store_contract import _assert_federated_unbind_contract
+
+    await _assert_federated_unbind_contract(store)
+
+
 async def test_directory_id_comparison_is_byte_exact_on_postgres(store) -> None:
     """Postgres compares ``directory_object_id`` byte-for-byte, so case is significant.
 
@@ -4422,3 +4434,58 @@ async def test_session_rotation_contract(store) -> None:
     from tests._session_rotation_contract import assert_session_rotation_contract
 
     await assert_session_rotation_contract(store)
+
+
+async def test_record_connection_events_writes_a_burst_all_or_nothing(store) -> None:
+    """BACKLOG #1731: the drainer's burst writer. Every row lands with the singular's scrub, seal and
+    AAD binding, and a burst that fails part-way writes none of its rows."""
+    from messagefoundry.store.store import ConnectionEventWrite
+
+    def ev(kind: str, now: float, **over: object) -> ConnectionEventWrite:
+        e = ConnectionEventWrite(
+            connection="IB_BURST",
+            transport="mllp",
+            direction="inbound",
+            kind=kind,
+            peer_host="10.0.0.1",
+            message_id=None,
+            reason=None,
+            now=now,
+        )
+        e.update(over)  # type: ignore[typeddict-item]
+        return e
+
+    await store.record_connection_events(
+        [
+            ev("established", 100.0),
+            ev("closed", 101.0, reason="clean eof"),
+            ev(
+                "connection_lost",
+                102.0,
+                connection="OB_BURST",
+                direction="outbound",
+                peer_host=None,
+                message_id="m-1",
+                reason="connect refused",
+            ),
+        ]
+    )
+    events = await store.list_connection_events()
+    assert [(e.kind, e.reason) for e in events] == [
+        ("connection_lost", "connect refused"),
+        ("closed", "clean eof"),
+        ("established", None),
+    ]
+    assert events[0].message_id == "m-1" and events[0].direction == "outbound"
+    assert events[2].peer_host == "10.0.0.1"
+
+    # The second row carries a value the driver cannot bind, so the first has already executed when
+    # the burst fails. The transaction must take it back out.
+    with pytest.raises(Exception):  # noqa: B017 -- the driver's own bind error class, which differs
+        await store.record_connection_events(
+            [ev("established", 200.0), ev("closed", 201.0, peer_host=object())]
+        )
+    assert len(await store.list_connection_events()) == 3
+
+    await store.record_connection_events([])  # an empty burst is a no-op
+    assert len(await store.list_connection_events()) == 3
