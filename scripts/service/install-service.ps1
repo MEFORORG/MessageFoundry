@@ -120,11 +120,31 @@ function Resolve-Nssm {
 
 function Set-SecureDataDirAcl {
     <#
-      Lock the data/log directory down to SYSTEM + Administrators (+ the service account), removing
-      ProgramData's inherited BUILTIN\Users:(RX). NSSM captures the engine's stdout/stderr under here,
-      and those logs are a PHI sink (parallel to the DB), so they must not be world-readable - this
-      mirrors the runtime DB lockdown (_secure_file / STORE-2). Review finding H-13. Best-effort: a
-      failure warns but never aborts the install. Well-known SIDs so it works on non-English Windows.
+      Lock the data/log directory down to SYSTEM + Administrators (+ the service account). NSSM
+      captures the engine's stdout/stderr under here, and those logs are a PHI sink (parallel to the
+      DB), so they must not be world-readable - this mirrors the runtime DB lockdown (_secure_file /
+      STORE-2). Review finding H-13. Best-effort: a failure warns but never aborts the install.
+      Well-known SIDs so it works on non-English Windows.
+
+      `/inheritance:r /grant:r` IS NOT A LOCKDOWN ON ITS OWN, and that was the shape here until
+      BACKLOG #1699 built the first test that read the DACL back. /inheritance:r removes INHERITED
+      ACEs; /grant:r replaces the permissions of the principals it NAMES. An EXPLICIT ACE for any
+      other principal survives both. Measured: an explicit BUILTIN\Users:(OI)(CI)RX on the data dir
+      came through the old call untouched, propagated to the logs directory beneath it, and icacls
+      exited 0 - so the installer reported a hardened PHI sink over a world-readable one.
+
+      ProgramData's own BUILTIN\Users ACE is inherited, which is why the default path looked correct
+      and the gap stayed invisible. It bites wherever the data dir is NOT freshly created under
+      ProgramData: an operator pointing -DataDir at an existing directory or share, a dir made by
+      another tool, or a reinstall after somebody granted access by hand.
+
+      So the explicit broad ACEs are removed as well, and then the resulting DACL is READ BACK. The
+      named removals cover AT LEAST the well-known broad principals listed below - not all of them,
+      and the list is not a closed set: Power Users (S-1-5-32-547) and Remote Desktop Users
+      (S-1-5-32-555) are two it does not name. That is what the read-back is for. It catches
+      whatever the list missed and NAMES it, rather than leaving the caller to believe a lockdown
+      that did not happen, so an omission degrades to a warning the operator must act on rather than
+      to a silent exposure.
     #>
     param([Parameter(Mandatory)][string]$Path, [string]$Account)
     # *S-1-5-18 = NT AUTHORITY\SYSTEM, *S-1-5-32-544 = BUILTIN\Administrators. (OI)(CI)F is inherited
@@ -135,7 +155,83 @@ function Set-SecureDataDirAcl {
     if ($LASTEXITCODE -ne 0) {
         Write-Warning ("Could not restrict ACLs on '$Path' (icacls exit $LASTEXITCODE); ensure it is " +
             "not world-readable - the captured logs can contain operational/PHI detail (docs/PHI.md).")
+        return
     }
+    # Drop any EXPLICIT broad ACE the grant above left standing. Removing a SID that is not present
+    # is a no-op and still exits 0, so the whole set goes in one call. Well-known SIDs, so this works
+    # on non-English Windows (an English host prints "BUILTIN\Users"; a German one does not).
+    #
+    # OWNER RIGHTS (S-1-3-4) is in the set and CREATOR OWNER (S-1-3-0) does not cover it. CREATOR
+    # OWNER materializes into an ACE for the creating principal at creation time; OWNER RIGHTS stays
+    # S-1-3-4 in the DACL and is evaluated against whoever owns the object AT ACCESS TIME. The owner
+    # is not a fixed principal - any Administrator can take ownership, and the service account owns
+    # every log file it creates - so it is a standing grant to a moving target over a PHI sink.
+    # Measured 2026-09-18 on the CI windows-2022 and windows-2025 runners, and reproduced locally: an
+    # EXPLICIT OWNER RIGHTS ACE on the data dir came through `/inheritance:r /grant:r` untouched with
+    # icacls exiting 0, propagated to the logs directory beneath it, and only the read-back saw it.
+    # Removing the ACE does not lock the owner out: with no S-1-3-4 ACE constraining them, Windows
+    # falls back to the owner's implicit READ_CONTROL + WRITE_DAC.
+    $broad = @(
+        "*S-1-1-0",       # Everyone
+        "*S-1-5-32-545",  # BUILTIN\Users
+        "*S-1-5-11",      # Authenticated Users
+        "*S-1-5-4",       # INTERACTIVE
+        "*S-1-3-0",       # CREATOR OWNER
+        "*S-1-3-4",       # OWNER RIGHTS
+        "*S-1-5-32-546",  # Guests
+        "*S-1-5-7"        # ANONYMOUS LOGON
+    )
+    & icacls $Path /remove:g @broad | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning ("Could not remove broad-principal ACEs from '$Path' (icacls exit " +
+            "$LASTEXITCODE); check it by hand with 'icacls $Path' - the captured logs are a PHI sink " +
+            "(docs/PHI.md).")
+        return
+    }
+    $residue = Get-BroadAclResidue -Path $Path -Account $Account
+    if ($residue) {
+        Write-Warning ("'$Path' still grants access to: $($residue -join ', '). The engine's logs " +
+            "under it can contain operational/PHI detail (docs/PHI.md); remove those grants by hand " +
+            "or point -DataDir at a directory only SYSTEM and Administrators can reach.")
+    }
+}
+
+function Get-BroadAclResidue {
+    <#
+      READ THE DACL BACK and return the names of any principals holding Allow access beyond SYSTEM,
+      Administrators and the service account. Returns an empty array when the directory is locked
+      down, which is what makes "the lockdown worked" a reading rather than an assumption.
+
+      An unresolvable identity is reported rather than skipped: a SID nobody can translate is still
+      a grant, and dropping it here would turn a residue into a clean result.
+    #>
+    param([Parameter(Mandatory)][string]$Path, [string]$Account)
+    $allowed = @("S-1-5-18", "S-1-5-32-544")
+    if ($Account) {
+        try {
+            $allowed += ([Security.Principal.NTAccount]$Account).Translate(
+                [Security.Principal.SecurityIdentifier]).Value
+        } catch {
+            # A virtual account's SID may not resolve before the service exists; fall back to the name.
+            $allowed += $Account
+        }
+    }
+    $found = @()
+    try { $acl = Get-Acl -Path $Path } catch {
+        Write-Warning "Could not read the ACL of '$Path' ($($_.Exception.Message))."
+        return @()
+    }
+    foreach ($rule in $acl.Access) {
+        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
+        $name = "$($rule.IdentityReference)"
+        $sid = $name
+        try {
+            $sid = $rule.IdentityReference.Translate(
+                [Security.Principal.SecurityIdentifier]).Value
+        } catch { }
+        if (($allowed -notcontains $sid) -and ($allowed -notcontains $name)) { $found += $name }
+    }
+    return ($found | Select-Object -Unique)
 }
 
 function Set-ConfigReadAcl {
@@ -417,22 +513,48 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     throw "Installing a Windows service requires an elevated (Administrator) PowerShell."
 }
 
-$NssmPath = Resolve-Nssm -Provided $NssmPath -DataDir $DataDir
-
-# Repo root is two levels up from this script (scripts\service\).
+# Repo root is two levels up from this script (scripts\service\). Computed FIRST: -AppExe and
+# -Config default from it, and the normalization below has to run before anything CONSUMES a path.
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 
+# --- absolute paths, before anything consumes one (BACKLOG #1554) -----------------------------------
+# A service resolves a relative path against its own working directory, so every path baked into the
+# registration must be absolute. Only -Config was normalized, and it was normalized LATE - after
+# Resolve-Nssm had already joined a possibly-relative -DataDir, and after Test-Path had validated a
+# relative -DbPath against a DIFFERENT directory from the one the service would resolve it against.
+# That is the whole defect: one path, validated here against the operator's shell location, resolved
+# there against AppDirectory ($RepoRoot).
+#
+# NOT Resolve-Path: it THROWS on a path that does not exist, and a first install legitimately has no
+# database file yet. GetUnresolvedProviderPathFromPSPath normalizes without requiring existence.
+#
+# THE ANCHOR IS $PWD, THE DIRECTORY THE OPERATOR RAN THIS FROM - not $PSScriptRoot and not $RepoRoot.
+# A relative path an operator types means "from where I am standing"; anchoring it to the script's own
+# location would silently relocate it, which is a quieter version of the same bug.
+function Resolve-AbsolutePath {
+    param([Parameter(Mandatory)][string]$Path)
+    return $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+}
+
+$DataDir = Resolve-AbsolutePath $DataDir
 if (-not $AppExe) { $AppExe = Join-Path $RepoRoot ".venv\Scripts\messagefoundry.exe" }
+else { $AppExe = Resolve-AbsolutePath $AppExe }
 if (-not $Config) { $Config = Join-Path $RepoRoot "samples\config" }
+else { $Config = Resolve-AbsolutePath $Config }
+# Derived from the ALREADY-absolute $DataDir, so the default is absolute without a second pass.
 if (-not $DbPath) { $DbPath = Join-Path $DataDir "messagefoundry.db" }
+else { $DbPath = Resolve-AbsolutePath $DbPath }
+
+# AFTER the normalization: Resolve-Nssm joins "bin" onto -DataDir and caches nssm.exe there, so a
+# relative -DataDir here would download the binary to one directory and register a service pointing at
+# another.
+$NssmPath = Resolve-Nssm -Provided $NssmPath -DataDir $DataDir
 
 if (-not (Test-Path $AppExe)) {
     throw "Engine executable not found at: $AppExe`nRun 'pip install -e .' in the project venv, or pass -AppExe."
 }
 if (-not (Test-Path $Config)) { throw "Config directory not found at: $Config" }
 
-# Absolute paths only: a service's relative paths resolve to the system directory.
-$Config   = (Resolve-Path $Config).Path
 $LogDir   = Join-Path $DataDir "logs"
 New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
 New-Item -ItemType Directory -Force -Path $LogDir  | Out-Null
@@ -449,17 +571,158 @@ $AppParams = "serve --config `"$Config`" --db `"$DbPath`" --host $ListenHost --p
 # --- install -----------------------------------------------------------------
 
 function Invoke-Nssm {
-    param([Parameter(ValueFromRemainingArguments = $true)]$NssmArgs)
-    & $NssmPath @NssmArgs
-    if ($LASTEXITCODE -ne 0) { throw "nssm $($NssmArgs -join ' ') failed (exit $LASTEXITCODE)" }
+    <#
+      Run nssm and FAIL CLOSED on a non-zero exit, naming the subcommand that failed.
+
+      The failure message joins the arguments because for 17 of the 18 call sites that is exactly what
+      an operator needs ("nssm set MessageFoundry AppStdout ... failed (exit 3)"). The 18th passes the
+      service-account password as a positional argument, and a joined message there puts a cleartext
+      password into the thrown message, the console, and the $Error record it leaves behind (BACKLOG
+      #1573).
+
+      So the secret is a SEPARATE, NAME-ONLY parameter and the message is built from $NssmArgs, which
+      never holds it. The redaction is therefore a property of how the message is CONSTRUCTED - there
+      is no code path anywhere that assembles a string containing the password and filters it after the
+      fact, which is the version that leaks the first time somebody adds a second message.
+
+      -Secret is name-only because $NssmArgs declares Position = 0: with an explicit position on the
+      remaining-arguments parameter, PowerShell stops binding the unpositioned ones positionally, so
+      `Invoke-Nssm set $ServiceName ...` still binds every token to $NssmArgs. Measured on Windows
+      PowerShell 5.1.26100 (the host CI runs these scripts on) and on PowerShell 7.
+
+      $LASTEXITCODE IS CLEARED FIRST, AND A MISSING ONE IS A FAILURE. It is a session-wide variable
+      that a failed LAUNCH never writes, so a check written after one reads whatever the PREVIOUS
+      native command left. Whether that is reachable depends on the host, and on Windows it is not:
+      measured 2026-09-18 on PowerShell 7.6.6 and Windows PowerShell 5.1.26100, a present-but-
+      unrunnable nssm.exe raises a TERMINATING ApplicationFailedException and this line is never
+      reached. On Linux it IS reachable - observed on this branch's ubuntu CI leg, where PowerShell
+      resolved a non-executable file, failed to start it, wrote a NON-terminating error, and ran
+      straight on to the check with $LASTEXITCODE never set.
+
+      So the clear buys two things on every host: the code reported is unambiguously the one THIS
+      call produced, and an absent one is named rather than printed as `failed (exit )`.
+    #>
+    param(
+        # A trailing argument that must never reach a message, a transcript, or an $Error record.
+        # Appended to the nssm command line as the LAST argument; the failure message shows a
+        # placeholder in its place.
+        [string]$Secret,
+        [Parameter(Position = 0, ValueFromRemainingArguments = $true)]$NssmArgs
+    )
+    $hasSecret = $PSBoundParameters.ContainsKey('Secret')
+    # Built BEFORE the call, from the non-secret arguments only.
+    $shown = @($NssmArgs)
+    if ($hasSecret) { $shown += '<redacted>' }
+    $global:LASTEXITCODE = $null
+    if ($hasSecret) { & $NssmPath @NssmArgs $Secret } else { & $NssmPath @NssmArgs }
+    $exit = $LASTEXITCODE
+    if ($null -eq $exit) {
+        throw ("nssm $($shown -join ' ') failed (no exit code: '$NssmPath' did not run)")
+    }
+    if ($exit -ne 0) { throw "nssm $($shown -join ' ') failed (exit $exit)" }
 }
+
+# BEGIN Stop-ServiceAndConfirm (kept byte-identical with uninstall-service.ps1; guarded by
+# tests/test_service_install_manifest.py, which fails if the two copies drift)
+function Stop-ServiceAndConfirm {
+    <#
+      Stop the service and CONFIRM from the SCM that it actually stopped. Returns $true when the
+      service is Stopped (or gone); $false when it is still running.
+
+      Neither half of this existed before (BACKLOG #1558), and neither half is enough on its own.
+
+      THE EXIT CODE, AND WHY THE OLD try/catch WAS NOT THE GUARD IT LOOKED LIKE. The previous call
+      was `try { & $NssmPath stop $ServiceName 2>&1 | Out-Null } catch { }`. Measured on both hosts:
+      under PowerShell 7.6.6 a non-zero native exit raises nothing, so the catch never fired and the
+      failure was simply unnoticed; under Windows PowerShell 5.1.26100 - the host CI runs these
+      scripts on - the `2>&1` MERGE turned nssm's stderr into a terminating RemoteException, which
+      the empty catch then swallowed, AND left $LASTEXITCODE at -1 because the pipeline aborted
+      before nssm's real exit code was recorded. So an exit-code check written after a merged
+      capture would have been unreachable on the very host that matters. This calls nssm BARE: its
+      output goes to the operator instead of Out-Null, no redirection wraps the error stream, and
+      $LASTEXITCODE is the true exit code on both hosts.
+
+      AND A MISSING EXIT CODE IS NOT A ZERO. $LASTEXITCODE is session-wide and a failed LAUNCH never
+      writes it, so a check written after one reads whatever the PREVIOUS native command left. The
+      catch above covers the hosts where such a failure is TERMINATING - measured 2026-09-18 on
+      PowerShell 7.6.6 and Windows PowerShell 5.1.26100, a present-but-unrunnable nssm.exe raises
+      ApplicationFailedException and lands there. It does NOT cover the hosts where the failure is
+      non-terminating: observed on this branch's ubuntu CI leg, where execution ran straight past the
+      catch with $LASTEXITCODE never set and the warning printed `exited ` with nothing after it. So
+      the variable is cleared first and a $null afterwards is treated as the catch treats a throw:
+      nssm did not run, say so, and stop through the SCM instead.
+
+      THE RE-READ. An exit code is still not enough. `nssm stop` can exit 0 while the process is
+      still shutting down - the engine drains connections for up to AppStopMethodConsole ms - and
+      the caller's next step (rewriting the configuration, or removing the registration) then runs
+      against a service that is still running. So the status is polled back from the SCM and the
+      caller is told what it is, rather than assuming.
+
+      NSSM'S STDOUT GOES TO THE HOST, NOT INTO THE RETURN VALUE. This function's contract is a single
+      boolean, and a bare call puts everything nssm prints on stdout into the function's output
+      stream ahead of it. The caller then holds an ARRAY, and `if (-not $stopped)` on a multi-element
+      array is $false however the stop actually went - so the "still running" warning the whole
+      function exists to raise is skipped exactly when nssm had something to say. Measured
+      2026-09-18 on PowerShell 7.6.6 and Windows PowerShell 5.1.26100 against a stub that prints one
+      stdout line: bare returns 2 objects, `| Out-Host` returns 1. Out-Host and not Out-Null because
+      the operator still needs to read it, and not a redirection, which is what broke the old form.
+      $LASTEXITCODE survives the pipe on both hosts (measured, same run).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ServiceName,
+        # Empty when nssm is unavailable; the stop then goes through the SCM instead.
+        [string]$NssmPath,
+        [int]$TimeoutSeconds = 30
+    )
+    if ($NssmPath) {
+        $launched = $true
+        $global:LASTEXITCODE = $null
+        try { & $NssmPath stop $ServiceName | Out-Host } catch {
+            $launched = $false
+            Write-Warning ("Could not run '$NssmPath' to stop '$ServiceName' " +
+                "($($_.Exception.Message)). Falling back to the SCM.")
+            Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+        }
+        $exit = $LASTEXITCODE
+        if ($launched -and $null -eq $exit) {
+            $launched = $false
+            Write-Warning ("'$NssmPath' left no exit code, so nssm never ran and '$ServiceName' was " +
+                "not stopped by it. Falling back to the SCM.")
+            Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+        } elseif ($launched -and $exit -ne 0) {
+            Write-Warning ("nssm stop '$ServiceName' exited $exit (its message is above). " +
+                "The service may still be running; the status is checked below.")
+        }
+    } else {
+        Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+    }
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ($true) {
+        $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        if (-not $svc) { return $true }
+        if ($svc.Status -eq "Stopped") { return $true }
+        if ((Get-Date) -ge $deadline) {
+            Write-Warning ("Service '$ServiceName' is still '$($svc.Status)' $TimeoutSeconds " +
+                "seconds after the stop was issued.")
+            return $false
+        }
+        Start-Sleep -Milliseconds 500
+    }
+}
+# END Stop-ServiceAndConfirm
 
 # If the service already exists, reconfigure it in place (idempotent install).
 # Detect via Get-Service rather than `nssm status` (which errors to stderr on a missing
 # service and would abort under ErrorActionPreference=Stop).
 if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
     Write-Host "Service '$ServiceName' exists - stopping and reconfiguring..."
-    try { & $NssmPath stop $ServiceName 2>&1 | Out-Null } catch { }  # best-effort
+    if (-not (Stop-ServiceAndConfirm -ServiceName $ServiceName -NssmPath $NssmPath)) {
+        Write-Warning ("Reconfiguring '$ServiceName' while it is still running. NSSM writes the new " +
+            "settings, but the RUNNING process keeps the old ones until it is restarted - so this " +
+            "install can report success over a service that is still on the previous configuration, " +
+            "including the previous run-as account and the previous paths. Stop it by hand and " +
+            "re-run, or restart it once this finishes, and confirm with 'nssm status $ServiceName'.")
+    }
 } else {
     Write-Host "Installing service '$ServiceName'..."
     Invoke-Nssm install $ServiceName $AppExe
@@ -498,6 +761,12 @@ if (-not $ServiceAccount -and -not $AllowLocalSystem) {
         "password). Pass -AllowLocalSystem to run as LocalSystem, or -ServiceAccount for a gMSA / " +
         "dedicated account instead (docs/SERVICE.md 'Least-privilege service account').")
 }
+# TWO VALUES, NEVER ONE (BACKLOG #1553). $RunAsObjectName is what NSSM is told to run the service as;
+# $ServiceAccount stays "the account that needs an EXPLICIT ACL grant", and is EMPTY for LocalSystem.
+# They must not be collapsed: Set-SecureDataDirAcl already grants *S-1-5-18, which IS LocalSystem, so
+# adding a named "LocalSystem" grant is redundant and can make icacls exit non-zero.
+$RunAsObjectName = if ($ServiceAccount) { $ServiceAccount } else { "LocalSystem" }
+
 if ($ServiceAccount) {
     # gMSA preflight (#99): verify the account is installed + usable on this host, then grant it the
     # "Log on as a service" right BEFORE registering (NSSM's ObjectName does not grant it). Both steps
@@ -512,24 +781,37 @@ if ($ServiceAccount) {
     }
     if ($ServiceAccountPassword) {
         # Convert the SecureString to plaintext only here - NSSM's ObjectName takes a plain password.
+        # -Secret keeps it out of the failure message Invoke-Nssm throws on a non-zero exit (#1573):
+        # passed positionally it would be joined into that message, the console, and the $Error record.
         $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($ServiceAccountPassword)
         try {
             $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
-            Invoke-Nssm set $ServiceName ObjectName $ServiceAccount $plain
+            Invoke-Nssm -Secret $plain set $ServiceName ObjectName $RunAsObjectName
         } finally {
             [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
         }
     } else {
         # Virtual / managed accounts (e.g. "NT SERVICE\MessageFoundry", a gMSA) take no password. NSSM
         # wants a gMSA's ObjectName with a trailing '$' and no password.
-        Invoke-Nssm set $ServiceName ObjectName $ServiceAccount
+        Invoke-Nssm set $ServiceName ObjectName $RunAsObjectName
     }
-    Write-Host "  Account: $ServiceAccount" -ForegroundColor Green
+    Write-Host "  Account: $RunAsObjectName" -ForegroundColor Green
 } else {
     # $ServiceAccount is empty only when -AllowLocalSystem was passed (the default above otherwise fills
-    # it with the virtual account), so this branch is now the explicit LocalSystem opt-out (#224). Leave
-    # ObjectName unset -> NSSM runs the service as LocalSystem (most-privileged); warn that it is the
-    # acknowledged, non-default choice.
+    # it with the virtual account), so this branch is the explicit LocalSystem opt-out (#224).
+    #
+    # OBJECTNAME IS SET EXPLICITLY HERE, AND IT USED TO BE LEFT ALONE (BACKLOG #1553). The comment that
+    # stood here said "leave ObjectName unset -> NSSM runs the service as LocalSystem", and that is
+    # true only of a FRESH install. On a RERUN over a service already registered with another account,
+    # not writing ObjectName leaves THAT account configured - and the ACL block below then locks the
+    # data and config dirs to SYSTEM/Administrators, stripping the account the service is still
+    # running as. The service loses write on its data dir and read on its config dir, and SEC-003
+    # source-trust then refuses to load config at all. Writing it every time makes the run-as account
+    # and the ACLs agree on every path.
+    #
+    # It also makes NSSM's create-time default irrelevant. Whether that default really is LocalSystem
+    # was never measured; setting the value explicitly removes the need to know.
+    Invoke-Nssm set $ServiceName ObjectName $RunAsObjectName
     Write-Warning ("Service will run as LocalSystem (most-privileged) - acknowledged via " +
         "-AllowLocalSystem. The default is now the least-privilege virtual account " +
         "'NT SERVICE\$ServiceName' (no password); prefer it or a gMSA for production. See docs/SERVICE.md " +
@@ -543,6 +825,15 @@ if ($ServiceAccount) {
 # read on the data dir (+ key file) it needs at startup (#44 / WIN2025 S2.2) - a grant that can only name
 # the account once its SID resolves. For a LocalSystem opt-out ($ServiceAccount empty) the grants lock
 # the dirs to SYSTEM/Administrators only, which LocalSystem (= SYSTEM) can read/write.
+#
+# THESE GRANTS ARE ONLY CORRECT BECAUSE OBJECTNAME IS NOW WRITTEN ON EVERY PATH (BACKLOG #1553). They
+# name $ServiceAccount, so "the account the ACLs are built for" and "the account the service actually
+# runs as" have to be the same thing. That held on a fresh install and NOT on a rerun: a rerun with
+# -AllowLocalSystem left the previous account configured while these three calls stripped its access -
+# the data dir here, and the config dir below, where losing READ makes SEC-003 source-trust refuse to
+# load config at all. $ServiceAccount stays EMPTY for LocalSystem on purpose; the LocalSystem grant is
+# the *S-1-5-18 ACE Set-SecureDataDirAcl already writes, and naming "LocalSystem" as well is redundant
+# and can make icacls exit non-zero.
 #
 # Harden the PHI sink (review H-13): NSSM writes the engine's stdout/stderr under $LogDir, so lock the
 # data dir (logs inherit) down to SYSTEM/Administrators/(service account) - not world-readable.
