@@ -5,7 +5,7 @@
 
 - **Status:** Proposed (2026-08-13) — **NO CODE. Nothing here is built.** The arm is settled and the mechanism family is chosen; four decisions in §"What the owner must decide" gate any implementation.
 - **Date:** 2026-08-13
-- **Related:** [BACKLOG #1136](../BACKLOG.md) (ASVS 6.3.2 research) · [BACKLOG #1236](../BACKLOG.md) (the sole-administrator availability defect, split out of #1131) · [ADR 0063](0063-no-split-store-unified-store-for-sharding.md) (one unified store under engine sharding) · [ADR 0110](0110-vs-code-extension-engine-lifecycle.md) (the IDE's engine-lifecycle model, whose §5 fork hazard cites the behaviour retired here) · [SERVICE.md](../SERVICE.md) · [CONFIGURATION.md](../CONFIGURATION.md) · [CLAUDE.md](../../CLAUDE.md) §0 (not deployed), §9 (PHI)
+- **Related:** [BACKLOG #1136](../BACKLOG.md) (ASVS 6.3.2 research) · [BACKLOG #1236](../BACKLOG.md) (the sole-administrator availability defect, split out of #1131) · [ADR 0063](0063-no-split-store-unified-store-for-sharding.md) (one unified store under engine sharding) · [ADR 0110](0110-ide-engine-link-doctor-the-status-bar-tells-the-truth-about-the-promote-target.md) (the IDE's engine-lifecycle model, whose §5 fork hazard cites the behaviour retired here) · [SERVICE.md](../SERVICE.md) · [CONFIGURATION.md](../CONFIGURATION.md) · [CLAUDE.md](../../CLAUDE.md) §0 (not deployed), §9 (PHI)
 
 ---
 
@@ -155,7 +155,7 @@ structurally the moment `initialize()` returns `None`; `pipeline/alerts.py` and 
 `scaffold.py` and `.gitignore`; `pipeline/dr.py`, whose seed-gate premise names the bootstrap admin
 in four comments; the `ide/` extension, including two user-facing strings that would otherwise tell
 an operator a launch creates a bootstrap admin **at the moment it asks for consent**, a mocha test
-pinning one of those sentences, and [ADR 0110](0110-vs-code-extension-engine-lifecycle.md) §5; and
+pinning one of those sentences, and [ADR 0110](0110-ide-engine-link-doctor-the-status-bar-tells-the-truth-about-the-promote-target.md) §5; and
 roughly a dozen documentation files, several read from disk by doc-drift tests so they must land in
 the same change or CI reds.
 
