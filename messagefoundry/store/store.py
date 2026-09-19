@@ -74,6 +74,7 @@ from messagefoundry.config.response import CapturedResponse as CapturedResponse 
 from messagefoundry.config.settings import StoreBackend, StorePrivilegeStatus
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
+from messagefoundry.service_status import _system_exe
 from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.content_search import SearchSpec, row_matches
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
@@ -1591,11 +1592,16 @@ def _secure_file(path: Path, *, extra_read_grants: Sequence[str] | None = None) 
                     path,
                 )
                 return
-            # icacls is a fixed system tool, invoked without a shell; an extra-grant principal (if any)
-            # is a single argv token, never a shell word, so it can't inject a flag (low-27/STORE-5).
+            # icacls is pinned to its absolute System32 path and invoked without a shell; an
+            # extra-grant principal (if any) is a single argv token, never a shell word, so it can't
+            # inject a flag (low-27/STORE-5). The pin is what makes "fixed system tool" true:
+            # CreateProcess resolves an unqualified name through a search path that reaches the
+            # caller's working directory, and because this call only logs on a non-zero exit, a
+            # planted icacls.exe that exits 0 would leave this PHI-adjacent file its inherited
+            # (possibly broad) ACL while reporting nothing (BACKLOG #1769).
             grants = [f"{user}:F", *(f"{p}:R" for p in extra_read_grants or ())]
             result = subprocess.run(  # nosec B603 B607
-                ["icacls", str(path), "/inheritance:r", "/grant:r", *grants],
+                [_system_exe("icacls.exe"), str(path), "/inheritance:r", "/grant:r", *grants],
                 check=False,
                 capture_output=True,
                 text=True,
