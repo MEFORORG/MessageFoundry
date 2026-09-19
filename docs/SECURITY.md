@@ -1325,7 +1325,7 @@ listen source. The refusal action differs materially per listener, so each has i
 |---|---|---|---|
 | **MLLP** | peer socket address (`writer.get_extra_info('peername')`) | not in `source_ip_allowlist` | **DENY** — connection refused + WARNING log + a `peer_not_allowlisted` connection event; the refusal does **not** consume a `max_connections` slot |
 | **TCP** | peer socket address | not in `source_ip_allowlist` | **DENY** — as MLLP (refuse, log, `peer_not_allowlisted` event) |
-| **X12** | peer socket address | not in `source_ip_allowlist` | **DENY** — connection refused + WARNING log; **no connection event emitted** |
+| **X12** | peer socket address | not in `source_ip_allowlist` | **DENY** — as MLLP (refuse, log, `peer_not_allowlisted` event); BACKLOG #1665 |
 | **HTTP** | peer socket address | not in `source_ip_allowlist` | **DENY** — a real `403 {"error":"forbidden"}` is written to the peer, then close; WARNING log + `peer_not_allowlisted` event |
 | **DICOM C-STORE SCP** | `event.assoc.requestor.address` | not in `source_ip_allowlist` | **DENY** — DIMSE status **`0x0124` (Not Authorized)** returned **before any durable commit**; WARNING log naming the peer IP and calling AE; **no connection event** |
 | **MLLP / HTTP / DICOM** — peer client certificate | the TLS peer certificate presented at handshake | `tls = true` **and** `tls_ca_file` set → `ssl.CERT_REQUIRED` plus strict RFC 5280 verify flags; no client certificate, or one not issued by that CA | **DENY** — the TLS handshake fails and the connection **never reaches the accept path**, so there is **no** connection event and no allow-list evaluation. `tls_ca_file` unset → server-only TLS and no peer-certificate decision. TCP and X12 have no inbound TLS at this release |
@@ -1336,8 +1336,8 @@ listen source. The refusal action differs materially per listener, so each has i
 > **Telemetry honesty.** The `peer_not_allowlisted` connection event is durable when the connection's
 > `capture_connection_errors` is `true`, **or is unset (`None`, the default) and the
 > `[diagnostics].connection_events` master switch is on — which it is by default**. So on a default
-> deployment MLLP, TCP and HTTP allow-list refusals **do** write a `connection_event` store row (never
-> an audit row); X12 and DICOM emit no connection event at any setting and are log-only. The emit is
+> deployment MLLP, TCP, X12 and HTTP allow-list refusals **do** write a `connection_event` store row
+> (never an audit row); DICOM emits no connection event at any setting and is log-only. The emit is
 > fail-soft: a capture failure can never raise into the accept path.
 
 > **Adjacent, and deliberately not a row above.** `[egress].allowed_db` / `allowed_http` / `allowed_tcp`
