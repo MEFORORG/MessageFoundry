@@ -30,6 +30,7 @@ __all__ = [
     "message_detail",
     "message_edit",
     "message_resend_confirm",
+    "message_resend_done",
     "message_search",
     "messages",
     "parse_tree_page",
@@ -415,12 +416,9 @@ def _resend_section(detail: MessageDetail) -> list[object]:
     ]
 
 
-def message_detail(detail: MessageDetail, *, error: str = "") -> Markup:
+def message_detail(detail: MessageDetail) -> Markup:
     """A single message: metadata + the AUDITED raw body (escaped inside <pre>) + deliveries/events, plus
-    an Attachments panel (#149, ADR 0105 Phase 3b) when very-large documents were detached at ingress.
-
-    ``error`` is the refused-mutation banner — a resend that did NOT run. The route resolves it from
-    an allow-listed ``?e=<code>`` to fixed module text, so nothing caller-supplied is rendered here."""
+    an Attachments panel (#149, ADR 0105 Phase 3b) when very-large documents were detached at ingress."""
     meta = rows_table(
         ["Field", "Value"],
         [
@@ -490,12 +488,10 @@ def message_detail(detail: MessageDetail, *, error: str = "") -> Markup:
             ),
             rows_table(["Content type", "Size", ""], att_rows),
         ]
-    banner = [el("p", text(error), class_="banner")] if error else []
     return page(
         "Message",
         el("p", el("a", "← Messages", href="/ui/messages")),
         el("div", el("h1", "Message detail"), replay, edit, class_="detail-head"),
-        *banner,
         meta,
         el(
             "div",
@@ -516,9 +512,46 @@ def message_detail(detail: MessageDetail, *, error: str = "") -> Markup:
     )
 
 
-def message_resend_confirm(message_id: str, to: str, source: str, idempotency_key: str) -> Markup:
+def message_resend_done(message_id: str, to: str, source: str, *, duplicate: bool) -> Markup:
+    """The resend OUTCOME page — what the POST answers with instead of redirecting to the detail page.
+
+    Redirecting there would have needed ``messages:view_raw``, which a resend-only role does not
+    hold, so every outcome reached that role as a raw 403 (see ``routes/core``'s notice block for the
+    measurement). Rendering here needs nothing that role does not already have.
+
+    ``duplicate`` is ADR 0090 §4's no-op: the key was already used and NOTHING was queued. Saying
+    "queued" for it would be the same lie as answering a refusal with the success response, so the
+    two outcomes are worded apart. The ways out are LINKS, not redirects — a role that cannot open
+    the detail page simply does not follow that one."""
+    said = (
+        "That key was already used, so nothing new was queued. The earlier resend stands."
+        if duplicate
+        else f"A new delivery of this message is queued to “{to}”, copied from “{source}”."
+    )
+    return page(
+        "Resend message",
+        el("h1", "Already resent" if duplicate else "Resend queued"),
+        el("p", text(said), class_="muted"),
+        el("p", RESEND_TAIL_WARNING, class_="banner"),
+        el(
+            "p",
+            el("a", "← Message detail", href=f"/ui/messages/{_seg(message_id)}", class_="btn-link"),
+            " ",
+            el("a", "All messages", href="/ui/messages", class_="btn-link"),
+        ),
+        active="messages",
+    )
+
+
+def message_resend_confirm(
+    message_id: str, to: str, source: str, idempotency_key: str, *, error: str = ""
+) -> Markup:
     """The resend confirm step — the body-less half of the step-up gate, and where the ADR 0090 §3
     tail-placement caution is stated.
+
+    ``error`` is a REFUSED resend, re-rendered on this same page rather than redirected elsewhere.
+    The route resolves it from the engine's status to fixed module text, so nothing caller-supplied
+    is rendered here — see ``routes/core``'s notice block.
 
     THE POST THIS RENDERS CARRIES NOTHING IN ITS BODY: the whole selection lives in this page's own
     URL. IT READS NO MESSAGE either — every value below arrives as an argument and is echoed back
@@ -534,6 +567,7 @@ def message_resend_confirm(message_id: str, to: str, source: str, idempotency_ke
         "Resend message",
         el("p", el("a", "← Message detail", href=detail_url)),
         el("h1", "Resend this message?"),
+        *([el("p", text(error), class_="banner")] if error else []),
         el(
             "p",
             text(
