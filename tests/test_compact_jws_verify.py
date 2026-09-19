@@ -64,7 +64,7 @@ def _mint(
 ) -> str:
     """A real token from the shipped signer — never a hand-rolled one, so the fixture cannot drift
     from what the engine actually produces."""
-    signer = CompactJwtSigner(private_key=_pem(key), algorithm=alg)
+    signer = CompactJwtSigner(private_key=_pem(key), algorithm=alg, setting="test_idp_signing_key")
     return signer.sign(claims if claims is not None else {"sub": "jdoe", "iss": "https://idp"})
 
 

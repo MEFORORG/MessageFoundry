@@ -149,44 +149,64 @@ def test_signature_algorithm_has_384_members() -> None:
 
 
 def test_rs384_compact_roundtrip(rsa_pem: str) -> None:
-    signer = CompactJwtSigner(private_key=rsa_pem, algorithm=SignatureAlgorithm.RS384, key_id="k1")
+    signer = CompactJwtSigner(
+        private_key=rsa_pem,
+        algorithm=SignatureAlgorithm.RS384,
+        key_id="k1",
+        setting="smart_private_key",
+    )
     jwt = signer.sign({"iss": "c", "exp": 1})
     assert len(jwt.split(".")) == 3
     _verify_compact(jwt, signer, SignatureAlgorithm.RS384)
 
 
 def test_es384_compact_roundtrip(ec384_pem: str) -> None:
-    signer = CompactJwtSigner(private_key=ec384_pem, algorithm=SignatureAlgorithm.ES384)
+    signer = CompactJwtSigner(
+        private_key=ec384_pem, algorithm=SignatureAlgorithm.ES384, setting="smart_private_key"
+    )
     jwt = signer.sign({"iss": "c", "exp": 1})
     _verify_compact(jwt, signer, SignatureAlgorithm.ES384)
 
 
 def test_es384_signature_is_96_bytes(ec384_pem: str) -> None:
     # P-384 r||s is two 48-byte coordinates — the JOSE width the verifier expects.
-    signer = CompactJwtSigner(private_key=ec384_pem, algorithm=SignatureAlgorithm.ES384)
+    signer = CompactJwtSigner(
+        private_key=ec384_pem, algorithm=SignatureAlgorithm.ES384, setting="smart_private_key"
+    )
     sig = _b64u_decode(signer.sign({"a": 1}).split(".")[2])
     assert len(sig) == 96
 
 
 def test_es384_rejects_p256_key(ec256_pem: str) -> None:
     with pytest.raises(SigningError, match="secp384r1"):
-        CompactJwtSigner(private_key=ec256_pem, algorithm=SignatureAlgorithm.ES384)
+        CompactJwtSigner(
+            private_key=ec256_pem, algorithm=SignatureAlgorithm.ES384, setting="smart_private_key"
+        )
 
 
 def test_rs384_is_deterministic(rsa_pem: str) -> None:
-    signer = CompactJwtSigner(private_key=rsa_pem, algorithm=SignatureAlgorithm.RS384)
+    signer = CompactJwtSigner(
+        private_key=rsa_pem, algorithm=SignatureAlgorithm.RS384, setting="smart_private_key"
+    )
     claims = {"iss": "c", "exp": 1, "jti": "fixed"}
     assert signer.sign(claims) == signer.sign(claims)  # PKCS1-v1_5 is deterministic
 
 
 def test_es384_is_randomized(ec384_pem: str) -> None:
-    signer = CompactJwtSigner(private_key=ec384_pem, algorithm=SignatureAlgorithm.ES384)
+    signer = CompactJwtSigner(
+        private_key=ec384_pem, algorithm=SignatureAlgorithm.ES384, setting="smart_private_key"
+    )
     claims = {"iss": "c", "exp": 1, "jti": "fixed"}
     assert signer.sign(claims) != signer.sign(claims)  # ECDSA is randomized
 
 
 def test_compact_header_has_typ_and_kid(rsa_pem: str) -> None:
-    signer = CompactJwtSigner(private_key=rsa_pem, algorithm=SignatureAlgorithm.RS384, key_id="k9")
+    signer = CompactJwtSigner(
+        private_key=rsa_pem,
+        algorithm=SignatureAlgorithm.RS384,
+        key_id="k9",
+        setting="smart_private_key",
+    )
     header = json.loads(_b64u_decode(signer.sign({"a": 1}).split(".")[0]))
     assert header == {"alg": "RS384", "typ": "JWT", "kid": "k9"}
 

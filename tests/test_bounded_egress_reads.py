@@ -496,12 +496,16 @@ def test_a_signing_key_file_past_the_bound_fails_at_construction(tmp_path: Path)
     on the same principle -- a bare read of a path that turns out to name a huge file buffers it."""
     big = tmp_path / "key.pem"
     big.write_bytes(b"\0" * (_MAX_KEY_FILE_BYTES + 1))
-    with pytest.raises(SigningError, match="bound"):
-        _read_key_material(str(big))
+    with pytest.raises(SigningError, match="bound") as caught:
+        _read_key_material("sign_private_key", str(big))
+    # BACKLOG #1664: the over-cap arm names the setting, never the value. A value reaching this arm
+    # is a real path rather than key material -- the open succeeded -- but the rule is one rule.
+    assert str(big) not in str(caught.value)
+    assert "sign_private_key" in str(caught.value)
 
 
 def test_a_real_sized_key_file_still_reads(tmp_path: Path, ec_pem: str) -> None:
     """The control: a real PEM is a few kilobytes, so the bound refuses nothing an operator ships."""
     path = tmp_path / "ok.pem"
     path.write_bytes(ec_pem.encode("ascii"))  # bytes, so Windows does not translate the newlines
-    assert _read_key_material(str(path)) == ec_pem.encode("utf-8")
+    assert _read_key_material("sign_private_key", str(path)) == ec_pem.encode("utf-8")
