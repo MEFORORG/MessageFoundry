@@ -238,7 +238,7 @@ async def test_audit_and_event_detail_never_contain_message_body(
     )
     await client.get(f"/messages/{mid}")  # view → 'viewed' event
     await client.get(f"/messages/{mid}/outbound")  # transformed-body view → 'outbound.read' audit
-    await client.get("/messages", params={"audit_summary": "true"})  # summary display → audited
+    await client.get("/messages")  # exposes the summary → server-audited, no opt-in
     blobs = [a["detail"] or "" for a in await engine.store.list_audit()]
     blobs += [e["detail"] or "" for e in await engine.store.events_for(mid)]
     # 'MSH|' / 'PID|' only appear in a raw HL7 body, never in legitimate audit metadata.
@@ -637,13 +637,15 @@ async def test_summary_audit_coalescer_rolls_over_with_count() -> None:
     assert any(r[1] == "bob" for r in store.rows)
 
 
-async def test_audit_summary_skips_when_no_summaries(
+async def test_no_summary_audit_when_the_listed_messages_have_no_summaries(
     engine: Engine, client: httpx.AsyncClient
 ) -> None:
+    """Summary auditing is server-enforced (M-5), but it is driven by what the response actually
+    EXPOSES: a list carrying no summaries exposes no PHI, so it records no audit row."""
     await engine.store.enqueue_message(
         channel_id="ch1", raw=ADT, deliveries=[("archive", ADT)]
     )  # no summary
-    await client.get("/messages", params={"audit_summary": "true"})
+    await client.get("/messages")
     assert len(await engine.store.list_audit()) == 0
 
 
