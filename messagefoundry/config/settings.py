@@ -1158,14 +1158,30 @@ class InboundSettings(_Section):
     # delivery) is not yet implemented and is rejected at engine start.
     ack_after: AckAfter = AckAfter.INGEST
 
-    # Very-large-document streaming in-flight budget (#149, ADR 0105 Phase 1a) — the aggregate DoS guard
-    # that replaces the frame-cap-as-only-OOM-guard for streaming inbounds. It caps the TOTAL bytes of
-    # over-threshold message bodies concurrently mid-detach (buffered + being sealed into the attachment
-    # substrate) across ALL inbounds; a detach that would push the running total over it is refused with
-    # backpressure (the message is NAK'd/ERROR'd, never accepted-and-dropped) so a burst of huge uploads
-    # can't exhaust memory. 0 (the default) = unlimited (the per-connection max_message_bytes still bounds
-    # a SINGLE body); a positive value bounds concurrency. Only over-threshold streaming detaches count
-    # against it — below-threshold and non-streaming ingress is byte-identical and never touches it.
+    # Very-large-document streaming in-flight budget (#149, ADR 0105 Phase 1a) — the OPT-IN aggregate DoS
+    # guard for streaming inbounds. It caps the TOTAL bytes of over-threshold message bodies concurrently
+    # mid-detach (buffered + being sealed into the attachment substrate) across ALL inbounds; a detach
+    # that would push the running total over it is refused with backpressure (the message is
+    # NAK'd/ERROR'd, never accepted-and-dropped) so a burst of huge uploads can't exhaust memory. Only
+    # over-threshold streaming detaches count against it — below-threshold and non-streaming ingress is
+    # byte-identical and never touches it.
+    #
+    # THE TWO CEILINGS BOUND DIFFERENT THINGS, and this one does NOT replace the other. A SINGLE body on a
+    # streaming inbound is bounded by that inbound's per-connection max_message_bytes, which applies
+    # whether or not this is set. What THIS bounds is the AGGREGATE. 0 (the default) = unlimited IN THE
+    # AGGREGATE: no single body escapes max_message_bytes, but the NUMBER of such bodies in flight at once
+    # is uncapped until an operator sets a positive value. docs/CONNECTIONS.md ("Two ceilings bound it")
+    # is the operator-facing statement of the same split; docs/CONFIGURATION.md carries the catalog row.
+    #
+    # BACKLOG #1729: this block used to open by calling the setting "the aggregate DoS guard that replaces
+    # the frame-cap-as-only-OOM-guard", four lines above its own "0 (the default) = unlimited" — one
+    # comment contradicting itself, and the SDS-3.7 shape (a compensating control resting on a false
+    # premise) for anyone who read only the first sentence. The DEFAULT is deliberately unchanged: it is a
+    # coupled pin (tests/test_threat_model_doc_drift.py, "streaming-detach budget default 0 = unlimited",
+    # against a vault THREAT-MODEL.md row), and "a multiple of the largest max_message_bytes" is not
+    # expressible here at all — max_message_bytes is PER-CONNECTION and no registry exists at settings
+    # load. What closes the visibility half is a start-time WARNING, keyed on the registry where the
+    # streaming inbounds are actually in hand: pipeline/wiring_runner.warn_unbudgeted_streaming_inbound.
     stream_inflight_budget_bytes: int = 0
 
 
