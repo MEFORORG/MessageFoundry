@@ -5142,6 +5142,10 @@ def create_app(
     ) -> SystemStatus:
         now = time.time()
         total = running = 0
+        # BACKLOG #1741: the deployed inbounds that failed to build/bind at start (ADR 0031). The
+        # console's nav heart reads these — without them it reported "ok" over an engine listening on
+        # nothing. Names are scoped to the caller (see EngineInfo); the count is not.
+        failed_in: list[str] = []
         # Engine-wide KPI roll-up (#93): combined inbound + outbound endpoint counts with a
         # running/stopped breakdown (vs channels_*, which count inbound only).
         conn_total = conn_running = conn_not_deployed = 0
@@ -5158,6 +5162,10 @@ def create_app(
             out_deployed = [name for name, oc in rr.registry.outbound.items() if oc.deployed]
             total = len(in_deployed)
             running = sum(1 for name in in_deployed if rr.inbound_running(name))
+            # ADR 0031 start failures ONLY. A DR-parked connection (ADR 0048 / #61) lives in the
+            # DISJOINT filtered set and is deliberately excluded: parking is a run-profile decision,
+            # not a fault, and folding it in here would paint every DR-profiled engine degraded.
+            failed_in = [name for name in in_deployed if rr.connection_failed(name) is not None]
             # outbound_running (not outbound_status) so the running/stopped split gates on the engine
             # actually running AND the lane not operator-paused — consistent with inbound_running's
             # actually-started semantics (outbound_status reports "running" for any non-paused lane even
@@ -5261,6 +5269,13 @@ def create_app(
                 channels_running=running,
                 channels_stopped=total - running,
                 outbox_by_status=await engine.store.stats(),
+                channels_failed=len(failed_in),
+                # Scoped to the caller: an unscoped identity (allowed_channels is None) sees every
+                # name, a channel-scoped one only its own. `_user` keeps its historical underscore
+                # because both console call sites pass it by keyword across the UI seam.
+                channels_failed_names=[
+                    name for name in failed_in if _user.can_access_channel(name)
+                ],
             ),
             kpis=kpis,
             db=DbInfo(
@@ -6047,6 +6062,7 @@ def create_app(
                 stop_connection=stop_connection,
                 restart_connection=restart_connection,
                 replay_message=replay_message,
+                resend_message=resend_message,
                 edit_resend_message=edit_resend_message,
                 replay_dead_letters=replay_dead_letters,
                 list_active_alerts=list_active_alerts,

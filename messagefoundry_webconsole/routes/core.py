@@ -9,7 +9,7 @@ import logging
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any, TypedDict
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
@@ -21,6 +21,7 @@ from messagefoundry.api.models import (
     DeadLetterReplayRequest,
     EditResendRequest,
     PendingApprovalResponse,
+    ResendRequest,
 )
 from messagefoundry.api.security import get_auth
 from messagefoundry.api.validation import EPOCH_SECONDS_MAX, EpochSeconds
@@ -53,6 +54,7 @@ from .._auth import (
 )
 from .._html import CSP_PROBE_SRC
 from .._service import _service
+from ..pages._common import _seg
 
 _log = logging.getLogger(__name__)
 
@@ -102,6 +104,81 @@ class _MsgFilters(TypedDict):
 register_ui_action(
     r"^/ui/messages/[^/?#]+/edit$", Permission.MESSAGES_EDIT, auto_retry=False, unlock=True
 )
+
+# Resend to an ALTERNATE outbound (ADR 0090 §§1-8, BACKLOG #123/#1500). The GET confirm page is the
+# step-up `unlock` continuation; the POST behind it is deliberately NOT registered — its
+# `reauth_next` maps a stale-window step-up back to that confirm page, which re-renders with a fresh
+# idempotency key.
+#
+# QUERY-TOLERANT, for the reason `_auth.is_unlock_action` sets out: the whole selection rides the
+# query, `_reauth_redirect` puts the entire continuation into `next`, and `lookup_ui_action` /
+# `is_unlock_action` fullmatch the RAW value — so a path-only pattern would match nothing and
+# dead-end the flow at /ui with the selection silently gone.
+# KEEP THE OPTIONAL GROUP rather than pinning `\?to=...`: this form also fullmatches the bare route
+# TEMPLATE, which is what keeps the coverage guard in test_webui.py able to see this entry.
+register_ui_action(
+    r"^/ui/messages/[^/?#]+/resend-confirm(\?[^#]*)?$",
+    Permission.MESSAGES_RESEND,
+    auto_retry=False,
+    unlock=True,
+)
+
+#: Fixed text for each refused resend, rendered IN PLACE on the confirm page.
+#:
+#: THE OUTCOME IS NOT A REDIRECT TO THE MESSAGE DETAIL PAGE, and that is the whole reason these are
+#: notices rather than ``?e=`` codes. The detail page is ``require_ui(MESSAGES_VIEW_RAW)``, so a role
+#: holding ``messages:resend`` without ``messages:view_raw`` — the exact role this lane's permission
+#: choice exists to serve — followed such a redirect into a raw JSON 403 and learned nothing about
+#: whether a delivery had been queued. MEASURED on a mounted app before this was changed. Answering
+#: on the page the operator is already standing on needs no permission they do not have.
+#:
+#: Caller-supplied text still travels nowhere: these are module constants, and ``exc.detail`` (which
+#: quotes the operator's own ``to``/``source``, and for a key conflict a PRIOR resend's message id
+#: and target) is neither rendered nor logged.
+RESEND_MALFORMED_NOTICE = (
+    "That resend did not run — nothing was queued. That is not a usable connection name. Check the "
+    "spelling and try again."
+)
+RESEND_MISSING_NOTICE = (
+    "That resend did not run — nothing was queued. The message or the target outbound connection "
+    "was not found. Check them and try again."
+)
+RESEND_DENIED_NOTICE = (
+    "That resend did not run — nothing was queued. You are not authorized to resend to that "
+    "outbound connection."
+)
+#: The 409 arm covers SEVERAL separately-worded engine refusals — a target that is stopped, not
+#: deployed or owned by another engine shard (ADR 0090 §7), a source that is absent, retention-nulled
+#: or ambiguous (§4/§5), and an idempotency key already used for a different message or target (§4).
+#: They arrive as one status code, and ``exc.detail`` is the only thing that separates them.
+#:
+#: SO THE NOTICE SAYS "AT LEAST", NOT A CLOSED LIST (CLAUDE.md §11, SDS-3.6). An enumeration here
+#: would be a completeness claim about a set this module cannot observe: it already missed
+#: ``ResendKeyConflict`` once, and an operator who checks every named cause and finds nothing wrong
+#: is worse off than one told the list is partial.
+RESEND_BLOCKED_NOTICE = (
+    "That resend did not run — nothing was queued. The engine refused it. Common causes: the target "
+    "outbound is stopped, not deployed, or owned by another engine shard; or this message has no "
+    "single stored delivery body to copy. Check those first."
+)
+
+#: Which notice each refused status becomes. Anything outside this map is not a refusal this route
+#: knows how to explain, so it is re-raised rather than reported as one of these.
+_RESEND_NOTICES: dict[int, str] = {
+    403: RESEND_DENIED_NOTICE,
+    404: RESEND_MISSING_NOTICE,
+    409: RESEND_BLOCKED_NOTICE,
+}
+
+#: Ceiling on ``to`` and ``source`` in the query, BELOW the 256 the connection-name rule allows.
+#:
+#: ``_reauth_redirect`` packs the whole continuation into ``GET /ui/reauth``'s ``next``, which is
+#: ``Query(max_length=512)``, and ``quote()`` expands each ``=`` and ``&`` to three characters. At the
+#: model's own 256 ceiling a stale-window resend therefore built a 542-character ``next`` and the
+#: re-auth page answered a raw 422 — MEASURED, at 231 characters each. 200 keeps the worst case at
+#: 478. A connection name longer than this cannot be resent from the console; it still can over the
+#: JSON API, which has no continuation to carry.
+_RESEND_NAME_MAX = 200
 
 
 def _csp_report_bodies(doc: object) -> list[dict[str, object]] | None:
@@ -645,6 +722,112 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         assert_same_origin(request)
         await core.replay_message(message_id, engine=engine, identity=identity, request=request)
         return RedirectResponse(f"/ui/messages/{message_id}", status_code=303)
+
+    # Resend to an ALTERNATE outbound (ADR 0090 §§1-8, BACKLOG #123/#1500) — ADR 0090's residual (a).
+    # The JSON handler's own gate is require_step_up(MESSAGES_RESEND) and nothing else, so these two
+    # routes re-assert exactly that. NOT the edit verbs' MESSAGES_VIEW_RAW + phi=True: a resend
+    # re-transmits the STORED body and never renders it, so neither page nor response carries PHI.
+    # Copying that pair here would charge the per-actor PHI budget for a surface that emits none, and
+    # would refuse a role deliberately narrowed to resend-without-read.
+    #
+    # The confirm page is PLAIN require_ui, not step-up: it is the re-auth CONTINUATION, so gating it
+    # with step-up would bounce the operator straight back to /ui/reauth in a loop.
+    #
+    # It reads NO message, which is what lets it stand on `messages:resend` alone. Everything it
+    # renders is the operator's own query echoed back through the escaping builders, so it asserts
+    # nothing about whether the message exists; the engine handler behind the POST is the single
+    # authority on that and 404s outside the caller's channel scope.
+    @app.get("/ui/messages/{message_id}/resend-confirm", response_class=HTMLResponse)
+    async def ui_message_resend_confirm(
+        message_id: str,
+        to: str = Query(..., min_length=1, max_length=_RESEND_NAME_MAX),
+        source: str = Query(..., min_length=1, max_length=_RESEND_NAME_MAX),
+        _identity: Identity = Depends(require_ui(Permission.MESSAGES_RESEND)),
+    ) -> HTMLResponse:
+        # A fresh per-render idempotency token: a double-submit of THIS rendered confirm is the
+        # ADR 0090 §4 no-op, while re-opening the confirm page mints a new one and is a genuine
+        # second resend. It rides the POST's query rather than its body, which is what keeps that
+        # POST body-less.
+        return HTMLResponse(pages.message_resend_confirm(message_id, to, source, uuid4().hex))
+
+    # BOTH OUTCOMES ARE ANSWERED IN PLACE, not with a 303 to the message detail page. That page is
+    # `require_ui(MESSAGES_VIEW_RAW)`, so redirecting there handed a resend-without-read role a raw
+    # JSON 403 in place of every outcome — success and refusal alike — which is exactly the role the
+    # permission choice above exists to serve. Rendering here costs that role nothing it does not
+    # already hold.
+    #
+    # Re-POSTing this page on a browser refresh is safe by construction, which is why the usual
+    # post-redirect-get is not needed to make it so: the idempotency key is IN the URL, so a repeat
+    # is ADR 0090 §4's no-op and says "already queued" rather than queuing a second delivery.
+    @app.post("/ui/messages/{message_id}/resend", response_class=HTMLResponse)
+    async def ui_message_resend(
+        message_id: str,
+        request: Request,
+        to: str = Query(..., min_length=1, max_length=_RESEND_NAME_MAX),
+        source: str = Query(..., min_length=1, max_length=_RESEND_NAME_MAX),
+        idempotency_key: str = Query(..., min_length=1, max_length=128),
+        engine: Any = Depends(deps.get_engine),
+        identity: Identity = Depends(
+            require_ui_step_up(
+                Permission.MESSAGES_RESEND,
+                # A stale-window step-up re-opens the CONFIRM page, never this POST path. The target
+                # and source are carried back so the operator is not stranded mid-task; the stale
+                # `idempotency_key` deliberately is NOT, because the confirm page mints a fresh one
+                # and the attempt behind the old key never ran.
+                #
+                # `_seg` on the id for the reason the page builder applies it: a `?` or `#` here
+                # produces a `next` the write-action registry cannot fullmatch, and an unmatched
+                # continuation is dropped SILENTLY — the operator lands on /ui with the message and
+                # the selection gone and no error anywhere. Measured.
+                reauth_next=lambda r: (
+                    f"/ui/messages/{_seg(r.path_params['message_id'])}/resend-confirm?"
+                    + urlencode({k: r.query_params.get(k, "") for k in ("to", "source")})
+                ),
+            )
+        ),
+    ) -> Response:
+        assert_same_origin(request)
+
+        def _refused(notice: str, *, status: int) -> HTMLResponse:
+            # Re-render the confirm page carrying the notice, with a FRESH key: the refused attempt
+            # never claimed the old one, so reusing it would make the retry look like a duplicate.
+            _log.warning("message resend refused: status=%d", status)
+            return HTMLResponse(
+                pages.message_resend_confirm(message_id, to, source, uuid4().hex, error=notice),
+                status_code=400,
+            )
+
+        # The Query params carry the LENGTH bounds; the model carries the connection-name RULE
+        # (BACKLOG #1108), which the query declarations deliberately do not repeat -- a second copy
+        # would be a second definition. So the model can still refuse a value the query accepted, and
+        # a `to`/`source` that could not name a connection is refused HERE, before the engine sees it.
+        try:
+            body = ResendRequest(to=to, idempotency_key=idempotency_key, source=source)
+        except ValidationError:
+            # Its OWN notice, not the 404 one. Nothing was looked up, so "was not found" would send
+            # the operator hunting on /ui/connections for a connection whose real problem is that the
+            # name could not name one.
+            return _refused(RESEND_MALFORMED_NOTICE, status=400)
+        try:
+            result = await core.resend_message(
+                message_id, body=body, request=request, engine=engine, identity=identity
+            )
+        except HTTPException as exc:
+            # All three of 403/404/409 are handled rather than re-raised because an escaping
+            # HTTPException renders as application/json inside the HTML console, with the caller's
+            # own outbound name quoted in it. The log carries the STATUS only: the message id, the
+            # names and `exc.detail` are caller-supplied text, and logging those is log injection.
+            notice = _RESEND_NOTICES.get(exc.status_code)
+            if notice is None:
+                raise
+            return _refused(notice, status=exc.status_code)
+        # `duplicate` means the key was already used and NOTHING was queued (ADR 0090 §4). Reporting
+        # it as a send would be the same lie as answering a refusal with the success response.
+        return HTMLResponse(
+            pages.message_resend_done(
+                message_id, result.to, result.source, duplicate=(result.status == "duplicate")
+            )
+        )
 
     # Edit-and-resubmit (ADR 0090 §9, BACKLOG #153). GET renders the editor (a COPY of the raw); the
     # step-up gate opens it inside a fresh window (unlock continuation). The origin row is only READ
