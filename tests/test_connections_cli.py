@@ -134,7 +134,9 @@ def test_remove(cfg: Path, capsys: pytest.CaptureFixture[str]) -> None:
     )
     capsys.readouterr()
     assert rc == 0
-    assert "IB" not in load_config(cfg).inbound
+    # allow_empty: removing the only connection leaves an empty graph, which load_config refuses by
+    # default (BACKLOG #1648). Emptiness is what this test just asserted happened.
+    assert "IB" not in load_config(cfg, allow_empty=True).inbound
 
 
 def test_remove_missing_fails(cfg: Path, capsys: pytest.CaptureFixture[str]) -> None:
