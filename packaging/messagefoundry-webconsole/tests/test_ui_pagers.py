@@ -122,6 +122,33 @@ def test_the_pager_omits_an_empty_filter_rather_than_sending_it_blank() -> None:
     assert "status=" not in rendered
 
 
+def test_a_window_past_the_end_says_so_and_steps_back_to_real_rows() -> None:
+    """A bookmarked page-N link outlives the rows it named: retention purges, a filter narrows, or
+    an offset is typed by hand. The window is then empty and the old arithmetic printed a range
+    that contradicted the empty table under it, with a Previous that landed past the end again.
+
+    Both halves are asserted, because fixing only the sentence leaves the operator one click from a
+    second empty page, and fixing only the link leaves a count that reads as rows they cannot see.
+    """
+    from messagefoundry_webconsole.pages import _common
+
+    rendered = str(
+        _common._pager(path="/ui/messages", total=3, limit=50, offset=100, shown=0, noun="msg(s)")
+    )
+    assert "0 of 3 msg(s)" in rendered
+    assert "0-100" not in rendered, "the counter claimed a window that holds no rows"
+    assert "offset=0" in rendered, (
+        "Previous must reach the last page with rows, not one window back"
+    )
+    assert ">Next<" not in rendered
+
+    # Past the end of a MULTI-page set: Previous goes to the last populated page, not to zero.
+    deep = str(
+        _common._pager(path="/ui/messages", total=120, limit=50, offset=500, shown=0, noun="msg(s)")
+    )
+    assert "0 of 120 msg(s)" in deep and "offset=100" in deep
+
+
 async def test_the_messages_pager_pages_and_carries_every_filter(engine: Engine) -> None:
     """Three ADT on ch1 plus an ORU the message_type filter excludes, read two at a time.
 
@@ -215,17 +242,23 @@ async def test_the_dead_letter_pager_pages_and_carries_both_filters(engine: Engi
         assert "OB_OTHER" not in last.text, "the pager widened the query it was replaying"
 
 
-async def test_the_audit_page_says_it_is_a_window_rather_than_the_trail(engine: Engine) -> None:
-    """BACKLOG #1743 item 3: the audit page has no pager and must not read as the whole log.
+async def test_the_capped_pages_say_they_are_windows_rather_than_the_record(engine: Engine) -> None:
+    """BACKLOG #1743 item 3: neither capped page may read as the whole log.
 
-    It cannot page -- ``Store.list_audit`` takes no offset and there is no audit count to put in a
-    window-of-total line -- so the correction here is the claim, not a control: an operator who
-    takes this page for the complete trail reads an absence on screen as an absence in the log.
+    Neither can page -- ``list_audit`` and the security-event listing take a limit and no offset,
+    and there is no count to put in a window-of-total line -- so the correction is the claim, not a
+    control: a reader who takes either page for the complete record reads an absence on screen as
+    an absence in the record. BOTH pages are asserted because they are capped by one constant and
+    disclosed by one helper, and covering only the first would leave the second free to drift.
+
+    The bound itself is in the assertion: "capped at the newest 200" is the sentence that separates
+    a log holding 200 entries from a log holding 200,000, and a bare count states neither.
     """
     service = await _service(engine)
     async with _client(engine, service) as c:
         await _login(c)
-        r = await c.get("/ui/audit")
-        assert r.status_code == 200, r.text
-        assert "most recent entries" in r.text
-        assert "most recent entry(s)" in r.text
+        for path, noun in (("/ui/audit", "entry(s)"), ("/ui/security-events", "event(s)")):
+            r = await c.get(path)
+            assert r.status_code == 200, r.text
+            assert "only the most recent" in r.text, path
+            assert f"{noun} shown, capped at the newest 200." in r.text, path

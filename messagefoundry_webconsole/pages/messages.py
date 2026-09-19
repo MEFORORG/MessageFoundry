@@ -100,7 +100,21 @@ def messages(
     ``error`` renders a refusal banner in place of the "click Search" hint, the shape
     ``message_search`` uses: the filters come back carrying what the operator typed, and the route
     answers 400 instead of searching under a bound it dropped (BACKLOG #1744)."""
-    filters = _msg_filters(channel_id, status, message_type, control_id, received_from, received_to)
+    # ONE spelling of the six inside this function, feeding both the form and the pager links. They
+    # are the /messages query names, which is also what ``_msg_filters`` names its inputs and its
+    # fields — the form round-trips them and so must the links, or the two disagree about what the
+    # listing was run under. This does NOT collapse the whole chain: the route still declares them
+    # (``_MsgFilters`` in routes/core.py) and this function still declares them as parameters, so a
+    # seventh filter is still several edits. It removes the one pair that could drift unnoticed.
+    values = {
+        "channel_id": channel_id,
+        "status": status,
+        "message_type": message_type,
+        "control_id": control_id,
+        "received_from": received_from,
+        "received_to": received_to,
+    }
+    filters = _msg_filters(**values)
     if deferred or data is None:
         hint = (
             el("p", error, class_="banner")
@@ -128,17 +142,9 @@ def messages(
         offset=data.offset,
         shown=len(data.messages),
         noun="message(s)",
-        # Every filter this listing ran under, spelled with the query names the route reads back.
-        # ``defer`` is deliberately absent: a pager link must RUN the query, and the deferred arm
-        # returns above this line anyway.
-        filters={
-            "channel_id": channel_id,
-            "status": status,
-            "message_type": message_type,
-            "control_id": control_id,
-            "received_from": received_from,
-            "received_to": received_to,
-        },
+        # ``defer`` is deliberately NOT among them: a pager link must RUN the query, and the
+        # deferred arm returns above this line anyway.
+        filters=values,
     )
     return page(
         "Messages",
@@ -617,8 +623,14 @@ def dead_letters(
 
     ``channel_id`` / ``destination_name`` are the route's two query filters, taken here only so the
     pager can replay them (BACKLOG #1743). The page draws no filter form, so they render nowhere
-    else — but a Next link that dropped them would silently widen the listing, and the bulk-replay
-    buttons below are built from the rows on screen, so a wider page also grows that button set.
+    else, and a Next link that dropped them would silently widen the listing.
+
+    **THE BULK-REPLAY BUTTONS BELOW DO NOT TRACK EITHER ONE, and nothing here makes them.** They are
+    derived from the rows in the CURRENT WINDOW, so paging changes which per-channel and
+    per-destination buttons exist, and "Replay all dead (every channel)" re-queues channels the
+    filter excluded and the operator never saw. Deriving the replay set from the store instead of
+    from the rendered page is the other half of BACKLOG #1743 and is filed separately; this page
+    inherits that behaviour unchanged, which is why it is stated here rather than implied.
     """
     headers = ["Failed", "Channel", "Destination", "Type", "Attempts", "Last error", "Message"]
     body = [

@@ -1,9 +1,15 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Shared cell/format helpers for the /ui page builders (ADR 0065).
+"""Shared cell/format and URL helpers for the /ui page builders (ADR 0065).
 
 Small, escape-neutral formatters imported by the per-area page modules (``connections``,
 ``messages``, …) so the rendering conventions live in one place, never copy-pasted per module.
+
+Two of these build a URL rather than format a cell — ``_seg`` for one path segment, ``_pager``
+for a listing's Previous/Next query — and that is why they are here rather than in ``.._html``:
+that module is the page-agnostic escaping layer and knows nothing about /ui's routes or their
+query parameters, while getting an operator-supplied value safely into a link is exactly the
+convention this module exists to keep in one place.
 """
 
 from __future__ import annotations
@@ -33,26 +39,41 @@ def _pager(
     **``filters`` MUST carry every filter the current listing was run under.** A Previous/Next link
     that drops one re-runs a DIFFERENT, wider query and still returns rows, so the operator reads a
     result set under a filter they typed and the engine did not apply -- the same substitution
-    BACKLOG #1744 refused on the date bounds, arriving by a link instead of by a form. Empty values
-    are omitted rather than sent blank, because an empty string is a value at the route and not the
-    absence of one. Every value goes through ``urlencode`` and then the attribute escaping in
-    ``el``, so an operator-supplied filter can leave neither the query string nor the attribute.
+    BACKLOG #1744 refused on the date bounds, arriving by a link instead of by a form. Every value
+    goes through ``urlencode`` and then the attribute escaping in ``el``, so an operator-supplied
+    filter can leave neither the query string nor the attribute.
+
+    **An EMPTY value is omitted, and that is not the same as carrying it.** A blank box means the
+    operator set no filter, so the link says so; sending ``status=`` instead would hand the store a
+    narrowing predicate. These two readings are visibly different at the message log today --
+    measured 2026-09-18 on three messages: ``?channel_id=ch1`` renders all three, while
+    ``?channel_id=ch1&status=`` renders none. Omitting is the reading a link should replay.
+    **No page can show that difference**, because a blank filter narrows to zero rows and a
+    zero-row window renders no links at all -- so this is a statement about which reading is right,
+    not a hazard this builder leaves open. That the blank one is reachable AT ALL, from the filter
+    form's own submit, is a separate defect of the route and is filed separately.
 
     The caller passes ``path`` as a plain literal; this builder never interpolates into one.
     """
-    first = offset + 1 if shown else 0
-    parts: list[object] = [text(f"{first}-{offset + shown} of {total} {noun}")]
     active = {k: v for k, v in (filters or {}).items() if v}
 
-    def _link(label: str, target: int) -> None:
+    def _link(label: str, target: int) -> Markup:
         query = urlencode({**active, "limit": limit, "offset": target})
-        parts.append(Markup(" "))
-        parts.append(el("a", label, href=f"{path}?{query}", class_="btn-link"))
+        return el("a", label, href=f"{path}?{query}", class_="btn-link")
 
+    # An EMPTY window is not "rows 0 to offset": a bookmarked page-N link outlives the rows it named
+    # (a retention purge, a narrowed filter, a hand-typed offset), and "0-100 of 3" reads as a count
+    # that contradicts the empty table above it. Say the total and stop.
+    window = f"{offset + 1}-{offset + shown}" if shown else "0"
+    parts: list[object] = [text(f"{window} of {total} {noun}")]
     if offset > 0:
-        _link("Previous", max(offset - limit, 0))
+        # Step back to the last page that HAS rows rather than one window back, which from past the
+        # end would still be past the end and would strand the operator on a second empty page.
+        past_end = shown == 0 and offset >= total
+        previous = (max(total - 1, 0) // limit) * limit if past_end else max(offset - limit, 0)
+        parts += [Markup(" "), _link("Previous", previous)]
     if offset + shown < total:
-        _link("Next", offset + limit)
+        parts += [Markup(" "), _link("Next", offset + limit)]
     return el("p", *parts, class_="pager")
 
 

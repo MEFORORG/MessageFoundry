@@ -28,14 +28,28 @@ def _ts(ts: float) -> str:
     return datetime.fromtimestamp(ts, UTC).strftime("%Y-%m-%d %H:%M:%SZ")
 
 
-def audit_log(data: AuditList) -> Markup:
+def _window_note(shown: int, limit: int, noun: str) -> Markup:
+    """The one sentence that separates "this is everything" from "this is the newest ``limit``".
+
+    STATE THE BOUND, NOT JUST THE COUNT (BACKLOG #1743). A bare "200 entries" is the same sentence
+    whether the log holds 200 or 200,000, and the reader cannot tell which — so the cap goes in the
+    text beside the count. Styled ``muted`` rather than ``pager``: ``pager`` is the class the two
+    real pagers use for a line that CARRIES links, and borrowing it here would dress a dead end up
+    as navigation."""
+    return el("p", f"{shown} {noun} shown, capped at the newest {limit}.", class_="muted")
+
+
+def audit_log(data: AuditList, *, limit: int) -> Markup:
     """One window of the audit trail (``audit:read``): actor, action, channel, PHI-free detail.
 
-    NEWEST FIRST, AND ONLY THE NEWEST — the route asks for a fixed number of rows and this page
-    renders what came back (BACKLOG #1743). It cannot say window-of-total the way the messages and
-    dead-letter pagers do, because ``AuditList`` carries no total and the store has no audit count
-    to put in one; giving this page a pager is a separate row that has to add both. Until then the
-    honest surface for a full trail is the ``audit:export`` CSV, which streams its own filter."""
+    NEWEST FIRST, AND ONLY THE NEWEST — the route asks for ``limit`` rows and this page renders what
+    came back (BACKLOG #1743). It cannot say window-of-total the way the messages and dead-letter
+    pagers do, because ``AuditList`` carries no total and the store's ``list_audit`` has neither an
+    offset nor a count; giving this page a pager is a separate row that has to add both. Until then
+    the honest surface for a full trail is the ``audit:export`` CSV, which streams its own filter.
+
+    ``limit`` is passed in rather than re-declared here so the sentence states the bound the query
+    actually used — a second copy of the number would be wrong the day either one moved."""
     rows = [
         [_ts(e.ts), e.actor or "—", e.action, e.channel_id or "—", e.detail or ""]
         for e in data.entries
@@ -51,14 +65,18 @@ def audit_log(data: AuditList) -> Markup:
             class_="muted",
         ),
         rows_table(["When", "Actor", "Action", "Channel", "Detail"], rows),
-        el("p", f"{len(data.entries)} most recent entry(s).", class_="pager"),
+        _window_note(len(data.entries), limit, "entry(s)"),
         active="audit",
     )
 
 
-def security_events(data: SecurityEventsList) -> Markup:
+def security_events(data: SecurityEventsList, *, limit: int) -> Markup:
     """The caller's OWN security-event history (self-service): sign-ins, lockouts, password/MFA
-    changes on their account, newest first. No permission needed beyond a valid session."""
+    changes on their account, newest first. No permission needed beyond a valid session.
+
+    Capped and pagerless for the same reason as ``audit_log``, and disclosed for a sharper one: this
+    is where a user checks whether something happened to their account, so an event older than the
+    newest ``limit`` reads as an event that never happened (BACKLOG #1743)."""
     rows = [[_ts(e.ts), e.action, e.detail or ""] for e in data.events]
     return page(
         "My security events",
@@ -66,10 +84,12 @@ def security_events(data: SecurityEventsList) -> Markup:
         el(
             "p",
             "Recent security-relevant activity on your account (sign-ins, lockouts, credential "
-            "changes). Most recent first.",
+            "changes). Most recent first, and only the most recent — an older event missing here "
+            "is off this page, not absent from the record.",
             class_="muted",
         ),
         rows_table(["When", "Event", "Detail"], rows),
+        _window_note(len(data.events), limit, "event(s)"),
         active="security-events",
     )
 
