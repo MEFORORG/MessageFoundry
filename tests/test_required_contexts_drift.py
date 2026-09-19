@@ -115,3 +115,73 @@ def test_the_canonical_file_is_the_one_being_read() -> None:
     """Guards the seam itself: if the script stops reading the register, every arm above goes quiet."""
     assert _CANONICAL.exists()
     assert "required-contexts.txt" in _SCRIPT.read_text(encoding="utf-8")
+
+
+def _invoking_workflows() -> dict[str, list[str]]:
+    """Workflow file -> job keys whose steps invoke this script. Parsed, never grepped whole-file.
+
+    A whole-file substring search would be satisfied by the script's name inside a COMMENT, which is
+    exactly how the wiring would appear to have survived its own deletion -- two workflows in this
+    repository already mention this script in prose only.
+    """
+    import yaml
+
+    found: dict[str, list[str]] = {}
+    for path in sorted((_REPO / ".github" / "workflows").glob("*.yml")):
+        parsed = yaml.safe_load(path.read_text(encoding="utf-8"))
+        if not isinstance(parsed, dict):
+            continue
+        for key, job in (parsed.get("jobs") or {}).items():
+            steps = (job or {}).get("steps") or []
+            if any(_SCRIPT.name in str((s or {}).get("run", "")) for s in steps):
+                found.setdefault(path.name, []).append(str(key))
+    return found
+
+
+def test_a_workflow_actually_runs_this_checker() -> None:
+    """A detector nothing invokes is a file. This is the arm that keeps the wiring from being deleted.
+
+    THE DEFECT THIS EXISTS FOR, and it is a reading error rather than a code one. The script's own
+    docstring records that it "reported to nobody" on the 2026-09-14 drift, meaning its scheduled red
+    reached no pull request or session. That sentence has since been read as "no workflow runs it" --
+    a conclusion that leads straight to writing a second detector beside the working one. Nothing in
+    the tree contradicted the misreading, because nothing asserted the wiring at all: deleting the job
+    that runs this script would have reddened no test.
+    """
+    invoking = _invoking_workflows()
+    print(f"[drift] {_SCRIPT.name} is invoked by {invoking or 'NOTHING'}")
+    assert invoking, (
+        f"no workflow job runs {_SCRIPT.name}. It reads the live branch-protection set, which no "
+        "in-repo test can see, so without a workflow invoking it a protection change is undetectable "
+        "from this repository. Restore the step (it was required-workflow-state.yml's `accurate` job) "
+        "rather than deleting this test."
+    )
+
+
+def test_the_job_that_runs_this_checker_is_not_a_required_context() -> None:
+    """THE ASYMMETRY, and the more important half. Wired is necessary; wired-as-ADVISORY is the claim.
+
+    This checker calls the GitHub API. A required context whose job depends on a network read would
+    put every merge in the repository behind that call: a rate limit, an outage, or a revoked token
+    stops being a red run and starts being a wedged queue. The register's own header names the
+    required-but-absent trap for the same reason.
+
+    So the two arms are deliberately opposite -- one fails if nothing runs the script, the other fails
+    if what runs it has been promoted. Neither alone says what the posture is, and a single arm would
+    be satisfiable by the state this repository must not reach.
+    """
+    from tests._workflow_contexts import context_of, jobs_of, required_contexts
+
+    required = set(required_contexts())
+    promoted = [
+        f"{wf}:{key} reports {context_of(key, jobs_of(wf)[key])!r}"
+        for wf, keys in _invoking_workflows().items()
+        for key in keys
+        if context_of(key, jobs_of(wf)[key]) in required
+    ]
+    assert not promoted, (
+        "the job running the drift checker has become a REQUIRED status context:\n  "
+        + "\n  ".join(promoted)
+        + "\nIt reads branch protection over the network, so every merge would then depend on that "
+        "call succeeding. Keep it advisory: a red run is a report, not a gate."
+    )
