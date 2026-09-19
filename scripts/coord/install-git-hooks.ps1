@@ -172,7 +172,7 @@ if ($Status) {
         if (-not $durUrl) {
             Write-Host "             ^ ARMED at remote '$durRemote', which DOES NOT EXIST in this repo." -ForegroundColor Red
             Write-Host "               The hook exits 0 silently, so this looks identical to working." -ForegroundColor Red
-        } elseif ($durUrl -match 'MEFORORG/MessageFoundry(\.git)?/?$') {
+        } elseif ($durUrl -match '(^|[/:])MEFORORG/MessageFoundry(\.wiki)?(\.git)?/*$') {
             # ANCHORED ON THE END, and the unanchored version misreported for real. This read
             # `-match 'MEFORORG/MessageFoundry'` until 2026-09-19, when the private vault was
             # transferred into the same organization as MEFORORG/MessageFoundry-vault. A substring
@@ -180,6 +180,24 @@ if ($Status) {
             # canonical repo -- in red, with a remedy that would have pointed them away from the
             # correct target. Keep this in step with the case arms in scripts/hooks/durability_push.sh:
             # the two answer the same question and must not disagree.
+            #
+            # THE BOUNDARY BEFORE THE OWNER IS LOAD-BEARING, in the over-refusing direction. Without
+            # `(^|[/:])` this matched any owner whose name merely ENDS in the public one --
+            # `example.invalid/somemefororg/messagefoundry` -- and -Status then told that operator in
+            # red that nothing was being published while the hook was happily pushing there. A
+            # compensating control resting on a false premise is the defect CLAUDE.md sec. 11 names
+            # (SDS-3.7). `/*$` rather than `/?$` for the same reason the hook loops its strips: a
+            # doubled trailing slash is a legal spelling and one `?` does not reach it.
+            #
+            # `.wiki` IS OPTIONAL HERE BECAUSE THE HOOK STRIPS IT. A public repository's wiki is
+            # public too, so the hook refuses `...MessageFoundry.wiki.git`; without this arm -Status
+            # would call that same URL safely armed while the hook silently refused every commit --
+            # the two disagreeing is the exact failure this comment block was written to prevent.
+            #
+            # CASE IS COVERED BY THE OPERATOR, NOT BY THE PATTERN: PowerShell's `-match` is
+            # case-insensitive by default, which is what the hook's `tr 'A-Z' 'a-z'` buys on the
+            # other side. Do not "tighten" this to `-cmatch` -- that would reopen the fail-open half
+            # on `mefororg/messagefoundry`, which is the direction that publishes.
             Write-Host "             ^ POINTED AT THE PUBLIC CANONICAL REPO. The hook refuses this target," -ForegroundColor Red
             Write-Host "               so nothing is being made durable AND nothing is being published." -ForegroundColor Red
         } else {
