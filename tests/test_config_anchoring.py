@@ -494,7 +494,14 @@ def test_malformed_env_file_fails_cleanly_not_traceback(
     cfg = _config_dir(tmp_path, _NO_ENV_GRAPH)
     envdir = tmp_path / "environments"
     envdir.mkdir()
-    (envdir / "dev.toml").write_text("this is = = not valid toml\n", encoding="utf-8")
+    # The DUPLICATE-INLINE-KEY shape, for the reason recorded once at the guard itself
+    # (messagefoundry/__main__.py, the env_values() provider): it is the one malformed shape whose
+    # tomllib message quotes text FROM the file. An unterminated string quotes nothing, so a redaction
+    # assertion over it would pass for a renderer that leaks. The token is deliberately not
+    # credential-shaped: a real-looking one would trip the gitleaks gate for nothing this test needs.
+    (envdir / "dev.toml").write_text(
+        'a = {peer_host = "never-print-this-value", peer_host = 2}\n', encoding="utf-8"
+    )
     rc = _run_serve_stubbed(
         monkeypatch,
         ["serve", "--project-root", str(tmp_path), "--config", str(cfg), "--env", "dev"],
@@ -503,6 +510,11 @@ def test_malformed_env_file_fails_cleanly_not_traceback(
     err = capsys.readouterr().err
     assert "could not read environment values" in err
     assert "dev.toml" in err
+    # No configured VALUE travels -- the contract.
+    assert "never-print-this-value" not in err
+    # The positive control: the offending KEY is echoed, which proves the assertion above can see
+    # file text rather than merely being handed a shape with nothing to leak.
+    assert "peer_host" in err
 
 
 # --- AC-6 / BACKLOG #1062: the build check must READ values from the root it VALIDATED -------------
