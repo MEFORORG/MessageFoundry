@@ -1337,11 +1337,13 @@ def MLLP(
     hosts. ``receive_timeout`` (60 s) bounds SILENCE between reads and **resets on every byte
     received**, so ``max_frame_seconds`` (60 s) bounds one frame's life from its start byte to its
     end byte — that is what reaches a peer trickling a byte at a time, which is never idle.
-    ``max_frame_bytes`` (16 MiB) bounds the same frame's size; **raise ``max_frame_seconds`` whenever
-    you raise it**, since a larger frame needs proportionally longer to arrive. Each is disabled by
-    ``None``/``0``. Both connection refusals are **pre-ingress** — the socket is accepted, then
-    refused and closed with an ``at_capacity`` connection event, and no message was received to drop.
-    Each cap's full rationale, and what it does not cover, is on its constant in ``transports.mllp``.
+    ``max_frame_bytes`` (16 MiB) bounds the same frame's size. Each is disabled by ``None``/``0``.
+
+    What each cap does NOT cover, and when to change one, is stated **once** on its ``DEFAULT_*``
+    constant in ``messagefoundry.transports.mllp`` — including the two cases an operator is most
+    likely to meet: a listener behind a source-NAT proxy, and a feed carrying large embedded
+    documents. Read those rather than a summary here; ``docs/CONNECTIONS.md`` carries the same two in
+    operator form.
 
     **Inbound message-rate pacing (BACKLOG #1249).** ``max_messages_per_second`` bounds how fast one
     accepted inbound connection may feed messages in; ``None``/``0`` (the default) is no bound.

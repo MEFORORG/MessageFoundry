@@ -33,9 +33,11 @@ a planted-omission self-test). Five mechanisms:
 4. **Negative + shape assertions.** Retired false phrases must stay gone; Table A and Table B must
    carry an **identical row set in identical order** (the "documented in one table, missing from the
    other" failure that keeps re-opening 13.1.2/13.1.3); and every default the tables state is
-   **imported from the code** — all 30 of them, from ``model_fields[...].default`` or a module
-   constant — and asserted to appear on the same line as its anchor token, so changing a constant
-   reds the doc rather than letting it rot.
+   **imported from the code**, from ``model_fields[...].default`` or a module constant, and asserted
+   to appear on the same line as its anchor token, so changing a constant reds the doc rather than
+   letting it rot. The pinned set is :func:`_import_code_defaults` itself — it used to be quoted
+   here as a count, which went stale the first time a row was added and told a later reader auditing
+   coverage that pins were missing or spurious (SDS-3.6).
 5. **Planted-omission self-test.** The checkers are pure functions exercised against synthetic
    slices, so the guard itself cannot silently stop asserting.
 

@@ -504,10 +504,18 @@ async def test_a_pipelined_sender_gets_a_fresh_deadline_for_each_frame() -> None
         await writer.drain()
         acks = bytearray()
         try:
-            for _ in range(count):
+            for i in range(count):
                 # Slower than the handler, so the listener reads chunk by chunk.
                 await asyncio.sleep(0.03)
-                writer.write(body + bytes([EB, CR]) + bytes([SB]))  # close one frame, open the next
+                chunk = body + bytes([EB, CR])
+                if i < count - 1:
+                    # Open the next frame, except on the LAST chunk. A trailing start byte would
+                    # leave an empty frame open with a fresh stamp, and the deadline would then be
+                    # racing the ACK drain below — a slow drain would fire `frame_deadline` on the
+                    # dangling frame and fail the final assertion while pointing at a defect that is
+                    # not there. The last chunk closes cleanly instead.
+                    chunk += bytes([SB])
+                writer.write(chunk)
                 await writer.drain()
         except OSError:
             # The listener dropped us mid-feed. Fall through to the count assertion, which says what
@@ -530,7 +538,6 @@ async def test_a_pipelined_sender_gets_a_fresh_deadline_for_each_frame() -> None
         # Bound teardown so a listener-stop regression (the #55 Windows Proactor wedge) fails LOUD as a
         # fast timeout instead of silently hanging the shared session loop — mirrors test_connection_resilience.
         await asyncio.wait_for(source.stop(), timeout=5.0)
-    assert "frame_deadline" not in [r for _, _, r in cap.events]
     assert "frame_deadline" not in [r for _, _, r in cap.events]
 
 
@@ -625,4 +632,23 @@ def test_both_new_caps_ship_on_and_are_reachable_through_the_mllp_factory() -> N
     assert settings["max_connections_per_host"] == mllp_mod.DEFAULT_MAX_CONNECTIONS_PER_HOST
     # The same None/0-disables convention every other cap on this listener follows.
     assert MLLP(port=2575, max_frame_seconds=None).settings["max_frame_seconds"] is None
+    assert _mllp(max_frame_seconds=0).max_frame_seconds is None
+
+
+def test_a_negative_cap_is_refused_at_build_not_discovered_at_the_first_connection() -> None:
+    """A negative value is TRUTHY, so it survives the `if value` that reads `0` as "off".
+
+    Left unchecked, `max_connections_per_host=-1` is worse than a wrong number: `0 >= -1` is true,
+    so every peer is refused including one holding no connections, and because nothing is ever
+    admitted nothing ever clears `_host_capacity_warned` — one attacker-chosen key per source
+    address, which is the unbounded table this control is not allowed to contain. `max_frame_seconds`
+    negative would expire every frame the instant it opened. Both fail at build, where dry-run and
+    `messagefoundry check` surface them, rather than at the first connection in production.
+    """
+    with pytest.raises(ValueError, match="max_connections_per_host must be at least 1"):
+        _mllp(max_connections_per_host=-1)
+    with pytest.raises(ValueError, match="max_frame_seconds must not be negative"):
+        _mllp(max_frame_seconds=-1.0)
+    # 0 stays the documented "off" spelling for both, and is NOT caught by the refusal above.
+    assert _mllp(max_connections_per_host=0).max_connections_per_host is None
     assert _mllp(max_frame_seconds=0).max_frame_seconds is None

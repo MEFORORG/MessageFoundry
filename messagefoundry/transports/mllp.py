@@ -113,12 +113,20 @@ DEFAULT_RECEIVE_TIMEOUT = 60.0  # seconds — close inbound sockets idle this lo
 #: Seconds one frame may take from its START byte to its END byte (BACKLOG #1725).
 #:
 #: :data:`DEFAULT_RECEIVE_TIMEOUT` bounds SILENCE between reads and resets on every byte received, so
-#: a peer trickling one byte at a time is never idle: it would hold its slot — and up to
-#: ``max_frame_bytes`` of decoder buffer — for as long as it liked, without ever completing a message.
-#: This bounds the frame itself, so the two answer different questions and **both apply**. They are
-#: deliberately kept apart: dropping the per-read timeout would lose the idle-socket bound, which is a
-#: separate property and still wanted (a peer that opens a socket and says nothing at all never opens
-#: a frame, so no frame deadline would ever fire on it).
+#: a peer trickling one byte at a time INSIDE A FRAME is never idle: it would hold its slot — and up
+#: to ``max_frame_bytes`` of decoder buffer — for as long as it liked, without ever completing a
+#: message. This bounds the frame itself, so the two answer different questions and **both apply**.
+#: They are deliberately kept apart: dropping the per-read timeout would lose the idle-socket bound,
+#: which is a separate property and still wanted (a peer that opens a socket and says nothing at all
+#: never opens a frame, so no frame deadline would ever fire on it).
+#:
+#: **The clock runs from a START byte, and a peer that never sends one is outside it.** Inter-frame
+#: noise is discarded by the decoder without opening a frame, so a peer trickling bytes that are not
+#: an MLLP frame is neither idle nor in-frame and holds its slot. It buffers nothing, so the memory
+#: half of the threat is absent, and ``max_connections_per_host`` bounds how many slots one address
+#: can hold that way — but it is not bounded by THIS key, and reading it as "no peer can hold a slot
+#: without sending a message" would be wrong. Closing that needs a bound on a different unit
+#: (connected time without a completed message), which is a separate decision from this one.
 #:
 #: 60 s matches the idle bound, so the shipped posture reads as "a frame gets about as long to arrive
 #: as a quiet socket gets to stay open". ``None``/``0`` disables it, like every cap here.
@@ -1678,12 +1686,30 @@ class MLLPSource(SourceConnector):
         self.max_connections: int | None = int(mc) if mc else None
         mch = s.get("max_connections_per_host", DEFAULT_MAX_CONNECTIONS_PER_HOST)
         self.max_connections_per_host: int | None = int(mch) if mch else None
+        if self.max_connections_per_host is not None and self.max_connections_per_host < 1:
+            # A negative value is TRUTHY, so it survives the `if mch` above and becomes a cap that
+            # refuses every peer — including one holding zero connections, since `0 >= -1`. Nothing
+            # is admitted, so `_release` never runs and `_host_capacity_warned` grows one
+            # attacker-chosen key per address with nothing to clear it: the unbounded table this
+            # control is not allowed to contain. Refuse at build, where dry-run and `check` surface
+            # it, rather than at the first connection. `0` is the documented way to turn it off.
+            raise ValueError(
+                "MLLP max_connections_per_host must be at least 1 (use None or 0 to disable the "
+                f"per-host cap), got {self.max_connections_per_host}"
+            )
         rt = s.get("receive_timeout", DEFAULT_RECEIVE_TIMEOUT)
         self.receive_timeout: float | None = float(rt) if rt else None
         mf = s.get("max_frame_bytes", DEFAULT_MAX_FRAME_BYTES)
         self.max_frame_bytes: int | None = int(mf) if mf else None
         mfs = s.get("max_frame_seconds", DEFAULT_MAX_FRAME_SECONDS)
         self.max_frame_seconds: float | None = float(mfs) if mfs else None
+        if self.max_frame_seconds is not None and self.max_frame_seconds < 0:
+            # Negative is truthy here too, and it would expire every frame the instant one opened —
+            # a listener that drops every sender, configured from a value the author meant as "off".
+            raise ValueError(
+                "MLLP max_frame_seconds must not be negative (use None or 0 to disable the frame "
+                f"deadline), got {self.max_frame_seconds}"
+            )
         # Message-rate pacing. Absent -> OFF, unlike the caps above; see _pacing_settings and
         # DEFAULT_MAX_MESSAGES_PER_SECOND for why that deviation is deliberate and ruled.
         self.max_messages_per_second, self.message_burst = _pacing_settings(s)
@@ -1759,6 +1785,16 @@ class MLLPSource(SourceConnector):
                 await asyncio.gather(*still_running, return_exceptions=True)
         self._clients.clear()
         self._client_tasks.clear()
+        # Clear the per-host tables with them. A client task cancelled past its grace above, or one
+        # the runner ABANDONS when a stop() overruns (wiring_runner's demotion path leaves the drain
+        # running and reuses this same instance at the next promotion), never runs its `finally` —
+        # so a stale count would survive into the restarted listener, and `_release`'s own docstring
+        # names what that costs: "a per-host count left behind by a missed release locks that peer
+        # out permanently". A straggler that does run later decrements a missing key, which
+        # `_release` already treats as a no-op. `_active` keeps its existing behaviour: it is read
+        # by the global cap that predates this row, and resetting it here would be a separate change.
+        self._per_host.clear()
+        self._host_capacity_warned.clear()
         # Now that no client handlers are in flight, this should complete promptly — but on the Windows
         # ProactorEventLoop a still-pending overlapped accept/read can make wait_closed() never return,
         # which (on the suite's single shared session loop) wedges every subsequent test with no output
@@ -1870,7 +1906,14 @@ class MLLPSource(SourceConnector):
         `frame_deadline`, but only when connection-event capture is on; this line lands either way,
         and an operator reading `idle_timeout` for a peer that was never idle would look in the wrong
         place. Socket metadata only — no frame bytes, which is the whole point of the partial frame
-        this drops."""
+        this drops.
+
+        Unthrottled, unlike :meth:`_log_host_capacity_once`, and the difference is the rate rather
+        than a difference of opinion. A refused connection is free to the peer, so that path could be
+        driven as fast as it could call ``connect()``. Reaching this one costs a connection held for
+        ``max_frame_seconds``, so the caps already bound it: at the defaults, 32 lines per minute per
+        address. That is the same shape as the existing `frame_oversize` warning beside it, which is
+        also one line per dropped connection."""
         logger.warning(
             "MLLP frame from %s did not complete within max_frame_seconds (%.1fs); "
             "dropping the connection",
@@ -1975,22 +2018,26 @@ class MLLPSource(SourceConnector):
                             frame_opened_at += time.monotonic() - paced_from
                     frame_left = self._frame_seconds_left(frame_opened_at)
                     if frame_left is not None and frame_left <= 0.0:
-                        # A trickling peer is never idle, so the deadline has to be checked where
-                        # bytes ARRIVE and not only where they stop: this is the arm that fires on a
-                        # peer feeding one byte at a time inside the per-read timeout.
+                        # The budget went while we were NOT waiting on the socket — bytes arrived at
+                        # or past the deadline, so the read below returned instead of timing out.
+                        # The trickle case is caught by the TimeoutError arm, not here: the read is
+                        # armed with the frame's remaining life whenever that is the smaller bound.
                         self._log_frame_deadline(writer)
                         close_reason = "frame_deadline"
                         break
                     read_budget = self._read_budget(frame_left)
+                    # WHICH bound armed the wait, decided here rather than re-measured in the
+                    # handler below. Re-measuring loses at the boundary: when the two budgets are
+                    # close, or wait_for fires a hair early, the frame's remaining life reads as a
+                    # small POSITIVE number and a peer that was never idle is closed as
+                    # `idle_timeout` — the exact misdiagnosis this reason exists to prevent.
+                    armed_by_frame = frame_left is not None and frame_left == read_budget
                     if read_budget is not None:
                         try:
                             chunk = await asyncio.wait_for(reader.read(4096), read_budget)
                         except TimeoutError:
-                            # One wait_for serves both bounds, so name whichever actually ran out. An
-                            # open frame whose life is spent is the frame deadline; everything else —
-                            # including a quiet socket with no frame open — is the idle bound.
-                            spent = self._frame_seconds_left(frame_opened_at)
-                            if spent is not None and spent <= 0.0:
+                            # One wait_for serves both bounds, so name whichever armed it.
+                            if armed_by_frame:
                                 self._log_frame_deadline(writer)
                                 close_reason = "frame_deadline"
                             else:
