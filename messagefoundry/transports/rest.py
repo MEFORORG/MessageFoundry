@@ -944,7 +944,9 @@ def enforce_signature_header_limits(signer: object | None, *, connector: str) ->
 # byte-identical.
 
 #: Sentinel ``proxy_url`` value meaning "Use the OS/environment default web proxy" (getproxies()), #112.
-_PROXY_DEFAULT = "default"
+#: PUBLIC because the ``[egress].allowed_proxy`` gate in ``pipeline/wiring_runner.py`` has to exempt it
+#: (it names no address at config time), and a second copy of the literal would be free to drift.
+PROXY_DEFAULT = "default"
 
 
 def _normalize_no_proxy(value: Any) -> tuple[str, ...]:
@@ -1150,7 +1152,7 @@ def proxy_config_from_settings(
         return None
     bypass = _normalize_no_proxy(s.get("proxy_no_proxy"))
     proxy_url = str(raw).strip()
-    if proxy_url.lower() == _PROXY_DEFAULT:
+    if proxy_url.lower() == PROXY_DEFAULT:
         # "Use Default Web Proxy" — explicit creds are meaningless here (the system proxy carries its own),
         # so reject the ambiguous combo rather than silently drop a configured credential.
         if s.get("proxy_user") or s.get("proxy_password") or s.get("proxy_auth_type"):
@@ -1417,8 +1419,16 @@ class RestDestination(DestinationConnector):
         # a forward proxy carried as opener handlers, or the ECH sidecar the request is re-addressed to.
         # #1176: before this, the ECH case passed `proxy=None` and nothing else, so the token hop went
         # DIRECT and leaked the authorization server's SNI while the payload hop was routed.
+        # #1794 (#1660's third configuration): the client trust anchor travels the same way, so the
+        # credential-bearing hop verifies against the instance `[tls]` policy the delivery hop below has
+        # honoured since #1180. Pass the POLICY, never the `anchor` this method resolves for the delivery
+        # opener further down: the provider resolves its own against the TOKEN url, for the reason
+        # `oauth2_cc_provider_from_settings` records.
         self._token_provider = bearer_provider_from_settings(
-            s, proxy=self._proxy, ech_sidecar=self._ech_sidecar
+            s,
+            proxy=self._proxy,
+            ech_sidecar=self._ech_sidecar,
+            trust_anchor_policy=config.trust_anchor_policy,
         )
         if self._token_provider is not None:
             # The SMART bearer is injected per-request in _post, so the static-header cleartext check

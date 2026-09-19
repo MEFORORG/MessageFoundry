@@ -1216,11 +1216,82 @@ jobs:
     # These are DEADLOCK BACKSTOPS, not tightness gates -- the same reasoning the engine matrix records
     # for its own 66/55. Sizing a cap close to the observed run buys no detection and costs red builds
     # on green suites, and a gate that cries wolf gets deleted. The engine Windows legs carry 66/55 for
-    # a bigger suite; 40/30 here is proportionate and still well clear.
+    # a bigger suite; 40/30 was proportionate here and well clear at -n 4. It is 45/35 now, and the
+    # paragraphs below are why -- that sentence about sizing a cap close to the observed run is the
+    # rule that moved it, applied to its own tier.
     #
-    # RE-DERIVE IF the tier's -n 4 wall clock is ever observed above 25 minutes on the Windows leg, or
-    # if pytest_workers changes.
-    timeout-minutes: 40
+    # RE-DERIVED FOR THE WINDOWS LEG'S -n 3 EXPERIMENT (BACKLOG #1109, against #1304), because the
+    # trigger at the bottom of this note fires on its own change. The paragraphs above are the caps'
+    # ORIGINAL derivation, and it is a -n 4 basis on a local 20-PHYSICAL-core box; what follows
+    # re-derives them on measured HOSTED windows-2025 wall clock instead. Six samples of this tier at
+    # -n 4, 2026-09-16, sorted. A row carries its run id when it was read from the Actions API for this
+    # change; the three without one were supplied with the brief that ordered the experiment and are
+    # recorded as reported, not re-read:
+    #
+    #   1128.00s  18.8 min  GREEN  run 35113492633  step clock
+    #   1219.44s  20.3 min  red                     pytest clock, reported
+    #   1276.96s  21.3 min  GREEN                   pytest clock, reported
+    #   1341.00s  22.4 min  red    run 35113359729  step clock
+    #   1370.08s  22.8 min  red    run 35114064023  pytest clock (step clock 1376s)
+    #   1455.72s  24.3 min  red                     pytest clock, reported
+    #
+    # TWO INSTRUMENTS, AND THEY AGREE, which is what licenses pooling them into one column: run
+    # 35114064023 was read BOTH ways and they differ by 6 seconds on 1370, 0.4 percent. "Step clock" is
+    # the runner's own start-to-finish on the `Harness tests (pytest)` step; "pytest clock" is the
+    # figure pytest prints in its own summary line.
+    #
+    # WALL CLOCK DOES NOT PREDICT THE FAILURE, which is why the old trigger is rewritten and not just
+    # renumbered: the 1276.96s GREEN sits ABOVE the 1219.44s red, so the two populations overlap and no
+    # threshold on this axis separates them. Reds do skew long -- both greens are the two fastest rows
+    # -- and the mechanism is visible in run 35114064023's log: two tests each burned the gate's
+    # 45-second ceiling before failing, so a red clock partly measures the failure rather than the
+    # sizing. That is the association; it is not a discriminator, and it is why the trigger below reads
+    # GREEN runs only.
+    #
+    # THAT OVERLAP RESTS ENTIRELY ON THE TWO REPORTED ROWS, so whoever re-checks it should re-read them
+    # first. The three rows re-read here do NOT show it on their own -- one green at 1128 under two reds
+    # at 1341 and 1376 is a clean separation, and a reader with only those would draw the opposite
+    # conclusion. The overlap is real only if 1219.44 red and 1276.96 green are what they were reported
+    # to be.
+    #
+    # ONE OF THE FOUR REDS WAS CHECKED TO BE THE #1304 SIGNATURE, and the other three were not, which is
+    # said plainly because a table of reds invites the reader to assume they are all one failure. Job
+    # log for run 35114064023: `2 failed, 3209 passed ... in 1370.08s`, both failures `AssertionError:
+    # PWSH LAUNCH TIMED OUT after 45s (BACKLOG #1304)`, in test_worktree_gate_escaped_quote.py and
+    # test_worktree_gate_control_plane.py. The cap derivation below reads only the GREEN rows, so it
+    # does not depend on what the other reds were.
+    #
+    # WHY THE CAPS MOVE TO 45/35. Take the WORST green, not the friendliest one -- 1276.96s. Removing a
+    # worker cannot make the tier faster, and the pessimistic case is the CPU-PACKED bound, 4/3 of that:
+    # 1702.6s, 28.4 minutes. Against the old 30-minute step cap that is 97 seconds of margin, 5 percent,
+    # and the paragraph above says in terms that sizing a cap that close to the observed run buys no
+    # detection. 4/3 is not even a hard ceiling here: under `--dist loadfile` the floor is the largest
+    # single FILE, so dropping to 3 workers packs more coarsely and imbalance can cost MORE than 4/3.
+    # 35 minutes puts the same bound at 19 percent margin. The nesting invariant holds: recorded W25
+    # setup maxima are 2:32, ci.yml records provisioning noise alone at 4:30, so 7 + 35 = 42 under 45
+    # (measured setup on run 35113492633 was 68 seconds).
+    #
+    # THE EXPERIMENT'S OWN PREMISE ARGUES THE TRUE COST IS FAR BELOW THAT BOUND, and that is a READING,
+    # not a measurement: 4 workers each carrying the ~1.12 cores of average child occupancy recorded
+    # above is ~8.5 cores of demand on 4 vCPU, so the box is saturated in BOTH arms and the fourth
+    # worker buys queueing rather than throughput. This experiment is what tests it. THE CAPS ARE SIZED
+    # AGAINST THE BOUND, NOT AGAINST THE READING, so they hold even if the reading is wrong.
+    #
+    # NO FIGURE HERE IS AN -n 3 OBSERVATION. There are none; the first lands on this change's own run.
+    # READ THE STEP'S DURATION, NOT ONLY ITS CONCLUSION -- a green -n 3 run that costs 7 extra minutes
+    # on every harness PR is a different verdict from a green one that costs nothing, and the pass/fail
+    # alone cannot tell them apart.
+    #
+    # RE-DERIVE IF a GREEN Windows run of this tier is ever observed above 29 minutes at whatever worker
+    # count it is actually running, or if TOOLING_WORKERS changes. 29, not the old 25, and the reason is
+    # not that 25 was wrong: every one of the six -n 4 rows above is UNDER it, the worst by 44 seconds.
+    # It was sized for -n 4 and does not survive the move. The pessimistic -n 3 bound derived above is
+    # 28.4 minutes, so a 25-minute trigger would fire on the first ordinary run and say nothing; 29
+    # clears that bound and still leaves 6 minutes to the 35-minute cap. Move this WITH the worker count
+    # or it stops meaning anything.
+    # `pytest_workers` is NOT this tier's knob and never was -- see the TOOLING_WORKERS note on the
+    # step below.
+    timeout-minutes: 45
     defaults:
       run:
         shell: bash
@@ -1311,7 +1382,8 @@ jobs:
       # INDEPENDENT mechanism (CPython's C-level `dump_traceback_later`, not a Python `threading.Timer`),
       # writing down a DIFFERENT path: faulthandler dumps to a raw dup'd stderr fd, while pytest-timeout
       # writes through `config.get_terminal_writer()`. That distinction is why it is worth having on the
-      # one tier that runs `-n 4` -- `_pytest/faulthandler.py` comments that xdist monkeypatches
+      # tier that spawns the most children under `-n` (the count itself is per-leg now, see
+      # TOOLING_WORKERS below) -- `_pytest/faulthandler.py` comments that xdist monkeypatches
       # `sys.stderr` with a non-file, and whether the terminal-writer dump survives a worker's `os._exit`
       # and reaches the controller log is NOT established here (no xdist on the measuring box).
       # `PYTHONFAULTHANDLER=1` additionally arms the fatal-signal handler from interpreter start, before
@@ -1331,13 +1403,31 @@ jobs:
       # carry. It was deliberately not ported blind: it is a behaviour change whose zero cost was
       # measured on the engine tier's history and on no sample from this one. See BACKLOG #1304.
       - name: Harness tests (pytest)
-        timeout-minutes: 30 # see the job cap above for the derivation; must stay under it with setup
+        timeout-minutes: 35 # see the job cap above for the derivation; must stay under it with setup
         env:
           # Same reason as the apt step above: collection imports the Qt modules whether or not this
           # job executes them, and the shipped ones construct QApplication at import on some paths.
           QT_QPA_PLATFORM: offscreen
           PYTHONFAULTHANDLER: "1"
-        run: pytest -q -n 4 --dist loadfile -m tooling --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout=150 --timeout=120 --junitxml=tooling-junit.xml --durations=40
+          # THE TIER'S xdist WORKER COUNT, AND THE WINDOWS VALUE IS A LIVE EXPERIMENT (BACKLOG #1109,
+          # against #1304): 3 on windows-2025, 4 on every other leg. Sizing and the measured baselines
+          # it rests on are in the job-cap note above; the hypothesis is one line -- 4 workers each
+          # carrying ~1.12 cores of pwsh/git child occupancy is oversubscribed on a 4-vCPU runner
+          # before the workers themselves are counted, and that is the condition under which a single
+          # `pwsh` launch starves past the gate's 45-second ceiling.
+          #
+          # THIS TIER HAS NEVER READ `pytest_workers`, whatever the old RE-DERIVE trigger implied. That
+          # knob belongs to the ENGINE matrix (built in `changes`, consumed as `PYTEST_WORKERS` by the
+          # `test` job); this tier carried a bare `-n 4` literal here, so no edit to `pytest_workers`
+          # could ever have moved it and nobody reading that trigger would have been sent to this line.
+          # Naming the count in a variable is what makes the trigger true, and is why it now says
+          # TOOLING_WORKERS.
+          #
+          # Through `env` rather than interpolated into the run body, for the reason recorded on the
+          # `changes` job -- and because it is the same shape the engine step already uses for
+          # `PYTEST_WORKERS`.
+          TOOLING_WORKERS: "${{ matrix.os == 'windows-2025' && '3' || '4' }}"
+        run: pytest -q -n "$TOOLING_WORKERS" --dist loadfile -m tooling --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout=150 --timeout=120 --junitxml=tooling-junit.xml --durations=40
 
       # A marker typo, a manifest rename, or a conftest hook that silently stops firing all produce the
       # same thing: zero selected tests and a GREEN job. Deselection cannot be distinguished from success
@@ -2879,6 +2969,51 @@ jobs:
             "MEFOR_VALUE_REGISTRY_KEY_PASSWORD=smoke-key-pass" `
             "MEFOR_VALUE_REGISTRY_USER=smoke-user" `
             "MEFOR_VALUE_REGISTRY_PASSWORD=smoke-pass"
+
+      - name: Verify the data-directory DACL (review finding H-13)
+        shell: powershell
+        run: |
+          # READ BACK THE ACL THE INSTALLER PRODUCED. NSSM captures the engine's stdout/stderr under
+          # C:\ProgramData\MessageFoundry\logs, and those logs are a PHI sink parallel to the DB
+          # (docs/PHI.md), so the install's Set-SecureDataDirAcl strips ProgramData's inherited
+          # BUILTIN\Users:(RX). Nothing ever checked that it worked: this leg installed the service
+          # and never looked (BACKLOG #1699). tests/test_service_install_manifest.py runs the
+          # FUNCTION against a temp directory; this reads the DACL of the REAL data dir, left by a
+          # real elevated install.
+          #
+          # BOTH SPELLINGS. On an English runner icacls prints "BUILTIN\Users", not "S-1-5-32-545",
+          # so a SID-only match returns a false clean. Neither form may appear.
+          #
+          # OWNER RIGHTS (S-1-3-4) is in the list because it is the principal that actually went red,
+          # and removing CREATOR OWNER does not cover it: CREATOR OWNER materializes into an ACE for
+          # the creating principal, while OWNER RIGHTS stays S-1-3-4 in the DACL and is evaluated
+          # against whoever owns the object at ACCESS time. Measured 2026-09-18 on windows-2022 and
+          # windows-2025, in the unit arm that runs the function against a temp directory: an
+          # explicit one came through /inheritance:r /grant:r with icacls exiting 0 and reached the
+          # logs directory beneath it.
+          $dirs = @("C:\ProgramData\MessageFoundry", "C:\ProgramData\MessageFoundry\logs")
+          $broad = @("S-1-1-0", "Everyone", "S-1-5-32-545", "BUILTIN\Users",
+                     "S-1-5-11", "Authenticated Users", "S-1-5-32-546", "BUILTIN\Guests",
+                     "S-1-3-4", "OWNER RIGHTS")
+          $bad = @()
+          foreach ($d in $dirs) {
+            if (-not (Test-Path $d)) { throw "expected directory is missing: $d" }
+            $acl = (& icacls $d | Out-String)
+            "===== icacls $d ====="
+            $acl
+            # CONTROL: the read has to be able to SEE something, or an empty result reads as clean.
+            if ($acl -notmatch "S-1-5-18|SYSTEM") {
+              throw "icacls returned no SYSTEM ACE for $d - the instrument is not reading a DACL"
+            }
+            foreach ($p in $broad) {
+              if ($acl -match [regex]::Escape($p)) { $bad += "$d grants $p" }
+            }
+          }
+          if ($bad.Count -gt 0) {
+            $bad | ForEach-Object { "BROAD ACCESS: $_" }
+            throw "the data/log directory is reachable by a broad principal - the captured engine logs are a PHI sink (H-13, BACKLOG #1699)"
+          }
+          "data-directory DACL OK: no broad principal on either directory"
 
       - name: Start and verify /health
         run: |
