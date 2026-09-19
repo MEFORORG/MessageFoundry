@@ -1613,6 +1613,29 @@ def _secure_file(path: Path, *, extra_read_grants: Sequence[str] | None = None) 
         log.warning("could not restrict permissions on %s: %s", path, exc)
 
 
+async def _secure_file_async(path: Path, *, extra_read_grants: Sequence[str] | None = None) -> None:
+    """:func:`_secure_file` dispatched off the event loop — for the two callers that run ON one.
+
+    On Windows the restriction is an ``icacls`` subprocess, measured at 21 to 28 ms per file. Called
+    straight from a coroutine, that span is dead time for every other task on the loop: a deploying
+    site would see one such stall per secured file of every in-flight ACK, claim and delivery on each
+    DR backup, because ``snapshot_to`` runs on the SERVING loop by design (see
+    ``pipeline/dr_backup.py``, which keeps the consistent snapshot there and moves only the tar+AEAD
+    off it). ``MessageStore.open`` secures three files, but it completes before the API serves and
+    before any listener binds, so its stall has nothing to stall.
+
+    The synchronous :func:`_secure_file` stays the callable for every caller that is NOT on a loop —
+    the CLI key/cert writers, the lifespan bootstrap admin, and the ``config/*_edit.py`` writers
+    (whose one async caller already wraps the whole write in ``to_thread``). It is deliberately left
+    unrenamed and unmoved: ``tests/test_phi_at_rest_inventory.py`` asserts that token lives in this
+    module and in no other ``store/`` backend, and ``tests/test_cli.py`` patches it by that name.
+
+    ``_secure_file`` is resolved through the module global when the call is made, so a test that
+    patches the name is honoured through this wrapper too.
+    """
+    await asyncio.to_thread(_secure_file, path, extra_read_grants=extra_read_grants)
+
+
 def _opt_float(value: Any) -> float | None:
     """Coerce a possibly-NULL epoch column to ``float | None`` (a backend may return int/Decimal)."""
     return None if value is None else float(value)
@@ -2567,6 +2590,8 @@ class MessageStore:
             await cls._migrate(db)
             await db.commit()
             # Tighten permissions now that the file (and its WAL siblings) exist — they hold PHI.
+            # Off the loop (BACKLOG #1634): three files, each an icacls subprocess on Windows. Open
+            # completes before anything is serving, so this one is consistency rather than a fix.
             if str(path) != ":memory:":
                 main = Path(path)
                 for f in (
@@ -2575,7 +2600,7 @@ class MessageStore:
                     main.with_name(main.name + "-shm"),
                 ):
                     if f.exists():
-                        _secure_file(f)
+                        await _secure_file_async(f)
             store = cls(
                 db,
                 path=path,
@@ -9926,7 +9951,9 @@ class MessageStore:
         # Tighten the snapshot file's permissions: it is a full copy of the (PHI-bearing) store. The
         # encrypted .mfbak the BackupRunner wraps it in is the at-rest protection, but the transient
         # plaintext snapshot must not be world-readable either.
-        _secure_file(dest)
+        # Off the loop (BACKLOG #1634): this is the call that matters. A DR backup runs on the SERVING
+        # loop, so a synchronous icacls here stalls every in-flight ACK, claim and delivery with it.
+        await _secure_file_async(dest)
 
     async def stats(self) -> dict[str, int]:
         """Outbound-queue depth by status — feeds the monitoring/queue-depth view. Scoped to outbound
