@@ -505,7 +505,7 @@ class ConnectionRow(BaseModel):
     channel_name: str
     destination: str | None  # destination name; None for the source row
     name: str  # display name
-    status: str  # "running" | "stopping" (outbound: operator-paused, an in-flight head still draining) | "stopped" (outbound: paused AND quiesced) | "failed" (start failed, ADR 0031) | "filtered" (DR run-profile parked it below [dr].priority_threshold, #61 ADR 0048) | "draining" | "not_deployed" (present in the graph but deployed=false, #233 ADR 0111 — never wired, deploying it is a config change; distinct from "stopped", which SHOULD be running)
+    status: str  # "running" | "stopping" (outbound: operator-paused, an in-flight head still draining) | "stopped" (outbound: paused AND quiesced) | "failed" (start failed, ADR 0031) | "filtered" (DR run-profile parked it below [dr].priority_threshold, #61 ADR 0048) | "draining" | "not_deployed" (present in the graph but deployed=false, #233 ADR 0111 — never wired, deploying it is a config change; distinct from "stopped", which SHOULD be running) | "log_halted" (outbound: the engine cannot write its application log and has fail-closed, so NO lane delivers, #122 ADR 0189 — process-wide and NOT an operator pause; the fix is the disk, not this row's start button)
     direction: str  # "in" (source) | "out" (destination)
     method: str  # connection method/protocol, e.g. MLLP / File / TCP / REST
     peer: str | None  # MLLP host or file directory
@@ -632,6 +632,12 @@ class StatsResponse(BaseModel):
     # this model takes Pydantic's default extra='ignore', so an undeclared kwarg is dropped SILENTLY
     # and /stats would never grow the field.
     fenced_writes: int = 0
+    # #122 (ADR 0189): OUTBOUND rows the pooled claim gate refused while the delivery tier was halted.
+    # The runner property of the same name owns the reading rule; the two things an operator must not
+    # infer from this number are that a small count is a defect (the latch is set before the lanes are
+    # paused, so a claim in flight across that window lands here legitimately) and that zero is a clean
+    # bill (POOLED ONLY — a per_lane engine reports zero forever).
+    halted_claim_gate_hits: int = 0
 
 
 class MetricsHistorySample(BaseModel):
@@ -656,8 +662,9 @@ class GraphNode(BaseModel):
     """One node in the by-name data-flow graph (BACKLOG #76, ADR 0065 amendment). ``kind`` is one of
     ``inbound``/``router``/``handler``/``outbound``; ``status`` is the LIVE connection status for an
     inbound/outbound node (``running``/``stopping``/``stopped``/``failed``/``filtered``/``draining``/
-    ``not_deployed``) and ``None`` for a router/handler node. Names + status only — no PHI. The colour a
-    console derives from ``status`` is live-derived, never operator-assigned (that is BACKLOG #79)."""
+    ``not_deployed``/``log_halted``) and ``None`` for a router/handler node. Names + status only — no
+    PHI. The colour a console derives from ``status`` is live-derived, never operator-assigned (that is
+    BACKLOG #79)."""
 
     name: str
     kind: str

@@ -434,8 +434,10 @@ async def test_stats_reads_the_runners_claim_counters_rather_than_constants(
     A DISTINCT VALUE PER FIELD, on purpose. Equal values would let a crossed wiring (idle_poll read
     into wake_fanout, say) pass; these cannot be permuted without failing.
 
-    THE LAST ONE IS A DIFFERENT UNIT and the numbers say so: eight LANES were booked empty while
-    THREE claim ROUND-TRIPS aborted. Nothing here divides them.
+    THE LAST TWO ARE DIFFERENT UNITS AGAIN and the numbers say so: eight LANES were booked empty
+    while THREE claim ROUND-TRIPS aborted, and SEVEN outbound ROWS were refused at the halted claim
+    gate (#122, ADR 0189 — a counter on the runner itself, not on ``EmptyClaimCounters``). Nothing
+    here divides them.
     """
     ec = EmptyClaimCounters()
     for _ in range(3):
@@ -446,13 +448,18 @@ async def test_stats_reads_the_runners_claim_counters_rather_than_constants(
         ec.record_claim_lock_timeout()
     # monkeypatch, not a bare assignment: the engine fixture's teardown calls runner.stop(), so the
     # stub must be off the engine again before this test returns.
-    monkeypatch.setattr(engine, "_registry_runner", SimpleNamespace(empty_claims=ec))
+    monkeypatch.setattr(
+        engine,
+        "_registry_runner",
+        SimpleNamespace(empty_claims=ec, halted_claim_gate_hits=7),
+    )
 
     body = (await client.get("/stats")).json()
     assert body["empty_claims"] == 8
     assert body["empty_claims_idle_poll"] == 3
     assert body["empty_claims_wake_fanout"] == 5
     assert body["claim_lock_timeouts"] == 3
+    assert body["halted_claim_gate_hits"] == 7
 
 
 # --- connections -------------------------------------------------------------

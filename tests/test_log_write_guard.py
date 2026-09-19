@@ -34,6 +34,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from messagefoundry.api.app import _outbound_down_detail
 from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.settings import LoggingSettings, LogWriteFailurePolicy, load_settings
 from messagefoundry.config.wiring import (
@@ -53,6 +54,7 @@ from messagefoundry.logging_guard import (
     set_active_guard,
 )
 from messagefoundry.logging_setup import LogFile, configure_logging
+from messagefoundry.pipeline import wiring_runner
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore
@@ -61,6 +63,13 @@ from messagefoundry.store.store import MessageStatus, Stage
 RAW = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
 INBOUND = "IB_TEST"
 OUTBOUND = "OB_TEST"
+# The outbound a reload ADDS while the halt is latched (ADR 0189 door six) — a second, distinct lane
+# so the door-six test can assert on a destination the halt provably never saw.
+OUTBOUND_ADDED = "OB_TEST_ADDED"
+# What the door-six test patches `_WORKER_ERROR_BACKOFF_SECONDS` down to, so its absence-of-a-spin
+# window covers many claim cycles rather than one. Named here so the window and the cadence it is
+# measured against can never be edited apart.
+_BACKOFF = 0.05
 
 
 # --- helpers -----------------------------------------------------------------
@@ -711,7 +720,24 @@ def _break_sink_and_replacement(handler: GuardedFileHandler, directory: Path) ->
     directory.write_text("not a directory", encoding="utf-8")
 
 
-def _e2e_registry(outdir: Path, *, outbound_auto_start: bool = True) -> Registry:
+def _file_outbound(name: str, directory: Path, *, auto_start: bool) -> OutboundConnection:
+    """One FILE outbound writing ``{MSH-10}.hl7`` into ``directory``."""
+    return OutboundConnection(
+        name,
+        ConnectionSpec(
+            ConnectorType.FILE, {"directory": str(directory), "filename": "{MSH-10}.hl7"}
+        ),
+        auto_start=auto_start,
+    )
+
+
+def _e2e_registry(
+    outdir: Path,
+    *,
+    outbound_auto_start: bool = True,
+    added_outdir: Path | None = None,
+    added_auto_start: bool = True,
+) -> Registry:
     """A real graph: MLLP inbound -> router -> handler -> FILE outbound writing into ``outdir``.
 
     The inbound binds an ephemeral port and is never connected to; every message in these tests is
@@ -720,17 +746,18 @@ def _e2e_registry(outdir: Path, *, outbound_auto_start: bool = True) -> Registry
 
     ``outbound_auto_start=False`` engine-PARKS the delivery lane at boot (#115), which is the one
     down state a log-failure halt skips — the lane is already paused, so the halt never reaches it
-    and its ``_gate_parked`` marker survives. The default leaves every other caller unchanged."""
+    and its ``_gate_parked`` marker survives. The default leaves every other caller unchanged.
+
+    ``added_outdir`` declares a SECOND file outbound (``OUTBOUND_ADDED``) and makes the handler fan
+    out to both — the lane ADR 0189's door-six test has a later reload add. It is a knob here rather
+    than a post-hoc ``reg.handlers[...]`` write in the caller, because that write would bypass
+    ``add_handler``'s duplicate guard and its ``handler_accepts`` bookkeeping.
+    ``added_auto_start=False`` engine-parks that second lane at boot, so a runner can queue it a
+    genuine row without delivering one."""
     reg = Registry()
-    reg.add_outbound(
-        OutboundConnection(
-            OUTBOUND,
-            ConnectionSpec(
-                ConnectorType.FILE, {"directory": str(outdir), "filename": "{MSH-10}.hl7"}
-            ),
-            auto_start=outbound_auto_start,
-        )
-    )
+    reg.add_outbound(_file_outbound(OUTBOUND, outdir, auto_start=outbound_auto_start))
+    if added_outdir is not None:
+        reg.add_outbound(_file_outbound(OUTBOUND_ADDED, added_outdir, auto_start=added_auto_start))
     reg.add_inbound(
         InboundConnection(
             INBOUND,
@@ -739,7 +766,10 @@ def _e2e_registry(outdir: Path, *, outbound_auto_start: bool = True) -> Registry
         )
     )
     reg.add_router("r", lambda m: ["h"])
-    reg.add_handler("h", lambda m: Send(OUTBOUND, m))
+    if added_outdir is None:
+        reg.add_handler("h", lambda m: Send(OUTBOUND, m))
+    else:
+        reg.add_handler("h", lambda m: [Send(OUTBOUND, m), Send(OUTBOUND_ADDED, m)])
     return reg
 
 
@@ -753,15 +783,53 @@ async def _until(predicate: Callable[[], bool], timeout: float = 5.0) -> bool:
     return True
 
 
-async def _until_outbound_row(store: MessageStore, message_id: str, timeout: float = 5.0) -> bool:
-    """Wait for the message to reach the OUTBOUND stage — i.e. the router and transform ran."""
+async def _until_outbound_row(
+    store: MessageStore, message_id: str, timeout: float = 5.0, *, count: int = 1
+) -> bool:
+    """Wait for the message to reach the OUTBOUND stage — i.e. the router and transform ran.
+
+    ``count`` is the number of rows to wait FOR: the default of 1 is every single-destination caller,
+    and a fan-out passes its destination count, because waiting for "any row" would return on the
+    first one and race the second."""
     elapsed = 0.0
-    while not await store.outbox_for(message_id):
+    while len(await store.outbox_for(message_id)) < count:
         if elapsed > timeout:
             return False
         await asyncio.sleep(0.02)
         elapsed += 0.02
     return True
+
+
+async def _until_delivery_status(
+    store: MessageStore, message_id: str, destination: str, status: str, timeout: float = 5.0
+) -> bool:
+    """Wait for ONE destination's outbound row to reach ``status`` in the STORE.
+
+    The store is the authority on a delivery, and a written file is not: the connector writes, and the
+    row's terminal write commits after it. Anything that must know a delivery has RESOLVED — as
+    opposed to merely having produced bytes — has to ask here."""
+    elapsed = 0.0
+    while True:
+        rows = await store.outbox_for(message_id)
+        if any(r["destination_name"] == destination and r["status"] == status for r in rows):
+            return True
+        if elapsed > timeout:
+            return False
+        await asyncio.sleep(0.02)
+        elapsed += 0.02
+
+
+async def _added_row(store: MessageStore, message_id: str) -> dict[str, object]:
+    """The ``OUTBOUND_ADDED`` delivery row, for comparing a WHOLE row across a time window.
+
+    Whole-row equality is deliberate: a claim/reschedule cycle rewrites ``next_attempt_at``,
+    ``updated_at`` and ``status``, and naming only the fields we expect to move would let a future
+    cycle that moves a different one pass unnoticed."""
+    matched = [
+        r for r in await store.outbox_for(message_id) if r["destination_name"] == OUTBOUND_ADDED
+    ]
+    assert len(matched) == 1, f"expected one {OUTBOUND_ADDED} row, found {len(matched)}"
+    return matched[0]
 
 
 async def _until_processed(store: MessageStore, message_id: str, timeout: float = 5.0) -> bool:
@@ -1358,6 +1426,219 @@ async def test_a_reload_that_re_deploys_a_parked_lane_is_refused_into_a_dead_log
         assert await _until(lambda: any(outdir.iterdir())), "the repaired reload never delivered"
         assert await _until_processed(store, message_id), "delivered but never finalized"
         assert OUTBOUND not in runner._gate_parked
+    finally:
+        await runner.stop()
+
+
+# --- the door nobody has enumerated (ADR 0189) -------------------------------
+
+
+@pytest.mark.parametrize("claim_mode", CLAIM_MODES)
+async def test_an_unguarded_start_cannot_deliver_while_the_halt_is_latched(
+    store: MessageStore, tmp_path: Path, claim_mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # THE TEST THAT JUSTIFIES THE LATCH, and the only one here that is not about a door somebody
+    # already found. The four tests above each pin ONE entry into resuming delivery — start_outbound,
+    # restart_outbound, stop-then-start, and the reload's un-park — and each of those four was
+    # discovered the same way: in behaviour, after the previous fix shipped. Four gates are a
+    # completeness claim nobody can verify (CLAUDE.md section 11, SDS-3.6), so this test deliberately
+    # declines to use any of them.
+    #
+    # `_start_outbound_unsafe` is the unguarded primitive every one of the four doors eventually
+    # calls. Driving it DIRECTLY is a stand-in for the fifth door — whatever it turns out to be — and
+    # what it asserts is structural: with the delivery tier's halt latched and both sinks genuinely
+    # dead, a lane brought up by a path that asked NOTHING still ships no bytes. That is a claim about
+    # the claim gate, which every delivery passes through whichever door started the lane, and it
+    # cannot be satisfied by adding a fifth gate at a fifth door.
+    #
+    # MEASURED RED on main before `_delivery_halted` existed, in BOTH claim modes: the queued row was
+    # written into `outdir` while `guard.can_log()` read False throughout.
+    outdir, logdir = tmp_path / "out", tmp_path / "logs"
+    outdir.mkdir()
+    logdir.mkdir()
+    runner = _e2e_runner(store, outdir, logdir, claim_mode)
+    await runner.start()
+    try:
+        # Park the lane while the log still works, so a GENUINE delivery is queued and waiting — on an
+        # empty outbound stage "no file was written" cannot tell a working gate from an empty lane.
+        await runner.stop_outbound(OUTBOUND)
+        message_id = await store.enqueue_ingress(channel_id=INBOUND, raw=RAW)
+        assert await _until_outbound_row(store, message_id), "never reached the outbound stage"
+        assert list(outdir.iterdir()) == []
+
+        _kill_every_sink(logdir, monkeypatch)
+        logging.getLogger("t").warning("a record this engine cannot write anywhere")
+        assert await _until(lambda: runner._log_write_stopped), "the halt never fired"
+        assert runner._delivery_halted, "the delivery tier's latch never closed"
+
+        # THE FIFTH DOOR: straight past start_outbound, restart_outbound, the teardown park and the
+        # reload's un-park, into the primitive all four of them share. Nothing is repaired first.
+        await runner._start_outbound_unsafe(OUTBOUND)
+        await asyncio.sleep(1.0)  # generous: the repaired restart below ships far inside this
+
+        # THE LOAD-BEARING ASSERTION, and it is bytes on disk written by a real File connector out of
+        # a real store — not a read-back of the flag this change adds.
+        assert list(outdir.iterdir()) == [], (
+            "a queued row shipped with no application log behind it"
+        )
+        # …and the row is RETAINED PENDING, not dead-lettered and not stranded INFLIGHT by the refusal.
+        assert len(await store.outbox_for(message_id)) == 1
+        assert runner._delivery_halted, "the unguarded start cleared the latch"
+        # The lane also reports the CAUSE rather than an operator pause it never had.
+        assert runner.outbound_status(OUTBOUND) == "log_halted"
+        assert not runner.outbound_running(OUTBOUND)
+        # …and a resend's 409 names the log rather than pointing at a start button that is refused
+        # while the sinks are dead. The old wording is the one this must NOT be.
+        detail = _outbound_down_detail(runner, OUTBOUND)
+        assert "application log" in detail
+        assert "start it before resending" not in detail
+
+        # THE CONTROL, and it carries the attribution: the ONLY difference between these two arms is
+        # whether the log works. The same rig, the same queued row, delivered once the disk is fixed —
+        # so the refusal above cannot be an engine that never delivers, and the assertion is shown able
+        # to fail. Recovery goes through a GATED door on purpose: lifting the latch is the doors' job,
+        # and the claim gate is defence in depth behind them, never the recovery path.
+        _revive_every_sink(logdir, monkeypatch)
+        await runner.restart_outbound(OUTBOUND)
+        assert not runner._delivery_halted, "a repaired restart left the latch closed"
+
+        assert await _until(lambda: any(outdir.iterdir())), "the repaired restart never delivered"
+        assert await _until_processed(store, message_id), "delivered but never finalized"
+        assert runner.outbound_status(OUTBOUND) == "running"
+        # The NEGATIVE control on the 409 wording: a lane that is merely operator-paused must still
+        # get the start-it instruction, so the branch above is a discrimination and not a rewrite.
+        await runner.stop_outbound(OUTBOUND)
+        assert "start it before resending" in _outbound_down_detail(runner, OUTBOUND)
+    finally:
+        await runner.stop()
+
+
+@pytest.mark.parametrize("claim_mode", CLAIM_MODES)
+async def test_a_reload_that_adds_an_outbound_into_a_dead_log_lands_it_paused(
+    store: MessageStore, tmp_path: Path, claim_mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # DOOR SIX, which ADR 0189 named in option 4's rejection and did not close. Every other door is
+    # about a lane the halt ALREADY saw. This one is about a lane that did not exist when the halt
+    # ran: `_stop_all_for_log_failure` pauses the lanes in `self.registry.outbound`, so an outbound a
+    # LATER reload adds is in neither `_outbound_paused` nor `_gate_parked`, the reload's un-park gate
+    # never asks about it, and `_reconcile_outbounds` builds its connector and arms its lane.
+    #
+    # WHAT IS RED HERE IS THE LANE STATE, NOT THE BYTES, and saying so is the point. The claim gate
+    # this ADR added already refuses every row, so `outdir_added` stays empty with or without the fix
+    # — the byte assertion below is a guard against a regression in the latch, not the discriminator
+    # for this door. What the ungated lane does instead is reach that gate once per backoff for the
+    # halt's whole duration, which is why the row-untouched assertion is here too: it is the spin
+    # itself, and in pooled it is the assertion that moves.
+    outdir, added, logdir = tmp_path / "out", tmp_path / "added", tmp_path / "logs"
+    outdir.mkdir()
+    added.mkdir()
+    logdir.mkdir()
+
+    # PHASE 1 — a healthy engine queues a real row to the lane, with the lane engine-parked so nothing
+    # delivers it. A row addressed to a connection the engine does not currently declare is the whole
+    # premise: an operator removed it from the graph and later adds it back, and its rows waited.
+    # STDOUT ONLY here, and it is not a shortcut: `configure_logging` REMOVES a prior file handler
+    # without closing it (it closes only its own forward-queue handler, since an embedding host may
+    # still be using the rest), so a second call for the same path would leave phase 1's OS handle open
+    # and `_kill_every_sink`'s rmtree would fail on Windows with a PermissionError rather than
+    # producing the condition under test. Phase 2 is the only call here that opens the file sink.
+    configure_logging("INFO")
+    seeding = RegistryRunner(
+        _e2e_registry(outdir, added_outdir=added, added_auto_start=False),
+        store,
+        poll_interval=0.02,
+        claim_mode=claim_mode,
+    )
+    await seeding.start()
+    try:
+        message_id = await store.enqueue_ingress(channel_id=INBOUND, raw=RAW)
+        assert await _until_outbound_row(store, message_id, count=2), (
+            "never fanned out to both lanes"
+        )
+        # Wait for the first lane's row to be DONE IN THE STORE, not merely for its file to exist.
+        # Those are different instants and the gap is a real race this test hit: the connector writes
+        # the file, and the store write marking the row done commits after it. Stopping the runner in
+        # that gap leaves the row INFLIGHT, phase 2's `reset_stale_inflight` reverts it to PENDING, and
+        # the message can then never reach PROCESSED — because that lane is paused by the halt for the
+        # rest of the test and nothing will ever deliver it again. It surfaced once in six runs, at the
+        # control arm's "delivered but never finalized", a good three assertions away from its cause.
+        assert await _until_delivery_status(store, message_id, OUTBOUND, "done"), (
+            "the first lane never recorded its delivery"
+        )
+    finally:
+        await seeding.stop()
+    assert list(added.iterdir()) == [], "the engine-parked lane delivered at boot"
+    # The premise of everything below: exactly one row is left for the lane phase 2 has never heard of.
+    assert await _until_delivery_status(
+        store, message_id, OUTBOUND_ADDED, "pending", timeout=0.0
+    ), "the engine-parked lane's row is not waiting PENDING"
+
+    # PHASE 2 — a second engine comes up on the SAME store WITHOUT that connection. The row sits: the
+    # pooled lane provider is `registry.outbound | _destinations`, and this graph has it in neither.
+    runner = _e2e_runner(store, outdir, logdir, claim_mode)
+    await runner.start()
+    try:
+        assert OUTBOUND_ADDED not in runner._destinations
+
+        _kill_every_sink(logdir, monkeypatch)
+        logging.getLogger("t").warning("a record this engine cannot write anywhere")
+        assert await _until(lambda: runner._log_write_stopped), "the halt never fired"
+        assert runner._delivery_halted, "the delivery tier's latch never closed"
+        assert OUTBOUND_ADDED not in runner._outbound_paused, (
+            "the halt cannot have paused a lane that is not in its registry — the rig is wrong"
+        )
+
+        before = await _added_row(store, message_id)
+
+        # A margin of TEN claim cycles, not one, and the patch goes on BEFORE the reload. The pooled
+        # gate parks its lane for `_WORKER_ERROR_BACKOFF_SECONDS`, read from the module at call time —
+        # so patching works, and patching it AFTER the reload would not: the reload's own notify_work
+        # arms the lane immediately and the first park would already have taken the shipped 1.0 s.
+        # A window merely LONGER than one backoff buys a margin of one claim, and a test that
+        # discriminates by exactly one event is one scheduling hiccup from proving nothing. Ten cycles
+        # is a real margin AND finishes in half the wall clock a single un-patched cycle would need.
+        monkeypatch.setattr(wiring_runner, "_WORKER_ERROR_BACKOFF_SECONDS", _BACKOFF)
+        assert runner.halted_claim_gate_hits == 0, "the rig spun before the door was even opened"
+
+        # THE DOOR: a reload ADDS the connection, deployed and auto-start, with nothing repaired.
+        await runner.reload(_e2e_registry(outdir, added_outdir=added))
+        await asyncio.sleep(10 * _BACKOFF)
+
+        # THE LOAD-BEARING ASSERTION. The lane must land where the halt put every other lane: PAUSED,
+        # with NO engine-park marker. The marker is the half that matters — `_park_outbound_lane`
+        # would also satisfy the pause, and the very next reload's un-park gate would lift it again.
+        assert OUTBOUND_ADDED in runner._outbound_paused, (
+            "a reload brought an outbound up while the delivery halt was latched"
+        )
+        assert OUTBOUND_ADDED not in runner._gate_parked, (
+            "parked, not stopped — a later reload would lift this marker and re-open the door"
+        )
+        # …and it never reached the claim gate, from the engine's side and the store's. The counter
+        # names the event; the row is the independent cross-check (see :func:`_added_row`).
+        assert runner.halted_claim_gate_hits == 0, (
+            "a delivery lane reached the claim gate while halted — a door is missing"
+        )
+        assert await _added_row(store, message_id) == before, (
+            "the lane claimed and rescheduled its head while the process was refusing to work"
+        )
+        # The latch is intact and no byte moved (true with or without the gate — see the note above).
+        assert runner._delivery_halted, "the reload cleared the latch"
+        assert list(added.iterdir()) == [], "a queued row shipped with no application log behind it"
+        assert before["status"] == "pending", "the row was not retained PENDING"
+        assert runner.outbound_status(OUTBOUND_ADDED) == "log_halted"
+
+        # THE CONTROL, and it carries the attribution: the only difference between the two arms is
+        # whether the log works. Recovery is the ordinary one — the operator fixes the disk and starts
+        # the lane through a GATED door, which re-validates the sinks and lifts the latch — and it
+        # ships the SAME retained row. Without this arm the refusal above would also pass against an
+        # engine that can never bring an added outbound up at all.
+        _revive_every_sink(logdir, monkeypatch)
+        await runner.start_outbound(OUTBOUND_ADDED)
+        assert not runner._delivery_halted, "a repaired start left the latch closed"
+
+        assert await _until(lambda: any(added.iterdir())), "the repaired start never delivered"
+        assert await _until_processed(store, message_id), "delivered but never finalized"
+        assert runner.outbound_status(OUTBOUND_ADDED) == "running"
     finally:
         await runner.stop()
 
