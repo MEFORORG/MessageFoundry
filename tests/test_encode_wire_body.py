@@ -17,6 +17,7 @@ than loop the lane)."""
 from __future__ import annotations
 
 import asyncio
+import traceback
 
 import pytest
 
@@ -61,10 +62,42 @@ def _assert_content_free(exc: BaseException, *, encoding: str) -> None:
             )
     assert "Zaf" not in rendered and "MSH" not in rendered, "payload content leaked into the error"
     assert encoding in rendered, "the error should name the codec (it is actionable and safe)"
-    # `from None` is load-bearing: the chained UnicodeEncodeError's `.object` IS the *entire* payload,
-    # so any handler walking `__cause__` would resurrect exactly what we refused to log.
-    assert exc.__cause__ is None, "the UnicodeEncodeError must not be chained (use `from None`)"
-    assert exc.__context__ is None or exc.__suppress_context__
+    _assert_chain_severed(exc)
+
+
+def _walk_chain(exc: BaseException) -> list[BaseException]:
+    """Every exception reachable from ``exc`` by ATTRIBUTE, ignoring ``__suppress_context__``.
+
+    This is the instrument, and its indifference to the flag is the whole point. A structured-logging
+    serializer, a crash reporter, a debugger or any custom formatter reads ``__cause__``/``__context__``
+    directly; only the *default* traceback printer consults ``__suppress_context__``. Asserting against
+    the default rendering would pass against the very bug this exists to catch."""
+    seen: list[BaseException] = []
+    node: BaseException | None = exc.__cause__ or exc.__context__
+    while node is not None and node not in seen:
+        seen.append(node)
+        node = node.__cause__ or node.__context__
+    return seen
+
+
+def _assert_chain_severed(exc: BaseException) -> None:
+    """BOTH chains must be empty, not merely suppressed.
+
+    ``raise ... from None`` clears ``__cause__`` and sets ``__suppress_context__`` — but it LEAVES
+    ``__context__`` populated, and a ``UnicodeEncodeError``'s ``.object`` is the *entire payload*. The
+    flag only stops the default printer walking; it does not detach the exception. So the refusal must
+    be raised from OUTSIDE the ``except`` block, which is the only thing that leaves ``__context__``
+    empty (CPython sets it only when the raise happens while an exception is being handled)."""
+    assert exc.__cause__ is None, "the UnicodeEncodeError must not be chained on __cause__"
+    assert exc.__context__ is None, (
+        "the UnicodeEncodeError is still on __context__ — `from None` does NOT remove it, it only "
+        "sets __suppress_context__, and `.object` is the WHOLE payload. Raise outside the handler."
+    )
+    for link in _walk_chain(exc):
+        assert not isinstance(link, UnicodeEncodeError), (
+            f"a UnicodeEncodeError is reachable on the chain via {type(link).__name__}; "
+            "its `.object` is the entire payload"
+        )
 
 
 def test_encode_wire_body_is_content_free_and_permanent() -> None:
@@ -77,6 +110,41 @@ def test_encode_wire_body_is_content_free_and_permanent() -> None:
     assert "SOAP" in str(exc)
     # The POSITION is safe and useful — it is an index, not content.
     assert "position" in str(exc)
+
+
+def test_encode_wire_body_leaves_no_payload_on_the_context_chain() -> None:
+    """The residual `from None` does NOT close: ``__context__`` keeps the whole body.
+
+    Measured against the pre-fix code: ``__cause__`` was ``None`` and ``__suppress_context__`` was
+    ``True`` (so the assertions above passed), yet ``exc.__context__.object`` was byte-identical to
+    ``PAYLOAD``. Formatting the chain the way a non-default handler does then rendered the message —
+    PHI, or a credential once a config secret can reach the body."""
+    with pytest.raises(NegativeAckError) as ei:
+        encode_wire_body(PAYLOAD, "ascii", transport="SOAP")
+    exc = ei.value
+
+    # The direct reach: one attribute access, no formatting involved.
+    assert exc.__context__ is None, (
+        "the raise must happen outside the `except` block — `from None` leaves __context__ set"
+    )
+    assert getattr(exc.__context__, "object", None) != PAYLOAD
+
+    # And nothing anywhere on the chain carries the body, in any representation of the characters.
+    chain_text = " | ".join(
+        f"{link!r} {getattr(link, 'object', '')!r}" for link in _walk_chain(exc)
+    )
+    assert "Zaf" not in chain_text and "MSH" not in chain_text
+    for ch in (SECRET_CHAR, CJK_CHAR):
+        for form in _escapes(ch):
+            assert form not in chain_text, f"the offending character is reachable as {form!r}"
+
+    # A chain-walking formatter renders nothing of the message either. (The DEFAULT printer already
+    # honoured __suppress_context__ before the fix, so asserting on it alone would prove nothing.)
+    walked = "".join(
+        "".join(traceback.TracebackException.from_exception(link).format())
+        for link in [exc, *_walk_chain(exc)]
+    )
+    assert "Zaf" not in walked and "\\xe9" not in walked
 
 
 def test_encode_wire_body_passes_encodable_payloads_through_byte_identically() -> None:

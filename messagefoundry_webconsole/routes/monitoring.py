@@ -16,6 +16,7 @@ from .. import pages
 from .._auth import (
     require_ui,
 )
+from ._common import ACTIVE_ALERTS_LIMIT
 
 
 def register(app: FastAPI, deps: UiDeps) -> None:
@@ -36,7 +37,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # skipped, so require_ui re-asserts the permissions the same way the other /ui routes do).
         # Pass every param explicitly: calling the handler directly (not via Depends) leaves
         # its Query(...) defaults unresolved, so limit must be a real int here.
-        instances = await core.list_active_alerts(engine=engine, identity=identity, limit=200)
+        instances = await core.list_active_alerts(
+            engine=engine, identity=identity, limit=ACTIVE_ALERTS_LIMIT
+        )
         config = await core.alerts_rules(request, _user=identity)
         return HTMLResponse(pages.alerts(instances, config))
 

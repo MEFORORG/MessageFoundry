@@ -152,13 +152,20 @@ def _load_private_key(private_key: str, password: str | None) -> _PrivateKey:
     interpolate the key bytes or the (cryptography) deserialization detail, which could echo material."""
     material = _read_key_material(private_key)
     pw = password.encode("utf-8") if password else None
+    # The raise sits OUTSIDE the handler on purpose: `raise ... from None` would leave the
+    # deserialization error on `__context__`, where a chain-walking handler could still render the
+    # detail this refusal exists to withhold. See `encode_wire_body` in transports/base.py.
+    key: object = None
+    load_failed = False
     try:
         key = serialization.load_pem_private_key(material, password=pw)
     except (ValueError, TypeError):
+        load_failed = True
+    if load_failed:
         raise SigningError(
             "could not load the signing private key — check the PEM, and the password for an "
             "encrypted key (set private_key_password via env())"
-        ) from None
+        )
     if not isinstance(key, (rsa.RSAPrivateKey, ec.EllipticCurvePrivateKey)):
         raise SigningError(
             f"signing key must be an RSA or EC (ECDSA) private key, got {type(key).__name__}"

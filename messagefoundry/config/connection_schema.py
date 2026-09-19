@@ -37,7 +37,13 @@ from collections import abc
 from io import StringIO
 from typing import Any
 
-from .connections_file import _INBOUND_KEYS, _OUTBOUND_KEYS, _TRANSPORTS
+from .connections_file import (
+    _INBOUND_KEYS,
+    _OUTBOUND_KEYS,
+    _TRANSPORTS,
+    literal_values_typed,
+    union_members,
+)
 from .wiring import EnvRef, _is_secret_setting
 
 #: Bump when the emitted shape changes in a way a consumer must notice. The IDE refuses a schema
@@ -128,7 +134,7 @@ def _type_name(annotation: Any) -> str:
     """A coarse type tag the form can pick a control from: bool -> checkbox, int -> number, ..."""
     if annotation is inspect.Parameter.empty:
         return "unknown"
-    members = _literal_values_typed(_union_members(annotation))
+    members = literal_values_typed(union_members(annotation))
     for candidate, tag in ((bool, "bool"), (int, "int"), (float, "float"), (str, "str")):
         if candidate in members:
             return tag
@@ -141,22 +147,6 @@ def _type_name(annotation: Any) -> str:
     return "unknown"
 
 
-def _literal_values_typed(members: tuple[Any, ...]) -> tuple[Any, ...]:
-    """``members`` with each ``Literal[...]`` replaced by the TYPES of its allowed values.
-
-    A choice-valued setting is annotated ``Literal["move", "delete", "leave"]`` (optionally ``| None``)
-    and so carries **no bare ``str`` member**: the scalar scan in :func:`_type_name` would report it
-    "unknown" and the form would lose the control it picks from ``type`` for precisely the settings it
-    can render as a dropdown. A literal's values carry the setting's real type, so use theirs."""
-    out: list[Any] = []
-    for member in members:
-        if typing.get_origin(member) is typing.Literal:
-            out.extend(type(value) for value in typing.get_args(member))
-        else:
-            out.append(member)
-    return tuple(out)
-
-
 def _code_first_only(annotation: Any) -> bool:
     """Can this setting NOT be expressed in connections.toml, so a GUI must not offer to edit it?
 
@@ -165,7 +155,7 @@ def _code_first_only(annotation: Any) -> bool:
     arrive as raw dicts and the factory rejects them -- SOAP's ``body_secrets`` documents exactly that
     ("deliberately no TOML/GUI round-trip"). Offering an editable control would invite the author to
     write something the engine refuses at load."""
-    for member in _union_members(annotation):
+    for member in union_members(annotation):
         if _origin_of(member) in _TABLE_ORIGINS and EnvRef in typing.get_args(member):
             return True
     return False
@@ -173,7 +163,7 @@ def _code_first_only(annotation: Any) -> bool:
 
 def _choices(annotation: Any) -> list[Any] | None:
     """The allowed values of a ``Literal[...]`` annotation, else None (a free-text control)."""
-    for member in _union_members(annotation):
+    for member in union_members(annotation):
         if typing.get_origin(member) is typing.Literal:
             return list(typing.get_args(member))
     return None
@@ -181,21 +171,7 @@ def _choices(annotation: Any) -> list[Any] | None:
 
 def _accepts_env(annotation: Any) -> bool:
     """May this setting be written as ``{env = "KEY"}``? True when EnvRef is in the annotation."""
-    return EnvRef in _union_members(annotation)
-
-
-def _union_members(annotation: Any) -> tuple[Any, ...]:
-    if annotation is inspect.Parameter.empty:
-        return ()
-    args = typing.get_args(annotation)
-    return args if args and _is_union(annotation) else (annotation,)
-
-
-def _is_union(annotation: Any) -> bool:
-    import types
-
-    origin = typing.get_origin(annotation)
-    return origin is typing.Union or origin is types.UnionType
+    return EnvRef in union_members(annotation)
 
 
 def _origin_of(member: Any) -> Any:
