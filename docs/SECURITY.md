@@ -756,10 +756,15 @@ else would need its own authorization rule stated here.
    permission-equivalent JSON browse route carries a step-up. It **cannot** carry one, because it is
    the re-auth continuation itself — gating it would bounce the operator back to `/ui/reauth`
    indefinitely. It is accepted because the page renders **no message body**: a filename, an ordinal
-   and a connection name, all three of which the operator supplied on the previous screen. The same
-   shape now applies to `GET /ui/uploaded-logs/upload-form`, which *is* step-up-gated — a form page
-   may be gated when re-auth can legitimately hand control back to it, and this one can because it
-   renders nothing the operator has not just supplied.
+   and a connection name, all three of which the operator supplied on the previous screen.
+
+   **The "cannot" above is inherited from BACKLOG #1227 and is now in doubt, so do not build on it.**
+   `GET /ui/uploaded-logs/upload-form` is also a registered re-auth continuation, is step-up-gated,
+   and does *not* bounce indefinitely: re-auth refreshes the window before redirecting back, so the
+   gated page renders. That is the same sequence resend-confirm would see. Whether resend-confirm
+   has a discriminator this text has not stated, or whether its divergence is simply closable, is an
+   open question against #1227 — it is recorded here rather than papered over, because a
+   compensating control resting on an unexamined premise is the defect this section exists to avoid.
 
    **Both uploaded-logs WRITE divergences are closed**, and are recorded here because the reasoning
    that kept one of them open is worth not re-deriving. `POST /ui/uploaded-logs/file/{file_id}/resend`

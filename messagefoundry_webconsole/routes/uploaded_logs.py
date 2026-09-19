@@ -50,10 +50,10 @@ from ._common import _form_pairs
 # The browse GET decrypts PHI (step-up), so register it as an UNLOCK form — a stale step-up 303s to
 # /ui/reauth and GET-redirects back to the browse page. The PHI-shaped filter now travels in the POST
 # body of .../filter (BACKLOG #1184) and so cannot cross the redirect at all. The delete POST is
-# body-less + step-up, so it may be auto-retried after re-auth. The filter POST is a same-origin POST
-# and is not registered; the upload and resend POSTs are not registered either — each is body-carrying,
-# so each maps its ``reauth_next`` to a GET page that IS registered (the upload form below, the resend
-# confirm page below), the same shape messages' edit-resend uses.
+# body-less + step-up, so it may be auto-retried after re-auth. NONE of the three body-carrying POSTs
+# here — filter, upload, resend — is registered; each instead maps its ``reauth_next`` to a GET page
+# that IS registered: filter to the browse GET it was carved out of, upload to the form below, resend
+# to the confirm page below. That is the same shape messages' edit-resend uses.
 register_ui_action(
     r"^/ui/uploaded-logs/file/[^/?#]+$", Permission.FILES_BROWSE, auto_retry=False, unlock=True
 )

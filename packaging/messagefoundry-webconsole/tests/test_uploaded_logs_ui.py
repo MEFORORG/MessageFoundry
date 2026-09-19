@@ -90,27 +90,36 @@ def _app(engine: Engine, service: AuthService, tmp_path: Path, *, uploads: bool 
 
 
 async def _login(c: httpx.AsyncClient, name: str) -> None:
-    r = await c.post("/ui/login", data={"username": name, "password": PW})
+    # A REJECTED sign-in is also a 303 -- to /ui/login?e=bad (routes/core.py) -- so the target is
+    # named here for the same reason _assert_upload_stored names its own: on this console a bare
+    # "2xx or 3xx" assert cannot tell an accepted request from a refused one.
+    r = await c.post("/ui/login", data={"username": name, "password": PW}, follow_redirects=False)
     assert r.status_code in (200, 303), r.text
+    if r.status_code == 303:
+        assert "e=bad" not in r.headers["location"], r.headers["location"]
+
+
+def _assert_upload_stored(up: httpx.Response) -> None:
+    """A STORED upload is a 303 to the listing, and naming the target is what makes it discriminating.
+
+    Since BACKLOG #1739 the upload POST is step-up-gated, so a stale window answers the SAME POST
+    with a 303 of its own -- to /ui/reauth. A bare ``status_code in (200, 303)`` therefore passes on
+    a refusal, and the test fails several lines later as an IndexError on an empty listing, or
+    silently reads back some other file's id. Every upload in this module that expects success
+    routes through here, so the rule is stated once rather than re-derived per call site.
+    """
+    assert up.status_code == 303, up.text
+    assert up.headers["location"] == "/ui/uploaded-logs", up.headers["location"]
 
 
 async def _upload(c: httpx.AsyncClient, name: str = "acme.hl7") -> str:
-    """Upload BATCH and return its file_id, read back off the listing's browse link.
-
-    THE SUCCESS CHECK NAMES THE REDIRECT TARGET, and since BACKLOG #1739 it has to. A bare
-    ``status_code in (200, 303)`` stopped discriminating the moment the upload POST became
-    step-up-gated: a stale window ALSO answers 303, so a refused upload passed this assert and the
-    parse below then either raised a bare IndexError or returned some other file's id. That is the
-    fixture for both stale-window tests, so a blind check here would have let their premise fail
-    silently. 303 to the listing is success; 303 to /ui/reauth is the refusal.
-    """
+    """Upload BATCH and return its file_id, read back off the listing's browse link."""
     up = await c.post(
         "/ui/uploaded-logs/upload",
         files={"file": (name, BATCH, "application/octet-stream")},
         follow_redirects=False,
     )
-    assert up.status_code == 303, up.text
-    assert up.headers["location"] == "/ui/uploaded-logs", up.headers["location"]
+    _assert_upload_stored(up)
     listing = await c.get("/ui/uploaded-logs")
     fid = listing.text.split("/ui/uploaded-logs/file/", 1)[1].split('"', 1)[0].split("/")[0]
     assert len(fid) == 32
@@ -158,7 +167,7 @@ async def test_uploaded_logs_ui_flow(engine: Engine, tmp_path: Path) -> None:
             "/ui/uploaded-logs/upload",
             files={"file": ("acme.hl7", BATCH, "application/octet-stream")},
         )
-        assert up.status_code in (200, 303), up.text
+        _assert_upload_stored(up)
 
         # the file now shows in the list
         r = await c.get("/ui/uploaded-logs")
@@ -196,7 +205,7 @@ async def test_uploaded_logs_list_is_paged(engine: Engine, tmp_path: Path) -> No
                 "/ui/uploaded-logs/upload",
                 files={"file": (f"page{n}.hl7", BATCH, "application/octet-stream")},
             )
-            assert up.status_code in (200, 303), up.text
+            _assert_upload_stored(up)
 
         first = await c.get("/ui/uploaded-logs", params={"limit": 2, "offset": 0})
         assert first.status_code == 200
@@ -275,7 +284,7 @@ async def test_uploaded_logs_ui_is_owner_scoped(engine: Engine, tmp_path: Path) 
             "/ui/uploaded-logs/upload",
             files={"file": ("acme.hl7", BATCH, "application/octet-stream")},
         )
-        assert up.status_code in (200, 303), up.text
+        _assert_upload_stored(up)
         listing = await c.get("/ui/uploaded-logs")
         marker = "/ui/uploaded-logs/file/"
         fid = listing.text.split(marker, 1)[1].split('"', 1)[0].split("/")[0]
@@ -508,7 +517,8 @@ async def test_refused_resend_signal_is_legible_on_arrival(engine: Engine, tmp_p
     transport = httpx.ASGITransport(app=_app(engine, service, tmp_path))
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         await _login(c, "op")
-        # upload + list are plain require_ui, so neither needs a fresh step-up window.
+        # The list is plain require_ui; the upload is step-up-gated since BACKLOG #1739 but this
+        # service uses the default window, so a just-logged-in session satisfies it.
         fid = await _upload(c)
 
         # THE PROPERTY, asserted end to end: follow the WHOLE chain a browser would follow. Wherever
@@ -752,8 +762,10 @@ async def test_uploaded_log_browse_charges_the_phi_read_budget(
     # no short-circuit render path: it always calls core.browse_uploaded_file, whose body itself calls
     # enforce_phi_read_pacing (app.py). So the metadata browse charges token 1 (render = 200) and a
     # second browse over the budget 429s, with NO phi= on require_ui_step_up. Adding phi= here would
-    # charge the same bucket twice (dependency + handler body), 429ing even the first browse. Upload +
-    # list are plain require_ui (no phi), so neither spends a token. Synthetic HL7 only (reuses BATCH).
+    # charge the same bucket twice (dependency + handler body), 429ing even the first browse. Neither
+    # the upload nor the list passes phi=, so neither spends a token -- the upload's BACKLOG #1739
+    # step-up does not change that, since phi= is what charges the budget, not the step-up. Synthetic
+    # HL7 only (reuses BATCH).
     service = await _service(engine, ("op", Role.OPERATOR), per_actor=1)
     transport = httpx.ASGITransport(app=_app(engine, service, tmp_path))
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
@@ -762,7 +774,7 @@ async def test_uploaded_log_browse_charges_the_phi_read_budget(
             "/ui/uploaded-logs/upload",
             files={"file": ("acme.hl7", BATCH, "application/octet-stream")},
         )
-        assert up.status_code in (200, 303), up.text
+        _assert_upload_stored(up)
         r = await c.get("/ui/uploaded-logs")  # require_ui, no phi: spends no token
         marker = "/ui/uploaded-logs/file/"
         fid = r.text.split(marker, 1)[1].split('"', 1)[0].split("/")[0]
@@ -1033,7 +1045,9 @@ async def test_reauth_unlocks_the_upload_form(engine: Engine, tmp_path: Path) ->
         # The registry ACCEPTED the continuation. A rejected one lands at /ui, which is the failure
         # this test exists to tell apart from success -- both are a 303.
         assert r.headers["location"] == "/ui/uploaded-logs/upload-form", r.headers["location"]
-        # ...and the form really opens inside the window that re-auth just refreshed.
+        # ...and the destination is a real page rather than a dangling target. It does NOT show that
+        # re-auth refreshed the window: this session's window was already fresh from login, so a 200
+        # here holds either way. The Location assertion above is what this test rests on.
         form = await c.get("/ui/uploaded-logs/upload-form")
         assert form.status_code == 200, form.text
         assert "Upload a log file" in form.text
