@@ -88,7 +88,11 @@ def config_summary(config_dir: str | Path) -> dict[str, Any]:
     from messagefoundry.config.wiring import WiringError, load_config
 
     try:
-        reg = load_config(config_dir)
+        # allow_empty: the bundle REPORTS a graph, it does not gate one (BACKLOG #1648). Letting the
+        # empty-graph refusal through here would return `loaded: False` for a config that loads
+        # perfectly, sending support after an import error that does not exist — and the emptiness is
+        # already visible, and more honestly, in the zero counts below.
+        reg = load_config(config_dir, allow_empty=True)
     except WiringError as exc:
         return {"error": _diagnostic("MF-BUNDLE-CFG-001", exc), "loaded": False}
     except Exception as exc:  # never let a config problem abort the whole bundle
