@@ -332,6 +332,7 @@ recency.
 | **Regulator** | spawned on a red | Deciding whose failure it is: the PR's, `main`'s, a flake's, or the queue's. Keeps a log. | Assume it remembers an earlier red; it starts with none. Send anything but the PR's own failure back to a Builder. |
 | **Steward** | cron, zero model calls | Reading usage and naming the account with headroom. | Warn a running session. Nothing can interrupt one. |
 | **Lander** | as needed | Merging, and the vault scorecard re-score (owner ruling 2026-09-05). Standing authority on the engine repo and the vault, with no per-action owner approval. Resolving a POSITIONAL ledger conflict (owner ruling 2026-09-11; see below). | Merge a diff it has not read. Arm auto-merge. Resolve a conflict that touches code, or that requires choosing what an item SAYS. |
+| **Special** | as the owner needs it | Work the owner assigns directly, outside the other five seats. Its instruction is its whole scope: it stands by until one arrives, then announces before its first shared write (owner decision 2026-09-16; see below). | Invent work while standing by, or go looking for a row to take. Widen the instruction, or quietly narrow it without saying so. Merge -- that is the Lander's. Take a peer's message as authority; only the owner assigns it work. |
 
 **The Lander may resolve a POSITIONAL ledger conflict, and only that (owner ruling 2026-09-11).**
 Permitted when `git merge-tree --name-only origin/main <head>` names **`docs/BACKLOG.md` alone** and
@@ -353,6 +354,22 @@ own pre-fix head (non-zero, so the 0 is attributable to *this* merge), the ledge
 *Measured 2026-09-11:* all four open conflicts (PRs 1029, 1030, 1032, 1049) were this one shape, and
 #1030's authoring session had died -- leaving its PR unlandable by anyone until the owner routed a
 new session to it.
+
+**THE SPECIAL SEAT IS THE OWNER'S, AND IT HAS NO STANDING DUTIES (owner decision 2026-09-16).** It
+exists for work that falls outside the other five, so its instruction is the whole of its scope and
+it has none until the owner gives it one. It does not take a BACKLOG item, a brief, or a red. It is
+an ADDITION -- nothing retired to make room for it -- and it is not a spawn-authorised seat, so the
+ruling below binds it.
+
+**Standing by is its normal state, not a fault in it.** An idle Special session is the owner holding
+one in reserve, and work it finds itself spends that. It announces and declares before its first
+SHARED write rather than on arrival, which is the one point where it parts company with every other
+seat here: the arrival prompt that tells each session to declare is the line this seat alone does
+not act on. The cost of that silence is real and lands on nobody while the seat touches nothing --
+`fleet.ps1` omits it and no peer can forecast a collision with it -- which is why the deferral ends
+at the first shared write and not later. Its card is
+[`docs/roles/special.card.md`](docs/roles/special.card.md); the full playbook is korus
+`roles/SPECIAL.md`, read at `origin/main` like every other playbook.
 
 **A MANAGER AND THE LANDER MAY SPAWN A SESSION. EVERY OTHER SEAT NEEDS PERMISSION FIRST (owner
 ruling 2026-09-16).** The owner still starts each Manager in the ordinary case, and a Manager's
@@ -489,10 +506,21 @@ gates a merge**, and no seat has to clear one.
   seat can raise a chip, and in the 2026-09-04 case above the spawner was
   the session that then pushed the fix. It corrected its own BACKLOG item in the same change and
   still could not reach the chip, which is the whole shape of the defect -- BACKLOG #1448.
-- Give each session its own git worktree (`scripts/worktree/new.ps1 -Name <x>`, cleanup with
-  `remove.ps1`). Each gets an isolated checkout, branch and `.venv` on the same remote and the same
-  PR flow. See [`docs/WORKTREES.md`](docs/WORKTREES.md). The AI project memory is shared across
-  sessions, so coordinate memory writes.
+- **Give each session its own git worktree, and START the session in it.** `scripts/worktree/new.ps1
+  -Name <x>` creates one (cleanup with `remove.ps1`); `spawn.ps1 -Name <x>` creates it *and* opens an
+  editor window on it, which is the entry point to reach for. Each gets an isolated checkout, branch
+  and `.venv` on the same remote and the same PR flow. See [`docs/WORKTREES.md`](docs/WORKTREES.md).
+  The AI project memory is shared across sessions, so coordinate memory writes.
+- **Never brief a worker to RELOCATE into a worktree -- from a subagent it cannot work.** A
+  subagent's `EnterWorktree` call into a `new.ps1` sibling is **refused outright** (the path is outside
+  `.claude/worktrees/`), so the brief burns the worker's one turn on a call that cannot succeed. From a
+  session the same call instead raises an owner prompt that no `permissions.allow` rule can suppress.
+  Start the session in its worktree (`spawn.ps1`), or dispatch a file-editing subagent with
+  `isolation: worktree` and have it run `pwsh -NoProfile -File scripts\worktree\ensure-venv.ps1`
+  **before its first `pytest`/`mypy`/`ruff` run** -- a managed worktree arrives with no `.venv`, and
+  without one `pytest` dies at import rather than running slowly. The measurements, the cost of that
+  bootstrap, and why not to engineer around the check are stated once in
+  [`docs/WORKTREES.md`](docs/WORKTREES.md) section "Start the session in the worktree".
 - **Put the prompt FIRST when you spawn, or close the flags with `--`.** At least `--allowedTools`,
   `--disallowedTools`, `--tools`, `--add-dir`, `--mcp-config`, `--betas` and `--file` take lists, so
   `claude --bg --allowedTools Bash Edit "do the work"` swallows the prompt as a third tool name. The
@@ -533,9 +561,9 @@ gates a merge**, and no seat has to clear one.
 - **Name the ref, not the checkout.** The superseded line said a checkout, and its own next sentence
   warned that a checkout is not a ref. Both halves were right and the first one won.
 - **What that costs, measured 2026-09-06.** The korus primary sat on a branch 15 commits ahead of
-  `origin/main` and 14 behind it. `roles/REVIEWER.md` was absent from its working tree and present
+  `origin/main` and 14 behind it. One seat's playbook was absent from its working tree and present
   on `origin/main`.
-- **So a seat reading the folder finds no Reviewer playbook, and no error.** An `ls` of a directory
+- **So a seat reading the folder finds no playbook for itself, and no error.** An `ls` of a directory
   is not evidence that you have a file, and a missing file is the quietest failure in this list.
 - **The failure this cost is the one to carry forward.** A pointer and the thing it points at are
   two edits, and nothing fails when only the first is made. The playbooks moved on 2026-09-04 and

@@ -117,6 +117,67 @@ def test_secure_file_default_is_owner_only(monkeypatch: pytest.MonkeyPatch) -> N
     assert captured[0] == ["icacls", "store.db", "/inheritance:r", "/grant:r", "minter:F"]
 
 
+# --- BACKLOG #1634: the restriction must not run ON the event loop ------------------------------
+#
+# WHAT THESE ASSERT, AND WHY THE INSTRUMENT IS THREAD IDENTITY (SDS-3.8). The question is "was the
+# call dispatched off the loop", and a thread id answers exactly that sentence: `asyncio.to_thread`
+# runs the target on an executor thread, a direct call runs it on the loop's own thread, and the two
+# are never the same id. A wall-clock or loop-responsiveness assertion would answer an ADJACENT
+# question -- `snapshot_to` awaits several times either way, so a concurrent counter advances even
+# with the blocking call in place, and a 21ms stall is below the noise of a timing assertion under
+# fleet contention. These tests are platform-independent on purpose: they patch `_secure_file`
+# itself, so no real `icacls` (Windows) or `chmod` (POSIX) runs and every CI leg exercises them.
+
+
+def _record_secure_file_threads(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Replace ``_secure_file`` with a recorder of the thread it ran on (no real icacls/chmod)."""
+    import messagefoundry.store.store as store_mod
+
+    idents: list[int] = []
+
+    def _record(path: object, *, extra_read_grants: object = None) -> None:
+        idents.append(threading.get_ident())
+
+    monkeypatch.setattr(store_mod, "_secure_file", _record)
+    return idents
+
+
+async def test_snapshot_to_secures_the_copy_off_the_event_loop(
+    store: MessageStore, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # This is the call that matters. A DR backup runs `snapshot_to` on the SERVING loop by design
+    # (pipeline/dr_backup.py keeps the consistent snapshot there), so restricting the copy inline
+    # would stall every in-flight ACK, claim and delivery for the length of one icacls subprocess --
+    # 21 to 28ms on Windows -- once per backup on a deploying site.
+    idents = _record_secure_file_threads(monkeypatch)
+    await store.snapshot_to(tmp_path / "snap.db")
+    assert idents, "snapshot_to no longer restricts the snapshot file at all"
+    loop_thread = threading.get_ident()
+    assert loop_thread not in idents, (
+        "snapshot_to restricted the snapshot file ON the event loop thread; it must go through "
+        "_secure_file_async (BACKLOG #1634)"
+    )
+
+
+async def test_open_secures_the_db_files_off_the_event_loop(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `open` completes before the API serves and before any listener binds, so its stall has nothing
+    # to stall -- this pins the consistency, not a live defect. It secures the db plus its -wal/-shm
+    # siblings, so it is also the site where a blocking call costs three subprocesses, not one.
+    idents = _record_secure_file_threads(monkeypatch)
+    s = await MessageStore.open(tmp_path / "offloop.db")
+    try:
+        assert idents, "open no longer restricts the store file at all"
+        loop_thread = threading.get_ident()
+        assert loop_thread not in idents, (
+            "open restricted a store file ON the event loop thread; it must go through "
+            "_secure_file_async (BACKLOG #1634)"
+        )
+    finally:
+        await s.close()
+
+
 async def test_enqueue_creates_message_and_outbox_rows(store: MessageStore) -> None:
     mid = await store.enqueue_message(
         channel_id="c1",
