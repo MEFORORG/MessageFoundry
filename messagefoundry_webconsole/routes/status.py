@@ -37,26 +37,10 @@ _log = logging.getLogger(__name__)
 _DISK_WARN_BYTES = 5 * 1024**3  # < 5 GiB free → warn (orange)
 _DISK_CRIT_BYTES = 1 * 1024**3  # < 1 GiB free → critical (blinking red)
 
-# ADR 0014 operator-alert severities (store.py: "info|warning|critical"), ranked worst-last for the bell.
-_SEVERITY_RANK = {"info": 1, "warning": 2, "critical": 3}
-
-
 # At most this many failed inbounds are named in the heart's reason; the rest become "and N more".
 # The reason renders into a title= attribute, so an estate-wide outage must not produce a tooltip
 # hundreds of names long.
 _MAX_NAMED_FAILURES = 3
-
-
-def _worst_severity(severities: list[str]) -> str | None:
-    """The highest-ranked severity among active alerts, or ``None`` for an empty list (drives the bell's
-    color: critical→red, warning→orange, info→accent, none→gray)."""
-    worst: str | None = None
-    rank = 0
-    for s in severities:
-        r = _SEVERITY_RANK.get(s, 0)
-        if r > rank:
-            rank, worst = r, s
-    return worst
 
 
 def _failed_inbound_reason(count: int, names: list[str]) -> str:
@@ -213,13 +197,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         alerts: dict[str, object] | None = None
         if identity.has(Permission.MONITORING_DIAGNOSE):
             try:
-                instances = await core.list_active_alerts(
-                    engine=engine, identity=identity, limit=200
-                )
-                active = instances.alerts
+                # The store-computed aggregate, never this page (BACKLOG #1564) — see
+                # AlertInstanceList.total. limit=1 because no row is read here at all.
+                instances = await core.list_active_alerts(engine=engine, identity=identity, limit=1)
                 alerts = {
-                    "count": len(active),
-                    "severity": _worst_severity([a.severity for a in active]),
+                    "count": instances.total,
+                    "severity": instances.worst_severity,
                 }
             except HTTPException:
                 raise

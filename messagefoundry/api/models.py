@@ -391,9 +391,16 @@ class AlertSuspendRequest(RequestModel):
 
 
 class AlertInstanceList(BaseModel):
-    """The active (open + acknowledged) operator-alert instances, newest ``last_seen`` first (ADR 0044)."""
+    """The active (open + acknowledged) operator-alert instances, newest ``last_seen`` first (ADR 0044),
+    plus the store-computed aggregate over **every** such instance in the caller's scope."""
 
+    #: This page of instances — at most ``limit`` of them, so it can be shorter than ``total``.
     alerts: list[AlertInstanceInfo]
+    #: Active instances in scope, counted in the store and NOT bounded by ``limit`` (BACKLOG #1564).
+    total: int
+    #: The worst severity among all ``total`` of them, or ``None`` when there are none. Ranked in the
+    #: store; ``store.AlertSummary`` carries why neither field may be derived from ``alerts``.
+    worst_severity: str | None
 
 
 class DeadLetterReplayRequest(RequestModel):
