@@ -322,3 +322,15 @@ scripts/security/scan-tokens.local.txt
 # the state that serves both, so the rule is here rather than in a reviewer's memory.
 # Rooted with a leading slash: only the repo root, never a `docs/` or `tests/` file of that name.
 /PR_BODY.md
+
+# `mefor-coord/` AT A WORK-TREE ROOT IS DELIBERATELY NOT IGNORED. DO NOT ADD IT HERE.
+# The allocator writes claims under <git-common-dir>/mefor-coord/, which is inside .git -- already
+# outside the work tree, already invisible to `git status`, already impossible to commit. So a
+# `mefor-coord/` directory at a work-tree root is never a legitimate artifact. It means something
+# built that path from an empty or relative base and it landed in the process cwd.
+# Measured 2026-09-18: a test helper read `git rev-parse --git-common-dir` through a wrapper that
+# swallowed git's exit code, got "", and wrote five claim records to a worktree root.
+# Ignoring it would buy protection from `git add -A` at the price of deleting the only signal that
+# the leak happened at all -- and the signal is what surfaced this defect. The protection is bought
+# instead by a guard that fails the test which leaks: tests/conftest.py,
+# _no_allocation_records_in_the_checkout. A leak that shows up beats one that hides.

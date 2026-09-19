@@ -814,8 +814,18 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
   **THE ONE HOLDOUT IS RETIRED, AND IT LEFT BY MIGRATION RATHER THAN BY EDIT (BACKLOG #1250).** It was
   a machine-parsed contract: `docs/BACKLOG.md` and `docs/archive/backlog/BACKLOG-CLOSED.md` encoded
   item status as a banner alphabet, `scripts/docs/backlog_status_check.py` defined it, and
-  `.github/workflows/backlog-hygiene.yml` quoted it. All four went to the maintainer-internal
+  `.github/workflows/backlog-hygiene.yml` quoted it. The PARSING went to the maintainer-internal
   repository on 2026-09-13 with the ledger itself.
+
+  **TWO OF THOSE FOUR FILES ARE STILL TRACKED HERE, AND DELETING ONE OF THEM WEDGES EVERY PULL
+  REQUEST.** This paragraph previously read "all four went", which invites a tidier to remove a merge
+  gate. Measured 2026-09-16 with `git ls-files`: `BACKLOG-CLOSED.md` and `backlog_status_check.py` are
+  gone, `docs/BACKLOG.md` is still tracked as a stub, and `.github/workflows/backlog-hygiene.yml` is
+  still tracked **because its `name:` is a REQUIRED status-check context in branch protection**. The
+  job itself is a deliberate no-op that prints why it has nothing to check. Deleting it, renaming it,
+  or dropping either trigger makes the context never report -- and a required context that never
+  reports does not fail, it WEDGES, in the queue and out of it. Retiring it is a branch-protection
+  change, not an in-repo edit. That file's own header is the source of record; read it first.
 
   **SO NO GLYPH IN THIS REPOSITORY CARRIES MACHINE-PARSED MEANING ANY MORE, AND THE RULE ABOVE IS NOW
   UNCONDITIONAL HERE.** Nothing reads a status banner; nothing may start.
