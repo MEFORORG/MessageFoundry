@@ -43,6 +43,36 @@ from messagefoundry.logging_setup import (
 )
 
 
+class _VersionAction(argparse.Action):
+    """``--version``: print the version AND the package directory that answered (BACKLOG #1677).
+
+    The working directory precedes the venv's editable ``.pth`` entry on ``sys.path``, so running from
+    a directory that holds another tracked copy of ``messagefoundry/`` resolves the import to THAT
+    copy. There is no error, and nothing in the output says which tree answered, so an instrument that
+    trusts the run reports a self-consistent wrong answer.
+
+    A CUSTOM ACTION RATHER THAN ``action="version"`` WITH AN EMBEDDED NEWLINE. argparse's own version
+    action routes its text through ``HelpFormatter._fill_text``, which re-wraps it into a single
+    width-dependent paragraph: the newline is collapsed and the path lands mid-line at whatever column
+    the terminal happens to be. Printing the two lines here keeps them apart at any width -- which is
+    also why the test for this asserts on the presence of the path token, never on a line index.
+
+    ``Path(__file__).parent`` IS the package directory -- this module lives inside it -- so answering
+    the question needs no new import and no ``importlib`` lookup.
+    """
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: object,
+        option_string: str | None = None,
+    ) -> None:
+        _safe_print(f"messagefoundry {__version__}")
+        _safe_print(f"package: {Path(__file__).resolve().parent}")
+        parser.exit()
+
+
 def main(argv: list[str] | None = None) -> int:
     # Harden the human-facing streams for a legacy Windows codepage (cp1252/charmap): argparse's own
     # --help/usage printer and runtime log/print() lines bypass _safe_print, so a non-cp1252 char
@@ -59,8 +89,38 @@ def main(argv: list[str] | None = None) -> int:
             except (ValueError, OSError):
                 pass
 
+    # The last-resort hooks are a PROCESS property, so they are installed here, once, for every
+    # subcommand (BACKLOG #1674). `last_resort` states the ASVS 16.5.4 guarantee that an unhandled
+    # error can never escape as a raw traceback quoting a PHI-bearing value; until this call site they
+    # were installed inside `_serve` only, leaving the other 32 subcommands unguarded. `dryrun`,
+    # `audit-verify` and `backup` open the store, so an uncaught exception from one of them is the
+    # case that could carry a field value.
+    #
+    # INSTALLING THE HOOK CHANGES NO EXIT CODE: the interpreter still exits 1 after calling
+    # `sys.excepthook`. That is why this shape was taken over the alternative of wrapping the dispatch
+    # and exiting 2, which would have made every CLI exit-code assertion in the suite a fresh question.
+    #
+    # LATE IMPORT, DELIBERATELY. Two `tests/test_config_anchoring.py` monkeypatches target the module
+    # attribute `messagefoundry.last_resort.install_excepthook`; importing the name at module scope
+    # here would bind it before they can patch it, and they would silently stop applying.
+    from messagefoundry.last_resort import install_excepthook, install_thread_excepthook
+
+    install_excepthook()
+    # The sibling hook for every OTHER thread (BACKLOG #1055), which had the identical serve-only gap.
+    # sys.excepthook does not cover them, and the engine runs non-asyncio threads whose except clauses
+    # are deliberately narrow -- the sandbox session's raw stdout reader catches only OSError -- so
+    # anything else would otherwise reach the stdlib default and print an unredacted traceback to the
+    # NSSM-captured stderr.
+    install_thread_excepthook()
+
     parser = argparse.ArgumentParser(prog="messagefoundry", description=__doc__)
-    parser.add_argument("--version", action="version", version=f"messagefoundry {__version__}")
+    parser.add_argument(
+        "--version",
+        action=_VersionAction,
+        nargs=0,
+        default=argparse.SUPPRESS,
+        help="print the version and the package directory that answered",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     serve = sub.add_parser("serve", help="run the engine + localhost API")
@@ -1753,6 +1813,7 @@ def _serve(args: argparse.Namespace) -> int:
             tls_ca_file=settings.logging.forward_tls_ca_file,
             tls_verify=settings.logging.forward_tls_verify,
             tls_client_cert=settings.logging.forward_tls_client_cert,
+            tls_crl_file=settings.logging.forward_tls_crl_file,
         )
         if settings.logging.forward_enabled and settings.logging.forward_host
         else None
@@ -3391,14 +3452,10 @@ def _serve(args: argparse.Namespace) -> int:
             from messagefoundry.api.tls_client_cert import client_cert_http_protocol_class
 
             run_kwargs["http"] = client_cert_http_protocol_class()
-    from messagefoundry.last_resort import install_excepthook, install_thread_excepthook
 
-    install_excepthook()  # last-resort main-thread hook: an uncaught exception logs PHI-redacted (16.5.4)
-    # The sibling hook for every OTHER thread (BACKLOG #1055). sys.excepthook does not cover them, and
-    # the engine runs non-asyncio threads whose except clauses are deliberately narrow — the sandbox
-    # session's raw stdout reader catches only OSError — so anything else would otherwise reach the
-    # stdlib default and print an unredacted traceback to the NSSM-captured stderr.
-    install_thread_excepthook()
+    # The last-resort sys/threading excepthooks are already in force here: `main()` installs them for
+    # every subcommand (BACKLOG #1674). The asyncio loop handler is separate and is installed by the
+    # serving lifespan, inside the running loop.
     try:
         uvicorn.run(app, host=settings.api.host, port=settings.api.port, **run_kwargs)
     except Exception as exc:  # last-resort: log an abnormal server exit PHI-redacted, then re-raise
