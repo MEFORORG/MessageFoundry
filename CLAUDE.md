@@ -506,10 +506,21 @@ gates a merge**, and no seat has to clear one.
   seat can raise a chip, and in the 2026-09-04 case above the spawner was
   the session that then pushed the fix. It corrected its own BACKLOG item in the same change and
   still could not reach the chip, which is the whole shape of the defect -- BACKLOG #1448.
-- Give each session its own git worktree (`scripts/worktree/new.ps1 -Name <x>`, cleanup with
-  `remove.ps1`). Each gets an isolated checkout, branch and `.venv` on the same remote and the same
-  PR flow. See [`docs/WORKTREES.md`](docs/WORKTREES.md). The AI project memory is shared across
-  sessions, so coordinate memory writes.
+- **Give each session its own git worktree, and START the session in it.** `scripts/worktree/new.ps1
+  -Name <x>` creates one (cleanup with `remove.ps1`); `spawn.ps1 -Name <x>` creates it *and* opens an
+  editor window on it, which is the entry point to reach for. Each gets an isolated checkout, branch
+  and `.venv` on the same remote and the same PR flow. See [`docs/WORKTREES.md`](docs/WORKTREES.md).
+  The AI project memory is shared across sessions, so coordinate memory writes.
+- **Never brief a worker to RELOCATE into a worktree -- from a subagent it cannot work.** A
+  subagent's `EnterWorktree` call into a `new.ps1` sibling is **refused outright** (the path is outside
+  `.claude/worktrees/`), so the brief burns the worker's one turn on a call that cannot succeed. From a
+  session the same call instead raises an owner prompt that no `permissions.allow` rule can suppress.
+  Start the session in its worktree (`spawn.ps1`), or dispatch a file-editing subagent with
+  `isolation: worktree` and have it run `pwsh -NoProfile -File scripts\worktree\ensure-venv.ps1`
+  **before its first `pytest`/`mypy`/`ruff` run** -- a managed worktree arrives with no `.venv`, and
+  without one `pytest` dies at import rather than running slowly. The measurements, the cost of that
+  bootstrap, and why not to engineer around the check are stated once in
+  [`docs/WORKTREES.md`](docs/WORKTREES.md) section "Start the session in the worktree".
 - **Put the prompt FIRST when you spawn, or close the flags with `--`.** At least `--allowedTools`,
   `--disallowedTools`, `--tools`, `--add-dir`, `--mcp-config`, `--betas` and `--file` take lists, so
   `claude --bg --allowedTools Bash Edit "do the work"` swallows the prompt as a third tool name. The

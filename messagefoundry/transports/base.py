@@ -355,9 +355,19 @@ def encode_wire_body(payload: str, encoding: str, *, transport: str) -> bytes:
     That character is a character of the *message*: PHI, or a credential once a config secret can
     reach the body. ``safe_exc``/``redact`` scrub HL7 *shapes* and have no notion of either.
 
-    So this names the codec and the **position** — an index, never the content — and raises
-    ``from None``: the chained ``UnicodeEncodeError`` carries ``.object``, which is the **entire
-    payload**, so any handler that walks ``__cause__`` would resurrect what we just refused to log.
+    So this names the codec and the **position** — an index, never the content — and severs the
+    exception chain entirely: the ``UnicodeEncodeError`` carries ``.object``, which is the **entire
+    payload**, so any handler that walks the chain would resurrect what we just refused to log.
+
+    **``from None`` is NOT enough to sever it, and that is the whole reason the raise below sits
+    outside the ``except`` block.** ``raise ... from None`` clears ``__cause__`` and sets
+    ``__suppress_context__``, but it leaves ``__context__`` **populated**: the flag only tells the
+    default traceback *printer* to stop walking, it does not detach the exception. Anything that
+    reads the chain by attribute rather than formatting it the default way — a structured-logging
+    serializer, a crash reporter, a debugger, a custom formatter, or a bare
+    ``exc.__context__.object`` — still reaches the whole body. CPython populates ``__context__``
+    only when the raise happens *while an exception is being handled*, so hoisting the raise out of
+    the handler (keeping just the index in a local) leaves **both** chains empty.
 
     **Permanent** because it is: the same bytes will never encode on a retry, so it dead-letters
     rather than looping the lane forever. (``direct.py`` already had the right instinct — it catches
@@ -366,12 +376,14 @@ def encode_wire_body(payload: str, encoding: str, *, transport: str) -> bytes:
     try:
         return payload.encode(encoding)
     except UnicodeEncodeError as exc:
-        raise NegativeAckError(
-            f"{transport}: payload is not encodable as {encoding!r} "
-            f"(first offending character at position {exc.start})",
-            code="encoding",
-            permanent=True,
-        ) from None
+        # Keep the INDEX and nothing else; `exc` dies with the handler, taking `.object` with it.
+        offending_position = exc.start
+    raise NegativeAckError(
+        f"{transport}: payload is not encodable as {encoding!r} "
+        f"(first offending character at position {offending_position})",
+        code="encoding",
+        permanent=True,
+    )
 
 
 # The closed vocabulary for a captured reply's outcome (ADR 0013). Kept here, beside the transport
