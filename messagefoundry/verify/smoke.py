@@ -10,9 +10,9 @@
   Proves the real listener accepts + acks. (Full disposition is then confirmed in the console — a
   MANUAL row — so the tool stays dependency-light and not brittle to API specifics.)
 * store     — open the *existing* configured store backend and confirm it connects. For SQLite it
-  refuses to create the database file first (BACKLOG #1708): ``open_store``'s schema-ensure creates
-  whatever path it is handed, so the check used to PASS against a store it had just made and leave
-  the database behind — meaning it could not fail for the reason its title names.
+  refuses to create the database file first (BACKLOG #1708): ``open_store``'s schema-ensure created
+  whatever path it was handed until BACKLOG #1780, so the check used to PASS against a store it had
+  just made and leave the database behind — meaning it could not fail for the reason its title names.
 
 Synthetic HL7 only — never real PHI. The smoke message is inlined below rather than generated, so
 the verifier never imports ``messagefoundry.generators`` (BACKLOG #1192 / ASVS 15.2.3).
@@ -331,10 +331,14 @@ def smoke_live(
 def missing_sqlite_store(store: StoreSettings) -> Path | None:
     """The configured SQLite path when it is absent, else ``None`` (nothing for this gate to stop).
 
-    Every ``open_store`` call in the verifier goes through this first (BACKLOG #1708). ``open_store``
-    ensures the schema and SQLite's own connect creates an absent file, so an ungated call makes the
-    store it is about to report on. Read-only intent is not enough — ``newest_message_id`` and
-    ``check_smoke_disposition`` only ever read, and both created a database to do it.
+    Every ``open_store`` call in the verifier goes through this first (BACKLOG #1708). Before
+    BACKLOG #1780 an ungated call made the store it was about to report on: SQLite's connect creates
+    an absent file and ``open_store`` ensured the schema into it. Read-only intent was not enough —
+    ``newest_message_id`` and ``check_smoke_disposition`` only ever read, and both created a database
+    to do it. ``open_store`` now refuses an absent SQLite file by default (``StoreNotFoundError``).
+    This gate still runs first, so the verifier reports its own FAIL without importing the store
+    stack. The two differ at the edges: this one uses ``is_file()``, the seam counts only
+    ``FileNotFoundError`` as absent.
 
     ``:memory:`` creates nothing on disk and so is outside what this gate exists to stop.
 
@@ -358,9 +362,9 @@ def missing_sqlite_store(store: StoreSettings) -> Path | None:
 def check_store_connectivity(store: StoreSettings) -> CheckResult:
     """Open the *existing* configured store backend, confirm it connects, then close.
 
-    For SQLite the file must already be there. ``open_store`` ensures the schema, and SQLite's own
-    connect creates an absent file, so without this gate the check created the database it then
-    reported PASS against (BACKLOG #1708) — a mistyped ``[store].path`` passed, and an operator
+    For SQLite the file must already be there. Before BACKLOG #1780 ``open_store`` ensured the schema
+    into whatever SQLite's connect created, so without this gate the check created the database it
+    then reported PASS against (BACKLOG #1708) — a mistyped ``[store].path`` passed, and an operator
     running ``verify`` elevated on a fresh box left an administrator-owned store at the configured
     path before the service started under another identity.
 
