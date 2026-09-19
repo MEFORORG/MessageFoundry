@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import subprocess
 import unittest
 from pathlib import Path
@@ -53,6 +54,23 @@ EXPECTED_SEATS = frozenset({"manager", "builder", "regulator", "steward", "lande
 #: that cannot fail.
 EXPECTED_ELSEWHERE: frozenset[str] = frozenset()
 
+#: The seven seats CLAUDE.md section 5 retired on 2026-09-01. PINNED AS A SET, the way
+#: CONSOLE_SPELLINGS is, because iterating whatever the file happens to contain cannot notice an
+#: omission. Measured 2026-09-18: `asvs-tracker` was missing from every map, so the 12 records
+#: carrying it resolved to the "MATCHES NO SEAT" typo branch -- reading as a misspelling rather
+#: than as the roster fact it is, which is the exact failure CONSOLE_SPELLINGS exists to prevent.
+SECTION_5_RETIRED_2026_09_01 = frozenset(
+    {
+        "dispatcher",
+        "liaison",
+        "pm",
+        "cleaner",
+        "role-manager",
+        "process-improvement",
+        "asvs-tracker",
+    }
+)
+
 #: Retired 2026-09-10. Every observed spelling is listed in `retired` ON PURPOSE: an alias must land
 #: on a live seat, so a spelling left out would resolve to "MATCHES NO SEAT" and read as a typo.
 CONSOLE_SPELLINGS = frozenset({"console", "console1", "console-1", "consul"})
@@ -75,6 +93,103 @@ def read(p: Path) -> str:
 
 def seats() -> dict:
     return json.loads(read(SEATS_PATH))
+
+
+def _split_command(command: str | None) -> list[str]:
+    """Tokenise a hook's `command` string the way a Windows shell would.
+
+    `posix=False` is required, because a POSIX split eats the backslashes in a Windows path. It
+    also KEEPS the quote characters inside each token, so `"C:/x/hook.ps1"` arrives with its
+    quotes attached and `Path(token).name` then ends in one. Measured 2026-09-18: that alone made
+    a `command`-field duplicate invisible to the wiring test, which is the defect this helper was
+    written to close -- so the quotes come off here, once, rather than at each call site.
+    """
+    out = []
+    for tok in shlex.split(command or "", posix=False):
+        if len(tok) > 1 and tok[0] == tok[-1] and tok[0] in "\"'":
+            tok = tok[1:-1]
+        out.append(tok)
+    return out
+
+
+def session_start_args() -> list[list[str]]:
+    """One token list per SessionStart hook, flattened across the setting's groups.
+
+    TWO THINGS HAVE TO BE FLATTENED AND EACH WAS MISSED ONCE.
+
+    The GROUPS, because a hook wired a second time in a second group is still wired twice and a
+    test that inspects one group cannot see it. That is the shape the duplicate took on 2026-09-08.
+
+    And the two FIELDS a harness hook may use. `args` is a list; `command` may instead carry the
+    whole command line as one string. Measured 2026-09-18: a duplicate expressed through `command`
+    left both wiring tests green, while the same duplicate expressed as `args` went red -- so an
+    args-only reader guards the shape the 2026-09-08 duplicate happened to take and no other. That
+    other shape is live on this machine, in the user-scope `settings.json`.
+
+    SCOPE IS THIS FILE ONLY. `.claude/settings.local.json` and the user-scope roots also carry
+    SessionStart hooks, and nothing here can see them.
+    """
+    wired = json.loads(read(SETTINGS))["hooks"]["SessionStart"]
+    out: list[list[str]] = []
+    for entry in wired:
+        for h in entry.get("hooks", []):
+            # `command` FIRST, then `args`: that is the invocation order, so a caller reading the
+            # tokens after the script path sees the script's own arguments and not the executable.
+            out.append(_split_command(h.get("command")) + list(h.get("args") or []))
+    return out
+
+
+def script_parameters(hook: Path) -> set[str]:
+    """The parameter names the hook declares at script level.
+
+    Only the `param(...)` block that follows `[CmdletBinding()]`. A function's own `param(...)`
+    further down the file is not a script parameter and must not widen this set.
+
+    THREE SHAPES BROKE THE FIRST VERSION OF THIS, and two of them mattered in opposite
+    directions. Measured 2026-09-18:
+
+      - A COMMENT inside the block naming a superseded spelling re-admitted it, so the wiring this
+        file exists to catch went green. This repository's house style records a superseded
+        spelling in place, so that comment is the likeliest edit the hook will ever get. Comments
+        are stripped first.
+      - An UNTYPED parameter was invisible, because the pattern demanded a leading `[type]`, so a
+        legitimate `-Quiet` would be reported as undeclared. The type prefix is now optional.
+      - An ATTRIBUTE between `[CmdletBinding()]` and `param` broke the match entirely and the
+        assertion then failed saying the hook no longer declares its parameter, which is the
+        instrument failing while blaming the subject.
+    """
+    # An attribute may itself contain brackets -- `[OutputType([string])]` -- so the attribute
+    # arm allows one level of nesting. A flat `[^\]]+` stops at the inner `]` and the whole match
+    # fails, which is the third shape in the docstring.
+    attribute = r"\[(?:[^\[\]]|\[[^\[\]]*\])*\]"
+    block = re.search(
+        r"\[CmdletBinding\([^)]*\)\](?:\s*" + attribute + r")*\s*param\((.*?)^\)",
+        read(hook),
+        re.S | re.M,
+    )
+    if block is None:
+        return set()
+    body = re.sub(r"#[^\n]*", "", block.group(1))
+    return set(re.findall(r"(?:\[[\w\[\]]+\]\s*)*\$(\w+)\s*(?:=|,|\)|$)", body, re.M))
+
+
+#: Added by `[CmdletBinding()]`, so the wiring may legitimately pass one.
+POWERSHELL_COMMON_PARAMETERS = frozenset(
+    {
+        "Verbose",
+        "Debug",
+        "ErrorAction",
+        "WarningAction",
+        "InformationAction",
+        "ProgressAction",
+        "ErrorVariable",
+        "WarningVariable",
+        "InformationVariable",
+        "OutVariable",
+        "OutBuffer",
+        "PipelineVariable",
+    }
+)
 
 
 def card_paths() -> list[Path]:
@@ -134,6 +249,27 @@ class ASeatThatIsNotRunHereSaysSoRatherThanGoingSilent(unittest.TestCase):
     is exercised against an INJECTED occupant in `tests/test_coord_seat_roster_verdict.py`, which is
     the only place it can still be run.
     """
+
+    def test_every_seat_section_5_retired_resolves_to_a_retirement(self):
+        """AS A SET, because iterating the file cannot notice what the file omits.
+
+        Measured 2026-09-18: `asvs-tracker` was in no map at all, so the 12 records carrying it
+        got the "MATCHES NO SEAT" typo branch. A retired seat reading as a typo sends the reader
+        looking for a spelling error instead of telling them the seat was ended.
+        """
+        retired = seats()["retired"]
+        missing = sorted(SECTION_5_RETIRED_2026_09_01 - set(retired))
+        self.assertEqual(
+            [],
+            missing,
+            f"these seats section 5 retired resolve to nothing instead of a retirement: {missing}",
+        )
+
+    def test_no_seat_section_5_retired_is_live_or_an_alias(self):
+        reachable = sorted(
+            SECTION_5_RETIRED_2026_09_01 & (set(seats()["live"]) | set(seats()["aliases"]))
+        )
+        self.assertEqual([], reachable, f"these retired seats are still reachable: {reachable}")
 
     def test_the_bucket_is_empty_and_the_file_says_that_is_deliberate(self):
         """Without this, an empty bucket cannot be told from a half-finished edit."""
@@ -227,11 +363,20 @@ class EveryCardStaysWithinItsBudget(unittest.TestCase):
         self.assertEqual([], over, f"cards over {CARD_MAX_BYTES} bytes: {over}")
 
     def test_every_card_carries_every_required_section(self):
+        """As a HEADING, not as a phrase anywhere in the file.
+
+        This asserted `s not in read(p)`, a bare substring over the whole card. Measured
+        2026-09-18: renaming all five headings in `steward.card.md` while appending one prose line
+        that happened to carry the five phrases left the suite green. So a card could lose every
+        required section as STRUCTURE and pass, and the five deletion arms only went red because
+        each phrase happens to appear nowhere else in its card. `docs/ROLE-CARDS.md` calls these
+        sections pinned; requiring the heading is what makes that true.
+        """
         offenders = [
-            f"{p.name} is missing '{s}'"
+            f"{p.name} has no '## {s}' heading"
             for p in card_paths()
             for s in REQUIRED_SECTIONS
-            if s not in read(p)
+            if f"## {s}" not in read(p)
         ]
         self.assertEqual([], offenders, "\n  ".join(offenders))
 
@@ -265,6 +410,29 @@ class NoCardContradictsAnAnchoredRuling(unittest.TestCase):
             re.compile(r"open(?:ing)? (?:a |the )?PR[^.\n]{0,60}approval", re.I),
             "opening a PR needs no approval here (owner ruling 2026-08-29)",
         ),
+        # The SECOND shape, added 2026-09-18. This screen was built from the push case alone and
+        # therefore found only that shape -- builder.card.md carried "Declare its own seat. Your
+        # Manager does that." for the whole time this class existed. CLAUDE.md:418 records the
+        # opposite and says why the old rule was worth naming: it was SELF-CONFIRMING, because a
+        # Builder told it cannot declare does not try, renders undeclared, and confirms the rule.
+        # The shipped shape: "**Declare its own seat.** Your Manager does that." Note it crosses a
+        # sentence boundary, so the window CANNOT exclude "." the way the push patterns do -- the
+        # first draft of this pattern used `[^.\n]` and stayed quiet on the very line it was
+        # written for. `test_the_scan_fires_on_the_seat_declaration_line_this_card_shipped` is
+        # what caught that, which is the whole reason a positive control is not optional.
+        (
+            re.compile(
+                r"declare\b[^\n]{0,30}\bseat\b[^\n]{0,20}(?:your |the )?"
+                r"(?:manager|console|owner)\s+does",
+                re.I,
+            ),
+            "a seat declares its own seat (CLAUDE.md:418, measured 2026-09-02); the Manager "
+            "supplies the seat and goal at dispatch but does not declare for it",
+        ),
+        (
+            re.compile(r"(?:cannot|can't|must not|never)\s+declare\b[^\n]{0,30}\bseat\b", re.I),
+            "a seat CAN declare itself through the Bash tool (CLAUDE.md:418, measured 2026-09-02)",
+        ),
     )
 
     def test_no_card_says_a_push_needs_approval(self):
@@ -284,6 +452,18 @@ class NoCardContradictsAnAnchoredRuling(unittest.TestCase):
             "the scan did not fire on the exact sentence korus's cards carry, so it guards nothing",
         )
 
+    def test_the_scan_fires_on_the_seat_declaration_line_this_card_shipped(self):
+        """The second positive control, for the shape this screen missed for its whole life.
+
+        A screen built from one case finds one shape. This exact sentence sat in
+        `builder.card.md` while every test in this class was green.
+        """
+        planted = "- **Declare its own seat.** Your Manager does that."
+        self.assertTrue(
+            any(rx.search(planted) for rx, _ in self.FORBIDDEN),
+            "the scan did not fire on the seat-declaration line builder.card.md actually carried",
+        )
+
     def test_the_scan_accepts_the_wording_this_repository_uses(self):
         """The negative arm. A guard that fires on the correct text is worse than none."""
         good = "**Push your own branch and open your own PR, without asking.** Owner ruling 2026-08-29."
@@ -301,8 +481,11 @@ class NoCardContradictsAnAnchoredRuling(unittest.TestCase):
 class NoCardCitesAPlaybookPathThatDoesNotExistHere(unittest.TestCase):
     """The third way the copy would have been wrong, and the quietest.
 
-    The playbooks moved to korus on 2026-09-04. A bare `roles/BUILDER.md` resolves to nothing in
-    this checkout, and an absent file is the failure that reports nothing at all.
+    The playbooks moved to korus on 2026-09-02 (`a3df144`, which also added `roles/README.md`;
+    the repository itself was initialised 35 minutes earlier). 2026-09-04 is the separate, later
+    owner ruling that they are READ at `origin/main`, and conflating the two dates the move two
+    days late. A bare `roles/BUILDER.md` resolves to nothing in this checkout, and an absent file
+    is the failure that reports nothing at all.
     """
 
     BARE = re.compile(r"(?<![:/\w])roles/[A-Z][A-Z-]*\.md")
@@ -373,18 +556,72 @@ class TheHookIsWiredAndNeverBreaksATurn(unittest.TestCase):
     def test_the_hook_exists(self):
         self.assertTrue(HOOK.is_file(), f"{HOOK} is missing")
 
-    def test_the_hook_is_wired_at_session_start(self):
-        wired = json.loads(read(SETTINGS))["hooks"]["SessionStart"]
-        commands = [" ".join(h.get("args", [])) for entry in wired for h in entry.get("hooks", [])]
-        self.assertTrue(
-            any("role-card-inject.ps1" in c for c in commands),
-            f"role-card-inject.ps1 is not wired at SessionStart. Wired: {commands}",
+    def test_the_hook_is_wired_exactly_once_at_session_start(self):
+        """TWICE IS NOT HARMLESS, and the test that was here could not tell one from two.
+
+        It asserted `any(...)`, which a duplicate passes. Measured 2026-09-18: two commits had
+        each added a wiring, `origin/main` carried both, and this test reported green for the 13
+        days in between.
+
+        WHAT THE DUPLICATE COST depends on whether a seat resolved. With no marker the hook prints
+        its no-seat note, so 103 of the 104 wired worktrees printed that twice. Where a marker
+        existed the CARD doubled: worktree `manager-112d2a` has two injection records 17 ms apart,
+        5,203 characters each, so that session paid 10,406 for one card -- and the 150-line and
+        6 KB caps cannot see it, because each copy is inside budget.
+        """
+        commands = [a for a in session_start_args() if any(Path(x).name == HOOK.name for x in a)]
+        self.assertEqual(
+            1,
+            len(commands),
+            f"{HOOK.name} is wired {len(commands)} times at SessionStart, expected once: "
+            f"{[' '.join(a) for a in commands]}",
         )
+
+    def test_the_wiring_passes_the_worktree_root_spelled_in_full(self):
+        """POWERSHELL BINDS AN UNAMBIGUOUS PREFIX, so a shortened parameter works and looks right.
+
+        Measured 2026-09-18: the wiring passed `-Worktree` and PowerShell bound it to
+        `-WorktreeRoot`. The hook resolved the correct seat, so nothing reported a problem.
+
+        TWO LATER EDITS BREAK IT, and they break it differently. Add a second `-Worktree...`
+        parameter and `-Worktree` becomes AMBIGUOUS: PowerShell refuses the invocation with exit 1
+        and empty stdout, the body never runs, and the card silently disappears -- the hook's
+        never-fail guarantee cannot cover it, because binding precedes every `exit 0`. RENAME
+        `WorktreeRoot` to another `-Worktree...` spelling instead and the prefix still binds while
+        `$WorktreeRoot` falls back to `$PWD`, so the hook resolves whatever directory it happened
+        to start in. Only the second produces a wrong seat; both are red here.
+
+        ASSERTED POSITIVELY, because subtracting known names pins nothing. Measured the same day:
+        dropping the `-WorktreeRoot` token and leaving the value as a bare trailing argument passed
+        the subtract-only version, and a positional value binds by declaration order the moment a
+        second parameter exists -- which is the very failure above.
+        """
+        declared = script_parameters(HOOK) | POWERSHELL_COMMON_PARAMETERS
+        self.assertIn(
+            "WorktreeRoot",
+            declared,
+            "could not find a script-level -WorktreeRoot declaration in the hook. Either the hook "
+            "no longer declares it, or script_parameters() cannot read the shape it is written in.",
+        )
+
+        seen = 0
+        for args in session_start_args():
+            at = [i for i, a in enumerate(args) if Path(a).name == HOOK.name]
+            if not at:
+                continue
+            seen += 1
+            tail = args[at[0] + 1 :]
+            self.assertEqual(
+                ["-WorktreeRoot", "${CLAUDE_PROJECT_DIR}"],
+                tail,
+                "the wiring must pass -WorktreeRoot, spelled in full, and the project directory, "
+                f"and nothing else. It passes: {tail}",
+            )
+        self.assertEqual(1, seen, f"expected one {HOOK.name} wiring to inspect, found {seen}")
 
     def test_the_hook_keeps_the_existing_session_start_hook(self):
         """Adding a hook must not replace the one that was there."""
-        wired = json.loads(read(SETTINGS))["hooks"]["SessionStart"]
-        commands = [" ".join(h.get("args", [])) for entry in wired for h in entry.get("hooks", [])]
+        commands = [" ".join(a) for a in session_start_args()]
         self.assertTrue(
             any("seat-declare-prompt.ps1" in c for c in commands),
             "the seat declaration prompt was dropped when the role card hook was added",
