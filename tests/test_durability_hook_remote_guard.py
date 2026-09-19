@@ -303,6 +303,55 @@ def test_an_unset_nomination_does_nothing(tmp_path: Path) -> None:
     assert not reached
 
 
+def test_the_installer_manages_post_merge_everywhere_it_manages_post_commit() -> None:
+    """One script is installed as TWO hooks, and every site must name both.
+
+    post-commit fires on ``git commit``; post-merge fires on ``git merge`` and on a ``git pull``, so
+    a clone with only the first makes an entire class of commit durable by nothing.
+
+    THIS IS NOT HYPOTHETICAL AND THE ASYMMETRY IS HOW IT HID. Measured 2026-09-19 in the engine
+    clone: ``.git/hooks/post-merge`` existed, was byte-identical to the VAULT clone's copy of the
+    script, and was three weeks older than the post-commit beside it -- the vault's installer has
+    always written both, this one wrote only post-commit, and a clone that had met both installers
+    kept an orphan no audit here could see. ``-Status`` did not mention it, ``-Arm`` did not replace
+    it and ``-Uninstall`` did not remove it, so it went on refusing that clone's private remote
+    while the post-commit beside it was current.
+
+    Structural rather than behavioural on purpose: driving ``-Arm`` writes hooks into the real
+    shared ``.git/hooks`` for every worktree on the box at once, which a test must never do. What it
+    buys is the regression that actually happened -- a site added for one hook and not the other.
+    """
+    text = INSTALLER.read_text(encoding="utf-8")
+    code = [ln for ln in text.splitlines() if not ln.lstrip().startswith("#")]
+    body = "\n".join(code)
+
+    assert '$postMerge = Join-Path $hooksDir "post-merge"' in body, "no post-merge path is declared"
+
+    # Each pair is (what the site does, the post-commit spelling, the post-merge spelling).
+    sites = [
+        ("install copy", 'durability_push.sh") $postCommit', 'durability_push.sh") $postMerge'),
+        (
+            "uninstall",
+            "Remove-Item -LiteralPath $postCommit",
+            "Remove-Item -LiteralPath $postMerge",
+        ),
+        ("overwrite guard", "already exists at $postCommit", "already exists at $postMerge"),
+        ("chmod", "chmod +x $postCommit", "chmod +x $postMerge"),
+    ]
+    missing = [name for name, commit, merge in sites if commit in body and merge not in body]
+    assert not missing, (
+        f"install-git-hooks.ps1 handles post-commit but NOT post-merge at: {missing}. They are the "
+        "same script installed twice; a site that names one and not the other leaves either merges "
+        "or commits uncovered, and nothing else reports it."
+    )
+
+    # -Status must report the INSTALLED bytes, not merely that a marker is present. A marker sits in
+    # a header that changes once in months, so it reads INSTALLED across an arbitrarily old copy --
+    # and the matcher deciding whether this hook publishes lives in the body.
+    assert "$durMergeInstalled" in body, "-Status does not look at post-merge at all"
+    assert "$durSrcSha" in body, "-Status reports no content parity for the durability hook"
+
+
 # --- the second copy of this matcher ----------------------------------------------------------
 # `install-git-hooks.ps1 -Status` decides the same question in PowerShell so it can tell an operator
 # whether their nominated remote is the public one. Its own comment says to keep the two in step and
@@ -310,11 +359,23 @@ def test_an_unset_nomination_does_nothing(tmp_path: Path) -> None:
 # disagreement is silent in the reassuring direction: -Status calls the remote safely armed while
 # the hook refuses every commit, or calls it public while the hook is publishing.
 
-_STATUS_MATCHER = re.compile(r"\$durUrl -match '([^']+)'")
+# Keyed on the PATTERN, not on the code around it. An earlier version anchored on `$durUrl -match`
+# and broke the moment that line became a `Where-Object` over both url sets -- reporting zero
+# patterns, which the assertion below turns into a loud failure rather than a silent pass.
+_STATUS_MATCHER = re.compile(r"'([^']*MEFORORG/MessageFoundry[^']*)'")
 
 
 def _status_regex() -> str:
-    found = _STATUS_MATCHER.findall(INSTALLER.read_text(encoding="utf-8"))
+    # COMMENTS ARE STRIPPED FIRST. That file records its own history, and the history quotes the
+    # patterns it replaced -- so a reader of the raw text finds the retired `MEFORORG/MessageFoundry`
+    # sitting in a comment beside the live one and cannot tell which is running. Dropping `#` lines
+    # is what makes the count assertion below mean "one live pattern" rather than "one mention".
+    code = [
+        line
+        for line in INSTALLER.read_text(encoding="utf-8").splitlines()
+        if not line.lstrip().startswith("#")
+    ]
+    found = _STATUS_MATCHER.findall("\n".join(code))
     # Guard the instrument: a rename or a requote here would leave nothing to compare, and a parity
     # test over zero patterns passes.
     assert len(found) == 1, f"expected exactly one -match pattern in {INSTALLER.name}, got {found}"
