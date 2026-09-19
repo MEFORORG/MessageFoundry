@@ -4457,7 +4457,11 @@ class PostgresStore:
         if allowed_channels is not None:
             _append_channel_scope_pg(where, params, "connection", allowed_channels)
         clause = " WHERE " + " AND ".join(where)
-        row = await self._pool.fetchrow(
+        # `_fetchone`, NOT `self._pool.fetchrow`: the bounded helper, so this borrow is capped by
+        # [store].acquire_timeout (BACKLOG #1052). The nav bell polls roughly every 15s from every open
+        # tab, so an unbounded borrow here would hang the poll on a saturated pool instead of failing
+        # fast -- and the route's degrade path only runs if the await returns.
+        row = await self._fetchone(
             f"SELECT COUNT(*) AS n, MAX({_ALERT_SEVERITY_RANK_SQL}) AS worst"
             f" FROM alert_instance{clause}",
             *params,

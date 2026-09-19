@@ -277,14 +277,14 @@ def test_severity_rank_covers_the_whole_vocabulary() -> None:
     assert sorted(_ALERT_SEVERITY_RANK.values()) == list(range(1, len(AlertSeverity) + 1))
 
 
-def test_severity_rank_sql_is_not_alphabetical() -> None:
-    # The trap the CASE rank exists for: SQL MAX over the NAMES answers 'warning', because 'w' > 'c'.
-    # A test that only ever compared two rows could not tell the two implementations apart.
-    assert max(["critical", "warning"]) == "warning"
+def test_severity_rank_sql_quotes_its_literals() -> None:
+    # The ranking BEHAVIOUR is guarded by test_summary_counts_past_any_page_and_ranks_by_severity,
+    # which a name-MAX implementation fails. This pins the one property that test cannot see, because
+    # SQLite would accept it either way in some shapes: each severity is single-QUOTED. Unquoted,
+    # `WHEN info` parses as a column reference rather than a literal.
+    for name in _ALERT_SEVERITY_RANK:
+        assert f"'{name}'" in _ALERT_SEVERITY_RANK_SQL
     assert _ALERT_SEVERITY_RANK["critical"] > _ALERT_SEVERITY_RANK["warning"]
-    for name, rank in _ALERT_SEVERITY_RANK.items():
-        assert f" WHEN '{name}' THEN {rank}" in _ALERT_SEVERITY_RANK_SQL
-    assert _ALERT_SEVERITY_RANK_SQL.endswith(" ELSE 0 END")
 
 
 async def test_reason_encrypted_at_rest(tmp_path: Path) -> None:

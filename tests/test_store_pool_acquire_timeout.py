@@ -361,16 +361,11 @@ def test_postgres_borrows_outside_the_bounded_helper_are_pinned() -> None:
     a new bypass landed and the note is now too generous."""
     store_sites = _unbounded_borrow_sites("messagefoundry/store/postgres.py")
     cluster_sites = _unbounded_borrow_sites("messagefoundry/pipeline/cluster.py")
-    assert (len(store_sites), len(cluster_sites)) == (39, 10), (
-        "the measured population of pool borrows OUTSIDE the bounded helper moved from 39 (store)"
-        " + 10 (cluster), measured 2026-09-18. Re-read the CONNECTIONS.md scope note before changing"
+    assert (len(store_sites), len(cluster_sites)) == (38, 10), (
+        "the measured population of pool borrows OUTSIDE the bounded helper moved from 38 (store)"
+        " + 10 (cluster), measured 2026-08-10. Re-read the CONNECTIONS.md scope note before changing"
         " this number. Sites scanned:\n" + "\n".join(store_sites + cluster_sites)
     )
-    # The store count rose 38 -> 39 on 2026-09-18 (BACKLOG #1564): `summarize_active_alert_instances`
-    # is one more monitoring READ borrowing the way its sibling `list_active_alert_instances` already
-    # does. The CONNECTIONS.md note was re-read and NOT widened: it scopes the bound to the
-    # message-pipeline borrows and has never covered the monitoring reads, so it is not now too
-    # generous. A rise that is NOT of that shape still means a new bypass landed.
 
 
 # --- the setting -------------------------------------------------------------
