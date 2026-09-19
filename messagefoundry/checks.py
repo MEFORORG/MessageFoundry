@@ -342,15 +342,22 @@ def _check_raise_fstring(config_dir: str | Path) -> CheckResult:
     rule, so it is **advisory** (prints, never blocks) — which is what pays for both error directions,
     measured against the predicate:
 
-    * Over-flags. A benign interpolation (``raise ValueError(f"port {p} in use")``). Arithmetic, since
-      the first constructor argument need not be a string at all (``raise ValueError(retry + 1)``).
-      And two *literal-only* messages that do not fold to a constant: ``"bad %s" % ("b",)`` (the
-      folding helper has no tuple case) and ``"a {}".format("b")`` (the ``.format`` branch counts
-      arguments without inspecting them).
-    * Under-flags. A message assigned to a local first (``m = f"bad {x}"``; ``raise ValueError(m)``),
-      because a bare ``Name`` is resolved nowhere. That boundary is deliberate here and pinned by
-      ``test_raise_fstring_ignores_bare_name_message``; widening it is scope resolution, not this
-      check.
+    * Over-flags, at least. A benign interpolation (``raise ValueError(f"port {p} in use")``).
+      Arithmetic, since the first constructor argument need not be a string at all
+      (``raise ValueError(retry + 1)``). And *literal-only* messages that do not fold to a constant —
+      measured: ``"a %s" % ("b",)``, ``"a %s" % ["b"]``, ``"%(k)s" % {"k": "b"}`` (the folding helper
+      has no case for a tuple, list or dict operand), ``"a {}".format("b")`` (the ``.format`` branch
+      counts arguments without inspecting them) and ``"a" + f"b"`` (no case for a constant-only
+      f-string operand, which is why the same ``f"b"`` alone does not flag).
+    * Under-flags, at least. A message assigned to a local first (``m = f"bad {x}"``;
+      ``raise ValueError(m)``), because a bare ``Name`` is resolved nowhere — pinned by
+      ``test_raise_fstring_ignores_bare_name_message``, and widening *that* one is scope resolution
+      rather than this check. Measured and **not** deliberate, only unbuilt: a message in any
+      argument but the first positional (``raise FeedError("E01", f"p {x}")``,
+      ``raise FeedError(detail=f"p {x}")``), a ``*args`` splat (``raise ValueError(*parts)``), and an
+      interpolation wrapped in a call (``raise ValueError(f"p {x}".upper())``,
+      ``raise ValueError(str(msg["PID-5"]))``). :func:`_unsafe_lookup_hit` already reads keywords, a
+      second positional and a splat; this caller does not.
 
     Scans every ``*.py`` under ``config_dir`` (helpers included — a ``_*`` helper can ``raise`` too).
     A malformed module never crashes the gate (``SyntaxError``/``OSError`` → skip that file; ``validate``
@@ -385,7 +392,7 @@ def _check_raise_fstring(config_dir: str | Path) -> CheckResult:
     shown = ", ".join(hits[:5])
     more = f" (+{len(hits) - 5} more)" if len(hits) > 5 else ""
     detail = (
-        f"{len(hits)} raise(s) build the message from a variable (heuristic PHI reminder — keep "
+        f"{len(hits)} raise(s) build the message by interpolation (heuristic PHI reminder — keep "
         f"identifiers out of exception messages): {shown}{more}"
     )
     return CheckResult("raise-fstring", ok=True, required=False, detail=detail)

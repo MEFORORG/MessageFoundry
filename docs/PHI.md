@@ -908,9 +908,11 @@ AST-scans the config-dir Router/Handler modules and flags a `raise` whose messag
 variable — at least an f-string `raise ValueError(f"bad {x}")`, a `+` concatenation, a `%` format and
 a `.format(...)` call, which carry the same free-text payload past redaction; it prints a heuristic
 reminder and never blocks the gate. **It is a nudge, not a boundary, and does not narrow the residual
-above.** It reads the `raise` expression only, so a message assigned to a local first
-(`m = f"bad {x}"`; `raise ValueError(m)`) goes unflagged — the convention is what governs, and
-`_check_raise_fstring` records the check's own over- and under-flags. The existing controls — never log full bodies at
+above.** It reads only the **first positional argument** of the `raise`, so a message assigned to a
+local first (`m = f"bad {x}"`; `raise ValueError(m)`), one passed as a keyword or a later positional
+(`raise FeedError("E01", f"bad {x}")`), and one wrapped in a call (`raise ValueError(str(x))`) all go
+unflagged. The convention is what governs; `_check_raise_fstring` catalogues what the check itself
+over- and under-flags. The existing controls — never log full bodies at
 INFO+, the CR/LF log-injection filter, and silencing python-hl7's PHI-prone loggers — remain in
 [logging_setup.py](../messagefoundry/logging_setup.py).
 

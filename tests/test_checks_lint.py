@@ -137,9 +137,15 @@ def test_raise_fstring_over_flags_nonfolding_literals_and_arithmetic(tmp_path: P
 
     ``'%s' % ('b',)`` — the folding helper has no tuple case. ``'{}'.format('b')`` — the ``.format``
     branch counts arguments without inspecting them. ``retry + 1`` — the first constructor argument
-    need not be a string. All three are literal or numeric and carry no PHI. Tolerated because the
-    check only ever prints; narrowing any of them would move the shared predicate the ADR 0144
-    lookup lint also reads.
+    need not be a string. All three are literal or numeric and carry no PHI, and they are a sample,
+    not the whole set; the check's docstring catalogues the rest.
+
+    Tolerated because the check only ever prints. Narrowing the first two would mean changing the
+    shared predicate the ADR 0144 lookup lint also reads, so it is not a local call. The arithmetic
+    one is different and the distinction matters to whoever revisits this: it IS narrowable at this
+    caller alone, by requiring a string anchor before consulting the predicate, with no reach into
+    ``_unsafe_lookup_hit``. Left as noise here because it is out of this row's scope, not because it
+    cannot be done.
     """
     _write(
         tmp_path / "noise.py",
@@ -155,7 +161,13 @@ def test_raise_fstring_over_flags_nonfolding_literals_and_arithmetic(tmp_path: P
 
 
 def test_raise_fstring_ignores_argless_format_call(tmp_path: Path) -> None:
-    """``'a {}'.format()`` is unflagged by the zero-argument guard, not by constant folding."""
+    """``'a {}'.format()`` is unflagged by the zero-argument guard, not by constant folding.
+
+    The detail assertion is what separates this from a file the scanner never read: an unreadable
+    or absent module skips with a different detail, so asserting the skip alone would pass for the
+    wrong reason — the defect this whole test group was rewritten to remove.
+    """
     _write(tmp_path / "argless.py", "def f():\n    raise ValueError('a {}'.format())\n")
     result = _check_raise_fstring(tmp_path)
     assert result.ok is True and result.skipped is True
+    assert "no interpolated raises" in result.detail
