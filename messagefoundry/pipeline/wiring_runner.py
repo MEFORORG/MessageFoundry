@@ -1847,19 +1847,35 @@ class RegistryRunner:
         """Build a **fresh** connector for the named connection so it can be reachability-tested —
         never the live one in ``_sources``/``_destinations`` (probing the live connector would disturb
         running traffic). Resolves ``env()`` and enforces the ``[egress]`` allowlist fail-closed, the
-        same as a real build. Returns ``("in", source)`` or ``("out", destination)``. Raises
-        :class:`KeyError` if ``name`` isn't a connection, :class:`WiringError` on a bad ``env()`` /
-        egress. The caller closes the connector (``stop()`` / ``aclose()``) after testing."""
+        same as a real build. Returns ``("in", source)`` or ``("out", destination)``. The caller closes
+        the connector (``stop()`` / ``aclose()``) after testing.
+
+        Raises :class:`KeyError` if ``name`` isn't a connection, and :class:`WiringError` for EVERY
+        build failure — a bad ``env()`` / egress, and anything a connector constructor raises, which is
+        normalized here exactly as :func:`build_check_registry` normalizes the same seam. That
+        guarantee is the contract, not a courtesy: this docstring used to promise ``WiringError`` while
+        the body passed a connector's own exception straight through, so
+        :class:`~messagefoundry.transports.wincred.CredentialUnsupportedError` — a ``ValueError``, raised
+        when a File connection carries ``credential_*`` on a non-Windows host — escaped the API's
+        ``except WiringError`` as an unhandled 500 (BACKLOG #1824)."""
         ic = self.registry.inbound.get(name)
-        if ic is not None:
-            source_cfg = _source_config(ic, self._inbound_bind_host, self._env_values)
-            check_source_allowed(source_cfg, name, self._egress)
-            return "in", build_source(source_cfg)
         oc = self.registry.outbound.get(name)
-        if oc is not None:
-            dest_cfg = _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress)
-            check_egress_allowed(dest_cfg, self._egress)
-            return "out", build_destination(dest_cfg)
+        try:
+            if ic is not None:
+                source_cfg = _source_config(ic, self._inbound_bind_host, self._env_values)
+                check_source_allowed(source_cfg, name, self._egress)
+                return "in", build_source(source_cfg)
+            if oc is not None:
+                dest_cfg = _dest_config(
+                    oc, self._env_values, self._trust_anchor_policy, self._egress
+                )
+                check_egress_allowed(dest_cfg, self._egress)
+                return "out", build_destination(dest_cfg)
+        except WiringError:
+            raise
+        except Exception as exc:
+            raise WiringError(f"connector build failed: {exc}") from exc
+        # OUTSIDE the wrap on purpose: an unknown name is the caller's 404, not a build failure.
         raise KeyError(name)
 
     async def start_inbound(self, name: str) -> None:
