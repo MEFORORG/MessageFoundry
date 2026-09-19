@@ -1882,20 +1882,35 @@ class MLLPSource(SourceConnector):
                 return  # at per-host capacity — refuse (closed in the outer finally)
             self._admit(peer_host)
             established = True
-            await self._emit_event("established", peer_host=peer_host)
+            # The `established` emit sits INSIDE the try whose finally releases the slot. It is
+            # fail-soft against `Exception` but not against `CancelledError`, and stop() cancels
+            # straggling client tasks — so a cancellation delivered here used to escape past
+            # `_release`. That leaked an `_active` count before; with a per-host table it would leak
+            # an entry nothing ever decrements, locking that address out until restart.
             try:
+                await self._emit_event("established", peer_host=peer_host)
                 decoder = MLLPDecoder(max_frame_bytes=self.max_frame_bytes)
                 pacer = _MessagePacer.for_rate(
                     self.max_messages_per_second, self.message_burst, name=self._pacing_name
                 )
-                # Monotonic stamp of the read that carried the open frame's first byte, or None when
-                # no frame is open (BACKLOG #1725). A wall clock would let a DST jump either expire a
-                # healthy frame or reprieve a stalled one.
+                # Monotonic stamp of the read that carried the CURRENT frame's first byte, or None
+                # when no frame is open (BACKLOG #1725). A wall clock would let a DST jump either
+                # expire a healthy frame or reprieve a stalled one.
                 frame_opened_at: float | None = None
                 while True:
                     # ASVS 2.4.1 / 15.2.2 — the wait is BEFORE the read, never around the handler.
                     if pacer is not None:
+                        paced_from = time.monotonic()
                         await pacer.pace()
+                        if frame_opened_at is not None:
+                            # Deliberate back-pressure is the ENGINE declining to read, not the peer
+                            # being slow, so it must not spend the peer's frame budget. Push the
+                            # frame's start stamp forward by exactly what we withheld.
+                            # `_MessagePacer` promises it "never drops, never NAKs and never
+                            # refuses"; without this line a paced connection with a partial frame
+                            # buffered could be closed BY the pacing, which is that promise broken
+                            # and a partial frame discarded outside the count-and-log boundary.
+                            frame_opened_at += time.monotonic() - paced_from
                     frame_left = self._frame_seconds_left(frame_opened_at)
                     if frame_left is not None and frame_left <= 0.0:
                         # A trickling peer is never idle, so the deadline has to be checked where
@@ -1962,10 +1977,19 @@ class MLLPSource(SourceConnector):
                     # the only thing that knows whether a start byte arrived without its end byte.
                     # Reached on the success path alone (every arm above breaks), so a connection
                     # already being dropped never re-stamps.
+                    #
+                    # `decoded` is what makes this PER FRAME rather than per connection, and getting
+                    # it wrong is not a small error. A pipelined sender's reads almost never end on a
+                    # frame boundary, so `in_frame` stays True read after read across DIFFERENT
+                    # frames; stamping only when `frame_opened_at is None` would therefore measure
+                    # every later frame from the FIRST one's start byte and reset a perfectly healthy
+                    # feed once per `max_frame_seconds`, forever. Any frame that was being timed is
+                    # finished once this read completed one, so an open frame after that is a new one
+                    # and its clock starts here.
                     if not decoder.in_frame:
                         frame_opened_at = None  # the frame closed, or none was ever open
-                    elif frame_opened_at is None:
-                        frame_opened_at = time.monotonic()  # this read carried the first byte
+                    elif decoded or frame_opened_at is None:
+                        frame_opened_at = time.monotonic()  # this read carried a frame's first byte
             except OSError as exc:
                 failed = True  # peer reset; nothing to do but drop the connection
                 await self._emit_event("peer_reset", peer_host=peer_host, reason=safe_exc(exc))

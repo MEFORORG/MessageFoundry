@@ -11,6 +11,7 @@ metadata. The runner test proves the injected sink → bounded queue → drain t
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from pathlib import Path
 
 import pytest
@@ -20,7 +21,7 @@ from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Regi
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore
 from messagefoundry.transports import mllp as mllp_mod
-from messagefoundry.transports.mllp import SB, MLLPSource, build_ack, frame
+from messagefoundry.transports.mllp import CR, EB, SB, MLLPSource, build_ack, frame
 from messagefoundry.transports.tcp import TcpSource
 
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
@@ -336,6 +337,19 @@ async def test_runner_writes_connection_events_to_store(tmp_path: Path) -> None:
 # two apart.
 
 
+async def _wait_until_dropped(reader: asyncio.StreamReader, timeout: float = 3.0) -> None:
+    """Wait for the listener to drop us, accepting either spelling of "dropped".
+
+    A clean EOF reads as `b""`. On Windows, closing a socket that still has unread bytes in its
+    receive buffer sends an abortive RST instead of a FIN, which surfaces here as
+    `ConnectionResetError`. A peer that is still writing when the listener closes sits in exactly
+    that window, so asserting `b""` alone makes the test flake on which of the two the OS chose —
+    a detail of the teardown race, not of the bound under test.
+    """
+    with contextlib.suppress(ConnectionResetError):
+        assert await asyncio.wait_for(reader.read(), timeout) == b""
+
+
 async def _trickle(writer: asyncio.StreamWriter, count: int, interval: float) -> None:
     """Open a frame, then feed it one byte at a time — never silent, never finished.
 
@@ -371,7 +385,7 @@ async def test_a_trickling_peer_is_dropped_at_the_frame_deadline() -> None:
         # byte plus the idle bound) and read `idle_timeout`, which a shorter feed would have hidden
         # behind a passing `read()`.
         feeder = asyncio.create_task(_trickle(writer, count=200, interval=0.05))
-        assert await asyncio.wait_for(reader.read(), 3.0) == b""  # dropped -> EOF
+        await _wait_until_dropped(reader)
         feeder.cancel()
         await asyncio.gather(feeder, return_exceptions=True)
         writer.close()
@@ -447,6 +461,68 @@ async def test_a_slow_but_progressing_peer_inside_both_bounds_is_acked() -> None
         # Bound teardown so a listener-stop regression (the #55 Windows Proactor wedge) fails LOUD as a
         # fast timeout instead of silently hanging the shared session loop — mirrors test_connection_resilience.
         await asyncio.wait_for(source.stop(), timeout=5.0)
+
+
+async def test_a_pipelined_sender_gets_a_fresh_deadline_for_each_frame() -> None:
+    """The deadline is PER FRAME, and the single-frame control arm above cannot show it.
+
+    A pipelined sender's reads almost never end on a frame boundary, so `decoder.in_frame` stays True
+    read after read across DIFFERENT frames. A stamp taken only when nothing was being timed would
+    therefore measure every later frame from the FIRST frame's start byte, and drop a healthy feed
+    once per `max_frame_seconds` for as long as it kept the socket busy.
+
+    Here every frame is on the wire for microseconds while the connection stays continuously in-frame
+    for far longer than `max_frame_seconds`, driven by a deliberately slow handler. Both counts are
+    asserted: all frames acknowledged, and no `frame_deadline` anywhere.
+    """
+    cap = _Capture()
+    source = _mllp(receive_timeout=5.0, max_frame_seconds=0.3)
+    source.on_connection_event = cap
+
+    async def _slow_ack(raw: bytes) -> str:
+        await asyncio.sleep(0.01)
+        return build_ack(raw, code="AA")
+
+    await source.start(_slow_ack)
+    count = 40  # 40 chunks at 0.03 s is 1.2 s in-frame, four times max_frame_seconds
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
+        # Every chunk ENDS by opening the next frame, so the decoder is in-frame at the end of every
+        # read no matter how the reads happen to split. Relying on a 4096-byte read landing mid-frame
+        # by luck does not reproduce this: a version of this test that wrote all the frames at once
+        # passed against the defect, because two reads drained the lot and the clock never ran.
+        body = ADT.encode()
+        writer.write(bytes([SB]))
+        await writer.drain()
+        acks = bytearray()
+        try:
+            for _ in range(count):
+                # Slower than the handler, so the listener reads chunk by chunk.
+                await asyncio.sleep(0.03)
+                writer.write(body + bytes([EB, CR]) + bytes([SB]))  # close one frame, open the next
+                await writer.drain()
+        except OSError:
+            # The listener dropped us mid-feed. Fall through to the count assertion, which says what
+            # happened; a raw ConnectionResetError out of the write loop names only the symptom.
+            pass
+        deadline = asyncio.get_event_loop().time() + 5.0
+        while acks.count(b"MSA|AA") < count and asyncio.get_event_loop().time() < deadline:
+            block = await asyncio.wait_for(reader.read(65536), 5.0)
+            if not block:
+                break  # the listener dropped us, which is the regression this test is for
+            acks += block
+        assert acks.count(b"MSA|AA") == count, (
+            f"only {acks.count(b'MSA|AA')} of {count} pipelined frames were acknowledged; the "
+            "connection was dropped mid-feed, so the frame clock is running across frames rather "
+            "than being restarted for each one"
+        )
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        # Bound teardown so a listener-stop regression (the #55 Windows Proactor wedge) fails LOUD as a
+        # fast timeout instead of silently hanging the shared session loop — mirrors test_connection_resilience.
+        await asyncio.wait_for(source.stop(), timeout=5.0)
+    assert "frame_deadline" not in [r for _, _, r in cap.events]
     assert "frame_deadline" not in [r for _, _, r in cap.events]
 
 
