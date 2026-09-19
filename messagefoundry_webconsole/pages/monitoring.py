@@ -321,23 +321,22 @@ def events(
         ]
         for e in rows
     ]
-    if error:
-        # No results table AT ALL, not even its header row: the filter never ran, and an empty table
-        # under the banner reads as the result of the filter the operator typed (BACKLOG #1740).
-        return page(
-            "Events",
-            el("h1", "Events"),
-            _event_filter(connection, kind),
-            el("p", error, class_="banner"),
-            active="events",
-        )
-    empty = el("p", "No events.", class_="muted") if not rows else Markup("")
+    # One page() call with a varying tail, rather than two that have to be kept in step by hand.
+    # On a refusal the tail is the banner ALONE -- no results table, not even its header row: the
+    # filter never ran, so any table under the banner reads as its result (BACKLOG #1740).
+    tail: list[object] = (
+        [el("p", error, class_="banner")]
+        if error
+        else [
+            el("p", "No events.", class_="muted") if not rows else Markup(""),
+            rows_table(headers, body),
+        ]
+    )
     return page(
         "Events",
         el("h1", "Events"),
         _event_filter(connection, kind),
-        empty,
-        rows_table(headers, body),
+        *tail,
         active="events",
     )
 

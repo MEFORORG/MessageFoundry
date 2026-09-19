@@ -117,7 +117,19 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # bad selection must not abort the rest. After the dedupe, so a selection repeated N
             # times is still one row whether it is valid or not.
             # The rule's own sentence is discarded here on purpose -- see _NOT_A_CONNECTION_NAME.
-            if refuse(CONNECTION_RULE, name) is not None:
+            #
+            # Applied ONLY for an actor who is not channel-scoped, and that condition is the whole
+            # point. A channel-scoped actor's attempt on a name outside their scope is a security
+            # event the handler records through its own guard, and refusing here returns before it.
+            # MEASURED: a well-formed out-of-scope name writes one auth.channel_denied row naming
+            # the actor; with this check unconditional, a MALFORMED one wrote none -- so sending a
+            # bad name deleted your own security event. That is the defect purge-confirm's
+            # unannotated `dest` exists to avoid, and it must not come back in here.
+            #
+            # Nothing unvalidated reaches anything dangerous on that path: a scope holds only names
+            # that pass the rule, so a malformed name can never be in scope, and the handler denies
+            # and audits it before any store query.
+            if identity.allowed_channels is None and refuse(CONNECTION_RULE, name) is not None:
                 outcomes.append((None, _NOT_A_CONNECTION_NAME))
                 continue
             try:
@@ -250,8 +262,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             seen_dest.add(value)
             # BACKLOG #1740, same shape as ui_bulk_control above. It also stops an unvetted body
             # value reaching the result table, which the raw append below used to put there.
-            # The rule's own sentence is discarded here too -- see _NOT_A_CONNECTION_NAME.
-            if refuse(CONNECTION_RULE, value) is not None:
+            # Same shape and the same channel-scope carve-out as ui_bulk_control above.
+            if identity.allowed_channels is None and refuse(CONNECTION_RULE, value) is not None:
                 outcomes.append((None, _NOT_A_CONNECTION_NAME))
                 continue
             try:

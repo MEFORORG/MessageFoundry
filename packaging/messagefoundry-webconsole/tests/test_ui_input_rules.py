@@ -20,6 +20,7 @@ longer running -- deleting a ``check_filters`` call leaves the golden green.
 
 from __future__ import annotations
 
+import re
 from collections.abc import AsyncIterator
 
 import httpx
@@ -86,6 +87,19 @@ def test_each_rule_refuses_something_and_accepts_something() -> None:
         assert rule.adapter.validate_python(good) == good
         with pytest.raises(ValueError):
             rule.adapter.validate_python(bad)
+
+
+async def _channel_denials(engine: Engine) -> list[str]:
+    """The actor of every channel-scope denial recorded so far, in order.
+
+    Named exactly rather than matched on a ``denied`` suffix, so a step-up or permission denial on
+    the same request cannot stand in for the channel decision a test is measuring.
+    """
+    return [
+        r["actor"] or ""
+        for r in await engine.store.list_audit(limit=500)
+        if r["action"] == "auth.channel_denied"
+    ]
 
 
 # --- the message log --------------------------------------------------------------------------
@@ -364,8 +378,7 @@ async def test_a_blank_connection_box_does_not_deny_a_channel_scoped_operator(
         await cookie_login(c, "scoped")
         assert (await c.get("/ui/events")).status_code == 200  # control: no query at all
         assert (await c.get("/ui/events", params={"connection": "", "kind": ""})).status_code == 200
-    denied = [r for r in await engine.store.list_audit(limit=200) if r["action"].endswith("denied")]
-    assert denied == [], f"the filter form wrote a false denial row: {denied}"
+    assert await _channel_denials(engine) == [], "the filter form wrote a false denial row"
 
 
 @pytest.mark.parametrize(
@@ -432,5 +445,82 @@ async def test_purge_confirm_still_audits_a_channel_scoped_attempt_with_a_bad_de
         await cookie_login(c, "scoped")
         r = await c.get("/ui/connections/purge-confirm", params={"dest": BAD_NAME})
         assert r.status_code == 403
-    denied = [r for r in await engine.store.list_audit(limit=200) if r["action"].endswith("denied")]
-    assert len(denied) == 1, f"the attempt must still be audited: {denied}"
+    # The exact action and actor, not a count over a "denied" suffix: a step-up or permission
+    # denial on the same request would also write one *_denied row, and a count could not tell the
+    # two apart -- it would go green for a route that had stopped auditing the channel decision.
+    assert await _channel_denials(engine) == ["scoped"]
+
+
+async def test_the_bulk_routes_still_audit_a_channel_scoped_attempt(engine: Engine) -> None:
+    """The name rule must not become a way to delete your own security event.
+
+    MEASURED while the refusal was unconditional: a channel-scoped operator naming a well-formed
+    connection outside their scope wrote one ``auth.channel_denied`` row, and naming a MALFORMED one
+    wrote none -- the console refused first and the handler's guard never ran. Both bulk routes now
+    apply the rule only for an actor whose attempt would not have been audited anyway.
+    """
+    from messagefoundry_webconsole.pages.connections import _b64url
+
+    service = await auth_service(engine)
+    user_id = await provision(service, "scoped", [Role.OPERATOR.value])
+    await service.set_channel_scope(user_id, ["ch1"], actor="test")
+    async with ui_client(engine, service) as c:
+        await cookie_login(c, "scoped")
+        sel = f"source|{_b64url(BAD_NAME)}|{_b64url('')}"
+        r = await c.post(
+            "/ui/connections/bulk-control",
+            data={"action": "start", "sel": sel},
+            headers=SAME_ORIGIN,
+        )
+        assert r.status_code == 200
+        r = await c.post(
+            "/ui/connections/purge-bulk",
+            data={"scope": "all", "dest": BAD_NAME},
+            headers=SAME_ORIGIN,
+        )
+        assert r.status_code == 200
+    assert await _channel_denials(engine) == ["scoped", "scoped"]
+
+
+async def test_an_unscoped_operator_still_gets_the_name_refusal_on_the_bulk_routes(
+    admin: httpx.AsyncClient,
+) -> None:
+    """The other half of the carve-out above, so it cannot be read as "the rule was removed".
+
+    An actor holding the whole estate has no channel decision to audit, so the rule still applies
+    and a malformed name is still an outcome row rather than a request to the handler.
+    """
+    from messagefoundry_webconsole.pages.connections import _b64url
+
+    sel = f"source|{_b64url(BAD_NAME)}|{_b64url('')}"
+    r = await admin.post(
+        "/ui/connections/bulk-control",
+        data={"action": "start", "sel": sel},
+        headers=SAME_ORIGIN,
+    )
+    assert r.status_code == 200
+    assert "not applied: not a valid connection name" in r.text
+
+
+def test_for_echo_strips_exactly_what_the_printable_rule_refuses() -> None:
+    """The stripper and the rule must agree over the whole range, character by character.
+
+    ``for_echo`` spells the control range as a comparison while ``api/validation.py`` spells it as a
+    regex character class -- two statements of one rule, which is the drift this change otherwise
+    works to avoid. Nothing catches a divergence by accident, because every other test here uses
+    characters the two copies already agree on. This walks all of them.
+    """
+    from messagefoundry.api.validation import PRINTABLE_TEXT_PATTERN
+    from messagefoundry_webconsole.routes._common import for_echo
+
+    printable = re.compile(PRINTABLE_TEXT_PATTERN)
+    for code in range(0x00, 0x100):
+        char = chr(code)
+        refused_by_rule = printable.fullmatch(char) is None
+        stripped_by_echo = for_echo(char) == ""
+        assert refused_by_rule == stripped_by_echo, (
+            f"U+{code:04X}: the rule refuses it = {refused_by_rule}, "
+            f"for_echo strips it = {stripped_by_echo}"
+        )
+    # The control: the walk must have found characters on BOTH sides, or it proves nothing.
+    assert for_echo("\x00abc\x7f") == "abc"

@@ -138,7 +138,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             if exc.status_code == 400:  # make_spec rejected the criteria — re-render the form
                 return HTMLResponse(
                     pages.message_search(
-                        None, error=str(exc.detail), presets=preset_list, **shared
+                        # for_echo on the DETAIL too: it is engine-formatted text built from the
+                        # values the caller sent, so it is another way an input byte reaches the
+                        # page. el() escapes markup and passes control characters straight through.
+                        None,
+                        error=for_echo(str(exc.detail)),
+                        presets=preset_list,
+                        **shared,
                     ),
                     status_code=400,
                 )
@@ -294,7 +300,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         except HTTPException as exc:
             preset_list = await _presets(engine, identity, request)
             return HTMLResponse(
-                pages.message_search(None, error=str(exc.detail), presets=preset_list),
+                pages.message_search(None, error=for_echo(str(exc.detail)), presets=preset_list),
                 status_code=exc.status_code,
             )
         except ValueError:  # pydantic: an empty name, or a criterion that breaks its input rule
@@ -364,7 +370,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         except HTTPException as exc:
             if exc.status_code in (400, 404):
                 return HTMLResponse(
-                    pages.message_search(None, error=str(exc.detail), presets=preset_list),
+                    # for_echo: the layered 404 detail quotes the preset id the caller sent.
+                    pages.message_search(
+                        None, error=for_echo(str(exc.detail)), presets=preset_list
+                    ),
                     status_code=exc.status_code,
                 )
             raise

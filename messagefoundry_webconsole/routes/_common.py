@@ -145,9 +145,11 @@ def refuse(rule: FilterRule, value: object) -> str | None:
     request body, so there is no FastAPI parameter to annotate, and they are capture-and-continue
     batches that need a verdict per item rather than a short-circuit.
 
-    ``value`` is ``object`` rather than ``str`` so the field-wise caller below can hand over an echo
-    dict's value without a cast. Nothing is skipped for being the wrong type: a non-string is handed
-    to the rule and refused by it, the same as a bad string.
+    ``value`` is ``object`` rather than ``str`` so the field-wise caller below can hand over a
+    values mapping without a cast. Nothing is SKIPPED for being the wrong type -- whatever arrives is
+    handed to the rule. What the rule then does with it is pydantic's lax-mode answer and not a type
+    guarantee: ``bytes`` that decode to a legal name are accepted, for instance. No caller passes
+    anything but ``str | None`` today; read this as "nothing is silently dropped", not as a cast.
     """
     try:
         rule.adapter.validate_python(value)

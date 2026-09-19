@@ -244,6 +244,12 @@ def _rule_names_by_constraint() -> dict[tuple[str | None, int | None], str]:
     ``event kind`` are distinct rules over one annotated type today, so an annotated parameter
     carrying that constraint honestly reads ``event kind|status``. Picking a winner would put an
     arbitrary tie-break inside a table whose whole job is to be checkable.
+
+    The join covers only rules ``routes/_common`` OWNS. ``api/validation.py`` ships others that share
+    a constraint with these -- ``ActorFilter`` and ``IdempotencyKey`` are both printable-256, like
+    ``control id`` -- so a /ui parameter annotated with one of THOSE would be reported here under the
+    console's name for that constraint. No such parameter exists today. Widen this index before
+    annotating a /ui parameter with a rule the console does not name.
     """
     index: dict[tuple[str | None, int | None], list[str]] = {}
     for rule in ui_common.FILTER_RULES:

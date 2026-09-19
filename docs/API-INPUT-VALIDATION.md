@@ -131,7 +131,7 @@ A refusal takes one of two shapes, and which one depends on who produced the val
 | Where the value comes from | Shape |
 |---|---|
 | A filter form an operator types into (the message log, content search, the event log) | 400, and the page re-renders with the reason and what they typed |
-| A path segment, link or checkbox the console itself minted (the dead-letter filters, the per-name start/stop/restart, the purge pages) | 422, the same answer the engine API gives |
+| A path segment or link the console itself minted (the dead-letter filters, the five per-name connection routes) | 422, the same answer the engine API gives |
 | A name list in a bulk POST body (bulk control, bulk purge) | The batch continues and the refused selection gets its own outcome row |
 
 **Two console values share a name with a rule here and are not that rule.** The console's
@@ -139,11 +139,20 @@ A refusal takes one of two shapes, and which one depends on who produced the val
 numbers the engine API takes. The console parses each one and then applies this page's time-bound
 rule to the result, so the two surfaces refuse the same instants by different routes.
 
-**Other console parameters still carry a length bound and no rule.** The golden table lists every one
-of them, marked `-`. They include at least the uploaded-log filters and resend target, the
-dead-letter replay path segments, the connection detail and flag routes, and the engine-minted ids on
-`/ui` paths. Closing those is separate work, and the table is what makes each one visible: read it
-rather than this paragraph for the current set.
+**Two console parameters carry no rule on purpose, and it is an audit control that decides it.** The
+bulk purge confirm page's `dest`, and the name in each of the two bulk POST bodies. FastAPI checks a
+parameter before the handler runs, so a refusal there would return before the handler writes the row
+that records a channel-scoped operator reaching for a connection outside their scope — measured, a
+well-formed out-of-scope name writes that row and a malformed one wrote none, which means sending a
+bad name would delete your own security event. Nothing is lost: the confirm page already narrows
+`dest` to the live, quiesced outbound connections, and the two bulk bodies apply the rule for
+operators whose attempt would not have been audited anyway.
+
+**Other console parameters carry a length bound, or nothing, and no rule.** The golden table lists
+every one of them, marked `-`. They include at least the uploaded-log filters and resend target, the
+dead-letter replay path segments, the layered-search preset ids, and the engine-minted ids on `/ui`
+paths. Closing those is separate work, and the table is what makes each one visible: read it rather
+than this paragraph for the current set.
 
 **Several hundred response fields carry no rule, and they should not.** A response field is something
 the engine emits, not something you send. It is not an input, so an unbounded response field is not a
