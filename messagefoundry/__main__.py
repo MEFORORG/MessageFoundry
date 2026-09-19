@@ -293,7 +293,10 @@ def main(argv: list[str] | None = None) -> int:
         "open clarifications (Secure Development Standards section 5)",
     )
     adr_analyze.add_argument(
-        "--adr-dir", default="docs/adr", help="ADR directory (default: docs/adr)"
+        "--adr-dir",
+        default="docs/adr",
+        help="ADR directory (default: docs/adr). Exits 2, with or without --strict, if it is "
+        "missing, is not a directory, or holds no ADR",
     )
     adr_analyze.add_argument(
         "--repo-root",
@@ -5368,13 +5371,35 @@ def _check(args: argparse.Namespace) -> int:
 def _adr_analyze(args: argparse.Namespace) -> int:
     """Advisory spec-driven ADR coverage (Secure Development Standards §5). Reports acceptance-
     criteria→test link coverage, Accepted ADRs missing criteria, and open ``- [ ]`` clarifications.
-    Exits 0 unless ``--strict`` and a linked test/fixture is missing — no new blocking gate by default."""
+
+    Two exit codes, and which one a condition gets is the point of the split. A *finding* is
+    advisory: a missing linked test/fixture exits 0, or 1 under ``--strict``. An *absent corpus* —
+    :attr:`~messagefoundry.adr_analyze.AnalysisResult.error`, defined at
+    :func:`~messagefoundry.adr_analyze.analyze_adrs` — exits **2 with or without ``--strict``**,
+    because the analyzer never ran. 2 and not 1 keeps "could not start" apart from "ran and
+    reported a problem", the same split :func:`_emit_store_open_error` spends 2 on; and not 0
+    because this subcommand is otherwise unfailable by default, so a withdrawn ADR set would
+    silently turn a failing report into a passing one.
+
+    That split is between this command's own codes. It does **not** separate 2 from argparse's own
+    usage-error 2, so a caller that must tell a withdrawn corpus from a mistyped flag has to read
+    the output, not the code. Every subcommand here inherits that, ``--json`` disambiguates it, and
+    widening it was not worth a third code."""
     from messagefoundry.adr_analyze import analyze_adrs
 
     result = analyze_adrs(args.adr_dir, repo_root=args.repo_root)
     if args.json:
         _print_json(result.to_json(), compact=True)
-    else:
+    if result.error is not None:
+        # JSON on stdout XOR the human line on stderr. Emitting both would reorder under `2>&1`: a
+        # piped stdout is block-buffered and stderr is not, so the error line would land ahead of
+        # the JSON and break the parse it was meant to protect. The JSON body is the full report
+        # with `error` inside it, and so is NOT _emit_store_open_error's bare {"error": ...}: `ok`
+        # has to stay readable for a consumer that branches on it and nothing else.
+        if not args.json:
+            print(f"error: {result.error}", file=sys.stderr)  # not _safe_print; see its docstring
+        return 2
+    if not args.json:
         with_criteria = sum(1 for r in result.reports if r.has_criteria)
         _safe_print(
             f"ADRs analyzed: {len(result.reports)} ({with_criteria} with acceptance criteria)"
@@ -5938,7 +5963,13 @@ def _security(args: argparse.Namespace) -> int:
 
 def _safe_print(line: str) -> None:
     """Print a line, re-encoding to stdout's codec with replacement so a non-cp1252 character (an
-    ADR's em-dash or ``≥``) never crashes the human output on a legacy Windows console."""
+    ADR's em-dash or ``≥``) never crashes the human output on a legacy Windows console.
+
+    STDOUT ONLY, AND DO NOT EXTEND IT TO STDERR. ``sys.stdout`` carries ``surrogateescape``, which
+    still raises on an unencodable codepoint; ``sys.stderr`` carries ``backslashreplace`` and never
+    raises. So stderr needs no protection, and routing an error line through this would be a
+    downgrade: it would blank a character stderr prints as a readable escape, handing an operator a
+    path they cannot paste back. ``tests/test_cp1252_console_safety.py`` measures that asymmetry."""
     enc = getattr(sys.stdout, "encoding", None) or "utf-8"
     sys.stdout.write(line.encode(enc, "replace").decode(enc) + "\n")
 
