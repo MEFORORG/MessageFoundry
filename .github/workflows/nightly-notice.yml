@@ -34,6 +34,35 @@ name: Nightly failure notice
 # with no report reads exactly like a day with nothing to report. That is a detector whose failure
 # hides itself, which is one level worse than the defect it was built to catch.
 #
+# `Required workflow state` WAS ADDED FOR BACKLOG #1450, AND IT IS THE SAME SHAPE ONE STEP FURTHER IN.
+# Both of its jobs reconcile the repository against BRANCH PROTECTION, which no in-repo test can read:
+# `reachable` asks whether a required context can ever report, `accurate` asks whether
+# `.github/required-contexts.txt` still matches the live required set. Neither is a required context,
+# deliberately -- `accurate` reads the API, and requiring it would put every merge behind that call --
+# so before this entry their 07:00 UTC cron could go red with nothing carrying it. The detector had
+# already caught a real drift and reported to nobody; the missing half was alerting, never detection,
+# which is why this is a watch-list entry and not a second detector. The incident is recorded once, in
+# `scripts/ci/check_required_contexts_drift.py`'s docstring.
+#
+# THE WATCH LIST IS HAND-MAINTAINED AND HAS NO COVERAGE GUARD, WHICH IS THE NEXT DEFECT, NOT THIS ONE.
+# `failure-signal.yml` solves the same problem for itself with a machine-parsed `not-watched: <file> --
+# <reason>` register that `tests/test_failure_signal.py` enforces in both directions, so a workflow
+# nobody thought about cannot look like one deliberately excluded. This file has only the forward half:
+# `tests/test_nightly_notice.py` checks that every watched name resolves and has a cron, and nothing
+# checks the reverse. Several scheduled workflows here are unwatched, and some of those carry no
+# `pull_request` or `push` arm at all -- the same structural shape that justified DAST above. Some are
+# deliberate non-targets; today nothing says which, and that is the gap. Neither a count nor a list of
+# names is written here on purpose: both would be checked-in claims nothing re-measures, which is the
+# defect this whole file exists to end. Measure it instead -- every `schedule:` trigger is
+# `git grep -l "^  schedule:" .github/workflows`, and the watch list is the `workflows:` line below.
+# Porting the register is a filed follow-up, unallocated.
+#
+# AT LEAST ONE CLAIM THIS ENTRY FALSIFIES IS LEFT STANDING ON PURPOSE. `.github/required-contexts.txt`
+# still says nothing watches this cron and that giving its red a consumer is "still not done", in more
+# than one sentence. The script and `docs/CI.md` were corrected alongside this entry; that register was
+# not, and it is not enumerated here because an enumeration is the thing that goes quietly wrong.
+# `git grep -n "still not done" .github/required-contexts.txt` is the whole census.
+#
 # A WATCHED WORKFLOW MUST HAVE A `schedule:` TRIGGER. The job below fires only when the completed
 # run's event was `schedule`, so watching a workflow with no cron adds a name that can never match:
 # dead config that reads as coverage. `tests/test_nightly_notice.py` pins this for every watched name.
@@ -49,7 +78,7 @@ name: Nightly failure notice
 # every input arrives through `env:` and nothing here interpolates `${{ }}` into the script.
 on:
   workflow_run:
-    workflows: ["CI", "Security", "DAST", "Stalled PRs"]
+    workflows: ["CI", "Security", "DAST", "Stalled PRs", "Required workflow state"]
     types: [completed]
 
 # Read-only by default; the one job that writes escalates to `issues: write` and nothing else.
@@ -116,17 +145,71 @@ jobs:
             exit 0
           fi
 
+          # WHAT THIS RED HIDES, FOR THE WORKFLOW THAT ACTUALLY FAILED AND NO OTHER. This used to be one
+          # static paragraph naming CI, Security and DAST, sent verbatim to the reader of all five --
+          # so a Stalled PRs issue explained the server-DB store legs and named nothing about itself. A
+          # body that explains four workflows to the reader of one is how an alert stops being read.
+          #
+          # AN UNMATCHED NAME GETS NOTHING, deliberately. `*)` stays empty rather than guessing: a
+          # generic sentence here would be the same defect with one more indirection, and
+          # tests/test_nightly_notice.py asserts from the other side that a DAST issue carries no other
+          # arm's text.
+          #
+          # THE ARM LABELS ARE WORKFLOW NAMES AND ARE LOAD-BEARING. `workflow_run` matches on `name:`,
+          # so renaming a watched workflow detaches its arm silently -- the arm simply stops matching
+          # and the issue ships with no detail. `test_every_case_arm_names_a_watched_workflow` reds on
+          # that rather than letting it go quiet.
+          # EACH ARM IS A WHOLE PARAGRAPH, NOT A SENTENCE FRAGMENT. An earlier draft ended the line
+          # above with "Here that covers" and let each arm complete it, which reads as a truncated
+          # sentence for any workflow the `case` does not match -- and `*)` matching is exactly the
+          # state a sixth watch-list entry starts in. An empty DETAIL must degrade to a blank line.
+          DETAIL=""
+          case "$WF_NAME" in
+            "CI")
+              DETAIL="Here that covers the server-DB store, load/throughput and service-smoke legs
+          that the three required \`test\` legs skip."
+              ;;
+            "Security")
+              DETAIL="Here that covers the daily dependency audits and the released-line audit, whose
+          subject is a published release that no pull request can change."
+              ;;
+            "DAST")
+              DETAIL="Here that covers the entire workflow, which carries no \`pull_request\` trigger
+          by design."
+              ;;
+            "Stalled PRs")
+              DETAIL="Here that covers the daily sweep for pull requests that went green and can no
+          longer merge. A day with no report reads exactly like a day with nothing to report, so a red
+          here means the sweep itself did not run."
+              ;;
+            "Required workflow state")
+              # BOTH JOBS, because this fires on the RUN's conclusion and cannot tell them apart.
+              # Naming only the drift half would hand a red \`reachable\` a remedy that does not fix it
+              # and forbid the one that would -- the misdirection this workflow exists to avoid.
+              DETAIL="Here that covers one of two branch-protection reconciles, which read a server
+          setting no in-repo test can see. READ THE FAILING JOB; the remedies are different and only
+          one of them is a repository edit.
+
+          - \`the required-contexts file matches the server\` failed: the checked-in
+            \`.github/required-contexts.txt\` no longer matches branch protection. Mirror the SERVER
+            into that file and the prose it names. Do NOT edit branch protection to match the file --
+            that is the owner's decision, and a required context that never reports wedges every pull
+            request in the repository rather than failing one.
+          - \`required contexts belong to active workflows\` failed: a required context's workflow
+            cannot report at all -- typically disabled on the server, renamed, or deleted. No edit to
+            the register fixes that. Re-enable or restore the workflow, or ask the owner to drop the
+            context; both halves are owner decisions."
+              ;;
+          esac
+
           BODY="Nightly (scheduled) $WF_NAME failed.
 
           - run: $RUN_URL
           - commit: \`$HEAD_SHA\`
           - started: $RUN_STARTED
 
-          A scheduled run is not a PR context, so this failure appears nowhere else. For CI that is the
-          server-DB store, load/throughput and service-smoke legs the three required \`test\` legs skip;
-          for Security it is the daily dependency audits and the released-line audit, whose subject is a
-          published release that no pull request can change; for DAST it is the entire workflow, which
-          carries no \`pull_request\` trigger by design.
+          A scheduled run is not a PR context, so this failure appears nowhere else.
+          $DETAIL
 
           This issue is opened once and commented on each subsequent failure; it closes itself when a
           nightly goes green again."
