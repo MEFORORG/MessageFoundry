@@ -33,12 +33,14 @@ from messagefoundry_webconsole.pages.messages import (
     RESEND_TAIL_WARNING,
     message_detail,
     message_resend_confirm,
+    message_resend_done,
 )
 from messagefoundry_webconsole.routes.core import (
-    RESEND_BLOCKED_CODE,
+    _RESEND_NAME_MAX,
     RESEND_BLOCKED_NOTICE,
-    RESEND_DENIED_CODE,
-    RESEND_FAILED_CODE,
+    RESEND_DENIED_NOTICE,
+    RESEND_MALFORMED_NOTICE,
+    RESEND_MISSING_NOTICE,
 )
 
 PW = "a-strong-test-passphrase"
@@ -121,14 +123,17 @@ def test_a_message_with_no_delivery_is_explained_not_offered_a_form() -> None:
     assert "/ui/messages/m1/resend-confirm" not in html
 
 
-def test_the_detail_page_renders_a_refusal_banner_when_given_one() -> None:
-    """The banner text is module-fixed and passed in by the route; nothing caller-supplied reaches it."""
-    html = str(message_detail(_detail("archive"), error=RESEND_BLOCKED_NOTICE))
+def test_the_confirm_page_renders_a_refusal_banner_when_given_one() -> None:
+    """A refusal is answered ON THIS PAGE, not by a redirect. The banner text is module-fixed and
+    passed in by the route; nothing caller-supplied reaches it."""
+    html = str(message_resend_confirm("m1", "OB2", "archive", "k1", error=RESEND_BLOCKED_NOTICE))
     assert "nothing was queued" in html
     assert '<p class="banner">' in html
-    # NEGATIVE CONTROL: the banner is absent with no error, so the assertion above is about the
-    # argument rather than about something the page always renders.
-    assert 'class="banner"' not in str(message_detail(_detail("archive")))
+    # NEGATIVE CONTROL: with no error, the only banner is the tail warning -- so the assertion above
+    # is about the argument rather than about something the page always renders.
+    clean = str(message_resend_confirm("m1", "OB2", "archive", "k1"))
+    assert clean.count('class="banner"') == 1
+    assert "nothing was queued" not in clean
 
 
 # --- the confirm page ------------------------------------------------------------------------------
@@ -169,6 +174,33 @@ def test_the_confirm_page_post_is_body_less() -> None:
     # The page chrome carries a sign-out form of its own, so isolate THIS form by its action.
     form = html.split(action, 1)[1].split("</form>", 1)[0]
     assert "<input" not in form
+
+
+def test_the_outcome_page_words_a_duplicate_apart_from_a_send() -> None:
+    """ADR 0090 section 4's ``duplicate`` queued NOTHING. Reporting it as a send is the same lie as
+    answering a refusal with the success response."""
+    sent = str(message_resend_done("m1", "OB2", "archive", duplicate=False))
+    dup = str(message_resend_done("m1", "OB2", "archive", duplicate=True))
+    assert "Resend queued" in sent and "nothing new was queued" not in sent
+    assert "Already resent" in dup and "nothing new was queued" in dup
+    assert "Resend queued" not in dup
+
+
+def test_the_outcome_page_carries_the_tail_warning_too() -> None:
+    """The operator sees it when they decide AND when it lands. The confirm page's copy is read before
+    the act; this one is what they still have in front of them if a delivery arrives out of order."""
+    assert str(text(RESEND_TAIL_WARNING)) in str(
+        message_resend_done("m1", "OB2", "archive", duplicate=False)
+    )
+
+
+def test_the_outcome_page_leaves_by_link_not_by_redirect() -> None:
+    """Both ways out are anchors. A 303 to the message detail page would need ``messages:view_raw``,
+    which a resend-only role does not hold -- the measured defect this page replaced. A link that
+    role cannot follow is merely a link it does not click."""
+    html = str(message_resend_done("m1", "OB2", "archive", duplicate=False))
+    assert '<a href="/ui/messages/m1" class="btn-link">' in html
+    assert '<a href="/ui/messages" class="btn-link">' in html
 
 
 def test_the_confirm_page_holds_a_crafted_id_inside_its_path_segment() -> None:
@@ -287,9 +319,10 @@ async def test_the_console_resend_queues_a_delivery_and_audits_it(
         assert "idempotency_key=" in confirm.text
 
         r = await _post_resend(c, mid)
-        assert r.status_code == 303
-        # A BARE detail URL: success and refusal must not answer identically (see the next test).
-        assert r.headers["location"] == f"/ui/messages/{mid}"
+        assert r.status_code == 200
+        assert "Resend queued" in r.text
+        assert "queued to “OB2”" in r.text
+        assert str(text(RESEND_TAIL_WARNING)) in r.text
 
     rows = [a for a in await engine.store.list_audit() if a["action"] == "message_resend"]
     assert len(rows) == 1
@@ -298,10 +331,16 @@ async def test_the_console_resend_queues_a_delivery_and_audits_it(
     assert "DOE^JANE" not in detail_json and "MSH|" not in detail_json
 
 
-async def test_a_repeat_under_the_same_key_is_a_no_op(engine: Engine, tmp_path: Path) -> None:
+async def test_a_repeat_under_the_same_key_says_so_instead_of_claiming_a_send(
+    engine: Engine, tmp_path: Path
+) -> None:
     """ADR 0090 section 4: the key makes a retry a no-op, and the console carries a per-RENDER key so a
-    double-submit of one confirm page cannot double-deliver. Observed through the audit, which the
-    endpoint writes only on a real ``resent``."""
+    double-submit of one confirm page cannot double-deliver.
+
+    THE SECOND ANSWER MUST NOT READ LIKE THE FIRST. Both used to be a bare 303 to the same URL, so an
+    operator who refreshed was told twice that a delivery was queued when the second queued nothing --
+    the same lie this module refuses to tell on a refusal. The audit is the control: the endpoint
+    writes a row only on a real ``resent``."""
     engine.add_registry(_registry(tmp_path))
     await engine.start()
     service = await _service(engine)
@@ -309,23 +348,52 @@ async def test_a_repeat_under_the_same_key_is_a_no_op(engine: Engine, tmp_path: 
     mid = await _seed(engine)
     async with _client(engine, service) as c:
         await _login(c, "op")
-        assert (await _post_resend(c, mid)).status_code == 303
-        assert (await _post_resend(c, mid)).status_code == 303  # same key: duplicate, not a send
+        first = await _post_resend(c, mid)
+        assert first.status_code == 200 and "Resend queued" in first.text
+        second = await _post_resend(c, mid)  # same key
+        assert second.status_code == 200
+        assert "Already resent" in second.text
+        assert "nothing new was queued" in second.text
+        assert "Resend queued" not in second.text
     rows = [a for a in await engine.store.list_audit() if a["action"] == "message_resend"]
     assert len(rows) == 1
 
 
-async def test_an_unknown_message_is_refused_with_an_allow_listed_code(engine: Engine) -> None:
-    """A refusal must NOT answer with the success response. It lands on the detail page carrying one
-    fixed code, and the detail page renders that code's fixed text -- the caller's own outbound name
-    and the engine's quoting ``detail`` travel nowhere."""
+async def test_an_unknown_message_is_refused_in_place_with_fixed_text(engine: Engine) -> None:
+    """A refusal must NOT answer with the success response, and must not need a permission the
+    resending role may lack. It re-renders the confirm page at 400 carrying one module-fixed notice;
+    the caller's own outbound name and the engine's quoting ``detail`` travel nowhere."""
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR.value)
     async with _client(engine, service) as c:
         await _login(c, "op")
         r = await _post_resend(c, "no-such-message")
-        assert r.status_code == 303
-        assert r.headers["location"] == f"/ui/messages/no-such-message?e={RESEND_FAILED_CODE}"
+        assert r.status_code == 400
+        assert str(text(RESEND_MISSING_NOTICE)) in r.text
+        assert "Resend queued" not in r.text
+        # The retry is offered with a FRESH key, so it is not mistaken for a duplicate.
+        assert "idempotency_key=k1" not in r.text
+
+
+async def test_a_malformed_name_is_not_reported_as_a_missing_connection(engine: Engine) -> None:
+    """Nothing was looked up: the value failed the connection-name rule before any store or registry
+    read. Reusing the 404 text would send the operator hunting on /ui/connections for a connection
+    whose real problem is that the name could not name one."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR.value)
+    mid = await _seed(engine)
+    async with _client(engine, service) as c:
+        await _login(c, "op")
+        # URL-safe, so it reaches the route intact, and rejected by CONNECTION_NAME_PATTERN, which
+        # requires a leading LETTER. A value with a space would never have got past the request line.
+        r = await _post_resend(c, mid, to="9nosuchprefix")
+        assert r.status_code == 400
+        assert str(text(RESEND_MALFORMED_NOTICE)) in r.text
+        assert str(text(RESEND_MISSING_NOTICE)) not in r.text
+        # The operator's own typo IS shown back -- that is the page they are standing on, and seeing
+        # it is how they spot the mistake. What must not appear is a pydantic structured echo or the
+        # engine's quoting `detail`, which is where a value other than their own could come from.
+        assert '"input"' not in r.text and "string_pattern_mismatch" not in r.text
 
 
 async def test_a_denied_target_is_reported_as_denied_rather_than_missing(engine: Engine) -> None:
@@ -338,8 +406,9 @@ async def test_a_denied_target_is_reported_as_denied_rather_than_missing(engine:
     async with _client(engine, service) as c:
         await _login(c, "op")
         r = await _post_resend(c, mid, to="OB2")
-        assert r.status_code == 303
-        assert r.headers["location"] == f"/ui/messages/{mid}?e={RESEND_DENIED_CODE}"
+        assert r.status_code == 400
+        assert str(text(RESEND_DENIED_NOTICE)) in r.text
+        assert str(text(RESEND_MISSING_NOTICE)) not in r.text
 
 
 async def test_a_target_that_cannot_take_a_delivery_is_reported_as_blocked(
@@ -347,7 +416,7 @@ async def test_a_target_that_cannot_take_a_delivery_is_reported_as_blocked(
 ) -> None:
     """The engine is deliberately NOT started, so OB2 is REGISTERED but not running -- ADR 0090 section
     7's silent-drop guard. It is one of several engine refusals that arrive as 409, which is why the
-    notice names the causes without claiming which one fired."""
+    notice names common causes without claiming the list is closed."""
     engine.add_registry(_registry(tmp_path))
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR.value)
@@ -355,25 +424,18 @@ async def test_a_target_that_cannot_take_a_delivery_is_reported_as_blocked(
     async with _client(engine, service) as c:
         await _login(c, "op")
         r = await _post_resend(c, mid, to="OB2")
-        assert r.status_code == 303
-        assert r.headers["location"] == f"/ui/messages/{mid}?e={RESEND_BLOCKED_CODE}"
-        banner = await c.get(f"/ui/messages/{mid}?e={RESEND_BLOCKED_CODE}")
-        assert RESEND_BLOCKED_NOTICE in banner.text
+        assert r.status_code == 400
+        assert str(text(RESEND_BLOCKED_NOTICE)) in r.text
 
 
-async def test_an_unrecognised_code_renders_no_banner_rather_than_being_echoed(
-    engine: Engine,
-) -> None:
-    """``e`` is COMPARED against the allow-list, never rendered."""
-    service = await _service(engine)
-    await _add(service, "op", Role.OPERATOR.value)
-    mid = await _seed(engine)
-    async with _client(engine, service) as c:
-        await _login(c, "op")
-        r = await c.get(f"/ui/messages/{mid}?e=%3Cscript%3E")
-        assert r.status_code == 200
-        assert "<script>" not in r.text and "&lt;script&gt;" not in r.text
-        assert 'class="banner"' not in r.text
+def test_the_409_notice_makes_no_completeness_claim() -> None:
+    """CLAUDE.md section 11 / SDS-3.6. Several distinct engine refusals arrive as one 409 and this
+    module cannot tell them apart, so the notice must not read as a closed list -- it already missed
+    ``ResendKeyConflict`` once, and an operator who checks every named cause and finds nothing wrong
+    is worse off than one told the list is partial."""
+    assert "Common causes" in RESEND_BLOCKED_NOTICE
+    for closed in ("the cause is", "either", "must be", "only"):
+        assert closed not in RESEND_BLOCKED_NOTICE.lower()
 
 
 async def test_the_resend_lane_stands_on_messages_resend_alone(engine: Engine) -> None:
@@ -407,6 +469,13 @@ async def test_the_resend_lane_stands_on_messages_resend_alone(engine: Engine) -
         assert str(text(RESEND_TAIL_WARNING)) in ok.text
         # Same session, same message: the raw-body page IS refused.
         assert (await c.get(f"/ui/messages/{mid}")).status_code == 403
+        # AND THE OUTCOME STILL REACHES THIS ROLE. Redirecting to that 403 page was the measured
+        # defect the in-place answer fixes: every outcome, success and refusal alike, arrived as raw
+        # JSON this operator could not read. No registry here, so the POST refuses -- legibly.
+        refused = await _post_resend(c, mid, to="OB2")
+        assert refused.status_code == 400
+        assert str(text(RESEND_MISSING_NOTICE)) in refused.text
+        assert "forbidden" not in refused.text
     # Nothing read the message. The refused detail GET above cannot have written one either, so this
     # covers the confirm page specifically.
     assert not [a for a in await engine.store.list_audit() if a["action"] == "message_view"]
@@ -437,3 +506,41 @@ async def test_a_stale_step_up_reopens_the_confirm_page_with_the_selection(engin
         params = dict(parse_qsl(urlsplit(nxt).query))
         assert params == {"to": "OB2", "source": "archive"}
         assert "idempotency_key" not in nxt
+
+
+async def test_the_longest_accepted_names_still_fit_the_reauth_continuation(
+    engine: Engine,
+) -> None:
+    """THE BOUND THAT MADE THIS ROUTE'S OWN LIMITS DISAGREE WITH THE RE-AUTH PAGE'S.
+
+    ``_reauth_redirect`` packs the whole continuation into ``GET /ui/reauth``'s ``next``, which is
+    ``Query(max_length=512)``, and ``quote()`` expands every ``=`` and ``&`` to three characters. At
+    the connection-name rule's own 256 ceiling this route built a 542-character ``next`` and the
+    re-auth page answered a raw 422 -- a dead end with the selection gone. ``_RESEND_NAME_MAX`` is
+    what keeps the two agreeing, so drive the WORST case this route will accept and follow it.
+
+    MEASURED WHILE WRITING THIS, and it bounds what the cap buys: FastAPI solves DEPENDENCIES before
+    it validates a route's own ``Query`` params, so on a stale window ``reauth_next`` sees the raw
+    query and the cap has not run yet. The cap therefore guarantees that every value this route
+    DECLARES legal survives the continuation -- it does not stop an over-long one from being read by
+    the lambda. An over-long name still ends at a 422; the cap moves it to the POST, where a fresh
+    window rejects it, instead of leaving a legal value dead-ending at the re-auth page."""
+    service = await _service(engine, step_up_max_age=-1)
+    await _add(service, "op", Role.OPERATOR.value)
+    mid = await _seed(engine)
+    longest = "A" * _RESEND_NAME_MAX
+    async with _client(engine, service) as c:
+        await _login(c, "op")
+        r = await _post_resend(c, mid, to=longest, source=longest)
+        assert r.status_code == 303
+        follow = await c.get(r.headers["location"])
+        # The re-auth page renders; it does not 422 on a `next` this route was willing to build.
+        assert follow.status_code == 200, follow.text
+    # One over the ceiling is refused by THIS route. A FRESH window, because a stale one short-
+    # circuits at the dependency before the Query bound is reached (see the docstring).
+    fresh = await _service(engine)
+    await _add(fresh, "op2", Role.OPERATOR.value)
+    async with _client(engine, fresh) as c:
+        await _login(c, "op2")
+        over = await _post_resend(c, mid, to="A" * (_RESEND_NAME_MAX + 1), source="archive")
+        assert over.status_code == 422
