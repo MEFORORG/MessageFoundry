@@ -634,10 +634,18 @@ def _load_referent_registry(config_dir: str | Path) -> Any:
 
     The code-set edit itself is standalone data (validated by re-loading the one file); the referent
     pre-flight additionally needs the wired graph. Loading executes config modules, so a broken /
-    absent graph must never fail the core code-set operation — swallow and skip."""
+    absent graph must never fail the core code-set operation — swallow and skip.
+
+    ``allow_empty``: this is an AUTHORING surface, like ``connection upsert/remove`` (BACKLOG #1648).
+    Swallowing the empty-graph refusal here would be SILENT and wrong, not merely conservative — a
+    connection-less bundle still has Routers/Handlers that reference code sets, so ``rename`` would
+    move the table and leave every ``code_set("old")`` call dangling with no ``referents_rewritten``
+    in its result, and ``remove`` would report zero dangling referrers when there are some. Measured
+    A/B with a connection declared and without: the only difference was the connection, and only the
+    connection-less arm lost the rewrite."""
     from messagefoundry.config.wiring import load_config
 
     try:
-        return load_config(config_dir)
+        return load_config(config_dir, allow_empty=True)
     except (WiringError, FileNotFoundError, OSError, ValueError):
         return None
