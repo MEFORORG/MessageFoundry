@@ -1739,6 +1739,49 @@ jobs:
             echo "tooling_matrix=$TOOLING_DOCS" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # MERGE QUEUE. This arm says the queue's gating OUT LOUD. Without it a merge_group event
+          # fell through to the pull_request arm below, where BASE_SHA is
+          # `github.event.pull_request.base.sha` -- EMPTY on a queue event, because that payload
+          # carries no pull_request. `git diff --name-only "...HEAD"` with an empty left operand is
+          # HEAD...HEAD: it exits 0 and prints NOTHING (measured 2026-09-18 against a worktree of this
+          # repo). So every path grep below missed, and the queue's gating was settled by the
+          # `[ -z "$changed" ]` fail-safe near the bottom of this step.
+          #
+          # THAT REACHED THE RIGHT ANSWER FOR THE WRONG REASON, AND THE WRONG REASON IS ONE EDIT DEEP.
+          # The fail-safe reads "no files changed -> run everything". That is right for an empty PR
+          # diff and right here only by accident. Flip it to `code=false` -- the reading it invites in
+          # isolation, "nothing changed, so there is nothing to test" -- and every queue run skips
+          # install, lint, type-check and the whole of pytest, then reports GREEN, on the one commit
+          # that actually reaches `main`. Nothing downstream would report a problem, because a skipped
+          # required leg reports success. That is the silent-control decay ADR 0158 names, sitting on
+          # the merge path, which is the worst place to put it.
+          #
+          # THE VALUES BELOW ARE THE BEHAVIOUR THAT WAS ALREADY RUNNING, written down rather than
+          # inferred. They are deliberately NOT the whole of what a queue entry runs: `test` and
+          # `webconsole` name merge_group in their own step `if:` (so `code` here is belt-and-braces
+          # for them), and sqlserver-store, postgres-store, load-test, load-test-sqlserver and
+          # windows-service-smoke name it in their JOB `if:`, which is why `serverdb=false` here does
+          # not stop them. docker-smoke and ide have no merge_group arm, so `docker`/`ide` below do
+          # decide those two.
+          #
+          # WHETHER THAT HEAVY TIER SHOULD RUN PER QUEUE ENTRY IS A COVERAGE QUESTION THIS ARM DOES
+          # NOT ANSWER. It only stops the answer being an accident. Note while re-opening it that the
+          # nightly `schedule` comment at the top of this file, and sqlserver-store's own header,
+          # both justify the nightly cadence by saying these legs no longer re-run per merge. Via
+          # merge_group they do -- roughly the same count, one step earlier, where a finding can still
+          # stop the merge. The cadence may well be right; the stated cost rationale is stale.
+          if [ "$EVENT_NAME" = "merge_group" ]; then
+            echo "serverdb=false" >> "$GITHUB_OUTPUT"
+            echo "docker=false" >> "$GITHUB_OUTPUT"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "ide=false" >> "$GITHUB_OUTPUT"
+            echo "tooling=false" >> "$GITHUB_OUTPUT"
+            # Emitted even though `tooling` is false on this arm: fromJSON on an unset output fails
+            # the whole job rather than falling back, so no arm may leave it blank. FULL rather than
+            # DOCS because it tracks `code`, which is true here.
+            echo "tooling_matrix=$TOOLING_FULL" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           # Remaining case: pull_request. Compute the path-based filters from the PR diff.
           changed=$(git diff --name-only "$BASE_SHA...HEAD")
           # NB: the tests/test_(...) alternation MUST list every file the sqlserver-store /

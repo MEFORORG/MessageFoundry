@@ -258,7 +258,7 @@ def test_the_tooling_job_reads_the_matrix_and_does_not_carry_a_literal() -> None
     )
 
 
-@pytest.mark.parametrize("event", ["workflow_dispatch", "push", "schedule"])
+@pytest.mark.parametrize("event", ["workflow_dispatch", "push", "schedule", "merge_group"])
 def test_every_non_pr_arm_emits_a_matrix(tmp_path: Path, event: str) -> None:
     """An arm that exits without emitting KILLS the tooling job on fromJSON. It does not skip it."""
     bash = require_bash(tmp_path)
