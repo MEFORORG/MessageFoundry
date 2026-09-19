@@ -122,6 +122,12 @@ from typing import Any
 #: ``.browse_uploaded_file`` also changed shape (each is now the shared implementation the route pair
 #: calls, not the GET route object) — the keyword arguments the console passes are unchanged, but the
 #: contract did move, and a bump is the honest signal for that.
+#: 2026-09-14 (ASVS 6.3.3, BACKLOG #1549): ``AuthService`` gained the public
+#: ``factor_binding_is_blocked``, which the console's ``_ui_action_step_up_ok`` calls so the /ui lane
+#: applies the factor-binding refusal without reaching a private engine symbol. A METHOD the console
+#: calls forces a bump for the reason the federated-SSO entry above gives: a missing method is a hard
+#: AttributeError at request time, not a degraded render. The change that added it shipped without
+#: this bump, and the golden gate is what caught it.
 #:
 #: **v19 WAS DELIBERATELY SKIPPED, and the reason was a defect rather than an accident.** Two unlanded
 #: branches — ``w3-log-write-failure`` (``SystemStatus.log_sinks``, #122) and
@@ -129,12 +135,21 @@ from typing import Any
 #: for two independent contract changes. Skipping to 20 bought room but fixed nothing: the next pair
 #: of branches would collide identically. BACKLOG #1220 removed the hand-chosen number entirely.
 #:
+#: ASVS 6.4.5 / BACKLOG #1141: ``PasswordResetResponse`` gained the additive ``expires_at`` -- the
+#: instant the login gate stops accepting an admin-issued credential -- and ``routes/admin.py``
+#: reads it to state the deadline on the one-time page. Additive with a default, so an older
+#: console ignores it. **DELIBERATELY UNNUMBERED.** The ``vN`` labels are retired as identifiers
+#: (see #1220 above), and picking "v21" here is precisely the collision that entry records: PR 1145
+#: is an open branch that also moves this contract, and two branches choosing one number is how the
+#: golden snapshot once auto-merged clean carrying both changes under a single seam. The digest is
+#: the identifier; this line is the reason.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "c609055939e9a577"
+ENGINE_UI_SEAM: str = "8dd30734cd1e27f3"
 
 
 @dataclass(frozen=True, slots=True)

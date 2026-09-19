@@ -10,7 +10,7 @@ import ssl
 import types
 from itertools import product
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -19,17 +19,24 @@ from messagefoundry.config.tls_policy import (
     _APPROVED_TLS_SUITES,
     _MIN_TLS_STRENGTH_BITS,
     APPROVED_KEX_GROUPS,
+    SYSTEM_TRUST_ANCHOR,
     TLS_REVOCATION_ATTESTED_ENV,
     HopDisposition,
     HopPosture,
     InsecureHopRefused,
+    TrustAnchor,
+    TrustAnchorMode,
+    TrustAnchorPolicy,
     _is_encrypting,
     _is_forward_secret,
     _is_peer_authenticated,
     _is_strong_enough,
     _weak_suite_labels,
     active_hop_posture,
+    build_anchored_https_handler,
     build_smtp_tls_context,
+    build_verifying_client_context,
+    context_checks_revocation,
     current_hop_posture,
     enforce_insecure_hop,
     fips_attestation,
@@ -42,8 +49,11 @@ from messagefoundry.config.tls_policy import (
     is_loopback_hop_host,
     kex_groups_report,
     proxy_mtls_declared_but_unverified,
+    requests_verify_from_anchor,
+    resolve_trust_anchor,
     smtp_login_approved,
     tls_revocation_attested,
+    urllib_handler_context,
     validate_tls_ciphers,
 )
 
@@ -679,7 +689,11 @@ def test_every_context_that_pins_kex_groups_also_asserts_forward_secrecy() -> No
     assert not problems, (
         f"TLS context site(s) that pin key-exchange groups but do NOT assert forward secrecy: "
         f"{problems}. Every built context must be checked (ASVS 12.1.2) — the suite list is inherited "
-        f"from the interpreter unless something asserts it."
+        f"from the interpreter unless something asserts it. IF YOU JUST MOVED THE ASSERTION BEHIND A "
+        f"WRAPPER, that is this failure and the fix is to call harden_cipher_suites at the seam, not "
+        f"to teach this scan the wrapper's name: co-location is the requirement, because a scan that "
+        f"accepts N helper names has to trust that no future edit puts an early return above the "
+        f"assertion in any of them (ADR 0188 hit exactly this and split its helper)."
     )
 
 
@@ -1468,3 +1482,172 @@ def test_without_the_crl_the_revoked_client_gets_in(_crl_material: dict[str, str
     # authenticates until its notAfter. If this ever starts failing, revocation arrived by some
     # other route and the item's premise needs re-deriving rather than the test relaxing.
     assert _crl_handshake(None, "revoked", _crl_material) == "ACCEPTED"
+
+
+# --- BACKLOG #299: the OUTBOUND CRL, asserted on each hop's ACTUAL context ---------------------------
+#
+# The three shipped harden_crl_check call sites are all INBOUND listeners (api/tls.py, mllp.py's server
+# context, dicom.py's SCP mTLS branch). Every outbound hop verified its peer and checked no revocation,
+# which is the gap the #201 RevocationHopGuard refuses on.
+#
+# PER-HOP SCOPING IS THE BINDING RISK, and it is why these tests read verify_flags off the object the
+# handshake will use rather than off the setting. One instance-wide [tls].crl_file must never be read as
+# "revocation is checked" for a hop whose context never received it -- an ldap3.Tls or a truststore
+# context is built by a library that never sees the policy, and a settings-shaped assertion would grade
+# all of them green together.
+
+
+def _crl_policy(crl: str, ca: str | None = None, mode: str = "system") -> TrustAnchorPolicy:
+    return TrustAnchorPolicy(
+        crl_file=crl,
+        internal_ca_file=ca,
+        mode=cast("TrustAnchorMode", mode),
+    )
+
+
+def test_resolve_trust_anchor_carries_the_crl_onto_every_non_loopback_arm(
+    _crl_material: dict[str, str],
+) -> None:
+    crl = _crl_material["ca_and_fresh"]
+    ca = _crl_material["ca_only"]
+    # system mode, no internal CA: the anchor names no CA at all and still carries the CRL. This is the
+    # arm that matters most -- it is the shipped default, so most hops reach revocation through it.
+    plain = resolve_trust_anchor(connection_ca_file=None, host="10.0.0.5", policy=_crl_policy(crl))
+    assert plain.cafile is None and plain.crl_file == crl
+    # A connection that pins its OWN CA still gets the instance CRL: revocation is orthogonal to which
+    # roots anchor the hop.
+    pinned_conn = resolve_trust_anchor(
+        connection_ca_file=ca, host="10.0.0.5", policy=_crl_policy(crl)
+    )
+    assert pinned_conn.cafile == ca and pinned_conn.crl_file == crl
+    # augment and pinned modes carry it too.
+    for mode in ("augment", "pinned"):
+        anchor = resolve_trust_anchor(
+            connection_ca_file=None, host="10.0.0.5", policy=_crl_policy(crl, ca, mode)
+        )
+        assert anchor.crl_file == crl, mode
+        assert anchor.cafile == ca, mode
+
+
+def test_a_loopback_hop_is_exempt_from_the_crl(_crl_material: dict[str, str]) -> None:
+    # VERIFY_CRL_CHECK_LEAF refuses a peer whose ISSUER has no CRL in the store, not only a revoked one.
+    # An on-box peer is normally issued by a different local PKI the org CRL does not cover, and the
+    # revocation guard already ALLOWs a loopback hop -- so applying the CRL there would break working
+    # on-box traffic to close a gap the gate does not consider open.
+    for host in ("127.0.0.1", "localhost", "::1"):
+        anchor = resolve_trust_anchor(
+            connection_ca_file=None, host=host, policy=_crl_policy(_crl_material["ca_and_fresh"])
+        )
+        assert anchor.crl_file is None, host
+        assert anchor.narrows is False, host
+
+
+def test_no_crl_configured_leaves_every_anchor_byte_identical() -> None:
+    # The shipped default must not move: with no [tls].crl_file the anchors are what they were.
+    anchor = resolve_trust_anchor(
+        connection_ca_file=None, host="10.0.0.5", policy=TrustAnchorPolicy()
+    )
+    assert anchor.crl_file is None and anchor.narrows is False
+    assert anchor == SYSTEM_TRUST_ANCHOR
+
+
+def test_a_crl_alone_makes_the_anchor_narrow(_crl_material: dict[str, str]) -> None:
+    # LOAD-BEARING for the HTTP family. Those five call sites reuse a module-level opener built at
+    # IMPORT time, before any config exists, whenever the anchor does not narrow. A CRL-only anchor that
+    # answered False here would leave the hop on that unrevoked shared opener while its guard was told
+    # revocation was checked -- the exact per-hop scoping failure this item warns about.
+    anchor = resolve_trust_anchor(
+        connection_ca_file=None, host="10.0.0.5", policy=_crl_policy(_crl_material["ca_and_fresh"])
+    )
+    assert anchor.cafile is None
+    assert anchor.narrows is True
+
+
+def test_build_verifying_client_context_sets_the_crl_flag(_crl_material: dict[str, str]) -> None:
+    crl = _crl_material["ca_and_fresh"]
+    for anchor in (
+        TrustAnchor(cafile=None, load_system_roots=True, crl_file=crl),  # system + CRL
+        TrustAnchor(cafile=crl, load_system_roots=True, crl_file=crl),  # augment + CRL
+        TrustAnchor(cafile=crl, load_system_roots=False, crl_file=crl),  # pinned + CRL
+    ):
+        ctx = build_verifying_client_context(anchor)
+        assert ctx.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF, anchor
+        assert ctx.cert_store_stats()["crl"] >= 1, anchor
+        assert context_checks_revocation(ctx) is True, anchor
+    # NEGATIVE CONTROL: the same builder with no CRL leaves the flag clear, so the assertions above are
+    # not passing because something else sets it.
+    bare = build_verifying_client_context(SYSTEM_TRUST_ANCHOR)
+    assert not (bare.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF)
+    assert context_checks_revocation(bare) is False
+
+
+def test_build_anchored_https_handler_sets_the_crl_flag_on_its_own_context(
+    _crl_material: dict[str, str],
+) -> None:
+    crl = _crl_material["ca_and_fresh"]
+    # The system-plus-CRL arm keeps urllib's OWN context and loads the CRL onto it. `cafile` is None
+    # here, so this also pins the guard added around load_verify_locations, which rejects an all-None
+    # call.
+    handler = build_anchored_https_handler(
+        anchor=TrustAnchor(cafile=None, load_system_roots=True, crl_file=crl), connector="probe"
+    )
+    assert context_checks_revocation(urllib_handler_context(handler, connector="probe")) is True
+    # The pinned arm substitutes a context and must carry the CRL through that substitution.
+    pinned = build_anchored_https_handler(
+        anchor=TrustAnchor(cafile=crl, load_system_roots=False, crl_file=crl), connector="probe"
+    )
+    assert context_checks_revocation(urllib_handler_context(pinned, connector="probe")) is True
+    # NEGATIVE CONTROL.
+    bare = build_anchored_https_handler(anchor=SYSTEM_TRUST_ANCHOR, connector="probe")
+    assert context_checks_revocation(urllib_handler_context(bare, connector="probe")) is False
+
+
+def test_context_checks_revocation_answers_for_the_object_not_a_setting() -> None:
+    assert context_checks_revocation(None) is False
+    ctx = ssl.create_default_context()
+    assert context_checks_revocation(ctx) is False
+    ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
+    assert context_checks_revocation(ctx) is True
+
+
+def test_the_chain_crl_flag_contains_the_leaf_bit() -> None:
+    """``context_checks_revocation`` tests the LEAF bit and claims that answers for CHAIN too.
+
+    That claim is a measurement, not a reading of the two names, so it is pinned here rather than left
+    in a docstring. Measured on CPython 3.14 / OpenSSL 3.5.7: LEAF is 0x4 and CHAIN is 0xc, because
+    CHAIN is LEAF OR'd with X509_V_FLAG_CRL_CHECK_ALL. If they ever stop overlapping, a context set to
+    check the whole chain would read as checking nothing and every guard on it would wrongly refuse --
+    and nothing else in this suite would notice."""
+    assert int(ssl.VERIFY_CRL_CHECK_CHAIN) & int(ssl.VERIFY_CRL_CHECK_LEAF)
+    chain_ctx = ssl.create_default_context()
+    chain_ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_CHAIN
+    assert context_checks_revocation(chain_ctx) is True
+
+
+def test_requests_verify_refuses_a_crl_it_cannot_express(_crl_material: dict[str, str]) -> None:
+    # requests takes one bundle path and no revocation flag. Honouring the CA while dropping the CRL
+    # would report a revocation-checked hop that checks nothing, so it says so instead.
+    anchor = TrustAnchor(
+        cafile=_crl_material["ca_only"],
+        load_system_roots=False,
+        crl_file=_crl_material["ca_and_fresh"],
+    )
+    with pytest.raises(ValueError, match="crl_file"):
+        requests_verify_from_anchor(anchor, cell="probe")
+    # Without a CRL the two expressible shapes are unchanged.
+    assert requests_verify_from_anchor(SYSTEM_TRUST_ANCHOR, cell="probe") is None
+    assert (
+        requests_verify_from_anchor(
+            TrustAnchor(cafile=_crl_material["ca_only"], load_system_roots=False), cell="probe"
+        )
+        == _crl_material["ca_only"]
+    )
+
+
+def test_an_absent_outbound_crl_refuses_at_construction(tmp_path: Path) -> None:
+    # The instance-wide setting inherits harden_crl_check's three refusals, so a stale or missing CRL
+    # fails loudly where an operator sees it rather than at the first partner handshake.
+    with pytest.raises(ValueError, match="does not exist"):
+        build_verifying_client_context(
+            TrustAnchor(cafile=None, load_system_roots=True, crl_file=str(tmp_path / "nope.pem"))
+        )

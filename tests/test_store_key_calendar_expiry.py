@@ -14,9 +14,11 @@ Five arms, and the fifth is the one that separates a control from a log line:
 3. ``enforce_store_key_expiry = false`` disables the refusal AND is named by ``security_loosenings()``;
 4. a non-overdue key is unaffected (without this arm, a gate that refused everything would pass 1-3);
 5. the SITING: the refusal must not be swallowed by the blanket ``except Exception`` guarding the
-   rotation-meta reconcile in ``Engine.start``. Proved two ways — an AST check that the call is not
-   lexically inside that handler's ``try``, and the two engine-level tests above, which would both go
-   green-by-omission (``start()`` returning normally) if the gate were moved beneath it.
+   rotation-meta reconcile in ``Engine.start``. Proved three ways — an AST check that the call is not
+   lexically inside that handler's ``try``; the two engine-level tests above, which would both go
+   green-by-omission (``start()`` returning normally) if the gate were moved beneath it; and the
+   refusal's full propagation path, driven through the real ASGI application, which is the only arm
+   that fails if something BETWEEN ``Engine.start()`` and the server swallows the refusal.
 
 PHI/secret-safe: identifiers, dates and one-way key-ids only, and every key here is generated for the
 test. No message bodies are involved on this path at all.
@@ -30,7 +32,10 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _ast_sites import call_sites
+from fastapi import FastAPI
 
+from messagefoundry.api import create_managed_app
 from messagefoundry.config.ai_policy import SecurityEnforcement
 from messagefoundry.config.settings import (
     AlertsSettings,
@@ -297,21 +302,13 @@ def test_a_keyless_store_has_no_dek_to_expire() -> None:
 # --- ARM 5: the SITING, which is what makes this a control ------------------------------------
 
 
-def _calls_named(node: ast.AST, name: str) -> list[ast.Call]:
-    return [
-        n
-        for n in ast.walk(node)
-        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == name
-    ]
-
-
 def _guarded_reconcile_try(tree: ast.Module) -> ast.Try:
     """The ``try`` in engine.py whose body awaits ``reconcile_rotation_meta`` — the blanket handler
     whose entire body is a log call. Located by CONTENT, so it survives any line-number churn."""
     for node in ast.walk(tree):
         if not isinstance(node, ast.Try):
             continue
-        if _calls_named(node, "reconcile_rotation_meta"):
+        if call_sites(node, "reconcile_rotation_meta", bare_only=True):
             return node
     raise AssertionError(
         "no try/except around reconcile_rotation_meta in engine.py — this test's premise is gone; "
@@ -339,13 +336,13 @@ def test_the_refusal_is_sited_OUTSIDE_the_blanket_reconcile_handler() -> None:
     goes red. A refusal beneath that handler is logged and stepped over: a traceback, not a control."""
     tree = ast.parse(_ENGINE_PY.read_text(encoding="utf-8"))
     guarded = _guarded_reconcile_try(tree)
-    assert _calls_named(guarded, "enforce_store_key_expiry") == [], (
+    assert call_sites(guarded, "enforce_store_key_expiry", bare_only=True) == [], (
         "the store-key expiry refusal is sited INSIDE the blanket `except Exception` guarding the "
         "rotation-meta reconcile, whose entire body is a log call. It would be swallowed and the "
         "engine would start on an expired key. Site it after the handler (BACKLOG #1004, trap 1)."
     )
     # ...and it must exist somewhere, or the assertion above passes by absence.
-    assert _calls_named(tree, "enforce_store_key_expiry"), (
+    assert call_sites(tree, "enforce_store_key_expiry", bare_only=True), (
         "engine.py never calls enforce_store_key_expiry — the gate is gone, not merely re-sited"
     )
 
@@ -418,6 +415,73 @@ async def test_a_fresh_keyed_engine_starts_on_the_shipped_defaults(tmp_path: Pat
     """ARM 4 at the engine level. The shipped configuration cannot be surprised: a first keyed start
     stamps the DEK as new (tracked_since is an age FLOOR), so nothing can trip for 395 days."""
     await _start_engine(tmp_path, SecretRotationSettings())
+
+
+# --- ARM 5 (the whole path): the refusal aborts the ASGI LIFESPAN ------------------------------
+#
+# Every arm above stops at `Engine.start()`. None of them fails if the refusal is swallowed anywhere
+# BETWEEN `start()` and the server, and that span is where a refusal stops being a control: an
+# engine that raises into a handler which logs and continues is a traceback, and the service comes
+# up on an expired key with the operator told nothing that stops them.
+#
+# A STRUCTURAL NOTE, because the design record is wrong here and a reader will otherwise trust it.
+# BACKLOG #1004 states that `await engine.start()` sits in `async def lifespan` "with no enclosing
+# try", and treats that as why propagation holds. That is FALSE in the shipped code: the await IS
+# inside a `try` (BACKLOG #1257 moved the teardown's `try` up from the `yield` so a startup failure
+# could not abandon the engine in place and wedge interpreter shutdown). Propagation still holds,
+# on a different fact -- that `try` carries ZERO `except` handlers and only a `finally`, so it
+# cleans up and re-raises rather than swallowing. Do NOT mirror the AST siting guard above onto
+# `api/app.py`: it asserts the call is inside no `Try` at all, which is now the wrong property.
+# Assert the behaviour instead, which is what these two tests do.
+
+
+def _managed_app(tmp_path: Path, settings: SecretRotationSettings) -> FastAPI:
+    """The real serve-path application over a real KEYED SQLite store, built as `serve` builds it.
+
+    KEYED is load-bearing: the gate returns early when the store reports no active DEK key id, so a
+    keyless app cannot exercise this arm at all (`test_a_keyless_store_has_no_dek_to_expire`). The
+    key is generated here and never leaves the test. `security_enforcement` is passed explicitly
+    rather than left to its default so this stays pinned to ENFORCE if that default ever moves.
+    """
+    return create_managed_app(
+        store_settings=StoreSettings(
+            path=str(tmp_path / "lifespan-expiry.db"),
+            encryption_key=generate_key(),
+        ),
+        poll_interval=0.05,
+        secret_rotation_settings=settings,
+        security_enforcement=SecurityEnforcement.ENFORCE,
+    )
+
+
+async def test_an_overdue_key_aborts_the_ASGI_lifespan(tmp_path: Path) -> None:
+    """THE WIRING ARM. The refusal has to reach the server, not merely leave `Engine.start()`.
+
+    Requiring the exception TYPE also makes this the non-masking assertion: the lifespan's teardown
+    runs in a `finally` over a half-started engine, and a teardown that raised would replace this
+    error with its own -- the operator would then be shown a shutdown fault instead of the expired
+    key that caused it (the failure mode `tests/test_lifespan_startup_unwinds.py` was filed for).
+    """
+    app = _managed_app(tmp_path, SecretRotationSettings(store_key_last_rotated="2020-01-01"))
+    with pytest.raises(StoreKeyRotationOverdueError):
+        async with app.router.lifespan_context(app):
+            pass  # pragma: no cover -- startup must not reach here
+
+
+async def test_the_opt_out_lets_the_same_app_finish_its_lifespan(tmp_path: Path) -> None:
+    """POSITIVE CONTROL on the arm above. Same app, same overdue date, opt-out on.
+
+    Without this, the refusal is equally consistent with an app that cannot start for some reason
+    that has nothing to do with the DEK -- a green `pytest.raises` proving nothing about the gate.
+    That startup completes AND unwinds here also exercises the ordinary path, so a teardown
+    regression on this route surfaces as a hang in this file rather than only in #1257's test.
+    """
+    app = _managed_app(
+        tmp_path,
+        SecretRotationSettings(store_key_last_rotated="2020-01-01", enforce_store_key_expiry=False),
+    )
+    async with app.router.lifespan_context(app):
+        assert app.state.engine is not None, "the app started without wiring its engine"
 
 
 def test_the_gate_and_the_alert_read_the_SAME_overdue_expression() -> None:

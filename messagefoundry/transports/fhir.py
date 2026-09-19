@@ -399,7 +399,12 @@ class FhirDestination(DestinationConnector):
         from messagefoundry.transports.http_auth import bearer_provider_from_settings
 
         # ADR 0126: the token-endpoint call must ALSO traverse the proxy — thread the same ProxyConfig in.
-        self._token_provider = bearer_provider_from_settings(s, proxy=self._proxy)
+        # #1660: and the instance [tls] trust-anchor policy, so the token hop verifies against the same
+        # internal CA the delivery hop resolves below — it is resolved for the TOKEN host, which is
+        # routinely a different authorization-server host from this FHIR base URL.
+        self._token_provider = bearer_provider_from_settings(
+            s, proxy=self._proxy, trust_anchor_policy=config.trust_anchor_policy
+        )
         if self._token_provider is not None:
             # The bearer is injected per-request in _post, so the static-header cleartext check above
             # can't see it. Re-run the check treating the connection as credential-bearing, so an access
@@ -935,7 +940,11 @@ class FhirLookupExecutor:
             if proxy_dest is not None:
                 headers.update(proxy_dest.auth_headers())  # pre-emptive Proxy-Authorization (0126)
             # The read sends Authorization (static or SMART) — refuse it over cleartext http.
-            token = token_provider_from_settings(s, proxy=proxy)
+            # #1660: the SMART token hop takes the same instance [tls] anchor policy the read hop
+            # resolves below, against the TOKEN host rather than this lookup's base URL.
+            token = token_provider_from_settings(
+                s, proxy=proxy, trust_anchor_policy=trust_anchor_policy
+            )
             check_headers = {**headers, "Authorization": "Bearer"} if token is not None else headers
             refuse_cleartext_credentials(
                 scheme,

@@ -12,8 +12,11 @@ Elevated actions come in two forms: :func:`control_service` is fire-and-forget (
 process is detached, output isn't captured) — poll :func:`service_state` to observe the result;
 :func:`control_service_ex` (ADR 0113) waits on the elevated child and returns a
 :class:`ServiceControlOutcome` that distinguishes a cancelled UAC prompt from a failure, for the
-tray service-manager. Both elevate the same System32-only ``net`` command; neither elevates
-user-writable code.
+tray service-manager. Both elevate the same ``net`` command; neither elevates user-writable code.
+
+**Every** program either form hands to the OS is an absolute system-directory path, resolved by
+:func:`messagefoundry.service_status._system_exe`, whose docstring is the one place that explains
+why an unqualified name would not be safe here.
 """
 
 from __future__ import annotations
@@ -27,6 +30,11 @@ from enum import Enum
 from pathlib import Path
 
 import messagefoundry
+
+# The one System32 pin, shared with the read-only sibling — see `_system_exe` there for why every
+# program name has to be absolute. Private by convention, not by layer: service_status is the
+# stdlib-only neutral leaf, so importing it here crosses nothing.
+from messagefoundry.service_status import _system_dir, _system_exe
 
 # sc.exe is a console program; launched from the GUI process (pythonw has no console) each call
 # would briefly pop a console window — on the Status page's state poll that means a terminal
@@ -45,10 +53,13 @@ __all__ = [
     "service_state",
 ]
 
+# ``{0}`` is the absolute path to net.exe, quoted so a system root containing a space can't split
+# it. Quoting has to be per-token here because restart chains with `&`; :func:`_elevated_cmd_params`
+# adds the one further pair of quotes cmd's ``/s /c`` strips.
 _ACTIONS = {
-    "start": '{0} start "{1}"',
-    "stop": '{0} stop "{1}"',
-    "restart": '{0} stop "{1}" & {0} start "{1}"',
+    "start": '"{0}" start "{1}"',
+    "stop": '"{0}" stop "{1}"',
+    "restart": '"{0}" stop "{1}" & "{0}" start "{1}"',
 }
 
 # The restart action chains two `net` calls with `&`, so control_service can't avoid cmd.exe — and
@@ -60,6 +71,21 @@ _SAFE_SERVICE_NAME = re.compile(r"^[A-Za-z0-9 ._-]+$")
 
 def _is_safe_service_name(name: str) -> bool:
     return bool(_SAFE_SERVICE_NAME.match(name))
+
+
+def _elevated_cmd_params(action: str, name: str) -> str:
+    """The elevated ``cmd.exe`` parameter string for a service action, every program pinned.
+
+    ``/s`` plus an extra pair of quotes around the whole payload is the documented way to pass a
+    quoted program path: with ``/s``, ``cmd`` strips the first and the last quote and takes the rest
+    verbatim, so the outer pair is what that strip consumes. Without the wrap the quoted path comes
+    back unbalanced — measured on Windows 11 with a stand-in program, ``/s /c "<path>" stop "My
+    Engine"`` was reported as an unrecognised command, while the wrapped form ran for a path with
+    and without a space in it, and across the ``&`` chain.
+
+    ``action`` must be a key of :data:`_ACTIONS` and ``name`` must already be validated.
+    """
+    return f'/s /c "{_ACTIONS[action].format(_system_exe("net.exe"), name)}"'
 
 
 # The active-environment name is passed to install-service.ps1 as `-Environment <name>`, interpolated
@@ -94,7 +120,7 @@ def service_state(name: str) -> str:
     try:
         # nosec: fixed system tool (sc), no shell; `name` is validated above (low-16).
         proc = subprocess.run(
-            ["sc", "query", name],
+            [_system_exe("sc.exe"), "query", name],
             capture_output=True,
             text=True,
             timeout=5,
@@ -119,9 +145,17 @@ def control_service(action: str, name: str) -> bool:
         raise ValueError(f"unsafe service name {name!r}")
     if sys.platform != "win32":
         return False
-    command = _ACTIONS[action].format("net", name)
-    # ShellExecuteW with the "runas" verb raises the UAC prompt; SW_HIDE (0) hides the console.
-    ctypes.windll.shell32.ShellExecuteW(None, "runas", "cmd.exe", f"/c {command}", None, 0)
+    # ShellExecuteW with the "runas" verb raises the UAC prompt; SW_HIDE (0) hides the console. The
+    # system directory is passed as lpDirectory because a null one would start the elevated child in
+    # the CALLER's working directory — the directory a planted program would sit in.
+    ctypes.windll.shell32.ShellExecuteW(
+        None,
+        "runas",
+        _system_exe("cmd.exe"),
+        _elevated_cmd_params(action, name),
+        _system_dir(),
+        0,
+    )
     return True
 
 
@@ -171,6 +205,9 @@ class _SHELLEXECUTEINFOW(ctypes.Structure):
 def _runas_wait(file: str, params: str) -> ServiceControlOutcome:
     """Windows-only: elevate ``file params`` via ShellExecuteExW "runas", wait, read the exit code.
 
+    ``file`` must be an absolute path (callers use :func:`_system_exe`). The child runs from the
+    system directory, not the caller's working directory — see :func:`control_service`.
+
     A cancelled UAC prompt is a FALSE return with ``GetLastError() == ERROR_CANCELLED`` (verified,
     ADR 0113); a genuine elevation failure is any other FALSE. On success the child is waited on and
     its exit code decides DISPATCHED vs FAILED. Never raises.
@@ -188,6 +225,7 @@ def _runas_wait(file: str, params: str) -> ServiceControlOutcome:
     info.lpVerb = "runas"
     info.lpFile = file
     info.lpParameters = params
+    info.lpDirectory = _system_dir()
     info.nShow = _SW_HIDE
 
     if not shell32.ShellExecuteExW(ctypes.byref(info)):
@@ -220,10 +258,11 @@ def _runas_wait(file: str, params: str) -> ServiceControlOutcome:
 def control_service_ex(action: str, name: str) -> ServiceControlOutcome:
     """Start/stop/restart ``name`` with one UAC elevation, reporting the outcome (ADR 0113 §4).
 
-    An outcome-aware sibling of :func:`control_service`: it elevates the same System32-only command
-    (``cmd.exe /c net …``, single prompt even for restart), but via ShellExecuteExW so it can
-    distinguish a cancelled UAC prompt (:data:`ServiceControlOutcome.CANCELLED`) from a failure. It
-    never elevates user-writable code. Returns :data:`UNSUPPORTED` off Windows.
+    An outcome-aware sibling of :func:`control_service`: it elevates the same command (``cmd.exe /c
+    net …``, single prompt even for restart), but via ShellExecuteExW so it can distinguish a
+    cancelled UAC prompt (:data:`ServiceControlOutcome.CANCELLED`) from a failure. Both programs are
+    absolute system-directory paths, so it never elevates user-writable code (:func:`_system_exe`).
+    Returns :data:`UNSUPPORTED` off Windows.
 
     Raises :class:`ValueError` for an unknown ``action`` or a service name with shell metacharacters
     (it is interpolated into an elevated ``cmd.exe`` line — review low-16), *before* the platform
@@ -235,8 +274,7 @@ def control_service_ex(action: str, name: str) -> ServiceControlOutcome:
         raise ValueError(f"unsafe service name {name!r}")
     if sys.platform != "win32":
         return ServiceControlOutcome.UNSUPPORTED
-    command = _ACTIONS[action].format("net", name)
-    return _runas_wait("cmd.exe", f"/c {command}")
+    return _runas_wait(_system_exe("cmd.exe"), _elevated_cmd_params(action, name))
 
 
 def install_script_path() -> Path | None:
@@ -245,6 +283,20 @@ def install_script_path() -> Path | None:
     if pkg is None:
         return None
     script = Path(pkg).resolve().parents[1] / "scripts" / "service" / "install-service.ps1"
+    return script if script.exists() else None
+
+
+def uninstall_script_path() -> Path | None:
+    """Locate ``scripts/service/uninstall-service.ps1`` in the (editable-installed) repo.
+
+    The mirror of :func:`install_script_path`. Nothing launches the uninstaller from here (an
+    operator runs it directly); this exists so the policy guards over the service scripts can locate
+    both halves the same way, instead of one of them reaching for a relative path of its own.
+    """
+    pkg = messagefoundry.__file__
+    if pkg is None:
+        return None
+    script = Path(pkg).resolve().parents[1] / "scripts" / "service" / "uninstall-service.ps1"
     return script if script.exists() else None
 
 
@@ -263,9 +315,21 @@ def install_service(script_path: str, environment: str) -> bool:
     """Run the install script elevated in a *visible* PowerShell window (one-time setup, so the
     operator can read the output / 'next steps' and any errors). ``environment`` is the active
     environment the service runs as (ADR 0017 — install-service.ps1 requires it). Returns False off
-    Windows. Raises :class:`ValueError` for an unsafe environment name (it runs elevated)."""
+    Windows. Raises :class:`ValueError` for an unsafe environment name (it runs elevated).
+
+    The image is the system directory's ``WindowsPowerShell\\v1.0\\powershell.exe`` — Windows
+    PowerShell 5.1, the host the installer is written for (:func:`_system_exe`). Starting the child
+    in the system directory is safe for the installer, which derives its repo root from
+    ``$PSScriptRoot`` rather than from the working directory."""
     params = _install_params(script_path, environment)  # validates env on every platform
     if sys.platform != "win32":
         return False
-    ctypes.windll.shell32.ShellExecuteW(None, "runas", "powershell.exe", params, None, 1)
+    ctypes.windll.shell32.ShellExecuteW(
+        None,
+        "runas",
+        _system_exe("WindowsPowerShell", "v1.0", "powershell.exe"),
+        params,
+        _system_dir(),
+        1,
+    )
     return True

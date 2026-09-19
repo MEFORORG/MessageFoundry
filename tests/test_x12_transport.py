@@ -203,16 +203,25 @@ async def test_destination_no_reply_returns_when_not_expecting_one() -> None:
 
 async def test_destination_expect_reply_reads_returned_interchange() -> None:
     reply = _interchange(sender="ACK")
+    received: list[bytes] = []
 
     async def handler(raw: bytes) -> str:
+        received.append(raw)
         return reply  # written back verbatim on the same connection
 
     source = _source()
     await source.start(handler)
     try:
-        await _dest(source.sockport, expect_reply=True).send(EDI)
+        # The legacy expect_reply confirmation is CONSUMED, not captured: send() returns None even
+        # though a complete interchange came back. capture_response (ADR 0016) is the knob that
+        # hands one back as a DeliveryResponse, and test_x12_rte.py covers that path.
+        assert await _dest(source.sockport, expect_reply=True).send(EDI) is None
     finally:
         await source.stop()
+    # Settled by the time send() returns, because the source awaits the handler before writing the
+    # reply: the interchange reached the peer verbatim. That the destination BLOCKS for the reply is
+    # the sibling test below, which raises DeliveryError when none is sent.
+    assert received == [EDI.encode("utf-8")]
 
 
 async def test_destination_expect_reply_times_out_when_none_sent() -> None:

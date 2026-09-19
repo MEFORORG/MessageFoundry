@@ -1079,7 +1079,7 @@ class ApiSettings(_Section):
 
 
 class TlsSettings(_Section):
-    """``[tls]`` — the instance-wide client **trust-anchor** policy (#190, ADR 0093).
+    """``[tls]`` — the instance-wide client **trust-anchor and revocation** policy (#190, ADR 0093).
 
     A small, shared fallback for outbound connectors that verify a downstream *server* certificate
     (MLLP/DICOM/FTPS today). By default the OS trust store roots verify the peer; a hospital estate
@@ -1100,6 +1100,20 @@ class TlsSettings(_Section):
     #   "pinned"  — ONLY the internal CA, not the public bundle (a fully-private estate; strictest,
     #               the forward_tls_ca_file template).
     trust_anchor_mode: TrustAnchorMode = "system"
+    # PEM path to a CRL (or a CA+CRL bundle) for OUTBOUND hops (BACKLOG #299). NOT a secret — a path,
+    # the same status as internal_ca_file. Empty (default) = no outbound revocation checking, which is
+    # exactly the gap the #201 RevocationHopGuard refuses on an enforcing hop. Set it and every hop that
+    # resolves a trust anchor loads the CRL onto its OWN context and sets VERIFY_CRL_CHECK_LEAF.
+    #
+    # WARNING, and it is the operational half of this setting: VERIFY_CRL_CHECK_LEAF refuses a peer whose
+    # issuer has NO CRL in the store, not only a revoked one. So the file must cover every issuer the
+    # covered hops present, and it must be refreshed before its nextUpdate. Both failures are
+    # fail-CLOSED (the handshake is refused, nothing crosses unverified), and harden_crl_check refuses an
+    # already-expired or unloadable CRL at construction rather than at the first partner handshake.
+    # LOOPBACK HOPS ARE EXEMPT for that reason -- an on-box peer is usually issued by a different,
+    # local PKI the org CRL does not cover, and the revocation guard already ALLOWs a loopback hop, so
+    # applying a CRL there would break on-box traffic to close a gap the gate does not consider open.
+    crl_file: str | None = None
 
     @model_validator(mode="after")
     def _check_pinned_requires_internal_ca(self) -> TlsSettings:
@@ -1122,7 +1136,9 @@ class TlsSettings(_Section):
         outbound so a connector's client-verify context resolves the same anchor at build_check and
         live construction (the internal-outbound context builders call ``resolve_trust_anchor``)."""
         return TrustAnchorPolicy(
-            internal_ca_file=self.internal_ca_file, mode=self.trust_anchor_mode
+            internal_ca_file=self.internal_ca_file,
+            mode=self.trust_anchor_mode,
+            crl_file=self.crl_file,
         )
 
 
@@ -1142,14 +1158,30 @@ class InboundSettings(_Section):
     # delivery) is not yet implemented and is rejected at engine start.
     ack_after: AckAfter = AckAfter.INGEST
 
-    # Very-large-document streaming in-flight budget (#149, ADR 0105 Phase 1a) — the aggregate DoS guard
-    # that replaces the frame-cap-as-only-OOM-guard for streaming inbounds. It caps the TOTAL bytes of
-    # over-threshold message bodies concurrently mid-detach (buffered + being sealed into the attachment
-    # substrate) across ALL inbounds; a detach that would push the running total over it is refused with
-    # backpressure (the message is NAK'd/ERROR'd, never accepted-and-dropped) so a burst of huge uploads
-    # can't exhaust memory. 0 (the default) = unlimited (the per-connection max_message_bytes still bounds
-    # a SINGLE body); a positive value bounds concurrency. Only over-threshold streaming detaches count
-    # against it — below-threshold and non-streaming ingress is byte-identical and never touches it.
+    # Very-large-document streaming in-flight budget (#149, ADR 0105 Phase 1a) — the OPT-IN aggregate DoS
+    # guard for streaming inbounds. It caps the TOTAL bytes of over-threshold message bodies concurrently
+    # mid-detach (buffered + being sealed into the attachment substrate) across ALL inbounds; a detach
+    # that would push the running total over it is refused with backpressure (the message is
+    # NAK'd/ERROR'd, never accepted-and-dropped) so a burst of huge uploads can't exhaust memory. Only
+    # over-threshold streaming detaches count against it — below-threshold and non-streaming ingress is
+    # byte-identical and never touches it.
+    #
+    # THE TWO CEILINGS BOUND DIFFERENT THINGS, and this one does NOT replace the other. A SINGLE body on a
+    # streaming inbound is bounded by that inbound's per-connection max_message_bytes, which applies
+    # whether or not this is set. What THIS bounds is the AGGREGATE. 0 (the default) = unlimited IN THE
+    # AGGREGATE: no single body escapes max_message_bytes, but the NUMBER of such bodies in flight at once
+    # is uncapped until an operator sets a positive value. docs/CONNECTIONS.md ("Two ceilings bound it")
+    # is the operator-facing statement of the same split; docs/CONFIGURATION.md carries the catalog row.
+    #
+    # BACKLOG #1729: this block used to open by calling the setting "the aggregate DoS guard that replaces
+    # the frame-cap-as-only-OOM-guard", four lines above its own "0 (the default) = unlimited" — one
+    # comment contradicting itself, and the SDS-3.7 shape (a compensating control resting on a false
+    # premise) for anyone who read only the first sentence. The DEFAULT is deliberately unchanged: it is a
+    # coupled pin (tests/test_threat_model_doc_drift.py, "streaming-detach budget default 0 = unlimited",
+    # against a vault THREAT-MODEL.md row), and "a multiple of the largest max_message_bytes" is not
+    # expressible here at all — max_message_bytes is PER-CONNECTION and no registry exists at settings
+    # load. What closes the visibility half is a start-time WARNING, keyed on the registry where the
+    # streaming inbounds are actually in hand: pipeline/wiring_runner.warn_unbudgeted_streaming_inbound.
     stream_inflight_budget_bytes: int = 0
 
 
@@ -1626,6 +1658,14 @@ class LoggingSettings(_Section):
     forward_tls_verify: bool = True
     # Optional client cert (PEM cert+key chain) for mutual TLS to the collector. None = no client auth.
     forward_tls_client_cert: str | None = None
+    # Optional CRL (PEM, or a CA+CRL bundle) checked against the COLLECTOR's certificate (BACKLOG
+    # #299). The syslog forwarder builds its own context and resolves no trust anchor, so
+    # [tls].crl_file never reaches it -- this is its own knob rather than a silent inheritance, which
+    # would be the per-hop scoping error that item warns about. Applies only with
+    # forward_tls_verify=true: the opt-out arm is CERT_NONE, where there is no chain to check against.
+    # Same fail-closed refusals as every other CRL: absent, unloadable or past nextUpdate refuses at
+    # startup rather than at the first collector handshake.
+    forward_tls_crl_file: str | None = None
     # Per-hop insecure-forwarding attestation (#200, ADR 0092 shape — the [logging] sibling of a
     # connection's `tls_hop_attested`). The off-box forwarder ships a PHI-REDACTED copy of every log +
     # audit row, but the default `forward_protocol = "udp"` puts that evidence stream (usernames,
@@ -2239,6 +2279,12 @@ class AuthSettings(_Section):
     # REFUSES — always, independent of [security].enforcement (a substituted OIDC anchor permits JWKS
     # substitution + forged id_tokens). Dormant when None. Block-scoped (direct-read, not desugared).
     oidc_tls_ca_cert_pin: str | None = None
+    # BACKLOG #299: optional CRL (PEM, or a CA+CRL bundle) checked against the IdP's certificate. The
+    # IdP opener resolves no trust anchor, so [tls].crl_file cannot reach it -- this is its own knob
+    # rather than a silent inheritance. A revoked IdP cert matters more than on a data hop: this is the
+    # leg carrying the client secret, the authorization code and the identity assertion. Same
+    # fail-closed refusals as every other CRL (absent / unloadable / past nextUpdate refuses at start).
+    oidc_tls_crl_file: str | None = None
     oidc_redirect_path: str = "/ui/oidc/callback"  # full URI derived from [api].public_origin
     oidc_scopes: list[str] = Field(default_factory=lambda: ["openid", "profile"])
     oidc_signing_algorithms: list[str] = Field(default_factory=lambda: ["RS256"])
@@ -2861,6 +2907,23 @@ class EgressSettings(_Section):
     # `proxy_no_proxy` (#128). Each entry is a host / `.suffix` / `*.suffix` / `*`. Env (comma-separated):
     # MEFOR_EGRESS_PROXY_NO_PROXY.
     proxy_no_proxy: list[str] = []
+    # The forward-PROXY host allowlist (BACKLOG #1659). Each entry is "host" (any port) or "host:port".
+    # NOT a destination list: it gates the operator-chosen transport INTERMEDIARY an http-family
+    # connection dials through, which under `proxy_auth_type = basic` receives a pre-emptive
+    # `Proxy-Authorization` header on both destination schemes (ADR 0126) and so is a second
+    # credential-bearing egress host. It is deliberately its OWN list rather than an arm of
+    # `allowed_http`: ADR 0126 rules the proxy out of that gate's scope, because one corporate proxy
+    # fronts many destinations and would have to be co-listed with every one of them.
+    #
+    # DENY-BY-DEFAULT, matching `[ai].allowed_endpoints` (ADR 0135) rather than the permissive-when-
+    # empty `allowed_*` destination lists: an explicit `proxy_url` with an EMPTY `allowed_proxy` is
+    # refused at config load. That costs an operator who configures no proxy nothing (the gate only
+    # bites once a proxy is set), and it is the whole point of the key -- permissive-when-empty would
+    # leave the credential-bearing host ungated on exactly the default posture. The `"default"`
+    # sentinel is exempt: it names no address at config time, and `proxy_config_from_settings` refuses
+    # to combine it with proxy credentials, so that path mints no `Proxy-Authorization`.
+    # Env (comma-separated): MEFOR_EGRESS_ALLOWED_PROXY.
+    allowed_proxy: list[str] = []
 
     # Opt-in deny-by-default (Q5b): when true, a transport with an EMPTY allowlist refuses every
     # destination of that type instead of allowing any. A global on-ramp to fail-closed egress without
@@ -2878,6 +2941,7 @@ class EgressSettings(_Section):
         "allowed_smtp",
         "allowed_direct",
         "proxy_no_proxy",
+        "allowed_proxy",
         mode="before",
     )
     @classmethod
@@ -3925,9 +3989,10 @@ class IntegritySettings(_Section):
     At startup (and on demand) the engine hashes its loaded ``messagefoundry`` module files against the
     installed wheel's ``*.dist-info/RECORD`` baseline; on drift it writes a hash-chained
     ``startup_integrity`` audit row + fires the AlertSink. Both keys default safe: attestation is **on**
-    but **alert-only** (it never blocks startup), so an existing deployment is unchanged. An EDITABLE
-    install (``pip install -e .`` — no RECORD baseline) is a NO-OP regardless, so dev is never bricked
-    (see messagefoundry/integrity.py)."""
+    but **alert-only** (it never blocks startup). An install that **declares** itself editable
+    (``pip install -e .``) is a NO-OP regardless, so dev is never bricked. An install that merely *has no
+    usable baseline* is not that no-op (BACKLOG #1679): it verified nothing, so it warns, audits and
+    alerts, and under ``fail_closed_on_drift`` it refuses to start (see messagefoundry/integrity.py)."""
 
     # Run startup attestation at all. On by default (alert-only is harmless); a no-op off an editable
     # install. Set false only to suppress the check entirely (e.g. an unusual packaging where RECORD is
@@ -3938,6 +4003,10 @@ class IntegritySettings(_Section):
     # in-place security hotfix (the documented vendored-parser patch contingency) would itself trip a
     # RECORD mismatch, so fail-closed-by-default would brick a legitimate patch. Opt in for hard
     # enforcement on a locked-down instance.
+    # It ALSO refuses when attestation verified NOTHING — no baseline, a RECORD stripped of its package
+    # rows, or the package loaded from outside the install root (BACKLOG #1679). A pass that compared
+    # zero files cannot say the bytes are clean, and stripping the baseline is easier for the stated
+    # adversary than editing a module. An install that declares itself editable is still exempt.
     fail_closed_on_drift: bool = False
     # When true, the engine re-walks the tamper-evident audit hash-chain once at startup (#190). This is
     # ALERT-ONLY: a broken chain logs a WARNING + fires the AlertSink but NEVER crashes startup (a

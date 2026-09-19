@@ -8,7 +8,14 @@ connector that VERIFIES a downstream server cert over stdlib ``ssl`` (which has 
 egress, the REST/SOAP/FHIR https paths, and the Postgres asyncpg store hop. The chain is validated but a
 revoked-but-unexpired peer cert would still be accepted, so a production-PHI verified hop off-loopback is
 REFUSED at construction / ``messagefoundry check`` / dry-run (store: at open) unless revocation is
-attested (per-connection ``tls_revocation_attested`` or the blanket ``MEFOR_TLS_REVOCATION_ATTESTED`` env).
+attested (per-connection ``tls_revocation_attested``) or really checked.
+
+**BACKLOG #299 clamped the blanket ``MEFOR_TLS_REVOCATION_ATTESTED`` env.** It used to be OR'd into the
+per-connection attestation, so setting it once crossed every verifying outbound hop in an enforcing
+instance. It now ranks BELOW the enforcing refusal: under ``enforcing`` only the hop's own facts cross it
+(loopback, a CRL actually loaded on that hop's context, a proven terminator, or the per-connection flag),
+while a non-enforcing posture still crosses on the env exactly as before. Several tests here asserted the
+pre-clamp ALLOW and now assert the refusal; each says so at its own docstring.
 
 Loopback / attested / proxy-proven hops are byte-identical; a non-enforcing hop WARNs. The fourth
 relaxation, a synthetic instance, went with BACKLOG #1279 -- every instance carries patient data. It
@@ -28,14 +35,21 @@ from messagefoundry.config.tls_policy import (
     HopPosture,
     InsecureHopRefused,
     RevocationHopGuard,
+    TrustAnchorPolicy,
     active_hop_posture,
+    build_anchored_https_handler,
+    context_checks_revocation,
     revocation_hop_disposition,
+    urllib_handler_context,
 )
 from messagefoundry.config.wiring import FHIR, DICOMweb, Rest, Soap
 from messagefoundry.store.postgres import _build_ssl
 from messagefoundry.transports import build_destination
+from messagefoundry.transports.dicom import _client_ssl_context as _dicom_client_ssl_context
 from messagefoundry.transports.email import EmailDestination
 from messagefoundry.transports.mllp import MLLPDestination
+from messagefoundry.transports.remotefile import _ftps_ssl_context
+from messagefoundry.transports.rest import http_family_trust_anchor
 
 # The postures the gradient keys on. `is_phi` went with BACKLOG #1279 -- only the dial is left.
 PROD_PHI = HopPosture(enforcing=True)
@@ -65,20 +79,27 @@ def test_revocation_hop_disposition_matrix() -> None:
         is_loopback_hop: bool = False,
         proxy_proven: bool = False,
         attested: bool = False,
+        crl_checked: bool = False,
+        blanket_attested: bool = False,
     ) -> HopDisposition:
         return revocation_hop_disposition(
             enforcing=enforcing,
             is_loopback_hop=is_loopback_hop,
             proxy_proven=proxy_proven,
             attested=attested,
+            crl_checked=crl_checked,
+            blanket_attested=blanket_attested,
         )
 
     # loopback → ALLOW (on-box, not a network exposure) even on enforcing-PHI.
     assert disp(enforcing=True, is_loopback_hop=True) is HopDisposition.ALLOW
     # a proven revocation-checking terminator → ALLOW.
     assert disp(enforcing=True, proxy_proven=True) is HopDisposition.ALLOW
-    # attested → ALLOW.
+    # a PER-CONNECTION attestation → ALLOW.
     assert disp(enforcing=True, attested=True) is HopDisposition.ALLOW
+    # BACKLOG #299: this hop's own context checks a CRL → ALLOW, the relaxation that replaces a
+    # declaration with a real in-engine check.
+    assert disp(enforcing=True, crl_checked=True) is HopDisposition.ALLOW
     # A fourth ALLOW arm sat here -- `not is_phi`, the synthetic instance -- and went with BACKLOG
     # #1279. Every instance carries patient data, so it had no input left to fire on and this row,
     # which used to ALLOW, now falls through to the refusal below.
@@ -87,6 +108,51 @@ def test_revocation_hop_disposition_matrix() -> None:
     assert disp(enforcing=True) is HopDisposition.REFUSE
     # non-enforcing → WARN (crosses, loud-logged).
     assert disp(enforcing=False) is HopDisposition.WARN
+
+
+def test_blanket_attestation_does_not_defeat_an_enforcing_posture() -> None:
+    """BACKLOG #299, the attestation clamp: the blanket env ranks BELOW the enforcing refusal.
+
+    Before the clamp ``RevocationHopGuard.capture`` OR'd ``MEFOR_TLS_REVOCATION_ATTESTED`` into the
+    per-connection ``attested`` argument, so this first assertion returned ALLOW and one process-wide
+    environment variable crossed every verifying outbound hop in an enforcing instance."""
+    # ENFORCING + blanket env only → REFUSE. This is the row that flipped.
+    assert (
+        revocation_hop_disposition(
+            enforcing=True,
+            is_loopback_hop=False,
+            proxy_proven=False,
+            attested=False,
+            blanket_attested=True,
+        )
+        is HopDisposition.REFUSE
+    )
+    # The clamp is scoped to the enforcing posture: a non-enforcing hop still ALLOWs on the blanket env,
+    # byte-identical to the pre-clamp behaviour (it would otherwise WARN).
+    assert (
+        revocation_hop_disposition(
+            enforcing=False,
+            is_loopback_hop=False,
+            proxy_proven=False,
+            attested=False,
+            blanket_attested=True,
+        )
+        is HopDisposition.ALLOW
+    )
+    # And the clamp never removes a hop's OWN way out: each per-hop relaxation still crosses an
+    # enforcing hop while the blanket env alone does not.
+    for relaxation in ("is_loopback_hop", "proxy_proven", "attested", "crl_checked"):
+        kwargs: dict[str, bool] = {
+            "is_loopback_hop": False,
+            "proxy_proven": False,
+            "attested": False,
+            "crl_checked": False,
+        }
+        kwargs[relaxation] = True
+        assert (
+            revocation_hop_disposition(enforcing=True, blanket_attested=True, **kwargs)
+            is HopDisposition.ALLOW
+        ), relaxation
 
 
 # --- the guard: construction gate + unstamped no-op + attestation audit ------------------------------
@@ -123,10 +189,35 @@ def test_guard_unstamped_is_noop() -> None:
     _guard(REMOTE).enforce_construction()
 
 
-def test_guard_blanket_env_allows_prod_phi(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_guard_blanket_env_no_longer_crosses_an_enforcing_hop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #299 clamp, at the guard. This test asserted the OPPOSITE until the clamp landed: the
+    blanket env was OR'd into ``attested`` inside ``capture``, so it ALLOWed here."""
+    monkeypatch.setenv(TLS_REVOCATION_ATTESTED_ENV, "1")
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused, match="revocation"):
+        _guard(REMOTE).enforce_construction()
+    # The refusal names the blanket env, so an operator who set it is told why it stopped working.
+    with active_hop_posture(PROD_PHI):
+        guard = _guard(REMOTE)
+    assert TLS_REVOCATION_ATTESTED_ENV in guard._detail()
+    # A per-connection attestation still crosses the same hop, and a non-enforcing posture still
+    # crosses on the env alone.
+    with active_hop_posture(PROD_PHI):
+        _guard(REMOTE, attested=True).enforce_construction()
+    with active_hop_posture(STAGING_PHI):
+        _guard(REMOTE).enforce_construction()
+
+
+def test_guard_keeps_the_blanket_env_apart_from_the_per_connection_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The clamp is only expressible because ``capture`` stops collapsing the two claims into one field."""
     monkeypatch.setenv(TLS_REVOCATION_ATTESTED_ENV, "1")
     with active_hop_posture(PROD_PHI):
-        _guard(REMOTE).enforce_construction()  # blanket env folded into attested → ALLOW
+        guard = _guard(REMOTE)
+    assert guard.blanket_attested is True
+    assert guard.attested is False  # NOT OR'd in — that fold is what the clamp removed
 
 
 def test_guard_audits_attestation_that_suppresses_prod_refusal(caplog) -> None:
@@ -165,9 +256,17 @@ def test_mllp_tls_verify_unstamped_is_noop() -> None:
     MLLPDestination(mllp_cfg(REMOTE))  # no stamped posture → byte-identical
 
 
-def test_mllp_blanket_env_allows_prod_phi(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_mllp_blanket_env_no_longer_crosses_an_enforcing_hop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #299 clamp, through a real connector. Asserted the opposite before the clamp."""
     monkeypatch.setenv(TLS_REVOCATION_ATTESTED_ENV, "1")
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused, match="revocation"):
+        MLLPDestination(mllp_cfg(REMOTE))
+    # Per-connection attestation and a non-enforcing posture are untouched by the clamp.
     with active_hop_posture(PROD_PHI):
+        MLLPDestination(mllp_cfg(REMOTE, revocation_attested=True))
+    with active_hop_posture(STAGING_PHI):
         MLLPDestination(mllp_cfg(REMOTE))
 
 
@@ -279,10 +378,15 @@ def test_https_verified_unstamped_is_noop(cell: str) -> None:
 
 
 @pytest.mark.parametrize("cell", _HTTP_CELLS)
-def test_https_verified_blanket_env_allows_prod(cell: str, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_https_verified_blanket_env_no_longer_crosses_enforcing(
+    cell: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #299 clamp across the whole HTTP family. Asserted the opposite before the clamp."""
     monkeypatch.setenv(TLS_REVOCATION_ATTESTED_ENV, "1")
-    with active_hop_posture(PROD_PHI):
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused, match="revocation"):
         _build_https(_HTTPS[cell])
+    with active_hop_posture(STAGING_PHI):
+        _build_https(_HTTPS[cell])  # non-enforcing still crosses on the env
 
 
 # --- Postgres asyncpg store hop (_build_ssl verify path) --------------------------------------------
@@ -392,9 +496,14 @@ def test_email_tls_unstamped_is_noop() -> None:
     EmailDestination(email_cfg(REMOTE))  # no stamped posture → byte-identical
 
 
-def test_email_blanket_env_allows_prod_phi(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_email_blanket_env_no_longer_crosses_enforcing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """BACKLOG #299 clamp on the SMTP hop. Asserted the opposite before the clamp."""
     monkeypatch.setenv(TLS_REVOCATION_ATTESTED_ENV, "1")
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused, match="revocation"):
+        EmailDestination(email_cfg(REMOTE))
     with active_hop_posture(PROD_PHI):
+        EmailDestination(email_cfg(REMOTE, revocation_attested=True))
+    with active_hop_posture(STAGING_PHI):
         EmailDestination(email_cfg(REMOTE))
 
 
@@ -406,3 +515,143 @@ def test_email_cleartext_refuses_via_settings_not_revocation(
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
     with active_hop_posture(PROD_PHI), pytest.raises(ValueError, match="cleartext"):
         EmailDestination(email_cfg(REMOTE, use_tls=False))
+
+
+# --- BACKLOG #299: [tls].crl_file reaches each hop's OWN context, and closes that hop's guard --------
+#
+# The item records per-hop CRL scoping as the binding risk: one instance-wide crl_file must never
+# silence a guard on a hop whose handshake does not consult it. So every assertion below reads
+# VERIFY_CRL_CHECK_LEAF off the context the connector will really hand to wrap_socket, via
+# context_checks_revocation -- never off the setting, and never off a look-alike built beside it.
+
+
+@pytest.fixture(scope="module")
+def crl_bundle(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """A throwaway CA bundled with its own fresh CRL -- the shape harden_crl_check loads. Synthetic."""
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    now = datetime.datetime.now(datetime.UTC)
+    day = datetime.timedelta(days=1)
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-299-ca")])
+    ca = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - day)
+        .not_valid_after(now + 365 * day)
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    crl = (
+        x509.CertificateRevocationListBuilder()
+        .issuer_name(ca.subject)
+        .last_update(now - 2 * day)
+        .next_update(now + 30 * day)
+        .sign(key, hashes.SHA256())
+    )
+    path = tmp_path_factory.mktemp("crl299") / "ca_and_crl.pem"
+    path.write_bytes(
+        ca.public_bytes(serialization.Encoding.PEM) + crl.public_bytes(serialization.Encoding.PEM)
+    )
+    return str(path)
+
+
+def _crl_policy(crl: str) -> TrustAnchorPolicy:
+    """The shipped default plus a CRL -- `system` mode, no internal CA. The arm most hops reach."""
+    return TrustAnchorPolicy(crl_file=crl)
+
+
+def test_mllp_outbound_context_checks_revocation_with_a_configured_crl(crl_bundle: str) -> None:
+    cfg = Destination(
+        name="OB_MLLP",
+        type=ConnectorType.MLLP,
+        settings={"host": REMOTE, "port": 5000, "tls": True},
+        trust_anchor_policy=_crl_policy(crl_bundle),
+    )
+    with active_hop_posture(PROD_PHI):
+        dest = MLLPDestination(cfg)  # constructs: the CRL closes the guard that otherwise refuses
+    assert context_checks_revocation(dest._ssl) is True
+    # NEGATIVE CONTROL on the SAME connector: no CRL, and both the flag and the refusal come back.
+    bare = Destination(
+        name="OB_MLLP",
+        type=ConnectorType.MLLP,
+        settings={"host": REMOTE, "port": 5000, "tls": True},
+    )
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused, match="revocation"):
+        MLLPDestination(bare)
+
+
+def test_dicom_scu_context_checks_revocation_with_a_configured_crl(crl_bundle: str) -> None:
+    # The SCU (outbound C-STORE), not the SCP. dicom.py's only harden_crl_check call site sits in the
+    # SCP's `if ca:` mTLS branch, so this hop had no revocation checking at all.
+    ctx = _dicom_client_ssl_context(
+        {"tls": True, "host": REMOTE, "port": 11112},
+        trust_anchor_policy=_crl_policy(crl_bundle),
+    )
+    assert context_checks_revocation(ctx) is True
+    bare = _dicom_client_ssl_context({"tls": True, "host": REMOTE, "port": 11112})
+    assert context_checks_revocation(bare) is False
+
+
+def test_ftps_context_checks_revocation_with_a_configured_crl(crl_bundle: str) -> None:
+    ctx = _ftps_ssl_context(
+        {"host": REMOTE, "tls_verify": True}, trust_anchor_policy=_crl_policy(crl_bundle)
+    )
+    assert context_checks_revocation(ctx) is True
+    bare = _ftps_ssl_context({"host": REMOTE, "tls_verify": True})
+    assert context_checks_revocation(bare) is False
+
+
+def test_smtp_context_checks_revocation_with_a_configured_crl(crl_bundle: str) -> None:
+    cfg = email_cfg(REMOTE)
+    cfg = cfg.model_copy(update={"trust_anchor_policy": _crl_policy(crl_bundle)})
+    with active_hop_posture(PROD_PHI):
+        dest = EmailDestination(cfg)  # constructs: the CRL closes the guard
+    assert context_checks_revocation(dest._tls_context) is True
+
+
+@pytest.mark.parametrize("cell", _HTTP_CELLS)
+def test_http_family_opener_context_checks_revocation_with_a_configured_crl(
+    cell: str, crl_bundle: str
+) -> None:
+    """The HTTP family resolves the same anchor through ``http_family_trust_anchor``.
+
+    A CRL-only anchor has to ``narrow``, or these cells fall back to the module-level opener that was
+    built at import time and can carry no CRL -- the hop would then keep an unrevoked context."""
+    _ctype, factory, url = _HTTPS[cell]
+    anchor = http_family_trust_anchor(
+        factory(url=url).settings, url=url, trust_anchor_policy=_crl_policy(crl_bundle)
+    )
+    assert anchor.narrows is True  # or the shared unrevoked opener is reused
+    handler = build_anchored_https_handler(anchor=anchor, connector="probe")
+    assert context_checks_revocation(urllib_handler_context(handler, connector="probe")) is True
+    # NEGATIVE CONTROL: no CRL, no flag, and the anchor does not narrow.
+    bare = http_family_trust_anchor(factory(url=url).settings, url=url, trust_anchor_policy=None)
+    assert bare.narrows is False
+    bare_handler = build_anchored_https_handler(anchor=bare, connector="probe")
+    assert (
+        context_checks_revocation(urllib_handler_context(bare_handler, connector="probe")) is False
+    )
+
+
+def test_a_loopback_hop_gets_no_crl_and_still_crosses(crl_bundle: str) -> None:
+    # The exemption, end to end: an on-box peer is usually issued by a local PKI the org CRL does not
+    # cover, and VERIFY_CRL_CHECK_LEAF refuses a peer whose issuer has no CRL in the store. The guard
+    # already ALLOWs loopback, so applying the CRL there would break working traffic for no gain.
+    cfg = Destination(
+        name="OB_MLLP",
+        type=ConnectorType.MLLP,
+        settings={"host": LOOPBACK, "port": 5000, "tls": True},
+        trust_anchor_policy=_crl_policy(crl_bundle),
+    )
+    with active_hop_posture(PROD_PHI):
+        dest = MLLPDestination(cfg)
+    assert context_checks_revocation(dest._ssl) is False

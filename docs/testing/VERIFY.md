@@ -37,11 +37,43 @@ messagefoundry verify --report-md verify.md --report-json verify.json
 
 | Section | What it does |
 |---|---|
-| **host** | Python 3.14+ & engine import; optional driver extras (asyncpg / aioodbc+pyodbc / pydicom); **ODBC Driver 18** discoverable via `pyodbc.drivers()`; listener ports bindable (+ firewall = MANUAL); store/working dir writable (+ service-account ACLs = MANUAL); console importable; `CREATE_NO_WINDOW` present (no-flash). |
-| **store** | Opens the configured store backend (`[store]`/`MEFOR_STORE_*`) and confirms it connects — **no test-data writes** beyond the idempotent schema-ensure. Run once per backend the box is pointed at. |
+| **host** | Python 3.14+ & engine import; optional driver extras (asyncpg / aioodbc+pyodbc / pydicom); **ODBC Driver 18** discoverable via `pyodbc.drivers()`; listener ports bindable (+ firewall = MANUAL); store/working dir **already exists and is** writable (+ service-account ACLs = MANUAL); every `sc.exe` spawn passes `CREATE_NO_WINDOW` (no-flash; Windows-only, SKIP elsewhere). |
+| **store** | Opens the **already-existing** configured store backend (`[store]`/`MEFOR_STORE_*`) and confirms it connects — **no test-data writes**. A SQLite store the engine has never created is a FAIL, not a PASS. Run once per backend the box is pointed at. |
 | **smoke** | `self` (default) routes a synthetic HL7 through your config via dry-run — **no store, no network, no side effects**; `live` MLLP-sends one synthetic message to the running engine and confirms an **AA ACK**; `none` skips. Add **`--check-disposition`** (+ `--service-config`) to also poll the store and **FAIL unless the message reached `PROCESSED`** (a new `smoke.disposition` row). |
 | **manual** | Echoes the human-only steps (AD/Kerberos login, TOTP MFA, API bind+TLS, NSSM service, end-to-end disposition in the console) as MANUAL with instructions. |
 | **federation** | Federated SSO posture ([ADR 0142](../adr/0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md)) — **offline**, no socket is opened. With `[auth].oidc_enabled` false it emits a single SKIP. Enabled, it reports the pinned endpoints, the MFA-claim gate and the username UPN-suffix allow-list as **MANUAL** (the settings validators already refuse an unusable combination at load, so a PASS there would be a check that cannot fail), and **PASS/FAIL**s the things that genuinely can: the client secret resolving, the pinned TLS context building, and — with `--fed-id-token <file> --fed-jwks <file>` — a captured `id_token` replayed through the real validation ladder with a **verdict per rung**. Add `--fed-nonce` to cover the flow-binding rung; without it that rung and everything after it report SKIP, never PASS. **Handle that file as a credential — see below.** |
+
+### What writes, and what does not
+
+**`verify` no longer creates a store or a directory that was not already there** (BACKLOG #1708).
+`host.writable` used to run `mkdir(parents=True)` before probing, and `store.connect` used to open
+the SQLite store through a schema-ensure that creates an absent file. Both now FAIL and name the
+path instead.
+
+So a mistyped `[store].path` is now a FAIL where it used to be a PASS — the check was passing
+because it made whatever it was pointed at. Run `messagefoundry serve` once before
+`--section store`. And running `verify` elevated no longer leaves an administrator-owned store and
+directory tree at the configured path, which is the service-identity gap the `store.connect` row's
+own text tells you to go and confirm.
+
+**That is narrower than "verify only reads", and the difference matters on a live box.** Three
+things still write:
+
+| What | When | What it writes |
+|---|---|---|
+| `host.writable` | every host run | a probe temp file in the store dir, deleted immediately |
+| `store.connect` | `--section store`, store **already exists** | the schema-ensure and migrations `open_store` runs, plus SQLite `-wal`/`-shm` sidecars — as the calling user |
+| `smoke.live` | `--smoke live` only | one synthetic message, persisted by the engine |
+
+Two limits of the SQLite gate to know before pointing `verify` at something you care about:
+
+- **It is scoped to SQLite.** On PostgreSQL and SQL Server, `open_store` builds the full schema in
+  whatever database it is pointed at. A wrong-but-*existing* database name — `postgres`, or a
+  sibling application's — connects and gets populated, and reports PASS. Only a wrong database
+  *name* fails at connect. Check `[store].database` before running `--section store` against a
+  server backend.
+- **It stops creation, not writing.** Against a store that does exist, `store.connect` still runs
+  the schema-ensure as *you*. If you are elevated, that is still the identity gap above.
 
 ### Handling a captured `id_token`
 
@@ -66,7 +98,11 @@ which is why it is yours to remove.
 ## self vs live smoke
 - **`--smoke self`** — safe anywhere (CI, a fresh box, before the engine is even running). Proves your
   routers/handlers load and route a message cleanly. Needs `--config <your config>` (and `--inbound
-  NAME` if the config has several inbounds).
+  NAME` if the config has several inbounds). It **PASSES only on a delivering outcome**: a run whose
+  Router selects no handler (`UNROUTED`) or whose Handlers send nothing (`FILTERED`) **FAILs** and
+  names the disposition, because a routed-nowhere preview proves the config *loads*, not that it
+  routes. The synthetic message is a fixed `ADT^A01` from `MAINHOSP`, so a Router keyed on your own
+  sending facility declines it legitimately — point `--inbound` at a connection that takes one.
 - **`--smoke live`** — proves the real listener accepts + ACKs on the running engine. It persists **one**
   synthetic message (recognizable synthetic patient); confirm its `RECEIVED→ROUTED→PROCESSED`
   disposition and outbound delivery in the **console** (the `manual.disposition` row), or automate that
@@ -100,5 +136,5 @@ Secrets (DB creds) come from `MEFOR_*` env only — never a file or the report.
 ## What CI covers vs. what only the box can
 CI already runs the engine-conformance suites per-merge against **SQL Server 2025 + Postgres**
 containers. What CI can't replicate — and what `verify` is for — is the **host**: the OS ODBC driver,
-firewall, service-account ACLs, a real desktop session, AD/Kerberos against your domain, the visual
-no-console-flash check, and NSSM on Server 2025. Those are the MANUAL/host rows here.
+firewall, service-account ACLs, AD/Kerberos against your domain, the visual no-console-flash check,
+and NSSM on Server 2025. Those are the MANUAL/host rows here.

@@ -34,9 +34,25 @@ from typing import Any
 # here -- the same line, for the same reason, as `anchor_provenance.py` and `anchor_report.py`.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from scorecard import repo_stamp  # noqa: E402
+# `_git` is private to `scorecard`, and taken deliberately rather than re-implemented here: it is one
+# read-only probe with a timeout and a standing prohibition on any command that writes, and a second
+# copy of that plumbing in this file is a second place for the no-network rule to rot. The two modules
+# already share a process and a directory. `scorecard.py` is mirrored into the vault byte-for-byte
+# (tests/test_asvs_verifier_vault_contract.py), so this name does not drift out from under us silently.
+from scorecard import _git, repo_stamp  # noqa: E402
 
 VERDICTS = {"pass", "partial", "fail", "na", "needs-review", "unverified"}
+
+#: The branch that IS the record, and the ref BACKLOG #1476's question is actually about.
+#:
+#: NOT the same question as `repo_stamp().freshness`, which measures HEAD against the branch's OWN
+#: `@{upstream}` when it has one. On a pushed feature branch -- how the record is normally edited --
+#: a clone can be perfectly current with `origin/<branch>` while missing every cell landed here since
+#: the branch was cut. Such a clone re-renders those cells back to their old values, and the branch
+#: reading prints CURRENT while it happens. `_freshness` is not wrong: it returns the upstream it
+#: used precisely BECAUSE the two are different questions. Choosing which one to refuse on is the
+#: caller's job, and this file is the caller.
+_RECORD_LINE = "origin/main"
 
 #: How many cells one payload may write WITHOUT naming them in `--scope` (BACKLOG #1476).
 #:
@@ -63,6 +79,32 @@ _BANNED = re.compile(
     "\ufe0f\ufe0e"  # variation selectors
     "]"
 )
+
+
+def _record_line_gap(record: Path) -> tuple[int | None, str]:
+    """``(commits on the record line this clone lacks, a printable reading)``.
+
+    The count is the number of commits reachable from ``origin/main`` and not from ``HEAD``. That is
+    the whole question BACKLOG #1476 asks, and it answers the same on every branch: a feature branch
+    cut from a current record line reads zero however far ahead of its own upstream it has run, and
+    one cut from a stale base reads the gap even when it is perfectly in step with the ref it tracks.
+
+    ``None`` when the question cannot be ASKED here -- no work tree, or no ``origin/main`` in this
+    clone -- and NEVER when it can be asked and the answer is zero. An unaskable question and a
+    measured zero are different claims and must not print the same string; that is the never-silent
+    rule :class:`RepoStamp` states, from the caller's side.
+
+    No network, for the reason ``scorecard._git`` gives: a query that fetches gets bypassed, and a
+    bypassed guard is worse than none because its absence reads as nobody needing it.
+    """
+    repo = record if record.is_dir() else record.parent
+    if _git(repo, "rev-parse", "--verify", f"{_RECORD_LINE}^{{commit}}") is None:
+        return None, f"UNASKABLE ({_RECORD_LINE} is not in this clone)"
+    behind = _git(repo, "rev-list", "--count", f"HEAD..{_RECORD_LINE}")
+    if behind is None or not behind.isdigit():
+        return None, f"UNRESOLVED against {_RECORD_LINE}"
+    n = int(behind)
+    return n, (f"BEHIND {n} of {_RECORD_LINE}" if n else f"CURRENT with {_RECORD_LINE}")
 
 
 def _introduced_banned(payload: str, live: str) -> tuple[str, int] | None:
@@ -178,6 +220,32 @@ def _control_keys() -> tuple[str, ...]:
 #: top-level scalars and silently not for sub-table entries.
 _EVIDENCE_ORDERED = ("path", "line", "expect")
 _ABSENCE_ORDERED = ("pattern", "positive_control", "mutation")
+
+#: The ordered keys per sub-table, so the preservation guard can exclude them one level down exactly
+#: as it excludes `_ORDERED` one level up: `render()` COERCES these by design -- `line` through
+#: `int()`, the rest through `toml_str` -- so a payload stating another type there is NORMALISED, and
+#: refusing it would be the false refusal that gets a guard disabled.
+_SUBTABLE_ORDERED: dict[str, tuple[str, ...]] = {
+    "evidence": _EVIDENCE_ORDERED,
+    "absence": _ABSENCE_ORDERED,
+}
+
+#: An ordered key that cannot IDENTIFY an entry, because re-pointing it is the whole purpose of an
+#: anchor repair. Identifying by `line` would leave every repaired entry matching nothing.
+_NOT_IDENTIFYING = ("line",)
+
+#: How an entry is IDENTIFIED when the guard compares the record against the rewritten file --
+#: `(path, expect)` for evidence, DERIVED from the ordered tuple rather than listed, so a new
+#: sub-table brings its own identity and this line never changes.
+#:
+#: #1242: the comparison used to pair entry `i` against entry `i`. A DECLARED retirement of the first
+#: anchor then lined the record's anchor 0 up against the file's anchor 1 -- two different anchors --
+#: so the entry that SURVIVED was never compared against itself, and a field dropped from it read as
+#: green. `strict=False` meant the length change did not even raise.
+_IDENTITY: dict[str, tuple[str, ...]] = {
+    sub: tuple(k for k in ordered if k not in _NOT_IDENTIFYING)
+    for sub, ordered in _SUBTABLE_ORDERED.items()
+}
 
 
 #: A TOML bare key. Anything else must be QUOTED, and the reason is not cosmetic: a DOTTED key is not
@@ -329,6 +397,54 @@ def block_spans(text: str) -> dict[str, tuple[int, int]]:
     return spans
 
 
+def _entry_pairs(sub: str, was: list[Any], now: list[Any]) -> list[tuple[int, Any, int]]:
+    """Pair the record's sub-table entries against the rewritten file's BY IDENTITY (#1242).
+
+    Yields ``(record index, record entry, file index)`` ordered by the record index, which is what a
+    refusal names -- an operator reads the record, so "evidence[1]" has to mean the entry they can
+    find there.
+
+    IDENTITY FIRST, POSITION AS A FALLBACK, and the fallback is load-bearing rather than tidiness. An
+    anchor repair moves ``path`` by design, so a repaired entry matches nothing by identity --
+    identity matching ALONE would then silently stop comparing it, trading a loud comparison for a
+    quiet always-pass. Unmatched record entries are therefore paired, in order, against whatever the
+    file has left over: exactly what the index pairing did, kept for precisely the entries identity
+    cannot place.
+
+    Duplicate identities degrade to the same thing among themselves, first-come, which is the most a
+    comparison can do when two entries claim to be the same anchor.
+    """
+    keys = _IDENTITY.get(sub, ())
+
+    def ident(entry: Any) -> tuple[Any, ...] | None:
+        if not isinstance(entry, dict) or not keys or any(k not in entry for k in keys):
+            return None
+        return tuple(entry[k] for k in keys)
+
+    index: dict[tuple[Any, ...], list[int]] = {}
+    for j, entry in enumerate(now):
+        key = ident(entry)
+        if key is not None:
+            index.setdefault(key, []).append(j)
+
+    pairs: list[tuple[int, Any, int]] = []
+    unmatched: list[tuple[int, Any]] = []
+    taken: set[int] = set()
+    for i, entry in enumerate(was):
+        key = ident(entry)
+        candidates = index.get(key) if key is not None else None
+        if candidates:
+            j = candidates.pop(0)
+            taken.add(j)
+            pairs.append((i, entry, j))
+        else:
+            unmatched.append((i, entry))
+    leftover = [j for j in range(len(now)) if j not in taken]
+    for (i, entry), j in zip(unmatched, leftover, strict=False):
+        pairs.append((i, entry, j))
+    return sorted(pairs, key=lambda pair: pair[0])
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description="Apply re-verified ASVS cells into the scorecard TOML (ADR 0156).",
@@ -367,7 +483,8 @@ def main(argv: list[str] | None = None) -> int:
         "--allow-stale-clone",
         action="store_true",
         help=(
-            "write even though the clone holding --scorecard reads BEHIND or DIVERGED. Refused by "
+            "write even though the clone holding --scorecard is missing commits from "
+            f"{_RECORD_LINE}, or reads BEHIND or DIVERGED against its own upstream. Refused by "
             "default: a write from a stale base re-renders every cell landed since that base back "
             "to its old value, and the payload cannot show you that."
         ),
@@ -396,29 +513,51 @@ def main(argv: list[str] | None = None) -> int:
     # three days. No guard in this file could see it, because nothing was wrong with the payload --
     # the writer faithfully rendered a value it should never have been holding. So ask the clone.
     #
-    # MEASURED, AND NEVER SILENT WHEN IT CANNOT MEASURE. `repo_stamp` is a pure local read -- no
-    # fetch, no network -- so a clone that has not fetched in a week can read CURRENT and still be
-    # stale. That is exactly why `remote-knowledge` is printed beside the verdict instead of being
-    # left out: BEHIND 0 from a six-hour-old fetch and from a one-minute-old fetch are different
-    # claims. The two states refused are the two that carry the defect; every other state --
-    # NO-GIT, NO-UPSTREAM, UNRESOLVED -- is REPORTED and allowed, because a guard that refuses on
-    # states that were never the problem is a guard someone disables, and this file already says so
-    # about the verdict-move refusal.
+    # BEHIND THE RECORD LINE, NOT BEHIND WHATEVER REF THIS BRANCH TRACKS. The first version of this
+    # guard refused on `stamp.freshness` alone, which is measured against the branch's own
+    # `@{upstream}` when it has one. A clone on a pushed feature branch -- the ordinary way to edit
+    # the record -- then reads CURRENT however far its base has fallen behind `origin/main`, and the
+    # guard printed that CURRENT while waving the write through. `_record_line_gap` asks the other
+    # question. It separates the two workflows cleanly: a branch cut from a current record line reads
+    # a gap of zero no matter how far ahead of its own upstream it has run.
+    #
+    # MEASURED, AND NEVER SILENT WHEN IT CANNOT MEASURE. Both readings are pure local reads -- no
+    # fetch, no network -- so a clone that has not fetched in a week can read a gap of zero and still
+    # be stale. That is exactly why `remote-knowledge` is printed beside the verdicts instead of
+    # being left out: BEHIND 0 from a six-hour-old fetch and from a one-minute-old fetch are
+    # different claims. Every state that is not a measured gap -- NO-GIT, UNASKABLE, UNRESOLVED -- is
+    # REPORTED and falls back to the branch reading, because a guard that refuses on states that were
+    # never the problem is a guard someone disables, and this file already says so about the
+    # verdict-move refusal.
     stamp = repo_stamp(SCORECARD)
+    gap, record_line = _record_line_gap(SCORECARD)
     where = (
-        f"{SCORECARD} is at {stamp.ref()}: freshness={stamp.freshness} "
-        f"upstream={stamp.upstream} remote-knowledge={stamp.remote_knowledge}"
+        f"{SCORECARD} is at {stamp.ref()}: record-line={record_line} "
+        f"branch={stamp.freshness} upstream={stamp.upstream} "
+        f"remote-knowledge={stamp.remote_knowledge}"
     )
-    if (
-        stamp.freshness.startswith("BEHIND ") or stamp.freshness == "DIVERGED"
-    ) and not args.allow_stale_clone:
+    behind_record_line = gap is not None and gap > 0
+    # KEPT AS A SECOND REFUSAL RATHER THAN REPLACED. Where the record line is unaskable this is the
+    # only reading left, and where both are available a branch behind its own upstream is missing
+    # cells a peer pushed to the shared branch -- a smaller hole than #1476's, and a real one.
+    behind_own_upstream = stamp.freshness.startswith("BEHIND ") or stamp.freshness == "DIVERGED"
+    if (behind_record_line or behind_own_upstream) and not args.allow_stale_clone:
         # REFUSED ON A DRY RUN TOO. A dry run from a stale clone reports a clean, plausible,
         # wrong plan -- the cells it would revert are not in the payload and so are not in the
         # report -- and that report is what an operator reads before reaching for --apply.
         print(f"REFUSING: {where}")
+        if behind_record_line:
+            print(
+                f"  This clone is missing {gap} commit(s) from {_RECORD_LINE}. A write from this "
+                "base would re-render every cell landed there since it back to its old value."
+            )
+        if behind_own_upstream:
+            print(
+                f"  This branch reads {stamp.freshness} against its own upstream {stamp.upstream}, "
+                "so it is missing commits from there too."
+            )
         print(
-            "  A write from this base would re-render every cell landed since it back to its old "
-            "value. Pull the clone, rebuild the payload from the current record, and re-run. "
+            "  Pull the clone, rebuild the payload from the current record, and re-run. "
             "--allow-stale-clone overrides."
         )
         return 1
@@ -686,7 +825,9 @@ def main(argv: list[str] | None = None) -> int:
         # _ORDERED is excluded because render() deliberately COERCES those -- `int(cell['level'])`
         # and the quoted emissions -- so a payload stating another type there is NORMALISED BY
         # DESIGN, and refusing it would be the false-refusal this scoping exists to prevent.
-        # _SUBTABLES are excluded because they have their own key comparison below.
+        # _SUBTABLES are excluded because they have their own key AND type comparison below, one
+        # level further in, where the entries are matched by identity. That comparison used to be
+        # key-only, which is what made this exclusion a hole rather than a delegation (#1242).
         retyped = sorted(
             k
             for k in was
@@ -746,11 +887,51 @@ def main(argv: list[str] | None = None) -> int:
             # FIELD vanish from inside one, so a sub-table entry could be rewritten with fewer keys
             # while the count matched and this invariant reported green -- exactly the state the
             # top-level `set(was) - set(now)` above exists to prevent.
-            for i, (wsub, nsub) in enumerate(zip(was.get(sub, []), now.get(sub, []), strict=False)):
+            #
+            # MATCHED BY IDENTITY, NOT BY INDEX (#1242, see `_entry_pairs`). Pairing entry `i` against
+            # entry `i` compared two DIFFERENT anchors the moment a declared retirement removed one
+            # from the middle, so the entry that survived was never compared against itself.
+            #
+            # The payload entries line up 1:1 with the file's by construction -- `render` emits one
+            # block per payload entry, in order -- so `j` indexes both.
+            pay_entries = c.get(sub) or []
+            now_entries = now.get(sub, [])
+            ordered = _SUBTABLE_ORDERED.get(sub, ())
+            for i, wsub, j in _entry_pairs(sub, was.get(sub, []), now_entries):
+                nsub = now_entries[j]
                 lost_sub = set(wsub) - set(nsub)
                 if lost_sub:
                     print(
                         f"REFUSING: cell {c['id']} {sub}[{i}] would LOSE field(s) {sorted(lost_sub)}"
+                    )
+                    return 1
+                # ...and the VALUE question one level down, which the top-level type check excludes
+                # `_SUBTABLES` from BY NAME, deferring to "their own key comparison below" -- a key
+                # comparison, which a type-mangled field passes because it KEEPS ITS KEY. So the
+                # writer and the guard were blind in the same place one level down, and this item is
+                # explicit that leaving it there reproduces its founding defect: green while lossy.
+                #
+                # AGAINST THE TYPE THE PAYLOAD STATED, for the reason the top-level check gives: an
+                # intentional retype inside an entry is an EDIT, and a guard that refuses legitimate
+                # writes is a guard someone disables. The retracted scoping the comment above
+                # describes -- skip every key the payload carries -- has no variant here, and it
+                # would be worse than it was at the top level: `_carried` reads the PAYLOAD
+                # entry alone, with no union against the live entry, so a payload that OMITS a field
+                # loses the KEY (caught above) and a type mangle is reachable ONLY while the payload
+                # CARRIES the field. Skipping carried keys would leave this check dead on every input.
+                psub = pay_entries[j] if j < len(pay_entries) else None
+                retyped_sub = []
+                for k in wsub:
+                    if k in nsub and k not in ordered:
+                        want = psub[k] if isinstance(psub, dict) and k in psub else wsub[k]
+                        if type(want) is not type(nsub[k]):  # noqa: E721
+                            retyped_sub.append(k)
+                retyped_sub.sort()
+                if retyped_sub:
+                    print(
+                        f"REFUSING: cell {c['id']} {sub}[{i}] would CHANGE the TYPE of field(s) "
+                        f"{retyped_sub} (key kept, value corrupted -- the key comparison this "
+                        "check sits beside cannot see it)"
                     )
                     return 1
 

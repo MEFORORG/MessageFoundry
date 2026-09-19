@@ -16,6 +16,7 @@ import ssl
 import sys
 import types
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.transports import rest, soap
 from messagefoundry.transports.fhir import FhirLookupExecutor
+from messagefoundry.transports.http_auth import bearer_provider_from_settings
 from messagefoundry.transports.mllp import _mllp_ssl_context
 
 
@@ -489,6 +491,205 @@ def test_the_fhir_lookup_executor_honours_the_internal_ca(tmp_path: Path) -> Non
 def test_the_fhir_lookup_executor_default_is_the_shared_opener() -> None:
     ex = FhirLookupExecutor({"L": {"url": "https://fhir.example.org/fhir"}})
     assert ex._opener["L"] is rest._NO_REDIRECT_OPENER
+
+
+# --- the TOKEN hop (#1660) -------------------------------------------------------------------------
+#
+# The case above asserts on the DATA opener and its name says "every http-family destination". It
+# parametrizes four destinations whose settings hold only url/method/soap_action, so no token provider
+# is ever constructed and the credential-bearing leg was never in its scope. These add that leg.
+#
+# The token endpoint is a SEPARATE host from the data endpoint in the ordinary deployment, so the
+# anchor is resolved against the TOKEN url. `test_the_token_hop_resolves_against_the_token_host` is
+# the assertion that says so, and it is the one that fails if somebody later "fixes" this by copying
+# the destination's already-resolved data-hop anchor across.
+
+_TOKEN_URL = "https://auth.internal.example.org/token"
+
+#: A settings-mapping builder — the two token auth modes differ only in their key prefix, so each
+#: case below is parametrized over one of these rather than written twice.
+_SettingsFactory = Callable[..., dict[str, object]]
+
+
+def _ec384_key_pem() -> str:
+    """A P-384 private key PEM — ES384 is the cheaper of SMART's two SHALL algorithms (ADR 0024)."""
+    return (
+        ec.generate_private_key(ec.SECP384R1())
+        .private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+        .decode("ascii")
+    )
+
+
+def _smart_settings(**over: object) -> dict[str, object]:
+    return {
+        "smart_token_url": _TOKEN_URL,
+        "smart_client_id": "mefor-client",
+        "smart_private_key": _ec384_key_pem(),
+        "smart_algorithm": "ES384",
+        **over,
+    }
+
+
+def _oauth2_settings(**over: object) -> dict[str, object]:
+    return {
+        "oauth2_token_url": _TOKEN_URL,
+        "oauth2_client_id": "mefor-client",
+        "oauth2_client_secret": "s3cret",
+        **over,
+    }
+
+
+def _token_opener(provider: object) -> urllib.request.OpenerDirector:
+    return provider._opener  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    "build_settings", [_smart_settings, _oauth2_settings], ids=["smart", "oauth2"]
+)
+def test_the_token_hop_honours_the_internal_ca(
+    build_settings: _SettingsFactory, tmp_path: Path
+) -> None:
+    """The #1660 assertion: both token providers verify the authorization server against the org CA.
+
+    Before this, each built its opener with no ``trust_anchor`` at all, so the credential-bearing hop
+    silently fell back to the OS trust store while the data hop next to it honoured the policy."""
+    ca = _ca_pem(tmp_path, "mefor-token-ca")
+    provider = bearer_provider_from_settings(
+        build_settings(),
+        trust_anchor_policy=_internal_policy(ca),
+    )
+    assert provider is not None
+    opener = _token_opener(provider)
+    assert opener is not rest._NO_REDIRECT_OPENER
+    ctx = _opener_context(opener)
+    assert ctx is not None
+    assert _ca_subjects(ctx) == {"mefor-token-ca"}
+
+
+@pytest.mark.parametrize(
+    "build_settings", [_smart_settings, _oauth2_settings], ids=["smart", "oauth2"]
+)
+def test_the_token_hop_honours_the_connections_own_ca(
+    build_settings: _SettingsFactory, tmp_path: Path
+) -> None:
+    """The other half of the row's title: a connection that pins its OWN ``tls_ca_file`` wins verbatim
+    on the token hop too, with no instance ``[tls]`` block in play at all."""
+    ca = _ca_pem(tmp_path, "mefor-connection-ca")
+    provider = bearer_provider_from_settings(build_settings(tls_ca_file=ca))
+    assert provider is not None
+    ctx = _opener_context(_token_opener(provider))
+    assert ctx is not None
+    assert _ca_subjects(ctx) == {"mefor-connection-ca"}
+
+
+@pytest.mark.parametrize(
+    "build_settings", [_smart_settings, _oauth2_settings], ids=["smart", "oauth2"]
+)
+def test_the_token_hop_default_is_the_shared_opener(build_settings: _SettingsFactory) -> None:
+    """The byte-identical half. Nothing configured → the very object every stock hop has always had,
+    by IDENTITY — so #1660 cannot have moved an unconfigured instance."""
+    provider = bearer_provider_from_settings(build_settings())
+    assert provider is not None
+    assert _token_opener(provider) is rest._NO_REDIRECT_OPENER
+
+
+def test_the_token_hop_resolves_against_the_token_host(tmp_path: Path) -> None:
+    """The anchor is resolved for the TOKEN host, not copied from the destination's data host.
+
+    A loopback authorization server is exempt from the internal-CA policy (``resolve_trust_anchor``'s
+    loopback rule) even when the connection's data host is not, so the token hop here must come out
+    UNanchored while the same policy anchors the data hop. Reusing the data-hop anchor would anchor
+    it, which is exactly the shortcut this test exists to refuse."""
+    ca = _ca_pem(tmp_path, "mefor-host-scoped-ca")
+    policy = _internal_policy(ca)
+    dest = _http_dest(
+        ConnectorType.FHIR,
+        {"url": "https://fhir.internal.example.org/fhir", **_oauth2_settings()},
+        trust_anchor_policy=policy,
+    )
+    data_ctx = _opener_context(dest._opener)  # type: ignore[attr-defined]
+    assert data_ctx is not None
+    assert _ca_subjects(data_ctx) == {"mefor-host-scoped-ca"}
+
+    loopback = bearer_provider_from_settings(
+        _oauth2_settings(oauth2_token_url="https://localhost:9443/token"),
+        trust_anchor_policy=policy,
+    )
+    assert loopback is not None
+    assert _token_opener(loopback) is rest._NO_REDIRECT_OPENER
+
+
+@pytest.mark.parametrize(
+    ("ctype", "settings"),
+    [
+        # REST arrived last (#1794). #1660 threaded the policy through the FHIR and SOAP call sites
+        # and held this one out because rest.py was another session's file at the time; the parameter
+        # defaults to None, so the REST token hop was unfixed rather than broken and nothing warned.
+        (ConnectorType.REST, {"url": "https://partner.internal.example.org/api", "method": "POST"}),
+        (
+            ConnectorType.SOAP,
+            {"url": "https://partner.internal.example.org/svc", "soap_action": "S"},
+        ),
+        (ConnectorType.FHIR, {"url": "https://fhir.internal.example.org/fhir"}),
+    ],
+)
+def test_the_destination_threads_its_policy_onto_the_token_hop(
+    ctype: ConnectorType, settings: dict[str, object], tmp_path: Path
+) -> None:
+    """End to end from the outbound's own ``trust_anchor_policy``, which is where an operator's
+    ``[tls]`` block actually arrives — the factory-level cases above cannot see that wiring."""
+    ca = _ca_pem(tmp_path, "mefor-dest-token-ca")
+    dest = _http_dest(
+        ctype, {**settings, **_oauth2_settings()}, trust_anchor_policy=_internal_policy(ca)
+    )
+    provider = dest._token_provider  # type: ignore[attr-defined]
+    assert provider is not None
+    ctx = _opener_context(_token_opener(provider))
+    assert ctx is not None
+    assert _ca_subjects(ctx) == {"mefor-dest-token-ca"}
+
+
+def test_the_rest_token_hop_resolves_against_the_token_host_not_the_data_host(
+    tmp_path: Path,
+) -> None:
+    """``RestDestination`` is where copying the data-hop anchor across is easiest to do by accident:
+    it resolves an ``anchor`` local for its own delivery opener a few lines below the line that builds
+    the token provider. This pins the two apart end to end through the destination — a loopback
+    authorization server is exempt from the internal-CA policy while the same connection's public data
+    host is not, so the data opener comes out anchored and the token opener comes out shared."""
+    ca = _ca_pem(tmp_path, "mefor-rest-host-scoped-ca")
+    dest = _http_dest(
+        ConnectorType.REST,
+        {
+            "url": "https://partner.internal.example.org/api",
+            "method": "POST",
+            **_oauth2_settings(oauth2_token_url="https://localhost:9443/token"),
+        },
+        trust_anchor_policy=_internal_policy(ca),
+    )
+    data_ctx = _opener_context(dest._opener)  # type: ignore[attr-defined]
+    assert data_ctx is not None
+    assert _ca_subjects(data_ctx) == {"mefor-rest-host-scoped-ca"}
+    provider = dest._token_provider  # type: ignore[attr-defined]
+    assert provider is not None
+    assert _token_opener(provider) is rest._NO_REDIRECT_OPENER
+
+
+def test_the_fhir_lookup_token_hop_honours_the_internal_ca(tmp_path: Path) -> None:
+    """A ``FhirLookup`` has no ``Destination``, so the runner threads the policy in — and until #1660
+    it reached the read opener and stopped there, leaving the SMART mint on the OS trust store."""
+    ca = _ca_pem(tmp_path, "mefor-lookup-token-ca")
+    ex = FhirLookupExecutor(
+        {"L": {"url": "https://fhir.internal.example.org/fhir", **_smart_settings()}},
+        trust_anchor_policy=_internal_policy(ca),
+    )
+    ctx = _opener_context(_token_opener(ex._token["L"]))
+    assert ctx is not None
+    assert _ca_subjects(ctx) == {"mefor-lookup-token-ca"}
 
 
 def test_soap_mutual_tls_opener_honours_the_internal_ca(tmp_path: Path) -> None:

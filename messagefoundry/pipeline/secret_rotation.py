@@ -144,6 +144,26 @@ _FP_HEX_LEN = (
 )
 
 
+def _fingerprint_bytes(value: str) -> bytes:
+    """Normalise a stored/recomputed rotation ``fingerprint`` to comparison bytes for
+    :func:`hmac.compare_digest` (ASVS 11.2.4, BACKLOG #1167).
+
+    ``compare_digest`` is applied to **bytes**, not ``str``, deliberately — the same reasoning as
+    :func:`messagefoundry.store.store.audit_mac_bytes`, restated here rather than imported because this
+    module is engine-side and stdlib-only at runtime and must not pull a store backend in. Its ``str``
+    overload raises ``TypeError`` on any non-ASCII input, and ``secret_rotation_meta.fingerprint`` is
+    out-of-band writable. A raise would not surface: :meth:`~messagefoundry.pipeline.engine.Engine`'s
+    reconcile call site wraps :func:`reconcile_rotation_meta` in a blanket ``except Exception`` that logs
+    and continues, so one planted non-ASCII character would silently disable secret-rotation tracking for
+    **every** class rather than reading as the rotation it looks like. Encoding first makes the
+    comparison total.
+
+    ``surrogatepass`` keeps the mapping total and injective for every ``str`` CPython can hold, so a lone
+    surrogate encodes rather than raising and two distinct strings can never collide onto the same bytes.
+    """
+    return value.encode("utf-8", "surrogatepass")
+
+
 def _keyed_fingerprint(key: bytes, value: str) -> str:
     """A one-way KEYED-MAC fingerprint of ``value`` under the DEK-derived ``key`` (ASVS 13.3.4). HMAC-
     SHA256, NOT a salted hash: a salted hash of a low-entropy AD/SMTP password is offline-guessable,
@@ -287,7 +307,16 @@ async def reconcile_rotation_meta(
             tracked_since = today
             last_rotated = today
             changed = True
-        elif prior.fingerprint != fingerprint:
+        # ASVS 11.2.4 (BACKLOG #1167). Both operands are keyed and secret-derived — `_keyed_fingerprint`
+        # is an HMAC-SHA256 over a live secret value — so this is compared with `hmac.compare_digest`,
+        # never `!=`, which short-circuits on the first differing byte and so leaks how much of the
+        # stored MAC a guess already matches. `_fingerprint_bytes` is what keeps the comparison total;
+        # read its docstring before changing either side. Pinned by the monkeypatched-comparator
+        # call-count test in tests\test_secret_rotation_watcher.py, whose positive control asserts a
+        # plain `!=` counts zero compares.
+        elif not hmac.compare_digest(
+            _fingerprint_bytes(prior.fingerprint), _fingerprint_bytes(fingerprint)
+        ):
             tracked_since = datetime.date.fromisoformat(prior.tracked_since)
             last_rotated = today  # rotation auto-detected → reset the clock
             changed = True

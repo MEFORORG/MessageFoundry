@@ -512,6 +512,29 @@ _UNSCANNABLE_RE_PATTERNS = {
     "messagefoundry/logging_setup.py": (
         r"""'(?i)\\b(' + '|'.join(_CREDENTIAL_QUERY_KEYS) + ')=[^&\\s\\"\']+'""",
     ),
+    # BACKLOG #1572 -- the separator-aware redaction pass. Unresolvable BY CONSTRUCTION and that is the
+    # point: the character class is the delimiter set the MESSAGE declares in MSH-1/MSH-2, read at
+    # runtime, so there is no literal to write. Writing one out would mean hardcoding ``|^~&`` back into
+    # the redactor, which is the exact defect #1572 fixed.
+    #
+    # Nothing partner-chosen reaches the pattern unescaped. The sniff admits only non-word, non-space
+    # characters, and each is passed through ``re.escape`` before it is spliced, which escapes every
+    # character-class metacharacter (``-`` ``^`` ``]`` ``\``), so a header cannot inject a range, a
+    # negation, or a class terminator.
+    #
+    # The shapes are non-catastrophic by inspection. The segment pattern is a fixed ``{2}`` repetition,
+    # a one-character class, and one unbounded repetition of a negated class that is quantified nowhere
+    # and sits inside no quantified group. The field run's repetitions are all POSSESSIVE over
+    # ``[^\s<delims>]``, the exact complement of the ``[<delims>]`` class that follows each of them, so
+    # no two adjacent elements can match at one position and there is nothing to re-walk; the outer
+    # ``(?:...)+`` therefore has one parse of any prefix rather than many. The leading lookbehind is
+    # that same complement, so a delimiter-free run costs one match attempt rather than one per
+    # character -- the linear-scan property BACKLOG #1437 bought, carried onto this path rather than
+    # given back. ``tests/test_redaction.py`` pins the scan budget for both.
+    "messagefoundry/redaction.py": (
+        "f'\\\\b([A-Z][A-Z0-9]{{2}})([{chars}])[^\\\\r\\\\n]*'",
+        "f'(?<![^\\\\s{chars}])[^\\\\s{chars}]*+[{chars}][^\\\\s{chars}]*+(?:[{chars}][^\\\\s{chars}]*+)+'",
+    ),
     # BACKLOG #1478 -- the credential-label vocabulary. Unresolvable BY CONSTRUCTION and that is the
     # point: each label alternation is spliced from the SAME word tuple its admission gate is built
     # from, which is what makes gating provably non-narrowing. Writing the alternations out as
@@ -519,10 +542,29 @@ _UNSCANNABLE_RE_PATTERNS = {
     # non-catastrophic by inspection: one BOUNDED prefix repetition ``{0,6}`` (deliberately bounded --
     # unbounded it is quadratic on attacker-influenceable log text), then a literal alternation, then
     # a negated character class. No nested quantifier and no overlapping alternation.
+    #
+    # ``_CREDENTIAL_KV`` gained three spliced value fragments under BACKLOG #1685, and the clause above
+    # covers them all. Every repetition they add is DETERMINISTIC -- there is exactly one parse of any
+    # prefix, so there is nothing to re-walk:
+    #
+    # * ``_ODBC_BRACED`` is ``\{(?:[^}]|\}\})*+\}(?!\})``. Its two branches cannot both match at one
+    #   position, because ``[^}]`` excludes the single character ``\}\}`` needs. The quantifier is
+    #   POSSESSIVE, which this scanner reads as the mitigation rather than the shape, and correctly:
+    #   it is what stops the walk retrying on a brace that never closes.
+    # * ``_QUOTED_VALUE`` is ``'[^'\r\n]*+'|"[^"\r\n]*+"`` -- a negated class that excludes its own
+    #   closer, possessive for the same reason.
+    # * ``_ODBC_BRACED_OVERRUN`` is ``\{[^\r\n]*`` -- one unbounded repetition of a negated class,
+    #   quantified nowhere and inside no quantified group.
+    #
+    # Measured 2026-09-14, minimum over 25 interleaved rounds of 20 ``sub`` passes, against a
+    # reconstruction of the pre-#1685 pattern. Every shape occurring in real log text is level or
+    # faster (plain line 2.18 against 2.27 us; the 6 KB adversarial run naming every family 359
+    # against 357 us). The one regression is a 6 KB line whose value opens "{" and never closes, at 83
+    # against 25 us -- two linear walks rather than one, recorded in full in the module's docstring.
     "messagefoundry/secretscrub.py": (
         "'(?i)\\\\b(' + _LABEL_PREFIX + '(?:' + _alternation(_TOKEN_WORDS) + '))\\\\b\\\\s*[:=]\\\\s*(?:(?:bearer|basic|digest)\\\\s+)?[\\'\\\\\"]?[^\\\\s\\'\\\\\"]+'",
         "'\\\\b(' + re.escape(_ENV_PREFIX) + '[A-Z0-9_]+)\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*[\\'\\\\\"]?[^\\\\s\\'\\\\\"]+[\\'\\\\\"]?'",
-        "'(?i)\\\\b(' + _LABEL_PREFIX + '(?:' + _alternation(_CREDENTIAL_WORDS) + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*[\\'\\\\\"]?[^\\\\s\\'\\\\\";,&]+'",
+        "'(?i)\\\\b(' + _LABEL_PREFIX + '(?:' + _alternation(_CREDENTIAL_WORDS) + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _ODBC_BRACED + '|' + _QUOTED_VALUE + '|' + _ODBC_BRACED_OVERRUN + '|[\\'\\\\\"]?[^\\\\s\\'\\\\\";,&]+)'",
         "'(?i)\\\\b(' + _LABEL_PREFIX + '(?:' + _alternation(_KEY_MATERIAL_WORDS) + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*[\\'\\\\\"]?[^\\\\s\\'\\\\\";&]+'",
     ),
     "messagefoundry/parsing/_builtin_hl7.py": ("f'{e}\\\\.({prefixes})(?!{e})'",),  # ASVS 1.3.3

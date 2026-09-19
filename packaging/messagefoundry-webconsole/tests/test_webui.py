@@ -2528,6 +2528,10 @@ async def test_update_user_profile_roundtrip(engine: Engine) -> None:
     await _add(service, "u1", Role.VIEWER)
     async with _boss_client(engine, service) as c:
         uid = await _uid(service, "u1")
+        # BACKLOG #1737: the update lane is action-bound, and the grant is SINGLE-USE, so each of the
+        # two submits below needs its own. The continuation is the detail PAGE, not the POST path (a
+        # body-carrying action is in neither continuation allow-list) — that is where the grant mints.
+        await _mint_action(c, f"/ui/users/{uid}")
         r = await c.post(
             f"/ui/users/{uid}/update",
             data={"display_name": "User One", "email": "u1@example.test", "disabled": "on"},
@@ -2538,6 +2542,7 @@ async def test_update_user_profile_roundtrip(engine: Engine) -> None:
         assert user is not None
         assert user.display_name == "User One" and user.disabled
         # Re-enable (checkbox absent) + clear the email ("" clears to None — full-form semantics).
+        await _mint_action(c, f"/ui/users/{uid}")
         r = await c.post(
             f"/ui/users/{uid}/update",
             data={"display_name": "User One", "email": ""},
@@ -2549,10 +2554,64 @@ async def test_update_user_profile_roundtrip(engine: Engine) -> None:
         assert not user.disabled and user.email is None
 
 
+async def test_update_user_requires_a_grant_bound_to_this_action(engine: Engine) -> None:
+    """BACKLOG #1737 (ASVS 7.5.1): the console update lane must require the same action-bound,
+    single-use step-up its JSON twin (``PATCH /users/{id}``) requires — not the shared window.
+
+    THE CONTROL IS THE BOUNCE, AND IT IS ASSERTED BEFORE ANY GRANT EXISTS. Minting and then
+    succeeding shows the flow works, not that the gate stands: this session is freshly signed in, so
+    it already satisfies ``has_recent_step_up``, and a route back on ``require_ui_step_up`` would
+    serve step 1 with a 303 to the user page and the write applied. The wrong-action leg is the
+    second half of the same control — it fails a route that reads any fresh grant rather than this
+    action's, which a bare "does a grant work" test cannot tell apart.
+    """
+    service = await _service(engine)
+    await _add(service, "u1", Role.VIEWER)
+    async with _boss_client(engine, service) as c:
+        uid = await _uid(service, "u1")
+        form = {"display_name": "Renamed", "email": "u1@example.test", "disabled": "on"}
+
+        async def _update() -> httpx.Response:
+            return await c.post(
+                f"/ui/users/{uid}/update", data=form, headers={"Sec-Fetch-Site": "same-origin"}
+            )
+
+        async def _unchanged() -> None:
+            user = await service.store.get_user(uid)
+            assert user is not None
+            assert user.display_name != "Renamed" and not user.disabled
+
+        # 1. The login-seeded window alone does not reach it.
+        bounced = await _update()
+        assert bounced.status_code == 303
+        assert "/ui/reauth" in bounced.headers["location"]
+        await _unchanged()
+
+        # 2. Nor does a fresh grant minted for a DIFFERENT action on the same session.
+        await _mint_action(c, f"/ui/users/{uid}/reset-password")  # mints admin_reset_password
+        bounced = await _update()
+        assert bounced.status_code == 303
+        assert "/ui/reauth" in bounced.headers["location"]
+        await _unchanged()
+
+        # 3. The grant bound to THIS action does, so the gate did not just break the lane.
+        await _mint_action(c, f"/ui/users/{uid}")
+        r = await _update()
+        assert r.status_code == 303 and r.headers["location"] == f"/ui/users/{uid}"
+        user = await service.store.get_user(uid)
+        assert user is not None and user.display_name == "Renamed" and user.disabled
+
+        # 4. And it is spent: the next submit bounces again rather than riding the refreshed window.
+        bounced = await _update()
+        assert bounced.status_code == 303
+        assert "/ui/reauth" in bounced.headers["location"]
+
+
 async def test_cannot_disable_self_rerenders_error(engine: Engine) -> None:
     service = await _service(engine)
     async with _boss_client(engine, service) as c:
         uid = await _uid(service, "boss")
+        await _mint_action(c, f"/ui/users/{uid}")  # BACKLOG #1737: action-bound lane
         r = await c.post(
             f"/ui/users/{uid}/update",
             data={"display_name": "", "email": "", "disabled": "on"},
@@ -2690,6 +2749,32 @@ async def test_reset_password_shows_temp_once(engine: Engine) -> None:
         assert "Temporary password issued" in r.text and "<code>" in r.text
         user = await service.store.get_user(uid)
         assert user is not None and user.must_change_password
+        # BACKLOG #1141 (ASVS 6.4.5): the page an administrator actually reads states the deadline.
+        # Asserting the RENDERED instant, not merely that some date appears: the sentence is the
+        # renewal instruction, and one naming a moment the gate does not honour is worse than none.
+        from datetime import UTC, datetime
+
+        assert user.password_changed_at is not None
+        deadline = service.initial_credential_deadline(user.password_changed_at)
+        assert deadline is not None
+        assert (
+            datetime.fromtimestamp(deadline, UTC).strftime("%Y-%m-%d %H:%M:%SZ") in r.text
+            and "It stops working at" in r.text
+        )
+
+
+async def test_temp_password_page_states_no_deadline_when_expiry_is_off() -> None:
+    # The control for the assertion above. `initial_password_expiry_hours = 0` is a documented,
+    # supported value, and the honest page then says nothing about a deadline rather than softening
+    # the sentence -- so the assertion above is measuring the deadline arm, not boilerplate that is
+    # always present.
+    from messagefoundry_webconsole.pages import admin as pages
+
+    with_deadline = pages.temp_password_page("u2", "temp-secret", 1_800_000_000.0)
+    assert "It stops working at" in str(with_deadline)
+    without = pages.temp_password_page("u2", "temp-secret", None)
+    assert "It stops working at" not in str(without)
+    assert "Temporary password issued" in str(without)  # the rest of the page is unchanged
 
 
 async def test_reset_mfa_and_revoke_sessions_roundtrip(engine: Engine) -> None:
@@ -2966,9 +3051,11 @@ async def test_all_admin_posts_reject_cross_site(engine: Engine) -> None:
         # missing assert_same_origin on those routes must fail loudly, not hide behind a no-grant 303).
         await _mint_action(c, "/ui/account/webauthn/enroll")
         await _mint_action(c, "/ui/account/webauthn/abc123/delete")
-        # BACKLOG #1148 puts the two admin reset lanes into that same shape.
+        # BACKLOG #1148 puts the two admin reset lanes into that same shape, #1737 the update lane
+        # (whose grant mints against the detail PAGE — the POST path is not a continuation).
         await _mint_action(c, f"/ui/users/{boss_id}/reset-password")
         await _mint_action(c, f"/ui/users/{boss_id}/reset-mfa")
+        await _mint_action(c, f"/ui/users/{boss_id}")
         posts = [
             "/ui/users",
             f"/ui/users/{boss_id}/update",
@@ -3453,6 +3540,89 @@ async def test_ui_factor_bind_opt_out_uses_window(engine: Engine) -> None:
         await _cookie_login(c, "op")
         r = await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
         assert r.status_code == 200 and "Secret:" in r.text
+
+
+@pytest.mark.parametrize("action_step_up", (True, False), ids=("enforced", "opted-out"))
+async def test_ui_factor_bind_needs_the_existing_factor_whatever_the_knob_says(
+    engine: Engine, action_step_up: bool
+) -> None:
+    """The /ui twin of the engine's 6.3.3 factor-binding refusal.
+
+    RED when: the ``factor_binding_is_blocked`` refusal leaves ``_ui_action_step_up_ok``. The
+    ``opted-out`` arm is the regression that matters: under
+    ``[auth].require_action_step_up = false`` this lane's whole gate is the session window, so a
+    refreshed window alone would let an MFA-pending session bind a NEW factor on an account that
+    already holds one -- and the confirm ceremony then promotes it to MFA-satisfied.
+
+    The window is stamped directly rather than staged through a ceremony, because the reachable
+    chain crosses planes and the crossing is not what this test is about: /ui and the JSON API share
+    one session store, so somebody holding the password signs in at /ui, replays that same session
+    token as a Bearer to ``POST /me/reauth`` (MFA-exempt, and purpose-less so the mint-time guard
+    never fires), and comes back to the cookie lane with the window fresh. What this pins is that
+    the /ui gate must not open on a fresh window alone, however the window got there.
+
+    The victim holds a PASSKEY rather than a TOTP secret for the reason the JSON twin gives: against
+    a TOTP holder the enroll route refuses on its own with a 400, so a 303 assertion would grade a
+    gate that is wide open. Measured against the unfixed code, the opted-out arm stages a secret and
+    returns **200** on the TOTP enroll lane.
+    """
+    from messagefoundry.store.store import WebAuthnCredential
+
+    service = AuthService(
+        engine.store, AuthSettings(require_mfa=False, require_action_step_up=action_step_up)
+    )
+    await service.initialize()
+    await _add(service, "vic", Role.OPERATOR)
+
+    # The victim really holds a factor, so the enrollment deadlock carve-out does not cover them.
+    uid = await _uid(service, "vic")
+    await engine.store.add_webauthn_credential(
+        WebAuthnCredential(
+            credential_id_hash="ui-vic-passkey-hash",
+            credential_id="ui-vic-passkey-id-b64url",
+            user_id=uid,
+            rp_id="t",
+            public_key="cose-public-key-b64url",
+            sign_count=0,
+            transports=None,
+            device_type="multi_device",
+            backed_up=True,
+            label="yubikey",
+            aaguid="aaguid-0000",
+            created_at=1000.0,
+            last_used_at=None,
+        )
+    )
+    assert await service.store.has_webauthn_credentials(uid) is True
+
+    async with _client(engine, service) as c:
+        r = await _cookie_login(c, "vic")  # the attacker knows the password and nothing else
+        assert r.status_code == 303
+        tok = c.cookies.get("mf_session")
+        assert tok is not None
+        await service.store.mark_session_reauthed(hash_token(tok))
+        # The positive controls. Without them a refusal for some OTHER reason -- a stale window, a
+        # spent grant -- would read as this guard working and the opted-out arm would pass anyway.
+        assert await service.has_recent_step_up(tok) is True
+        assert await service.mfa_satisfied(tok) is False
+
+        for path, continuation in (
+            ("/ui/account/mfa/enroll", "/ui/account/mfa/enroll"),
+            ("/ui/account/webauthn/enroll", "/ui/account/webauthn/enroll"),
+        ):
+            r = await c.post(path, headers={"Sec-Fetch-Site": "same-origin"})
+            assert r.status_code == 303, f"{path} bound a factor on the password alone"
+            assert r.headers["location"] == f"/ui/reauth?next={continuation}"
+        # The confirm lane is refused on its own, not merely starved of a staged secret.
+        r = await c.post(
+            "/ui/account/mfa/verify",
+            data={"code": "000000"},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 303
+        assert r.headers["location"] == "/ui/reauth?next=/ui/account/mfa/confirm"
+        # No promotion happened: the session is still behind the 6.3.3 gate.
+        assert await service.mfa_satisfied(tok) is False
 
 
 # --- L4b review-driven regressions (adversarial review: 2 behavior bugs + coverage gaps) -----------

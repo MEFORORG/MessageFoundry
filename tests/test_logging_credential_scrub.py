@@ -91,6 +91,119 @@ class Family:
     patterns: tuple[str, ...]
 
 
+# --- BACKLOG #1685: a QUOTED credential value, whose tail the shipped pattern printed --------------
+
+
+@dataclass(frozen=True)
+class QuotedValue:
+    """One log line carrying a quoted credential, split into the pieces none of which may survive.
+
+    ``fragments`` is every piece of the secret the delimiter separates. That is the whole point of the
+    table: the defect replaced the value's HEAD and printed the rest, so an assertion naming only the
+    whole value would have passed while the tail reached the sink. ``survives`` is what the redaction
+    must NOT eat, since over-redaction is the wrong direction on an operator's live console."""
+
+    name: str
+    line: str
+    fragments: tuple[str, ...]
+    survives: tuple[str, ...]
+
+
+def odbc_line(value: str) -> str:
+    """An ODBC connection-string log line whose password is ``value``, brace-quoted.
+
+    ``value`` is already ODBC-ENCODED, so a doubled ``}}`` here means one ``}`` in the password."""
+    return "odbc conn Driver={ODBC Driver 18};UID=svc;PWD={" + value + "};Server=db-1.invalid"
+
+
+#: What survives an ODBC line: the server, and a brace-quoted value under a NON-credential keyword.
+_ODBC_SURVIVES = ("Driver={ODBC Driver 18}", "Server=db-1.invalid")
+
+
+#: A value is quoted PRECISELY so it may carry the characters that would otherwise end it -- ";", "="
+#: and spaces -- and those are what the shipped value class stopped at. Every sentinel carries a hyphen
+#: AND an underscore so nothing base64-shaped can reach it.
+#:
+#: SEVEN OF THE EIGHT ARE REPRODUCTIONS AND ONE IS A REGRESSION GUARD, recorded because the difference
+#: is invisible from the table. Measured against the shipped module at 1aa2d6a1b, every row below
+#: leaked its later fragments EXCEPT ``brace_equals``: the pre-fix class stopped at whitespace, quotes,
+#: ";", "," and "&" and admitted "=", so that row went green before the fix and proves only that the
+#: new alternates did not narrow it. Calling it a reproduction would overstate what was measured.
+QUOTED_VALUES: tuple[QuotedValue, ...] = (
+    QuotedValue(
+        "brace_semicolon",
+        odbc_line("wt-Semi_A-73;wt-Semi_B-74"),
+        ("wt-Semi_A-73", "wt-Semi_B-74"),
+        _ODBC_SURVIVES,
+    ),
+    QuotedValue(
+        "brace_space",
+        odbc_line("wt-Spc_A-75 wt-Spc_B-76"),
+        ("wt-Spc_A-75", "wt-Spc_B-76"),
+        _ODBC_SURVIVES,
+    ),
+    QuotedValue(
+        "brace_equals",
+        odbc_line("wt-Eq_A-77=wt-Eq_B-78"),
+        ("wt-Eq_A-77", "wt-Eq_B-78"),
+        _ODBC_SURVIVES,
+    ),
+    QuotedValue(
+        "brace_comma",
+        odbc_line("wt-Cma_A-79,wt-Cma_B-80"),
+        ("wt-Cma_A-79", "wt-Cma_B-80"),
+        _ODBC_SURVIVES,
+    ),
+    QuotedValue(
+        # THE ROW THAT TELLS A CORRECT FIX FROM A NAIVE ONE; the reasoning is on the test that pins it,
+        # ``test_a_first_closing_brace_pattern_would_still_leak_the_doubled_brace_row``.
+        "brace_doubled",
+        odbc_line("wt-Dbl_A-81}}wt-Dbl_B-82;wt-Dbl_C-83"),
+        ("wt-Dbl_A-81", "wt-Dbl_B-82", "wt-Dbl_C-83"),
+        _ODBC_SURVIVES,
+    ),
+    QuotedValue(
+        # THE MORE REACHABLE HALF OF THE DEFECT. Brace-quoting rides in on the SQL Server store; a
+        # password with a SPACE in it reaches every backend, and this is a real engine setting.
+        "single_quoted_space",
+        "ldap bind failed ad_bind_password='wt-Sq_A-84 wt-Sq_B-85' for svc",
+        ("wt-Sq_A-84", "wt-Sq_B-85"),
+        ("ldap bind failed", "for svc"),
+    ),
+    QuotedValue(
+        "double_quoted_space",
+        'api tls tls_key_password="wt-Dq_A-86 wt-Dq_B-87" could not open the chain',
+        ("wt-Dq_A-86", "wt-Dq_B-87"),
+        ("api tls", "could not open the chain"),
+    ),
+    QuotedValue(
+        "single_quoted_semicolon",
+        "connect failed password='wt-Qsc_A-88;wt-Qsc_B-89' retrying",
+        ("wt-Qsc_A-88", "wt-Qsc_B-89"),
+        ("connect failed", "retrying"),
+    ),
+)
+
+
+#: The quoted rows as families, so they inherit the three parametrized assertions below: the production
+#: chain scrubs them, the DECLARED pattern is what did it, and the admission gate does not change the
+#: result. DERIVED rather than written out again, so the two tables cannot drift -- the same reason
+#: ``_ANY_HINT`` is derived in the module under test.
+#:
+#: ``secret`` is the LAST fragment on purpose: that is the piece the shipped pattern printed verbatim,
+#: so the family assertion points at the actual leak rather than at the whole value, which the defect
+#: never emitted intact and which would therefore have gone green throughout.
+QUOTED_FAMILIES: tuple[Family, ...] = tuple(
+    Family(
+        name=f"quoted_{case.name}",
+        line=case.line,
+        secret=case.fragments[-1],
+        patterns=("_CREDENTIAL_KV",),
+    )
+    for case in QUOTED_VALUES
+)
+
+
 #: Every credential family the write-time chain must scrub. The first seven are the shapes measured
 #: passing VERBATIM at 68693cfc2, in the order they were measured.
 FAMILIES: tuple[Family, ...] = (
@@ -188,6 +301,7 @@ FAMILIES: tuple[Family, ...] = (
         secret="wt-Sm4rt_Key-66",
         patterns=("_KEY_MATERIAL",),
     ),
+    *QUOTED_FAMILIES,
 )
 
 
@@ -263,6 +377,94 @@ def test_the_gate_folds_the_way_the_patterns_match_not_the_way_str_lower_does() 
     assert not any(word in line.lower() for word in secretscrub._ANY_HINT)
     # And the shipped gate does admit it, so the chain scrubs it.
     assert "wt-F0ld_Chk-72" not in run_chain(line).getMessage()
+
+
+@pytest.mark.parametrize("case", QUOTED_VALUES, ids=lambda c: c.name)
+def test_no_fragment_of_a_quoted_credential_value_survives_the_chain(case: QuotedValue) -> None:
+    """EVERY piece of a quoted value must be gone, and the rest of the line must still be there.
+
+    The first half is the assertion the family table above cannot make: a family names ONE ``secret``,
+    so a pattern that replaced the value's head and printed the rest satisfies it for whichever piece
+    it happened to name. That is exactly what shipped -- the value class stopped at the characters the
+    quoting exists to carry, so the tail reached the stdout stream NSSM captures and the off-box
+    forwarder.
+
+    The second half pulls the other way and is why it sits in the same test. Over-redaction is the
+    direction this module may fail in, but it is not free: the reader is an operator watching a live
+    console for the message that says what to fix, and a quoted alternate that ran to end of line on a
+    WELL-FORMED value would pass the leak assertion and blind them."""
+    out = run_chain(case.line).getMessage()
+
+    survivors = [fragment for fragment in case.fragments if fragment in out]
+    assert not survivors, f"{case.name}: {survivors} survived a quoted value -- got {out!r}"
+    assert CREDENTIAL_PLACEHOLDER in out, f"{case.name}: nothing was marked redacted -- got {out!r}"
+
+    eaten = [context for context in case.survives if context not in out]
+    assert not eaten, f"{case.name}: the redaction ate {eaten} -- got {out!r}"
+
+
+def test_a_first_closing_brace_pattern_would_still_leak_the_doubled_brace_row() -> None:
+    """THE CONTROL THAT MAKES THE DOUBLED-BRACE ROW WORTH ITS PLACE.
+
+    ODBC ends a brace-quoted value at the first ``}`` that is not doubled; an interior literal ``}``
+    is written ``}}``. So the obvious fix -- ``\\{[^}]*\\}`` -- passes every other row in
+    :data:`QUOTED_VALUES` and leaks on this one, which is the only thing that row is for. Built here
+    rather than described in a comment, because a fixture whose discriminating power is only claimed
+    is one nobody notices losing.
+
+    The expected leak is DERIVED, not transcribed: a first-brace pattern stops after the head, so
+    everything after ``fragments[0]`` survives by construction."""
+    case = next(c for c in QUOTED_VALUES if c.name == "brace_doubled")
+    naive = re.compile(r"(?i)\b(pwd)\b\s*[:=]\s*\{[^}]*\}")
+    naive_out = naive.sub(lambda m: f"{m.group(1)}={CREDENTIAL_PLACEHOLDER}", case.line)
+
+    assert CREDENTIAL_PLACEHOLDER in naive_out, "the naive pattern did not fire at all"
+    leaked = [fragment for fragment in case.fragments if fragment in naive_out]
+    assert leaked == list(case.fragments[1:]), (
+        f"a first-closing-brace pattern was expected to leak every fragment after the head; it leaked "
+        f"{leaked} -- got {naive_out!r}"
+    )
+
+
+def test_an_unclosed_brace_redacts_to_end_of_line_and_no_further() -> None:
+    """A ``{`` this module cannot close is redacted to the end of ITS OWN line.
+
+    Two properties in one fixture, and they pull against each other. A truncated connection string --
+    a driver error is cut off wherever the driver cut it -- must not drop back to the plain value
+    class, which would print the password, so the run goes to end of line. And it must stop there,
+    because ``exc_text`` carries a whole rendered traceback: a run that crossed ``\\n`` would redact
+    every later frame and hand the operator a stack with no stack in it."""
+    record = run_chain(
+        "delivery failed",
+        exc_text=(
+            "Traceback:\n"
+            "  OperationalError: Driver={X};PWD={wt-Uncl_A-90;wt-Uncl_B-91\n"
+            "  at messagefoundry/store/sqlserver.py line 41\n"
+        ),
+    )
+    assert record.exc_text is not None
+    assert "wt-Uncl_A-90" not in record.exc_text
+    assert "wt-Uncl_B-91" not in record.exc_text
+    assert "at messagefoundry/store/sqlserver.py line 41" in record.exc_text
+
+
+def test_an_unclosed_quote_still_falls_back_to_the_plain_value_class() -> None:
+    """THE RESIDUAL, PINNED RATHER THAN DESCRIBED -- this is a limitation, not a fix.
+
+    An unterminated quote falls back to the plain value class, so the head goes and a later fragment
+    prints. That asymmetry with the brace form is deliberate: a ``{`` after a credential label is
+    unambiguous, while an apostrophe is ordinary prose, so a quote overrun would eat the rest of any
+    line whose value merely contains one.
+
+    Written as a test so the residual cannot quietly become false. If a later change adds the quote
+    overrun, this goes red and the reader is sent to the reasoning rather than left guessing."""
+    out = run_chain("connect failed password='wt-Unq_A-92 wt-Unq_B-93 retrying").getMessage()
+    assert "wt-Unq_A-92" not in out, "the head should still be redacted"
+    assert "wt-Unq_B-93" in out, (
+        "an unclosed quote now redacts past the whitespace. That may be an improvement, but it is a "
+        "behaviour change with a recorded reason against it -- see _CREDENTIAL_KV's residual note in "
+        "messagefoundry/secretscrub.py before deleting this test."
+    )
 
 
 #: Diagnostics carrying no credential, which the credential patterns must NOT eat. Over-redaction is

@@ -69,53 +69,109 @@ async def store() -> AsyncIterator[object]:
 
     settings = load_settings(environ=os.environ).store
     s = await SqlServerStore.open(settings)
-    # Clean slate (the container DB persists across tests in a run).
-    async with s._pool.acquire() as conn:
-        cur = await conn.cursor()
-        for table in (
-            "message_events",
-            "audit_log",
-            "audit_chain_meta",  # #190 audit-chain keying watermark — a keying test (CLI-23) sets it;
-            #                      leaving it would fail-close a later keyless record_audit (poison)
-            "cipher_meta",  # ASVS 11.3.4 per-key GCM invocation counters (no FK)
-            "connection_event",  # #46 lifecycle log (no FK) — ciphered `reason` rows else leak across
-            #                      runs and break the key-rotation reencrypt scan (persistent contamination)
-            "state",
-            "reference",  # ADR 0006 snapshot rows (no FK) — leaked ciphered/plaintext rows break the
-            #               exact reencrypt counts (the == 6 in
-            #               test_reencrypt_to_active_rotates_all_columns_including_state)
-            "reference_version",  # ADR 0006 active-version pointers (no FK)
-            "message_attachment",  # #149 attachment linkage (no FK; cleared for a clean slate)
-            "attachment_chunk",  # #149 attachment chunks (no FK)
-            "attachment",  # #149 attachment headers (no FK)
-            "queue",  # FK to messages(id) — must be cleared before messages
-            "response",  # FK to messages(id) — must be cleared before messages
-            "delivered_keys",  # H2 idempotency ledger (no FK, but ids reference messages)
-            "resend_log",  # ADR 0090 idempotency ledger (no FK) — STOREF-8/9 reuse keys across tests
-            "alert_instance",  # #56 operator alert-state (no FK) — ALERT-19 lists ALL active rows
-            "search_presets",  # ADR 0136 saved searches (no FK) — the ciphered `criteria` rides the
-            #                    key-rotation reencrypt scan, and this suite asserts EXACT rotate
-            #                    counts (the == 6 / == 2 above), so a preset left behind by one test
-            #                    silently miscounts an unrelated one
-            "messages",
-            "sessions",
-            "webauthn_credentials",  # ADR 0068: FK to users(id) — must clear before users
-            "user_roles",
-            "ad_group_role_map",
-            "users",
-            "roles",
-        ):
-            await cur.execute(f"DELETE FROM {table}")
-        await conn.commit()
-    # audit_chain_meta was cleared above; sync the in-memory keying watermark so this keyless fixture
-    # handle never carries a stale watermark that would fail-close a later keyless record_audit (#190).
-    s._audit_keyed_from = None
-    # open() seeded the reference read-through cache BEFORE the clean-slate DELETE above, so re-load it
-    # from the now-empty tables — otherwise a prior test's reference rows linger in this handle's
-    # in-memory cache/versions and leak across tests (mirrors the Postgres fixture; Track B Step 6).
-    await s._load_reference_cache()
-    yield s
-    await s.close()
+    # BACKLOG #1629: everything between open() and the yield runs inside this try, so a setup
+    # failure still closes the pool. Without it one failing setup step would leak a pool per test
+    # and the rest of the run would error on the connection cap, burying the real cause.
+    try:
+        # Clean slate (the container DB persists across tests in a run).
+        async with s._pool.acquire() as conn:
+            cur = await conn.cursor()
+            for table in (
+                "message_events",
+                "audit_log",
+                "audit_chain_meta",  # #190 audit-chain keying watermark — a keying test (CLI-23) sets it;
+                #                      leaving it would fail-close a later keyless record_audit (poison)
+                "cipher_meta",  # ASVS 11.3.4 per-key GCM invocation counters (no FK)
+                "connection_event",  # #46 lifecycle log (no FK) — ciphered `reason` rows else leak across
+                #                      runs and break the key-rotation reencrypt scan (persistent contamination)
+                "state",
+                "reference",  # ADR 0006 snapshot rows (no FK) — leaked ciphered/plaintext rows break the
+                #               exact reencrypt counts (the == 6 in
+                #               test_reencrypt_to_active_rotates_all_columns_including_state)
+                "reference_version",  # ADR 0006 active-version pointers (no FK)
+                "message_attachment",  # #149 attachment linkage (no FK; cleared for a clean slate)
+                "attachment_chunk",  # #149 attachment chunks (no FK)
+                "attachment",  # #149 attachment headers (no FK)
+                "queue",  # FK to messages(id) — must be cleared before messages
+                "response",  # FK to messages(id) — must be cleared before messages
+                "delivered_keys",  # H2 idempotency ledger (no FK, but ids reference messages)
+                "resend_log",  # ADR 0090 idempotency ledger (no FK) — STOREF-8/9 reuse keys across tests
+                "alert_instance",  # #56 operator alert-state (no FK) — ALERT-19 lists ALL active rows
+                "search_presets",  # ADR 0136 saved searches (no FK) — the ciphered `criteria` rides the
+                #                    key-rotation reencrypt scan, and this suite asserts EXACT rotate
+                #                    counts (the == 6 / == 2 above), so a preset left behind by one test
+                #                    silently miscounts an unrelated one
+                "messages",
+                "sessions",
+                "webauthn_credentials",  # ADR 0068: FK to users(id) — must clear before users
+                "user_roles",
+                "ad_group_role_map",
+                "users",
+                "roles",
+            ):
+                await cur.execute(f"DELETE FROM {table}")
+            await conn.commit()
+        # audit_chain_meta was cleared above; sync the in-memory keying watermark so this keyless fixture
+        # handle never carries a stale watermark that would fail-close a later keyless record_audit (#190).
+        s._audit_keyed_from = None
+        # open() seeded the reference read-through cache BEFORE the clean-slate DELETE above, so re-load it
+        # from the now-empty tables — otherwise a prior test's reference rows linger in this handle's
+        # in-memory cache/versions and leak across tests (mirrors the Postgres fixture; Track B Step 6).
+        await s._load_reference_cache()
+        yield s
+    finally:
+        await s.close()
+
+
+async def test_store_fixture_closes_the_pool_when_setup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #1629: a setup failure between open() and the yield still closes the pool.
+
+    The window under test is the FIXTURE's own setup, not ``open()``'s. ``SqlServerStore.open``
+    carries its own M-6 guard (``except Exception:`` -> ``pool.close()``/``wait_closed()`` plus the
+    executor shutdown), so a failure injected into any step ``open()`` performs is caught and the
+    pool closed *there*, ``open()`` never returns, and the fixture's ``try``/``finally`` is never
+    entered -- the closed-pool assertion below would then hold with the fix reverted, which is no
+    test at all.
+
+    So the failure is armed only once ``open()`` has RETURNED, and on the returned instance rather
+    than on the class. ``open()`` therefore runs its own ``_load_reference_cache`` for real, and the
+    raise can only land in the fixture's own call to it -- after the clean-slate DELETE batch,
+    before the ``yield``. Without the ``try``/``finally`` the generator walks away from a live pool,
+    so one bad setup step would leak a handle per test and every later test would error on the
+    connection cap instead of on the real fault. Test infrastructure: no deployment axis.
+
+    ``store.__wrapped__`` is the undecorated generator pytest keeps on the fixture object.
+    """
+    from messagefoundry.config.settings import StoreSettings
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    opened: list[SqlServerStore] = []
+
+    async def _boom() -> None:
+        raise RuntimeError("fixture setup failed after open")
+
+    real_open = SqlServerStore.open
+
+    async def _open_then_arm(settings: StoreSettings) -> SqlServerStore:
+        s = await real_open(settings)
+        # open() returned, so its M-6 guard is behind us and the pool is live. Patching the
+        # INSTANCE (not the class) is what pins the raise to a fixture-owned step: nothing
+        # inside open() can reach this attribute, because open() is already done.
+        assert not s._pool.closed, "open() handed back a closed pool -- anchor broken"
+        setattr(s, "_load_reference_cache", _boom)  # noqa: B010 - shadows the method on purpose
+        opened.append(s)
+        return s
+
+    monkeypatch.setattr(SqlServerStore, "open", _open_then_arm)
+
+    gen = store.__wrapped__()
+    with pytest.raises(RuntimeError, match="fixture setup failed after open"):
+        await anext(gen)
+
+    assert opened, "open() never returned, so no fixture-owned step ran and this asserts nothing"
+    assert opened[0]._pool.closed, "the fixture left its pool open on the failure path"
 
 
 async def test_enqueue_creates_message_and_outbox(store) -> None:
@@ -468,6 +524,30 @@ async def test_totp_store_contract(store) -> None:
     from tests._webauthn_store_contract import _assert_totp_contract
 
     await _assert_totp_contract(store)
+
+
+async def test_lockout_store_contract(store) -> None:
+    """The account-lockout counter on the real SQL Server backend.
+
+    ``increment_login_failure`` collapsed a read-modify-write that let parallel failures each read the
+    same pre-increment count and evade the lockout. This leg is the only thing that executes its
+    UPDLOCK body at all -- the shared contract is otherwise proven on SQLite, where the row lock this
+    backend needs does not exist."""
+    from tests._lockout_store_contract import _assert_lockout_contract
+
+    await _assert_lockout_contract(store)
+
+
+async def test_pending_approval_store_contract(store) -> None:
+    """BACKLOG #1540 ``pending_approvals.requester_user_id`` on the real SQL Server backend.
+
+    This backend is the one where getting the migration wrong is SILENT: the ADR 0064 schema marker
+    skips the whole batch once it matches, so an ``ALTER`` placed outside ``_SCHEMA`` never runs and
+    the column simply never appears. ``test_store_schema_hash.py`` pins the DDL text; only this leg
+    proves the column is really there and that the ``INSERT``/``SELECT`` carry it."""
+    from tests._pending_approval_store_contract import _assert_pending_approval_contract
+
+    await _assert_pending_approval_contract(store)
 
 
 async def test_directory_identity_store_contract(store) -> None:
@@ -986,6 +1066,24 @@ async def test_dead_letter_missing_handlers_errors_the_message(store) -> None:
     )
     assert await store.dead_letter_missing_handlers({"OtherHandler"}, now=200.0) == 1
     assert (await store.get_message(mid))["status"] == MessageStatus.ERROR.value
+
+
+async def test_dead_letter_missing_inbounds_errors_the_message(store) -> None:
+    # BACKLOG #1612. The channel-keyed sweep, at parity with its two siblings: an ingress row whose
+    # inbound left the registry is dead-lettered (nothing else would ever claim it), while an
+    # outbound row is spared even when ITS origin channel is the removed one — outbound lanes key on
+    # destination_name and drain regardless of where the message came from.
+    orphan = await store.enqueue_ingress(channel_id="GONE_IN", raw=RAW, now=100.0)
+    outbound = await store.enqueue_message(
+        channel_id="GONE_IN", raw=RAW, deliveries=[("OB", "p")], now=100.0
+    )
+    assert await store.dead_letter_missing_inbounds({"IB"}, now=200.0) == 1
+    assert (await store.get_message(orphan))["status"] == MessageStatus.ERROR.value
+    assert (await store.outbox_for(outbound))[0]["status"] == OutboxStatus.PENDING.value
+    # Replayable: the operator restores the inbound and the row comes back pending at its own stage.
+    assert await store.replay(orphan, now=300.0) == 1
+    item = await store.claim_next_fifo("GONE_IN", stage=Stage.INGRESS.value, now=300.0)
+    assert item is not None and item.payload == RAW
 
 
 async def test_transform_state_persists_and_reloads_on_reopen(store) -> None:
@@ -1942,6 +2040,84 @@ async def test_legacy_plaintext_error_detail_migrated_on_open(store) -> None:
         assert (await keyed.list_dead())[0]["last_error"] == fail
     finally:
         await keyed.close()
+
+
+async def test_state_plaintext_migrated_on_keyed_reopen(store) -> None:
+    """BACKLOG #1723: the no-key -> key open must seal ``state.value`` on THIS backend too.
+
+    ``state`` is the cell the static parity guard could not see here, because SQL Server writes it
+    with ``MERGE`` and ``tests/test_store_cipher_sweep_parity.py`` scoped itself with ``INSERT INTO``
+    alone. The scan is widened there; this is the runtime half, and it is separate from
+    ``test_legacy_plaintext_error_detail_migrated_on_open`` above because ``state`` reaches the sweep
+    through the COMPOSITE-PK pass rather than the id-keyed ``_CIPHER_COLUMNS`` loop that test drives —
+    a pass dropped from one is invisible to the other.
+
+    ``state`` carries transform state, which is PHI-bearing by design — that is why
+    ``test_keyless_open_of_encrypted_state_fails_closed`` exists — so leaving it plaintext through a
+    keying is the defect this pins.
+    """
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.crypto import AesGcmCipher
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    settings = load_settings(environ=os.environ).store
+    key = b"s" * 32
+    try:
+        # (1) KEYLESS: the MERGE lands the value as plaintext at rest.
+        plain = await SqlServerStore.open(settings)
+        try:
+            mid, ing = await _ingress_and_claim(plain, "IB", RAW)
+            await plain.route_handoff(
+                ingress_id=ing.id,
+                message_id=mid,
+                channel_id="IB",
+                handlers=[("H", RAW)],
+                disposition=MessageStatus.ROUTED,
+                now=100.0,
+            )
+            rtd = await plain.claim_next_fifo("IB", stage=Stage.ROUTED.value, now=100.0)
+            await plain.transform_handoff(
+                routed_id=rtd.id,
+                message_id=mid,
+                channel_id="IB",
+                deliveries=[("OB", "b")],
+                state_ops=[("ns", "k", {"mrn": "M-LEGACY-STATE"})],
+                now=100.0,
+            )
+            rows = await plain._fetchall("SELECT value FROM state")
+            # A NEGATIVE assert, so it must exclude EVERY marker version: a v1-only spelling passes
+            # on an encrypted v2 value and would make this whole setup vacuous. Over EVERY row, not
+            # row 0: the CI database is shared, so which row comes back first is not this test's to
+            # decide, and a `rows[0]` spelling would pass while a sibling row stayed plaintext.
+            assert rows and all(not r["value"].startswith(MARKER_PREFIX) for r in rows), rows
+        finally:
+            await plain.close()
+
+        # (2) Re-open WITH a key: open() runs _encrypt_existing_rows over the legacy plaintext.
+        keyed = await SqlServerStore.open(settings, cipher=AesGcmCipher(key))
+        try:
+            rows = await keyed._fetchall("SELECT value FROM state")
+            assert rows and all(r["value"].startswith(MARKER_PREFIX) for r in rows), (
+                f"state.value is still plaintext at rest after a keyed reopen: {rows}"
+            )
+            assert all("M-LEGACY-STATE" not in r["value"] for r in rows), rows
+            # ... and the read path still returns the original cleartext through the new key.
+            assert keyed.state_view()[("ns", "k")] == {"mrn": "M-LEGACY-STATE"}
+        finally:
+            await keyed.close()
+    finally:
+        # Shared-DB hygiene, even on assertion failure: state sealed under this test's key makes the
+        # next KEYLESS fixture open fail closed inside _load_state_cache, cascading setup ERRORs
+        # across every later test in the run.
+        cleanup = await SqlServerStore.open(settings, cipher=AesGcmCipher(key))
+        try:
+            async with cleanup._pool.acquire() as conn:
+                cur = await conn.cursor()
+                for table in ("message_events", "state", "response", "queue", "messages"):
+                    await cur.execute(f"DELETE FROM {table}")
+                await conn.commit()
+        finally:
+            await cleanup.close()
 
 
 # --- ADR 0006 reference snapshots (BACKLOG #235) — the T-SQL port proof --------------------------

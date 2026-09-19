@@ -705,7 +705,7 @@ inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bu
 | `POST` | `/ui/users/{user_id}/reset-password` | `users:manage` | `require_ui_step_up_action` (action `admin_reset_password`) |
 | `POST` | `/ui/users/{user_id}/revoke-sessions` | `users:manage` | `require_ui_step_up` |
 | `POST` | `/ui/users/{user_id}/roles` | `users:manage` | `require_ui_step_up` |
-| `POST` | `/ui/users/{user_id}/update` | `users:manage` | `require_ui_step_up` |
+| `POST` | `/ui/users/{user_id}/update` | `users:manage` | `require_ui_step_up_action` (action `admin_user_update`) |
 
 **The two-permission `/ui` routes**, each failing closed on either permission:
 
@@ -1277,7 +1277,8 @@ one-to-one — that is why the bind/exposure posture occupies two rows and the A
 | Consecutive credential failures on one account | the account's failure counter | ≥ 5 consecutive failures locks for 15 minutes; a lapsed window restarts the counter | **DENY** before any verify + an audit row whose name is leg-specific — `auth.login_locked` on the password path, `auth.mfa_failed` / `auth.webauthn_failed` with `reason=locked` on the TOTP/recovery and assertion legs (the password path still runs a dummy argon2 verify to keep timing flat) | 5 / 15 min | `[auth].lockout_threshold`, `lockout_minutes` |
 | New client IP during a session | this request's address vs `session.client` | knob on **and** a session exists, is unrevoked, has an anchor, and the two are not the same host (both-loopback counts as one host) | **CHALLENGE** — force a fresh step-up; first sighting also writes `auth.admin_action_new_ip` + an out-of-band notice; repeats WARNING-log only. **Never** an RBAC deny | **off** | `[auth].admin_new_ip_step_up` |
 | Credential recency | age of `session.reauth_at` | `now − reauth_at > step_up_max_age_seconds`, or `reauth_at is None` | **DENY** 403 + `X-Step-Up-Required: 1` (console: 303 → `/ui/reauth`) | 300 s | `[auth].step_up_max_age_seconds` |
-| Action-bound step-up grant | a single-use grant minted only by `reauth(purpose=…)`, on the **monotonic** clock | no unconsumed grant for this route's action | **DENY** 403 + `X-Step-Up-Required` + `X-Step-Up-Action: <action>`; opting out falls back to the session window | on | `[auth].require_action_step_up` |
+| Action-bound step-up grant | a single-use grant minted only by `reauth(purpose=…)`, on the **monotonic** clock | no unconsumed grant for this route's action | **DENY** 403 + `X-Step-Up-Required` + `X-Step-Up-Action: <action>`; opting out falls back to the session window — **except on a factor bind**, see the row below | on | `[auth].require_action_step_up` |
+| Binding a NEW second factor | the session's MFA state × the account's existing factors | the action binds a factor (`mfa_enroll`, `mfa_confirm`, `webauthn_enroll`) **and** the session has not satisfied its second factor **and** the account already holds one of either kind | **DENY** — the existing factor must be proven first (`POST /auth/mfa-verify`, or the code/passkey leg of `/ui/reauth`). An account with **no** factor still enrols its first one from a password-only session; that carve-out is what the MFA gate's enrollment exemption is for | on | **no knob** — `require_action_step_up` does not reach it, deliberately |
 | MFA state | `session.mfa_verified_at` × factor enrollment × account roles | the rule is **provider-blind** (BACKLOG #1144 — an AD account used to be exempt here, on a delegation the directory never asserted): enrolled → always required, whatever the scope says; un-enrolled → required when the knob is on **and** the scope covers the account — **`every_local_account` by default**, i.e. every account despite the value's narrower name, or the Administrator role only under `administrators`. A directory session that was minted without an engine-verified factor is refused outright while the knob is on | **DENY** 403 + `X-MFA-Required: 1` on **every** authorized route — an **access gate**, not only a step-up gate; the console twin is a 303 to `/ui/mfa`, with the account and factor-enrolment routes exempt so an un-enrolled user is not stranded. An earlier revision of this row said Administrator-only and step-up-boundary-only; both were wrong | on; scope `every_local_account` | `[security].require_mfa`, `[security].require_mfa_scope` (the `[auth]` spellings are rejected at load) |
 | Identity provider — local credential rotation | `identity.auth_provider` | the provider is AD (the credential is the directory's, not the engine's) | **DENY** `POST /me/password` with **400**; the step-up re-proof for that identity becomes a **live directory re-bind** instead of a local hash compare, so a disabled AD account cannot refresh its window, and the engine MFA gate never fires for it | n/a | `[auth].ad_enabled` |
 | Authentication ambience | how the session was minted | browser Kerberos SSO and the OIDC callback mint with `seed_reauth=False` | **CHALLENGE** — the session is born **without** step-up freshness, so its first sensitive action forces an explicit credential step-up (the *second* signal in this table whose action is a challenge rather than a hard decision) | n/a | (by design) |
@@ -1699,12 +1700,15 @@ offer.
 `[security].allowed_client_networks` is a pre-auth network
 gate that applies to **every** pathway equally, so it is a note here rather than a column.
 
-**Lockout asymmetry and control coverage (ASVS 6.1.3 / 6.3.4).** The engine's per-account lockout
-protects **Local** accounts only, and only the password and TOTP/recovery legs **feed** it; WebAuthn
-assertion failures deliberately do not (signatures are not guessable secrets, and a flaky authenticator
+**Lockout asymmetry and control coverage (ASVS 6.1.3 / 6.3.4).** Only the **Local** password and
+TOTP/recovery legs **feed** the engine's per-account lockout, but the lock they set is **enforced
+wherever a pathway reaches an engine account row, directory accounts included** — `verify_mfa` and
+`finish_webauthn_assertion` never filtered on `auth_provider`, and since BACKLOG #1638 a Kerberos or
+OIDC sign-in refuses a locked mirror row before it completes; WebAuthn
+assertion failures deliberately do not **feed** it (signatures are not guessable secrets, and a flaky authenticator
 must not lock an account) — **but an already-locked account IS refused at the assertion leg before any
 verification** (`finish_webauthn_assertion` checks `locked_until` first and audits
-`auth.webauthn_failed` with `reason=locked`), so the lock is *enforced* across every local factor even
+`auth.webauthn_failed` with `reason=locked`), so the lock is *enforced* across every factor leg even
 though only two legs feed it. Neither fed nor enforced on `POST /me/reauth` or
 `POST /me/password` — which now matters more, because since the AD sign-in was retired the step-up
 re-auth route is the **only** place an AD password is still bound, and it is covered by a per-actor
@@ -1759,7 +1763,7 @@ threshold, the switch that disables it, and — the part that matters for "not d
 
 | # | Control | Protects | Threshold / window | Disable switch | What remains when off |
 |---|---|---|---|---|---|
-| 1 | **Per-account lockout** | one account's credential-guessing, on the password **and** TOTP/recovery legs | 5 consecutive failures → 15 min; a lapsed window restarts the counter, so each lock expires on its own — but **repetition is unbounded**: an attacker who keeps failing re-locks the account as each window lapses. Signal, recovery and what to arrange in advance: below the table | **no dedicated off switch.** `lockout_minutes = 0` makes the lock expire instantly, which is the effective opt-out; `lockout_threshold = 0` is **not** an off switch — it locks on the *first* failure | limiters 2 + 3 only |
+| 1 | **Per-account lockout** | one account's credential-guessing, on the password **and** TOTP/recovery legs | 5 consecutive failures → 15 min; the count is applied by a single atomic store call, so failures submitted **in parallel** each land and a burst locks the account exactly as a serial run does; a lapsed window restarts the counter, so each lock expires on its own — but **repetition is unbounded**: an attacker who keeps failing re-locks the account as each window lapses. Signal, recovery and what to arrange in advance: below the table | **no dedicated off switch.** `lockout_minutes = 0` makes the lock expire instantly, which is the effective opt-out; `lockout_threshold = 0` is **not** an off switch — it locks on the *first* failure | limiters 2 + 3 only |
 | 2 | **Sign-in sliding window** (`allow_login_attempt`) | password-spraying across many usernames, which never trips a single account's lockout | > 10 attempts per client IP **or** > 60 across all clients, per 60 s (either dimension alone refuses — `global_full or key_full`) | `[auth].login_rate_limit_enabled = false` | lockout only — **and limiter 3 disappears with it** (see below) |
 | 3 | **Per-actor credential-ceremony budget** (`allow_reauth_attempt`) | a session holder guessing a password at the re-proof surface, where lockout does **not** apply | > 10 ceremonies per acting **user**, per 60 s. **No global dimension** (`glob=0`) | *the same* `[auth].login_rate_limit_enabled` | **nothing** — `POST /me/reauth` and `POST /me/password` then have no anti-automation control at all |
 | 4 | **argon2 concurrency cap** | executor exhaustion under a login flood | an instance semaphore sized `max(2, min(8, cpu_count))`; every hash/verify runs off the event loop | none | n/a |
@@ -1770,7 +1774,7 @@ threshold, the switch that disables it, and — the part that matters for "not d
 | 9 | **JWKS min-refetch floor** (`JwksCache.get_key`) | unauthenticated `kid`-driven refetch amplification against the IdP on the OIDC callback leg — the sibling of control 7 on the *other* federated leg | one upstream fetch per **300 s**, globally (`[auth].oidc_jwks_min_refetch_seconds`), plus a `_MAX_JWKS_BYTES` **512 KiB** response-body cap and a 3600 s key TTL. Within the floor an unknown `kid` raises `JwksError` and that login fails (a still-cached key is served even past the soft TTL rather than fail while throttled) | `oidc_jwks_min_refetch_seconds = 0` — no validator floor, so this **is** a genuine opt-out, and it restores the amplification | limiter 2 and control 7 (the same legs charge `allow_login_attempt` and stage a bounded flow first) |
 
 **Control 1 bounds the lock, not the campaign.** Each lockout releases itself after
-`lockout_minutes`, but `_register_failure` restarts the counter on a lapsed window and re-locks on the
+`lockout_minutes`, but `increment_login_failure` restarts the counter on a lapsed window and re-locks on the
 next run to the threshold, and the account row persists a failure count and an expiry — never a count
 of locks — so nothing accumulates across cycles and the number of cycles has no ceiling. The account
 is reachable in the gap between one lock expiring and the next being set, and no longer. Sustaining
@@ -1792,21 +1796,27 @@ account is locked right now, and a locked account still lists as enabled. Diagno
 from the audit log, not the user list.
 
 **Recovery.** Absent a sustained attacker nothing is needed — the lock expires on its own. Against a
-sustained one: across all three store backends the writes that clear `locked_until` are
-`set_password`, the successful-login write and the failed-attempt write, and only `set_password` can
-run while a lock is live — control 1 refuses before any credential is verified, so neither the
-successful-login write nor the login-time rehash beside it is ever reached, and the failed-attempt
-write only clears an **already lapsed** lock. Two routes reach `set_password` while an account is
-locked, both local-account-only, and **both issue a new password rather than merely lifting the
-lock**: the holder's own `POST /me/password`, reachable only while they still have a live session
+sustained one: across all three store backends **at least** four writes clear `locked_until` —
+`set_password`, the successful-login write, the atomic failed-attempt write
+(`increment_login_failure`) and the raw lockout-state write (`record_login_failure`), whose only
+remaining caller is the offline unlock below. Two of the four can run while a lock is live:
+`set_password` and that offline unlock. Control 1 refuses before any credential is verified, so
+neither the successful-login write nor the login-time rehash beside it is ever reached, and the
+failed-attempt write only clears an **already lapsed** lock. Two routes reach `set_password` while an
+account is locked, both local-account-only, and **both issue a new password rather than merely lifting
+the lock**: the holder's own `POST /me/password`, reachable only while they still have a live session
 (session validation never consults `locked_until`, and that route is exempt from both the must-change
 and the MFA-pending gates), and the
-[administrator's reset](#admin-password-reset-wp-l3-12-asvs-646). No shipped command clears a lock
-without going through one of those two — the CLI manages no users.
+[administrator's reset](#admin-password-reset-wp-l3-12-asvs-646). The one shipped command that lifts a
+lock without issuing a password is `messagefoundry admin-unlock`
+([ADR 0171](adr/0171-offline-administrator-unlock-a-host-gated-cli-recovery-path-for-a-sole-administrator-lockout.md)),
+which is gated on **host access** rather than on a credential: reaching it needs the config, the store
+path and, on an encrypted store, the key material.
 
 **Arrange in advance.** Keep a **second administrator who can sign in**: the administrator reset
-refuses a self-reset, so a sole administrator holding no live session has no in-band route back for as
-long as an attacker sustains the lock.
+refuses a self-reset, so a sole administrator holding no live session has no *in-band* route back for
+as long as an attacker sustains the lock — only the host-gated `admin-unlock`, which needs access to
+the engine host itself.
 
 > **Binding conditionality — controls 2 and 3 are one switch, not two.**
 > `[auth].login_rate_limit_enabled = false` constructs **neither** limiter: `_login_limiter` and
@@ -1872,8 +1882,12 @@ Every enforced limit, with both dimensions stated even where one is hard-coded o
 is not uniform.** The four sliding-window limiters (sign-in, credential ceremony, PHI read, admin
 write) and the two pending-flow caches are **in-process, per API process** — N engine shards multiply
 *those* budgets by N. The account lockout, the concurrent-session cap and the bootstrap-admin timer are
-**store-backed** (`record_login_failure` / `enforce_session_cap` / `set_user_disabled` against the one
-unified store), so they are **shared** by every API process and are **not** multiplied by N. The
+**store-backed** (`increment_login_failure` / `enforce_session_cap` / `set_user_disabled` against the
+one unified store), so they are **shared** by every API process and are **not** multiplied by N. For
+the lockout, shared is not by itself enough and the second half is what makes the first half true: the
+count, the lapsed-window reset and the lock decision are **one atomic call** per attempt, so parallel
+attempts — from one process or from N shards — cannot each read the same pre-increment count and lose
+an increment between them. The
 per-uploader file/byte quota is also **not** multiplied by N: it is scoped to the `uploads_dir` (an
 uncached sidecar scan) with its check-then-write held as an atomic reservation on that same unified
 store, so shards sharing one dir enforce one budget between them. The request-body cap, the
@@ -1885,7 +1899,7 @@ additionally front the API with a proxy/WAF limiter and TLS.
 |---|---|---|---|---|---|---|---|---|
 | Sign-in attempts | `[auth].login_rate_limit_enabled`, `login_rate_limit_per_ip`, `login_rate_limit_global`, `login_rate_limit_window_seconds` | on / 10 / 60 / 60.0 s | 60 s | no | **yes** (60) | **yes** (10) | **in-process** — 3 JSON + 4 console entry routes | logged, **not** audited. **429 + `Retry-After: 30` on `POST /ui/login`** — the only *sign-in-window* route that sends the header (the two `/ui/reauth*` **ceremony** routes send it too, see the row below); a **303 redirect to `/ui/login?e=rate_limited` (no 429, no `Retry-After`)** on `GET /ui/sso`, `GET /ui/oidc/start` and `GET /ui/oidc/callback`, because a browser navigation cannot render a 429 usefully; **429 with no `Retry-After`** on the three JSON routes |
 | Credential ceremonies | *(shares* `login_rate_limit_per_ip` *and* `login_rate_limit_window_seconds`*, and the same enable flag)* | on / 10 / — / 60.0 s | 60 s | **yes** (10) | no (`glob=0`) | no | **in-process** — 3 JSON + 3 console ceremony routes | 429; `Retry-After: 30` on the two `/ui/reauth*` routes, none on the other four; logged |
-| Account lockout | `[auth].lockout_threshold`, `lockout_minutes` | 5 / 15 min | — | **yes** | no | no | **store-backed** — local password + TOTP/recovery legs | refuse + an audit row, named per leg — `auth.login_locked` on the password leg, `auth.mfa_failed` / `auth.webauthn_failed` with `reason=locked` on the factor legs |
+| Account lockout | `[auth].lockout_threshold`, `lockout_minutes` | 5 / 15 min | — | **yes** | no | no | **store-backed** — local password + TOTP/recovery legs, counted by one atomic `increment_login_failure` per attempt (SQLite under the store lock, PostgreSQL under `SELECT ... FOR UPDATE`, SQL Server under `UPDLOCK`), so concurrent attempts against one account serialize on the row instead of each reading the same pre-increment count | refuse + an audit row, named per leg — `auth.login_locked` on the password leg, `auth.mfa_failed` / `auth.webauthn_failed` with `reason=locked` on the factor legs |
 | PHI reads | `[auth].phi_read_rate_limit_enabled`, `phi_read_rate_limit_per_actor`, `phi_read_rate_limit_global`, `phi_read_rate_limit_window_seconds` | on / 120 / **0 = off** / 60.0 s | 60 s | **yes** (120) | off by default | no | **in-process** — 7 JSON routes via `require_phi_read`, 4 bulk-PHI step-up GETs charged at admission, 5 `/ui` views via `require_ui(phi=True)`, and 1 further `/ui` GET that inherits the charge by delegating into the handler body | 429 + `Retry-After: 10`, logged |
 | Admin writes | `[auth].admin_write_rate_limit_enabled`, `admin_write_rate_limit_per_actor`, `admin_write_rate_limit_window_seconds` | on / 12 / 1.0 s | 1.0 s | **yes** (12) | no (`glob=0`) | no | **in-process** — **non-GET only**, via `require_step_up`, `require_step_up_action` **and** `require_paced`; `/ui` re-applies it in `require_ui` | 429 + `Retry-After: 1`, logged |
 | Concurrent sessions | `[auth].max_sessions_per_user` | 5 (`0` = unlimited) | — | **yes** | no | no | **store-backed** — every login | the user's oldest session is revoked |
@@ -1960,7 +1974,18 @@ inherited from another caller. It is surfaced on `GET /audit` and in the `audit:
 **Tamper-evidence (AUDIT-INTEGRITY).** Each `audit_log` row carries a `row_hash` that chains the
 previous row's hash with this row's content (SHA-256), so deleting, editing, or reordering any row is
 detectable. Verify the chain with `messagefoundry audit-verify` — exit 0 means at least that no
-surviving row was edited or reordered. It does **not** mean nothing was removed: deleting the *newest*
+surviving row was edited or reordered. **A scheduled job reads the exit code and nothing else, so
+these four are kept distinct:** `0` a clean walk over at least one row, `1` a broken chain, `2` the
+path is not an audit database, and `3` a clean walk over an **empty** log. Exit 2 covers at least an
+absent path, a zero-byte file, a file carrying no `audit_log` table, and a path that is not a SQLite
+database at all — the verifier refuses each rather than creating or migrating the evidence it was
+asked to check, and it opens read-only so it cannot write to that file either way. It never spends
+`1` on any of them, because `1` is reserved for a chain that was read and found broken. Exit 3
+exists because "there was nothing to verify" is not a
+pass; pass `--allow-empty` to accept it as one on an instance that has not logged anything yet, or
+pass an expected anchor of `0:`, which asserts the same thing and is checked. `audit-anchor` keeps
+exit 0 on an empty log — sealing a fresh instance as `0:` is the point of it — but refuses the same
+non-audit-database paths. It does **not** mean nothing was removed: deleting the *newest*
 rows leaves a prefix that still chains cleanly, so a bare verify is clean after a tail-truncation. For
 that, snapshot `messagefoundry audit-anchor` (`COUNT:HEAD`) and pass it back as `messagefoundry
 audit-verify --expected-anchor`. It is an exact point-in-time seal, which fixes what it is for: it

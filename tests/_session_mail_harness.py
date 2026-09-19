@@ -217,8 +217,15 @@ def run_drain(
     event: str = "Stop",
     session_id: str | None = SELF_ID,
     cwd: Path | None = None,
+    script: Path = DRAIN,
 ) -> subprocess.CompletedProcess[str]:
     """Drive the hook exactly as Claude Code does.
+
+    ``script`` defaults to the shipped drain and exists for PLANTED CONTROLS: an arm that asserts a
+    guard protected a file has to also run a build with that guard removed, or it cannot tell a guard
+    that worked from a sweep that never reached the file. The fail-open assertions below are the
+    reason this is a parameter rather than a second copy of the function -- they are centralised so no
+    invocation path goes unchecked, and a control build is a path.
 
     The payload MUST carry ``cwd``: mail-drain.ps1:272 falls back to ``(Get-Location).Path``, so a
     payload without it would point the drain at the LIVE checkout's mail root, which is both a false
@@ -234,7 +241,7 @@ def run_drain(
     if session_id is not None:
         payload["session_id"] = session_id
     proc = subprocess.run(
-        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(DRAIN)],
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(script)],
         cwd=str(cwd or repo),
         input=json.dumps(payload),
         capture_output=True,
@@ -245,8 +252,8 @@ def run_drain(
     # FAIL OPEN, asserted in the helper and not per-test. A Stop hook that fails can end a turn badly
     # and a SessionStart hook that fails replaces the whole starting context; asserting it per-test
     # would leave every path nobody wrote a test for unchecked.
-    assert proc.returncode == 0, f"drain exited {proc.returncode}: {proc.stderr}"
-    assert not proc.stderr.strip(), f"drain wrote to stderr: {proc.stderr}"
+    assert proc.returncode == 0, f"{script.name} exited {proc.returncode}: {proc.stderr}"
+    assert not proc.stderr.strip(), f"{script.name} wrote to stderr: {proc.stderr}"
     return proc
 
 

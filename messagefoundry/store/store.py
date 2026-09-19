@@ -35,6 +35,7 @@ independently, so overlapping id sets are reachable in normal operation. They no
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import hmac
 import json
@@ -43,6 +44,7 @@ import os
 import shutil
 import stat
 import subprocess
+import threading
 import time
 from collections.abc import (
     AsyncIterator,
@@ -58,7 +60,7 @@ from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Final, Protocol, runtime_checkable
+from typing import Any, Final, NoReturn, Protocol, runtime_checkable
 from uuid import uuid4
 
 import aiosqlite
@@ -118,6 +120,138 @@ _RELEASE_CHUNK = 500
 # fixed parameters; the chunks run inside the reset's single transaction, so atomicity is unchanged.
 _RESET_LANE_CHUNK = 500
 
+# How long a transaction unwind waits for its shielded ROLLBACK before giving up on it. A
+# cancellation is usually a shutdown, so the unwind must never be able to hang shutdown on a worker
+# thread that is wedged on the abandoned statement. 5s matches the SQL Server store's
+# `_DIRTY_CLOSE_TIMEOUT` (ADR 0159) and the read pool's `busy_timeout`, so the store's three
+# "stop waiting on a stuck connection" bounds agree rather than each carrying its own number.
+_ROLLBACK_TIMEOUT = 5.0
+
+
+def _drain_detached_rollback(role: str, fut: asyncio.Future[None]) -> None:
+    """Retrieve a detached rollback's outcome so asyncio does not log it as never-retrieved."""
+    if fut.cancelled():
+        return
+    exc = fut.exception()
+    if exc is not None:
+        log.warning("sqlite: detached %s rollback failed: %s", role, exc)
+
+
+async def _unwind_txn(db: aiosqlite.Connection, *, role: str) -> bool:
+    """Roll the open transaction on ``db`` back while the caller unwinds. Returns ``True`` if a
+    further cancellation was swallowed to finish the job.
+
+    ``role`` is ``"writer"`` or ``"read"`` and only names the connection in the log lines. The
+    mechanism is deliberately identical for both — see *why both roles wait* below.
+
+    Called from :func:`_writer_txn` with the writer lock STILL HELD, so no other writer can take the
+    connection mid-rollback, and from :meth:`MessageStore._read` on a borrowed pooled connection this
+    task still owns — it goes back to the queue only after this helper returns — so no other reader
+    can take it either.
+
+    The rollback is **shielded** because a cancellation is the common reason we are here, and an
+    unshielded ``await`` on the cancelled task's own stack is cancelled at once — leaving exactly the
+    half-open transaction this exists to close. It is **bounded** because aiosqlite runs the ROLLBACK
+    on a worker thread that may still be stuck on the abandoned statement.
+
+    A FURTHER cancellation (shutdown cancels a task, then the gather cancels it again) is swallowed
+    and the wait resumes for what is left of the bound.
+
+    **Why both roles wait rather than returning early.** This is where SQLite parts company with the
+    pooled SQL Server path (ADR 0159's ``_release_dirty``, which swallows the second cancel and
+    returns immediately): there the connection is already quarantined OUT of the pool, so returning
+    early strands nothing. Neither SQLite connection can be quarantined. The writer is exactly ONE
+    connection behind one lock, so returning early would release the lock over a half-open
+    transaction and the next writer would inherit it. The read pool is a FIXED
+    :class:`asyncio.Queue` filled once at ``open()`` with **no reopen path**, so dropping a
+    connection rather than healing it would shrink the pool permanently, and dropping all
+    ``_READ_POOL_SIZE`` of them would park every later read forever — silently, and strictly worse
+    than the half-open transaction it was avoiding (BACKLOG #1635). Waiting out the bound is the only
+    remedy available to either role, so do not port the quarantine here."""
+    loop = asyncio.get_running_loop()
+    rollback = asyncio.ensure_future(db.rollback())
+    deadline = loop.time() + _ROLLBACK_TIMEOUT
+    swallowed_cancel = False
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            rollback.add_done_callback(functools.partial(_drain_detached_rollback, role))
+            log.warning(
+                "sqlite: %s rollback did not complete within %.1fs; it will finish detached and the"
+                " next user of this connection may inherit an open transaction",
+                role,
+                _ROLLBACK_TIMEOUT,
+            )
+            return swallowed_cancel
+        try:
+            await asyncio.wait_for(asyncio.shield(rollback), remaining)
+        except TimeoutError:
+            continue  # the loop head re-reads the deadline and gives up there
+        except asyncio.CancelledError:
+            swallowed_cancel = True  # re-cancelled mid-unwind; keep waiting out the bound
+            continue
+        except Exception:  # noqa: BLE001 — a rollback failure must not mask the original failure
+            log.warning("sqlite: %s rollback failed", role, exc_info=True)
+        return swallowed_cancel
+
+
+async def _unwind_and_raise(db: aiosqlite.Connection, exc: BaseException, *, role: str) -> NoReturn:
+    """Unwind ``db``'s open transaction, then re-raise ``exc`` — or a cancellation if one landed
+    mid-unwind.
+
+    A cancellation swallowed by :func:`_unwind_txn` while an ORDINARY failure was rolling back must
+    not be dropped: re-raising only the original would leave the task running through a shutdown, so
+    the cancellation wins and carries the original failure as its cause.
+
+    One definition, shared by :func:`_writer_txn` and :meth:`MessageStore._read`, because both have
+    exactly this obligation and a second copy is how the two drift apart. It never returns."""
+    if await _unwind_txn(db, role=role) and not isinstance(exc, asyncio.CancelledError):
+        raise asyncio.CancelledError from exc
+    raise exc
+
+
+@asynccontextmanager
+async def _writer_txn(db: aiosqlite.Connection, lock: asyncio.Lock) -> AsyncIterator[None]:
+    """Run the block inside ONE writer transaction, holding ``lock``, unwinding on **BaseException**.
+
+    **Every writer that opens an EXPLICIT transaction goes through here** — ``execute("BEGIN")``
+    appears nowhere else on ``self._db``, and ``tests/test_writer_txn_is_the_only_begin.py`` keeps it
+    that way. It is NOT yet the store's only writer shape: most short writers take the lock, issue
+    one statement and ``_commit()``, and sqlite3's ``isolation_level=''`` auto-begins for them, so
+    they hold an implicit transaction with the same exposure. Converting those is deferred work
+    (ADR 0159) — do not read this helper's existence as covering them.
+
+    The handler is ``BaseException`` and not ``Exception`` on purpose:
+    :class:`asyncio.CancelledError` derives from ``BaseException``, so an ``except Exception``
+    rollback never fires on a cancellation and the block would unwind with its transaction still
+    open. SQLite has ONE writer connection behind ``lock``, so the next writer to
+    take the lock would inherit that transaction — its statements would join work the cancelled
+    caller never committed, and the first ``COMMIT`` would make the pair durable together. Under the
+    staged pipeline (ADR 0001) that is how a cancelled stage handoff would lose or duplicate work on
+    first deployment, which is why the unwind is part of the reliability invariant, not hygiene.
+
+    ``BEGIN`` is INSIDE the ``try`` deliberately: aiosqlite runs it on a worker thread, so a
+    cancellation delivered at that await can leave the transaction open with nothing written. A
+    ``ROLLBACK`` with no transaction open is a no-op, so covering it costs nothing.
+
+    The block owns its own ``COMMIT`` (nothing here commits for it), so an early ``return`` after an
+    explicit ``rollback()`` — the idempotent no-op exits — still runs that rollback under the lock.
+    **That cuts both ways, and it is the rule a new caller must not miss:** a clean exit unwinds
+    NOTHING, so any path leaving the block between the ``BEGIN`` and the ``COMMIT`` has to
+    ``rollback()`` itself first or it leaves the transaction open for the next writer."""
+    async with lock:
+        try:
+            await db.execute("BEGIN")
+            yield
+        except BaseException as exc:
+            await _unwind_and_raise(db, exc, role="writer")
+
+
+class _GroupPoisoned(Exception):  # noqa: N818 — control-flow signal, not an error condition
+    """Raised inside the group-commit batch's writer transaction when a member failed, so the shared
+    transaction unwinds through :func:`_writer_txn` (under the lock) instead of being rolled back by
+    hand. Caught by :meth:`_GroupCommitter._flush`, which then rejects every member's future."""
+
 
 class _AbortMember(Exception):  # noqa: N818 — control-flow signal, not an error condition
     """Raised inside a grouped member body to short-circuit it WITHOUT failing the batch.
@@ -163,10 +297,13 @@ class _GroupCommitter:
     Coalesces N grouped stage-handoff mutations into ONE ``COMMIT`` under the store's single writer
     lock, amortizing the per-commit fsync (a large win under ``synchronous=FULL``). A member is
     enrolled via :meth:`submit`; the committer coroutine drains the open batch under ``self._lock``,
-    runs each member's statements inside one ``BEGIN`` … ``COMMIT``, then resolves every member's
-    future. If ANY member raises (other than :class:`_AbortMember`), or the commit itself fails, the
-    whole batch is rolled back and EVERY member's future is rejected — each caller re-runs (a
-    coordinated form of the crash-re-run the INFLIGHT-guarded idempotent handoffs already tolerate).
+    runs each member's statements inside one :func:`_writer_txn` (``BEGIN`` … ``COMMIT``), then
+    resolves every member's future. If ANY member raises (other than :class:`_AbortMember`), or the
+    commit itself fails, or the committer task is CANCELLED, the whole batch is rolled back and EVERY
+    member's future is rejected — each caller re-runs (a coordinated form of the crash-re-run the
+    INFLIGHT-guarded idempotent handoffs already tolerate). Resolving the futures on the cancellation
+    path matters as much as the rollback does: a member's caller parks on its future (the ACK gate
+    among them), so a batch abandoned without rejection would park every one of them forever.
 
     Enabled only when ``window_ms > 0``; otherwise the store never constructs one and each grouped
     method commits inline (byte-identical to the pre-feature path)."""
@@ -261,9 +398,8 @@ class _GroupCommitter:
             return
         self._pending = self._pending[len(batch) :]
         results: list[Any] = []
-        async with self._lock:
-            try:
-                await self._db.execute("BEGIN")
+        try:
+            async with _writer_txn(self._db, self._lock):
                 for member in batch:
                     try:
                         results.append((member, await member.run(), None))
@@ -275,22 +411,31 @@ class _GroupCommitter:
                 # If ANY member raised a real error, the shared transaction is poisoned: roll the whole
                 # batch back and reject EVERY member's future (each re-runs). We cannot selectively keep
                 # the good members — they share one transaction with the failed mutation.
-                first_error = next((e for _, _, e in results if e is not None), None)
-                if first_error is not None:
-                    await self._db.rollback()
-                    self._reject_all(batch, results)
-                    return
+                if any(e is not None for _, _, e in results):
+                    raise _GroupPoisoned
                 await self._db.commit()
                 # A1 live cost counter: one physical commit covers the whole batch (group-commit's whole
                 # point is fewer fsyncs), so count ONE committed transaction here, not one per member.
                 self._note_commit()
-            except Exception as exc:  # noqa: BLE001 — commit/rollback failure fails the whole group
-                try:
-                    await self._db.rollback()
-                except Exception:  # noqa: BLE001 — best-effort; the connection may be unusable
-                    log.warning("group-commit rollback failed", exc_info=True)
-                self._reject_all(batch, results, fallback=exc)
-                return
+        except _GroupPoisoned:
+            self._reject_all(batch, results)
+            return
+        except Exception as exc:  # noqa: BLE001 — a commit failure fails the whole group
+            self._reject_all(batch, results, fallback=exc)
+            return
+        except BaseException:
+            # Cancellation (shutdown). _writer_txn has already rolled the batch back under the lock;
+            # what is left is that every member's future MUST still be resolved or its caller parks on
+            # it forever — the ACK gate among them. Then re-raise so the committer task really dies.
+            # The fallback is a plain error, not the CancelledError: a member's caller may not itself
+            # be shutting down, and it should see a failure to re-run rather than a cancellation of
+            # its own that it would propagate.
+            self._reject_all(
+                batch,
+                results,
+                fallback=RuntimeError("group commit rolled back (committer cancelled)"),
+            )
+            raise
         # Commit succeeded → publish each member's read-through cache delta (committer frame, durable
         # write in hand) then resolve its future, OUTSIDE the lock. The publish runs BEFORE the future
         # resolves so a co-batched sibling that wakes on its own result already sees this delta, and so
@@ -470,6 +615,29 @@ REINGRESS_TARGET_PREFIX = "@reingress:"
 #: forever. Defined here (not in ``base``) because ``base`` imports THIS module, never the reverse;
 #: ``base`` re-exports it as the public name. See :meth:`Store.reserve_upload_quota`.
 UPLOAD_RESERVATION_STALE_AFTER = 300.0
+
+#: A queue row whose body is still THERE, and therefore still replayable (BACKLOG #1560). Its
+#: negation — ``payload = '' AND body_ref IS NULL`` — is exactly what retention leaves behind, and
+#: three facts make that an exact discriminator rather than a heuristic:
+#:
+#: 1. every purge path writes a *literal* ``payload=''`` (:meth:`QueueStore.purge_message_bodies`,
+#:    :meth:`QueueStore.purge_dead_letters`, and the server backends' twins);
+#: 2. a real body is written through ``self._cipher.encrypt`` (:meth:`_insert_outbound_row`), never
+#:    through ``_enc``, so on a keyed store it is a ``mfenc:`` cell and can never be ``''``;
+#: 3. a store-once row's ``''`` inline payload is a DEREF SENTINEL, not an erasure — it carries a
+#:    live ``body_ref``, and the purge releases that ref *before* it blanks the row.
+#:
+#: Spliced into :meth:`QueueStore.replay` and :meth:`QueueStore.replay_dead` so neither can re-queue
+#: a delivery whose content no longer exists: the connector would be handed a zero-byte frame and the
+#: finalizer would record it as a successful send.
+_REPLAYABLE_BODY = "payload <> '' OR body_ref IS NOT NULL"
+
+#: The same predicate over an aliased ``queue q``, DERIVED rather than retyped so the two can never
+#: drift apart. Used by :meth:`_attachment_still_referenced_sql`, which reached this predicate first:
+#: the attachment GC already treated a purged row as unreplayable while ``replay`` replayed it anyway.
+_REPLAYABLE_BODY_Q = _REPLAYABLE_BODY.replace("payload", "q.payload").replace(
+    "body_ref", "q.body_ref"
+)
 
 
 @dataclass(frozen=True)
@@ -1355,6 +1523,51 @@ def _qmark_cutoff_case(
     return f"(CASE {column} {' '.join(whens)} ELSE ? END)", params
 
 
+#: Upper bound on :func:`_await_connection_worker_exit`. Measured exits land between 4 microseconds
+#: and 4 milliseconds even on a saturated box, so this is a runaway guard, not a working budget —
+#: it exists so a worker that somehow never breaks cannot reintroduce the #1670 hang.
+_CONNECTION_WORKER_EXIT_TIMEOUT: Final[float] = 5.0
+
+
+async def _await_connection_worker_exit(
+    conn: aiosqlite.Connection, *, timeout: float = _CONNECTION_WORKER_EXIT_TIMEOUT
+) -> None:
+    """Wait until the background thread ``conn`` drove its statements on has actually terminated.
+
+    ``await Connection.close()`` does **not** promise this. aiosqlite hands the close result back
+    with ``call_soon_threadsafe`` and only *then* breaks out of its loop, so the awaiting coroutine
+    can resume — and the caller run all the way to ``threading.enumerate()`` — while the worker is
+    still parked in that very call. Measured on aiosqlite 0.22.1 under CPU contention: the thread is
+    caught at ``core.py:66``, one statement short of its ``break``, and joins in 4us to 4ms.
+
+    That residue matters because the thread is created **without** ``daemon=True``: while it is
+    listed, it is a thread interpreter exit would have to join. #1670 closed the case where nothing
+    closed the connection at all; this closes the window where the close has returned but the thread
+    it stops has not yet gone.
+
+    Polls rather than joining so the event loop is never blocked (a join would park it), bounded by
+    ``timeout`` so a worker that never breaks is logged instead of hanging the caller. Reads
+    aiosqlite's private ``_thread`` and degrades to a no-op if a future release renames it — the
+    wait is a tightening, never a correctness dependency.
+    """
+    thread = getattr(conn, "_thread", None)
+    if not isinstance(thread, threading.Thread) or not thread.is_alive():
+        return
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    delay = 0.0  # first pass just yields; the worker usually only needs to be scheduled once
+    while thread.is_alive():
+        if loop.time() >= deadline:
+            log.warning(
+                "aiosqlite worker thread %s still running %.1fs after its connection closed",
+                thread.name,
+                timeout,
+            )
+            return
+        await asyncio.sleep(delay)
+        delay = 0.001 if delay == 0.0 else min(delay * 2.0, 0.05)
+
+
 def _secure_file(path: Path, *, extra_read_grants: Sequence[str] | None = None) -> None:
     """Restrict a store file to its owner — it holds PHI at rest.
 
@@ -1480,6 +1693,59 @@ def password_claim_set(must_change_password: bool, placeholder: str) -> str:
     if must_change_password:
         return ""
     return f" password_claimed_at=COALESCE(password_claimed_at, {placeholder}),"
+
+
+@dataclass(frozen=True)
+class LockoutState:
+    """What one failed credential attempt writes to the account-lockout columns, plus whether that
+    attempt is the one that locked the account. Computed by :func:`next_lockout_state`."""
+
+    attempts: int
+    locked_until: float | None
+    just_locked: bool
+
+
+def next_lockout_state(
+    *,
+    failed_attempts: int,
+    locked_until: float | None,
+    now: float,
+    threshold: int,
+    lockout_seconds: float,
+) -> LockoutState:
+    """The per-account lockout policy for ONE failed credential attempt -- shared by all three
+    backends so the rule is stated once.
+
+    **It runs inside each backend's atomic increment, and the siting is the fix rather than the
+    arithmetic.** The same arithmetic used to run in ``AuthService._register_failure`` against a user
+    row read before the argon2 verify. Every await between that read and the write back is a window in
+    which another attempt reads the SAME pre-increment count, so N wrong passwords submitted in
+    parallel would all compute 1, the account would never reach ``threshold``, and an attacker who
+    parallelizes would evade the lockout entirely on a first deployment. Callers must pass the values
+    they re-read under the lock that also carries the write.
+
+    A LAPSED lock restarts the counter, so one post-lockout failure cannot re-lock immediately, and
+    the stale ``locked_until`` is cleared whenever the restarted count is back below ``threshold``.
+
+    ``just_locked`` is True only for the attempt that takes the account from unlocked to locked. An
+    attempt landing while a LIVE lock is already set extends the lock but reports False, so exactly
+    one ACCOUNT_LOCKED notice fires per lockout however many attempts arrive at once -- which is what
+    the caller's one-notification-per-lockout contract rests on now that a burst can reach here past
+    the caller's own locked-account pre-check.
+
+    Nothing here accumulates across lock CYCLES: the row persists a failure count and an expiry, never
+    a count of locks, so re-locking is unbounded by construction (docs/SECURITY.md, control 1). Adding
+    a cross-cycle ceiling means re-deriving that note in the same change.
+    """
+    already_locked = locked_until is not None and now < locked_until
+    lapsed = locked_until is not None and now >= locked_until
+    attempts = (0 if lapsed else failed_attempts) + 1
+    locked = now + lockout_seconds if attempts >= threshold else None
+    return LockoutState(
+        attempts=attempts,
+        locked_until=locked,
+        just_locked=locked is not None and not already_locked,
+    )
 
 
 def _append_channel_scope(
@@ -1862,7 +2128,11 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
     id           TEXT PRIMARY KEY,
     operation    TEXT NOT NULL,        -- registered op key, e.g. 'dead_letter_replay'
     params       TEXT NOT NULL,        -- JSON args captured at request time, replayed on approval
-    requester    TEXT NOT NULL,        -- who initiated; can never self-approve (dual-control, 2.3.5)
+    requester    TEXT NOT NULL,        -- who initiated, as a DISPLAY label only (see requester_user_id)
+    -- BACKLOG #1540: the requester's immutable users.id, and the ONLY key the self-approval refusal
+    -- compares. Nullable, and never backfilled -- the Store protocol's create_pending_approval says
+    -- why, and ApprovalGate.approve is what enforces it.
+    requester_user_id TEXT,
     requested_at REAL NOT NULL,
     status       TEXT NOT NULL DEFAULT 'pending',  -- pending | approved | rejected | expired | failed
                                        -- 'failed': the gate released it but the executor raised, so
@@ -2282,50 +2552,85 @@ class MessageStore:
                 f"invalid synchronous mode {synchronous!r}; expected 'NORMAL' or 'FULL'"
             )
         db = await aiosqlite.connect(str(path))
-        db.row_factory = aiosqlite.Row
-        await db.execute("PRAGMA journal_mode=WAL")
-        # NORMAL is crash-safe under WAL (only risk is losing the last txn on OS crash/power loss,
-        # never corruption) and avoids an fsync per commit — a large write-throughput win vs FULL.
-        # `sync` is validated above, so this f-string can't inject. FULL is available for the
-        # paranoid (every commit fsynced) via [store] synchronous = "full".
-        await db.execute(f"PRAGMA synchronous={sync}")
-        await db.execute("PRAGMA foreign_keys=ON")
-        await db.execute("PRAGMA busy_timeout=5000")
-        await db.executescript(_SCHEMA)
-        await cls._migrate(db)
-        await db.commit()
-        # Tighten permissions now that the file (and its WAL siblings) exist — they hold PHI.
-        if str(path) != ":memory:":
-            main = Path(path)
-            for f in (main, main.with_name(main.name + "-wal"), main.with_name(main.name + "-shm")):
-                if f.exists():
-                    _secure_file(f)
-        store = cls(
-            db,
-            path=path,
-            cipher=cipher,
-            group_commit_window_ms=group_commit_window_ms,
-            group_commit_max_batch=group_commit_max_batch,
-            synchronous=sync,
-            audit_mac_key=audit_mac_key,
-            audit_mac_fn=audit_mac_fn,
-            message_events=message_events,
-        )
-        # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the first block
-        # BEFORE anything on this handle encrypts — the at-rest migration below included, since on a
-        # store that is having a key enabled for the first time it is itself a large burst. A no-op when
-        # the cipher carries no bound (keyless / `vault_transit`).
-        await store.checkpoint_cipher_invocations()
-        await store._encrypt_existing_rows()  # one-time PHI-at-rest migration when a key is set
-        await store._load_audit_chain_meta()  # load/auto-init the #190 keying watermark
-        await (
-            store._load_state_cache()
-        )  # populate the in-memory state read-through cache (ADR 0005)
-        await store._load_reference_cache()  # populate the reference-snapshot read cache (ADR 0006)
-        await store._open_read_pool(str(path))  # dedicated read-only WAL pool (lockfree-reads)
-        if store._group_commit is not None:
-            store._group_commit.start()  # spin the committer coroutine (needs the running loop)
-        return store
+        # Everything past `connect` runs under the cleanup below (#1670). aiosqlite drives each
+        # statement on a background thread created WITHOUT `daemon=True`, so a connection nobody
+        # closes parks a non-daemon thread forever and interpreter exit then blocks in
+        # `threading._shutdown` joining it — the process hangs instead of reporting the error. The
+        # very first PRAGMA is where a path that is not a database raises, and that is already past
+        # `connect`, so an operator typo reaches this on an ordinary run.
+        store: MessageStore | None = None
+        try:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+            # NORMAL is crash-safe under WAL (only risk is losing the last txn on OS crash/power
+            # loss, never corruption) and avoids an fsync per commit — a large write-throughput win
+            # vs FULL. `sync` is validated above, so this f-string can't inject. FULL is available
+            # for the paranoid (every commit fsynced) via [store] synchronous = "full".
+            await db.execute(f"PRAGMA synchronous={sync}")
+            await db.execute("PRAGMA foreign_keys=ON")
+            await db.execute("PRAGMA busy_timeout=5000")
+            await db.executescript(_SCHEMA)
+            await cls._migrate(db)
+            await db.commit()
+            # Tighten permissions now that the file (and its WAL siblings) exist — they hold PHI.
+            if str(path) != ":memory:":
+                main = Path(path)
+                for f in (
+                    main,
+                    main.with_name(main.name + "-wal"),
+                    main.with_name(main.name + "-shm"),
+                ):
+                    if f.exists():
+                        _secure_file(f)
+            store = cls(
+                db,
+                path=path,
+                cipher=cipher,
+                group_commit_window_ms=group_commit_window_ms,
+                group_commit_max_batch=group_commit_max_batch,
+                synchronous=sync,
+                audit_mac_key=audit_mac_key,
+                audit_mac_fn=audit_mac_fn,
+                message_events=message_events,
+            )
+            # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the first
+            # block BEFORE anything on this handle encrypts — the at-rest migration below included,
+            # since on a store that is having a key enabled for the first time it is itself a large
+            # burst. A no-op when the cipher carries no bound (keyless / `vault_transit`).
+            await store.checkpoint_cipher_invocations()
+            await store._encrypt_existing_rows()  # one-time PHI-at-rest migration when a key is set
+            await store._load_audit_chain_meta()  # load/auto-init the #190 keying watermark
+            await (
+                store._load_state_cache()
+            )  # populate the in-memory state read-through cache (ADR 0005)
+            await (
+                store._load_reference_cache()
+            )  # populate the reference-snapshot read cache (ADR 0006)
+            await store._open_read_pool(str(path))  # dedicated read-only WAL pool (lockfree-reads)
+            if store._group_commit is not None:
+                store._group_commit.start()  # spin the committer coroutine (needs the running loop)
+            return store
+        except BaseException:
+            # Close the store when one was constructed — it owns the read pool's connections too,
+            # each with its own worker thread — then the writer either way. `Connection.close` is
+            # idempotent (it returns immediately once the connection is gone), so the second call
+            # after a successful `store.close()` is a no-op. Both are best-effort: a failure while
+            # cleaning up must never replace the error the caller needs to see.
+            if store is not None:
+                try:
+                    await store.close()
+                except Exception:  # noqa: BLE001 — cleanup must never mask the real failure
+                    log.warning("error closing a partially-opened store", exc_info=True)
+            try:
+                await db.close()
+                # `close` returns before the worker thread it stops has left `threading.enumerate()`
+                # (see :func:`_await_connection_worker_exit`). A failed open is the shortest path
+                # there is — one PRAGMA, then straight out — so the caller most often wins that race
+                # here, and the caller of a raising `open` is entitled to find nothing left behind.
+                await _await_connection_worker_exit(db)
+            except Exception:  # noqa: BLE001 — cleanup must never mask the real failure
+                log.warning("error closing the connection after a failed store open", exc_info=True)
+            raise
 
     async def _open_read_pool(self, path: str) -> None:
         """Open the bounded read-only connection pool for a file-backed WAL store (lockfree-reads).
@@ -2353,15 +2658,29 @@ class MessageStore:
         """Yield a connection to run a read on without taking the write lock (lockfree-reads).
 
         Pooled path (file-backed WAL): borrow a read-only connection and wrap the block in one deferred
-        read transaction, so every statement in the block sees a single consistent WAL snapshot taken at
-        ``BEGIN`` and concurrent writes can't interleave. The transaction is always closed
+        read transaction, so every statement in the block sees a single consistent WAL snapshot and
+        concurrent writes can't interleave. ``BEGIN`` is DEFERRED, so the snapshot opens at the block's
+        FIRST statement rather than at the ``BEGIN`` itself — what the block gets is one snapshot, not a
+        snapshot of the instant it was entered. The transaction is always closed
         (``COMMIT``/``ROLLBACK``) before the connection returns to the pool, so the next borrower starts
         a *fresh* snapshot (a read always reflects the latest committed write) and never pins the WAL.
+
+        **"Always closed" means on BaseException too, and the ``BEGIN``'s own await is inside the guard
+        for a reason.** aiosqlite runs that ``BEGIN`` on a worker thread, so it lands whether or not the
+        awaiting task survives; a cancellation delivered there used to unwind past a handler that only
+        began *after* the ``BEGIN``, and the connection went back into the pool holding an open
+        transaction. Every later borrower's ``BEGIN`` would then raise "cannot start a transaction
+        within a transaction" from that same unguarded position, so the pool would never heal: one such
+        cancellation would permanently fail one read in ``_READ_POOL_SIZE`` on a deploying site
+        (BACKLOG #1635). The unwind goes through :func:`_unwind_txn` — shielded and bounded — because a
+        bare ``await conn.execute("ROLLBACK")`` is itself cancellable, and a second cancellation landing
+        on it would return the poisoned connection anyway.
 
         Fallback path (``:memory:``, no pool): reads share the single writer connection, serialized under
         ``self._lock`` — the pre-pool behaviour, required because ``:memory:`` can't be reached by a
         second connection. Callers must therefore never invoke a ``_read()`` method while already
-        holding ``self._lock`` (none do)."""
+        holding ``self._lock`` (none do). There is no ``BEGIN`` on this path at all, so a test that means
+        to exercise the snapshot or the unwind must use a FILE-backed store."""
         pool = self._read_pool
         if pool is None:
             async with self._lock:
@@ -2369,14 +2688,15 @@ class MessageStore:
             return
         conn = await pool.get()
         try:
-            await conn.execute("BEGIN")
             try:
+                await conn.execute("BEGIN")
                 yield conn
                 await conn.execute("COMMIT")
-            except BaseException:
-                await conn.execute("ROLLBACK")
-                raise
+            except BaseException as exc:
+                await _unwind_and_raise(conn, exc, role="read")
         finally:
+            # Synchronous on purpose: the unwind above has already finished, and `put_nowait` has no
+            # await for a further cancellation to land on, so the connection cannot be stranded.
             pool.put_nowait(conn)
 
     async def _run_grouped(
@@ -2387,10 +2707,11 @@ class MessageStore:
     ) -> Any:
         """Run one grouped stage-handoff ``body`` (statements only — NO BEGIN/commit/rollback).
 
-        Group-commit DISABLED (the default, ``window == 0``): run ``body`` inline under ``self._lock``
-        inside its own ``BEGIN`` … ``commit`` with an except-rollback — byte-identical to the
-        pre-feature path. An :class:`_AbortMember` (the idempotent no-op early-exit) rolls back and
-        returns its carried result, exactly mirroring the old explicit ``rollback(); return <sentinel>``.
+        Group-commit DISABLED (the default, ``window == 0``): run ``body`` inline in one
+        :func:`_writer_txn` — its own ``BEGIN`` … ``commit`` under ``self._lock``, unwound on any
+        ``BaseException`` (cancellation included). An :class:`_AbortMember` (the idempotent no-op
+        early-exit) unwinds that transaction and returns its carried result, exactly mirroring the old
+        explicit ``rollback(); return <sentinel>``.
 
         Group-commit ENABLED: enrol ``body`` in the committer, which runs it between the batch's single
         ``BEGIN`` … ``COMMIT`` and resolves this caller's future post-commit (so an inbound ACK waiting on
@@ -2406,17 +2727,13 @@ class MessageStore:
         detached into the committer)."""
         gc = self._group_commit
         if gc is None:
-            async with self._lock:
-                try:
-                    await self._db.execute("BEGIN")
+            try:
+                async with _writer_txn(self._db, self._lock):
                     result = await body()
                     await self._commit()
-                except _AbortMember as abort:
-                    await self._db.rollback()
-                    return abort.result  # zero-mutation no-op: nothing committed → no publish
-                except Exception:
-                    await self._db.rollback()
-                    raise
+            except _AbortMember as abort:
+                # Zero-mutation no-op: _writer_txn rolled it back under the lock → nothing to publish.
+                return abort.result
             # Commit landed and the lock is released — publish the committed delta in this same frame,
             # with no await between commit and publish, so a cancel can't interpose and strand the cache.
             if on_commit is not None:
@@ -3491,6 +3808,15 @@ class MessageStore:
         preset_cols = {row["name"] for row in await cur.fetchall()}
         if preset_cols and "last_used_at" not in preset_cols:
             await db.execute("ALTER TABLE search_presets ADD COLUMN last_used_at REAL")
+        # BACKLOG #1540: a pre-existing pending_approvals table predates requester_user_id — ALTER it
+        # in, nullable (an ALTER cannot add NOT NULL without a default, and there is no name-to-id
+        # backfill that is CORRECT: after a rename the stored name may belong to somebody else, so
+        # resolving it would key the refusal on the wrong person). NULL on an existing row means "this
+        # request cannot be authorized" and approve() refuses it with a distinct 409.
+        cur = await db.execute("PRAGMA table_info(pending_approvals)")
+        approval_cols = {row["name"] for row in await cur.fetchall()}
+        if "requester_user_id" not in approval_cols:
+            await db.execute("ALTER TABLE pending_approvals ADD COLUMN requester_user_id TEXT")
         await MessageStore._migrate_outbox_to_queue(db)
 
     @staticmethod
@@ -3560,11 +3886,16 @@ class MessageStore:
         for conn in self._read_conns:
             try:
                 await conn.close()
+                await _await_connection_worker_exit(conn)
             except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
                 log.warning("error closing read-pool connection", exc_info=True)
         self._read_conns = []
         self._read_pool = None
         await self._db.close()
+        # Each close above returns before the worker thread it stops has actually gone, and those
+        # threads are non-daemon, so a `close`d store could still hold threads interpreter exit has
+        # to join. Wait them out so "the store is closed" means every thread it owned is gone.
+        await _await_connection_worker_exit(self._db)
 
     # --- write path ----------------------------------------------------------
 
@@ -3593,42 +3924,37 @@ class MessageStore:
         now = time.time() if now is None else now
         mid = uuid4().hex
         status = MessageStatus.ROUTED.value if deliveries else MessageStatus.UNROUTED.value
-        async with self._lock:
-            try:
-                await self._db.execute("BEGIN")
-                await self._insert_message(
-                    mid,
-                    channel_id=channel_id,
-                    raw=raw,
-                    status=status,
-                    control_id=control_id,
-                    message_type=message_type,
-                    source_type=source_type,
-                    summary=summary,
-                    metadata=metadata,
-                    error=None,
-                    now=now,
-                )
-                await self._insert_outbound_deliveries(mid, channel_id, deliveries, now)
-                # #63 verbosity gate — a routine 'received' row is thinnable; suppressing it does NOT
-                # touch the messages/queue disposition rows above (count-and-log is separate).
-                if should_record_event("received", self._message_events):
-                    await self._db.execute(
-                        "INSERT INTO message_events (message_id, ts, event, detail) VALUES (?,?,?,?)",
-                        (
-                            mid,
-                            now,
-                            "received",
-                            self._enc(
-                                f"{len(deliveries)} destination(s)",
-                                aad=cell_aad("message_events", "detail", mid, now, "received"),
-                            ),
+        async with _writer_txn(self._db, self._lock):
+            await self._insert_message(
+                mid,
+                channel_id=channel_id,
+                raw=raw,
+                status=status,
+                control_id=control_id,
+                message_type=message_type,
+                source_type=source_type,
+                summary=summary,
+                metadata=metadata,
+                error=None,
+                now=now,
+            )
+            await self._insert_outbound_deliveries(mid, channel_id, deliveries, now)
+            # #63 verbosity gate — a routine 'received' row is thinnable; suppressing it does NOT
+            # touch the messages/queue disposition rows above (count-and-log is separate).
+            if should_record_event("received", self._message_events):
+                await self._db.execute(
+                    "INSERT INTO message_events (message_id, ts, event, detail) VALUES (?,?,?,?)",
+                    (
+                        mid,
+                        now,
+                        "received",
+                        self._enc(
+                            f"{len(deliveries)} destination(s)",
+                            aad=cell_aad("message_events", "detail", mid, now, "received"),
                         ),
-                    )
-                await self._commit()
-            except Exception:
-                await self._db.rollback()
-                raise
+                    ),
+                )
+            await self._commit()
         return mid
 
     async def _insert_outbound_deliveries(
@@ -3928,11 +4254,15 @@ class MessageStore:
         row is blanked — whichever of :meth:`purge_message_bodies` (``done``/``cancelled`` case) or
         :meth:`purge_dead_letters` (``dead`` case) does so. Gating on replayability (not merely status,
         and not merely a non-blank inline ``payload``) is what makes it correct under either purge order
-        AND for a store-once row whose ``payload`` is ``''`` but whose ``body_ref`` is still live."""
+        AND for a store-once row whose ``payload`` is ``''`` but whose ``body_ref`` is still live.
+
+        The replayability half is :data:`_REPLAYABLE_BODY`, shared with :meth:`replay` /
+        :meth:`replay_dead` (BACKLOG #1560) so the attachment GC and the replay guard can never
+        disagree about which rows are still deliverable."""
         return (
             "EXISTS (SELECT 1 FROM queue q WHERE q.message_id = "
             f"{msg_col} AND (q.status IN (?, ?) OR "
-            "(q.status = ? AND (q.payload <> '' OR q.body_ref IS NOT NULL))))"
+            f"(q.status = ? AND ({_REPLAYABLE_BODY_Q}))))"
         )
 
     async def release_message_attachments(self, message_id: str) -> None:
@@ -3942,14 +4272,9 @@ class MessageStore:
         attachment a sibling message still references). :meth:`purge_message_bodies` releases the whole
         eligible set in its own transaction via the same seam (:meth:`_release_message_attachments`)."""
         self._require_streaming_attachments()
-        async with self._lock:
-            try:
-                await self._db.execute("BEGIN")
-                await self._release_message_attachments("message_id = ?", (message_id,))
-                await self._commit()
-            except Exception:
-                await self._db.rollback()
-                raise
+        async with _writer_txn(self._db, self._lock):
+            await self._release_message_attachments("message_id = ?", (message_id,))
+            await self._commit()
 
     async def sweep_orphan_attachments(self) -> int:
         """Reclaim orphaned attachment storage at startup so **no PHI chunk accumulates at rest** (#149,
@@ -4022,6 +4347,13 @@ class MessageStore:
         row_id = uuid4().hex
         # When the body is shared, the inline payload is empty ('' — never ciphertext-of-empty, so it
         # reads back as a blank that the deref replaces). NOT NULL is satisfied by the '' sentinel.
+        #
+        # DO NOT "simplify" the else-arm to `self._enc(...)`. `_enc` short-circuits a falsy value to
+        # itself, so a legitimately EMPTY body would land as '' — indistinguishable at rest from a
+        # retention erasure, and `_REPLAYABLE_BODY` (BACKLOG #1560) would then refuse to replay it. The
+        # direct `encrypt('')` writes a real `mfenc:` cell instead, which is exactly what keeps the two
+        # apart on a keyed store. (Keyless, `IdentityCipher.encrypt('')` is '' and they do collapse; the
+        # guard is replay-only, so a first delivery is unaffected either way.)
         stored_payload = (
             ""
             if body_ref is not None
@@ -4228,31 +4560,26 @@ class MessageStore:
         keeps the method a safe no-op if it is ever invoked for an already-consumed row. Returns
         ``True`` if this call performed the handoff, ``False`` if it was a no-op."""
         now = time.time() if now is None else now
-        async with self._lock:
-            try:
-                await self._db.execute("BEGIN")
-                cur = await self._db.execute(
-                    "DELETE FROM queue WHERE id=? AND stage=? AND status=?",
-                    (ingress_id, Stage.INGRESS.value, OutboxStatus.INFLIGHT.value),
-                )
-                if not cur.rowcount:
-                    # Already handed off by a prior run (crash-restart) — idempotent no-op.
-                    await self._db.rollback()
-                    return False
-                await self._insert_outbound_deliveries(message_id, channel_id, deliveries, now)
-                await self._db.execute(
-                    "UPDATE messages SET status=? WHERE id=?", (disposition.value, message_id)
-                )
-                event = {
-                    MessageStatus.ROUTED: "routed",
-                    MessageStatus.FILTERED: "filtered",
-                    MessageStatus.UNROUTED: "unrouted",
-                }.get(disposition, "routed")
-                await self._event(message_id, event, None, f"{len(deliveries)} destination(s)", now)
-                await self._commit()
-            except Exception:
+        async with _writer_txn(self._db, self._lock):
+            cur = await self._db.execute(
+                "DELETE FROM queue WHERE id=? AND stage=? AND status=?",
+                (ingress_id, Stage.INGRESS.value, OutboxStatus.INFLIGHT.value),
+            )
+            if not cur.rowcount:
+                # Already handed off by a prior run (crash-restart) — idempotent no-op.
                 await self._db.rollback()
-                raise
+                return False
+            await self._insert_outbound_deliveries(message_id, channel_id, deliveries, now)
+            await self._db.execute(
+                "UPDATE messages SET status=? WHERE id=?", (disposition.value, message_id)
+            )
+            event = {
+                MessageStatus.ROUTED: "routed",
+                MessageStatus.FILTERED: "filtered",
+                MessageStatus.UNROUTED: "unrouted",
+            }.get(disposition, "routed")
+            await self._event(message_id, event, None, f"{len(deliveries)} destination(s)", now)
+            await self._commit()
         return True
 
     async def route_handoff(
@@ -4349,25 +4676,20 @@ class MessageStore:
             )
             for k, v in rows.items()
         ]
-        async with self._lock:
-            try:
-                await self._db.execute("BEGIN")
-                # Drop the set's prior version(s) — we keep only the active snapshot per name.
-                await self._db.execute("DELETE FROM reference WHERE name=?", (name,))
-                if encrypted:
-                    await self._db.executemany(
-                        "INSERT INTO reference (name, version, key, value) VALUES (?,?,?,?)",
-                        encrypted,
-                    )
-                await self._db.execute(
-                    "INSERT OR REPLACE INTO reference_version (name, version, synced_at, row_count)"
-                    " VALUES (?,?,?,?)",
-                    (name, version, time.time(), len(encrypted)),
+        async with _writer_txn(self._db, self._lock):
+            # Drop the set's prior version(s) — we keep only the active snapshot per name.
+            await self._db.execute("DELETE FROM reference WHERE name=?", (name,))
+            if encrypted:
+                await self._db.executemany(
+                    "INSERT INTO reference (name, version, key, value) VALUES (?,?,?,?)",
+                    encrypted,
                 )
-                await self._commit()
-            except Exception:
-                await self._db.rollback()
-                raise
+            await self._db.execute(
+                "INSERT OR REPLACE INTO reference_version (name, version, synced_at, row_count)"
+                " VALUES (?,?,?,?)",
+                (name, version, time.time(), len(encrypted)),
+            )
+            await self._commit()
         # Commit succeeded → swap the active snapshot in the read cache (plaintext, decoded form).
         self._reference_cache[name] = dict(rows)
 
@@ -4644,41 +4966,34 @@ class MessageStore:
         now = time.time() if now is None else now
         mid = uuid4().hex
         event = "error" if status is MessageStatus.ERROR else "filtered"
-        async with self._lock:
-            try:
-                await self._db.execute("BEGIN")
-                await self._insert_message(
-                    mid,
-                    channel_id=channel_id,
-                    raw=raw,
-                    status=status.value,
-                    control_id=control_id,
-                    message_type=message_type,
-                    source_type=source_type,
-                    summary=summary,
-                    metadata=metadata,
-                    error=error,
-                    now=now,
+        async with _writer_txn(self._db, self._lock):
+            await self._insert_message(
+                mid,
+                channel_id=channel_id,
+                raw=raw,
+                status=status.value,
+                control_id=control_id,
+                message_type=message_type,
+                source_type=source_type,
+                summary=summary,
+                metadata=metadata,
+                error=error,
+                now=now,
+            )
+            # #63 verbosity gate. `event` is 'error' (a compliance-floor event → always kept) or
+            # 'filtered' (routine → thinnable). The messages row above records the disposition
+            # regardless (count-and-log is separate).
+            if should_record_event(event, self._message_events):
+                await self._db.execute(
+                    "INSERT INTO message_events (message_id, ts, event, detail) VALUES (?,?,?,?)",
+                    (
+                        mid,
+                        now,
+                        event,
+                        self._enc(error, aad=cell_aad("message_events", "detail", mid, now, event)),
+                    ),
                 )
-                # #63 verbosity gate. `event` is 'error' (a compliance-floor event → always kept) or
-                # 'filtered' (routine → thinnable). The messages row above records the disposition
-                # regardless (count-and-log is separate).
-                if should_record_event(event, self._message_events):
-                    await self._db.execute(
-                        "INSERT INTO message_events (message_id, ts, event, detail) VALUES (?,?,?,?)",
-                        (
-                            mid,
-                            now,
-                            event,
-                            self._enc(
-                                error, aad=cell_aad("message_events", "detail", mid, now, event)
-                            ),
-                        ),
-                    )
-                await self._commit()
-            except Exception:
-                await self._db.rollback()
-                raise
+            await self._commit()
         return mid
 
     # --- delivery worker path ------------------------------------------------
@@ -5269,16 +5584,14 @@ class MessageStore:
 
         if _standalone:
             # Inline immediate commit (mirrors the disabled path) — never enrol in the committer.
-            async with self._lock:
-                try:
-                    await self._db.execute("BEGIN")
+            # This is the ONE grouped writer with a second transaction of its own, so routing only
+            # _run_grouped would have left this arm with the `except Exception` shape it copied.
+            try:
+                async with _writer_txn(self._db, self._lock):
                     await _body()
                     await self._commit()
-                except _AbortMember:
-                    await self._db.rollback()
-                except Exception:
-                    await self._db.rollback()
-                    raise
+            except _AbortMember:
+                pass  # vanished row: _writer_txn rolled it back under the lock
             return
         await self._run_grouped(_body)
 
@@ -5690,195 +6003,186 @@ class MessageStore:
         ``control_id``/``message_type``/``summary`` are passed **in** so the store stays parsing-free.
         Returns ``True`` if this call performed the handoff, ``False`` if it was an already-consumed no-op."""
         now = time.time() if now is None else now
-        async with self._lock:
+        async with _writer_txn(self._db, self._lock):
+            # 1. The work-row must still be INFLIGHT (the claim set it so); it carries the artifact ref.
+            cur = await self._db.execute(
+                "SELECT message_id, payload FROM queue WHERE id=? AND stage=? AND status=?",
+                (response_row_id, Stage.RESPONSE.value, OutboxStatus.INFLIGHT.value),
+            )
+            wr = await cur.fetchone()
+            if wr is None:
+                await self._db.rollback()  # already consumed by a committed prior run — no-op
+                return False
+            origin_id = wr["message_id"]
             try:
-                await self._db.execute("BEGIN")
-                # 1. The work-row must still be INFLIGHT (the claim set it so); it carries the artifact ref.
-                cur = await self._db.execute(
-                    "SELECT message_id, payload FROM queue WHERE id=? AND stage=? AND status=?",
-                    (response_row_id, Stage.RESPONSE.value, OutboxStatus.INFLIGHT.value),
-                )
-                wr = await cur.fetchone()
-                if wr is None:
-                    await self._db.rollback()  # already consumed by a committed prior run — no-op
-                    return False
-                origin_id = wr["message_id"]
-                try:
-                    ref = (
-                        self._dec(
-                            wr["payload"],
-                            aad=cell_aad("queue", "payload", response_row_id),
-                        )
-                        or ""
-                    )
-                    origin_msg_id, dest, seq_s = ref.split("\x1f")
-                    seq = int(seq_s)
-                except Exception:  # noqa: BLE001 - any decrypt/parse failure = an unrecoverable ref
-                    # A corrupt/undecryptable work-row reference (DB corruption, a cipher/key failure)
-                    # can NEVER be re-ingressed. Dead-letter the token + ERROR the origin in THIS
-                    # transaction and CONSUME it (return True) — never re-loop forever on a row that can't
-                    # be parsed. Mirrors the depth-cap branch (a different unrecoverable-token case).
-                    await self._db.execute(
-                        "UPDATE queue SET status=?, last_error=?, next_attempt_at=?, updated_at=?"
-                        " WHERE id=?",
-                        (
-                            OutboxStatus.DEAD.value,
-                            self._enc(
-                                "re-ingress work-row reference is corrupt/unparseable",
-                                aad=cell_aad("queue", "last_error", response_row_id),
-                            ),
-                            now,
-                            now,
-                            response_row_id,
-                        ),
-                    )
-                    await self._event(origin_id, "dead", None, "re-ingress ref corrupt", now)
-                    await self._maybe_finalize_message(origin_id, now)
-                    await self._commit()
-                    return True
-                # 2. The IMMUTABLE artifact body (same committed bytes every re-run → re-run-stable). NULL
-                #    only if retention purged it — but an outstanding work-row makes the message
-                #    purge-ineligible (Q8), so this is defensive: treat as empty, still consume.
-                cur = await self._db.execute(
-                    "SELECT body FROM response"
-                    " WHERE message_id=? AND destination_name=? AND response_seq=?",
-                    (origin_msg_id, dest, seq),
-                )
-                art = await cur.fetchone()
-                body = (
+                ref = (
                     self._dec(
-                        art["body"],
-                        aad=cell_aad("response", "body", origin_msg_id, dest, seq),
+                        wr["payload"],
+                        aad=cell_aad("queue", "payload", response_row_id),
                     )
-                    if (art and art["body"] is not None)
-                    else ""
+                    or ""
                 )
-                body = body or ""
-                # 3. The origin's correlation lineage (absent keys → depth 0, origin is its own root).
-                cur = await self._db.execute(
-                    "SELECT metadata FROM messages WHERE id=?", (origin_id,)
-                )
-                mrow = await cur.fetchone()
-                origin_meta: dict[str, Any] = {}
-                # EF-3: ciphered at rest, bound to the origin message's metadata cell
-                meta_json = (
-                    self._dec(mrow["metadata"], aad=cell_aad("messages", "metadata", origin_id))
-                    if mrow
-                    else None
-                )
-                if meta_json:
-                    loaded = json.loads(meta_json)
-                    if isinstance(loaded, dict):
-                        origin_meta = loaded
-                child_depth = int(origin_meta.get("correlation_depth", 0) or 0) + 1
-                root = origin_meta.get("correlation_root_id") or origin_id
-                if child_depth > correlation_depth_cap:
-                    # Depth-cap breach: dead-letter the token, ERROR the origin (Q4). Consume (don't
-                    # re-loop), produce NO child.
-                    await self._db.execute(
-                        "UPDATE queue SET status=?, last_error=?, next_attempt_at=?, updated_at=?"
-                        " WHERE id=?",
-                        (
-                            OutboxStatus.DEAD.value,
-                            self._enc(
-                                f"re-ingress correlation depth exceeded "
-                                f"({child_depth} > {correlation_depth_cap})",
-                                aad=cell_aad("queue", "last_error", response_row_id),
-                            ),
-                            now,
-                            now,
-                            response_row_id,
+                origin_msg_id, dest, seq_s = ref.split("\x1f")
+                seq = int(seq_s)
+            except Exception:  # noqa: BLE001 - any decrypt/parse failure = an unrecoverable ref
+                # A corrupt/undecryptable work-row reference (DB corruption, a cipher/key failure)
+                # can NEVER be re-ingressed. Dead-letter the token + ERROR the origin in THIS
+                # transaction and CONSUME it (return True) — never re-loop forever on a row that can't
+                # be parsed. Mirrors the depth-cap branch (a different unrecoverable-token case).
+                await self._db.execute(
+                    "UPDATE queue SET status=?, last_error=?, next_attempt_at=?, updated_at=?"
+                    " WHERE id=?",
+                    (
+                        OutboxStatus.DEAD.value,
+                        self._enc(
+                            "re-ingress work-row reference is corrupt/unparseable",
+                            aad=cell_aad("queue", "last_error", response_row_id),
                         ),
-                    )
-                    await self._event(
-                        origin_id, "dead", dest, f"re-ingress depth cap ({child_depth})", now
-                    )
-                    await self._maybe_finalize_message(origin_id, now)
-                    await self._commit()
-                    return True
-                # 4. Content-addressed child id (defense-in-depth; the guarded DELETE is the gate).
-                new_mid = self._reingress_message_id(origin_id, dest, seq, body)
-                cur = await self._db.execute("SELECT 1 FROM messages WHERE id=?", (new_mid,))
-                already = await cur.fetchone() is not None
-                if not already:
-                    # 5. The re-ingressed message (RECEIVED, or RECEIVED→ERROR on a non-peekable HL7 body).
-                    child_meta = json.dumps(
-                        {
-                            "correlation_id": origin_id,
-                            "correlation_root_id": root,
-                            "correlation_depth": child_depth,
-                            "reingress_of_seq": seq,
-                        }
-                    )
-                    await self._insert_message(
-                        new_mid,
-                        channel_id=loopback_channel_id,
-                        raw=body,
-                        status=(
-                            MessageStatus.ERROR.value
-                            if peek_failed
-                            else MessageStatus.RECEIVED.value
-                        ),
-                        control_id=control_id,
-                        message_type=message_type,
-                        source_type="reingress",
-                        summary=summary,
-                        metadata=child_meta,
-                        error="re-ingress body failed HL7 peek" if peek_failed else None,
-                        now=now,
-                    )
-                    # 6. The ingress queue row — UNLESS peek_failed (an ERROR message owes no work).
-                    if not peek_failed:
-                        # ingest-time (ADR 0009) + metrics only; FIFO orders by rowid (ADR 0059)
-                        ingress_created = now
-                        # Hoist the row id so the payload binds to its own (queue, payload, id) cell.
-                        reingress_row_id = uuid4().hex
-                        await self._db.execute(
-                            "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
-                            " handler_name, payload, status, attempts, next_attempt_at, created_at,"
-                            " updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                            (
-                                reingress_row_id,
-                                new_mid,
-                                Stage.INGRESS.value,
-                                loopback_channel_id,
-                                None,
-                                None,
-                                self._cipher.encrypt(
-                                    body, aad=cell_aad("queue", "payload", reingress_row_id)
-                                ),
-                                OutboxStatus.PENDING.value,
-                                0,
-                                now,
-                                ingress_created,
-                                now,
-                            ),
-                        )
-                    await self._event(
-                        new_mid,
-                        "received",
-                        None,
-                        f"reingress from {origin_id}/{dest}/seq{seq}",
                         now,
-                    )
-                    await self._event(
-                        origin_id, "reingressed", dest, f"-> {new_mid} depth {child_depth}", now
-                    )
-                # 7. CONSUME THE TOKEN — the guarded DELETE is the synchronization point (clone
-                #    route_handoff). rowcount 0 (already consumed) → roll back, no-op.
-                cur = await self._db.execute(
-                    "DELETE FROM queue WHERE id=? AND stage=? AND status=?",
-                    (response_row_id, Stage.RESPONSE.value, OutboxStatus.INFLIGHT.value),
+                        now,
+                        response_row_id,
+                    ),
                 )
-                if not cur.rowcount:
-                    await self._db.rollback()
-                    return False
-                # 8. The origin may now finalize (its last outstanding RESPONSE row is gone).
+                await self._event(origin_id, "dead", None, "re-ingress ref corrupt", now)
                 await self._maybe_finalize_message(origin_id, now)
                 await self._commit()
-            except Exception:
+                return True
+            # 2. The IMMUTABLE artifact body (same committed bytes every re-run → re-run-stable). NULL
+            #    only if retention purged it — but an outstanding work-row makes the message
+            #    purge-ineligible (Q8), so this is defensive: treat as empty, still consume.
+            cur = await self._db.execute(
+                "SELECT body FROM response"
+                " WHERE message_id=? AND destination_name=? AND response_seq=?",
+                (origin_msg_id, dest, seq),
+            )
+            art = await cur.fetchone()
+            body = (
+                self._dec(
+                    art["body"],
+                    aad=cell_aad("response", "body", origin_msg_id, dest, seq),
+                )
+                if (art and art["body"] is not None)
+                else ""
+            )
+            body = body or ""
+            # 3. The origin's correlation lineage (absent keys → depth 0, origin is its own root).
+            cur = await self._db.execute("SELECT metadata FROM messages WHERE id=?", (origin_id,))
+            mrow = await cur.fetchone()
+            origin_meta: dict[str, Any] = {}
+            # EF-3: ciphered at rest, bound to the origin message's metadata cell
+            meta_json = (
+                self._dec(mrow["metadata"], aad=cell_aad("messages", "metadata", origin_id))
+                if mrow
+                else None
+            )
+            if meta_json:
+                loaded = json.loads(meta_json)
+                if isinstance(loaded, dict):
+                    origin_meta = loaded
+            child_depth = int(origin_meta.get("correlation_depth", 0) or 0) + 1
+            root = origin_meta.get("correlation_root_id") or origin_id
+            if child_depth > correlation_depth_cap:
+                # Depth-cap breach: dead-letter the token, ERROR the origin (Q4). Consume (don't
+                # re-loop), produce NO child.
+                await self._db.execute(
+                    "UPDATE queue SET status=?, last_error=?, next_attempt_at=?, updated_at=?"
+                    " WHERE id=?",
+                    (
+                        OutboxStatus.DEAD.value,
+                        self._enc(
+                            f"re-ingress correlation depth exceeded "
+                            f"({child_depth} > {correlation_depth_cap})",
+                            aad=cell_aad("queue", "last_error", response_row_id),
+                        ),
+                        now,
+                        now,
+                        response_row_id,
+                    ),
+                )
+                await self._event(
+                    origin_id, "dead", dest, f"re-ingress depth cap ({child_depth})", now
+                )
+                await self._maybe_finalize_message(origin_id, now)
+                await self._commit()
+                return True
+            # 4. Content-addressed child id (defense-in-depth; the guarded DELETE is the gate).
+            new_mid = self._reingress_message_id(origin_id, dest, seq, body)
+            cur = await self._db.execute("SELECT 1 FROM messages WHERE id=?", (new_mid,))
+            already = await cur.fetchone() is not None
+            if not already:
+                # 5. The re-ingressed message (RECEIVED, or RECEIVED→ERROR on a non-peekable HL7 body).
+                child_meta = json.dumps(
+                    {
+                        "correlation_id": origin_id,
+                        "correlation_root_id": root,
+                        "correlation_depth": child_depth,
+                        "reingress_of_seq": seq,
+                    }
+                )
+                await self._insert_message(
+                    new_mid,
+                    channel_id=loopback_channel_id,
+                    raw=body,
+                    status=(
+                        MessageStatus.ERROR.value if peek_failed else MessageStatus.RECEIVED.value
+                    ),
+                    control_id=control_id,
+                    message_type=message_type,
+                    source_type="reingress",
+                    summary=summary,
+                    metadata=child_meta,
+                    error="re-ingress body failed HL7 peek" if peek_failed else None,
+                    now=now,
+                )
+                # 6. The ingress queue row — UNLESS peek_failed (an ERROR message owes no work).
+                if not peek_failed:
+                    # ingest-time (ADR 0009) + metrics only; FIFO orders by rowid (ADR 0059)
+                    ingress_created = now
+                    # Hoist the row id so the payload binds to its own (queue, payload, id) cell.
+                    reingress_row_id = uuid4().hex
+                    await self._db.execute(
+                        "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
+                        " handler_name, payload, status, attempts, next_attempt_at, created_at,"
+                        " updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            reingress_row_id,
+                            new_mid,
+                            Stage.INGRESS.value,
+                            loopback_channel_id,
+                            None,
+                            None,
+                            self._cipher.encrypt(
+                                body, aad=cell_aad("queue", "payload", reingress_row_id)
+                            ),
+                            OutboxStatus.PENDING.value,
+                            0,
+                            now,
+                            ingress_created,
+                            now,
+                        ),
+                    )
+                await self._event(
+                    new_mid,
+                    "received",
+                    None,
+                    f"reingress from {origin_id}/{dest}/seq{seq}",
+                    now,
+                )
+                await self._event(
+                    origin_id, "reingressed", dest, f"-> {new_mid} depth {child_depth}", now
+                )
+            # 7. CONSUME THE TOKEN — the guarded DELETE is the synchronization point (clone
+            #    route_handoff). rowcount 0 (already consumed) → roll back, no-op.
+            cur = await self._db.execute(
+                "DELETE FROM queue WHERE id=? AND stage=? AND status=?",
+                (response_row_id, Stage.RESPONSE.value, OutboxStatus.INFLIGHT.value),
+            )
+            if not cur.rowcount:
                 await self._db.rollback()
-                raise
+                return False
+            # 8. The origin may now finalize (its last outstanding RESPONSE row is gone).
+            await self._maybe_finalize_message(origin_id, now)
+            await self._commit()
         return True
 
     async def response_body_for_work_row(self, response_row_id: str) -> str | None:
@@ -5933,52 +6237,47 @@ class MessageStore:
         # is safe_text-scrubbed (#120) + encrypted.
         now = time.time() if now is None else now
         dest = "\x1fack:" + inbound_name
-        async with self._lock:
-            try:
-                await self._db.execute("BEGIN")
-                cur = await self._db.execute(
-                    "SELECT COALESCE(MAX(response_seq), 0) AS m FROM response"
-                    " WHERE message_id=? AND destination_name=? AND kind='ack_sent'",
-                    (message_id, dest),
+        async with _writer_txn(self._db, self._lock):
+            cur = await self._db.execute(
+                "SELECT COALESCE(MAX(response_seq), 0) AS m FROM response"
+                " WHERE message_id=? AND destination_name=? AND kind='ack_sent'",
+                (message_id, dest),
+            )
+            seq_row = await cur.fetchone()
+            seq = (int(seq_row["m"]) if seq_row else 0) + 1
+            # Encrypt AFTER seq is known so body/detail bind to the (message_id, dest, seq) cell.
+            enc_body = (
+                self._enc(ack_body, aad=cell_aad("response", "body", message_id, dest, seq))
+                if (ack_body and self._cipher.encrypts)
+                else None
+            )
+            enc_detail = (
+                self._enc(
+                    safe_text(detail)[:200],
+                    aad=cell_aad("response", "detail", message_id, dest, seq),
                 )
-                seq_row = await cur.fetchone()
-                seq = (int(seq_row["m"]) if seq_row else 0) + 1
-                # Encrypt AFTER seq is known so body/detail bind to the (message_id, dest, seq) cell.
-                enc_body = (
-                    self._enc(ack_body, aad=cell_aad("response", "body", message_id, dest, seq))
-                    if (ack_body and self._cipher.encrypts)
-                    else None
-                )
-                enc_detail = (
-                    self._enc(
-                        safe_text(detail)[:200],
-                        aad=cell_aad("response", "detail", message_id, dest, seq),
-                    )
-                    if detail
-                    else None
-                )
-                await self._db.execute(
-                    "INSERT INTO response"
-                    " (message_id, destination_name, response_seq, body, outcome, detail,"
-                    "  captured_at, kind, ack_code, ack_phase)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?)",
-                    (
-                        message_id,
-                        dest,
-                        seq,
-                        enc_body,
-                        outcome,
-                        enc_detail,
-                        now,
-                        "ack_sent",
-                        ack_code,
-                        ack_phase,
-                    ),
-                )
-                await self._commit()
-            except Exception:
-                await self._db.rollback()
-                raise
+                if detail
+                else None
+            )
+            await self._db.execute(
+                "INSERT INTO response"
+                " (message_id, destination_name, response_seq, body, outcome, detail,"
+                "  captured_at, kind, ack_code, ack_phase)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (
+                    message_id,
+                    dest,
+                    seq,
+                    enc_body,
+                    outcome,
+                    enc_detail,
+                    now,
+                    "ack_sent",
+                    ack_code,
+                    ack_phase,
+                ),
+            )
+            await self._commit()
 
     async def correlate_response(self, message_id: str) -> list[CapturedResponse]:
         """Every captured reply for ``message_id`` (ADR 0013) + the inbound ``ack_sent`` rows (ADR
@@ -6412,6 +6711,67 @@ class MessageStore:
             )
             return len(orphans)
 
+    async def dead_letter_missing_inbounds(
+        self, valid_names: set[str], now: float | None = None
+    ) -> int:
+        """Dead-letter every non-terminal **channel-keyed** row whose ``channel_id`` is no longer in
+        the registry (a removed/renamed inbound). The third startup sweep beside
+        :meth:`dead_letter_missing_destinations` and :meth:`dead_letter_missing_handlers`, closing the
+        one lane key the other two cannot see.
+
+        Scoped to the stages whose lane key IS ``channel_id`` — ingress, routed and response (the
+        outbound stage keys on ``destination_name`` and its delivery worker drains regardless of where
+        the message came from, so an outbound row is never swept here). No router, transform or
+        re-ingress worker is spawned for an unknown inbound and the pooled lane provider for those
+        stages is the live registry's inbound set, so such a row would otherwise sit ``pending``
+        forever — never claimed, never dead-lettered, and invisible to the buildup and stall alerts,
+        which only ask ``pending_depth`` about registry lanes. Call once at startup, after
+        :meth:`reset_stale_inflight`. Returns the rows killed; the message shows ``ERROR`` and an
+        operator replays it (per-message :meth:`replay`) once the inbound is restored — a replay
+        re-pends each row at its own stage, so a routed orphan resumes at transform rather than
+        re-running routing.
+
+        ``valid_names`` must be the WHOLE deployment's inbound names, not one engine shard's slice:
+        a shard's ``registry.inbound`` holds only its own inbounds (ADR 0037), so keying off that map
+        would dead-letter every sibling shard's live rows on a unified store. ``Registry
+        .inbound_names()`` is the pinned whole-config set; the caller passes it."""
+        now = time.time() if now is None else now
+        channel_keyed = (Stage.INGRESS.value, Stage.ROUTED.value, Stage.RESPONSE.value)
+        async with self._lock:
+            cur = await self._db.execute(
+                "SELECT id, message_id, channel_id FROM queue"
+                " WHERE stage IN (?, ?, ?) AND status IN (?, ?)",
+                (*channel_keyed, OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value),
+            )
+            # Filter in Python (valid_names may be empty → NOT IN () is invalid SQL); the non-terminal
+            # channel-keyed backlog is small relative to message history.
+            orphans = [r for r in await cur.fetchall() if r["channel_id"] not in valid_names]
+            if not orphans:
+                return 0
+            error = "inbound removed from registry"
+            for row in orphans:
+                await self._db.execute(
+                    "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?"
+                    " WHERE id=?",
+                    (
+                        OutboxStatus.DEAD.value,
+                        now,
+                        self._enc(error, aad=cell_aad("queue", "last_error", row["id"])),
+                        now,
+                        row["id"],
+                    ),
+                )
+                await self._event(row["message_id"], "dead", None, error, now)
+                await self._maybe_finalize_message(row["message_id"], now)
+            await self._commit()
+            log.warning(
+                "dead-lettered %d orphaned ingress/routed/response row(s) at startup for missing"
+                " inbound(s): %s",
+                len(orphans),
+                ", ".join(sorted({r["channel_id"] for r in orphans})),
+            )
+            return len(orphans)
+
     async def replay(self, message_id: str, now: float | None = None) -> int:
         """Re-queue a message for re-processing/re-delivery (attempts reset) — the message-level
         recovery path. **Two modes, by whether anything is stuck:**
@@ -6428,7 +6788,21 @@ class MessageStore:
 
         ``cancelled`` rows are never touched (an operator purged them). A message with no re-queueable
         rows (parse/validation ERROR, FILTERED, or UNROUTED with no queue rows) returns 0, status
-        untouched. Returns rows requeued."""
+        untouched. Returns rows requeued.
+
+        **A row whose body retention has ERASED is never re-queued** (:data:`_REPLAYABLE_BODY`,
+        BACKLOG #1560). Re-pending one handed the connector a zero-byte frame and had the finalizer
+        record it as a successful delivery. The predicate rides the existing ``WHERE``, so a MIXED
+        batch simply SKIPS the erased rows and recovers the rest — it never aborts the whole call, and
+        an operator recovering a partly-purged message still gets back what is left. When *every*
+        candidate row is erased the UPDATE matches nothing, so this returns 0 and — because the status
+        write and the audit event both hang off ``rowcount`` — the message keeps its disposition and no
+        ``replayed`` event is written for a replay that did not happen.
+
+        The ``stuck`` count deliberately does NOT carry the predicate. An unreplayable ``dead`` row
+        still means something is stuck, so the message stays in RECOVER mode and this returns 0.
+        Excluding it would fall through to RE-SEND and re-transmit the message's *delivered* siblings,
+        which the operator did not ask for — a worse outcome than doing nothing."""
         now = time.time() if now is None else now
         async with self._lock:
             cur = await self._db.execute(
@@ -6449,14 +6823,18 @@ class MessageStore:
                 # their idempotency-ledger entries FIRST so the re-claimed rows are NOT skip-and-completed
                 # as crash-re-run duplicates — a replay must actually re-deliver. Scoped to THIS message's
                 # DONE rows (the exact set the UPDATE below re-pends), so no other message is affected.
+                # It carries the erased-body predicate for exactly that reason: the UPDATE skips a purged
+                # row, so dropping its ledger entry would disarm the duplicate guard for a delivery that
+                # is never going to run again (#1560).
                 await self._db.execute(
                     "DELETE FROM delivered_keys WHERE outbox_id IN"
-                    " (SELECT id FROM queue WHERE message_id=? AND status=?)",
+                    f" (SELECT id FROM queue WHERE message_id=? AND status=? AND ({_REPLAYABLE_BODY}))",
                     (message_id, OutboxStatus.DONE.value),
                 )
             cur = await self._db.execute(
                 "UPDATE queue SET status=?, attempts=0, next_attempt_at=?,"
-                f" last_error=NULL, updated_at=? WHERE message_id=? AND status IN ({placeholders})",
+                f" last_error=NULL, updated_at=? WHERE message_id=? AND status IN ({placeholders})"
+                f" AND ({_REPLAYABLE_BODY})",
                 (OutboxStatus.PENDING.value, now, now, message_id, *replay_from),
             )
             if cur.rowcount:
@@ -6519,204 +6897,193 @@ class MessageStore:
         :class:`ResendKeyConflict` (the ``idempotency_key`` was already used for a different
         message/target — review #123-4)."""
         now = time.time() if now is None else now
-        async with self._lock:
-            try:
-                await self._db.execute("BEGIN")
-                # Idempotency gate FIRST (ADR 0090 §4): claim the key, and only proceed if we created the
-                # row. INSERT OR IGNORE + rowcount is the atomic test-and-set on the UNIQUE resend_key.
-                ins = await self._db.execute(
-                    "INSERT OR IGNORE INTO resend_log"
-                    " (resend_key, message_id, to_destination, from_destination, outbox_id, created_at)"
-                    " VALUES (?,?,?,?,?,?)",
-                    (idempotency_key, message_id, to, from_ or "", None, now),
+        async with _writer_txn(self._db, self._lock):
+            # Idempotency gate FIRST (ADR 0090 §4): claim the key, and only proceed if we created the
+            # row. INSERT OR IGNORE + rowcount is the atomic test-and-set on the UNIQUE resend_key.
+            ins = await self._db.execute(
+                "INSERT OR IGNORE INTO resend_log"
+                " (resend_key, message_id, to_destination, from_destination, outbox_id, created_at)"
+                " VALUES (?,?,?,?,?,?)",
+                (idempotency_key, message_id, to, from_ or "", None, now),
+            )
+            if not ins.rowcount:
+                # Key already used. Bind the key to its (message_id, to) request: only a repeat of
+                # the SAME resend is an idempotent duplicate — a key reused for a DIFFERENT message or
+                # target is a conflict (raise), never a silent no-op that drops a distinct resend and
+                # reports the unrelated first outcome (ADR 0090 §4, review #123-4).
+                prior = await self._db.execute(
+                    "SELECT message_id, to_destination, from_destination, outbox_id FROM resend_log"
+                    " WHERE resend_key=?",
+                    (idempotency_key,),
                 )
-                if not ins.rowcount:
-                    # Key already used. Bind the key to its (message_id, to) request: only a repeat of
-                    # the SAME resend is an idempotent duplicate — a key reused for a DIFFERENT message or
-                    # target is a conflict (raise), never a silent no-op that drops a distinct resend and
-                    # reports the unrelated first outcome (ADR 0090 §4, review #123-4).
-                    prior = await self._db.execute(
-                        "SELECT message_id, to_destination, from_destination, outbox_id FROM resend_log"
-                        " WHERE resend_key=?",
-                        (idempotency_key,),
+                pr = await prior.fetchone()
+                if pr is not None and (
+                    pr["message_id"] != message_id or pr["to_destination"] != to
+                ):
+                    raise ResendKeyConflict(
+                        f"idempotency key {idempotency_key!r} was already used to resend message"
+                        f" {pr['message_id']!r} to {pr['to_destination']!r}; it cannot be reused for"
+                        f" message {message_id!r} to {to!r}"
                     )
-                    pr = await prior.fetchone()
-                    if pr is not None and (
-                        pr["message_id"] != message_id or pr["to_destination"] != to
-                    ):
-                        raise ResendKeyConflict(
-                            f"idempotency key {idempotency_key!r} was already used to resend message"
-                            f" {pr['message_id']!r} to {pr['to_destination']!r}; it cannot be reused for"
-                            f" message {message_id!r} to {to!r}"
-                        )
-                    await self._commit()
-                    return ResendOutcome(
-                        status="duplicate",
-                        message_id=message_id,
-                        to_destination=pr["to_destination"] if pr else to,
-                        from_destination=pr["from_destination"] if pr else (from_ or ""),
-                        outbox_id=pr["outbox_id"] if pr else None,
-                    )
-                if body_override is not None:
-                    # Edit-and-resend DIRECT power-path (ADR 0090 §9.1.3, BACKLOG #153): ship the
-                    # operator's EDITED body to `to` as a NEW, correlated CHILD delivery. The ORIGIN
-                    # message row is only READ (its channel/type + correlation metadata) and NEVER opened
-                    # for write, so its count-and-log disposition + error history stay byte-identical —
-                    # the #153 "the original must NOT change" invariant (§9.1.3; review #153-1/#153-2).
-                    # This is the direct-path analogue of `reingress`'s correlated child: the outbound row
-                    # hangs off the CHILD's id, so the finalizer recomputes the CHILD's disposition (never
-                    # the origin's) once `to` resolves. `from_destination` stays '' (no source lane read).
-                    mcur = await self._db.execute(
-                        "SELECT channel_id, source_type, message_type, metadata"
-                        " FROM messages WHERE id=?",
-                        (message_id,),
-                    )
-                    mrow = await mcur.fetchone()
-                    if mrow is None:
-                        raise ReingressOriginMissing(
-                            f"message {message_id} no longer exists -- cannot edit-and-resend"
-                        )
-                    src_channel = str(mrow["channel_id"])
-                    src_dest = from_ or ""
-                    body = body_override
-                    # A blank edited body would ship a zero-length delivery recorded PROCESSED (§5 parity
-                    # with the retention-nulled reject). The API bounds this (min_length=1); guard anyway.
-                    if not body:
-                        raise ResendSourceEmpty(
-                            f"message {message_id} edited body is empty -- cannot resend"
-                        )
-                    # Correlate the child to the origin (mirrors `reingress`): correlation_id/_root_id/
-                    # _depth link the logs, plus an explicit `edited_from` for the edit provenance.
-                    raw_meta = self._dec(
-                        mrow["metadata"], aad=cell_aad("messages", "metadata", message_id)
-                    )
-                    try:
-                        parent_meta = json.loads(raw_meta) if raw_meta else {}
-                    except (ValueError, TypeError):
-                        parent_meta = {}
-                    if not isinstance(parent_meta, dict):
-                        parent_meta = {}
-                    child_depth = int(parent_meta.get("correlation_depth", 0) or 0) + 1
-                    root = parent_meta.get("correlation_root_id") or message_id
-                    child_meta = json.dumps(
-                        {
-                            "correlation_id": message_id,
-                            "correlation_root_id": root,
-                            "correlation_depth": child_depth,
-                            "edited_from": message_id,
-                        }
-                    )
-                    # The child is created ROUTED with its single outbound delivery already in flight (it
-                    # skips router/transform — the operator supplied the final body); the finalizer drives
-                    # it to PROCESSED/ERROR from that row, exactly like any message at the outbound stage.
-                    # Idempotency is the resend_log gate above (claimed once per key, single txn); a
-                    # rolled-back partial frees the key and re-runs cleanly, so a uuid4 child id is safe.
-                    child_mid = uuid4().hex
-                    await self._insert_message(
-                        child_mid,
-                        channel_id=src_channel,
-                        raw=body,
-                        status=MessageStatus.ROUTED.value,
-                        control_id=None,
-                        message_type=mrow["message_type"],
-                        source_type=mrow["source_type"],
-                        summary=None,
-                        metadata=child_meta,
-                        error=None,
-                        now=now,
-                    )
-                    await self._event(
-                        child_mid, "received", None, f"edit-resend from {message_id}", now
-                    )
-                    await self._event(message_id, "edit_resend", to, f"-> {child_mid}", now)
-                    # The alternate-lane outbound row hangs off the CHILD (never the origin); channel_id
-                    # carries the origin producer so metrics/RBAC still attribute to the origin's inbound.
-                    outbox_id = await self._insert_outbound_row(
-                        child_mid, src_channel, to, body, now
-                    )
-                else:
-                    # Resolve the source + its stored body (deref a shared body via COALESCE, like
-                    # outbox_payloads_for). ANY retained stage='outbound' row is an eligible source — the
-                    # transform already produced its body, so a `done`/`cancelled` body, a `dead` one
-                    # (diverting a permanently-failed delivery to a standby is a marquee use case, ADR 0090
-                    # §1), or a still-`pending`/`inflight` one all ship the same bytes. `from_destination`
-                    # names the SOURCE LANE the bytes were produced for, not a claim that that lane
-                    # delivered (review #123-3: the eligibility contract is retained-body, not delivered).
-                    src_where = "message_id=? AND stage=?"
-                    src_params: list[object] = [message_id, Stage.OUTBOUND.value]
-                    if from_ is not None:
-                        src_where += " AND destination_name=?"
-                        src_params.append(from_)
-                    cur = await self._db.execute(
-                        "SELECT q.id, q.body_ref, q.destination_name, q.channel_id,"
-                        " COALESCE(sb.body, q.payload) AS _body_ciphertext"
-                        " FROM queue q LEFT JOIN shared_body sb ON sb.hash = q.body_ref"
-                        f" WHERE {src_where} ORDER BY q.destination_name",
-                        tuple(src_params),
-                    )
-                    rows = list(await cur.fetchall())
-                    if not rows:
-                        raise ResendSourceNotFound(
-                            f"message {message_id} has no delivered body"
-                            + (f" for source {from_!r}" if from_ is not None else "")
-                            + " to resend"
-                        )
-                    if from_ is None and len({r["destination_name"] for r in rows}) > 1:
-                        raise ResendSourceAmbiguous(
-                            f"message {message_id} was delivered to multiple destinations --"
-                            " specify the source destination (from) to resend"
-                        )
-                    src = rows[0]
-                    src_channel = str(src["channel_id"])
-                    src_dest = str(src["destination_name"])
-                    # The body's cell depends on its source: a store-once shared body (body_ref set) binds
-                    # to the shared_body content-address; an inline payload binds to the queue row (11.3.3).
-                    body_aad = (
-                        cell_aad("shared_body", "body", src["body_ref"])
-                        if src["body_ref"] is not None
-                        else cell_aad("queue", "payload", src["id"])
-                    )
-                    decoded = self._dec(src["_body_ciphertext"], aad=body_aad)
-                    # must-fix #2 / §5: a retention-nulled ('') source body would ship a zero-length body
-                    # recorded PROCESSED. Reject rather than resend nothing. (A '' inline payload is exactly
-                    # what purge_message_bodies leaves; the deref COALESCE already resolved any shared body.)
-                    if not decoded:
-                        raise ResendSourceEmpty(
-                            f"message {message_id} source body was purged by retention -- cannot resend"
-                        )
-                    body = decoded
-                    # #123 stored-body path: the resend is another delivery of the SAME logged message.
-                    # Insert the alternate-lane outbound row at the TAIL on the ORIGIN message_id (reuse
-                    # the shared helper; inline body, one copy; channel_id carries the origin producer so
-                    # metrics/RBAC attribute correctly), and flip the ORIGIN to ROUTED.
-                    outbox_id = await self._insert_outbound_row(
-                        message_id, src_channel, to, body, now
-                    )
-                    # Re-queue status exception (must-fix #4, same as replay): a delivery is back in
-                    # flight → ROUTED, committed atomically with the pending row so retention's
-                    # NOT-EXISTS(pending/inflight) eligibility sees it and skips the message (#3 re-open).
-                    await self._db.execute(
-                        "UPDATE messages SET status=?, error=NULL WHERE id=?",
-                        (MessageStatus.ROUTED.value, message_id),
-                    )
-                    await self._event(
-                        message_id, "resent", to, f"resend {src_dest or '?'}->{to}", now
-                    )
-                await self._db.execute(
-                    "UPDATE resend_log SET outbox_id=? WHERE resend_key=?",
-                    (outbox_id, idempotency_key),
-                )
                 await self._commit()
                 return ResendOutcome(
-                    status="resent",
+                    status="duplicate",
                     message_id=message_id,
-                    to_destination=to,
-                    from_destination=src_dest,
-                    outbox_id=outbox_id,
+                    to_destination=pr["to_destination"] if pr else to,
+                    from_destination=pr["from_destination"] if pr else (from_ or ""),
+                    outbox_id=pr["outbox_id"] if pr else None,
                 )
-            except Exception:
-                await self._db.rollback()
-                raise
+            if body_override is not None:
+                # Edit-and-resend DIRECT power-path (ADR 0090 §9.1.3, BACKLOG #153): ship the
+                # operator's EDITED body to `to` as a NEW, correlated CHILD delivery. The ORIGIN
+                # message row is only READ (its channel/type + correlation metadata) and NEVER opened
+                # for write, so its count-and-log disposition + error history stay byte-identical —
+                # the #153 "the original must NOT change" invariant (§9.1.3; review #153-1/#153-2).
+                # This is the direct-path analogue of `reingress`'s correlated child: the outbound row
+                # hangs off the CHILD's id, so the finalizer recomputes the CHILD's disposition (never
+                # the origin's) once `to` resolves. `from_destination` stays '' (no source lane read).
+                mcur = await self._db.execute(
+                    "SELECT channel_id, source_type, message_type, metadata"
+                    " FROM messages WHERE id=?",
+                    (message_id,),
+                )
+                mrow = await mcur.fetchone()
+                if mrow is None:
+                    raise ReingressOriginMissing(
+                        f"message {message_id} no longer exists -- cannot edit-and-resend"
+                    )
+                src_channel = str(mrow["channel_id"])
+                src_dest = from_ or ""
+                body = body_override
+                # A blank edited body would ship a zero-length delivery recorded PROCESSED (§5 parity
+                # with the retention-nulled reject). The API bounds this (min_length=1); guard anyway.
+                if not body:
+                    raise ResendSourceEmpty(
+                        f"message {message_id} edited body is empty -- cannot resend"
+                    )
+                # Correlate the child to the origin (mirrors `reingress`): correlation_id/_root_id/
+                # _depth link the logs, plus an explicit `edited_from` for the edit provenance.
+                raw_meta = self._dec(
+                    mrow["metadata"], aad=cell_aad("messages", "metadata", message_id)
+                )
+                try:
+                    parent_meta = json.loads(raw_meta) if raw_meta else {}
+                except (ValueError, TypeError):
+                    parent_meta = {}
+                if not isinstance(parent_meta, dict):
+                    parent_meta = {}
+                child_depth = int(parent_meta.get("correlation_depth", 0) or 0) + 1
+                root = parent_meta.get("correlation_root_id") or message_id
+                child_meta = json.dumps(
+                    {
+                        "correlation_id": message_id,
+                        "correlation_root_id": root,
+                        "correlation_depth": child_depth,
+                        "edited_from": message_id,
+                    }
+                )
+                # The child is created ROUTED with its single outbound delivery already in flight (it
+                # skips router/transform — the operator supplied the final body); the finalizer drives
+                # it to PROCESSED/ERROR from that row, exactly like any message at the outbound stage.
+                # Idempotency is the resend_log gate above (claimed once per key, single txn); a
+                # rolled-back partial frees the key and re-runs cleanly, so a uuid4 child id is safe.
+                child_mid = uuid4().hex
+                await self._insert_message(
+                    child_mid,
+                    channel_id=src_channel,
+                    raw=body,
+                    status=MessageStatus.ROUTED.value,
+                    control_id=None,
+                    message_type=mrow["message_type"],
+                    source_type=mrow["source_type"],
+                    summary=None,
+                    metadata=child_meta,
+                    error=None,
+                    now=now,
+                )
+                await self._event(
+                    child_mid, "received", None, f"edit-resend from {message_id}", now
+                )
+                await self._event(message_id, "edit_resend", to, f"-> {child_mid}", now)
+                # The alternate-lane outbound row hangs off the CHILD (never the origin); channel_id
+                # carries the origin producer so metrics/RBAC still attribute to the origin's inbound.
+                outbox_id = await self._insert_outbound_row(child_mid, src_channel, to, body, now)
+            else:
+                # Resolve the source + its stored body (deref a shared body via COALESCE, like
+                # outbox_payloads_for). ANY retained stage='outbound' row is an eligible source — the
+                # transform already produced its body, so a `done`/`cancelled` body, a `dead` one
+                # (diverting a permanently-failed delivery to a standby is a marquee use case, ADR 0090
+                # §1), or a still-`pending`/`inflight` one all ship the same bytes. `from_destination`
+                # names the SOURCE LANE the bytes were produced for, not a claim that that lane
+                # delivered (review #123-3: the eligibility contract is retained-body, not delivered).
+                src_where = "message_id=? AND stage=?"
+                src_params: list[object] = [message_id, Stage.OUTBOUND.value]
+                if from_ is not None:
+                    src_where += " AND destination_name=?"
+                    src_params.append(from_)
+                cur = await self._db.execute(
+                    "SELECT q.id, q.body_ref, q.destination_name, q.channel_id,"
+                    " COALESCE(sb.body, q.payload) AS _body_ciphertext"
+                    " FROM queue q LEFT JOIN shared_body sb ON sb.hash = q.body_ref"
+                    f" WHERE {src_where} ORDER BY q.destination_name",
+                    tuple(src_params),
+                )
+                rows = list(await cur.fetchall())
+                if not rows:
+                    raise ResendSourceNotFound(
+                        f"message {message_id} has no delivered body"
+                        + (f" for source {from_!r}" if from_ is not None else "")
+                        + " to resend"
+                    )
+                if from_ is None and len({r["destination_name"] for r in rows}) > 1:
+                    raise ResendSourceAmbiguous(
+                        f"message {message_id} was delivered to multiple destinations --"
+                        " specify the source destination (from) to resend"
+                    )
+                src = rows[0]
+                src_channel = str(src["channel_id"])
+                src_dest = str(src["destination_name"])
+                # The body's cell depends on its source: a store-once shared body (body_ref set) binds
+                # to the shared_body content-address; an inline payload binds to the queue row (11.3.3).
+                body_aad = (
+                    cell_aad("shared_body", "body", src["body_ref"])
+                    if src["body_ref"] is not None
+                    else cell_aad("queue", "payload", src["id"])
+                )
+                decoded = self._dec(src["_body_ciphertext"], aad=body_aad)
+                # must-fix #2 / §5: a retention-nulled ('') source body would ship a zero-length body
+                # recorded PROCESSED. Reject rather than resend nothing. (A '' inline payload is exactly
+                # what purge_message_bodies leaves; the deref COALESCE already resolved any shared body.)
+                if not decoded:
+                    raise ResendSourceEmpty(
+                        f"message {message_id} source body was purged by retention -- cannot resend"
+                    )
+                body = decoded
+                # #123 stored-body path: the resend is another delivery of the SAME logged message.
+                # Insert the alternate-lane outbound row at the TAIL on the ORIGIN message_id (reuse
+                # the shared helper; inline body, one copy; channel_id carries the origin producer so
+                # metrics/RBAC attribute correctly), and flip the ORIGIN to ROUTED.
+                outbox_id = await self._insert_outbound_row(message_id, src_channel, to, body, now)
+                # Re-queue status exception (must-fix #4, same as replay): a delivery is back in
+                # flight → ROUTED, committed atomically with the pending row so retention's
+                # NOT-EXISTS(pending/inflight) eligibility sees it and skips the message (#3 re-open).
+                await self._db.execute(
+                    "UPDATE messages SET status=?, error=NULL WHERE id=?",
+                    (MessageStatus.ROUTED.value, message_id),
+                )
+                await self._event(message_id, "resent", to, f"resend {src_dest or '?'}->{to}", now)
+            await self._db.execute(
+                "UPDATE resend_log SET outbox_id=? WHERE resend_key=?",
+                (outbox_id, idempotency_key),
+            )
+            await self._commit()
+            return ResendOutcome(
+                status="resent",
+                message_id=message_id,
+                to_destination=to,
+                from_destination=src_dest,
+                outbox_id=outbox_id,
+            )
 
     async def reingress(
         self,
@@ -6744,132 +7111,123 @@ class MessageStore:
         :class:`ResendKeyConflict` (the key was already used for a DIFFERENT origin/target). No mutation
         on a raise (the whole txn rolls back)."""
         now = time.time() if now is None else now
-        async with self._lock:
-            try:
-                await self._db.execute("BEGIN")
-                mcur = await self._db.execute(
-                    "SELECT channel_id, source_type, message_type, metadata FROM messages WHERE id=?",
-                    (origin_message_id,),
+        async with _writer_txn(self._db, self._lock):
+            mcur = await self._db.execute(
+                "SELECT channel_id, source_type, message_type, metadata FROM messages WHERE id=?",
+                (origin_message_id,),
+            )
+            orow = await mcur.fetchone()
+            if orow is None:
+                raise ReingressOriginMissing(
+                    f"message {origin_message_id} no longer exists -- cannot edit-and-resubmit"
                 )
-                orow = await mcur.fetchone()
-                if orow is None:
-                    raise ReingressOriginMissing(
-                        f"message {origin_message_id} no longer exists -- cannot edit-and-resubmit"
-                    )
-                channel_id = str(orow["channel_id"])
-                target = f"{REINGRESS_TARGET_PREFIX}{channel_id}"
-                # Idempotency gate FIRST (ADR 0090 §4): claim the key; proceed only if we created the row.
-                ins = await self._db.execute(
-                    "INSERT OR IGNORE INTO resend_log"
-                    " (resend_key, message_id, to_destination, from_destination, outbox_id, created_at)"
-                    " VALUES (?,?,?,?,?,?)",
-                    (idempotency_key, origin_message_id, target, "", None, now),
+            channel_id = str(orow["channel_id"])
+            target = f"{REINGRESS_TARGET_PREFIX}{channel_id}"
+            # Idempotency gate FIRST (ADR 0090 §4): claim the key; proceed only if we created the row.
+            ins = await self._db.execute(
+                "INSERT OR IGNORE INTO resend_log"
+                " (resend_key, message_id, to_destination, from_destination, outbox_id, created_at)"
+                " VALUES (?,?,?,?,?,?)",
+                (idempotency_key, origin_message_id, target, "", None, now),
+            )
+            if not ins.rowcount:
+                prior = await self._db.execute(
+                    "SELECT message_id, to_destination, outbox_id FROM resend_log WHERE resend_key=?",
+                    (idempotency_key,),
                 )
-                if not ins.rowcount:
-                    prior = await self._db.execute(
-                        "SELECT message_id, to_destination, outbox_id FROM resend_log WHERE resend_key=?",
-                        (idempotency_key,),
+                pr = await prior.fetchone()
+                if pr is not None and (
+                    pr["message_id"] != origin_message_id or pr["to_destination"] != target
+                ):
+                    raise ResendKeyConflict(
+                        f"idempotency key {idempotency_key!r} was already used for a different"
+                        f" resubmit ({pr['message_id']!r} -> {pr['to_destination']!r}); it cannot be"
+                        f" reused for message {origin_message_id!r}"
                     )
-                    pr = await prior.fetchone()
-                    if pr is not None and (
-                        pr["message_id"] != origin_message_id or pr["to_destination"] != target
-                    ):
-                        raise ResendKeyConflict(
-                            f"idempotency key {idempotency_key!r} was already used for a different"
-                            f" resubmit ({pr['message_id']!r} -> {pr['to_destination']!r}); it cannot be"
-                            f" reused for message {origin_message_id!r}"
-                        )
-                    await self._commit()
-                    return ReingressOutcome(
-                        status="duplicate",
-                        message_id=origin_message_id,
-                        new_message_id=(pr["outbox_id"] if pr else "") or "",
-                        channel_id=channel_id,
-                    )
-                # Correlate the child to the origin (mirrors _insert_passthrough_child): correlation_id /
-                # _root_id / _depth link the logs, plus an explicit `edited_from` for the edit provenance.
-                raw_meta = self._dec(
-                    orow["metadata"], aad=cell_aad("messages", "metadata", origin_message_id)
-                )
-                try:
-                    parent_meta = json.loads(raw_meta) if raw_meta else {}
-                except (ValueError, TypeError):
-                    parent_meta = {}
-                if not isinstance(parent_meta, dict):
-                    parent_meta = {}
-                child_depth = int(parent_meta.get("correlation_depth", 0) or 0) + 1
-                root = parent_meta.get("correlation_root_id") or origin_message_id
-                child_meta = json.dumps(
-                    {
-                        "correlation_id": origin_message_id,
-                        "correlation_root_id": root,
-                        "correlation_depth": child_depth,
-                        "edited_from": origin_message_id,
-                    }
-                )
-                new_mid = self._edit_resubmit_message_id(idempotency_key, channel_id, raw)
-                # Explicit-id INSERT-OR-IGNORE ingress (defense-in-depth): a re-run after a rolled-back
-                # partial re-derives the SAME id and skips the re-insert instead of minting a new one.
-                exists = await self._db.execute("SELECT 1 FROM messages WHERE id=?", (new_mid,))
-                if await exists.fetchone() is None:
-                    await self._insert_message(
-                        new_mid,
-                        channel_id=channel_id,
-                        raw=raw,
-                        status=MessageStatus.RECEIVED.value,
-                        control_id=None,  # re-derived by the inbound peek when it re-routes
-                        message_type=orow["message_type"],
-                        source_type=orow["source_type"],
-                        summary=None,
-                        metadata=child_meta,
-                        error=None,
-                        now=now,
-                    )
-                    # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by rowid (ADR 0059).
-                    # Hoist the row id so the payload binds to its own (queue, payload, id) cell.
-                    resubmit_row_id = uuid4().hex
-                    await self._db.execute(
-                        "INSERT INTO queue"
-                        " (id, message_id, stage, channel_id, destination_name, payload,"
-                        "  status, attempts, next_attempt_at, created_at, updated_at)"
-                        " VALUES (?,?,?,?,NULL,?,?,0,?,?,?)",
-                        (
-                            resubmit_row_id,
-                            new_mid,
-                            Stage.INGRESS.value,
-                            channel_id,
-                            self._cipher.encrypt(
-                                raw, aad=cell_aad("queue", "payload", resubmit_row_id)
-                            ),
-                            OutboxStatus.PENDING.value,
-                            now,
-                            now,
-                            now,
-                        ),
-                    )
-                    self.body_copies += (
-                        1  # A1: the ingress queue.payload is a second durable raw copy
-                    )
-                    await self._event(
-                        new_mid, "received", None, f"edit-resubmit from {origin_message_id}", now
-                    )
-                    await self._event(
-                        origin_message_id, "edit_resubmit", None, f"-> {new_mid}", now
-                    )
-                await self._db.execute(
-                    "UPDATE resend_log SET outbox_id=? WHERE resend_key=?",
-                    (new_mid, idempotency_key),
-                )
                 await self._commit()
                 return ReingressOutcome(
-                    status="resubmitted",
+                    status="duplicate",
                     message_id=origin_message_id,
-                    new_message_id=new_mid,
+                    new_message_id=(pr["outbox_id"] if pr else "") or "",
                     channel_id=channel_id,
                 )
-            except Exception:
-                await self._db.rollback()
-                raise
+            # Correlate the child to the origin (mirrors _insert_passthrough_child): correlation_id /
+            # _root_id / _depth link the logs, plus an explicit `edited_from` for the edit provenance.
+            raw_meta = self._dec(
+                orow["metadata"], aad=cell_aad("messages", "metadata", origin_message_id)
+            )
+            try:
+                parent_meta = json.loads(raw_meta) if raw_meta else {}
+            except (ValueError, TypeError):
+                parent_meta = {}
+            if not isinstance(parent_meta, dict):
+                parent_meta = {}
+            child_depth = int(parent_meta.get("correlation_depth", 0) or 0) + 1
+            root = parent_meta.get("correlation_root_id") or origin_message_id
+            child_meta = json.dumps(
+                {
+                    "correlation_id": origin_message_id,
+                    "correlation_root_id": root,
+                    "correlation_depth": child_depth,
+                    "edited_from": origin_message_id,
+                }
+            )
+            new_mid = self._edit_resubmit_message_id(idempotency_key, channel_id, raw)
+            # Explicit-id INSERT-OR-IGNORE ingress (defense-in-depth): a re-run after a rolled-back
+            # partial re-derives the SAME id and skips the re-insert instead of minting a new one.
+            exists = await self._db.execute("SELECT 1 FROM messages WHERE id=?", (new_mid,))
+            if await exists.fetchone() is None:
+                await self._insert_message(
+                    new_mid,
+                    channel_id=channel_id,
+                    raw=raw,
+                    status=MessageStatus.RECEIVED.value,
+                    control_id=None,  # re-derived by the inbound peek when it re-routes
+                    message_type=orow["message_type"],
+                    source_type=orow["source_type"],
+                    summary=None,
+                    metadata=child_meta,
+                    error=None,
+                    now=now,
+                )
+                # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by rowid (ADR 0059).
+                # Hoist the row id so the payload binds to its own (queue, payload, id) cell.
+                resubmit_row_id = uuid4().hex
+                await self._db.execute(
+                    "INSERT INTO queue"
+                    " (id, message_id, stage, channel_id, destination_name, payload,"
+                    "  status, attempts, next_attempt_at, created_at, updated_at)"
+                    " VALUES (?,?,?,?,NULL,?,?,0,?,?,?)",
+                    (
+                        resubmit_row_id,
+                        new_mid,
+                        Stage.INGRESS.value,
+                        channel_id,
+                        self._cipher.encrypt(
+                            raw, aad=cell_aad("queue", "payload", resubmit_row_id)
+                        ),
+                        OutboxStatus.PENDING.value,
+                        now,
+                        now,
+                        now,
+                    ),
+                )
+                self.body_copies += 1  # A1: the ingress queue.payload is a second durable raw copy
+                await self._event(
+                    new_mid, "received", None, f"edit-resubmit from {origin_message_id}", now
+                )
+                await self._event(origin_message_id, "edit_resubmit", None, f"-> {new_mid}", now)
+            await self._db.execute(
+                "UPDATE resend_log SET outbox_id=? WHERE resend_key=?",
+                (new_mid, idempotency_key),
+            )
+            await self._commit()
+            return ReingressOutcome(
+                status="resubmitted",
+                message_id=origin_message_id,
+                new_message_id=new_mid,
+                channel_id=channel_id,
+            )
 
     @staticmethod
     def _edit_resubmit_message_id(idempotency_key: str, channel: str, body: str) -> str:
@@ -6899,9 +7257,17 @@ class MessageStore:
         match the dead-letter view (:meth:`list_dead` is outbound-only): this is the bulk DLQ replay,
         so it must only touch rows the operator can actually see. Dead **ingress** rows (processing
         failures) are recovered via the per-message :meth:`replay`, not here. Unlike :meth:`replay`
-        this never touches rows that already delivered. Returns the number of dead rows requeued."""
+        this never touches rows that already delivered. Returns the number of dead rows requeued.
+
+        **Rows whose body retention has ERASED are excluded** (:data:`_REPLAYABLE_BODY`, BACKLOG
+        #1560), and the predicate lives in the shared ``clause`` so it reaches BOTH statements. That is
+        the point: the affected message set is computed by a separate ``SELECT DISTINCT message_id``
+        before the UPDATE, so guarding only the write would revert a purged message from ``ERROR`` to
+        ``ROUTED`` with nothing actually re-queued — a NEW false disposition, worse than the zero-byte
+        send it replaced, and invisible to a ``rowcount`` check. A mixed batch replays the rows that
+        still have a body and leaves the rest dead."""
         now = time.time() if now is None else now
-        where = ["stage=?", "status=?"]
+        where = ["stage=?", "status=?", f"({_REPLAYABLE_BODY})"]
         params: list[object] = [Stage.OUTBOUND.value, OutboxStatus.DEAD.value]
         if channel_id is not None:
             where.append("channel_id=?")
@@ -7784,6 +8150,7 @@ class MessageStore:
         operation: str,
         params: str,
         requester: str,
+        requester_user_id: str,
         requested_at: float,
         expires_at: float | None,
     ) -> None:
@@ -7791,17 +8158,25 @@ class MessageStore:
         async with self._lock:
             await self._db.execute(
                 "INSERT INTO pending_approvals "
-                "(id, operation, params, requester, requested_at, status, expires_at) "
-                "VALUES (?,?,?,?,?,'pending',?)",
-                (approval_id, operation, params, requester, requested_at, expires_at),
+                "(id, operation, params, requester, requester_user_id, requested_at, status,"
+                " expires_at) VALUES (?,?,?,?,?,?,'pending',?)",
+                (
+                    approval_id,
+                    operation,
+                    params,
+                    requester,
+                    requester_user_id,
+                    requested_at,
+                    expires_at,
+                ),
             )
             await self._commit()
 
     async def get_pending_approval(self, approval_id: str) -> aiosqlite.Row | None:
         async with self._read() as db:
             cur = await db.execute(
-                "SELECT id, operation, params, requester, requested_at, status, approver, decided_at,"
-                " expires_at FROM pending_approvals WHERE id = ?",
+                "SELECT id, operation, params, requester, requester_user_id, requested_at, status,"
+                " approver, decided_at, expires_at FROM pending_approvals WHERE id = ?",
                 (approval_id,),
             )
             return await cur.fetchone()
@@ -7810,6 +8185,8 @@ class MessageStore:
         """Open (still-``pending``, unexpired) approval requests, newest-first."""
         async with self._read() as db:
             cur = await db.execute(
+                # No requester_user_id here: the approver queue shows the DISPLAY label, and the
+                # authorization key is read through get_pending_approval on the approve path.
                 "SELECT id, operation, params, requester, requested_at, status, approver, decided_at,"
                 " expires_at FROM pending_approvals"
                 " WHERE status = 'pending' AND (expires_at IS NULL OR expires_at > ?)"
@@ -8499,27 +8876,18 @@ class MessageStore:
             return cur.rowcount > 0
 
     async def delete_user(self, user_id: str) -> None:
-        async with self._lock:
-            try:
-                await self._db.execute("BEGIN")
-                await self._db.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
-                await self._db.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
-                await self._db.execute(
-                    "DELETE FROM webauthn_credentials WHERE user_id=?", (user_id,)
-                )
-                # BACKLOG #1233: presets are owner-scoped by Identity.user_id (#1225) and there is no
-                # FK cascade on this table, so without this DELETE the rows outlive the account —
-                # PHI-shaped `criteria` (ADR 0136) persisting with no owner able to reach or purge it,
-                # and counted by nothing. `owner` holds the user_id, not the username, which is what
-                # makes this a single keyed DELETE rather than a name lookup.
-                await self._db.execute(
-                    "DELETE FROM search_presets WHERE owner_user_id=?", (user_id,)
-                )
-                await self._db.execute("DELETE FROM users WHERE id=?", (user_id,))
-                await self._commit()
-            except Exception:
-                await self._db.rollback()
-                raise
+        async with _writer_txn(self._db, self._lock):
+            await self._db.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
+            await self._db.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+            await self._db.execute("DELETE FROM webauthn_credentials WHERE user_id=?", (user_id,))
+            # BACKLOG #1233: presets are owner-scoped by Identity.user_id (#1225) and there is no
+            # FK cascade on this table, so without this DELETE the rows outlive the account —
+            # PHI-shaped `criteria` (ADR 0136) persisting with no owner able to reach or purge it,
+            # and counted by nothing. `owner` holds the user_id, not the username, which is what
+            # makes this a single keyed DELETE rather than a name lookup.
+            await self._db.execute("DELETE FROM search_presets WHERE owner_user_id=?", (user_id,))
+            await self._db.execute("DELETE FROM users WHERE id=?", (user_id,))
+            await self._commit()
 
     async def record_login_success(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
@@ -8546,6 +8914,46 @@ class MessageStore:
                 (failed_attempts, locked_until, now, user_id),
             )
             await self._commit()
+
+    async def increment_login_failure(
+        self,
+        user_id: str,
+        *,
+        threshold: int,
+        lockout_seconds: float,
+        now: float | None = None,
+    ) -> tuple[int, bool]:
+        """Count one failed credential attempt and apply the lockout policy in ONE atomic step;
+        return ``(failed_attempts, just_locked)``.
+
+        The re-read + compute + write run under one ``self._lock``, the way ``consume_totp_step``
+        does, so two concurrent wrong credentials cannot both read the same pre-increment count and
+        lose an increment between them. :func:`next_lockout_state` carries the policy and the reason
+        this has to be one call rather than three.
+
+        Returns ``(0, False)`` for an unknown user -- there is no row to count against, and a caller
+        that reached here on a missing account has already refused it."""
+        now = time.time() if now is None else now
+        async with self._lock:
+            cur = await self._db.execute(
+                "SELECT failed_attempts, locked_until FROM users WHERE id=?", (user_id,)
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return 0, False
+            state = next_lockout_state(
+                failed_attempts=int(row["failed_attempts"]),
+                locked_until=_opt_float(row["locked_until"]),
+                now=now,
+                threshold=threshold,
+                lockout_seconds=lockout_seconds,
+            )
+            await self._db.execute(
+                "UPDATE users SET failed_attempts=?, locked_until=?, updated_at=? WHERE id=?",
+                (state.attempts, state.locked_until, now, user_id),
+            )
+            await self._commit()
+            return state.attempts, state.just_locked
 
     async def upsert_role(
         self,
@@ -8581,22 +8989,17 @@ class MessageStore:
         """Delete a custom (``builtin=0``) role and any user/AD-group assignments of it in one
         transaction (ADR 0045 D4); never touches a built-in row. Returns ``True`` if a custom role was
         removed. Idempotent."""
-        async with self._lock:
-            try:
-                await self._db.execute("BEGIN")
-                cur = await self._db.execute("SELECT builtin FROM roles WHERE id=?", (role_id,))
-                row = await cur.fetchone()
-                if row is None or int(row["builtin"]) != 0:
-                    await self._db.rollback()
-                    return False
-                await self._db.execute("DELETE FROM user_roles WHERE role_id=?", (role_id,))
-                await self._db.execute("DELETE FROM ad_group_role_map WHERE role_id=?", (role_id,))
-                await self._db.execute("DELETE FROM roles WHERE id=?", (role_id,))
-                await self._commit()
-                return True
-            except Exception:
+        async with _writer_txn(self._db, self._lock):
+            cur = await self._db.execute("SELECT builtin FROM roles WHERE id=?", (role_id,))
+            row = await cur.fetchone()
+            if row is None or int(row["builtin"]) != 0:
                 await self._db.rollback()
-                raise
+                return False
+            await self._db.execute("DELETE FROM user_roles WHERE role_id=?", (role_id,))
+            await self._db.execute("DELETE FROM ad_group_role_map WHERE role_id=?", (role_id,))
+            await self._db.execute("DELETE FROM roles WHERE id=?", (role_id,))
+            await self._commit()
+            return True
 
     async def get_user_role_ids(self, user_id: str) -> list[str]:
         async with self._read() as db:
@@ -8621,34 +9024,29 @@ class MessageStore:
         updated_at UPDATE; otherwise a fresh row with ``preset_id`` is inserted. The PHI-shaped criteria
         is encrypted at rest (cell_aad bound to the effective id). Returns ``(effective_id, replaced)``."""
         now = time.time() if now is None else now
-        async with self._lock:
-            try:
-                await self._db.execute("BEGIN")
-                cur = await self._db.execute(
-                    "SELECT id FROM search_presets WHERE owner_user_id=? AND name=?",
-                    (owner_user_id, name),
+        async with _writer_txn(self._db, self._lock):
+            cur = await self._db.execute(
+                "SELECT id FROM search_presets WHERE owner_user_id=? AND name=?",
+                (owner_user_id, name),
+            )
+            row = await cur.fetchone()
+            effective_id = str(row["id"]) if row is not None else preset_id
+            enc = self._enc(criteria, aad=cell_aad("search_presets", "criteria", effective_id))
+            if row is not None:
+                await self._db.execute(
+                    "UPDATE search_presets SET criteria=?, updated_at=? WHERE id=?",
+                    (enc, now, effective_id),
                 )
-                row = await cur.fetchone()
-                effective_id = str(row["id"]) if row is not None else preset_id
-                enc = self._enc(criteria, aad=cell_aad("search_presets", "criteria", effective_id))
-                if row is not None:
-                    await self._db.execute(
-                        "UPDATE search_presets SET criteria=?, updated_at=? WHERE id=?",
-                        (enc, now, effective_id),
-                    )
-                    replaced = True
-                else:
-                    await self._db.execute(
-                        "INSERT INTO search_presets"
-                        " (id, owner_user_id, name, criteria, created_at, updated_at) VALUES (?,?,?,?,?,?)",
-                        (effective_id, owner_user_id, name, enc, now, now),
-                    )
-                    replaced = False
-                await self._commit()
-                return effective_id, replaced
-            except Exception:
-                await self._db.rollback()
-                raise
+                replaced = True
+            else:
+                await self._db.execute(
+                    "INSERT INTO search_presets"
+                    " (id, owner_user_id, name, criteria, created_at, updated_at) VALUES (?,?,?,?,?,?)",
+                    (effective_id, owner_user_id, name, enc, now, now),
+                )
+                replaced = False
+            await self._commit()
+            return effective_id, replaced
 
     async def list_search_presets(self, owner_user_id: str) -> list[dict[str, Any]]:
         """List a user's presets (id/name/timestamps only — NEVER the criteria), newest name order."""
@@ -8720,20 +9118,15 @@ class MessageStore:
         now: float | None = None,
     ) -> None:
         now = time.time() if now is None else now
-        async with self._lock:
-            try:
-                await self._db.execute("BEGIN")
-                await self._db.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
-                for role_id in role_ids:
-                    await self._db.execute(
-                        "INSERT INTO user_roles (user_id, role_id, assigned_at, assigned_by)"
-                        " VALUES (?,?,?,?)",
-                        (user_id, role_id, now, assigned_by),
-                    )
-                await self._commit()
-            except Exception:
-                await self._db.rollback()
-                raise
+        async with _writer_txn(self._db, self._lock):
+            await self._db.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
+            for role_id in role_ids:
+                await self._db.execute(
+                    "INSERT INTO user_roles (user_id, role_id, assigned_at, assigned_by)"
+                    " VALUES (?,?,?,?)",
+                    (user_id, role_id, now, assigned_by),
+                )
+            await self._commit()
 
     async def set_user_channel_scope(
         self, user_id: str, scope_json: str | None, *, now: float | None = None
@@ -8783,19 +9176,14 @@ class MessageStore:
 
     async def set_ad_group_role_map(self, entries: Iterable[tuple[str, str]]) -> None:
         pairs = sorted({(g.strip().lower(), r) for g, r in entries if g.strip()})
-        async with self._lock:
-            try:
-                await self._db.execute("BEGIN")
-                await self._db.execute("DELETE FROM ad_group_role_map")
-                for ad_group, role_id in pairs:
-                    await self._db.execute(
-                        "INSERT INTO ad_group_role_map (ad_group, role_id) VALUES (?,?)",
-                        (ad_group, role_id),
-                    )
-                await self._commit()
-            except Exception:
-                await self._db.rollback()
-                raise
+        async with _writer_txn(self._db, self._lock):
+            await self._db.execute("DELETE FROM ad_group_role_map")
+            for ad_group, role_id in pairs:
+                await self._db.execute(
+                    "INSERT INTO ad_group_role_map (ad_group, role_id) VALUES (?,?)",
+                    (ad_group, role_id),
+                )
+            await self._commit()
 
     async def channels_for_ad_groups(self, groups: Iterable[str]) -> set[str]:
         """Channels mapped to a user's AD groups (per-channel RBAC C3). May include the sentinel
@@ -8822,19 +9210,14 @@ class MessageStore:
         pairs = sorted(
             {(g.strip().lower(), c.strip()) for g, c in entries if g.strip() and c.strip()}
         )
-        async with self._lock:
-            try:
-                await self._db.execute("BEGIN")
-                await self._db.execute("DELETE FROM ad_group_scope_map")
-                for ad_group, channel in pairs:
-                    await self._db.execute(
-                        "INSERT INTO ad_group_scope_map (ad_group, channel) VALUES (?,?)",
-                        (ad_group, channel),
-                    )
-                await self._commit()
-            except Exception:
-                await self._db.rollback()
-                raise
+        async with _writer_txn(self._db, self._lock):
+            await self._db.execute("DELETE FROM ad_group_scope_map")
+            for ad_group, channel in pairs:
+                await self._db.execute(
+                    "INSERT INTO ad_group_scope_map (ad_group, channel) VALUES (?,?)",
+                    (ad_group, channel),
+                )
+            await self._commit()
 
     async def create_session(
         self,
@@ -9095,84 +9478,79 @@ class MessageStore:
             f"SELECT id FROM messages m WHERE m.received_at < {cutoff_sql} "
             "AND NOT EXISTS (SELECT 1 FROM queue q WHERE q.message_id = m.id AND q.status IN (?, ?))"
         )
-        async with self._lock:
-            try:
-                await self._db.execute("BEGIN")
-                cur = await self._db.execute(
-                    f"UPDATE messages SET metadata=NULL, raw='', summary=NULL, error=NULL "
-                    f"WHERE (raw <> '' OR metadata IS NOT NULL) AND id IN ({eligible})",
-                    (*cutoff_params, *inflight),
-                )
-                purged = cur.rowcount
-                # store-once: release the shared bodies the eligible delivered/cancelled rows reference
-                # (decrement refcount, GC at 0, null body_ref) BEFORE blanking — so a shared body is freed
-                # exactly when its last referrer is purged, never orphaned and never kept too long.
-                await self._release_outbound_body_refs(
-                    "stage=? AND status IN (?, ?) AND body_ref IS NOT NULL "
-                    f"AND message_id IN ({eligible})",
-                    (
-                        Stage.OUTBOUND.value,
-                        OutboxStatus.DONE.value,
-                        OutboxStatus.CANCELLED.value,
-                        *cutoff_params,
-                        *inflight,
-                    ),
-                )
-                # Blank the kept (delivered/cancelled) outbound payloads for the same eligible set. Inline
-                # bodies have a non-blank payload; a store-once row's payload is already '' and its
-                # body_ref was just nulled above, so this UPDATE simply clears its last_error.
-                await self._db.execute(
-                    f"UPDATE queue SET payload='', last_error=NULL "
-                    f"WHERE stage=? AND status IN (?, ?) AND (payload <> '' OR last_error IS NOT NULL) "
-                    f"AND message_id IN ({eligible})",
-                    (
-                        Stage.OUTBOUND.value,
-                        OutboxStatus.DONE.value,
-                        OutboxStatus.CANCELLED.value,
-                        *cutoff_params,
-                        *inflight,
-                    ),
-                )
-                # #149 Phase 3a: release the streaming attachment each eligible message holds — but ONLY
-                # once the message has NO queue row that could still be delivered/replayed (the negated
-                # live-holder predicate). The delivered/cancelled payloads were just blanked above, so an
-                # all-DONE/CANCELLED message now has no live holder and its attachment is decref'd (GC at 0)
-                # + its join rows DELETEd in THIS transaction. A message whose outbound rows are all DEAD is
-                # `eligible` for the body-null above, yet its DEAD rows stay REPLAYABLE (their payload is
-                # deliberately KEPT here, deferred to purge_dead_letters) — so it keeps a live holder and its
-                # attachment MUST survive: releasing it would GC the document out from under a later dead-row
-                # replay (fail-loud DeliveryError in _hydrate_payload, permanent PHI-document loss). The
-                # per-MESSAGE analogue of the shared-body split: whichever purge blanks the LAST replayable
-                # row releases the attachment. Idempotent — a re-run finds the join rows gone and decrefs
-                # nothing (no underflow, no premature GC of an attachment a SIBLING message still holds).
-                await self._release_message_attachments(
-                    f"message_id IN (SELECT id FROM messages m WHERE m.received_at < {cutoff_sql} "
-                    f"AND NOT {self._attachment_still_referenced_sql('m.id')})",
-                    (
-                        *cutoff_params,
-                        OutboxStatus.PENDING.value,
-                        OutboxStatus.INFLIGHT.value,
-                        OutboxStatus.DEAD.value,
-                    ),
-                )
-                await self._db.execute(
-                    f"UPDATE message_events SET detail=NULL "
-                    f"WHERE detail IS NOT NULL AND message_id IN ({eligible})",
-                    (*cutoff_params, *inflight),
-                )
-                # Captured request/response replies (ADR 0013) are PHI on the same window as the body:
-                # null body+detail in place (the row is kept, like messages.raw). The FK to messages(id)
-                # is never violated — purge keeps the messages row (Mirth Data-Pruner). Idempotent.
-                await self._db.execute(
-                    f"UPDATE response SET body=NULL, detail=NULL, resp_headers=NULL "
-                    f"WHERE (body IS NOT NULL OR detail IS NOT NULL OR resp_headers IS NOT NULL) "
-                    f"AND message_id IN ({eligible})",
-                    (*cutoff_params, *inflight),
-                )
-                await self._commit()
-            except Exception:
-                await self._db.rollback()
-                raise
+        async with _writer_txn(self._db, self._lock):
+            cur = await self._db.execute(
+                f"UPDATE messages SET metadata=NULL, raw='', summary=NULL, error=NULL "
+                f"WHERE (raw <> '' OR metadata IS NOT NULL) AND id IN ({eligible})",
+                (*cutoff_params, *inflight),
+            )
+            purged = cur.rowcount
+            # store-once: release the shared bodies the eligible delivered/cancelled rows reference
+            # (decrement refcount, GC at 0, null body_ref) BEFORE blanking — so a shared body is freed
+            # exactly when its last referrer is purged, never orphaned and never kept too long.
+            await self._release_outbound_body_refs(
+                "stage=? AND status IN (?, ?) AND body_ref IS NOT NULL "
+                f"AND message_id IN ({eligible})",
+                (
+                    Stage.OUTBOUND.value,
+                    OutboxStatus.DONE.value,
+                    OutboxStatus.CANCELLED.value,
+                    *cutoff_params,
+                    *inflight,
+                ),
+            )
+            # Blank the kept (delivered/cancelled) outbound payloads for the same eligible set. Inline
+            # bodies have a non-blank payload; a store-once row's payload is already '' and its
+            # body_ref was just nulled above, so this UPDATE simply clears its last_error.
+            await self._db.execute(
+                f"UPDATE queue SET payload='', last_error=NULL "
+                f"WHERE stage=? AND status IN (?, ?) AND (payload <> '' OR last_error IS NOT NULL) "
+                f"AND message_id IN ({eligible})",
+                (
+                    Stage.OUTBOUND.value,
+                    OutboxStatus.DONE.value,
+                    OutboxStatus.CANCELLED.value,
+                    *cutoff_params,
+                    *inflight,
+                ),
+            )
+            # #149 Phase 3a: release the streaming attachment each eligible message holds — but ONLY
+            # once the message has NO queue row that could still be delivered/replayed (the negated
+            # live-holder predicate). The delivered/cancelled payloads were just blanked above, so an
+            # all-DONE/CANCELLED message now has no live holder and its attachment is decref'd (GC at 0)
+            # + its join rows DELETEd in THIS transaction. A message whose outbound rows are all DEAD is
+            # `eligible` for the body-null above, yet its DEAD rows stay REPLAYABLE (their payload is
+            # deliberately KEPT here, deferred to purge_dead_letters) — so it keeps a live holder and its
+            # attachment MUST survive: releasing it would GC the document out from under a later dead-row
+            # replay (fail-loud DeliveryError in _hydrate_payload, permanent PHI-document loss). The
+            # per-MESSAGE analogue of the shared-body split: whichever purge blanks the LAST replayable
+            # row releases the attachment. Idempotent — a re-run finds the join rows gone and decrefs
+            # nothing (no underflow, no premature GC of an attachment a SIBLING message still holds).
+            await self._release_message_attachments(
+                f"message_id IN (SELECT id FROM messages m WHERE m.received_at < {cutoff_sql} "
+                f"AND NOT {self._attachment_still_referenced_sql('m.id')})",
+                (
+                    *cutoff_params,
+                    OutboxStatus.PENDING.value,
+                    OutboxStatus.INFLIGHT.value,
+                    OutboxStatus.DEAD.value,
+                ),
+            )
+            await self._db.execute(
+                f"UPDATE message_events SET detail=NULL "
+                f"WHERE detail IS NOT NULL AND message_id IN ({eligible})",
+                (*cutoff_params, *inflight),
+            )
+            # Captured request/response replies (ADR 0013) are PHI on the same window as the body:
+            # null body+detail in place (the row is kept, like messages.raw). The FK to messages(id)
+            # is never violated — purge keeps the messages row (Mirth Data-Pruner). Idempotent.
+            await self._db.execute(
+                f"UPDATE response SET body=NULL, detail=NULL, resp_headers=NULL "
+                f"WHERE (body IS NOT NULL OR detail IS NOT NULL OR resp_headers IS NOT NULL) "
+                f"AND message_id IN ({eligible})",
+                (*cutoff_params, *inflight),
+            )
+            await self._commit()
         return int(purged)
 
     async def strip_embedded_documents(
@@ -9268,16 +9646,11 @@ class MessageStore:
             docs += n_docs
             reclaimed += n_bytes
         if updates:
-            async with self._lock:
-                try:
-                    await self._db.execute("BEGIN")
-                    await self._db.executemany(
-                        "UPDATE messages SET raw=?, documents_pruned=? WHERE id=?", updates
-                    )
-                    await self._commit()
-                except Exception:
-                    await self._db.rollback()
-                    raise
+            async with _writer_txn(self._db, self._lock):
+                await self._db.executemany(
+                    "UPDATE messages SET raw=?, documents_pruned=? WHERE id=?", updates
+                )
+                await self._commit()
         return StripResult(
             messages_stripped=msgs, documents_stripped=docs, bytes_reclaimed=reclaimed
         )
@@ -9418,48 +9791,43 @@ class MessageStore:
         cutoff_sql, cutoff_params = _qmark_cutoff_case(
             "destination_name", older_than, connection_cutoffs
         )
-        async with self._lock:
-            try:
-                await self._db.execute("BEGIN")
-                # store-once: release shared bodies these dead rows reference (refcount-/GC/null body_ref)
-                # before blanking, so a shared body outlives its last dead referrer no longer than this.
-                # This one STAYS scoped to outbound, and that is not an oversight: `body_ref` is written
-                # only by _insert_outbound_deliveries, so an ingress/routed/response row always carries an
-                # inline payload and a NULL body_ref. A wider scope here would match nothing extra.
-                await self._release_outbound_body_refs(
-                    f"stage=? AND status=? AND body_ref IS NOT NULL AND updated_at < {cutoff_sql}",
-                    (Stage.OUTBOUND.value, OutboxStatus.DEAD.value, *cutoff_params),
-                )
-                cur = await self._db.execute(
-                    "UPDATE queue SET payload='', last_error=NULL "
-                    "WHERE status=? AND (payload <> '' OR last_error IS NOT NULL) "
-                    f"AND updated_at < {cutoff_sql}",
-                    (OutboxStatus.DEAD.value, *cutoff_params),
-                )
-                # #149 Phase 3a: a dead row just lost its payload + body_ref, so it can no longer be
-                # replayed. If that was the message's LAST replayable row (no pending/inflight and no other
-                # still-replayable dead row, per the negated live-holder predicate), release its streaming
-                # attachment here — the deferred half of the per-MESSAGE split with purge_message_bodies
-                # (which handles the all-done/cancelled case). Scoped to the messages owning a dead row in
-                # THIS purge window; same idempotent join-row DELETE, so a re-run decrefs nothing. Runs in
-                # this transaction, after the body_ref release + payload blank above, so the just-purged
-                # dead rows already read as non-replayable (payload='' AND body_ref NULL).
-                await self._release_message_attachments(
-                    "message_id IN (SELECT DISTINCT q0.message_id FROM queue q0 "
-                    f"WHERE q0.status=? AND q0.updated_at < {cutoff_sql} "
-                    f"AND NOT {self._attachment_still_referenced_sql('q0.message_id')})",
-                    (
-                        OutboxStatus.DEAD.value,
-                        *cutoff_params,
-                        OutboxStatus.PENDING.value,
-                        OutboxStatus.INFLIGHT.value,
-                        OutboxStatus.DEAD.value,
-                    ),
-                )
-                await self._commit()
-            except Exception:
-                await self._db.rollback()
-                raise
+        async with _writer_txn(self._db, self._lock):
+            # store-once: release shared bodies these dead rows reference (refcount-/GC/null body_ref)
+            # before blanking, so a shared body outlives its last dead referrer no longer than this.
+            # This one STAYS scoped to outbound, and that is not an oversight: `body_ref` is written
+            # only by _insert_outbound_deliveries, so an ingress/routed/response row always carries an
+            # inline payload and a NULL body_ref. A wider scope here would match nothing extra.
+            await self._release_outbound_body_refs(
+                f"stage=? AND status=? AND body_ref IS NOT NULL AND updated_at < {cutoff_sql}",
+                (Stage.OUTBOUND.value, OutboxStatus.DEAD.value, *cutoff_params),
+            )
+            cur = await self._db.execute(
+                "UPDATE queue SET payload='', last_error=NULL "
+                "WHERE status=? AND (payload <> '' OR last_error IS NOT NULL) "
+                f"AND updated_at < {cutoff_sql}",
+                (OutboxStatus.DEAD.value, *cutoff_params),
+            )
+            # #149 Phase 3a: a dead row just lost its payload + body_ref, so it can no longer be
+            # replayed. If that was the message's LAST replayable row (no pending/inflight and no other
+            # still-replayable dead row, per the negated live-holder predicate), release its streaming
+            # attachment here — the deferred half of the per-MESSAGE split with purge_message_bodies
+            # (which handles the all-done/cancelled case). Scoped to the messages owning a dead row in
+            # THIS purge window; same idempotent join-row DELETE, so a re-run decrefs nothing. Runs in
+            # this transaction, after the body_ref release + payload blank above, so the just-purged
+            # dead rows already read as non-replayable (payload='' AND body_ref NULL).
+            await self._release_message_attachments(
+                "message_id IN (SELECT DISTINCT q0.message_id FROM queue q0 "
+                f"WHERE q0.status=? AND q0.updated_at < {cutoff_sql} "
+                f"AND NOT {self._attachment_still_referenced_sql('q0.message_id')})",
+                (
+                    OutboxStatus.DEAD.value,
+                    *cutoff_params,
+                    OutboxStatus.PENDING.value,
+                    OutboxStatus.INFLIGHT.value,
+                    OutboxStatus.DEAD.value,
+                ),
+            )
+            await self._commit()
             return int(cur.rowcount)
 
     async def purge_state(self, *, older_than: float, now: float | None = None) -> int:
@@ -9558,6 +9926,9 @@ class MessageStore:
                     await self._db.backup(target)
                 finally:
                     await target.close()
+                    # A snapshot runs on a live engine, so the per-backup worker thread must be gone
+                    # before this returns — otherwise a snapshot schedule accretes non-daemon threads.
+                    await _await_connection_worker_exit(target)
         # Tighten the snapshot file's permissions: it is a full copy of the (PHI-bearing) store. The
         # encrypted .mfbak the BackupRunner wraps it in is the at-rest protection, but the transient
         # plaintext snapshot must not be world-readable either.
