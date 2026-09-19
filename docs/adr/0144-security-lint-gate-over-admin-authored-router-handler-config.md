@@ -30,8 +30,9 @@ And the reliability invariant (CLAUDE.md §2): *"routers and transforms must be 
 out, no external side effects)"* — with the two sanctioned read-only carve-outs (`db_lookup`, `fhir_lookup`).
 
 There is already **precedent in the gate itself.** [`messagefoundry check`](../../messagefoundry/checks.py)
-ships advisory AST scans over the config-dir modules — `_check_raise_fstring` (an f-string `raise` that can
-carry free-text PHI past the exception-path redaction) and `_check_accepts_candidate` — and CI already runs
+ships advisory AST scans over the config-dir modules — `_check_raise_fstring` (a `raise` whose message is
+built from a variable, which can carry free-text PHI past the exception-path redaction) and
+`_check_accepts_candidate` — and CI already runs
 `bandit` + `pip-audit` **on the engine's own code**. The gap: **no security lint runs over the operator's
 Router/Handler code**, which is exactly the code the 15.2.5 residual is about.
 

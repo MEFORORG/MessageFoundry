@@ -86,6 +86,7 @@ from messagefoundry.config.wiring import (
     inbound_binding_conflicts,
     resolve_env_settings,
     resolve_listener_binding,
+    resolved_encoding_problems,
 )
 from messagefoundry.fhirsearch import FhirSearchParams
 from messagefoundry.logging_guard import LogSinkEvent
@@ -7059,6 +7060,17 @@ def build_check_registry(
     )
     if conflicts:
         raise PortConflictError("; ".join(conflicts))
+    # Encoding pre-flight, the RESOLVED half of Registry.encoding_problems (BACKLOG #1767). Same shape
+    # and same place as the port pre-flight above and for the same reason: an env()-supplied value is
+    # legible only once this instance's environment values are in hand, which is here and not at
+    # load_config. It builds no connector either, so it runs outside the posture scope. Every message
+    # reads this codec name, so a bad one takes the whole connection down on the first message, and
+    # `raise` here turns that into a WiringError at `check` / reload / promote / connection upsert.
+    # All of them at once, not the first: the caller is usually showing an operator a 422, and the
+    # second bad environment value is no less true than the first.
+    encoding_problems = resolved_encoding_problems(registry, env_values=env_values)
+    if encoding_problems:
+        raise WiringError("; ".join(encoding_problems))
     try:
         # Stamp the derived posture for the whole build so a cell's posture-keyed hop-refusal (ADR 0092)
         # decides against THIS config's posture. The port-conflict pre-flight above builds no connector,
