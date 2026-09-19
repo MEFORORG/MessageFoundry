@@ -6062,6 +6062,7 @@ def create_app(
                 stop_connection=stop_connection,
                 restart_connection=restart_connection,
                 replay_message=replay_message,
+                resend_message=resend_message,
                 edit_resend_message=edit_resend_message,
                 replay_dead_letters=replay_dead_letters,
                 list_active_alerts=list_active_alerts,

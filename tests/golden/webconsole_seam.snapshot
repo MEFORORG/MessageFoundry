@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-7971814960ea0bb3
+653a5ef631d53030
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -33,6 +33,7 @@ start_connection
 stop_connection
 restart_connection
 replay_message
+resend_message
 edit_resend_message
 replay_dead_letters
 list_active_alerts
@@ -219,6 +220,7 @@ messagefoundry.api.models.PoolInfo: acquire_wait, backend, claim_pool, idle, max
 messagefoundry.api.models.PoolWaitInfo: count, max_ms, mean_ms, p50_ms, p95_ms, p99_ms
 messagefoundry.api.models.ReloadRequest: config_dir, dry_run
 messagefoundry.api.models.ReloadResult: degraded, dry_run, failures, handlers, inbound, outbound, routers, running
+messagefoundry.api.models.ResendRequest: idempotency_key, source, to
 messagefoundry.api.models.SearchPresetCreateRequest: criteria, name
 messagefoundry.api.models.SearchPresetCriteria: channel_id, content, control_id, field_path, field_value, limit, message_type, status, target
 messagefoundry.api.models.SecurityLoosening: risk, switch

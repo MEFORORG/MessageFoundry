@@ -15,6 +15,7 @@
 ^/ui/dead-letters/replay-all$	-	step_up=1,auto_retry=1,unlock=0
 ^/ui/messages/[^/?#]+/edit$	-	step_up=1,auto_retry=0,unlock=1
 ^/ui/messages/[^/?#]+/replay$	-	step_up=1,auto_retry=1,unlock=0
+^/ui/messages/[^/?#]+/resend-confirm(\?[^#]*)?$	-	step_up=1,auto_retry=0,unlock=1
 ^/ui/messages/search$	-	step_up=1,auto_retry=0,unlock=1
 ^/ui/messages/search/layered$	-	step_up=1,auto_retry=0,unlock=1
 ^/ui/roles/[^/?#]+/edit$	-	step_up=1,auto_retry=0,unlock=1

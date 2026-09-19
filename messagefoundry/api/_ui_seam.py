@@ -151,12 +151,19 @@ from typing import Any
 #: ``factor_binding_is_blocked`` entry above, and it forces a bump for the same reason. Unnumbered:
 #: the ``vN`` labels are retired as identifiers (#1220 above); the digest is the identifier.
 #:
+#: ADR 0090 / BACKLOG #1500: ``CoreHandlers`` gained ``resend_message`` — the resend-to-an-alternate-
+#: outbound handler the /ui message-detail affordance calls, closing ADR 0090's residual (a). A NEW
+#: REQUIRED field on a frozen slotted dataclass with no default, so a console carrying that render
+#: against an engine without it fails at the ``UiDeps`` construction rather than degrading — the same
+#: class as the ``UploadedFileList.scope`` entry above, and it forces a bump for the same reason.
+#: Unnumbered: the ``vN`` labels are retired as identifiers (#1220 above); the digest is the identifier.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "7971814960ea0bb3"
+ENGINE_UI_SEAM: str = "653a5ef631d53030"
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,6 +192,12 @@ class CoreHandlers:
     stop_connection: Callable[..., Awaitable[Any]]
     restart_connection: Callable[..., Awaitable[Any]]
     replay_message: Callable[..., Awaitable[Any]]
+    # Resend a stored body to an ALTERNATE outbound (ADR 0090 §§1-8, BACKLOG #123/#1500). Its JSON
+    # gate is require_step_up(MESSAGES_RESEND) and NOTHING more: the handler returns ids only and
+    # never a body, so the /ui route in front of it asserts that one permission and passes no
+    # ``phi=``. Copying the edit verbs' MESSAGES_VIEW_RAW + phi=True here would charge the PHI
+    # budget for a route that emits none, and would lock out a role narrowed to resend alone.
+    resend_message: Callable[..., Awaitable[Any]]
     edit_resend_message: Callable[..., Awaitable[Any]]  # edit-and-resubmit (ADR 0090 §9, seam v2)
     replay_dead_letters: Callable[..., Awaitable[Any]]
     list_active_alerts: Callable[..., Awaitable[Any]]
