@@ -9,6 +9,7 @@ a lifespan-managed app, which owns its engine on the client's own loop."""
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -911,17 +912,24 @@ async def test_connection_operations(
     assert (await client.post("/connections/nope/start")).status_code == 404
 
     # Stop the outbound → delivery pauses and the idle lane quiesces (zero in-flight); status → 'stopped'.
+    await _quiesced_stopped_outbound(engine, client)
+    assert rr.outbound_status("out1") == "stopped"
+
+    # A queued delivery to the STOPPED outbound stays PENDING (never delivered) and can now be purged.
+    await engine.store.enqueue_message(channel_id="in1", raw=ADT, deliveries=[("out1", ADT)])
+    assert (await client.post("/connections/out1/purge")).json()["cancelled"] == 1
+
+
+async def _quiesced_stopped_outbound(engine: Engine, client: httpx.AsyncClient) -> None:
+    """Stop ``out1`` and wait for the lane to quiesce — the precondition purge requires."""
+    rr = engine.registry_runner
+    assert rr is not None
     assert (await client.post("/connections/out1/stop")).json()["running"] is False
     for _ in range(200):
         if rr.outbound_quiesced("out1"):
             break
         await asyncio.sleep(0.02)
     assert rr.outbound_quiesced("out1") is True
-    assert rr.outbound_status("out1") == "stopped"
-
-    # A queued delivery to the STOPPED outbound stays PENDING (never delivered) and can now be purged.
-    await engine.store.enqueue_message(channel_id="in1", raw=ADT, deliveries=[("out1", ADT)])
-    assert (await client.post("/connections/out1/purge")).json()["cancelled"] == 1
 
 
 async def _started_outbound_engine(engine: Engine, tmp_path: Path) -> None:
@@ -1013,6 +1021,98 @@ async def test_engine_not_started_returns_503(tmp_path: Path) -> None:
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         assert (await c.get("/health")).status_code == 200  # health needs no engine
         assert (await c.get("/channels")).status_code == 503
+
+
+async def test_purge_audits_every_completed_purge_including_zero_cancelled(
+    engine: Engine, client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    """BACKLOG #1641: the ungated purge path writes its own outcome row, ``cancelled=0`` included.
+
+    Why the zero-cancel row is unconditional — and what the GATED path does and does not record —
+    is stated once, on the write itself in ``purge_connection``. This test pins both halves of the
+    ambiguity that rationale turns on: cancelled=0 writes a row, a 409 does not."""
+    await _started_outbound_engine(engine, tmp_path)
+    await _quiesced_stopped_outbound(engine, client)
+
+    # Nothing queued: a real, completed purge that cancelled zero rows. Audited anyway, and the
+    # requested scope is carried through (a `top` purge and an `all` purge are different commands).
+    assert (await client.post("/connections/out1/purge?scope=top")).json()["cancelled"] == 0
+    rows = await engine.store.list_audit(action="connection_purge")
+    assert len(rows) == 1
+    assert json.loads(rows[0]["detail"] or "{}") == {
+        "connection": "out1",
+        "scope": "top",
+        "cancelled": 0,
+    }
+    # #1641 names the missing client alongside the missing outcome, so both are pinned here.
+    # "127.0.0.1" is httpx ASGITransport's default peer, which client_ip() reads off the scope.
+    assert rows[0]["actor"] == "system" and rows[0]["client"] == "127.0.0.1"
+    assert rows[0]["channel_id"] is None  # an outbound spans channels
+
+    # A purge that DOES cancel records the count.
+    await engine.store.enqueue_message(channel_id="in1", raw=ADT, deliveries=[("out1", ADT)])
+    assert (await client.post("/connections/out1/purge")).json()["cancelled"] == 1
+    rows = await engine.store.list_audit(action="connection_purge")
+    assert len(rows) == 2
+    assert json.loads(rows[0]["detail"] or "{}") == {
+        "connection": "out1",
+        "scope": "all",
+        "cancelled": 1,
+    }
+
+    # A REFUSED purge (409 — the outbound is running again) cancelled nothing and never ran, so it
+    # adds no row. This is the other half of the ambiguity: 409 stays silent, cancelled=0 does not.
+    assert (await client.post("/connections/out1/start")).json()["running"] is True
+    assert (await client.post("/connections/out1/purge")).status_code == 409
+    assert len(await engine.store.list_audit(action="connection_purge")) == 2
+
+
+async def test_connection_control_audits_the_resolved_role(
+    engine: Engine, client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    """BACKLOG #1642: start/stop/restart write a ``connection_control`` row naming the RESOLVED role.
+
+    Why the resolved role is recorded rather than ``_dual_role_control``'s ``role`` argument is
+    stated once, in the ``_record_control_audit`` docstring. These assertions pin the resolved
+    value, so a change back to the raw argument fails here."""
+    await _started_outbound_engine(engine, tmp_path)
+
+    # An INBOUND resolves to `source`, and the connection IS its channel.
+    assert (await client.post("/connections/in1/stop")).json()["running"] is False
+    rows = await engine.store.list_audit(action="connection_control")
+    assert len(rows) == 1
+    assert json.loads(rows[0]["detail"] or "{}") == {
+        "connection": "in1",
+        "action": "stop",
+        "role": "source",
+        "running": False,
+    }
+    assert rows[0]["channel_id"] == "in1"
+    assert rows[0]["actor"] == "system" and rows[0]["client"] == "127.0.0.1"
+
+    # An OUTBOUND resolves to `destination` and carries no channel.
+    assert (await client.post("/connections/out1/restart")).json()["running"] is True
+    rows = await engine.store.list_audit(action="connection_control")
+    assert len(rows) == 2
+    assert json.loads(rows[0]["detail"] or "{}") == {
+        "connection": "out1",
+        "action": "restart",
+        "role": "destination",
+        "running": True,
+    }
+    assert rows[0]["channel_id"] is None
+
+    # All three verbs are recorded, not just the two above.
+    assert (await client.post("/connections/in1/start")).json()["running"] is True
+    verbs = [
+        json.loads(a["detail"] or "{}")["action"]
+        for a in await engine.store.list_audit(action="connection_control")
+    ]
+    assert sorted(verbs) == ["restart", "start", "stop"]
+
+    # A 404 moved no lane, so it writes no row (the denial paths audit as auth.channel_denied).
+    assert (await client.post("/connections/nope/start")).status_code == 404
+    assert len(await engine.store.list_audit(action="connection_control")) == 3
 
 
 # --- websocket (sync TestClient against a lifespan-managed app) ---------------

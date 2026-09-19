@@ -1100,6 +1100,42 @@ async def _audit_channel_denied(
     )
 
 
+async def _record_control_audit(
+    engine: Engine,
+    identity: Identity,
+    name: str,
+    action: str,
+    *,
+    role: str,
+    running: bool,
+    client: str | None,
+) -> None:
+    """Audit a completed start/stop/restart of a connection (BACKLOG #1642).
+
+    Written on the SUCCESS path only — the denial paths already write ``auth.channel_denied``, and a
+    409/404 means the lane never moved, so a row there would assert an action that did not happen.
+
+    ``role`` is the RESOLVED role of the branch that ran (``source`` for an inbound, ``destination``
+    for an outbound), never ``_dual_role_control``'s ``role`` ARGUMENT: that argument is ``None`` on
+    every bare-name JSON caller and a real value only on the console's bulk path, so recording it raw
+    would leave the same operation attributed two different ways and NULL on the commoner one.
+
+    ``channel_id`` follows the sibling ``connection_credential_test`` row: an inbound IS its channel,
+    while an outbound spans channels and so carries none.
+
+    ``client`` (ADR 0150) is REQUIRED, unlike the ``_audit_channel_denied`` sibling's optional one:
+    that helper is also handed to the console seam as a bare callback with no request in hand, while
+    every caller of this one already has the address resolved, so a default would only let a future
+    caller drop it silently."""
+    await engine.store.record_audit(
+        "connection_control",
+        actor=identity.username,
+        channel_id=name if role == "source" else None,
+        detail=json.dumps({"connection": name, "action": action, "role": role, "running": running}),
+        client=client,
+    )
+
+
 async def _run_connection_test(
     rr: RegistryRunner, name: str, direction: str
 ) -> ConnectionTestResult:
@@ -2187,7 +2223,11 @@ def create_app(
                 # is a CONFIG change (flip deployed=true + reload + supply its env() values), not a
                 # runtime action. (stop never raises: an already-parked lane is a no-op.)
                 raise HTTPException(409, str(exc)) from None
-            return {"name": name, "running": rr.inbound_running(name)}
+            running = rr.inbound_running(name)
+            await _record_control_audit(
+                engine, identity, name, action, role="source", running=running, client=client
+            )
+            return {"name": name, "running": running}
         if rr is not None and want_out and name in rr.registry.outbound:
             # A shared outbound spans channels, so a channel-scoped user can't control one (mirrors purge).
             if identity.allowed_channels is not None:
@@ -2211,7 +2251,11 @@ def create_app(
                 # connector to build and no worker to resume; deploying it is a config change, not a
                 # runtime action. (stop never raises: an already-parked lane is a no-op.)
                 raise HTTPException(409, str(exc)) from None
-            return {"name": name, "running": rr.outbound_running(name)}
+            running = rr.outbound_running(name)
+            await _record_control_audit(
+                engine, identity, name, action, role="destination", running=running, client=client
+            )
+            return {"name": name, "running": running}
         # Neither an inbound nor an outbound (or no runner). Run the per-channel guard first so a scoped
         # user is 403'd for a name outside their scope (don't disclose existence), then 404.
         await _control_guard(engine, identity, name, client)
@@ -2499,6 +2543,30 @@ def create_app(
                     detail="held for a second approver (dual-control)",
                 )
         cancelled = await engine.store.cancel_queued(None, name, top_only=(scope == "top"))
+        # BACKLOG #1641: written UNCONDITIONALLY, cancelled=0 included. Deliberately NOT the
+        # `if requeued:` shape of the dead_letter_replay sibling: replay guards on "PHI was actually
+        # re-transmitted", but a purge that cancels nothing is still a completed destructive command
+        # against a live queue, and suppressing it leaves a zero-cancel purge indistinguishable from
+        # the 409s above, which changed nothing and wrote nothing.
+        #
+        # This row covers the UNGATED path ONLY. A dual-control purge returns 202 above and is
+        # executed later by the `_purge` executor in _build_approval_gate, which never re-enters this
+        # handler and writes no connection_purge row of its own. That path is not unaudited — the
+        # gate writes approval.requested / approval.approved, and the latter's detail carries the
+        # executor's {"cancelled": N} result — but those rows identify the operation only by
+        # approval_id: the connection NAME and the SCOPE live in the pending-approval row's params,
+        # not in the audit log. So a query of action='connection_purge' answers "which outbound, at
+        # what scope, cancelling how many" completely for ungated purges and not at all for gated
+        # ones, which still need a join back through approval_id. Closing that asymmetry is the
+        # sibling gap tracked for the _purge executor; it is deliberately not fixed here.
+        #
+        # No channel_id: purge targets an outbound, which spans every inbound feeding it.
+        await engine.store.record_audit(
+            "connection_purge",
+            actor=identity.username,
+            detail=json.dumps({"connection": name, "scope": scope, "cancelled": cancelled}),
+            client=client_ip(request),
+        )
         return PurgeResult(cancelled=cancelled)
 
     @app.post("/statistics/reset", response_model=StatsResetResult)
