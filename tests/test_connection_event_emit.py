@@ -320,3 +320,218 @@ async def test_runner_writes_connection_events_to_store(tmp_path: Path) -> None:
         assert all(e.direction == "inbound" and e.transport == "mllp" for e in events)
     finally:
         await store.close()
+
+
+# --- BACKLOG #1725: the open-frame deadline and the per-host connection cap ----------------------
+#
+# `receive_timeout` is applied PER READ, so it resets on every byte received: it bounds a SILENT
+# socket and says nothing about how long one frame may take to arrive. `max_connections` counts
+# sockets rather than hosts, and `source_ip_allowlist` ships off, so on a default listener there was
+# no peer-scoped term at all. A deploying site would therefore let one unauthenticated peer hold
+# every slot of a listener, each socket pinning up to `max_frame_bytes` of decoder buffer, while
+# never completing a message. Nothing is lost or dropped; the cost is availability.
+#
+# Three arms, and the third is not optional: a deadline that fires on a legitimate slow-but-
+# progressing sender is an outage wearing a security control's clothes, and only that arm tells the
+# two apart.
+
+
+async def _trickle(writer: asyncio.StreamWriter, count: int, interval: float) -> None:
+    """Open a frame, then feed it one byte at a time — never silent, never finished.
+
+    Stops quietly once the listener drops the connection: a refused write is the PASS condition here,
+    not a failure of the sender.
+    """
+    try:
+        writer.write(bytes([SB]))
+        await writer.drain()
+        for _ in range(count):
+            await asyncio.sleep(interval)
+            writer.write(b"A")
+            await writer.drain()
+    except OSError:
+        pass  # the listener dropped us, which is what the test is waiting for
+
+
+async def test_a_trickling_peer_is_dropped_at_the_frame_deadline() -> None:
+    """The defect's own case: a byte every 0.05 s under a 0.5 s per-read timeout.
+
+    The peer is never idle for 0.5 s, so `receive_timeout` provably cannot be what fires; before the
+    deadline existed this connection was held for as long as the peer cared to trickle.
+    """
+    cap = _Capture()
+    source = _mllp(receive_timeout=0.5, max_frame_seconds=0.3)
+    source.on_connection_event = cap
+    await source.start(_ack_handler)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
+        # 200 bytes at 0.05 s outlives the 3 s read window by a wide margin, so with no deadline this
+        # peer is still trickling when the wait expires: the arm reds on the TIMEOUT as well as on
+        # the reason. Measured with the deadline stubbed out — the drop then came at 2.5 s (the last
+        # byte plus the idle bound) and read `idle_timeout`, which a shorter feed would have hidden
+        # behind a passing `read()`.
+        feeder = asyncio.create_task(_trickle(writer, count=200, interval=0.05))
+        assert await asyncio.wait_for(reader.read(), 3.0) == b""  # dropped -> EOF
+        feeder.cancel()
+        await asyncio.gather(feeder, return_exceptions=True)
+        writer.close()
+    finally:
+        # Bound teardown so a listener-stop regression (the #55 Windows Proactor wedge) fails LOUD as a
+        # fast timeout instead of silently hanging the shared session loop — mirrors test_connection_resilience.
+        await asyncio.wait_for(source.stop(), timeout=5.0)
+    assert await _wait_for(lambda: "closed" in cap.kinds())
+    reason = next(r for k, _, r in cap.events if k == "closed")
+    assert reason == "frame_deadline", (
+        f"a trickling peer was closed for {reason!r}; the per-read timeout was 0.5 s and the peer "
+        "sent a byte every 0.05 s, so the idle bound cannot be what fired"
+    )
+
+
+async def test_an_idle_peer_still_hits_receive_timeout_while_a_frame_is_open() -> None:
+    """The idle bound fires independently, on the case the frame deadline would NOT cover.
+
+    A frame is open and its deadline is far away (5 s) while the per-read timeout is 0.1 s, so the two
+    bounds are separable by their reasons. This is the arm that would red if the deadline had replaced
+    `receive_timeout` rather than joining it, or if taking the smaller of the two lost the idle bound
+    whenever a frame was open. `test_idle_timeout_close_reason` above covers the same bound with NO
+    frame open, which is the other half of "independently".
+    """
+    cap = _Capture()
+    source = _mllp(receive_timeout=0.1, max_frame_seconds=5.0)
+    source.on_connection_event = cap
+    await source.start(_ack_handler)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
+        writer.write(bytes([SB]) + b"MSH|")  # open a frame, then say nothing more
+        await writer.drain()
+        assert await asyncio.wait_for(reader.read(), 2.0) == b""  # idle close
+        writer.close()
+    finally:
+        # Bound teardown so a listener-stop regression (the #55 Windows Proactor wedge) fails LOUD as a
+        # fast timeout instead of silently hanging the shared session loop — mirrors test_connection_resilience.
+        await asyncio.wait_for(source.stop(), timeout=5.0)
+    assert await _wait_for(lambda: "closed" in cap.kinds())
+    reason = next(r for k, _, r in cap.events if k == "closed")
+    assert reason == "idle_timeout", (
+        f"an idle peer with an open frame was closed for {reason!r}; the frame had 5 s of budget "
+        "left, so the idle bound is the only one that should have fired"
+    )
+
+
+async def test_a_slow_but_progressing_peer_inside_both_bounds_is_acked() -> None:
+    """The control arm: an over-tight deadline is an outage, and nothing else here would catch it.
+
+    A real partner on a congested link sends one message in several TCP segments with pauses between
+    them. This peer stays inside both bounds — each gap is under `receive_timeout` and the whole frame
+    completes well inside `max_frame_seconds` — so it must be acknowledged exactly as before.
+    """
+    cap = _Capture()
+    source = _mllp(receive_timeout=0.5, max_frame_seconds=1.0)
+    source.on_connection_event = cap
+    await source.start(_ack_handler)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
+        blob = frame(ADT)
+        step = max(1, len(blob) // 4)
+        for offset in range(0, len(blob), step):
+            writer.write(blob[offset : offset + step])
+            await writer.drain()
+            await asyncio.sleep(
+                0.05
+            )  # under receive_timeout; ~0.2 s total, under max_frame_seconds
+        ack = await asyncio.wait_for(reader.read(200), 2.0)
+        assert b"MSA|AA" in ack, f"the slow-but-progressing sender was not acknowledged: {ack!r}"
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        # Bound teardown so a listener-stop regression (the #55 Windows Proactor wedge) fails LOUD as a
+        # fast timeout instead of silently hanging the shared session loop — mirrors test_connection_resilience.
+        await asyncio.wait_for(source.stop(), timeout=5.0)
+    assert "frame_deadline" not in [r for _, _, r in cap.events]
+
+
+async def test_per_host_cap_refuses_a_further_connection_from_the_same_address() -> None:
+    """`max_connections_per_host` refuses where `max_connections` cannot.
+
+    The global cap is left OFF, so nothing but the per-host term can produce this refusal, and the
+    `at_capacity` event carries the reason that says which budget it was.
+    """
+    cap = _Capture()
+    source = _mllp(max_connections=0, max_connections_per_host=2)
+    source.on_connection_event = cap
+    assert (
+        source.max_connections is None
+    )  # 0 disables the global cap: only the per-host one is live
+    await source.start(_ack_handler)
+    try:
+        _r1, w1 = await asyncio.open_connection("127.0.0.1", source.sockport)
+        _r2, w2 = await asyncio.open_connection("127.0.0.1", source.sockport)
+        assert await _wait_for(lambda: source._active == 2)
+        r3, w3 = await asyncio.open_connection("127.0.0.1", source.sockport)
+        assert await asyncio.wait_for(r3.read(), 2.0) == b""  # third from 127.0.0.1 refused -> EOF
+        assert await _wait_for(lambda: "at_capacity" in cap.kinds())
+        refused = next((p, r) for k, p, r in cap.events if k == "at_capacity")
+        assert refused == ("127.0.0.1", "max_connections_per_host")
+        # The slot comes back when one of that host's own connections ends — the refusal is
+        # pre-ingress and momentary, not a ban.
+        w1.close()
+        await w1.wait_closed()
+        assert await _wait_for(lambda: source._per_host.get("127.0.0.1", 0) == 1)
+        _r4, w4 = await asyncio.open_connection("127.0.0.1", source.sockport)
+        assert await _wait_for(lambda: source._active == 2)
+        for w in (w2, w3, w4):
+            w.close()
+    finally:
+        # Bound teardown so a listener-stop regression (the #55 Windows Proactor wedge) fails LOUD as a
+        # fast timeout instead of silently hanging the shared session loop — mirrors test_connection_resilience.
+        await asyncio.wait_for(source.stop(), timeout=5.0)
+    assert source._per_host == {}, (
+        "a peer address was left in the per-host table after every connection closed; a table that "
+        f"only grows is the leak the cap would otherwise introduce: {source._per_host}"
+    )
+
+
+async def test_the_global_cap_refusal_is_still_unqualified() -> None:
+    """Both caps emit `at_capacity`, so the REASON is the only thing telling an operator which one
+    refused. The global refusal must keep carrying none, or the discriminator is worthless."""
+    cap = _Capture()
+    source = _mllp(max_connections=1, max_connections_per_host=0)
+    source.on_connection_event = cap
+    assert source.max_connections_per_host is None  # 0 disables the per-host cap
+    await source.start(_ack_handler)
+    try:
+        _r1, w1 = await asyncio.open_connection("127.0.0.1", source.sockport)
+        assert await _wait_for(lambda: source._active == 1)
+        r2, w2 = await asyncio.open_connection("127.0.0.1", source.sockport)
+        assert await asyncio.wait_for(r2.read(), 2.0) == b""
+        assert await _wait_for(lambda: "at_capacity" in cap.kinds())
+        assert next(r for k, _, r in cap.events if k == "at_capacity") is None
+        w1.close()
+        w2.close()
+    finally:
+        # Bound teardown so a listener-stop regression (the #55 Windows Proactor wedge) fails LOUD as a
+        # fast timeout instead of silently hanging the shared session loop — mirrors test_connection_resilience.
+        await asyncio.wait_for(source.stop(), timeout=5.0)
+
+
+def test_both_new_caps_ship_on_and_are_reachable_through_the_mllp_factory() -> None:
+    """A cap nobody can configure is not a control, and one that ships off protects nobody.
+
+    Pinned against the module constants rather than literals, so changing a default without the
+    factory (or the factory without the connector) reds here instead of shipping a listener whose
+    documented default is not the one it runs.
+    """
+    from messagefoundry.config.wiring import MLLP
+
+    source = _mllp()
+    assert source.max_frame_seconds == mllp_mod.DEFAULT_MAX_FRAME_SECONDS
+    assert source.max_connections_per_host == mllp_mod.DEFAULT_MAX_CONNECTIONS_PER_HOST
+    # Well under the socket cap: a per-host term set near the global one bounds nothing.
+    assert source.max_connections_per_host * 4 <= mllp_mod.DEFAULT_MAX_CONNECTIONS
+
+    settings = MLLP(port=2575).settings
+    assert settings["max_frame_seconds"] == mllp_mod.DEFAULT_MAX_FRAME_SECONDS
+    assert settings["max_connections_per_host"] == mllp_mod.DEFAULT_MAX_CONNECTIONS_PER_HOST
+    # The same None/0-disables convention every other cap on this listener follows.
+    assert MLLP(port=2575, max_frame_seconds=None).settings["max_frame_seconds"] is None
+    assert _mllp(max_frame_seconds=0).max_frame_seconds is None

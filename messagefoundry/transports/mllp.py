@@ -80,7 +80,9 @@ __all__ = [
     "EB",
     "CR",
     "DEFAULT_MAX_FRAME_BYTES",
+    "DEFAULT_MAX_FRAME_SECONDS",
     "DEFAULT_MAX_CONNECTIONS",
+    "DEFAULT_MAX_CONNECTIONS_PER_HOST",
     "DEFAULT_RECEIVE_TIMEOUT",
     "frame",
     "MLLPDecoder",
@@ -107,6 +109,40 @@ CR = 0x0D  # carriage return
 DEFAULT_MAX_FRAME_BYTES = 16 * 1024 * 1024  # 16 MiB — fits embedded base64 docs, bounds OOM
 DEFAULT_MAX_CONNECTIONS = 256  # bound concurrent inbound clients (connection-flood guard)
 DEFAULT_RECEIVE_TIMEOUT = 60.0  # seconds — close inbound sockets idle this long (slowloris guard)
+
+#: Seconds one frame may take from its START byte to its END byte (BACKLOG #1725).
+#:
+#: :data:`DEFAULT_RECEIVE_TIMEOUT` bounds SILENCE between reads and resets on every byte received, so
+#: a peer trickling one byte at a time is never idle: it would hold its slot — and up to
+#: ``max_frame_bytes`` of decoder buffer — for as long as it liked, without ever completing a message.
+#: This bounds the frame itself, so the two answer different questions and **both apply**. They are
+#: deliberately kept apart: dropping the per-read timeout would lose the idle-socket bound, which is a
+#: separate property and still wanted (a peer that opens a socket and says nothing at all never opens
+#: a frame, so no frame deadline would ever fire on it).
+#:
+#: 60 s matches the idle bound, so the shipped posture reads as "a frame gets about as long to arrive
+#: as a quiet socket gets to stay open". A partner that legitimately needs longer for one very large
+#: frame raises this key alone. ``None``/``0`` disables it, like every cap here.
+DEFAULT_MAX_FRAME_SECONDS = 60.0
+
+#: Concurrent inbound clients allowed from ONE peer address (BACKLOG #1725).
+#:
+#: :data:`DEFAULT_MAX_CONNECTIONS` counts sockets, not hosts, so one peer can take every slot a
+#: listener has; ``source_ip_allowlist`` ships off, so on a default listener there is no other
+#: peer-scoped term at all. 32 is an eighth of the global cap, and that ratio is the point of the
+#: number — a per-host cap set near the global one bounds nothing, while at an eighth it takes at
+#: least eight distinct source addresses to fill a default listener. It is still far above what a
+#: real partner needs: MLLP is request/response over one socket per sending channel, so a partner
+#: holding thirty-two simultaneous connections into one listener port is already unusual.
+#:
+#: This is a CONNECTION cap, not a rate cap, which is why it does not contradict
+#: :class:`_MessagePacer`'s "never scoped per PEER". That rule is about a per-IP MESSAGE budget, which
+#: NAT collapses — two feeds behind one egress address would throttle each other. A slot cap inverts
+#: the argument: thirty-two simultaneous sockets from one address into one listener port is not a
+#: shape ordinary NAT'd traffic produces, and the refusal costs no message. It is pre-ingress at
+#: accept, exactly like the ``max_connections`` refusal, so nothing was received to drop and the peer
+#: reconnects as soon as one of its own connections finishes. ``None``/``0`` disables it.
+DEFAULT_MAX_CONNECTIONS_PER_HOST = 32
 
 #: Message-rate pacing ships OFF, and that is a DELIBERATE DEVIATION from this module's
 #: "key absent -> secure default" convention, ruled 2026-08-11 (ASVS 2.4.1 / 15.2.2). A rate limit
@@ -1592,7 +1628,24 @@ def _pacing_settings(settings: Mapping[str, Any]) -> tuple[float | None, float]:
 
 class MLLPSource(SourceConnector):
     """Listen for inbound MLLP connections, hand each message to the pipeline handler,
-    and frame whatever the handler returns back to the sender as the ACK."""
+    and frame whatever the handler returns back to the sender as the ACK.
+
+    **Four resource caps, on four different units, all shipped on (BACKLOG #1725).** They are
+    separate because each bounds something the others do not, and a peer can sit inside three of them
+    while abusing the fourth:
+
+    ==========================  =========================================================
+    ``max_connections``         concurrent sockets on this listener
+    ``max_connections_per_host``   concurrent sockets from ONE peer address
+    ``receive_timeout``         SILENCE between reads — resets on every byte received
+    ``max_frame_seconds``       one frame's life, start byte to end byte
+    ==========================  =========================================================
+
+    ``max_frame_bytes`` bounds the same frame's size. A peer trickling one byte at a time is inside
+    ``receive_timeout`` forever, which is why the frame deadline exists; a peer opening many
+    connections from one address is inside ``max_connections`` until it has taken every slot, which
+    is why the per-host cap does. Each takes ``None``/``0`` to disable it.
+    """
 
     def __init__(self, config: Source) -> None:
         s = config.settings
@@ -1605,10 +1658,14 @@ class MLLPSource(SourceConnector):
         # Caps below: key absent → secure default; present-but-falsy (None/0) → disabled.
         mc = s.get("max_connections", DEFAULT_MAX_CONNECTIONS)
         self.max_connections: int | None = int(mc) if mc else None
+        mch = s.get("max_connections_per_host", DEFAULT_MAX_CONNECTIONS_PER_HOST)
+        self.max_connections_per_host: int | None = int(mch) if mch else None
         rt = s.get("receive_timeout", DEFAULT_RECEIVE_TIMEOUT)
         self.receive_timeout: float | None = float(rt) if rt else None
         mf = s.get("max_frame_bytes", DEFAULT_MAX_FRAME_BYTES)
         self.max_frame_bytes: int | None = int(mf) if mf else None
+        mfs = s.get("max_frame_seconds", DEFAULT_MAX_FRAME_SECONDS)
+        self.max_frame_seconds: float | None = float(mfs) if mfs else None
         # Message-rate pacing. Absent -> OFF, unlike the caps above; see _pacing_settings and
         # DEFAULT_MAX_MESSAGES_PER_SECOND for why that deviation is deliberate and ruled.
         self.max_messages_per_second, self.message_burst = _pacing_settings(s)
@@ -1624,6 +1681,12 @@ class MLLPSource(SourceConnector):
         self._server: asyncio.Server | None = None
         self._handler: InboundHandler | None = None
         self._active = 0
+        #: Live connections per peer address, for `max_connections_per_host`. A host is DROPPED at
+        #: zero rather than left sitting at 0, because a dict that only ever grows is the memory leak
+        #: a per-host cap would otherwise introduce — and a peer cycling source addresses is exactly
+        #: the caller this cap exists to bound. Keyed by IP string; a peer whose address the socket
+        #: cannot report (`_peer_host` -> None) is never counted and never refused by that cap.
+        self._per_host: dict[str, int] = {}
         # Live client writers + their handler tasks, so stop()/reload can actively close established
         # connections (a peer may hold one open for weeks) and bound the wait — server.wait_closed()
         # alone hangs on a still-connected sender on py3.12.1+ and is a no-op quiesce on 3.11 (H-2).
@@ -1717,6 +1780,63 @@ class MLLPSource(SourceConnector):
             )
             raise
 
+    def _at_host_capacity(self, peer_host: str | None) -> bool:
+        """Whether this peer address already holds every connection ``max_connections_per_host``
+        allows it (BACKLOG #1725). Always ``False`` when the cap is off or the socket could not
+        report an address — a cap that cannot name its subject must not refuse anybody."""
+        if self.max_connections_per_host is None or peer_host is None:
+            return False
+        return self._per_host.get(peer_host, 0) >= self.max_connections_per_host
+
+    def _admit(self, peer_host: str | None) -> None:
+        """Take one connection slot, globally and (when the peer has an address) for that host."""
+        self._active += 1
+        if peer_host is not None:
+            self._per_host[peer_host] = self._per_host.get(peer_host, 0) + 1
+
+    def _release(self, peer_host: str | None) -> None:
+        """Give both slots back. Paired with :meth:`_admit` in one place so the two counters cannot
+        drift — a per-host count left behind by a missed release locks that peer out permanently."""
+        self._active -= 1
+        if peer_host is None:
+            return
+        remaining = self._per_host.get(peer_host, 0) - 1
+        if remaining > 0:
+            self._per_host[peer_host] = remaining
+        else:
+            self._per_host.pop(peer_host, None)
+
+    def _log_frame_deadline(self, writer: asyncio.StreamWriter) -> None:
+        """Say which bound dropped the connection (BACKLOG #1725). The `closed` event's reason says
+        `frame_deadline`, but only when connection-event capture is on; this line lands either way,
+        and an operator reading `idle_timeout` for a peer that was never idle would look in the wrong
+        place. Socket metadata only — no frame bytes, which is the whole point of the partial frame
+        this drops."""
+        logger.warning(
+            "MLLP frame from %s did not complete within max_frame_seconds (%.1fs); "
+            "dropping the connection",
+            writer.get_extra_info("peername"),
+            self.max_frame_seconds,
+        )
+
+    def _frame_seconds_left(self, frame_opened_at: float | None) -> float | None:
+        """Seconds left on the open frame's deadline, or ``None`` when no deadline is running.
+
+        ``None`` means "this bound has nothing to say" — either ``max_frame_seconds`` is off or no
+        frame is open. A value at or below zero means the frame outlived its budget. The result may
+        be negative: the caller clamps it where it is spent as a timeout, and reads its SIGN where it
+        is deciding which bound fired.
+        """
+        if frame_opened_at is None or self.max_frame_seconds is None:
+            return None
+        return self.max_frame_seconds - (time.monotonic() - frame_opened_at)
+
+    def _read_budget(self, frame_left: float | None) -> float | None:
+        """How long the next read may block: the idle bound, the open frame's remaining life, or the
+        smaller of the two. ``None`` only when neither bound is configured (an unbounded read)."""
+        budgets = [b for b in (self.receive_timeout, frame_left) if b is not None]
+        return max(0.0, min(budgets)) if budgets else None
+
     async def _on_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         assert self._handler is not None
         # Register before anything else so stop() can always find + close this connection — no race
@@ -1744,7 +1864,23 @@ class MLLPSource(SourceConnector):
             if self.max_connections is not None and self._active >= self.max_connections:
                 await self._emit_event("at_capacity", peer_host=peer_host)
                 return  # at capacity — refuse the new client (closed in the outer finally)
-            self._active += 1
+            if self._at_host_capacity(peer_host):
+                # Same refusal, a different budget: this peer address already holds its share
+                # (BACKLOG #1725). Deliberately the SAME `at_capacity` kind rather than a new one —
+                # the connection event vocabulary is asserted against the emit sites and mirrored in
+                # the web console filter, and what an operator needs here is WHICH cap refused them,
+                # which the reason carries. The counter is not incremented, as above.
+                logger.warning(
+                    "MLLP connection from %s refused: %s already holds max_connections_per_host (%d)",
+                    writer.get_extra_info("peername"),
+                    peer_host,
+                    self.max_connections_per_host,
+                )
+                await self._emit_event(
+                    "at_capacity", peer_host=peer_host, reason="max_connections_per_host"
+                )
+                return  # at per-host capacity — refuse (closed in the outer finally)
+            self._admit(peer_host)
             established = True
             await self._emit_event("established", peer_host=peer_host)
             try:
@@ -1752,16 +1888,37 @@ class MLLPSource(SourceConnector):
                 pacer = _MessagePacer.for_rate(
                     self.max_messages_per_second, self.message_burst, name=self._pacing_name
                 )
+                # Monotonic stamp of the read that carried the open frame's first byte, or None when
+                # no frame is open (BACKLOG #1725). A wall clock would let a DST jump either expire a
+                # healthy frame or reprieve a stalled one.
+                frame_opened_at: float | None = None
                 while True:
                     # ASVS 2.4.1 / 15.2.2 — the wait is BEFORE the read, never around the handler.
                     if pacer is not None:
                         await pacer.pace()
-                    if self.receive_timeout:
+                    frame_left = self._frame_seconds_left(frame_opened_at)
+                    if frame_left is not None and frame_left <= 0.0:
+                        # A trickling peer is never idle, so the deadline has to be checked where
+                        # bytes ARRIVE and not only where they stop: this is the arm that fires on a
+                        # peer feeding one byte at a time inside the per-read timeout.
+                        self._log_frame_deadline(writer)
+                        close_reason = "frame_deadline"
+                        break
+                    read_budget = self._read_budget(frame_left)
+                    if read_budget is not None:
                         try:
-                            chunk = await asyncio.wait_for(reader.read(4096), self.receive_timeout)
+                            chunk = await asyncio.wait_for(reader.read(4096), read_budget)
                         except TimeoutError:
-                            close_reason = "idle_timeout"
-                            break  # idle past receive_timeout — close the connection
+                            # One wait_for serves both bounds, so name whichever actually ran out. An
+                            # open frame whose life is spent is the frame deadline; everything else —
+                            # including a quiet socket with no frame open — is the idle bound.
+                            spent = self._frame_seconds_left(frame_opened_at)
+                            if spent is not None and spent <= 0.0:
+                                self._log_frame_deadline(writer)
+                                close_reason = "frame_deadline"
+                            else:
+                                close_reason = "idle_timeout"
+                            break  # past one of the two read bounds — close the connection
                     else:
                         chunk = await reader.read(4096)
                     if not chunk:
@@ -1801,11 +1958,19 @@ class MLLPSource(SourceConnector):
                             "framing_error", peer_host=peer_host, reason=safe_exc(exc)
                         )
                         break
+                    # Run the frame clock off the DECODER, after it has consumed this read — it is
+                    # the only thing that knows whether a start byte arrived without its end byte.
+                    # Reached on the success path alone (every arm above breaks), so a connection
+                    # already being dropped never re-stamps.
+                    if not decoder.in_frame:
+                        frame_opened_at = None  # the frame closed, or none was ever open
+                    elif frame_opened_at is None:
+                        frame_opened_at = time.monotonic()  # this read carried the first byte
             except OSError as exc:
                 failed = True  # peer reset; nothing to do but drop the connection
                 await self._emit_event("peer_reset", peer_host=peer_host, reason=safe_exc(exc))
             finally:
-                self._active -= 1
+                self._release(peer_host)
         finally:
             self._clients.discard(writer)
             if task is not None:

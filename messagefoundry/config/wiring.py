@@ -1276,8 +1276,10 @@ def MLLP(
     encoding: str = "utf-8",
     # Inbound DoS guards (defaults mirror transports.mllp.DEFAULT_*; pass None/0 to disable):
     max_connections: int | None = 256,  # cap concurrent clients (connection-flood guard)
+    max_connections_per_host: int | None = 32,  # cap concurrent clients from ONE peer address
     receive_timeout: float | None = 60.0,  # close a client idle this many seconds (slowloris)
     max_frame_bytes: int | None = 16 * 1024 * 1024,  # cap one frame's bytes (OOM guard); both dirs
+    max_frame_seconds: float | None = 60.0,  # cap one frame's life, start byte to end byte
     # INBOUND message-RATE pacing. Unlike the caps above these default to OFF, and that is ruled
     # rather than accidental: a rate on a clinical interface is only safe at a number taken from a
     # real feed profile. Both are parameters of this factory, and a connections.toml inbound entry
@@ -1323,11 +1325,22 @@ def MLLP(
     tls_ciphers: str
     | None = None,  # BOTH: opt-in OpenSSL cipher string for THIS hop; unset = the inherited default (ADR 0188)
 ) -> ConnectionSpec:
-    """An MLLP endpoint. Inbound uses port/max_connections/receive_timeout/max_frame_bytes (the
-    bind interface comes from the service's ``[inbound].bind_host``, so ``host`` is rejected on an
-    inbound); outbound uses host/port/connect_timeout/timeout_seconds/max_frame_bytes. ``encoding``
-    applies to framing in both directions. ``capture_response`` (outbound, ADR 0013) records the
-    application ACK as a captured reply (a negative ACK still dead-letters/retries unchanged).
+    """An MLLP endpoint. Inbound uses port + the five resource caps below (the bind interface comes
+    from the service's ``[inbound].bind_host``, so ``host`` is rejected on an inbound); outbound uses
+    host/port/connect_timeout/timeout_seconds/max_frame_bytes. ``encoding`` applies to framing in both
+    directions. ``capture_response`` (outbound, ADR 0013) records the application ACK as a captured
+    reply (a negative ACK still dead-letters/retries unchanged).
+
+    **Inbound resource caps (BACKLOG #1725).** Five keys on five different units, all shipped on, each
+    disabled by ``None``/``0``: ``max_connections`` (256) bounds concurrent sockets on the listener;
+    ``max_connections_per_host`` (32) bounds concurrent sockets from ONE peer address, the term
+    ``max_connections`` does not carry, since it counts sockets rather than hosts;
+    ``receive_timeout`` (60 s) bounds SILENCE between reads and **resets on every byte received**;
+    ``max_frame_seconds`` (60 s) bounds one frame's life from its start byte to its end byte, which is
+    what stops a peer trickling a byte at a time from holding a slot and a decoder buffer while never
+    being idle; ``max_frame_bytes`` (16 MiB) bounds that same frame's size. Both connection refusals
+    are **pre-ingress** — the socket is accepted, then refused and closed with an ``at_capacity``
+    connection event, and no message was received to drop.
 
     **Inbound message-rate pacing (BACKLOG #1249).** ``max_messages_per_second`` bounds how fast one
     accepted inbound connection may feed messages in; ``None``/``0`` (the default) is no bound.
@@ -1439,8 +1452,10 @@ def MLLP(
             "port": port,
             "encoding": encoding,
             "max_connections": max_connections,
+            "max_connections_per_host": max_connections_per_host,
             "receive_timeout": receive_timeout,
             "max_frame_bytes": max_frame_bytes,
+            "max_frame_seconds": max_frame_seconds,
             "max_messages_per_second": max_messages_per_second,
             "message_burst": message_burst,
             "connect_timeout": connect_timeout,
