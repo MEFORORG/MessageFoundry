@@ -549,7 +549,7 @@ gates a merge**, and no seat has to clear one.
 - Rules a Builder needs belong in the **account's** `settings.json`, outside git.
   `.claude/settings.json` is tracked, and every worktree carries its own copy from its own branch, so
   an uncommitted edit to the primary checkout reaches nothing else.
-- Read a role playbook from the **`wshallwshall/korus`** repository, and read it at `origin/main`
+- Read a role playbook from the **`MEFORORG/korus`** repository, and read it at `origin/main`
   rather than out of a working tree. Owner ruling 2026-09-04.
 
       git -C <korus clone> fetch origin
