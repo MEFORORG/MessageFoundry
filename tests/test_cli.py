@@ -191,8 +191,11 @@ def test_dryrun_redacts_bodies_by_default(
 # never raises, so `error` is null there and the assertion over it asserts nothing. These fixtures ship
 # their own handler that DOES raise, quoting PID-5 and PID-3 the way an author debugging a feed does.
 #
-# PHI: every value here is synthetic (CLAUDE.md §9). The raise is built by concatenation, not an
-# f-string, so the advisory `raise-fstring` check does not flag the probe it exists to model.
+# PHI: every value here is synthetic (CLAUDE.md §9). The raise is built by concatenation, which the
+# advisory `raise-fstring` check now DOES flag (it reads the `+` spelling as well as the f-string).
+# That costs these fixtures nothing: the check only ever prints, and its detail carries a filename
+# and line number, never the message text. The assertions below are about `redact` on the dryrun and
+# check surfaces, which is a separate path from the lint.
 PHI_RAISER_CONFIG = """\
 # SPDX-License-Identifier: AGPL-3.0-or-later
 from messagefoundry import File, handler, inbound, router
