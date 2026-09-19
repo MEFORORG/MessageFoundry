@@ -11,9 +11,9 @@ Three tiers:
   2. A Windows-gated integration test using ``icacls`` to add a world-writable ACE and asserting
      ``load_config`` refuses it.
   3. A test that a Win32 API error makes the guard fail OPEN with a WARNING (caplog), not raise.
-     That posture is unchanged and deliberate: the three pre-existing fail-open arms (API error,
-     unresolvable owner SID, unenumerable DACL) keep it; only the new owner-membership arm is
-     fail-closed.
+     That posture is unchanged and deliberate; only the new owner-membership arm is fail-closed.
+     Which arms fail open and why is stated once, in ADR 0036 Decision 3 as amended - this module
+     does not restate the enumeration (CLAUDE.md section 11, SDS-3.5).
 """
 
 from __future__ import annotations
@@ -150,6 +150,22 @@ def test_foreign_nonadmin_owner_refused() -> None:
     reason = _evaluate_config_dacl(_OWNER, [(_ALLOW, _FULL, _OWNER)], _SELF, _never_admin)
     assert reason is not None
     assert _OWNER in reason
+    # Match the OWNER arm's own wording, not just the SID. _OWNER appears in the ACE refusal too
+    # ("a non-owner, non-admin principal (...) has write access"), so asserting the SID alone would
+    # still pass if `trusted.add(owner_sid)` were deleted and the ACE arm fired instead - the test
+    # would silently change which arm it covers.
+    assert "so it can rewrite the code this loader executes" in reason
+
+
+def test_foreign_nonadmin_owner_refused_with_no_write_ace_at_all() -> None:
+    """The owner arm in isolation: a read-only DACL whose OWNER is a foreign low-privilege principal.
+
+    This is the shape the POSIX arm refuses as a 0644 file owned by another uid - every ACE is clean,
+    and the refusal rests entirely on ownership. The sibling cases all pair the foreign owner with an
+    owner-write ACE, so without this one no test separates the owner arm from the ACE arm."""
+    reason = _evaluate_config_dacl(_OWNER, [(_ALLOW, _READ_EXEC, _USERS)], _SELF, _never_admin)
+    assert reason is not None
+    assert "so it can rewrite the code this loader executes" in reason
 
 
 def test_unresolvable_owner_membership_refused() -> None:
@@ -221,6 +237,18 @@ def test_well_known_admin_sids_recognized(sid: str) -> None:
         "S-1-5-21-1-2-3-51x",  # non-numeric RID (a truncated/garbled SID string)
         "S-1-5-80-512",  # a service SID that merely ends in an admin RID
         "",
+        # A machine/domain SID is S-1-5-21 plus THREE sub-authorities plus the RID. Anything with a
+        # different count is malformed, and int() would happily parse the RID off it.
+        "S-1-5-21-1-500",  # one sub-authority: too short, but long enough for a `len < 6` check
+        "S-1-5-21-1-2-500",  # two sub-authorities
+        "S-1-5-21-1-2-3-4-500",  # four sub-authorities
+        # int() accepts all three of these and returns 500; str.isdigit() alone accepts the last.
+        "S-1-5-21-1-2-3-+500",
+        "S-1-5-21-1-2-3- 500",
+        # Arabic-Indic digits, written as escapes so this file stays ASCII (a stock Windows cp1252
+        # console raises UnicodeEncodeError on the literal form). int() reads them as 500 and
+        # str.isdigit() returns True for them, which is why the check also requires isascii().
+        "S-1-5-21-1-2-3-\u0665\u0660\u0660",
     ],
 )
 def test_non_admin_sids_not_recognized(sid: str) -> None:

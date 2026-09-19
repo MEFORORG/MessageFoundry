@@ -157,12 +157,21 @@ function Set-ConfigReadAcl {
 function Set-SecureConfigAcl {
     <#
       Lock the config directory down to SYSTEM + Administrators (+ the service account, RX), STRIPPING
-      inherited ACEs (/inheritance:r). The in-process source-trust guard (SEC-003) refuses to load any
-      config dir/module a broad/low-privilege principal can write, so this brings the on-disk ACL into
-      line with what the runtime enforces - inherited write/modify ACEs (e.g. from a parent profile or
-      ProgramData) are removed. Opt-in via -LockConfigDir because the config dir often lives in a repo
-      where stripping inheritance is surprising. Mirrors Set-SecureDataDirAcl: well-known SIDs (non-
-      English Windows), best-effort (warn, never abort).
+      inherited ACEs (/inheritance:r), and set its OWNER to Administrators. The in-process source-trust
+      guard (SEC-003) refuses to load any config dir/module a broad/low-privilege principal can write,
+      so this brings the on-disk ACL into line with what the runtime enforces - inherited write/modify
+      ACEs (e.g. from a parent profile or ProgramData) are removed. Opt-in via -LockConfigDir because
+      the config dir often lives in a repo where stripping inheritance is surprising. Mirrors
+      Set-SecureDataDirAcl: well-known SIDs (non-English Windows), best-effort (warn, never abort).
+
+      THE OWNER STEP IS NOT COSMETIC (ADR 0036 Amendment A, BACKLOG #1647). The guard vets the OWNER
+      as well as the DACL, because an owner holds WRITE_DAC implicitly and can rewrite the executed
+      .py whatever the ACEs say. A DACL-only lockdown therefore does NOT clear the guard: the dir
+      keeps the owner it was created with - typically the individual operator who made it - and the
+      runtime membership lookup is local-only and sees DIRECT members, so an operator whose admin
+      rights arrive through a nested domain group is refused. Without this step the shipped installer
+      could not produce a config dir that loads, and the only remaining cure would be
+      MEFOR_ALLOW_INSECURE_CONFIG_SOURCE, which disables the whole control.
     #>
     param([Parameter(Mandatory)][string]$Path, [string]$Account)
     # *S-1-5-18 = SYSTEM, *S-1-5-32-544 = Administrators. Full control, inherited (OI)(CI) by children.
@@ -175,6 +184,18 @@ function Set-SecureConfigAcl {
         Write-Warning ("Could not lock down the config dir '$Path' (icacls exit $LASTEXITCODE); a " +
             "low-privileged principal with write would cause the engine to REFUSE to load it (SEC-003, " +
             "docs/SERVICE.md). Lock it manually or re-run elevated.")
+    }
+    # /T so the *.py files the guard also vets carry the same owner, not just the directory. /C so one
+    # unsettable file (an open editor, an AV scan) does not abort the walk and leave the rest of the
+    # tree on the old owner - the guard evaluates each *.py individually, so a partial pass refuses on
+    # whichever module was missed, and the directory itself would already look correct.
+    & icacls $Path /setowner "*S-1-5-32-544" /T /C | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning ("Could not set Administrators as the owner of the config dir '$Path' (icacls " +
+            "exit $LASTEXITCODE); the engine vets the OWNER as well as the ACL and would REFUSE to " +
+            "load a dir owned by a non-administrator (SEC-003, docs/SERVICE.md). With /C some files " +
+            "may have been skipped - check which, then run " +
+            "'icacls ""$Path"" /setowner ""*S-1-5-32-544"" /T /C' elevated.")
     }
 }
 
@@ -539,10 +560,15 @@ if ($LockConfigDir) {
     Write-Host "  Config : locked to $cfgGrantees; inheritance disabled (SEC-003)."
 } else {
     if ($ServiceAccount) { Set-ConfigReadAcl -Path $Config -Account $ServiceAccount }
-    Write-Warning ("The config dir '$Config' still inherits its parent's ACL. The engine's in-process " +
-        "source-trust guard (SEC-003) will REFUSE to load if a low-privileged principal (Everyone, " +
-        "Authenticated Users, Users, or any non-admin) has write/modify on the dir or any *.py in it. " +
-        "Re-run with -LockConfigDir, or point -Config at a dedicated admin-owned dir; see docs/SERVICE.md " +
+    # Name BOTH refusal criteria. The owner arm (ADR 0036 Amendment A) is independent of the DACL, so
+    # an operator who audits the ACL, finds no low-privilege write grant and starts the service can
+    # still be refused - and this warning would have told them the ACL was the whole story.
+    Write-Warning ("The config dir '$Config' still inherits its parent's ACL, and its OWNER has not " +
+        "been set. The engine's in-process source-trust guard (SEC-003) will REFUSE to load if a " +
+        "low-privileged principal (Everyone, Authenticated Users, Users, or any non-admin) has " +
+        "write/modify on the dir or any *.py in it, AND separately if the dir's owner is neither the " +
+        "run-as account nor an administrator it can resolve. Re-run with -LockConfigDir (which sets " +
+        "both), or point -Config at a dedicated admin-owned dir; see docs/SERVICE.md " +
         "'Restrict the config directory'.")
 }
 if ($ServiceAccount) {
