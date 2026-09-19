@@ -23,7 +23,7 @@ from messagefoundry.api.models import (
     PendingApprovalResponse,
 )
 from messagefoundry.api.security import get_auth
-from messagefoundry.api.validation import EPOCH_SECONDS_MAX, EpochSeconds
+from messagefoundry.api.validation import EPOCH_SECONDS_MAX, ConnectionName, EpochSeconds
 from messagefoundry.auth import Identity, Permission
 from messagefoundry.auth.identity import AuthProvider
 from messagefoundry.auth.service import AuthService, Elevation, MfaStatus
@@ -53,6 +53,7 @@ from .._auth import (
 )
 from .._html import CSP_PROBE_SRC
 from .._service import _service
+from ._common import UI_BODY_FILTER_RULES, blank_to_none, check_filters, for_echo
 
 _log = logging.getLogger(__name__)
 
@@ -443,13 +444,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         request: Request,
         engine: Any = Depends(deps.get_engine),
         identity: Identity = Depends(require_ui(Permission.MESSAGES_READ, phi=True)),
-        # The four metadata filters are length-bounded here where the JSON twin declares an alphabet
-        # (ConnectionName / StatusFilter / MessageTypeFilter / ControlIdFilter). That gap is the
-        # console-declaration item, filed separately, and closing it is an annotation swap. The two
-        # date bounds below are NOT part of it and cannot be closed that way: they are browser
-        # datetime-local STRINGS, not the epoch numbers the twin takes, so they need the hand-written
-        # parse below — which is why BACKLOG #1744 fixed them here and left the four alone. The
-        # carve-out is written down in docs/API-INPUT-VALIDATION.md.
+        # The four metadata filters keep a plain `str` declaration and are checked in the body
+        # against _common.UI_BODY_FILTER_RULES (BACKLOG #1740). Annotating them would make FastAPI
+        # answer 422 and discard the form, and this form already refuses its two date bounds with
+        # a 400 re-render that gives the operator back what they typed (BACKLOG #1744). One form
+        # refusing its own six fields two different ways is the shape being avoided here.
         channel_id: str | None = Query(None, max_length=256),
         status_filter: str | None = Query(None, alias="status", max_length=64),
         message_type: str | None = Query(None, max_length=64),
@@ -483,23 +482,37 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 raise ValueError("a received-date bound carries its own offset")
             return _EPOCH_BOUND.validate_python(parsed.replace(tzinfo=UTC).timestamp())
 
+        # What ARRIVED, for the rules to judge. Separate from the echo dict below, and the split
+        # is load-bearing: for_echo strips the control characters, so checking the echo would hand
+        # the rules a value the operator did not send and a NUL in message_type would PASS.
+        arrived: dict[str, object] = {
+            "channel_id": channel_id,
+            "status": status_filter,
+            "message_type": message_type,
+            "control_id": control_id,
+        }
         # Echoed back into the filter form by every arm below, so the operator never loses what they
         # typed — built once, as routes/search.py does with its own criteria. A TypedDict rather than
         # a plain dict so mypy still matches each key to its named parameter through the ``**``.
         typed = _MsgFilters(
-            channel_id=channel_id or "",
-            status=status_filter or "",
-            message_type=message_type or "",
-            control_id=control_id or "",
-            received_from=received_from or "",
-            received_to=received_to or "",
+            channel_id=for_echo(channel_id),
+            status=for_echo(status_filter),
+            message_type=for_echo(message_type),
+            control_id=for_echo(control_id),
+            received_from=for_echo(received_from),
+            received_to=for_echo(received_to),
         )
-        try:
-            epoch_from, epoch_to = _epoch(received_from), _epoch(received_to)
-        except ValueError:  # fromisoformat, or pydantic on an out-of-window instant
-            return HTMLResponse(
-                pages.messages(None, error=_BAD_BOUND_MESSAGE, **typed), status_code=400
-            )
+        # BACKLOG #1740: the four metadata filters, against the SAME rules GET /messages declares.
+        # A direct handler call runs no request validation, so without this the console searched on
+        # a value the JSON route refuses.
+        refusal = check_filters(UI_BODY_FILTER_RULES["/ui/messages"], arrived)
+        if refusal is None:
+            try:
+                epoch_from, epoch_to = _epoch(received_from), _epoch(received_to)
+            except ValueError:  # fromisoformat, or pydantic on an out-of-window instant
+                refusal = _BAD_BOUND_MESSAGE
+        if refusal is not None:
+            return HTMLResponse(pages.messages(None, error=refusal, **typed), status_code=400)
 
         if defer:
             # Form-only landing: pre-filled, NOT run until the operator submits (#4b).
@@ -509,10 +522,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             request,
             engine=engine,
             identity=identity,
-            channel_id=channel_id,
-            status=status_filter,
-            message_type=message_type,
-            control_id=control_id,
+            # blank_to_none, or a submitted-but-empty box becomes a literal match on "" and
+            # the log answers 200 with no rows -- which reads as an empty store, not a dropped
+            # filter. A browser sends every box in a GET form, so this is the ordinary path.
+            channel_id=blank_to_none(channel_id),
+            status=blank_to_none(status_filter),
+            message_type=blank_to_none(message_type),
+            control_id=blank_to_none(control_id),
             received_from=epoch_from,
             received_to=epoch_to,
             limit=limit,
@@ -569,8 +585,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         request: Request,
         engine: Any = Depends(deps.get_engine),
         identity: Identity = Depends(require_ui(Permission.MESSAGES_READ, phi=True)),
-        channel_id: str | None = Query(None, max_length=256),
-        destination_name: str | None = Query(None, max_length=256),
+        # Annotated, not body-validated, unlike ui_messages above: this page carries no filter form.
+        # Both values arrive only from a link the console itself built out of a name already in the
+        # store, so there is nothing an operator typed to hand back and a 422 is the honest refusal
+        # — the same one GET /dead-letters gives for the same two items (BACKLOG #1740).
+        channel_id: ConnectionName | None = Query(None),
+        destination_name: ConnectionName | None = Query(None),
         limit: int = Query(50, ge=1, le=500),
         offset: int = Query(0, ge=0),
     ) -> HTMLResponse:
@@ -591,6 +611,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     # cross-site POST carries no cookie, so require_ui already 303s). No step-up gate applies to
     # start/stop/restart (unlike replay, which is require_step_up and lands with the browser MFA
     # flow in a later milestone). Each redirects back to the dashboard.
+    #
+    # All three declare `name: ConnectionName`, the rule /connections/{name}/start declares for the
+    # same path segment, so FastAPI answers 422 before the handler runs (BACKLOG #1740). No operator
+    # types this: the console renders the name into a form action from the live registry, so only a
+    # hand-built URL reaches the refusal and there is no form to send it back to.
     async def _ui_control(
         request: Request,
         name: str,
@@ -606,7 +631,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
 
     @app.post("/ui/connections/{name}/start")
     async def ui_start_connection(
-        name: str,
+        name: ConnectionName,
         request: Request,
         engine: Any = Depends(deps.get_engine),
         identity: Identity = Depends(require_ui(Permission.CONNECTIONS_CONTROL)),
@@ -615,7 +640,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
 
     @app.post("/ui/connections/{name}/stop")
     async def ui_stop_connection(
-        name: str,
+        name: ConnectionName,
         request: Request,
         engine: Any = Depends(deps.get_engine),
         identity: Identity = Depends(require_ui(Permission.CONNECTIONS_CONTROL)),
@@ -624,7 +649,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
 
     @app.post("/ui/connections/{name}/restart")
     async def ui_restart_connection(
-        name: str,
+        name: ConnectionName,
         request: Request,
         engine: Any = Depends(deps.get_engine),
         identity: Identity = Depends(require_ui(Permission.CONNECTIONS_CONTROL)),
