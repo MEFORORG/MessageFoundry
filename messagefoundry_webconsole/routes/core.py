@@ -53,7 +53,7 @@ from .._auth import (
 )
 from .._html import CSP_PROBE_SRC
 from .._service import _service
-from ._common import UI_BODY_FILTER_RULES, check_filters
+from ._common import UI_BODY_FILTER_RULES, blank_to_none, check_filters, for_echo
 
 _log = logging.getLogger(__name__)
 
@@ -482,21 +482,30 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 raise ValueError("a received-date bound carries its own offset")
             return _EPOCH_BOUND.validate_python(parsed.replace(tzinfo=UTC).timestamp())
 
+        # What ARRIVED, for the rules to judge. Separate from the echo dict below, and the split
+        # is load-bearing: for_echo strips the control characters, so checking the echo would hand
+        # the rules a value the operator did not send and a NUL in message_type would PASS.
+        arrived: dict[str, object] = {
+            "channel_id": channel_id,
+            "status": status_filter,
+            "message_type": message_type,
+            "control_id": control_id,
+        }
         # Echoed back into the filter form by every arm below, so the operator never loses what they
         # typed — built once, as routes/search.py does with its own criteria. A TypedDict rather than
         # a plain dict so mypy still matches each key to its named parameter through the ``**``.
         typed = _MsgFilters(
-            channel_id=channel_id or "",
-            status=status_filter or "",
-            message_type=message_type or "",
-            control_id=control_id or "",
-            received_from=received_from or "",
-            received_to=received_to or "",
+            channel_id=for_echo(channel_id),
+            status=for_echo(status_filter),
+            message_type=for_echo(message_type),
+            control_id=for_echo(control_id),
+            received_from=for_echo(received_from),
+            received_to=for_echo(received_to),
         )
         # BACKLOG #1740: the four metadata filters, against the SAME rules GET /messages declares.
         # A direct handler call runs no request validation, so without this the console searched on
         # a value the JSON route refuses.
-        refusal = check_filters(UI_BODY_FILTER_RULES["/ui/messages"], typed)
+        refusal = check_filters(UI_BODY_FILTER_RULES["/ui/messages"], arrived)
         if refusal is None:
             try:
                 epoch_from, epoch_to = _epoch(received_from), _epoch(received_to)
@@ -513,10 +522,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             request,
             engine=engine,
             identity=identity,
-            channel_id=channel_id,
-            status=status_filter,
-            message_type=message_type,
-            control_id=control_id,
+            # blank_to_none, or a submitted-but-empty box becomes a literal match on "" and
+            # the log answers 200 with no rows -- which reads as an empty store, not a dropped
+            # filter. A browser sends every box in a GET form, so this is the ordinary path.
+            channel_id=blank_to_none(channel_id),
+            status=blank_to_none(status_filter),
+            message_type=blank_to_none(message_type),
+            control_id=blank_to_none(control_id),
             received_from=epoch_from,
             received_to=epoch_to,
             limit=limit,

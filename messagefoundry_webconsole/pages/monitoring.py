@@ -321,12 +321,21 @@ def events(
         ]
         for e in rows
     ]
-    empty = el("p", "No events.", class_="muted") if not rows and not error else Markup("")
+    if error:
+        # No results table AT ALL, not even its header row: the filter never ran, and an empty table
+        # under the banner reads as the result of the filter the operator typed (BACKLOG #1740).
+        return page(
+            "Events",
+            el("h1", "Events"),
+            _event_filter(connection, kind),
+            el("p", error, class_="banner"),
+            active="events",
+        )
+    empty = el("p", "No events.", class_="muted") if not rows else Markup("")
     return page(
         "Events",
         el("h1", "Events"),
         _event_filter(connection, kind),
-        el("p", error, class_="banner") if error else Markup(""),
         empty,
         rows_table(headers, body),
         active="events",

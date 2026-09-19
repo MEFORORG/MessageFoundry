@@ -16,7 +16,13 @@ from .. import pages
 from .._auth import (
     require_ui,
 )
-from ._common import ACTIVE_ALERTS_LIMIT, UI_BODY_FILTER_RULES, check_filters
+from ._common import (
+    ACTIVE_ALERTS_LIMIT,
+    UI_BODY_FILTER_RULES,
+    blank_to_none,
+    check_filters,
+    for_echo,
+)
 
 
 def register(app: FastAPI, deps: UiDeps) -> None:
@@ -57,11 +63,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     ) -> HTMLResponse:
         # L6b (#75 parity): expose the JSON handler's event-kind filter (a single kind from
         # the fixed dropdown → a one-element kinds list; blank/unknown = no filter).
-        conn, evt_kind = connection or "", kind or ""
-        # BACKLOG #1740: both filters, against the rules GET /events declares for the same two items.
+        # BACKLOG #1740: both filters, against the rules GET /events declares for the same two
+        # items -- judged on what ARRIVED, not on the for_echo'd copy below, which has had its
+        # control characters stripped and would therefore pass a rule the raw value fails.
         refusal = check_filters(
-            UI_BODY_FILTER_RULES["/ui/events"], {"connection": conn, "kind": evt_kind}
+            UI_BODY_FILTER_RULES["/ui/events"], {"connection": connection, "kind": kind}
         )
+        conn, evt_kind = for_echo(connection), for_echo(kind)
         if refusal is not None:
             # No rows: the filter was never applied, and a table under a refusal banner would read
             # as the result of the filter the operator typed.
@@ -72,7 +80,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         rows = await core.list_connection_events(
             engine=engine,
             identity=identity,
-            connection=connection,
+            # blank_to_none: the handler's channel guard runs on any value that is not None,
+            # so a submitted-but-empty connection box made a channel-scoped operator 403 and wrote
+            # a false auth.channel_denied row naming them, every time they used this form.
+            connection=blank_to_none(connection),
             kind=kinds,
             since=None,
             limit=100,

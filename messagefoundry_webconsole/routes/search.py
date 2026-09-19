@@ -23,7 +23,7 @@ from .._auth import (
     require_ui,
     require_ui_step_up,
 )
-from ._common import UI_BODY_FILTER_RULES, _form_pairs, check_filters
+from ._common import UI_BODY_FILTER_RULES, _form_pairs, blank_to_none, check_filters, for_echo
 
 # content-search (ADR 0046 #51): the search PAGE is step-up-gated (bulk-PHI decrypt), so register
 # it as an UNLOCK form — a stale step-up 303s to /ui/reauth and GET-redirects back to the fresh
@@ -75,22 +75,30 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # so it counts as a criterion too — keeping /ui at parity with the JSON API.
         has_criteria = bool(content) or bool(field_value) or bool(field_path)
         preset_list = await _presets(engine, identity, request)
+        # What ARRIVED, for the rules to judge -- see routes/core.py: checking the for_echo'd
+        # copy below would hand them a value with its control characters already stripped.
+        arrived: dict[str, object] = {
+            "channel_id": channel_id,
+            "status": status_filter,
+            "message_type": message_type,
+            "control_id": control_id,
+        }
         shared = dict(  # noqa: C408
-            content=content or "",
-            field_path=field_path or "",
-            field_value=field_value or "",
+            content=for_echo(content),
+            field_path=for_echo(field_path),
+            field_value=for_echo(field_value),
             target=target,
-            channel_id=channel_id or "",
-            status=status_filter or "",
-            message_type=message_type or "",
-            control_id=control_id or "",
+            channel_id=for_echo(channel_id),
+            status=for_echo(status_filter),
+            message_type=for_echo(message_type),
+            control_id=for_echo(control_id),
         )
         # BACKLOG #1740: the four metadata filters, against the rules GET /messages/search declares.
         # Checked HERE rather than in the GET route so both arms are covered by one call; on the POST
         # arm SearchPresetCriteria has already applied the same four rules, so this never fires
         # there. A direct handler call runs no request validation, which is why the GET arm had no
         # rule at all.
-        refusal = check_filters(UI_BODY_FILTER_RULES["/ui/messages/search"], shared)
+        refusal = check_filters(UI_BODY_FILTER_RULES["/ui/messages/search"], arrived)
         if refusal is not None:
             # BACKLOG #1025, as on the bare-form branch below: this arm returns before
             # core.search_messages, which charges the per-actor read budget in its own body.
@@ -117,10 +125,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 field_path=field_path,
                 field_value=field_value,
                 target=target,
-                channel_id=channel_id,
-                status=status_filter,
-                message_type=message_type,
-                control_id=control_id,
+                # blank_to_none, as on ui_messages: a submitted-but-empty box otherwise
+                # becomes a literal match on "" and the search returns nothing.
+                channel_id=blank_to_none(channel_id),
+                status=blank_to_none(status_filter),
+                message_type=blank_to_none(message_type),
+                control_id=blank_to_none(control_id),
                 limit=limit,
                 scan_limit=deps.default_scan_limit,
             )
@@ -219,13 +229,18 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 control_id=form.get("control_id") or None,
                 limit=50,  # the form carries no page-size control; same default the GET declares
             )
-        except ValueError:  # pydantic: a criterion is longer than its bound
+        except ValueError:  # pydantic: a criterion breaks its length bound OR its alphabet rule
             enforce_phi_read_pacing(request, identity)  # this arm never reaches the paced handler
             preset_list = await _presets(engine, identity, request)
             return HTMLResponse(
                 pages.message_search(
                     None,
-                    error="a search criterion is longer than that field allows",
+                    # Not "longer than that field allows": SearchPresetCriteria carries the
+                    # api/validation.py ALPHABET rules too, so a connection name with a space lands
+                    # here and that sentence named a bound nothing had exceeded (BACKLOG #1740).
+                    # Still no echo of what was posted -- content and field_value are PHI-shaped and
+                    # this page deliberately does not put them back (BACKLOG #1184).
+                    error="a search criterion is not a value that field accepts",
                     presets=preset_list,
                 ),
                 status_code=400,

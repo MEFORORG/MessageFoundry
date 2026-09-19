@@ -2,7 +2,7 @@ GET /ui/account	m	query	-	-
 GET /ui/account/sessions	m	query	-	-
 GET /ui/cluster	m	query	-	-
 GET /ui/connection/{name}	name	path	-	-
-GET /ui/connections/purge-confirm	dest	query	connection	422
+GET /ui/connections/purge-confirm	dest	query	-	-
 GET /ui/connections/purge-confirm	scope	query	-	-
 GET /ui/dead-letters	channel_id	query	connection	422
 GET /ui/dead-letters	destination_name	query	connection	422
@@ -40,7 +40,7 @@ GET /ui/uploaded-logs/file/{file_id}/resend-confirm	to	query	-	-
 GET /ui/users/{user_id}	user_id	path	-	-
 POST /ui/account/sessions/{session_id}/revoke	session_id	path	-	-
 POST /ui/account/webauthn/{credential_id_hash}/delete	credential_id_hash	path	-	-
-POST /ui/connections/{name}/flag	name	path	-	-
+POST /ui/connections/{name}/flag	name	path	connection	422
 POST /ui/connections/{name}/purge/{scope}	name	path	connection	422
 POST /ui/connections/{name}/purge/{scope}	scope	path	-	-
 POST /ui/connections/{name}/restart	name	path	connection	422

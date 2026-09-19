@@ -116,6 +116,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # OUTCOME ROW rather than a raise, because this is a capture-and-continue batch and one
             # bad selection must not abort the rest. After the dedupe, so a selection repeated N
             # times is still one row whether it is valid or not.
+            # The rule's own sentence is discarded here on purpose -- see _NOT_A_CONNECTION_NAME.
             if refuse(CONNECTION_RULE, name) is not None:
                 outcomes.append((None, _NOT_A_CONNECTION_NAME))
                 continue
@@ -136,7 +137,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
 
     @app.post("/ui/connections/{name}/flag")
     async def ui_set_connection_flag(
-        name: str,
+        # Annotated like the other per-name routes (BACKLOG #1740). This one is the reason not to
+        # leave it for later: it is the only one of the five that WRITES, reaching the
+        # comment-preserving connections.toml writer through core.set_connection_flag.
+        name: ConnectionName,
         request: Request,
         engine: Any = Depends(deps.get_engine),
         identity: Identity = Depends(require_ui(Permission.CONFIG_DEPLOY)),
@@ -172,10 +176,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         request: Request,
         engine: Any = Depends(deps.get_engine),
         identity: Identity = Depends(require_ui_step_up(Permission.MESSAGES_PURGE)),
-        # Annotated, so FastAPI 422s before the handler runs (BACKLOG #1740). Every entry arrives
-        # from a checkbox this console rendered out of a live outbound name, so a refusal means a
-        # hand-built URL and there is no form to hand it back to.
-        dest: list[ConnectionName] | None = Query(None),
+        # NOT annotated, unlike every other name on this surface, and the reason is an audit
+        # row. FastAPI validates a query parameter before the handler body, so a 422 here would
+        # return BEFORE the channel-scope branch below that calls core.audit_channel_denied --
+        # measured: a channel-scoped operator sending a malformed dest got 422 and zero audit rows,
+        # where a well-formed one gets 403 and a row naming them and their host (ADR 0150). Nothing
+        # is lost by leaving it unannotated: the eligibility loop below intersects dest with
+        # rr.outbound_quiesced(d), which admits only live outbound names -- a strictly narrower set
+        # than the name rule (BACKLOG #1740).
+        dest: list[str] | None = Query(None),
         scope: str = Query("all", max_length=8),
     ) -> HTMLResponse:
         # Step-up-unlock confirm page for the bulk purge. A channel-scoped user can't purge a
@@ -241,6 +250,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             seen_dest.add(value)
             # BACKLOG #1740, same shape as ui_bulk_control above. It also stops an unvetted body
             # value reaching the result table, which the raw append below used to put there.
+            # The rule's own sentence is discarded here too -- see _NOT_A_CONNECTION_NAME.
             if refuse(CONNECTION_RULE, value) is not None:
                 outcomes.append((None, _NOT_A_CONNECTION_NAME))
                 continue

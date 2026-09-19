@@ -173,6 +173,39 @@ def check_filters(rules: Mapping[str, FilterRule], values: Mapping[str, object])
     return None
 
 
+def for_echo(value: str | None) -> str:
+    """``value`` with C0, DEL and C1 control characters dropped, for rendering back into a form.
+
+    A refusal page echoes what the operator typed so they can correct it -- including a value that
+    was refused for carrying a control character, which would otherwise put that exact byte into the
+    response body. ``api/validation.py`` draws the printable rule because a NUL, CR or LF forges a
+    record in anything reading a line at a time; re-emitting one on the refusal page would hand it
+    straight back out. Markup escaping does not cover this: it escapes ``< > & " '`` and passes C0
+    through untouched.
+
+    Applied on every render arm rather than only the refusal, so no arm can be the one that forgets.
+    A value that passed its rule has no control characters, so this is a no-op there.
+    """
+    return "".join(c for c in (value or "") if not ("\x00" <= c <= "\x1f" or "\x7f" <= c <= "\x9f"))
+
+
+def blank_to_none(value: str | None) -> str | None:
+    """``None`` for a blank value, so an empty filter box is NO filter rather than a match on ``""``.
+
+    A browser submits every box in a GET filter form, empty ones included, so ``?channel_id=`` is
+    how a form arrives rather than an edge case. The store's filter builder appends a bind for any
+    value that is not ``None``, so an empty string becomes a literal equality test against ``""``:
+    the message log answers 200 with zero rows, and the operator reads an empty result as an empty
+    store. On ``/ui/events`` it is worse -- the handler's channel guard runs against ``""``, so a
+    channel-scoped operator gets a 403 and a false ``auth.channel_denied`` audit row naming them,
+    every time they use the filter form.
+
+    This is what :func:`check_filters` already assumes when it treats a blank as "no filter", and
+    what the JSON twin's ``Query(None)`` default means.
+    """
+    return value or None
+
+
 async def _form_pairs(request: Request) -> list[tuple[str, str]]:
     # stdlib urlencoded-form parsing (no python-multipart dep), like /ui/login. Pair order is
     # preserved so repeated fields (checkboxes, map rows) can be collected positionally.

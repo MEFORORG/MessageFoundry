@@ -329,32 +329,43 @@ async def test_ui_input_rule_table_matches_golden(engine: Engine) -> None:
 
 
 async def test_the_input_rule_drift_check_can_return_the_other_answer(engine: Engine) -> None:
-    """The control. A comparison that still passes against a doctored golden is measuring nothing.
+    """The control. A comparison that still passes against a doctored table is measuring nothing.
 
-    Doctors the RULE column specifically, because that is the column this table exists for: a row
-    losing its rule must be visible, and a checker that only noticed missing ROWS would pass a
-    parameter silently downgraded to no rule at all.
+    Doctors the LIVE rows rather than the golden, and runs the SAME equality the real test runs.
+    Doctoring the golden instead would pass for the wrong reason the day the table has genuinely
+    drifted -- the two would differ either way, and the control could not tell which.
+
+    Two assertions, because one is not enough. The first pins that the replacement actually changed
+    something: if every ``connection|422`` row ever disappears, the substitution becomes a no-op and
+    a single inequality assertion degenerates into re-testing the assertion above.
     """
     transport = await _serve_ui_app(engine)
     actual = _input_rule_rows(transport.app)
-    doctored = [
-        row.replace("\tconnection\t422", "\t-\t-") for row in _read_golden("ui_input_rules.txt")
-    ]
-    assert doctored != actual, "doctoring the rule column must be visible to the comparison"
+    doctored = [row.replace("\tconnection\t422", "\t-\t-") for row in actual]
+    assert doctored != actual, "the doctored table must differ, or this control measures nothing"
+    assert doctored != _read_golden("ui_input_rules.txt"), (
+        "a row whose rule column was blanked must fail the comparison the real test makes"
+    )
 
 
-async def test_every_declared_body_rule_names_a_mounted_route(engine: Engine) -> None:
-    """A route may only declare body-checked filters on a path that is actually mounted.
+async def test_every_declared_body_rule_names_a_live_route_and_parameter(engine: Engine) -> None:
+    """A body-checked declaration must name a mounted path AND a parameter that route really has.
 
-    The typo guard the golden cannot give: a misspelled path in ``UI_BODY_FILTER_RULES`` silently
-    means that route checks nothing, and the table would then report it as carrying no rule -- true,
-    and not the drift anyone was looking for.
+    The typo guard the golden cannot give, in both halves. A misspelled PATH means the route checks
+    nothing at all. A misspelled FIELD is quieter still: ``check_filters`` reads the echo dict with
+    ``.get(field, "")``, so a key that is not there looks blank, blank means "no filter", and that
+    rule is simply off. In both cases the table would report the parameter as carrying no rule --
+    true, and not the drift anyone was looking for, so a regenerated golden would absorb it.
     """
     transport = await _serve_ui_app(engine)
-    mounted = {
-        r.path
-        for r in transport.app.router.routes  # type: ignore[attr-defined]
-        if isinstance(r, APIRoute)
-    }
-    unmounted = sorted(set(ui_common.UI_BODY_FILTER_RULES) - mounted)
-    assert not unmounted, f"these paths declare filter rules and are not mounted: {unmounted}"
+    aliases: dict[str, set[str]] = {}
+    for route in transport.app.router.routes:  # type: ignore[attr-defined]
+        if isinstance(route, APIRoute):
+            aliases.setdefault(route.path, set()).update(
+                (f.alias or f.name)
+                for f in (*route.dependant.path_params, *route.dependant.query_params)
+            )
+    for path, rules in ui_common.UI_BODY_FILTER_RULES.items():
+        assert path in aliases, f"{path} declares filter rules and is not a mounted route"
+        unknown = sorted(set(rules) - aliases[path])
+        assert not unknown, f"{path} declares rules for parameters it does not have: {unknown}"
