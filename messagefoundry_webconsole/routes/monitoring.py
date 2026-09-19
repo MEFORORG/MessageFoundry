@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from typing import Any, TypedDict
+from typing import Any
 
 from fastapi import Depends, FastAPI, Query, Request
 from fastapi.responses import HTMLResponse
@@ -16,18 +16,7 @@ from .. import pages
 from .._auth import (
     require_ui,
 )
-from ._common import ACTIVE_ALERTS_LIMIT, UI_BODY_FILTER_RULES, FilterRefused, check_filters
-
-
-class _EventFilters(TypedDict):
-    """The event-log filter values echoed back into the form, keyed as ``pages.events`` names them.
-
-    A TypedDict rather than a plain dict so mypy still matches each key to its named parameter
-    through the ``**`` -- the same reason ``routes.core._MsgFilters`` is one.
-    """
-
-    connection: str
-    kind: str
+from ._common import ACTIVE_ALERTS_LIMIT, UI_BODY_FILTER_RULES, check_filters
 
 
 def register(app: FastAPI, deps: UiDeps) -> None:
@@ -68,13 +57,17 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     ) -> HTMLResponse:
         # L6b (#75 parity): expose the JSON handler's event-kind filter (a single kind from
         # the fixed dropdown → a one-element kinds list; blank/unknown = no filter).
-        echo = _EventFilters(connection=connection or "", kind=kind or "")
-        try:
-            check_filters(UI_BODY_FILTER_RULES["/ui/events"], echo)
-        except FilterRefused as exc:
+        conn, evt_kind = connection or "", kind or ""
+        # BACKLOG #1740: both filters, against the rules GET /events declares for the same two items.
+        refusal = check_filters(
+            UI_BODY_FILTER_RULES["/ui/events"], {"connection": conn, "kind": evt_kind}
+        )
+        if refusal is not None:
             # No rows: the filter was never applied, and a table under a refusal banner would read
             # as the result of the filter the operator typed.
-            return HTMLResponse(pages.events([], error=exc.message, **echo), status_code=400)
+            return HTMLResponse(
+                pages.events([], connection=conn, kind=evt_kind, error=refusal), status_code=400
+            )
         kinds = [kind] if kind else None
         rows = await core.list_connection_events(
             engine=engine,
@@ -85,7 +78,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             limit=100,
             request=request,
         )
-        return HTMLResponse(pages.events(rows, **echo))
+        return HTMLResponse(pages.events(rows, connection=conn, kind=evt_kind))
 
     async def _flow_data(request: Request, engine: Any, identity: Identity) -> tuple[Any, Any]:
         """Fetch the two read-only monitoring:read sources for the Flow & trends page (BACKLOG #76):

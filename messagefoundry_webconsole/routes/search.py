@@ -23,7 +23,7 @@ from .._auth import (
     require_ui,
     require_ui_step_up,
 )
-from ._common import UI_BODY_FILTER_RULES, FilterRefused, _form_pairs, check_filters
+from ._common import UI_BODY_FILTER_RULES, _form_pairs, check_filters
 
 # content-search (ADR 0046 #51): the search PAGE is step-up-gated (bulk-PHI decrypt), so register
 # it as an UNLOCK form — a stale step-up 303s to /ui/reauth and GET-redirects back to the fresh
@@ -85,19 +85,18 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             message_type=message_type or "",
             control_id=control_id or "",
         )
-        try:
-            # BACKLOG #1740: the four metadata filters, against the rules GET /messages/search
-            # declares. Checked HERE rather than in the GET route so both arms are covered by one
-            # call; on the POST arm SearchPresetCriteria has already applied the same four rules, so
-            # this never fires there. A direct handler call runs no request validation, which is why
-            # the GET arm had no rule at all.
-            check_filters(UI_BODY_FILTER_RULES["/ui/messages/search"], shared)
-        except FilterRefused as exc:
+        # BACKLOG #1740: the four metadata filters, against the rules GET /messages/search declares.
+        # Checked HERE rather than in the GET route so both arms are covered by one call; on the POST
+        # arm SearchPresetCriteria has already applied the same four rules, so this never fires
+        # there. A direct handler call runs no request validation, which is why the GET arm had no
+        # rule at all.
+        refusal = check_filters(UI_BODY_FILTER_RULES["/ui/messages/search"], shared)
+        if refusal is not None:
             # BACKLOG #1025, as on the bare-form branch below: this arm returns before
             # core.search_messages, which charges the per-actor read budget in its own body.
             enforce_phi_read_pacing(request, identity)
             return HTMLResponse(
-                pages.message_search(None, error=exc.message, presets=preset_list, **shared),
+                pages.message_search(None, error=refusal, presets=preset_list, **shared),
                 status_code=400,
             )
         if not has_criteria:

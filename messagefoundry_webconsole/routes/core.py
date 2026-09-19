@@ -53,7 +53,7 @@ from .._auth import (
 )
 from .._html import CSP_PROBE_SRC
 from .._service import _service
-from ._common import UI_BODY_FILTER_RULES, FilterRefused, check_filters
+from ._common import UI_BODY_FILTER_RULES, check_filters
 
 _log = logging.getLogger(__name__)
 
@@ -493,18 +493,17 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             received_from=received_from or "",
             received_to=received_to or "",
         )
-        try:
-            # BACKLOG #1740: the four metadata filters, against the SAME rules GET /messages
-            # declares. A direct handler call runs no request validation, so without this the
-            # console searched on a value the JSON route refuses.
-            check_filters(UI_BODY_FILTER_RULES["/ui/messages"], typed)
-            epoch_from, epoch_to = _epoch(received_from), _epoch(received_to)
-        except FilterRefused as exc:
-            return HTMLResponse(pages.messages(None, error=exc.message, **typed), status_code=400)
-        except ValueError:  # fromisoformat, or pydantic on an out-of-window instant
-            return HTMLResponse(
-                pages.messages(None, error=_BAD_BOUND_MESSAGE, **typed), status_code=400
-            )
+        # BACKLOG #1740: the four metadata filters, against the SAME rules GET /messages declares.
+        # A direct handler call runs no request validation, so without this the console searched on
+        # a value the JSON route refuses.
+        refusal = check_filters(UI_BODY_FILTER_RULES["/ui/messages"], typed)
+        if refusal is None:
+            try:
+                epoch_from, epoch_to = _epoch(received_from), _epoch(received_to)
+            except ValueError:  # fromisoformat, or pydantic on an out-of-window instant
+                refusal = _BAD_BOUND_MESSAGE
+        if refusal is not None:
+            return HTMLResponse(pages.messages(None, error=refusal, **typed), status_code=400)
 
         if defer:
             # Form-only landing: pre-filled, NOT run until the operator submits (#4b).

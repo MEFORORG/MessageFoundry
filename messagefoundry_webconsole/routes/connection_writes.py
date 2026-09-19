@@ -10,7 +10,6 @@ from urllib.parse import parse_qsl
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
-from pydantic import TypeAdapter, ValidationError
 
 from messagefoundry.api._ui_seam import UiDeps
 from messagefoundry.api.models import (
@@ -28,20 +27,24 @@ from .._auth import (
     require_ui,
     require_ui_step_up,
 )
+from ._common import CONNECTION_RULE, refuse
 
 _log = logging.getLogger(__name__)
 
-#: The connection-name rule, as a standalone validator rather than a parameter annotation. The two
-#: bulk routes below read their names out of the POST BODY with ``parse_qsl``, so there is no FastAPI
-#: parameter to annotate and no automatic 422 to inherit (BACKLOG #1740).
-_CONNECTION_NAME: TypeAdapter[str] = TypeAdapter(ConnectionName)
-
 #: What a bulk outcome row says for a selection that is not a name this console could have rendered.
+#:
+#: The two bulk routes below read their names out of the POST BODY with ``parse_qsl``, so there is no
+#: FastAPI parameter to annotate and no automatic 422 to inherit. They call ``_common.refuse`` with
+#: the SAME ``CONNECTION_RULE`` the form routes and the golden table use, rather than minting a
+#: second adapter for one rule (BACKLOG #1740).
 #:
 #: Paired with a ``None`` target, so the row renders the fixed 'unrecognized selection' label, for
 #: the reason ``pages.decode_row_key`` already gives: a value that failed the rule did not come from
 #: the page, and reflecting it back would put unvetted input on the result table. The RESULT column
 #: still says which of the two refusals it was, so this is distinguishable from a malformed row key.
+#:
+#: The rule's own operator-facing sentence is not reused here: it explains a FORM field to someone
+#: correcting it, and a bulk result table has no field to correct.
 #:
 #: What it costs, since it is a real cost: a connection registered under a name the API rule rejects
 #: is refused here without being named. The JSON control routes already refuse that name too, so it
@@ -109,15 +112,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             if (role, name) in seen:
                 continue
             seen.add((role, name))
-            try:
-                # BACKLOG #1740: the rule /connections/{name}/start declares for the same value. It
-                # has to be applied by hand here -- the name comes out of the POST body, so there is
-                # no parameter for FastAPI to refuse. An OUTCOME ROW rather than a raise: this is a
-                # capture-and-continue batch, and one bad selection must not abort the rest. After
-                # the dedupe, so a selection repeated N times is still one row whether it is valid
-                # or not.
-                _CONNECTION_NAME.validate_python(name)
-            except ValidationError:
+            # BACKLOG #1740: the rule /connections/{name}/start declares for the same value. An
+            # OUTCOME ROW rather than a raise, because this is a capture-and-continue batch and one
+            # bad selection must not abort the rest. After the dedupe, so a selection repeated N
+            # times is still one row whether it is valid or not.
+            if refuse(CONNECTION_RULE, name) is not None:
                 outcomes.append((None, _NOT_A_CONNECTION_NAME))
                 continue
             try:
@@ -240,14 +239,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             if value in seen_dest:
                 continue
             seen_dest.add(value)
-            try:
-                # BACKLOG #1740: the rule /connections/{name}/purge declares for the same value,
-                # applied by hand because the name rides the POST body. An outcome row, not a raise:
-                # this is a capture-and-continue batch, so one forged dest must not abort a purge the
-                # operator stepped up for. It also stops an unvetted body value being echoed onto the
-                # result table, which the raw append below used to do.
-                _CONNECTION_NAME.validate_python(value)
-            except ValidationError:
+            # BACKLOG #1740, same shape as ui_bulk_control above. It also stops an unvetted body
+            # value reaching the result table, which the raw append below used to put there.
+            if refuse(CONNECTION_RULE, value) is not None:
                 outcomes.append((None, _NOT_A_CONNECTION_NAME))
                 continue
             try:

@@ -23,11 +23,15 @@ registered AFTER its ``{param}`` sibling would be shadowed — an authz regressi
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Annotated, Any
 
 import httpx
+from fastapi.routing import APIRoute
+from pydantic import TypeAdapter
 from starlette.routing import Mount
 
 import messagefoundry_webconsole._auth as ui_auth
+import messagefoundry_webconsole.routes._common as ui_common
 from messagefoundry.api import create_app
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
@@ -195,3 +199,162 @@ async def test_literal_routes_precede_path_param_siblings(engine: Engine) -> Non
             f"{literal!r} must register before {param!r} or the path-param route shadows it "
             "(route-order authz regression)"
         )
+
+
+# --- the third golden: which input rule each /ui parameter carries (BACKLOG #1740) ----------------
+#
+# A different thing from the two above. ``ui_routes.txt`` pins WHICH routes are mounted and
+# ``ui_write_actions.txt`` pins the step-up continuation registry; this pins, for every string path
+# and query parameter on those routes, the ``api/validation.py`` rule it enforces and how a refusal
+# is shaped. It lives HERE rather than beside its behavioural tests so all three tables come from
+# ONE mount (``_serve_ui_app``) and one route walk: a separate module would have believed in a route
+# population nothing ever compared against this one's.
+
+
+def _string_schema(schema: dict[str, Any]) -> dict[str, Any] | None:
+    """The string branch of a parameter's JSON schema, or ``None`` if it has none.
+
+    A /ui parameter is rarely a bare string: ``X | None`` renders as ``anyOf`` and a repeated query
+    value as ``array``. Digging to the string branch lets one comparison cover all three, and
+    returning ``None`` for an int or a bool is how ``limit``/``offset``/``defer`` stay out of the
+    table -- they are not data items these rules govern, and excluding them also keeps this golden
+    from churning on unrelated pager work.
+    """
+    if schema.get("type") == "string":
+        return schema
+    if schema.get("type") == "array":
+        items = schema.get("items")
+        return _string_schema(items) if isinstance(items, dict) else None
+    for branch in schema.get("anyOf", []):
+        if isinstance(branch, dict) and (found := _string_schema(branch)) is not None:
+            return found
+    return None
+
+
+def _constraint(schema: dict[str, Any]) -> tuple[str | None, int | None]:
+    """A string schema reduced to the pair that identifies a rule: its pattern and its ceiling."""
+    max_length = schema.get("maxLength")
+    return (schema.get("pattern"), max_length if isinstance(max_length, int) else None)
+
+
+def _rule_names_by_constraint() -> dict[tuple[str | None, int | None], str]:
+    """Every rule ``routes/_common`` defines, indexed by the constraint it actually enforces.
+
+    Names are JOINED where two rules share a constraint rather than one winning: ``status`` and
+    ``event kind`` are distinct rules over one annotated type today, so an annotated parameter
+    carrying that constraint honestly reads ``event kind|status``. Picking a winner would put an
+    arbitrary tie-break inside a table whose whole job is to be checkable.
+    """
+    index: dict[tuple[str | None, int | None], list[str]] = {}
+    for rule in ui_common.FILTER_RULES:
+        schema = _string_schema(rule.adapter.json_schema())
+        assert schema is not None, f"{rule.name} does not resolve to a string schema"
+        index.setdefault(_constraint(schema), []).append(rule.name)
+    return {key: "|".join(sorted(names)) for key, names in index.items()}
+
+
+def _string_annotation(field: Any) -> dict[str, Any] | None:
+    """The string schema of one FastAPI parameter, or ``None`` if it is not a string parameter.
+
+    Rebuilds the parameter's effective type first: FastAPI splits an ``Annotated`` alias into an
+    annotation plus metadata, and a ``Query(max_length=...)`` contributes metadata with no
+    annotation of its own. Only the pair carries the real constraint.
+    """
+    info = field.field_info
+    annotation = Annotated[(info.annotation, *info.metadata)] if info.metadata else info.annotation
+    return _string_schema(TypeAdapter(annotation).json_schema())
+
+
+def _input_rule_rows(app: object) -> list[str]:
+    """The live table: ``METHOD path<TAB>param<TAB>where<TAB>rule<TAB>refusal``.
+
+    ``rule`` is ``-`` where the parameter carries no rule ``routes/_common`` defines, which is the
+    honest reading and not a hidden gap: several /ui path ids are BACKLOG #1740's second limb and
+    several query values are not control-plane data items at all. Those rows are IN the golden on
+    purpose, so closing one is a visible diff rather than an invisible improvement.
+
+    One row per METHOD, matching ``_mounted_ui_routes`` above, so the two tables believe in the same
+    route population. A list, not a set: a duplicate registration must fail rather than merge away.
+    """
+    by_constraint = _rule_names_by_constraint()
+    rows: list[str] = []
+    for route in app.router.routes:  # type: ignore[attr-defined]
+        if not isinstance(route, APIRoute) or not route.path.startswith("/ui"):
+            continue
+        body_rules = ui_common.UI_BODY_FILTER_RULES.get(route.path, {})
+        for where, fields in (
+            ("path", route.dependant.path_params),
+            ("query", route.dependant.query_params),
+        ):
+            for field in fields:
+                schema = _string_annotation(field)
+                if schema is None:
+                    continue
+                # The ALIAS, not the python name: ``status_filter`` rides the wire as ``status``,
+                # which is the key both the filter form and UI_BODY_FILTER_RULES use.
+                name = field.alias or field.name
+                if declared := by_constraint.get(_constraint(schema)):
+                    rule, refusal = declared, "422"
+                elif (body_rule := body_rules.get(name)) is not None:
+                    rule, refusal = body_rule.name, "400-rerender"
+                else:
+                    rule, refusal = "-", "-"
+                rows += [
+                    f"{method} {route.path}\t{name}\t{where}\t{rule}\t{refusal}"
+                    for method in route.methods
+                ]
+    return sorted(rows)
+
+
+async def test_ui_input_rule_table_matches_golden(engine: Engine) -> None:
+    """The pinned table. A /ui parameter that loses its rule, gains a different one, or arrives with
+    none at all diverges here -- including a NEW route, which lands as an unexpected ``-`` row.
+
+    WHAT IT DOES NOT SEE, so nobody reads it as more than it is. The ``400-rerender`` column is read
+    from ``UI_BODY_FILTER_RULES``, not from the route body, so deleting a route's ``check_filters``
+    call leaves both that dict row and this golden intact and green. The behavioural tests in
+    ``test_ui_input_rules.py`` are what catch that, and neither guard is sufficient alone. The table
+    is also built from FastAPI's parameter list, so a route that reads its values out of the request
+    BODY contributes no rows at all -- ``ui_bulk_control`` and ``ui_purge_bulk`` are absent from it.
+    """
+    transport = await _serve_ui_app(engine)
+    actual = _input_rule_rows(transport.app)
+    golden = _read_golden("ui_input_rules.txt")
+    assert actual == golden, (
+        "the /ui input-rule table drifted from tests/golden/ui_input_rules.txt -- if intentional, "
+        "regenerate the golden; if not, a parameter lost or changed the rule it carries.\n"
+        f"missing (in golden, not live): {sorted(set(golden) - set(actual))}\n"
+        f"unexpected (live, not golden): {sorted(set(actual) - set(golden))}"
+    )
+
+
+async def test_the_input_rule_drift_check_can_return_the_other_answer(engine: Engine) -> None:
+    """The control. A comparison that still passes against a doctored golden is measuring nothing.
+
+    Doctors the RULE column specifically, because that is the column this table exists for: a row
+    losing its rule must be visible, and a checker that only noticed missing ROWS would pass a
+    parameter silently downgraded to no rule at all.
+    """
+    transport = await _serve_ui_app(engine)
+    actual = _input_rule_rows(transport.app)
+    doctored = [
+        row.replace("\tconnection\t422", "\t-\t-") for row in _read_golden("ui_input_rules.txt")
+    ]
+    assert doctored != actual, "doctoring the rule column must be visible to the comparison"
+
+
+async def test_every_declared_body_rule_names_a_mounted_route(engine: Engine) -> None:
+    """A route may only declare body-checked filters on a path that is actually mounted.
+
+    The typo guard the golden cannot give: a misspelled path in ``UI_BODY_FILTER_RULES`` silently
+    means that route checks nothing, and the table would then report it as carrying no rule -- true,
+    and not the drift anyone was looking for.
+    """
+    transport = await _serve_ui_app(engine)
+    mounted = {
+        r.path
+        for r in transport.app.router.routes  # type: ignore[attr-defined]
+        if isinstance(r, APIRoute)
+    }
+    unmounted = sorted(set(ui_common.UI_BODY_FILTER_RULES) - mounted)
+    assert not unmounted, f"these paths declare filter rules and are not mounted: {unmounted}"

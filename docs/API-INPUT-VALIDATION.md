@@ -108,13 +108,23 @@ keeps a size bound and no alphabet rule: an HL7 v2 body is separated by carriage
 web console is mounted inside the engine and calls the handler callables directly rather than over
 HTTP. A direct call runs no request validation at all. Where the console builds an engine request
 model, these rules apply because the model carries them. Where it hands a handler plain values, the
-console has to apply the rule itself or there is no rule on that path.
+console applies the rule itself, route by route.
+
+That is a choice, not a law, and the alternative was considered. Each handler the console calls *is*
+a route function, and its signature already carries these rules, so a wrapper at the seam could read
+each signature and validate the console's arguments before every call — closing every handler at
+once, including the ones no one has worked through yet. Two costs decided against it for now. The
+wrapper has to skip the parameters that are not data (`engine`, `request`, `identity`), and whatever
+rule does the skipping will one day skip a real parameter without saying so — the same silent-skip
+failure the seam already documents for permission checks. And it cannot produce the 400 re-render
+below, because it never sees the form. Revisit it when the remaining console parameters are closed.
 
 **The console applies these rules on its message, dead-letter, event and connection-control routes.**
 It reuses the annotated types this module defines rather than restating their patterns, so narrowing
-a rule here narrows both surfaces at once. Which parameter carries which rule is pinned as a table in
-`packaging/messagefoundry-webconsole/tests/golden/ui_input_rules.txt`, generated from the live routes,
-and behavioural tests in `test_ui_input_rules.py` check that each route still refuses.
+a rule's pattern here narrows both surfaces at once. Which parameter carries which rule is pinned as
+a table in `packaging/messagefoundry-webconsole/tests/golden/ui_input_rules.txt`, generated from the
+live routes, and behavioural tests in `test_ui_input_rules.py` check that each route still refuses.
+The table cannot see the second thing and the tests cannot see the first, so both are needed.
 
 A refusal takes one of two shapes, and which one depends on who produced the value:
 

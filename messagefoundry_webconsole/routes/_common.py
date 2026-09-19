@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
-from typing import Final
+from typing import Final, NamedTuple
 from urllib.parse import parse_qsl
 
 from fastapi import HTTPException, Request, status
@@ -36,7 +36,7 @@ _log = logging.getLogger(__name__)
 ACTIVE_ALERTS_LIMIT = 200
 
 
-# --- The rules the console's own filter forms enforce (BACKLOG #1740) -----------------------------
+# --- The rules the console applies to its own input (BACKLOG #1740) -------------------------------
 #
 # The console mounts inside the engine and calls the JSON handlers BY REFERENCE, so a handler's own
 # ``Query(...)`` declaration never runs for a /ui caller. Every rule ``api/validation.py`` defines
@@ -44,62 +44,83 @@ ACTIVE_ALERTS_LIMIT = 200
 # ``/ui/messages`` declared a plain ``str`` with a length bound, so a value the JSON route refuses
 # reached the store query through the console.
 #
-# Each rule below reuses the twin's ANNOTATED TYPE rather than restating its pattern. That is what
-# stops the two surfaces drifting: narrowing ``ConnectionName`` narrows both at once.
+# Each rule reuses the twin's ANNOTATED TYPE rather than restating its pattern, so narrowing
+# ``ConnectionName``'s PATTERN narrows both surfaces at once. The length bounds the /ui routes keep
+# in their ``Query(...)`` declarations are NOT part of that: they stay in front of the rule
+# deliberately, because a refused value is echoed back into the form and an unbounded one would make
+# the refusal page as large as the request.
 
-#: Each filter rule: the annotated type the JSON twin declares for the same data item, and the
-#: sentence the console shows when it refuses a value.
-#:
-#: ``status`` and ``event kind`` resolve to the same annotated type today. They are two entries
-#: anyway, because the twin declares them as two named rules and narrowing one later must not
-#: silently narrow the other.
-#:
-#: The sentence describes the ALPHABET and never quotes the value. Pydantic's own message quotes the
-#: offending input, and these are PHI-shaped pages; the value goes back only into the escaped form
-#: field the operator typed it into, so they can correct it.
-_FILTER_RULES: Final[dict[str, tuple[TypeAdapter[str], str]]] = {
-    "connection": (
-        TypeAdapter(ConnectionName),
-        "a connection name is a letter, then letters, digits, underscore or hyphen",
-    ),
-    "status": (
-        TypeAdapter(StatusFilter),
-        "a status is one word of letters and underscores",
-    ),
-    "event kind": (
-        TypeAdapter(EventKindFilter),
-        "an event kind is one word of letters and underscores",
-    ),
-    "message type": (
-        TypeAdapter(MessageTypeFilter),
-        "a message type is printable text with no control characters",
-    ),
-    "control id": (
-        TypeAdapter(ControlIdFilter),
-        "a control id is printable text with no control characters",
-    ),
-}
 
-#: Which /ui routes check which filters in their own handler body, and against which rule above.
+class FilterRule(NamedTuple):
+    """One input rule: what it is called, what enforces it, and what the console says on a refusal.
+
+    ``refusal`` describes the ALPHABET and never quotes the value. Pydantic's own message quotes the
+    offending input, and these are PHI-shaped pages; the value goes back only into the escaped form
+    field the operator typed it into, so they can correct it.
+    """
+
+    name: str
+    adapter: TypeAdapter[str]
+    refusal: str
+
+
+#: ``status`` and ``event kind`` are two rules over one annotated type today. They stay two, because
+#: the JSON twin declares them as two named rules and narrowing one later must not silently narrow
+#: the other.
+CONNECTION_RULE = FilterRule(
+    "connection",
+    TypeAdapter(ConnectionName),
+    "a connection name is a letter, then letters, digits, underscore or hyphen",
+)
+STATUS_RULE = FilterRule(
+    "status", TypeAdapter(StatusFilter), "a status is one word of letters and underscores"
+)
+EVENT_KIND_RULE = FilterRule(
+    "event kind",
+    TypeAdapter(EventKindFilter),
+    "an event kind is one word of letters and underscores",
+)
+MESSAGE_TYPE_RULE = FilterRule(
+    "message type",
+    TypeAdapter(MessageTypeFilter),
+    "a message type is printable text with no control characters",
+)
+CONTROL_ID_RULE = FilterRule(
+    "control id",
+    TypeAdapter(ControlIdFilter),
+    "a control id is printable text with no control characters",
+)
+
+#: Every rule the console defines. The golden input-rule table resolves an ANNOTATED parameter's own
+#: constraint against these, so a parameter and a body check report in the same vocabulary.
+FILTER_RULES: Final[tuple[FilterRule, ...]] = (
+    CONNECTION_RULE,
+    STATUS_RULE,
+    EVENT_KIND_RULE,
+    MESSAGE_TYPE_RULE,
+    CONTROL_ID_RULE,
+)
+
+#: Which /ui routes check which filters in their own handler body, and against which rule.
 #:
-#: Here rather than beside each route because it is the console's answer to a question asked ACROSS
-#: routes -- "which operator-typed filter carries which rule" -- and because the golden input-rule
-#: table reads this same mapping. A table built from a second, test-side transcription would agree
-#: with a route that had stopped applying a rule.
+#: Here rather than beside each route because it answers a question asked ACROSS routes -- which
+#: operator-typed filter carries which rule -- and because the golden input-rule table reads this
+#: same mapping. A table built from a second, test-side transcription would agree with a route that
+#: had stopped applying a rule.
 #:
 #: These routes are body-checked rather than annotated because each has a filter FORM. An annotation
 #: makes FastAPI answer a bare 422 and discard the submission; these answer 400 and re-render the
 #: form carrying what the operator typed. The /ui routes whose values the console itself mints --
 #: ``/ui/dead-letters``, the per-name controls, the purge pages -- are annotated instead, and so are
 #: absent here.
-UI_BODY_FILTER_RULES: Final[dict[str, dict[str, str]]] = {
+UI_BODY_FILTER_RULES: Final[dict[str, dict[str, FilterRule]]] = {
     # Keyed as ``pages.messages`` / ``pages.message_search`` / ``pages.events`` key their echo
     # keywords, so the dict a route checks IS the dict it renders back.
     "/ui/messages": {
-        "channel_id": "connection",
-        "status": "status",
-        "message_type": "message type",
-        "control_id": "control id",
+        "channel_id": CONNECTION_RULE,
+        "status": STATUS_RULE,
+        "message_type": MESSAGE_TYPE_RULE,
+        "control_id": CONTROL_ID_RULE,
     },
     # The same four items ``GET /messages/search`` declares, and the same four
     # ``SearchPresetCriteria`` already enforces on the console's POST search arm.
@@ -108,53 +129,48 @@ UI_BODY_FILTER_RULES: Final[dict[str, dict[str, str]]] = {
     # ``store.content_search.make_spec`` already applies, and ``api/validation.py`` declares no
     # second copy of it. ``target`` is a closed literal the route signature already pins.
     "/ui/messages/search": {
-        "channel_id": "connection",
-        "status": "status",
-        "message_type": "message type",
-        "control_id": "control id",
+        "channel_id": CONNECTION_RULE,
+        "status": STATUS_RULE,
+        "message_type": MESSAGE_TYPE_RULE,
+        "control_id": CONTROL_ID_RULE,
     },
-    "/ui/events": {"connection": "connection", "kind": "event kind"},
+    "/ui/events": {"connection": CONNECTION_RULE, "kind": EVENT_KIND_RULE},
 }
 
 
-class FilterRefused(Exception):
-    """A /ui filter value the JSON twin would refuse, carrying the operator-facing sentence.
+def refuse(rule: FilterRule, value: object) -> str | None:
+    """``rule.refusal`` if ``rule`` would refuse ``value``, else ``None``.
 
-    Deliberately NOT a ``ValueError``. ``ui_messages`` already catches ``ValueError`` for a
-    different refusal with a different message (a malformed received-date bound, BACKLOG #1744), and
-    a subclass would put the ORDER of two ``except`` clauses in charge of which sentence an operator
-    reads -- a thing no test would fail on and no reviewer would see.
+    The per-VALUE entry point, used directly by the bulk POST routes: they read names out of the
+    request body, so there is no FastAPI parameter to annotate, and they are capture-and-continue
+    batches that need a verdict per item rather than a short-circuit.
+
+    ``value`` is ``object`` rather than ``str`` so the field-wise caller below can hand over an echo
+    dict's value without a cast. Nothing is skipped for being the wrong type: a non-string is handed
+    to the rule and refused by it, the same as a bad string.
     """
+    try:
+        rule.adapter.validate_python(value)
+    except ValidationError:
+        return rule.refusal
+    return None
 
-    def __init__(self, message: str) -> None:
-        super().__init__(message)
-        self.message = message
 
+def check_filters(rules: Mapping[str, FilterRule], values: Mapping[str, object]) -> str | None:
+    """The refusal for the first value in ``values`` its rule would refuse, or ``None`` if all pass.
 
-def check_filters(rules: Mapping[str, str], values: Mapping[str, object]) -> None:
-    """Raise :class:`FilterRefused` for the first value in ``values`` its rule would refuse.
-
-    ``rules`` is one route's row out of :data:`UI_BODY_FILTER_RULES`, mapping a form field name to a
-    key of :data:`_FILTER_RULES`; ``values`` is that route's already-built echo dict, so the operator
-    keeps what they typed on the refusal render. A blank or absent value is "no filter" and passes,
-    which is what the twin's ``Query(None)`` default means too.
-
-    ``values`` is typed ``Mapping[str, object]`` because every caller passes a ``TypedDict``, which
-    mypy will not narrow to ``Mapping[str, str]``. Nothing is skipped for being the wrong type: a
-    non-string value is handed to the rule and refused by it, the same as a bad string.
+    ``rules`` is one route's row out of :data:`UI_BODY_FILTER_RULES`; ``values`` is that route's
+    already-built echo dict, so the operator keeps what they typed on the refusal render. A blank or
+    absent value is "no filter" and passes, which is what the twin's ``Query(None)`` default means.
 
     First refusal rather than a collected list: the pages carry a single banner, and a form with two
     bad fields costs one round trip to correct either way.
     """
     for field, rule in rules.items():
         value = values.get(field, "")
-        if not value:
-            continue
-        adapter, sentence = _FILTER_RULES[rule]
-        try:
-            adapter.validate_python(value)
-        except ValidationError as exc:
-            raise FilterRefused(sentence) from exc
+        if value and (refusal := refuse(rule, value)) is not None:
+            return refusal
+    return None
 
 
 async def _form_pairs(request: Request) -> list[tuple[str, str]]:
