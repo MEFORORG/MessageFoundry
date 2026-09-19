@@ -119,6 +119,7 @@ __all__ = [
     "PortConflictError",
     "API_LISTENER_LABEL",
     "inbound_binding_conflicts",
+    "resolved_encoding_problems",
     "resolve_listener_binding",
     "bindings_overlap",
     "Diagnostic",
@@ -3715,10 +3716,19 @@ def _is_text_codec(value: str) -> bool:
     ``hex``, ``rot13``, ``zlib``), which ``codecs.lookup`` accepts and the transports do not. The
     mirror-image probe ``b"".decode(value)`` is no probe at all — CPython short-circuits an empty
     decode without consulting the codec, so it returns cleanly for *every* string including
-    ``"not-a-real-codec"``."""
+    ``"not-a-real-codec"``.
+
+    ``UnicodeError`` is caught beside ``LookupError`` because the two failures are NOT interchangeable
+    and only one of them is a lookup: ``"undefined"`` is a real registered codec whose whole purpose is
+    to refuse every conversion, so ``codecs.lookup`` finds it and ``"".encode`` raises ``UnicodeError``
+    (a ``ValueError``, not a ``LookupError``). Measured: catching only ``LookupError`` let that escape
+    this function uncaught, out of ``load_config`` and — once the resolved pass existed — out of
+    ``build_check_registry`` as a bare ``UnicodeError`` rather than the ``WiringError`` every caller
+    funnels into a red check line or a 422. Unusable for the same reason a missing codec is unusable,
+    so it gets the same verdict rather than a different exception."""
     try:
         "".encode(value)
-    except LookupError:
+    except (LookupError, UnicodeError):
         return False
     return True
 
@@ -3761,9 +3771,30 @@ def resolved_encoding_problems(registry: Registry, *, env_values: Mapping[str, A
     ADR 0111, counted by :meth:`Registry.encoding_census` rather than hidden.
 
     An ``env()`` ref this cannot resolve — a missing key, or a value its ``cast`` rejects — is skipped
-    rather than reported: :func:`resolve_env_settings` raises on it loudly moments later when the
-    connector is built, and a second message here would only make the first read as the failure.
-    :func:`_resolve_port` skips an unresolved port for the same reason."""
+    rather than reported: for a connection, a database lookup and a FHIR lookup,
+    :func:`resolve_env_settings` raises on it loudly moments later when the connector is built, and a
+    second message here would only make the first read as the failure. :func:`_resolve_port` skips an
+    unresolved port for the same reason.
+
+    **That justification does NOT extend to a reference set, and the difference is not this pass's to
+    fix.** ``_build_check_connectors`` env-resolves ``inbound``, ``outbound``, ``lookups`` and
+    ``fhir_lookups`` only; ``references`` is resolved by ``pipeline.reference_sync`` on a serving
+    engine, so a reference source whose ``encoding`` key has no value anywhere is skipped here and
+    reported by nothing until sync. A reference set whose key DOES have a value is probed here like any
+    other, so this is the missing-value gap and not an encoding gap — widening it belongs with the
+    reference table's build-check resolution, unfiled and named rather than numbered.
+
+    **A clean pass here does NOT mean an ``env()``-supplied INBOUND encoding decodes.** Measured
+    2026-09-18: both listener decode sites read ``ic.spec.settings["encoding"]`` RAW, and
+    ``_source_config``'s :func:`resolve_env_settings` writes its result into a copy that is never read
+    back — so the value reaching ``bytes.decode`` is the ``EnvRef`` object itself (``TypeError``), and
+    ``ingress_guards.ingress_encoding`` stringifies the same ref into ``"EnvRef(key=...)"`` and fails
+    the preview with that as the codec name. The outbound half is fine: ``_dest_config`` resolves, so
+    an outbound ``env()`` encoding works and this pass guards it properly. Recorded here because a
+    validation pass that reads as certifying a config the runtime cannot execute is the
+    false-premise shape the repo's SDS-3.7 forbids: this pass rejects a bad codec NAME, and says
+    nothing about whether the inbound path can use a good one. Resolving the listener's encoding is a
+    separate change to the ingress hot path — unfiled, and named rather than numbered."""
     problems: list[str] = []
     for kind, name, value, deployed in registry._declared_encodings():
         if not isinstance(value, EnvRef):
@@ -3773,12 +3804,35 @@ def resolved_encoding_problems(registry: Registry, *, env_values: Mapping[str, A
         resolved = _resolve_one_env_value(value, env_values)
         if resolved is _UNSET:
             continue  # no value here — reported loud by resolve_env_settings at connector build
+        if resolved is None or resolved == "":
+            # `env("charset", default=None)` is a DECLARED opt-out, not a bad codec name: an explicit
+            # None means "not declared" and falls back to utf-8, which `ingress_guards.ingress_encoding`
+            # states as its own rule (`str(declared) if declared else "utf-8"`). Refusing it here would
+            # hard-fail `check`, every reload and every unrelated `connection upsert` on a config that
+            # runs correctly — a per-environment override that this environment declines to set. Empty
+            # string falls the same way, being the same falsy "unset" spelling out of a TOML value.
+            continue
         if isinstance(resolved, str) and _is_text_codec(resolved):
             continue
+        # NEVER render ``resolved``. It is a MEFOR_VALUE_* environment value and this string is raised
+        # as a WiringError into the operator log, the support bundle, GET /logs/tail and a 422 body —
+        # the exact carriage BACKLOG #1183 had to strip a value out of once already. The key is
+        # operator-authored, so `encoding=env('store_password')` is one copy-paste away and printed the
+        # password verbatim (measured). `_cast_bool` says why withholding AT THE SOURCE, rather than
+        # trusting the handler that renders it, is what makes that invariant hold.
+        # The TYPE is safe to name and is the other half of the diagnostic: `charset = 8859` in a value
+        # file types as an int, and "not a text codec" alone sends the operator hunting a misspelling
+        # that is not there. Spelled "type X" because an article would have to agree with a name this
+        # does not control — "a int" is how "a {name}" reads when it does not.
+        withheld = (
+            "value withheld"
+            if isinstance(resolved, str)
+            else f"type {type(resolved).__name__}, value withheld"
+        )
         problems.append(
-            f"{kind} {name!r}: encoding from environment value {value.key!r} is {resolved!r}, which "
-            f"is not a Python text codec — every message would fail at decode/encode; set it to a "
-            f"codec name such as 'utf-8', 'latin-1' or 'cp1252' in this environment's values "
+            f"{kind} {name!r}: encoding from environment value {value.key!r} is not a Python text "
+            f"codec ({withheld}) — every message would fail at decode/encode; set it to a codec "
+            f"name such as 'utf-8', 'latin-1' or 'cp1252' in this environment's values "
             f"(environments/<env>.toml or MEFOR_VALUE_*)"
         )
     return problems
@@ -3991,7 +4045,10 @@ class Registry:
           :func:`resolved_encoding_problems` probes it inside ``build_check_registry``, which has the
           environment values. The word is *deferred* and not *checked* because that pass can be
           absent: ``messagefoundry check`` SKIPs its ``build-check`` line on a bare config dir with no
-          ``messagefoundry.toml``, and that line says so itself.
+          ``messagefoundry.toml``, and that line says so itself. *Deferred* is therefore a promise
+          about WHERE the value is probed, never that a value exists to probe — a ref with no value at
+          all is counted here and reported by the missing-value path instead, whose one gap
+          :func:`resolved_encoding_problems` names.
         * ``unchecked`` — nothing probes it on any path. The population this bucket exists for is an
           :func:`env` ref on a ``deployed=False`` connection, whose values ADR 0111 forbids resolving.
           A value that is neither a literal string nor an ``env()`` ref falls here too — unreachable
