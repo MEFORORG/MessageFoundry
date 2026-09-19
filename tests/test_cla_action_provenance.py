@@ -17,10 +17,18 @@ WHAT THIS MODULE ASSERTS, in the order that matters:
 4. the limitation sentence is present, verbatim.
 
 WHY THE NEGATIVE CONTROLS ARE NOT OPTIONAL. A green check is evidence only once somebody has proved
-it can go red. Three tests below mutate a COPY of the tree in `tmp_path` -- one byte of the bundle,
-one character of the record, the vendoring header -- and assert the checker reports each. Without
-them a checker that silently read the wrong path would pass forever while measuring nothing, which
-is the failure this repository has already paid for more than once.
+it can go red. The tests below mutate a COPY of the tree in `tmp_path` -- at least a byte of the
+bundle, a character of the record, the vendoring header, the lockfile, and a recorded file removed
+outright -- and assert the checker reports each. Without them a checker that silently read the wrong
+path would pass forever while measuring nothing, which is the failure this repository has already
+paid for more than once.
+
+THE CONTROLS ARE WHAT FOUND THE ONE REAL HOLE IN THIS GATE, and they found it by being EXTENDED
+rather than by being present. The first cut mutated only the bundle, and `--write` refused as
+designed. The same shape over the LOCKFILE returned exit 0 and regenerated a clean record carrying
+the injected package -- the artifact an auditor is told to scan, laundered by the tool whose refusal
+message says it will not launder anything. Covering three of four recorded files left the one
+exploitable path uncovered, so a control table is read for what it OMITS.
 
 WHAT NONE OF IT PROVES. A clean audit of the vendored lockfile proves the DECLARED dependencies of
 the pinned upstream commit are clean. It does not prove the bundle was built from them: that needs
@@ -34,9 +42,11 @@ import functools
 import hashlib
 import importlib.util
 import json
+import re
 import shutil
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import pytest
 
@@ -75,16 +85,46 @@ def _inject(tree: Path) -> None:
     bundle.write_bytes(bundle.read_bytes() + b"\n// injected\n")
 
 
+def _inject_lockfile(tree: Path) -> None:
+    """Add a package to the copied lockfile -- the tamper that once regenerated clean.
+
+    Shaped like the real attack rather than like a corruption: the file still parses, still looks
+    like npm wrote it, and the only visible effect is one more component in the inventory.
+    """
+    path = tree / provenance.LOCK_PATH
+    lock = json.loads(path.read_text(encoding="utf-8"))
+    lock["packages"]["node_modules/evil-pkg"] = {
+        "version": "9.9.9",
+        "resolved": "https://registry.npmjs.org/evil-pkg/-/evil-pkg-9.9.9.tgz",
+        "license": "MIT",
+    }
+    path.write_text(json.dumps(lock, indent=2) + "\n", encoding="utf-8", newline="\n")
+
+
 @functools.cache
-def _record() -> dict:
+def _record() -> dict[str, Any]:
     """The committed record, parsed once. No test mutates it; the copies live under ``tmp_path``."""
-    return json.loads((REPO_ROOT / provenance.RECORD_PATH).read_text(encoding="utf-8"))
+    record: dict[str, Any] = json.loads(
+        (REPO_ROOT / provenance.RECORD_PATH).read_text(encoding="utf-8")
+    )
+    return record
 
 
 def _property(section: str, name: str) -> str:
-    """One property value from the record's ``metadata`` or its primary ``component``."""
-    holder = _record()["metadata"] if section == "metadata" else _record()["metadata"]["component"]
-    for entry in holder["properties"]:
+    """One property value from the record's ``metadata`` or its primary ``component``.
+
+    An unknown *section* raises rather than defaulting to ``component``. With a two-branch
+    conditional here, ``_property("metdata", ...)`` searched the component's properties, failed to
+    find the key, and reported "the record carries no 'metdata' property" -- naming a section it
+    had never looked in and sending the reader to the wrong half of the document.
+    """
+    holders = {
+        "metadata": _record()["metadata"],
+        "component": _record()["metadata"]["component"],
+    }
+    if section not in holders:
+        raise AssertionError(f"unknown record section {section!r}; expected metadata or component")
+    for entry in holders[section]["properties"]:
         if entry["name"] == name:
             return str(entry["value"])
     raise AssertionError(f"the record carries no {section} property {name!r}")
@@ -105,6 +145,21 @@ def test_the_vendored_bundle_still_derives_from_the_pinned_upstream_commit() -> 
     assert hashlib.sha256(body).hexdigest() == provenance.UPSTREAM_BUNDLE_SHA256
     assert _property("component", "messagefoundry:upstream:bundle-sha256") == (
         provenance.UPSTREAM_BUNDLE_SHA256
+    )
+
+
+def test_the_vendored_lockfile_is_the_upstream_blob() -> None:
+    """The recorded lock blob id is RE-DERIVED from the file on disk, not merely asserted.
+
+    The bundle's upstream digest was reproducible from the start and the lockfile's was not, and
+    that asymmetry is what let a tampered lockfile regenerate a clean record. `git hash-object`
+    agrees with this computation, so an auditor can confirm it with a tool they already trust.
+    """
+    lock = (REPO_ROOT / provenance.LOCK_PATH).read_bytes().replace(b"\r\n", b"\n")
+
+    assert provenance.git_blob_id(lock) == provenance.UPSTREAM_LOCK_BLOB_ID
+    assert _property("component", "messagefoundry:upstream:lock-blob-id") == (
+        provenance.UPSTREAM_LOCK_BLOB_ID
     )
 
 
@@ -154,9 +209,65 @@ def test_the_pinned_commit_is_named_consistently(relative: str) -> None:
 
     The whole file is searched, not its head: `cla.yml` names the commit beside the `uses:` line
     that consumes the action, which sits about 180 lines in.
+
+    SEARCHED AS BYTES. One of these paths is the 1.18 MB minified bundle, and decoding it to `str`
+    with `errors="replace"` to find a 40-character ASCII commit id spent a megabyte of mangling per
+    run for nothing. The id is ASCII, so the byte search answers the same question.
     """
-    text = (REPO_ROOT / relative).read_text(encoding="utf-8", errors="replace")
-    assert provenance.UPSTREAM_COMMIT in text, f"{relative} does not name the pinned commit"
+    blob = (REPO_ROOT / relative).read_bytes()
+    assert provenance.UPSTREAM_COMMIT.encode("ascii") in blob, (
+        f"{relative} does not name the pinned commit"
+    )
+
+
+#: The prose that restates the record's numbers. Two documents, so a reader who finds one of them
+#: is not reading a figure the record has since moved past.
+_PROSE_DOCS = (
+    REPO_ROOT / provenance.ACTION_DIR / "README.md",
+    REPO_ROOT / "docs" / "SUPPLY-CHAIN.md",
+)
+
+
+def _derived_facts() -> dict[str, str]:
+    """Every number the prose restates, DERIVED from the record rather than typed out here.
+
+    Hardcoding them in this test would make it a third copy of the same facts, which is the defect
+    it exists to catch.
+    """
+    components = _record()["components"]
+    runtime = sum(1 for component in components if component["scope"] == "required")
+    return {
+        "package count": str(len(components)),
+        "runtime package count": str(runtime),
+        "excluded package count": str(len(components) - runtime),
+        "vendoring header length": str(len(provenance.VENDORING_HEADER)),
+        "upstream bundle digest": provenance.UPSTREAM_BUNDLE_SHA256,
+    }
+
+
+@pytest.mark.parametrize("label", sorted(_derived_facts()))
+def test_the_prose_states_the_number_the_record_holds(label: str) -> None:
+    """The counts and digests repeated in prose still match the generated record.
+
+    CLAUDE.md section 11 (SDS-3.5) says state a load-bearing fact once and link to it. These are
+    restated anyway, because a reader of the README should not have to open a 95 KB CycloneDX
+    document to learn how many packages are in the closure. The cost of that choice is drift, and
+    this test is what pays it: re-pin the lockfile and every figure below moves, so a document left
+    behind reds here instead of quietly contradicting the artifact it describes.
+    """
+    expected = _derived_facts()[label]
+    # WORD-BOUNDED, because a bare substring search here false-passes. The pinned commit is
+    # `ca4a40a7d1004f18d9960b404b97e5f30a505a08` and it contains the digits `404`, so had the
+    # package count ever moved 403 -> 404 a containment check would have found the "new" number
+    # inside a hex SHA and reported the prose up to date. Measured while building this test.
+    pattern = re.compile(rf"\b{re.escape(expected)}\b")
+    stating = [doc.name for doc in _PROSE_DOCS if pattern.search(doc.read_text(encoding="utf-8"))]
+
+    assert stating, (
+        f"no prose document states the record's {label} ({expected}). Either the record moved and "
+        f"{[doc.name for doc in _PROSE_DOCS]} still carry the old figure, or the sentence naming it "
+        "was dropped -- read the record before editing either."
+    )
 
 
 def test_the_record_is_the_purl_of_the_pinned_commit() -> None:
@@ -240,3 +351,41 @@ def test_write_refuses_to_launder_a_changed_bundle(tree: Path) -> None:
 
     assert provenance.main(["--write", "--root", str(tree)]) == 2
     assert (tree / provenance.RECORD_PATH).read_bytes() == before
+
+
+def test_the_gate_sees_a_tampered_lockfile(tree: Path) -> None:
+    """An added package reds the check, and the message names the lockfile rather than the bundle."""
+    _inject_lockfile(tree)
+
+    problems = provenance.check(tree)
+    assert any("not the upstream blob it is recorded as" in p for p in problems), problems
+
+
+def test_write_refuses_to_launder_a_tampered_lockfile(tree: Path) -> None:
+    """THE CONTROL FOR THE HOLE THIS REVIEW FOUND. ``--write`` must refuse the lockfile too.
+
+    Before the lockfile derivation existed this returned 0, printed "wrote ...", and produced a
+    record whose `components` listed the injected package and whose `--check` was clean. The
+    bundle-only refusal made the tool look like it covered the artifact auditors actually scan.
+    """
+    _inject_lockfile(tree)
+    before = (tree / provenance.RECORD_PATH).read_bytes()
+
+    assert provenance.main(["--write", "--root", str(tree)]) == 2
+    assert (tree / provenance.RECORD_PATH).read_bytes() == before, (
+        "the record was rewritten over a tampered lockfile -- the laundering path is open again"
+    )
+
+
+@pytest.mark.parametrize("relative", sorted(provenance.RECORDED_FILES))
+def test_the_gate_sees_a_removed_recorded_file(tree: Path, relative: str) -> None:
+    """Deleting any recorded file is REPORTED, not raised.
+
+    Every recorded path was opened unguarded, so removing one -- the LICENSE that makes the
+    Apache-2.0 vendoring lawful, say -- surfaced as a FileNotFoundError traceback instead of as the
+    finding it is. A gate that crashes on the change it exists to name has told the reader nothing.
+    """
+    (tree / relative).unlink()
+
+    problems = provenance.check(tree)
+    assert any(relative in p and "is not in the tree" in p for p in problems), problems

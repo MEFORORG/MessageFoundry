@@ -35,14 +35,19 @@ messagefoundry/auth/data/common_passwords.txt text eol=lf
 .github/actions/**/dist/** -text
 
 # The vendored CLA action's provenance record and the upstream lockfile it inventories (BACKLOG
-# #1578). Both hold pure LF, and `scripts/security/build_cla_action_provenance.py` records a SHA-256
-# of each; under `core.autocrlf=true` an unpinned checkout would convert them and the recorded
-# digests would describe no file on disk. `eol=lf` rather than the `-text` above, and the difference
-# is the same one the shipped-set stanza below records: `-text` FREEZES current bytes and lets a
-# later Windows editor save commit CRLF permanently, while `eol=lf` NORMALIZES on the way in, which
-# is what keeps a recorded digest true across future writes. The generator additionally digests
-# these two over CRLF-normalized bytes, so a checkout made before this pin still verifies instead of
-# failing with a hex mismatch that names nothing.
+# #1578). Both hold pure LF, and under `core.autocrlf=true` an unpinned checkout would convert them.
+# `eol=lf` rather than the `-text` above, and the difference is the same one the shipped-set stanza
+# below records: `-text` FREEZES current bytes and lets a later Windows editor save commit CRLF
+# permanently, while `eol=lf` NORMALIZES on the way in.
+#
+# THE TWO FILES ARE PROTECTED BY DIFFERENT MECHANISMS, and an earlier version of this comment said
+# one covered both. Only the lockfile is a RECORDED file: the generator digests it over
+# CRLF-normalized bytes and re-derives its git blob id the same way, so a checkout made before this
+# pin still verifies instead of failing with a hex mismatch that names nothing. The record itself is
+# NOT digested -- it IS the record, so nothing could hold its own digest -- and its CRLF tolerance
+# comes from `check()` reading it with universal-newline translation. The pin is belt and braces for
+# both; it is load-bearing for neither, and nobody should read it as the thing keeping the record
+# honest.
 .github/actions/cla-assistant-lite/provenance.cdx.json text=auto eol=lf
 .github/actions/cla-assistant-lite/upstream-package-lock.json text=auto eol=lf
 

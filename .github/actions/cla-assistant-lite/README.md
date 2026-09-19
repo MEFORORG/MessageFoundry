@@ -36,8 +36,10 @@ osv-scanner --lockfile package-lock.json:.github/actions/cla-assistant-lite/upst
 trivy sbom .github/actions/cla-assistant-lite/provenance.cdx.json
 ```
 
+**The two commands do not cover the same set, so run the first one.** `osv-scanner` reads the lockfile and reports on all 403 packages. `trivy sbom` reads the CycloneDX record, where the 242 packages npm marked `dev` carry CycloneDX `scope: excluded` and are skipped. For a compiled ncc/webpack artifact the dev toolchain is exactly what produced the bundle, so the lockfile scan is the wider lane and the SBOM scan is the convenient one.
+
 The lockfile is named `upstream-package-lock.json` rather than `package-lock.json` on purpose. GitHub's dependency graph ingests a file with the stock name anywhere in the repository, and the 2021-era tree it describes carries advisories nobody here can remediate: moving a pin means rebuilding the bundle, which needs the absent toolchain. So the record is **audit-only** — a tool an auditor points at it reads it, and a tool that scans for manifests does not. `.github/dependabot.yml` carries no npm entry for this directory for the same reason.
 
 ### Where the bundle runs
 
-CI only. `.github/workflows/cla.yml` runs it on `pull_request_target`, `merge_group` and `issue_comment` — a privileged context holding a repository token. `.github/` sits outside `[tool.hatch.build.targets.sdist].only-include`, so the bundle is not packaged into the wheel or sdist and no engine deployment carries it.
+CI only. `.github/workflows/cla.yml` runs it on `pull_request_target`, and on an `issue_comment` whose body is exactly `recheck` or the sign-off sentence — a privileged context holding a repository token. The workflow is also triggered by `merge_group`, but the step's own `if:` skips the bundle there rather than running it, so the trigger list of the workflow is wider than the list of events the bundle actually executes on. `.github/` sits outside `[tool.hatch.build.targets.sdist].only-include`, so the bundle is not packaged into the wheel or sdist and no engine deployment carries it.

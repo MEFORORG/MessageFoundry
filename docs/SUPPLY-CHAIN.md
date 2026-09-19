@@ -105,7 +105,9 @@ is **CycloneDX** (native VEX support); an SPDX rendering can be produced on requ
 `contributor-assistant/github-action`, vendored on 2026-08-29 because GitHub archived the upstream
 repository and no maintained fork exists. It is **not a released artifact**: `.github/` is outside
 the sdist's `only-include`, so no wheel, sdist or engine deployment carries it. It runs in CI, on
-`pull_request_target`, `merge_group` and `issue_comment`.
+`pull_request_target` and on an `issue_comment` whose body is exactly `recheck` or the sign-off
+sentence. `cla.yml` is also triggered by `merge_group`, where the step's `if:` skips the bundle
+rather than running it.
 
 Every audit lane above is ecosystem-scoped — `pip-audit` reads Python locks, `npm-audit` reads
 `ide/package-lock.json` — so none of them could see a bundle sitting in `.github/`. Its provenance
@@ -117,8 +119,10 @@ is recorded instead, in the same format the release SBOMs use (BACKLOG #1578):
 | [`upstream-package-lock.json`](../.github/actions/cla-assistant-lite/upstream-package-lock.json) | that lockfile, verbatim from the pinned commit |
 
 `scripts/security/build_cla_action_provenance.py --check` verifies the record describes the tree,
-and `tests/test_cla_action_provenance.py` runs it on every pull request, so the bundle cannot move
-without the record moving with it.
+and `tests/test_cla_action_provenance.py` is the gate. It sits in the repo-harness tier
+(`tests/tooling_manifest.txt`), which runs on every pull request that touches `.github/` or
+`scripts/` — that is, on every change that can alter its answer, since nothing under
+`messagefoundry/` can. So the bundle cannot move without the record moving with it.
 
 Two things are worth stating precisely, because a supply-chain record that implies more than it
 proves is worse than none:
@@ -126,7 +130,8 @@ proves is worse than none:
 1. **What is proven.** The vendored bundle is the upstream blob at the pinned commit with a
    176-byte two-line header prepended, and nothing else changed. An auditor strips the first two
    lines, takes the SHA-256, and compares it with the upstream digest in the record — no network,
-   no Node.
+   no Node. The lockfile is derived the same way: `git hash-object` on it reproduces the blob id
+   the record names, so neither vendored artifact rests on a number somebody merely wrote down.
 2. **What is not.** A clean audit of the lockfile proves the *declared* dependencies of that
    upstream commit are clean. It does **not** prove the bundle was built from them. Reproducing an
    ncc/webpack build needs a Node toolchain this repository does not carry, so nobody can check

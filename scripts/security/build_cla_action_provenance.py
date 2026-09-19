@@ -18,14 +18,24 @@ its own text (:data:`LIMITATION`) and :mod:`tests.test_cla_action_provenance` fa
 goes missing, because a provenance record that quietly implies more than it proves is worse than
 none -- it is a compensating control resting on a false premise.
 
-WHAT IS ACTUALLY PROVEN, and it is more than the ledger checksum was. The vendored bundle is the
-upstream blob at commit ``ca4a40a7`` with a 176-byte two-line header prepended, verified byte for
-byte. So an auditor with no network can recompute the upstream digest from the file on disk:
+WHAT IS ACTUALLY PROVEN, and it is more than the ledger checksum was. BOTH vendored upstream
+artifacts are derived offline rather than asserted, so an auditor with no network recomputes them
+from the files on disk:
 
     sha256 of (dist/index.js with its first two lines removed) == UPSTREAM_BUNDLE_SHA256
+    git blob id of upstream-package-lock.json               == UPSTREAM_LOCK_BLOB_ID
 
-which is what :func:`split_vendoring_header` and the test around it check. That turns a recorded
-number into a reproducible derivation.
+The first is what :func:`split_vendoring_header` checks -- the vendored bundle is the upstream blob
+at commit ``ca4a40a7`` with a 176-byte two-line header prepended, verified byte for byte. The second
+is :func:`git_blob_id`, and ``git hash-object`` agrees with it. Both turn a recorded number into a
+reproducible derivation, and :func:`verify_derivation` runs both.
+
+COVERING ONLY THE BUNDLE WAS A HOLE WITH A WORKING EXPLOIT, recorded because the refusal below reads
+as if it always covered everything. ``--write`` refuses when :func:`verify_derivation` reports
+anything; while that function looked only at the bundle, a tampered lockfile reddened ``--check``
+and then regenerated CLEAN -- measured on a copy, an injected package came back exit 0, "wrote ...",
+a clean ``--check``, and the package in ``components``. The lockfile is the artifact the README
+tells an auditor to scan, so that was the laundering path that mattered.
 
 WHY THE LOCKFILE IS NOT NAMED ``package-lock.json``. GitHub's dependency graph ingests a file with
 that name anywhere in the repository. The 2021-era tree it describes carries advisories nobody here
@@ -95,7 +105,11 @@ UPSTREAM_BUNDLE_SHA256 = "a44111084c0d4782206c04b4276292f7fec6d1f7a33525512fbeef
 UPSTREAM_LOCK_BLOB_ID = "5700fc1014797e967a7a5395c1198643634cf204"
 
 #: When the bundle was vendored -- the author date of ``4c884575435bc72a8ae21e0740772aecba999e68``,
-#: the only commit that has ever touched :data:`ACTION_DIR`.
+#: the commit that added the bundle. NOT "the only commit that has ever touched
+#: :data:`ACTION_DIR`", which an earlier draft of this comment said: the commit adding this record
+#: touches that directory too, so the claim was false on arrival. A shallow engine checkout cannot
+#: enumerate the directory's history anyway (``git rev-parse --is-shallow-repository`` reports
+#: true), so nothing here could have checked it.
 VENDORED_DATE = "2026-08-29"
 
 #: When this record was built and its upstream digests re-verified against the archived repository.
@@ -125,10 +139,20 @@ LIMITATION = (
 #: Where the bundle runs, stated because the answer bounds every severity claim about it. It is a
 #: CI-only artifact: `.github/` is outside `[tool.hatch.build.targets.sdist].only-include`, so no
 #: wheel, sdist or engine deployment carries it.
+#:
+#: NARROWER THAN THE WORKFLOW'S TRIGGERS, and an earlier draft of this sentence read the `on:` block
+#: instead of the step and so named one event too many. `cla.yml` is triggered by merge_group, but
+#: the `CLA Assistant` step's own `if:` skips it there -- that file's header records the paired
+#: measurement (run 33796353619 on pull_request_target RAN the step; run 33797809984 on merge_group
+#: SKIPPED it, both green). A record that overstates where a privileged bundle runs inflates every
+#: severity claim read off it, which is the defect this property exists to bound.
 EXPOSURE = (
-    "CI only. The bundle executes in .github/workflows/cla.yml on pull_request_target, "
-    "merge_group and issue_comment -- a privileged context holding a repository token. It is not "
-    "packaged into the wheel or sdist and no engine deployment carries it."
+    "CI only, and narrower than the workflow's triggers. The bundle executes in "
+    ".github/workflows/cla.yml on pull_request_target, and on issue_comment when the comment body "
+    "is exactly 'recheck' or the sign-off sentence -- a privileged context holding a repository "
+    "token. The workflow is also triggered by merge_group, where the step's own `if:` skips the "
+    "bundle rather than running it. It is not packaged into the wheel or sdist and no engine "
+    "deployment carries it."
 )
 
 #: The vendored bundle, and the lockfile it is audited against. Named once because both the keys of
@@ -164,6 +188,22 @@ VENDORING_HEADER = (
 )
 
 
+def missing_recorded(root: Path) -> list[str]:
+    """Recorded files absent from *root*, as human-readable problems.
+
+    Checked BEFORE anything reads them. :func:`read_recorded` opens every path unguarded, so
+    without this a deleted ``LICENSE`` -- the file that makes the Apache-2.0 vendoring lawful --
+    came out of ``--check`` as a ``FileNotFoundError`` traceback rather than as the finding it is.
+    A gate that crashes on the change it exists to name has told the reader nothing.
+    """
+    return [
+        f"{relative} is recorded but is not in the tree. A file this record describes was removed, "
+        "so the record no longer describes the vendored action; restore it or re-vendor."
+        for relative in sorted(RECORDED_FILES)
+        if not (root / relative).is_file()
+    ]
+
+
 def read_recorded(root: Path) -> dict[str, bytes]:
     """Read every file in :data:`RECORDED_FILES` once, raw, keyed by repository-relative path.
 
@@ -187,6 +227,18 @@ def digest(data: bytes, mode: DigestMode) -> str:
     if mode == "lf":
         return hashlib.sha256(data.replace(b"\r\n", b"\n")).hexdigest()
     raise ValueError(f"unknown digest mode {mode!r}")
+
+
+def git_blob_id(data: bytes) -> str:
+    """Git's object id for *data* as a blob: SHA-1 over ``blob <length>\\0`` then the bytes.
+
+    NOT A SECURITY CONTROL, and ``usedforsecurity=False`` says so to the reader and to bandit. It
+    is git's content address, reimplemented in four lines so :data:`UPSTREAM_LOCK_BLOB_ID` can be
+    REPRODUCED from the vendored lockfile instead of merely asserted -- the same move
+    :func:`split_vendoring_header` makes for the bundle. ``git hash-object`` agrees with it, which
+    is what lets an auditor confirm the number with a tool they already trust.
+    """
+    return hashlib.sha1(b"blob %d\0" % len(data) + data, usedforsecurity=False).hexdigest()
 
 
 def digest_mode_summary() -> str:
@@ -320,6 +372,13 @@ def build_record(contents: dict[str, bytes]) -> dict[str, Any]:
             "above -- reproducible offline, no network and no Node.",
         ),
         ("messagefoundry:upstream:lock-blob-id", UPSTREAM_LOCK_BLOB_ID),
+        (
+            "messagefoundry:upstream:lock-derivation",
+            "The vendored lockfile is the upstream blob byte for byte. `git hash-object "
+            "upstream-package-lock.json` reproduces the id above -- reproducible offline, and "
+            "checked on every run, so the inventory below cannot be regenerated from a lockfile "
+            "that is not the one at the pinned commit.",
+        ),
         ("messagefoundry:upstream:lock-packages", str(len(components))),
         ("messagefoundry:upstream:lock-packages-runtime", str(runtime)),
         ("messagefoundry:recorded-files:digest-mode", digest_mode_summary()),
@@ -334,7 +393,12 @@ def build_record(contents: dict[str, bytes]) -> dict[str, Any]:
         "version": 1,
         "metadata": {
             "timestamp": RECORD_TIMESTAMP,
-            "lifecycles": [{"phase": "build"}],
+            # `post-build`, NOT `build`. A CycloneDX consumer reads the `build` phase as "this BOM
+            # was emitted by the build that produced the component", which would contradict
+            # LIMITATION in the same document: nobody here ran or can reproduce that build. This
+            # record was assembled from a finished artifact after the fact, which is what
+            # `post-build` means.
+            "lifecycles": [{"phase": "post-build"}],
             "tools": {
                 "components": [
                     {
@@ -387,32 +451,63 @@ def render(record: dict[str, Any]) -> str:
 
 
 def verify_derivation(contents: dict[str, bytes]) -> list[str]:
-    """The checks that are facts rather than formatting. Returns human-readable problems."""
+    """The checks that are facts rather than formatting. Returns human-readable problems.
+
+    BOTH VENDORED UPSTREAM ARTIFACTS ARE DERIVED HERE, and covering only the bundle was a hole with
+    a working exploit. ``--write`` refuses when this returns anything, so while the lockfile was
+    merely digested-as-found rather than derived, a tampered ``upstream-package-lock.json`` reddened
+    ``--check`` and then regenerated CLEAN: measured on a copy, an injected ``evil-pkg`` entry came
+    back exit 0, "wrote ...", a clean ``--check``, and the package sitting in ``components``. That
+    is precisely the laundering the refusal below exists to stop, through the artifact the README
+    tells an auditor to scan.
+
+    Every problem is accumulated rather than returned at the first one, so a run that changed both
+    artifacts names both. Reporting one and hiding the other is how a second change rides in behind
+    the first.
+    """
+    problems: list[str] = []
+
     try:
         body = split_vendoring_header(contents[BUNDLE_PATH])
     except ValueError as exc:
-        return [str(exc)]
-    body_sha = hashlib.sha256(body).hexdigest()
-    if body_sha != UPSTREAM_BUNDLE_SHA256:
-        return [
-            "the vendored bundle's body does not reproduce the recorded upstream digest: "
-            f"got {body_sha}, recorded {UPSTREAM_BUNDLE_SHA256}. The bundle was changed, or it is "
-            "no longer the upstream blob at " + UPSTREAM_COMMIT
-        ]
-    return []
+        problems.append(str(exc))
+    else:
+        body_sha = hashlib.sha256(body).hexdigest()
+        if body_sha != UPSTREAM_BUNDLE_SHA256:
+            problems.append(
+                "the vendored bundle's body does not reproduce the recorded upstream digest: "
+                f"got {body_sha}, recorded {UPSTREAM_BUNDLE_SHA256}. The bundle was changed, or it "
+                "is no longer the upstream blob at " + UPSTREAM_COMMIT
+            )
+
+    # Over CRLF-normalized bytes, matching this file's `lf` digest mode: git hashes the BLOB, and a
+    # checkout made before `.gitattributes` pinned this path could hold CRLF on disk.
+    lock_blob = git_blob_id(contents[LOCK_PATH].replace(b"\r\n", b"\n"))
+    if lock_blob != UPSTREAM_LOCK_BLOB_ID:
+        problems.append(
+            "the vendored lockfile is not the upstream blob it is recorded as: got git blob id "
+            f"{lock_blob}, recorded {UPSTREAM_LOCK_BLOB_ID}. The inventory in this record is "
+            "derived from that file, so it now describes a dependency closure that is not the one "
+            "at " + UPSTREAM_COMMIT
+        )
+    return problems
 
 
 def check(root: Path) -> list[str]:
     """Every reason the record on disk fails to describe the tree at *root*. Empty means clean."""
+    missing = missing_recorded(root)
+    if missing:
+        return missing
     contents = read_recorded(root)
     problems = verify_derivation(contents)
     record_path = root / RECORD_PATH
     if not record_path.exists():
         return problems + [f"{RECORD_PATH} does not exist; run --write"]
     if problems:
-        # The derivation already failed, so the record cannot be rendered (a missing header raises)
-        # or would be compared against a bundle that is not the one it describes. Either way the
-        # fixed-point answer would add nothing to the problem already found.
+        # The derivation already failed, so the record either cannot be rendered at all (a missing
+        # vendoring header raises) or would be compared against artifacts that are not the ones it
+        # describes. Either way the fixed-point answer adds nothing to the problem already found,
+        # and printing a second failure beside it would bury the one that names the cause.
         return problems
     # read_text applies universal-newline translation, so a CRLF checkout of the record compares
     # equal to the LF form render() produces without normalizing here.
@@ -437,8 +532,9 @@ def main(argv: list[str] | None = None) -> int:
 
     root: Path = args.root
     if args.write:
-        contents = read_recorded(root)
-        problems = verify_derivation(contents)
+        problems = missing_recorded(root)
+        contents = {} if problems else read_recorded(root)
+        problems = problems or verify_derivation(contents)
         if problems:
             for problem in problems:
                 print(f"REFUSED: {problem}", file=sys.stderr)

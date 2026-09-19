@@ -7,7 +7,7 @@
     "timestamp": "2026-09-18T00:00:00Z",
     "lifecycles": [
       {
-        "phase": "build"
+        "phase": "post-build"
       }
     ],
     "tools": {
@@ -79,6 +79,10 @@
           "value": "5700fc1014797e967a7a5395c1198643634cf204"
         },
         {
+          "name": "messagefoundry:upstream:lock-derivation",
+          "value": "The vendored lockfile is the upstream blob byte for byte. `git hash-object upstream-package-lock.json` reproduces the id above -- reproducible offline, and checked on every run, so the inventory below cannot be regenerated from a lockfile that is not the one at the pinned commit."
+        },
+        {
           "name": "messagefoundry:upstream:lock-packages",
           "value": "403"
         },
@@ -115,7 +119,7 @@
       },
       {
         "name": "messagefoundry:provenance:exposure",
-        "value": "CI only. The bundle executes in .github/workflows/cla.yml on pull_request_target, merge_group and issue_comment -- a privileged context holding a repository token. It is not packaged into the wheel or sdist and no engine deployment carries it."
+        "value": "CI only, and narrower than the workflow's triggers. The bundle executes in .github/workflows/cla.yml on pull_request_target, and on issue_comment when the comment body is exactly 'recheck' or the sign-off sentence -- a privileged context holding a repository token. The workflow is also triggered by merge_group, where the step's own `if:` skips the bundle rather than running it. It is not packaged into the wheel or sdist and no engine deployment carries it."
       },
       {
         "name": "messagefoundry:provenance:reason",
