@@ -959,6 +959,55 @@ def test_allow_empty_config_lets_the_same_dir_pass(tmp_path: Path) -> None:
     assert report.ok is True
 
 
+def test_allow_empty_config_does_not_blind_the_graph_advisories(tmp_path: Path) -> None:
+    """The opt-out must not silently disable the legs that READ the router/handler graph.
+
+    ``send-target`` and ``dead-config`` judge Routers and Handlers, which exist whether or not a
+    connection is declared. Their docstrings delegate a load failure to ``validate`` -- and under
+    ``--allow-empty-config`` ``validate`` is precisely the leg that no longer reports it, so a leg
+    that skipped here would be covered by nothing. The fixture's ``Send('nowhere')`` is a real
+    dangling literal target and ``send-target`` is the one leg that catches it.
+
+    Falsified by dropping ``allow_empty=True`` from either leg's ``load_config``: both come back
+    ``skipped=True, detail='config did not load'`` -- about a config that loaded."""
+    report = run_checks(_helper_only_config(tmp_path), run_lint=False, allow_empty_config=True)
+    by_name = {r.name: r for r in report.results}
+
+    send_target = by_name["send-target"]
+    assert send_target.detail != "config did not load"
+    assert send_target.ok is False and "nowhere" in send_target.detail
+    assert by_name["dead-config"].detail != "config did not load"
+    # Both are advisory, so the gate still passes -- the point is that they RAN.
+    assert send_target.required is False and report.ok is True
+
+
+def test_allow_empty_config_does_not_silently_skip_a_required_leg(tmp_path: Path) -> None:
+    """``--allow-empty-config`` must not turn a REQUIRED check into a skip.
+
+    ``build-check`` and ``reference-backend`` are required, and their skip arms delegate the
+    reporting to ``validate`` -- the one leg this flag silences. A skipped required leg does not
+    block, so without the opt-out at their own ``load_config`` the flag would disable two required
+    checks while the gate still exits 0, and print "config did not load" about a config that loaded.
+    ``reference-backend``'s subject is ``registry.references``, which a connection-less config can
+    still declare, so this is not merely a wording defect.
+
+    Falsified by dropping ``allow_empty=True`` from either leg: both come back ``skipped=True``."""
+    cfg = _helper_only_config(tmp_path)
+    # The required legs need settings present, or they skip earlier for an unrelated (legitimate)
+    # reason and this test would pass without exercising anything.
+    (cfg / "messagefoundry.toml").write_text("[store]\nbackend = 'sqlite'\n", encoding="utf-8")
+
+    report = run_checks(cfg, run_lint=False, allow_empty_config=True)
+    by_name = {r.name: r for r in report.results}
+
+    for name in ("build-check", "reference-backend"):
+        leg = by_name[name]
+        assert leg.required is True
+        assert leg.skipped is False, f"{name} skipped: {leg.detail}"
+        assert leg.ok is True, leg.detail
+    assert report.ok is True
+
+
 def test_allow_empty_config_does_not_mask_a_real_problem(tmp_path: Path) -> None:
     """The opt-out is scoped to emptiness: an unresolved router still fails the leg under it.
 

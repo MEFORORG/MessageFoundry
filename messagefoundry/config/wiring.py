@@ -3839,6 +3839,18 @@ class Registry:
         if problem is not None:
             raise WiringError(problem)
 
+    @property
+    def declares_no_connections(self) -> bool:
+        """True when this graph would receive and send nothing (BACKLOG #1648).
+
+        The predicate on its own, because it has two readers that must not drift: the load-time rule
+        in :meth:`graph_problems`, and ``Engine.reload_detail``'s POST-shard-filter check, which is
+        a genuinely different moment (the filter can empty a graph the loader already passed) and
+        raises its own message naming the directory. Widening the rule must move both, so it lives
+        in one place even though the two messages deliberately differ.
+        """
+        return not self.inbound and not self.outbound
+
     def graph_problems(self, *, allow_empty: bool = False) -> Iterator[str]:
         """Every static problem in this graph, as human-readable messages, in report order.
 
@@ -3854,7 +3866,7 @@ class Registry:
         # predicate is inbound AND outbound — deliberately the WIDER of the two shapes already in the
         # tree, matching Engine.reload_detail — so an outbound-only config (a half-built graph, or one
         # shard's slice viewed unfiltered) is still accepted here rather than newly refused.
-        if not allow_empty and not self.inbound and not self.outbound:
+        if not allow_empty and self.declares_no_connections:
             yield (
                 "config declares no connections — no inbound and no outbound connection is "
                 "declared, so this graph would receive and send nothing; declare one, or run "
@@ -5612,6 +5624,10 @@ def validate_config(directory: str | Path, *, allow_empty: bool = False) -> list
         return [Diagnostic(message=str(exc), file=str(directory))]
     registry = Registry()
     diagnostics: list[Diagnostic] = []
+    # Tracked separately from `diagnostics` on purpose — see the empty-graph note at the end of this
+    # function. Only a source that could have DECLARED a connection counts: a module or
+    # connections.toml. A bad code-set table is a diagnostic that explains nothing about emptiness.
+    declaring_source_failed = False
     # Load reference tables first (so a module-top-level code_set(...) resolves during import). A
     # bad/duplicate table is recorded as a diagnostic, not raised, so the editor sees every problem.
     codesets_dir = directory / CODESETS_DIR_NAME
@@ -5625,6 +5641,7 @@ def validate_config(directory: str | Path, *, allow_empty: bool = False) -> list
                 _exec_module(path)
             except WiringError as exc:
                 diagnostics.append(Diagnostic(message=str(exc), file=str(path)))
+                declaring_source_failed = True
     # Merge connections.toml best-effort too (ADR 0007), so the editor sees TOML problems alongside the
     # *.py ones and the router/port checks below cover TOML-authored connections. Lazy import (cycle).
     from messagefoundry.config.connections_file import (
@@ -5638,14 +5655,19 @@ def validate_config(directory: str | Path, *, allow_empty: bool = False) -> list
             load_connections_file(conn_file, registry)
         except WiringError as exc:
             diagnostics.append(Diagnostic(message=str(exc), file=str(conn_file)))
+            declaring_source_failed = True
     # The graph rules are NOT re-implemented here (BACKLOG #1656): Registry.graph_problems is the
     # one place the inbound->router, `accepts=` (ADR 0084), encoding (BACKLOG #1613), port-collision
     # (low-13) and empty-graph (BACKLOG #1648) rules — and their exact message strings — live. This
     # caller reports them all; Registry.validate raises the first.
     #
-    # `allow_empty` also absorbs a load failure above: with a module or connections.toml broken, an
-    # empty graph is a DERIVED symptom, and printing it beside its own cause sends the reader after
-    # the wrong problem. The rule still fires on a directory that loaded cleanly and declared nothing.
-    problems = registry.graph_problems(allow_empty=allow_empty or bool(diagnostics))
+    # `declaring_source_failed` also absorbs the empty-graph rule: with a module or connections.toml
+    # broken, an empty graph is a DERIVED symptom, and printing it beside its own cause sends the
+    # reader after the wrong problem. It is deliberately NOT `bool(diagnostics)` — a diagnostic that
+    # cannot explain emptiness (a bad codesets/ table) must not hide a genuinely empty graph, and
+    # keying on the list would also couple this suppressor to `Diagnostic.severity`, which is a plain
+    # str field: a future warning-severity diagnostic would suppress the rule here while
+    # `checks._check_validate` filters it out, leaving its own `load_config` to raise unhandled.
+    problems = registry.graph_problems(allow_empty=allow_empty or declaring_source_failed)
     diagnostics.extend(Diagnostic(message=m) for m in problems)
     return diagnostics

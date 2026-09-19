@@ -3456,7 +3456,10 @@ def _graph(args: argparse.Namespace) -> int:
         return resolved
     config_dir, _ = resolved
     try:
-        reg = load_config(config_dir)
+        # allow_empty: `graph` REPORTS a graph, it does not gate one (BACKLOG #1648), and its edges
+        # come from Routers and Handlers, which a connection-less config still has. Refusing here
+        # would make the reporting surface go dark on the config an operator most wants to look at.
+        reg = load_config(config_dir, allow_empty=True)
     except WiringError as exc:
         return _emit_error(str(exc), as_json=args.json)
     # Edges come from the one authoritative static extractor (ADR 0091 D1): AST-first with the
@@ -4110,7 +4113,10 @@ def _cert_inventory(args: argparse.Namespace) -> int:
         from messagefoundry.config.wiring import WiringError, load_config
 
         try:
-            reg = load_config(args.config)
+            # allow_empty: a read-only inventory (BACKLOG #1648). Refusing here would also drop the
+            # API / service-caller cert pairs resolved from settings just above, so an operator would
+            # lose unrelated expiry output because the graph happens to declare no connection.
+            reg = load_config(args.config, allow_empty=True)
         except (WiringError, FileNotFoundError, OSError) as exc:
             return _cert_fail(f"cannot load --config: {exc}", as_json=args.json)
         pairs.extend(
@@ -5498,7 +5504,11 @@ def _impact(args: argparse.Namespace) -> int:
         return _emit_error("--apply is only valid with --rename-to", as_json=args.json)
 
     try:
-        registry = load_config(args.config)
+        # allow_empty: `impact` is the CLI front door to the SAME rename/delete pre-flight
+        # `codeset_edit` runs (BACKLOG #1648), and reverse-dependency analysis over Routers,
+        # Handlers and code sets needs no connection. Exempting the pre-flight and refusing here
+        # would leave the two disagreeing about the same config.
+        registry = load_config(args.config, allow_empty=True)
     except (WiringError, FileNotFoundError, OSError) as exc:
         return _emit_error(str(exc), as_json=args.json)
 

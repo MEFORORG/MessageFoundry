@@ -1523,7 +1523,12 @@ class Engine:
             match["flagged"] = flagged
 
             def validate(check_dir: Path) -> None:
-                registry = load_config(check_dir)
+                # allow_empty: an edit-time build check on an AUTHORING surface, the twin of the one
+                # in `__main__._connection` (BACKLOG #1648). A flag toggle rewrites an existing entry
+                # and so cannot empty the graph today; the keyword is here so the two identical
+                # callbacks do not diverge, and so reusing this one for an operation that CAN remove
+                # an entry does not quietly start refusing a legitimate edit.
+                registry = load_config(check_dir, allow_empty=True)
                 build_check_registry(
                     registry,
                     inbound_bind_host=self._inbound_bind_host,
@@ -1660,8 +1665,11 @@ class Engine:
         # other shards and no outbound at all (the filter keeps outbound connections, so it can only
         # empty a graph that had none). Deleting this copy would let such a reload swap in an empty
         # graph with no refusal; tests/test_config_reload_outcome.py pins that. Same predicate as the
-        # load-time rule, deliberately; this one can name the directory, which that one cannot.
-        if not registry.inbound and not registry.outbound:
+        # load-time rule, deliberately — and READ FROM IT (`Registry.declares_no_connections`), so a
+        # later widening cannot land in the loader and silently skip the one moment this copy covers.
+        # The MESSAGE still differs on purpose: this site can name the directory, which the loader's
+        # rule cannot.
+        if registry.declares_no_connections:
             raise WiringError(
                 f"config directory {config_dir!r} declares no connections — "
                 "refusing to reload to an empty graph"

@@ -171,9 +171,19 @@ def run_checks(
     the process directory, so the documented ``check --config config`` invocation is untouched.
 
     ``allow_empty_config`` (``--allow-empty-config``, BACKLOG #1648) drops the empty-graph rule from
-    the blocking validate leg only. The other legs load the config with the rule in force, so an empty
-    dir still reads as "config did not load" on their (non-blocking) skip lines — they report on a
-    graph, and there is no graph to report on.
+    the blocking validate leg.
+
+    A leg whose SUBJECT survives an empty graph drops the rule unconditionally instead, at its own
+    ``load_config`` — ``build-check``, ``reference-backend``, ``dead-config`` and ``send-target``.
+    Each of their skip arms delegates the reporting to ``validate``, and ``--allow-empty-config`` is
+    exactly when ``validate`` stops reporting it, so a leg that skipped there would be covered by
+    nothing — and its "config did not load" line would be false about a config that loaded. Use that
+    test when deciding for a new leg: ask whether it reads something a connection-less config still
+    has (Routers, Handlers, reference sets), not whether the flag was passed.
+
+    The remaining legs still load with the rule in force and do skip on an empty dir: they report on
+    connections, and there are none. The skip line they print says "config did not load", which is
+    inexact for this one cause; threading the keyword further was left out of scope.
     """
     results = [
         _check_validate(config_dir, allow_empty=allow_empty_config),
@@ -275,7 +285,12 @@ def _check_dead_config(config_dir: str | Path) -> CheckResult:
     from messagefoundry.config.wiring import WiringError, load_config
 
     try:
-        registry = load_config(config_dir)
+        # allow_empty: this leg's subject is the ROUTER/HANDLER reference graph, which exists whether
+        # or not a connection is declared (BACKLOG #1648). Without it the docstring's delegation
+        # above -- "a config dir that fails to load is left to validate" -- breaks under
+        # `--allow-empty-config`, because validate is then the one leg that does not report it, and
+        # the skip line would read "config did not load" about a config that loaded.
+        registry = load_config(config_dir, allow_empty=True)
     except (WiringError, OSError, ImportError, SyntaxError, ValueError):
         # A broken config is reported (blocking) by validate; the advisory never crashes the gate.
         return CheckResult(
@@ -309,7 +324,12 @@ def _check_send_target(config_dir: str | Path) -> CheckResult:
     from messagefoundry.config.wiring import WiringError, load_config
 
     try:
-        registry = load_config(config_dir)
+        # allow_empty: same reason as dead-config above (BACKLOG #1648). This leg judges literal
+        # Send()/Router targets against what is registered, and a connection-less config is exactly
+        # where EVERY such target dangles — the case most worth printing, not least. Letting the
+        # empty-graph refusal through would make `--allow-empty-config` silently disable the one leg
+        # that catches a dangling literal target.
+        registry = load_config(config_dir, allow_empty=True)
     except (WiringError, OSError, ImportError, SyntaxError, ValueError):
         return CheckResult(
             "send-target", ok=True, required=False, skipped=True, detail="config did not load"
@@ -1480,7 +1500,11 @@ def _check_build(
             detail=f"settings did not load: {exc}",
         )
     try:
-        registry = load_config(config_dir)
+        # allow_empty: same reason as reference-backend (BACKLOG #1648) -- REQUIRED leg, and its skip
+        # arm delegates to the one leg `--allow-empty-config` silences. With zero connections there
+        # is nothing to build-check and it passes trivially, which is the honest answer; a skip line
+        # reading "config did not load" about a config that loaded is not.
+        registry = load_config(config_dir, allow_empty=True)
     except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
         # A broken graph is reported (blocking) by validate; don't double-fail here.
         return CheckResult(
@@ -2192,7 +2216,11 @@ def _check_reference_backend(
             detail=f"settings did not load: {exc}",
         )
     try:
-        registry = load_config(config_dir)
+        # allow_empty: this leg is REQUIRED and its subject is `registry.references`, which exists
+        # with zero connections declared (BACKLOG #1648). Its skip arm delegates to validate -- the
+        # one leg `--allow-empty-config` silences -- so without this the flag would silently disable
+        # a required check and print "config did not load" about a config that loaded.
+        registry = load_config(config_dir, allow_empty=True)
     except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
         return CheckResult(
             "reference-backend",

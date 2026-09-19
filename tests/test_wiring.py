@@ -533,6 +533,26 @@ def test_load_config_accepts_an_outbound_only_graph(tmp_path: Path) -> None:
     assert "o" in load_config(tmp_path).outbound
 
 
+def test_load_config_accepts_an_inbound_only_graph(tmp_path: Path) -> None:
+    # The other arm of the same predicate, pinned so its shape is stated by a test and not only by a
+    # comment. An inbound-only graph receives and delivers nowhere, which is a real half-built
+    # config -- and the one Engine.reload_detail's post-filter check exists for, since the shard
+    # filter KEEPS outbound connections and so can only empty a graph that had none. RED if the
+    # predicate is ever widened to `not registry.outbound`.
+    _write(
+        tmp_path,
+        """
+        from messagefoundry import inbound, router, MLLP
+        inbound("i", MLLP(port=2731), router="r")
+
+        @router("r")
+        def route(msg):
+            return []
+        """,
+    )
+    assert "i" in load_config(tmp_path).inbound
+
+
 def test_validate_config_reports_a_config_that_declares_no_connections(tmp_path: Path) -> None:
     _helper_only(tmp_path)
     diags = validate_config(tmp_path)
@@ -550,6 +570,29 @@ def test_validate_config_does_not_report_emptiness_beside_its_own_cause(tmp_path
     (tmp_path / "cfg.py").write_text("import nonexistent_module_xyz\n", encoding="utf-8")
     diags = validate_config(tmp_path)
     assert len(diags) == 1 and _EMPTY_MARKER not in diags[0].message
+
+
+def test_validate_config_still_reports_emptiness_beside_a_diagnostic_that_cannot_cause_it(
+    tmp_path: Path,
+) -> None:
+    """The suppressor is scoped to the sources that DECLARE connections, not to any diagnostic.
+
+    A malformed ``codesets/`` table is a real diagnostic and no explanation at all for an empty
+    graph -- the modules loaded, they simply wired nothing. Suppressing on the whole diagnostics
+    list would hide the empty graph behind it and make the operator fix the CSV, re-run, and only
+    then learn the real problem. Both are reported in one pass instead.
+
+    Falsified by restoring ``allow_empty=allow_empty or bool(diagnostics)``."""
+    codesets = tmp_path / "codesets"
+    codesets.mkdir()
+    (codesets / "bad.csv").write_text("code,value\nA,1\nA,2\n", encoding="utf-8")  # duplicate key
+    _helper_only(tmp_path)
+
+    messages = [d.message for d in validate_config(tmp_path)]
+
+    assert len(messages) == 2, messages
+    assert any(_EMPTY_MARKER in m for m in messages)
+    assert any(_EMPTY_MARKER not in m for m in messages)  # the code-set problem, still reported
 
 
 def test_registry_validate_and_validate_config_agree_on_the_empty_graph(tmp_path: Path) -> None:
