@@ -38,6 +38,8 @@ from typing import NamedTuple
 import pytest
 from _bash_resolver import explain_returncode, probe_env, require_bash
 
+from tests._workflow_contexts import context_of, jobs_of, on_block
+
 _REPO = Path(__file__).resolve().parents[1]
 _WORKFLOWS = _REPO / ".github" / "workflows"
 _NOTICE = _WORKFLOWS / "nightly-notice.yml"
@@ -50,11 +52,16 @@ def _load(path: Path) -> dict:
 
 
 def _on(doc: dict) -> dict:
-    """The `on:` block. PyYAML parses a bare ``on:`` key as the BOOLEAN True, so reading ``doc["on"]``
-    returns None and every assertion below would pass against nothing."""
-    block = doc.get(True, doc.get("on"))
-    assert isinstance(block, dict), f"could not read the `on:` block — got {block!r}"
-    return block
+    """The `on:` block, via the SHARED reader rather than another hand-rolled copy.
+
+    The reasoning lives with the reader, in ``tests/_workflow_contexts.on_block``.
+
+    IT IS NOT YET THE ONLY COPY, and saying so matters more than the tidy claim. At least seven other
+    test modules still hand-roll the same dance in at least three spellings that do not agree on the
+    quoted ``"on":`` case. This module was migrated because it is the one under change; migrating the
+    rest is a filed follow-up, unallocated. A reader here should not infer the sweep happened.
+    """
+    return on_block(doc)
 
 
 def test_it_keys_on_the_ci_workflow_s_actual_name() -> None:
@@ -113,6 +120,151 @@ def test_it_also_watches_the_stalled_prs_workflow() -> None:
     assert stalled_name in watched, (
         f"nightly-notice.yml watches {watched} but stalled-prs.yml is named {stalled_name!r}. Its "
         "daily red would then reach nobody, and its silence reads exactly like a clean sweep."
+    )
+
+
+def test_it_also_watches_the_required_workflow_state_workflow() -> None:
+    """BACKLOG #1450: the branch-protection reconciles had a detector and no consumer.
+
+    Why that workflow's cron needed a consumer is recorded once, in ``nightly-notice.yml``'s own
+    header; the drift incident that measured the cost is recorded once, in
+    ``scripts/ci/check_required_contexts_drift.py``'s docstring.
+
+    IT IS NOT A DUPLICATE OF
+    ``test_required_contexts_drift.py::test_the_scheduled_red_of_this_checker_reaches_a_person``, and
+    the difference is the SUBJECT rather than the assertion. That row follows the drift SCRIPT: move
+    the ``accurate`` step into some other watched workflow and it is satisfied. This row follows the
+    FILE, which also carries ``reachable`` -- a job that runs no such script and would then be left
+    scheduled, advisory and unwatched, with nothing red. Neither covers the other's move.
+    """
+    watched = _on(_load(_NOTICE))["workflow_run"]["workflows"]
+    state_name = _load(_WORKFLOWS / "required-workflow-state.yml").get("name")
+    assert state_name, (
+        "required-workflow-state.yml has no `name:` -- workflow_run has nothing to key on"
+    )
+    assert state_name in watched, (
+        f"nightly-notice.yml watches {watched} but required-workflow-state.yml is named "
+        f"{state_name!r}. Its cron would then go red with no pull request, label or notice carrying "
+        "it -- the alerting gap BACKLOG #1450 recorded, which is NOT fixed by adding a second "
+        "detector."
+    )
+
+
+def test_the_shared_on_reader_handles_every_workflow_in_this_repository() -> None:
+    """The corpus arm. ``on:`` has three value spellings and this repository already uses two.
+
+    ``_on`` above delegates to ``tests/_workflow_contexts.on_block``, which is a SHARED reader -- the
+    natural next caller is a sweep over every workflow, e.g. the coverage guard
+    ``nightly-notice.yml``'s own header records as the next defect. An earlier revision of that reader
+    asserted ``isinstance(block, dict)`` and would have raised on ``dependabot-auto-merge.yml``, whose
+    ``on:`` is the bare string ``pull_request``.
+
+    Asserted over the real directory rather than over invented documents, because the point is that
+    the reader survives what is actually checked in.
+
+    BOTH EXTENSIONS. GitHub Actions reads `.yaml` as well as `.yml`, so a `*.yml` glob would let a
+    `.yaml` workflow sit outside the corpus while the test name claims the whole repository -- the
+    positive control would still pass, because it only proves the glob found files, not that it was
+    aimed at the population. There are no `.yaml` workflows today; the glob is for when there are.
+    """
+    paths = sorted([*_WORKFLOWS.glob("*.yml"), *_WORKFLOWS.glob("*.yaml")])
+    # Positive control: an empty glob would make every assertion below vacuous.
+    assert len(paths) > 5, f"the workflow scan found only {len(paths)} files"
+    for path in paths:
+        triggers = _on(_load(path))
+        assert triggers, f"{path.name} parsed to an empty `on:` block, so it can never run"
+
+
+#: One arm label of the shipped `case "$WF_NAME" in`, e.g. `    "DAST")`.
+_CASE_ARM = re.compile(r'^"([^"]+)"\)$')
+
+
+def _case_arms() -> dict[str, str]:
+    """Arm label -> the prose that arm puts in the issue body, AS THE READER WILL SEE IT.
+
+    Read out of the SHIPPED script rather than restated here, so an arm added or renamed is covered
+    without touching this helper. Comment lines are dropped: they never reach a reader.
+
+    TWO NORMALISATIONS, AND SKIPPING EITHER MAKES EVERY "is this text in the body?" CHECK A FALSE
+    NEGATIVE -- which is the quiet direction, because the assertion still passes when the text leaked.
+    Backticks are backslash-escaped inside the double-quoted shell string and arrive unescaped; the
+    assignment's opening ``DETAIL="`` and its closing quote are shell syntax and reach nobody.
+    Indentation is deliberately NOT stripped: the sub-bullets are indented in the issue too, so
+    trimming here would stop these matching the body they were read from.
+    """
+    arms: dict[str, str] = {}
+    label: str | None = None
+    buf: list[str] = []
+    for raw in str(_notice_step()["run"]).splitlines():
+        line = raw.strip()
+        if (match := _CASE_ARM.match(line)) is not None:
+            label, buf = match.group(1), []
+        elif label is not None and line == ";;":
+            arms[label] = "\n".join(buf).removesuffix('"').replace("\\`", "`")
+            label, buf = None, []
+        elif label is not None and line and not line.startswith("#"):
+            buf.append(line.removeprefix('DETAIL="') if line.startswith('DETAIL="') else raw)
+    # Positive control, keyed to the WATCH LIST rather than to a constant. A literal `>= 4` written
+    # beside a five-arm block is a quorum the population has already passed: delete an arm and it
+    # still holds. test_every_case_arm_names_a_watched_workflow asserts the two sets are equal, so
+    # this only has to catch the parser silently matching nothing.
+    assert arms, "the `case` block parsed to no arms at all -- the arm expression stopped matching"
+    return arms
+
+
+def _arm_lines() -> dict[str, frozenset[str]]:
+    """Every SUBSTANTIVE line of each arm, for screening one arm's text out of another's issue.
+
+    EVERY LINE, NOT ONE FINGERPRINT, AND THAT IS A MEASUREMENT RATHER THAN A PREFERENCE. The first
+    version of this screened on each arm's single longest line. Pasting the branch-protection remedy
+    into the DAST arm -- a plausible edit, and exactly the defect the screen exists for -- left the
+    suite GREEN, because the pasted text was not the line the fingerprint happened to pick. A screen
+    built from one case finds one shape.
+
+    Short lines are dropped: a line like ``edit.`` is shared prose, not evidence of a leak.
+    """
+    raw = {
+        label: frozenset(ln.strip() for ln in text.splitlines() if len(ln.strip()) >= 40)
+        for label, text in _case_arms().items()
+    }
+    # A line two arms share is not evidence of a leak, so it is DROPPED from the screen rather than
+    # forbidden. Requiring the arms to be pairwise disjoint would put a constraint on the shipped
+    # alert prose -- two detectors can honestly be described by the same sentence -- and would report
+    # a correct body as a leak. What must hold is that each arm keeps something of its own.
+    unique = {
+        label: own - frozenset().union(*(o for k, o in raw.items() if k != label))
+        for label, own in raw.items()
+    }
+    bare = sorted(label for label, own in unique.items() if not own)
+    assert not bare, (
+        f"the {bare} arm(s) have no line of their own, so a leak into another workflow's issue would "
+        f"be invisible to this screen. Give each arm one distinctive sentence."
+    )
+    return unique
+
+
+def test_the_case_arms_and_the_watch_list_are_the_same_set() -> None:
+    """The arm labels are workflow NAMES, and nothing else ties them to the watch list.
+
+    ``workflow_run`` matches on a workflow's ``name:``. Rename a watched workflow and the watch-list
+    guards above red, so somebody updates the list -- and this ``case`` arm, a hundred lines down in a
+    shell string, keeps the old literal, matches nothing, and every issue from then on ships with no
+    detail at all. No error, no red, just a quietly less useful alert.
+
+    BOTH DIRECTIONS, because they fail differently and only one of them is loud. An arm with no
+    watched workflow is dead text. A watched workflow with no arm is the live half: it opens issues
+    that say a nightly failed and nothing about what that hides, which is most of what a reader came
+    for -- and adding a sixth entry to the list is exactly the moment it happens. The mirror of this
+    is what ``failure-signal.yml`` enforces for its own list, and what this file's header calls "dead
+    config that reads as coverage".
+    """
+    watched = set(_on(_load(_NOTICE))["workflow_run"]["workflows"])
+    arms = set(_case_arms())
+    assert arms == watched, (
+        f"the issue body's `case` arms and the watch list have drifted apart.\n"
+        f"  arms with no watched workflow (dead text): {sorted(arms - watched)}\n"
+        f"  watched with no arm (issues ship with no detail): {sorted(watched - arms)}\n"
+        f"An arm label is a workflow NAME, so it must track that workflow's `name:`."
     )
 
 
@@ -520,6 +672,32 @@ def test_a_red_dast_nightly_opens_an_issue_that_names_dast(tmp_path: Path) -> No
     )
     assert run.searched_for == ["Nightly DAST is failing"], _diagnostic(run)
 
+    # BACKLOG #1450 made the body's detail per-workflow via `case "$WF_NAME"`. Both directions are
+    # asserted, and the NEGATIVE one is the load-bearing half: generalising an arm to `*)` reds
+    # nothing by itself, it just puts three other workflows' prose in front of the reader of one.
+    #
+    # SCREENED AGAINST EVERY ARM, not against one known-bad phrase. A `"branch protection" not in
+    # body` check would be satisfied by any future arm that happens not to use those two words, which
+    # is a screen built from one case rather than from the property.
+    arms = _arm_lines()
+    seen = {line.strip() for line in body.splitlines()}
+    # SUBSET, matching the sibling row for Required workflow state. A non-empty intersection would
+    # pass on PARTIAL delivery -- a lost continuation line in a multi-line arm -- and the two rows
+    # would then hold the same property to different strengths for no reason.
+    assert arms["DAST"] <= seen, (
+        f"the DAST arm did not reach a DAST issue in full{_diagnostic(run)}"
+    )
+    leaked = {
+        label: sorted(lines & (seen - arms["DAST"]))
+        for label, lines in arms.items()
+        if label != "DAST"
+    }
+    leaked = {label: found for label, found in leaked.items() if found}
+    assert not leaked, (
+        f"a DAST issue carries {sorted(leaked)}'s detail -- an arm has been generalised, the case "
+        f"dispatch dropped, or text pasted into the wrong arm: {leaked}{_diagnostic(run)}"
+    )
+
 
 def test_a_second_red_dast_nightly_comments_instead_of_opening_a_duplicate(tmp_path: Path) -> None:
     """Dedup is what keeps this readable across a run of red nights."""
@@ -557,27 +735,75 @@ def test_a_dast_run_that_did_not_fail_writes_nothing(conclusion: str, tmp_path: 
     assert _writes(run) == [], f"a {conclusion!r} run wrote something{_diagnostic(run)}"
 
 
-def test_a_green_ci_nightly_cannot_close_the_dast_issue(tmp_path: Path) -> None:
+def test_a_workflow_with_no_case_arm_still_gets_a_readable_body(tmp_path: Path) -> None:
+    """The `*)` path is live code, and an earlier draft of it shipped a truncated sentence.
+
+    The per-workflow detail replaced one static paragraph, and the first version ended the line above
+    it with "Here that covers" for every workflow to complete. An unmatched name left `DETAIL` empty,
+    so the issue read "...appears nowhere else. Here that covers" and then stopped. The static
+    paragraph it replaced always read as a whole sentence; the dispatch removed that guarantee.
+
+    `test_the_case_arms_and_the_watch_list_are_the_same_set` keeps that state from lasting, but it is
+    exactly the state a sixth watch-list entry starts in -- so the degraded form has to be readable
+    rather than merely rare.
+    """
+    run = _run_notice(tmp_path, workflow="Unwatched Example", conclusion="failure", open_issues={})
+    _ok(run)
+    body = _opt([c for c in run.calls if c[:2] == ["issue", "create"]][0], "--body")
+    assert "Nightly (scheduled) Unwatched Example failed." in body, _diagnostic(run)
+    assert "Here that covers" not in body, (
+        f"the body carries a sentence lead-in with nothing completing it{_diagnostic(run)}"
+    )
+    seen = {line.strip() for line in body.splitlines()}
+    leaked = {label: sorted(lines & seen) for label, lines in _arm_lines().items()}
+    leaked = {label: found for label, found in leaked.items() if found}
+    assert not leaked, (
+        f"an unmatched workflow received {sorted(leaked)}'s detail: {leaked}{_diagnostic(run)}"
+    )
+    # Still the two things a reader acts on, and still self-closing.
+    assert _FIXTURE_ENV["RUN_URL"] in body and _FIXTURE_ENV["HEAD_SHA"] in body, _diagnostic(run)
+    assert "closes itself when a" in body, _diagnostic(run)
+
+
+def _watched_except_dast() -> list[str]:
+    """Every watched workflow but DAST, read from the file rather than listed here.
+
+    The isolation rows below hold a DAST issue open and check that no OTHER watched workflow's green
+    run touches it, so the parameters ARE the watch list minus DAST. Hardcoding two of them would
+    leave the rest untested and give a sixth entry no coverage and no red -- the same hand-maintained
+    coupling the rest of this module derives its way out of.
+    """
+    return [w for w in _on(_load(_NOTICE))["workflow_run"]["workflows"] if w != "DAST"]
+
+
+@pytest.mark.parametrize("workflow", _watched_except_dast())
+def test_a_green_nightly_cannot_close_another_workflows_issue(
+    workflow: str, tmp_path: Path
+) -> None:
     """THE ISOLATION CONTROL, and the reason the title is derived rather than hardcoded.
 
-    Widening the watch list to three workflows created a way for one signal to silence another: a
-    single shared issue title would let a green nightly CI close the issue a red DAST run opened, and
-    the DAST finding would vanish with nothing anywhere reporting a problem. This row fails against
-    exactly that defect -- the DAST issue is open, CI is green, and nothing may touch it.
+    Widening the watch list created a way for one signal to silence another: a single shared issue
+    title would let a green nightly close the issue a red DAST run opened, and the DAST finding would
+    vanish with nothing anywhere reporting a problem. This row fails against exactly that defect --
+    the DAST issue is open, the other workflow is green, and nothing may touch it.
+
+    PARAMETRIZED OVER THE WATCH LIST RATHER THAN COPIED PER WORKFLOW. The property belongs to the
+    SCRIPT, not to any one entry, so a fresh copy per addition measures one claim at N depths -- and
+    the first such copy had already dropped the `no open issue` assertion below.
     """
     run = _run_notice(
         tmp_path,
-        workflow="CI",
+        workflow=workflow,
         conclusion="success",
         open_issues={"Nightly DAST is failing": 4242},
     )
     _ok(run)
     assert _writes(run) == [], (
-        f"a GREEN CI nightly touched an issue opened by a RED DAST run{_diagnostic(run)}"
+        f"a GREEN {workflow} nightly touched an issue opened by a RED DAST run{_diagnostic(run)}"
     )
-    assert run.searched_for == ["Nightly CI is failing"], (
+    assert run.searched_for == [f"Nightly {workflow} is failing"], (
         f"the script searched for {run.searched_for} -- it must key on the workflow that COMPLETED, "
-        f"or the three signals share one issue{_diagnostic(run)}"
+        f"or every watched signal shares one issue{_diagnostic(run)}"
     )
     assert "no open issue" in run.stdout, _diagnostic(run)
 
@@ -593,6 +819,66 @@ def test_a_red_dast_nightly_does_not_comment_on_cis_issue(tmp_path: Path) -> Non
     _ok(run)
     assert [c[:2] for c in _writes(run)] == [["issue", "create"]], _diagnostic(run)
     assert "7" not in [c[2] for c in _writes(run) if len(c) > 2], _diagnostic(run)
+
+
+def test_a_red_required_workflow_state_nightly_opens_an_issue_that_names_it(tmp_path: Path) -> None:
+    """THE ROW BACKLOG #1450 EXISTS FOR, asked as behaviour rather than as config.
+
+    "the watch list contains Required workflow state" is the weaker claim, and the one a reader
+    mistakes for the fix. This runs the shipped body and asserts the red becomes an `issue create`
+    carrying the two things a reader acts on -- the run link and the commit.
+
+    IT ALSO ASSERTS BOTH REMEDIES, which is not decoration here. The workflow carries TWO jobs and
+    this notice fires on the RUN's conclusion, so it cannot say which failed -- and their remedies are
+    not interchangeable. A red `accurate` means the checked-in file and branch protection disagree,
+    and editing the FILE is a pull request while editing PROTECTION to match a stale file can arm a
+    context that never reports and wedge every pull request. A red `reachable` means a required
+    context's workflow cannot report at all, which no edit to that file fixes. A body naming only the
+    first would hand half of its readers a remedy that does nothing and forbid the one that works.
+    A notice that delivers and misdirects is worse than one that does not deliver.
+
+    THE NAME COMES FROM THE WORKFLOW FILE, not from a literal repeated here, so a rename cannot leave
+    this row passing against a `case` arm that no longer matches.
+    """
+    workflow = str(_load(_WORKFLOWS / "required-workflow-state.yml")["name"])
+    run = _run_notice(tmp_path, workflow=workflow, conclusion="failure", open_issues={})
+    _ok(run)
+    creates = [c for c in run.calls if c[:2] == ["issue", "create"]]
+    assert len(creates) == 1, f"expected exactly one `gh issue create`{_diagnostic(run)}"
+    argv = creates[0]
+    assert _opt(argv, "--title") == f"Nightly {workflow} is failing", _diagnostic(run)
+    assert _opt(argv, "--label") == "bug", _diagnostic(run)
+    assert run.searched_for == [f"Nightly {workflow} is failing"], _diagnostic(run)
+    body = _opt(argv, "--body")
+    assert f"Nightly (scheduled) {workflow} failed." in body, (
+        f"the issue body does not name the workflow that actually failed{_diagnostic(run)}"
+    )
+    assert _FIXTURE_ENV["RUN_URL"] in body and _FIXTURE_ENV["HEAD_SHA"] in body, (
+        f"the body omits the run link or the commit -- the two things a reader acts on"
+        f"{_diagnostic(run)}"
+    )
+    assert _arm_lines()[workflow] <= {line.strip() for line in body.splitlines()}, (
+        f"the `case` arm for {workflow!r} did not reach the issue in full, so a reader loses part of "
+        f"the remedy. Its label is a workflow NAME and must track this file's `name:`{_diagnostic(run)}"
+    )
+    # THE WEDGE WARNING, asserted as a literal on purpose. The subset check above proves the arm
+    # arrived whole; it cannot prove the arm still SAYS this, because rewording the sentence changes
+    # both sides together. This is the one instruction whose loss is not a worse alert but a wedged
+    # repository, so it is pinned to text rather than derived.
+    assert "Do NOT edit branch protection" in body, (
+        f"the body does not warn against the one remedy that can wedge every pull request in the "
+        f"repository{_diagnostic(run)}"
+    )
+    # The `reachable` remedy, which the file edit above does NOT fix. Asserted by the job's CONTEXT
+    # string (its `name:`, else its key) via the shared resolver, never `job.get("name", "")` -- an
+    # empty default is a substring of every body, so an unnamed job would pass vacuously.
+    for job_key, job in jobs_of("required-workflow-state.yml").items():
+        reported = context_of(job_key, job)
+        assert reported, f"{job_key!r} resolves to an empty context string"
+        assert reported in body, (
+            f"the body never names the {job_key!r} job, so a reader cannot tell which of the two "
+            f"reconciles failed -- and their remedies differ{_diagnostic(run)}"
+        )
 
 
 #: The job's `if:` is `<github path> == '<literal>'` and nothing more. Anything else must reach a
