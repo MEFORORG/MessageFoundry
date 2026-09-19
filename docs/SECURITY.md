@@ -749,7 +749,9 @@ else would need its own authorization rule stated here.
    browser cannot act on.
 2. **No `/ui` route charges the per-actor admin-write pacing floor** (see the interim note under
    [Anti-automation](#admin-password-reset-wp-l3-12-asvs-646)).
-3. **One uploaded-logs GET is weaker than its JSON equivalent, and cannot be otherwise.**
+3. **The uploaded-logs resend-confirm GET is weaker than its JSON equivalent, and cannot be
+   otherwise** (it is not the only weaker uploaded-logs GET — `GET /ui/uploaded-logs` is one too,
+   under item 5, and the set of record is `_UI_WEAKER_THAN_JSON_EQUIVALENT`, not this prose).
    `GET /ui/uploaded-logs/file/{file_id}/resend-confirm` is plain `require_ui` while the
    permission-equivalent JSON browse route carries a step-up. It **cannot** carry one, because it is
    the re-auth continuation itself — gating it would bounce the operator back to `/ui/reauth`

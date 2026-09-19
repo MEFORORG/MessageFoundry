@@ -81,14 +81,16 @@ register_ui_action(
 # ``test_write_action_method_matches_its_continuation`` — an unlock entry is 303-GET-redirected to,
 # so one that also served POST would be an open-POST gadget. Something had to move.
 #
-# THIS SPLITS THE OPPOSITE WAY FROM ``routes/search.py``, WHICH IS THE ONLY OTHER SPLIT OF AN
-# EXISTING PAIR, so the divergence is deliberate rather than an oversight. There the form KEPT
-# ``/ui/messages/search`` and the POST took the new ``/ui/messages/search/run``. Here the POST is the
-# half that is pinned from outside this package: ``api/app.py``'s ``_UPLOAD_BODY_PATHS`` matches
-# ``request.url.path`` against an EXACT frozenset to lift the 1 MiB request-body cap, so moving the
-# POST means an engine-package edit to keep large uploads working. (The two doc-drift tests that name
-# this path — ASVS file-surface and threat-model — are substring checks and would have tolerated
-# either spelling; the frozenset is the only hard pin, and it is the whole of the reason.)
+# THIS SPLITS THE OPPOSITE WAY FROM EVERY EARLIER SPLIT OF AN EXISTING PAIR, so the divergence is
+# deliberate rather than an oversight. At least two went the other way — ``/ui/messages/search`` kept
+# the form and gave the POST ``/ui/messages/search/run`` (routes/search.py), and the browse GET below
+# kept its path while its criteria POST became ``.../filter`` (BACKLOG #1184). Both moved the POST.
+#
+# Here the POST is the half pinned from OUTSIDE this package: ``api/app.py``'s ``_UPLOAD_BODY_PATHS``
+# matches ``request.url.path`` against an EXACT frozenset to lift the 1 MiB request-body cap, so
+# moving the POST means an engine-package edit or large uploads start failing at the cap. That is the
+# whole of the reason. (The doc-drift tests naming this path are substring checks and would have
+# tolerated either spelling — do not cite them as a constraint; the frozenset is the only hard pin.)
 register_ui_action(
     r"^/ui/uploaded-logs/upload-form$", Permission.FILES_UPLOAD, auto_retry=False, unlock=True
 )

@@ -95,11 +95,22 @@ async def _login(c: httpx.AsyncClient, name: str) -> None:
 
 
 async def _upload(c: httpx.AsyncClient, name: str = "acme.hl7") -> str:
-    """Upload BATCH and return its file_id, read back off the listing's browse link."""
+    """Upload BATCH and return its file_id, read back off the listing's browse link.
+
+    THE SUCCESS CHECK NAMES THE REDIRECT TARGET, and since BACKLOG #1739 it has to. A bare
+    ``status_code in (200, 303)`` stopped discriminating the moment the upload POST became
+    step-up-gated: a stale window ALSO answers 303, so a refused upload passed this assert and the
+    parse below then either raised a bare IndexError or returned some other file's id. That is the
+    fixture for both stale-window tests, so a blind check here would have let their premise fail
+    silently. 303 to the listing is success; 303 to /ui/reauth is the refusal.
+    """
     up = await c.post(
-        "/ui/uploaded-logs/upload", files={"file": (name, BATCH, "application/octet-stream")}
+        "/ui/uploaded-logs/upload",
+        files={"file": (name, BATCH, "application/octet-stream")},
+        follow_redirects=False,
     )
-    assert up.status_code in (200, 303), up.text
+    assert up.status_code == 303, up.text
+    assert up.headers["location"] == "/ui/uploaded-logs", up.headers["location"]
     listing = await c.get("/ui/uploaded-logs")
     fid = listing.text.split("/ui/uploaded-logs/file/", 1)[1].split('"', 1)[0].split("/")[0]
     assert len(fid) == 32
@@ -969,12 +980,18 @@ async def test_a_stale_step_up_window_uploads_nothing(engine: Engine, tmp_path: 
         assert "/ui/uploaded-logs/file/" not in listing.text
         assert list(await engine.store.list_audit(action="upload.create", limit=200)) == []
 
-    # POSITIVE CONTROL, same store, same POST, same file -- a FRESH window. Without it the zeros
-    # above are indistinguishable from instruments that cannot see an upload at all.
-    fresh = await _service(engine, ("fresh", Role.OPERATOR))
+    # POSITIVE CONTROL: same store, same app shape, same POST, same file, THE SAME USER -- and one
+    # variable changed, the step-up window. Without it the zeros above are indistinguishable from
+    # instruments that cannot see an upload at all.
+    #
+    # "op" rather than a fresh account ON PURPOSE. A control that also swaps the user varies two
+    # things at once, and a failure in it could then be attributed to either -- which is the whole
+    # value the control is supposed to add. The window is fixed at AuthService construction, so a
+    # second service is what changing only it costs.
+    fresh = await _service(engine)  # no users tuple: "op" already exists in the shared store
     transport2 = httpx.ASGITransport(app=_app(engine, fresh, tmp_path))
     async with httpx.AsyncClient(transport=transport2, base_url="http://t") as c2:
-        await _login(c2, "fresh")
+        await _login(c2, "op")
         allowed = await c2.post(
             "/ui/uploaded-logs/upload",
             files={"file": ("acme.hl7", BATCH, "application/octet-stream")},
@@ -985,7 +1002,41 @@ async def test_a_stale_step_up_window_uploads_nothing(engine: Engine, tmp_path: 
         listing2 = await c2.get("/ui/uploaded-logs")
         assert "acme.hl7" in listing2.text
         assert "/ui/uploaded-logs/file/" in listing2.text
+        # Exactly one across the WHOLE store, which is the stale arm's zero and this arm's one.
         assert len(await engine.store.list_audit(action="upload.create", limit=200)) == 1
+
+
+async def test_reauth_unlocks_the_upload_form(engine: Engine, tmp_path: Path) -> None:
+    """BACKLOG #1739 -- /ui/reauth must actually hand control back to the upload form.
+
+    THE OTHER HALF OF THE REFUSAL, and the half nothing else here covers. The stale-window test
+    above asserts where the SENDER was pointed; it cannot see whether that destination is reachable.
+    If the registered pattern were misspelled, ``lookup_ui_action`` returns None, /ui/reauth 303s to
+    /ui instead, and a stale-window operator could never reach the upload form again -- while every
+    other check stayed green: both goldens are regenerated from whatever is registered, and
+    ``test_write_action_method_matches_its_continuation`` asserts INSIDE a ``fullmatch`` guard, so a
+    pattern matching no route passes it vacuously.
+
+    Modelled on ``test_webui.py::test_reauth_unlocks_real_user_form``, the same arm for /ui/users/new.
+    """
+    service = await _service(engine, ("op", Role.OPERATOR))
+    transport = httpx.ASGITransport(app=_app(engine, service, tmp_path))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        await _login(c, "op")
+        r = await c.post(
+            "/ui/reauth",
+            data={"next": "/ui/uploaded-logs/upload-form", "password": PW},
+            headers={"Sec-Fetch-Site": "same-origin"},
+            follow_redirects=False,
+        )
+        assert r.status_code == 303, r.text
+        # The registry ACCEPTED the continuation. A rejected one lands at /ui, which is the failure
+        # this test exists to tell apart from success -- both are a 303.
+        assert r.headers["location"] == "/ui/uploaded-logs/upload-form", r.headers["location"]
+        # ...and the form really opens inside the window that re-auth just refreshed.
+        form = await c.get("/ui/uploaded-logs/upload-form")
+        assert form.status_code == 200, form.text
+        assert "Upload a log file" in form.text
 
 
 async def test_resend_confirm_does_not_reflect_hostile_markup(
