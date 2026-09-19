@@ -5387,17 +5387,47 @@ _WIN_REJECTED_SIDS = frozenset(
     }
 )
 
-# SIDs trusted to hold write on executed config (the owner is also always trusted, plus the current
-# process user, both passed in at evaluation time): SYSTEM and the local Administrators group. The two
-# placeholder/alias SIDs CREATOR OWNER (S-1-3-0) and OWNER RIGHTS (S-1-3-4) resolve to whoever OWNS the
-# object (not a foreign principal), so an ACE granting them write is equivalent to an owner grant and
-# is trusted — they appear on inherited ACLs (e.g. the user-profile temp dir) and must not be refused.
-_WIN_TRUSTED_SIDS = frozenset(
+# BUILTIN\Administrators, the group a foreign owner must resolve into to be trusted.
+_WIN_ADMINISTRATORS_SID = "S-1-5-32-544"
+
+# Literal SIDs whose holder administers this machine whatever domain it is joined to.
+_WIN_ADMIN_SIDS = frozenset(
     {
         "S-1-5-18",  # NT AUTHORITY\SYSTEM
-        "S-1-5-32-544",  # BUILTIN\Administrators
-        "S-1-3-0",  # CREATOR OWNER (placeholder: rights granted to the object's owner)
+        _WIN_ADMINISTRATORS_SID,
+    }
+)
+
+# SIDs trusted to hold write on executed config (the current process user and the directory owner are
+# added at evaluation time): the admin SIDs above, plus two owner-relative placeholders.
+#
+# CREATOR OWNER (S-1-3-0) and OWNER RIGHTS (S-1-3-4) are trusted because neither names a principal
+# this ACL can be read against, so refusing them would refuse on no evidence: S-1-3-4 carries the
+# CURRENT owner's effective rights, and S-1-3-0 is an inherit-only placeholder Windows replaces with
+# the CREATOR's SID when the ACE is inherited by a child. They appear on ordinary inherited ACLs (e.g.
+# the user-profile temp dir) and must not be refused.
+#
+# Do NOT read that as "they alias the owner, so the owner arm covers them". It does not hold for
+# S-1-3-0 (a creator is not necessarily the current owner — ownership can be transferred afterwards),
+# and the owner arm is skipped entirely when the process token cannot be read (``self_sid is None`` in
+# :func:`_evaluate_config_dacl`). The justification is the paragraph above, not the owner arm.
+_WIN_TRUSTED_SIDS = _WIN_ADMIN_SIDS | frozenset(
+    {
+        "S-1-3-0",  # CREATOR OWNER (inherit-only placeholder: resolved to the child's creator)
         "S-1-3-4",  # OWNER RIGHTS (the current owner's effective rights)
+    }
+)
+
+# Relative identifiers (a SID's last sub-authority) of the well-known administrator principals inside a
+# machine/domain SID (``S-1-5-21-<authority>-<RID>``): the built-in Administrator account and the
+# Domain / Schema / Enterprise Admins groups. Unlike SYSTEM these vary per domain, so they cannot be
+# listed as literal SIDs.
+_WIN_ADMIN_RIDS = frozenset(
+    {
+        500,  # the built-in Administrator account
+        512,  # Domain Admins
+        518,  # Schema Admins
+        519,  # Enterprise Admins
     }
 )
 
@@ -5405,18 +5435,72 @@ _WIN_TRUSTED_SIDS = frozenset(
 _WIN_ACCESS_ALLOWED_ACE_TYPE = 0x00
 
 
+def _is_well_known_admin_sid(sid: str) -> bool:
+    """Whether ``sid`` names an administrator by its well-known form alone, with no lookup.
+
+    Deciding these syntactically keeps the Administrators-membership lookup off the path for every
+    ordinary SYSTEM- or admin-owned install, which is what makes a fail-closed membership arm
+    affordable in :func:`_evaluate_config_dacl`.
+
+    **Known limitation, deliberately accepted (ADR 0036 Amendment A).** The RID arm matches an admin
+    RID under *any* machine/domain authority, not only this machine's or a domain it trusts, so a
+    directory carrying a foreign ``S-1-5-21-<other machine>-500`` owner (an NTFS volume from another
+    host: removable media, a mounted VHD, a restored backup) is trusted here. Narrowing it needs the
+    local machine SID *and* the trusted-domain list, and the naive narrowing — requiring the owner's
+    authority to match ``self_sid``'s — breaks the ordinary case, because the engine's default run-as
+    identity is a virtual account (``S-1-5-80-*``) with no machine authority to compare. The RID arm
+    exists so a legitimate domain admin owner resolves at all; the local-only membership lookup cannot
+    see a nested domain group."""
+    if sid in _WIN_ADMIN_SIDS:
+        return True
+    parts = sid.split("-")
+    # A machine/domain SID is S-1-5-21-<three sub-authorities>-<RID>: exactly 8 dash-separated parts.
+    # Anything shorter (e.g. "S-1-5-21-1-500") is malformed, and matching it would widen the arm to
+    # strings no Windows API produces. isascii() rejects the Unicode digits int() would otherwise
+    # accept ("٥٠٠" parses as 500); isdigit() rejects a sign or surrounding space.
+    if len(parts) != 8 or parts[:4] != ["S", "1", "5", "21"]:
+        return False
+    rid_text = parts[-1]
+    if not (rid_text.isascii() and rid_text.isdigit()):
+        return False
+    return int(rid_text) in _WIN_ADMIN_RIDS
+
+
 def _evaluate_config_dacl(
     owner_sid: str,
     aces: Sequence[tuple[int, int, str]],
     self_sid: str | None,
+    owner_in_admins: Callable[[str], bool | None],
 ) -> str | None:
-    """Pure DACL policy: return a refusal reason, or ``None`` if the source is trusted.
+    """Pure DACL + owner policy: return a refusal reason, or ``None`` if the source is trusted.
 
     ``aces`` is ``(ace_type, access_mask, trustee_sid)`` tuples as strings (``ConvertSidToStringSidW``
     form). A source is refused when any **ALLOWED** ACE grants a **write-class** right to a principal
     that is neither the file owner, nor the current process user, nor a trusted admin/SYSTEM SID —
     and unconditionally when a broad/low-privilege SID (Everyone/Authenticated Users/Users/…) holds
-    such a right. Kept free of ctypes so the policy is unit-testable on every platform."""
+    such a right.
+
+    The **owner** is then vetted in its own right (CONFIG-2), mirroring the POSIX arm's refusal of a
+    foreign uid: an owner holds WRITE_DAC implicitly, so a low-privilege owner can rewrite the code
+    this loader executes as the service account no matter what the DACL currently says. The owner
+    passes as the current process user, as a well-known admin SID (:func:`_is_well_known_admin_sid`),
+    or as a resolved member of Administrators. ``owner_in_admins`` returning ``None`` means the
+    membership could **not** be determined, and that is a **refusal**, not a warning-and-proceed —
+    ASVS v5.0.0 V16.5.3 (fail gracefully and securely, no fail-open when validation logic errors).
+    The refusal carries the documented ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` escape because it is
+    raised through :func:`_refuse_unsafe_config_source`.
+
+    Order matters, and it is not cosmetic: the ACEs are evaluated first so an observed insecure ACE is
+    reported as itself instead of being masked by the owner verdict. A ``self_sid`` of ``None`` (the
+    process token could not be read) **skips** the owner comparison entirely, exactly as the POSIX arm
+    skips it without ``self_uid`` — an unreadable token must not turn this guard into a service that
+    cannot start. That is the one unresolvable input here that does not refuse, and it differs from an
+    unresolvable membership: this one leaves nothing to compare against, that one leaves a question
+    answerable and unanswered. It is the **fourth** non-refusing arm of this guard, alongside the three
+    WARNING arms in :func:`_assert_safe_config_source_windows`; that caller logs it, because a control
+    that disables itself silently leaves no trace an operator could act on.
+
+    Kept free of ctypes so the policy is unit-testable on every platform."""
     trusted = set(_WIN_TRUSTED_SIDS)
     trusted.add(owner_sid)
     if self_sid is not None:
@@ -5430,6 +5514,19 @@ def _evaluate_config_dacl(
             return f"a broad/low-privilege principal ({trustee_sid}) has write access"
         if trustee_sid not in trusted:
             return f"a non-owner, non-admin principal ({trustee_sid}) has write access"
+    if self_sid is None or owner_sid == self_sid or _is_well_known_admin_sid(owner_sid):
+        return None
+    owner_is_admin = owner_in_admins(owner_sid)
+    if owner_is_admin is None:
+        return (
+            f"the owner ({owner_sid}) is not the account the engine runs as, and its Administrators "
+            f"membership could not be resolved"
+        )
+    if not owner_is_admin:
+        return (
+            f"the owner ({owner_sid}) is neither the account the engine runs as nor an administrator, "
+            f"so it can rewrite the code this loader executes"
+        )
     return None
 
 
@@ -5438,11 +5535,22 @@ def _assert_safe_config_source_windows(directory: Path) -> None:
 
     Parses the owner + DACL of the directory and each ``*.py`` (incl. ``_*.py`` helpers, the same
     candidate set as POSIX) via ctypes/advapi32 and refuses to load when :func:`_evaluate_config_dacl`
-    rejects it. **Fail-open with a loud WARNING on a Win32 API error**: a ``GetNamedSecurityInfoW``
-    failure must not brick a previously-working service — it logs and proceeds (no worse than the old
-    no-op). A NULL/absent DACL, however, means "everyone allowed" and is treated as a REFUSAL. All
-    ctypes work lives behind the ``sys.platform == 'win32'`` guard in the caller so mypy/lint pass on
-    the Linux CI leg (mirrors :mod:`messagefoundry.secrets_dpapi`)."""
+    rejects it. A NULL/absent DACL means "everyone allowed" and is a REFUSAL. All ctypes work lives
+    behind the ``sys.platform == 'win32'`` guard in the caller so mypy/lint pass on the Linux CI leg
+    (mirrors :mod:`messagefoundry.secrets_dpapi`).
+
+    **Two error postures live here, and they differ deliberately** (ADR 0036 Decision 3 as amended).
+    **Four** arms **fail open with a loud WARNING**: a ``GetNamedSecurityInfoW`` failure, an
+    unresolvable owner SID, a DACL that cannot be enumerated, and a process token that cannot be read
+    (which costs the owner comparison alone — the ACE pass still runs, and is warned about once per
+    load rather than once per file). They log and proceed, so they never reach
+    :func:`_refuse_unsafe_config_source` and carry no escape hatch — the original argument was that a
+    transient Win32 failure must not brick a service that started fine before the check existed. The
+    **owner-membership** arm does not follow them: an Administrators lookup that cannot be performed is
+    a refusal, raised through :func:`_refuse_unsafe_config_source` so the documented
+    ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` override still clears it. That inconsistency is known and
+    named rather than papered over; widening the fail-closed posture to the other four is a separate,
+    unfiled change."""
     if sys.platform != "win32":  # pragma: no cover - guard for type-checker / non-Windows
         return
     import ctypes
@@ -5468,6 +5576,21 @@ def _assert_safe_config_source_windows(directory: Path) -> None:
     advapi32.GetAce.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p)]
     advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
     advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
+    advapi32.ConvertStringSidToSidW.restype = wintypes.BOOL
+    advapi32.ConvertStringSidToSidW.argtypes = [
+        wintypes.LPCWSTR,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi32.LookupAccountSidW.restype = wintypes.BOOL
+    advapi32.LookupAccountSidW.argtypes = [
+        wintypes.LPCWSTR,  # lpSystemName (NULL = this machine)
+        ctypes.c_void_p,  # Sid
+        wintypes.LPWSTR,  # Name
+        ctypes.POINTER(wintypes.DWORD),  # cchName
+        wintypes.LPWSTR,  # ReferencedDomainName
+        ctypes.POINTER(wintypes.DWORD),  # cchReferencedDomainName
+        ctypes.POINTER(ctypes.c_int),  # peUse (SID_NAME_USE)
+    ]
     advapi32.OpenProcessToken.restype = wintypes.BOOL
     advapi32.OpenProcessToken.argtypes = [
         wintypes.HANDLE,
@@ -5555,7 +5678,184 @@ def _assert_safe_config_source_windows(directory: Path) -> None:
         finally:
             kernel32.CloseHandle(token)
 
+    # LOCALGROUP_MEMBERS_INFO_0 — level 0 of NetLocalGroupGetMembers returns member SIDs only. Levels
+    # 1..3 return NAMES, and translating a domain member's SID to a name is what reaches out to a domain
+    # controller; level 0 keeps the lookup on the local SAM/LSA. That matters because the owner arm is
+    # fail-closed: a lookup that could block on an unreachable DC would turn a network partition into a
+    # refused start. The cost of staying local is that only DIRECT members are seen — an account that is
+    # an administrator only through a nested domain group does not resolve, and is refused.
+    class _LOCALGROUP_MEMBERS_INFO_0(ctypes.Structure):
+        _fields_ = (("lgrmi0_sid", ctypes.c_void_p),)
+
+    _MAX_PREFERRED_LENGTH = 0xFFFFFFFF
+    _ERROR_MORE_DATA = 234
+    # With MAX_PREFERRED_LENGTH the API allocates as much as it needs, so a real local Administrators
+    # group is one page. The budget bounds a provider that keeps saying "more data" without ever
+    # draining; it is a termination guard, not a size limit anyone should tune.
+    _MAX_MEMBER_PAGES = 64
+
+    def _administrators_group_name() -> str | None:
+        # NetLocalGroupGetMembers takes a NAME, so resolve BUILTIN\Administrators to its localized one
+        # ("Administratoren", "Administradores", ...). S-1-5-32-544 is a BUILTIN SID that LSA resolves
+        # locally, so this lookup does not depend on a domain controller either.
+        sid_ptr = ctypes.c_void_p()
+        if not advapi32.ConvertStringSidToSidW(_WIN_ADMINISTRATORS_SID, ctypes.byref(sid_ptr)):
+            return None
+        try:
+            name_len = wintypes.DWORD(0)
+            domain_len = wintypes.DWORD(0)
+            use = ctypes.c_int(0)
+            advapi32.LookupAccountSidW(  # sizing probe: fails by design, fills the two lengths
+                None,
+                sid_ptr,
+                None,
+                ctypes.byref(name_len),
+                None,
+                ctypes.byref(domain_len),
+                ctypes.byref(use),
+            )
+            if name_len.value == 0:
+                return None
+            name = ctypes.create_unicode_buffer(name_len.value)
+            domain = ctypes.create_unicode_buffer(max(domain_len.value, 1))
+            if not advapi32.LookupAccountSidW(
+                None,
+                sid_ptr,
+                name,
+                ctypes.byref(name_len),
+                domain,
+                ctypes.byref(domain_len),
+                ctypes.byref(use),
+            ):
+                return None
+            return name.value
+        finally:
+            if sid_ptr:
+                kernel32.LocalFree(sid_ptr)
+
+    def _unresolved(why: str) -> tuple[frozenset[str], bool]:
+        """Log why the membership lookup gave up, then report an EMPTY, INCOMPLETE result.
+
+        Every abandon path funnels through here because the arm it feeds is fail-closed: it stops the
+        service, and without this line the operator sees one string — "its Administrators membership
+        could not be resolved" — for a missing netapi32, an access-denied enumeration, an unreadable
+        member SID and a short read alike, with no way to tell which."""
+        _logger.warning(
+            "config-source trust guard could not resolve local Administrators membership (%s); an "
+            "owner that is neither the run-as account nor a well-known admin SID will be REFUSED "
+            "(see docs/SERVICE.md for the required config-dir ownership)",
+            why,
+        )
+        return frozenset(), False
+
+    def _local_administrators_members() -> tuple[frozenset[str], bool]:
+        """Direct member SIDs of the local Administrators group, and whether the read was COMPLETE.
+
+        The completeness flag is why this returns a pair rather than an optional set. Membership is
+        **monotone**: a SID found in a partial enumeration really is a member, so a partial read can
+        still answer *yes* soundly. Only a *no* needs the full set — and answering *no* from a short
+        read is what would refuse a legitimate admin owner while reporting, confidently and wrongly,
+        that it "is neither the account the engine runs as nor an administrator"."""
+        try:
+            netapi32 = ctypes.WinDLL("netapi32", use_last_error=True)
+        except OSError:
+            # No netapi32 on this SKU: unresolvable, and the caller refuses a non-well-known owner.
+            return _unresolved("netapi32 is not available on this Windows SKU")
+        netapi32.NetLocalGroupGetMembers.restype = wintypes.DWORD
+        netapi32.NetLocalGroupGetMembers.argtypes = [
+            wintypes.LPCWSTR,  # servername (NULL = this machine)
+            wintypes.LPCWSTR,  # localgroupname
+            wintypes.DWORD,  # level
+            ctypes.POINTER(ctypes.c_void_p),  # bufptr
+            wintypes.DWORD,  # prefmaxlen
+            ctypes.POINTER(wintypes.DWORD),  # entriesread
+            ctypes.POINTER(wintypes.DWORD),  # totalentries
+            ctypes.POINTER(ctypes.c_void_p),  # resumehandle
+        ]
+        netapi32.NetApiBufferFree.restype = wintypes.DWORD
+        netapi32.NetApiBufferFree.argtypes = [ctypes.c_void_p]
+
+        group = _administrators_group_name()
+        if group is None:
+            return _unresolved(
+                "BUILTIN\\Administrators could not be resolved to its local group name"
+            )
+        members: set[str] = set()
+        resume = ctypes.c_void_p(0)
+        for _page in range(_MAX_MEMBER_PAGES):
+            buf = ctypes.c_void_p()
+            read = wintypes.DWORD(0)
+            total = wintypes.DWORD(0)
+            rc = netapi32.NetLocalGroupGetMembers(
+                None,
+                group,
+                0,
+                ctypes.byref(buf),
+                _MAX_PREFERRED_LENGTH,
+                ctypes.byref(read),
+                ctypes.byref(total),
+                ctypes.byref(resume),
+            )
+            if rc not in (0, _ERROR_MORE_DATA):
+                # rc is a NET_API_STATUS: 5 is ERROR_ACCESS_DENIED (a SAM-access hardening baseline,
+                # or a domain controller where the group object's own ACL decides), 2220 is
+                # NERR_GroupNotFound. Naming the number is the difference between an operator who can
+                # look it up and one who only knows the service will not start.
+                return _unresolved(f"NetLocalGroupGetMembers returned status {rc}")
+            try:
+                entries = ctypes.cast(buf, ctypes.POINTER(_LOCALGROUP_MEMBERS_INFO_0))
+                for i in range(read.value):
+                    member_ptr = entries[i].lgrmi0_sid
+                    member = _sid_to_str(member_ptr) if member_ptr else None
+                    if member is None:
+                        # Keep what was read: membership is monotone, so the SIDs already collected
+                        # are still sound evidence for a YES. Only the NO becomes unavailable.
+                        return frozenset(members), False
+                    members.add(member)
+            finally:
+                if buf:
+                    netapi32.NetApiBufferFree(buf)
+            if rc == _ERROR_MORE_DATA:
+                # A "there is more" page that yielded nothing cannot have advanced the resume handle,
+                # so looping again asks the identical question — an unbounded spin inside load_config
+                # (startup, and every POST /config/reload) rather than an answer.
+                if read.value == 0:
+                    return _unresolved("NetLocalGroupGetMembers made no progress across a page")
+                continue
+            # rc == 0 terminates the enumeration. totalentries counts what was available from THIS
+            # resume position, so a final page that read fewer than it was promised is a short read.
+            # It is not an error and nothing is logged: the members collected still answer YES, and
+            # only a NO is withheld.
+            return frozenset(members), read.value >= total.value
+        return _unresolved(
+            f"the Administrators enumeration did not finish in {_MAX_MEMBER_PAGES} pages"
+        )
+
+    # One enumeration per load, not per candidate file: the directory and its *.py share an owner in
+    # every realistic layout, and the group does not change mid-load. A list is the memo cell because
+    # the result is a tuple whose "not yet computed" state must stay distinct from any valid value.
+    admins_cache: list[tuple[frozenset[str], bool]] = []
+
+    def _owner_in_admins(sid: str) -> bool | None:
+        if not admins_cache:
+            admins_cache.append(_local_administrators_members())
+        members, complete = admins_cache[0]
+        if sid in members:
+            return True  # monotone: a SID present in a partial read is still genuinely a member
+        return False if complete else None
+
     self_sid = _self_sid()
+    if self_sid is None:
+        # The fourth fail-open arm, and the only one that is not a per-file event: with no process
+        # SID there is nothing to compare an owner against, so _evaluate_config_dacl skips the owner
+        # arm for every candidate below (the ACE pass still runs). Warn once per load — an operator
+        # cannot act on a control that quietly stops checking half of what it checks.
+        _logger.warning(
+            "config-source trust guard could not read this process's own user SID; the OWNER of %s "
+            "will NOT be vetted for this load (the DACL is still checked) — verify the config dir is "
+            "owned by an administrator or the service account (see docs/SERVICE.md)",
+            directory,
+        )
     candidates = [directory, *directory.glob("*.py")]
     for path in candidates:
         owner_sid_ptr = ctypes.c_void_p()
@@ -5629,7 +5929,7 @@ def _assert_safe_config_source_windows(directory: Path) -> None:
                     path,
                 )
                 continue
-            reason = _evaluate_config_dacl(owner_sid, aces, self_sid)
+            reason = _evaluate_config_dacl(owner_sid, aces, self_sid, _owner_in_admins)
             if reason is not None:
                 _refuse_unsafe_config_source(
                     f"refusing to load config from writable-by-others path {path}: {reason}; "
@@ -5669,11 +5969,13 @@ def _assert_safe_config_source(directory: Path) -> None:
     Because :func:`_exec_module` runs arbitrary Python as the engine's service account, a
     lower-privileged user who can write into the config dir (or a module file) could execute
     code as that account on the next reload. On POSIX we hard-fail on a group/world-writable
-    directory or module. On Windows the equivalent NTFS-DACL check now runs in-process
+    directory or module, **and on one owned by another unprivileged uid**. On Windows the equivalent
+    NTFS-DACL check now runs in-process
     (:func:`_assert_safe_config_source_windows`, SEC-003): the directory and each ``*.py``
-    owner/DACL is parsed via ctypes and a source whose DACL grants a broad/low-privilege
-    principal a write-class right is refused — no longer a silent no-op delegated entirely to
-    install-time ACLs (docs/SERVICE.md, DEPLOY-1)."""
+    owner/DACL is parsed via ctypes and a source is refused when its DACL grants a broad/low-privilege
+    principal a write-class right, **or when its owner is neither the engine's own account nor an
+    administrator** (the Windows counterpart of that foreign-uid arm, CONFIG-2) — no longer a silent
+    no-op delegated entirely to install-time ACLs (docs/SERVICE.md, DEPLOY-1)."""
     if not directory.is_dir():
         return
     if sys.platform == "win32":
