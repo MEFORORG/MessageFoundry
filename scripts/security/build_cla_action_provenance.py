@@ -30,12 +30,21 @@ at commit ``ca4a40a7`` with a 176-byte two-line header prepended, verified byte 
 is :func:`git_blob_id`, and ``git hash-object`` agrees with it. Both turn a recorded number into a
 reproducible derivation, and :func:`verify_derivation` runs both.
 
-COVERING ONLY THE BUNDLE WAS A HOLE WITH A WORKING EXPLOIT, recorded because the refusal below reads
-as if it always covered everything. ``--write`` refuses when :func:`verify_derivation` reports
-anything; while that function looked only at the bundle, a tampered lockfile reddened ``--check``
-and then regenerated CLEAN -- measured on a copy, an injected package came back exit 0, "wrote ...",
-a clean ``--check``, and the package in ``components``. The lockfile is the artifact the README
-tells an auditor to scan, so that was the laundering path that mattered.
+THE OTHER TWO RECORDED FILES ARE PINNED RATHER THAN DERIVED (:data:`PINNED_DIGESTS`), because no
+upstream id for them is recorded here. Weaker as provenance, identical as a refusal.
+
+EVERY RECORDED FILE NEEDS AN ANCHOR, AND FINDING THAT OUT TOOK TWO ROUNDS. ``--write`` refuses only
+what :func:`verify_derivation` reports, so a recorded file with no anchor is regenerated from the
+tree -- the record is rewritten to describe the change instead of reporting it. Measured twice on a
+copy, and the second time is the one to remember: round one closed the LOCKFILE (an injected package
+came back exit 0, "wrote ...", a clean ``--check``, and the package in ``components``), and round two
+found the identical hole still open on ``action.yml`` -- the file GitHub reads to decide which script
+the privileged ``pull_request_target`` job runs. Closing one instance of a class is not closing the
+class, and a repair round introduces its own asymmetries.
+
+THE RECORD IS ALSO AN ALLOWLIST, so :func:`unrecorded_files` walks the directory. Four named keys
+cannot see a file that was ADDED beside them, and a dropped ``dist/payload.js`` plus a repointed
+``action.yml`` is a complete path from "add a file" to "the record signs off on it".
 
 WHY THE LOCKFILE IS NOT NAMED ``package-lock.json``. GitHub's dependency graph ingests a file with
 that name anywhere in the repository. The 2021-era tree it describes carries advisories nobody here
@@ -172,12 +181,37 @@ DigestMode = Literal["raw", "lf"]
 #: ``action.yml`` and ``LICENSE`` take ``lf`` because nothing pins them -- `git check-attr text`
 #: reports them unspecified, so `core.autocrlf=true` converts them on checkout and a raw digest of
 #: either would name no file that exists on Windows.
+ACTION_YML_PATH = f"{ACTION_DIR}/action.yml"
+LICENSE_PATH = f"{ACTION_DIR}/LICENSE"
+
 RECORDED_FILES: dict[str, DigestMode] = {
     BUNDLE_PATH: "raw",
-    f"{ACTION_DIR}/action.yml": "lf",
-    f"{ACTION_DIR}/LICENSE": "lf",
+    ACTION_YML_PATH: "lf",
+    LICENSE_PATH: "lf",
     LOCK_PATH: "lf",
 }
+
+#: PINNED DIGESTS, and the reason they are constants rather than whatever `--write` finds on disk.
+#: `--write` refuses only what :func:`verify_derivation` reports, so a recorded file with no anchor
+#: is regenerated from the tree -- the record is rewritten to describe the change instead of
+#: reporting it. Measured on a copy: repoint `action.yml`'s `runs.main` at `dist/evil.js`, and
+#: `--check` reds while `--write` returns 0 and leaves `--check` clean over the tampered file.
+#: ACTION.YML IS THE FILE GITHUB READS TO DECIDE WHICH SCRIPT THE PRIVILEGED `pull_request_target`
+#: JOB RUNS, so that was the laundering path through the file that SELECTS the code.
+#:
+#: The bundle and the lockfile anchor to upstream identities (:data:`UPSTREAM_BUNDLE_SHA256`,
+#: :data:`UPSTREAM_LOCK_BLOB_ID`). These two have no upstream id recorded here, so they anchor to
+#: the reviewed bytes instead -- weaker as provenance, identical as a refusal. Changing either is
+#: then a deliberate edit to this constant, which is the friction the bundle already has.
+PINNED_DIGESTS: dict[str, str] = {
+    ACTION_YML_PATH: "8acc29dc1f1559b9c5117eee0ffb24710233459ddff6e068fcdd3c04486e2a4f",
+    LICENSE_PATH: "7503bb1b07845ec2f549da3c778f788f885f0f3be523dbcb41d7d070419ee88e",
+}
+
+#: Files that live in :data:`ACTION_DIR` and are deliberately NOT recorded. README.md is prose about
+#: the record; the record cannot contain its own digest. Everything else in that directory is
+#: unaccounted for -- see :func:`unrecorded_files`.
+UNRECORDED_BY_DESIGN = frozenset({f"{ACTION_DIR}/README.md", RECORD_PATH})
 
 #: The vendoring header prepended to the upstream bundle, byte for byte. The vendored file is this
 #: followed by the upstream blob and nothing else, which :func:`split_vendoring_header` verifies.
@@ -186,6 +220,28 @@ VENDORING_HEADER = (
     b"// Vendored from contributor-assistant/github-action@"
     b"ca4a40a7d1004f18d9960b404b97e5f30a505a08 (v2.6.1). See README.md in this directory.\n"
 )
+
+
+def unrecorded_files(root: Path) -> list[str]:
+    """Files in :data:`ACTION_DIR` that no part of this record accounts for.
+
+    THE RECORD IS AN ALLOWLIST, AND AN ALLOWLIST IS NOT AN INVENTORY. Without this, a file DROPPED
+    into the vendored action -- ``dist/payload.js`` beside the audited bundle, say -- was invisible:
+    measured on a copy, ``--check`` exited 0 and printed "describes the vendored tree" over a
+    directory carrying unrecorded executable content. Chained with a repointed ``action.yml`` that
+    is a complete path from "add a file" to "the record signs off on it", which is why this walks
+    the directory instead of trusting the four keys it was handed.
+    """
+    action_dir = root / ACTION_DIR
+    if not action_dir.is_dir():
+        return [f"{ACTION_DIR} is not a directory in this tree"]
+    accounted = set(RECORDED_FILES) | UNRECORDED_BY_DESIGN
+    found = {path.relative_to(root).as_posix() for path in action_dir.rglob("*") if path.is_file()}
+    return [
+        f"{relative} is in {ACTION_DIR} but nothing in this record accounts for it. A file was "
+        "added to the vendored action; record it or remove it -- do not regenerate over it."
+        for relative in sorted(found - accounted)
+    ]
 
 
 def missing_recorded(root: Path) -> list[str]:
@@ -294,6 +350,13 @@ def lock_components(lock: dict[str, Any]) -> list[dict[str, Any]]:
     for path, entry in packages.items():
         if not path or not isinstance(entry, dict):
             continue  # the "" key is the upstream root project, described by metadata.component
+        if "node_modules/" not in path:
+            # A workspace or local link, not an installed package. Without this the rsplit below
+            # returns the whole path and builds a purl like `pkg:npm/packages/cli@1.0.0`, whose
+            # namespace resolves to nothing -- a scanner either drops it silently or reports an
+            # unknown package. The current lockfile has no such entry, so this is a guard against a
+            # future re-pin rather than a fix for today.
+            continue
         name = path.rsplit("node_modules/", 1)[-1]
         version = entry.get("version")
         if not name or not isinstance(version, str):
@@ -490,16 +553,30 @@ def verify_derivation(contents: dict[str, bytes]) -> list[str]:
             "derived from that file, so it now describes a dependency closure that is not the one "
             "at " + UPSTREAM_COMMIT
         )
+
+    for relative, pinned in sorted(PINNED_DIGESTS.items()):
+        found = digest(contents[relative], RECORDED_FILES[relative])
+        if found != pinned:
+            problems.append(
+                f"{relative} does not match its pinned digest: got {found}, pinned {pinned}. It is "
+                "a recorded file of the vendored action, so regenerating would rewrite the record "
+                "to describe the change instead of reporting it."
+            )
     return problems
 
 
 def check(root: Path) -> list[str]:
     """Every reason the record on disk fails to describe the tree at *root*. Empty means clean."""
-    missing = missing_recorded(root)
-    if missing:
-        return missing
+    # Accumulated, not returned at the first one. An early return here would defeat at the outer
+    # level exactly what verify_derivation accumulates for: a bad merge that removes LICENSE AND
+    # edits the bundle would report the removal, then surface the bundle only after somebody fixed
+    # the first thing -- one hidden failure per round trip.
+    problems = unrecorded_files(root) + missing_recorded(root)
+    if any(not (root / relative).is_file() for relative in RECORDED_FILES):
+        # Nothing below can read the tree, so this is as far as the run goes.
+        return problems
     contents = read_recorded(root)
-    problems = verify_derivation(contents)
+    problems += verify_derivation(contents)
     record_path = root / RECORD_PATH
     if not record_path.exists():
         return problems + [f"{RECORD_PATH} does not exist; run --write"]
@@ -531,22 +608,30 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     root: Path = args.root
+    # NAME THE FILE ACTED ON, not the repository-relative constant. `--root /tmp/copy` printed
+    # "wrote .github/actions/..." -- a path in the real checkout, while writing somewhere else. A
+    # transcript then cannot say which tree was measured, which is SDS-3.8 inside the tool's own
+    # output.
+    record_path = root / RECORD_PATH
     if args.write:
-        problems = missing_recorded(root)
-        contents = {} if problems else read_recorded(root)
-        problems = problems or verify_derivation(contents)
+        problems = unrecorded_files(root) + missing_recorded(root)
+        contents = (
+            {}
+            if any(not (root / relative).is_file() for relative in RECORDED_FILES)
+            else read_recorded(root)
+        )
+        problems += verify_derivation(contents) if contents else []
         if problems:
             for problem in problems:
                 print(f"REFUSED: {problem}", file=sys.stderr)
             print(
-                "Refusing to write a record over a bundle whose provenance does not check out. "
-                "A regenerated record would launder the change into evidence.",
+                "Refusing to regenerate over a vendored action whose provenance does not check "
+                "out. A regenerated record would launder the change into evidence.",
                 file=sys.stderr,
             )
             return 2
-        record = render(build_record(contents))
-        (root / RECORD_PATH).write_text(record, encoding="utf-8", newline="\n")
-        print(f"wrote {RECORD_PATH}")
+        record_path.write_text(render(build_record(contents)), encoding="utf-8", newline="\n")
+        print(f"wrote {record_path}")
         return 0
 
     problems = check(root)
@@ -554,7 +639,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"FAIL: {problem}", file=sys.stderr)
     if problems:
         return 1
-    print(f"{RECORD_PATH} describes the vendored tree")
+    print(f"{record_path} describes the vendored tree")
     return 0
 
 

@@ -23,12 +23,17 @@ outright -- and assert the checker reports each. Without them a checker that sil
 path would pass forever while measuring nothing, which is the failure this repository has already
 paid for more than once.
 
-THE CONTROLS ARE WHAT FOUND THE ONE REAL HOLE IN THIS GATE, and they found it by being EXTENDED
+THE CONTROLS ARE WHAT FOUND EVERY REAL HOLE IN THIS GATE, and they found each one by being EXTENDED
 rather than by being present. The first cut mutated only the bundle, and `--write` refused as
 designed. The same shape over the LOCKFILE returned exit 0 and regenerated a clean record carrying
-the injected package -- the artifact an auditor is told to scan, laundered by the tool whose refusal
-message says it will not launder anything. Covering three of four recorded files left the one
-exploitable path uncovered, so a control table is read for what it OMITS.
+the injected package. Extending it again, to `action.yml`, found the identical hole STILL OPEN after
+the lockfile was fixed -- on the file GitHub reads to decide which script the privileged job runs.
+
+SO THE CONTROLS ARE PARAMETRIZED OVER `RECORDED_FILES` NOW, not written one at a time. Two rounds of
+hand-picked controls left a hole each time, and both times the table looked complete. A control that
+enumerates is read for what it OMITS; a control that iterates the set cannot omit a member of it.
+Separately, `unrecorded_files` covers what no per-file control can: a file ADDED to the directory,
+which four named keys are structurally unable to see.
 
 WHAT NONE OF IT PROVES. A clean audit of the vendored lockfile proves the DECLARED dependencies of
 the pinned upstream commit are clean. It does not prove the bundle was built from them: that needs
@@ -220,19 +225,30 @@ def test_the_pinned_commit_is_named_consistently(relative: str) -> None:
     )
 
 
-#: The prose that restates the record's numbers. Two documents, so a reader who finds one of them
-#: is not reading a figure the record has since moved past.
-_PROSE_DOCS = (
-    REPO_ROOT / provenance.ACTION_DIR / "README.md",
-    REPO_ROOT / "docs" / "SUPPLY-CHAIN.md",
-)
+_README = REPO_ROOT / provenance.ACTION_DIR / "README.md"
+_SUPPLY_CHAIN = REPO_ROOT / "docs" / "SUPPLY-CHAIN.md"
+
+#: Which prose documents restate which derived figure. EVERY named document must carry the CURRENT
+#: value, which is the whole point: an earlier cut asserted only that SOME document did, so updating
+#: the README and leaving docs/SUPPLY-CHAIN.md saying 403 stayed green while a published
+#: supply-chain document contradicted the artifact it describes. Measured, then pinned here.
+_PROSE_SITES: dict[str, tuple[Path, ...]] = {
+    "package count": (_README, _SUPPLY_CHAIN),
+    "runtime package count": (_README,),
+    "excluded package count": (_README,),
+    "vendoring header length": (_README, _SUPPLY_CHAIN),
+    "upstream bundle digest": (_README,),
+}
 
 
 def _derived_facts() -> dict[str, str]:
     """Every number the prose restates, DERIVED from the record rather than typed out here.
 
     Hardcoding them in this test would make it a third copy of the same facts, which is the defect
-    it exists to catch.
+    it exists to catch. Called from inside a test body, never at collection time: it reads and
+    parses the record, so at collection a missing record would be a module-wide COLLECTION ERROR
+    that took the negative controls down with it -- including the one that reports a missing record
+    cleanly.
     """
     components = _record()["components"]
     runtime = sum(1 for component in components if component["scope"] == "required")
@@ -245,14 +261,14 @@ def _derived_facts() -> dict[str, str]:
     }
 
 
-@pytest.mark.parametrize("label", sorted(_derived_facts()))
+@pytest.mark.parametrize("label", sorted(_PROSE_SITES))
 def test_the_prose_states_the_number_the_record_holds(label: str) -> None:
-    """The counts and digests repeated in prose still match the generated record.
+    """Every document that restates a derived figure still states the CURRENT one.
 
     CLAUDE.md section 11 (SDS-3.5) says state a load-bearing fact once and link to it. These are
     restated anyway, because a reader of the README should not have to open a 95 KB CycloneDX
     document to learn how many packages are in the closure. The cost of that choice is drift, and
-    this test is what pays it: re-pin the lockfile and every figure below moves, so a document left
+    this test is what pays it: re-pin the lockfile and every figure moves, so a document left
     behind reds here instead of quietly contradicting the artifact it describes.
     """
     expected = _derived_facts()[label]
@@ -261,12 +277,17 @@ def test_the_prose_states_the_number_the_record_holds(label: str) -> None:
     # package count ever moved 403 -> 404 a containment check would have found the "new" number
     # inside a hex SHA and reported the prose up to date. Measured while building this test.
     pattern = re.compile(rf"\b{re.escape(expected)}\b")
-    stating = [doc.name for doc in _PROSE_DOCS if pattern.search(doc.read_text(encoding="utf-8"))]
+    silent = [
+        doc.name
+        for doc in _PROSE_SITES[label]
+        if not pattern.search(doc.read_text(encoding="utf-8"))
+    ]
 
-    assert stating, (
-        f"no prose document states the record's {label} ({expected}). Either the record moved and "
-        f"{[doc.name for doc in _PROSE_DOCS]} still carry the old figure, or the sentence naming it "
-        "was dropped -- read the record before editing either."
+    assert not silent, (
+        f"{silent} no longer state the record's {label} ({expected}). Either the record moved and "
+        "those documents still carry the old figure, or the sentence naming it was dropped -- read "
+        "the record before editing either, and update _PROSE_SITES if a document dropped it on "
+        "purpose."
     )
 
 
@@ -375,6 +396,37 @@ def test_write_refuses_to_launder_a_tampered_lockfile(tree: Path) -> None:
     assert (tree / provenance.RECORD_PATH).read_bytes() == before, (
         "the record was rewritten over a tampered lockfile -- the laundering path is open again"
     )
+
+
+@pytest.mark.parametrize("relative", sorted(provenance.RECORDED_FILES))
+def test_write_refuses_to_launder_any_recorded_file(tree: Path, relative: str) -> None:
+    """EVERY recorded file, not a chosen two. The omission here is what shipped both holes.
+
+    Round one of review covered the bundle; round two measured the identical laundering path still
+    open on `action.yml`, the file GitHub reads to decide which script the privileged job runs. A
+    parametrized control cannot be half-written the way two hand-picked ones were.
+    """
+    path = tree / relative
+    path.write_bytes(path.read_bytes() + b"\n# appended\n")
+    before = (tree / provenance.RECORD_PATH).read_bytes()
+
+    assert provenance.main(["--write", "--root", str(tree)]) == 2, relative
+    assert (tree / provenance.RECORD_PATH).read_bytes() == before, (
+        f"the record was rewritten over a changed {relative} -- that file has no refusal behind it"
+    )
+
+
+def test_the_gate_sees_an_added_file_in_the_action_directory(tree: Path) -> None:
+    """A file DROPPED beside the audited bundle is reported, not ignored.
+
+    The record names four files, so before this it could not see a fifth. Measured on a copy:
+    `dist/payload.js` plus `extra.yml` left `--check` at exit 0 saying it described the tree.
+    """
+    (tree / provenance.ACTION_DIR / "dist" / "payload.js").write_bytes(b"// dropped in\n")
+
+    problems = provenance.check(tree)
+    assert any("nothing in this record accounts for it" in p for p in problems), problems
+    assert provenance.main(["--write", "--root", str(tree)]) == 2
 
 
 @pytest.mark.parametrize("relative", sorted(provenance.RECORDED_FILES))

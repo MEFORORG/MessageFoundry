@@ -185,5 +185,15 @@ updates:
   # anywhere in the repository, independently of this file, so the stock name would raise the same
   # unactionable alerts through a door `dependabot.yml` does not control. The `upstream-` prefix keeps
   # the lockfile readable by a tool an auditor POINTS at it and invisible to one that SCANS for
-  # manifests. Detection is not waived, it is relocated: docs/SUPPLY-CHAIN.md carries the audit
-  # commands, and `tests/test_cla_action_provenance.py` fails if the bundle moves without its record.
+  # manifests.
+  #
+  # WHAT THAT COSTS, STATED PLAINLY BECAUSE AN EARLIER DRAFT HERE DID NOT. It read "Detection is not
+  # waived, it is relocated", naming docs/SUPPLY-CHAIN.md's audit commands and
+  # `tests/test_cla_action_provenance.py`. That was false, and falsely reassuring. No workflow runs
+  # osv-scanner; trivy runs only against the container image (which does not copy `.github/`) and the
+  # Dockerfile. And the test is a CHANGE detector -- it fails when the bundle moves without its
+  # record, and has no view of advisories at all. So VULNERABILITY detection over this closure is
+  # MANUAL AND UNSCHEDULED: somebody runs the command in the README or nobody does. A compensating
+  # control resting on a false premise is the defect CLAUDE.md section 11 (SDS-3.7) forbids, so the
+  # gap is recorded rather than papered over. Bounded by where the bundle runs: CI only, never
+  # shipped in a wheel, sdist or deployment.

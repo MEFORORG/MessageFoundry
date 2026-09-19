@@ -120,9 +120,15 @@ is recorded instead, in the same format the release SBOMs use (BACKLOG #1578):
 
 `scripts/security/build_cla_action_provenance.py --check` verifies the record describes the tree,
 and `tests/test_cla_action_provenance.py` is the gate. It sits in the repo-harness tier
-(`tests/tooling_manifest.txt`), which runs on every pull request that touches `.github/` or
-`scripts/` — that is, on every change that can alter its answer, since nothing under
-`messagefoundry/` can. So the bundle cannot move without the record moving with it.
+(`tests/tooling_manifest.txt`), which runs on a pull request touching at least `.github/`,
+`scripts/` or `docs/` — the live list is the path filter in `ci.yml`, not this sentence. Those cover
+every input the gate reads, and nothing under `messagefoundry/` is one. So the bundle cannot move
+without the record moving with it.
+
+That gate detects **change**, not vulnerabilities. Nothing in CI scans this closure for advisories:
+the audit commands below are run by hand or not at all. The exposure is bounded by where the bundle
+runs — CI only, never in a wheel, sdist or deployment — and `.github/dependabot.yml` records why no
+automated remediation lane exists for it.
 
 Two things are worth stating precisely, because a supply-chain record that implies more than it
 proves is worse than none:
