@@ -1953,8 +1953,8 @@ def create_app(
                     continue  # per-channel RBAC: hide an inbound outside the caller's scope
                 inb = metrics.inbound.get(iname)
                 speer, sport = _peer_port(ic.spec.type.value, ic.spec.settings)
-                ifail = rr.connection_failed(iname)  # ADR 0031: start failed → not listening
-                ifiltered = rr.connection_filtered(iname)  # #61 ADR 0048: DR-parked below threshold
+                ifail = rr.inbound_failed(iname)  # ADR 0031: start failed → not listening
+                ifiltered = rr.inbound_filtered(iname)  # #61 ADR 0048: DR-parked below threshold
                 rows.append(
                     ConnectionRow(
                         role="source",
@@ -2008,8 +2008,8 @@ def create_app(
                     continue
                 emitted_dests.add(dname)
                 oc = reg.outbound.get(dname)
-                dfail = rr.connection_failed(dname)  # ADR 0031: built? or degraded?
-                dfiltered = rr.connection_filtered(dname)  # #61 ADR 0048: DR-parked below threshold
+                dfail = rr.outbound_failed(dname)  # ADR 0031: built? or degraded?
+                dfiltered = rr.outbound_filtered(dname)  # #61 ADR 0048: DR-parked below threshold
                 # An outbound the live graph no longer declares (removed by a reload) keeps draining
                 # its queued rows — report it honestly as "draining" with an unknown method, rather
                 # than mislabeling it as a running File connector.
@@ -2074,13 +2074,14 @@ def create_app(
             # ADR 0031 / #61 ADR 0048: an outbound that FAILED to build (0031) or was DR-PARKED below the
             # threshold (0048) has no metrics edge until traffic is routed to it, so it would be invisible
             # above. Emit a standalone row for every still-failed/filtered outbound not already shown, so
-            # a degraded or parked lane is never silently hidden from the dashboard. A failed connection
-            # is also in degraded_connections; a filtered one is in filtered_connections — the two reasons
-            # map to the distinct "failed" vs "filtered" status (a connection is never in both).
+            # a degraded or parked lane is never silently hidden from the dashboard. Both sources are the
+            # OUTBOUND-scoped snapshots (see `Direction`): these are destination rows, so an inbound
+            # namesake's failure or DR park must never reach them. The two reasons map to the distinct
+            # "failed" vs "filtered" status (a connection is never in both).
             standalone: dict[str, tuple[str, str | None]] = {
-                name: ("failed", reason) for name, reason in rr.degraded_connections().items()
+                name: ("failed", reason) for name, reason in rr.degraded_outbound().items()
             }
-            for name, reason in rr.filtered_connections().items():
+            for name, reason in rr.filtered_outbound().items():
                 standalone.setdefault(name, ("filtered", reason))
             # Also surface any operator-paused OR not-deployed outbound with no failed/filtered/edge row
             # yet, so a paused idle/no-edge lane stays visible + selectable (its purge-eligibility is the
@@ -2104,7 +2105,7 @@ def create_app(
                     continue  # channel-scoped users never see shared-outbound topology (see above)
                 oc = reg.outbound.get(dname)
                 if oc is None or dname in emitted_dests:
-                    continue  # inbound failures appear as their source row; shown dests are covered
+                    continue  # a removed/draining outbound has no spec to render; shown dests are covered
                 dmethod = _method_label(oc.spec.type.value)
                 dpeer, dport = _peer_port(oc.spec.type.value, oc.spec.settings)
                 rows.append(
@@ -2301,7 +2302,7 @@ def create_app(
                 metadata=dict(ic.metadata) if ic.metadata else None,
                 settings=redacted_settings(ic.spec.settings),
                 # ADR 0031 failure reason, or the #61 (ADR 0048) DR-parked reason — whichever applies.
-                error=rr.connection_failed(name) or rr.connection_filtered(name),
+                error=rr.inbound_failed(name) or rr.inbound_filtered(name),
             )
         oc = rr.registry.outbound.get(name)
         if oc is not None:
@@ -2321,7 +2322,7 @@ def create_app(
                 settings=redacted_settings(oc.spec.settings),
                 simulated=rr.outbound_simulated(name),
                 # ADR 0031 failure reason, or the #61 (ADR 0048) DR-parked reason — whichever applies.
-                error=rr.connection_failed(name) or rr.connection_filtered(name),
+                error=rr.outbound_failed(name) or rr.outbound_filtered(name),
             )
         raise HTTPException(404, f"no such connection: {name}")
 
@@ -4949,9 +4950,9 @@ def create_app(
             ic = reg.inbound[name]
             if not ic.deployed:
                 return "not_deployed"
-            if rr.connection_failed(name):
+            if rr.inbound_failed(name):
                 return "failed"
-            if rr.connection_filtered(name):
+            if rr.inbound_filtered(name):
                 return "filtered"
             return "running" if rr.inbound_running(name) else "stopped"
 
@@ -4959,9 +4960,9 @@ def create_app(
             oc = reg.outbound[name]
             if not oc.deployed:
                 return "not_deployed"
-            if rr.connection_failed(name):
+            if rr.outbound_failed(name):
                 return "failed"
-            if rr.connection_filtered(name):
+            if rr.outbound_filtered(name):
                 return "filtered"
             return rr.outbound_status(name)
 
