@@ -35,6 +35,7 @@ independently, so overlapping id sets are reachable in normal operation. They no
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import hmac
 import json
@@ -59,7 +60,7 @@ from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Final, Protocol, runtime_checkable
+from typing import Any, Final, NoReturn, Protocol, runtime_checkable
 from uuid import uuid4
 
 import aiosqlite
@@ -118,29 +119,34 @@ _RELEASE_CHUNK = 500
 # fixed parameters; the chunks run inside the reset's single transaction, so atomicity is unchanged.
 _RESET_LANE_CHUNK = 500
 
-# How long a writer-transaction unwind waits for its shielded ROLLBACK before giving up on it. A
+# How long a transaction unwind waits for its shielded ROLLBACK before giving up on it. A
 # cancellation is usually a shutdown, so the unwind must never be able to hang shutdown on a worker
 # thread that is wedged on the abandoned statement. 5s matches the SQL Server store's
 # `_DIRTY_CLOSE_TIMEOUT` (ADR 0159) and the read pool's `busy_timeout`, so the store's three
 # "stop waiting on a stuck connection" bounds agree rather than each carrying its own number.
-_WRITER_ROLLBACK_TIMEOUT = 5.0
+_ROLLBACK_TIMEOUT = 5.0
 
 
-def _drain_detached_rollback(fut: asyncio.Future[None]) -> None:
+def _drain_detached_rollback(role: str, fut: asyncio.Future[None]) -> None:
     """Retrieve a detached rollback's outcome so asyncio does not log it as never-retrieved."""
     if fut.cancelled():
         return
     exc = fut.exception()
     if exc is not None:
-        log.warning("sqlite: detached writer rollback failed: %s", exc)
+        log.warning("sqlite: detached %s rollback failed: %s", role, exc)
 
 
-async def _unwind_writer_txn(db: aiosqlite.Connection) -> bool:
-    """Roll the open writer transaction back while the caller unwinds. Returns ``True`` if a further
-    cancellation was swallowed to finish the job.
+async def _unwind_txn(db: aiosqlite.Connection, *, role: str) -> bool:
+    """Roll the open transaction on ``db`` back while the caller unwinds. Returns ``True`` if a
+    further cancellation was swallowed to finish the job.
+
+    ``role`` is ``"writer"`` or ``"read"`` and only names the connection in the log lines. The
+    mechanism is deliberately identical for both — see *why both roles wait* below.
 
     Called from :func:`_writer_txn` with the writer lock STILL HELD, so no other writer can take the
-    connection mid-rollback.
+    connection mid-rollback, and from :meth:`MessageStore._read` on a borrowed pooled connection this
+    task still owns — it goes back to the queue only after this helper returns — so no other reader
+    can take it either.
 
     The rollback is **shielded** because a cancellation is the common reason we are here, and an
     unshielded ``await`` on the cancelled task's own stack is cancelled at once — leaving exactly the
@@ -148,23 +154,32 @@ async def _unwind_writer_txn(db: aiosqlite.Connection) -> bool:
     on a worker thread that may still be stuck on the abandoned statement.
 
     A FURTHER cancellation (shutdown cancels a task, then the gather cancels it again) is swallowed
-    and the wait resumes for what is left of the bound. This is where SQLite parts company with the
+    and the wait resumes for what is left of the bound.
+
+    **Why both roles wait rather than returning early.** This is where SQLite parts company with the
     pooled SQL Server path (ADR 0159's ``_release_dirty``, which swallows the second cancel and
-    returns immediately): there the connection is already quarantined out of the pool, so returning
-    early is safe. Here there is exactly ONE writer connection behind one lock, so returning early
-    would release the lock over a half-open transaction and the next writer would inherit it."""
+    returns immediately): there the connection is already quarantined OUT of the pool, so returning
+    early strands nothing. Neither SQLite connection can be quarantined. The writer is exactly ONE
+    connection behind one lock, so returning early would release the lock over a half-open
+    transaction and the next writer would inherit it. The read pool is a FIXED
+    :class:`asyncio.Queue` filled once at ``open()`` with **no reopen path**, so dropping a
+    connection rather than healing it would shrink the pool permanently, and dropping all
+    ``_READ_POOL_SIZE`` of them would park every later read forever — silently, and strictly worse
+    than the half-open transaction it was avoiding (BACKLOG #1635). Waiting out the bound is the only
+    remedy available to either role, so do not port the quarantine here."""
     loop = asyncio.get_running_loop()
     rollback = asyncio.ensure_future(db.rollback())
-    deadline = loop.time() + _WRITER_ROLLBACK_TIMEOUT
+    deadline = loop.time() + _ROLLBACK_TIMEOUT
     swallowed_cancel = False
     while True:
         remaining = deadline - loop.time()
         if remaining <= 0:
-            rollback.add_done_callback(_drain_detached_rollback)
+            rollback.add_done_callback(functools.partial(_drain_detached_rollback, role))
             log.warning(
-                "sqlite: writer rollback did not complete within %.1fs; it will finish detached and"
-                " the next writer may inherit an open transaction",
-                _WRITER_ROLLBACK_TIMEOUT,
+                "sqlite: %s rollback did not complete within %.1fs; it will finish detached and the"
+                " next user of this connection may inherit an open transaction",
+                role,
+                _ROLLBACK_TIMEOUT,
             )
             return swallowed_cancel
         try:
@@ -175,8 +190,23 @@ async def _unwind_writer_txn(db: aiosqlite.Connection) -> bool:
             swallowed_cancel = True  # re-cancelled mid-unwind; keep waiting out the bound
             continue
         except Exception:  # noqa: BLE001 — a rollback failure must not mask the original failure
-            log.warning("sqlite: writer rollback failed", exc_info=True)
+            log.warning("sqlite: %s rollback failed", role, exc_info=True)
         return swallowed_cancel
+
+
+async def _unwind_and_raise(db: aiosqlite.Connection, exc: BaseException, *, role: str) -> NoReturn:
+    """Unwind ``db``'s open transaction, then re-raise ``exc`` — or a cancellation if one landed
+    mid-unwind.
+
+    A cancellation swallowed by :func:`_unwind_txn` while an ORDINARY failure was rolling back must
+    not be dropped: re-raising only the original would leave the task running through a shutdown, so
+    the cancellation wins and carries the original failure as its cause.
+
+    One definition, shared by :func:`_writer_txn` and :meth:`MessageStore._read`, because both have
+    exactly this obligation and a second copy is how the two drift apart. It never returns."""
+    if await _unwind_txn(db, role=role) and not isinstance(exc, asyncio.CancelledError):
+        raise asyncio.CancelledError from exc
+    raise exc
 
 
 @asynccontextmanager
@@ -213,13 +243,7 @@ async def _writer_txn(db: aiosqlite.Connection, lock: asyncio.Lock) -> AsyncIter
             await db.execute("BEGIN")
             yield
         except BaseException as exc:
-            swallowed_cancel = await _unwind_writer_txn(db)
-            if swallowed_cancel and not isinstance(exc, asyncio.CancelledError):
-                # A cancellation landed while we were rolling an ORDINARY failure back. Re-raising
-                # only that failure would drop the cancellation and leave the task running through a
-                # shutdown, so the cancellation wins and carries the original failure as its cause.
-                raise asyncio.CancelledError from exc
-            raise
+            await _unwind_and_raise(db, exc, role="writer")
 
 
 class _GroupPoisoned(Exception):  # noqa: N818 — control-flow signal, not an error condition
@@ -2628,15 +2652,29 @@ class MessageStore:
         """Yield a connection to run a read on without taking the write lock (lockfree-reads).
 
         Pooled path (file-backed WAL): borrow a read-only connection and wrap the block in one deferred
-        read transaction, so every statement in the block sees a single consistent WAL snapshot taken at
-        ``BEGIN`` and concurrent writes can't interleave. The transaction is always closed
+        read transaction, so every statement in the block sees a single consistent WAL snapshot and
+        concurrent writes can't interleave. ``BEGIN`` is DEFERRED, so the snapshot opens at the block's
+        FIRST statement rather than at the ``BEGIN`` itself — what the block gets is one snapshot, not a
+        snapshot of the instant it was entered. The transaction is always closed
         (``COMMIT``/``ROLLBACK``) before the connection returns to the pool, so the next borrower starts
         a *fresh* snapshot (a read always reflects the latest committed write) and never pins the WAL.
+
+        **"Always closed" means on BaseException too, and the ``BEGIN``'s own await is inside the guard
+        for a reason.** aiosqlite runs that ``BEGIN`` on a worker thread, so it lands whether or not the
+        awaiting task survives; a cancellation delivered there used to unwind past a handler that only
+        began *after* the ``BEGIN``, and the connection went back into the pool holding an open
+        transaction. Every later borrower's ``BEGIN`` would then raise "cannot start a transaction
+        within a transaction" from that same unguarded position, so the pool would never heal: one such
+        cancellation would permanently fail one read in ``_READ_POOL_SIZE`` on a deploying site
+        (BACKLOG #1635). The unwind goes through :func:`_unwind_txn` — shielded and bounded — because a
+        bare ``await conn.execute("ROLLBACK")`` is itself cancellable, and a second cancellation landing
+        on it would return the poisoned connection anyway.
 
         Fallback path (``:memory:``, no pool): reads share the single writer connection, serialized under
         ``self._lock`` — the pre-pool behaviour, required because ``:memory:`` can't be reached by a
         second connection. Callers must therefore never invoke a ``_read()`` method while already
-        holding ``self._lock`` (none do)."""
+        holding ``self._lock`` (none do). There is no ``BEGIN`` on this path at all, so a test that means
+        to exercise the snapshot or the unwind must use a FILE-backed store."""
         pool = self._read_pool
         if pool is None:
             async with self._lock:
@@ -2644,14 +2682,15 @@ class MessageStore:
             return
         conn = await pool.get()
         try:
-            await conn.execute("BEGIN")
             try:
+                await conn.execute("BEGIN")
                 yield conn
                 await conn.execute("COMMIT")
-            except BaseException:
-                await conn.execute("ROLLBACK")
-                raise
+            except BaseException as exc:
+                await _unwind_and_raise(conn, exc, role="read")
         finally:
+            # Synchronous on purpose: the unwind above has already finished, and `put_nowait` has no
+            # await for a further cancellation to land on, so the connection cannot be stranded.
             pool.put_nowait(conn)
 
     async def _run_grouped(

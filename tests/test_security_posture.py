@@ -51,19 +51,19 @@ _SECURITY = "security.yml"
 # .github/required-contexts.txt below, so "blocking" is a checked claim rather than a label.
 _BLOCKING_SECURITY_JOBS = frozenset(
     {
-        "pip-audit",
-        "npm-audit",
-        "bandit",
-        "gitleaks",
-        "semgrep",
-        "crypto-inventory",
-        "forbidden-content",
         # The two composite roll-ups, PROMOTED 2026-09-15 out of _PENDING_PROMOTION_SECURITY_JOBS
         # after the owner added both contexts to branch protection. Recording a context is what drags
         # its job under every rule in this module for the first time, so this line is the point at
         # which the composites are graded like the seven scans they duplicate rather than like staged
-        # work nobody grades. They stay here THROUGH the overlap: both sets are required at once, and
-        # the seven above come out at consolidation step 3 (docs/CI.md).
+        # work nobody grades.
+        #
+        # SINCE 2026-09-16 THEY ARE THE ONLY BLOCKING JOBS IN security.yml. The seven original scans --
+        # pip-audit, npm-audit, bandit, gitleaks, semgrep, crypto-inventory, forbidden-content -- were
+        # listed here until the owner removed their contexts from branch protection at about 18:45Z that
+        # day (consolidation step 4, taken before step 3). They are now in
+        # _SUPERSEDED_SECURITY_JOBS below. They were NOT deleted from the workflow; this module would
+        # red if they had been, because `test_every_security_job_is_classified` asserts set equality
+        # over every job in the file.
         "repo-scan",
         "dependency-and-secret-scan",
     }
@@ -83,6 +83,50 @@ _ADVISORY_SECURITY_JOBS = frozenset({"sbom", "trivy"})
 # a PR cannot be required, but that is a reason to keep it out of branch protection -- not a reason to
 # discard its findings.
 _ADVISORY_BY_PLACEMENT_SECURITY_JOBS = frozenset({"released-line-audit"})
+
+# SUPERSEDED: hard-failing, reporting on EVERY pull request, and deliberately NOT required -- because a
+# required COMPOSITE now runs the same scan. Added 2026-09-16, when the owner removed these seven
+# contexts from branch protection (consolidation step 4, taken before step 3; docs/CI.md).
+#
+# WHY THIS IS NOT ONE OF THE THREE BUCKETS ABOVE, checked rather than argued:
+#
+#   * not _ADVISORY_SECURITY_JOBS      -- those MUST carry `continue-on-error: true`. These must NOT:
+#                                         they still scan for real and a finding must still redden the
+#                                         job, because `repo-scan`'s copy of that scan is the gate and
+#                                         a red original is how a human notices the copy would fail.
+#   * not _ADVISORY_BY_PLACEMENT       -- that bucket asserts the job CANNOT report on a pull request
+#                                         (schedule/dispatch-only `if:`). These have no `if:` at all
+#                                         and report on every one. Filing them there would have made
+#                                         `test_advisory_by_placement_jobs_cannot_run_on_a_pull_request`
+#                                         red, which is the assertion that keeps that bucket honest.
+#   * not _PENDING_PROMOTION           -- that bucket points FORWARD: not required YET, and must become
+#                                         required. These point the other way. Sharing the list would
+#                                         give one name two opposite meanings, which is the confusion
+#                                         every classification in this module exists to prevent.
+#
+# THIS IS A STAGING BUCKET AND IT MUST EMPTY. It exists only for the window between consolidation step
+# 4 (done) and step 3 (deleting the seven jobs). While it is non-empty the repository pays seven runner
+# slots a run for scans that gate nothing -- the cost of having inverted the step order, and the cheaper
+# of the two windows on offer. Emptying it means deleting the seven jobs from security.yml; nothing
+# requires their contexts, so that deletion can no longer wedge a pull request.
+#
+# WHAT MAKES THE POSTURE SAFE, and it is a checked claim, not a reassurance:
+# tests/test_security_composite_parity.py asserts each composite's copy of a scan body is
+# BYTE-IDENTICAL to the original's. So every assertion this repository makes about one of these seven
+# steps is an assertion about a string the required composite shares. That is also what licenses the
+# nine negative controls written about these scans to be re-pointed at the composite contexts in
+# tests/negative_controls.toml rather than deleted.
+_SUPERSEDED_SECURITY_JOBS = frozenset(
+    {
+        "pip-audit",
+        "npm-audit",
+        "bandit",
+        "gitleaks",
+        "semgrep",
+        "crypto-inventory",
+        "forbidden-content",
+    }
+)
 
 # PENDING PROMOTION: hard-failing, running on every pull request, and NOT YET in branch protection --
 # the transient fourth posture that step 1 of the security-job consolidation creates. The two
@@ -197,15 +241,130 @@ def test_every_security_job_is_classified() -> None:
         _BLOCKING_SECURITY_JOBS
         | _ADVISORY_SECURITY_JOBS
         | _ADVISORY_BY_PLACEMENT_SECURITY_JOBS
+        | _SUPERSEDED_SECURITY_JOBS
         | _PENDING_PROMOTION_SECURITY_JOBS
     )
     print(f"[security-posture] classified {len(classified)} of {len(actual)} jobs in {_SECURITY}")
     assert actual == classified, (
         f"security.yml jobs are not all classified.\n"
         f"  unclassified (add to _BLOCKING_SECURITY_JOBS, _ADVISORY_SECURITY_JOBS, "
-        f"_ADVISORY_BY_PLACEMENT_SECURITY_JOBS or _PENDING_PROMOTION_SECURITY_JOBS): "
+        f"_ADVISORY_BY_PLACEMENT_SECURITY_JOBS, _SUPERSEDED_SECURITY_JOBS or "
+        f"_PENDING_PROMOTION_SECURITY_JOBS): "
         f"{sorted(actual - classified)}\n"
         f"  named here but gone from the workflow: {sorted(classified - actual)}"
+    )
+
+
+def test_no_job_is_in_two_posture_buckets() -> None:
+    """The buckets make OPPOSITE assertions, so an overlap is a contradiction, not a duplicate.
+
+    `test_every_security_job_is_classified` compares a UNION against the workflow's jobs, and a union
+    cannot see a name filed twice -- the set equality holds either way. That matters most for the pair
+    this repository actually confused: a job left in `_BLOCKING_SECURITY_JOBS` while also listed as
+    `_SUPERSEDED_SECURITY_JOBS` would be asserted both to be in the required set and not to be, and
+    whichever assertion ran first would decide which of two contradictory claims the suite reported.
+    """
+    buckets = {
+        "_BLOCKING_SECURITY_JOBS": _BLOCKING_SECURITY_JOBS,
+        "_ADVISORY_SECURITY_JOBS": _ADVISORY_SECURITY_JOBS,
+        "_ADVISORY_BY_PLACEMENT_SECURITY_JOBS": _ADVISORY_BY_PLACEMENT_SECURITY_JOBS,
+        "_SUPERSEDED_SECURITY_JOBS": _SUPERSEDED_SECURITY_JOBS,
+        "_PENDING_PROMOTION_SECURITY_JOBS": _PENDING_PROMOTION_SECURITY_JOBS,
+    }
+    overlaps = [
+        f"{job!r} is in both {a} and {b}"
+        for i, (a, first) in enumerate(buckets.items())
+        for b, second in list(buckets.items())[i + 1 :]
+        for job in sorted(first & second)
+    ]
+    assert not overlaps, (
+        "a security.yml job is filed under two postures, which assert contradictory things about it:\n  "
+        + "\n  ".join(overlaps)
+    )
+
+
+def test_superseded_jobs_are_not_required() -> None:
+    """The whole claim of the bucket. A superseded job that is still required is misfiled, not retired.
+
+    This is the arm that would have caught the 2026-09-16 drift from the other side: while the seven
+    sat in `_BLOCKING_SECURITY_JOBS` and protection still named them, nothing here was wrong. The
+    moment the register drops them, being listed as blocking becomes false -- and if a future
+    protection edit puts one back, this test reddens rather than the repository quietly running a
+    required gate that this module grades as retired.
+    """
+    required = set(required_contexts())
+    jobs = jobs_of(_SECURITY)
+    still_required = sorted(
+        context_of(k, jobs[k])
+        for k in _SUPERSEDED_SECURITY_JOBS
+        if context_of(k, jobs[k]) in required
+    )
+    assert not still_required, (
+        f"{still_required} is classified SUPERSEDED but is still in .github/required-contexts.txt. "
+        "Either branch protection took the context back -- in which case move the job key to "
+        "_BLOCKING_SECURITY_JOBS, which is what subjects it to the rules for required gates -- or the "
+        "register is wrong. Do not leave it in both lists."
+    )
+
+
+def test_superseded_jobs_carry_no_continue_on_error() -> None:
+    """Off the merge path is NOT findings discarded -- the same rule the by-placement bucket carries.
+
+    A superseded scan is the early warning for its own replacement: the composite runs a byte-identical
+    copy, so a finding the original reports is a finding the required composite will report too. Neuter
+    the original and that warning goes silent while the job still shows a green tick.
+    """
+    jobs = jobs_of(_SECURITY)
+    for key in sorted(_SUPERSEDED_SECURITY_JOBS):
+        job = jobs[key]
+        assert job.get("continue-on-error") in (None, False), (
+            f"security.yml job {key!r} is superseded but must still go red on a finding; it now "
+            "declares continue-on-error, which discards them. It is already outside branch protection, "
+            "so there is nothing continue-on-error can protect here -- delete the job instead "
+            "(consolidation step 3)."
+        )
+        for step in job.get("steps") or []:
+            name = (step or {}).get("name") or (step or {}).get("uses") or "<unnamed step>"
+            assert (step or {}).get("continue-on-error") in (None, False), (
+                f"security.yml job {key!r}, step {name!r} declares continue-on-error"
+            )
+
+
+def test_every_superseded_job_is_consolidated_by_a_required_composite() -> None:
+    """ "Superseded" names a REPLACEMENT, and this is the assertion that it exists and still gates.
+
+    Without it the bucket is a place to park a job whose context somebody dropped, and the seven scans
+    would leave the merge path with nothing recording that anything took them over. The mapping is
+    read from tests/test_security_composite_parity.py, which is also what asserts the copied bodies are
+    byte-identical -- so the claim "the same scan still gates" rests on one mapping, not two.
+    """
+    from tests.test_security_composite_parity import _COMPOSITES
+
+    required = set(required_contexts())
+    jobs = jobs_of(_SECURITY)
+    consolidated_by = {
+        original: composite
+        for composite, originals in _COMPOSITES.items()
+        for original in originals
+    }
+    orphans: list[str] = []
+    for key in sorted(_SUPERSEDED_SECURITY_JOBS):
+        composite = consolidated_by.get(key)
+        if composite is None:
+            orphans.append(f"{key!r} is consolidated by no composite in _COMPOSITES")
+        elif composite not in jobs:
+            orphans.append(
+                f"{key!r} names composite {composite!r}, which is not a job in {_SECURITY}"
+            )
+        elif context_of(composite, jobs[composite]) not in required:
+            orphans.append(
+                f"{key!r} is superseded by {composite!r}, whose context is NOT required -- the scan "
+                "left the merge path and nothing replaced it"
+            )
+    assert not orphans, (
+        "a superseded security.yml job has no required composite carrying its scan:\n  "
+        + "\n  ".join(orphans)
+        + "\nA scan that stopped gating and was not taken over is coverage lost, not consolidated."
     )
 
 
@@ -374,15 +533,22 @@ def test_required_jobs_carry_no_continue_on_error() -> None:
     # change in the collapse — a matrix split, or a context that quietly stops resolving — forces a
     # look here instead of passing on a self-consistent count.
     #
-    # 15/13 since 2026-09-15, when the owner added `security.yml`'s two composite roll-ups to branch
-    # protection (consolidation step 2, docs/CI.md) -- two new contexts backed by two new distinct
-    # jobs. It was 13/11 from 2026-09-04, when the owner retired the review requirement and
-    # `a reviewer has read this` came off branch protection; 14/12 from 2026-08-31 (BACKLOG #1404),
-    # when that context was armed; and 13/11 before that. One collapse throughout: ci.yml's `test`
-    # matrix reports 3 contexts from 1 job, so 15 - 2 = 13.
+    # 8/6 since 2026-09-16, when the owner removed the seven original `security.yml` scan contexts from
+    # branch protection (consolidation step 4, taken BEFORE step 3; docs/CI.md). It was 15/13 from
+    # 2026-09-15, when the owner added the two composite roll-ups (step 2); 13/11 from 2026-09-04, when
+    # the owner retired the review requirement and `a reviewer has read this` came off branch
+    # protection; 14/12 from 2026-08-31 (BACKLOG #1404), when that context was armed; and 13/11 before
+    # that. One collapse throughout: ci.yml's `test` matrix reports 3 contexts from 1 job, so 8 - 2 = 6.
     #
-    # THE COUNT WILL DROP TO 8/6 AT CONSOLIDATION STEP 3, when the seven original scan jobs are
-    # deleted and their contexts come off protection. Expect to edit this line then; it is not drift.
+    # 8/6 IS THE FIGURE THE PREVIOUS COMMENT PREDICTED, and it arrived by the other half of the change.
+    # That comment read "THE COUNT WILL DROP TO 8/6 AT CONSOLIDATION STEP 3, when the seven original
+    # scan jobs are deleted and their contexts come off protection" -- it assumed the deletion and the
+    # protection edit would land together. Only the protection edit landed. The count is the same
+    # either way, because a deleted job and a job whose context is no longer required are both absent
+    # from `_required_jobs()`; but the seven jobs are still in the workflow, still running, and still
+    # graded by this module under `_SUPERSEDED_SECURITY_JOBS`. A predicted number arriving for an
+    # unpredicted reason is worth the note: the pin cannot tell those two states apart, and the
+    # classification is what does.
     #
     # THIS MODULE READS THE CANONICAL FILE, NOT THE SERVER, so a context that reaches protection and
     # not the file is not examined here. That file's own header states the ordering rule -- protection
@@ -402,8 +568,8 @@ def test_required_jobs_carry_no_continue_on_error() -> None:
         f"[security-posture] examined {examined} distinct jobs backing "
         f"{len(required_contexts())} required contexts"
     )
-    assert examined == 13, (
-        f"expected the {len(required_contexts())} required contexts to resolve to 13 distinct jobs "
+    assert examined == 6, (
+        f"expected the {len(required_contexts())} required contexts to resolve to 6 distinct jobs "
         f"(the 3 `test` legs share one matrix job); got {examined}. If the workflow layout genuinely "
         "changed, update this count."
     )

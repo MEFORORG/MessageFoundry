@@ -286,6 +286,20 @@ def install_script_path() -> Path | None:
     return script if script.exists() else None
 
 
+def uninstall_script_path() -> Path | None:
+    """Locate ``scripts/service/uninstall-service.ps1`` in the (editable-installed) repo.
+
+    The mirror of :func:`install_script_path`. Nothing launches the uninstaller from here (an
+    operator runs it directly); this exists so the policy guards over the service scripts can locate
+    both halves the same way, instead of one of them reaching for a relative path of its own.
+    """
+    pkg = messagefoundry.__file__
+    if pkg is None:
+        return None
+    script = Path(pkg).resolve().parents[1] / "scripts" / "service" / "uninstall-service.ps1"
+    return script if script.exists() else None
+
+
 def _install_params(script_path: str, environment: str) -> str:
     """Build the argument string for the elevated installer launch.
 

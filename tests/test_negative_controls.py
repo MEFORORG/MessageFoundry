@@ -102,16 +102,41 @@ def _problems_for(controls: list[reg.Control]) -> list[str]:
 
 
 def test_the_reconciliation_fails_when_a_context_loses_its_control() -> None:
-    """PLANTED: the `gitleaks (secret scan)` entry is dropped. The gate must name that context.
+    """PLANTED: every control for one REQUIRED context is dropped. The gate must name that context.
 
     Without this, "every context is covered" and "the reconciliation compares nothing" produce the
     same green -- which is the defect this whole registry exists to make visible, occurring inside the
     verification of its own fix.
+
+    THE VICTIM IS CHOSEN FROM THE LIVE REQUIRED SET, NOT NAMED, and that is a repair rather than a
+    style preference. This test used to hard-code `gitleaks (secret scan)`. On 2026-09-16 the owner
+    removed that context from branch protection (consolidation step 4, docs/CI.md), so dropping its
+    entries stopped producing any problem at all -- `_problems_for` only reports coverage gaps over the
+    REQUIRED set, and gitleaks had left it. The plant planted nothing and the assertion failed. A
+    negative control keyed to a specific context inherits that context's whole future; keyed to
+    "whichever required context the registry covers", it cannot be retired out from under itself.
+
+    It is still a real plant: the victim is a context the shipped registry genuinely covers, so the
+    coverage gap this creates is one that did not exist a line earlier.
     """
-    controls = [c for c in reg.load() if c.context != "gitleaks (secret scan)"]
+    shipped = reg.load()
+    required = set(required_contexts())
+    victim = next(
+        (c.context for c in shipped if c.context in required),
+        None,
+    )
+    assert victim is not None, (
+        "no control in the shipped registry names a currently required context, so this plant has "
+        "nothing to remove. Either the registry is empty or it has drifted off the required set "
+        "entirely -- reconcile it before trusting any other arm in this module."
+    )
+    controls = [c for c in shipped if c.context != victim]
     problems = _problems_for(controls)
-    assert any("gitleaks (secret scan)" in p for p in problems), problems
-    print(f"[#1000] negative control: dropping one entry produced {len(problems)} problem(s)")
+    assert any(victim in p for p in problems), (victim, problems)
+    print(
+        f"[#1000] negative control: dropping every entry for {victim!r} produced "
+        f"{len(problems)} problem(s)"
+    )
 
 
 def test_the_reconciliation_stays_green_on_the_shipped_registry() -> None:
@@ -150,9 +175,14 @@ def test_the_ci_wiring_check_reports_a_command_nobody_invokes() -> None:
 
     This is the quiet way a fixture-based control dies: the asserter script stays in the tree, the
     registry keeps pointing at it, and the step that ran it is deleted. Nothing else here would notice.
+
+    The `context` below is inert -- `unwired_ci_commands` reads only `ci` and `workflow`, so this arm
+    passes whatever string sits there. It was `semgrep (project SAST rules)` until 2026-09-16, when
+    that context left branch protection; it is updated to a required one so the fixture does not read
+    as a claim that semgrep still gates a merge. Nothing about the assertion changed.
     """
     orphan = reg.Control(
-        context="semgrep (project SAST rules)",
+        context="repo-scan (bandit, semgrep, crypto-inventory, forbidden-content)",
         plants="x" * 50,
         holds="x" * 50,
         observed="x" * 50,

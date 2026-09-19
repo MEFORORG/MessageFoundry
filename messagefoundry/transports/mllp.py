@@ -798,6 +798,11 @@ class MLLPDestination(DestinationConnector):
                 cell="MLLP outbound",
                 description="verified MLLP-over-TLS egress (no revocation check)",
                 attested=config.tls_revocation_attested,
+                # BACKLOG #299: the context this hop will actually hand to wrap_socket. A CRL that
+                # reached it (via [tls].crl_file through the resolved anchor) sets
+                # VERIFY_CRL_CHECK_LEAF, and the guard reads that flag rather than the setting -- so a
+                # sibling hop the same CRL never reached keeps its refusal.
+                context=self._ssl,
             )
             if self._ssl is not None and self._ssl.verify_mode is not ssl.CERT_NONE
             else None

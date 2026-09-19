@@ -40,6 +40,7 @@ tests/test_ci_docs_only_detector.py
 tests/test_ci_engine_step_excludes_webconsole.py
 tests/test_ci_faulthandler_belts.py
 tests/test_ci_leg_data_class.py
+tests/test_ci_red_clearer.py
 tests/test_ci_red_reader.py
 tests/test_ci_retry_native_crash.py
 tests/test_ci_step_margin.py
@@ -67,6 +68,7 @@ tests/test_coord_handoff_pointer.py
 tests/test_coord_handoff_report.py
 tests/test_coord_lane_statement.py
 tests/test_coord_lock.py
+tests/test_coord_occupancy_unplaceable.py
 tests/test_coord_overlap_attribution.py
 tests/test_coord_overlap_cache.py
 tests/test_coord_overlap_signals.py
@@ -134,6 +136,7 @@ tests/test_session_mail.py
 tests/test_session_registry.py
 tests/test_setup_leak_gate_reports_source.py
 tests/test_shipped_line_endings_pinned.py
+tests/test_spawn_lock.py
 tests/test_stale_repo_slug_check.py
 tests/test_stalled_prs.py
 tests/test_steer_inject.py
