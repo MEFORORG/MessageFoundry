@@ -120,23 +120,46 @@ def test_defaults_are_json_safe(schema: dict[str, Any]) -> None:
 
 #: A setting the GUI is drawing a field for cannot also be a setting nothing can populate: every
 #: emitted parameter IS a keyword-only parameter of a registered factory, which
-#: `test_every_factory_parameter_is_emitted` establishes as an equality. So these claims are
-#: self-contradictory wherever they appear in emitted text, whatever their wording elsewhere.
+#: `test_every_factory_parameter_is_emitted` establishes as an equality. That equality is what makes
+#: the claim self-contradictory; DETECTION is still a phrase set, so it is kept wide and the words
+#: this repository actually reaches for are all in it -- "unreachable" included, since the prose
+#: explaining the defect uses that word and would otherwise sail past its own guard.
+#:
+#: "unreachable" is ANCHORED TO ITS SUBJECT rather than taken bare. Bare, it matched the FTP and
+#: SFTP `validate_directory` help ("fail-fast at start on an unreachable remote dir"), where the
+#: unreachable thing is a directory on a remote host and the sentence is entirely correct.
+_SETTING_WORD = r"(?:setting|keys?|control|pacer|parameter)s?"
 _UNSETTABLE_CLAIM = re.compile(
-    r"could not be reached|cannot be reached|no factory parameter", re.IGNORECASE
+    r"could not be reached|cannot be reached"
+    rf"|{_SETTING_WORD}[^.]{{0,60}}?\bunreachable|\bunreachable[^.]{{0,20}}?{_SETTING_WORD}"
+    r"|no factory parameter|nothing can populate|no surface can set"
+    r"|not settable|no way to (?:turn|switch) (?:this |it )?on",
+    re.IGNORECASE,
 )
 #: Narrower: true of a `codeFirstOnly` parameter, which connections.toml genuinely cannot express,
 #: so it is only a contradiction for the rest.
-_NO_TOML_CLAIM = re.compile(r"no connections\.toml key", re.IGNORECASE)
+_NO_TOML_CLAIM = re.compile(
+    r"no connections\.toml key|not.{0,20}in connections\.toml", re.IGNORECASE
+)
 
-#: A reference into the maintainer-internal ledger, in either spelling used in `wiring.py` comments.
-_LEDGER_REFERENCE = re.compile(r"(?:BACKLOG\s*)?#\s*\d{2,}", re.IGNORECASE)
+#: A reference into the maintainer-internal ledger. Both spellings: with the hash (`BACKLOG #1249`,
+#: `#1249`) and without it (`BACKLOG 1249`). An earlier draft wrote the hash form as
+#: `(?:BACKLOG\s*)?#\d+`, where the optional prefix matched nothing the bare `#\d+` did not.
+_LEDGER_REFERENCE = re.compile(r"#\s*\d{2,}|\bBACKLOG\s+\d{2,}", re.IGNORECASE)
 
 
 def _unreachability_claims(schema: dict[str, Any]) -> list[str]:
-    """Emitted strings telling the form that a setting it is rendering cannot be set."""
+    """Emitted strings telling the form that a setting it is rendering cannot be set.
+
+    `doc` is screened alongside `section` and `help` because it is emitted too: `_summary` puts the
+    factory docstring's FIRST paragraph there and the IDE renders it. Leaving it out would have made
+    this guard's own remedy -- move the history into the docstring -- a way to reintroduce the defect
+    with every test still green."""
     found: list[str] = []
+    both = (_UNSETTABLE_CLAIM, _NO_TOML_CLAIM)
     for transport, described in sorted(schema["transports"].items()):
+        if any(pattern.search(described.get("doc") or "") for pattern in both):
+            found.append(f"{transport}.doc")
         for param, spec in sorted(described["params"].items()):
             patterns = [_UNSETTABLE_CLAIM]
             if not spec.get("codeFirstOnly"):
@@ -148,6 +171,24 @@ def _unreachability_claims(schema: dict[str, Any]) -> list[str]:
     return found
 
 
+#: The fields these guards read must actually carry text. A comment restructure can move a heading
+#: onto a different parameter (open the block with an `inbound:` marker, say, and `_param_comments`
+#: appends the line to the PREVIOUS parameter's help instead of starting a section), at which point
+#: every check below reads "" and passes covering nothing.
+_PACING_SECTION_TOKEN = "message-RATE pacing"
+
+
+def _shipped_pacing_section(schema: dict[str, Any]) -> str:
+    """The MLLP pacing heading as shipped, proven non-empty so a guard over it cannot go vacuous."""
+    section = schema["transports"]["mllp"]["params"]["max_messages_per_second"].get("section") or ""
+    assert _PACING_SECTION_TOKEN in section, (
+        "the MLLP pacing block no longer opens a `section` on max_messages_per_second "
+        f"(got {section!r}). Every guard below reads that field, so they are passing on an empty "
+        "string rather than on a clean heading -- re-aim them before trusting a green run."
+    )
+    return section
+
+
 def test_no_emitted_text_tells_the_form_a_rendered_setting_cannot_be_set(
     schema: dict[str, Any],
 ) -> None:
@@ -155,39 +196,54 @@ def test_no_emitted_text_tells_the_form_a_rendered_setting_cannot_be_set(
 
     `_param_comments` promotes the own-line comment block preceding a parameter into that
     parameter's `section`, so a note an author wrote for the next maintainer is rendered to an
-    operator as the heading above the input. MLLP's rate-pacing block was one: it kept explaining
-    that the pacer existed and no factory parameter or `connections.toml` key could populate it,
-    for the whole period after both keys became `MLLP()` parameters (BACKLOG #1249). A deploying
-    operator would have been told the control could not be reached while looking at the box that
-    reaches it.
+    operator as the heading above the input. MLLP's rate-pacing block was one, and what it said is
+    stated once in `MLLP()`'s docstring under "Inbound message-rate pacing" (BACKLOG #1249) rather
+    than copied here: a deploying operator would have been told the control could not be reached
+    while looking at the box that reaches it.
 
-    Unlike a phrase screen over prose, the contradiction here is structural: a parameter reaches
-    the schema only by BEING a keyword-only parameter of a registered factory, so no emitted string
-    about it may say it is unreachable. The `codeFirstOnly` carve-out is the one honest exception --
-    those really cannot be written in `connections.toml`."""
+    What is structural here is the JUSTIFICATION, not the detection, and the difference matters to
+    anyone deciding how much this guard is worth: a parameter reaches the schema only by BEING a
+    keyword-only parameter of a registered factory, so the claim is self-contradictory wherever it
+    appears -- but what finds it is still a list of phrases, and a fresh way of saying the same wrong
+    thing passes. The `codeFirstOnly` carve-out is the one honest exception to the
+    `connections.toml` half; those really cannot be written there."""
+    _shipped_pacing_section(schema)  # the fields below carry text, so a pass is not vacuous
     claims = _unreachability_claims(schema)
     assert not claims, (
         f"these emitted strings tell the connection form that a setting it renders cannot be set: "
         f"{claims}. Every emitted parameter is a live factory parameter, so the text is stale -- "
-        "move the history into the factory's docstring, which the schema does not read past its "
-        "first paragraph."
+        "move the history into a factory docstring paragraph AFTER the first, which is the part "
+        "`_summary` does not emit. The first paragraph IS emitted, as `doc`, and is screened here."
     )
 
 
 def test_the_unreachability_check_fails_on_the_claim_it_was_cut_from(
     schema: dict[str, Any],
 ) -> None:
-    """Proves the check above can fail, by replanting the retired MLLP sentence into the schema."""
+    """Proves the check above can fail, by replanting the retired MLLP sentence into the schema.
+
+    Planted in each of the three emitted fields in turn, because they are reached by different code
+    paths: `section` and `help` per parameter, `doc` per transport."""
     retired = (
         "INBOUND message-RATE pacing. The connector has read both keys since the pacer was built -- "
         "until now no factory parameter and no connections.toml key could populate them, so the "
         "setting existed and could not be reached."
     )
-    planted = copy.deepcopy(schema)
-    planted["transports"]["mllp"]["params"]["max_messages_per_second"]["section"] = retired
-    assert _unreachability_claims(planted) == ["mllp.max_messages_per_second.section"], (
-        "the check does not see the exact string this guard was written against -- it is not a guard"
-    )
+    for target, expected in (
+        (("params", "max_messages_per_second", "section"), "mllp.max_messages_per_second.section"),
+        (("params", "message_burst", "help"), "mllp.message_burst.help"),
+        (("doc",), "mllp.doc"),
+    ):
+        planted = copy.deepcopy(schema)
+        node: Any = planted["transports"]["mllp"]
+        for step in target[:-1]:
+            node = node[step]
+        node[target[-1]] = retired
+        assert _unreachability_claims(planted) == [expected], (
+            f"planting the retired sentence in {expected} produced "
+            f"{_unreachability_claims(planted)} -- this field is not screened, so a green run says "
+            "nothing about it"
+        )
     assert _unreachability_claims(schema) == [], (
         "the check already fires on the shipped schema, so a green run above proves nothing"
     )
@@ -199,22 +255,46 @@ def test_the_mllp_pacing_section_carries_no_internal_ledger_number(
     """The ledger is maintainer-internal; a `section` string is operator-facing in a GUI.
 
     MLLP's rate-pacing heading carried one, so it is pinned here along with the wording fix. SCOPE,
-    stated plainly rather than implied: this pins the two MLLP pacing parameters ONLY. A census of
-    the whole emitted schema on 2026-09-19 found 40 strings across 11 transports carrying a `#NNN`
-    or `BACKLOG #NNN` reference -- the raw-TCP and HTTP pacing sections among them. Widening this
-    assertion to the schema is a separate sweep with its own row, and pinning a COUNT here would go
-    red for everyone the first time somebody legitimately edits an unrelated comment."""
+    stated plainly rather than implied: this pins the MLLP pacing block ONLY. A census of the whole
+    emitted schema on 2026-09-19 found 40 strings across 11 transports carrying a ledger reference
+    -- the raw-TCP and HTTP pacing sections among them. Widening this assertion to the schema is a
+    separate sweep with its own row, and pinning a COUNT here would go red for everyone the first
+    time somebody legitimately edits an unrelated comment.
+
+    Only fields that actually carry text are asserted over. `message_burst` has no `section` of its
+    own -- the engine emits a heading once, on the parameter that OPENS the block -- so asserting
+    over it would have been an assertion that could not fail."""
     params = schema["transports"]["mllp"]["params"]
-    for name in ("max_messages_per_second", "message_burst"):
-        for field in ("section", "help"):
-            text = params[name].get(field) or ""
-            assert not _LEDGER_REFERENCE.search(text), (
-                f"mllp.{name}.{field} puts an internal ledger reference in front of an operator: "
-                f"{text!r}. The maintainer trail belongs in the factory docstring."
-            )
-    # The check must be able to see one: the same pattern over a planted string.
-    assert _LEDGER_REFERENCE.search("INBOUND message-RATE pacing (BACKLOG #1249)."), (
-        "the ledger pattern does not match the reference this guard was written against"
+    subjects = {
+        "max_messages_per_second.section": _shipped_pacing_section(schema),
+        "max_messages_per_second.help": params["max_messages_per_second"]["help"],
+        "message_burst.help": params["message_burst"]["help"],
+    }
+    for where, text in subjects.items():
+        assert text, f"mllp.{where} is empty, so the assertion below cannot fail -- re-aim it"
+        assert not _LEDGER_REFERENCE.search(text), (
+            f"mllp.{where} puts an internal ledger reference in front of an operator: {text!r}. "
+            "The maintainer trail belongs in a factory docstring paragraph after the first."
+        )
+
+
+def test_the_ledger_pattern_reads_the_field_and_not_just_a_literal(
+    schema: dict[str, Any],
+) -> None:
+    """Proves the ledger guard fires off the SCHEMA, not off a string typed into the test.
+
+    The earlier control ran the pattern over a literal in this file, which established that the
+    regex compiles and nothing else: it would have passed against an empty schema. This plants the
+    reference into the real field and reads it back through the same accessor the guard uses."""
+    for reference in ("(BACKLOG #1249)", "(#1249)", "(BACKLOG 1249)"):
+        planted = copy.deepcopy(schema)
+        section = f"INBOUND message-RATE pacing {reference}. Defaults to OFF."
+        planted["transports"]["mllp"]["params"]["max_messages_per_second"]["section"] = section
+        assert _LEDGER_REFERENCE.search(_shipped_pacing_section(planted)), (
+            f"the ledger pattern does not see {reference!r} in the emitted section"
+        )
+    assert not _LEDGER_REFERENCE.search(_shipped_pacing_section(schema)), (
+        "the pattern fires on the shipped heading, so a green run above proves nothing"
     )
 
 

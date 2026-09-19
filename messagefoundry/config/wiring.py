@@ -1280,8 +1280,8 @@ def MLLP(
     max_frame_bytes: int | None = 16 * 1024 * 1024,  # cap one frame's bytes (OOM guard); both dirs
     # INBOUND message-RATE pacing. Unlike the caps above these default to OFF, and that is ruled
     # rather than accidental: a rate on a clinical interface is only safe at a number taken from a
-    # real feed profile. Set either key here, or on a connections.toml inbound entry -- that entry
-    # desugars through this same factory. Over budget the listener PAUSES READING so TCP
+    # real feed profile. Both are parameters of this factory, and a connections.toml inbound entry
+    # desugars through it, so either surface sets them. Over budget the listener PAUSES READING so TCP
     # back-pressures the sender: nothing is dropped, refused, NAK'd or reordered, which the
     # count-and-log invariant requires (a discarding limiter was never an option here).
     max_messages_per_second: float | None = None,  # None/0 = no rate bound (the shipped default)
@@ -1330,14 +1330,15 @@ def MLLP(
     application ACK as a captured reply (a negative ACK still dead-letters/retries unchanged).
 
     **Inbound message-rate pacing (BACKLOG #1249).** ``max_messages_per_second`` bounds how fast one
-    accepted inbound connection may feed messages in; ``message_burst`` sizes the allowance above that
-    rate. Both default to ``None`` (no bound), and both reach the connector from here or from a
-    ``connections.toml`` inbound entry, which desugars through this same factory. The connector read
-    both keys before either was a parameter here, so comments and docs written in that window called
-    the setting unreachable; it is reachable now. The ledger number stays in this docstring rather
-    than in the parameter comment above it, because that comment is the GUI's section heading: the
-    connection editor renders whatever ``connection schema --json`` introspects (ADR 0007), and the
-    ledger is maintainer-internal. Only a docstring's FIRST paragraph reaches that schema.
+    accepted inbound connection may feed messages in; ``None``/``0`` (the default) is no bound.
+    ``message_burst`` sizes the allowance above that sustained rate; ``None`` (the default) is one
+    second's worth of it, **not** an unbounded burst. Both keys reach the connector from here or from
+    a ``connections.toml`` inbound entry, which desugars through this same factory. THIS IS THE ONE
+    STATEMENT OF THE HISTORY, cited rather than repeated elsewhere: the connector read both keys
+    before either was a parameter here, so text written in that window described the setting as
+    reachable through no surface at all, and some of it outlived the window. Why the ledger number
+    sits here and not in the parameter comment above -- that comment becomes an operator-facing GUI
+    heading; see :mod:`messagefoundry.config.connection_schema`.
 
     **Persistent outbound connection (ADR 0067).** Ships **opt-in** this release: ``persistent=False``
     is the default (connect-per-message — today's proven posture, dial a fresh connection per delivery).

@@ -524,14 +524,13 @@ def test_ingest_plane_rate_limit_row_matches_the_code() -> None:
     This guard has moved twice, and the history is why it reads the signature instead of pinning a
     verdict. Until 2026-08-11 it asserted the doc said "no message-rate or volume limit exists"; the
     MLLP pacing build (ASVS 2.4.1 / 15.2.2) falsified that, so it moved to requiring both that a
-    control exists and that it "ships OFF". BACKLOG #1249 falsified that wording in turn: the pacer
-    was built, but at that point the two keys were parameters of no factory, and ``connections.toml``
-    desugars through those SAME factories, so no documented surface could set either. "Off" was the
-    more dangerous half-truth, because a reader takes it to mean "then set it to on".
+    control exists and that it "ships OFF". BACKLOG #1249 falsified that wording in turn, for the
+    reason stated once in ``MLLP()``'s own docstring under "Inbound message-rate pacing" -- read it
+    there rather than from a copy here. "Off" was the more dangerous half-truth, because a reader
+    takes it to mean "then set it to on".
 
-    THAT WINDOW HAS CLOSED. Both keys are keyword-only parameters of ``MLLP()`` today, so the branch
-    below that demands the row say "NOT REACHABLE" is the one that no longer fires. The prose in this
-    module is held to that same reading by
+    THAT WINDOW HAS CLOSED, so the branch below that demands the row say "NOT REACHABLE" is the one
+    that no longer fires. The prose in this module is held to that same reading by
     ``test_this_module_does_not_outlive_the_reachability_it_reports``.
 
     WHAT THIS ASSERTS IS CONSISTENCY, NOT A PREFERENCE, AND THE DISTINCTION IS THE WHOLE POINT.
@@ -603,20 +602,31 @@ def _module_docstrings(path: Path) -> list[tuple[str, str]]:
 #: Present-tense claims that the MLLP pacing keys cannot be set. Each was true of the code before the
 #: keys became ``MLLP()`` parameters and each was still sitting in a docstring here afterwards, which
 #: is what this pattern exists to stop recurring. Deliberately PRESENT tense: the surviving history
-#: prose above records the same facts in the past tense and must keep being allowed to.
+#: prose records the same facts in the past tense and must keep being allowed to.
+#:
+#: The ledger-status alternative is anchored to a row number and is the one piece held
+#: case-SENSITIVE. Written as a bare ``is OPEN`` under ``re.IGNORECASE`` it matched the ordinary
+#: English "is open" -- "while the MLLP connection is open", "the CRL question is open" -- and would
+#: have reddened this guard from an unrelated docstring in a module of this size.
 _PACING_UNREACHABLE_PROSE = re.compile(
     r"neither key is a parameter"
     r"|no documented surface can set"
-    r"|is OPEN\b"
+    r"|(?-i:#\s*\d+ is OPEN)"
     r"|owner has not chosen"
-    r"|keys? (?:is|are) not (?:a )?parameters?",
+    r"|keys? (?:is|are) not (?:a )?parameters?"
+    r"|keys? (?:is|are) (?:still )?unreachable",
     re.IGNORECASE,
 )
 
 #: The mirror: present-tense claims that they CAN be set. Checked only while the signature says they
-#: cannot, so neither state is pinned as the correct one.
+#: cannot, so neither state is pinned as the correct one. Exercised by the control below even though
+#: that branch is not the live one -- an untested screen that runs only in the case the two-branch
+#: design exists for is worse than none, because it reports clean.
 _PACING_REACHABLE_PROSE = re.compile(
-    r"both keys are keyword-only parameters|both keys reach|keys? (?:is|are) now reachable",
+    r"keys? (?:is|are) (?:now )?(?:keyword-only )?parameters? of"
+    r"|keys? (?:is|are) (?:now )?(?:reachable|settable)"
+    r"|keys? reach the connector"
+    r"|keys? can be set",
     re.IGNORECASE,
 )
 
@@ -631,10 +641,10 @@ def test_this_module_does_not_outlive_the_reachability_it_reports() -> None:
     """The prose in this module is held to the same signature reading as its assertions.
 
     The assertions in ``test_ingest_plane_rate_limit_row_matches_the_code`` read reachability from
-    ``inspect.signature(wiring.MLLP)`` and were therefore correct throughout. Its DOCSTRING was not:
-    it kept reporting the two pacing keys as settable through no surface at all for the whole period
-    after they became ``MLLP()`` parameters, and nothing failed, because prose is not executed. A
-    reader reaches for the docstring to learn what the test means before reading what it does.
+    ``inspect.signature(wiring.MLLP)`` and were therefore correct throughout. Its DOCSTRING was not,
+    and nothing failed, because prose is not executed. A reader reaches for a test's docstring to
+    learn what it means before reading what it does. What the stale half said, and when it stopped
+    being true, is stated once in ``MLLP()``'s docstring.
 
     This is a phrase screen, and a phrase screen finds the shape it was cut from. It pins the claims
     that actually drifted rather than pretending to grade meaning; a fresh way of saying the same
@@ -657,8 +667,10 @@ def test_this_module_does_not_outlive_the_reachability_it_reports() -> None:
 def test_the_prose_screen_catches_the_claim_that_actually_drifted() -> None:
     """Proves the screen above can fail, by replanting the sentence it was cut from.
 
-    Both directions are exercised, because a screen that matched everything would pass the test above
-    for the wrong reason."""
+    BOTH screens are exercised, not just the live one. The ``reachable=False`` branch runs only if
+    the keys are ever withdrawn from ``MLLP()`` -- which is the single case the two-branch design
+    exists for -- so an unexercised screen there would report clean at exactly the moment it was
+    needed."""
     retired = (
         "the pacer is built, but neither key is a parameter of the MLLP() factory and "
         "connections.toml desugars through that SAME factory, so no documented surface can set "
@@ -672,15 +684,29 @@ def test_the_prose_screen_catches_the_claim_that_actually_drifted() -> None:
     assert not _pacing_prose_complaints(_module_docstrings(Path(__file__)), reachable=True), (
         "the screen matches this module as it stands, so a green run above proves nothing"
     )
-    # And the mirror: the surviving PAST-tense history must not trip the present-tense screen.
+    # The MIRROR screen, which no live run reaches. Four ways of claiming the keys are settable;
+    # all four must be seen, because the failure mode of a phrase screen is a near-miss wording.
+    for claim in (
+        "both keys are keyword-only parameters of MLLP() today",
+        "both keys are now settable",
+        "the keys reach the connector from here",
+        "the pacing keys can be set on the factory",
+    ):
+        assert _pacing_prose_complaints([("mirror", claim)], reachable=False), (
+            f"the reachable-prose screen misses {claim!r}; it runs only when the keys are withdrawn, "
+            "so nothing else would ever catch that"
+        )
+    # And the past tense stays legal under BOTH screens: recording why the guard moved is not a
+    # present-tense claim in either direction.
     history = (
         "at that point the two keys were parameters of no factory, so no documented surface could "
         "set either"
     )
-    assert not _pacing_prose_complaints([("history", history)], reachable=True), (
-        "the screen reads past-tense history as a present-tense claim, so it would forbid recording "
-        "why the guard moved"
-    )
+    for direction in (True, False):
+        assert not _pacing_prose_complaints([("history", history)], direction), (
+            "a screen reads past-tense history as a present-tense claim, so it would forbid "
+            "recording why the guard moved"
+        )
 
 
 def test_four_get_phi_pacing_scope_matches_the_call_sites() -> None:
