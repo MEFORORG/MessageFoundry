@@ -138,9 +138,15 @@ transport = "mllp"
 ```
 
 - The `transport` maps to the same factory — eleven are reachable as data (`mllp`/`tcp`/`http`/`file`/
-  `timer`/`rest`/`database`/`database_poll`/`soap`/`sftp`/`ftp`) and **the factory is the schema**; an
-  unknown transport/key/router fails loud at load (`messagefoundry check`), exactly like a bad
-  `inbound()` call. The remaining connectors (`X12`/`FHIR`/`DICOM`/`DICOMweb`/`Email`/`Direct`/
+  `timer`/`rest`/`database`/`database_poll`/`soap`/`sftp`/`ftp`) and **the factory is the schema**; at
+  least an unknown transport/key/router fails loud at load (`messagefoundry check`), exactly like a bad
+  `inbound()` call. The factory's parameter **types** are part of that schema too: a `[settings]` value
+  of the wrong kind — `port = "2576"`, `persistent = "yes"` — is refused at load naming the setting and
+  the type it wanted. A quoted TOML value is always a string, so write the number or `true`/`false`
+  without quotes. An `env()` reference is also accepted, but give it a `cast` for a non-string setting:
+  an environment value arrives as text and an **uncast** ref hands the connector that text. An inline
+  `default =` is held to the setting's type here, because a default is **not** converted by `cast`.
+  The remaining connectors (`X12`/`FHIR`/`DICOM`/`DICOMweb`/`Email`/`Direct`/
   `Loopback`/`PassThrough`) are **code-first only** today — declare them in a `.py` module. A name
   declared in **both** a `.py` module and `connections.toml` is a hard error (no silent shadowing).
 - **Edit it two ways, same file:** by hand, or via `messagefoundry connection list|upsert|remove`
