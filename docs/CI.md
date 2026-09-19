@@ -209,9 +209,22 @@ contexts unreported; one escaped only because it counted against branch protecti
 sentence because a reader who concludes the checker is unwired goes on to build a second one. The
 wiring is real and `tests/test_required_contexts_drift.py` now pins it -- one arm asserts a workflow
 invokes the script, another asserts the job invoking it is **not** a required context, so neither the
-wiring nor its advisory posture can be dropped silently. What is still missing is a consumer for the
-cron's red: `failure-signal.yml` watches CI, Security and backlog-hygiene, not this workflow. Giving it
-one is an alerting design over shared CI and is deliberately not folded in here.
+wiring nor its advisory posture can be dropped silently.
+
+**The cron's red now has a consumer (BACKLOG #1450).** `failure-signal.yml` still watches CI, Security
+and backlog-hygiene and was never the right place for this: it labels a pull request, and a scheduled
+red has none. `nightly-notice.yml` is, and it now watches `Required workflow state` -- a scheduled
+failure of either job becomes one deduplicated issue that closes itself when the cron goes green.
+A third arm in `tests/test_required_contexts_drift.py` pins that route from the script's side, keyed
+off whichever workflow invokes the script rather than off a literal name, because `workflow_run`
+matches on a workflow's `name:` and a rename would otherwise detach the notice in silence.
+
+Three limits, so nobody reads more into it. It carries the **scheduled** red only -- a pull-request red
+is already visible on the pull request. It fires on the **run's** conclusion, so it names the workflow
+that broke and not the job. And the posture is unchanged: still advisory, still not required, and a red
+still blocks no merge. The remedy the issue body prints is to mirror the **server** into
+`.github/required-contexts.txt`; editing branch protection to match a stale file is the owner's
+decision and is the move that can wedge every pull request.
 
 #### Step 4 landed on the server and the repository was six hours behind
 
@@ -392,8 +405,8 @@ Two limits, stated so nobody reads more into a green than it carries:
   shipped sweep, proving its two canaries still detect an injected defect. So a change that **blinds the
   detector** reds a PR even though the nightly scan itself is advisory: the probe's *ability to fail*
   gates the merge, the probe *run* does not. `dast.yml` has no `pull_request` arm, so it never reports on
-  a PR — and `nightly-notice.yml` watches only `ci.yml`, so a red DAST nightly surfaces in the Actions
-  tab rather than as an issue. See [ADR 0155](adr/0155-dast-dynamic-security-testing-of-the-running-engine.md).
+  a PR -- its nightly red reaches a person through `nightly-notice.yml`, which watches `DAST` and opens
+  one deduplicated issue. See [ADR 0155](adr/0155-dast-dynamic-security-testing-of-the-running-engine.md).
 - **A SQL-Server test leg can die with a native segfault** (exit 139, in the DB driver). It hits `main`
   too — it is not a regression in your PR. Clear it with `gh run rerun <run-id> --failed`.
 - **`prod` is a fail-closed PHI environment.** `serve --env prod` refuses to start without a store
@@ -402,3 +415,16 @@ Two limits, stated so nobody reads more into a green than it carries:
   supply all three or the service crash-loops and never serves `/health`.
 - **Git-Bash mangles `git show <ref>:<path>`** (the colon). Use
   `MSYS_NO_PATHCONV=1 git show "origin/main:.github/workflows/ci.yml"`.
+- **An instrument that does not record WHICH TREE answered can be self-consistently wrong.** Two
+  directories can supply `messagefoundry/` to one interpreter, it picks between them silently, and a
+  review packet was once measured against the wrong one with no signal at all. Why that happens is
+  stated once, on `_VersionAction` in [`messagefoundry/__main__.py`](../messagefoundry/__main__.py);
+  what to do about it is here. **`messagefoundry --version` prints the resolved package directory on
+  its own second line (BACKLOG #1677) — record that line whenever a measurement will be quoted.**
+  - **`PYTHONSAFEPATH=1` is not the fix, and is deliberately NOT set across these workflows.** It
+    drops the working directory from `sys.path`, which removes *one* of the two candidates and lets
+    the venv's editable `.pth` target win unconditionally — and on a multi-worktree box that target
+    can be a third checkout, unrelated to both the working directory and the repository you think you
+    are testing. It does not answer "which tree"; it changes which wrong answer you get silently. It
+    would also change nothing here, because every leg installs editable from its own checkout, so the
+    two candidates already agree. Print the path and read it.

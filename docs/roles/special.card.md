@@ -100,7 +100,7 @@ name the instrument beside every number.
 
 ## The full playbook
 
-In the **`wshallwshall/korus`** repository, read at `origin/main` and never out of a working tree.
+In the **`MEFORORG/korus`** repository, read at `origin/main` and never out of a working tree.
 **List the folder rather than typing a filename from memory** -- the seat set changes, and a file
 that is not there yet resolves to nothing rather than to an error:
 

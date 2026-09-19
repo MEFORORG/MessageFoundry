@@ -26,12 +26,19 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import socket
 from pathlib import Path
 
 import pytest
 
 from messagefoundry.config.models import AckMode, ConnectorType, ContentType, Validation
-from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
+from messagefoundry.config.wiring import (
+    MLLP,
+    ConnectionSpec,
+    InboundConnection,
+    Registry,
+    build_inbound_connection,
+)
 from messagefoundry.parsing.binary import (
     chunk_b64,
     is_doc_ref,
@@ -475,3 +482,117 @@ async def test_skeleton_composes_with_copy_on_send(store: MessageStore) -> None:
     # Mutating the copy does not disturb the original skeleton's handle (independent snapshots).
     copy.set("OBX-5.5", "changed")
     assert msg.field("OBX-5.5") == handle
+
+
+# --- unlimited aggregate budget: the opt-out says so at start (BACKLOG #1729) ---
+#
+# The POSITIVE-budget refusal above (test_in_flight_budget_exceeded_naks) was the only behavioural
+# cover this guard had. The ZERO path — the SHIPPED default — had none, and zero is falsy, so
+# `if budget and ...` in _detach_documents short-circuits the whole check. These pin both halves:
+# that unlimited really is unlimited (a characterization pin, deliberately green on a pristine tree),
+# and that binding a streaming listener in that state now says so out loud (new behaviour, red without
+# the change). The default is NOT flipped — tests/test_threat_model_doc_drift.py pins it at 0 against
+# a vault THREAT-MODEL.md row, and that coupling is the point of leaving it alone.
+
+
+async def test_zero_budget_admits_a_detach_that_a_positive_budget_refuses(
+    store: MessageStore,
+) -> None:
+    # CHARACTERIZATION PIN, NOT A FAIL-WITHOUT-THE-FIX TEST — it passes on a pristine tree by design.
+    # It fixes the MEANING of the shipped default so a later "0 = auto" reading cannot land quietly:
+    # the same body that a budget of 10 refuses (AE) is accepted (AA) at 0. Both arms are asserted in
+    # ONE test against ONE body, so it cannot degrade into an assertion the zero arm alone satisfies.
+    b64 = _big_b64(2000)
+    raw = _hl7_with_doc(b64).encode("utf-8")
+    ic = _streaming_ic(threshold=500)
+
+    refused = RegistryRunner(_registry(ic), store, stream_inflight_budget_bytes=10)
+    assert _ack_code(await refused._handle_inbound(ic, raw)) == "AE"
+
+    unlimited = RegistryRunner(_registry(ic), store, stream_inflight_budget_bytes=0)
+    assert _ack_code(await unlimited._handle_inbound(ic, raw)) == "AA"
+    assert unlimited._stream_inflight_bytes == 0  # released, exactly as on the positive path
+    # The detach really happened on the unlimited run (an attachment exists), so "AA" is not an
+    # accidental pass from some earlier gate declining to reach the budget check at all.
+    assert len(await _attachments(store)) == 1
+
+
+def test_streaming_inbound_with_unlimited_budget_warns(caplog) -> None:
+    ic = _streaming_ic(threshold=500, max_message_bytes=64 * 1024 * 1024)
+    with caplog.at_level("WARNING", logger=wiring_runner.__name__):
+        warned = wiring_runner.warn_unbudgeted_streaming_inbound(ic, budget=0)
+    assert warned
+    assert len(caplog.records) == 1
+    text = caplog.records[0].getMessage()
+    assert "IB_STREAM" in text  # names the connection an operator has to act on
+    assert "stream_inflight_budget_bytes" in text  # and the setting that fixes it
+    assert "67108864" in text  # and the single-body cap that still applies
+
+
+def test_streaming_inbound_with_no_max_message_bytes_names_the_engine_ceiling(caplog) -> None:
+    # max_message_bytes=None inherits the engine ingress ceiling. The warning must not print "None"
+    # as if no single-body bound existed — that would overstate the exposure it is reporting.
+    ic = _streaming_ic(threshold=500, max_message_bytes=None)
+    with caplog.at_level("WARNING", logger=wiring_runner.__name__):
+        assert wiring_runner.warn_unbudgeted_streaming_inbound(ic, budget=0)
+    text = caplog.records[0].getMessage()
+    assert "16 MiB" in text
+    assert "None" not in text
+
+
+def test_positive_budget_does_not_warn(caplog) -> None:
+    ic = _streaming_ic(threshold=500)
+    with caplog.at_level("WARNING", logger=wiring_runner.__name__):
+        assert wiring_runner.warn_unbudgeted_streaming_inbound(ic, budget=1) is False
+    assert caplog.records == []
+
+
+def test_non_streaming_inbound_does_not_warn(caplog) -> None:
+    # The stock shape: no stream_threshold_bytes, budget at its 0 default. The detach path is never
+    # reached, so there is nothing for the budget to bound and nothing to say. A warning here would
+    # fire on every stock instance, which is how a real signal gets tuned out.
+    ic = _streaming_ic(threshold=None)
+    with caplog.at_level("WARNING", logger=wiring_runner.__name__):
+        assert wiring_runner.warn_unbudgeted_streaming_inbound(ic, budget=0) is False
+    assert caplog.records == []
+
+
+async def test_binding_a_streaming_listener_emits_the_warning(store: MessageStore, caplog) -> None:
+    # ASSERT THE INSTRUMENT FIRED: the three tests above exercise the function in isolation, which
+    # proves nothing about whether the engine ever calls it. This drives a REAL listener bind through
+    # RegistryRunner.start() and reads the log, with a non-streaming sibling on the same run as the
+    # in-test control — so a warning that fired for everything, or for nothing, both fail here.
+    def free_port() -> int:
+        s = socket.socket()
+        try:
+            s.bind(("127.0.0.1", 0))
+            return int(s.getsockname()[1])
+        finally:
+            s.close()
+
+    reg = Registry()
+    reg.add_inbound(
+        build_inbound_connection(
+            "IB_STREAMS", MLLP(port=free_port()), router="r", stream_threshold_bytes=500
+        )
+    )
+    reg.add_inbound(build_inbound_connection("IB_PLAIN", MLLP(port=free_port()), router="r"))
+    reg.add_router("r", lambda m: [])
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02
+    )  # stream_inflight_budget_bytes=0 default
+
+    with caplog.at_level("WARNING", logger=wiring_runner.__name__):
+        await runner.start()
+        try:
+            assert runner.inbound_running("IB_STREAMS")
+            assert runner.inbound_running("IB_PLAIN")
+        finally:
+            await runner.stop()
+
+    budget_lines = [
+        m for m in (r.getMessage() for r in caplog.records) if "stream_inflight_budget_bytes" in m
+    ]
+    assert len(budget_lines) == 1  # exactly the streaming one, not its plain sibling
+    assert "IB_STREAMS" in budget_lines[0]
+    assert "IB_PLAIN" not in budget_lines[0]
