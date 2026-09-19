@@ -17,6 +17,7 @@ from __future__ import annotations
 import atexit
 import logging
 import os
+import shutil
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -397,6 +398,70 @@ def _tolerate_logging_on_closed_capture_streams() -> Iterator[None]:
 # which would change collection globally and is outside this item's ruled scope — a deliberately
 # scoped run already reads as partial; a full-suite run is the one that must not.
 # ---------------------------------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------------------------------
+# NO TEST MAY LEAVE ALLOCATION RECORDS IN THE CHECKOUT.
+#
+# The allocator (scripts/coord/alloc.ps1) and the fixtures that MIMIC it write their claims under
+# <git-common-dir>/mefor-coord/alloc/<kind>/<number>.json. That path is inside .git, so a correct write
+# is invisible to `git status` and cannot ride into a commit. A `mefor-coord/` directory at the WORK
+# TREE root is therefore never legitimate -- it means something built that path from an empty or
+# relative base and it landed in the process cwd instead.
+#
+# MEASURED 2026-09-18, and the reason this guard exists rather than a comment. tests/test_ledger_check.py
+# built the path from `git rev-parse --git-common-dir` read through a helper that returns only stdout
+# with check=False. Every git call in that run returned empty, so the base was "", Path("") / "mefor-
+# coord" is RELATIVE, and five claim records landed at a worktree root. The records name the defect
+# themselves: every field the helper DERIVED from git was "" while every field the caller PASSED was
+# intact. Nothing reported a problem, because the write succeeded -- it just succeeded somewhere else.
+#
+# The guard is function-scoped so the failure names the test that did it. It compares against a
+# pre-test snapshot, so a directory left behind by an earlier run fails ONE test rather than cascading
+# through the suite; and it removes what leaked, so the next test's snapshot is clean again and the
+# guard stays armed for the rest of the run. The evidence is not lost by that removal -- the failure
+# message carries the file list, which is the part that identifies the writer.
+#
+# Both roots are checked because they can differ: the leak lands in the pytest process's cwd, which is
+# usually the checkout root but is not required to be.
+# ---------------------------------------------------------------------------------------------------
+
+_CHECKOUT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _coord_leak_roots() -> list[Path]:
+    """The work-tree directories a stray allocation record can land in, de-duplicated."""
+    roots: list[Path] = []
+    for base in (_CHECKOUT_ROOT, Path.cwd().resolve()):
+        candidate = base / "mefor-coord"
+        if candidate not in roots:
+            roots.append(candidate)
+    return roots
+
+
+@pytest.fixture(autouse=True)
+def _no_allocation_records_in_the_checkout() -> Iterator[None]:
+    """Fail the test that writes a mefor-coord/ tree into the work tree instead of its own temp repo."""
+    before = {root: root.exists() for root in _coord_leak_roots()}
+    yield
+
+    leaked: list[str] = []
+    for root, existed in before.items():
+        if existed or not root.exists():
+            continue
+        leaked.extend(
+            sorted(str(f) for f in root.rglob("*") if f.is_file()) or [f"{root} (no files)"]
+        )
+        shutil.rmtree(root, ignore_errors=True)
+
+    if leaked:
+        detail = "\n  ".join(leaked)
+        pytest.fail(
+            "this test wrote allocation records into the checkout instead of its own temp tree.\n"
+            "A correct write goes under <git-common-dir>/mefor-coord/, which is inside .git.\n"
+            "A relative or empty base lands it in the process cwd, where `git add -A` can commit it.\n"
+            f"Leaked (now removed):\n  {detail}"
+        )
 
 
 def pytest_report_header() -> list[str]:

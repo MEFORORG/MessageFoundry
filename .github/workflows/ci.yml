@@ -2970,6 +2970,51 @@ jobs:
             "MEFOR_VALUE_REGISTRY_USER=smoke-user" `
             "MEFOR_VALUE_REGISTRY_PASSWORD=smoke-pass"
 
+      - name: Verify the data-directory DACL (review finding H-13)
+        shell: powershell
+        run: |
+          # READ BACK THE ACL THE INSTALLER PRODUCED. NSSM captures the engine's stdout/stderr under
+          # C:\ProgramData\MessageFoundry\logs, and those logs are a PHI sink parallel to the DB
+          # (docs/PHI.md), so the install's Set-SecureDataDirAcl strips ProgramData's inherited
+          # BUILTIN\Users:(RX). Nothing ever checked that it worked: this leg installed the service
+          # and never looked (BACKLOG #1699). tests/test_service_install_manifest.py runs the
+          # FUNCTION against a temp directory; this reads the DACL of the REAL data dir, left by a
+          # real elevated install.
+          #
+          # BOTH SPELLINGS. On an English runner icacls prints "BUILTIN\Users", not "S-1-5-32-545",
+          # so a SID-only match returns a false clean. Neither form may appear.
+          #
+          # OWNER RIGHTS (S-1-3-4) is in the list because it is the principal that actually went red,
+          # and removing CREATOR OWNER does not cover it: CREATOR OWNER materializes into an ACE for
+          # the creating principal, while OWNER RIGHTS stays S-1-3-4 in the DACL and is evaluated
+          # against whoever owns the object at ACCESS time. Measured 2026-09-18 on windows-2022 and
+          # windows-2025, in the unit arm that runs the function against a temp directory: an
+          # explicit one came through /inheritance:r /grant:r with icacls exiting 0 and reached the
+          # logs directory beneath it.
+          $dirs = @("C:\ProgramData\MessageFoundry", "C:\ProgramData\MessageFoundry\logs")
+          $broad = @("S-1-1-0", "Everyone", "S-1-5-32-545", "BUILTIN\Users",
+                     "S-1-5-11", "Authenticated Users", "S-1-5-32-546", "BUILTIN\Guests",
+                     "S-1-3-4", "OWNER RIGHTS")
+          $bad = @()
+          foreach ($d in $dirs) {
+            if (-not (Test-Path $d)) { throw "expected directory is missing: $d" }
+            $acl = (& icacls $d | Out-String)
+            "===== icacls $d ====="
+            $acl
+            # CONTROL: the read has to be able to SEE something, or an empty result reads as clean.
+            if ($acl -notmatch "S-1-5-18|SYSTEM") {
+              throw "icacls returned no SYSTEM ACE for $d - the instrument is not reading a DACL"
+            }
+            foreach ($p in $broad) {
+              if ($acl -match [regex]::Escape($p)) { $bad += "$d grants $p" }
+            }
+          }
+          if ($bad.Count -gt 0) {
+            $bad | ForEach-Object { "BROAD ACCESS: $_" }
+            throw "the data/log directory is reachable by a broad principal - the captured engine logs are a PHI sink (H-13, BACKLOG #1699)"
+          }
+          "data-directory DACL OK: no broad principal on either directory"
+
       - name: Start and verify /health
         run: |
           # THIS PROBE SPEAKS https AND PINS THE CERTIFICATE THE SERVICE MINTS (BACKLOG #1276 part A,

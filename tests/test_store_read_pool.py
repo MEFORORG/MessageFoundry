@@ -126,6 +126,45 @@ async def test_each_pooled_read_sees_the_latest_commit(file_store: MessageStore)
     assert await file_store.count_messages() == 2
 
 
+async def _count(conn) -> int:
+    cur = await conn.execute("SELECT COUNT(*) AS n FROM messages")
+    return int((await cur.fetchone())["n"])
+
+
+async def test_one_read_block_sees_one_snapshot_across_its_statements(
+    file_store: MessageStore,
+) -> None:
+    """The other half of the transaction guarantee, and the half nothing asserted (BACKLOG #1633).
+
+    ``test_each_pooled_read_sees_the_latest_commit`` above pins FRESHNESS — each new block gets the
+    latest commit. This pins STABILITY — inside ONE block, a write that commits between two
+    statements is invisible to the second, so a multi-statement read (a list plus its count, a
+    message plus its outbox rows) can never assemble a torn view of two different database states.
+    Remove the ``BEGIN``/``COMMIT`` from ``_read`` and the second count below returns 2.
+
+    The interleaved write runs on the WRITER connection under ``self._lock``, which this block does
+    not hold on the pooled path — that is the whole point of lockfree reads, and it is also why the
+    write really does commit here rather than blocking until the block exits.
+
+    FILE-backed on purpose. ``_open_read_pool`` returns early for ``:memory:``, leaving ``_read`` on
+    the pre-pool path with no ``BEGIN`` at all, so a ``:memory:`` fixture would pass this whether or
+    not the guarantee holds.
+    """
+    assert file_store._read_pool is not None, "no pool: this would assert nothing on :memory:"
+    await _enqueue(file_store, 1)
+
+    async with file_store._read() as conn:
+        first = await _count(conn)
+        await _enqueue(file_store, 2)  # commits mid-block, on the writer connection
+        second = await _count(conn)
+
+    assert (first, second) == (1, 1), "the block saw a write that landed after its snapshot"
+    # Control: the write really did commit, and the NEXT block sees it. Without this the equality
+    # above is equally consistent with the interleaved enqueue having silently done nothing.
+    async with file_store._read() as conn:
+        assert await _count(conn) == 2
+
+
 async def test_outbox_payloads_for_decrypts_through_pool(file_store: MessageStore) -> None:
     # The #14 parity read path (decrypts the transformed payload) must work through the pool too.
     mid = await _enqueue(file_store, 1)

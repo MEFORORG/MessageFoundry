@@ -402,3 +402,16 @@ Two limits, stated so nobody reads more into a green than it carries:
   supply all three or the service crash-loops and never serves `/health`.
 - **Git-Bash mangles `git show <ref>:<path>`** (the colon). Use
   `MSYS_NO_PATHCONV=1 git show "origin/main:.github/workflows/ci.yml"`.
+- **An instrument that does not record WHICH TREE answered can be self-consistently wrong.** Two
+  directories can supply `messagefoundry/` to one interpreter, it picks between them silently, and a
+  review packet was once measured against the wrong one with no signal at all. Why that happens is
+  stated once, on `_VersionAction` in [`messagefoundry/__main__.py`](../messagefoundry/__main__.py);
+  what to do about it is here. **`messagefoundry --version` prints the resolved package directory on
+  its own second line (BACKLOG #1677) — record that line whenever a measurement will be quoted.**
+  - **`PYTHONSAFEPATH=1` is not the fix, and is deliberately NOT set across these workflows.** It
+    drops the working directory from `sys.path`, which removes *one* of the two candidates and lets
+    the venv's editable `.pth` target win unconditionally — and on a multi-worktree box that target
+    can be a third checkout, unrelated to both the working directory and the repository you think you
+    are testing. It does not answer "which tree"; it changes which wrong answer you get silently. It
+    would also change nothing here, because every leg installs editable from its own checkout, so the
+    two candidates already agree. Print the path and read it.
