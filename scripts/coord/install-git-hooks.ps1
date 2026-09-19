@@ -172,7 +172,14 @@ if ($Status) {
         if (-not $durUrl) {
             Write-Host "             ^ ARMED at remote '$durRemote', which DOES NOT EXIST in this repo." -ForegroundColor Red
             Write-Host "               The hook exits 0 silently, so this looks identical to working." -ForegroundColor Red
-        } elseif ($durUrl -match 'MEFORORG/MessageFoundry') {
+        } elseif ($durUrl -match 'MEFORORG/MessageFoundry(\.git)?/?$') {
+            # ANCHORED ON THE END, and the unanchored version misreported for real. This read
+            # `-match 'MEFORORG/MessageFoundry'` until 2026-09-19, when the private vault was
+            # transferred into the same organization as MEFORORG/MessageFoundry-vault. A substring
+            # match hits that too, so -Status told a reader their PRIVATE remote was the public
+            # canonical repo -- in red, with a remedy that would have pointed them away from the
+            # correct target. Keep this in step with the case arms in scripts/hooks/durability_push.sh:
+            # the two answer the same question and must not disagree.
             Write-Host "             ^ POINTED AT THE PUBLIC CANONICAL REPO. The hook refuses this target," -ForegroundColor Red
             Write-Host "               so nothing is being made durable AND nothing is being published." -ForegroundColor Red
         } else {

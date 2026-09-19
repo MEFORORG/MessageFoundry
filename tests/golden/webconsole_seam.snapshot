@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-bb0d08912d9bd9f9
+00530873daf5e80d
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -102,6 +102,7 @@ current_user
 
 ## api.security surface (imported directly by the console, outside UiDeps)
 client_ip: (conn: 'Request | WebSocket') -> 'str | None'
+enforce_phi_read_hop: (request: 'Request') -> 'None'
 enforce_phi_read_pacing: (request: 'Request', identity: 'Identity') -> 'None'
 get_auth: (request: 'Request') -> 'AuthService | None'
 
@@ -197,7 +198,7 @@ messagefoundry.api.models.DeadLetterReplayRequest: channel_id, destination_name
 messagefoundry.api.models.DeadLetterRow: attempts, channel_id, control_id, destination_name, failed_at, last_error, message_id, message_type, outbox_id, received_at, summary
 messagefoundry.api.models.DrStatus: activation_mode, active, enabled, threshold
 messagefoundry.api.models.EditResendRequest: idempotency_key, raw, reroute, to
-messagefoundry.api.models.EngineInfo: channels_running, channels_stopped, channels_total, outbox_by_status, pid, uptime_seconds, version
+messagefoundry.api.models.EngineInfo: channels_failed, channels_failed_names, channels_running, channels_stopped, channels_total, outbox_by_status, pid, uptime_seconds, version
 messagefoundry.api.models.EngineKpis: connections_not_deployed, connections_running, connections_stopped, connections_total, messages_per_second, messages_total
 messagefoundry.api.models.EventInfo: destination, detail, event, ts
 messagefoundry.api.models.GraphEdge: provenance, source, source_kind, target, target_kind

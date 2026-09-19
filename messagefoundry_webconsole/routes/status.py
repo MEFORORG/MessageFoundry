@@ -41,6 +41,12 @@ _DISK_CRIT_BYTES = 1 * 1024**3  # < 1 GiB free → critical (blinking red)
 _SEVERITY_RANK = {"info": 1, "warning": 2, "critical": 3}
 
 
+# At most this many failed inbounds are named in the heart's reason; the rest become "and N more".
+# The reason renders into a title= attribute, so an estate-wide outage must not produce a tooltip
+# hundreds of names long.
+_MAX_NAMED_FAILURES = 3
+
+
 def _worst_severity(severities: list[str]) -> str | None:
     """The highest-ranked severity among active alerts, or ``None`` for an empty list (drives the bell's
     color: critical→red, warning→orange, info→accent, none→gray)."""
@@ -51,6 +57,29 @@ def _worst_severity(severities: list[str]) -> str | None:
         if r > rank:
             rank, worst = r, s
     return worst
+
+
+def _failed_inbound_reason(count: int, names: list[str]) -> str:
+    """The heart's tooltip for ``count`` failed inbounds, naming the ones the caller may see.
+
+    ``names`` is the caller-visible SUBSET (``EngineInfo.channels_failed_names``), so it can be
+    shorter than ``count`` or empty — a channel-scoped operator still learns that something is down
+    without learning whose feed it is. Connection NAMES only: the engine's failure reason is a raw
+    exception string, and this text lands in a ``title=`` attribute.
+    """
+    shown = names[:_MAX_NAMED_FAILURES]
+    if count == 1:
+        # The scoped caller's single hidden failure takes the second form: "1 inbound connections"
+        # is what a shared plural head would produce, and an operator reading a tooltip notices.
+        if shown:
+            return f"inbound {shown[0]} failed to start"
+        return "1 inbound connection failed to start"
+    head = f"{count} inbound connections failed to start"
+    if not shown:
+        return head
+    hidden = count - len(shown)
+    listed = ", ".join(shown)
+    return f"{head}: {listed}, and {hidden} more" if hidden > 0 else f"{head}: {listed}"
 
 
 def _derive_health(
@@ -67,11 +96,34 @@ def _derive_health(
     - disk free (DB drive, and log drive if metered) < 1 GiB → **down**, < 5 GiB → **warn**.
     - server DB connection pool saturated (``idle == 0``) → **warn**.
     - running on the DR failover box (``dr.active``) → **warn**; a clustered engine with no leader → **down**.
+    - any deployed inbound that failed to start → **warn**, naming it (BACKLOG #1741).
+    - zero deployed inbounds on a STARTED engine → **warn** (BACKLOG #1741).
+
+    The last two are why connection state belongs here at all: without them the heart read ``ok``
+    over an empty configuration and over an inbound that never got its port, while the dashboard row
+    beside it already said ``failed``. Both are ``warn``, not ``down`` — an ADR 0031 start failure is
+    isolated by design, so the rest of the graph is genuinely still serving.
     """
     issues: list[tuple[int, str]] = []  # (level, reason); 1 = warn, 2 = down
     if sysinfo is None:
         issues.append((2, "store unreachable"))
     else:
+        eng = sysinfo.engine
+        # Both connection rules are appended FIRST, and ``reason`` below takes the first issue at
+        # the worst level — so at equal severity a connection problem wins the tooltip over low
+        # disk, a saturated pool or DR-active. Deliberate: a feed that is not listening is the more
+        # actionable message. Insertion order IS the warn-level tie-break; moving these moves it.
+        if eng.channels_failed:
+            issues.append(
+                (1, _failed_inbound_reason(eng.channels_failed, eng.channels_failed_names))
+            )
+        # channels_total (DEPLOYED inbounds), never channels_running: a cluster standby binds no
+        # listeners by design, so running == 0 is correct there and keying on it would paint every
+        # standby permanently warn. uptime_seconds is the started gate — /status reports 0.0 until
+        # engine.started_at is set, and an engine that has not started yet is not "listening on
+        # nothing", it is still coming up.
+        if eng.channels_total == 0 and eng.uptime_seconds > 0:
+            issues.append((1, "no inbound connections deployed"))
         frees = [("db", sysinfo.db.disk_free_bytes)]
         if sysinfo.logs is not None:
             frees.append(("logs", sysinfo.logs.disk_free_bytes))

@@ -286,7 +286,7 @@ messagefoundry-tray = "messagefoundry.tray.__main__:main"
 ci-scanners = [
     "bandit==1.9.4",
     "pip-audit==2.10.1",
-    "zizmor==1.30.0",
+    "zizmor==1.30.1",
 ]
 # The RELEASE SIGNING toolchain (BACKLOG #332). Exact `==`, and the version is the contract for the
 # same reason the scanners' are: this runs in the job holding `id-token: write`, and whatever executes
@@ -334,7 +334,7 @@ ci-scanners = [
 # rather than its own closure; it lands mainly on the two wheel-build jobs and on `security.yml`'s SBOM
 # job, and a `--require-hashes -r <file>` install cannot be subset, so there is no cheaper one-lock form.
 release-tools = [
-    "build==1.5.0",
+    "build==1.6.1",
     "cyclonedx-bom~=7.3.1",
     "sigstore==4.4.0",
 ]
@@ -359,7 +359,7 @@ release-tools = [
 #                  disagree.
 ci-quality = [
     "diff-cover==10.5.1",
-    "mutmut==3.7.0",
+    "mutmut==3.8.0",
     "pytest-cov>=7.0",
     "pytest-timeout>=2.3",
 ]
