@@ -59,11 +59,6 @@ def _script_text() -> str:
     return _SCRIPT.read_text(encoding="utf-8")
 
 
-def _uninstall_text() -> str:
-    assert _UNINSTALL is not None
-    return _UNINSTALL.read_text(encoding="utf-8")
-
-
 # --------------------------------------------------------------- the AST extract-and-run harness
 
 
@@ -238,7 +233,7 @@ def test_gmsa_preflight_and_logon_right_are_wired(monkeypatch: pytest.MonkeyPatc
 
 
 # --- the nssm failure message must not carry the service-account password (BACKLOG #1573) ---------
-# ``Invoke-Nssm`` throws "nssm <args> failed (exit N)" on a non-zero exit. One of its 19 call sites
+# ``Invoke-Nssm`` throws "nssm <args> failed (exit N)" on a non-zero exit. One of its 18 call sites
 # passes the service-account password, so a joined message there puts cleartext into the throw, the
 # host's error rendering, and the $Error record it leaves behind.
 #
@@ -250,8 +245,11 @@ def test_gmsa_preflight_and_logon_right_are_wired(monkeypatch: pytest.MonkeyPatc
 _SECRET = "hunter2-DO-NOT-LEAK-THIS"
 
 
-def _nssm_stub(path_stem: Path, *, message: str, exit_code: int) -> Path:
+def _nssm_stub(path_stem: Path, *, message: str, exit_code: int, chatter: str = "") -> Path:
     """Write a stub nssm that prints ``message`` to stderr and exits ``exit_code``.
+
+    ``chatter``, when given, is printed to STDOUT as well -- nssm is not silent, and stdout is the
+    stream that lands in a PowerShell function's return value.
 
     THE STUB MUST BE A REAL NATIVE COMMAND ON THE HOST RUNNING THE TEST, and a ``.cmd`` is not one
     off Windows. These arms exist to read a genuine ``$LASTEXITCODE`` back from a genuine child
@@ -265,13 +263,19 @@ def _nssm_stub(path_stem: Path, *, message: str, exit_code: int) -> Path:
     silence saw a warning. The scripts were right; the stub was not a command.
 
     So: a batch file on Windows, a shebanged shell script with the execute bit everywhere else.
+    NEVER an extension a desktop has an association for -- see ``_stub_control``, which records what
+    a ``.txt`` did here.
     """
     if sys.platform.startswith("win"):
         stub = path_stem.with_suffix(".cmd")
-        stub.write_text(f"@echo off\r\necho {message} 1>&2\r\nexit /b {exit_code}\r\n", "ascii")
+        out = f"echo {chatter}\r\n" if chatter else ""
+        stub.write_text(
+            f"@echo off\r\n{out}echo {message} 1>&2\r\nexit /b {exit_code}\r\n", "ascii"
+        )
         return stub
     stub = path_stem.with_suffix(".sh")
-    stub.write_text(f"#!/bin/sh\necho '{message}' >&2\nexit {exit_code}\n", "ascii")
+    out = f"echo '{chatter}'\n" if chatter else ""
+    stub.write_text(f"#!/bin/sh\n{out}echo '{message}' >&2\nexit {exit_code}\n", "ascii")
     stub.chmod(0o755)
     return stub
 
@@ -361,7 +365,7 @@ def test_nssm_failure_message_redacts_the_service_account_password(tmp_path: Pat
 def test_ordinary_nssm_failures_still_name_their_arguments(tmp_path: Path) -> None:
     """POSITIVE CONTROL. Without this, emptying every message passes the test above.
 
-    18 of the 19 call sites carry no secret and their joined arguments are the whole diagnostic
+    17 of the 18 call sites carry no secret and their joined arguments are the whole diagnostic
     value of the throw.
     """
     arms = _invoke_nssm_arms(tmp_path)
@@ -370,7 +374,7 @@ def test_ordinary_nssm_failures_still_name_their_arguments(tmp_path: Path) -> No
     assert "AppStdout" in ordinary, "an ordinary nssm failure must still name its subcommand"
     assert "service.out.log" in ordinary, (
         "an ordinary nssm failure must still name its arguments -- a fix that strips every "
-        "argument would satisfy the redaction test while destroying 18 useful messages"
+        "argument would satisfy the redaction test while destroying 17 useful messages"
     )
     assert "exit 3" in ordinary, "the failure message must carry nssm's exit code"
 
@@ -438,18 +442,23 @@ def _stop_arms(
     nssm_exit: int | None,
     states: list[str],
     timeout: int = 1,
+    chatter: str = "",
 ) -> dict:
     """Run Stop-ServiceAndConfirm with Get-Service and Stop-Service shadowed.
 
     ``states`` is what the shadowed Get-Service reports on successive calls (the last value repeats);
     an empty list means the service is absent. ``nssm_exit`` of None runs the no-nssm branch, which
-    is uninstall-service.ps1's third stop site.
+    is uninstall-service.ps1's third stop site. ``chatter`` makes the stub print to STDOUT.
+
+    ``outputs`` counts the non-warning objects the helper emitted. It is reported rather than
+    collapsed because the COUNT is the defect: the callers test one boolean.
     """
     assert _SCRIPT is not None
     stub = _nssm_stub(
         tmp_path / f"nssm-stop-{uuid.uuid4().hex}",
         message="nssm: stop reported a problem",
         exit_code=nssm_exit if nssm_exit is not None else 0,
+        chatter=chatter,
     )
     prelude = _stub_control(stub, nssm_exit) if nssm_exit is not None else ""
     nssm_arg = _psq(str(stub)) if nssm_exit is not None else "''"
@@ -476,12 +485,14 @@ def _stop_arms(
   $emitted = & {{
     {_STOP_FN} -ServiceName 'MessageFoundry' -NssmPath {nssm_arg} -TimeoutSeconds {timeout}
   }} 3>&1
+  $outputs = 0
   foreach ($o in @($emitted)) {{
     if ($o -is [System.Management.Automation.WarningRecord]) {{ $warnings += "$o" }}
-    else {{ $result = $o }}
+    else {{ $result = $o; $outputs++ }}
   }}
   [pscustomobject]@{{
     result           = [bool]$result
+    outputs          = $outputs
     warnings         = @($warnings)
     stopServiceCalls = $script:StopServiceCalls
     getServiceCalls  = $script:GetServiceCalls
@@ -511,6 +522,34 @@ def test_a_nonzero_nssm_exit_is_no_longer_swallowed(tmp_path: Path) -> None:
     joined = " ".join(arms["warnings"])
     assert "3" in joined and "nssm stop" in joined, (
         f"a non-zero `nssm stop` exit must be surfaced, not swallowed; warnings were {arms['warnings']}"
+    )
+
+
+def test_nssm_chatter_does_not_become_part_of_the_return_value(tmp_path: Path) -> None:
+    """THE HELPER RETURNS ONE BOOLEAN, and nssm is not silent.
+
+    The call is bare on purpose - a redirection is what broke the previous version - but bare also
+    means nssm's STDOUT joins the function's output stream, ahead of the boolean. Both callers then
+    hold an ARRAY, and `if (-not $stopped)` on a multi-element array is $false no matter how the stop
+    went: install-service.ps1 reconfigures, and uninstall-service.ps1 removes the registration, both
+    without the "still running" warning, and precisely when nssm had something to report.
+
+    Measured 2026-09-18 on PowerShell 7.6.6 and Windows PowerShell 5.1.26100 against a stub printing
+    one stdout line: a bare call returned 2 objects, `| Out-Host` returned 1 and left $LASTEXITCODE
+    intact. The arms around this one cannot see it -- they keep the LAST non-warning object and drop
+    the rest, which is exactly the extra output that breaks the real callers.
+    """
+    arms = _stop_arms(
+        tmp_path, nssm_exit=0, states=["Running"], chatter="nssm: MessageFoundry: STOP: 0"
+    )
+    assert arms["outputs"] == 1, (
+        "Stop-ServiceAndConfirm emitted nssm's stdout into its own output stream, so the caller "
+        "gets an array instead of a boolean and `-not $stopped` is always false (got "
+        f"{arms['outputs']} objects)"
+    )
+    assert arms["result"] is False, (
+        "a service still Running must report False; a True here means the boolean was read off the "
+        "wrong object"
     )
 
 
@@ -923,10 +962,16 @@ def _lockdown(
         if broad_ace
         else ""
     )
+    # THE RESTORE IS IN A `finally`, and that is not tidiness. Set-SecureDataDirAcl strips
+    # inheritance and replaces the DACL partway through; _extract sets $ErrorActionPreference =
+    # 'Stop', so any throw from icacls, Get-Acl or the function itself would abandon the tree
+    # locked. pytest's tmp_path reaper then hits a directory it cannot delete, and the PermissionError
+    # surfaces on some LATER run with nothing tying it back to here.
     body = rf"""
-{pre}
   $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
   $data = {_psq(str(data))}
+  try {{
+{pre}
   $before = (& icacls $data | Out-String)
   $beforeSids = @((Get-Acl $data).Access | ForEach-Object {{
     try {{ $_.IdentityReference.Translate(
@@ -944,14 +989,16 @@ def _lockdown(
   $logSids = @((Get-Acl (Join-Path $data 'logs')).Access | ForEach-Object {{
     try {{ $_.IdentityReference.Translate(
       [Security.Principal.SecurityIdentifier]).Value }} catch {{ "$($_.IdentityReference)" }} }})
-  # Put the tree back in reach so pytest can clean it up.
-  & icacls {_psq(str(parent))} /inheritance:e /grant "${{me}}:(OI)(CI)F" | Out-Null
-  & icacls $data /inheritance:e /grant "${{me}}:(OI)(CI)F" | Out-Null
   [pscustomobject]@{{
     before = $before; after = $after; afterLogs = $afterLogs
     beforeSids = @($beforeSids); sids = @($sids); logSids = @($logSids)
     warnings = @($warnings); account = $me
   }} | ConvertTo-Json -Depth 4 -Compress
+  }} finally {{
+    # Put the tree back in reach so pytest can clean it up, however the block above ended.
+    & icacls {_psq(str(parent))} /inheritance:e /grant "${{me}}:(OI)(CI)F" | Out-Null
+    & icacls $data /inheritance:e /grant "${{me}}:(OI)(CI)F" | Out-Null
+  }}
 """
     out: dict = json.loads(
         _ok(_extract(_SCRIPT, _ACL_FNS, body), tmp_path).strip().splitlines()[-1]

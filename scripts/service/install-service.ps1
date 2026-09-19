@@ -139,9 +139,12 @@ function Set-SecureDataDirAcl {
       another tool, or a reinstall after somebody granted access by hand.
 
       So the explicit broad ACEs are removed as well, and then the resulting DACL is READ BACK. The
-      named removals cover every well-known broad principal; the read-back catches anything else -
-      a local group, say - and names it, rather than leaving the caller to believe a lockdown that
-      did not happen.
+      named removals cover AT LEAST the well-known broad principals listed below - not all of them,
+      and the list is not a closed set: Power Users (S-1-5-32-547) and Remote Desktop Users
+      (S-1-5-32-555) are two it does not name. That is what the read-back is for. It catches
+      whatever the list missed and NAMES it, rather than leaving the caller to believe a lockdown
+      that did not happen, so an omission degrades to a warning the operator must act on rather than
+      to a silent exposure.
     #>
     param([Parameter(Mandatory)][string]$Path, [string]$Account)
     # *S-1-5-18 = NT AUTHORITY\SYSTEM, *S-1-5-32-544 = BUILTIN\Administrators. (OI)(CI)F is inherited
@@ -550,8 +553,8 @@ function Invoke-Nssm {
     <#
       Run nssm and FAIL CLOSED on a non-zero exit, naming the subcommand that failed.
 
-      The failure message joins the arguments because for 18 of the 19 call sites that is exactly what
-      an operator needs ("nssm set MessageFoundry AppStdout ... failed (exit 3)"). The 19th passes the
+      The failure message joins the arguments because for 17 of the 18 call sites that is exactly what
+      an operator needs ("nssm set MessageFoundry AppStdout ... failed (exit 3)"). The 18th passes the
       service-account password as a positional argument, and a joined message there puts a cleartext
       password into the thrown message, the console, and the $Error record it leaves behind (BACKLOG
       #1573).
@@ -633,6 +636,16 @@ function Stop-ServiceAndConfirm {
       the caller's next step (rewriting the configuration, or removing the registration) then runs
       against a service that is still running. So the status is polled back from the SCM and the
       caller is told what it is, rather than assuming.
+
+      NSSM'S STDOUT GOES TO THE HOST, NOT INTO THE RETURN VALUE. This function's contract is a single
+      boolean, and a bare call puts everything nssm prints on stdout into the function's output
+      stream ahead of it. The caller then holds an ARRAY, and `if (-not $stopped)` on a multi-element
+      array is $false however the stop actually went - so the "still running" warning the whole
+      function exists to raise is skipped exactly when nssm had something to say. Measured
+      2026-09-18 on PowerShell 7.6.6 and Windows PowerShell 5.1.26100 against a stub that prints one
+      stdout line: bare returns 2 objects, `| Out-Host` returns 1. Out-Host and not Out-Null because
+      the operator still needs to read it, and not a redirection, which is what broke the old form.
+      $LASTEXITCODE survives the pipe on both hosts (measured, same run).
     #>
     param(
         [Parameter(Mandatory)][string]$ServiceName,
@@ -643,7 +656,7 @@ function Stop-ServiceAndConfirm {
     if ($NssmPath) {
         $launched = $true
         $global:LASTEXITCODE = $null
-        try { & $NssmPath stop $ServiceName } catch {
+        try { & $NssmPath stop $ServiceName | Out-Host } catch {
             $launched = $false
             Write-Warning ("Could not run '$NssmPath' to stop '$ServiceName' " +
                 "($($_.Exception.Message)). Falling back to the SCM.")
