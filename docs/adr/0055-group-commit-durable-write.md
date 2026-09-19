@@ -84,9 +84,11 @@ poison-guard, and ACK-on-receipt — via a backend-appropriate mechanism.** Core
 
 **App-side committer coroutine (the SQLite lever; the fallback for any single-writer server path).** A
 dedicated committer per store coalesces N already-prepared mutations into **one** `commit()` under the writer
-lock — the single writer holds the txn open across N members, then one durable sync. A **group rollback
-rejects every member's future** → each caller re-runs; this is a *coordinated* version of the crash-re-run
-the system already tolerates, **licensed by the existing idempotent INFLIGHT-guarded handoffs**.
+lock — the single writer holds the txn open across N members, then one durable sync. Each member runs
+inside its **own `SAVEPOINT`**, so a failing member is rolled back alone and its siblings still commit
+(**amended 2026-09-16, BACKLOG #1632** — see AC-1). A **whole-batch rollback rejects every member's
+future** → each caller re-runs; this is a *coordinated* version of the crash-re-run the system already
+tolerates, **licensed by the existing idempotent INFLIGHT-guarded handoffs**.
 
 - **GROUPED:** `enqueue_ingress`, `route_handoff`, `transform_handoff`, `mark_done`,
   `complete_with_response`, `dead_letter_now`, `mark_failed`.
@@ -117,8 +119,28 @@ standalone, ACK-on-ingress-future, cache-publish-on-success) is identical.
 
 ## Acceptance Criteria
 
-- **AC-1** — IF a group commit rolls back, THEN **every** member's future SHALL be rejected and each caller
-  SHALL re-run (no member is silently dropped or partially applied). → `tests/test_group_commit.py::test_group_rollback_reruns_all`
+- **AC-1** *(amended 2026-09-16 — BACKLOG #1632; original text below)* — IF a member fails, THEN its
+  statements SHALL be rolled back on **its own `SAVEPOINT`** and **only its own** future SHALL be rejected,
+  and its co-batched siblings SHALL still commit. IF the batch as a whole cannot commit — the `COMMIT`
+  itself failing, the committer being CANCELLED, or a member's savepoint unwind failing — THEN **every**
+  member's future SHALL be rejected and each caller SHALL re-run. No member is silently dropped or
+  partially applied either way. →
+  `tests/test_group_commit.py::test_poisoned_member_does_not_reject_its_siblings` ·
+  `::test_poisoned_member_does_not_reject_its_siblings_via_store_api` ·
+  `::test_commit_failure_still_rejects_every_member` ·
+  `tests/test_backlog1548_writer_txn_cancel_unwind.py::test_group_commit_writer_unwinds`
+  - **Original:** *"IF a group commit rolls back, THEN **every** member's future SHALL be rejected and each
+    caller SHALL re-run."* Kept verbatim because the amendment is not a clarification: that AC **specified
+    the defect**. One poisoned message rejected every message that happened to arrive inside its
+    coalescing window, so each innocent sibling took its lane's error backoff and logged a stack trace for
+    a failure that was not its own, and re-ran work that had already succeeded. Group-commit is off by
+    default (ADR 0107 withdrew the lever), so a site that turned it on is the only one that would have met
+    this — but that site would have had every transient store fault amplified across its whole batch.
+  - **Why savepoints and not a re-run.** The alternative was to re-run the healthy members inline, each in
+    its own transaction. Rejected: on the failure path that degenerates to N transactions and N fsyncs,
+    which is group-commit inverted, and it calls a member body a second time on a double-invocation safety
+    nobody has established. `ROLLBACK TO` keeps the failure path at one transaction and one fsync, and
+    invokes nothing twice.
 - **AC-2** — THE SYSTEM SHALL never group `claim_next_fifo`/`claim_ready`: the `attempts+1` poison-guard
   commits **standalone, before** the claimed work, and never shares a rollback fate with it. →
   `tests/test_group_commit.py::test_claim_poisonguard_standalone`
