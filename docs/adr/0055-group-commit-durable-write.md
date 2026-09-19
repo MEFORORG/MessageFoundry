@@ -21,7 +21,9 @@
 > [ADR 0057](0057-inline-step-a-fast-path.md) inline stage-fusion — a *different* mechanism — and it is itself gated
 > behind a pre-registered measurement (ADR 0099 §Decision 4). This ADR is retained for the record only.
 
-- **Status:** **Proposed** (2026-06-29) — design; the build is **authorized now as a no-regret lever** by
+- **Status:** **SUPERSEDED / WITHDRAWN (2026-07-12) by [ADR 0099](0099-phase-4-group-commit-amortize-the-per-event-transaction-cost.md) — DO NOT BUILD.**
+  The authorization this line used to carry is **REVOKED**; see the banner above. Retained for the record only.
+  *(Historical, revoked:)* design; the build was **authorized as a no-regret lever** by
   [ADR 0051](0051-corepoint-throughput-parity-strategy.md)'s delayed-hardware adjustment, with its relative
   fsync/msg delta **proxy-measured on the 265KF** (consumer floor). The *absolute* throughput claim still
   waits on the enterprise / spec-matched-cloud measurement.
