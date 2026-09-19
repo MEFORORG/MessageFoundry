@@ -1069,6 +1069,14 @@ than blocking the FIFO lane on a request the endpoint will never accept.
 scheme is constrained to `http`/`https`, and the outbound host is gated by the fail-closed
 `[egress].allowed_http` allowlist (WP-11c). Standard library only (`urllib`) — no new dependency.
 
+**No credentials inside an endpoint URL (BACKLOG #1793).** A URL of the form `https://user:password@host/`
+is refused when the connector is built. The error names the setting and never the password. This covers
+at least `url` on REST, SOAP, FHIR, DICOMweb and `FhirLookup`, plus `oauth2_token_url`, `smart_token_url`
+and `[ai].endpoint`. The shape never worked: `urllib` does not send URL userinfo as auth, and its error
+text carried the password into `last_error`. Put credentials in `basic_user`/`basic_password` or
+`bearer_token` (or the `oauth2_*`/`smart_*` settings), each via `env()`. `proxy_url` is not refused,
+because a forward proxy URL may carry its own credentials.
+
 **Idempotency — operator responsibility.** Delivery is **at-least-once**, so a retry **re-sends** the
 request. The receiving endpoint **must be idempotent** (an idempotency key, a natural upsert, or a
 message-id de-dup) or a retried `POST` will double-apply.
