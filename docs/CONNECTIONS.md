@@ -2461,6 +2461,20 @@ Four facts that are easy to get wrong, stated plainly first:
   The slow-loris guard is the **separate**
   `receive_timeout` (default 60 s), not `max_connections`; the HTTP listener additionally answers a
   synchronous `408` when a request read exceeds it.
+- **`receive_timeout` bounds SILENCE, not a message, and on the MLLP listener a second bound covers
+  the difference.** It is applied **per read**, so it resets on every byte received: a peer trickling
+  one byte at a time is never idle by it. The MLLP listener therefore also runs
+  `max_frame_seconds` (default 60 s), which bounds one frame from its **start byte to its end byte**
+  and closes the connection with a `frame_deadline` reason when it is exceeded (BACKLOG #1725). The
+  two run **together** and neither replaces the other — a peer that opens a socket and sends nothing
+  never opens a frame, so only the idle bound reaches it. **The raw-TCP, X12, HTTP and DICOM intakes
+  carry no frame-life bound**; this paragraph is about the MLLP listener alone.
+- **`max_connections` counts sockets, not hosts, so the MLLP listener carries a per-peer term as
+  well.** `max_connections_per_host` (default 32, an eighth of the socket cap) bounds the connections
+  one peer address may hold at once, refused the same pre-ingress way as the socket cap and carrying
+  a `max_connections_per_host` reason on its `at_capacity` event (BACKLOG #1725). Without it one
+  unauthenticated peer could take every slot a listener has, since `source_ip_allowlist` ships off.
+  **Again MLLP only** — the raw-TCP, X12, HTTP and DICOM intakes have no per-host term.
 - **The DICOM C-STORE SCP is a different shape** and none of the paragraph above describes it. It has
   no `max_connections` and no engine-side active-client counter: its bound is `max_associations`
   (**default 10**, `transports/dicom.py:165`), enforced inside pynetdicom, which **rejects the
@@ -2689,7 +2703,7 @@ reading this page already applies to a file the scan never opened.
 
 | Service/hop | Concurrency bound (setting + default) | Behaviour when the limit is reached | Fallback / recovery |
 |---|---|---|---|
-| MLLP listener (inbound) | `max_connections` default 256 concurrent clients | connection accepted, then immediately refused and closed with an `at_capacity` connection_event; the counter is not incremented | the peer reconnects; a slot frees as soon as any client finishes or trips `receive_timeout` |
+| MLLP listener (inbound) | `max_connections` default 256 concurrent clients, plus `max_connections_per_host` default 32 from any one peer address | connection accepted, then immediately refused and closed with an `at_capacity` connection_event; the counter is not incremented. The per-host refusal carries a `max_connections_per_host` reason, which is the only thing distinguishing the two budgets | the peer reconnects; a slot frees as soon as any client finishes or trips `receive_timeout` or `max_frame_seconds` |
 | MLLP destination | 1 in-flight delivery per outbound connection (`per_lane`), else the `pooled_max_processing_lanes` budget | a lane waits for a slot; the socket itself is per-delivery unless `persistent=true` | transient failure re-queues into the `RetryPolicy` path; a stale persistent connection is not reused past `idle_timeout_seconds` |
 | Raw TCP listener (inbound) | `max_connections` default 256 concurrent clients | accepted then immediately refused and closed with an `at_capacity` connection_event | as MLLP |
 | X12 listener (inbound) | `max_connections` default 256 concurrent clients | connection accepted, then immediately refused and closed at the application layer; the active-client counter is not incremented. An ADR 0021 `at_capacity` connection_event is emitted, as on the raw-TCP listener (BACKLOG #1665); an allow-list refusal emits `peer_not_allowlisted` and a WARNING log | as MLLP |
@@ -2740,7 +2754,7 @@ reading this page already applies to a file the scan never opened.
 
 | Service/hop | Timeout setting + default | Release procedure | Failure handling | Retry posture |
 |---|---|---|---|---|
-| MLLP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris); the ACK **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. Not operator-configurable — an ACK is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against | the client handler's outer `finally` closes the writer, with a 5 s shutdown grace | a decode/parse/validate failure NAKs synchronously and records `ERROR` before any ingress row; an ACK over its write bound drops the connection as a `peer_reset` | n/a — the sender retries |
+| MLLP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris) and `max_frame_seconds` 60 s bounds one frame start-byte to end-byte, which is what reaches a peer that trickles bytes and is therefore never idle; the ACK **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. That write bound is not operator-configurable — an ACK is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against | the client handler's outer `finally` closes the writer, with a 5 s shutdown grace | a decode/parse/validate failure NAKs synchronously and records `ERROR` before any ingress row; a frame over its deadline closes with a `frame_deadline` reason, having received nothing to drop; an ACK over its write bound drops the connection as a `peer_reset` | n/a — the sender retries |
 | MLLP destination | `connect_timeout` 10 s, `timeout_seconds` 30 s (drain + ACK read) | the socket is closed per delivery, or reused and aged out via `idle_timeout_seconds` / `max_connection_age_seconds` when `persistent` | transient errors re-queue; a `NegativeAckError` (AR) dead-letters immediately | `RetryPolicy` — **default `retry_max_attempts` is 100, finite**; lower it, or set `None` to retry forever |
 | Raw TCP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris); the reply **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. Not operator-configurable — a reply is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path; a reply over its write bound drops the connection as a `peer_reset` | n/a |
 | X12 listener (inbound) | `receive_timeout` 60 s; `max_interchange_bytes` bounds one ISA/IEA frame; the reply **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. Not operator-configurable, for the same reason as the raw-TCP row | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path; an allow-list refusal emits `peer_not_allowlisted` plus a WARNING log, and a capacity refusal emits `at_capacity`; a reply over its write bound drops the connection on a logged warning **and** the `peer_reset` its release path already carries. This listener emits the same seven kinds as the raw-TCP row above (BACKLOG #1665) | n/a |

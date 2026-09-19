@@ -369,7 +369,16 @@ def _import_code_defaults() -> list[tuple[str, float | int, str]]:
 
     return [
         ("max_connections", mllp.DEFAULT_MAX_CONNECTIONS, "transports.mllp"),
+        # BACKLOG #1725. Both are MLLP-listener-only, so the tables must not be read as stating a
+        # bound the raw-TCP/X12/HTTP/DICOM intakes also carry; the prose rows say so in words, and
+        # these two pins only hold the stated NUMBER to the constant.
+        (
+            "max_connections_per_host",
+            mllp.DEFAULT_MAX_CONNECTIONS_PER_HOST,
+            "transports.mllp",
+        ),
         ("receive_timeout", mllp.DEFAULT_RECEIVE_TIMEOUT, "transports.mllp"),
+        ("max_frame_seconds", mllp.DEFAULT_MAX_FRAME_SECONDS, "transports.mllp"),
         ("acquire_timeout", database._DEFAULT_DB_ACQUIRE_TIMEOUT, "transports.database"),
         (
             "pooled_max_processing_lanes",
