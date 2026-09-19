@@ -423,7 +423,8 @@ gates a merge**, and no seat has to clear one.
    so a question there is answered by the next brief rather than by a reply. Where a worker is its
    own session instead, `mail.ps1` requires `-To` and refuses to guess, so the Manager puts its own
    worktree path in the brief. Do not use `-To all`: that path spawns a nested process and may be
-   refused. With no address, put the question in the PR body.
+   refused. With no address, put the question in your exit report; the Manager carries it into the
+   PR body when it opens the PR.
 2. At least two kinds of refusal reach a Builder while it runs. Local git hooks fire at commit and
    push time; the live list is `.pre-commit-config.yaml`. The user-scope PreToolUse guards fire at
    tool-call time: `worktree_gate.ps1`, installed to `%USERPROFILE%\.claude\hooks\` by
@@ -655,10 +656,18 @@ gates a merge**, and no seat has to clear one.
 
 - New behavior gets a test. Run, in order: `ruff check` + `ruff format --check`, `mypy` (strict),
   `pytest` (with `QT_QPA_PLATFORM=offscreen` for the PySide6 harness tests).
+- **Then review your own diff with the `code-review` SUBAGENT, at effort `xhigh`, named explicitly.**
+  Ruff is style, mypy is types, pytest is regression, and `/simplify` above is a quality pass that
+  points at `code-review` for bugs -- none of them looks for a NEW correctness defect. **Say
+  "subagent", not "a review":** without the `Agent` tool `code-review` degrades to one inline pass,
+  so the looser word lets the degraded form read as compliance. Cap repair at **two rounds**, then
+  ship with the critic notes in your exit report. korus `roles/BUILDER.md` section 4c is the source
+  of record for the reasoning and the traps; do not restate them here.
 - `pre-commit` does not run mypy. Run it by hand before you commit, or strict typing first fails in
   CI, after your process is gone.
 - If the full suite will not finish inside your turn, run the tests covering your change and push.
-  Record in the PR body which checks you ran and which you skipped. An unpushed branch is lost.
+  Record in your exit report which checks you ran and which you skipped, for the Manager to carry
+  into the PR body. An unpushed branch is lost.
 - Some checks only ever run on a hosted runner, for example NSSM under `windows-service-smoke`. A
   Builder never sees their result. Push, and name in your exit report which legs must be read, so
   the Manager carries it into the PR body it opens. The Manager or the Regulator reads them after
@@ -680,7 +689,8 @@ gates a merge**, and no seat has to clear one.
   uncommitted edit, a force-push and `reset --hard` are not recoverable. What needs the
   owner is an action git cannot undo. Examples: writing outside the worktree, a DB migration against
   a real store, a global install. A Builder cannot ask, so it must not take one. If your brief
-  requires one, stop, push what is green, and say so in the PR body. Adding a dependency is not in
+  requires one, stop, push what is green, and say so in your exit report, which the Manager carries
+  into the PR body. Adding a dependency is not in
   this class: follow §7, edit `pyproject.toml` and re-lock. Parameterize SQL; catch exceptions
   specifically (§6).
 
