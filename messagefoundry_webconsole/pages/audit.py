@@ -19,6 +19,7 @@ from datetime import UTC, datetime
 from messagefoundry.api.auth_models import AuditList, SecurityEventsList
 
 from .._html import Markup, el, page, register_nav, rows_table
+from ._common import _window_note
 
 __all__ = ["audit_log", "security_events"]
 
@@ -26,17 +27,6 @@ __all__ = ["audit_log", "security_events"]
 def _ts(ts: float) -> str:
     """Render an epoch timestamp as a UTC ISO string (seconds); the raw float is opaque to operators."""
     return datetime.fromtimestamp(ts, UTC).strftime("%Y-%m-%d %H:%M:%SZ")
-
-
-def _window_note(shown: int, limit: int, noun: str) -> Markup:
-    """The one sentence that separates "this is everything" from "this is the newest ``limit``".
-
-    STATE THE BOUND, NOT JUST THE COUNT (BACKLOG #1743). A bare "200 entries" is the same sentence
-    whether the log holds 200 or 200,000, and the reader cannot tell which — so the cap goes in the
-    text beside the count. Styled ``muted`` rather than ``pager``: ``pager`` is the class the two
-    real pagers use for a line that CARRIES links, and borrowing it here would dress a dead end up
-    as navigation."""
-    return el("p", f"{shown} {noun} shown, capped at the newest {limit}.", class_="muted")
 
 
 def audit_log(data: AuditList, *, limit: int) -> Markup:

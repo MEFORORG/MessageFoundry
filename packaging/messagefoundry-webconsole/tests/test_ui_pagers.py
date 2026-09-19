@@ -8,14 +8,15 @@ Both routes already accepted ``limit``/``offset`` and both response models alrea
 any result set and a count they could read as the whole of it.
 
 The defect these tests are really aimed at is the SECOND one, which a pager introduces rather than
-fixes: a Previous/Next link that drops the active filters re-runs a wider query and still returns
-rows, so the operator reads a result set under a filter they typed and the engine did not apply.
-Each test below therefore seeds rows that the filter EXCLUDES and asserts they stay off both pages
--- a pager that lost its filters would surface them, and a bare "the link exists" assertion would
-not notice.
+fixes: a link that drops the active filters. ``pages._common._pager`` carries the reasoning; what
+matters here is the test design it forces. Each test seeds rows that the filter EXCLUDES and
+asserts they stay off both pages -- a pager that lost its filters would surface them, and a bare
+"the link exists" assertion would not notice.
 """
 
 from __future__ import annotations
+
+from urllib.parse import parse_qsl
 
 import httpx
 import pytest
@@ -72,8 +73,18 @@ def _next_href(html: str) -> str:
     for chunk in html.split(marker)[1:]:
         href, _, rest = chunk.partition('"')
         if ">Next<" in rest:
-            return href
+            return href.replace("&amp;", "&")
     raise AssertionError("no Next link in the page")
+
+
+def _query(href: str) -> dict[str, str]:
+    """The link's query as a mapping, so an assertion names the PAIRS it cares about.
+
+    Comparing the whole href as one string would pin parameter ORDER, which is an artifact of a
+    dict literal's insertion order and carries no meaning -- the route binds by name. Reordering
+    those keys would then red these tests with a failure that reads like a dropped filter.
+    """
+    return dict(parse_qsl(href.split("?", 1)[1], keep_blank_values=True))
 
 
 #: Named rather than pasted, so this source file stays pure ASCII: a literal arrow here would be the
@@ -182,8 +193,14 @@ async def test_the_messages_pager_pages_and_carries_every_filter(engine: Engine)
         assert "1-2 of 3 message(s)" in first.text
         assert ">Next<" in first.text and ">Previous<" not in first.text
 
-        href = _next_href(first.text).replace("&amp;", "&")
-        assert href == "/ui/messages?channel_id=ch1&message_type=ADT%5EA01&limit=2&offset=2"
+        href = _next_href(first.text)
+        assert href.startswith("/ui/messages?")
+        assert _query(href) == {
+            "channel_id": "ch1",
+            "message_type": "ADT^A01",  # the caret rode as %5E and came back decoded
+            "limit": "2",
+            "offset": "2",
+        }
 
         last = await c.get(href)
         assert last.status_code == 200, last.text
@@ -196,6 +213,44 @@ async def test_the_messages_pager_pages_and_carries_every_filter(engine: Engine)
         assert "ORU0" not in both, "the pager widened the query it was replaying"
 
 
+async def test_a_blank_filter_box_is_not_a_filter(engine: Engine) -> None:
+    """The message log's own form submits every box it has, blank ones included, and a blank box
+    reached the store as ``status = ''`` -- which no row matches.
+
+    MEASURED before the fix, three messages on ch1: the bare ``?channel_id=ch1`` found all three
+    and the form-shaped URL below found none, so pressing Search with any box left empty returned
+    an empty log. The two date bounds were never affected (``_epoch`` already returns None for a
+    blank), which is why the defect survived BACKLOG #1744's pass over them.
+
+    THE FULLY-BLANK ARM IS THE CONTROL: with no filter at all the page must show everything, so a
+    fix that turned blanks into a narrowing predicate the other way would fail here rather than
+    pass. It is also exactly what the form submits from a cold /ui/messages.
+    """
+    service = await _service(engine)
+    for n in range(3):
+        await engine.store.enqueue_message(
+            channel_id="ch1",
+            raw=ADT,
+            deliveries=[("archive", ADT)],
+            control_id=f"ADT{n}",
+            message_type="ADT^A01",
+            source_type="file",
+        )
+    blank = "status=&message_type=&control_id=&received_from=&received_to="
+    async with _client(engine, service) as c:
+        await _login(c)
+        scoped = await c.get(f"/ui/messages?channel_id=ch1&{blank}")
+        assert "1-3 of 3 message(s)" in scoped.text, "a blank box narrowed the query"
+
+        everything = await c.get(f"/ui/messages?channel_id=&{blank}")
+        assert "1-3 of 3 message(s)" in everything.text
+
+        # Dead letters take the same treatment, and an unmatched NON-blank filter still narrows --
+        # without this the assertions above would also pass on a route that ignored its filters.
+        assert "0 of 0 dead delivery(s)" in (await c.get("/ui/dead-letters?channel_id=")).text
+        assert "0 of 0 message(s)" in (await c.get("/ui/messages?channel_id=nosuch")).text
+
+
 async def test_the_dead_letter_pager_pages_and_carries_both_filters(engine: Engine) -> None:
     """Three dead deliveries to one destination plus one to another, read two at a time.
 
@@ -206,7 +261,7 @@ async def test_the_dead_letter_pager_pages_and_carries_both_filters(engine: Engi
     service = await _service(engine)
 
     async def _dead(destination: str, control_id: str) -> None:
-        await engine.store.enqueue_message(
+        message_id = await engine.store.enqueue_message(
             channel_id="ch1",
             raw=ADT,
             deliveries=[(destination, ADT)],
@@ -215,8 +270,13 @@ async def test_the_dead_letter_pager_pages_and_carries_both_filters(engine: Engi
             source_type="file",
             now=0.0,
         )
+        # Dead-letter only THIS message's delivery. ``claim_ready`` drains whatever is due, so a
+        # bare loop over it would also kill any unrelated row a later edit to this test enqueues --
+        # passing today only because each call empties the queue the previous one filled.
+        mine = {row["id"] for row in await engine.store.outbox_for(message_id)}
         for item in await engine.store.claim_ready(now=0.0):
-            await engine.store.dead_letter_now(item.id, "permanent reject", now=1.0)
+            if item.id in mine:
+                await engine.store.dead_letter_now(item.id, "permanent reject", now=1.0)
 
     for n in range(3):
         await _dead("OB_ACME_ADT", f"DL{n}")
@@ -230,10 +290,14 @@ async def test_the_dead_letter_pager_pages_and_carries_both_filters(engine: Engi
         assert "1-2 of 3 dead delivery(s)" in first.text
         assert ">Next<" in first.text and ">Previous<" not in first.text
 
-        href = _next_href(first.text).replace("&amp;", "&")
-        assert href == (
-            "/ui/dead-letters?channel_id=ch1&destination_name=OB_ACME_ADT&limit=2&offset=2"
-        )
+        href = _next_href(first.text)
+        assert href.startswith("/ui/dead-letters?")
+        assert _query(href) == {
+            "channel_id": "ch1",
+            "destination_name": "OB_ACME_ADT",
+            "limit": "2",
+            "offset": "2",
+        }
 
         last = await c.get(href)
         assert last.status_code == 200, last.text

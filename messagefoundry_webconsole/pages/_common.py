@@ -5,11 +5,12 @@
 Small, escape-neutral formatters imported by the per-area page modules (``connections``,
 ``messages``, …) so the rendering conventions live in one place, never copy-pasted per module.
 
-Two of these build a URL rather than format a cell — ``_seg`` for one path segment, ``_pager``
-for a listing's Previous/Next query — and that is why they are here rather than in ``.._html``:
-that module is the page-agnostic escaping layer and knows nothing about /ui's routes or their
-query parameters, while getting an operator-supplied value safely into a link is exactly the
-convention this module exists to keep in one place.
+Some of these build a URL or a whole footer rather than format a cell — at least ``_seg`` for one
+path segment, ``_pager`` for a listing's Previous/Next query, and ``_window_note`` for a listing
+that is capped and cannot page — and that is why they are here rather than in ``.._html``: that
+module is the page-agnostic escaping layer and knows nothing about /ui's routes or their query
+parameters, while getting an operator-supplied value safely into a link is exactly the convention
+this module exists to keep in one place.
 """
 
 from __future__ import annotations
@@ -54,7 +55,11 @@ def _pager(
     form's own submit, is a separate defect of the route and is filed separately.
 
     The caller passes ``path`` as a plain literal; this builder never interpolates into one.
+    ``limit`` is floored at 1 here rather than assumed: every route clamps it (``Query(ge=1)``), but
+    none of the three list models declares a bound, so the clamp is a property of today's callers
+    and not of this builder, and a zero would 500 the whole page on the division below.
     """
+    limit = max(limit, 1)
     active = {k: v for k, v in (filters or {}).items() if v}
 
     def _link(label: str, target: int) -> Markup:
@@ -63,9 +68,12 @@ def _pager(
 
     # An EMPTY window is not "rows 0 to offset": a bookmarked page-N link outlives the rows it named
     # (a retention purge, a narrowed filter, a hand-typed offset), and "0-100 of 3" reads as a count
-    # that contradicts the empty table above it. Say the total and stop.
-    window = f"{offset + 1}-{offset + shown}" if shown else "0"
-    parts: list[object] = [text(f"{window} of {total} {noun}")]
+    # that contradicts the empty table above it. State the total, then the offset separately so the
+    # operator can still say WHERE they were -- which is what the replaced "(offset N)" line gave.
+    if shown:
+        parts: list[object] = [text(f"{offset + 1}-{offset + shown} of {total} {noun}")]
+    else:
+        parts = [text(f"0 of {total} {noun} (offset {offset})")]
     if offset > 0:
         # Step back to the last page that HAS rows rather than one window back, which from past the
         # end would still be past the end and would strand the operator on a second empty page.
@@ -75,6 +83,20 @@ def _pager(
     if offset + shown < total:
         parts += [Markup(" "), _link("Next", offset + limit)]
     return el("p", *parts, class_="pager")
+
+
+def _window_note(shown: int, limit: int, noun: str) -> Markup:
+    """The footer for a listing that is CAPPED and cannot page — the sentence that separates "this
+    is everything" from "this is the newest ``limit``" (BACKLOG #1743).
+
+    STATE THE BOUND, NOT JUST THE COUNT. A bare "200 entries" is the same sentence whether the log
+    holds 200 or 200,000, and the reader cannot tell which, so the cap goes in the text beside the
+    count. Styled ``muted`` rather than ``pager``: ``pager`` is the class :func:`_pager` uses for a
+    line that CARRIES links, and borrowing it here would dress a dead end up as navigation.
+
+    It lives beside :func:`_pager` rather than in the one page that calls it today, because the next
+    capped listing needs the same sentence and copying it is how the two pagers diverged."""
+    return el("p", f"{shown} {noun} shown, capped at the newest {limit}.", class_="muted")
 
 
 def _num(value: object) -> str:

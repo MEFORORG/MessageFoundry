@@ -505,14 +505,23 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # Form-only landing: pre-filled, NOT run until the operator submits (#4b).
             return HTMLResponse(pages.messages(None, deferred=True, **typed))
 
+        # A BLANK BOX IS NOT A FILTER, and until this line it was. A browser GET form submits every
+        # field it has, so leaving a box empty sends ``status=``, which arrives here as "" rather
+        # than None; the store's filter builder gates on ``is not None`` and emits ``status = ''``,
+        # which no row matches. MEASURED 2026-09-18 on three messages: ``?channel_id=ch1`` renders
+        # all three and ``?channel_id=ch1&status=`` renders none — so pressing Search on this page's
+        # own form with any box left empty returned an empty log. ``or None`` is the whole fix, and
+        # it belongs here rather than in the store: an empty string is a legitimate value to a query
+        # API, and it is the BROWSER FORM that means "unset" by it. The two date bounds already went
+        # through ``_epoch``, which returns None for a blank, which is why they were never affected.
         data = await core.list_messages(
             request,
             engine=engine,
             identity=identity,
-            channel_id=channel_id,
-            status=status_filter,
-            message_type=message_type,
-            control_id=control_id,
+            channel_id=channel_id or None,
+            status=status_filter or None,
+            message_type=message_type or None,
+            control_id=control_id or None,
             received_from=epoch_from,
             received_to=epoch_to,
             limit=limit,
@@ -578,13 +587,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             request,
             engine=engine,
             identity=identity,
-            channel_id=channel_id,
-            destination_name=destination_name,
+            # ``or None`` for the same reason as the message log above: a blank means unset, and
+            # without it an empty string reaches the store as a predicate no row matches.
+            channel_id=channel_id or None,
+            destination_name=destination_name or None,
             limit=limit,
             offset=offset,
         )
-        # The two filters go to the page as well as to the query: the pager links must replay them,
-        # or a Next re-runs the listing unfiltered and still returns rows (BACKLOG #1743).
+        # The two filters go to the page as well as to the query, because the pager links have to
+        # replay them — see ``pages._common._pager`` for why (BACKLOG #1743).
         return HTMLResponse(
             pages.dead_letters(
                 data,

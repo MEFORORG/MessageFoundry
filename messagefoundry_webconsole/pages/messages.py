@@ -10,7 +10,7 @@ markup.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, TypedDict
 
 from messagefoundry.api.models import (
     DeadLetterList,
@@ -33,6 +33,23 @@ __all__ = [
     "parse_tree_page",
     "parse_tree_unavailable",
 ]
+
+
+class _MsgFilterValues(TypedDict):
+    """The message log's filters, keyed by their /messages QUERY names.
+
+    A TypedDict rather than a plain dict for the reason ``routes/core.py``'s ``_MsgFilters`` gives
+    one layer up: it is splatted into a named-parameter call, and only a TypedDict makes mypy match
+    each key to its parameter through the ``**``. The same value also feeds the pager, so an
+    untyped dict would turn a mistyped key into one runtime error and one silently dropped filter.
+    """
+
+    channel_id: str
+    status: str
+    message_type: str
+    control_id: str
+    received_from: str
+    received_to: str
 
 
 def _msg_filters(
@@ -91,29 +108,27 @@ def messages(
     "open a connection's messages, adjust, then Search" landing (#4b). Otherwise the results table
     renders, followed by the window-of-total counter and its Previous/Next links.
 
-    Those links carry the six filters back (BACKLOG #1743). Before that the page reached only the
-    first window of any result set and said so in a form — ``N of TOTAL (offset 0)`` — that an
-    operator could read as the whole of it; there was no way forward from the console at all. The
-    six arguments below are the values the listing was actually run under, so they are what the
-    links must replay: a Next that dropped one would re-run a wider query and look like it worked.
+    Before that the page reached only the first window of any result set and said so in a form —
+    ``N of TOTAL (offset 0)`` — that an operator could read as the whole of it, with no way forward
+    from the console at all (BACKLOG #1743). The filter arguments below are the values the listing
+    was actually run under, which is why they are also handed to the pager; ``_common._pager``
+    carries the reason a link must replay them.
 
     ``error`` renders a refusal banner in place of the "click Search" hint, the shape
     ``message_search`` uses: the filters come back carrying what the operator typed, and the route
     answers 400 instead of searching under a bound it dropped (BACKLOG #1744)."""
-    # ONE spelling of the six inside this function, feeding both the form and the pager links. They
-    # are the /messages query names, which is also what ``_msg_filters`` names its inputs and its
-    # fields — the form round-trips them and so must the links, or the two disagree about what the
-    # listing was run under. This does NOT collapse the whole chain: the route still declares them
-    # (``_MsgFilters`` in routes/core.py) and this function still declares them as parameters, so a
-    # seventh filter is still several edits. It removes the one pair that could drift unnoticed.
-    values = {
-        "channel_id": channel_id,
-        "status": status,
-        "message_type": message_type,
-        "control_id": control_id,
-        "received_from": received_from,
-        "received_to": received_to,
-    }
+    # ONE spelling of them inside this function, feeding both the form and the pager links, so the
+    # two cannot disagree about what the listing was run under. This does NOT collapse the whole
+    # chain — the route still declares them and so does this signature — it removes the one pair
+    # that could have drifted unnoticed.
+    values = _MsgFilterValues(
+        channel_id=channel_id,
+        status=status,
+        message_type=message_type,
+        control_id=control_id,
+        received_from=received_from,
+        received_to=received_to,
+    )
     filters = _msg_filters(**values)
     if deferred or data is None:
         hint = (
@@ -143,8 +158,10 @@ def messages(
         shown=len(data.messages),
         noun="message(s)",
         # ``defer`` is deliberately NOT among them: a pager link must RUN the query, and the
-        # deferred arm returns above this line anyway.
-        filters=values,
+        # deferred arm returns above this line anyway. Rebuilt as a plain dict because a TypedDict
+        # is a ``Mapping[str, object]`` to mypy however its fields are declared — the ``str`` here
+        # is the type system's artifact, not a conversion; every value already is one.
+        filters={key: str(value) for key, value in values.items()},
     )
     return page(
         "Messages",
@@ -611,9 +628,7 @@ def parse_tree_unavailable(message_id: str, reason: str) -> Markup:
     )
 
 
-def dead_letters(
-    data: DeadLetterList, *, channel_id: str = "", destination_name: str = ""
-) -> Markup:
+def dead_letters(data: DeadLetterList, *, channel_id: str, destination_name: str) -> Markup:
     """The dead-letter list (newest first) + per-channel bulk replay (M3).
 
     Each row links to the audited message detail (single-message replay lives there, M2b). The bulk
@@ -622,8 +637,10 @@ def dead_letters(
     identifiers, carried in the action PATH so the step-up auto-retry re-POST needs no body.
 
     ``channel_id`` / ``destination_name`` are the route's two query filters, taken here only so the
-    pager can replay them (BACKLOG #1743). The page draws no filter form, so they render nowhere
-    else, and a Next link that dropped them would silently widen the listing.
+    pager can replay them (BACKLOG #1743) — ``_common._pager`` carries the reason. The page draws no
+    filter form, so they render nowhere else. They are REQUIRED rather than defaulted to "": a
+    default would let a second render site omit them, and the page would still render while its
+    links quietly widened the listing, which is the one failure this argument exists to prevent.
 
     **THE BULK-REPLAY BUTTONS BELOW DO NOT TRACK EITHER ONE, and nothing here makes them.** They are
     derived from the rows in the CURRENT WINDOW, so paging changes which per-channel and

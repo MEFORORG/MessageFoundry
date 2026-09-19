@@ -105,7 +105,7 @@ def _list_pager(data: UploadedFileList) -> Markup:
     This listing has no filters, so the shared builder is called with none: the links carry only two
     integers the engine has already clamped, and nothing operator-supplied reaches the URL — the same
     reason the refusal codes on this page are fixed tokens. That is a property of THIS page, not of
-    the builder, which exists to round-trip the filters its other two callers do have."""
+    the builder, which exists to round-trip the filters other callers do have."""
     return _pager(
         path="/ui/uploaded-logs",
         total=data.total,
