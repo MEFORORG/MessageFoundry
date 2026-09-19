@@ -235,6 +235,13 @@ _KNOWN_UNWIRED: dict[str, str] = {
         "repair -- wiring it before that shipped a false-deny class to every seat on every clone, "
         "and that friction is what gets a control disarmed. The repair is BACKLOG #1341."
     ),
+    "context-budget.ps1": (
+        "Owner instruction 2026-09-15: stop reporting a context budget at all. Its UserPromptSubmit "
+        "wiring was removed in the same change that added this entry. The SCRIPT is kept only "
+        "because deleting it also retires tests/test_context_budget_hook.py and its manifest row, "
+        "which is a separate diff and not one this PR was reviewed for. Deleting all three is the "
+        "intended end state, not this entry."
+    ),
     "lane-level.ps1": "Not a PreToolUse guard; invoked directly by coordination scripts.",
     "steer-inject.ps1": "Opt-in steering channel, armed per-session rather than by a matcher.",
     "steer-send.ps1": "The sending half of the same opt-in channel; never a hook handler.",
