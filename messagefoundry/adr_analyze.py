@@ -12,13 +12,15 @@ Architecture Decision Records and report, **advisory-only** (never blocks a comm
 * **Open clarifications** — unchecked ``- [ ]`` task items (the "clarify" step): questions that
   should be resolved before an ADR flips to ``Accepted``.
 
-Pure (filesystem reads only). It is **advisory**: :attr:`AnalysisResult.ok` is informational and the
-CLI exits 0 unless ``--strict`` is passed, so it adds no new blocking gate — the §5 practices are
-recommended, not required.
+Pure (filesystem reads only). Its **findings** are advisory: :attr:`AnalysisResult.ok` is
+informational and the CLI exits 0 unless ``--strict`` is passed, so it adds no new blocking gate —
+the §5 practices are recommended, not required. One condition is not a finding and is never
+advisory — an absent corpus; :func:`analyze_adrs` defines it and says why.
 """
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,6 +31,10 @@ __all__ = [
     "AnalysisResult",
     "analyze_adrs",
 ]
+
+# How an ADR file is recognised. Quoted verbatim in the "nothing matched" error so the message and
+# the code state the same rule -- it is looser than the ``NNNN-`` naming convention it implements.
+_DISCOVERY_GLOB = "[0-9]*.md"
 
 # A reference inside an Acceptance-Criteria block pointing at a test or fixture, e.g.
 # ``tests/test_foo.py::test_bar`` or ``fixtures/IB_ACME/adt.hl7``. The ``::node`` pytest selector is
@@ -97,9 +103,14 @@ class AdrReport:
 
 @dataclass(frozen=True)
 class AnalysisResult:
-    """The whole-ADR-set report."""
+    """The whole-ADR-set report.
+
+    ``error`` is a human-readable line naming the directory when there was no corpus to analyze,
+    and ``None`` otherwise; :func:`analyze_adrs` sets it and gives the reasoning.
+    """
 
     reports: list[AdrReport]
+    error: str | None = None
 
     @property
     def coverage_gaps(self) -> list[tuple[str, str]]:
@@ -116,12 +127,13 @@ class AnalysisResult:
 
     @property
     def ok(self) -> bool:
-        """Advisory: True iff there are no acceptance-criteria coverage gaps."""
-        return not self.coverage_gaps
+        """True iff a corpus was analyzed and it has no acceptance-criteria coverage gaps."""
+        return self.error is None and not self.coverage_gaps
 
     def to_json(self) -> dict[str, object]:
         return {
             "ok": self.ok,
+            "error": self.error,
             "adrs": [r.to_json() for r in self.reports],
             "coverage_gaps": [{"adr": a, "ref": ref} for a, ref in self.coverage_gaps],
             "accepted_without_criteria": self.accepted_without_criteria,
@@ -209,8 +221,36 @@ def analyze_adrs(adr_dir: str | Path, repo_root: str | Path | None = None) -> An
 
     ``repo_root`` anchors the on-disk existence check for each ``→`` test/fixture reference; it
     defaults to two levels above ``adr_dir`` (i.e. the repo root for the standard ``docs/adr`` layout).
+
+    **AN ABSENT CORPUS IS AN ERROR, NOT AN EMPTY CLEAN RUN.** ``Path.glob`` yields nothing and
+    raises nothing for a directory that does not exist, so a missing ADR directory -- or one left
+    holding only its ``README.md`` and ``TEMPLATE.md`` scaffolding -- used to produce zero reports
+    and an :attr:`AnalysisResult.ok` of True. A check that cannot fail is worse than no check: it
+    would turn a withdrawn ADR set into a silent pass. So a path that does not exist, is not a
+    directory, or matches no ADR sets :attr:`AnalysisResult.error` -- a line naming the directory
+    -- and clears ``ok``; the CLI spends exit 2 on it whether or not ``--strict`` is passed.
+
+    **The error line says what was looked for, not why nothing was found.** ``Path.exists`` and
+    ``Path.glob`` both swallow ``OSError``, so a directory the process cannot read is
+    indistinguishable here from one that is absent or genuinely empty. A message naming a cause
+    the code cannot observe would send an operator to re-create a directory that is already there,
+    so each line below stays on the observation and admits the unreadable case.
     """
     adr_path = Path(adr_dir)
+    # Lexical ``abspath`` and not ``resolve()``: it makes the relative ``docs/adr`` default useful
+    # to an operator, and collapses any ``..`` they typed, without rewriting a path handed in
+    # through a symlink into its target.
+    shown = os.path.abspath(adr_path)
+    if not adr_path.exists():
+        return AnalysisResult(reports=[], error=f"no ADR directory found or readable at {shown}")
+    if not adr_path.is_dir():
+        return AnalysisResult(reports=[], error=f"the ADR path is not a directory: {shown}")
+    # ``is_file()`` because the glob matches a directory named like an ADR too, and handing one to
+    # ``_parse_adr`` raises where the whole point here is a reported error.
+    files = sorted(f for f in adr_path.glob(_DISCOVERY_GLOB) if f.is_file())
+    if not files:
+        return AnalysisResult(
+            reports=[], error=f"no file matching {_DISCOVERY_GLOB} found in {shown}"
+        )
     root = Path(repo_root) if repo_root is not None else adr_path.resolve().parents[1]
-    reports = [_parse_adr(f, root) for f in sorted(adr_path.glob("[0-9]*.md"))]
-    return AnalysisResult(reports=reports)
+    return AnalysisResult(reports=[_parse_adr(f, root) for f in files])

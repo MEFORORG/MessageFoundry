@@ -86,6 +86,7 @@ from messagefoundry.config.wiring import (
     inbound_binding_conflicts,
     resolve_env_settings,
     resolve_listener_binding,
+    resolved_encoding_problems,
 )
 from messagefoundry.fhirsearch import FhirSearchParams
 from messagefoundry.logging_guard import LogSinkEvent
@@ -2324,6 +2325,13 @@ class RegistryRunner:
         # authentication requirement most needs to cover. No allow_insecure_bind is passed — a
         # cleartext escape hatch does not get to waive authentication.
         check_http_intake_auth(source_cfg, ic.name, posture=self._hop_posture)
+        # BACKLOG #1729, sited with the gates above because it shares their seam and nothing else does:
+        # this is the one point that sees an inbound's OWN streaming settings and the SERVICE-level
+        # aggregate budget together, on start, on reload, and on a runtime connection start. It is the
+        # odd one out of this block in two ways, both deliberate — it reads the InboundConnection rather
+        # than the built Source (stream_threshold_bytes is a wiring field, not a transport setting), and
+        # it WARNS where its neighbours refuse. See the function for why a refusal is not available here.
+        warn_unbudgeted_streaming_inbound(ic, budget=self._stream_inflight_budget)
         # #200 (ADR 0092): stamp the posture for the source build too (a DATABASE poll source keys its
         # weakened-TLS refusal on it), matching the exposure-check posture threading above.
         with active_hop_posture(self._hop_posture):
@@ -7105,6 +7113,17 @@ def build_check_registry(
     )
     if conflicts:
         raise PortConflictError("; ".join(conflicts))
+    # Encoding pre-flight, the RESOLVED half of Registry.encoding_problems (BACKLOG #1767). Same shape
+    # and same place as the port pre-flight above and for the same reason: an env()-supplied value is
+    # legible only once this instance's environment values are in hand, which is here and not at
+    # load_config. It builds no connector either, so it runs outside the posture scope. Every message
+    # reads this codec name, so a bad one takes the whole connection down on the first message, and
+    # `raise` here turns that into a WiringError at `check` / reload / promote / connection upsert.
+    # All of them at once, not the first: the caller is usually showing an operator a 422, and the
+    # second bad environment value is no less true than the first.
+    encoding_problems = resolved_encoding_problems(registry, env_values=env_values)
+    if encoding_problems:
+        raise WiringError("; ".join(encoding_problems))
     try:
         # Stamp the derived posture for the whole build so a cell's posture-keyed hop-refusal (ADR 0092)
         # decides against THIS config's posture. The port-conflict pre-flight above builds no connector,
@@ -7988,6 +8007,47 @@ def check_tcp_tls_exposure(
         "the cleartext risk on a trusted, firewalled network (refused even with the flag on a "
         "production-PHI instance — set tls_hop_attested=true if the segment is secured by other means)."
     )
+
+
+def warn_unbudgeted_streaming_inbound(ic: InboundConnection, *, budget: int) -> bool:
+    """Warn at listener start when ``ic`` enables the ADR 0105 over-threshold detach while
+    ``[inbound].stream_inflight_budget_bytes`` is unlimited (#149, BACKLOG #1729). Returns whether it
+    warned, so a caller (and a test) can tell "warned" from "nothing to say".
+
+    **It WARNS and never raises, and that scoping is the whole design decision here.** The backlog row
+    proposes refusing ``serve`` on a PHI-carrying environment in this state. That refusal is not
+    buildable as written: ``HopPosture.is_phi`` was retired (BACKLOG #1279) precisely because *every*
+    instance carries patient data, so "on a PHI-carrying environment" no longer selects a subset — the
+    refusal would fire on every streaming graph that is valid today, with no new opt-in gating it. That
+    is the shape docs/CONFIGURATION.md's ``require_memory_encryption_declaration`` row forbids ("a new
+    refusal fires only on a new opt-in"), whose single recorded exception (BACKLOG #326 / ADR 0140)
+    says in the same breath not to generalise it. A warning is outside that rule, and it is rung 1 of
+    the same ladder ADR 0152 climbs: the refusal stays available later behind a new opt-in setting.
+
+    Silent in both of the cases where there is nothing to say: a positive budget (the aggregate IS
+    bounded) and an inbound with no ``stream_threshold_bytes`` (the detach path is never reached, so
+    the budget bounds nothing that runs — which is why a stock graph is byte-identical and quiet).
+
+    **What it does NOT distinguish is an explicit ``0`` from an unset default**, and that is a
+    deliberate limit rather than an oversight. The exposure is identical either way, so for a warning
+    the distinction carries nothing; it would matter for a refusal, where an explicit ``0`` should read
+    as an audited opt-out the way ``[security].allow_keeping_phi_indefinitely`` does for retention. Any
+    future refusal has to thread ``model_fields_set`` down from the settings object, which reaches this
+    runner only through ``pipeline/engine.py`` and ``api/app.py``."""
+    if budget > 0 or ic.stream_threshold_bytes is None:
+        return False
+    log.warning(
+        "inbound %r enables very-large-document streaming (stream_threshold_bytes=%d) while "
+        "[inbound].stream_inflight_budget_bytes is 0 (unlimited in the AGGREGATE). A single body is "
+        "still bounded by this connection's max_message_bytes (%s), but the number of over-threshold "
+        "bodies buffered mid-detach at once is uncapped, so a burst of large documents is bounded only "
+        "by that size times the listener's connection limit. Set a positive "
+        "[inbound].stream_inflight_budget_bytes to bound the aggregate.",
+        ic.name,
+        ic.stream_threshold_bytes,
+        ic.max_message_bytes if ic.max_message_bytes is not None else "the engine 16 MiB ceiling",
+    )
+    return True
 
 
 def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
