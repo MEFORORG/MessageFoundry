@@ -234,17 +234,31 @@ def test_a_table_that_only_looks_like_an_env_marker_is_still_judged() -> None:
         _check("rest", {"headers": {"X-Key": {"not": "a marker"}}})
 
 
-def test_an_env_only_container_stays_the_factorys(tmp_path: Path) -> None:
-    """SOAP's ``body_secrets: Mapping[str, EnvRef]`` is skipped WHOLE, outer shape included.
+@pytest.mark.parametrize("value", [0, False, "", [], 5, "x"], ids=repr)
+def test_an_env_only_containers_outer_shape_is_judged_here_and_its_entries_are_not(
+    value: object,
+) -> None:
+    """SOAP's ``body_secrets: Mapping[str, EnvRef]`` splits: the SHAPE is judged here, the ENTRIES are
+    the factory's.
 
-    Its factory refuses both depths already and names the shape it wants, which beats a generic
-    "must be a table"; ``connection_schema._code_first_only`` separately reports the setting
-    unauthorable in TOML. Asserted through the factory so this pins the behaviour a deploying author
-    would actually meet, not merely that this module declined to speak."""
-    _check("soap", {"body_secrets": 5})
+    A first cut skipped it whole on the ground that ``_hoist_body_secrets`` refuses a non-mapping with
+    a better message. That premise is only half true -- the factory's guard sits behind
+    ``if not body_secrets: return {}``, so ``0``, ``false``, ``""`` and ``[]`` were accepted in
+    silence and the connection ran with no body secrets at all. Parametrized over BOTH the falsy and
+    the truthy arms because pinning only the truthy ones is exactly how that hole survived a review."""
+    with pytest.raises(WiringError, match="'body_secrets' must be a table"):
+        _check("soap", {"body_secrets": value})
+
+
+def test_an_env_only_containers_entries_stay_the_factorys() -> None:
+    """The other half. A TABLE reaches the factory unexamined by this module, because its entries are
+    env() refs and ``_hoist_body_secrets`` judges them far better than a type message could.
+
+    Asserted through the factory so this pins what a deploying author would actually meet, not merely
+    that this module declined to speak."""
     _check("soap", {"body_secrets": {"tok": "inline"}})
-    with pytest.raises(WiringError, match="body_secrets must be a mapping"):
-        Soap(url="https://p.example/svc", soap_action="a", body_secrets=5)  # type: ignore[arg-type]
+    with pytest.raises(WiringError, match="must be an env\\(\\) reference"):
+        Soap(url="https://p.example/svc", soap_action="a", body_secrets={"a" * 20: "inline"})  # type: ignore[dict-item]
 
 
 # --- an env() default that is a container ------------------------------------
@@ -266,6 +280,24 @@ def test_an_env_default_is_judged_at_both_depths() -> None:
         inner.value
     )
     assert "converted by the ref's cast" not in str(inner.value)
+
+
+def test_the_unquote_hint_fires_only_where_a_scalar_was_wanted() -> None:
+    """The "a quoted TOML value is always a string" note is remedial advice, and on a CONTAINER
+    refusal the remedy it implies is wrong.
+
+    The fix for ``proxy_no_proxy = "host"`` is ``["host"]``; unquoting gives ``proxy_no_proxy = host``,
+    which tomllib rejects -- a second, worse failure caused by the first message's own advice, which is
+    the exact hazard the note was written to avoid for scalars. Paired so it cannot be satisfied by
+    deleting the note: the scalar arm asserts it still fires where it IS right."""
+    with pytest.raises(WiringError) as scalar:
+        _check("mllp", {"port": "2575"})
+    assert "a quoted TOML value is always a string" in str(scalar.value)
+    for settings in ({"proxy_no_proxy": "host"}, {"capture_response_headers": "content-type"}):
+        with pytest.raises(WiringError) as container:
+            _check("rest", settings)
+        assert "must be an array, got a string" in str(container.value)
+        assert "a quoted TOML value is always a string" not in str(container.value)
 
 
 # --- the refusal must not echo the value -------------------------------------
@@ -322,15 +354,15 @@ def test_the_container_settings_are_actually_reached(transport: str) -> None:
 
     Zero container parameters is a legitimate answer for most transports and is not a failure -- what
     would be a failure is a container parameter the walk declines to read for a reason nobody chose.
-    The one deliberate decline is asserted by name above (SOAP's ``body_secrets``)."""
+    It asserts the RULE (every container has a judgeable outer shape) rather than a roster of
+    exemptions: an exemption list is satisfied by adding a name to it, which is also how a genuinely
+    unintended skip gets waved through."""
     signature = _factory_signature(_TRANSPORTS[transport])
     assert signature is not None
     for name, param in signature.parameters.items():
         members = literal_values_typed(union_members(param.annotation))
         if not any(typing.get_origin(member) is not None for member in members):
             continue
-        if name == "body_secrets":
-            continue  # asserted as a deliberate skip by test_an_env_only_container_stays_the_factorys
         with pytest.raises(WiringError, match=f"{name!r} must be"):
             _check_setting_types(
                 _TRANSPORTS[transport],

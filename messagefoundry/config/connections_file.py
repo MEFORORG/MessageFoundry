@@ -292,8 +292,19 @@ def _build_spec(transport: str, table: dict[str, Any], where: str) -> Connection
     if not isinstance(raw, dict):
         raise WiringError(f"{where}: [settings] must be a table")
     settings = {key: parse_env_setting(value) for key, value in raw.items()}
-    _check_setting_types(factory, settings, transport, where)
     try:
+        # INSIDE the try, not above it. This module's contract is that a bad [settings] table fails
+        # loud as a WiringError NAMING THE CONNECTION, and the check below reads annotations through
+        # typing.get_origin/get_args over whatever wiring.py happens to declare, so a TypeError or
+        # ValueError out of that walk would otherwise escape as a raw traceback naming nothing.
+        #
+        # IT ABSORBS TypeError AND ValueError, AND SAYS SO RATHER THAN IMPLYING MORE. A factory guard
+        # that raises anything else still escapes, and one does today: `odbc_params = { env = "x" }`
+        # reaches _reject_envref_odbc_params as an EnvRef, which calls .items() on it and raises
+        # AttributeError past this handler (measured). Widening the catch is a change to the factory
+        # boundary this branch does not own; the hole is recorded rather than papered over, because a
+        # comment claiming coverage it does not have is worse than no comment (SDS-3.7).
+        _check_setting_types(factory, settings, transport, where)
         return factory(**settings)
     except WiringError:
         raise
@@ -337,11 +348,10 @@ def _build_spec(transport: str, table: dict[str, Any], where: str) -> Connection
 #   `_element_accepted` returns None for a container element annotation, so there is no recursion to
 #   bound and no crafted file can make this walk deep.
 #
-#   AN env() SPELLING IS A DIFFERENT RULE, OWNED ELSEWHERE. `parse_env_setting` reads the env marker
-#   only at the TOP level of [settings], so one written inside a table or array arrives here as a
-#   plain dict. Whether it is LEGAL there is answered by the factories (`_hoist_body_secrets`,
-#   `_reject_envref_odbc_params`) and by the open nested-headers refusal, not by a type check. This
-#   module skips it at element depth so those strictly better messages survive.
+#   AN env() SPELLING IS A DIFFERENT RULE, OWNED ELSEWHERE, and an element written that way is
+#   skipped. Stated once, in `_element_fits` -- including which positions have a downstream refusal
+#   and which are open holes. Do not restate it here (SDS-3.5); the copy that drifts is the one
+#   nobody is looking at.
 
 #: The scalar types a ``[settings]`` value can arrive as from TOML. ``bool`` LEADS because it is an
 #: ``int`` subclass: order matters everywhere below, and a plain ``isinstance(value, int)`` would read
@@ -408,8 +418,8 @@ def _check_setting_types(
     declare (the factory's own ``unexpected keyword argument`` is the better message), and any
     annotation carrying a member this module does not model. An ``EnvRef`` is judged through its
     inline ``default`` only -- see the comment in the loop for why that is the half that is knowable
-    here. A container value is judged at its outer shape and then one level in; the depth cap and the
-    env()-marker carve-out both live in :func:`_first_type_problem`."""
+    here. A container value is judged at its outer shape and then one level in: :func:`_element_accepted`
+    is the depth cap, :func:`_element_fits` the env()-marker carve-out."""
     signature = _factory_signature(factory)
     if signature is None:
         return
@@ -458,12 +468,17 @@ def _check_setting_types(
             # Without this the refusal reads as simply wrong to an author looking at the `cast = "int"`
             # they wrote on the same line. The reason lives in the comment above, where they cannot see it.
             detail += " (a default is not converted by the ref's cast)"
-        elif isinstance(offender, str) and str not in judged.scalars:
+        elif judged.scalars and isinstance(offender, str) and str not in judged.scalars:
             # Stated as a FACT, not as an instruction. "Write it unquoted" is wrong for every value
             # that is not already a valid unquoted TOML spelling of the wanted type: it sends the
             # author of `persistent = "yes"` to `persistent = yes`, and of `port = "abc"` to
             # `port = abc`, both of which tomllib rejects -- a second, worse failure caused by the
             # first message's own advice.
+            #
+            # `judged.scalars` GUARDS it, because a CONTAINER refusal makes that advice wrong a second
+            # way. The fix for `proxy_no_proxy = "host"` is `["host"]`; unquoting gives
+            # `proxy_no_proxy = host`, which tomllib rejects. The hint fires only where a SCALAR was
+            # wanted, which is the only position in which "unquote it" can ever be right.
             detail += " (a quoted TOML value is always a string, whatever it contains)"
         # The VALUE is deliberately absent, and an ELEMENT refusal keeps that promise the same way: it
         # names the entry KEY or the array INDEX and never the element's value. A [settings] value can
@@ -560,55 +575,35 @@ def _accepted_types(annotation: Any) -> _Accepted | None:
        such settings today are secrets whose factory raises a strictly better message than a generic
        type refusal ("must be an env() reference -- a share password is a secret and is never
        inline"). A future non-secret of this shape should be reconsidered here.
-    3. A CONTAINER of env() refs, SOAP's ``body_secrets: Mapping[str, EnvRef] | None``. That is
-       reason 2 one level down, and it is the ONLY container that skips its OUTER shape as well:
-       ``connection_schema._code_first_only`` already reports the setting unauthorable in TOML, and
-       ``_hoist_body_secrets`` refuses a non-mapping by naming the shape it wants, which beats
-       "must be a table".
 
-    A container whose elements are merely UNREADABLE -- a nested ``dict[str, list[str]]`` -- is
-    none of the three. Its outer shape is knowable whatever its elements are, so it is judged and
-    only the element walk stops; see :func:`_accepts_nothing` for why those two are not one case."""
+    A CONTAINER always answers with itself, however unreadable its elements are: the OUTER shape is
+    knowable whatever they hold, so it is judged and only the element walk stops (:func:`_element_accepted`).
+
+    **A THIRD REASON WAS TRIED AND REMOVED, which is worth the four lines it costs to say.** It
+    skipped an env()-only container -- SOAP's ``body_secrets: Mapping[str, EnvRef] | None`` -- whole,
+    outer shape included, on the ground that ``_hoist_body_secrets`` refuses a non-mapping with a
+    better message. That premise is only HALF true: the factory's guard sits behind
+    ``if not body_secrets: return {}``, so ``body_secrets = 0``, ``false``, ``""`` and ``[]`` were all
+    accepted in silence and the connection ran with no body secrets at all (measured). A compensating
+    control must not rest on a false premise, so the skip went and the outer shape is judged here;
+    the ELEMENT walk still stops, which is what leaves the factory its better message on a table."""
     accepted = _classify(annotation)
     if accepted is None:
         return None  # reason 1
-    if accepted.scalars:
-        return accepted
-    if accepted.mapping_values or accepted.sequence_items:
-        if _accepts_nothing(accepted.mapping_values + accepted.sequence_items):
-            return None  # reason 3
+    if accepted.scalars or accepted.mapping_values or accepted.sequence_items:
         return accepted
     return None  # reason 2
-
-
-def _accepts_nothing(annotations: tuple[Any, ...]) -> bool:
-    """Is every one of these element annotations UNDERSTOOD, and judgeable as nothing at all?
-
-    True only for the env()-only container. It is the discriminator between two skips that look
-    identical from the outside and are not: a container of env() refs is the factory's business at
-    BOTH depths, while a container of containers is unreadable only one level down and still has an
-    outer shape worth refusing. Folding them together silently cost the nested case its outer check
-    -- caught by the paired control in
-    ``tests/test_connections_file_container_settings.py``, which is what that control is for.
-
-    An UNMODELLED element answers False, so the ambiguous case falls to "judge the outer shape",
-    which is the half that is always knowable."""
-    for annotation in annotations:
-        accepted = _classify(annotation)
-        if accepted is None:
-            return False
-        if accepted.scalars or accepted.mapping_values or accepted.sequence_items:
-            return False
-    return True
 
 
 def _accepted_scalars(annotation: Any) -> frozenset[type] | None:
     """The scalar types ``annotation`` accepts, or ``None`` meaning "no scalar to judge here".
 
-    A thin read over :func:`_accepted_types`, kept because it is the narrow question the schema-side
-    coverage pin asks: does the check still READ this parameter as a scalar? A container-only
-    annotation answers ``None`` here exactly as it did before containers were modelled, so that pin
-    measures the same population it always did."""
+    **It has no production caller** -- :func:`_check_setting_types` reads :func:`_accepted_types`
+    directly. It is kept as the narrow question the schema-side coverage pin in
+    ``tests/test_connections_file.py`` asks: does the check still READ this parameter as a scalar? A
+    container-only annotation answers ``None`` here exactly as it did before containers were
+    modelled, so that pin measures the same population it always did (225 of 238 keyword-only
+    parameters, unchanged by #1809)."""
     accepted = _accepted_types(annotation)
     if accepted is None or not accepted.scalars:
         return None
@@ -622,9 +617,10 @@ def _element_accepted(annotations: tuple[Any, ...]) -> _Accepted | None:
     recursing, so the walk is one level deep by construction: there is no recursion to bound, no
     depth counter to get wrong, and no crafted ``connections.toml`` that can make this descend.
 
-    Stopping the ELEMENT walk is all it stops. The parameter's outer shape was already judged by the
-    caller, and :func:`_accepts_nothing` is what decides the separate question of whether a container
-    should be skipped whole.
+    Stopping the ELEMENT walk is all it stops: the parameter's outer shape was already judged by the
+    caller, whatever this answers. ``None`` covers two element shapes for one reason -- a nested
+    container and an env()-only element are both unreadable here -- and the second is what leaves
+    SOAP's ``body_secrets`` table to ``_hoist_body_secrets``, which judges it far better.
 
     Several annotations merge into one accepted set, which only ever makes the element check MORE
     permissive (``dict[str, str] | list[int]`` would accept a string item). No factory spells that
@@ -675,10 +671,19 @@ def _element_fits(value: Any, element: _Accepted) -> bool:
     Same outcome, different reason, and the reason is the part that must not be lost: whether an
     env() ref may be WRITTEN one level down is a rule this module does not own. ``parse_env_setting``
     desugars the marker only at the top level of ``[settings]``, so a nested one arrives as a plain
-    dict and a type check cannot tell a legal one from a mistake. The factories answer it and answer
-    it better -- ``_hoist_body_secrets`` names the shape it wants, ``_reject_envref_odbc_params`` says
-    why a nested ref cannot work -- and the nested-headers refusal is separate open work. A type
-    refusal here would preempt every one of those with a worse message."""
+    dict and a type check cannot tell a legal one from a mistake. Where a refusal exists it is the
+    factory's and it is strictly better than a type message -- ``_hoist_body_secrets`` names the shape
+    it wants, ``_reject_envref_odbc_params`` says why a nested ref cannot work -- and refusing here
+    would preempt both.
+
+    **WHERE NO REFUSAL EXISTS THE VALUE GOES THROUGH, and that is a HOLE, not a decision this skip
+    makes safe.** At least three, measured on this branch, all of which load clean, survive
+    ``resolve_env_settings`` unchanged, and reach the connector as a literal ``{'env': ...}`` table:
+    ``headers``, answered by an open nested-env() refusal at the factory seam; ``odbc_params``, whose
+    ``_reject_envref_odbc_params`` tests ``isinstance(v, EnvRef)`` and so cannot see the raw-dict
+    spelling a ``connections.toml`` produces; and any ``list[str]`` setting, answered by nothing at
+    all. None of them is #1809 -- this check judges TYPES -- and a second refusal written here would
+    collide with the one already open, so they need a row, not a patch."""
     if isinstance(value, EnvRef) or _is_env_marker(value):
         return True
     return _value_matches(value, element.scalars)
