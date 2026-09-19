@@ -206,6 +206,41 @@ def test_release_load_bearing_canaries_present() -> None:
     assert not missing, f"release.yml lost these load-bearing guards: {missing}"
 
 
+#: The two halves every publish/release guard in release.yml must carry.
+#:
+#: The ref test alone was the defect. `workflow_dispatch` is a trigger on this workflow and it accepts
+#: ANY ref the workflow is present on -- a TAG included. On a dispatch picked against a tag
+#: `github.ref` IS `refs/tags/...`, so a ref-only guard is satisfied and the step runs. The file's own
+#: dry-run promise ("run it manually to dry-run it") is what makes that the likely operator action.
+#:
+#: DECLARED HERE, ABOVE THEIR FIRST USE, and not beside the section-(4b) test that is their main
+#: consumer: section (4) below reads them too, and a module-level name resolved at call time makes
+#: that ordering invisible. Moving either test to its own module would have raised `NameError` at run
+#: time rather than at review time.
+_EVENT_GUARD = "github.event_name == 'push'"
+_REF_GUARD = "startsWith(github.ref, 'refs/tags/')"
+
+#: The guard must be the CONJUNCTION of those halves, not merely contain both. Two INDEPENDENT
+#: substring tests accept `A || B`, which is strictly WORSE than the ref-only spelling this change
+#: removed: a dispatch against ANY ref -- a branch included -- would satisfy it, and both halves are
+#: still present so a token-by-token check stays green. Order is left free because it carries no
+#: meaning; the operator between the halves carries all of it.
+#:
+#: COMPARED WITH ALL WHITESPACE REMOVED. `github.event_name=='push' && startsWith(github.ref,'refs/
+#: tags/')` is a valid, correctly-ANDed expression that a byte-exact match rejects, and reddening a
+#: tag-blocking test over spacing teaches the next author to relax the rule rather than fix a guard.
+#: Whitespace is the one thing in a GitHub expression that carries no meaning at all.
+_GUARD_CONJUNCTIONS = (
+    f"{_EVENT_GUARD} && {_REF_GUARD}",
+    f"{_REF_GUARD} && {_EVENT_GUARD}",
+)
+
+
+def _despace(text: str) -> str:
+    """``text`` with every run of whitespace removed, for comparing GitHub expressions by meaning."""
+    return re.sub(r"\s+", "", text)
+
+
 # --- (4) the irreversible PyPI upload runs LAST and only on a tag ------------------------------------
 
 
@@ -232,12 +267,13 @@ def test_release_pypi_publish_is_last_step_and_tag_gated() -> None:
         f"irreversible sink) — last step is instead: {last!r}"
     )
 
-    # The publish must be tag-gated: its `if:` line must guard on a tag ref (so workflow_dispatch dry-runs
-    # never publish). Grab the block from the publish step name to end-of-job.
-    pub_block = release_job[release_job.index("Publish to PyPI") :]
-    assert "if: startsWith(github.ref, 'refs/tags/')" in pub_block, (
-        "the PyPI publish step is no longer tag-gated — a branch/workflow_dispatch run could publish"
-    )
+    # THE GUARD ITSELF IS SECTION (4b)'s, NOT THIS TEST'S. This block asserted the tag gate over raw
+    # text scoped to one step, which cannot see the JOB's `if` — so hoisting the pair to the job (the
+    # DRY-er shape (4b) deliberately accepts, and already how `release-webconsole` gates itself)
+    # would pass there and red here, two tests disagreeing about one invariant. (4b) parses the YAML,
+    # conjoins job and step, and covers all six publishing steps rather than this one; stating the
+    # rule once and linking is the whole of the fix. What stays here is what (4b) does NOT check:
+    # that the publish is the LAST step, and the step ORDER below.
 
     # Publish (irreversible) must come AFTER build, leak-gate, sign and the GitHub release.
     #
@@ -259,6 +295,151 @@ def test_release_pypi_publish_is_last_step_and_tag_gated() -> None:
     ]
     assert order == sorted(order), (
         f"release steps are out of order — the irreversible PyPI upload must run last: {order}"
+    )
+
+
+# --- (4b) every mutating step tests the EVENT as well as the ref (BACKLOG #1584) ---------------------
+
+#: Steps in release.yml that mutate a public sink BY PUBLISHING A RELEASE ARTIFACT -- the three PyPI
+#: publishes and the three GitHub-release mutations. Pinned as a count so a NEW one cannot be added
+#: without either carrying the guard pair or landing here deliberately. An empty scan must never read
+#: as a pass.
+#:
+#: THIS IS A BOUNDED SCOPE, NOT AN INVENTORY OF EVERY PUBLIC WRITE THIS WORKFLOW MAKES. Two steps
+#: write to public, append-only sinks on a `workflow_dispatch` and are deliberately NOT counted here:
+#: `python -m sigstore sign` is unconditional and, being keyless, appends to the public Rekor
+#: transparency log; `actions/attest-build-provenance` is gated on `!github.event.repository.private`
+#: alone and writes to GitHub's attestation store. Both predate BACKLOG #1584 and both are filed as
+#: BACKLOG #1805 -- so read a green here as "no release ARTIFACT is published on a dispatch", never
+#: as "a dispatch writes nothing public".
+_EXPECTED_MUTATING_STEPS = 6
+
+#: Actions that publish a release artifact, matched as a `uses:` prefix.
+_PUBLISHING_ACTIONS = (
+    "pypa/gh-action-pypi-publish@",
+    "softprops/action-gh-release@",
+    "actions/create-release@",
+)
+
+#: …and the same sinks reached from a shell line. `gh release view` is deliberately absent: it reads.
+_PUBLISHING_COMMANDS = re.compile(
+    r"\bgh release (?:create|edit|upload)\b"
+    r"|\b(?:python\s+-m\s+)?twine\s+upload\b"
+    r"|\bgh api\b[^\n]*\breleases\b"
+)
+
+
+def _mutating_steps(job: dict) -> list[tuple[str, str]]:
+    """``(step name, EFFECTIVE if-expression)`` for every step in ``job`` that publishes an artifact.
+
+    Found by what a step DOES, never by its ``name:`` -- the names differ per distribution and a name
+    is the one thing in these files that may be reworded freely. The routes it knows are the PyPI
+    publish actions (``pypa/gh-action-pypi-publish``, or a bare ``twine upload``) and the
+    GitHub-release ones (``gh release create|edit|upload``, ``gh api ...releases``, and the two
+    common release actions) in an EXECUTED shell line or a ``uses:``.
+
+    THAT LIST IS NOT EXHAUSTIVE AND THE PINNED COUNT DOES NOT MAKE IT SO. Measured: a step running
+    ``python -m twine upload`` used to slip past entirely, leaving the count at six and the suite
+    green -- so "a new publishing step cannot be added without carrying the guard pair" is true only
+    of the routes below. A genuinely new route (a fresh action, a REST call spelled another way) is
+    invisible here, and the count cannot report what it never counted. Add the route when one
+    appears; do not read a green as proof that none did.
+
+    Comments are stripped before matching, for the reason ``_executed_shell`` exists: this workflow's
+    rationale prose quotes the very commands being matched (the v0.3.1 deadlock note contains a
+    literal ``gh release create``), so a whole-body match would report the explanation as a step.
+
+    The returned guard is the JOB's ``if`` conjoined with the STEP's, because that is what GitHub
+    evaluates -- a step runs only when both hold. Reading the step's ``if`` alone would false-accuse
+    the DRY-er refactor of hoisting the pair to the job (already the established shape here:
+    ``release-webconsole`` gates on the repository and the tag namespace at job level), and would be
+    blind to a job condition that admits a dispatch.
+    """
+    found: list[tuple[str, str]] = []
+    job_if = str(job.get("if") or "").strip()
+    for raw_step in job.get("steps") or []:
+        step = raw_step or {}
+        name = step.get("name") or step.get("uses") or "<unnamed step>"
+        uses = str(step.get("uses") or "")
+        publishes = uses.startswith(_PUBLISHING_ACTIONS)
+        body = _executed_shell(str(step.get("run") or ""))
+        releases = _PUBLISHING_COMMANDS.search(body) is not None
+        if publishes or releases:
+            step_if = str(step.get("if") or "").strip()
+            effective = " && ".join(p for p in (job_if, step_if) if p)
+            found.append((str(name), effective))
+    return found
+
+
+def test_every_mutating_release_step_gates_on_the_event_and_the_ref() -> None:
+    """No mutating step may publish on a `workflow_dispatch`, however the run's ref is spelled.
+
+    The header of release.yml promises a manual run is a dry-run: it "does NOT create a GitHub
+    release and does NOT publish to PyPI". A guard testing only `startsWith(github.ref, 'refs/tags/')`
+    does not keep that promise, because a dispatch can be pointed at a tag.
+
+    Scope of the exposure, stated so this test is not read as more than it is: the publish action
+    carries `skip-existing: true`, so re-dispatching an ALREADY-PUBLISHED tag is a no-op. What a
+    ref-only guard WOULD have admitted is a tag whose version is not yet on PyPI, or an actor holding
+    workflow_dispatch permission without tag-push permission. MessageFoundry has zero deployments and
+    this workflow has never been dispatched against a tag, so nothing was published this way.
+
+    Scope of the RULE, which is narrower than "no mutating step": it covers the steps that publish a
+    release ARTIFACT. `_EXPECTED_MUTATING_STEPS` carries the two public writes that are deliberately
+    out (Sigstore's Rekor entry and the SLSA attestation, both BACKLOG #1805) so a green here is not
+    read as a claim about them.
+
+    Mutation: drop either half of any of the six guards, or swap its `&&` for `||`. Red here, naming
+    the step.
+    """
+    yaml = pytest.importorskip("yaml")
+    jobs = (yaml.safe_load(_release()) or {}).get("jobs") or {}
+    assert jobs, "release.yml declares no jobs — the workflow shape moved"
+
+    checked = 0
+    offenders: list[str] = []
+    for job_key, job in jobs.items():
+        for name, guard in _mutating_steps(job or {}):
+            checked += 1
+            flat = _despace(guard)
+            missing = [tok for tok in (_EVENT_GUARD, _REF_GUARD) if _despace(tok) not in flat]
+            if missing:
+                offenders.append(
+                    f"release.yml:{job_key} — step {name!r} guard {guard!r} omits {missing}"
+                )
+                continue
+            # Both halves present is NOT the requirement — they must be ANDed. `A || B` carries both
+            # and fires on a dispatch against any ref, so a token-by-token check would green the
+            # widest form of the very defect #1584 closed.
+            if not any(_despace(c) in flat for c in _GUARD_CONJUNCTIONS):
+                offenders.append(
+                    f"release.yml:{job_key} — step {name!r} guard {guard!r} carries both halves but "
+                    f"not as a conjunction"
+                )
+            # A disjunction anywhere in a publish guard needs a human, not a substring test: `||`
+            # binds looser than `&&`, so it can re-admit a dispatch from outside the pair above.
+            elif "||" in guard:
+                offenders.append(
+                    f"release.yml:{job_key} — step {name!r} guard {guard!r} contains `||`; a "
+                    f"disjunction in a publish guard must be reviewed by hand"
+                )
+
+    # Liveness: report what was EXAMINED. "no offenders" and "nothing was scanned" otherwise produce
+    # the same green, and this detector keys on step shape, which a refactor can move.
+    print(f"[release-pipeline] examined {checked} artifact-publishing step(s) in release.yml")
+    # OFFENDERS FIRST, count second. A seventh UNGUARDED step trips both; reported count-first it
+    # reads as a bookkeeping nit whose natural fix is to raise the constant, and the real failure
+    # surfaces only on the re-run. The actionable assert goes first; the count is the backstop.
+    assert not offenders, (
+        "a release step that publishes an artifact does not test the EVENT as well as the ref, so a "
+        "workflow_dispatch pointed at a tag could reach it (BACKLOG #1584):\n  "
+        + "\n  ".join(offenders)
+    )
+    assert checked == _EXPECTED_MUTATING_STEPS, (
+        f"expected {_EXPECTED_MUTATING_STEPS} artifact-publishing steps in release.yml, found "
+        f"{checked}. A new publish or `gh release` step must carry {_EVENT_GUARD!r} AND "
+        f"{_REF_GUARD!r}, ANDed; if one was deliberately removed, lower the constant in the same "
+        f"commit."
     )
 
 

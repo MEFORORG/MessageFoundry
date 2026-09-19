@@ -63,7 +63,12 @@ artifacts — **no engine code changes**:
    same helper and retained as CI artifacts.
 3. **SBOM quality gate.** Score the Python engine and npm extension SBOMs with `sbomqs` (pinned `v2.0.11`,
    checksum-verified) — advisory (`sbomqs score -b` + NTIA breakdown), printed to the CI/release log, never
-   blocking. (The container-image SBOM is generated + retained in the separate `trivy` job but not scored,
+   blocking. *Amended 2026-09-18 (BACKLOG #1698): "checksum-verified" now means two different things by
+   workflow.* `security.yml` still verifies against the release's own `checksums.txt`, which is adequate in
+   a job holding `contents: read`. `release.yml` verifies against a **SHA-256 literal held in this repo**,
+   because that copy runs inside `id-token: write` — beside the identity that Sigstore-signs and publishes
+   the release, and before the signing step — and a same-origin checksums file is replaced by whoever
+   replaces the asset it attests. (The container-image SBOM is generated + retained in the separate `trivy` job but not scored,
    to avoid a second pinned-tool install there; it can be scored on demand from the retained artifact.)
 4. **VEX companion.** Maintain an **OpenVEX** source of truth at
    [`security/vex/messagefoundry.openvex.json`](../../security/vex/messagefoundry.openvex.json). Wire it
@@ -122,7 +127,17 @@ our own scanner, closing the SBOM→VEX→gate loop. Strengthens the answer to h
 questionnaires — a differentiator vs. Mirth/Corepoint, which ship no SBOM.
 
 **Negative / risks** — More release/CI surface to maintain (pinned tool versions: `cyclonedx-bom~=7.3`,
-`@cyclonedx/cyclonedx-npm@6.0.0`, `sbomqs v2.0.11` — bump deliberately). The core-lock-derived SBOM
+`@cyclonedx/cyclonedx-npm@6.0.0`, `sbomqs v2.0.11` — bump deliberately). *Amended 2026-09-18:* bumping
+sbomqs in `release.yml` is now **two coupled edits in one commit** — `VER` and `SBOMQS_SHA256` — and the
+new digest should be taken from **both** the release `checksums.txt` and GitHub's server-side asset
+`digest` field, two independent routes, which is what makes the literal evidence rather than a copied
+line. Moving only `VER` fails the `sha256sum -c`, and that step is `continue-on-error: true`, so the
+release still succeeds while shipping **no** sbomqs score. That degradation is silent by design of the
+advisory gate. What no offline test can catch is whether a digest is the RIGHT one for a version —
+that means fetching the asset, the network dependency the in-repo pin exists to remove. What a test
+*could* catch, and does not today, is the two literals moving apart at all: pinning the `(VER,
+SBOMQS_SHA256)` pair, and asserting release.yml's `VER` matches security.yml's, would force both edits
+into one commit. Filed, not built — recorded here so the gap is not re-derived as unavoidable. The core-lock-derived SBOM
 represents the default runtime, not every extra (mitigated: pip-audit audits the all-extras set; the doc
 states the scope). The VEX is hand-maintained and must not drift into stale/false assessments (mitigated:
 `security/vex/README.md` process + honesty requirement).
