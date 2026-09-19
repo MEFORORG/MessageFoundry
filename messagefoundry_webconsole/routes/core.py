@@ -583,7 +583,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             limit=limit,
             offset=offset,
         )
-        return HTMLResponse(pages.dead_letters(data))
+        # The two filters go to the page as well as to the query: the pager links must replay them,
+        # or a Next re-runs the listing unfiltered and still returns rows (BACKLOG #1743).
+        return HTMLResponse(
+            pages.dead_letters(
+                data,
+                channel_id=channel_id or "",
+                destination_name=destination_name or "",
+            )
+        )
 
     # Safe operator actions (M2): inbound connection start/stop/restart. These reuse the JSON
     # control handlers (require CONNECTIONS_CONTROL + the per-channel _control_guard), and add

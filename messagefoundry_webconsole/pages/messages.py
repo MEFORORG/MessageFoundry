@@ -21,7 +21,7 @@ from messagefoundry.api.models import (
 from messagefoundry.parsing.tree import TreeNode
 
 from .._html import Markup, el, page, rows_table, text
-from ._common import _seg
+from ._common import _pager, _seg
 
 __all__ = [
     "dead_letter_pending",
@@ -88,8 +88,14 @@ def messages(
     """The message log (list of summaries; each summary is view_summary-redacted server-side).
 
     ``deferred`` (or ``data is None``) renders the pre-filled filter form WITHOUT running a query — the
-    "open a connection's messages, adjust, then Search" landing (#4b). Otherwise the results table + pager
-    render as usual.
+    "open a connection's messages, adjust, then Search" landing (#4b). Otherwise the results table
+    renders, followed by the window-of-total counter and its Previous/Next links.
+
+    Those links carry the six filters back (BACKLOG #1743). Before that the page reached only the
+    first window of any result set and said so in a form — ``N of TOTAL (offset 0)`` — that an
+    operator could read as the whole of it; there was no way forward from the console at all. The
+    six arguments below are the values the listing was actually run under, so they are what the
+    links must replay: a Next that dropped one would re-run a wider query and look like it worked.
 
     ``error`` renders a refusal banner in place of the "click Search" hint, the shape
     ``message_search`` uses: the filters come back carrying what the operator typed, and the route
@@ -115,10 +121,24 @@ def messages(
         ]
         for m in data.messages
     ]
-    pager = el(
-        "p",
-        text(f"{len(data.messages)} of {data.total} (offset {data.offset})"),
-        class_="pager",
+    pager = _pager(
+        path="/ui/messages",
+        total=data.total,
+        limit=data.limit,
+        offset=data.offset,
+        shown=len(data.messages),
+        noun="message(s)",
+        # Every filter this listing ran under, spelled with the query names the route reads back.
+        # ``defer`` is deliberately absent: a pager link must RUN the query, and the deferred arm
+        # returns above this line anyway.
+        filters={
+            "channel_id": channel_id,
+            "status": status,
+            "message_type": message_type,
+            "control_id": control_id,
+            "received_from": received_from,
+            "received_to": received_to,
+        },
     )
     return page(
         "Messages",
@@ -585,13 +605,20 @@ def parse_tree_unavailable(message_id: str, reason: str) -> Markup:
     )
 
 
-def dead_letters(data: DeadLetterList) -> Markup:
+def dead_letters(
+    data: DeadLetterList, *, channel_id: str = "", destination_name: str = ""
+) -> Markup:
     """The dead-letter list (newest first) + per-channel bulk replay (M3).
 
     Each row links to the audited message detail (single-message replay lives there, M2b). The bulk
     "Replay all dead" per channel re-queues every dead delivery for that channel (step-up-gated; may be
     held for dual-control approval). Channel names are the ``[TYPE]_[PARTNER]_[MSG]`` URL-safe
     identifiers, carried in the action PATH so the step-up auto-retry re-POST needs no body.
+
+    ``channel_id`` / ``destination_name`` are the route's two query filters, taken here only so the
+    pager can replay them (BACKLOG #1743). The page draws no filter form, so they render nowhere
+    else — but a Next link that dropped them would silently widen the listing, and the bulk-replay
+    buttons below are built from the rows on screen, so a wider page also grows that button set.
     """
     headers = ["Failed", "Channel", "Destination", "Type", "Attempts", "Last error", "Message"]
     body = [
@@ -606,10 +633,14 @@ def dead_letters(data: DeadLetterList) -> Markup:
         ]
         for d in data.dead_letters
     ]
-    pager = el(
-        "p",
-        text(f"{len(data.dead_letters)} of {data.total} (offset {data.offset})"),
-        class_="pager",
+    pager = _pager(
+        path="/ui/dead-letters",
+        total=data.total,
+        limit=data.limit,
+        offset=data.offset,
+        shown=len(data.dead_letters),
+        noun="dead delivery(s)",
+        filters={"channel_id": channel_id, "destination_name": destination_name},
     )
     channels = sorted({d.channel_id for d in data.dead_letters})
     pairs = sorted(

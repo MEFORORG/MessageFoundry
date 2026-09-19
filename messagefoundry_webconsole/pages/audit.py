@@ -2,10 +2,14 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Audit + self-service security-event page builders for the /ui ops dashboard (ADR 0065, L1c).
 
-Read-only views over the tamper-evident audit log: the full audit trail (``audit:read``) and the
-caller's own ``auth.*`` security-event history (self-service). Both are metadata-only — the audit
+Read-only views over the tamper-evident audit log: the most recent audit entries (``audit:read``) and
+the caller's own ``auth.*`` security-event history (self-service). Both are metadata-only — the audit
 ``detail`` is PHI-free JSON — but every value is still placed through the escaping element builders in
 :mod:`.._html`, so an actor/action/detail string can never inject markup.
+
+Both are capped windows and neither pages (BACKLOG #1743). They must say so: a reader who takes the
+audit page for the whole trail reads an absence on screen as an absence in the log, which is the one
+misreading a tamper-evident record exists to prevent.
 """
 
 from __future__ import annotations
@@ -25,7 +29,13 @@ def _ts(ts: float) -> str:
 
 
 def audit_log(data: AuditList) -> Markup:
-    """The full audit trail (``audit:read``): actor, action, channel, and PHI-free detail, newest first."""
+    """One window of the audit trail (``audit:read``): actor, action, channel, PHI-free detail.
+
+    NEWEST FIRST, AND ONLY THE NEWEST — the route asks for a fixed number of rows and this page
+    renders what came back (BACKLOG #1743). It cannot say window-of-total the way the messages and
+    dead-letter pagers do, because ``AuditList`` carries no total and the store has no audit count
+    to put in one; giving this page a pager is a separate row that has to add both. Until then the
+    honest surface for a full trail is the ``audit:export`` CSV, which streams its own filter."""
     rows = [
         [_ts(e.ts), e.actor or "—", e.action, e.channel_id or "—", e.detail or ""]
         for e in data.entries
@@ -35,10 +45,13 @@ def audit_log(data: AuditList) -> Markup:
         el("h1", "Audit log"),
         el(
             "p",
-            "The tamper-evident audit trail (metadata only — no PHI). Most recent first.",
+            "The tamper-evident audit trail (metadata only — no PHI). Most recent first. This page "
+            "shows only the most recent entries, so an older event missing here is off this page, "
+            "not out of the log; the audit export is the complete record.",
             class_="muted",
         ),
         rows_table(["When", "Actor", "Action", "Channel", "Detail"], rows),
+        el("p", f"{len(data.entries)} most recent entry(s).", class_="pager"),
         active="audit",
     )
 

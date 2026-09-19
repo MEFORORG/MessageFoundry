@@ -8,7 +8,52 @@ Small, escape-neutral formatters imported by the per-area page modules (``connec
 
 from __future__ import annotations
 
-from urllib.parse import quote
+from collections.abc import Mapping
+from urllib.parse import quote, urlencode
+
+from .._html import Markup, el, text
+
+
+def _pager(
+    *,
+    path: str,
+    total: int,
+    limit: int,
+    offset: int,
+    shown: int,
+    noun: str,
+    filters: Mapping[str, str] | None = None,
+) -> Markup:
+    """The window-of-total counter plus Previous/Next links for one paged listing (BACKLOG #1743).
+
+    ``total`` is the whole filtered set and ``shown`` is the size of the rendered window, so the line
+    states both. A bare count cannot distinguish "you have three" from "you are looking at three of
+    forty", which is the reading that makes a pager invisible.
+
+    **``filters`` MUST carry every filter the current listing was run under.** A Previous/Next link
+    that drops one re-runs a DIFFERENT, wider query and still returns rows, so the operator reads a
+    result set under a filter they typed and the engine did not apply -- the same substitution
+    BACKLOG #1744 refused on the date bounds, arriving by a link instead of by a form. Empty values
+    are omitted rather than sent blank, because an empty string is a value at the route and not the
+    absence of one. Every value goes through ``urlencode`` and then the attribute escaping in
+    ``el``, so an operator-supplied filter can leave neither the query string nor the attribute.
+
+    The caller passes ``path`` as a plain literal; this builder never interpolates into one.
+    """
+    first = offset + 1 if shown else 0
+    parts: list[object] = [text(f"{first}-{offset + shown} of {total} {noun}")]
+    active = {k: v for k, v in (filters or {}).items() if v}
+
+    def _link(label: str, target: int) -> None:
+        query = urlencode({**active, "limit": limit, "offset": target})
+        parts.append(Markup(" "))
+        parts.append(el("a", label, href=f"{path}?{query}", class_="btn-link"))
+
+    if offset > 0:
+        _link("Previous", max(offset - limit, 0))
+    if offset + shown < total:
+        _link("Next", offset + limit)
+    return el("p", *parts, class_="pager")
 
 
 def _num(value: object) -> str:
