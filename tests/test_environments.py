@@ -131,7 +131,47 @@ def test_resolve_env_settings_batches_a_non_value_error_cast_with_other_failures
     with pytest.raises(WiringError) as ei:
         resolve_env_settings(settings, {"b_port": "notaport"})  # a_host missing + b_port KeyError
     msg = str(ei.value)
-    assert "missing: a_host" in msg and "b_port" in msg
+    # Name the CLAUSE, not just the key. `"b_port" in msg` alone passes if b_port were reported
+    # under `missing:` instead -- the two clauses are concatenated into one string, so a bare
+    # substring test cannot tell which one carried it, and the whole point here is that the
+    # KeyError reached the UNCASTABLE clause rather than ending the pass.
+    assert "missing: a_host" in msg
+    assert "uncastable: setting 'port' (env 'b_port')" in msg, f"wrong clause: {msg!r}"
+    # Redaction must hold in the BATCHED report too, not only in the single-failure one above: a
+    # regression that put the raw value back would most plausibly land in exactly this shared line.
+    assert "notaport" not in msg, f"the raw env value survived into the batched error: {msg!r}"
+
+
+def test_resolve_env_settings_redacts_whatever_the_casts_name_turns_out_to_be() -> None:
+    # The message interpolates exactly two things the caller controls: `type(exc).__name__` and
+    # `want`, the cast's name. `want` is `getattr(cast, "__name__", None) or
+    # type(cast).__name__`, and the tests above all override `__name__` to "int" to mirror the
+    # production `_cast_bool` idiom -- so neither of its real shapes was ever exercised. Both are
+    # pinned here, because a NAME is the only other channel by which the value could reach the
+    # operator's error text.
+    secret = "pw-K3yErr_Val-88"  # the #1656 needle, reused so no new .gitleaks.toml entry is owed
+
+    def lookup_a_port(raw: object) -> int:  # a code-first cast keeping its own __name__
+        return {"6661": 6661}[str(raw)]
+
+    with pytest.raises(WiringError) as ei:
+        resolve_env_settings({"port": env("p", cast=lookup_a_port)}, {"p": secret})
+    msg = str(ei.value)
+    assert secret not in msg, f"the raw env value survived into the error text: {msg!r}"
+    # `_NAMED_CASTS` only ever yields int/float/bool/str, none of which raise a non-ValueError, so
+    # this wording -- the operator's OWN function name -- is the one a real KeyError case produces.
+    assert "not a valid lookup_a_port" in msg, f"the cast's real name is the diagnostic: {msg!r}"
+
+    class TableCast:  # a callable OBJECT: no __name__ at all, so the fallback arm runs
+        def __call__(self, raw: object) -> int:
+            return {"6661": 6661}[str(raw)]
+
+    with pytest.raises(WiringError) as ei:
+        resolve_env_settings({"port": env("p", cast=TableCast())}, {"p": secret})
+    msg = str(ei.value)
+    assert secret not in msg, f"the fallback arm leaked the value: {msg!r}"
+    assert "not a valid TableCast" in msg, f"the fallback names the cast's TYPE: {msg!r}"
+    assert "value withheld" in msg and "KeyError" in msg
 
 
 def test_resolve_env_settings_reports_missing_and_uncastable_together() -> None:
@@ -208,10 +248,17 @@ def test_named_bool_cast_failure_renders_the_operator_diagnostic() -> None:
 
 
 def test_named_bool_cast_batches_with_other_failures() -> None:
-    # The bool parser must raise what the existing handler catches (ValueError/TypeError), not a
-    # WiringError of its own -- one raised from inside the cast would propagate past that handler,
-    # skipping BOTH the batching and the redaction. A WiringError still arrives here either way, so
-    # only a report naming every problem at once distinguishes the two.
+    # The bool parser's failure must be BATCHED with the others rather than ending the pass.
+    #
+    # THIS COMMENT USED TO SAY a WiringError raised from inside the cast "would propagate past that
+    # handler, skipping BOTH the batching and the redaction". That was true of `except (ValueError,
+    # TypeError)` and is FALSE now: BACKLOG #1656 limb 2 widened the handler to `except Exception`,
+    # which catches a cast's own WiringError too and redacts it like any other. So the reason the
+    # bool parser raises ValueError is no longer escape -- it is that a cast should fail the way
+    # every other cast fails, and not lean on the catch-all to tidy up after it.
+    #
+    # A WiringError arrives here either way, so only a report naming every problem at once
+    # distinguishes batching from merely not-crashing.
     settings = {"host": env("a_host"), "port": env("b_port", cast=int), "debug": _bool_ref()}
     with pytest.raises(WiringError) as ei:
         resolve_env_settings(settings, {"b_port": "notnum", "flag": "perhaps"})

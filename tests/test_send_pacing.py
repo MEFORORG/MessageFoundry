@@ -187,10 +187,49 @@ def test_validate_config_reports_an_unexpected_toml_loader_failure_as_a_diagnost
     d = tmp_path / "unexpected"
     d.mkdir()
     (d / "connections.toml").write_text("", encoding="utf-8")
+    # A SECOND, EARLIER problem, because "took the other diagnostics with it" is the actual harm and
+    # a directory holding only a connections.toml cannot exhibit it: `diagnostics` is a local list,
+    # so an escape discards everything collected before the TOML arm. This module's diagnostic is
+    # appended first and must still be there.
+    (d / "feed.py").write_text("raise RuntimeError('module fell over too')\n", encoding="utf-8")
+    messages = [x.message for x in validate_config(d)]
+    assert len(messages) == 2, f"a prior diagnostic was lost: {messages!r}"
+    assert any("module fell over too" in m for m in messages), "the *.py diagnostic did not survive"
+    unexpected = [m for m in messages if "unexpected RuntimeError" in m]
+    assert len(unexpected) == 1 and "loader fell over" in unexpected[0]
+
+
+def test_an_unexpected_loader_failure_is_scrubbed_before_it_becomes_a_diagnostic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both ``validate_config`` connections.toml arms interpolate somebody else's exception text, so
+    both run through ``scrub_credentials``. The reasoning, the three measured shapes and the limits
+    of the backstop are stated once at the handler in ``config/wiring.py`` (SDS-3.5); this pins only
+    the LABELLED-credential shape, which is the one the scrub actually covers.
+    """
+    from messagefoundry.config import connections_file as cf
+    from messagefoundry.secretscrub import CREDENTIAL_PLACEHOLDER
+
+    # ASSEMBLED AT RUNTIME, never a committed literal: gitleaks scans this repository and cannot tell
+    # a test needle from a live credential. `tests/test_merge_gate_controls.py::_fabricated_secrets`
+    # already sets this practice, and it is what keeps .gitleaks.toml from owing another entry.
+    secret = "pw" + "-Scrub" + "M3_Val" + "-77"
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError(f"connect failed password={secret}")
+
+    monkeypatch.setattr(cf, "load_connections_file", _boom)
+    d = tmp_path / "leaky"
+    d.mkdir()
+    (d / "connections.toml").write_text("", encoding="utf-8")
     messages = [x.message for x in validate_config(d)]
     assert len(messages) == 1
+    assert secret not in messages[0], (
+        f"the credential survived into the diagnostic: {messages[0]!r}"
+    )
+    assert CREDENTIAL_PLACEHOLDER in messages[0], f"nothing was scrubbed: {messages[0]!r}"
+    # The exception TYPE still survives -- it is the actionable half, naming the loader gap to fix.
     assert "unexpected RuntimeError" in messages[0]
-    assert "loader fell over" in messages[0]
 
 
 # --- _pace_outbound: (a) a single lane's second send is held >= the interval ----------------------
