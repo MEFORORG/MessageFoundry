@@ -135,6 +135,10 @@ class EmailDestination(DestinationConnector):
         # is legitimately secure (a trusted segment / on-box relay) is not forced to ALSO set a blunt
         # process-wide env var — without this, attestation would be dead config on EMAIL alone.
         self._hop_guard: InsecureHopGuard | None = None
+        # Set on the verify-ON arm below and acted on after the TLS context exists (BACKLOG #299 --
+        # the guard reads the CRL flag off that context). Only that arm ever sets it; the cleartext and
+        # verify-off arms carry their own gates and deliberately have no revocation guard.
+        revocation_guard_pending = False
         if not self.use_tls:
             # ADR 0153: `cleartext_accepted` joins this disjunction. The pre-gate fires BEFORE the shared
             # authority below, so without this arm an SMTP outbound that declared the acceptance would
@@ -236,12 +240,7 @@ class EmailDestination(DestinationConnector):
             # reached only when use_tls=true AND tls_verify=true, which is the guard's documented
             # precondition (tls_policy.py: "the caller has already built a verifying context") — that
             # precondition was VIOLATED by this call site before #323.
-            RevocationHopGuard.capture(
-                host=self.host,
-                cell="Email destination (verified SMTP TLS, no revocation check)",
-                description="delivers over verified SMTP TLS but performs no certificate revocation checking",
-                attested=config.tls_revocation_attested,
-            ).enforce_construction()
+            revocation_guard_pending = True
         # Built once at construction (fail-fast), reused by every send. None when TLS is off entirely.
         self._tls_context: ssl.SSLContext | None = (
             build_smtp_tls_context(
@@ -255,6 +254,20 @@ class EmailDestination(DestinationConnector):
             if self.use_tls
             else None
         )
+        # The revocation guard runs AFTER the context exists (BACKLOG #299), because it now reads
+        # VERIFY_CRL_CHECK_LEAF off the very context this destination will hand to smtplib: a
+        # [tls].crl_file that reached this hop through the resolved anchor closes the gap the guard
+        # refuses on, and asking the context is the only way to know it reached THIS hop. The refusals
+        # above still precede it, so an unverified or credential-leaking hop is rejected first and the
+        # guard's documented precondition (the caller has already built a verifying context) holds.
+        if revocation_guard_pending:
+            RevocationHopGuard.capture(
+                host=self.host,
+                cell="Email destination (verified SMTP TLS, no revocation check)",
+                description="delivers over verified SMTP TLS but performs no certificate revocation checking",
+                attested=config.tls_revocation_attested,
+                context=self._tls_context,
+            ).enforce_construction()
 
     async def send(
         self, payload: str, *, metadata: Mapping[str, str] | None = None

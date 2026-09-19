@@ -626,9 +626,10 @@ def test_the_token_hop_resolves_against_the_token_host(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("ctype", "settings"),
     [
-        # REST is ABSENT on purpose. Its `bearer_provider_from_settings` call site is the one
-        # remaining caller that does not pass the policy through; that one-line change is held out of
-        # this branch because rest.py is another session's file. Add the REST row here when it lands.
+        # REST arrived last (#1794). #1660 threaded the policy through the FHIR and SOAP call sites
+        # and held this one out because rest.py was another session's file at the time; the parameter
+        # defaults to None, so the REST token hop was unfixed rather than broken and nothing warned.
+        (ConnectorType.REST, {"url": "https://partner.internal.example.org/api", "method": "POST"}),
         (
             ConnectorType.SOAP,
             {"url": "https://partner.internal.example.org/svc", "soap_action": "S"},
@@ -650,6 +651,32 @@ def test_the_destination_threads_its_policy_onto_the_token_hop(
     ctx = _opener_context(_token_opener(provider))
     assert ctx is not None
     assert _ca_subjects(ctx) == {"mefor-dest-token-ca"}
+
+
+def test_the_rest_token_hop_resolves_against_the_token_host_not_the_data_host(
+    tmp_path: Path,
+) -> None:
+    """``RestDestination`` is where copying the data-hop anchor across is easiest to do by accident:
+    it resolves an ``anchor`` local for its own delivery opener a few lines below the line that builds
+    the token provider. This pins the two apart end to end through the destination — a loopback
+    authorization server is exempt from the internal-CA policy while the same connection's public data
+    host is not, so the data opener comes out anchored and the token opener comes out shared."""
+    ca = _ca_pem(tmp_path, "mefor-rest-host-scoped-ca")
+    dest = _http_dest(
+        ConnectorType.REST,
+        {
+            "url": "https://partner.internal.example.org/api",
+            "method": "POST",
+            **_oauth2_settings(oauth2_token_url="https://localhost:9443/token"),
+        },
+        trust_anchor_policy=_internal_policy(ca),
+    )
+    data_ctx = _opener_context(dest._opener)  # type: ignore[attr-defined]
+    assert data_ctx is not None
+    assert _ca_subjects(data_ctx) == {"mefor-rest-host-scoped-ca"}
+    provider = dest._token_provider  # type: ignore[attr-defined]
+    assert provider is not None
+    assert _token_opener(provider) is rest._NO_REDIRECT_OPENER
 
 
 def test_the_fhir_lookup_token_hop_honours_the_internal_ca(tmp_path: Path) -> None:
