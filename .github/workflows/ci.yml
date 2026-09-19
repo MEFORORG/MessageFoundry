@@ -1902,12 +1902,15 @@ jobs:
         # would kill real work. Recorded as a direction, not applied as a guess.
         timeout-minutes: 10
         run: |
-          # PIPEFAIL: both curls below pipe into `sudo tee`, which writes whatever it is handed --
-          # including nothing -- and returns 0, so an unguarded pipeline leaves an EMPTY apt source
-          # and the retry loop underneath then blames the Ubuntu runner mirror for a Microsoft fetch
-          # that failed two lines up. `tee` drains stdin, so no SIGPIPE arrives here for pipefail to
-          # turn into a false failure. Mechanism, and the job deliberately left OFF pipefail:
-          # tests/test_ci_odbc_installer_pipefail.py.
+          # PIPEFAIL: `sudo tee` returns 0 for an empty write, so an unguarded pipe would leave an
+          # EMPTY apt source and let the loop below blame the Ubuntu mirror for it. Why this is safe
+          # here, and why `changes` is deliberately OFF pipefail, with the mechanism:
+          # tests/test_ci_odbc_installer_pipefail.py
+          #
+          # NO --retry ON THESE TWO CURLS, deliberately: curl cannot rewind stdout, so a retry after
+          # a partial transfer writes the fragment AND the retried body through `tee`, leaving a
+          # corrupt key while curl exits 0 -- which pipefail cannot see. Retry belongs with a
+          # -o <file> fetch, not a piped one.
           set -o pipefail
           curl -fsSL --max-time 60 https://packages.microsoft.com/keys/microsoft.asc \
             | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc > /dev/null
@@ -2606,12 +2609,15 @@ jobs:
         # would kill real work. Recorded as a direction, not applied as a guess.
         timeout-minutes: 10
         run: |
-          # PIPEFAIL: both curls below pipe into `sudo tee`, which writes whatever it is handed --
-          # including nothing -- and returns 0, so an unguarded pipeline leaves an EMPTY apt source
-          # and the retry loop underneath then blames the Ubuntu runner mirror for a Microsoft fetch
-          # that failed two lines up. `tee` drains stdin, so no SIGPIPE arrives here for pipefail to
-          # turn into a false failure. Mechanism, and the job deliberately left OFF pipefail:
-          # tests/test_ci_odbc_installer_pipefail.py.
+          # PIPEFAIL: `sudo tee` returns 0 for an empty write, so an unguarded pipe would leave an
+          # EMPTY apt source and let the loop below blame the Ubuntu mirror for it. Why this is safe
+          # here, and why `changes` is deliberately OFF pipefail, with the mechanism:
+          # tests/test_ci_odbc_installer_pipefail.py
+          #
+          # NO --retry ON THESE TWO CURLS, deliberately: curl cannot rewind stdout, so a retry after
+          # a partial transfer writes the fragment AND the retried body through `tee`, leaving a
+          # corrupt key while curl exits 0 -- which pipefail cannot see. Retry belongs with a
+          # -o <file> fetch, not a piped one.
           set -o pipefail
           curl -fsSL --max-time 60 https://packages.microsoft.com/keys/microsoft.asc \
             | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc > /dev/null
