@@ -5,6 +5,7 @@ code-first inbound()/outbound() populate, sharing every factory + guard."""
 
 from __future__ import annotations
 
+import inspect
 import textwrap
 from pathlib import Path
 
@@ -19,6 +20,8 @@ from messagefoundry.config.connections_edit import (
 from messagefoundry.config.connections_file import (
     _INBOUND_KEYS,
     _OUTBOUND_KEYS,
+    _TRANSPORTS,
+    _accepted_scalars,
     _check_setting_types,
     _factory_signature,
 )
@@ -794,8 +797,13 @@ def test_int_is_accepted_for_a_float_setting(tmp_path: Path) -> None:
 
 
 def test_env_ref_is_accepted_for_a_typed_setting(tmp_path: Path) -> None:
-    """An env() reference is legal where the annotation names EnvRef; the VALUE is checked later, by
-    the ref's own ``cast``, against the running instance's environment."""
+    """An env() reference is legal where the annotation names EnvRef, and a ref carrying no inline
+    ``default`` passes whole: the value it will resolve to is a RUNTIME value this check never sees.
+
+    It is NOT true that "the ref's own ``cast`` checks the value" -- ``resolve_env_settings`` assigns
+    the environment's raw value when ``cast`` is None, so an uncast ref hands the factory a string.
+    That is the runtime half of BACKLOG #1650 and it is still open; only the inline ``default`` is
+    judged here, by ``test_env_default_is_held_to_the_annotation``."""
     reg = load_config(_inbound_settings(tmp_path, '  port = { env = "acme_port", cast = "int" }'))
     assert isinstance(reg.inbound["IB"].spec.settings["port"], EnvRef)
 
@@ -881,6 +889,71 @@ def test_unknown_setting_still_reports_the_factory_message(tmp_path: Path) -> No
         load_config(_inbound_settings(tmp_path, "  port = 2575\n  nonsense = 1"))
 
 
+@pytest.mark.parametrize(
+    ("settings", "setting"),
+    [('  persistent = "yes"', "persistent"), ('  port = "abc"', "port")],
+    ids=["bool-word", "non-numeric-string"],
+)
+def test_the_quoting_hint_is_a_fact_not_an_instruction(
+    tmp_path: Path, settings: str, setting: str
+) -> None:
+    """ "Write it unquoted" is WRONG for any string that is not already a valid unquoted TOML spelling
+    of the wanted type: it sends the author of ``persistent = "yes"`` to ``persistent = yes`` and of
+    ``port = "abc"`` to ``port = abc``, both of which tomllib rejects -- a second, worse failure caused
+    by the first message's own advice. State the rule instead; the "must be ..." half names the target."""
+    loader = _outbound_settings if setting == "persistent" else _inbound_settings
+    with pytest.raises(WiringError) as excinfo:
+        load_config(loader(tmp_path, settings))
+    message = str(excinfo.value)
+    assert "a quoted TOML value is always a string" in message
+    assert "write it unquoted" not in message
+
+
+def test_refusal_names_the_type_written_not_the_types_allowed(tmp_path: Path) -> None:
+    """ "got ..." describes the FILE, so a bool value reads "a boolean". Reusing the expectation
+    vocabulary made it read ``got true or false``, which describes the annotation instead."""
+    with pytest.raises(WiringError) as excinfo:
+        load_config(_inbound_settings(tmp_path, "  port = true"))
+    assert "got a boolean" in str(excinfo.value)
+    assert "got true or false" not in str(excinfo.value)
+
+
+def test_env_default_is_held_to_the_annotation(tmp_path: Path) -> None:
+    """``resolve_env_settings`` returns a ``default`` with the ref's ``cast`` NEVER applied, so
+    ``{ env = ..., cast = "int", default = "16" }`` reaches the connector as the STRING "16" -- the
+    very shape this check exists to stop, written one level down where the cast looks like cover."""
+    with pytest.raises(WiringError) as excinfo:
+        load_config(
+            _inbound_settings(
+                tmp_path,
+                '  port = 2575\n  max_frame_bytes = { env = "m", cast = "int", default = "16" }',
+            )
+        )
+    assert "'max_frame_bytes' env() default must be an integer" in str(excinfo.value)
+    assert "16" not in str(excinfo.value)  # the value stays out, default or not (BACKLOG #1183)
+
+
+def test_a_well_typed_env_default_is_accepted(tmp_path: Path) -> None:
+    """The accepting half of ``test_env_default_is_held_to_the_annotation`` above: the check reads
+    the default, so it must let a correctly-typed one through rather than refusing every default."""
+    reg = load_config(_inbound_settings(tmp_path, '  port = { env = "acme_port", default = 2575 }'))
+    assert isinstance(reg.inbound["IB"].spec.settings["port"], EnvRef)
+
+
+def test_env_default_refusal_does_not_offer_an_env_ref_as_the_remedy(tmp_path: Path) -> None:
+    """``port`` is annotated ``int | EnvRef``, so the expected-type clause would normally end "or an
+    env() reference". Inside a ``default`` that is not a legal spelling -- ``parse_env_setting`` reads
+    the env marker only at the top level of [settings] -- so the advice would loop back to this same
+    message with "got a table"."""
+    with pytest.raises(WiringError) as excinfo:
+        load_config(
+            _inbound_settings(tmp_path, '  port = { env = "p", cast = "int", default = "2575" }')
+        )
+    assert "'port' env() default must be an integer," in str(excinfo.value)
+    assert "env() reference" not in str(excinfo.value)
+    assert "a default is not converted by the ref's cast" in str(excinfo.value)
+
+
 def _unresolvable_factory(*, port: int) -> None:
     """A stand-in for a factory whose annotations will not resolve under ``eval_str=True``."""
 
@@ -888,15 +961,67 @@ def _unresolvable_factory(*, port: int) -> None:
 _unresolvable_factory.__annotations__["port"] = "NoSuchTypeAnywhere"
 
 
-def test_unresolvable_annotations_skip_the_check_rather_than_accepting() -> None:
+def _malformed_factory(*, port: int) -> None:
+    """A stand-in whose annotation is not even parseable, so the resolve raises ``SyntaxError``."""
+
+
+_malformed_factory.__annotations__["port"] = "int |"
+
+
+@pytest.mark.parametrize("transport", sorted(_TRANSPORTS))
+def test_every_transport_factory_actually_resolves(transport: str) -> None:
+    """The POSITIVE control, without which the test below proves nothing about the shipped code.
+
+    ``_factory_signature`` returning None is a silent, total switch-off of this check for a whole
+    transport. One ``if TYPE_CHECKING:`` import referenced from a ``wiring.py`` annotation would do
+    it, and every other test here would stay green while BACKLOG #1650 read as shipped coverage for a
+    transport it no longer covered. Pinned per transport so the failure names which one went dark.
+
+    The KEYWORD_ONLY assertion rides along for the same reason: ``_check_setting_types`` skips any
+    parameter that is not keyword-only, and so does ``connection_schema``'s emitted schema, so one
+    parameter losing its ``*`` would drop that setting out of BOTH the GUI and this check at once."""
+    signature = _factory_signature(_TRANSPORTS[transport])
+    assert signature is not None, (
+        f"{transport}: annotations no longer resolve, so NOTHING is checked"
+    )
+    not_kwonly = [
+        name
+        for name, param in signature.parameters.items()
+        if param.kind is not inspect.Parameter.KEYWORD_ONLY
+    ]
+    assert not not_kwonly, f"{transport}: silently skipped by the type check and the schema"
+    # Resolving is necessary and NOT sufficient: _accepted_scalars has its own total switch-off, and a
+    # blanket annotation migration (Annotated[int, ...], say) would send every parameter down it while
+    # this test stayed green on all eleven transports. So assert the check still READS most of them.
+    # Measured today: 225 of 238 keyword-only parameters yield a type to judge a value against.
+    judged = sum(1 for p in signature.parameters.values() if _accepted_scalars(p.annotation))
+    assert judged >= len(signature.parameters) * 0.8, (
+        f"{transport}: only {judged}/{len(signature.parameters)} settings are judged -- "
+        "the signature resolves but the check reads almost nothing"
+    )
+
+
+@pytest.mark.parametrize(
+    ("factory", "raises"),
+    [(_unresolvable_factory, "NameError"), (_malformed_factory, "SyntaxError")],
+    ids=["undefined-name", "unparseable"],
+)
+def test_unresolvable_annotations_skip_the_check_rather_than_accepting(
+    factory: object, raises: str
+) -> None:
     """The degradation path, pinned because it is how this gate would become the false green it was
     built to remove. ``_describe_transport`` in connection_schema.py falls back to STRING annotations
     when ``eval_str=True`` cannot resolve them; a type check must not do that -- matching a value
-    against the string ``"int | EnvRef"`` reports OK having examined nothing. Skip the factory whole."""
-    assert _factory_signature(_unresolvable_factory) is None
+    against the string ``"int | EnvRef"`` reports OK having examined nothing. Skip the factory whole.
+
+    Both resolve failures are cases of ONE rule, which is why they are parametrized rather than copied:
+    ``eval_str=True`` runs ``eval()`` and fails more ways than NameError. The SyntaxError arm used to
+    ESCAPE as a raw traceback naming no connection, past this module's "fails loud as a WiringError"
+    contract, for the very failure class this path exists to absorb."""
+    assert _factory_signature(factory) is None, f"{raises} no longer degrades to a skip"  # type: ignore[arg-type]
     # A skip, not a crash: a bad value passes through to the factory's own guards.
     _check_setting_types(
-        _unresolvable_factory,  # type: ignore[arg-type]
+        factory,  # type: ignore[arg-type]
         {"port": "2575"},
         "fake",
         "inbound connection 'IB'",

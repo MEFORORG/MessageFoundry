@@ -47,6 +47,7 @@ from messagefoundry.config.models import (
     StallThreshold,
 )
 from messagefoundry.config.wiring import (
+    _UNSET,  # the "no default=" sentinel an EnvRef carries
     MLLP,
     ConnectionSpec,
     Database,
@@ -327,9 +328,21 @@ def _build_spec(transport: str, table: dict[str, Any], where: str) -> Connection
 #: TOML ``true`` as a valid integer -- the silent acceptance this check exists to stop.
 _SCALAR_TYPES: tuple[type, ...] = (bool, int, float, str)
 
-#: How each scalar reads in an operator-facing message.
+#: How each scalar reads as the type the setting EXPECTS ("must be ...").
 _SCALAR_WORDS: dict[type, str] = {
     bool: "true or false",
+    int: "an integer",
+    float: "a number",
+    str: "a string",
+}
+
+#: How each scalar reads as what the author ACTUALLY WROTE ("got ..."). Kept apart from
+#: :data:`_SCALAR_WORDS` because the two are different sentences and only one of them is about the
+#: file: a bool's allowed VALUES are "true or false", but a value of that type IS "a boolean". Reusing
+#: the expectation word made a refusal read ``got true or false``, which describes the annotation and
+#: tells the author nothing about the line they wrote.
+_SCALAR_NOUNS: dict[type, str] = {
+    bool: "a boolean",
     int: "an integer",
     float: "a number",
     str: "a string",
@@ -353,7 +366,13 @@ def _factory_signature(factory: Callable[..., ConnectionSpec]) -> inspect.Signat
     keyed on a per-call callable would retain every one and hit on none."""
     try:
         return inspect.signature(factory, eval_str=True)
-    except (NameError, TypeError):
+    except (NameError, AttributeError, SyntaxError, TypeError):
+        # AT LEAST these -- an undefined name, a renamed/moved type behind a dotted path, a malformed
+        # annotation string, an unsupported operand -- because every one means the same thing here and
+        # the answer is always SKIP. Not an enumeration of what `eval()` can raise (SDS-3.6): it can
+        # raise anything, and an uncaught one still escapes. Catching only NameError and TypeError let
+        # a SyntaxError ESCAPE as a raw traceback naming no connection (measured), past this module's
+        # "fails loud as a WiringError" contract, for the failure class this path exists to absorb.
         return None
 
 
@@ -367,7 +386,9 @@ def _check_setting_types(
 
     Silently skips anything it cannot judge: an unresolvable signature, a key the factory does not
     declare (the factory's own ``unexpected keyword argument`` is the better message), and any
-    annotation carrying a member this module does not model."""
+    annotation carrying a member this module does not model. An ``EnvRef`` is judged through its
+    inline ``default`` only -- see the comment in the loop for why that is the half that is knowable
+    here."""
     signature = _factory_signature(factory)
     if signature is None:
         return
@@ -375,21 +396,50 @@ def _check_setting_types(
         param = signature.parameters.get(key)
         if param is None or param.kind is not inspect.Parameter.KEYWORD_ONLY:
             continue
-        if isinstance(value, EnvRef):
+        accepted = _accepted_scalars(param.annotation)
+        if accepted is None:
+            continue
+        checked = value
+        is_default = isinstance(value, EnvRef)
+        if is_default:
             # An env() reference is legal on ANY setting, whether or not EnvRef is in the annotation:
             # resolve_env_settings resolves every ref in the table regardless, so the annotation is not
-            # the authority on where a ref may be written. Its resolved value is checked by the ref's
-            # own `cast` (a WiringError naming the setting and key), not here. NOTE the schema side
-            # answers this question NARROWLY -- connection_schema._accepts_env reports env False for a
-            # plain `str` setting -- so a GUI offers no env() control where this accepts one. Closing
-            # that gap means changing the annotations or resolve_env_settings, both in wiring.py.
+            # the authority on where a ref may be WRITTEN. NOTE the schema side answers that question
+            # NARROWLY -- connection_schema._accepts_env reports env False for a plain `str` setting --
+            # so a GUI offers no env() control where this accepts one. Closing that gap means changing
+            # the annotations or resolve_env_settings, both in wiring.py.
+            #
+            # What CAN be judged here is an inline `default =`, because resolve_env_settings returns a
+            # default WITHOUT applying the ref's `cast`. So `{ env = "m", cast = "int", default = "16" }`
+            # reaches the factory as the STRING "16" -- the exact shape this check exists to stop,
+            # written one level down where the cast looks like it covers it.
+            #
+            # The value that arrives FROM the environment is NOT judged here and must not be claimed to
+            # be: an uncast ref hands the factory whatever the environment holds, as a string. That is
+            # a RUNTIME value, so it belongs to the runtime numeric guards (step 2 of BACKLOG #1650),
+            # which are not built.
+            if value.default is _UNSET:
+                continue
+            checked = value.default
+        if _value_matches(checked, accepted):
             continue
-        accepted = _accepted_scalars(param.annotation)
-        if accepted is None or _value_matches(value, accepted):
-            continue
-        detail = f"{key!r} must be {_render_expected(accepted, param.annotation)}, got {_word_for(value)}"
-        if isinstance(value, str) and str not in accepted:
-            detail += " (a quoted TOML value is a string: write it unquoted, or use an env() ref)"
+        subject = f"{key!r} env() default" if is_default else repr(key)
+        # A DEFAULT may not itself be an env() ref -- parse_env_setting reads the env marker only at
+        # the top level of [settings] -- so offering one here would be a remedy that loops straight
+        # back to this same message with "got a table".
+        expected = _render_expected(accepted, None if is_default else param.annotation)
+        detail = f"{subject} must be {expected}, got {_word_for(checked)}"
+        if is_default:
+            # Without this the refusal reads as simply wrong to an author looking at the `cast = "int"`
+            # they wrote on the same line. The reason lives in the comment above, where they cannot see it.
+            detail += " (a default is not converted by the ref's cast)"
+        elif isinstance(checked, str) and str not in accepted:
+            # Stated as a FACT, not as an instruction. "Write it unquoted" is wrong for every value
+            # that is not already a valid unquoted TOML spelling of the wanted type: it sends the
+            # author of `persistent = "yes"` to `persistent = yes`, and of `port = "abc"` to
+            # `port = abc`, both of which tomllib rejects -- a second, worse failure caused by the
+            # first message's own advice.
+            detail += " (a quoted TOML value is always a string, whatever it contains)"
         # The VALUE is deliberately absent. A [settings] value can be a password or a connector key,
         # and this string reaches the operator log, the support bundle and GET /logs/tail -- the same
         # reasoning that keeps the value out of resolve_env_settings' cast diagnostic (BACKLOG #1183).
@@ -400,10 +450,18 @@ def _check_setting_types(
 def _accepted_scalars(annotation: Any) -> frozenset[type] | None:
     """The scalar types ``annotation`` accepts, or ``None`` meaning "do not check this setting".
 
-    ``None`` must never be read as "accepted". It is returned for an annotation carrying a member this
-    function does not model -- a container, ``Any``, a nested type -- because refusing a value against
-    an annotation we cannot read would reject valid config, and this gate's failure mode must be
-    letting something through rather than blocking a correct file."""
+    ``None`` must never be read as "accepted". It is returned for TWO distinct reasons. They are named
+    in PROSE only -- both still return a bare ``None`` and no caller can tell them apart, which is
+    deliberate today and is the thing to change first if reason 2 ever needs its own answer:
+
+    1. An annotation carrying a member this function does not model -- a container, ``Any``, a nested
+       type. Refusing a value against an annotation we cannot read would reject valid config, and this
+       gate's failure mode must be letting something through rather than blocking a correct file.
+    2. An annotation every member of which was understood, none of which is a scalar: an env()-ONLY
+       setting such as ``File.credential_password: EnvRef | None``. Skipped DELIBERATELY, not by
+       accident -- all three such settings today are secrets whose factory raises a strictly better
+       message than a generic type refusal ("must be an env() reference -- a share password is a
+       secret and is never inline"). A future non-secret of this shape should be reconsidered here."""
     if annotation is inspect.Parameter.empty:
         return None
     accepted: set[type] = set()
@@ -413,9 +471,9 @@ def _accepted_scalars(annotation: Any) -> frozenset[type] | None:
         if member is EnvRef:
             continue  # handled by the caller; an env() ref never reaches the scalar test
         if member not in _SCALAR_TYPES:
-            return None
+            return None  # reason 1
         accepted.add(member)
-    return frozenset(accepted) or None
+    return frozenset(accepted) if accepted else None  # reason 2 when empty
 
 
 def _scalar_of(value: Any) -> type | None:
@@ -437,17 +495,20 @@ def _value_matches(value: Any, accepted: frozenset[type]) -> bool:
 
 
 def _render_expected(accepted: frozenset[type], annotation: Any) -> str:
+    """The expected-type clause. ``annotation`` may be ``None`` to suppress the env() alternative,
+    for a position where an env() reference is not a legal spelling in the first place."""
+    # One list, one join: appending to the joined string left a leading " or " whenever `accepted` was
+    # empty, which is reachable the moment reason 2 in _accepted_scalars stops being a skip.
     words = [_SCALAR_WORDS[scalar] for scalar in _SCALAR_TYPES if scalar in accepted]
-    rendered = " or ".join(words)
-    if EnvRef in union_members(annotation):
-        rendered += " or an env() reference"
-    return rendered
+    if annotation is not None and EnvRef in union_members(annotation):
+        words.append("an env() reference")
+    return " or ".join(words)
 
 
 def _word_for(value: Any) -> str:
     scalar = _scalar_of(value)
     if scalar is not None:
-        return _SCALAR_WORDS[scalar]
+        return _SCALAR_NOUNS[scalar]
     if isinstance(value, dict):
         return "a table"
     if isinstance(value, list):
@@ -462,7 +523,14 @@ def _word_for(value: Any) -> str:
 
 
 def union_members(annotation: Any) -> tuple[Any, ...]:
-    """``annotation``'s union members, or a one-tuple when it is not a union."""
+    """``annotation``'s union members, or a one-tuple when it is not a union.
+
+    ``inspect.Parameter.empty`` comes back as a one-tuple, where the copy this replaced returned an
+    empty one. Named because it is the ONE input on which the two differ, and every caller absorbs it:
+    ``_type_name`` returns early on ``empty``, and the membership/origin tests in ``_code_first_only``,
+    ``_choices``, ``_accepts_env`` and :func:`_accepted_scalars` all answer the same either way
+    (verified over the 238 keyword-only factory parameter annotations and ``empty``: zero
+    caller-visible differences)."""
     origin = typing.get_origin(annotation)
     if origin is typing.Union or origin is types.UnionType:
         return typing.get_args(annotation)
