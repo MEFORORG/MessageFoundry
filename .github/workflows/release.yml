@@ -8,15 +8,27 @@
 #                 publish is the first real tag; validate it with a `vX.Y.Z-rc1` pre-release tag (also
 #                 matched below) once Trusted Publishing is configured.
 #
-#                 EVERY MUTATING STEP TESTS THE EVENT AS WELL AS THE REF — `github.event_name == 'push'
-#                 && startsWith(github.ref, 'refs/tags/')` (BACKLOG #1584). A ref test ALONE does not
-#                 keep the dry-run promise above: `workflow_dispatch` accepts any ref this workflow is
-#                 present on, a TAG included, and on such a run `github.ref` IS `refs/tags/...`. So a
-#                 manual dispatch picked against a tag would satisfy a ref-only guard and publish to
-#                 PyPI — which is what "run it manually to dry-run it" invites an operator to do.
-#                 Reading the old guard as "a branch ref isn't `refs/tags/...`" is what hid this: a
-#                 true sentence about the wrong half of the trigger. The six steps that carry the pair
-#                 are the three PyPI publishes and the three GitHub-release mutations.
+#                 EVERY STEP THAT PUBLISHES A RELEASE ARTIFACT TESTS THE EVENT AS WELL AS THE REF —
+#                 `github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')` (BACKLOG
+#                 #1584). A ref test ALONE does not keep the dry-run promise above:
+#                 `workflow_dispatch` accepts any ref this workflow is present on, a TAG included,
+#                 and on such a run `github.ref` IS `refs/tags/...`. So a manual dispatch picked
+#                 against a tag would satisfy a ref-only guard and publish to PyPI — which is what
+#                 "run it manually to dry-run it" invites an operator to do. Reading the old guard as
+#                 "a branch ref isn't `refs/tags/...`" is what hid this: a true sentence about the
+#                 wrong half of the trigger. The steps carrying the pair are at least the three PyPI
+#                 publishes and the three GitHub-release mutations; the COUNT is pinned in
+#                 tests/test_release_pipeline.py, which is its one authority — do not restate a
+#                 number here that nothing keeps in sync with that test.
+#
+#                 THE DRY-RUN IS NOT SILENT, AND THE SENTENCE ABOVE IS DELIBERATELY NARROWER THAN
+#                 "every mutating step". Two steps below write to public, append-only sinks on a
+#                 dispatch and carry NEITHER half of that pair: `python -m sigstore sign` is
+#                 unconditional and, being keyless, appends an entry to the public Rekor transparency
+#                 log; `actions/attest-build-provenance` is gated on `!github.event.repository.private`
+#                 alone. Both predate #1584 — a dispatch against a BRANCH already reached them — and
+#                 both are filed as BACKLOG #1805. The promise this file keeps today is that a manual
+#                 run publishes no release ARTIFACT, not that it writes nothing public.
 #
 # PyPI publish uses Trusted Publishing (OIDC) — no API token. OWNER PREREQ (one-time, before the first
 # tag): claim the `messagefoundry` PyPI project + configure a Trusted Publisher (a PENDING publisher works
@@ -394,8 +406,17 @@ jobs:
           # independent routes agreeing is what makes the literal evidence instead of a copied line;
           # this one was established that way on 2026-09-18.
           #
-          # `set -o pipefail` for the reason security.yml's gitleaks step carries it: a status read
-          # through a pipe is the last command's, so a silent failure upstream reads as success.
+          # `set -o pipefail` is FORWARD-DEFENSIVE here, and saying so is the honest form. The
+          # hazard it names elsewhere — a status read through a pipe is the last command's, so a
+          # silent failure upstream reads as success — applied to the DELETED
+          # `grep " ${asset}$" sbomqs-checksums.txt | sha256sum -c -`, where the grep could fail.
+          # The one pipeline left is `echo … | sha256sum -c -`, whose first element cannot fail, so
+          # this line guards nothing TODAY. Kept because it costs nothing and the next edit that
+          # adds a pipe here inherits it; the leak gate's note at the top of this job records the
+          # matching measurement, that pipefail is not what fixes a status-through-a-pipe bug.
+          # NOTE the hazard it describes is live in security.yml's twin of this step, which still
+          # runs `grep " ${asset}$" sbomqs-checksums.txt | sha256sum -c -` and carries no pipefail.
+          # That file is not in this change's scope; the asymmetry is recorded, not fixed here.
           set -o pipefail
           VER=2.0.11
           SBOMQS_SHA256=14fd58b89d4948265cce0fdb95d9b635ff667f352b5a9a05b3d13dbefa5d0195

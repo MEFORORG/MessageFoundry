@@ -959,27 +959,59 @@ def test_security_yml_pip_bootstrap_count_is_exact() -> None:
 # --- the non-pip half of the same intake: fetched release assets ----------------------------------
 
 
+def _executed_shell(text: str) -> str:
+    """A ``run:`` body with its comment lines removed — what the runner would actually EXECUTE.
+
+    ``_code_lines`` above does this for a whole workflow FILE; the two rules below need it per STEP,
+    and one definition beats a copy in each — the failure mode of a duplicated stripper is silent. A
+    future fix for a ``#`` inside a heredoc, or a trailing inline comment, gets applied to whichever
+    copy the author happened to be reading, and the missed copy goes blind without reporting
+    anything.
+
+    SCOPED TO THIS FILE, AND THERE IS STILL A THIRD COPY. ``tests/test_release_pipeline.py`` carries
+    its own ``_executed_shell`` with a body that differs by ``lstrip`` versus ``strip``, and
+    ``_code_lines`` above is a fourth near-copy over a different input type. So the failure mode
+    named above is LIVE across the tests/ tree; this helper narrows it from two copies to one within
+    this module and claims nothing beyond that. Hoisting all of them into a shared test module (the
+    tree already imports one, ``_bash_resolver``) is the actual remedy and is not done here.
+
+    Load-bearing, not tidiness: the rationale comments in these workflows quote the very commands
+    under test — the gitleaks step explains the ``curl | tar`` it replaced, and release.yml's sbomqs
+    step NAMES ``checksums.txt`` while explaining why it no longer fetches one — so a whole-body
+    match reports the explanation as the offence. A detector counting itself.
+    """
+    return "\n".join(ln for ln in text.splitlines() if not ln.strip().startswith("#"))
+
+
 def test_release_asset_downloads_in_blocking_jobs_are_checksum_verified() -> None:
     """A version tag says WHICH artifact to fetch, not that the bytes received are that artifact.
 
     `curl … | tar -xz` inside a required gate executes third-party bytes with no integrity check, and
     it is dependency intake no lockfile in this repo covers — the same class the pip rules above
-    address, arriving by a different route. The sbomqs step in this same workflow already verifies
-    against the release's own checksums file, so this was unfinished scope rather than an accepted
-    risk, and that step is the template any download IN THIS WORKFLOW must follow.
+    address, arriving by a different route. security.yml's sbomqs step verifies against the release's
+    own checksums file, so this was unfinished scope rather than an accepted risk, and the SHAPE of
+    that step is the template a download in this workflow must follow.
 
-    THE TEMPLATE STOPS AT THIS FILE'S DOOR (BACKLOG #1698). A checksums file fetched from the SAME
-    origin as the asset is signed by nothing and moves with it: whoever can replace the tarball can
-    replace the line attesting it, so a same-origin check establishes that the bytes are
-    self-consistent, never that they are the bytes anyone reviewed. That is adequate here, where the
+    THAT TEMPLATE IS PROSE, NOT A THING THIS RULE ENFORCES, and the distinction is the point of this
+    paragraph. Measured 2026-09-18: security.yml's `sbom` job carries JOB-level
+    `continue-on-error: true`, so the skip below passes over it and this rule never examines the
+    sbomqs step at all — deleting its `curl … checksums.txt` and `sha256sum -c` leaves the suite
+    green. The two steps this rule actually examines are the `gitleaks` installs. Citing the sbomqs
+    step as a control this rule holds would be a compensating control resting on a false premise.
+
+    THE TEMPLATE ALSO STOPS AT THIS FILE'S DOOR (BACKLOG #1698). A checksums file fetched from the
+    SAME origin as the asset is signed by nothing and moves with it: whoever can replace the tarball
+    can replace the line attesting it, so a same-origin check establishes that the bytes are
+    self-consistent, never that they are the bytes anyone reviewed. That is accepted here, where the
     jobs hold `contents: read`. It is NOT adequate inside a job holding `id-token: write`, where the
     download executes beside the identity that signs and publishes the release. `release.yml`'s copy
     of this same sbomqs step is therefore pinned to an in-repo SHA-256 literal instead, and
     `test_release_asset_downloads_in_oidc_jobs_are_pinned_in_repo` below holds that stronger line.
 
     Scoped to BLOCKING jobs. An advisory job cannot turn a required context green while compromised,
-    so `trivy` (`continue-on-error: true`, schedule/dispatch-gated) is deliberately out — worth
-    hardening, but not on this rule.
+    so `trivy` AND `sbom` (both `continue-on-error: true`) are out — worth hardening, but not on
+    this rule. Naming both: the earlier wording named only `trivy`, which read as though `sbom` were
+    covered.
     """
     yaml = pytest.importorskip("yaml")
     wf = yaml.safe_load((_WORKFLOWS / "security.yml").read_text(encoding="utf-8"))
@@ -991,11 +1023,7 @@ def test_release_asset_downloads_in_blocking_jobs_are_checksum_verified() -> Non
         if (job or {}).get("continue-on-error") is True:
             continue
         for step in (job or {}).get("steps") or []:
-            raw = str((step or {}).get("run") or "")
-            # Comments OUT before matching. The rationale comments in these workflows quote the very
-            # command being prohibited — the gitleaks step explains the `curl | tar` it replaced — so a
-            # whole-body match reports the explanation as the offence: a detector counting itself.
-            body = "\n".join(ln for ln in raw.splitlines() if not ln.strip().startswith("#"))
+            body = _executed_shell(str((step or {}).get("run") or ""))
             if "releases/download" not in body:
                 continue
             checked += 1
@@ -1023,20 +1051,50 @@ def test_release_asset_downloads_in_blocking_jobs_are_checksum_verified() -> Non
 #: A bare lowercase 64-hex token — the shape of an in-repo SHA-256 pin, as `sha256sum -c` wants it.
 _SHA256_LITERAL = re.compile(r"\b[0-9a-f]{64}\b")
 
-#: Fetching one of these next to the signing identity is the defect, not the remedy: a checksums file
-#: served from the asset's own origin is replaced by whoever replaces the asset.
-_SAME_ORIGIN_CHECKSUM_FETCH = re.compile(r"curl[^\n]*checksums?[\w.-]*\.txt", re.I)
+#: `NAME=<64 hex>` — a shell variable holding such a pin, which is how release.yml spells it.
+_SHA256_ASSIGNMENT = re.compile(r"(\w+)=([0-9a-f]{64})\b")
+
+#: A `$VAR` or `${VAR}` reference, for binding a verification line back to one of those assignments.
+_VAR_REF = re.compile(r"\$\{?(\w+)\}?")
+
+#: The command that CHECKS a digest.
+_CHECKSUM_VERIFY = "sha256sum -c"
+
+#: Reaching for one of these next to the signing identity is the defect, not the remedy: a checksums
+#: file served from the asset's own origin is replaced by whoever replaces the asset.
+#:
+#: GATED ON A FETCH, NOT ON THE FILENAME. An earlier form matched `checksums?[\w.-]*\.txt` anywhere in
+#: the executed body, which is a filename pattern where the rule needs an ORIGIN pattern: measured, it
+#: rejected `sha256sum -c ci/checksums/sbomqs-checksums.txt` — a COMMITTED, reviewed file that changes
+#: only in a commit, which is exactly the posture this rule demands. So match a fetch verb carrying
+#: the name, or an assignment staging it into a URL (the two-line `url="${base}/checksums.txt"` form).
+_SAME_ORIGIN_CHECKSUM_FETCH = re.compile(
+    r"(?:curl|wget|gh\s+release\s+download)[^\n]*checksums?[\w.-]*\.txt"
+    r"|\w+=[\"']?[^\s\"']*/checksums?[\w.-]*\.txt",
+    re.I,
+)
 
 
 def test_release_asset_downloads_in_oidc_jobs_are_pinned_in_repo() -> None:
     """A download inside `id-token: write` must be pinned IN REPO, not against its own origin.
 
-    `security.yml`'s rule above accepts a same-origin `checksums.txt`, and that is adequate for a job
+    A same-origin `checksums.txt` is accepted in `security.yml`, and that is adequate for a job
     holding `contents: read`. This is the stronger line for the privileged case, and the difference is
     the JOB, not the tool: a step running under `id-token: write` shares the identity that
     Sigstore-signs the artifacts and publishes to PyPI, and in `release.yml` the sbomqs step runs
     BEFORE the signing step. Anything executing there is in position ahead of every control standing
     after it, so a backdoored binary would carry a VALID signature and VALID provenance downstream.
+
+    TWO CHECKS, and the first is a BINDING rather than a presence test. `sha256sum -c` must run, and
+    the digest it checks must trace to an in-repo 64-hex literal — inline on that line, or through a
+    variable assigned one in the same body. Separately, no checksums file may be FETCHED from the
+    asset's origin.
+
+    The binding is the part that took two passes to get right. Measured: three independent whole-body
+    searches (a 64-hex exists / `sha256sum -c` appears / no checksums fetch) ALL pass on a step that
+    carries an unrelated `docker pull …@sha256:…` beside `sha256sum -c some-other-manifest` and then
+    installs an unverified tarball — the exact shape this rule exists to reject. Co-presence is not a
+    pin; a detector that accepts it would have stated a guarantee it did not hold.
 
     A same-origin checksums file does not close that: it is signed by nothing and moves with the asset
     it attests, so it proves self-consistency rather than provenance. An in-repo literal changes only
@@ -1068,24 +1126,36 @@ def test_release_asset_downloads_in_oidc_jobs_are_pinned_in_repo() -> None:
         for raw_step in job.get("steps") or []:
             step = raw_step or {}
             # NO step-level continue-on-error skip here — see the docstring.
-            raw = str(step.get("run") or "")
-            # Comments OUT before matching, the same reason the sibling rule strips them: the
-            # rationale comment on this very step NAMES checksums.txt while explaining why it is not
-            # used, so a whole-body match would report the explanation as the offence.
-            body = "\n".join(ln for ln in raw.splitlines() if not ln.strip().startswith("#"))
+            body = _executed_shell(str(step.get("run") or ""))
             if "releases/download" not in body:
                 continue
             checked += 1
             name = step.get("name") or "<unnamed step>"
-            if not _SHA256_LITERAL.search(body):
+            # The literal must be BOUND to the verification, not merely co-present. Measured: three
+            # independent whole-body searches (a 64-hex exists / `sha256sum -c` appears / no
+            # checksums fetch) all pass on a step carrying an unrelated `docker pull …@sha256:…`
+            # beside `sha256sum -c some-other-manifest`, which verifies nothing about the tarball it
+            # then installs. So find the verification LINE and require the digest it checks to trace
+            # to an in-repo literal — inline, or through a variable assigned one in the same body.
+            pinned = {m.group(1) for m in _SHA256_ASSIGNMENT.finditer(body)}
+            verify_lines = [ln for ln in body.splitlines() if _CHECKSUM_VERIFY in ln]
+            if not verify_lines:
                 offenders.append(
-                    f"release.yml:{job_key} — step {name!r} downloads a release asset with no in-repo "
-                    f"SHA-256 literal, inside `id-token: write`"
+                    f"release.yml:{job_key} — step {name!r} carries no {_CHECKSUM_VERIFY!r}, so "
+                    f"nothing compares the bytes against a literal, inside `id-token: write`"
+                )
+            elif not any(
+                _SHA256_LITERAL.search(ln) or pinned & {m.group(1) for m in _VAR_REF.finditer(ln)}
+                for ln in verify_lines
+            ):
+                offenders.append(
+                    f"release.yml:{job_key} — step {name!r} runs {_CHECKSUM_VERIFY!r} but the digest "
+                    f"it checks traces to no in-repo SHA-256 literal, inside `id-token: write`"
                 )
             if _SAME_ORIGIN_CHECKSUM_FETCH.search(body):
                 offenders.append(
-                    f"release.yml:{job_key} — step {name!r} fetches a checksums file from the asset's "
-                    f"own origin; that is replaced by whoever replaces the asset"
+                    f"release.yml:{job_key} — step {name!r} reaches for a checksums file from the "
+                    f"asset's own origin; that is replaced by whoever replaces the asset"
                 )
 
     # Liveness: report what was EXAMINED. "no offenders" and "nothing was scanned" otherwise produce
