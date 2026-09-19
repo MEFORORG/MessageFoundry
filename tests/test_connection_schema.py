@@ -133,13 +133,17 @@ _UNSETTABLE_CLAIM = re.compile(
     r"could not be reached|cannot be reached"
     rf"|{_SETTING_WORD}[^.]{{0,60}}?\bunreachable|\bunreachable[^.]{{0,20}}?{_SETTING_WORD}"
     r"|no factory parameter|nothing can populate|no surface can set"
+    rf"|{_SETTING_WORD} cannot be set|no way to set"
     r"|not settable|no way to (?:turn|switch) (?:this |it )?on",
     re.IGNORECASE,
 )
 #: Narrower: true of a `codeFirstOnly` parameter, which connections.toml genuinely cannot express,
-#: so it is only a contradiction for the rest.
+#: so it is only a contradiction for the rest. `\bnot\b` and `\bcannot\b` are anchored: written as a
+#: bare `not.{0,20}in connections\.toml` this matched INSIDE "cannot", "annotation" and "another",
+#: so an ordinary true sentence ("read as a string, not an int, in connections.toml") would have
+#: reddened the guard and its message would have told the author to delete correct prose.
 _NO_TOML_CLAIM = re.compile(
-    r"no connections\.toml key|not.{0,20}in connections\.toml", re.IGNORECASE
+    r"no connections\.toml key|\bcannot\b.{0,20}in connections\.toml", re.IGNORECASE
 )
 
 #: A reference into the maintainer-internal ledger. Both spellings: with the hash (`BACKLOG #1249`,
@@ -154,11 +158,16 @@ def _unreachability_claims(schema: dict[str, Any]) -> list[str]:
     `doc` is screened alongside `section` and `help` because it is emitted too: `_summary` puts the
     factory docstring's FIRST paragraph there and the IDE renders it. Leaving it out would have made
     this guard's own remedy -- move the history into the docstring -- a way to reintroduce the defect
-    with every test still green."""
+    with every test still green.
+
+    `doc` is screened with `_UNSETTABLE_CLAIM` ONLY. A transport-level docstring covers every one of
+    that transport's parameters at once, so there is no single `codeFirstOnly` flag to grade the
+    `connections.toml` claim against -- and for a transport that HAS a code-first-only setting (SOAP's
+    `body_secrets`) the claim would be true. Screening it there would demand the deletion of a correct
+    sentence."""
     found: list[str] = []
-    both = (_UNSETTABLE_CLAIM, _NO_TOML_CLAIM)
     for transport, described in sorted(schema["transports"].items()):
-        if any(pattern.search(described.get("doc") or "") for pattern in both):
+        if _UNSETTABLE_CLAIM.search(described.get("doc") or ""):
             found.append(f"{transport}.doc")
         for param, spec in sorted(described["params"].items()):
             patterns = [_UNSETTABLE_CLAIM]
@@ -255,11 +264,18 @@ def test_the_mllp_pacing_section_carries_no_internal_ledger_number(
     """The ledger is maintainer-internal; a `section` string is operator-facing in a GUI.
 
     MLLP's rate-pacing heading carried one, so it is pinned here along with the wording fix. SCOPE,
-    stated plainly rather than implied: this pins the MLLP pacing block ONLY. A census of the whole
-    emitted schema on 2026-09-19 found 40 strings across 11 transports carrying a ledger reference
-    -- the raw-TCP and HTTP pacing sections among them. Widening this assertion to the schema is a
-    separate sweep with its own row, and pinning a COUNT here would go red for everyone the first
-    time somebody legitimately edits an unrelated comment.
+    stated plainly rather than implied: this pins the MLLP pacing block ONLY.
+
+    Censused 2026-09-19 with `_LEDGER_REFERENCE` as defined above -- the needle is named because the
+    count is a fact about it: **39 emitted strings across 10 of the 11 registered transports** carry a
+    ledger reference (only `timer` carries none), the raw-TCP and HTTP pacing sections among them. 40
+    before the MLLP fix in this change. An earlier draft of this docstring said "40 across 11", which
+    was wrong in both halves at once -- it kept the pre-fix string count and reported the count of
+    REGISTERED transports as the count of AFFECTED ones. Recorded rather than quietly corrected,
+    because a wrong measurement in a docstring is the exact defect this change exists to fix.
+
+    Widening this assertion to the schema is a separate sweep with its own row, and pinning a COUNT
+    here would go red for everyone the first time somebody legitimately edits an unrelated comment.
 
     Only fields that actually carry text are asserted over. `message_burst` has no `section` of its
     own -- the engine emits a heading once, on the parameter that OPENS the block -- so asserting
@@ -284,18 +300,30 @@ def test_the_ledger_pattern_reads_the_field_and_not_just_a_literal(
     """Proves the ledger guard fires off the SCHEMA, not off a string typed into the test.
 
     The earlier control ran the pattern over a literal in this file, which established that the
-    regex compiles and nothing else: it would have passed against an empty schema. This plants the
-    reference into the real field and reads it back through the same accessor the guard uses."""
-    for reference in ("(BACKLOG #1249)", "(#1249)", "(BACKLOG 1249)"):
-        planted = copy.deepcopy(schema)
-        section = f"INBOUND message-RATE pacing {reference}. Defaults to OFF."
-        planted["transports"]["mllp"]["params"]["max_messages_per_second"]["section"] = section
-        assert _LEDGER_REFERENCE.search(_shipped_pacing_section(planted)), (
-            f"the ledger pattern does not see {reference!r} in the emitted section"
-        )
-    assert not _LEDGER_REFERENCE.search(_shipped_pacing_section(schema)), (
-        "the pattern fires on the shipped heading, so a green run above proves nothing"
+    regex compiles and nothing else: it would have passed against an empty schema. This plants each
+    spelling into each of the three fields the guard asserts over, and reads them back out of the
+    schema. Covering only the `section` would have left the two `help` reads unproven -- the same
+    reason the sibling plant test walks every field it screens."""
+    fields = (
+        ("max_messages_per_second", "section"),
+        ("max_messages_per_second", "help"),
+        ("message_burst", "help"),
     )
+    for reference in ("(BACKLOG #1249)", "(#1249)", "(BACKLOG 1249)"):
+        for param, field in fields:
+            planted = copy.deepcopy(schema)
+            planted["transports"]["mllp"]["params"][param][field] = (
+                f"INBOUND message-RATE pacing {reference}. Defaults to OFF."
+            )
+            read_back = planted["transports"]["mllp"]["params"][param][field]
+            assert _LEDGER_REFERENCE.search(read_back), (
+                f"the ledger pattern does not see {reference!r} in mllp.{param}.{field}"
+            )
+    for param, field in fields:
+        text = schema["transports"]["mllp"]["params"][param][field]
+        assert not _LEDGER_REFERENCE.search(text), (
+            f"the pattern fires on the shipped mllp.{param}.{field}, so a green run proves nothing"
+        )
 
 
 def test_cli_emits_schema_without_a_config_dir(tmp_path: Any) -> None:

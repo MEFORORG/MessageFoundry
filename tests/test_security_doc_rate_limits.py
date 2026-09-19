@@ -27,12 +27,15 @@ from __future__ import annotations
 import ast
 import inspect
 import re
+import tokenize
+from io import StringIO
 from pathlib import Path
 
 import pytest
 from _ast_sites import call_sites, callee_name, calls_to, named_func
 
 from messagefoundry.auth.service import AuthService
+from messagefoundry.config import wiring
 from messagefoundry.config.settings import AuthSettings, ServiceSettings
 from messagefoundry.store.base import Store
 
@@ -541,12 +544,7 @@ def test_ingest_plane_rate_limit_row_matches_the_code() -> None:
     so; leave them exposed and it demands the row stop saying unreachable. Either way stays cheap,
     and neither is pre-empted by a green run here.
     """
-    import inspect
-
-    from messagefoundry.config import wiring
-
-    pacing_keys = {"max_messages_per_second", "message_burst"}
-    accepted = pacing_keys & set(inspect.signature(wiring.MLLP).parameters)
+    accepted = _PACING_KEYS & set(inspect.signature(wiring.MLLP).parameters)
 
     block = _section(_H_LIMITS)
     assert "Ingest plane" in block
@@ -570,7 +568,7 @@ def test_ingest_plane_rate_limit_row_matches_the_code() -> None:
     # BACKLOG #1114 ported it to the raw-TCP, X12 and HTTP intakes, and the row named the raw-TCP one
     # as never covered. Pinning either state as correct would settle by build what the code decides.
     for factory, label in (("Tcp", "raw-TCP"), ("X12", "X12"), ("Http", "HTTP")):
-        reaches = pacing_keys <= set(inspect.signature(getattr(wiring, factory)).parameters)
+        reaches = _PACING_KEYS.issubset(inspect.signature(getattr(wiring, factory)).parameters)
         if reaches:
             assert label in block, (
                 f"{factory}() now accepts the pacing keys, so the ingest row must name the "
@@ -589,13 +587,36 @@ def test_ingest_plane_rate_limit_row_matches_the_code() -> None:
         assert cap in block, f"the ingest row must name the {cap} resource cap it DOES have"
 
 
-def _module_docstrings(path: Path) -> list[tuple[str, str]]:
-    """``(owner, docstring)`` for the module and every function/class defined in ``path``."""
-    tree = ast.parse(path.read_text(encoding="utf-8"))
+#: The MLLP pacing keys, and the one place this module decides whether they are reachable. It was
+#: derived twice by copy, which let the two copies disagree about what "reachable" means.
+_PACING_KEYS = frozenset({"max_messages_per_second", "message_burst"})
+
+
+def _pacing_is_reachable() -> bool:
+    """Whether ``MLLP()`` exposes either pacing key, read live from the signature.
+
+    EITHER, not both, and the asymmetry with the ``Tcp``/``X12``/``Http`` loop below -- which uses
+    ``<=`` and so requires both -- is deliberate rather than an oversight: the MLLP row's claim is
+    about the pacer being settable at all, while the other three are named as covered or not."""
+    return bool(_PACING_KEYS & set(inspect.signature(wiring.MLLP).parameters))
+
+
+def _module_prose(path: Path) -> list[tuple[str, str]]:
+    """``(owner, text)`` for every docstring AND every comment in ``path``.
+
+    Comments are included because the claim this screens for lived in a COMMENT when it was found --
+    an own-line block in `wiring.py` -- and `ast` cannot see one. A docstring-only screen would have
+    let the identical sentence come back three characters away from where it was removed. Comments
+    are attributed by line rather than by owner, which is enough to find them."""
+    source = path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
     found: list[tuple[str, str]] = [("<module>", ast.get_docstring(tree) or "")]
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
             found.append((node.name, ast.get_docstring(node) or ""))
+    for token in tokenize.generate_tokens(StringIO(source).readline):
+        if token.type is tokenize.COMMENT:
+            found.append((f"comment:line {token.start[0]}", token.string.lstrip("#").strip()))
     return [(owner, text) for owner, text in found if text]
 
 
@@ -631,10 +652,10 @@ _PACING_REACHABLE_PROSE = re.compile(
 )
 
 
-def _pacing_prose_complaints(docstrings: list[tuple[str, str]], reachable: bool) -> list[str]:
-    """Docstrings here whose present-tense reachability claim contradicts the live signature."""
+def _pacing_prose_complaints(prose: list[tuple[str, str]], reachable: bool) -> list[str]:
+    """Prose here whose present-tense reachability claim contradicts the live signature."""
     pattern = _PACING_UNREACHABLE_PROSE if reachable else _PACING_REACHABLE_PROSE
-    return [owner for owner, text in docstrings if pattern.search(text)]
+    return [owner for owner, text in prose if pattern.search(text)]
 
 
 def test_this_module_does_not_outlive_the_reachability_it_reports() -> None:
@@ -644,23 +665,20 @@ def test_this_module_does_not_outlive_the_reachability_it_reports() -> None:
     ``inspect.signature(wiring.MLLP)`` and were therefore correct throughout. Its DOCSTRING was not,
     and nothing failed, because prose is not executed. A reader reaches for a test's docstring to
     learn what it means before reading what it does. What the stale half said, and when it stopped
-    being true, is stated once in ``MLLP()``'s docstring.
+    being true is stated in ``MLLP()``'s docstring, under "Inbound message-rate pacing".
 
     This is a phrase screen, and a phrase screen finds the shape it was cut from. It pins the claims
     that actually drifted rather than pretending to grade meaning; a fresh way of saying the same
     wrong thing would pass it. The structurally-grounded half of this fix is in
     ``tests/test_connection_schema.py``, which derives the same contradiction from the schema itself
     instead of from wording."""
-    from messagefoundry.config import wiring
-
-    pacing_keys = {"max_messages_per_second", "message_burst"}
-    reachable = bool(pacing_keys & set(inspect.signature(wiring.MLLP).parameters))
-    complaints = _pacing_prose_complaints(_module_docstrings(Path(__file__)), reachable)
+    reachable = _pacing_is_reachable()
+    complaints = _pacing_prose_complaints(_module_prose(Path(__file__)), reachable)
     verdict = "settable" if reachable else "unreachable"
     assert not complaints, (
-        f"MLLP() reports the pacing keys as {verdict}, but these docstrings state the opposite in "
-        f"the present tense: {sorted(complaints)}. Correct the prose -- the assertions already read "
-        "the signature, so only the explanation is wrong."
+        f"MLLP() reports the pacing keys as {verdict}, but this prose states the opposite in the "
+        f"present tense: {sorted(complaints)}. Correct it -- the assertions already read the "
+        "signature, so only the explanation is wrong."
     )
 
 
@@ -670,7 +688,12 @@ def test_the_prose_screen_catches_the_claim_that_actually_drifted() -> None:
     BOTH screens are exercised, not just the live one. The ``reachable=False`` branch runs only if
     the keys are ever withdrawn from ``MLLP()`` -- which is the single case the two-branch design
     exists for -- so an unexercised screen there would report clean at exactly the moment it was
-    needed."""
+    needed.
+
+    The check over THIS module reads the live signature rather than hardcoding a direction. Pinned
+    to ``reachable=True`` it inverted on withdrawal: a maintainer who correctly rewrote the prose to
+    say the keys are no longer parameters would satisfy the guard above and fail this control, and
+    the only ways out would be reverting correct prose or editing the control."""
     retired = (
         "the pacer is built, but neither key is a parameter of the MLLP() factory and "
         "connections.toml desugars through that SAME factory, so no documented surface can set "
@@ -681,8 +704,9 @@ def test_the_prose_screen_catches_the_claim_that_actually_drifted() -> None:
         "the screen does not match the exact sentence this guard was written against -- it is not a "
         "guard"
     )
-    assert not _pacing_prose_complaints(_module_docstrings(Path(__file__)), reachable=True), (
-        "the screen matches this module as it stands, so a green run above proves nothing"
+    assert not _pacing_prose_complaints(_module_prose(Path(__file__)), _pacing_is_reachable()), (
+        "the live screen already matches this module as it stands, so a green run above proves "
+        "nothing"
     )
     # The MIRROR screen, which no live run reaches. Four ways of claiming the keys are settable;
     # all four must be seen, because the failure mode of a phrase screen is a near-miss wording.

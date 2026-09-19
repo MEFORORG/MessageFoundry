@@ -1331,14 +1331,20 @@ def MLLP(
 
     **Inbound message-rate pacing (BACKLOG #1249).** ``max_messages_per_second`` bounds how fast one
     accepted inbound connection may feed messages in; ``None``/``0`` (the default) is no bound.
-    ``message_burst`` sizes the allowance above that sustained rate; ``None`` (the default) is one
-    second's worth of it, **not** an unbounded burst. Both keys reach the connector from here or from
-    a ``connections.toml`` inbound entry, which desugars through this same factory. THIS IS THE ONE
-    STATEMENT OF THE HISTORY, cited rather than repeated elsewhere: the connector read both keys
-    before either was a parameter here, so text written in that window described the setting as
-    reachable through no surface at all, and some of it outlived the window. Why the ledger number
-    sits here and not in the parameter comment above -- that comment becomes an operator-facing GUI
-    heading; see :mod:`messagefoundry.config.connection_schema`.
+    ``message_burst`` sizes the allowance above that sustained rate; ``None`` **and** ``0`` both mean
+    one second's worth of it -- **not** an unbounded burst, and **not** a burst of zero. The connector
+    reads it as ``message_burst or rate``, so any falsy value takes the rate. Both keys reach the
+    connector from here or from a ``connections.toml`` inbound entry, which desugars through this same
+    factory.
+
+    The history behind that last sentence -- the connector read both keys before either was a
+    parameter here, so text written in that window described the setting as reachable through no
+    surface at all, and some of it outlived the window -- is stated HERE, and cited from
+    ``tests/test_connection_schema.py`` and ``tests/test_security_doc_rate_limits.py``. Treat it as
+    the CANONICAL statement, not the only one: at least ``docs/SECURITY.md``'s ingest row and the two
+    pacing test modules say it independently. Why the ledger number sits in this paragraph and not in
+    the parameter comment above it -- that comment becomes an operator-facing GUI heading; see
+    :mod:`messagefoundry.config.connection_schema`.
 
     **Persistent outbound connection (ADR 0067).** Ships **opt-in** this release: ``persistent=False``
     is the default (connect-per-message — today's proven posture, dial a fresh connection per delivery).
