@@ -2540,8 +2540,17 @@ class MessageStore:
             await db.execute("PRAGMA foreign_keys=ON")
             await db.execute("PRAGMA busy_timeout=5000")
             await db.executescript(_SCHEMA)
-            await cls._migrate(db)
-            await db.commit()
+            # BACKLOG #1586: the migrations run in ONE transaction, so an interrupted run leaves no
+            # trace. Outside one, each ALTER ... ADD COLUMN commits on its own, and a failure before
+            # its paired backfill leaves the column present -- the next open's column-missing guard
+            # then skips that backfill for good. The transaction opens exactly here and no earlier:
+            # before the PRAGMAs, foreign_keys=ON is a silent no-op and journal_mode=WAL raises;
+            # before executescript, its implicit COMMIT ends the transaction before _migrate runs.
+            # _writer_txn rolls back on BaseException; the lock is a fresh one because nothing else
+            # can reach this connection yet.
+            async with _writer_txn(db, asyncio.Lock()):
+                await cls._migrate(db)
+                await db.commit()
             # Tighten permissions now that the file (and its WAL siblings) exist — they hold PHI.
             if str(path) != ":memory:":
                 main = Path(path)
@@ -3703,16 +3712,14 @@ class MessageStore:
         # seq/rowid but KEPT the names ix_queue_fifo_in/out with CREATE IF NOT EXISTS — so an upgraded DB
         # silently keeps its old created_at-trailing index and never adopts the seq-only claim's index.
         # Drop the old-named indexes and build the seq-trailing ones under a NEW name (so name-existence is
-        # a correct discriminator). This is NOT a transactional swap on SQLite — Python's sqlite3 auto-
-        # commits DDL — but it does not need to be: the FIFO index is CORRECTNESS-NEUTRAL (the claim orders
-        # by rowid and names no index, ADR 0059), so a crash in the DROP→CREATE gap leaves a lane
-        # transiently unindexed (claims stay correct, just slower) and the next open's idempotent re-run
-        # (DROP IF EXISTS / CREATE IF NOT EXISTS) converges to the seq-trailing pair. This runs at open,
-        # before serving, so the transient gap is never observed by a live claim. DROP-old before
-        # CREATE-new so the on-disk FIFO index count never doubles; a fresh DB no-ops the drops and a
-        # re-opened migrated DB no-ops everything. (The server backends run the same swap inside a real
-        # schema transaction, so they additionally get atomicity — see ADR 0060 / sqlserver.py /
-        # postgres.py.)
+        # a correct discriminator). The swap is atomic now that `open` runs this whole method in one
+        # transaction (BACKLOG #1586), as it already was on the server backends (ADR 0060 /
+        # sqlserver.py / postgres.py). It never depended on that: the FIFO index is CORRECTNESS-NEUTRAL
+        # (the claim orders by rowid and names no index, ADR 0059), so any partial index state still
+        # claims correctly, just slower, and the next open's idempotent re-run (DROP IF EXISTS / CREATE
+        # IF NOT EXISTS) converges to the seq-trailing pair. DROP-old before CREATE-new so the on-disk
+        # FIFO index count never doubles; a fresh DB no-ops the drops and a re-opened migrated DB
+        # no-ops everything.
         await db.execute("DROP INDEX IF EXISTS ix_queue_fifo_in")
         await db.execute("DROP INDEX IF EXISTS ix_queue_fifo_out")
         await db.execute(
