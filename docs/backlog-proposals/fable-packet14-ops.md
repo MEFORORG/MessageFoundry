@@ -279,7 +279,7 @@ health`.
 > or more characters, which `_LONG_B64` sweeps regardless (the #1183 shape the module docstring warns
 > about); only the secret-domain family test went red. Separately, nothing pins the tray's import
 > layering (`tests/test_dependency_boundaries.py` has no `tray` rule; `test_tray_boundary.py` pins the
-> render model only), and `tests/test_semgrep_handler_rules.py::test_rules_file_ships_in_the_package`
+> render model only), and `tests/test_semgrep_handler_rules.py::test_rules_file_resolves_through_the_package`
 > resolves the rules file through the source tree in an editable install rather than a built wheel.
 
 **Cluster:** Quality & Testing. **Priority:** P3. **Verdict:** build.
