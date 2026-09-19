@@ -1079,7 +1079,7 @@ class ApiSettings(_Section):
 
 
 class TlsSettings(_Section):
-    """``[tls]`` — the instance-wide client **trust-anchor** policy (#190, ADR 0093).
+    """``[tls]`` — the instance-wide client **trust-anchor and revocation** policy (#190, ADR 0093).
 
     A small, shared fallback for outbound connectors that verify a downstream *server* certificate
     (MLLP/DICOM/FTPS today). By default the OS trust store roots verify the peer; a hospital estate
@@ -1100,6 +1100,20 @@ class TlsSettings(_Section):
     #   "pinned"  — ONLY the internal CA, not the public bundle (a fully-private estate; strictest,
     #               the forward_tls_ca_file template).
     trust_anchor_mode: TrustAnchorMode = "system"
+    # PEM path to a CRL (or a CA+CRL bundle) for OUTBOUND hops (BACKLOG #299). NOT a secret — a path,
+    # the same status as internal_ca_file. Empty (default) = no outbound revocation checking, which is
+    # exactly the gap the #201 RevocationHopGuard refuses on an enforcing hop. Set it and every hop that
+    # resolves a trust anchor loads the CRL onto its OWN context and sets VERIFY_CRL_CHECK_LEAF.
+    #
+    # WARNING, and it is the operational half of this setting: VERIFY_CRL_CHECK_LEAF refuses a peer whose
+    # issuer has NO CRL in the store, not only a revoked one. So the file must cover every issuer the
+    # covered hops present, and it must be refreshed before its nextUpdate. Both failures are
+    # fail-CLOSED (the handshake is refused, nothing crosses unverified), and harden_crl_check refuses an
+    # already-expired or unloadable CRL at construction rather than at the first partner handshake.
+    # LOOPBACK HOPS ARE EXEMPT for that reason -- an on-box peer is usually issued by a different,
+    # local PKI the org CRL does not cover, and the revocation guard already ALLOWs a loopback hop, so
+    # applying a CRL there would break on-box traffic to close a gap the gate does not consider open.
+    crl_file: str | None = None
 
     @model_validator(mode="after")
     def _check_pinned_requires_internal_ca(self) -> TlsSettings:
@@ -1122,7 +1136,9 @@ class TlsSettings(_Section):
         outbound so a connector's client-verify context resolves the same anchor at build_check and
         live construction (the internal-outbound context builders call ``resolve_trust_anchor``)."""
         return TrustAnchorPolicy(
-            internal_ca_file=self.internal_ca_file, mode=self.trust_anchor_mode
+            internal_ca_file=self.internal_ca_file,
+            mode=self.trust_anchor_mode,
+            crl_file=self.crl_file,
         )
 
 
@@ -1626,6 +1642,14 @@ class LoggingSettings(_Section):
     forward_tls_verify: bool = True
     # Optional client cert (PEM cert+key chain) for mutual TLS to the collector. None = no client auth.
     forward_tls_client_cert: str | None = None
+    # Optional CRL (PEM, or a CA+CRL bundle) checked against the COLLECTOR's certificate (BACKLOG
+    # #299). The syslog forwarder builds its own context and resolves no trust anchor, so
+    # [tls].crl_file never reaches it -- this is its own knob rather than a silent inheritance, which
+    # would be the per-hop scoping error that item warns about. Applies only with
+    # forward_tls_verify=true: the opt-out arm is CERT_NONE, where there is no chain to check against.
+    # Same fail-closed refusals as every other CRL: absent, unloadable or past nextUpdate refuses at
+    # startup rather than at the first collector handshake.
+    forward_tls_crl_file: str | None = None
     # Per-hop insecure-forwarding attestation (#200, ADR 0092 shape — the [logging] sibling of a
     # connection's `tls_hop_attested`). The off-box forwarder ships a PHI-REDACTED copy of every log +
     # audit row, but the default `forward_protocol = "udp"` puts that evidence stream (usernames,
@@ -2239,6 +2263,12 @@ class AuthSettings(_Section):
     # REFUSES — always, independent of [security].enforcement (a substituted OIDC anchor permits JWKS
     # substitution + forged id_tokens). Dormant when None. Block-scoped (direct-read, not desugared).
     oidc_tls_ca_cert_pin: str | None = None
+    # BACKLOG #299: optional CRL (PEM, or a CA+CRL bundle) checked against the IdP's certificate. The
+    # IdP opener resolves no trust anchor, so [tls].crl_file cannot reach it -- this is its own knob
+    # rather than a silent inheritance. A revoked IdP cert matters more than on a data hop: this is the
+    # leg carrying the client secret, the authorization code and the identity assertion. Same
+    # fail-closed refusals as every other CRL (absent / unloadable / past nextUpdate refuses at start).
+    oidc_tls_crl_file: str | None = None
     oidc_redirect_path: str = "/ui/oidc/callback"  # full URI derived from [api].public_origin
     oidc_scopes: list[str] = Field(default_factory=lambda: ["openid", "profile"])
     oidc_signing_algorithms: list[str] = Field(default_factory=lambda: ["RS256"])

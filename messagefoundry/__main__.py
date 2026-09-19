@@ -1746,6 +1746,7 @@ def _serve(args: argparse.Namespace) -> int:
             tls_ca_file=settings.logging.forward_tls_ca_file,
             tls_verify=settings.logging.forward_tls_verify,
             tls_client_cert=settings.logging.forward_tls_client_cert,
+            tls_crl_file=settings.logging.forward_tls_crl_file,
         )
         if settings.logging.forward_enabled and settings.logging.forward_host
         else None
