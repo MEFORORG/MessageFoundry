@@ -1274,7 +1274,7 @@ handler returns** — runs `mark_statement` (bound from the row's columns) so th
 | `mark_statement` | — | run **per row after** the handler succeeds, with `:name` params bound from the row, e.g. `UPDATE mf_inbox SET status='DONE' WHERE id=:id`. Omit only for a genuinely read-only/idempotent feed. |
 | `body_column` | — | unset → the **whole row** as a JSON object `{column: value}` (pair with `content_type=json`); set → that **one column's value verbatim** (e.g. a column holding an HL7 message → `content_type=hl7v2`) |
 | `poll_seconds` | `5.0` | interval between polls |
-| `poll_max_rows` | `500` | most rows one poll will **fetch** from `poll_statement`'s result set. The rest are left in the table — not read, not marked, not errored — and the next poll selects them again. Charged at the fetch, so a long-unattended table is no longer materialised whole into memory. Progress needs `mark_statement` to take a handled row out of the `poll_statement` predicate, which is the shape this connector already requires. See [*Per-tick poll ceilings*](#per-tick-poll-ceilings). `None`/`0` = unlimited. |
+| `poll_max_rows` | `500` | most rows one poll will **hand off** from `poll_statement`'s result set. The rest are left in the table — not read, not marked, not errored — and the next poll selects them again. Still charged at the **fetch**, so a long-unattended table is not materialised whole into memory; a row the source cannot turn into a body does not spend a slot, and the poll asks the driver for the shortfall instead (at most 64 such rows per poll, then it defers the rest). Progress needs `mark_statement` to take a handled row out of the `poll_statement` predicate, which is the shape this connector already requires. See [*Per-tick poll ceilings*](#per-tick-poll-ceilings). `None`/`0` = unlimited. |
 | `encoding` | `utf-8` | charset for the body bytes handed to the pipeline |
 | `dialect` / `odbc_driver` / `odbc_params` / `odbc_user_key` / `odbc_password_key` | `sqlserver` / … | same as `Database(...)` — `dialect="generic"` polls any OS-installed ODBC driver (PostgreSQL / Oracle / MySQL); see [*Generic ODBC*](#generic-odbc-postgresql--oracle--mysql) |
 | `auth` / `username` / `password` / `port` / `encrypt` / `trust_server_certificate` / `connect_timeout` / `app_name` / `pool_max` | — | identical to the `Database(...)` destination above |
@@ -2605,13 +2605,28 @@ the interval, or set the knob to `0` for that connection.
 pipeline hand-off and the durable commit. The `File(...)` source still lists and sorts the whole
 directory each scan, because taking the first N in name or mtime order requires seeing all of them. On
 the database source the ceiling is charged at the **fetch**, so the rest of the result set is never
-pulled out of the driver.
+pulled out of the driver. One poll asks the driver for at most `poll_max_rows` plus the rows it had to
+step over, capped at 64 of those.
 
 **Files left for a retry do not spend the budget.** A locked or vanished file, a malfunctioning
 pre-ingest scan hook, a handler failure, and a listing entry refused as an unsafe name all leave the
 item where it is. Charging those would let one permanently stuck item consume the whole ceiling on every
 tick and starve the healthy items behind it. Only an item the tick finished with — handed off, or
 quarantined to the error directory — charges.
+
+**A database row that cannot become a body does not spend it either, and the two sources reach that
+by different routes.** A file source charges on **completion**, so it simply does not count an item it
+left in place. The database ceiling is charged at the **fetch**, for the memory reason above, so the
+row has to be decoded under the open cursor and replaced from the same cursor — the shortfall is
+re-fetched, never the whole result set. Do not read this as parity of mechanism; what the two share is
+that a budget can only be charged by something that makes progress. Two bounds keep the replacement
+from becoming a log flood: a `body_column` that names no column `poll_statement` selects is **static**
+and is reported once per poll before any row is read, and everything else is per-row and capped at 64
+skips, after which the poll stops fetching and defers the rest. Each skipped row is logged and emits a
+`row_undecodable` connection event. It is **not marked**: `mark_statement` is your `UPDATE`, and
+marking a row that never became a message would record data DONE that was never ingested. Nor is there
+a store disposition to record — a row the source could not read was never a received message, the same
+reading this page already applies to a file the scan never opened.
 
 ### Table A — concurrency limits & behaviour at the limit (ASVS 13.1.2 / 13.2.6)
 
