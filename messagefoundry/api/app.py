@@ -4349,7 +4349,7 @@ def create_app(
         # rejects exactly this pairing for dual-control config reload). The owner survives as DATA in
         # `detail.uploader`, which is where it belongs.
         try:
-            for pruned in await us.prune_expired():
+            for pruned in (await us.prune_expired()).pruned:
                 await engine.store.record_audit(
                     "upload.prune",
                     actor="system",
