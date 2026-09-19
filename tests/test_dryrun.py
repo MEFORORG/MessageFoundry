@@ -23,7 +23,10 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.parsing.message import Message, RawMessage
 from messagefoundry.pipeline.dryrun import (
+    AmbiguousInboundError,
     DeliveryPreview,
+    NoInboundError,
+    UnknownInboundError,
     _partition,
     disposition_for,
     dry_run,
@@ -246,9 +249,31 @@ def test_select_inbound_requires_name_when_ambiguous() -> None:
     reg.add_inbound(
         InboundConnection("in2", ConnectionSpec(ConnectorType.MLLP, {"port": 2576}), router="r")
     )
-    with pytest.raises(ValueError):
+    with pytest.raises(AmbiguousInboundError, match="choose one: in, in2"):
         select_inbound(reg)
     assert select_inbound(reg, "in2").name == "in2"
+
+
+def test_select_inbound_names_its_three_failures_apart() -> None:
+    """BACKLOG #1707: a caller must be able to tell an open choice from a defect.
+
+    Each is still a ``ValueError``, which is what ``dryrun`` and ``dryrun --trace`` catch.
+    """
+    reg = _registry(lambda m: ["h"], {"h": lambda m: Send("out", m)})
+    with pytest.raises(UnknownInboundError) as unknown:
+        select_inbound(reg, "IB_TYPO")
+    assert "'IB_TYPO'" in str(unknown.value) and "the config has: in" in str(unknown.value)
+
+    # Zero inbounds, with and without a name. The wording is pinned because the old text printed
+    # "multiple inbound connections; choose one:" over an empty list.
+    for name in (None, "in"):
+        with pytest.raises(NoInboundError) as empty:
+            select_inbound(Registry(), name)
+        assert "no inbound connection" in str(empty.value)
+        assert "multiple" not in str(empty.value)
+
+    for exc_type in (AmbiguousInboundError, UnknownInboundError, NoInboundError):
+        assert issubclass(exc_type, ValueError), exc_type
 
 
 # --- parse-once on the per-message fan-out (hotpath) --------------------------
