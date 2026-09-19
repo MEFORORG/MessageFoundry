@@ -141,6 +141,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   on every ordinary boot. For continuous coverage of a live engine the off-box log forward / tee remains
   the control, and `[integrity].audit_verify_on_start` is unchanged — it is a bare walk and stays blind
   to a truncated tail. ([BACKLOG #328](docs/BACKLOG.md))
+- **The advisory `raise-fstring` lint in `messagefoundry check` now reads three more spellings of the
+  same risk.** It matched only an f-string, so `raise ValueError("bad " + x)`, the `%` form and
+  `.format(...)` carried an interpolated message past it — the identical free-text PHI payload, in the
+  spellings an author is most likely to reach for after an f-string. It now shares the predicate the
+  ADR 0144 lookup lint already used, so the two cannot drift on what counts as interpolation. A
+  deploying site's existing config dir may therefore report hits it did not report before: the check
+  is advisory and still only ever prints, so it cannot block the gate, and its detail names a file and
+  line, never the message text. The check keeps the name `raise-fstring`. It stays a nudge rather
+  than a boundary: it reads only the first positional argument of the `raise`, so a message assigned
+  to a local first, passed as a keyword or a later positional, or wrapped in a call is still
+  unflagged. ([BACKLOG #1676](docs/BACKLOG.md))
 
 ### Changed
 - **An API request body with an unknown or misspelled key is now refused with HTTP 422 instead of

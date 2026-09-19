@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field
 from messagefoundry.api.phi_gate import PhiGatedModel
 from messagefoundry.api.request_model import RequestModel
 from messagefoundry.api.validation import (
+    ALERT_SUSPEND_MINUTES_MAX,
     MAX_EXPORT_IDS,
     MAX_MAP_ENTRIES,
     ConnectionName,
@@ -386,8 +387,10 @@ class AlertSuspendRequest(RequestModel):
     window end is ``now + minutes·60``; the instance keeps firing into state (stays open/counted) — only
     re-alerts are silenced for the window. ``POST /alerts/{id}/resume`` takes no body."""
 
-    # Bounded so an operator can't set an unbounded / absurd window; 1 minute .. 30 days.
-    minutes: float = Field(gt=0, le=43200)
+    # Bounded so an operator can't set an unbounded / absurd window: any positive number of minutes,
+    # up to 30 days. The ceiling is named in `api.validation` because the /ui suspend form quotes it
+    # back to the operator when it refuses a window (BACKLOG #1744).
+    minutes: float = Field(gt=0, le=ALERT_SUSPEND_MINUTES_MAX)
 
 
 class AlertInstanceList(BaseModel):

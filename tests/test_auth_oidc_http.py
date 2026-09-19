@@ -99,6 +99,62 @@ def test_missing_ca_file_refuses_at_construction(tmp_path: Path) -> None:
         oidc_http.build_idp_opener(str(tmp_path / "does-not-exist.pem"))
 
 
+def _ca_and_crl_pem() -> bytes:
+    """A throwaway CA bundled with its own fresh CRL -- the shape harden_crl_check loads."""
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-test-idp-crl-ca")])
+    now = datetime.datetime.now(datetime.UTC)
+    day = datetime.timedelta(days=1)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - day)
+        .not_valid_after(now + 365 * day)
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    crl = (
+        x509.CertificateRevocationListBuilder()
+        .issuer_name(cert.subject)
+        .last_update(now - 2 * day)
+        .next_update(now + 30 * day)
+        .sign(key, hashes.SHA256())
+    )
+    return cert.public_bytes(serialization.Encoding.PEM) + crl.public_bytes(
+        serialization.Encoding.PEM
+    )
+
+
+def test_a_configured_crl_turns_on_revocation_checking_on_the_idp_hop(tmp_path: Path) -> None:
+    """BACKLOG #299. This hop resolves no trust anchor, so [tls].crl_file cannot reach it and it
+    carries its own [auth].oidc_tls_crl_file. Asserted on the opener's OWN context."""
+    bundle = tmp_path / "idp-ca-and-crl.pem"
+    bundle.write_bytes(_ca_and_crl_pem())
+
+    # NEGATIVE CONTROL first: same CA, no CRL, no flag. Without this the assertion below could pass on
+    # a context that had the flag for some other reason.
+    bare = _https_context(oidc_http.build_idp_opener(str(bundle)))
+    assert not (bare.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF)
+
+    ctx = _https_context(oidc_http.build_idp_opener(str(bundle), crl_file=str(bundle)))
+    assert ctx.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+    assert ctx.cert_store_stats()["crl"] >= 1
+    # Verification is not weakened by adding revocation.
+    assert ctx.check_hostname is True
+    assert ctx.verify_mode == ssl.CERT_REQUIRED
+
+
+def test_a_missing_idp_crl_refuses_at_construction(tmp_path: Path) -> None:
+    """Fail closed, like the CA path: a configured-but-absent CRL must not degrade to no checking."""
+    ca = tmp_path / "idp-ca.pem"
+    ca.write_bytes(_self_signed_ca_pem())
+    with pytest.raises(ValueError, match="does not exist"):
+        oidc_http.build_idp_opener(str(ca), crl_file=str(tmp_path / "absent-crl.pem"))
+
+
 def test_group_writable_anchor_warns_not_refuses_in_warn_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
