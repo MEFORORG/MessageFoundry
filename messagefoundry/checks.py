@@ -351,14 +351,19 @@ def _check_raise_fstring(config_dir: str | Path) -> CheckResult:
       counts arguments without inspecting them) and ``"a" + f"b"`` (no case for a constant-only
       f-string operand, which is why the same ``f"b"`` alone does not flag).
     * Under-flags, at least. A message assigned to a local first (``m = f"bad {x}"``;
-      ``raise ValueError(m)``), because a bare ``Name`` is resolved nowhere — pinned by
-      ``test_raise_fstring_ignores_bare_name_message``, and widening *that* one is scope resolution
-      rather than this check. Measured and **not** deliberate, only unbuilt: a message in any
-      argument but the first positional (``raise FeedError("E01", f"p {x}")``,
-      ``raise FeedError(detail=f"p {x}")``), a ``*args`` splat (``raise ValueError(*parts)``), and an
-      interpolation wrapped in a call (``raise ValueError(f"p {x}".upper())``,
-      ``raise ValueError(str(msg["PID-5"]))``). :func:`_unsafe_lookup_hit` already reads keywords, a
-      second positional and a splat; this caller does not.
+      ``raise ValueError(m)``), because this caller passes the predicate no scope ``env``, so a bare
+      ``Name`` is not followed here — pinned by ``test_raise_fstring_ignores_bare_name_message``. The
+      lookup lint builds that ``env`` (:func:`_lookup_scope_envs`), so widening *that* one means
+      passing it, not changing the predicate. Measured and **not** deliberate, only unbuilt: a message
+      in any argument but the first positional (``raise FeedError("E01", f"p {x}")``,
+      ``raise FeedError(detail=f"p {x}")``), a ``*args`` splat (``raise ValueError(*parts)``), and a
+      field read rather than an interpolation (``raise ValueError(str(msg["PID-5"]))`` — the predicate
+      reads through the ``str`` call and does not count the subscript it finds).
+      :func:`_unsafe_lookup_hit` already reads keywords, a second positional and a splat; this caller
+      does not.
+    * No longer an under-flag: an interpolation wrapped in a call
+      (``raise ValueError(f"p {x}".upper())``). The predicate reads a call's arguments and receiver,
+      so the wrapped f-string flags — pinned by ``test_raise_fstring_flags_call_wrapped_interpolation``.
 
     Scans every ``*.py`` under ``config_dir`` (helpers included — a ``_*`` helper can ``raise`` too).
     A malformed module never crashes the gate (``SyntaxError``/``OSError`` → skip that file; ``validate``
