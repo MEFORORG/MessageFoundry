@@ -19,6 +19,12 @@ nested ``CLAUDE.md`` -- maintainer process text, not product -- out to whoever i
 the sdist allowlist nor release.yml's leak grep objected, because both ask whether a member sits inside
 the package tree and the instructions file does. Build config plus the git index, no build and no
 network: the third guard shells out to ``git ls-files``, which the first two do not.
+
+The shared build-config reader (BACKLOG #1836) is the fourth, and its subject is the other three
+rather than the product. Three modules here walked ``[tool.hatch.build]`` by hand and two of them
+disagreed about it silently; ``tests/_force_include`` is now the single reader, its global-table
+branch is driven by synthetic pyprojects because no real distribution reaches it, and a scan over
+both ``testpaths`` roots names the next module to re-derive the descent.
 """
 
 from __future__ import annotations
@@ -30,6 +36,8 @@ import tomllib
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
+
+from tests._force_include import hatch_build, wheel_force_include
 
 _REPO = Path(__file__).resolve().parents[1]
 
@@ -78,6 +86,10 @@ _INSTRUCTIONS_FILE = "CLAUDE.md"
 #: to this, which is why resolving needs it.
 _HARNESS_PROJECT = _REPO / "packaging" / "messagefoundry-harness"
 
+#: The second `testpaths` collection root (see the root pyproject.toml). The drift scan below reads
+#: both, because a guard named for every test module must actually see every test module.
+_WEBCONSOLE_TESTS = _REPO / "packaging" / "messagefoundry-webconsole" / "tests"
+
 
 @functools.cache
 def _tracked(*prefixes: str) -> frozenset[str]:
@@ -101,27 +113,6 @@ def _tracked(*prefixes: str) -> frozenset[str]:
     return frozenset(p for p in out.split("\0") if p)
 
 
-def _hatch_build(pyproject: Path) -> dict[str, Any]:
-    """The ``[tool.hatch.build]`` table, or an empty one."""
-    data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
-    build: dict[str, Any] = data.get("tool", {}).get("hatch", {}).get("build", {})
-    return build
-
-
-def _wheel_force_include(pyproject: Path) -> dict[str, str]:
-    """The map that reaches the WHEEL, resolved the way hatchling resolves it.
-
-    ``BuilderConfig.force_include`` reads the TARGET table when it carries the key and otherwise falls
-    back to the global ``[tool.hatch.build]`` one. Reading only the target table would skip a
-    distribution that used the global spelling -- the natural choice when one map should serve two
-    targets -- and skipping is silent.
-    """
-    build = _hatch_build(pyproject)
-    target: dict[str, str] = build.get("targets", {}).get("wheel", {}).get("force-include", {})
-    fallback: dict[str, str] = build.get("force-include", {})
-    return target or fallback
-
-
 def _repo_relative(pyproject: Path, source: str) -> str:
     """A ``force-include`` source as a repo-relative POSIX path.
 
@@ -143,9 +134,7 @@ def _repo_relative(pyproject: Path, source: str) -> str:
 
 def _force_include_sources(pyproject: Path) -> frozenset[str]:
     """The repo-relative paths a ``force-include`` map pulls from."""
-    return frozenset(
-        _repo_relative(pyproject, source) for source in _wheel_force_include(pyproject)
-    )
+    return frozenset(_repo_relative(pyproject, source) for source in wheel_force_include(pyproject))
 
 
 def _shipped_by(sources: frozenset[str], tracked: frozenset[str]) -> frozenset[str]:
@@ -275,7 +264,7 @@ def test_the_harness_force_include_maps_every_source_to_its_own_path() -> None:
     invariant is that the wheel mirrors the tree: ``../../harness/<x>`` lands at ``harness/<x>``.
     """
     pyproject = _HARNESS_PROJECT / "pyproject.toml"
-    include = _wheel_force_include(pyproject)
+    include = wheel_force_include(pyproject)
     assert len(include) >= 10, (
         f"the harness force-include map has {len(include)} entries -- too few"
     )
@@ -285,6 +274,128 @@ def test_the_harness_force_include_maps_every_source_to_its_own_path() -> None:
         if _repo_relative(pyproject, source) != target
     }
     assert not wrong, f"these force-include entries rename what they ship: {wrong}"
+
+
+# --- BACKLOG #1836: the shared reader, and the branch no distribution in this repo takes ----------
+#
+# `wheel_force_include` reaches the global `[tool.hatch.build].force-include` table whenever the wheel
+# target omits the key. Nothing under packaging/ is written that way today, so against the real tree
+# that branch never runs -- and an extraction whose only new behaviour is never executed is a third
+# definition wearing a shared name. These arms drive it over pyprojects written here.
+#
+# tmp_path rather than the tree, and that is the whole point: the shapes below are the ones this
+# repository does NOT currently use, so there is nothing real to read them off.
+
+
+def _synthetic_pyproject(tmp_path: Path, build_tables: str) -> Path:
+    """A real pyproject -- ``[project]`` and all -- carrying ``build_tables`` verbatim."""
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        f"""[project]
+name = "synthetic"
+version = "0"
+{build_tables}""",
+        encoding="utf-8",
+    )
+    return pyproject
+
+
+def test_the_reader_falls_back_to_the_global_force_include_table(tmp_path: Path) -> None:
+    """The branch the real tree does not exercise, and the disagreement that motivated the extraction.
+
+    One map serving both the wheel and the sdist is written in the global table, and hatchling honours
+    it. Before BACKLOG #1836, ``_packaged_import_trees`` in test_install_instruction_provenance.py read
+    the target table alone: such a distribution would have contributed NO import tree there, while the
+    #1702 guards above went on reading the same file correctly. Neither side would have failed.
+
+    Mutation: drop the fallback from ``tests/_force_include.wheel_force_include``. Red: empty map.
+    """
+    pyproject = _synthetic_pyproject(
+        tmp_path,
+        """[tool.hatch.build.force-include]
+"../../harness" = "harness"
+""",
+    )
+    assert wheel_force_include(pyproject) == {"../../harness": "harness"}
+
+
+def test_the_reader_prefers_the_wheel_target_and_does_not_merge(tmp_path: Path) -> None:
+    """hatchling REPLACES rather than merges -- the same rule ``exclude`` follows two tests below.
+
+    A reader that merged would report a source the wheel never pulls, and
+    ``test_no_force_include_entry_outlives_the_file_it_names`` would then demand git track it.
+    """
+    pyproject = _synthetic_pyproject(
+        tmp_path,
+        """[tool.hatch.build.force-include]
+"../../sdist_only" = "sdist_only"
+
+[tool.hatch.build.targets.wheel.force-include]
+"../../harness" = "harness"
+""",
+    )
+    assert wheel_force_include(pyproject) == {"../../harness": "harness"}
+
+
+def test_the_reader_branches_on_presence_and_not_on_emptiness(tmp_path: Path) -> None:
+    """``'force-include' in self.target_config``, not ``target or fallback``.
+
+    A declared-but-empty wheel map says "this target force-includes nothing", and reopening the global
+    table there would credit the wheel with a tree the build does not put in it. The predecessor's
+    ``or`` did exactly that. The case is narrow; getting it right once is what a shared reader buys
+    over two near-copies that each looked obviously fine.
+    """
+    pyproject = _synthetic_pyproject(
+        tmp_path,
+        """[tool.hatch.build.force-include]
+"../../sdist_only" = "sdist_only"
+
+[tool.hatch.build.targets.wheel]
+force-include = {}
+""",
+    )
+    assert wheel_force_include(pyproject) == {}
+
+
+def test_no_test_module_walks_the_hatch_build_table_for_itself() -> None:
+    """The drift guard. Two hand-walked readers is what #1836 was; a third would be just as silent.
+
+    WIDER THAN THE DEFECT, on purpose. #1836 was two readings of one key, but the same table holds
+    ``exclude``, ``only-include`` and every build target, and a hand walk into any of them is free to
+    disagree with the next one the same silent way. So the scan matches the KEY ACCESS for either the
+    hatch table or the force-include map, and names any module but the shared reader.
+
+    Matching the access and not the word matters: every module here writes both names in prose and in
+    TOML headings, and a bare-word scan would red on a comment -- CLAUDE.md section 11's first-match
+    hazard.
+
+    THAT HAZARD FIRED HERE WHILE THIS WAS BEING WRITTEN, which is why the mutation below is spelled
+    in words. A key access quoted in a docstring is still a key access to this scan, so writing the
+    old code out reddened this very file. Mutation: descend the dotted TOML path by hand in any test
+    module, the way three of them did before #1836. Red: names that file.
+    """
+    key_access = re.compile(r"""(?:get\(|\[)\s*["'](?:hatch|force-include)["']""")
+    shared = _REPO / "tests" / "_force_include.py"
+    assert key_access.search(shared.read_text(encoding="utf-8")), (
+        "tests/_force_include.py no longer reads either key, so this scan's pattern has stopped "
+        "matching the thing it looks for and its silence would mean nothing"
+    )
+    # BOTH `testpaths` roots, not just this one. The console's suite is a second collection root
+    # (pyproject.toml's testpaths names it), and a scan that stopped at tests/ would carry a name
+    # claiming more reach than it has -- the next hand reader could land there unguarded.
+    modules = [*(_REPO / "tests").glob("*.py"), *_WEBCONSOLE_TESTS.glob("*.py")]
+    assert len(modules) >= 100, f"the module scan matched only {len(modules)} files -- it broke"
+    others = sorted(
+        path.relative_to(_REPO).as_posix()
+        for path in modules
+        if path != shared and key_access.search(path.read_text(encoding="utf-8", errors="replace"))
+    )
+    assert not others, (
+        f"these test modules walk hatchling's build config themselves instead of calling "
+        f"tests._force_include: {others}. A second reader is free to disagree with the first -- "
+        f"#1836 was exactly that, and the disagreement is silent: one side keeps guarding a "
+        f"distribution while the other quietly stops seeing it."
+    )
 
 
 def test_the_engine_excludes_its_nested_instructions_from_every_build_target() -> None:
@@ -304,7 +415,7 @@ def test_the_engine_excludes_its_nested_instructions_from_every_build_target() -
     Mutation: change the pattern to ``/CLAUDE.md``, empty the list, or add
     ``exclude = ["*.pyc"]`` to ``[tool.hatch.build.targets.sdist]``.
     """
-    build = _hatch_build(_REPO / "pyproject.toml")
+    build = hatch_build(_REPO / "pyproject.toml")
     excluded: list[str] = build.get("exclude", [])
     assert _INSTRUCTIONS_FILE in excluded, (
         f"[tool.hatch.build].exclude in the root pyproject.toml must carry the bare "
