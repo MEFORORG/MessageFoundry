@@ -69,8 +69,8 @@ The full standard follows: the evidence review, the AI failure-mode map, the com
 | **Applies to** | Any project developed under the SDS. **MessageFoundry (MEFOR)** is the reference implementation (Appendix A); future projects add Appendix B, C, … |
 | **Maintained by** | Project maintainers (open-source). Each deploying/adopting organization assigns its own local owner. |
 | **Status** | Draft for review |
-| **Version** | 0.13 |
-| **Date** | August 10, 2026 |
+| **Version** | 0.14 |
+| **Date** | September 18, 2026 |
 | **License** | Publishable under the project's open-source license; intended to be shared with adopters and reused across projects. |
 | **Review cadence** | At least annually, and on any material change to the metric evidence base or the AI toolchain. |
 | **Aligns to** | **ISO/IEC 25010:2023** (product-quality model — Maintainability = modularity / reusability / analyzability / modifiability / testability) · companion to SDS **PW.7 / PW.8** and the [Secure AI-Assisted Development Standards](Secure_AI_Development_Standards.md) §3 failure-modes / §9 deferred-gates. Evidence base is **peer-reviewed metric-validity studies + DORA 2024 + GitClear + the METR RCT + Stanford CCS'23**, each carried with its honesty caveat (§7). **Confers no certification.** |
@@ -199,10 +199,98 @@ ran*. That is a distinct failure mode and it needs its own control:
    reading the source**: plant the violation the gate exists to catch, inside the scope and
    outside it, and record where it goes red and where it stays green. An unmutated scope claim is
    itself an unverified green check. MEFOR's register is **Appendix A.5**.
+5. **Assume a control can report success while doing nothing, then try to make it do exactly
+   that.** Rules 1 to 4 ask a gate to prove it ran and to describe its scope honestly. This rule is
+   the posture that finds the gates nobody thought to question. Do not ask whether a control exists,
+   or whether its code reads correctly; ask what it would take for the control to pass while
+   exercising nothing it names, and attempt that. A 2026-09 whole-repository re-review met this
+   shape in at least three kinds of control, found by work packets running independently of one
+   another (BACKLOG #1746). The class was named earlier, from its own 2026-08 instances, in
+   [ADR 0158](adr/0158-silent-controls-green-signals-that-mean-nothing-and-shape-over-detection.md),
+   which declares its taxonomy open rather than complete; the shapes below are what the 2026-09 pass
+   adds to it, not a second copy of it. Hold them as separate suspicions, and the list as open,
+   because each fails for a different reason:
+   - **A test that cannot fail.** Break the behavior the test names, deliberately, and the suite
+     stays green. The count of covering tests is then not evidence of cover, and no figure derived
+     from that count repairs it.
+   - **A gate that passes on nothing.** It returns a clean verdict over an empty input, sometimes
+     one it created itself: zero rows verified, zero runs clean, an empty configuration directory
+     accepted as valid. Rules 1 and 2 are the repair, and only together: rule 1 makes the zero
+     visible in the receipt, and rule 2 is what turns an unexplained zero into a failure. Rule 1
+     alone leaves the gate reporting nothing examined and still passing, because a clean verdict
+     over nothing looks exactly like a clean verdict over everything.
+   - **A control whose stated premise is false.** It runs, it covers the scope it claims, and it
+     still cannot do what the sentence beside it promises, because the property it keys on is not
+     the property that makes an input dangerous. That is **SDS-3.7** in
+     [Secure Development Standards](Secure_Development_Standards.md), reached from the quality side
+     rather than the security side.
+6. **Score a control by its exit status and its failure lines, never by parsing its summary text.**
+   Measured in the same review: a driver built to run negative controls scored every control green
+   while reading nothing, because its expression over the test runner's summary never matched once
+   colour codes sat between the count and the word it keyed on, and the quiet flag it passed
+   suppressed the count line outright. Summary text is formatted for a human and is free to change
+   under you; worse, a parser that matches nothing and a parser reading a clean result return the
+   same verdict. Record which roots the run actually collected as well: this repository has two test
+   roots, and a run naming only `tests` silently skips the web-console suite (Appendix A.5,
+   signal 3), so an instrument can be scored correctly and still have answered over less than it
+   claims. This binds a reviewer's own tooling as hard as it binds the gates under review — any
+   instrument that emits a verdict is a control and owes the same proof (**SDS-3.8**, same source).
+   A local tool that emits no verdict stays outside it, on the ground §5.1 already states for
+   `/simplify`.
+7. **A test suite is a control, so it owes the same proof.** Before a change is called covered,
+   answer four questions about the tests covering it, in this order. Questions 1 to 3 apply
+   **signal 3** (*tests verify behavior, not mocks*) to a single change rather than restating it;
+   the ordering and question 4 are what this rule adds:
+   1. Does any of them assert nothing? A test that calls the code and checks no value passes
+      forever. Name them.
+   2. Does any of them assert only that a mock was called? That verifies the test's own wiring
+      rather than the code's behavior. Name those separately from the first group, because the
+      repair differs.
+   3. Is the failure path covered, or only the happy path? For this engine, answer by naming the
+      NAK path, the dead-letter path, the rollback path, and the disposition recorded when each
+      fires. A happy-path-only suite over a reliability invariant is the most expensive kind of
+      false confidence.
+   4. **Run a negative control.** Confirm the test is green first; break the code that the most
+      load-bearing covering test protects, deliberately; confirm that test turns red; revert the
+      break and confirm it is green again; record what was broken and what happened. The
+      green-before and the revert are both part of the step, because a test that was already red
+      turns red for free, and a deliberate break left in the tree is a defect shipped. This is
+      the mutation requirement of rule 4 above, aimed at a test rather than at a scope claim, and it
+      is the step that cannot be faked, because a green suite is evidence only once it has been
+      shown to go red for the reason you care about. **A test that stays green under a deliberate
+      break is itself a finding**, frequently a larger one than the defect being chased when it
+      surfaced.
+
+   The negative control's record is the answer. A coverage percentage and a mutation score are
+   triage signals that inform the reading (§4.1); neither answers any of the four, and the tools
+   producing them keep the advisory placement §5 gives them.
+8. **Review against the signals in §4, and raise no second rubric beside them.** Two rubrics over
+   one subject is how two reviewers reach different verdicts on the same code, so cite a signal
+   rather than restating it, and do not invent a local variant for one review. A review of this
+   engine additionally carries the project-specific lenses the generic signals do not reach — at
+   least these four: the **reliability invariant** and the **purity** of routers and transforms
+   ([`../CLAUDE.md`](../CLAUDE.md) §2), the **client-side half of the one-way dependency direction**
+   ([`../CLAUDE.md`](../CLAUDE.md) §4), and **PHI containment** ([`../CLAUDE.md`](../CLAUDE.md) §9).
+   Take that third lens at exactly the width stated, because the engine-side half is already signal
+   1's and Appendix A.5 grades it Strong for it; only the client-side convention has **no instrument
+   at all**. Raising a lens over ground a signal already holds is the second rubric this rule
+   forbids, and the boundary between the two halves is A.5's, not a reviewer's to redraw. Each lens
+   is defined once in the source named, and a finding cites the definition
+   rather than repeating it. PHI containment is the lens whose scope is wider than this tree: a full
+   message body can reach a log from a dependency's logger as readily as from code written here, so
+   the question covers what the engine imports and not only what it contains.
 
 Applies to any gate, in any project adopting this rubric — a deferred or advisory gate that silently
 stops measuring is worse than an absent one, because the scorecard still counts it. A gate whose
-scope is narrower than its scorecard sentence is the same defect wearing a different disguise.
+scope is narrower than its scorecard sentence is the same defect wearing a different disguise. Rules
+1 to 5 bind gates in that sense; rules 6 to 8 reach past a gate — to a reviewer's own instruments, to
+a test suite, and to the conduct of a review, on the ground that each of those is a control too — so
+read the section heading as the shortest true label for the section rather than its full extent.
+Rules 5 to 7 generalise on the same terms, with one substitution: rule 7's question 3 names this
+engine's failure paths as its worked example,
+and an adopting project answers that question over its own. Rule 8's second half does not generalise
+at all: the lenses it names are this engine's, and an adopting project owes the equivalent list for
+its own invariants.
 
 ### 4.1 The anti-metric rule (hard)
 
@@ -234,7 +322,7 @@ The five gates this document adds (rubric rows 7–11) are *quality-measurement*
 
 ### 5.1 `/simplify` — a local review tool, not a gate
 
-`/simplify` is a Claude Code skill that reviews the changed code for **reuse, simplification, efficiency, and altitude** (quality only — bugs are `/code-review`'s job). The one difference worth knowing: `/code-review` and `/security-review` **report** findings a human arbitrates, while `/simplify` **applies** its fixes, which is why it runs *before* the local `ruff` / `mypy` / `pytest` quartet rather than after. It is not one of the five gates above and not a rubric signal: no CI leg runs it, nothing reads its output, it sits **outside** the AI companion §6.5 local gate rather than inside it, and §4.0's liveness rule — which binds gates — does not reach it, because there is no green check to trust. Its status is deliberately left unscored: the skill ships with Claude Code rather than with this project, so there is no artifact here to score, and **Built** is therefore a claim this document does not make (Appendix A preamble — the Built / designed-but-deferred / aspirational honesty taxonomy). Nothing it produces certifies quality (§4.1) — it is a review a human asked for, not a verdict, and the maintainer owns every applied edit, keeping or discarding each one under the AI companion's *reject code you cannot explain* floor (§6.6).
+`/simplify` is a Claude Code skill that reviews the changed code for **reuse, simplification, efficiency, and altitude** (quality only — bugs are `/code-review`'s job). The one difference worth knowing: `/code-review` and `/security-review` **report** findings a human arbitrates, while `/simplify` **applies** its fixes, which is why it runs *before* the local `ruff` / `mypy` / `pytest` quartet rather than after. It is not one of the five gates above and not a rubric signal: no CI leg runs it, nothing reads its output, it sits **outside** the AI companion §6.5 local gate rather than inside it, and §4.0's liveness rule — which binds gates, and any instrument that emits a verdict — does not reach it, because there is no green check to trust. Its status is deliberately left unscored: the skill ships with Claude Code rather than with this project, so there is no artifact here to score, and **Built** is therefore a claim this document does not make (Appendix A preamble — the Built / designed-but-deferred / aspirational honesty taxonomy). Nothing it produces certifies quality (§4.1) — it is a review a human asked for, not a verdict, and the maintainer owns every applied edit, keeping or discarding each one under the AI companion's *reject code you cannot explain* floor (§6.6).
 
 **Out of scope: at least these deliberately-justified duplications**, because collapsing any of them would undo a decision already made elsewhere — the store-backend parity between [`messagefoundry/store/sqlserver.py`](../messagefoundry/store/sqlserver.py) and [`postgres.py`](../messagefoundry/store/postgres.py) that signal 9's clone detection already whitelists (A.2); the `messagefoundry/anon/` package deliberately vendored to `tee/anon/` under [ADR 0030](adr/0030-anonymization-test-harness-tee.md) and pinned by `tests/test_anon_parity.py`, which signal 9 cannot see at all because its `jscpd` scan covers `messagefoundry/` only.
 
@@ -471,6 +559,7 @@ The evidence caveats in **§7** are part of this appendix's basis: the metric-in
 
 | Version | Date | Change |
 |----|----|----|
+| 0.14 | September 18, 2026 | **Promoted four review rules into §4.0 — adversarial liveness, how to score a control, test quality as a step, and one rubric per subject.** §4.0's rules 1 to 4 ask a gate to prove it ran and to state its measured scope; a 2026-09 whole-repository re-review found the wider defect those rules only partly reach, in at least three kinds of control and by work packets running independently (BACKLOG #1746): tests that stay green when the behavior they name is broken on purpose, gates returning a clean verdict over an empty input they were handed or created, and controls whose stated premise is false because the property they key on is not the property that makes an input dangerous (the **SDS-3.7** shape, reached from the quality side). New **rule 5** makes the search for that shape the required posture rather than an optional one, and cites [ADR 0158](adr/0158-silent-controls-green-signals-that-mean-nothing-and-shape-over-detection.md) — which named the class from its own 2026-08 instances and declares its taxonomy open — as the record these shapes extend rather than restate; its empty-input bullet names rules 1 **and** 2 as the repair, because rule 1 only makes the zero visible and rule 2 is what fails an unexplained one. New **rule 6** fixes how a control is scored — exit status and failure lines, never parsed summary text, and the run records which roots it actually collected — after the review's own negative-control driver reported every control green while its expression over the runner's summary matched nothing; that binds any instrument emitting a verdict as hard as the gates (**SDS-3.8**), while the local tools that emit no verdict stay outside it on §5.1's standing ground. New **rule 7** makes test quality a step with four ordered questions ending in a negative control: break the code the most load-bearing covering test protects, confirm that test turns red, and record it. A test that stays green under a deliberate break is itself a finding. Its first three questions apply **signal 3** to one change rather than restating it; the ordering and the negative control are what the rule adds. New **rule 8** requires review against the §4 signals with no second rubric raised beside them, and names the project-specific lenses the generic signals do not reach — at least the reliability invariant, purity, the **client-side half** of the dependency-direction rule, and PHI containment — each cited from [`../CLAUDE.md`](../CLAUDE.md) rather than restated here, with the note that PHI containment reaches what the engine imports and not only what it contains. The dependency lens is deliberately half-width: Appendix A.5 already grades signal 1 Strong for the engine-side rule and records that only the client-side convention has no instrument, so a full-width lens would duplicate a signal. Rules 5 to 7 generalise to any adopting project, rule 7's question 3 substituting the adopter's own failure paths for this engine's; rule 8's lens list does not generalise. Rules 1 to 5 bind gates, while rules 6 to 8 reach past a gate to a reviewer's own instruments, a test suite, and the conduct of a review, which the section's closing paragraph now says rather than leaving the heading to imply. Rule 7's negative control is two-directional, matching rule 4: confirm green, break, confirm red, revert, confirm green again. No scoring change — A− stands, still 11 signals — and no gate placement moved: the mutation and coverage tools keep the advisory standing §4.1 and §5 already give them. Appendix A.5, which shipped under BACKLOG #1092 as rule 4's register and is pinned by `tests/test_quality_record_scope_claims.py`, is untouched by this pass. |
 | 0.13 | August 10, 2026 | **Scope audit of the record's own "machine-checked" claims — new §4.0 rule 4 and Appendix A.5.** Every scorecard claim of machine enforcement now names its instrument and that instrument's **measured** scope, established by mutation rather than by reading the source. The substantive correction is **signal 1**: the row read as an unqualified repo-wide guarantee, and `tests/test_dependency_boundaries.py` measures **five** engine packages under `messagefoundry/` — planted forbidden imports go red in `transports/` and `store/` and stay green in `auth/`, `anon/`, `checks.py`, `harness/`, `tee/` and `scripts/`. The gate is sound; the sentence beside it was not, and the **client-side** layering convention it appeared to cover has no instrument. The same pass found one prior description of that gate *understated* it — it resolves `ast.ImportFrom` and relative imports, not `ast.Import` alone — which is why scope is now mutation-verified in both directions rather than read off the code. Signals 3, 5 and 11's figures were re-measured and were **stale in one direction** (test functions 5,402 → 9,706; `pytest.raises` ~1,000 → 1,608; `docs/SECURITY.md` 735 → 1,849 ln; `docs/PHI.md` 688 → 1,335 ln; `C901` 122 across 43 files → 132 across 46), so dates now attach to the figures. Signal 2's "no blanket ignores" **stands** once scoped: zero blanket suppressions inside the mypy-checked tree. `tests/test_quality_record_scope_claims.py` pins A.5 against the gate's own package list, so widening the gate without updating the record fails. No scoring change — A− stands, still 11 signals — because this corrects the record, not the controls. Generalised from BACKLOG #1092, whose reusable finding is that across a 74-element audit **eight verdicts flipped and all eight flipped "covered" to "gap"**; a symmetric process would not do that. |
 | 0.12 | August 5, 2026 | **Removed the status glyphs, and added §5.1 for `/simplify`** — at least the following. All 41 status glyphs are gone, per [`../CLAUDE.md`](../CLAUDE.md) §11: a glyph's meaning is positional and invisible to a reader who learns it from examples, and every table here reads identically without one. Most sat beside the word they decorated (`Built`, `Strong`, `shipped`) and were simply deleted, that word carrying the meaning on its own; only two were rewrites — the red circle in Appendix A.2 row 6 became **Failing**, and the Appendix A.3 legend, where the glyph was the subject rather than a decoration, became prose. The pass also edited **five historical rows of this table in place** (0.11, 0.10, 0.9, 0.8, 0.3), so the record itself moved; only the glyphs in them changed. Added **§5.1** as the single home for `/simplify`, a local, human-invoked review tool that **applies** its fixes: it is not one of the five measurement gates, sits outside the AI companion §6.5 local gate, and carries no **Built** status, because it ships with Claude Code rather than with this project and so leaves no artifact here to score. §5.1's out-of-scope list is an open "at least" class: it names the store-backend parity signal 9 already whitelists and the ADR 0030 `tee/anon/` vendoring that signal 9's `messagefoundry/`-scoped scan cannot see, and it carries the defensive branching tolerant HL7 parsing requires as a separate signal 11 (complexity) concern rather than a duplication one. Corrected a **pre-existing** Appendix A.3 error that the glyph pass surfaced rather than introduced: the legend glossed its status marker as *shipped (advisory; PR \#1028 or PR \#1040)* over a five-item list whose item 5 is blocking and shipped under PR \#1047 — that legend is unchanged in every commit this file has existed in, so it long predates this cycle. No scoring change: A− stands, still 11 signals, still five measurement gates. |
 | 0.11 | July 27, 2026 | **Added the liveness rule (new section 4.0) and built the control.** v0.10 recorded that signal 7 had been scored Built for two versions while its tool crashed before producing a mutant. That is a failure mode this rubric had no defence against: section 4.1 forbids over-trusting a *number*, but nothing forbade over-trusting a *green check that never ran* — and three defects across two of the five Tier 2 gates turned out to have that shape (two measuring nothing, one publishing a wrong derived number). Section 4.0 now requires every advisory gate to prove it measured something (units **examined**, never units found — a clean repo reports zero and must still pass) or to declare explicitly, with a reason, that it had nothing to measure; and any derived headline figure must be cross-checked against an independently produced measurement of the same quantity. Implemented as the `liveness` job in `quality-advisory.yml` — the only job there permitted to go red — with `tests/test_gate_liveness.py` replaying the historical incidents to prove the check catches them, and the good-news cases to prove it does not fire on them. **The control was itself adversarially reviewed before merge, and the review found it carrying the same weakness it was built to catch, in three places** — a dead coverage gate could pass by claiming "not applicable", an empty mutmut results file reported a flawless score, and the reconciliation sum was algebraically blind to the very count it claimed to protect. All three are fixed and regression-tested; rule 3 above was rewritten because of the third. No scoring change (A− stands); the gates were repaired in v0.10, this is the control that keeps them honest. |

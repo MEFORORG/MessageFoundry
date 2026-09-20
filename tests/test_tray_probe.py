@@ -18,6 +18,7 @@ import pytest
 
 from messagefoundry.tray import probe as probe_module
 from messagefoundry.tray.probe import (
+    ENGINE_HEALTH_KEYS,
     build_verify,
     classify_health,
     classify_ui,
@@ -27,22 +28,59 @@ from messagefoundry.tray.probe import (
 )
 from messagefoundry.tray.state import HealthProbe, UiProbe
 
+#: The body the engine's tokenless ``GET /health`` actually returns on a stock deployment.
+#: ``tests/test_client_network_allowlist.py`` builds the real app in-process and proves this is the
+#: shape, so the table below is a fixture of a measured payload rather than a guess at one.
+STOCK_HEALTH_BODY = {"status": "ok", "version": None, "observed_client": None}
+
 
 @pytest.mark.parametrize(
     ("status", "body", "expected"),
     [
         (None, None, HealthProbe.DOWN),  # connection error
-        (200, {"status": "ok", "version": None}, HealthProbe.OK),
-        (200, {"status": "ok"}, HealthProbe.OK),
-        (200, {}, HealthProbe.FOREIGN),  # 200 but no status key → foreign
+        (200, STOCK_HEALTH_BODY, HealthProbe.OK),
+        # An AUTHENTICATED /health fills the same three keys in (ASVS 13.4.6 withholds the version
+        # from the tokenless probe, it does not remove the key). Values are never the signal.
+        (200, {"status": "ok", "version": "0.3.2", "observed_client": "127.0.0.1"}, HealthProbe.OK),
+        # CONTAINMENT, not equality: a newer engine that adds a Health field is still our engine.
+        # The tray can point at an engine on another box, so the two versions can differ.
+        (200, {**STOCK_HEALTH_BODY, "uptime_seconds": 12.0}, HealthProbe.OK),
+        # --- BACKLOG #1715: the generic health bodies that used to read OK ---
+        # The commonest health body in the industry. Any other server on the port answers this.
+        (200, {"status": "ok"}, HealthProbe.FOREIGN),
+        (200, {"status": "UP"}, HealthProbe.FOREIGN),
+        # A PARTIAL key set is still not our engine — the whole set or nothing.
+        (200, {"status": "ok", "version": None}, HealthProbe.FOREIGN),
+        (200, {"status": "ok", "observed_client": None}, HealthProbe.FOREIGN),
+        (200, {"version": None, "observed_client": None}, HealthProbe.FOREIGN),
+        # --- shapes that were already FOREIGN and must stay so ---
+        (200, {}, HealthProbe.FOREIGN),
         (200, "hello", HealthProbe.FOREIGN),  # 200 non-dict body
         (200, None, HealthProbe.FOREIGN),  # 200 non-JSON
         (404, None, HealthProbe.FOREIGN),
-        (500, {"status": "ok"}, HealthProbe.FOREIGN),  # non-200 is never OK
+        # The STATUS-CODE arm on its own: the body is the real engine's, so the 500 is the only
+        # thing making this FOREIGN. (It used to carry {"status": "ok"}, which now fails the key
+        # test too — the case would have passed without the status check ever running.)
+        (500, STOCK_HEALTH_BODY, HealthProbe.FOREIGN),
     ],
 )
 def test_classify_health(status: int | None, body: object, expected: HealthProbe) -> None:
     assert classify_health(status, body) is expected
+
+
+def test_classify_health_keys_on_the_whole_tokenless_key_set() -> None:
+    """BACKLOG #1715: dropping ANY ONE of the three keys must lose the OK verdict.
+
+    The table above pins chosen shapes; this drives the set itself, so a future key added to
+    ``ENGINE_HEALTH_KEYS`` is covered without anyone remembering to add a row.
+
+    Mutation: relax ``classify_health`` back to ``"status" in body``. Red: every subset is OK."""
+    assert classify_health(200, dict.fromkeys(ENGINE_HEALTH_KEYS)) is HealthProbe.OK
+    for dropped in ENGINE_HEALTH_KEYS:
+        body = dict.fromkeys(ENGINE_HEALTH_KEYS - {dropped})
+        assert classify_health(200, body) is HealthProbe.FOREIGN, (
+            f"a body missing only {dropped!r} still read as the engine"
+        )
 
 
 @pytest.mark.parametrize(
@@ -64,12 +102,19 @@ def _client(handler) -> httpx.Client:  # type: ignore[no-untyped-def]
 
 
 def test_probe_health_ok() -> None:
-    with _client(lambda req: httpx.Response(200, json={"status": "ok", "version": None})) as c:
+    with _client(lambda req: httpx.Response(200, json=STOCK_HEALTH_BODY)) as c:
         assert probe_health(c) is HealthProbe.OK
 
 
 def test_probe_health_foreign() -> None:
     with _client(lambda req: httpx.Response(200, json={"nope": 1})) as c:
+        assert probe_health(c) is HealthProbe.FOREIGN
+
+
+def test_probe_health_foreign_for_a_generic_health_responder() -> None:
+    """BACKLOG #1715, end to end through the transport: some OTHER program on the engine's port
+    answering the industry-default body must move the tray to FOREIGN, not RUNNING."""
+    with _client(lambda req: httpx.Response(200, json={"status": "ok"})) as c:
         assert probe_health(c) is HealthProbe.FOREIGN
 
 
@@ -259,12 +304,13 @@ def test_probe_health_refuses_an_oversized_reply_without_buffering_it(
 def test_probe_health_still_reads_a_normal_reply(monkeypatch: pytest.MonkeyPatch) -> None:
     """NEGATIVE CONTROL: a probe that refused EVERY reply would pass the test above.
 
-    The body sits exactly on the ceiling -- the largest ``/health`` that must still classify OK."""
+    The body sits exactly on the ceiling -- the largest ``/health`` that must still classify OK. It
+    carries the full tokenless key set (BACKLOG #1715), so the padding is sized against that shape."""
     from messagefoundry.tray import probe as probe_mod
 
     monkeypatch.setattr(probe_mod, "MAX_PROBE_RESPONSE_BYTES", 4096)
-    padding = "v" * (4096 - len(json.dumps({"status": "ok", "version": ""}).encode()))
-    body = json.dumps({"status": "ok", "version": padding}).encode()
+    padding = "v" * (4096 - len(json.dumps({**STOCK_HEALTH_BODY, "version": ""}).encode()))
+    body = json.dumps({**STOCK_HEALTH_BODY, "version": padding}).encode()
     assert len(body) == 4096, "the control is only a control if the body sits exactly on the bound"
 
     stream = _CountingStream(body, count=1)

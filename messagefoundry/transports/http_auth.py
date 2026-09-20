@@ -63,6 +63,7 @@ from messagefoundry.transports.rest import (
     http_family_trust_anchor,
     proxy_auth_handler_from_settings,
     refuse_cleartext_credential_hop,
+    refuse_url_credentials,
 )
 from messagefoundry.transports.smart import token_provider_from_settings
 
@@ -158,6 +159,12 @@ class OAuth2ClientCredentialsProvider:
         scheme = urllib.parse.urlsplit(token_url).scheme.lower()
         if scheme not in ("http", "https"):
             raise HttpAuthError(f"oauth2_token_url must be http or https, got scheme {scheme!r}")
+        refuse_url_credentials(
+            token_url,
+            "oauth2_token_url",
+            use="oauth2_client_id/oauth2_client_secret",
+            error=HttpAuthError,
+        )
         # The client_secret / minted bearer is a credential — the token-endpoint hop must not carry it
         # over cleartext http. Re-keyed (#200, ADR 0092) onto the SAME posture-keyed authority the
         # REST/SOAP/FHIR delivery cells consume (``refuse_cleartext_credential_hop``) so a production-PHI

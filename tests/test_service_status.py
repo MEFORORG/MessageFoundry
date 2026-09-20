@@ -81,6 +81,76 @@ def test_parse_service_state() -> None:
     assert service_status.parse_service_state("STATE : 1  STOPPED") == "stopped"
     assert service_status.parse_service_state("STATE : 3  STOP_PENDING") == "stopped"
     assert service_status.parse_service_state("garbage") == "unknown"
+    # No numeric code: fall back to the state word.
+    assert service_status.parse_service_state("STATE : RUNNING") == "running"
+    # A tab-indented field is still the field.
+    assert service_status.parse_service_state("\tSTATE\t: 4\tRUNNING") == "running"
+    # A code the SCM defines but this module does not report stays unknown.
+    assert service_status.parse_service_state("STATE : 7  PAUSED") == "unknown"
+    assert service_status.parse_service_state("STATE : 2  START_PENDING") == "unknown"
+
+
+# Verbatim `sc query` blocks, which is the shape the parser is actually handed.
+#
+# Only ONE of these three discriminates against the whole-output substring search BACKLOG #1556
+# removed, and it is named for that: the old body tested RUNNING before STOP, so a running service
+# came out right despite its STOPPABLE / ACCEPTS_SHUTDOWN flags line, and a stopped service whose
+# NAME carries the letters "running" came out wrong. The other two are positive controls -- they
+# pin the shapes the parser must keep reading correctly, and they passed before the fix too.
+_STOPPED_BUT_OLD_PARSER_SAID_RUNNING = """SERVICE_NAME: AcmeRunningSync
+DISPLAY_NAME: Acme Running Sync
+        TYPE               : 10  WIN32_OWN_PROCESS
+        STATE              : 1  STOPPED
+        WIN32_EXIT_CODE    : 1077  (0x435)
+"""
+
+_RUNNING = """SERVICE_NAME: MessageFoundry
+DISPLAY_NAME: MessageFoundry Engine
+        TYPE               : 10  WIN32_OWN_PROCESS
+        STATE              : 4  RUNNING
+                                (STOPPABLE, PAUSABLE, ACCEPTS_SHUTDOWN)
+        WIN32_EXIT_CODE    : 0  (0x0)
+"""
+
+# `sc queryex` adds fields after STATE; the parser must not depend on STATE being last.
+_RUNNING_QUERYEX = """SERVICE_NAME: MessageFoundry
+        TYPE               : 10  WIN32_OWN_PROCESS
+        STATE              : 4  RUNNING
+                                (STOPPABLE, PAUSABLE, ACCEPTS_SHUTDOWN)
+        WIN32_EXIT_CODE    : 0  (0x0)
+        SERVICE_EXIT_CODE  : 0  (0x0)
+        CHECKPOINT         : 0x0
+        WAIT_HINT          : 0x0
+        PID                : 4812
+        FLAGS              :
+"""
+
+
+def test_parse_service_state_reads_the_state_field_not_the_whole_output() -> None:
+    """BACKLOG #1556: the verdict comes from the STATE field, not from a word anywhere.
+
+    The one arm the fix changes. The service is STOPPED and its own name contains the letters
+    `running`, which is exactly what the removed substring search read."""
+    assert service_status.parse_service_state(_STOPPED_BUT_OLD_PARSER_SAID_RUNNING) == "stopped"
+    # The block really does carry the wrong word ahead of the STATE field -- otherwise this test
+    # would pass against the parser it was written to reject.
+    head = _STOPPED_BUT_OLD_PARSER_SAID_RUNNING.upper().split("STATE")[0]
+    assert "RUNNING" in head
+
+
+def test_parse_service_state_on_real_running_output() -> None:
+    """Positive controls: the shapes `sc query` and `sc queryex` print for a running service."""
+    assert service_status.parse_service_state(_RUNNING) == "running"
+    assert service_status.parse_service_state(_RUNNING_QUERYEX) == "running"
+    # The flags line sits between STATE and the rest, and `queryex` keeps going past it.
+    assert "STOPPABLE" in _RUNNING
+    assert "PID" in _RUNNING_QUERYEX
+
+
+def test_parse_service_state_ignores_a_state_word_outside_the_state_field() -> None:
+    """No STATE field means no verdict, however many state words the output carries."""
+    assert service_status.parse_service_state("SERVICE_NAME: RunningStoppedSvc") == "unknown"
+    assert service_status.parse_service_state("DISPLAY_NAME: Is It Running") == "unknown"
 
 
 async def test_query_unsafe_or_empty_name_is_unavailable() -> None:
