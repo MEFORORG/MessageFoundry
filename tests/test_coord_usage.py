@@ -20,6 +20,25 @@ lies converts "I should check" into "I already know":
 
 Driven as real subprocesses against fixtures, because these are PowerShell scripts and a Python
 re-implementation of their rules would only assert that the re-implementation agrees with itself.
+
+THE ``pwsh`` LAUNCHES HERE GO THROUGH ``run_single`` (BACKLOG #1304), at 21 call sites. A launch out
+of this file starved past its 60-second ceiling on the ``windows-2025`` harness leg while
+``test_session_mail.py`` held 16 concurrent ``pwsh`` on a 4-vCPU runner; the evidence, and the rule
+for what may take the lock, live in ``tests/_spawn_lock.py``. Read that module before adding a launch
+here.
+
+AT LEAST ONE ``pwsh`` LAUNCH IN THIS FILE IS STILL UNLOCKED, and it is named rather than counted
+because an enumeration here would be the liability CLAUDE.md section 11 warns about (SDS-3.6). The
+two ``bash`` sites are excluded by ``_LOCKED_INTERPRETERS``, which matches on the binary being
+launched -- and one of them, ``test_bash_runs_the_wired_command_end_to_end_and_it_publishes``, runs
+the wired statusLine command, whose whole job is to invoke ``pwsh``. So that is a real ``pwsh``
+launch on a 60-second ceiling sitting outside the lock. It is left alone: wrapping it means calling
+``single_spawn`` directly around a ``bash`` invocation, which is a behaviour change to a test that
+has produced no #1304 evidence, and the module's rule is not to wrap on a hunch.
+
+``tests/test_spawn_lock.py`` gates the 21 direct sites against a 22nd being added unwrapped. That
+gate exists because this paragraph is a convention, and ``run_single``'s own docstring says a
+convention in a docstring does not hold a line.
 """
 
 from __future__ import annotations
@@ -35,6 +54,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+
+from tests._spawn_lock import run_single
 
 ROOT = Path(__file__).resolve().parents[1]
 COLLECT = ROOT / "scripts" / "coord" / "usage-collect.ps1"
@@ -62,7 +83,7 @@ def collect(state: Path, payload: dict[str, Any] | str) -> str:
     one explicitly.
     """
     raw = payload if isinstance(payload, str) else json.dumps(payload)
-    proc = subprocess.run(
+    proc = run_single(
         ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(COLLECT), "-StateDir", str(state)],
         input=raw,
         capture_output=True,
@@ -77,7 +98,7 @@ def collect(state: Path, payload: dict[str, Any] | str) -> str:
 
 
 def read(state: Path, *extra: str) -> tuple[int, dict[str, Any]]:
-    proc = subprocess.run(
+    proc = run_single(
         [
             "pwsh",
             "-NoProfile",
@@ -422,7 +443,7 @@ def test_the_installer_refuses_to_replace_someone_elses_statusline(tmp_path: Pat
     settings.write_text(
         json.dumps({"statusLine": {"type": "command", "command": "my-own-thing"}}), encoding="utf-8"
     )
-    proc = subprocess.run(
+    proc = run_single(
         [
             "pwsh",
             "-NoProfile",
@@ -614,7 +635,7 @@ def test_the_installed_command_actually_runs_the_collector(tmp_path: Path) -> No
     """
     settings = tmp_path / "settings.json"
     settings.write_text("{}", encoding="utf-8")
-    subprocess.run(
+    run_single(
         [
             "pwsh",
             "-NoProfile",
@@ -642,7 +663,7 @@ def test_the_installed_command_actually_runs_the_collector(tmp_path: Path) -> No
     )
 
     payload = json.dumps({"session_id": "wired", "rate_limits": {"five_hour": window(55.0, 3600)}})
-    proc = subprocess.run(
+    proc = run_single(
         ["pwsh", "-NoProfile", "-NonInteractive", "-Command", cmd],
         input=payload,
         capture_output=True,
@@ -699,7 +720,7 @@ def install(
     if collector is not None:
         cmd += ["-CollectorPath", str(collector)]
     cmd += list(args)
-    return subprocess.run(
+    return run_single(
         cmd, capture_output=True, text=True, timeout=TIMEOUT, check=False, env=_env(pin)
     )
 
@@ -714,7 +735,7 @@ def reader(
     if home is not None:
         cmd += ["-HomeDir", str(home)]
     cmd += list(args)
-    proc = subprocess.run(
+    proc = run_single(
         cmd, capture_output=True, text=True, timeout=TIMEOUT, check=False, env=_env(pin)
     )
     out = proc.stdout.strip()
@@ -809,7 +830,7 @@ def test_the_no_pin_arm_really_runs_without_a_pin_and_inside_the_fixture_home() 
     itself could not be redirected — and ``-AllRoots`` would enumerate and WIRE the owner's live
     account roots.
     """
-    probe = subprocess.run(
+    probe = run_single(
         [
             "pwsh",
             "-NoProfile",
@@ -1168,46 +1189,102 @@ def test_the_reader_defaults_to_its_own_config_roots_state_dir(fake_home: Path) 
     assert doc["five_hour"]["used_percentage"] == pytest.approx(12.0)
 
 
-def test_the_no_data_error_diagnoses_which_state_this_root_is_in(fake_home: Path) -> None:
-    """Requirement 4. Five states with five different fixes must not share one message.
+# ---------------------------------------------------------------- requirement 4: the five diagnoses
+#
+# Requirement 4. Five states with five different fixes must not share one message. The old message
+# said "not installed or has not run yet" and printed the bare installer command with NO root -- so
+# following the reader's own advice re-ran the exact invocation that produced the false INSTALLED
+# claim.
+#
+# ONE TEST PER STATE, AND THE SPLIT IS THE #1304 FIX RATHER THAN TIDYING. These five arms were one
+# test driving EIGHT sequential pwsh launches, and on the windows-2025 harness leg that test measured
+# 90.88s GREEN (run 35472705438) against the step's 120s per-test `--timeout` -- a 1.3x margin on a
+# tier where a launch's cost is set by whatever else holds the runner's 4 vCPU. The evidence for what
+# starved, and why a first-launch cold start is refuted, is in `tests/_spawn_lock.py`; it is not
+# restated here.
+#
+# Charging eight launches to one 120s budget is what made this test the worst case in the file:
+# `run_single` waits a storm out BEFORE launching, and the wait is charged to the same per-test clock.
+# Split, the widest arm holds three launches instead of eight. THAT BUYS MARGIN, IT DOES NOT BUY
+# SAFETY, and the difference is worth stating because the arithmetic does not close: `_SINGLE_WAIT_S`
+# is 90s, so any arm can in principle be pushed past 120s by a long enough storm, and three other
+# tests in this file hold four or five launches and were not re-timed for this change. What the split
+# removes is the test that could not fit under ANY wait; the residual is bounded by the same
+# fail-open the lock has everywhere else, and it is recorded beside `_SINGLE_WAIT_S` rather than
+# argued away here.
+#
+# The arms are independent by construction: each writes the whole settings.json state it reads, onto
+# its own `fake_home`. That also retires arm (d)'s sequencing hazard -- it used to have to reset the
+# fixture before arm (e) because a rewrite of an unparseable file would silently disable every
+# setting in it, and there is no shared fixture left to corrupt.
+#
+# THE (a)-(e) LETTERS IN THE DOCSTRINGS BELOW ARE THE MERGED TEST'S, KEPT ON PURPOSE. They index this
+# paragraph and the blame trail, not a list that still exists in the code, so a reader landing on one
+# arm from `git log -S` can place it in the original sequence. They are the only thing that survives
+# the split as a handle on the old test.
+#
+# NOTHING GATES THE FIVE STATES BEING DISTINCT FROM EACH OTHER, and that is deliberate after one
+# attempt at it was withdrawn. A tuple of the five names plus `len(set(...)) == len(...)` is true by
+# construction and stays true however the arms are edited, so it reported nothing while reading like a
+# control -- the false-premise shape CLAUDE.md section 11 forbids (SDS-3.7). Distinctness is held, as
+# it always was, by five exact-match assertions a reviewer can see. A real gate would have to drive
+# the arms off one table, and these arms are too different in shape for that to be an improvement.
 
-    The old message said "not installed or has not run yet" and printed the bare installer command
-    with NO root — so following the reader's own advice re-ran the exact invocation that produced the
-    false INSTALLED claim.
-    """
+#: Requirement 4's five states, named once so one rename cannot leave two spellings behind. NOT every
+#: state the reader can emit -- ``WIRED_ELSEWHERE`` and ``NO_SUCH_ROOT`` are requirement 4's
+#: neighbours and are pinned by their own tests further down, still as literals.
+NOT_WIRED_NO_SETTINGS = "NOT_WIRED_NO_SETTINGS"
+NOT_WIRED_NO_STATUSLINE = "NOT_WIRED_NO_STATUSLINE"
+FOREIGN_STATUSLINE = "FOREIGN_STATUSLINE"
+SETTINGS_UNREADABLE = "SETTINGS_UNREADABLE"
+WIRED_HERE = "WIRED_HERE"
+
+
+def test_a_root_with_no_settings_file_is_diagnosed_as_not_wired(fake_home: Path) -> None:
+    """(a) No settings.json at all. The verdict is UNKNOWN and the root is named."""
     pin = fake_home / ".claude-account-1"
-
-    # (a) no settings.json at all
-    code, doc, out = reader("-Json", pin=pin, home=fake_home)
+    code, doc, _ = reader("-Json", pin=pin, home=fake_home)
     assert code == UNKNOWN
-    assert doc["statusline_state"] == "NOT_WIRED_NO_SETTINGS"
+    assert doc["statusline_state"] == NOT_WIRED_NO_SETTINGS
     assert doc["config_root"].lower() == str(pin).lower()
 
-    # (b) settings.json with no statusLine
+
+def test_a_settings_file_with_no_statusline_is_diagnosed_separately(fake_home: Path) -> None:
+    """(b) The file exists and carries no statusLine, which is a different fix from having no file."""
+    pin = fake_home / ".claude-account-1"
     (pin / "settings.json").write_text("{}", encoding="utf-8")
     _, doc, _ = reader("-Json", pin=pin, home=fake_home)
-    assert doc["statusline_state"] == "NOT_WIRED_NO_STATUSLINE"
+    assert doc["statusline_state"] == NOT_WIRED_NO_STATUSLINE
 
-    # (c) somebody else's statusLine
+
+def test_somebody_elses_statusline_is_not_reported_as_ours(fake_home: Path) -> None:
+    """(c) A foreign statusLine. Installing over it is a decision, not a repair, so it gets its own
+    state rather than being folded into "not wired"."""
+    pin = fake_home / ".claude-account-1"
     (pin / "settings.json").write_text(
         json.dumps({"statusLine": {"type": "command", "command": "theirs"}}), encoding="utf-8"
     )
-    _, doc, out = reader("-Json", pin=pin, home=fake_home)
-    assert doc["statusline_state"] == "FOREIGN_STATUSLINE"
+    _, doc, _ = reader("-Json", pin=pin, home=fake_home)
+    assert doc["statusline_state"] == FOREIGN_STATUSLINE
 
-    # (d) unreadable. The installer REFUSES this root (exit 1) rather than rewriting a file it could
-    # not parse, which is why the fixture is reset before arm (e): a bad write here would silently
-    # disable every setting in the file, not just this one.
+
+def test_an_unreadable_settings_file_is_named_and_the_installer_refuses_it(fake_home: Path) -> None:
+    """(d) Unreadable. The installer REFUSES this root (exit 1) rather than rewriting a file it could
+    not parse -- a rewrite would silently disable every setting in it, not just this one."""
+    pin = fake_home / ".claude-account-1"
     (pin / "settings.json").write_text("{ not json", encoding="utf-8")
     _, doc, _ = reader("-Json", pin=pin, home=fake_home)
-    assert doc["statusline_state"] == "SETTINGS_UNREADABLE"
+    assert doc["statusline_state"] == SETTINGS_UNREADABLE
     assert install("-ConfigDir", str(pin), pin=None, home=fake_home).returncode == 1
 
-    # (e) ours, and pointing where this reader looks -- so the fix really is "start a new session"
+
+def test_a_correctly_wired_root_is_told_to_start_a_new_session(fake_home: Path) -> None:
+    """(e) Ours, and pointing where this reader looks -- so the fix really is "start a new session"."""
+    pin = fake_home / ".claude-account-1"
     (pin / "settings.json").write_text("{}", encoding="utf-8")
     assert install("-ConfigDir", str(pin), pin=None, home=fake_home).returncode == 0
-    _, doc, out = reader("-Json", pin=pin, home=fake_home)
-    assert doc["statusline_state"] == "WIRED_HERE"
+    _, doc, _ = reader("-Json", pin=pin, home=fake_home)
+    assert doc["statusline_state"] == WIRED_HERE
     _, _, human = reader(pin=pin, home=fake_home)
     assert "Start a NEW session" in human
     # Every remedy must name the root, or it repeats the original defect.
@@ -1365,7 +1442,7 @@ def test_the_collector_publishes_under_its_pinned_root_when_given_no_state_dir(
     """The other end of the shared derivation. A LEGACY wired command passes no ``-StateDir``, so this
     is the path such a root actually takes at run time."""
     pin = fake_home / ".claude-account-2"
-    proc = subprocess.run(
+    proc = run_single(
         [
             "pwsh",
             "-NoProfile",
@@ -1400,7 +1477,7 @@ def test_the_collector_never_manufactures_a_config_root(fake_home: Path) -> None
         ([], ghost),  # resolved from the pin
         (["-StateDir", str(ghost / "mefor-usage")], None),  # named explicitly
     ):
-        proc = subprocess.run(
+        proc = run_single(
             [
                 "pwsh",
                 "-NoProfile",
@@ -1433,7 +1510,7 @@ def test_the_collector_still_publishes_when_the_shared_library_is_missing(
     isolated.mkdir()
     shutil.copy(COLLECT, isolated / "usage-collect.ps1")
     pin = fake_home / ".claude-account-1"
-    proc = subprocess.run(
+    proc = run_single(
         [
             "pwsh",
             "-NoProfile",
@@ -1510,7 +1587,7 @@ def test_config_roots_ps1_keeps_the_contract_three_scripts_depend_on(tmp_path: P
         "resolving home inside the library defeats the -HomeDir seam every test depends on"
     )
     # Loading it must produce no output and no side effects.
-    proc = subprocess.run(
+    proc = run_single(
         [
             "pwsh",
             "-NoProfile",
@@ -1546,7 +1623,7 @@ def test_the_root_list_survives_being_wrapped_in_an_array_at_one_element(
         f"$r = @(Get-LaunchableConfigRoots -HomeDir '{home}'); "
         "Write-Output $r.Count; Write-Output $r[0].GetType().Name"
     )
-    proc = subprocess.run(
+    proc = run_single(
         ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
         capture_output=True,
         text=True,
@@ -1568,7 +1645,7 @@ def test_install_then_the_wired_command_then_the_reader_all_agree(fake_home: Pat
     assert install(pin=pin, home=fake_home).returncode == 0
 
     cmd = wired(pin / "settings.json")
-    proc = subprocess.run(
+    proc = run_single(
         ["pwsh", "-NoProfile", "-NonInteractive", "-Command", cmd],
         # BOTH windows, deliberately: with only five_hour the seven_day window is legitimately
         # "never published", the overall verdict is UNKNOWN, and this test would be asserting the
@@ -1645,7 +1722,7 @@ def test_the_shared_predicate_matches_the_one_install_gate_and_its_python_twin_u
             'Write-Output "$n $mine $gate $coord" }',
         ]
     )
-    proc = subprocess.run(
+    proc = run_single(
         ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
         capture_output=True,
         text=True,
@@ -1688,7 +1765,7 @@ def test_the_one_place_the_copies_disagree_is_named_rather_than_discovered() -> 
         "Write-Output $script:ClaudeAccountRootName.IsMatch($n); "
         "Write-Output ($n -match '^\\.claude$|^\\.claude-account-\\d+$')"
     )
-    proc = subprocess.run(
+    proc = run_single(
         ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
         capture_output=True,
         text=True,
@@ -1745,7 +1822,7 @@ def test_a_window_carried_from_another_root_is_refused_even_when_the_document_is
     state = b / "mefor-usage"  # A publishes into B's directory
 
     def run(pin: Path, payload: dict[str, Any]) -> None:
-        proc = subprocess.run(
+        proc = run_single(
             [
                 "pwsh",
                 "-NoProfile",
@@ -1969,7 +2046,7 @@ def test_a_correctly_wired_root_that_stopped_publishing_still_warns(fake_home: P
     assert "cannot tell them apart" in human
     # And the properties the staleness guard already provided must survive alongside it.
     _, parsed, _ = reader("-Json", pin=pin, home=fake_home)
-    assert parsed["statusline_state"] == "WIRED_HERE"
+    assert parsed["statusline_state"] == WIRED_HERE
     assert parsed["five_hour"]["used_percentage"] == pytest.approx(64.0), (
         "the number must still show"
     )
@@ -2016,7 +2093,7 @@ def test_the_survey_refuses_a_window_carried_from_another_root(fake_home: Path) 
     state = b / "mefor-usage"
 
     def fire(pin: Path, payload: dict[str, Any]) -> None:
-        proc = subprocess.run(
+        proc = run_single(
             [
                 "pwsh",
                 "-NoProfile",
@@ -2048,7 +2125,7 @@ def test_the_survey_refuses_a_window_carried_from_another_root(fake_home: Path) 
     fire(b, {"session_id": "B"})
     # And A gets a healthy publish of its own, so the survey renders at all.
     (a / "mefor-usage").mkdir(exist_ok=True)
-    proc = subprocess.run(
+    proc = run_single(
         [
             "pwsh",
             "-NoProfile",
@@ -2204,7 +2281,7 @@ def avail(*args: str, home: Path | None = None) -> subprocess.CompletedProcess[s
     if home is not None:
         cmd += ["-HomeDir", str(home)]
     cmd += list(args)
-    return subprocess.run(
+    return run_single(
         cmd, capture_output=True, text=True, timeout=TIMEOUT, check=False, env=_env(None)
     )
 
@@ -2323,7 +2400,7 @@ def test_a_marker_timestamp_is_reported_in_iso_utc_not_the_boxs_local_format(
     out = avail("-Mark", "-ConfigDir", str(root), "-Reason", "cancelled")
     assert out.returncode == 0, out.stdout
 
-    proc = subprocess.run(
+    proc = run_single(
         [
             "pwsh",
             "-NoProfile",

@@ -373,13 +373,31 @@ def test_classify_self_smoke() -> None:
         # from MAINHOSP, so a Router keyed on another feed declines it legitimately.
         assert "--inbound" in r.detail, bad
 
+    # NOT_DEPLOYED has its own arm now (BACKLOG #1714, packet 14 P14-09). It used to reach the
+    # fail-closed arm below, which got the VERDICT right and left the operator no next step -- and
+    # `disposition_for` returns it for real, for a routed run whose every Send addressed a
+    # present-but-not-deployed destination (BACKLOG #1690).
+    nd = smoke._classify_self_smoke(MessageStatus.NOT_DEPLOYED, "SUMMARY")
+    assert nd.status is Status.FAIL
+    assert nd.detail.startswith("SUMMARY ")
+    # A remedy, and specifically NOT the unrouted/filtered one: the Router and the Handler both did
+    # their job, so re-pointing `--inbound` would send the operator after a feed that was fine.
+    assert "--inbound" not in nd.detail
+    # Both spellings are chosen to DISCRIMINATE. A bare `"deploy" in detail.lower()` would not:
+    # the fail-closed arm this replaced said "NOT_DEPLOYED is not a delivering outcome", which
+    # contains the word and none of the advice.
+    assert "deploy the outbound" in nd.detail
+    assert "present-but-not-deployed" in nd.detail
+
+    # FILTERED must no longer claim the outcome above as one of its own meanings -- naming it in
+    # both places is what made a decline indistinguishable from an author's filter.
+    filtered = smoke._classify_self_smoke(MessageStatus.FILTERED, "SUMMARY")
+    assert "present-but-not-deployed" not in filtered.detail
+
     # FAIL CLOSED. Each of these must fail NAMING itself rather than fall through to the PASS arm --
-    # that fall-through is the defect, so the fix must not leave a door in. NOT_DEPLOYED is no longer
-    # hypothetical: `disposition_for` started returning it for a routed run whose every Send addressed
-    # a present-but-not-deployed destination (BACKLOG #1690), and this arm is what already handled it
-    # correctly -- no delivery, so no PASS, and no "--inbound" remedy that flag could act on. Splitting
-    # it out with a reason of its own is packet 14's P14-09, a separate item.
-    for unknown in (MessageStatus.ERROR, MessageStatus.NOT_DEPLOYED, MessageStatus.ROUTED):
+    # that fall-through is the defect, so the fix must not leave a door in. These are the members
+    # `disposition_for` does not return, so this arm has no usable remedy to offer and gives none.
+    for unknown in (MessageStatus.ERROR, MessageStatus.ROUTED):
         r = smoke._classify_self_smoke(unknown, "SUMMARY")
         assert r.status is Status.FAIL, unknown
         assert unknown.value.upper() in r.detail, unknown

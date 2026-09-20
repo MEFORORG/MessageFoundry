@@ -19,8 +19,9 @@
     *Consequences* section requires. The relay is the `_StderrRelay` class in the same module: it
     carries the inbound name, the child pid and a per-session generation counter, and neutralises
     control bytes through `scrub_control_chars` imported from
-    [`logging_setup.py`](../../messagefoundry/logging_setup.py) -- the one definition, called rather
-    than reimplemented beside it. `SandboxSession.__init__` takes `inbound` as a **required
+    [`controlchars.py`](../../messagefoundry/controlchars.py) -- the one definition, called rather
+    than reimplemented beside it. (It was defined in `logging_setup.py` when this ADR was written
+    and moved to `controlchars.py` on BACKLOG #1591, so the log write guard could reach it too.) `SandboxSession.__init__` takes `inbound` as a **required
     keyword-only** parameter with no default, plumbed from `RegistryRunner._sandbox_for` in
     [`pipeline/wiring_runner.py`](../../messagefoundry/pipeline/wiring_runner.py), which is the widened
     diff *Consequences* accepted.
@@ -94,7 +95,7 @@ frame reader at [`sandbox.py`](../../messagefoundry/pipeline/sandbox.py) (`_read
 relayed line is attributed to the inbound, the child pid and a per-session **worker generation**
 counter — a pid alone is not a unique identity, because an OS recycles pids and a stale generation's
 relay can still be draining a killed child while the live one runs. Control bytes are neutralised by
-`logging_setup.scrub_control_chars`, the **one** definition `ControlCharScrubFilter` already applies to
+`controlchars.scrub_control_chars`, the **one** definition `ControlCharScrubFilter` already applies to
 every record, called here at the point a byte stream is assembled into a record rather than
 reimplemented beside it. Lines are rate-limited, with the suppression count reported rather than
 silently dropped.

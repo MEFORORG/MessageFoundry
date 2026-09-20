@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import Any
@@ -22,7 +23,7 @@ from messagefoundry.api.approvals import ApprovalGate
 from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
-from messagefoundry.config.models import ConnectorType
+from messagefoundry.config.models import ConnectorType, RetryPolicy
 from messagefoundry.config.settings import ApprovalsSettings, AuthSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
@@ -275,6 +276,103 @@ async def test_purge_dual_control_skips_running_outbound(engine: Engine, tmp_pat
 def test_settings_validator_rejects_unknown_operation() -> None:
     with pytest.raises(ValueError, match="unknown operation"):
         ApprovalsSettings(operations=["not_a_real_op"])
+
+
+# --- BACKLOG #1646: the released replay writes its own dead_letter_replay row ------------------
+#
+# approval.approved attributes both identities and the count, but the executor wrote NO
+# `dead_letter_replay` row -- so an auditor filtering on the ACTION NAME saw only the ungated
+# replays, where _record_reload_audit was given exactly that parity for config_reload. The queries
+# below filter on the action name deliberately: that IS the auditor's query this row is about.
+
+
+async def _dead_letter(engine: Engine) -> None:
+    """Seed one message and fail its only delivery, so a replay has something to re-queue.
+
+    LOAD-BEARING. `_request_replay` on its own posts against an engine holding no dead letters, so
+    `requeued` is 0, the guarded audit write never runs, and an assertion on top of it would pass
+    whether or not the executor writes the row."""
+    await engine.store.enqueue_message(
+        channel_id="ch1", raw=ADT, deliveries=[("archive", ADT)], source_type="file"
+    )
+    item = (await engine.store.claim_ready())[0]
+    await engine.store.mark_failed(item.id, "boom", RetryPolicy(max_attempts=1))
+
+
+async def _release_a_replay(engine: Engine) -> httpx.Response:
+    """Provision a requester and a DISTINCT approver, hold a replay, and return the release."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await _add(service, "approver", Role.ADMINISTRATOR)
+    async with _client(engine, service, ON) as c:
+        approval_id = (await _request_replay(c, await _token(c, "op"))).json()["approval_id"]
+        admin = await _token(c, "approver")
+        return await c.post(f"/approvals/{approval_id}/approve", headers=admin)
+
+
+async def test_released_replay_is_audited_under_its_own_action_name(engine: Engine) -> None:
+    await _dead_letter(engine)
+    ok = await _release_a_replay(engine)
+    assert ok.status_code == 200
+    # POSITIVE CONTROL: something was actually re-queued, so the guarded write really did run.
+    assert ok.json()["result"] == {"requeued": 1}
+
+    rows = await engine.store.list_audit(action="dead_letter_replay")
+    assert len(rows) == 1
+    row = rows[0]
+    # The REQUESTER owns the action -- matching the inline row. The approver's half of the ceremony
+    # is on approval.approved, which is where the second identity belongs.
+    assert str(row["actor"]) == "op"
+    assert json.loads(str(row["detail"])) == {"destination_name": None, "requeued": 1}
+    # ADR 0150: `client` is the address of the ACTOR NAMED IN THE ROW. That actor is the requester,
+    # while the request in flight belongs to the approver, so no address is in scope here.
+    assert row["client"] is None
+
+
+async def test_released_replay_that_requeues_nothing_writes_no_row(engine: Engine) -> None:
+    """The write is GUARDED on requeued, matching the inline route: this action name means PHI was
+    actually re-transmitted (review M-4). The zero-effect release is not thereby lost --
+    approval.approved carries the executor's own {"requeued": 0} result."""
+    ok = await _release_a_replay(engine)  # no dead letters seeded
+    assert ok.status_code == 200 and ok.json()["result"] == {"requeued": 0}
+
+    assert await engine.store.list_audit(action="dead_letter_replay") == []
+    approved = (await engine.store.list_audit(action="approval.approved"))[0]
+    assert json.loads(str(approved["detail"]))["result"] == {"requeued": 0}
+
+
+async def test_a_pending_replay_with_no_captured_requester_still_releases(engine: Engine) -> None:
+    """A request persisted BEFORE the guard began capturing `requester` carries no such key. Reading
+    it with ``p["requester"]`` would raise KeyError inside the executor, and ApprovalGate.approve
+    would compensate that into a 'failed' row (ASVS 2.3.3) -- recording an operation that ran, and
+    re-queued PHI, as one that did not. The row is written with a NULL actor instead: no literal is
+    safe (a username could be "unknown"), and the requester is still named on approval.approved."""
+    await _dead_letter(engine)
+    service = await _service(engine)
+    await _add(service, "approver", Role.ADMINISTRATOR)
+    await engine.store.create_pending_approval(
+        approval_id="cafebabecafebabecafebabecafebabe",
+        operation="dead_letter_replay",
+        params="{}",  # the pre-#1646 shape: scope keys absent, and no requester
+        requester="op",
+        requester_user_id="op-id",
+        requested_at=time.time(),
+        expires_at=None,
+    )
+    async with _client(engine, service, ON) as c:
+        ok = await c.post(
+            "/approvals/cafebabecafebabecafebabecafebabe/approve",
+            headers=await _token(c, "approver"),
+        )
+        assert ok.status_code == 200  # NOT a 500 from a KeyError the gate compensated
+        assert ok.json()["result"] == {"requeued": 1}
+
+    rows = await engine.store.list_audit(action="dead_letter_replay")
+    assert len(rows) == 1 and rows[0]["actor"] is None
+    approved = (await engine.store.list_audit(action="approval.approved"))[0]
+    assert json.loads(str(approved["detail"]))["requester"] == "op"
+    # The row the gate writes on a compensated failure must be absent: the operation did run.
+    assert await engine.store.list_audit(action="approval.failed") == []
 
 
 # --- ASVS 2.3.3: the released-but-unexecuted compensating transition ---------------------------

@@ -39,7 +39,9 @@ class TrayState(Enum):
     RUNNING_UNMANAGED = "running_unmanaged"  # a dev `serve` on the port, not the NSSM service
     STOPPING = "stopping"
     WEDGED = "wedged"  # service RUNNING but /health dead past the boot grace
-    FOREIGN = "foreign"  # the port answers, but not with a MessageFoundry /health body
+    # The port answers, but not with a MessageFoundry /health body. Inherits the best-effort
+    # caveat on HealthProbe.FOREIGN, which is where that is stated.
+    FOREIGN = "foreign"
     UNKNOWN = "unknown"  # SCM could not be queried and the API is not clearly up
 
 
@@ -57,9 +59,28 @@ class ScmState(Enum):
 
 
 class HealthProbe(Enum):
-    """Outcome of the tokenless ``GET /health`` probe — liveness only, never a body field."""
+    """Outcome of the tokenless ``GET /health`` probe — liveness only. The body's KEY NAMES are read
+    to tell our engine from another server; no body VALUE is ever read, so the ADR 0113 §2
+    not-a-console boundary holds.
 
-    OK = "ok"  # 200 with a MessageFoundry Health shape ({"status": "ok", ...})
+    **FOREIGN is BEST-EFFORT, and nothing downstream may treat it as proof (BACKLOG #1715).**
+    ``probe.classify_health`` separates OK from FOREIGN by the key set of a ``/health`` body; see
+    ``probe.ENGINE_HEALTH_KEYS`` for why that set, and for what the pin on it does not cover. It is
+    a shape test, so it errs in both directions: another server answering 200 with those key names
+    reads :data:`OK`, and a real engine whose ``/health`` key set has moved -- an older tray probing
+    a newer engine, or a proxy rewriting the body -- reads :data:`FOREIGN`.
+
+    The cost of a wrong verdict is bounded but NOT only cosmetic. :data:`TrayState.FOREIGN` greys
+    out Start, Stop and Restart (``menu.build_menu`` renders them disabled, not absent), so a real
+    engine misread as FOREIGN loses its service actions, not just its icon. That lands on a LOCAL
+    engine too: ``monitor_only`` keys on the URL's locality ALONE, so a loopback engine installed
+    from a different wheel than the tray stays controllable right up until its key set disagrees.
+
+    What this verdict is NOT: authentication, authorization and TLS verification belong to the
+    engine and to the probe client, and none of them rests on it. Do not build a control on it.
+    """
+
+    OK = "ok"  # 200 carrying the engine's tokenless /health key set (probe.ENGINE_HEALTH_KEYS)
     FOREIGN = "foreign"  # answered, but the body is not a MessageFoundry /health payload
     DOWN = "down"  # no answer at all (connection refused / timeout)
 
