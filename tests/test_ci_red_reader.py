@@ -509,6 +509,94 @@ def test_the_truncation_caveat_quotes_the_number_the_fetch_actually_asks_for(
     assert seen and f"per_page={mod.RUNS_PAGE}" in seen[0][-1]
 
 
+# --- the reader must actually be RUN (BACKLOG #1385 residual 3) --------------
+#
+# This script landed 2026-09-04 with every test above beside it and NO WORKFLOW RAN IT. Verified
+# 2026-09-16: `git grep -l report_ci_red origin/main -- .github` returned nothing, while
+# `failure-signal.yml` wrote the label and no workflow triggered on it. Every test above passed the
+# whole time, because they test the RULE and nothing tested the DELIVERY. That gap is the same defect
+# class the script exists to close, one level up -- so it gets its own test rather than a comment.
+
+
+def _callers() -> set[str]:
+    """Workflow files with a `run:` body that EXECUTES this script.
+
+    RUN BODIES, NOT FILE TEXT, and that distinction was measured rather than reasoned. The first
+    draft of this helper grepped the whole file, and the mutation that deletes the invocation left it
+    GREEN -- `ci-red-report.yml`'s own header names the script five times, so prose about running it
+    satisfied a grep for running it. Which is this item in miniature: twelve days of comments saying
+    this reader existed, and nothing calling it.
+    """
+    from tests._workflow_contexts import WORKFLOWS, load_workflow
+
+    found: set[str] = set()
+    for path in sorted(WORKFLOWS.glob("*.yml")):
+        jobs = load_workflow(path.name).get("jobs")
+        if not isinstance(jobs, dict):
+            continue
+        for job in jobs.values():
+            steps = job.get("steps") if isinstance(job, dict) else None
+            for step in steps if isinstance(steps, list) else []:
+                if isinstance(step, dict) and "report_ci_red.py" in str(step.get("run") or ""):
+                    found.add(path.name)
+    return found
+
+
+def test_a_workflow_actually_runs_this_script() -> None:
+    """A signal nobody reads is not a signal, and neither is a reader nobody runs."""
+    assert _callers(), (
+        "no workflow in .github/workflows RUNS scripts/ci/report_ci_red.py. The ci-red label is then "
+        "written by failure-signal.yml and read by nothing, which is BACKLOG #1385's residual 3 and "
+        "the state this script shipped in for twelve days. A workflow that only MENTIONS the script "
+        "in a comment does not satisfy this -- that is the shape being ruled out."
+    )
+
+
+def test_the_workflow_that_runs_it_holds_no_required_context() -> None:
+    """ADVISORY ONLY, asserted rather than trusted to a comment.
+
+    A required status check that cannot report wedges every pull request in the repository -- the
+    required-but-absent trap `.github/required-contexts.txt` and docs/CI.md both name. This reader
+    queries the live API and would be the easiest possible thing to wedge on, and gating merges on a
+    report ABOUT other merges is circular besides.
+    """
+    from tests._workflow_contexts import required_contexts, resolve
+
+    callers = _callers()
+    assert callers, "nothing runs the reader, so this test is vacuous -- fix that test first"
+
+    contexts = required_contexts()
+    assert contexts, "required-contexts.txt yielded nothing, so this check would pass vacuously"
+    offenders = {
+        context: where[0]
+        for context in contexts
+        if (where := resolve(context)) is not None and where[0] in callers
+    }
+    assert offenders == {}, (
+        f"the ci-red reader is a REQUIRED status context via {offenders}. It queries the live Actions "
+        "API; the day that query fails, every pull request in the repository is wedged behind a check "
+        "that cannot report. Keep it advisory."
+    )
+
+
+def test_warn_only_still_fails_closed_on_a_query_it_could_not_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--warn-only` downgrades a FINDING, never a failure to measure.
+
+    LOAD-BEARING FOR THE WIRING, which is why it is asserted separately from
+    `test_warn_only_downgrades_the_finding_but_still_reports_it` above. The scheduled job passes
+    `--warn-only` on a measurement: 22 of 41 open pull requests carried `ci-red` on 2026-09-16 and
+    nothing removes the label, so exiting 1 on a finding would red that job every day forever. That
+    only stays honest while the flag means "a finding is not a failure" and NOT "always exit 0" -- if
+    it ever swallowed exit 2, the cron would report a clean repository on a query that never ran.
+    """
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json", encoding="utf-8")
+    assert mod.main(["--prs-json", str(bad), "--warn-only"]) == 2
+    assert "Treating as a FAILURE" in capsys.readouterr().out
+
+
 def test_supplying_saved_runs_never_reaches_the_network(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

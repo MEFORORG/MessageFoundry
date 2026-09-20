@@ -1052,8 +1052,17 @@ def test_block_mode_through_run_checks(tmp_path: Path) -> None:
         '    return Send("OB", msg)\n',
         encoding="utf-8",
     )
-    assert run_checks(tmp_path, run_lint=False).ok is True  # advisory never blocks the gate
-    assert run_checks(tmp_path, run_lint=False, strict_handler_security=True).ok is False
+    # allow_empty_config: the fixture is a handler with no connections, and the gate refuses an empty
+    # graph (BACKLOG #1648). This test is about the handler-security lint, so drop that one rule
+    # rather than wire a connection the lint never reads — otherwise `.ok is False` below would pass
+    # for the wrong reason.
+    assert run_checks(tmp_path, run_lint=False, allow_empty_config=True).ok is True  # advisory
+    assert (
+        run_checks(
+            tmp_path, run_lint=False, strict_handler_security=True, allow_empty_config=True
+        ).ok
+        is False
+    )
 
 
 def test_cli_strict_handler_security_exit_code(tmp_path: Path) -> None:
@@ -1068,7 +1077,17 @@ def test_cli_strict_handler_security_exit_code(tmp_path: Path) -> None:
         '    return Send("OB", msg)\n',
         encoding="utf-8",
     )
-    base = [sys.executable, "-m", "messagefoundry", "check", "--config", str(tmp_path), "--no-lint"]
+    # --allow-empty-config: handler-only fixture, no connections (see the sibling run_checks test).
+    base = [
+        sys.executable,
+        "-m",
+        "messagefoundry",
+        "check",
+        "--config",
+        str(tmp_path),
+        "--no-lint",
+        "--allow-empty-config",
+    ]
     advisory = subprocess.run(base, capture_output=True, text=True)
     strict = subprocess.run([*base, "--strict-handler-security"], capture_output=True, text=True)
     assert advisory.returncode == 0, advisory.stdout + advisory.stderr
@@ -1096,13 +1115,19 @@ def test_allow_threads_through_run_checks(tmp_path: Path) -> None:
     from messagefoundry.checks import run_checks
 
     (tmp_path / "feed.py").write_text(_PANDAS_BODY_IMPORT, encoding="utf-8")
-    assert run_checks(tmp_path, run_lint=False, strict_handler_security=True).ok is False
+    assert (
+        run_checks(
+            tmp_path, run_lint=False, strict_handler_security=True, allow_empty_config=True
+        ).ok
+        is False
+    )
     assert (
         run_checks(
             tmp_path,
             run_lint=False,
             strict_handler_security=True,
             handler_security_allow=frozenset({"pandas"}),
+            allow_empty_config=True,
         ).ok
         is True
     )
@@ -1145,6 +1170,7 @@ def test_cli_handler_security_allow_exit_code(tmp_path: Path) -> None:
         str(tmp_path),
         "--no-lint",
         "--strict-handler-security",
+        "--allow-empty-config",  # handler-only fixture, no connections (BACKLOG #1648)
     ]
     blocked = subprocess.run(base, capture_output=True, text=True)
     allowed = subprocess.run(

@@ -1,0 +1,67 @@
+GET /ui/account	m	query	-	-
+GET /ui/account/sessions	m	query	-	-
+GET /ui/cluster	m	query	-	-
+GET /ui/connection/{name}	name	path	-	-
+GET /ui/connections/purge-confirm	dest	query	-	-
+GET /ui/connections/purge-confirm	scope	query	-	-
+GET /ui/dead-letters	channel_id	query	connection	422
+GET /ui/dead-letters	destination_name	query	connection	422
+GET /ui/events	connection	query	connection	400-rerender
+GET /ui/events	kind	query	event kind	400-rerender
+GET /ui/login	e	query	-	-
+GET /ui/messages	channel_id	query	connection	400-rerender
+GET /ui/messages	control_id	query	control id	400-rerender
+GET /ui/messages	message_type	query	message type	400-rerender
+GET /ui/messages	received_from	query	-	-
+GET /ui/messages	received_to	query	-	-
+GET /ui/messages	status	query	status	400-rerender
+GET /ui/messages/search	channel_id	query	connection	400-rerender
+GET /ui/messages/search	control_id	query	control id	400-rerender
+GET /ui/messages/search	field_path	query	-	-
+GET /ui/messages/search	message_type	query	message type	400-rerender
+GET /ui/messages/search	status	query	status	400-rerender
+GET /ui/messages/search	target	query	-	-
+GET /ui/messages/search/layered	presets	query	-	-
+GET /ui/messages/{message_id}	message_id	path	-	-
+GET /ui/messages/{message_id}/attachments/{attachment_id}	attachment_id	path	-	-
+GET /ui/messages/{message_id}/attachments/{attachment_id}	message_id	path	-	-
+GET /ui/messages/{message_id}/edit	message_id	path	-	-
+GET /ui/messages/{message_id}/parse-tree	message_id	path	-	-
+GET /ui/reauth	next	query	-	-
+GET /ui/roles/{role_id}/edit	role_id	path	-	-
+GET /ui/uploaded-logs	e	query	-	-
+GET /ui/uploaded-logs/file/{file_id}	control_id	query	-	-
+GET /ui/uploaded-logs/file/{file_id}	field_path	query	-	-
+GET /ui/uploaded-logs/file/{file_id}	file_id	path	-	-
+GET /ui/uploaded-logs/file/{file_id}	message_type	query	-	-
+GET /ui/uploaded-logs/file/{file_id}/delete-confirm	file_id	path	-	-
+GET /ui/uploaded-logs/file/{file_id}/resend-confirm	file_id	path	-	-
+GET /ui/uploaded-logs/file/{file_id}/resend-confirm	to	query	-	-
+GET /ui/users/{user_id}	user_id	path	-	-
+POST /ui/account/sessions/{session_id}/revoke	session_id	path	-	-
+POST /ui/account/webauthn/{credential_id_hash}/delete	credential_id_hash	path	-	-
+POST /ui/connections/{name}/flag	name	path	connection	422
+POST /ui/connections/{name}/purge/{scope}	name	path	connection	422
+POST /ui/connections/{name}/purge/{scope}	scope	path	-	-
+POST /ui/connections/{name}/restart	name	path	connection	422
+POST /ui/connections/{name}/start	name	path	connection	422
+POST /ui/connections/{name}/stop	name	path	connection	422
+POST /ui/dead-letters/{channel_id}/replay	channel_id	path	-	-
+POST /ui/dead-letters/{channel_id}/{destination_name}/replay	channel_id	path	-	-
+POST /ui/dead-letters/{channel_id}/{destination_name}/replay	destination_name	path	-	-
+POST /ui/messages/search/presets/{preset_id}/delete	preset_id	path	-	-
+POST /ui/messages/{message_id}/edit-resend	message_id	path	-	-
+POST /ui/messages/{message_id}/replay	message_id	path	-	-
+POST /ui/roles/custom/{role_id}/delete	role_id	path	-	-
+POST /ui/roles/custom/{role_id}/update	role_id	path	-	-
+POST /ui/uploaded-logs/file/{file_id}/delete	file_id	path	-	-
+POST /ui/uploaded-logs/file/{file_id}/filter	file_id	path	-	-
+POST /ui/uploaded-logs/file/{file_id}/resend	file_id	path	-	-
+POST /ui/uploaded-logs/file/{file_id}/resend	to	query	-	-
+POST /ui/users/{user_id}/channel-scope	user_id	path	-	-
+POST /ui/users/{user_id}/delete	user_id	path	-	-
+POST /ui/users/{user_id}/reset-mfa	user_id	path	-	-
+POST /ui/users/{user_id}/reset-password	user_id	path	-	-
+POST /ui/users/{user_id}/revoke-sessions	user_id	path	-	-
+POST /ui/users/{user_id}/roles	user_id	path	-	-
+POST /ui/users/{user_id}/update	user_id	path	-	-

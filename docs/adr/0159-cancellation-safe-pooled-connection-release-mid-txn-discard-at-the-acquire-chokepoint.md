@@ -266,9 +266,9 @@ the next reader does not re-derive the wrong precedent from the same comment.
   and on a clean exit checks `db.in_transaction` — rolling back and raising if the block wrote without
   committing. It leaves the auto-begin semantics alone, so a read-only early exit stays free, and it
   needs no sentinel: `in_transaction` already reports precisely what a sentinel would have to encode.
-  This is unfiled work, named by subject here rather than by a number, because none is allocated for
-  it. **So do not cite this ADR as evidence that a given SQLite writer unwinds on cancellation; check
-  whether that writer goes through `_writer_txn`.**
+  It is filed as BACKLOG #1803. The 2026-09-18 amendment below records what this sentence said
+  before that number existed. **So do not cite this ADR as evidence that a given SQLite writer
+  unwinds on cancellation; check whether that writer goes through `_writer_txn`.**
 
   One property the whole residual rests on is worth stating once: **`isolation_level` is never set
   anywhere in the package.** `MessageStore.open` calls `aiosqlite.connect(str(path))` with no such
@@ -277,6 +277,97 @@ the next reader does not re-derive the wrong precedent from the same comment.
   leave `in_transaction` `True`; a bare `SELECT`, `CREATE TABLE`, `CREATE INDEX`, `ALTER TABLE` and
   `PRAGMA` all leave it `False`. That asymmetry is what makes the early exits safe today and what
   makes `in_transaction` a sound completion check for the guard above.
+
+  **AMENDED 2026-09-18. The remedy above now has a number, and its hazard reaches further than this
+  ADR framed it.** The decision stands. This amendment changes the pointer and records the reach.
+
+  **The remedy is BACKLOG #1803, priority P1.** The remedy paragraph above first said: *"This is
+  unfiled work, named by subject here rather than by a number, because none is allocated for it."*
+  The number was issued on 2026-09-18. On that date a store manager session was building the guard
+  on branch `b1803-writer-guard`. Read that as the state when this was written, not as a live index.
+
+  **The trigger is any exception, not only a cancellation.** This ADR frames the short-writer hazard
+  as cancellation. But a short writer without the rollback handler has nothing that unwinds on an
+  ordinary `Exception` either, so that error leaves its implicit transaction open exactly as a
+  cancellation would. Two instances were measured on 2026-09-18. In both, the error is the outcome
+  the caller expects and catches:
+
+  - `set_user_federated_subject` (BACKLOG #1801). The loser of the #1256 race hits the UNIQUE index
+    on the federated subject.
+  - `add_webauthn_credential` (BACKLOG #1804). Two concurrent enrolments of one label under ADR 0068,
+    or a double submit, hit the UNIQUE index on `(user_id, label)`.
+
+  An expected error is strictly more reachable than a cancellation. In both, the next `_writer_txn`
+  writer then failed once with `cannot start a transaction within a transaction`. On first
+  deployment that writer could be a stage handoff. The census behind #1803 found two more writers an
+  ordinary path reaches, `create_user` and `create_session`, where no caller catches the error.
+
+  **A third class needs no caller error at all.** Two faults in the environment reach the same
+  mechanism:
+
+  - A Vault outage. `TransitCipher` raises `CipherError` on any transport failure, and six writers
+    encrypt after their first DML: `claim_next_fifo`, `replay`, `cancel_queued` and the three
+    `dead_letter_missing_*` writers.
+  - `SQLITE_BUSY`. The writer's `busy_timeout` is 5 s. With several engine-shard processes on one
+    SQLite file, a first DML that waits past it raises `database is locked` and leaves an empty
+    implicit transaction. That applies to every short writer. Whether it counts as an ordinary
+    error is still open.
+
+  **The measured consequence is a torn write against ADR 0001's reliability invariant.** The census
+  drove `claim_next_fifo`'s skip-and-complete path with a cipher that raises `CipherError` after two
+  UPDATEs. The next unrelated short writer then committed the half that had run: the queue row DONE,
+  no `message_events` row, and the message stuck `ROUTED`. That is one writer, with the fault
+  simulated. The census recorded the `SQLITE_BUSY` case as an empty transaction and did not drive it
+  to a torn write. On first deployment a Vault outage would break the rule that a stage handoff
+  commits whole or not at all.
+
+  None of this reaches the SQL Server decision. Its discriminator rests on the pooled idiom's own
+  `except Exception` rollback, which is exactly what these SQLite writers lack. The guard designed
+  above unwinds on `BaseException`, so it covers the cancellation this ADR was written for and the
+  wider triggers alike.
+
+  **The census counts differ from this ADR's, and the difference is NOT reconciled.** The census ran
+  at engine `origin/main` `909a38549`, where `store.py` is byte-identical to `363d79f49`, the commit
+  that wrote this ADR's figures. The scanner behind this ADR's figures was never recorded, so nobody
+  can re-run it.
+
+  | Figure | This ADR | Census |
+  | --- | --- | --- |
+  | Lock blocks that write | 74 | 76, in 75 methods |
+  | `return` and `raise` sites inside them | 52 | 55 |
+  | Blocks with an exit before the last commit | 13 | 15 blocks, 18 exits |
+
+  The census states its criterion for the last row. An exit is a `return` or `raise` inside a
+  writing block, placed before the block's last direct `self._commit()`; a block with no direct
+  commit counts every exit. That returns fifteen, the figure the early-exit paragraph above calls
+  not reproducible. Whether it is the same fifteen is unknown, since that figure had no recorded
+  criterion either.
+
+  The census session offered two explanations. **They are its RECONSTRUCTIONS, not what this ADR
+  says, and neither has been checked against this ADR's scan.**
+
+  - For 74 against 76: `reserve_upload_quota` holds two lock blocks, which a scan keyed by method
+    counts once. `revoke_user_sessions` passes its SQL through a variable, which a scan of literal
+    arguments cannot see. Under that reading the blast-radius split reproduces: the same 19
+    multi-statement blocks, and 57 single-statement blocks, which is this ADR's 55 plus those two.
+  - For 13 against 15, starting from the census's 15: counting only `return` exits drops
+    `attachment_incref` and gives 14. Also requiring a direct `_commit()` drops
+    `add_cipher_invocations`, which commits inside its helper, and gives 13.
+
+  Nobody has proposed an explanation for 52 against 55.
+
+  **The early-exit safety claim above REPRODUCES.** The census drove all 18 exits on `origin/main`
+  code and read `in_transaction` after each one. Seventeen pass silently, `attachment_incref`
+  already rolls back, and none would raise where it used to return. So the guard changes nothing on
+  any measured exit. That confirms this ADR rather than correcting it.
+
+  One path outside that criterion is named so nobody reads it as a regression.
+  `gcm_bound.checkpoint_invocations` swallows a failed upsert, and it runs inside
+  `_encrypt_existing_rows` and `reencrypt_to_active`. A failure after the last batch commits would
+  end the block cleanly with a transaction open. The guard would raise there. That is the guard
+  doing its job, and only a failure outside the ordinary path reaches it.
+
+  The census and its probes are recorded with BACKLOG #1803.
 - **A new *source* for a 1222 that was assumed to come only from producer contention** (BACKLOG #344
   instance 2, found independently and concurrently). That work traced the other end of this same chain:
   a contended head raises 1222, the store swallows it as a normal EMPTY (the `_is_lock_timeout` branch),

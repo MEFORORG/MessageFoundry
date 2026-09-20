@@ -104,16 +104,55 @@ database poll is validated by the parsing and connector rules, not by anything o
 edit-and-resubmit body is the one place a message body arrives over the API, and it deliberately
 keeps a size bound and no alphabet rule: an HL7 v2 body is separated by carriage returns.
 
-**The web console declares its own bounds for the same items.** The console's `/ui` routes carry at
-least 17 of their own parameter declarations for items this page governs, and they are hand-written
-copies rather than references to this module. They can drift. Two of them are a different data item
-that happens to share a name: the console's `received_from` and `received_to` are `datetime-local`
-strings from a browser form, not the epoch numbers the engine API takes.
+**The console reaches its handlers in process, so nothing here runs unless the console runs it.** The
+web console is mounted inside the engine and calls the handler callables directly rather than over
+HTTP. A direct call runs no request validation at all. Where the console builds an engine request
+model, these rules apply because the model carries them. Where it hands a handler plain values, the
+console applies the rule itself, route by route.
 
-**The console reaches some handlers in process, which skips this validation entirely.** The console
-is mounted inside the engine and calls a set of handler callables directly rather than over HTTP. A
-direct call runs no request validation. Where the console builds an engine request model, these rules
-do apply. Where it calls a handler with plain values, they do not.
+That is a choice, not a law, and the alternative was considered. Each handler the console calls *is*
+a route function, and its signature already carries these rules, so a wrapper at the seam could read
+each signature and validate the console's arguments before every call — closing every handler at
+once, including the ones no one has worked through yet. Two costs decided against it for now. The
+wrapper has to skip the parameters that are not data (`engine`, `request`, `identity`), and whatever
+rule does the skipping will one day skip a real parameter without saying so — the same silent-skip
+failure the seam already documents for permission checks. And it cannot produce the 400 re-render
+below, because it never sees the form. Revisit it when the remaining console parameters are closed.
+
+**The console applies these rules on its message, dead-letter, event and connection-control routes.**
+It reuses the annotated types this module defines rather than restating their patterns, so narrowing
+a rule's pattern here narrows both surfaces at once. Which parameter carries which rule is pinned as
+a table in `packaging/messagefoundry-webconsole/tests/golden/ui_input_rules.txt`, generated from the
+live routes, and behavioural tests in `test_ui_input_rules.py` check that each route still refuses.
+The table cannot see the second thing and the tests cannot see the first, so both are needed.
+
+A refusal takes one of two shapes, and which one depends on who produced the value:
+
+| Where the value comes from | Shape |
+|---|---|
+| A filter form an operator types into (the message log, content search, the event log) | 400, and the page re-renders with the reason and what they typed |
+| A path segment or link the console itself minted (the dead-letter filters, the five per-name connection routes) | 422, the same answer the engine API gives |
+| A name list in a bulk POST body (bulk control, bulk purge) | The batch continues and the refused selection gets its own outcome row |
+
+**Two console values share a name with a rule here and are not that rule.** The console's
+`received_from` and `received_to` are `datetime-local` strings from a browser form, not the epoch
+numbers the engine API takes. The console parses each one and then applies this page's time-bound
+rule to the result, so the two surfaces refuse the same instants by different routes.
+
+**Two console parameters carry no rule on purpose, and it is an audit control that decides it.** The
+bulk purge confirm page's `dest`, and the name in each of the two bulk POST bodies. FastAPI checks a
+parameter before the handler runs, so a refusal there would return before the handler writes the row
+that records a channel-scoped operator reaching for a connection outside their scope — measured, a
+well-formed out-of-scope name writes that row and a malformed one wrote none, which means sending a
+bad name would delete your own security event. Nothing is lost: the confirm page already narrows
+`dest` to the live, quiesced outbound connections, and the two bulk bodies apply the rule for
+operators whose attempt would not have been audited anyway.
+
+**Other console parameters carry a length bound, or nothing, and no rule.** The golden table lists
+every one of them, marked `-`. They include at least the uploaded-log filters and resend target, the
+dead-letter replay path segments, the layered-search preset ids, and the engine-minted ids on `/ui`
+paths. Closing those is separate work, and the table is what makes each one visible: read it rather
+than this paragraph for the current set.
 
 **Several hundred response fields carry no rule, and they should not.** A response field is something
 the engine emits, not something you send. It is not an input, so an unbounded response field is not a

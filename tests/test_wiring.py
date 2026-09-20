@@ -11,12 +11,14 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.wiring import (
     API_LISTENER_LABEL,
     MLLP,
     ConnectionSpec,
     File,
     Ftp,
+    InboundConnection,
     PortConflictError,
     Registry,
     Sftp,
@@ -690,6 +692,160 @@ def test_validate_config_refuses_unsafe_source(
     monkeypatch.setattr(os, "getuid", lambda: owner_uid + 1)
     diags = validate_config(tmp_path)
     assert diags and "owned by uid" in diags[0].message
+
+
+# --- the empty graph is refused on every loading path (BACKLOG #1648) --------
+#
+# A config dir that declares no connections used to load, validate and `check` clean: only the
+# engine RELOAD refused it. An operator could therefore serve a graph that binds no listener and
+# drains no destination, with every surface reporting a healthy engine. The rule now lives in
+# Registry.graph_problems, so load_config raises it and validate_config reports it.
+
+_EMPTY_MARKER = "declares no connections"
+
+
+def _helper_only(directory: Path) -> Path:
+    """A config dir that LOADS cleanly and declares no connection at all.
+
+    Deliberately not an empty directory: a router and a handler make it the case the rule is for --
+    real config modules that simply wire nothing -- rather than the trivial no-modules case, which a
+    weaker rule keyed on "no *.py files" would also catch."""
+    return _write(
+        directory,
+        """
+        from messagefoundry import router, handler, Send
+
+        @router("r")
+        def route(msg):
+            return ["h"]
+
+        @handler("h")
+        def handle(msg):
+            return Send("nowhere", msg)
+        """,
+    )
+
+
+def test_load_config_refuses_a_config_that_declares_no_connections(tmp_path: Path) -> None:
+    _helper_only(tmp_path)
+    with pytest.raises(WiringError, match=_EMPTY_MARKER):
+        load_config(tmp_path)
+
+
+def test_load_config_allow_empty_opt_out_loads_the_same_directory(tmp_path: Path) -> None:
+    # The opt-out `messagefoundry check --allow-empty-config` rides on. Paired with the test above so
+    # neither can pass alone: a rule that never fires reds the first, one with no escape reds this.
+    _helper_only(tmp_path)
+    registry = load_config(tmp_path, allow_empty=True)
+    assert not registry.inbound and not registry.outbound
+    assert "r" in registry.routers  # the modules really did execute
+
+
+def test_load_config_accepts_an_outbound_only_graph(tmp_path: Path) -> None:
+    # The predicate is inbound AND outbound, matching Engine.reload_detail -- NOT inbound alone. A
+    # half-built or outbound-only graph must keep loading, or this rule would newly refuse configs
+    # that work today. RED if the predicate is tightened to `not registry.inbound`.
+    _write(
+        tmp_path,
+        """
+        from messagefoundry import outbound, File
+        outbound("o", File(directory="."))
+        """,
+    )
+    assert "o" in load_config(tmp_path).outbound
+
+
+def test_load_config_accepts_an_inbound_only_graph(tmp_path: Path) -> None:
+    # The other arm of the same predicate, pinned so its shape is stated by a test and not only by a
+    # comment. An inbound-only graph receives and delivers nowhere, which is a real half-built
+    # config -- and the one Engine.reload_detail's post-filter check exists for, since the shard
+    # filter KEEPS outbound connections and so can only empty a graph that had none. RED if the
+    # predicate is ever widened to `not registry.outbound`.
+    _write(
+        tmp_path,
+        """
+        from messagefoundry import inbound, router, MLLP
+        inbound("i", MLLP(port=2731), router="r")
+
+        @router("r")
+        def route(msg):
+            return []
+        """,
+    )
+    assert "i" in load_config(tmp_path).inbound
+
+
+def test_validate_config_reports_a_config_that_declares_no_connections(tmp_path: Path) -> None:
+    _helper_only(tmp_path)
+    diags = validate_config(tmp_path)
+    assert len(diags) == 1 and _EMPTY_MARKER in diags[0].message
+
+
+def test_validate_config_allow_empty_reports_nothing(tmp_path: Path) -> None:
+    _helper_only(tmp_path)
+    assert validate_config(tmp_path, allow_empty=True) == []
+
+
+def test_validate_config_does_not_report_emptiness_beside_its_own_cause(tmp_path: Path) -> None:
+    # A module that fails to load leaves an empty registry, so the empty-graph rule would fire as a
+    # DERIVED symptom and send the reader after the wrong problem. Exactly one diagnostic, the cause.
+    (tmp_path / "cfg.py").write_text("import nonexistent_module_xyz\n", encoding="utf-8")
+    diags = validate_config(tmp_path)
+    assert len(diags) == 1 and _EMPTY_MARKER not in diags[0].message
+
+
+def test_validate_config_still_reports_emptiness_beside_a_diagnostic_that_cannot_cause_it(
+    tmp_path: Path,
+) -> None:
+    """The suppressor is scoped to the sources that DECLARE connections, not to any diagnostic.
+
+    A malformed ``codesets/`` table is a real diagnostic and no explanation at all for an empty
+    graph -- the modules loaded, they simply wired nothing. Suppressing on the whole diagnostics
+    list would hide the empty graph behind it and make the operator fix the CSV, re-run, and only
+    then learn the real problem. Both are reported in one pass instead.
+
+    Falsified by restoring ``allow_empty=allow_empty or bool(diagnostics)``."""
+    codesets = tmp_path / "codesets"
+    codesets.mkdir()
+    (codesets / "bad.csv").write_text("code,value\nA,1\nA,2\n", encoding="utf-8")  # duplicate key
+    _helper_only(tmp_path)
+
+    messages = [d.message for d in validate_config(tmp_path)]
+
+    assert len(messages) == 2, messages
+    assert any(_EMPTY_MARKER in m for m in messages)
+    assert any(_EMPTY_MARKER not in m for m in messages)  # the code-set problem, still reported
+
+
+def test_registry_validate_and_validate_config_agree_on_the_empty_graph(tmp_path: Path) -> None:
+    # BACKLOG #1656: the two validators are one rule list now, so the message an editor shows and the
+    # message the loader raises are the same string, not two hand-kept copies that can drift.
+    _helper_only(tmp_path)
+    (diagnostic,) = validate_config(tmp_path)
+    with pytest.raises(WiringError) as raised:
+        load_config(tmp_path)
+    assert str(raised.value) == diagnostic.message
+
+
+def test_graph_problems_reports_every_problem_while_validate_raises_the_first() -> None:
+    """The contract difference #1656 exists to preserve: one rule list, two behaviours.
+
+    ``Registry.validate`` stops at the first problem (the loader has nothing to hand the engine);
+    ``graph_problems`` yields them all (the editor must show the full set). RED if a refactor makes
+    either caller raise on behalf of the other."""
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection("i1", ConnectionSpec(ConnectorType.MLLP, {"port": 1}), router="missing_a")
+    )
+    reg.add_inbound(
+        InboundConnection("i2", ConnectionSpec(ConnectorType.MLLP, {"port": 2}), router="missing_b")
+    )
+    problems = list(reg.graph_problems())
+    assert len(problems) == 2
+    assert "missing_a" in problems[0] and "missing_b" in problems[1]
+    with pytest.raises(WiringError) as raised:
+        reg.validate()
+    assert str(raised.value) == problems[0]
 
 
 # --- structured validation (validate_config) ---------------------------------

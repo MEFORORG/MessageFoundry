@@ -321,9 +321,39 @@ The owner-locked posture is **lightweight verification after each backup**, with
    on its own connection off the hot path, so it can afford the fuller PRAGMA). Non-`ok` → `FAIL`.
 4. **Row-count sanity check** — re-count the key tables in the snapshot and compare to the manifest's recorded
    counts (catches a truncated/torn snapshot the integrity check might miss at the logical level).
-5. **Record the verify result** in the `dr_backup` audit row; on `FAIL`, **the archive is marked failed and
-   the keep-N prune does not count it as the latest good backup** (so a failing backup never silently evicts
-   the last *good* one).
+5. **Record the verify result** in the `dr_backup` audit row; on `FAIL`, **the archive never earns the
+   canonical name** — it is retained under an excluded `.failed` name for diagnosis, and so is not a keep-N
+   candidate in this prune or any later one.
+
+**The archive is written to a staging name and the canonical name is published by atomic rename** — after the
+verify passes where `verify_after_backup = true`, and after the completed, fsynced write where it is false.
+One statable rule governs both:
+
+> The canonical name means this archive passed every check this instance was configured to run.
+
+*Amended (BACKLOG #1587).* Step 5 previously read "the archive is marked failed and the keep-N prune does not
+count it as the latest good backup", and the shipped code satisfied that reading by skipping the prune on the
+failing run. It was too weak: the failed archive still **held the canonical name**, so the *next* run's prune
+counted it as a retention slot and evicted an older **good** copy instead. Deferring an eviction by one run is
+not preventing it — at `retention_keep = 2`, two good backups either side of one failure left one good copy.
+The bar is the name, not the prune.
+
+*Consequence, stated rather than quietly bounded.* A file keep-N cannot see is a file keep-N cannot prune, so
+**two** classes of PHI-bearing archive now sit at the destination with **nothing in the engine expiring them**:
+
+- **`.failed`** — left deliberately, for diagnosis. Auto-deleting it defeats keeping it, and expiring it by
+  keep-N is the defect above.
+- **`.part`** — left by any abort between the write and the rename: a dropped UNC share, a verify cancelled
+  because the engine stopped mid-backup, a rename that failed. On a box that restarts during its backup window
+  these accumulate at one full-size archive per incident.
+
+Clearing both is the operator's, and [`docs/PHI.md`](../PHI.md) lists them among the tiers with no retention
+rather than implying keep-N covers them. They are sealed under the store DEK exactly like a good archive, so
+the at-rest protection is unchanged and only the retention bound is.
+
+This is still strictly better than what it replaced: before this change those same aborts left a **truncated**
+file wearing the canonical name, which keep-N counted as a good backup. The unbounded-growth cost is real and
+is the one the fix accepts; being handed a truncated archive as the newest good one is not survivable.
 
 ### Full restore-verify (opt-in / on-demand)
 
@@ -377,9 +407,18 @@ here:
   read-only, run `integrity_check` + the row-count check, and report `PASS`/`FAIL`.
   → `tests/test_restore_verify.py::test_verify_pass_failclosed_and_key_mismatch`
 - **AC-6** — WHEN a new backup succeeds with `retention_keep = N`, THE SYSTEM SHALL prune archives older than
-  the newest N at the destination, AND SHALL NOT count a verify-FAILED archive as the latest good backup when
-  pruning.
-  → `tests/test_backup_runner.py::test_keep_n_prune_excludes_failed`
+  the newest N at the destination. THE SYSTEM SHALL publish the canonical archive name, by atomic rename, ONLY
+  to an archive that has passed every check this instance was configured to run — the restore-verify WHERE
+  `verify_after_backup = true`, a completed and fsynced write WHERE it is false — AND SHALL retain a
+  verify-FAILED archive under a name OUTSIDE the keep-N candidate set, so that it occupies a retention slot in
+  neither THIS prune nor any LATER one.
+  → `tests/test_backup_runner.py::test_a_verify_failed_archive_never_takes_a_retention_slot`
+  → `tests/test_backup_runner.py::test_keep_n_prunes_the_oldest_once_the_kept_set_is_full`
+
+  *Tightened (BACKLOG #1587).* The prior wording — "SHALL NOT count a verify-FAILED archive as the latest good
+  backup when pruning" — had a weak reading the shipped code already satisfied by skipping the prune on the
+  failing run, while the failed archive kept the canonical name and evicted a good copy on the NEXT run.
+  The criterion now binds the NAME, which is the thing keep-N actually reads.
 - **AC-7** — WHERE `[store].backend in {postgres, sqlserver}`, THE SYSTEM SHALL NOT take a DB store snapshot
   (`snapshot_to` raises the DBA-delegation path, #52) AND SHALL back up the config bundle only (or skip per
   `config_only_on_server_db`), logging the delegation once.

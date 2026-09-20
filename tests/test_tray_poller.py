@@ -10,7 +10,13 @@ import httpx
 
 from messagefoundry.tray.config import TrayConfig
 from messagefoundry.tray.poller import StatusPoller, Tracking, advance
-from messagefoundry.tray.state import HealthProbe, ScmState, TrayState, UiProbe
+from messagefoundry.tray.state import (
+    HealthProbe,
+    ScmState,
+    TrayState,
+    UiProbe,
+    derive_state,
+)
 from messagefoundry.tray.winsvc import ScmReading
 
 # --- pure advance() ---------------------------------------------------------
@@ -41,15 +47,71 @@ def test_advance_pending_checkpoint_progress() -> None:
     assert t1.pending_since == 0.0
     assert in1.checkpoint_advancing is True  # fresh pending
     assert in1.wait_hint_s == 5.0
-    # Checkpoint advanced (1 → 2): still advancing.
+    # Checkpoint advanced (1 -> 2): still advancing, and the pending clock re-anchors to `now`.
+    # dwWaitHint is the estimate for the NEXT checkpoint, not for the whole transition, so the
+    # elapsed the reducer sees is time-since-progress (BACKLOG #1555).
     r_b = ScmReading(ScmState.START_PENDING, checkpoint=2, wait_hint_s=5.0)
     t2, in2 = advance(t1, r_b, HealthProbe.DOWN, UiProbe.UNKNOWN, 3.0)
     assert in2.checkpoint_advancing is True
-    assert in2.pending_elapsed_s == 3.0
-    # Checkpoint stalled (2 → 2): not advancing.
+    assert t2.pending_since == 3.0
+    assert in2.pending_elapsed_s == 0.0
+    # Checkpoint stalled (2 -> 2): not advancing, and the clock holds the re-anchored t=3.0.
     t3, in3 = advance(t2, r_b, HealthProbe.DOWN, UiProbe.UNKNOWN, 6.0)
     assert in3.checkpoint_advancing is False
-    assert in3.pending_elapsed_s == 6.0
+    assert t3.pending_since == 3.0
+    assert in3.pending_elapsed_s == 3.0
+
+
+def test_advance_progressing_slow_start_stays_starting_past_the_wait_hint() -> None:
+    """A service that keeps reporting progress reads as STARTING however long the start takes."""
+    tracking = Tracking()
+    for tick, checkpoint in ((0.0, 1), (4.0, 2), (8.0, 3), (12.0, 4), (16.0, 5)):
+        reading = ScmReading(ScmState.START_PENDING, checkpoint=checkpoint, wait_hint_s=5.0)
+        tracking, inputs = advance(tracking, reading, HealthProbe.DOWN, UiProbe.UNKNOWN, tick)
+        assert tracking.pending_since == tick  # re-anchored on every checkpoint increase
+        assert derive_state(inputs) is TrayState.STARTING
+    # One sample later the checkpoint has not moved yet: 1.0s since progress, well inside the hint,
+    # even though 17.0s have passed since the transition began.
+    held = ScmReading(ScmState.START_PENDING, checkpoint=5, wait_hint_s=5.0)
+    t_final, in_final = advance(tracking, held, HealthProbe.DOWN, UiProbe.UNKNOWN, 17.0)
+    assert t_final.pending_since == 16.0  # the anchor holds while the checkpoint does not move
+    assert in_final.checkpoint_advancing is False
+    assert in_final.pending_elapsed_s == 1.0
+    assert derive_state(in_final) is TrayState.STARTING
+
+
+def test_advance_frozen_checkpoint_still_reaches_wedged() -> None:
+    """The other arm: a checkpoint that never moves keeps its anchor and ages past the hint."""
+    tracking = Tracking()
+    frozen = ScmReading(ScmState.START_PENDING, checkpoint=1, wait_hint_s=5.0)
+    # t=0.0 is the fresh pending tick (assumed progressing); t=4.0 is still inside the 5.0s hint;
+    # t=17.0 is the paired arm of the test above, which stays STARTING there.
+    expected = (
+        (0.0, TrayState.STARTING),
+        (4.0, TrayState.STARTING),
+        (8.0, TrayState.WEDGED),
+        (17.0, TrayState.WEDGED),
+    )
+    for tick, state in expected:
+        tracking, inputs = advance(tracking, frozen, HealthProbe.DOWN, UiProbe.UNKNOWN, tick)
+        assert tracking.pending_since == 0.0  # never re-anchored
+        assert inputs.pending_elapsed_s == tick
+        assert derive_state(inputs) is state
+
+
+def test_advance_stop_pending_re_anchors_harmlessly_and_clears_on_leaving() -> None:
+    """STOP_PENDING shares the clock: it re-anchors too, and STOPPING is unconditional."""
+    stopping_a = ScmReading(ScmState.STOP_PENDING, checkpoint=1, wait_hint_s=5.0)
+    stopping_b = ScmReading(ScmState.STOP_PENDING, checkpoint=2, wait_hint_s=5.0)
+    t1, in1 = advance(Tracking(), stopping_a, HealthProbe.DOWN, UiProbe.UNKNOWN, 0.0)
+    t2, in2 = advance(t1, stopping_b, HealthProbe.DOWN, UiProbe.UNKNOWN, 9.0)
+    assert t2.pending_since == 9.0  # re-anchored on the checkpoint increase
+    assert derive_state(in1) is TrayState.STOPPING
+    assert derive_state(in2) is TrayState.STOPPING  # the clock never reaches the STOPPING branch
+    # Leaving the pending states drops the anchor, so a later pending run cannot inherit it.
+    t3, in3 = advance(t2, ScmReading(ScmState.STOPPED), HealthProbe.DOWN, UiProbe.UNKNOWN, 10.0)
+    assert t3.pending_since is None
+    assert in3.pending_elapsed_s is None
 
 
 # --- StatusPoller transition/toast logic ------------------------------------

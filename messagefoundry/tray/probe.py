@@ -5,10 +5,10 @@
 Two credential-free HTTP reads against the engine, with **pure** classifiers so the
 status-vs-foreign-vs-down and console-enabled logic is unit-tested without a network:
 
-- :func:`probe_health` — ``GET /health`` with **no** ``Authorization`` header. The engine's
-  ``/health`` is tokenless and always ``200 {"status": "ok", ...}``; a bare-``Health``-model decode
-  cannot tell a foreign ``{}`` responder from the real thing (both default to ``status="ok"``), so
-  :func:`classify_health` inspects the raw body for the ``status`` key.
+- :func:`probe_health` — ``GET /health`` with **no** ``Authorization`` header. A bare-``Health``-model
+  decode cannot tell a foreign ``{}`` responder from the real thing (both default to
+  ``status="ok"``), so :func:`classify_health` inspects the raw body for the whole of
+  :data:`ENGINE_HEALTH_KEYS`.
 - :func:`probe_ui` — ``GET /ui`` with redirects **not** followed: ``404`` ⇒ ``serve_ui`` off,
   ``303``→``/ui/login`` (or any non-404 answer) ⇒ the console is mounted.
 
@@ -74,16 +74,48 @@ DEFAULT_TIMEOUT_S = 2.0
 MAX_PROBE_RESPONSE_BYTES = 1024 * 1024
 
 
+#: Every key the engine's tokenless ``GET /health`` carries (BACKLOG #1715).
+#:
+#: The route answers through ``api/models.Health``, which declares ``status``, ``version`` and
+#: ``observed_client`` and is serialized WITHOUT ``exclude_none``, so all three names are present on
+#: every reply.
+#:
+#: **The NAMES are the contract; the VALUES are not, and must never be keyed on.** ``version`` is
+#: ``null`` to an unauthenticated caller under ASVS 13.4.6, but is the real build string on an engine
+#: with ``[auth] enabled = false`` -- ``allow_no_auth`` hands even a tokenless caller the system
+#: identity. ``observed_client`` is ``null`` unless ``[security].allowed_client_networks`` is in use.
+#: The key SET is the one thing steady across all of those, which is why :func:`classify_health`
+#: keys on it.
+#:
+#: This set must stay a SUBSET of what the route actually sends, and
+#: ``tests/test_client_network_allowlist.py`` pins that against the real app in-process. **That pin
+#: is a SAME-TREE check and its limit matters:** it catches a ``Health`` change landing beside this
+#: file, and it CANNOT catch an older tray probing a newer engine, which is the only way a key goes
+#: missing at runtime. Nothing here gates that skew; containment (below) is what keeps it survivable.
+ENGINE_HEALTH_KEYS = frozenset({"status", "version", "observed_client"})
+
+
 def classify_health(status_code: int | None, body: object) -> HealthProbe:
     """Pure: map an HTTP status + parsed body to a :class:`HealthProbe`.
 
     ``None`` status ⇒ the socket did not answer ⇒ :data:`DOWN`. A ``200`` whose body is a JSON
-    object carrying a ``status`` key is our ``/health`` ⇒ :data:`OK`. Anything else that answered
-    is some other server ⇒ :data:`FOREIGN`.
+    object carrying every one of :data:`ENGINE_HEALTH_KEYS` is our ``/health`` ⇒ :data:`OK`.
+    Anything else that answered is some other server ⇒ :data:`FOREIGN`.
+
+    Keying on the key set rather than on the ``status`` key alone is BACKLOG #1715: ``{"status":
+    "ok"}`` is the commonest health body in the industry, so the old single-key test called every
+    such responder our engine and left :data:`FOREIGN` reachable only for a non-JSON answer. See
+    :data:`ENGINE_HEALTH_KEYS` for why the names and not the values.
+
+    **Containment, not equality, and that is deliberate.** A body carrying the three names plus
+    others still reads :data:`OK`, so a newer engine that added a ``Health`` field is still our
+    engine. Under equality that engine would render as "another program answers on this port" -- a
+    loud, wrong alarm from the one component whose job is naming that case. Containment cannot make
+    that error: it fails only toward :data:`FOREIGN`, and only when a key goes away.
     """
     if status_code is None:
         return HealthProbe.DOWN
-    if status_code == 200 and isinstance(body, dict) and "status" in body:
+    if status_code == 200 and isinstance(body, dict) and ENGINE_HEALTH_KEYS.issubset(body):
         return HealthProbe.OK
     return HealthProbe.FOREIGN
 

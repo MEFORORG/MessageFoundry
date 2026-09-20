@@ -22,17 +22,21 @@ from datetime import UTC, datetime
 
 import httpx
 import pytest
+from _ui_clients import (
+    SAME_ORIGIN as SFS,
+)
+from _ui_clients import (
+    auth_service,
+    bearer,
+    cookie_login,
+    provision,
+    seed_message,
+    ui_client,
+)
 
-from messagefoundry.api import create_app
 from messagefoundry.auth import Role
-from messagefoundry.auth.identity import ALL_CHANNELS
-from messagefoundry.auth.service import AuthService
-from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 
-PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms -- satisfies the ASVS policy (WP-3)
-ADT = "MSH|^~\\&|S|F|R|RF|20260604||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
-SFS = {"Sec-Fetch-Site": "same-origin"}
 SUSPEND_REFUSAL = "the suspend window must be a positive number of minutes"
 BOUND_REFUSAL = "the received-date bounds must be UTC datetime-local values"
 
@@ -53,60 +57,15 @@ REFUSED_BOUNDS = (
 )
 
 
-async def _service(engine: Engine) -> AuthService:
-    # require_mfa=False for the same reason as the rest of this suite: these tests exercise input
-    # validation, and the fixtures never enroll an authenticator.
-    service = AuthService(engine.store, AuthSettings(require_mfa=False))
-    await service.initialize()
-    return service
-
-
-def _client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
-    transport = httpx.ASGITransport(app=create_app(engine, auth=service, serve_ui=True))
-    return httpx.AsyncClient(transport=transport, base_url="http://t")
-
-
-async def _provision(service: AuthService, username: str, roles: list[str]) -> None:
-    user_id = await service.create_local_user(
-        username=username,
-        password=PW,
-        display_name=None,
-        email=None,
-        roles=roles,
-        actor="test",
-    )
-    # BACKLOG #1152: an unset channel scope DENIES; grant the estate explicitly.
-    await service.set_channel_scope(user_id, [ALL_CHANNELS], actor="test")
-    user = await service.store.get_user(user_id)
-    assert user is not None and user.password_hash is not None
-    await service.store.set_password(
-        user_id, password_hash=user.password_hash, must_change_password=False
-    )
-
-
-async def _login(c: httpx.AsyncClient, username: str) -> None:
-    r = await c.post("/ui/login", data={"username": username, "password": PW})
-    assert r.status_code in (200, 303)
-
-
 @pytest.fixture
 async def op(engine: Engine) -> AsyncIterator[httpx.AsyncClient]:
     """A browser client already signed in as an OPERATOR -- the setup ~10 of these tests share. The
     custom-role test builds its own client instead, because its whole point is a different role."""
-    service = await _service(engine)
-    await _provision(service, "op", [Role.OPERATOR.value])
-    async with _client(engine, service) as c:
-        await _login(c, "op")
+    service = await auth_service(engine)
+    await provision(service, "op", [Role.OPERATOR.value])
+    async with ui_client(engine, service) as c:
+        await cookie_login(c, "op")
         yield c
-
-
-async def _bearer(c: httpx.AsyncClient, username: str) -> dict[str, str]:
-    """A native bearer token, so a test can ask the JSON twin the SAME question. The /ui cookie is
-    confined to /ui and is rejected on the JSON API, so it cannot stand in for this."""
-    token = (await c.post("/auth/login", json={"username": username, "password": PW})).json()[
-        "token"
-    ]
-    return {"Authorization": f"Bearer {token}"}
 
 
 async def _open_alert(engine: Engine, now: float) -> int:
@@ -130,17 +89,6 @@ async def _suspended_until(engine: Engine, alert_id: int) -> float | None:
     row = await engine.store.get_alert_instance(alert_id)
     assert row is not None
     return row.suspended_until
-
-
-async def _seed_message(engine: Engine) -> str:
-    return await engine.store.enqueue_message(
-        channel_id="ch1",
-        raw=ADT,
-        deliveries=[("archive", ADT)],
-        control_id="MSG1",
-        message_type="ADT^A01",
-        source_type="file",
-    )
 
 
 # --- half one: the alert suspend window --------------------------------------
@@ -183,7 +131,7 @@ async def test_console_suspend_refusal_matches_the_json_route(
     """The parity claim, measured on both surfaces against the SAME input: the console 400s exactly
     where the JSON route 422s, and neither mutes the instance."""
     alert_id = await _open_alert(engine, time.time())
-    headers = await _bearer(op, "op")
+    headers = await bearer(op, "op")
     for value in (999999, 0, -5):
         json_twin = await op.post(
             f"/alerts/{alert_id}/suspend", json={"minutes": value}, headers=headers
@@ -201,25 +149,25 @@ async def test_suspend_refusal_omits_the_rules_a_diagnose_only_caller_cannot_rea
     """The refusal re-renders /ui/alerts, whose Rules half is gated on ``monitoring:read`` -- and the
     suspend route holds ``monitoring:diagnose`` only. A custom role holding diagnose WITHOUT read must
     get the refusal without that section, so fixing this route does not widen what it can read."""
-    service = await _service(engine)
+    service = await auth_service(engine)
     role = await service.create_custom_role(
         display_name="Alert Suspender",
         description=None,
         permissions=["monitoring:diagnose"],
         actor="test",
     )
-    await _provision(service, "diagnoser", [role.id])
-    await _provision(service, "reader", [Role.OPERATOR.value])
+    await provision(service, "diagnoser", [role.id])
+    await provision(service, "reader", [Role.OPERATOR.value])
     alert_id = await _open_alert(engine, time.time())
-    async with _client(engine, service) as c:
-        await _login(c, "diagnoser")
+    async with ui_client(engine, service) as c:
+        await cookie_login(c, "diagnoser")
         r = await c.post(f"/ui/alerts/{alert_id}/suspend", data={"minutes": "0"}, headers=SFS)
         assert r.status_code == 400 and SUSPEND_REFUSAL in r.text
         assert ">Rules<" not in r.text
         assert "Re-alert after" not in r.text
-    async with _client(engine, service) as c:
+    async with ui_client(engine, service) as c:
         # Positive control on the SAME assertion: an operator holds read, so it does see the section.
-        await _login(c, "reader")
+        await cookie_login(c, "reader")
         r = await c.post(f"/ui/alerts/{alert_id}/suspend", data={"minutes": "0"}, headers=SFS)
         assert r.status_code == 400
         assert ">Rules<" in r.text and "Re-alert after" in r.text
@@ -236,7 +184,7 @@ async def test_console_messages_refuses_a_bound_the_engine_would_not_apply(
     """400 + the filter form carrying the error and the value the operator typed. Pre-fix an unreadable
     bound answered 200 with the filter DROPPED, so the page showed rows that filter excluded, and an
     out-of-window or offset-bearing one reached the store query as an instant nobody asked for."""
-    await _seed_message(engine)
+    await seed_message(engine)
     r = await op.get("/ui/messages", params={field: value})
     assert r.status_code == 400
     assert BOUND_REFUSAL in r.text
@@ -249,7 +197,7 @@ async def test_out_of_window_bounds_are_the_ones_the_json_route_refuses(
 ) -> None:
     """Pins the pairing above: the two instants are refused by the JSON route as epoch seconds, so the
     console is now enforcing that route's rule rather than a rule of its own invention."""
-    headers = await _bearer(op, "op")
+    headers = await bearer(op, "op")
     for value in OUT_OF_WINDOW:
         epoch = datetime.fromisoformat(value).replace(tzinfo=UTC).timestamp()
         r = await op.get("/messages", params={"received_from": epoch}, headers=headers)
@@ -261,7 +209,7 @@ async def test_console_messages_still_filters_on_a_valid_bound(
 ) -> None:
     """Positive control for the refusals above: a readable, in-window, offset-free bound is still
     APPLIED -- present when the window contains the row, absent when it does not."""
-    await _seed_message(engine)
+    await seed_message(engine)
     past = await op.get("/ui/messages", params={"received_from": "2020-01-01T00:00"})
     assert past.status_code == 200 and "MSG1" in past.text
     future = await op.get("/ui/messages", params={"received_from": "2099-01-01T00:00"})
@@ -275,7 +223,7 @@ async def test_deferred_landing_still_renders_its_prefilled_form(
 ) -> None:
     """The ``defer=1`` landing (#4b) fills both bounds server-side and renders the form without
     searching. Validation now runs before that branch, so this pins that the generated values pass."""
-    await _seed_message(engine)
+    await seed_message(engine)
     r = await op.get("/ui/messages", params={"defer": "1", "channel_id": "ch1"})
     assert r.status_code == 200
     assert "Adjust the filters and click Search to run." in r.text
