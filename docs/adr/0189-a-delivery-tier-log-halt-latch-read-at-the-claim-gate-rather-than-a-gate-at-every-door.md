@@ -191,6 +191,15 @@ per-connection facts an operator fixes on that row, while the halt is process-wi
 its own page. `outbound_quiesced` -- the purge precondition -- still answers off the pause set, so a
 halted-and-quiesced lane stays purgeable.
 
+**That last sentence is a promise the claim gate has to keep, and in `per_lane` it did not.** The
+purge precondition is pause-set membership AND a quiescence Event that only the delivery worker's
+loop-top PAUSE gate sets; the halt gate returns out of the worker ABOVE that gate, so the Event the
+halt's own pause had just cleared stayed cleared with the worker that owns it gone. The lane read
+`stopping` for the life of the process, and its purge was refused with no in-flight head to wait
+for. The halt gate now signals quiescence on its way out. Pooled was never affected -- its
+dispatcher routes the lane to PAUSED and fires `on_lane_paused`. Pinned by
+`test_a_log_halted_lane_reports_that_it_drained_so_its_queue_stays_purgeable`, over both modes.
+
 **Negative / risks** -- the pooled half is post-claim, so a halted pooled lane that some path readies
 will claim a head, reschedule it, and park, once per `_WORKER_ERROR_BACKOFF_SECONDS`, for as long as
 the disk stays broken. The claim's `attempts` increment is undone by the reschedule, so the retry

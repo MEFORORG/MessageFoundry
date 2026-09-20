@@ -1514,6 +1514,113 @@ async def test_an_unguarded_start_cannot_deliver_while_the_halt_is_latched(
         await runner.stop()
 
 
+async def _seed_an_outbound_row_behind_the_halt(store: MessageStore, control_id: str) -> str:
+    """Put ONE pending ``OUTBOUND`` delivery row in the store, by hand, through the store's own
+    ingress -> outbound handoff. Returns the message id.
+
+    FOR A HALTED ENGINE ONLY — it takes the ingress claim the router worker would take, so on a
+    running engine it races that worker and loses. Behind a halt there is no competitor: the internal
+    stages are down in both claim modes, and the store is untouched by an application-log failure.
+
+    Hand-driven because the ordinary route cannot produce this state at all. A halt pauses only the
+    lanes that were NOT already paused, so a lane with rows waiting on it is a lane the halt skips —
+    and a LIVE lane with a healthy File destination has by definition already drained what it was
+    given. The row has to be queued after the halt, which means around the workers.
+
+    ``control_id`` replaces MSH-10, which is what ``_file_outbound`` names the delivered file after,
+    so a delivery of this row would be visible as its own file rather than overwriting another."""
+    raw = RAW.replace("|M1|", f"|{control_id}|")
+    message_id = await store.enqueue_ingress(channel_id=INBOUND, raw=raw, control_id=control_id)
+    claimed = await store.claim_next_fifo(INBOUND, stage=Stage.INGRESS.value)
+    assert claimed is not None and claimed.message_id == message_id, (
+        "a worker took the ingress row — this engine is not halted"
+    )
+    assert await store.handoff(
+        ingress_id=claimed.id,
+        message_id=message_id,
+        channel_id=INBOUND,
+        deliveries=[(OUTBOUND, raw)],
+        disposition=MessageStatus.ROUTED,
+    )
+    return message_id
+
+
+@pytest.mark.parametrize("claim_mode", CLAIM_MODES)
+async def test_a_log_halted_lane_reports_that_it_drained_so_its_queue_stays_purgeable(
+    store: MessageStore, tmp_path: Path, claim_mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # THE HALT'S OTHER HALF: refusing to deliver is only correct if the operator can still SEE the
+    # lane as stopped. `outbound_quiesced` is the purge precondition and the `/connections` row's
+    # `paused` field, and it is a pause-set membership AND a per-lane quiescence Event — so a lane
+    # that stops claiming without SETTING that Event reads as 'stopping' forever: the console shows
+    # an in-flight head that does not exist and `DELETE /connections/{name}/queue` 409s with nothing
+    # left to wait for. The rows the halt promises to RETAIN then cannot be cleared either way.
+    #
+    # MEASURED RED in per_lane before the halt gate learned to signal: `_stop_outbound_unsafe`
+    # CLEARS the Event and leaves the per_lane worker's loop-top PAUSE gate to set it once the head
+    # resolves, and the halt gate sits ABOVE that pause branch and returns straight out of the
+    # worker. Nothing else in the process ever sets it: the lane's worker is gone.
+    #
+    # Pooled passes both arms unchanged — its dispatcher routes the lane to PAUSED and fires
+    # `on_lane_paused` — so the parametrization is a second, independent reading of the same
+    # question rather than two copies of one.
+    outdir, logdir = tmp_path / "out", tmp_path / "logs"
+    outdir.mkdir()
+    logdir.mkdir()
+    runner = _e2e_runner(store, outdir, logdir, claim_mode)
+    await runner.start()
+    try:
+        # THE CONTROL, and it runs FIRST and in the SAME claim mode: an ORDINARY operator pause of
+        # this very lane, with the log healthy, must reach quiescence. Without it "quiesced never
+        # became true" is satisfied by a rig whose lane never signals at all, and the arm below would
+        # attribute a broken instrument to the halt.
+        await runner.stop_outbound(OUTBOUND)
+        assert await _until(lambda: runner.outbound_quiesced(OUTBOUND)), (
+            "an ordinary operator pause never reported quiescence — the rig cannot see the signal"
+        )
+        assert runner.outbound_status(OUTBOUND) == "stopped"
+
+        # Back to a LIVE lane, which is the only state the halt actually pauses: a lane already in
+        # `_outbound_paused` is filtered out of `_stop_all_for_log_failure`'s list.
+        await runner.start_outbound(OUTBOUND)
+        assert not runner.outbound_quiesced(OUTBOUND), "the resume left the stale quiesced signal"
+        assert await _until(lambda: runner.outbound_status(OUTBOUND) == "running")
+
+        # A real delivery over the live lane, driven the ordinary way, so "the lane was working" is
+        # measured rather than assumed — the halt below has to be the thing that stops it.
+        delivered_id = await store.enqueue_ingress(channel_id=INBOUND, raw=RAW)
+        assert await _until_delivery_status(store, delivered_id, OUTBOUND, "done"), (
+            "the live lane never delivered — the rig is wrong"
+        )
+        assert [p.name for p in outdir.iterdir()] == ["M1.hl7"]
+
+        _kill_every_sink(logdir, monkeypatch)
+        logging.getLogger("t").warning("a record this engine cannot write anywhere")
+        assert await _until(lambda: runner._log_write_stopped), "the halt never fired"
+        assert runner._delivery_halted, "the delivery tier's latch never closed"
+        assert OUTBOUND in runner._outbound_paused, "the halt did not pause the live lane"
+        await asyncio.sleep(0.2)  # let every worker reach its gate, at poll_interval 0.02
+
+        # A genuine row for the operator to purge, queued AFTER the halt so the lane it sits on is the
+        # halted one. Nothing may touch it: the worker is gone and the claim gate refuses.
+        retained_id = await _seed_an_outbound_row_behind_the_halt(store, "MHALTED")
+        await asyncio.sleep(0.3)  # many claim cycles at poll_interval 0.02
+        assert [p.name for p in outdir.iterdir()] == ["M1.hl7"], (
+            "a queued row shipped with no application log behind it"
+        )
+
+        # THE LOAD-BEARING ASSERTION. The lane is paused and has ZERO rows in flight, so it is
+        # genuinely drained and must say so — this is what the purge precondition reads.
+        assert runner.outbound_quiesced(OUTBOUND), (
+            "a halted lane stopped claiming without ever reporting that it had drained"
+        )
+        # …and 'drained' must mean drained: the retained row is PENDING, never stranded INFLIGHT
+        # behind a signal that says there is nothing to wait for.
+        assert await _until_delivery_status(store, retained_id, OUTBOUND, "pending", timeout=0.0)
+    finally:
+        await runner.stop()
+
+
 @pytest.mark.parametrize("claim_mode", CLAIM_MODES)
 async def test_a_reload_that_adds_an_outbound_into_a_dead_log_lands_it_paused(
     store: MessageStore, tmp_path: Path, claim_mode: str, monkeypatch: pytest.MonkeyPatch

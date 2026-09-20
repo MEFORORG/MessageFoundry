@@ -1674,10 +1674,15 @@ class RegistryRunner:
             raise KeyError(name)
 
     def _mark_outbound_quiesced(self, name: str) -> None:
-        """Pooled dispatcher ``on_lane_paused`` callback: the outbound ``name`` lane reached PAUSED
-        (drained to zero in-flight). Set its quiescence Event so ``outbound_quiesced`` / ``outbound_status``
-        report 'stopped' (the purge precondition). Get-or-create so a pause on a never-seen lane still
-        signals."""
+        """The outbound ``name`` lane has DRAINED to zero in-flight. Set its quiescence Event so
+        ``outbound_quiesced`` / ``outbound_status`` report 'stopped' (the purge precondition).
+        Get-or-create so a pause on a never-seen lane still signals.
+
+        One helper for both claim modes, because the fact is one fact and a second spelling of it is
+        how the two drift: the pooled dispatcher calls this as its ``on_lane_paused`` callback, and
+        the per_lane :meth:`_delivery_worker` calls it at BOTH its loop-top exits — the operator-pause
+        gate and the #122 halt gate above it. The halt gate was the one that did not, and a lane that
+        stops claiming without signalling reads as 'stopping' for the life of the process."""
         self._outbound_quiesced.setdefault(name, asyncio.Event()).set()
 
     @property
@@ -5155,7 +5160,19 @@ class RegistryRunner:
             # log working clears the latch and respawns this worker). Placed ABOVE the operator-pause
             # gate because a halted lane that is ALSO paused must not sit in _wait_for_resume: a
             # resume would release it straight into a claim.
+            #
+            # SIGNAL QUIESCENCE ON THE WAY OUT, and that is not tidiness — it is the half of the halt
+            # the operator can see. The halt takes a lane down through _stop_outbound_unsafe, which
+            # CLEARS this lane's quiescence Event and leaves the setting to the pause gate below; this
+            # gate sits ABOVE that gate and RETURNS, so the Event stayed cleared and no later caller
+            # could set it — the worker that owns the gate is gone. outbound_quiesced() then reads
+            # False forever: the console shows an in-flight head that does not exist, and the purge
+            # that would clear the rows the halt promises to RETAIN is refused with nothing left to
+            # wait for. Zero rows are in flight here for exactly the reason the pause gate below
+            # relies on — this is the loop TOP, above the claim, and the prior iteration's items have
+            # all resolved — so the signal states a fact rather than papering over one.
             if self._delivery_halted:
+                self._mark_outbound_quiesced(name)
                 return
             try:
                 # Connection controls: loop-top operator-PAUSE gate, BEFORE the claim. When paused, signal
@@ -5164,7 +5181,7 @@ class RegistryRunner:
                 # block on the per-lane resume Event. COOPERATIVE — never a task.cancel; mirrors the
                 # _stop.is_set() loop guard. The in-flight item ALWAYS finishes before the loop re-checks.
                 if name in self._outbound_paused:
-                    self._outbound_quiesced.setdefault(name, asyncio.Event()).set()
+                    self._mark_outbound_quiesced(name)
                     woken = await self._wait_for_resume(name)
                     continue
                 # FIFO (default): claim only the due head — a backing-off head blocks the lane
