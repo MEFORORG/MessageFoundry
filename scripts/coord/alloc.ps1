@@ -143,12 +143,44 @@ $allocRoot = Join-Path $common "mefor-coord/alloc"
 $alloc = Join-Path $allocRoot $Kind
 New-Item -ItemType Directory -Force -Path $alloc | Out-Null
 
+# TWO NORMALISERS, EXTRACTED RATHER THAN RESTATED AT EACH SITE.
+#
+# Each decides something irreversible. Get-PathKey decides whether a recorded claim is YOURS, which
+# is what -List reports and what the re-entrancy check below acts on; Get-AdrSlug decides which file
+# a number names. Both were spelled inline at every site that needed them, and BACKLOG #1703 would
+# have added two more. A RESTATED PREDICATE IS A THIRD PREDICATE, and a disagreement between two of
+# them is what this area keeps producing -- the same lesson tests/test_install_gate_allowlist_merge.py
+# records for the worktree gate's own path normaliser, where a bare TrimEnd keyed a drive ROOT and a
+# drive-RELATIVE path identically.
+#
+# CASE-FOLDING STAYS AT THE COMPARISON, in each site's `-ieq`/`-ine`. Folding it in here would make
+# the key lossy for the one caller that PRINTS it, and the operators already compare case-insensitively.
+#
+# THIS EXTRACTION PRESERVES THE EXISTING SPELLING EXACTLY, INCLUDING ITS KNOWN DEFECTS, AND THAT IS
+# DELIBERATE -- do not read the citation above as a claim that this helper is free of them. The bare
+# TrimEnd collapses a drive ROOT onto a drive-RELATIVE path (`C:/` and `C:` both key `C:`), and
+# ledger_check.py::owns rstrips only the RECORDED side where every site here trims both. Neither is
+# reachable from a git toplevel today, and repairing them changes what -List reports and what -For
+# refuses, so it is its own change with its own evidence -- not a side effect of collapsing five
+# copies into one. Collapsing them first is what makes that repair a single edit instead of five.
+function Get-PathKey([string]$p) { ($p -replace '\\', '/').TrimEnd('/') }
+function Get-AdrSlug([string]$t) { ($t.ToLowerInvariant() -replace '[^a-z0-9]+', '-').Trim('-') }
+
+# FOLD ANYTHING OUT OF A RECORD BEFORE IT IS PRINTED AS AN INSTRUCTION (BACKLOG #1040).
+#
+# The reuse block below is the first path in this file to print FILE CONTENT as a remedy an agent
+# then acts on, and `title` is free text nothing validates at allocation time. A value carrying line
+# breaks can forge a second, earlier-looking remedy block inside the real one -- naming another file
+# and another worktree. ledger_check.py::_safe_for_message folds the same two fields for the same
+# reason, and its docstring says a remedy block is precisely what that defect forged.
+function ConvertTo-Safe([string]$s) { ($s -replace '[\p{C}]', ' ').Trim() }
+
 if ($List) {
     foreach ($k in @("adr", "backlog")) {
         $dir = Join-Path $allocRoot $k
         $mine = @(Get-ChildItem $dir -Filter *.json -EA SilentlyContinue | ForEach-Object {
                 $c = Get-Content $_.FullName -Raw | ConvertFrom-Json
-                if (($c.worktree -replace '\\', '/').TrimEnd('/') -ieq ($repo -replace '\\', '/').TrimEnd('/')) { $c }
+                if ((Get-PathKey $c.worktree) -ieq (Get-PathKey $repo)) { $c }
             })
         Write-Host "$k allocated to this worktree: $(if ($mine) { ($mine.number -join ', ') } else { '(none)' })"
     }
@@ -184,7 +216,7 @@ if ($For) {
     # registry and will never look here. Refusing beats writing an unusable claim.
     $targetCommon = (& git -C $target rev-parse --path-format=absolute --git-common-dir 2>$null)
     if (-not $targetCommon) { throw "-For '$For' has no resolvable git common dir." }
-    if (($targetCommon.Trim() -replace '\\', '/').TrimEnd('/') -ine ($common -replace '\\', '/').TrimEnd('/')) {
+    if ((Get-PathKey $targetCommon.Trim()) -ine (Get-PathKey $common)) {
         throw "-For '$target' belongs to a DIFFERENT clone. Its allocations live in that clone's own registry, so an allocation written here would never be found."
     }
     $ownerRepo = $target
@@ -222,66 +254,133 @@ if ($For) {
 # the way past it that a hurried reader takes is to allocate again, which is this defect.
 #
 # -ShowFloor IS EXCLUDED. It allocates nothing, it does not require -Title, and its contract is to
-# print the floor; short-circuiting it would make the inspector answer a different question. The
-# same reasoning puts this block after the -List early return, which stays offline and reads only
-# the local registry.
+# print the floor; short-circuiting it would make the inspector answer a different question. It sits
+# after the -List early return for the reason that return already carries at the pre-flight block.
+#
+# WHY THIS IS A SCAN AND NOT A KEY LOOKUP, because claim.ps1 next door gets re-entrancy for free and
+# the difference looks like an oversight. That register is keyed BY the work identity, so its file
+# name IS the question and its CreateNew is both the answer and the mutual exclusion. This register
+# is keyed by the NUMBER -- which, at the moment the question is asked, has not been minted. The scan
+# is what that key costs, not a workaround laid over it. An index keyed on owner+slug was considered
+# and declined: it cannot be written in the same atomic CreateNew as the record, so a crash between
+# the two leaves a record the index does not list, and unlike an unreadable record (warned about
+# below) a missing index entry has nothing to notice it.
+#
+# WHAT THIS DOES NOT CLOSE, stated here because the fix reads as total and is not. The scan and the
+# CreateNew are a read-then-act with the fetch and the whole floor sweep between them -- measured in
+# this file at 6.7s for the sweep plus up to three fetch attempts. Two runs for one owner and one
+# title that both start inside that window both scan empty and both allocate, because CreateNew
+# excludes on the NUMBER and they do not share one. Placing the check before the fetch is right for
+# the reason above AND it widens this window; those are one decision. A lock is deliberately NOT
+# added: losing this race costs a hole, which is exactly the pre-fix status quo, so the check stays
+# a strict improvement -- where a half-written lock entry nobody holds would be a new failure.
 if (-not $ShowFloor) {
-    $ownerKey = ($ownerRepo -replace '\\', '/').TrimEnd('/')
-    $titleKey = $Title.Trim()
-    # Normalised exactly as the -List block above and `owns` both normalise it. A third spelling of
-    # one comparison is how the definitions start to drift, and this one decides whether a number is
-    # re-issued.
-    $existing = @(
-        foreach ($f in (Get-ChildItem $alloc -Filter *.json -EA SilentlyContinue)) {
+    $ownerKey = Get-PathKey $ownerRepo
+    # THE KEY IS THE SLUG, NOT THE RAW TITLE, AND THE SLUG IS THE IDENTITY THE NAMESPACE ALREADY USES.
+    # The title becomes the filename, so "Worktree gate", "Worktree  gate" and "Worktree-gate" are one
+    # ADR wearing three spellings -- a trimmed case-insensitive compare calls them three and mints
+    # three numbers for one subject, which is this defect reached by a stray keystroke.
+    #
+    # THE RESIDUAL, SINCE THE FOLDING IS LOSSY: two GENUINELY different ADRs whose titles slug alike
+    # ("Use TLS" and "Use T.L.S.") read as one, and the second is told to reuse the first's number. It
+    # takes both from one worktree, and the remedy is printed and cheap -- give it a different title,
+    # which it needs anyway since the slug is the filename. Weighed against a false MISS, which costs
+    # a permanent hole nobody can reclaim, that is the trade this file makes everywhere.
+    $titleKey = Get-AdrSlug $Title
+    # AN EMPTY KEY MATCHES TOO MUCH, SO IT MATCHES NOTHING. `-Title "   "` and `-Title "---"` both
+    # pass the -Title guard above (a whitespace string is truthy) and both slug to "". So does a
+    # record whose `title` field is missing, null, or all punctuation -- and an empty key would pair
+    # them and hand back a number for unrelated work. Skipping the check costs a hole at worst, which
+    # is the direction this block errs in everywhere else.
+    $existing = [System.Collections.Generic.List[object]]::new()
+    foreach ($f in ($(if ($titleKey) { Get-ChildItem $alloc -Filter *.json -EA SilentlyContinue }))) {
+        # THE FILENAME IS THE NUMBER, AND THE BODY'S `number` FIELD IS NOT. Get-Floor parses
+        # `$f.BaseName` and ledger_check.py::owns opens `<number>.json` -- both key on the name. A
+        # record copied or hand-repaired during one of the docs/LEDGER-GATE.md recoveries can carry a
+        # body that disagrees, and handing back the BODY's number would name one the floor sweep still
+        # counts free: a clean-merging collision, which is the single thing this script exists to
+        # prevent. TryParse for the same reason Get-Floor uses it -- a stray `notes.json` here must be
+        # skipped, not cast, because $ErrorActionPreference is Stop and a throw bricks every
+        # allocation from this clone until somebody finds the file.
+        $number = 0
+        if (-not [int]::TryParse($f.BaseName, [ref]$number)) { continue }
+        $rec = $null
+        try {
+            $rec = Get-Content $f.FullName -Raw | ConvertFrom-Json
+        } catch {
             $rec = $null
-            try {
-                $rec = Get-Content $f.FullName -Raw | ConvertFrom-Json
-            } catch {
-                $rec = $null
-            }
-            # WARN ON THE OUTCOME, NOT ON THE EXCEPTION. A record this check could not read is
-            # indistinguishable from an absent one, and "no match" is precisely what mints the
-            # duplicate this block exists to prevent -- so it must announce itself. The empty file is
-            # the shape to expect, because the atomic CreateNew below makes the file BEFORE anything is
-            # written into it and a process killed in between leaves exactly one. MEASURED: an empty
-            # file does not throw here -- `ConvertFrom-Json` yields $null and the catch never runs -- so
-            # a warning hung off the catch alone was silent on the only case it was written for.
-            if ($null -eq $rec) {
-                Write-Host "WARNING: an allocation record could not be read, so it was not matched against" -ForegroundColor Yellow
-                Write-Host "         this title. If the number you want is in it, this run may issue a second" -ForegroundColor Yellow
-                Write-Host "         one: $($f.FullName)" -ForegroundColor Yellow
-            }
-            elseif ((("$($rec.worktree)" -replace '\\', '/').TrimEnd('/') -ieq $ownerKey) -and
-                ("$($rec.title)".Trim() -ieq $titleKey)) { $rec }
         }
-    )
+        # WARN ON THE OUTCOME, NOT ON THE EXCEPTION. A record this check could not read is
+        # indistinguishable from an absent one, and "no match" is precisely what mints the duplicate
+        # this block exists to prevent -- so it must announce itself. The empty file is the shape to
+        # expect, because the atomic CreateNew below makes the file BEFORE anything is written into it
+        # and a process killed in between leaves exactly one. MEASURED: an empty file does not throw
+        # here -- `ConvertFrom-Json` yields $null and the catch never runs -- so a warning hung off the
+        # catch alone was silent on the only case it was written for.
+        if ($null -eq $rec) {
+            # Worded so it is true whichever way the run then goes. It used to end "this run may issue
+            # a second one", which is false on every run that goes on to REUSE -- and an empty record
+            # is never cleaned up, so that false line would print on every run thereafter.
+            Write-Host "WARNING: an allocation record could not be read, so this check could not match" -ForegroundColor Yellow
+            Write-Host "         it. If the number you are asking for is the one in it, this run cannot" -ForegroundColor Yellow
+            Write-Host "         see that: $($f.FullName)" -ForegroundColor Yellow
+            continue
+        }
+        # The WORKTREE half is normalised by the same Get-PathKey the -List block and ledger_check.py's
+        # `owns` compare with; the TITLE half is this block's own, because neither of those reads the
+        # title field at all. Saying "normalised exactly as -List" would cover one half and be vacuous
+        # for the other -- and the other is the half that decides whether a number is re-issued.
+        if (((Get-PathKey "$($rec.worktree)") -ieq $ownerKey) -and
+            ((Get-AdrSlug "$($rec.title)") -eq $titleKey)) {
+            # EVERYTHING KEPT HERE IS EITHER THE FILENAME OR FOLDED. `Number` and `Sort` come from the
+            # file name, which is the authoritative key; the three free-text fields go through
+            # ConvertTo-Safe because they are printed as an instruction block a few lines below.
+            $existing.Add([pscustomobject]@{
+                Number   = $f.BaseName
+                Sort     = $number
+                Title    = ConvertTo-Safe "$($rec.title)"
+                Worktree = ConvertTo-Safe "$($rec.worktree)"
+                Branch   = ConvertTo-Safe "$($rec.branch)"
+            })
+        }
+    }
+
     if ($existing.Count -gt 0) {
         # LOWEST NUMBER WINS, SORTED NUMERICALLY AND NOT BY THE D4 FILENAME. The first number issued is
         # the one any citation already written is most likely to name, and lexical order stops agreeing
         # with numeric order the moment a number passes 9999 -- silently, by answering with a different
-        # record than the one that was meant.
-        $hit = $existing | Sort-Object { [int]$_.number } | Select-Object -First 1
-        $recordedTitle = "$($hit.title)"
+        # record than the one that was meant. Sorted ONCE: the multi-match note below lists the same
+        # order it tells you to file at, which two independent sorts cannot promise.
+        $ordered = @($existing | Sort-Object Sort)
+        $hit = $ordered[0]
+        # THE SLUG COMES FROM THE RECORDED TITLE, NOT FROM $Title. The two can legitimately differ, and
+        # the file the FIRST run named is the one that may already exist on disk. Naming a second
+        # spelling would send the operator to create a duplicate of their own ADR.
+        $slug = Get-AdrSlug $hit.Title
 
         Write-Host ""
-        Write-Host "REUSING ADR $($hit.number) -- this owner already holds a number for this title." -ForegroundColor Green
-        if ($existing.Count -gt 1) {
-            $all = (($existing | Sort-Object { [int]$_.number } | ForEach-Object { $_.number }) -join ', ')
-            Write-Host "NOTE: it holds $($existing.Count) of them for this title: $all. They predate this" -ForegroundColor Yellow
-            Write-Host "      check and cannot be reclaimed. File the work at $($hit.number); the rest stay holes." -ForegroundColor Yellow
+        Write-Host "REUSING ADR $($hit.Number) -- this owner already holds a number for this title." -ForegroundColor Green
+        if ($ordered.Count -gt 1) {
+            Write-Host "NOTE: it holds $($ordered.Count) of them for this title: $($ordered.Number -join ', '). They predate" -ForegroundColor Yellow
+            Write-Host "      this check and cannot be reclaimed. File the work at $($hit.Number); the rest stay holes." -ForegroundColor Yellow
         }
-        # THE SLUG COMES FROM THE RECORDED TITLE, NOT FROM $Title. The title match is case-insensitive
-        # and trims, so the two can legitimately differ -- and the file the FIRST run named is the one
-        # that may already exist on disk. Naming a second spelling would send the operator to create a
-        # duplicate of their own ADR.
-        $slug = ($recordedTitle.ToLowerInvariant() -replace '[^a-z0-9]+', '-').Trim('-')
-        Write-Host "  file  : docs/adr/$($hit.number)-$slug.md"
+        Write-Host "  file  : docs/adr/$($hit.Number)-$slug.md"
         Write-Host "  index : add its row to docs/adr/README.md in the SAME commit (the gate checks)."
-        Write-Host "  title : $recordedTitle"
-        Write-Host "  allocated to: $($hit.worktree) [$($hit.branch)] -- COMMIT FROM THERE, the gate keys entitlement on it."
+        Write-Host "  title : $($hit.Title)"
+        Write-Host "  allocated to: $($hit.Worktree) [$($hit.Branch)] -- COMMIT FROM THERE, the gate keys entitlement on it."
         Write-Host "  NOTHING NEW WAS ALLOCATED. A second number for one piece of work is a permanent hole,"
         Write-Host "        so a re-run hands back the first. If this really is a DIFFERENT ADR, give it a"
         Write-Host "        different title -- the title is also the filename, so they should differ anyway."
+        # THE SAME TWO NOTES THE ALLOCATION PATH ENDS WITH, because a reuse is the run a SECOND seat is
+        # most likely to be reading. BACKLOG #1768 is exactly a reader who did not see the work-claim
+        # line and concluded the row was claimed; printing the number without it on the reuse path
+        # would reinstate that defect on the quieter half of the script.
+        Write-Host "  NOTE: this reserves the NUMBER only, never the WORK. The work claim is the other"
+        Write-Host "        register and is taken against a BACKLOG ITEM, not against this number:"
+        Write-Host "        scripts\coord\claim.ps1 -Take <backlog item> -Note '<what>'"
+        if ($For) {
+            Write-Host "  -For: this number belongs to the named worktree, NOT the one this ran in." -ForegroundColor Yellow
+        }
         exit 0
     }
 }
@@ -728,7 +827,7 @@ for ($i = $start; $i -lt $start + 500; $i++) {
 
     Write-Host ""
     if ($Kind -eq "adr") {
-        $slug = ($Title.ToLowerInvariant() -replace '[^a-z0-9]+', '-').Trim('-')
+        $slug = Get-AdrSlug $Title
         Write-Host "ALLOCATED ADR $name" -ForegroundColor Green
         Write-Host "  file  : docs/adr/$name-$slug.md"
         Write-Host "  index : add its row to docs/adr/README.md in the SAME commit (the gate checks)."
@@ -762,8 +861,8 @@ for ($i = $start; $i -lt $start + 500; $i++) {
     # invocation, so it stays worth reading.
     $cwdTop = (& git rev-parse --path-format=absolute --show-toplevel 2>$null)
     if ($cwdTop -and -not $For) {
-        $a = ($cwdTop.Trim() -replace '\\', '/').TrimEnd('/')
-        $b = ($repo -replace '\\', '/').TrimEnd('/')
+        $a = Get-PathKey $cwdTop.Trim()
+        $b = Get-PathKey $repo
         if ($a -ine $b) {
             Write-Host "  NOTE: your shell is in $a, but this allocator lives in $b, so the allocation is recorded" -ForegroundColor Yellow
             Write-Host "        to $b. COMMIT FROM THERE -- the ledger gate keys entitlement on the worktree" -ForegroundColor Yellow

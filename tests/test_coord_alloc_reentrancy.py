@@ -89,9 +89,31 @@ def _numbers(repo: Path) -> list[str]:
     return sorted(p.stem for p in _registry(repo).glob("*.json"))
 
 
+def _key(path: str) -> str:
+    """The comparison alloc.ps1 makes at the CALL SITE, which is ``Get-PathKey`` plus its ``-ieq``.
+
+    Separators first, then the trailing slash, matching ``Get-PathKey``'s order: reversed, a path
+    recorded with a trailing backslash keeps it and the comparison fails for a reason that has
+    nothing to do with re-entrancy.
+
+    **It is deliberately LOOSER than ``Get-PathKey`` alone, and these cases are not a parity check
+    on it.** ``.casefold()`` stands in for the ``-ieq`` the script compares with, and ``.strip()``
+    is this file's own, because the value on one side comes from ``git rev-parse`` with its newline
+    attached. What these assertions pin is WHICH TREE a record names, never how the script spells a
+    key -- read them as that, or this helper becomes the restated predicate its own subject warns
+    about.
+    """
+    return path.strip().replace("\\", "/").rstrip("/").casefold()
+
+
+def _out(proc: subprocess.CompletedProcess[str]) -> str:
+    """Both streams. The allocator writes its warnings to stdout and its refusals to stderr."""
+    return proc.stdout + proc.stderr
+
+
 def _allocated(proc: subprocess.CompletedProcess[str]) -> str:
     """The number a run reports, whichever of the two verbs it used."""
-    combined = proc.stdout + proc.stderr
+    combined = _out(proc)
     assert proc.returncode == 0, combined
     match = re.search(r"^(?:ALLOCATED|REUSING) ADR (\d+)", combined, re.MULTILINE)
     assert match, f"no number in:\n{combined}"
@@ -138,15 +160,32 @@ def test_a_different_title_in_the_same_worktree_still_allocates(tmp_path: Path) 
     )
 
 
-def test_the_title_match_ignores_case_and_surrounding_space(tmp_path: Path) -> None:
-    """A re-typed title differing only in case is the same re-run, and must not spend a number."""
-    repo = _checkout(tmp_path / "loose-title")
+@pytest.mark.parametrize(
+    "retyped",
+    ["  worktree gate  ", "Worktree  Gate", "Worktree-gate", "worktree gate."],
+    ids=["space", "double-space", "hyphen", "trailing-dot"],
+)
+def test_a_title_that_slugs_the_same_is_the_same_re_run(tmp_path: Path, retyped: str) -> None:
+    """THE KEY IS THE SLUG, because the slug is what the ADR filename is built from.
+
+    All four spellings name ``worktree-gate``. A trimmed case-insensitive compare would call the
+    last three DIFFERENT titles and mint a number for each, which is this defect reached by a stray
+    keystroke rather than by a deliberate re-run.
+
+    Parametrized rather than written four times because the four differ only in the input: the
+    argument, the assertions and what they would mean are identical, which is the one shape where
+    a table is clearer than four bodies.
+    """
+    repo = _checkout(tmp_path / f"loose-{retyped.strip().replace(' ', '_')}")
 
     issued = _allocated(_run(repo, "-Kind", "adr", "-Title", "Worktree Gate", "-NoFetch"))
-    again = _run(repo, "-Kind", "adr", "-Title", "  worktree gate  ", "-NoFetch")
+    again = _run(repo, "-Kind", "adr", "-Title", retyped, "-NoFetch")
 
-    assert _allocated(again) == issued, again.stdout + again.stderr
-    assert _numbers(repo) == [issued], f"a case-only difference spent a number: {_numbers(repo)}"
+    assert _allocated(again) == issued, _out(again)
+    assert _numbers(repo) == [issued], (
+        f"{retyped!r} slugs to the same ADR filename as the recorded title but spent a second "
+        f"number: {_numbers(repo)}"
+    )
     assert f"docs/adr/{issued}-worktree-gate.md" in again.stdout, (
         "the filename must be slugged from the RECORDED title, not from what this run was given -- "
         "otherwise a re-run names a second file for one number:\n" + again.stdout
@@ -177,11 +216,42 @@ def test_a_sibling_worktree_of_the_same_clone_gets_its_own_number(tmp_path: Path
     records = {
         p.stem: json.loads(p.read_text(encoding="utf-8")) for p in _registry(repo).glob("*.json")
     }
-    assert records[theirs]["worktree"].rstrip("/").casefold().replace("\\", "/") == str(
+    assert _key(records[theirs]["worktree"]) == _key(
         _git("rev-parse", "--path-format=absolute", "--show-toplevel", cwd=sibling)
-    ).strip().rstrip("/").casefold().replace("\\", "/"), (
-        f"the sibling's record names the wrong tree: {records[theirs]}"
+    ), f"the sibling's record names the wrong tree: {records[theirs]}"
+
+
+def test_an_allocation_made_with_for_reuses_against_the_named_tree(tmp_path: Path) -> None:
+    """``-For`` moves the recorded owner, so it must move the reuse key with it.
+
+    The check reads ``$ownerRepo``, which ``-For`` repoints -- so a Manager re-running one brief's
+    allocation gets the Builder's number back rather than a second one. The third limb is the
+    control: the SAME title without ``-For`` has a different owner and must still allocate, or the
+    check has collapsed into a title-only match and ``-For`` has stopped meaning anything.
+    """
+    repo = _checkout(tmp_path / "for-primary")
+    target = tmp_path / "for-target"
+    _git("worktree", "add", "-b", "target", str(target), cwd=repo)
+
+    issued = _allocated(
+        _run(repo, "-Kind", "adr", "-Title", "Peer ADR", "-For", str(target), "-NoFetch")
     )
+    again = _run(repo, "-Kind", "adr", "-Title", "Peer ADR", "-For", str(target), "-NoFetch")
+    assert _allocated(again) == issued, (
+        "a re-run with the same -For minted a second number for the named tree:\n" + _out(again)
+    )
+
+    own = _run(repo, "-Kind", "adr", "-Title", "Peer ADR", "-NoFetch")
+    assert _allocated(own) != issued, (
+        "the same title from a DIFFERENT owner was handed the -For tree's number, so the reuse "
+        "check is matching on title alone:\n" + _out(own)
+    )
+    records = {
+        p.stem: json.loads(p.read_text(encoding="utf-8")) for p in _registry(repo).glob("*.json")
+    }
+    assert _key(records[issued]["worktree"]) == _key(
+        _git("rev-parse", "--path-format=absolute", "--show-toplevel", cwd=target)
+    ), f"-For did not record the named tree: {records[issued]}"
 
 
 def test_show_floor_is_not_short_circuited_by_an_existing_allocation(tmp_path: Path) -> None:
@@ -239,6 +309,80 @@ def test_a_reuse_needs_no_remote_but_a_fresh_number_still_does(tmp_path: Path) -
     )
     assert "REFUSING TO ALLOCATE" in combined, combined
     assert _numbers(repo) == [issued], f"the refusal left a number behind: {_numbers(repo)}"
+
+
+def test_a_title_that_already_holds_two_numbers_reports_both_and_picks_the_lowest(
+    tmp_path: Path,
+) -> None:
+    """THE BRANCH THAT SERVES THE POPULATION THE WHOLE CHANGE IS JUSTIFIED BY, and it is unreachable.
+
+    Once the check is in place the allocator can never create a second record for one owner and
+    title, so ``$ordered.Count -gt 1`` fires only on duplicates that PREDATE it -- the 19 titles
+    docs/LEDGER-GATE.md measures. Nothing else here can plant that state, so this case writes the
+    second record straight into the registry, the way the unreadable case writes its empty one.
+
+    It also pins the choice: the LOWEST number is the one handed back, because it is the one any
+    citation already written is most likely to name.
+    """
+    repo = _checkout(tmp_path / "already-duplicated")
+    issued = _allocated(_run(repo, "-Kind", "adr", "-Title", "Twice numbered", "-NoFetch"))
+    recorded = json.loads((_registry(repo) / f"{issued}.json").read_text(encoding="utf-8"))
+    higher = f"{int(issued) + 7:04d}"
+    (_registry(repo) / f"{higher}.json").write_text(
+        json.dumps({**recorded, "number": higher}), encoding="utf-8"
+    )
+
+    proc = _run(repo, "-Kind", "adr", "-Title", "Twice numbered", "-NoFetch")
+    assert _allocated(proc) == issued, (
+        f"the lower number {issued} must win over {higher}:\n" + _out(proc)
+    )
+    combined = _out(proc)
+    assert higher in combined, (
+        "the note must list every number this title already holds, or the operator cannot see the "
+        "holes they are leaving behind:\n" + combined
+    )
+    assert _numbers(repo) == sorted([issued, higher]), (
+        f"a third number was minted on top of the duplicate pair: {_numbers(repo)}"
+    )
+
+
+def test_the_number_comes_from_the_filename_not_the_record_body(tmp_path: Path) -> None:
+    """THE FILENAME IS THE KEY, and a record whose body disagrees must not be believed.
+
+    Get-Floor parses ``$f.BaseName`` and ledger_check.py::owns opens ``<number>.json``, so both key
+    on the name. A body carrying a different number is what a hand-repair during a LEDGER-GATE
+    recovery leaves behind. Believing the body would hand back a number with NO registry file, which
+    the floor sweep still counts free -- the clean-merging collision this script exists to prevent.
+    """
+    repo = _checkout(tmp_path / "body-disagrees")
+    issued = _allocated(_run(repo, "-Kind", "adr", "-Title", "Mislabelled", "-NoFetch"))
+    path = _registry(repo) / f"{issued}.json"
+    record = json.loads(path.read_text(encoding="utf-8"))
+    path.write_text(json.dumps({**record, "number": "0999"}), encoding="utf-8")
+
+    proc = _run(repo, "-Kind", "adr", "-Title", "Mislabelled", "-NoFetch")
+    assert _allocated(proc) == issued, (
+        "the reuse path believed the record body over its filename, so it named a number with no "
+        "registry file behind it:\n" + _out(proc)
+    )
+    assert "0999" not in _out(proc), "the body's number reached the operator:\n" + _out(proc)
+
+
+def test_a_title_that_slugs_to_nothing_never_matches(tmp_path: Path) -> None:
+    """An empty key would pair every punctuation-only title with every untitled record.
+
+    ``-Title "   "`` passes the -Title guard, because a whitespace string is truthy in PowerShell,
+    and slugs to "". So does ``"---"``. If an empty key were allowed to match, the second would be
+    handed the first's number for work that has nothing to do with it.
+    """
+    repo = _checkout(tmp_path / "empty-slug")
+    first = _allocated(_run(repo, "-Kind", "adr", "-Title", "   ", "-NoFetch"))
+    second = _allocated(_run(repo, "-Kind", "adr", "-Title", "---", "-NoFetch"))
+
+    assert first != second, (
+        "two unrelated titles that both slug to the empty string were treated as one re-run"
+    )
+    assert _numbers(repo) == sorted([first, second]), _numbers(repo)
 
 
 def test_a_record_the_check_cannot_read_says_so(tmp_path: Path) -> None:
