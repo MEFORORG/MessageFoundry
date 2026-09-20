@@ -47,6 +47,8 @@ from pathlib import Path
 import pytest
 from _bash_resolver import bash_candidates, explain_returncode, require_bash
 
+from tests._force_include import hatch_build
+
 _REPO = Path(__file__).resolve().parents[1]
 PYPROJECT = _REPO / "pyproject.toml"
 RELEASE_YML = _REPO / ".github" / "workflows" / "release.yml"
@@ -81,8 +83,10 @@ def _release() -> str:
 
 
 def _only_include() -> list[str]:
-    data = _pyproject()
-    return data["tool"]["hatch"]["build"]["targets"]["sdist"]["only-include"]
+    # Through the shared reader (BACKLOG #1836), not a fourth descent of the same dotted path: this
+    # module and tests/test_packaging.py both read [tool.hatch.build], one target apart.
+    include: list[str] = hatch_build(PYPROJECT)["targets"]["sdist"]["only-include"]
+    return include
 
 
 def _leak_gate_regex() -> str:

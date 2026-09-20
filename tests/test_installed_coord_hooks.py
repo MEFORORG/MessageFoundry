@@ -1186,3 +1186,64 @@ def test_the_allowlist_reader_skips_comments_and_blanks_and_keeps_paths(tmp_path
     assert read_governed_roots(tmp_path / "absent.txt") == [], (
         "an absent allowlist is the documented kill switch and must read as an empty governed set"
     )
+
+
+# ----------------------------------------------- a remediation must name a flag that exists
+
+
+INSTALLER_PS1 = Path(__file__).resolve().parents[1] / "scripts" / "coord" / "install-git-hooks.ps1"
+
+
+def _declared_switches(text: str) -> set[str]:
+    """The parameter names the script's own `param(...)` block declares."""
+    block = re.search(r"^param\(\s*(.*?)^\)", text, re.S | re.M)
+    assert block, "install-git-hooks.ps1 has no param block -- the probe, not the script, is broken"
+    return {"-" + name for name in re.findall(r"\$(\w+)", block.group(1))}
+
+
+def _reissue_instructions(text: str) -> list[tuple[str, set[str]]]:
+    """Every `Write-Host` line that tells a reader to RE-RUN THIS SCRIPT, with the flags it names.
+
+    Scoped to re-run instructions on purpose. This file's output also quotes flags belonging to
+    `alloc.ps1` and `claim.ps1` (`-Kind`, `-Take`, `-Note`, `-Title`, `-List`), and those are not
+    this script's to declare. A probe that graded them would be red on correct text.
+    """
+    out = []
+    for line in re.findall(r'Write-Host "([^"]*)"', text):
+        if "Re-run" not in line:
+            continue
+        named = set(re.findall(r"(?<![\w-])(-[A-Z][A-Za-z]+)", line))
+        # pwsh's own flags appear when the line spells a full command.
+        named -= {"-NoProfile", "-File", "-Command", "-NonInteractive"}
+        out.append((line, named))
+    return out
+
+
+def test_every_re_run_instruction_names_a_real_parameter() -> None:
+    """`-Status` told a reader to "Re-run with -Arm." for a script that has no such parameter.
+
+    Following it returns `A parameter cannot be found that matches parameter name 'Arm'`, which
+    reads as a broken tool rather than as a wrong instruction -- so the reader stops, and the stale
+    hook the message was warning about stays installed. Measured 2026-09-20: the box's `post-merge`
+    was three weeks older than the `post-commit` beside it and refused the PRIVATE vault as though
+    it were the public repository, and this string is what stood between the warning and the fix.
+    """
+    text = INSTALLER_PS1.read_text(encoding="utf-8")
+    declared = _declared_switches(text)
+    instructions = _reissue_instructions(text)
+    assert instructions, "found no re-run instructions at all -- the probe stopped working"
+    bad = [(line, sorted(named - declared)) for line, named in instructions if named - declared]
+    assert not bad, (
+        "a re-run instruction names a flag this script does not declare "
+        f"(declared: {sorted(declared)}):\n"
+        + "".join(f"  {flags} in: {line.strip()}\n" for line, flags in bad)
+    )
+
+
+def test_the_re_run_probe_can_fail() -> None:
+    """The anti-vacuity arm. A probe that finds no instructions would pass the test above silently."""
+    declared = _declared_switches(INSTALLER_PS1.read_text(encoding="utf-8"))
+    planted = 'Write-Host "               Re-run with -Arm." -ForegroundColor Yellow'
+    found = _reissue_instructions(planted)
+    assert found, "the probe did not see a re-run instruction it was handed"
+    assert found[0][1] - declared == {"-Arm"}, found

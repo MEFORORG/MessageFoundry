@@ -32,6 +32,8 @@ import subprocess
 import unittest
 from pathlib import Path
 
+import pytest
+
 _REPO = Path(__file__).resolve().parents[1]
 
 CARD_DIR = _REPO / "docs" / "roles"
@@ -129,8 +131,11 @@ def session_start_args() -> list[list[str]]:
     args-only reader guards the shape the 2026-09-08 duplicate happened to take and no other. That
     other shape is live on this machine, in the user-scope `settings.json`.
 
-    SCOPE IS THIS FILE ONLY. `.claude/settings.local.json` and the user-scope roots also carry
-    SessionStart hooks, and nothing here can see them.
+    SCOPE IS THIS FUNCTION ONLY. `.claude/settings.local.json` and the user-scope roots also carry
+    SessionStart hooks, and this reader sees neither. The user-scope wrapper IS graded, further down
+    this file under "the USER-SCOPE wrapper" -- by a separate reader, on a different question. Do
+    not merge the two: this one asks whether the REPOSITORY wires the hook once and correctly, and
+    that one asks whether N machine-local copies still agree and still warn.
     """
     wired = json.loads(read(SETTINGS))["hooks"]["SessionStart"]
     out: list[list[str]] = []
@@ -894,3 +899,115 @@ class TheRegulatorRetirementDeniesTheWatchdogSucceededIt(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ================================================================ the USER-SCOPE wrapper
+#
+# `session_start_args()` above says, correctly, that its scope is this repository's own
+# `.claude/settings.json` and that nothing there can see the user-scope roots. This section is the
+# other half. It reads those roots directly.
+#
+# WHAT IT GUARDS, AND WHY THAT IS NOT THE SAME QUESTION. The project wiring names a path inside the
+# worktree, so a stale worktree simply has no file to run. The USER-SCOPE wrapper is different: it
+# tries the worktree, falls back to the parent of `--git-common-dir` (the primary checkout), and
+# until 2026-09-20 it `exit 0`-ed in silence when neither had the hook. That silence is how the
+# whole defect went unnoticed for two weeks -- 13 of 171 worktrees on the development box resolved
+# nothing and said nothing. The wrapper now prints one line in that case, in the shape
+# `mefor-announce` beside it already used.
+#
+# THE WRAPPER HAS NO COMMITTED SOURCE. It exists only as N copies, one per config root, with no
+# installer and no parity check -- which is precisely the installed-copy drift this suite keeps
+# meeting. Nothing here can say which copy is authoritative, so it does not try: it asserts they
+# AGREE WITH EACH OTHER and that each still carries the warning branch. A hand-edit to one root
+# fails; an identical edit to all of them does not, and that limit is stated rather than papered
+# over.
+
+
+USER_SCOPE_MARKER = "korus-role-card"
+#: The branch whose absence is the silent failure. Matched on the emitted text, not on the code
+#: around it, so reformatting the wrapper does not red this while a deleted warning would.
+WARNING_SUBSTRING = "is absent from this worktree"
+
+
+def user_scope_role_card_wrappers() -> list[tuple[Path, str]]:
+    """Every user-scope `settings.json` carrying the role-card wrapper, with its command text.
+
+    Reads `Path.home().glob(".claude*")` the way `test_selfheal_installed_parity.py` does -- the
+    box runs several config roots and a session uses exactly one, so any of them can be the one
+    that matters and none of them is discoverable from the repository.
+    """
+    out: list[tuple[Path, str]] = []
+    for d in sorted(Path.home().glob(".claude*")):
+        if not d.is_dir():
+            continue
+        f = d / "settings.json"
+        if not f.is_file():
+            continue
+        try:
+            cfg = json.loads(f.read_text(encoding="utf-8-sig"))
+        except (json.JSONDecodeError, OSError):
+            continue  # a root this test cannot parse is not a finding about role cards
+        for groups in cfg.get("hooks", {}).values():
+            for group in groups:
+                for hook in group.get("hooks", []):
+                    command = str(hook.get("command", ""))
+                    if USER_SCOPE_MARKER in command:
+                        out.append((f, command))
+    return out
+
+
+def wrapper_disagreements(wrappers: list[tuple[Path, str]]) -> list[str]:
+    """Findings over a set of wrapper copies. Empty list means they agree and each warns.
+
+    PURE, so the failing paths can be driven without touching a real config root. Every arm below
+    that matters is unreachable on a healthy box, which is the state in which a guard is least
+    likely to be correct and least likely to be noticed.
+    """
+    if not wrappers:
+        return []
+    findings = []
+    bodies = {command for _, command in wrappers}
+    if len(bodies) > 1:
+        findings.append(
+            f"{len(bodies)} DIFFERENT wrapper bodies across {len(wrappers)} config root(s): "
+            + ", ".join(sorted(str(p) for p, _ in wrappers))
+        )
+    missing = sorted(str(p) for p, command in wrappers if WARNING_SUBSTRING not in command)
+    if missing:
+        findings.append(
+            "the no-hit warning branch is GONE from: "
+            + ", ".join(missing)
+            + " -- these roots go back to exiting 0 in silence when neither the worktree nor the "
+            "primary has role-card-inject.ps1, which is the failure that hid this for two weeks"
+        )
+    return findings
+
+
+def test_the_user_scope_wrappers_agree_and_still_warn() -> None:
+    wrappers = user_scope_role_card_wrappers()
+    if not wrappers:
+        pytest.skip(
+            "SKIP (nothing compared): no user-scope settings.json on this machine carries the "
+            f"{USER_SCOPE_MARKER!r} wrapper. Expected on CI, which has no config roots -- so this "
+            "arm is honest there and only ever grades a developer box."
+        )
+    print(f"compared {len(wrappers)} user-scope wrapper(s): {[str(p) for p, _ in wrappers]}")
+    findings = wrapper_disagreements(wrappers)
+    assert not findings, "\n".join("  * " + f for f in findings)
+
+
+@pytest.mark.parametrize(
+    ("bodies", "expect"),
+    [
+        ([], 0),  # nothing installed -- not a finding, the caller skips
+        (["A warns: is absent from this worktree"], 0),
+        (["A warns: is absent from this worktree"] * 6, 0),
+        (["A warns: is absent from this worktree", "B differs: is absent from this worktree"], 1),
+        (["silent wrapper with no warning"], 1),
+        (["silent one", "another silent one"], 2),  # both disagreement AND missing warning
+    ],
+)
+def test_the_wrapper_probe_reports_each_failure_shape(bodies: list[str], expect: int) -> None:
+    """Exhaustive over the decision, because five of these six cannot occur on a healthy box."""
+    made = [(Path(f"root{i}/settings.json"), b) for i, b in enumerate(bodies)]
+    assert len(wrapper_disagreements(made)) == expect, wrapper_disagreements(made)

@@ -84,7 +84,7 @@ $postCommit = Join-Path $hooksDir "post-commit"
 # THIS FILE ALREADY EXISTED ON THIS BOX AND THIS INSTALLER DID NOT KNOW IT. Measured 2026-09-19 in
 # the engine clone: .git/hooks/post-merge was byte-identical to the VAULT clone's copy of
 # durability_push.sh and three weeks older than the post-commit beside it -- written by the vault's
-# installer, which has always managed both. -Status never mentioned it, -Arm never replaced it and
+# installer, which has always managed both. -Status never mentioned it, no re-install replaced it and
 # -Uninstall never removed it, so it sat there carrying the pre-2026-09-19 matcher that refuses the
 # private vault. A `git pull` in that clone printed the refusal while the post-commit beside it was
 # current. An unmanaged hook is worse than an absent one: it runs, and no audit here can see it.
@@ -180,7 +180,7 @@ if ($Status) {
         Write-Host "             ^ THE TWO DISAGREE. They are the same script and a commit reaches one or" -ForegroundColor Yellow
         Write-Host "               the other depending on whether it came from a commit or a merge, so one" -ForegroundColor Yellow
         Write-Host "               installed alone leaves that whole class of commit covered by nothing." -ForegroundColor Yellow
-        Write-Host "               Re-run with -Arm." -ForegroundColor Yellow
+        Write-Host "               Re-run this script with NO flags -- the bare invocation IS the install." -ForegroundColor Yellow
     }
 
     # CONTENT PARITY, because the marker above is not content. The marker is one line in a header
@@ -200,7 +200,7 @@ if ($Status) {
         if ($iSha -ne $durSrcSha) {
             Write-Host "             ^ STALE. The copy that RUNS is not the one in this checkout, so every" -ForegroundColor Red
             Write-Host "               rule in it -- including which remotes it refuses to publish to -- is" -ForegroundColor Red
-            Write-Host "               whatever it was when it was installed. Re-run with -Arm." -ForegroundColor Red
+            Write-Host "               whatever it was when it was installed. Re-run with NO flags to replace it." -ForegroundColor Red
             Write-Host "               Read the branch you are on first: arming from a checkout that PREDATES" -ForegroundColor Red
             Write-Host "               the installed copy downgrades it for every worktree of this clone." -ForegroundColor Red
         }

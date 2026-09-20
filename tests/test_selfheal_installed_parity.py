@@ -189,6 +189,84 @@ def source_is_committed() -> bool:
     return out.returncode == 0 and not out.stdout.strip()
 
 
+def source_revisions_missing_from_head(
+    ref: str = "origin/main", root: Path | None = None, rel: str | None = None
+) -> list[str] | None:
+    """Commits on ``ref`` that touch :data:`SOURCE` and that this checkout's HEAD does not carry.
+
+    ``[]`` means the comparand is current. A non-empty list means it is BEHIND. ``None`` means the
+    question could not be answered here -- no git, no such ref, or a history too truncated to
+    subtract -- and that is deliberately NOT the same value as ``[]``.
+
+    WHY THIS EXISTS. Measured 2026-09-20 across four worktrees of this repository, against the one
+    installed payload:
+
+        determined-mahavira-62ec8f    source 10584 B  content 9ef7708d2509  -> FAILS (correct)
+        watchdog-e9fcb7               source 10581 B  content dc62fb56be76  -> PASSES
+        lander-3c7b3d                 source 10581 B  content dc62fb56be76  -> PASSES
+        mefor-batch-assignment-6f63b7 source 10584 B  content 9ef7708d2509  -> FAILS (correct)
+
+    The two that passed are behind the commit that changed the payload's licence header, so their
+    working-tree source still carries the SAME stale text as the installed copy. The files match,
+    the assertion is satisfied, and the payload has genuinely drifted. A checkout behind ``main``
+    therefore returns a CONFIRMING GREEN on the exact condition this module exists to catch, and
+    nothing in its output said the comparison was made against a stale comparand.
+
+    That is not a weaker check. It is a second claim wearing a control's clothes: the comparison ran
+    correctly and answered a different question from the one the reader takes it to have answered.
+    """
+    # `root` and `rel` exist ONLY so the three answers can be driven apart in a throwaway repo.
+    # Without that, the BEHIND branch is unreachable from any checkout that is up to date, and a
+    # guard whose firing path no test ever walks is a guard nobody has checked.
+    at = root or ROOT
+    path = rel if rel is not None else SOURCE.relative_to(ROOT).as_posix()
+    try:
+        out = subprocess.run(
+            ["git", "log", "--format=%h", f"HEAD..{ref}", "--", path],
+            cwd=at,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.split()
+
+
+def withheld_reason(drifted: bool, behind: list[str] | None) -> str | None:
+    """Why a GREEN from this comparison would mean nothing, or ``None`` if it would mean something.
+
+    PURE ON PURPOSE. The branch it guards is unreachable from a checkout that is up to date and has
+    real drift -- which is every checkout that would notice the guard was wrong -- so keeping the
+    decision inline left it untested in exactly the situation it exists for. Shipping an unexercised
+    guard is the defect this module is being changed to fix, one level up.
+
+    A RED IS NEVER WITHHELD. Drift in some direction is real whatever the comparand's state; only the
+    reassuring answer depends on the comparand being the right one.
+    """
+    if drifted:
+        return None
+    if behind is None:
+        return (
+            "SKIP (nothing meaningful compared): the payload MATCHES, but whether "
+            f"{SOURCE.relative_to(ROOT).as_posix()} is CURRENT could not be determined here -- no "
+            "git, no origin/main, or a history too truncated to subtract. Unknown is not the same "
+            "as current, and a green that cannot say which is worth nothing."
+        )
+    if behind:
+        return (
+            "SKIP (nothing meaningful compared): the payload MATCHES, but this checkout's "
+            f"{SOURCE.relative_to(ROOT).as_posix()} is BEHIND origin/main by {len(behind)} "
+            f"commit(s) that touch it ({' '.join(behind)}). A stale comparand matching a stale "
+            "installed copy is the false green this guard exists for: both sides carry the SAME old "
+            "text and agree. Rebase onto origin/main and re-run to get an answer that means "
+            "something."
+        )
+    return None
+
+
 def test_the_payload_target_was_derived_and_not_assumed() -> None:
     """Guard the derivation. If the parse of the installer default breaks AND nothing is wired,
     :func:`payload_targets` returns an empty list, the parity test below skips for want of a target, and
@@ -242,6 +320,19 @@ def test_the_installed_selfheal_payload_matches_the_committed_source() -> None:
 
     source_bytes = SOURCE.read_bytes()
     source_hash = content_hash(source_bytes)
+    behind = source_revisions_missing_from_head()
+    # ON THE SAME LINES AS THE VERDICT, ON PURPOSE. A check that prints "no differences" without
+    # printing WHAT it examined hides two different bugs, and this module was hiding one of them.
+    print(
+        "comparand currency: "
+        + (
+            "UNKNOWN -- could not subtract HEAD from origin/main here"
+            if behind is None
+            else "current"
+            if not behind
+            else f"BEHIND by {len(behind)} commit(s) touching the source: {' '.join(behind)}"
+        )
+    )
     drifted: list[tuple[Path, str]] = []
     for p in present:
         installed_bytes = p.read_bytes()
@@ -261,6 +352,10 @@ def test_the_installed_selfheal_payload_matches_the_committed_source() -> None:
         )
         if installed_hash != source_hash:
             drifted.append((p, installed_hash))
+
+    withheld = withheld_reason(bool(drifted), behind)
+    if withheld:
+        pytest.skip(withheld)
 
     assert not drifted, (
         f"CONTENT DRIFT: the worktree-selfheal payload that RUNS is not this checkout's.\n"
@@ -379,3 +474,91 @@ def test_folding_crlf_does_not_hide_a_bom_a_lost_newline_or_cr_only_endings() ->
             f"{label} did not change the content hash -- the failure text claims this case still trips "
             f"the parity assertion, and it does not"
         )
+
+
+# ------------------------------------------------------- the comparand-currency probe itself
+
+
+@pytest.fixture
+def two_commit_repo(tmp_path: Path) -> Path:
+    """A repo whose `main` changed a file that a checked-out earlier commit does not have.
+
+    This is the shape of every stale worktree on the development box: the file exists on both
+    sides, and the older side's copy is the one that agrees with a stale installed payload.
+    """
+    r = tmp_path / "r"
+    r.mkdir()
+
+    def run(*a: str) -> None:
+        subprocess.run(["git", "-C", str(r), *a], check=True, capture_output=True)
+
+    subprocess.run(["git", "init", "-q", "-b", "main", str(r)], check=True, capture_output=True)
+    run("config", "user.email", "t@example.invalid")
+    run("config", "user.name", "t")
+    (r / "payload.ps1").write_text("MessageFoundry Organization" + chr(10), encoding="utf-8")
+    run("add", "-A")
+    run("commit", "-qm", "first")
+    first = subprocess.run(
+        ["git", "-C", str(r), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    (r / "payload.ps1").write_text("MessageFoundry Foundation, LLC" + chr(10), encoding="utf-8")
+    run("add", "-A")
+    run("commit", "-qm", "second")
+    run("checkout", "-q", first)  # now BEHIND main by one commit touching payload.ps1
+    return r
+
+
+def test_the_currency_probe_reports_BEHIND_when_the_checkout_is(two_commit_repo: Path) -> None:
+    """The firing path. Without this the guard below is never exercised from a current checkout."""
+    behind = source_revisions_missing_from_head(ref="main", root=two_commit_repo, rel="payload.ps1")
+    assert behind is not None, "the probe could not answer in a repo built to be answerable"
+    assert len(behind) == 1, (
+        f"expected exactly the one commit that touched payload.ps1, got {behind}"
+    )
+
+
+def test_the_currency_probe_reports_current_when_it_is(two_commit_repo: Path) -> None:
+    """The NEGATIVE arm. A probe that says BEHIND everywhere would also have passed the test above."""
+    subprocess.run(["git", "-C", str(two_commit_repo), "checkout", "-q", "main"], check=True)
+    assert (
+        source_revisions_missing_from_head(ref="main", root=two_commit_repo, rel="payload.ps1")
+        == []
+    )
+
+
+def test_the_currency_probe_keeps_UNKNOWN_apart_from_current(two_commit_repo: Path) -> None:
+    """`None` and `[]` must not render the same. Conflating them is how a green stops meaning anything.
+
+    This is the whole lesson of the defect that prompted the guard: a control only controls when it
+    asks the same question as the thing it checks, and "I could not ask" is not "the answer is no".
+    """
+    unknown = source_revisions_missing_from_head(
+        ref="refs/heads/zzqx9137-no-such-ref", root=two_commit_repo, rel="payload.ps1"
+    )
+    assert unknown is None, f"a missing ref must answer UNKNOWN, not current; got {unknown!r}"
+    current = source_revisions_missing_from_head(
+        ref="HEAD", root=two_commit_repo, rel="payload.ps1"
+    )
+    assert current == [], f"HEAD cannot be behind itself; got {current!r}"
+    assert unknown != current, "UNKNOWN and current must be distinguishable values"
+
+
+@pytest.mark.parametrize(
+    ("drifted", "behind", "withheld"),
+    [
+        (True, None, False),  # a red survives an unanswerable comparand
+        (True, ["abc1234"], False),  # a red survives a stale one
+        (True, [], False),
+        (False, [], False),  # the only green that means anything
+        (False, None, True),  # unknown currency
+        (False, ["abc1234"], True),  # the false green this guard exists for
+    ],
+)
+def test_only_a_MEANINGLESS_green_is_withheld(
+    drifted: bool, behind: list[str] | None, withheld: bool
+) -> None:
+    """Exhaustive over the decision. Three of these six were unreachable from this box before."""
+    got = withheld_reason(drifted, behind)
+    assert (got is not None) == withheld, f"drifted={drifted} behind={behind!r} -> {got!r}"
+    if withheld:
+        assert got is not None and got.startswith("SKIP (nothing meaningful compared)")

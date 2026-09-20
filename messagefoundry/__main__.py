@@ -92,7 +92,7 @@ def main(argv: list[str] | None = None) -> int:
     # The last-resort hooks are a PROCESS property, so they are installed here, once, for every
     # subcommand (BACKLOG #1674). `last_resort` states the ASVS 16.5.4 guarantee that an unhandled
     # error can never escape as a raw traceback quoting a PHI-bearing value; until this call site they
-    # were installed inside `_serve` only, leaving the other 32 subcommands unguarded. `dryrun`,
+    # were installed inside `_serve` only, leaving the other 33 subcommands unguarded. `dryrun`,
     # `audit-verify` and `backup` open the store, so an uncaught exception from one of them is the
     # case that could carry a field value.
     #
@@ -859,6 +859,19 @@ def main(argv: list[str] | None = None) -> int:
         help="service settings TOML (default: ./messagefoundry.toml if present)",
     )
     ai_policy.add_argument("--json", action="store_true", help="emit JSON only (parsed by the IDE)")
+
+    cluster_vip = sub.add_parser(
+        "cluster-vip",
+        help="print the resolved [cluster.vip] block (for the net-helper installer)",
+    )
+    cluster_vip.add_argument(
+        "--service-config",
+        default=None,
+        help="service settings TOML (default: ./messagefoundry.toml if present)",
+    )
+    cluster_vip.add_argument(
+        "--json", action="store_true", help="emit JSON only (parsed by the net-helper installer)"
+    )
 
     verify = sub.add_parser(
         "verify",
@@ -5301,6 +5314,58 @@ def _ai_policy(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cluster_vip(args: argparse.Namespace) -> int:
+    """Print the ``[cluster.vip]`` block resolved from local service settings (BACKLOG #1523).
+
+    THE ONE READ OF THAT BLOCK OUTSIDE PYTHON, and the reason it exists at all.
+    ``scripts/service/install-net-helper.ps1`` writes ``address``, ``interface`` and ``mask`` into
+    ``mefor-net-helper.conf``, and the helper refuses any request naming values other than the ones
+    in that file (ADR 0056). So the installer's three values and the engine's three values must be
+    the same three values, and a TOML parser in PowerShell would be a SECOND DEFINITION of the
+    block rather than a second reader of it: it would not resolve ``prefix``/``netmask`` down to the
+    one wire ``mask``, and it would not refuse the switched-on-but-unusable block
+    :class:`~messagefoundry.config.settings.ClusterVipSettings` refuses at load. This projects what
+    the loader already resolved, so there is one parser and one definition.
+
+    ``mask`` is the dotted-decimal netmask whichever of ``prefix`` and ``netmask`` was written, and
+    is ``null`` when neither is (which an enabled block cannot be -- the loader refuses it).
+    ``cluster_enabled`` is carried because ``[cluster.vip].enabled`` additionally requires
+    ``[cluster].enabled``: a caller that reported "the VIP is off" without it would name the wrong
+    switch to an operator who set only one of the two. ``gratuitous_arp`` and
+    ``release_grace_seconds`` complete the block for an operator reading the human form -- no
+    installer reads them, so ``test_cli_cluster_vip`` asserts them rather than leaving two fields in
+    a machine contract with no reader at all.
+
+    Prints config only -- never message data (PHI-safe). Exit 2 and a ``{"error": ...}`` line on a
+    config that will not load, mirroring ``ai-policy``, so a caller parsing stdout as JSON sees the
+    reason rather than an empty read. ``OSError`` is in the catch because a ``--service-config`` that
+    names a DIRECTORY passes ``Path.exists()`` and then raises ``IsADirectoryError`` on open -- an
+    easy typo for the file inside it, and a traceback there would leave stdout empty and the caller
+    reporting "printed nothing" instead of the reason."""
+    from pydantic import ValidationError
+
+    from messagefoundry.config.settings import load_settings
+
+    try:
+        settings = load_settings(config_path=args.service_config)
+    except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
+        print(json.dumps({"error": str(exc)}))
+        return 2
+
+    vip = settings.cluster.vip
+    payload = {
+        "enabled": vip.enabled,
+        "cluster_enabled": settings.cluster.enabled,
+        "address": vip.address,
+        "interface": vip.interface,
+        "mask": vip.mask,
+        "gratuitous_arp": vip.gratuitous_arp,
+        "release_grace_seconds": vip.release_grace_seconds,
+    }
+    _print_json(payload, compact=args.json)
+    return 0
+
+
 def _generate(args: argparse.Namespace) -> int:
     from messagefoundry.generators import (
         _core,
@@ -6077,6 +6142,7 @@ _DISPATCH = {
     "backup": _backup,
     "restore-verify": _restore_verify,
     "ai-policy": _ai_policy,
+    "cluster-vip": _cluster_vip,
     "verify": _verify,
     "support-bundle": _support_bundle,
     "service": _service,
