@@ -21,7 +21,29 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-PROFILES_DIR = Path(__file__).resolve().parents[1] / "profiles"
+from harness.load._lookup import (
+    ESTATE_PATTERNS,
+    LOCAL_PROFILES_SUBPATH,
+    PROFILES_DIR,
+    local_profiles_dir,
+    read_profile_toml,
+    resolve_profile,
+    scan_profiles,
+)
+
+#: Re-exported from :mod:`harness.load._lookup`, where the three schemas' shared lookup lives.
+__all__ = [
+    "LOCAL_PROFILES_SUBPATH",
+    "PROFILES_DIR",
+    "EstateProfile",
+    "EstateProfileError",
+    "EstateSlo",
+    "get_estate_profile",
+    "list_estate_profiles",
+    "load_estate_profile",
+    "load_estate_profile_text",
+    "local_profiles_dir",
+]
 
 #: How close ``total_event_rate`` and ``per_conn_event_rate × count`` must agree (relative) when BOTH
 #: are given — a hand-authored profile that states both must be self-consistent, else it is rejected.
@@ -106,23 +128,10 @@ class EstateProfile:
 
 
 def load_estate_profile(path: Path | str) -> EstateProfile:
-    """Parse an estate profile TOML file. Raises :class:`EstateProfileError` on a problem. Tolerant of a
-    leading UTF-8 BOM (PowerShell ``Set-Content -Encoding utf8`` prepends one, which bare ``tomllib``
-    rejects with an opaque parse error)."""
+    """Parse an estate profile TOML file. Raises :class:`EstateProfileError` on a problem. Tolerant of
+    a leading UTF-8 BOM (:func:`~harness.load._lookup.read_profile_toml` explains why)."""
     p = Path(path)
-    try:
-        raw = p.read_bytes()
-    except OSError as exc:
-        raise EstateProfileError(f"cannot read {p.name}: {exc}") from exc
-    try:
-        text = raw.decode("utf-8-sig")  # strips a UTF-8 BOM if present; still enforces UTF-8
-    except UnicodeDecodeError as exc:
-        raise EstateProfileError(f"cannot read {p.name}: not valid UTF-8 ({exc})") from exc
-    try:
-        data = tomllib.loads(text)
-    except tomllib.TOMLDecodeError as exc:
-        raise EstateProfileError(f"cannot read {p.name}: {exc}") from exc
-    return _profile_from_data(data, where=p.name)
+    return _profile_from_data(read_profile_toml(p, error=EstateProfileError), where=p.name)
 
 
 def load_estate_profile_text(text: str, *, where: str = "<text>") -> EstateProfile:
@@ -135,29 +144,29 @@ def load_estate_profile_text(text: str, *, where: str = "<text>") -> EstateProfi
 
 
 def list_estate_profiles() -> dict[str, str]:
-    """Built-in profile name → description, read from the estate profile TOMLs (``estate*.toml``). Keep
-    the glob in step with ``tests/test_load_config.py::test_all_shipped_profiles_parse`` (which EXCLUDES
-    the same set — an estate-schema profile is not a [load] profile)."""
-    out: dict[str, str] = {}
-    for path in sorted(PROFILES_DIR.glob("estate*.toml")):
-        try:
-            prof = load_estate_profile(path)
-            out[prof.name] = prof.description
-        except EstateProfileError:
-            out[path.stem] = "(invalid profile)"
-    return out
+    """Profile name to description: the shipped estate TOMLs (``estate*.toml``), plus any
+    operator-local ones, each labelled.
+
+    The glob is :data:`~harness.load._lookup.ESTATE_PATTERNS`, which
+    ``harness.load.profile.list_profiles`` excludes and
+    ``tests/test_load_config.py::test_all_shipped_profiles_parse`` reads — one definition rather than
+    three copies that were already out of step (BACKLOG #1837)."""
+    return scan_profiles(
+        include=ESTATE_PATTERNS,
+        load=load_estate_profile,
+        error=EstateProfileError,
+    )
 
 
 def get_estate_profile(name_or_path: str) -> EstateProfile:
-    """Resolve a built-in profile name or a filesystem path to an :class:`EstateProfile`."""
-    candidate = Path(name_or_path)
-    if candidate.exists():
-        return load_estate_profile(candidate)
-    builtin = PROFILES_DIR / f"{name_or_path}.toml"
-    if builtin.exists():
-        return load_estate_profile(builtin)
-    choices = ", ".join(sorted(list_estate_profiles())) or "(none)"
-    raise EstateProfileError(f"unknown estate profile {name_or_path!r}; built-ins: {choices}")
+    """Resolve a filesystem path, an operator-local profile name, or a built-in name."""
+    return resolve_profile(
+        name_or_path,
+        load=load_estate_profile,
+        listing=list_estate_profiles,
+        error=EstateProfileError,
+        label="estate profile",
+    )
 
 
 def _profile_from_data(data: dict[str, Any], *, where: str) -> EstateProfile:

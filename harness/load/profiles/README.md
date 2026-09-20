@@ -41,7 +41,12 @@ hubs) with **generic, synthetic** values only. They name no real partner, site c
 message volume; the weights are an illustrative ADT-dominant shape, not any real site's percentages.
 A real-numbers profile (if you ever build one) belongs **only** in the git-ignored `migration-local/`
 tree: put it at `migration-local/profiles/<name>.toml` and `--load <name>` finds it, or run any path
-with `--load <path>`. Never commit one here, **and never drop one in this directory gitignored by
+with `--load <path>`. That directory serves **all three** schemas — `--connscale <name>` and
+`--estate <name>` resolve there too (BACKLOG #1837). It holds three schemas the way this one does,
+so name a local profile the way a shipped one is named: an operator `[connscale]` profile is
+`connscale-<site>.toml`, an `[estate]` one is `estate-<site>.toml`. A name outside its schema's
+prefixes still runs, but `--list-connscale-profiles` / `--list-estate-profiles` will not show it.
+Never commit one here, **and never drop one in this directory gitignored by
 name either** — that was tried, and it shipped. The harness wheel force-includes this directory
 whole; hatchling's `recurse_forced_files` walks the filesystem and consults no `.gitignore`, and
 `exclude` does not reach a force-included file, so the wheel carries whatever is sitting here on the
