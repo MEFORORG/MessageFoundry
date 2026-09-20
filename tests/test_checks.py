@@ -916,3 +916,120 @@ def test_check_dryrun_honors_explicit_service_config(tmp_path: Path) -> None:
     results = run_checks(cfg, messages_dir=msgs, run_lint=False, service_config=toml).results
     dr = next(r for r in results if r.name == "dryrun")
     assert dr.ok and dr.required and not dr.skipped, dr.detail
+
+
+# --- the empty-config refusal reaches the gate (BACKLOG #1648) ----------------
+
+
+def _helper_only_config(tmp_path: Path) -> Path:
+    """A config dir that loads cleanly and declares no connection — a router and a handler only."""
+    (tmp_path / "cfg.py").write_text(
+        "from messagefoundry import router, handler, Send\n\n"
+        "@router('r')\n"
+        "def route(msg):\n"
+        "    return ['h']\n\n"
+        "@handler('h')\n"
+        "def handle(msg):\n"
+        "    return Send('nowhere', msg)\n",
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+def test_validate_check_fails_on_a_config_that_declares_no_connections(tmp_path: Path) -> None:
+    """The required validate leg blocks, naming the problem — it used to pass such a dir silently.
+
+    Falsified by dropping the empty-graph rule from ``Registry.graph_problems``: the leg goes green
+    and the gate reports a clean config that would receive and send nothing."""
+    report = run_checks(_helper_only_config(tmp_path), run_lint=False)
+    validate = next(r for r in report.results if r.name == "validate")
+    assert validate.ok is False and validate.required is True
+    assert "declares no connections" in validate.detail
+    assert report.ok is False
+
+
+def test_allow_empty_config_lets_the_same_dir_pass(tmp_path: Path) -> None:
+    """``--allow-empty-config`` drops that one rule and nothing else.
+
+    Paired with the test above so neither passes alone: a rule that never fires reds that one, an
+    opt-out that does not work reds this one."""
+    report = run_checks(_helper_only_config(tmp_path), run_lint=False, allow_empty_config=True)
+    validate = next(r for r in report.results if r.name == "validate")
+    assert validate.ok is True, validate.detail
+    assert report.ok is True
+
+
+def test_allow_empty_config_does_not_blind_the_graph_advisories(tmp_path: Path) -> None:
+    """The opt-out must not silently disable the legs that READ the router/handler graph.
+
+    ``send-target`` and ``dead-config`` judge Routers and Handlers, which exist whether or not a
+    connection is declared. Their docstrings delegate a load failure to ``validate`` -- and under
+    ``--allow-empty-config`` ``validate`` is precisely the leg that no longer reports it, so a leg
+    that skipped here would be covered by nothing. The fixture's ``Send('nowhere')`` is a real
+    dangling literal target and ``send-target`` is the one leg that catches it.
+
+    Falsified by dropping ``allow_empty=True`` from either leg's ``load_config``: both come back
+    ``skipped=True, detail='config did not load'`` -- about a config that loaded."""
+    report = run_checks(_helper_only_config(tmp_path), run_lint=False, allow_empty_config=True)
+    by_name = {r.name: r for r in report.results}
+
+    send_target = by_name["send-target"]
+    assert send_target.detail != "config did not load"
+    assert send_target.ok is False and "nowhere" in send_target.detail
+    assert by_name["dead-config"].detail != "config did not load"
+    # Both are advisory, so the gate still passes -- the point is that they RAN.
+    assert send_target.required is False and report.ok is True
+
+
+def test_allow_empty_config_does_not_silently_skip_a_required_leg(tmp_path: Path) -> None:
+    """``--allow-empty-config`` must not turn a REQUIRED check into a skip.
+
+    ``build-check`` and ``reference-backend`` are required, and their skip arms delegate the
+    reporting to ``validate`` -- the one leg this flag silences. A skipped required leg does not
+    block, so without the opt-out at their own ``load_config`` the flag would disable two required
+    checks while the gate still exits 0, and print "config did not load" about a config that loaded.
+    ``reference-backend``'s subject is ``registry.references``, which a connection-less config can
+    still declare, so this is not merely a wording defect.
+
+    Falsified by dropping ``allow_empty=True`` from either leg: both come back ``skipped=True``."""
+    cfg = _helper_only_config(tmp_path)
+    # The required legs need settings present, or they skip earlier for an unrelated (legitimate)
+    # reason and this test would pass without exercising anything.
+    (cfg / "messagefoundry.toml").write_text("[store]\nbackend = 'sqlite'\n", encoding="utf-8")
+
+    report = run_checks(cfg, run_lint=False, allow_empty_config=True)
+    by_name = {r.name: r for r in report.results}
+
+    for name in ("build-check", "reference-backend"):
+        leg = by_name[name]
+        assert leg.required is True
+        assert leg.skipped is False, f"{name} skipped: {leg.detail}"
+        assert leg.ok is True, leg.detail
+    assert report.ok is True
+
+
+def test_allow_empty_config_does_not_mask_a_real_problem(tmp_path: Path) -> None:
+    """The opt-out is scoped to emptiness: an unresolved router still fails the leg under it.
+
+    Falsified by implementing ``--allow-empty-config`` as "skip the validate leg": this goes green."""
+    (tmp_path / "cfg.py").write_text(
+        "from messagefoundry import inbound, MLLP\n"
+        "inbound('IB_X', MLLP(port=2599), router='missing')\n",
+        encoding="utf-8",
+    )
+    report = run_checks(tmp_path, run_lint=False, allow_empty_config=True)
+    validate = next(r for r in report.results if r.name == "validate")
+    assert validate.ok is False and "unknown router" in validate.detail
+
+
+def test_cli_check_allow_empty_config_flag(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The flag is reachable from ``messagefoundry check`` and changes the exit code."""
+    cfg = _helper_only_config(tmp_path)
+    refused = main(["check", "--config", str(cfg), "--no-lint", "--json"])
+    capsys.readouterr()
+    allowed = main(["check", "--config", str(cfg), "--no-lint", "--allow-empty-config", "--json"])
+    capsys.readouterr()
+    assert refused == 1
+    assert allowed == 0

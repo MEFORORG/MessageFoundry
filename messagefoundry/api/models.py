@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field
 from messagefoundry.api.phi_gate import PhiGatedModel
 from messagefoundry.api.request_model import RequestModel
 from messagefoundry.api.validation import (
+    ALERT_SUSPEND_MINUTES_MAX,
     MAX_EXPORT_IDS,
     MAX_MAP_ENTRIES,
     ConnectionName,
@@ -386,8 +387,10 @@ class AlertSuspendRequest(RequestModel):
     window end is ``now + minutes·60``; the instance keeps firing into state (stays open/counted) — only
     re-alerts are silenced for the window. ``POST /alerts/{id}/resume`` takes no body."""
 
-    # Bounded so an operator can't set an unbounded / absurd window; 1 minute .. 30 days.
-    minutes: float = Field(gt=0, le=43200)
+    # Bounded so an operator can't set an unbounded / absurd window: any positive number of minutes,
+    # up to 30 days. The ceiling is named in `api.validation` because the /ui suspend form quotes it
+    # back to the operator when it refuses a window (BACKLOG #1744).
+    minutes: float = Field(gt=0, le=ALERT_SUSPEND_MINUTES_MAX)
 
 
 class AlertInstanceList(BaseModel):
@@ -701,6 +704,33 @@ class Health(BaseModel):
 
 
 class EngineInfo(BaseModel):
+    """Inbound-only engine counters (vs :class:`EngineKpis`, which combines inbound + outbound).
+
+    ``uptime_seconds`` is ``0.0`` until the engine has STARTED (``Engine.started_at`` is unset), so
+    ``uptime_seconds > 0`` is the supported "this engine has started" test, and the console's health
+    rollup keys its empty-graph warn on exactly that. It is NOT monotonic: ``/status`` derives it as
+    ``max(0.0, time.time() - started_at)`` off the WALL clock, so a backwards step (an NTP
+    correction on a long-running box) reads ``0.0`` on an engine that HAS started, until the clock
+    catches up. A gate written as ``> 0`` therefore stays silent for that window rather than firing
+    wrongly, which is the safe direction for one. Do not restate this as "uptime only grows": that
+    reading invites the next gate to be built on it the other way round, where the same clock step
+    produces a false alarm instead of a held one.
+
+    ``channels_failed`` counts the DEPLOYED inbound connections that failed to build or bind at start
+    (ADR 0031 isolation — the engine came up and serves the rest of the graph). It is an estate-wide
+    count, exactly like ``channels_total`` / ``channels_running`` beside it. It is a SUBSET of
+    ``channels_stopped``, never a fourth bucket: a connection that failed to start is not running, so
+    ``channels_stopped == channels_total - channels_running`` already counts it. Do not add the two.
+
+    ``channels_failed_names`` is the subset of those names the CALLER is authorized to see, so it can
+    be shorter than ``channels_failed`` and empty while the count is not. ``/connections`` hides an
+    out-of-scope inbound's name from a channel-scoped caller, and this field must not become a side
+    channel around that; the count itself discloses nothing ``channels_total`` does not. Names only,
+    never the failure reason — a reason is a raw exception string and this field renders into a
+    tooltip.
+
+    Both are additive + defaulted, so an older client deserializes ``/status`` unchanged."""
+
     version: str
     uptime_seconds: float
     pid: int
@@ -708,6 +738,8 @@ class EngineInfo(BaseModel):
     channels_running: int
     channels_stopped: int
     outbox_by_status: dict[str, int]
+    channels_failed: int = 0  # deployed inbounds that failed to start (ADR 0031), estate-wide
+    channels_failed_names: list[str] = Field(default_factory=list)  # the caller-visible subset
 
 
 class EngineKpis(BaseModel):
@@ -740,7 +772,10 @@ class EngineKpis(BaseModel):
 class DbInfo(BaseModel):
     path: str
     size_bytes: int  # db file + -wal + -shm
-    disk_free_bytes: int
+    # None = unmeasurable -- see DbStatus.disk_free_bytes (BACKLOG #1563). Required, not defaulted
+    # like `synchronous` below: that default exists for wire compatibility, and this field has never
+    # been optional on the wire, so a caller must say which of the two it means.
+    disk_free_bytes: int | None
     journal_mode: str
     messages: int
     events: int
@@ -755,11 +790,18 @@ class LogInfo(BaseModel):
     """App-log storage metering for the configured ``[logging].log_dir`` (#50), mirroring
     :class:`DbInfo`'s DB-side ``size_bytes`` / ``disk_free_bytes``. **Metadata only — never any log
     content** (no PHI). Present only when a log directory is configured; when the engine logs to stdout
-    (captured off-process by NSSM) the ``logs`` field on :class:`SystemStatus` is ``None``."""
+    (captured off-process by NSSM) the ``logs`` field on :class:`SystemStatus` is ``None``.
+
+    **Three states, deliberately, and they used to be two** (BACKLOG #1563). ``logs is None`` means no
+    log directory is CONFIGURED. A ``LogInfo`` whose fields are ``None`` means one is configured but
+    the metering PROBE failed. A field holding ``0`` is a real measured zero. Collapsing the middle
+    case into a bare ``None`` hid a vanished log directory behind the stdout-only answer."""
 
     path: str
-    size_bytes: int  # total bytes of regular files under the log directory (one level)
-    disk_free_bytes: int  # free space on the log directory's filesystem
+    # None = unmeasurable (see DbStatus.disk_free_bytes). The two halves fail independently: a
+    # readable directory on an unstattable mount yields a size with no free space, and vice versa.
+    size_bytes: int | None  # total bytes of regular files under the log directory (one level)
+    disk_free_bytes: int | None  # free space on the log directory's filesystem
 
 
 class LogSinkInfo(BaseModel):

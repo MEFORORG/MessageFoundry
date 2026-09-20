@@ -15,8 +15,10 @@ else lands first — it flips to ``BEHIND`` and stops. Armed auto-merge does NOT
 branch; it only waits on checks, which are already green. Nothing re-syncs it. Nothing reports it.
 
 WHY NOTHING ELSE CATCHES IT. Every existing signal is a check outcome, and no check has failed — that
-is the whole problem. ``statusCheckRollup`` is all green, ``nightly-notice.yml`` watches CI runs (there
-is no failing run), and the author has no reason to look because their last signal was a full pass.
+is the whole problem. ``statusCheckRollup`` is all green, ``nightly-notice.yml`` reacts to a run's
+CONCLUSION and there is no failing run to react to (it watches this workflow too -- see below -- which
+catches this checker breaking, not the stall it looks for), and the author has no reason to look
+because their last signal was a full pass.
 The state is indistinguishable from "merging shortly" except by asking a question nobody asks:
 *is this PR still able to merge at all?* A green dashboard and a wedged repository look identical.
 
