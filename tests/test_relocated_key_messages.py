@@ -7,10 +7,14 @@ spellings as file or env input. So a refusal, warning or ``--help`` string that 
 one hands out a remediation that dies at load with "unrecognized config key(s)" -- authoritative-looking,
 because it came from the gate itself, and only discoverable by spending a restart.
 
-THIS FILE IS A BUDGET, NOT A BAN. Naming a relocated key is not automatically wrong: several messages name
-one to explain WHY a check fired while giving a remediation on a key that did NOT move, and those are
-confusing rather than broken. Grading them is in the #1361 row. What this test stops is the class GROWING
--- a new file, a new key, or more sites in a file already carrying some.
+THE BUDGET IS A MECHANISM, AND IT IS CURRENTLY EMPTY -- so today this file bans the class outright. That
+is a measured state, not a rule change: #1361 graded every budgeted site and every one of them was
+reworded, so there is nothing left to tolerate. See ``_BUDGET`` for what each retired row was.
+
+Naming a relocated key is still not AUTOMATICALLY wrong, which is why the mechanism stays. A message may
+name one to explain WHY a check fired while prescribing a key that did not move. Grade such a site on what
+an operator would DO with the sentence: a description of state can be re-budgeted with its reason, an
+instruction to set a rejected key cannot.
 
 SCANNED WITH ``ast``, NOT ``grep``. These messages are multi-line implicit concatenations: "requires " ends
 one line and "[api].public_origin" starts the next, so a line-based scan matches neither and reports a clean
@@ -31,24 +35,38 @@ _ENGINE = pathlib.Path(__file__).resolve().parents[1] / "messagefoundry"
 
 # Sites tolerated today, keyed by (path, old spelling) with the count as a CEILING. A ceiling rather than an
 # equality so a fix that REMOVES one does not red the test -- PR 593 removes two from __main__.py.
-_BUDGET: dict[tuple[str, str], int] = {
-    # The ([ai].data_class, 2) row that sat here is GONE with BACKLOG #1279: the key left the
-    # relocation map (it was removed, not relocated) and both sites in __main__.py went with it, so
-    # the row could never be read again -- a budget entry for a spelling the scanner no longer knows.
-    #
-    # THE [api] AND [ai] ROWS ARE GONE TOO, graded and reworded under #1361 rather than tolerated.
-    # Every one of them was actionable misdirection, not description: `--host` help named [api].host
-    # as the file key the flag overrides, the DEBUG refusal said "set [ai].production=false", the /ui
-    # refusal said "Bind [api].host to a loopback address", and app.py said "set [api].serve_ui=false"
-    # -- four instructions that die at load. The rest named [api].public_origin as the subject of a
-    # value complaint, which sends an operator to a key they cannot have set: the only file route to
-    # that value is [security].web_console_public_address, which desugars into the internal field.
-    # They now name the [security] spelling, matching the already-fixed OIDC refusal in settings.py.
-    # Name the relocated SWITCH to explain why a connection was refused, while the fix they give is
-    # [egress].allowed_db / allowed_http -- keys that did NOT move, so the remediation works.
-    ("messagefoundry/pipeline/reference_sync.py", "[egress].deny_by_default"): 1,
-    ("messagefoundry/pipeline/wiring_runner.py", "[egress].deny_by_default"): 5,
-}
+_BUDGET: dict[tuple[str, str], int] = {}
+# EMPTY ON PURPOSE, AND THAT IS THE WHOLE OF BACKLOG #1361's REMAINING LIMB. It is not an accident,
+# and it is not a claim that the scanner stopped working -- test_the_census_examined_a_population and
+# test_the_scanner_actually_detects_a_violation exist to tell those apart, so read their result
+# before reading this dict's emptiness as good news.
+#
+# What each retired row was, so nobody re-adds one thinking it was tolerated on merit:
+#
+#   ([ai].data_class, 2) left with BACKLOG #1279 -- the key was REMOVED rather than relocated, so it
+#   dropped out of the relocation map and the scanner can no longer produce that key at all.
+#
+#   The [api]/[ai] rows (12 budgeted, 10 live) were graded REWORD under #1361, because none of them
+#   merely described state. Four were outright instructions that die at load: `--host` help named
+#   [api].host as the file key the flag overrides, the DEBUG refusal said "set [ai].production=
+#   false", the /ui refusal said "Bind [api].host to a loopback address", and api/app.py said "set
+#   [api].serve_ui=false". The rest named [api].public_origin as the SUBJECT of a value complaint,
+#   which sends an operator to a key they cannot have set -- the only file route to that value is
+#   [security].web_console_public_address, which desugars into the internal field.
+#
+#   The [egress] six (reference_sync + wiring_runner) named the relocated SWITCH to explain a
+#   refusal while prescribing [egress].allowed_db / allowed_http, keys that did NOT move. The
+#   remediation always worked, so the FIX was never the defect and is unchanged. The EXPLANATION
+#   was, and worse here than anywhere else in the budget: [egress].deny_by_default sat in one
+#   sentence beside two live keys of that same real section, so it reads as equally settable. An
+#   operator adding it to their [egress] block gets "unrecognized config key(s)" at next start.
+#   They now name [security].block_unlisted_outbound, which is already how __main__.py spells this
+#   switch in the warning fifteen lines above the DEBUG gate.
+#
+# Re-budgeting a site is still allowed -- add the row with the reason it DESCRIBES state rather than
+# prescribing a fix. The bar is what an operator would DO with the sentence, not whether it is
+# accurate about the internal field (docstrings, which do name the internal field, are excluded
+# above for exactly that reason).
 
 _PLANTED_VIOLATION = "\n".join(
     [
@@ -149,6 +167,12 @@ def test_no_new_file_or_key_names_a_relocated_spelling() -> None:
 
 
 def test_no_file_grows_its_share_of_the_class() -> None:
+    """DORMANT WHILE ``_BUDGET`` IS EMPTY -- it iterates the budget, so an empty one makes it vacuous.
+
+    Say so rather than let it read as the guard that is holding: with no budgeted sites the weight is
+    entirely on test_no_new_file_or_key_names_a_relocated_spelling above, which reds on ANY hit. This
+    one wakes up again the moment a site is legitimately re-budgeted, and it is kept for that.
+    """
     counts = _census()
     grown = {k: (counts[k], ceiling) for k, ceiling in _BUDGET.items() if counts[k] > ceiling}
     assert not grown, f"more sites than budgeted (actual, ceiling): {grown}"

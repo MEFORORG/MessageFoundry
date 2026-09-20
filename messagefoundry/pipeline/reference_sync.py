@@ -125,8 +125,8 @@ async def _load_database_source(
         # otherwise ignored the flag).
         if egress.deny_by_default and not egress.allowed_db:
             raise ReferenceSyncError(
-                "DATABASE reference source: [egress].deny_by_default is set and [egress].allowed_db "
-                "is empty — list the reference server to permit it"
+                "DATABASE reference source: [security].block_unlisted_outbound is set and "
+                "[egress].allowed_db is empty — list the reference server to permit it"
             )
         if egress.allowed_db and not _egress_allows(
             server, settings.get("port", 1433), egress.allowed_db
