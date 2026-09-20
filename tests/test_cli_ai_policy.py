@@ -108,8 +108,9 @@ def test_a_directory_at_service_config_is_an_error_line_not_a_traceback(
 #: and needs no entry in ``.gitleaks.toml``'s allowlist -- an allowlist entry is a scanner blind spot
 #: bought for nothing when the fixture can simply not look like a key.
 #:
-#: SHORT, which is load-bearing, and the same value ``tests/test_cli_cluster_vip.py`` plants for the
-#: same reason. Pydantic abbreviates a long ``input_value`` repr FROM THE MIDDLE, so a 32-character
+#: SHORT, which is load-bearing. (The sibling plants the same literal; that is not asserted anywhere
+#: and nothing keeps the two in step, so do not read either file's value as pinned by the other.)
+#: Pydantic abbreviates a long ``input_value`` repr FROM THE MIDDLE, so a 32-character
 #: value comes back as ``{'backend': 'postgres', '...-A-REAL-ONE-x'}`` and an ``in`` test over the
 #: whole string reads False while most of the value is plainly on screen. A real 32-character
 #: password leaks its tail exactly that way. Measured at ``19c98e023``, this subcommand rendered
@@ -171,8 +172,14 @@ def test_without_json_the_output_is_indented_and_still_parses(
 ) -> None:
     # --json is the compact spelling the IDE asks for; the bare form is the one an operator reads.
     # Both are JSON, which is what lets the error handling be the same on both.
-    cfg = _write(tmp_path / "messagefoundry.toml", '[ai]\nmode = "byo"\nenvironment = "dev"\n')
+    #
+    # `off`, NOT `byo`, and that is the whole reason this config differs from the one above.
+    # AiSettings.mode DEFAULTS to byo, so asserting `mode == "byo"` here would pass unchanged against
+    # a subcommand that ignored --service-config entirely and projected model defaults -- a green
+    # assertion proving only that some JSON came out. `off` is not the default, so this leg reads the
+    # file to pass.
+    cfg = _write(tmp_path / "messagefoundry.toml", '[ai]\nmode = "off"\nenvironment = "dev"\n')
     assert main(["ai-policy", "--service-config", str(cfg)]) == 0
     human = capsys.readouterr().out
     assert "\n  " in human
-    assert json.loads(human)["mode"] == "byo"
+    assert json.loads(human)["mode"] == "off"

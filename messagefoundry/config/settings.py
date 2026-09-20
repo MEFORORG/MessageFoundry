@@ -5400,27 +5400,51 @@ def settings_error_detail(exc: Exception) -> str:
     A LONG VALUE IS NOT SAFER: pydantic abbreviates a long ``input_value`` repr from the middle, so a
     32-character password loses its head and discloses its tail.
 
-    THIS IS THE RENDERER TO REACH FOR, AND FIVE CALLERS STILL DO NOT REACH FOR IT. Measured over
-    ``messagefoundry/__main__.py`` at ``f6d2c7bef``, the commit BACKLOG #1523 landed as: of 20
-    ``except`` arms naming ``ValidationError``, 7 render ``str(exc)`` in the handler --
-    ``_admin_unlock``, ``_provision_admin``, ``_backup``, ``_restore_verify``, ``_ai_policy``,
-    ``_cluster_vip`` and ``_connection``. #1523 fixed ``_cluster_vip``.
+    THIS IS THE RENDERER TO REACH FOR, AND AT LEAST FIFTEEN CALLERS STILL DO NOT REACH FOR IT.
+    "At least", and never an enumeration, for two reasons this paragraph has already been wrong about
+    once each.
 
-    ``_ai_policy`` IS NOW FIXED TOO, and this paragraph said "the other six stand" until it was.
-    That correction is written here rather than folded away because the stale list is the hazard the
-    paragraph exists to name: a reader checking whether ``ai-policy`` still discloses would have
-    found its own name on a to-do list and stopped. Re-measured with the same instrument over the
-    same file, ``origin/main`` at ``19c98e023`` still gave 20 arms and the 6 the sentence above
-    implies; with ``_ai_policy`` rendered through this function it gives 20 and **five** --
-    ``_admin_unlock``, ``_provision_admin``, ``_backup``, ``_restore_verify`` and ``_connection`` --
-    and ALL FIVE now reach the operator through ``_emit_error`` (it was five of six before, and
-    ``_ai_policy`` was the one that printed its own JSON instead).
+    FIRST, THE NUMBER IS A MEASUREMENT AND NOT AN INVARIANT. Nothing gates a new ``except`` arm, so
+    the next one lands without touching this paragraph; PR 1141 was open with one in it while this
+    was being written. Re-measure before you quote it.
 
-    ``ai-policy`` was RUN and confirmed to disclose a planted ``MEFOR_STORE_PASSWORD`` on the same
-    config ``tests/test_cli_cluster_vip.py`` plants one against; ``tests/test_cli_ai_policy.py`` now
-    holds that case. The remaining five were read, not run, so this counts arms rather than confirmed
-    disclosures. That sweep is NOT part of #1523 and is stated rather than done, so nobody reads this
-    docstring as covering it.
+    SECOND, AND THIS IS THE ONE THAT BIT: THE INSTRUMENT DECIDES THE ANSWER, so read what it asked.
+    This paragraph used to say SEVEN arms, then SIX, then FIVE, each from an AST walk for a literal
+    ``str(<bound>)`` in the handler. That walk is BLIND TO AN F-STRING, and most of these sites use
+    one. Re-run over ``messagefoundry/__main__.py`` at ``19c98e023`` asking instead whether the bound
+    exception reaches ANY string rendering -- ``str()``, an f-string, ``%`` or ``.format`` -- of the
+    20 ``except`` arms naming ``ValidationError``, **16** render it, not five. The narrow instrument
+    was not measuring a smaller problem; it was measuring a smaller part of the same one. The earlier
+    counts are kept above as what they were: readings, from a tool that answered an adjacent question.
+
+    SO NO LIST HERE IS THE POPULATION. #1523 fixed ``_cluster_vip``; this change fixed ``_ai_policy``
+    (and this paragraph said those five were what remained, under the narrow walk, until the broad
+    one was run). ``ai-policy`` is also the only one RUN and confirmed to disclose a planted
+    ``MEFOR_STORE_PASSWORD``, first here and now pinned by ``tests/test_cli_ai_policy.py``; every
+    other site was read, not run, so what follows counts ARMS, not confirmed disclosures.
+
+    WHERE TO START, IF YOU ARE THE ONE DOING THE SWEEP, because the arms are not equally bad and a
+    count flattens them. ``_serve`` (``__main__.py`` around line 1495) and ``_supervise`` are the
+    two that matter most: both render a boot-time ``load_settings`` failure with
+    ``print(f"error: {exc}", file=sys.stderr)``, and the engine runs as a Windows service under NSSM,
+    which captures that stream to a file (docs/SERVICE.md). On first deployment a ``[store]`` that
+    fails validation would therefore write ``MEFOR_STORE_PASSWORD`` into a persisted service log, on
+    every start attempt, with no operator present to see it -- and support-bundle assembly collects
+    logs. ``ai-policy`` reached one IDE bridge read; that one reaches a file that keeps it. A third
+    group -- ``_security`` and ``_alert`` -- validates JSON the operator just typed at a named path,
+    where echoing the input back is arguably the point; do not sweep those without deciding that
+    question separately.
+
+    ``_emit_error`` IS NOT THE CHOKEPOINT, and the shape of the sweep depends on knowing that. It
+    takes an already-rendered ``str``, not an exception, so it cannot call this function without a
+    signature change; many of its 56 call sites pass hand-authored or deliberately value-carrying
+    text that must NOT be re-rendered (the JSON-echo group above is the clearest kind); and half the
+    arms above never touch it, printing straight to stderr through their own emitter. The shape that
+    DOES work is already written, in ``messagefoundry/verify/runner.py``'s ``_load_settings``: a
+    wrapper returning ``(settings, detail)`` so each caller keeps its own emitter, stream and exit
+    code. That one renders safely and is still missing ``OSError``, so it is a third site holding
+    half the fix. The sweep is NOT part of #1523 or of this change, and is stated rather than done,
+    so nobody reads this docstring as covering it.
     """
     from pydantic import ValidationError
 
