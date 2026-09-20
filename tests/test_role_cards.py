@@ -163,11 +163,13 @@ def script_parameters(hook: Path) -> set[str]:
     """
     # THE ATTRIBUTE RUN AND THE `param(` BODY ARE SCANNED BY BRACKET DEPTH, NOT MATCHED BY A
     # REGEX. The regex that did this wrote the attribute arm as `\[(?:[^\[\]]|\[[^\[\]]*\])*\]`
-    # and then starred it again inside `(?:\s*...)*`, so a near-miss backtracked exponentially:
-    # CodeQL `py/redos`, high severity, on this file. A depth scan cannot backtrack. It also
-    # drops the old pattern's `^\)` requirement that the closing paren sit at column 0, which was
-    # a formatting rule the hook was never told about, and it handles an attribute nested to any
-    # depth -- `[OutputType([string])]` -- rather than the one level the regex allowed.
+    # and starred it again inside `(?:\s*...)*`, which is the same nested-quantifier shape that
+    # earned the alert below. CodeQL did NOT flag this one -- the alert named the `findall`
+    # pattern, and an earlier pass here rewrote this search first on the assumption that it had.
+    # The scan is kept anyway: a depth scan cannot backtrack at all, it drops the old pattern's
+    # `^\)` requirement that the closing paren sit at column 0 (a formatting rule the hook was
+    # never told about), and it handles an attribute nested to any depth -- `[OutputType([string])]`
+    # -- rather than the one level the regex allowed.
     text = read(hook)
     head = re.search(r"\[CmdletBinding\([^)]*\)\]", text)
     if head is None:
@@ -207,7 +209,15 @@ def script_parameters(hook: Path) -> set[str]:
     if body_end is None:
         return set()
     body = re.sub(r"#[^\n]*", "", text[body_start : body_end - 1])
-    return set(re.findall(r"(?:\[[\w\[\]]+\]\s*)*\$(\w+)\s*(?:=|,|\)|$)", body, re.M))
+    # The `$name` capture carries no leading type or attribute arm. One used to sit in front of
+    # it -- `(?:\[[\w\[\]]+\]\s*)*` -- and it was INERT, because a `*` group matches zero
+    # times and every name it could skip past is found without it. It was also the ReDoS: the
+    # class `[\w\[\]]` admits both brackets, so `\[[\w\[\]]+\]` starred again is ambiguous,
+    # and CodeQL named the input shape exactly -- "starting with '[' and containing many
+    # repetitions of '0]['". Dropping it is measured to change nothing: seven param-body shapes,
+    # typed, untyped, arrayed, attributed, nested-generic and multi-declaration, return
+    # identical sets from both patterns.
+    return set(re.findall(r"\$(\w+)\s*(?:=|,|\)|$)", body, re.M))
 
 
 #: Added by `[CmdletBinding()]`, so the wiring may legitimately pass one.
