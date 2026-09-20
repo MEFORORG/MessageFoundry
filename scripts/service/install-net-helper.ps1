@@ -30,7 +30,7 @@
     .\install-net-helper.ps1 -HelperSource ..\..\net-helper\out -NssmPath C:\tools\nssm.exe
 
 .EXAMPLE
-    .\install-net-helper.ps1 -HelperSource D:\build\net-helper -ServiceConfig C:\ProgramData\MessageFoundry\messagefoundry.toml -Interface "Ethernet 2"
+    .\install-net-helper.ps1 -HelperSource D:\build\net-helper -ServiceConfig C:\ProgramData\MessageFoundry\messagefoundry.toml
 #>
 [CmdletBinding()]
 param(
@@ -40,19 +40,30 @@ param(
     # Administrator-only by default, and the README explains why it is not under ProgramData: the
     # engine's account has modify rights there, so it could replace the binary that runs as SYSTEM.
     [string]$InstallDir = "C:\Program Files\MessageFoundry\net-helper",
-    [string]$ServiceName = "MessageFoundryNetHelper",
+    # BOTH SERVICE NAMES ARE PATTERN-VALIDATED because both are interpolated into a WQL filter
+    # (`Get-CimInstance Win32_Service -Filter "Name='$x'"`). A single quote in the value would end the
+    # WQL literal, so the query either errors or matches a DIFFERENT service - and this script reads
+    # the engine's run-as account out of that result and writes it into the helper's pipe ACL.
+    # messagefoundry/service.py's `_SAFE_SERVICE_NAME` gates the same class; this is the same idea in
+    # the same character set, minus the space Windows allows but neither script needs.
+    [ValidatePattern('^[A-Za-z0-9._-]+$')][string]$ServiceName = "MessageFoundryNetHelper",
     # The engine's service, read for its run-as account (the pipe's only non-administrator caller).
-    [string]$EngineServiceName = "MessageFoundry",
+    [ValidatePattern('^[A-Za-z0-9._-]+$')][string]$EngineServiceName = "MessageFoundry",
     # The engine executable, used only to read [cluster.vip]. Defaults to the repo venv, as
     # install-service.ps1's -AppExe does.
     [string]$AppExe,
     # The engine's service settings TOML. Omitted, `cluster-vip` falls back to ./messagefoundry.toml
     # if one is there - which depends on where you are standing, so pass it on a real install.
     [string]$ServiceConfig,
-    # This node's adapter name, overriding [cluster.vip].interface. The address and mask are the
-    # same on every node; the adapter name need not be, and the engine config may name another
-    # node's.
-    [string]$Interface,
+    # THERE IS NO -Interface OVERRIDE, and that is a decision rather than an omission. [cluster.vip]
+    # is file-only with no MEFOR_CLUSTER_VIP_* env layer (docs/CONFIGURATION.md), so each node's
+    # settings file already carries THAT node's adapter, which is what ADR 0056 D2 means by "this
+    # node's NIC". An override would write a name the engine will never send: the controller sends
+    # [cluster.vip].interface and the helper compares it with StringComparison.Ordinal, so every
+    # bind on that node would be refused. It would also be the one value in the .conf that never
+    # passed _vip_interface_problems. If shared, templated configs are a real deployment shape, that
+    # is a question for the config layer, not a flag here.
+    #
     # The account that may call the pipe, overriding the engine service's own run-as account. A name
     # or a SID; a name is resolved to a SID before it is written (see Resolve-ClientAccountSid).
     [string]$ClientAccount,
@@ -203,24 +214,30 @@ function Resolve-ClientAccountSid {
 
 function Get-BroadWriteHolders {
     <#
-      Principals holding Allow-write on $Path beyond the four that always may.
+      Principals who can write $Path, or can make themselves able to, beyond the five that always
+      may. Two arms: the OWNER, and Allow-write entries on the DACL.
 
       Returns an empty array when the directory is administrator-only, which is what makes "the
-      folder is safe" a reading rather than an assumption. An identity that will not translate is
-      REPORTED, not skipped: an untranslatable SID is still a grant, and dropping it would turn a
-      residue into a clean result.
+      folder is safe" a reading rather than an assumption.
 
       NOT install-service.ps1's Get-BroadAclResidue, and deliberately not a copy of it. That one
-      allows the engine's service account, because the engine has to write its data directory. Here
-      nothing outside the four may write at all - whoever can write this folder can replace a binary
-      that later runs as SYSTEM. Same shape, different allow-list; naming them apart keeps a reader
-      from assuming one answers the other's question.
+      allows the engine's service account, because the engine has to write its data directory; it
+      takes any Allow entry rather than write-class ones, and it has no owner arm. Here nothing
+      outside the five may write at all - whoever can write this folder can replace a binary that
+      later runs as SYSTEM. Same shape, different question; naming them apart keeps a reader from
+      assuming one answers the other's.
     #>
     param([Parameter(Mandatory)][string]$Path)
+    # The same four principals messagefoundry/config/wiring.py's _WIN_TRUSTED_SIDS trusts for the
+    # same reason, plus OWNER RIGHTS: that module's comment records that S-1-3-0 and S-1-3-4 both
+    # appear on ordinary inherited ACLs and must not be refused. Omitting S-1-3-4 would be a false
+    # REFUSAL whose only escape is -AllowBroadAcl, which downgrades the whole check to a warning --
+    # so one false positive would disable the gate.
     $allowed = @(
         "S-1-5-18",                                                                # SYSTEM
         "S-1-5-32-544",                                                            # Administrators
         "S-1-3-0",                                                                 # CREATOR OWNER
+        "S-1-3-4",                                                                 # OWNER RIGHTS
         "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"           # TrustedInstaller
     )
     $rights = [Security.AccessControl.FileSystemRights]
@@ -238,19 +255,42 @@ function Get-BroadWriteHolders {
         $rights::WriteExtendedAttributes -bor $rights::Delete -bor $rights::DeleteSubdirectoriesAndFiles -bor
         $rights::ChangePermissions -bor $rights::TakeOwnership) -bor $genericAll -bor $genericWrite
     $found = @()
-    $acl = Get-Acl -Path $Path
+    try { $acl = Get-Acl -Path $Path -ErrorAction Stop } catch {
+        # THROWN, NOT WARNED. install-service.ps1's sibling warns and returns empty, because there it
+        # reports on a lockdown that already happened. Here the empty result IS the verdict that lets
+        # a SYSTEM-launched binary be written, and "could not read the permissions" must not render
+        # as "the permissions are fine".
+        throw ("Could not read the permissions of '$Path' ($($_.Exception.Message)), so nothing " +
+            "established that only administrators can write there. Fix the path or pass " +
+            "-AllowBroadAcl to install without the check.")
+    }
+
+    # THE OWNER ARM, and the DACL alone is not the question. An owner holds WRITE_DAC implicitly, so
+    # a low-privilege owner can rewrite the DACL whatever it says today and then replace a binary
+    # this install is about to have the SCM start as SYSTEM. messagefoundry/config/wiring.py's
+    # _evaluate_config_dacl carries the same arm for the same reason (SEC-003, CWE-732); a check
+    # without it reports a clean folder for exactly that case.
+    $ownerSid = $null
+    try {
+        $ownerSid = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    } catch { $ownerSid = "$($acl.Owner)" }
+    if ($allowed -notcontains $ownerSid) {
+        $found += "$($acl.Owner) (owner, so implicitly WRITE_DAC)"
+    }
+
     foreach ($rule in $acl.Access) {
         if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
         if (([int]$rule.FileSystemRights -band $writeMask) -eq 0) { continue }
         $name = "$($rule.IdentityReference)"
+        # $allowed holds SIDs only, so an untranslatable identity falls back to its own text and is
+        # REPORTED rather than skipped: a SID nobody can translate is still a grant, and dropping it
+        # would turn a residue into a clean result.
         $sid = $name
         try {
             $sid = $rule.IdentityReference.Translate(
                 [Security.Principal.SecurityIdentifier]).Value
         } catch { }
-        if (($allowed -notcontains $sid) -and ($allowed -notcontains $name)) {
-            $found += "$name ($($rule.FileSystemRights))"
-        }
+        if ($allowed -notcontains $sid) { $found += "$name ($($rule.FileSystemRights))" }
     }
     return ($found | Select-Object -Unique)
 }
@@ -285,9 +325,18 @@ $vip = Get-VipSettings -AppExe $AppExe -ServiceConfig $ServiceConfig
 if (-not $vip.enabled) {
     $which = if ($vip.cluster_enabled) { "[cluster.vip].enabled is false" }
              else { "[cluster].enabled and [cluster.vip].enabled are both false" }
-    throw ("$which in the engine's settings, so there is no address to install a helper for. Set " +
-        "both, with address, interface and one of prefix/netmask, then re-run. Read what the " +
-        "engine currently has with: & `"$AppExe`" cluster-vip" +
+    # WHICH FILE WAS READ IS PART OF THE MESSAGE. With no -ServiceConfig the engine reads
+    # ./messagefoundry.toml ONLY IF IT EXISTS, and otherwise every field comes back at its default -
+    # which is indistinguishable here from a file that really does say "off". Telling an operator to
+    # go set two switches that are already set in a file nothing opened is the worse of the two
+    # wrong answers, so the message names the possibility instead of picking one.
+    $where = if ($ServiceConfig) { "'$ServiceConfig'" }
+             else { "./messagefoundry.toml, if there is one in '$PWD' -- pass -ServiceConfig if " +
+                    "the engine's settings live elsewhere, because with no file the engine reports " +
+                    "defaults and defaults look exactly like this" }
+    throw ("$which in $where, so there is no address to install a helper for. Set both, with " +
+        "address, interface and one of prefix/netmask, then re-run. Read what the engine " +
+        "currently has with: & `"$AppExe`" cluster-vip" +
         $(if ($ServiceConfig) { " --service-config `"$ServiceConfig`"" } else { "" }))
 }
 # An enabled block cannot reach here with any of these empty: the engine refuses to LOAD one that
@@ -297,19 +346,24 @@ foreach ($field in @("address", "interface", "mask")) {
     if (-not $vip.$field) { throw "[cluster.vip].$field resolved to nothing; cannot write the .conf." }
 }
 
-$confInterface = if ($Interface) { $Interface } else { $vip.interface }
-if ($Interface -and ($Interface -ne $vip.interface)) {
-    Write-Host ("  Adapter: using -Interface '$Interface' rather than [cluster.vip].interface " +
-        "'$($vip.interface)'. The engine reads its own setting, so change it there too before the " +
-        "controller ships.")
-}
+$confInterface = $vip.interface
 # The helper looks for the adapter only when asked to ACT, so a wrong name here is silent until the
 # first failover. Warned and not thrown: an adapter can legitimately be added after the install, and
 # Get-NetAdapter is absent on some SKUs.
+#
+# COMPARED WITH -ceq, NOT LEFT TO Get-NetAdapter -Name. That parameter is case-INSENSITIVE and
+# wildcard-aware, so it resolves 'ethernet0' to an adapter named 'Ethernet0' and the check passes for
+# exactly the mismatch the warning text names -- NetOps compares with StringComparison.Ordinal. A
+# warning whose instrument cannot see the case it warns about is a control resting on a false
+# premise (CLAUDE.md section 11, SDS-3.7), so the names are fetched and compared here instead.
 try {
-    if (-not (Get-NetAdapter -Name $confInterface -ErrorAction SilentlyContinue)) {
-        Write-Warning ("No adapter on this node is named '$confInterface'. Matching is " +
-            "case-sensitive in the helper. List them with: Get-NetAdapter | Select-Object Name")
+    $adapters = @(Get-NetAdapter -ErrorAction Stop | ForEach-Object { $_.Name })
+    if ($adapters -cnotcontains $confInterface) {
+        $near = @($adapters | Where-Object { $_ -ieq $confInterface })
+        $detail = if ($near.Count) { "This node has '$($near[0])', which differs only in case, and " +
+                                     "the helper matches exactly." }
+                  else { "List them with: Get-NetAdapter | Select-Object Name" }
+        Write-Warning ("No adapter on this node is named '$confInterface'. $detail")
     }
 } catch {
     Write-Warning ("Could not list adapters to check '$confInterface' ($($_.Exception.Message)).")
@@ -331,22 +385,27 @@ if ($ClientAccount) {
 }
 if (-not $clientName) { throw "Could not read a run-as account from $clientSource." }
 
+# Resolved ONCE. The translation is an LSA lookup and a domain round trip for a domain account, and
+# a second call would be a second place the same "does not resolve" failure is thrown from.
+$clientSid = Resolve-ClientAccountSid -Account $clientName
+
 # REFUSED, NOT WARNED, for the two SHARED built-in accounts. Every service on the box running as
 # LocalService or NetworkService shares that SID, so writing one here would hand the helper's
 # administrator rights to all of them. HelperConfig's own broad-group check does not cover these two
-# (its list is the Everyone, Users and Interactive family), so nothing downstream would stop it. An
-# operator who really means it can still pass the name or the SID to -ClientAccount.
-if (-not $ClientAccount) {
-    $sidPreview = Resolve-ClientAccountSid -Account $clientName
-    if ($sidPreview -in @("S-1-5-19", "S-1-5-20")) {
-        throw ("The engine service runs as '$clientName', which every service on this host running " +
-            "under the same built-in account shares. Admitting it to the helper's pipe would give " +
-            "all of them the helper's rights. Move the engine to its own account (the installer " +
-            "defaults to NT SERVICE\$EngineServiceName), or pass -ClientAccount '$clientName' to " +
-            "say you mean it.")
-    }
+# (its list is the Everyone, Users and Interactive family), so nothing downstream would stop it.
+#
+# THIS REFUSAL COVERS THIS SCRIPT ONLY, AND SAYING SO IS THE POINT. A .conf written by hand, by a
+# future MSI, or by a configuration-management tool bypasses it entirely and the helper accepts it.
+# Closing that properly means adding LocalServiceSid and NetworkServiceSid to HelperConfig's
+# BroadGroups, which is a change to the helper binary and its ADR 0056 contract, not to an installer.
+# An operator who really means it can still pass the name or the SID to -ClientAccount.
+if ((-not $ClientAccount) -and ($clientSid -in @("S-1-5-19", "S-1-5-20"))) {
+    throw ("The engine service runs as '$clientName', which every service on this host running " +
+        "under the same built-in account shares. Admitting it to the helper's pipe would give " +
+        "all of them the helper's rights. Move the engine to its own account (the installer " +
+        "defaults to NT SERVICE\$EngineServiceName), or pass -ClientAccount '$clientName' to " +
+        "say you mean it.")
 }
-$clientSid = Resolve-ClientAccountSid -Account $clientName
 if ($clientSid -eq "S-1-5-18") {
     Write-Warning ("The engine service runs as LocalSystem, which already has the rights this " +
         "helper exists to hold on its behalf. The install will work, and it buys nothing: move the " +
@@ -375,7 +434,15 @@ $LogPath = Join-Path $InstallDir "net-helper.log"
 
 # Stopped BEFORE the copy. Windows holds a running image open, so copying over it fails - and a
 # reinstall onto a node that already has the helper is the ordinary case, not the exception.
-if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
+#
+# NOT Stop-ServiceAndConfirm. That function is shared byte-identically between install-service.ps1
+# and uninstall-service.ps1 with a drift test pinning the pair, and it takes an empty -NssmPath to
+# mean "stop through the SCM" -- so it WOULD work here. A third and fourth copy of a byte-pinned
+# function is the cost this avoids; what it must not cost is the property, so this loop does the
+# same two things that function exists to do: it issues the stop and then CONFIRMS from the SCM
+# rather than assuming (BACKLOG #1558).
+$serviceExists = [bool](Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)
+if ($serviceExists) {
     Write-Host "  Service '$ServiceName' exists - stopping it before the files are replaced."
     Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
     $deadline = (Get-Date).AddSeconds(30)
@@ -391,7 +458,19 @@ if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
 }
 
 Copy-Item $SourceExe $TargetExe -Force
-Copy-Item $NssmPath $TargetNssm -Force
+# SKIPPED WHEN THEY ARE THE SAME FILE. Re-running with -NssmPath pointed at the already-installed
+# copy is the ordinary reinstall, and Copy-Item raises "cannot be copied onto itself" there -- which
+# under $ErrorActionPreference = "Stop" aborts AFTER the service has been stopped, leaving the node
+# with a stopped helper and no completed install.
+if ($NssmPath -ne $TargetNssm) { Copy-Item $NssmPath $TargetNssm -Force }
+
+# EVERY nssm CALL BELOW RUNS THE INSTALLED COPY, and this line is what makes that true. NSSM writes
+# the path of the nssm.exe that ran `install` into the service's own ImagePath, so registering with
+# the source binary would point the SCM at a SYSTEM-launched executable outside the folder whose
+# permissions were just checked -- and the read-back guard further down would then refuse the
+# install it had already performed. net-helper/README.md registers with "$dir\nssm.exe" for the same
+# reason and makes confirming it its own numbered step.
+$NssmPath = $TargetNssm
 
 # The helper reads this with a strict UTF-8 decoder. Written with an explicit BOM-less UTF-8 encoder
 # rather than Set-Content, whose default encoding differs between PowerShell 7 and Windows
@@ -414,7 +493,7 @@ $confLines = @(
 
 # --- registration -------------------------------------------------------------------------------
 
-if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
+if ($serviceExists) {
     Write-Host "Reconfiguring '$ServiceName'..."
 } else {
     Write-Host "Registering '$ServiceName'..."
@@ -427,6 +506,20 @@ Invoke-HelperNssm set $ServiceName Description "Binds and releases the MessageFo
 Invoke-HelperNssm set $ServiceName Start SERVICE_AUTO_START
 Invoke-HelperNssm set $ServiceName AppStdout $LogPath
 Invoke-HelperNssm set $ServiceName AppStderr $LogPath
+
+# ROTATION AND A RESTART THROTTLE ARE NOT OPTIONAL HERE, and the helper needs them more than the
+# engine does. It refuses to start on a bad .conf (exit 2) or a pipe name another process holds
+# (exit 3), and it does so IMMEDIATELY. NSSM's default action on exit is Restart with a sub-second
+# throttle, so an unthrottled, unrotated helper answers a one-character typo with a tight restart
+# loop appending "startup refused" to a file on the system volume -- under Program Files, where a
+# full disk is not a local problem. The values match install-service.ps1's: 5s throttle, 10 MB
+# rotation. The engine's AppStopMethodConsole is deliberately NOT copied: that exists to give uvicorn
+# time to drain connections, and the helper serves one caller at a time and holds no state.
+Invoke-HelperNssm set $ServiceName AppExit Default Restart
+Invoke-HelperNssm set $ServiceName AppThrottle 5000
+Invoke-HelperNssm set $ServiceName AppRotateFiles 1
+Invoke-HelperNssm set $ServiceName AppRotateOnline 1
+Invoke-HelperNssm set $ServiceName AppRotateBytes 10485760
 # LocalSystem is not a choice here the way it is for the engine. The helper's whole job is the
 # administrator-rights work the engine's least-privilege account cannot do (ADR 0056), and its
 # app.manifest already requires elevation - started by an unprivileged account it fails at once with
@@ -440,7 +533,9 @@ $registered = (Get-CimInstance Win32_Service -Filter "Name='$ServiceName'" -Erro
 if (-not $registered) {
     throw "'$ServiceName' has no registered image path after the install; nothing to start."
 }
-if ($registered -notlike "*$TargetNssm*") {
+# IndexOf and not -like: a path is not a wildcard pattern, and '[' or ']' anywhere in $TargetNssm
+# would make -like compare a character class instead of the text.
+if ($registered.IndexOf($TargetNssm, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
     throw ("'$ServiceName' would start '$registered', not '$TargetNssm'. Remove the service and " +
         "re-run: a registration pointing at another copy of nssm.exe is a binary outside the folder " +
         "whose permissions this install just checked.")

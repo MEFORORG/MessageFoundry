@@ -92,13 +92,18 @@ It does three things the manual steps leave to you.
   refuses a request that does not match its file exactly.
 - **It writes `client_account` as a SID**, resolved from the engine service's run-as account. A SID
   survives a rename, and it skips the name translation that fails outright on a LocalSystem engine.
-- **It refuses to install into a folder a non-administrator can write**, which is the property
+- **It reads `-InstallDir`'s owner and its access list** and refuses to install when anyone outside
+  SYSTEM, Administrators, TrustedInstaller, CREATOR OWNER and OWNER RIGHTS can write there or owns
+  it. That is what it checks, and it is narrower than
   [Keep the helper's files where only administrators can write](#keep-the-helpers-files-where-only-administrators-can-write)
-  describes. Pass `-AllowBroadAcl` to install anyway.
+  asks of you: it says nothing about the files already in the folder, or about the parent it
+  inherits from. Pass `-AllowBroadAcl` to install anyway.
 
 It does not download NSSM. The pinned archive and its SHA-256 live in `install-service.ps1`, and a
-second copy of that pin would be a second thing to keep current, so
-[Prepare the files once](#prepare-the-files-once-on-any-machine) is still yours to run.
+second copy of that pin would be a second thing to keep current, so steps 1 to 4 of
+[Prepare the files once](#prepare-the-files-once-on-any-machine) are still yours to run. Skip that
+section's steps 5 and 6: the script writes its own `mefor-net-helper.conf` into `-InstallDir` from
+the engine, and never reads the one you would copy from the example.
 
 The uninstaller **does not release the address by default**. On the node holding the VIP, releasing it
 during an uninstall drops a live address and nothing takes it over, because the helper that would have

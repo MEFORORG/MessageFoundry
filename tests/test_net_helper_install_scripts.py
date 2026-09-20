@@ -24,9 +24,11 @@ The fourth is a plain syntax check, which is worth its line precisely because no
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import subprocess
+import uuid
 from pathlib import Path
 
 import pytest
@@ -49,19 +51,80 @@ def _text(path: Path | None) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def _pwsh(script: str, tmp_path: Path) -> str:
+def _psq(value: str) -> str:
+    """One PowerShell single-quoted literal. Backslashes are literal inside single quotes."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+# ONE pwsh PROCESS FOR THE WHOLE FILE. This test imports the engine, so tests/tooling_manifest.txt
+# correctly leaves it off the path-gated tooling tier and it runs on every engine leg of every code
+# PR. Measured on this box: three spawns cost 1.16s of a 1.83s file, and ci.yml records a ~2.4x
+# process-spawn tax on the Windows leg. Every check here is the same operation -- Parser::ParseFile
+# over a file in scripts/service/ -- so one session-scoped run answers all of them at once, and each
+# test still asserts its own property with its own message.
+@pytest.fixture(scope="session")
+def ast_report(tmp_path_factory: pytest.TempPathFactory) -> dict[str, object]:
     if shutil.which("pwsh") is None:
         pytest.skip("SKIP (nothing run): pwsh not on PATH")
-    f = tmp_path / "net-helper-guard.ps1"
+    assert _DIR is not None and _UNINSTALL is not None
+    script = f"""
+$ErrorActionPreference = 'Stop'
+$report = @{{}}
+
+# ParseFile parses; it never runs the file.
+$parse = @{{}}
+foreach ($name in @('install-net-helper.ps1', 'uninstall-net-helper.ps1')) {{
+  $path = Join-Path {_psq(str(_DIR))} $name
+  $errs = $null
+  $null = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$null, [ref]$errs)
+  $parse[$name] = @($errs | ForEach-Object {{ "$($_.Extent.StartLineNumber): $($_.Message)" }})
+}}
+$report['parse'] = $parse
+
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    {_psq(str(_UNINSTALL))}, [ref]$null, [ref]$null)
+$defined = [bool]$ast.Find({{ $args[0] -is
+    [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $args[0].Name -eq 'Invoke-HelperRelease' }}, $true)
+$calls = @($ast.FindAll({{ $args[0] -is
+    [System.Management.Automation.Language.CommandAst] -and
+    $args[0].CommandElements.Count -gt 0 -and
+    $args[0].CommandElements[0].Extent.Text -eq 'Invoke-HelperRelease' }}, $true))
+$guarded = 0
+foreach ($call in $calls) {{
+  $node = $call
+  $ok = $false
+  while ($node) {{
+    if ($node -is [System.Management.Automation.Language.IfStatementAst]) {{
+      foreach ($clause in $node.Clauses) {{
+        # THE CONDITION MUST BE THE BARE VARIABLE. A substring match would also accept
+        # `if (-not $ReleaseAddress)`, which is the inverted form of the very default this pins.
+        if ($clause.Item1.PipelineElements.Count -eq 1) {{
+          $expr = $clause.Item1.PipelineElements[0].Expression
+          if ($expr -is [System.Management.Automation.Language.VariableExpressionAst] -and
+              $expr.VariablePath.UserPath -eq 'ReleaseAddress') {{ $ok = $true }}
+        }}
+      }}
+    }}
+    $node = $node.Parent
+  }}
+  if ($ok) {{ $guarded++ }}
+}}
+$report['release'] = @{{ defined = $defined; calls = $calls.Count; guarded = $guarded }}
+$report | ConvertTo-Json -Depth 5 -Compress
+"""
+    f = tmp_path_factory.mktemp("netguard") / f"guard-{uuid.uuid4().hex}.ps1"
     f.write_text(script, encoding="utf-8")
     proc = subprocess.run(
         ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(f)],
         capture_output=True,
         text=True,
-        timeout=120,
+        timeout=180,
     )
     assert proc.returncode == 0, f"harness failed: {proc.stdout}\n{proc.stderr}"
-    return proc.stdout.strip()
+    parsed = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert isinstance(parsed, dict)
+    return parsed
 
 
 # A pinned NSSM release hash is 64 hex characters in a quoted literal. Matched case-insensitively so
@@ -69,7 +132,7 @@ def _pwsh(script: str, tmp_path: Path) -> str:
 _SHA256 = re.compile(r"""["'][0-9a-fA-F]{64}["']""")
 
 
-def test_the_installer_carries_no_second_nssm_pin(tmp_path: Path) -> None:
+def test_the_installer_carries_no_second_nssm_pin() -> None:
     install_service = _text(_INSTALL_SERVICE)
     # THE CONTROL FIRST. install-service.ps1 holds both, so a search that cannot find them there
     # proves nothing by finding none in the new script.
@@ -89,12 +152,12 @@ def test_the_installer_carries_no_second_nssm_pin(tmp_path: Path) -> None:
     )
     found = _SHA256.search(helper_installer)
     assert found is None, (
-        f"install-net-helper.ps1 carries what looks like a pinned hash ({found.group() if found else ''}). "
+        f"install-net-helper.ps1 carries what looks like a pinned hash ({found.group()}). "
         "See the previous assertion."
     )
 
 
-def test_the_installer_reads_cluster_vip_through_the_engine(tmp_path: Path) -> None:
+def test_the_installer_reads_cluster_vip_through_the_engine() -> None:
     text = _text(_INSTALL)
     assert "cluster-vip" in text, (
         "install-net-helper.ps1 no longer runs `messagefoundry cluster-vip`. That subcommand exists "
@@ -112,49 +175,30 @@ def test_the_installer_reads_cluster_vip_through_the_engine(tmp_path: Path) -> N
         )
 
 
-def test_the_uninstaller_releases_the_address_only_when_asked(tmp_path: Path) -> None:
-    """The release call site must sit under an ``if ($ReleaseAddress)``.
+def test_the_uninstaller_releases_the_address_only_when_asked(
+    ast_report: dict[str, object],
+) -> None:
+    """The release call site must sit under an ``if ($ReleaseAddress)``, un-negated.
 
     READ THE AST, NOT THE TEXT. The script's own prose explains the decision and names both the
-    switch and the function, so a string scan would find the explanation and report compliance.
-    This walks up from the call to its enclosing ``if`` statements instead.
+    switch and the function, so a string scan would find the explanation and report compliance. The
+    harness walks up from each call to its enclosing ``if`` statements and requires the condition to
+    be the BARE variable -- a substring test would also pass ``if (-not $ReleaseAddress)``, which is
+    the inverted form of the very default this exists to pin.
     """
-    assert _UNINSTALL is not None
-    src = str(_UNINSTALL).replace("'", "''")
-    script = f"""
-$ErrorActionPreference = 'Stop'
-$ast = [System.Management.Automation.Language.Parser]::ParseFile('{src}', [ref]$null, [ref]$null)
-$defn = $ast.Find({{ $args[0] -is
-    [System.Management.Automation.Language.FunctionDefinitionAst] -and
-    $args[0].Name -eq 'Invoke-HelperRelease' }}, $true)
-if (-not $defn) {{ throw 'Invoke-HelperRelease is not defined' }}
-$calls = @($ast.FindAll({{ $args[0] -is
-    [System.Management.Automation.Language.CommandAst] -and
-    $args[0].CommandElements.Count -gt 0 -and
-    $args[0].CommandElements[0].Extent.Text -eq 'Invoke-HelperRelease' }}, $true))
-$guarded = 0
-foreach ($call in $calls) {{
-  $node = $call
-  $ok = $false
-  while ($node) {{
-    if ($node -is [System.Management.Automation.Language.IfStatementAst]) {{
-      foreach ($clause in $node.Clauses) {{
-        if ($clause.Item1.Extent.Text -match '\\$ReleaseAddress') {{ $ok = $true }}
-      }}
-    }}
-    $node = $node.Parent
-  }}
-  if ($ok) {{ $guarded++ }}
-}}
-Write-Output "$($calls.Count) $guarded"
-"""
-    calls, guarded = (int(n) for n in _pwsh(script, tmp_path).split())
+    release = ast_report["release"]
+    assert isinstance(release, dict)
+    assert release["defined"], (
+        "CONTROL FAILED: Invoke-HelperRelease is not defined in uninstall-net-helper.ps1, so a "
+        "zero call count below would mean nothing -- re-aim this guard"
+    )
+    calls, guarded = int(release["calls"]), int(release["guarded"])
     assert calls >= 1, (
         "CONTROL FAILED: no call to Invoke-HelperRelease was found, so 'all of them are guarded' "
         "would be vacuously true -- re-aim this guard"
     )
     assert guarded == calls, (
-        f"{calls - guarded} of {calls} calls to Invoke-HelperRelease are not under an "
+        f"{calls - guarded} of {calls} calls to Invoke-HelperRelease are not under a bare "
         "`if ($ReleaseAddress)`. Releasing by default drops a live address during an uninstall on "
         "the node that holds the VIP, and nothing takes it over -- the helper that would have "
         "re-bound it elsewhere is what is being removed."
@@ -162,16 +206,10 @@ Write-Output "$($calls.Count) $guarded"
 
 
 @pytest.mark.parametrize("name", ["install-net-helper.ps1", "uninstall-net-helper.ps1"])
-def test_the_script_parses(tmp_path: Path, name: str) -> None:
+def test_the_script_parses(ast_report: dict[str, object], name: str) -> None:
     # No CI leg runs either script, so a syntax error would first show up on an operator's node
     # mid-install. Parsing is not running: ParseFile never executes the file.
-    assert _DIR is not None
-    src = str(_DIR / name).replace("'", "''")
-    script = f"""
-$errs = $null
-$null = [System.Management.Automation.Language.Parser]::ParseFile(
-    '{src}', [ref]$null, [ref]$errs)
-if ($errs) {{ $errs | ForEach-Object {{ Write-Output "$($_.Extent.StartLineNumber): $($_.Message)" }} }}
-else {{ Write-Output 'clean' }}
-"""
-    assert _pwsh(script, tmp_path) == "clean"
+    parse = ast_report["parse"]
+    assert isinstance(parse, dict)
+    assert name in parse, f"CONTROL FAILED: the harness did not parse {name} -- re-aim this guard"
+    assert parse[name] == [], f"{name} has parse errors:\n" + "\n".join(parse[name])

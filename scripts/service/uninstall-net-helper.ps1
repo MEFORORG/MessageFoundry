@@ -30,7 +30,11 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$ServiceName = "MessageFoundryNetHelper",
+    # PATTERN-VALIDATED because the name is interpolated into a WQL filter below
+    # (`Get-CimInstance Win32_Service -Filter "Name='$ServiceName'"`). A single quote would end the
+    # WQL literal and the query would error or match a different service, whose image path this
+    # script then reports as the helper's. Same character set as the installer's.
+    [ValidatePattern('^[A-Za-z0-9._-]+$')][string]$ServiceName = "MessageFoundryNetHelper",
     # Where install-net-helper.ps1 put the files. Read for mefor-net-helper.conf, which is the only
     # record on the node of which address the helper was scoped to.
     [string]$InstallDir = "C:\Program Files\MessageFoundry\net-helper",
@@ -66,12 +70,16 @@ function Get-HelperConf {
     <#
       The helper's own scope, read from its own file in its own format.
 
-      NOT a second parser of anything. mefor-net-helper.conf is plain `key = value` written by
-      install-net-helper.ps1 and read by HelperConfig.Load; this reads the same four lines the same
-      way, because the address the helper was scoped to is recorded nowhere else on the node.
+      A SECOND READER OF THE .conf, and there is no way around that. HelperConfig.Load is the
+      definition of the format; this reads the same lines the same way, taking everything after the
+      first '=' as the value, because the address the helper was scoped to is recorded nowhere else
+      on the node and this script has to work with the service already stopped. The helper's `ping`
+      answer carries only ok and version, so there is no request that would return the scope instead.
 
       Returns $null when the file is missing or holds no address - the caller then reports that it
-      could not read the scope, rather than reporting a clean node.
+      could not read the scope, rather than reporting a clean node. `Interface` may still be empty
+      even when an address is present (a truncated or hand-edited file), so the release path checks
+      it before it binds it to a mandatory parameter.
     #>
     param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-Path $Path)) { return $null }
@@ -191,6 +199,14 @@ if ($ReleaseAddress) {
             "'$confPath', so there is no address to release.")
     } elseif ($boundBefore -eq $false) {
         Write-Host "  Address: $($conf.Address) is not bound on this node; nothing to release."
+    } elseif (-not $conf.Interface) {
+        # CHECKED BEFORE IT IS BOUND to a [Parameter(Mandatory)][string]. An empty value there is a
+        # terminating binding error under $ErrorActionPreference = "Stop", and it would land here --
+        # after the node was read and before anything was removed or reported. The whole
+        # read-then-remove-then-inventory ordering exists to stop exactly that, so a .conf with an
+        # address and no interface warns and falls through to the inventory instead.
+        Write-Warning ("-ReleaseAddress was passed, but '$confPath' names no interface, so the " +
+            "release request cannot be built. The inventory below has the manual command.")
     } else {
         $released = Invoke-HelperRelease -Address $conf.Address -Interface $conf.Interface
     }
@@ -198,11 +214,14 @@ if ($ReleaseAddress) {
 
 # --- stop and remove --------------------------------------------------------------------------------
 
-# THE SCM, NOT NSSM, AND NOT A THIRD COPY OF Stop-ServiceAndConfirm. That helper exists because the
-# ENGINE drains connections on a Ctrl+C for up to AppStopMethodConsole milliseconds, so its stop has
-# to be issued through nssm and then confirmed. The helper drains nothing: it serves one caller at a
-# time and holds no state. Stop-Service does the same job here in a form with nothing to keep in sync
-# with the two copies that are already pinned against each other.
+# THE SCM, NOT NSSM, AND NOT A THIRD COPY OF Stop-ServiceAndConfirm. That function takes an empty
+# -NssmPath to mean "stop through the SCM" -- uninstall-service.ps1 calls it that way when nssm is
+# absent -- so it WOULD work here, and an earlier version of this comment wrongly said it required
+# nssm. The real reason is the copies: it is shared byte-identically between the two engine scripts
+# with a drift test pinning the pair, and a third and fourth copy is a cost this script does not need
+# to pay for a helper that drains nothing. What it must not cost is the PROPERTY, so this does the
+# two things that function exists to do -- issue the stop, then confirm the status back from the SCM
+# rather than assuming it (BACKLOG #1558).
 Write-Host "Stopping '$ServiceName'..."
 Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
 $stopped = $false

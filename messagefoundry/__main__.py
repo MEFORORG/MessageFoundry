@@ -870,9 +870,7 @@ def main(argv: list[str] | None = None) -> int:
         help="service settings TOML (default: ./messagefoundry.toml if present)",
     )
     cluster_vip.add_argument(
-        "--json",
-        action="store_true",
-        help="emit JSON only (parsed by scripts/service/install-net-helper.ps1)",
+        "--json", action="store_true", help="emit JSON only (parsed by the net-helper installer)"
     )
 
     verify = sub.add_parser(
@@ -5333,18 +5331,24 @@ def _cluster_vip(args: argparse.Namespace) -> int:
     is ``null`` when neither is (which an enabled block cannot be -- the loader refuses it).
     ``cluster_enabled`` is carried because ``[cluster.vip].enabled`` additionally requires
     ``[cluster].enabled``: a caller that reported "the VIP is off" without it would name the wrong
-    switch to an operator who set only one of the two.
+    switch to an operator who set only one of the two. ``gratuitous_arp`` and
+    ``release_grace_seconds`` complete the block for an operator reading the human form -- no
+    installer reads them, so ``test_cli_cluster_vip`` asserts them rather than leaving two fields in
+    a machine contract with no reader at all.
 
     Prints config only -- never message data (PHI-safe). Exit 2 and a ``{"error": ...}`` line on a
     config that will not load, mirroring ``ai-policy``, so a caller parsing stdout as JSON sees the
-    reason rather than an empty read."""
+    reason rather than an empty read. ``OSError`` is in the catch because a ``--service-config`` that
+    names a DIRECTORY passes ``Path.exists()`` and then raises ``IsADirectoryError`` on open -- an
+    easy typo for the file inside it, and a traceback there would leave stdout empty and the caller
+    reporting "printed nothing" instead of the reason."""
     from pydantic import ValidationError
 
     from messagefoundry.config.settings import load_settings
 
     try:
         settings = load_settings(config_path=args.service_config)
-    except (FileNotFoundError, ValueError, ValidationError) as exc:
+    except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
         print(json.dumps({"error": str(exc)}))
         return 2
 

@@ -98,6 +98,32 @@ def test_either_mask_spelling_projects_the_one_wire_mask(
     assert "prefix" not in payload and "netmask" not in payload
 
 
+def test_the_whole_block_is_projected_including_the_fields_no_installer_reads(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``gratuitous_arp`` and ``release_grace_seconds`` are in the payload and pinned here.
+
+    No installer reads either one; they are there because the subcommand projects the block, and an
+    operator reading the human form should see the block. That makes them two fields in a
+    machine-parsed contract with no other reader, which is a liability -- so this is their reader. A
+    rename or a default change on ``ClusterVipSettings`` turns this red instead of silently changing
+    what the CLI emits.
+    """
+    cfg = _write(tmp_path / "messagefoundry.toml", _VIP_ON + _VIP_USABLE + "prefix = 24\n")
+    _, on = _run(capsys, "--service-config", str(cfg), "--json")
+    assert on["gratuitous_arp"] is True
+    assert on["release_grace_seconds"] == 2.0
+    assert set(on) == {
+        "enabled",
+        "cluster_enabled",
+        "address",
+        "interface",
+        "mask",
+        "gratuitous_arp",
+        "release_grace_seconds",
+    }
+
+
 def test_off_block_reports_which_switch_is_off(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -140,6 +166,18 @@ def test_missing_config_is_an_error_line_and_exit_2(
     assert code == 2
     assert "absent.toml" in str(payload["error"])
     assert "address" not in payload
+
+
+def test_a_directory_at_service_config_is_an_error_line_not_a_traceback(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # An easy typo: the config DIRECTORY instead of the file inside it. Path.exists() is True and the
+    # open raises IsADirectoryError, which is an OSError and not a FileNotFoundError -- so without
+    # OSError in the catch the traceback goes to stderr, stdout is empty, and the installer reports
+    # "printed nothing" instead of the reason.
+    code, payload = _run(capsys, "--service-config", str(tmp_path), "--json")
+    assert code == 2
+    assert "error" in payload
 
 
 def test_enabled_but_unusable_block_is_an_error_not_a_half_read(
