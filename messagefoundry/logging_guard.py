@@ -245,6 +245,8 @@ class LogWriteGuard:
                 rolled_aside=rolled_aside,
             )
         if streak > _MAX_ROLLS_PER_WINDOW:
+            # The precondition holds through this join: ``reason`` arrived scrubbed and everything
+            # appended is a literal plus two formatted numbers, so nothing new needs escaping.
             self.record_unwritable(
                 sink,
                 reason=(
@@ -609,9 +611,9 @@ class _GuardedSinkMixin(_SinkBase):
             return
         self._reentry.active = True
         try:
-            # SCRUBBED WHERE IT IS BUILT, NOT AT THE NOTICE WRITER (BACKLOG #1591). The notice below
-            # is written by ``_emit_direct``, so no handler filter will ever see it; the guard
-            # scrubs again at its own boundary for the consumers it owns. See the module docstring.
+            # SCRUBBED HERE, WHERE IT IS BUILT, AND NOWHERE ELSE (BACKLOG #1591). The notice below is
+            # written by ``_emit_direct``, so no handler filter will ever see it, and the three other
+            # consumers of this string take it from the guard unchanged. See the module docstring.
             reason = _safe_reason(sys.exception())
             try:
                 # The path is the notice's OTHER interpolated limb, so it is escaped on the same
