@@ -27,6 +27,20 @@ reads ``self.build_config``, so a target table that declares an EMPTY map means 
 does not re-open the global one. The difference is narrow and it is exactly the kind of thing one
 shared reader exists to get right once.
 
+**READ, NOT INFERRED, because three places in this repository had asserted hatchling's behaviour and
+none could check it** -- the backend is a build-isolation dependency and is installed in no
+interpreter here. At the pinned ``hatchling==1.32.0`` every ``[build-system]`` table names:
+
+* ``src/hatchling/builders/config.py:679`` is the ``in self.target_config`` test above;
+* ``src/hatchling/builders/plugin/interface.py:209`` is ``recurse_forced_files``, and it never calls
+  ``include_path`` -- which ``recurse_selected_project_files`` does at ``:204``. That is why
+  ``exclude`` cannot filter a force-included file, and why the harness map is enumerated rather than
+  excluded (BACKLOG #1702).
+
+Retire the question the same way if the pin moves::
+
+    pip download hatchling==1.32.0 --no-deps --no-binary :all: -d .
+
 **Not covered here, deliberately:** which distributions exist. The two force-include readers each
 glob ``packaging/*`` for their own reasons, written down where they happen, and folding those
 together would decide a question this module was not asked. **That split is safe for a reason, not
