@@ -63,7 +63,7 @@ from __future__ import annotations
 
 import inspect
 import sys
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from time import perf_counter
@@ -159,32 +159,55 @@ def _sends_from(result: object) -> list[str]:
     return [it.to for it in items if isinstance(it, Send)]
 
 
+#: Router-return containers this observer will walk: re-iterable, and walking one consumes nothing.
+#:
+#: An ALLOWLIST rather than ``isinstance(result, Iterable)``, and the difference is a real defect the
+#: first cut of BACKLOG #1694 shipped. "Not an ``Iterator``" is not the same test as "safe to walk":
+#: an object whose ``__iter__`` hands back a stored generator has no ``__next__``, so it is an
+#: ``Iterable`` and not an ``Iterator`` -- and walking it here DRAINS it, leaving the real routing
+#: nothing to materialise. The traced run then delivered 0 where the untraced run delivered 1, which
+#: is exactly the pure-observer break the carve-out exists to prevent (ADR 0072 gate 1a).
+#:
+#: Everything outside this tuple is reported as no ``routed_to`` with ``lazy_result`` set: an honest
+#: "not traced" rather than a silent "selected nothing".
+_ROUTED_CONTAINERS = (list, tuple, set, frozenset)
+
+
+def _router_return_is_untraceable(result: object) -> bool:
+    """True when :func:`_routed_from` declines to walk this shape, so the record is incomplete.
+
+    Drives ``lazy_result``. A generator is the familiar case; a single-pass custom iterable and a
+    ``__getitem__``-only sequence are the ones the first cut missed, and missing them meant the one
+    situation where the tracer actually broke the run was the one it failed to declare."""
+    return result is not None and not isinstance(result, (str, *_ROUTED_CONTAINERS))
+
+
 def _routed_from(result: object) -> list[str]:
-    """Handler names in a Router's raw return, by the rule the real routing uses.
+    """Handler names in a Router's raw return. Reports a subset, never a substitute.
 
-    That rule is :func:`messagefoundry.pipeline.dryrun._handler_names`: ``str`` is one name, ``None``
-    is none, and any other non-``str`` iterable is a sequence of names -- list, tuple, set. This read
-    only ``str`` and ``list``, so a Router returning a tuple or a set traced as an empty
-    ``routed_to`` while routing perfectly well, and the trace contradicted the run it was observing
-    (BACKLOG #1694). A tracer that disagrees with the untraced run is worse than no trace: the reader
-    has no way to tell which half is lying.
+    ``str`` is one name, ``None`` is none, and the containers in :data:`_ROUTED_CONTAINERS` are
+    walked. Reading only ``str`` and ``list`` made a tuple- or set-returning Router trace as an empty
+    ``routed_to`` while it routed perfectly well, so the trace contradicted the run it was observing
+    (BACKLOG #1694).
 
-    A **generator** Router is the one shape still reported as no ``routed_to``, for the pure-observer
-    reason :func:`_sends_from` gives -- draining the one-shot iterator would leave the real routing
-    nothing to materialise, so the traced run would deliver 0 where the untraced run delivers N. The
-    invocation carries ``lazy_result`` so that omission is declared rather than read as a Router that
-    selected nothing."""
+    **Elements are emitted only if they are already** ``str``. They are NOT coerced.
+    :func:`messagefoundry.pipeline.dryrun._handler_names` passes elements through untouched, so
+    ``str()`` here invents names the run never routed to: ``b"h"`` materialises to ``[104]`` for the
+    real routing and would trace as ``['104']``, and a ``(str, Enum)`` member routes as ``'h'`` and
+    would trace as ``'HName.H'``. ADR 0072 gate 1b lets this trace say LESS than the run did, never
+    something different, so a non-``str`` element is dropped rather than stringified. Dropping it
+    also keeps ``str()`` off objects whose ``__str__`` can raise -- one of those turned a delivering
+    run into an ERROR under the first cut.
+
+    A shape this declines to walk carries ``lazy_result`` -- see
+    :func:`_router_return_is_untraceable`."""
     if result is None:
         return []
     if isinstance(result, str):
         return [result]
-    # Ordered BEFORE the Iterable arm: a generator is an Iterable too, and consuming it is the one
-    # thing a pure observer must not do.
-    if isinstance(result, Iterator):
+    if not isinstance(result, _ROUTED_CONTAINERS):
         return []
-    if not isinstance(result, Iterable):
-        return []
-    return [str(name) for name in result]
+    return [name for name in result if isinstance(name, str)]
 
 
 # --- per-invocation recorder -------------------------------------------------
@@ -286,6 +309,11 @@ class _Recorder:
             # `_partition` so a generator Handler now delivers.
             self.lazy_result = isinstance(result, Iterator)
         if self.kind == "router":
+            # Widen the declaration for the Router half: `_routed_from` walks an allowlist, so a
+            # single-pass custom iterable or a `__getitem__`-only sequence is equally untraced and
+            # must say so. The Handler half keeps the Iterator test -- `_sends_from` still routes
+            # through `handler_result_items`, which has its own rule.
+            self.lazy_result = self.lazy_result or _router_return_is_untraceable(result)
             self.routed_to = _routed_from(result)
         elif self.kind == "handler":
             self.sends = _sends_from(result)
