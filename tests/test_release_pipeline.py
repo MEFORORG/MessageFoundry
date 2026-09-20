@@ -379,16 +379,58 @@ def test_both_wheel_smokes_compare_versions_not_strings() -> None:
     # DERIVED, not hardcoded. This read `== 2` and broke the day a third wheel job (the separately
     # versioned console) was added — a guard that must be edited whenever the thing it guards grows is
     # a guard that gets its number bumped without thought. The property worth pinning is "EVERY wheel
-    # smoke normalises", so count the jobs that actually build a wheel and require one comparison each,
-    # plus the engine's own. A new wheel job carrying a string compare now fails HERE.
+    # smoke normalises", so derive the expected set of smokes rather than a literal.
     wheel_builds = rel.count("python -m build --wheel")
     assert wheel_builds >= 2, f"expected the harness + console wheel builds, found {wheel_builds}"
-    assert rel.count("from packaging.version import") == wheel_builds + 1, (
-        f"every wheel smoke must compare PEP 440 versions — {wheel_builds} wheel-building job(s) plus "
-        f"the engine smoke require {wheel_builds + 1} comparisons, found "
-        f"{rel.count('from packaging.version import')}. Fixing only one moves the failure rather than "
-        f"removing it."
+
+    # ASKED PER STEP, because a TOTAL over the file cannot express that property and this one silently
+    # stopped doing so. It counted `from packaging.version import` occurrences against `wheel_builds +
+    # 1`, which held only while each smoke normalised in exactly one place — the tag compare. The
+    # console and harness INSPECTION scripts now normalise too (they compare a source literal, and a
+    # lockstep pin, against metadata the backend canonicalised: BACKLOG #1701, #1585), so the total
+    # moved to 5 while every underlying claim got STRONGER. A total also never bound the right thing:
+    # three comparisons in one job and none in another satisfied it exactly as well as one each.
+    smokes = {
+        # `.get("run") or ""` rather than `step["run"]`, matching _wheel_smoke_steps(): a smoke step
+        # written with `uses:` must fail the assertion below with its own message, not a KeyError.
+        name: str(step.get("run") or "")
+        for name, job in _jobs().items()
+        for step in (job.get("steps") or [])
+        if isinstance(step, dict) and str(step.get("name") or "").startswith("Smoke-check")
+    }
+    assert len(smokes) == wheel_builds + 1, (
+        f"expected one smoke step per wheel-building job ({wheel_builds}) plus the engine's, found "
+        f"{sorted(smokes)}. A wheel job without a smoke step publishes an artifact nothing read."
     )
+    for name, run in sorted(smokes.items()):
+        assert "from packaging.version import" in run, (
+            f"{name}'s smoke compares versions as strings. Every version comparison on the release "
+            f"path must normalise (PEP 440): the tag carries a hyphen a pre-release cannot be "
+            f"spelled without, and the backend canonicalises everything it writes into metadata, so "
+            f"a string compare rejects `0.3.0-rc1` against `0.3.0rc1` — the same release."
+        )
+
+    # NAMED SHAPES, because the import check above only proves a step normalises SOMEWHERE. Each
+    # wheel smoke now normalises in TWO places — its inspection's own version check, and its tag
+    # compare — so reverting ONE of them, and deleting the import it no longer needs, leaves the
+    # other import behind and that loop green. Measured before this was added: per step, the engine
+    # holds 1 occurrence and the console and harness 2 each.
+    #
+    # These are the two string compares actually removed (BACKLOG #1701, #1585), named one at a time
+    # so a revert says WHICH came back. Scanned over CODE ONLY: the workflow quotes both shapes in
+    # the comments explaining why they went, and a guard that fires on its own documentation gets
+    # the documentation deleted rather than the guard respected.
+    code = "\n".join(line for line in rel.splitlines() if not line.lstrip().startswith("#"))
+    for shape, what in (
+        ("!= dist.version", "the console's installed __version__ against its wheel metadata"),
+        ('f"=={dist.version}"', "the harness's lockstep pin against the version it ships at"),
+    ):
+        assert shape not in code, (
+            f"a raw string compare of {what} is back ({shape}). Those two sides are normalised "
+            f"differently by construction — the build backend canonicalises what it writes into "
+            f"metadata and leaves the source spelling alone — so this rejects `0.3.0-rc1` against "
+            f"`0.3.0rc1`, the same release, at the last gate before the PyPI upload."
+        )
 
 
 # --- the separately-versioned web console (ASVS 15.2.4) --------------------------------------------
@@ -1436,4 +1478,166 @@ def test_the_harness_smoke_checks_the_lockstep_pin_on_the_built_artifact(
     )
     assert "1585" in out, (
         f"the harness smoke rejected {why} without naming the row that explains it.\n{out}"
+    )
+
+
+# --- the same release, spelled two ways (BACKLOG #1701, #1585) --------------------------------------
+
+#: What a build backend writes into ``Version:``. ALWAYS canonical -- PEP 440 normalisation is the
+#: backend's job, and `tests/test_version.py::test_installed_metadata_matches_dunder_version` records
+#: the same fact for the engine ("a pre-release __version__ like 0.1.0-rc1 becomes 0.1.0rc1 in
+#: metadata").
+_PRERELEASE_METADATA = "0.3.0rc1"
+
+#: What an AUTHOR may type, and both are supported here rather than tolerated. `tests/test_version.py
+#: ::test_version_is_semver` admits the hyphen, and the release trigger only fires on
+#: `v[0-9]+.[0-9]+.[0-9]+-*`, so a pre-release TAG cannot be spelled any other way.
+#:
+#: The canonical arm is the ARMED CONTROL, not padding: it exercises the identical fixture, install
+#: and script, so a red on the hyphenated arm beside a green here is attributable to the SPELLING.
+#: Both arms failing means the harness broke, which is the failure a bare one-arm test hides.
+_PRERELEASE_SPELLINGS = (_PRERELEASE_METADATA, "0.3.0-rc1")
+_PRERELEASE_IDS = ["canonical", "hyphenated"]
+
+
+@pytest.mark.parametrize("spelling", _PRERELEASE_SPELLINGS, ids=_PRERELEASE_IDS)
+def test_the_console_smoke_accepts_every_supported_prerelease_spelling(
+    spelling: str, venv_template: Path, tmp_path: Path
+) -> None:
+    """The console's source literal and its metadata are NORMALISED DIFFERENTLY, by construction.
+
+    ``dist.version`` comes out of ``Version:``, which the backend canonicalises;
+    ``__version__`` is whatever was typed into ``messagefoundry_webconsole/__init__.py``. Comparing
+    the two as raw strings therefore rejects a wheel that is perfectly well-formed, and it rejects
+    it at the LAST gate before the PyPI upload burns the version.
+
+    This is the defect the sibling tag-vs-built compare was already fixed for (see
+    :func:`test_both_wheel_smokes_compare_versions_not_strings`): the same trap, one comparison over.
+    """
+    script, dist, pkg, exe, purelib = _prepared("release-webconsole", venv_template, tmp_path)
+    _write_install(
+        purelib,
+        dist,
+        pkg,
+        _PRERELEASE_METADATA,
+        package_files=_good_package(pkg, spelling),
+    )
+
+    rc, stdout, out = _run_smoke(exe, script, tmp_path)
+    assert rc == 0, (
+        f"the console smoke REJECTED __version__ {spelling!r} against metadata "
+        f"{_PRERELEASE_METADATA!r} -- the same release, and PEP 440 says so. A pre-release could "
+        f"not be published while this holds.\n{out}"
+    )
+    # The shell captures stdout as `built=$(...)` and compares THAT against the tag, so a script that
+    # accepted the install but printed the source spelling would move the failure rather than remove
+    # it: the tag compare would then normalise a string this step never vouched for.
+    assert stdout.strip() == _PRERELEASE_METADATA, (
+        f"the console smoke printed {stdout.strip()!r}, not the metadata version "
+        f"{_PRERELEASE_METADATA!r} the release compares against the tag.\n{out}"
+    )
+
+
+@pytest.mark.parametrize("spelling", _PRERELEASE_SPELLINGS, ids=_PRERELEASE_IDS)
+def test_the_harness_smoke_accepts_every_supported_prerelease_pin_spelling(
+    spelling: str, venv_template: Path, tmp_path: Path
+) -> None:
+    """``Requires-Dist`` keeps the spelling the pyproject was written in; ``Version:`` does not.
+
+    Measured: ``str(Requirement("messagefoundry[harness]==0.3.0-rc1").specifier)`` is
+    ``"==0.3.0-rc1"`` -- ``packaging`` preserves the raw version in a specifier, and
+    ``str(Requirement(...))`` round-trips it, so a hyphen typed into
+    ``packaging/messagefoundry-harness/pyproject.toml`` reaches the built metadata intact while
+    ``Version:`` beside it has been canonicalised.
+
+    So an ``f"=={dist.version}"`` string compare reds the lockstep check on exactly the releases
+    that need it most, and the operator sees a "pin drifted" error naming two versions that are the
+    same one.
+    """
+    script, dist, pkg, exe, purelib = _prepared("release-harness", venv_template, tmp_path)
+    _write_install(
+        purelib,
+        dist,
+        pkg,
+        _PRERELEASE_METADATA,
+        package_files=_good_package(pkg, _PRERELEASE_METADATA),
+        requires=[f"messagefoundry[harness]=={spelling}"],
+    )
+
+    rc, stdout, out = _run_smoke(exe, script, tmp_path)
+    assert rc == 0, (
+        f"the harness smoke called `messagefoundry[harness]=={spelling}` a drift from "
+        f"{_PRERELEASE_METADATA} -- it is the same version, and the lockstep premise holds.\n{out}"
+    )
+    assert stdout.strip() == _PRERELEASE_METADATA, (
+        f"the harness smoke printed {stdout.strip()!r}, not {_PRERELEASE_METADATA!r}.\n{out}"
+    )
+
+
+def test_the_console_smoke_still_rejects_a_different_prerelease(
+    venv_template: Path, tmp_path: Path
+) -> None:
+    """The control for the two accepting tests above: normalising must not flatten rc1 into rc2.
+
+    Those assert ``rc == 0`` on every arm, so a script that stopped comparing at all would satisfy
+    them both. The existing mismatch case uses 9.9.9 against 7.7.7, which a broken check would also
+    have to pass -- but it is nowhere near the pre-release territory this change moved, and a fix
+    that over-normalised would land exactly there.
+    """
+    script, dist, pkg, exe, purelib = _prepared("release-webconsole", venv_template, tmp_path)
+    _write_install(
+        purelib,
+        dist,
+        pkg,
+        _PRERELEASE_METADATA,
+        package_files=_good_package(pkg, "0.3.0rc2"),
+    )
+
+    rc, _stdout, out = _run_smoke(exe, script, tmp_path)
+    assert rc != 0, (
+        f"the console smoke accepted __version__ 0.3.0rc2 against metadata "
+        f"{_PRERELEASE_METADATA} -- those are different releases, and PEP 440 orders them.\n{out}"
+    )
+    assert "0.3.0rc2" in out and _PRERELEASE_METADATA in out, (
+        f"the console smoke rejected the mismatch without naming both versions.\n{out}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("requires", "why"),
+    [
+        (["messagefoundry[harness]==0.3.0rc2"], "a pin at a DIFFERENT pre-release"),
+        (
+            ["messagefoundry[harness]==0.3.0.*"],
+            "a wildcard, which matches 0.3.0.post1 and is no pin",
+        ),
+        (["messagefoundry[harness]>=0.3.0-rc1"], "a range wearing the supported spelling"),
+    ],
+    ids=["other-prerelease", "wildcard", "range-hyphenated"],
+)
+def test_the_harness_smoke_still_rejects_a_pin_that_is_not_the_shipped_version(
+    requires: list[str], why: str, venv_template: Path, tmp_path: Path
+) -> None:
+    """Normalising the PIN must not soften the operator or the version it is compared against.
+
+    The wildcard arm is the one that needs saying. ``Version("0.3.0.*")`` RAISES, so a fix that
+    simply wrapped both sides in ``Version()`` would report "unparseable version" and drop BACKLOG
+    #1585 along with the instruction naming the file to edit -- telling the operator the wheel is
+    corrupt when the pyproject is merely wrong. It must reject, and it must reject as a DRIFT.
+    """
+    script, dist, pkg, exe, purelib = _prepared("release-harness", venv_template, tmp_path)
+    _write_install(
+        purelib,
+        dist,
+        pkg,
+        _PRERELEASE_METADATA,
+        package_files=_good_package(pkg, _PRERELEASE_METADATA),
+        requires=requires,
+    )
+
+    rc, _stdout, out = _run_smoke(exe, script, tmp_path)
+    assert rc != 0, f"the harness smoke published a wheel with {why}.\n{out}"
+    assert "1585" in out, (
+        f"the harness smoke rejected {why} without naming the row that explains it -- the operator "
+        f"is told the artifact is broken rather than which file to fix.\n{out}"
     )

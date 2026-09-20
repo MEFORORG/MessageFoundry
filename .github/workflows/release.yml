@@ -642,10 +642,44 @@ jobs:
           m = re.search(r"""^__version__\s*=\s*["']([^"']+)["']""", text, re.M)
           if m is None:
               raise SystemExit(f"::error::no __version__ literal in the installed {origin}")
-          if m.group(1) != dist.version:
+          # COMPARED AS PEP 440 VERSIONS, NOT AS STRINGS — the two sides are normalised differently by
+          # construction. `dist.version` comes out of `Version:`, which hatchling canonicalises, while
+          # `__version__` is whatever was typed into the version root, and the hyphen spelling is
+          # SUPPORTED here rather than tolerated (tests/test_version.py::test_version_is_semver admits
+          # it, and the tag trigger above only fires on `...-*`, so a pre-release tag cannot be spelled
+          # any other way). A string compare therefore rejects `0.3.0-rc1` against metadata `0.3.0rc1`
+          # — the same release — and reds every console pre-release at the last gate before the PyPI
+          # upload burns the version. Its sibling tag-vs-built compare below was fixed for exactly this
+          # trap; this is the same trap one comparison over.
+          # tests/test_version.py::test_installed_metadata_matches_dunder_version parses both sides of
+          # the identical question for the engine, and says why in its own comment.
+          #
+          # WHAT THIS GIVES UP, stated rather than left to be discovered: the check is now PEP 440
+          # equality, not a spelling check, so `v0.3.0`, `0.3.0.0` and `0.3` all pass against metadata
+          # `0.3.0` as well. That is the whole equivalence class, not just the hyphen. Nothing else
+          # constrains the console literal's spelling, and its only consumer is the version string
+          # printed at messagefoundry_webconsole/__init__.py. What the check still catches is the
+          # failure it exists for — a wheel whose package tree and metadata came from different trees
+          # — because epochs, post-releases and local segments all still compare unequal.
+          #
+          # `packaging` is installed into this venv above, from the constraints.lock pin. Imported HERE
+          # rather than at the top, matching the harness smoke: everything before this point is
+          # stdlib-only, and that is what lets the guards above report a broken wheel instead of a
+          # missing dependency.
+          from packaging.version import InvalidVersion, Version
+
+          try:
+              source_version, metadata_version = Version(m.group(1)), Version(dist.version)
+          except InvalidVersion as exc:
+              raise SystemExit(
+                  f"::error::unparseable version ({exc}) — installed {PKG}.__version__ "
+                  f"{m.group(1)!r}, wheel metadata {dist.version!r}"
+              )
+          if source_version != metadata_version:
               raise SystemExit(
                   f"::error::installed {PKG}.__version__ {m.group(1)} != wheel metadata version "
-                  f"{dist.version} — the console's version root and its built artifact disagree"
+                  f"{dist.version} (normalised {source_version} != {metadata_version}) — the console's "
+                  f"version root and its built artifact disagree"
               )
 
           print(
@@ -888,6 +922,7 @@ jobs:
           # here rather than at the top because everything before this point is stdlib-only, and that
           # is what lets the earlier guards report a broken wheel instead of a missing dependency.
           from packaging.requirements import Requirement
+          from packaging.version import InvalidVersion, Version
 
           engine = [
               req
@@ -899,7 +934,40 @@ jobs:
                   f"::error::{DIST} {dist.version} declares {len(engine)} requirements on the engine, "
                   f"expected exactly one (BACKLOG #1585)"
               )
-          if str(engine[0].specifier) != f"=={dist.version}" or engine[0].extras != {"harness"}:
+          # THE PINNED VERSION IS COMPARED AS A PEP 440 VERSION, NOT AS A SPECIFIER STRING. `packaging`
+          # preserves the raw spelling: str(Requirement("messagefoundry[harness]==0.3.0-rc1").specifier)
+          # is "==0.3.0-rc1", and str(Requirement(...)) round-trips it, so a hyphen typed into the
+          # harness pyproject reaches Requires-Dist intact while `Version:` beside it has been
+          # canonicalised to 0.3.0rc1. An f"=={dist.version}" string compare therefore calls a CORRECT
+          # lockstep pin a drift on every pre-release, and prints two versions that are the same one.
+          #
+          # THE OPERATOR AND THE EXTRA STAY EXACT, and that is the half worth not losing: a range is
+          # not a lockstep pin however it is spelled, and dropping [harness] makes the table look
+          # stricter while it quietly stops installing PySide6
+          # (tests/test_packaging.py::test_the_harness_pin_keeps_the_extra_the_harness_actually_needs).
+          clauses = list(engine[0].specifier)
+          pinned = None
+          if len(clauses) == 1 and clauses[0].operator == "==":
+              try:
+                  pinned = Version(clauses[0].version)
+              except InvalidVersion:
+                  # A WILDCARD PIN IS A DRIFT, NOT A BROKEN ARTIFACT, and it must not escape through
+                  # the metadata branch below. `==0.3.0.*` is a legal specifier that Version() refuses
+                  # — and it matches 0.3.0.1 and 0.3.0.post1, so it is precisely the loose shape this
+                  # check exists to refuse (tests/test_packaging.py::_engine_pin screens the same
+                  # shape). Reported as "unparseable version" it would drop BACKLOG #1585 and the
+                  # instruction to fix the dependencies table, telling the operator the wheel is
+                  # corrupt when the pyproject is merely wrong.
+                  pinned = None
+          try:
+              shipped = Version(dist.version)
+          except InvalidVersion as exc:
+              # The DISTRIBUTION's own version, not the pin: a build that wrote an unparseable
+              # `Version:` is a broken artifact and gets its own message.
+              raise SystemExit(
+                  f"::error::unparseable version ({exc}) — {DIST} metadata {dist.version!r}"
+              )
+          if pinned is None or pinned != shipped or engine[0].extras != {"harness"}:
               raise SystemExit(
                   f"::error::{DIST} {dist.version} requires "
                   f"messagefoundry{sorted(engine[0].extras)}{engine[0].specifier}, not "
