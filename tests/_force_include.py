@@ -38,10 +38,18 @@ interpreter here. At the pinned ``hatchling==1.32.0`` every ``[build-system]`` t
   harness map is enumerated rather than excluded (BACKLOG #1702).
 
 **"Unfiltered" is the wrong word for that last one, and the overstatement is worth not inheriting.**
-``recurse_forced_files`` does filter, just not by anything an author configures: ``EXCLUDED_DIRECTORIES``
-at ``:222`` and ``EXCLUDED_FILES`` at ``:226``, both fixed lists, against a plain ``os.path`` walk. The
-true statement is narrower and is the one that matters -- **no include or exclude OPTION reaches a
-force-included path.**
+``recurse_forced_files`` does filter, at **at least three** sites in its directory branch -- a floor
+rather than a list, because the first draft of this paragraph named two of them and stopped
+(SDS-3.6, and it caught this file): ``EXCLUDED_DIRECTORIES`` at ``:222``, ``EXCLUDED_FILES`` at
+``:226``, and ``path_is_reserved`` at ``:231``. The claim that survives all three is the one that
+matters -- **no include or exclude OPTION reaches a force-included path**, because those flow through
+``include_path`` and none of the three is it.
+
+**Do not upgrade that to "nothing an author configures", which is what the draft said.** The first two
+are fixed lists, but ``path_is_reserved`` reads ``build_reserved_paths``, and ``config.py:838-848``
+populates that **from the force-include map itself** -- so the third filter is derived from the
+author's own configuration, just not from an include/exclude option. Its job there is to stop a mapped
+DIRECTORY walk re-adding a path another entry already claims.
 
 Re-read it the same way if the pin moves, rather than trusting the line numbers above::
 
