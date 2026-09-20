@@ -52,5 +52,42 @@ Source = "https://github.com/MEFORORG/MessageFoundry"
 Issues = "https://github.com/MEFORORG/MessageFoundry/issues"
 
 [tool.hatch.build.targets.wheel]
-# harness/ is two levels up (the repo root); pull the whole package tree into the wheel as `harness`.
-force-include = { "../../harness" = "harness" }
+# harness/ is two levels up (the repo root). This table used to carry the one mapping
+# `{"../../harness" = "harness"}`, and that whole-directory mapping also shipped `harness/CLAUDE.md` --
+# this repository's internal Claude Code conventions -- to everyone who installs the harness
+# (BACKLOG #1702). Sub-directories are still mapped whole and recurse, so only the top level is listed.
+#
+# DO NOT REACH FOR `exclude` HERE. It cannot fix this, and that is measured rather than assumed.
+# hatchling 1.32.0's `recurse_forced_files` (hatchling/builders/plugin/interface.py) never calls
+# `include_path`, so a force-included file is filtered only by hatchling's own EXCLUDED_FILES and
+# EXCLUDED_DIRECTORIES -- every file-selection option is inert over it. `exclude = ["CLAUDE.md"]` was
+# added beside the whole-directory mapping and the wheel BUILT AND LISTED: 101 members, with
+# `harness/CLAUDE.md` still among them, identical to the build without it. `include` and `only-include`
+# are dead here for the same reason. Enumerating is the only route. (The ENGINE'S root pyproject.toml
+# does use `exclude` for its own nested CLAUDE.md, because its package tree is walked, not mapped.)
+#
+# THE COST, IN BOTH DIRECTIONS. A NEW top-level file or directory under harness/ does not ship until it
+# is added here. And an entry left behind after its file is deleted is WORSE than not shipping: hatchling
+# raises `FileNotFoundError: Forced include not found` and the whole build dies, first seen inside the
+# release job, because nothing in PR CI runs a build. `tests/test_packaging.py` derives both directions
+# from the tracked tree, so each is loud in PR CI instead of silent until a tag.
+[tool.hatch.build.targets.wheel.force-include]
+"../../harness/acceptance" = "harness/acceptance"
+"../../harness/config" = "harness/config"
+"../../harness/load" = "harness/load"
+"../../harness/reconcile" = "harness/reconcile"
+"../../harness/README.md" = "harness/README.md"
+"../../harness/__main__.py" = "harness/__main__.py"
+"../../harness/_async.py" = "harness/_async.py"
+"../../harness/_console_widgets.py" = "harness/_console_widgets.py"
+"../../harness/_login.py" = "harness/_login.py"
+"../../harness/_spreadsheet.py" = "harness/_spreadsheet.py"
+"../../harness/compose.py" = "harness/compose.py"
+"../../harness/file_panel.py" = "harness/file_panel.py"
+"../../harness/file_transport.py" = "harness/file_transport.py"
+"../../harness/mllp.py" = "harness/mllp.py"
+"../../harness/monitor.py" = "harness/monitor.py"
+"../../harness/receive.py" = "harness/receive.py"
+"../../harness/scenarios.py" = "harness/scenarios.py"
+"../../harness/send.py" = "harness/send.py"
+"../../harness/window.py" = "harness/window.py"
