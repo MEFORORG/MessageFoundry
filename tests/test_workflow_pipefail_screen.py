@@ -792,12 +792,13 @@ _GRANDFATHERED: frozenset[tuple[str, str, str]] = frozenset(
         (
             "release.yml",
             "release-harness",
-            "Smoke-check the harness wheel (version == engine == tag)",
+            "Smoke-check the harness wheel (clean venv, install, import, version == engine == tag)",
         ),
         (
             "release.yml",
             "release-webconsole",
-            "Smoke-check the console wheel (version == the console's OWN __version__ == tag)",
+            "Smoke-check the console wheel (clean venv, install, then the console's OWN "
+            "__version__ == tag)",
         ),
         ("security.yml", "sbom", "Score SBOM quality (sbomqs — advisory)"),
         ("security.yml", "trivy", "Install Trivy (pinned)"),
