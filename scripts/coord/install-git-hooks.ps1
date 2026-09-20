@@ -587,10 +587,21 @@ if ($armedRemote) {
     # refs/tags/rescue/auto/main collided between the engine and the vault, which push to one
     # remote; the bare shape this line used to print still resolves, to that contested fossil. So
     # an operator who built a query from the old wording got a CONFIDENT HIT at a commit belonging
-    # to neither repository and concluded their work was backed up. Keep this in step with
-    # scripts/hooks/durability_push.sh:122 and :126 -- the two lines that assign $TAG.
+    # to neither repository and concluded their work was backed up. Keep this in step with the two
+    # lines in scripts/hooks/durability_push.sh that assign $TAG.
+    #
+    # ANCHORED BY CONTENT, BECAUSE THE LINE NUMBERS THAT USED TO SIT HERE HAD ROTTED. This citation
+    # read `:122 and :126` while those assignments sat at 194 and 198 -- measured 2026-09-20 against
+    # origin/main. A pointer and the thing it points at are two edits, only one of which ever gets
+    # made, and no gate anywhere reports the gap. `$TAG` is greppable; a line number is not.
     Write-Host "             Every commit now also lands as refs/tags/rescue/auto/<repo>/<branch>"
     Write-Host "             there, or refs/tags/rescue/auto/<repo>/detached/<sha> off a branch."
+    # A REWRITE ALSO LEAVES A REF NOW, and an operator who does not expect it reads it as a stray.
+    # A rebase, amend or reset followed by a commit preserves the tip the moving tag steps off, at
+    # refs/tags/rescue/orphan/<repo>/<branch>/<sha>. Why, and what it does not cover, is stated once
+    # in scripts/hooks/durability_push.sh under "preserve before the tag moves off a discarded tip".
+    Write-Host "             A rebase or amend also leaves refs/tags/rescue/orphan/<repo>/<branch>/<sha>"
+    Write-Host "             holding the tip it discarded, so the rewrite does not drop it."
 } else {
     Write-Host "!! DURABILITY HOOK IS INSTALLED BUT NOT ARMED." -ForegroundColor Yellow
     Write-Host "   mefor.durabilityRemote is unset, so it exits 0 without pushing and nothing is" -ForegroundColor Yellow
