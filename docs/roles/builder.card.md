@@ -20,10 +20,10 @@ Builder's brief, never as a reply to you.
   and STOP. Stopping costs one worker. Guessing costs the round plus the unwind.
 - **Wait for an answer.** Mail reaches the reader's next turn, and for you that turn never comes.
 - **Plan and wait for a "go".** The brief is the go.
-- **Declare its own seat.** Your Manager does that.
 - **Exit without pushing.** As a subagent you die with your Manager, and unpushed work leaves no
   trace that it existed -- not a branch, not a stash, not a file anyone can find.
-- **Spawn another session.**
+- **Spawn another session.** A subagent cannot outlive a mistake; a spawned session can. Only a
+  Manager and the Lander may spawn, and reaching for it means something upstream has failed.
 - **Merge.** That is the Lander's, always.
 - **Use `--no-verify`, or rename a file to get past a gate.** If a gate fires, fix the cause or say
   plainly that you could not.
@@ -48,12 +48,17 @@ because one arrived.
 ## On arrival
 
 1. Read `roles/COMMON.md`, then `roles/BUILDER.md`, from korus at `origin/main`.
-2. Work in your own worktree. Two sessions in one tree clobber each other, and the primary is
+2. **Declare your seat.** You CAN, through the Bash tool -- measured 2026-09-02, a headless `-p`
+   Builder did it. This card said the opposite until 2026-09-18, and that rule was self-confirming:
+   a Builder told it cannot declare does not try, renders undeclared, and confirms the rule. Quote
+   the Windows path; unquoted, the shell eats the backslashes.
+   `pwsh -NoProfile -File scripts\coord\seat.ps1 -Declare -Seat builder -Goal "<one line>"`
+3. Work in your own worktree. Two sessions in one tree clobber each other, and the primary is
    blocked to you: `pwsh -NoProfile -File scripts/worktree/new.ps1 -Name <short-name>`.
-3. Check the merge base BEFORE reading a diff or opening a PR:
+4. Check the merge base BEFORE reading a diff or opening a PR:
    `git merge-base --is-ancestor origin/main HEAD`. Exit 0 means you contain the trunk tip.
-4. Check who else is in your files: `pwsh -NoProfile -File scripts/coord/overlap.ps1`.
-5. If you add a file under `tests/`, classify it in `tests/tooling_manifest.txt` in the same commit,
+5. Check who else is in your files: `pwsh -NoProfile -File scripts/coord/overlap.ps1`.
+6. If you add a file under `tests/`, classify it in `tests/tooling_manifest.txt` in the same commit,
    or the PR can never go green.
 
 ## Before you claim it works
@@ -72,7 +77,7 @@ Picking the work, scoping it, or the merge.
 
 ## The full playbook
 
-`roles/BUILDER.md`, in the **`wshallwshall/korus`** repository, read at `origin/main` and never out of a
+`roles/BUILDER.md`, in the **`MEFORORG/korus`** repository, read at `origin/main` and never out of a
 working tree:
 
     git -C <korus clone> fetch origin

@@ -532,8 +532,42 @@ host-wide — coordinate with whatever else the box runs.
 .\scripts\service\uninstall-service.ps1
 ```
 
-This stops and removes the service. The log files and message store under `DataDir`
-are left in place.
+This stops the service and removes its registration. **It does not return the host to its
+pre-install state.** The script reads the host before it removes the registration, then prints an
+inventory of what is still there and the command that clears each one. Read that inventory; the
+list below says what it covers.
+
+| Left behind | Why | Clear it with |
+|---|---|---|
+| The `DataDir` tree — logs, message store, and `bin\nssm.exe` if the installer downloaded it | Your data, and the NSSM binary the uninstall just used | Delete it yourself once you are sure you are not reinstalling. `DataDir` is a PHI sink — dispose of it the way [PHI.md](PHI.md) describes |
+| An access-control entry for the run-as account on `DataDir` **and** on the config directory | The installer grants both so the service can read config and write logs | `-RemoveAccountAces`, or `icacls "<dir>" /remove:g "*<SID>"` |
+| The `SeServiceLogonRight` ("Log on as a service") grant | NSSM's `ObjectName` does not grant it, so the installer does | `-RemoveLogonRight`, or secpol.msc under Local Policies, User Rights Assignment |
+| Inheritance turned off on `DataDir`, and (with `-LockConfigDir`) on the config directory plus its owner moved to Administrators | See below | `icacls "<dir>" /inheritance:e`, by hand |
+| Windows Error Reporting keys, when you installed with `-SuppressCrashDumps` — **two** surfaces, `ExcludedApplications` and `LocalDumps`, reported separately because Windows evaluates them independently | [Stated above](#suppress-windows-crash-dumps-of-the-engine-adr-0152-phase-0) — removing them switches PHI-carrying dumps back on | By hand, under that registry path |
+
+**Why the uninstaller does not put the permissions back.** Turning inheritance on again would hand
+the parent directory's principals read access to logs and a message store that can carry PHI — on
+the way out, when nobody is watching. And nothing recorded what the permissions and the owner were
+before the installer changed them, so a "restore" would be inventing a state rather than returning
+to one. The two switches exist for the residues that **are** reversible, and both are opt-in.
+
+```powershell
+.\scripts\service\uninstall-service.ps1 -RemoveLogonRight -RemoveAccountAces
+```
+
+**Pass them on the uninstall run itself.** Both act on facts that only exist while the service is
+registered — the run-as account, its SID, the config directory. Once the service is gone the script
+exits at its "not installed" guard, so a second run with the switches does nothing. The inventory
+says so, and names the manual command for each.
+
+`-RemoveLogonRight` is safe for the installer's default per-service virtual account, whose SID
+belongs to this service alone. It warns first for any other account: a gMSA or a dedicated user may
+log other services on, and they fail to start with error 1069 once the right is gone. The script
+also refuses to remove the right when the account is the only holder on the host, which would take
+it from every service at once.
+
+A read that fails leaves its residue out of the inventory, so the script names what it could not
+read rather than printing a shorter list. Check those by hand before you call the host clean.
 
 ## Troubleshooting
 

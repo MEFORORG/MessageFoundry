@@ -42,11 +42,10 @@ cffi==2.0.0
     #   pynacl
 charset-normalizer==3.4.7
     # via requests
-click==8.4.1
+click==8.5.0
     # via uvicorn
 colorama==0.4.6 ; sys_platform == 'win32'
     # via
-    #   click
     #   pytest
     #   uvicorn
 cryptography==50.0.1
@@ -267,7 +266,7 @@ typing-inspection==0.4.2
     # via
     #   fastapi
     #   pydantic
-tzdata==2026.3
+tzdata==2026.4
     # via messagefoundry
 urllib3==2.7.0
     # via requests

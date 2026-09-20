@@ -1,6 +1,7 @@
 # ADR 0059 — seq-only per-lane FIFO ordering (drop the `_fifo_created_at` write-time clamp)
 
-- Status: **Proposed**
+- Status: **Accepted** -- **built**, and load-bearing: `ADR 0059` is cited 50 times across the engine
+  (`pipeline/wiring_runner.py`, `store/base.py`, `config/ingest_time.py`), and `_fifo_created_at` is gone.
 - Date: 2026-06-30
 - Relates to: ADR 0001 (staged pipeline), ADR 0055 (group-committer), ADR 0058 (batch claim); issue #285 (per-lane FIFO no-skip); throughput roadmap (docs/throughput-roadmap.md, "collapse-commit-depth"); supersedes the `_fifo_created_at` mechanism introduced for clock-regression resilience.
 

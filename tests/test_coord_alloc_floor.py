@@ -545,3 +545,35 @@ def test_list_reaches_no_network(tmp_path: Path) -> None:
         "-List probed the remote, so the pre-flight block now runs before the early return:\n"
         + "\n".join(invocations)
     )
+
+
+# --- BACKLOG #1768: the allocator must not speak the work-claim register -----------------------
+
+
+def test_the_allocator_does_not_speak_the_work_claim_register() -> None:
+    """An ALLOCATION reserves a NUMBER; a CLAIM reserves the WORK. Two registers, two scripts.
+
+    `alloc.ps1` used to end every successful allocation with `claimed by: <worktree>`, which is
+    `claim.ps1`'s word for the other thing. A reader who saw it concluded the row was claimed and
+    did not run `claim.ps1 -Take` -- a collision the allocator cannot prevent and does not report.
+
+    AN ABSENCE ASSERTION, DELIBERATELY. Pinning the exact replacement label would red the day
+    somebody legitimately rewords it, which is the tripwire shape this repo has been removing
+    elsewhere. Pinning the absence of the wrong register reds only on the regression it guards.
+
+    Non-vacuity is carried by the second assertion, and it pins the DATA rather than the label:
+    deleting the line outright would otherwise pass this test silently. The wording stays free.
+
+    Reads the source. It does not allocate -- see this module's docstring for why nothing here may.
+    """
+    src = (_ROOT / "scripts" / "coord" / "alloc.ps1").read_text(encoding="utf-8")
+
+    assert "claimed by:" not in src, (
+        "alloc.ps1 labels an allocation with claim.ps1's register again (BACKLOG #1768). An "
+        "allocation reserves the NUMBER; the work claim is a separate register and a separate "
+        "script, and conflating them means a row nobody claimed reads as claimed."
+    )
+    assert '$ownerRepo [$ownerBranch]"' in src, (
+        "the success output no longer names the worktree the number is recorded against, so the "
+        "absence check above would pass on a line that had simply been deleted"
+    )
