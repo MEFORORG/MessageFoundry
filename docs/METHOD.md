@@ -245,8 +245,10 @@ named files, and the two **merge clean**. It has fired three times here. Full re
 
 ## A PR's state is a join over three clocks
 
-**This section is for the Manager, the Watchdog and the Lander. A Builder never evaluates it,
-because its process exits before any run reports.**
+**This section is for the Manager, the Lander, and the Watchdog because it reads merge state to
+tell a draining queue from a stalled one. A Builder never evaluates it, because its process exits
+before any run reports.** The Watchdog is here on that reading duty, not as the Regulator's
+replacement: that seat retired 2026-09-19 and nothing took its ruling.
 
 `mergeStateStatus` alone will mislead you. It reports `BEHIND` or `DIRTY` in preference to `BLOCKED`.
 A seat that triages on that field will push and wedge the PR further from green.
