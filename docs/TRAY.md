@@ -57,6 +57,10 @@ A status-coloured disc, themed to your taskbar (light/dark), one per engine stat
 | 🟣 violet | `FOREIGN` | Something that isn't MessageFoundry answers on the port |
 | ◻ slate | `UNKNOWN` | The service state could not be read |
 
+`UNKNOWN` also covers the tray's own status check failing, which is why it is a display-only
+state: it does not disturb what the tray remembers about the engine, so a wedged engine is still
+reported as wedged once the checks come back.
+
 Hover for a tooltip; the tray raises a brief balloon only on meaningful transitions (engine
 came up, stopped unexpectedly, went unreachable), rate-limited so a crash-loop can't spam you.
 

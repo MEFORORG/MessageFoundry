@@ -7,7 +7,9 @@ A single daemon thread ticks every few seconds: read the local SCM state, probe 
 to the shell's update callback (which repaints the icon on the UI thread). The cadence tightens
 to ``waitHint/10`` while a service transition is in flight. A tick that *raises* is logged and
 published as ``UNKNOWN`` rather than ending the thread: an icon frozen on its last good reading
-reports stale state as live, and says nothing about having stopped.
+reports stale state as live, and says nothing about having stopped. That stand-in is a **display**
+fallback only -- it is kept out of every piece of cross-tick memory, for the reasons set out on
+:meth:`StatusPoller._unknown_result`.
 
 The timing that turns raw readings into :class:`~messagefoundry.tray.state.ProbeInputs` — the boot-grace clock and
 stuck-pending detection — is the **pure** :func:`advance`, keyed to a **monotonic** ``now`` so a
@@ -69,6 +71,13 @@ class PollResult:
 
 
 _PENDING = (ScmState.START_PENDING, ScmState.STOP_PENDING)
+
+# What a tick that *raised* stands in with: SCM unqueryable, both probes dark. Deliberately
+# clock-free and tracking-free constants -- see :meth:`StatusPoller._unknown_result` for why the
+# synthetic reading must never reach `advance`.
+_UNKNOWN_READING = ScmReading(state=ScmState.UNAVAILABLE)
+_UNKNOWN_INPUTS = ProbeInputs(scm=ScmState.UNAVAILABLE, health=HealthProbe.DOWN, ui=UiProbe.UNKNOWN)
+_UNKNOWN_STATE = derive_state(_UNKNOWN_INPUTS)  # UNKNOWN, derived through the reducer not asserted
 
 
 def advance(
@@ -169,8 +178,20 @@ class StatusPoller:
             try:
                 result = self.poll_once(now)
             except Exception:  # supervisory boundary -- see the module docstring
-                log.exception("tray status poll raised; publishing UNKNOWN for this tick")
-                result = self._unknown_result(now)
+                if self._stop.is_set():
+                    # `stop()` sets the event, joins for _STOP_JOIN_TIMEOUT_S, then closes the
+                    # probe client; two probes at DEFAULT_TIMEOUT_S can outlast that join, and
+                    # httpx then raises a bare RuntimeError through `probe_health`/`probe_ui`,
+                    # which catch only httpx.HTTPError. That is the shutdown, not a fault, so it
+                    # does not warrant an ERROR traceback on every clean exit. It is still
+                    # recorded: this branch is reached by *any* exception raised inside the join
+                    # window, so a genuine defect landing there must not vanish silently.
+                    log.debug("tray status poll raised while stopping", exc_info=True)
+                else:
+                    log.exception("tray status poll raised; publishing UNKNOWN for this tick")
+                result = self._unknown_result()
+            if self._stop.is_set():
+                return  # a tick that outlived `stop()` must not repaint an already torn-down shell
             try:
                 self._on_update(result)
             except Exception:  # a UI callback must never kill the poll loop (supervisory boundary)
@@ -187,33 +208,58 @@ class StatusPoller:
         self._tracking, inputs = advance(self._tracking, reading, health, ui, now)
         return self._build_result(inputs, reading, now)
 
-    def _unknown_result(self, now: float) -> PollResult:
+    def _unknown_result(self) -> PollResult:
         """The stand-in :class:`PollResult` for a tick that raised.
 
-        Folded through the same pure :func:`advance` / :meth:`_build_result` path as a real tick, so
-        the tracking clock keeps moving and the next successful tick sees a consistent history.
-        :func:`derive_state` already reduces an unqueryable SCM with both probes dark to
+        A **display** fallback, not a state transition. The synthetic reading is deliberately kept
+        out of both pieces of cross-tick memory, because it is a statement about the *poller*
+        having failed, not an observation of the service:
+
+        * It never reaches :func:`advance`. An ``UNAVAILABLE`` fold clears ``running_since`` and
+          ``pending_since``, so the next real RUNNING tick would re-anchor the boot grace at zero.
+          :func:`~messagefoundry.tray.state.derive_state` needs ``running_elapsed_s`` past
+          :data:`~messagefoundry.tray.state.BOOT_GRACE_S` to return ``WEDGED``, so a poll raising
+          more often than that grace would pin a genuinely wedged engine at ``STARTING`` for as
+          long as it kept failing -- defeating the one detection the tray exists for, in exactly
+          the intermittent-failure case this fallback is here to survive. The same wipe would
+          reset stuck-pending detection.
+        * It never stamps ``_last_state``, which is the toast machine's memory of the last *real*
+          reading. Stamping would fire a false "Engine running" balloon on recovery from a
+          transient failure, swallow the real "Engine stopped" balloon when a failed tick lands
+          between RUNNING and STOPPED, and spend the first-reading no-toast exemption.
+
+        It carries no toast of its own: ``transition_toast`` has no ``-> UNKNOWN`` rule, so there
+        is nothing to suppress here. :func:`~messagefoundry.tray.state.derive_state` already
+        reduces an unqueryable SCM with both probes dark to
         :data:`~messagefoundry.tray.state.TrayState.UNKNOWN`, so the reducer needs no failure case
         of its own.
         """
-        reading = ScmReading(state=ScmState.UNAVAILABLE)
-        self._tracking, inputs = advance(
-            self._tracking, reading, HealthProbe.DOWN, UiProbe.UNKNOWN, now
+        return PollResult(
+            snapshot=self._build_snapshot(_UNKNOWN_STATE, _UNKNOWN_INPUTS),
+            inputs=_UNKNOWN_INPUTS,
+            reading=_UNKNOWN_READING,
         )
-        return self._build_result(inputs, reading, now)
 
     def _build_result(self, inputs: ProbeInputs, reading: ScmReading, now: float) -> PollResult:
         state = derive_state(inputs)
-        snapshot = StatusSnapshot(
+        toast = self._maybe_toast(state, now)  # reads _last_state, so it must precede the stamp
+        self._last_state = state
+        return PollResult(
+            snapshot=self._build_snapshot(state, inputs),
+            inputs=inputs,
+            reading=reading,
+            toast=toast,
+        )
+
+    def _build_snapshot(self, state: TrayState, inputs: ProbeInputs) -> StatusSnapshot:
+        """The render model for a derived state. Pure with respect to the poller's own memory."""
+        return StatusSnapshot(
             state=state,
             service_name=self._config.service_name,
             engine_url=self._config.engine_url,
             console_enabled=inputs.ui is UiProbe.ENABLED,
             monitor_only=self._config.monitor_only,
         )
-        toast = self._maybe_toast(state, now)
-        self._last_state = state
-        return PollResult(snapshot=snapshot, inputs=inputs, reading=reading, toast=toast)
 
     def _maybe_toast(self, state: TrayState, now: float) -> Toast | None:
         """A transition toast, if warranted and not inside the rate-limit window."""

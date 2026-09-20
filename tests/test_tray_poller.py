@@ -4,8 +4,9 @@
 
 from __future__ import annotations
 
+import logging
 import queue
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import httpx
 import pytest
@@ -17,6 +18,7 @@ from messagefoundry.tray.state import HealthProbe, ScmState, TrayState, UiProbe
 from messagefoundry.tray.winsvc import ScmReading
 
 _ENGINE_URL = "http://127.0.0.1:8765"
+_POLLER_LOGGER = "messagefoundry.tray.poller"
 
 # --- pure advance() ---------------------------------------------------------
 
@@ -79,12 +81,12 @@ def _scripted_poller(
     def up(_c: httpx.Client) -> UiProbe:
         return next(ui_it)
 
-    def on_update(_r: object) -> None:
+    def noop(_r: PollResult) -> None:
         return None
 
     poller = StatusPoller(
         cfg,
-        on_update=on_update,
+        on_update=noop,
         scm_reader=reader,
         health_probe=hp,
         ui_probe=up,
@@ -160,11 +162,13 @@ def test_poller_snapshot_reflects_ui_and_monitor_only() -> None:
 
 def test_poll_thread_survives_a_raising_tick_and_publishes_unknown(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A tick that raises is published as UNKNOWN and the thread ticks on, rather than dying."""
     # The real next_poll_seconds against a near-zero base, so the recovery tick lands without a
     # sleep in the test and the cadence function itself is still exercised.
     monkeypatch.setattr(state_mod, "POLL_BASE_S", 0.001)
+    caplog.set_level(logging.ERROR, logger=_POLLER_LOGGER)
 
     first_tick = iter([True])
 
@@ -195,3 +199,213 @@ def test_poll_thread_survives_a_raising_tick_and_publishes_unknown(
 
     assert fallback.snapshot.state is TrayState.UNKNOWN  # published instead of freezing the icon
     assert recovered.snapshot.state is TrayState.RUNNING  # and the tick after it recovered
+
+    # The row asked for the failure to be *logged*, not just absorbed. Without this the whole test
+    # stays green with the `log.exception` line deleted, and a silent swallow is the defect the
+    # row's own measurement describes -- output going nowhere under `pythonw`.
+    failures = [
+        r for r in caplog.records if r.name == _POLLER_LOGGER and r.levelno >= logging.ERROR
+    ]
+    assert len(failures) == 1
+    assert "publishing UNKNOWN" in failures[0].getMessage()
+    assert failures[0].exc_info is not None  # a traceback, not a bare one-line error
+
+
+# --- the UNKNOWN stand-in is a display fallback, not a state transition ------
+
+
+def test_a_failed_tick_leaves_the_tracking_and_toast_memory_untouched() -> None:
+    """The synthetic reading must reach neither `advance` nor `_last_state`.
+
+    Those two wipes are what the five behavioural arms below detect; this pins the mechanism
+    directly, so a regression names its own cause rather than surfacing as a stray balloon.
+    """
+    poller, client = _scripted_poller(
+        scm=[ScmReading(ScmState.RUNNING)], health=[HealthProbe.OK], ui=[UiProbe.ENABLED]
+    )
+    try:
+        poller.poll_once(100.0)
+        before_tracking, before_state = poller._tracking, poller._last_state
+        fallback = poller._unknown_result()
+    finally:
+        client.close()
+
+    assert fallback.snapshot.state is TrayState.UNKNOWN
+    assert fallback.toast is None
+    assert poller._tracking == before_tracking  # the boot-grace and pending clocks did not move
+    assert poller._last_state is before_state  # the toast machine still holds the last real state
+
+
+def test_a_wedged_engine_still_reaches_wedged_across_intermittent_poll_failures() -> None:
+    """The defect this repair exists for: SCM RUNNING with /health dark, polls failing every 15s.
+
+    Why the fold defeats WEDGED is stated once, on `StatusPoller._unknown_result`.
+    """
+    poller, client = _scripted_poller(
+        scm=[ScmReading(ScmState.RUNNING)] * 3,
+        health=[HealthProbe.DOWN] * 3,
+        ui=[UiProbe.UNKNOWN] * 3,
+    )
+    try:
+        first = poller.poll_once(0.0)  # SCM RUNNING, /health dark: inside the boot grace
+        poller._unknown_result()  # a tick raises at t=10
+        mid = poller.poll_once(20.0)  # still inside the 30s grace, measured from t=0
+        poller._unknown_result()  # another raises at t=25
+        late = poller.poll_once(40.0)  # past the grace, measured from t=0
+    finally:
+        client.close()
+
+    assert first.snapshot.state is TrayState.STARTING
+    assert mid.snapshot.state is TrayState.STARTING
+    assert mid.inputs.running_elapsed_s == 20.0  # the anchor survived the failed tick
+    assert late.snapshot.state is TrayState.WEDGED  # the detection the tray exists for
+    assert late.inputs.running_elapsed_s == 40.0
+
+
+def test_an_already_wedged_pending_service_stays_wedged_across_a_failed_tick() -> None:
+    """A service the tray has ALREADY called WEDGED must not flip back to STARTING.
+
+    This is the wider half of the defect, and the arm above does not catch it. The fold clears
+    `last_scm` and `last_checkpoint` together, and **either one alone** is enough: with `last_scm`
+    gone the next real pending tick is no longer `same_pending`, so it re-anchors `pending_since`
+    AND takes the "freshly entered pending is assumed to be progressing" branch; with
+    `last_checkpoint` reset to 0 the stalled checkpoint 7 reads as advancing. Both halves of the
+    WEDGED condition are cleared at once, so the fold disables stuck detection outright rather
+    than merely delaying it. Unlike the boot-grace arm, this holds regardless of how `advance`
+    anchors `pending_since`.
+    """
+    stalled = ScmReading(ScmState.START_PENDING, checkpoint=7, wait_hint_s=5.0)
+    poller, client = _scripted_poller(
+        scm=[stalled] * 4, health=[HealthProbe.DOWN] * 4, ui=[UiProbe.UNKNOWN] * 4
+    )
+    try:
+        poller.poll_once(0.0)  # enters START_PENDING at checkpoint 7
+        poller.poll_once(4.0)  # checkpoint has not moved, but still inside the 5s wait hint
+        wedged = poller.poll_once(8.0)  # stalled past its own wait hint
+        poller._unknown_result()  # a tick raises at t=10
+        after = poller.poll_once(12.0)  # the service is every bit as stuck as it was
+    finally:
+        client.close()
+
+    assert wedged.snapshot.state is TrayState.WEDGED
+    assert after.snapshot.state is TrayState.WEDGED  # did not flip back to STARTING
+    assert after.inputs.checkpoint_advancing is False  # the stalled checkpoint is still stalled
+    assert after.inputs.pending_elapsed_s == 12.0  # the pending anchor survived the failed tick
+
+
+def test_recovery_from_a_transient_failure_raises_no_false_running_balloon() -> None:
+    poller, client = _scripted_poller(
+        scm=[ScmReading(ScmState.STOPPED)] + [ScmReading(ScmState.RUNNING)] * 2,
+        health=[HealthProbe.DOWN, HealthProbe.OK, HealthProbe.OK],
+        ui=[UiProbe.UNKNOWN, UiProbe.ENABLED, UiProbe.ENABLED],
+    )
+    try:
+        poller.poll_once(0.0)  # first reading: STOPPED, no startup toast
+        came_up = poller.poll_once(1.0)  # STOPPED -> RUNNING: the one real balloon
+        poller._unknown_result()  # a tick raises at t=100, on an engine that never stopped
+        still_up = poller.poll_once(101.0)  # past the 30s rate-limit window, so nothing suppresses
+    finally:
+        client.close()
+
+    assert came_up.toast is not None and "running" in came_up.toast.body.lower()
+    assert still_up.snapshot.state is TrayState.RUNNING
+    assert still_up.toast is None  # the engine never left RUNNING, so there is nothing to announce
+
+
+def test_a_failed_tick_between_running_and_stopped_keeps_the_stopped_balloon() -> None:
+    poller, client = _scripted_poller(
+        scm=[ScmReading(ScmState.RUNNING), ScmReading(ScmState.STOPPED)],
+        health=[HealthProbe.OK, HealthProbe.DOWN],
+        ui=[UiProbe.ENABLED, UiProbe.UNKNOWN],
+    )
+    try:
+        poller.poll_once(0.0)  # first reading: RUNNING, no startup toast
+        poller._unknown_result()  # a tick raises at t=50, as the service is going down
+        stopped = poller.poll_once(51.0)
+    finally:
+        client.close()
+
+    assert stopped.snapshot.state is TrayState.STOPPED
+    # transition_toast only announces a stop from RUNNING/RUNNING_UNMANAGED/STOPPING/WEDGED, so a
+    # stamped UNKNOWN in between silently swallows the one balloon an operator needs most.
+    assert stopped.toast is not None and "stopped" in stopped.toast.body.lower()
+
+
+def test_a_first_tick_failure_does_not_spend_the_startup_no_toast_exemption() -> None:
+    poller, client = _scripted_poller(
+        scm=[ScmReading(ScmState.RUNNING)], health=[HealthProbe.OK], ui=[UiProbe.ENABLED]
+    )
+    try:
+        poller._unknown_result()  # the very first tick raises
+        first_real = poller.poll_once(1.0)
+    finally:
+        client.close()
+
+    assert first_real.snapshot.state is TrayState.RUNNING
+    assert first_real.toast is None  # still the *first* real reading: never toast on startup
+
+
+# --- a tick that outlives stop() must neither log nor publish ----------------
+
+
+def _stopping_poller(
+    reader: Callable[[str], ScmReading], published: list[PollResult]
+) -> tuple[StatusPoller, httpx.Client]:
+    client = httpx.Client(base_url=_ENGINE_URL)
+    poller = StatusPoller(
+        TrayConfig(engine_url=_ENGINE_URL, service_name="MessageFoundry"),
+        on_update=published.append,
+        scm_reader=reader,
+        health_probe=lambda _c: HealthProbe.OK,
+        ui_probe=lambda _c: UiProbe.ENABLED,
+    )
+    poller._client = client
+    return poller, client
+
+
+def test_a_tick_raising_after_stop_is_recorded_as_shutdown_not_as_a_fault(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`stop()` joins for 3s then closes the client; two probes at 2s each can outlast that.
+
+    httpx then raises a bare RuntimeError, which `probe_health`/`probe_ui` do not catch (they
+    catch only httpx.HTTPError). Claiming a fault for that would put an ERROR traceback in
+    tray.log on every clean exit, and publishing it would repaint a torn-down shell after
+    `run()` has returned. It is still recorded, at DEBUG: the branch is reached by *any*
+    exception raised inside the join window, so a real defect there must not vanish.
+    """
+    caplog.set_level(logging.DEBUG, logger=_POLLER_LOGGER)
+    published: list[PollResult] = []
+
+    def reader(_name: str) -> ScmReading:
+        poller._stop.set()  # stop() ran and closed the probe client under this in-flight tick
+        raise RuntimeError("Cannot send a request, as the client has been closed.")
+
+    poller, client = _stopping_poller(reader, published)
+    try:
+        poller._run()  # returns rather than looping; driven on this thread, so no race
+    finally:
+        client.close()
+
+    records = [r for r in caplog.records if r.name == _POLLER_LOGGER]
+    assert published == []  # nothing repainted after run() returned
+    assert [r for r in records if r.levelno >= logging.ERROR] == []  # no fault claimed
+    assert [r.levelno for r in records] == [logging.DEBUG]  # but not swallowed silently either
+    assert records[0].exc_info is not None  # with the traceback, for whoever turns DEBUG on
+
+
+def test_a_successful_tick_that_outlives_stop_does_not_publish() -> None:
+    """The same guard for the commoner case: the probes finish, but `stop()` already returned."""
+    published: list[PollResult] = []
+
+    def reader(_name: str) -> ScmReading:
+        poller._stop.set()
+        return ScmReading(ScmState.RUNNING)
+
+    poller, client = _stopping_poller(reader, published)
+    try:
+        poller._run()
+    finally:
+        client.close()
+
+    assert published == []
