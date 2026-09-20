@@ -97,9 +97,11 @@ def _declared_extras() -> frozenset[str]:
 def _packaged_import_trees() -> frozenset[str]:
     """The repo-root import package each `packaging/<dist>/` builds, read from its own build config.
 
-    Derived, not listed: both second distributions force-include a tree from the repo root into the
-    wheel (`../../harness` -> `harness`), and the wheel TARGET is the import package's name. A list
-    here would be a second definition of which trees ship, free to drift from the build.
+    Derived, not listed: both second distributions force-include from the repo root into the wheel, and
+    the first segment of each wheel TARGET is the import package's name. A list here would be a second
+    definition of which trees ship, free to drift from the build. Reading the target rather than the
+    source is what makes this survive either map shape -- the console still maps one whole directory,
+    while the harness maps nineteen entries one by one (BACKLOG #1702).
     """
     trees: set[str] = set()
     for pyproject in sorted((_ROOT / "packaging").glob("*/pyproject.toml")):

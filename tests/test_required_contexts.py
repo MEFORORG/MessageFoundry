@@ -73,6 +73,12 @@ _CLAIM_FILES = (
     Path(".github/workflows/freethread-smoke.yml"),
     Path("tests/test_push_guard.py"),
     Path("scripts/hooks/push_guard.py"),
+    # Added under BACKLOG #1705, after both were found carrying a stale answer to "does this check
+    # block a merge". security.yml's header enumerated the set; .semgrep/messagefoundry.yml's header
+    # cited a LINE NUMBER in the canonical file plus a posture bucket the `semgrep` job had left.
+    # Neither was in this tuple, so the numeric scan below had never read either one.
+    Path(".github/workflows/security.yml"),
+    Path(".semgrep/messagefoundry.yml"),
 )
 
 # Contexts that must NEVER appear in the canonical file. Each is a job that cannot report on an
