@@ -117,6 +117,7 @@ tests/test_private_paths_stay_ignored.py
 tests/test_push_guard.py
 tests/test_quality_advisory_invariants.py
 tests/test_quality_record_scope_claims.py
+tests/test_release_member_gate.py
 tests/test_required_contexts.py
 tests/test_required_contexts_drift.py
 tests/test_required_workflow_state.py
