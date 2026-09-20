@@ -1489,6 +1489,13 @@ class _HostileWriteStream(io.StringIO):
 
 
 def _fail_the_next_write(handler: GuardedFileHandler, message: str) -> None:
+    # CLOSE THE REAL HANDLE BEFORE REBINDING. Dropping the last reference to it instead leaves the
+    # OS handle alive until the interpreter happens to collect it, and CPython's open() does not ask
+    # for FILE_SHARE_DELETE -- so on Windows the os.replace inside _roll would raise PermissionError
+    # and every test built on this helper would flip to stage 2 for a reason unrelated to what it
+    # asserts. `_break_the_open_handle` above closes explicitly for the same reason.
+    if handler.stream is not None:
+        handler.stream.close()
     handler.stream = _HostileWriteStream(OSError(message))
 
 
@@ -1526,9 +1533,14 @@ def test_the_ordinary_failure_reason_survives_the_scrub_intact(tmp_path: Path) -
     handler.emit(_record("ordinary"))
 
     notice = log_path.read_text(encoding="utf-8").splitlines()[0]
-    assert "ValueError" in notice and "closed file" in notice
-    assert "\\x" not in notice and "\\n" not in notice  # nothing was escaped that should not be
-    assert "<diagnostic dropped" not in notice  # and the fallback did not fire
+    # The REASON span only, not the whole line. The line also carries the rolled-aside path, and on
+    # Windows a temp directory whose next segment starts with n or x puts a literal backslash-n or
+    # backslash-x in it -- so asserting "no escapes anywhere on this line" would red on somebody
+    # else's machine while claiming the scrubber had mangled a diagnostic.
+    reason = notice[notice.index("(") + 1 : notice.rindex(")")]
+    assert "ValueError" in reason and "closed file" in reason
+    assert "\\x" not in reason and "\\n" not in reason  # nothing was escaped that should not be
+    assert "<diagnostic dropped" not in reason  # and the fallback did not fire
 
 
 def test_status_and_the_alert_carry_no_raw_newline_from_a_stage_two_break(
@@ -1647,28 +1659,22 @@ def test_a_hostile_rolled_aside_path_cannot_forge_a_line_either(tmp_path: Path) 
     assert "\n" not in rolled_aside and "\r" not in rolled_aside
 
 
-def test_the_guard_boundary_scrubs_a_reason_handed_to_it_directly(
+def test_a_hostile_sink_label_cannot_forge_a_line_on_the_last_resort_channel(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    # BY CONSTRUCTION, NOT BY THE MIXIN REMEMBERING. LogWriteGuard is public: a second guarded sink
-    # type, or any direct caller, would otherwise land a forged line on /status, on the AlertSink
-    # page and on stderr with every test in this file still green. The mixin still scrubs too, and
-    # must -- it writes the notice BEFORE the guard is ever told -- but the boundary that owns
-    # ``last_event`` enforces it for everyone.
-    events: list[LogSinkEvent] = []
+    # THE THIRD INTERPOLATED LIMB. The stderr line carries the sink LABEL beside the reason, and
+    # ``register`` takes an arbitrary str. The label is a program literal at every in-tree call
+    # site, so this is unreachable today -- but escaping is one C-level pass with no credential
+    # patterns behind it, so closing the limb costs less than arguing that nobody will open it.
     guard = LogWriteGuard()
-    guard.set_escalation(events.append)
-    guard.register("file")
+    guard.register(f"file\r\n{_FORGED_TAIL}")
 
-    guard.record_unwritable("file", reason=_FORGED_REASON)
+    guard.record_unwritable(f"file\r\n{_FORGED_TAIL}", reason="disk full")
 
-    assert "\n" not in events[0].reason and "\r" not in events[0].reason
-    last_event = guard.status()[0].last_event or ""
-    assert "\n" not in last_event and "\r" not in last_event
-    assert "cannot write\\r\\n" in last_event
-    assert (
-        len([line for line in capsys.readouterr().err.splitlines() if "IS UNWRITABLE" in line]) == 1
-    )
+    err = capsys.readouterr().err.splitlines()
+    assert len(err) == 1, f"the sink label forged an extra physical line: {err!r}"
+    assert "IS UNWRITABLE" in err[0]
+    assert "file\\r\\n" in err[0]
 
 
 def test_the_scrubs_run_in_the_handler_chains_order_and_the_reverse_would_leak() -> None:
@@ -1701,34 +1707,73 @@ def test_a_credential_straddling_the_output_bound_is_masked_before_it_is_cut() -
     assert len(scrubbed) == limit  # …and the output is still bounded
 
 
-def test_scrubbing_an_already_scrubbed_reason_changes_nothing() -> None:
-    # The mixin scrubs, then the guard scrubs again at its boundary. That second call is only
-    # harmless if this holds: a masked credential must not expand the string past the bound on the
-    # first pass and then lose its tail to the slice on the second, which would truncate an
-    # operator's last_event mid-word with nothing reporting it.
-    limit = logging_guard._DIAGNOSTIC_LIMIT
-    crowded = "q" * (limit - 54) + "reopen failed for postgres://mefor_svc:s3cr3t-pw@dbhost"
-
-    once = logging_guard._safe_diagnostic(crowded)
-    assert logging_guard._safe_diagnostic(once) == once
+def test_the_diagnostic_scrub_is_not_idempotent_so_it_runs_exactly_once() -> None:
+    # PINNED AS A LIMIT, NOT AS A VIRTUE. An earlier revision scrubbed again at the guard boundary
+    # as belt and braces, on the premise that a second pass costs nothing. It does not: escaping
+    # removes the whitespace _CREDENTIAL_KV's value class terminates on, so pass two swallows the
+    # placeholder and everything up to the next real space -- and /status would then disagree with
+    # the notice already written on the sink. If this test ever goes green as an equality, the
+    # boundary belt can come back; until then the precondition on record_rollover is the control.
+    once = logging_guard._safe_diagnostic("password=hunter2\nsecond half of the diagnostic")
+    assert "hunter2" not in once and "second half of the diagnostic" in once
+    assert logging_guard._safe_diagnostic(once) != once, (
+        "the diagnostic scrub has become idempotent; re-read _safe_diagnostic's docstring, which "
+        "tells callers to run it exactly once because it was not"
+    )
+    # …while the escape-only arm IS idempotent, which is what lets a path and a label be escaped
+    # wherever they are touched without anyone tracking whether it already happened.
+    escaped = logging_guard._escape_only("a\r\nb", fallback="x")
+    assert logging_guard._escape_only(escaped, fallback="x") == escaped
 
 
 def test_the_fallback_cannot_raise_on_a_diagnostic_that_is_not_a_string() -> None:
     # The whole contract of this module is that a broken log sink never becomes an application
     # exception. ``_roll`` is a subclass seam and the guard's stage methods are public, so a caller
     # can hand in something that is not a str; the fallback must not itself raise while handling it.
+    # Each arm reports its OWN sentinel: /status presents rolled_aside as a filename, so a sentence
+    # about scrubbers landing there would read as one.
     assert logging_guard._safe_diagnostic(12345) == logging_guard._DIAGNOSTIC_DROPPED  # type: ignore[arg-type]
-    assert logging_guard._safe_path(object()) == logging_guard._DIAGNOSTIC_DROPPED  # type: ignore[arg-type]
+    assert (
+        logging_guard._escape_only(object(), fallback=logging_guard._PATH_DROPPED)  # type: ignore[arg-type]
+        == logging_guard._PATH_DROPPED
+    )
 
 
 def test_a_legitimate_path_is_not_rewritten_by_the_credential_patterns() -> None:
-    # WHY THE PATH LIMB TAKES _safe_path, NOT _safe_diagnostic. /status publishes rolled_aside so an
-    # operator can find the broken file. Running a path through the credential patterns lets a
+    # WHY THE PATH LIMB TAKES _escape_only, NOT _safe_diagnostic. /status publishes rolled_aside so
+    # an operator can find the broken file. Running a path through the credential patterns lets a
     # directory segment ending in a credential word swallow the rest of the path, so /status would
     # name a file that does not exist -- during the incident this guard exists for.
     path = "/var/log/mefor/secret=1/app.log.broken-x"
 
-    assert logging_guard._safe_path(path) == path
+    assert logging_guard._escape_only(path, fallback=logging_guard._PATH_DROPPED) == path
     assert logging_guard._safe_diagnostic(path) != path, (
         "the credential patterns no longer rewrite this path, so the split has stopped being needed"
+    )
+
+
+def test_the_guards_scrub_composition_still_covers_the_installed_filter_chain() -> None:
+    # THE DRIFT ALARM the composition cannot provide by construction. _scrub_diagnostic hand-copies
+    # what _install_phi_filters installs, and the precedent is not hypothetical: CredentialScrubFilter
+    # joined that chain under BACKLOG #1478 and this module only learned of it under #1591, so the
+    # guard's diagnostics shipped with no credential pass for the whole interval. Pinning the
+    # MEMBERSHIP makes the next divergence loud; the order test above pins the other half.
+    from messagefoundry import logging_setup
+
+    handler = logging.NullHandler()
+    logging_setup._install_phi_filters(handler)
+    installed = {type(f).__name__ for f in handler.filters}
+
+    # Each installed filter is either composed by _scrub_diagnostic, covered by safe_exc at the
+    # point every reason is built, or carries a written carve-out in _safe_diagnostic's docstring.
+    accounted = {
+        "RedactionFilter",  # safe_exc, applied with the scrub by _safe_reason
+        "CredentialScrubFilter",  # scrub_credentials, composed by _scrub_diagnostic
+        "ControlCharScrubFilter",  # scrub_control_chars, composed by _scrub_diagnostic
+        "CredentialQueryScrubFilter",  # carve-out: no guard diagnostic carries a request URL
+    }
+    assert installed == accounted, (
+        f"the handler filter chain has moved: {sorted(installed ^ accounted)}. logging_guard's "
+        "_scrub_diagnostic stands in for that chain on a path no filter reaches, so a filter added "
+        "there and not here silently does not apply to the guard's own diagnostics"
     )
