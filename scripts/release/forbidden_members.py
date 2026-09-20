@@ -43,7 +43,7 @@ import zlib
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 
-#: Basenames no published distribution may carry, matched CASE-INSENSITIVELY on the final path
+#: Basenames no published distribution may carry, matched CASEFOLDED on the final path
 #: component. Case folding is the safe direction for a denylist: Windows and macOS filesystems fold
 #: case, so ``claude.md`` and ``CLAUDE.md`` are one file to the person who committed it, and a rule
 #: that only caught one spelling would be satisfied by a rename that changed nothing.
@@ -106,24 +106,52 @@ def _members(archive: Path) -> list[str]:
     )
 
 
+def _normalise(part: str) -> str:
+    """One path component, reduced to the form the denylist is written in (BACKLOG #1838).
+
+    TRAILING DOTS AND SPACES ARE STRIPPED because Windows strips them when it opens the file, so
+    ``CLAUDE.md `` and ``CLAUDE.md.`` install as ``CLAUDE.md`` -- exactly the file this gate exists
+    to stop. Measured: all four of ``CLAUDE.md ``, ``CLAUDE.md.``, ``.claude./x`` and ``.claude /x``
+    passed the first version of this rule.
+
+    CASEFOLD, NOT ``lower()``. The two differ, and ``lower()`` is the weaker: ``agentſ.md``
+    (U+017F LATIN SMALL LETTER LONG S) casefolds to exactly ``agents.md`` and lowercases to itself,
+    so it passed while the module docstring and this project's own test name both said "case-folded".
+    That mismatch between prose and code is the defect; the prose was right.
+
+    This is NOT a claim to normalise away every equivalent spelling. A homoglyph (Cyrillic
+    ``а`` for ``a``) still passes, and no case-insensitive matcher catches one -- the scope
+    paragraph in the module docstring says so, and it stays true.
+    """
+    return part.rstrip(". ").casefold()
+
+
 def forbidden(member: str) -> str | None:
     """Why ``member`` is forbidden, or ``None``.
 
-    Splits on ``/`` alone, which is what both container formats use -- ``PurePosixPath`` would agree,
-    and ``Path`` on Windows would additionally split on a backslash that is a LEGAL character in a
-    member name. Empty components (a trailing slash on a directory entry) drop out.
+    SPLITS ON BOTH ``/`` AND ``\\``. An earlier version split on ``/`` alone, reasoning that it is
+    "what both container formats use". That is true of what a spec-conformant writer STORES and
+    false of what the readers hand back: ``tarfile.getnames()`` and ``zipfile.namelist()`` return
+    stored names verbatim, so a member written as ``pkg\\CLAUDE.md`` arrives with its backslash
+    intact, split into ONE component, and matched nothing (BACKLOG #1838). Hatchling on the Linux
+    release runner emits ``/``, so that was a hole in the rule rather than a live bypass -- but a
+    gate should not depend on the writer being well-behaved, which is the whole premise of a
+    denylist over built artifacts.
+
+    Empty components (a trailing slash on a directory entry, a leading ``/``, a doubled separator)
+    drop out.
     """
-    parts = [p for p in member.split("/") if p]
+    parts = [p for p in member.replace("\\", "/").split("/") if p]
     if not parts:
         return None
     for part in parts[:-1]:
-        if part.lower() in FORBIDDEN_PATH_COMPONENTS:
+        if _normalise(part) in FORBIDDEN_PATH_COMPONENTS:
             return f"path component {part!r} is maintainer-internal"
     leaf = parts[-1]
-    if leaf.lower() in FORBIDDEN_BASENAMES:
+    if _normalise(leaf) in FORBIDDEN_BASENAMES:
         return f"basename {leaf!r} is maintainer-internal"
     # A directory entry named for a forbidden component arrives with no child to catch it.
-    if leaf.lower() in FORBIDDEN_PATH_COMPONENTS:
+    if _normalise(leaf) in FORBIDDEN_PATH_COMPONENTS:
         return f"path component {leaf!r} is maintainer-internal"
     return None
 
