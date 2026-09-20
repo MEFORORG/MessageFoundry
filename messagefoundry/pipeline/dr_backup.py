@@ -110,6 +110,16 @@ _MANIFEST_MEMBER = "manifest.json"
 #:
 #: This is still strictly better than what it replaced: before BACKLOG #1587 those same aborts left
 #: a TRUNCATED file wearing the canonical name, which keep-N then counted as a good backup.
+#: The two archive extensions this runner writes: encrypted under the store DEK, or plaintext on
+#: a box that set the audited ``[backup].allow_unencrypted`` escape. Named together because keep-N
+#: retention has to span BOTH -- see :meth:`BackupRunner._prune_keep_n` (BACKLOG #1724).
+#:
+#: Orthogonal to the staging suffixes below: those come AFTER the extension, so a `.part` or
+#: `.failed` file matches neither pattern. Widening to two extensions does not reopen #1587.
+_ENCRYPTED_EXT = ".mfbak"
+_PLAINTEXT_EXT = ".mfbak.plain"
+_ARCHIVE_EXTS = (_ENCRYPTED_EXT, _PLAINTEXT_EXT)
+
 _STAGING_SUFFIX = ".part"
 _FAILED_SUFFIX = ".failed"
 
@@ -382,7 +392,7 @@ class BackupRunner:
                 "[backup].config_only_on_server_db=false — nothing to back up; the DB is the DBA's job",
             )
 
-        ext = ".mfbak" if key is not None else ".mfbak.plain"
+        ext = _ENCRYPTED_EXT if key is not None else _PLAINTEXT_EXT
         stamp = _utc_stamp(now)
         inst = _safe_segment(self._instance) or "instance"
         archive_path = dest_dir / f"mefor-backup-{inst}-{stamp}{ext}"
@@ -463,7 +473,7 @@ class BackupRunner:
 
         # keep-N prune runs only after that rename, so the candidate set contains this archive and
         # every earlier archive that also passed — and nothing that failed (AC-6).
-        pruned = self._prune_keep_n(dest_dir, inst, ext)
+        pruned = self._prune_keep_n(dest_dir, inst, just_written=archive_path)
 
         return BackupResult(
             archive_path=str(archive_path),
@@ -646,15 +656,33 @@ class BackupRunner:
 
     # --- keep-N retention ----------------------------------------------------
 
-    def _prune_keep_n(self, dest_dir: Path, inst: str, ext: str) -> int:
+    def _prune_keep_n(self, dest_dir: Path, inst: str, *, just_written: Path) -> int:
         """Delete this instance's archives beyond the newest ``retention_keep`` at the destination.
         ``0`` = keep all. Only archives this runner writes (same instance prefix + extension) are
         candidates, so an operator's unrelated files at the destination are never touched.
 
         The candidate set is the CANONICAL name and nothing else, which is what stops a bad archive
         spending a retention slot: the caller publishes that name only to an archive that passed
-        every configured check, so this method is called with the just-published archive as the
-        newest candidate and every earlier PASSING archive behind it."""
+        every configured check (BACKLOG #1587).
+
+        RETENTION SPANS BOTH EXTENSIONS, which is BACKLOG #1724. This pruned only the extension the
+        CURRENT pass wrote, and the two anchored patterns are disjoint -- neither matches the
+        other's files. So configuring a store key on a box that had been writing ``.mfbak.plain``
+        left every existing plaintext archive outside keep-N forever, and removing a key stranded
+        the ``.mfbak`` ones the same way. The window silently stopped applying to a whole generation
+        of archives, in either direction, with nothing reporting it.
+
+        ``just_written`` is that published archive, and it is EXCLUDED FROM THE CANDIDATES AND
+        COUNTED rather than relied upon to sort newest. This docstring used to say it simply is the
+        newest candidate; that holds only while stamps rise with the wall clock, and widening the
+        set to both extensions makes the assumption carry more weight because an older-generation
+        archive can now evict. A clock stepping backwards -- an NTP correction, a restored VM
+        snapshot -- would otherwise let a pass delete the archive it had just published.
+
+        The exclusion is COUNTED, not assumed. Reserving its retention slot unconditionally keeps
+        ``keep - 1`` archives whenever the published file is not actually at the destination, and at
+        ``retention_keep = 1`` that keeps ZERO while the pass reports success -- a data-loss defect,
+        not an off-by-one in a report."""
         keep = self._settings.retention_keep
         if keep <= 0:
             return 0
@@ -678,14 +706,46 @@ class BackupRunner:
         # `with_suffix(".corrupt.mfbak")`. So (2) is not hypothetical margin — a loose glob would
         # count those fixtures — it is simply protecting against a different name than the comment
         # claimed.
-        pattern = f"{prefix}????????T??????Z{ext}"
+        # One anchored pattern PER EXTENSION, never a single loose one. A loose `*` would cover both
+        # extensions too and would undo (2) above.
+        candidates = [
+            p
+            for archive_ext in _ARCHIVE_EXTS
+            for p in dest_dir.glob(f"{prefix}????????T??????Z{archive_ext}")
+            if p.is_file()
+        ]
+        # COUNT the exclusion, do not assume it -- see the docstring. The published archive can be
+        # absent for ordinary reasons: antivirus quarantining a freshly written multi-GB opaque file
+        # on a share, a cleanup script, or a second engine sharing the instance and destination,
+        # which the default NullCoordinator does not prevent.
+        reserved = sum(1 for p in candidates if p == just_written)
         archives = sorted(
-            (p for p in dest_dir.glob(pattern) if p.is_file()),
-            key=lambda p: p.name,  # name carries a UTC timestamp → lexical sort == chronological
+            (p for p in candidates if p != just_written),
+            # The stamp is fixed-width and precedes the extension, so a lexical sort over the
+            # name is chronological across extensions too, not just within one.
+            #
+            # NORMCASE, and not decoration: `Path.glob` is case-INSENSITIVE on Windows, the
+            # platform this ships on, so `...Z.MFBAK` enters the candidate set -- and a
+            # case-SENSITIVE sort puts `M` (0x4D) before `m` (0x6D) and reads the newest
+            # archive as the oldest. That deleted the newest archive and kept two older ones
+            # at keep=3.
+            key=lambda p: os.path.normcase(p.name),
             reverse=True,
         )
+        # The first pass after an encryption change deletes a whole generation at once -- measured,
+        # 18 archives in one run at keep=7 -- and the only record of that was a `pruned` integer
+        # inside one audit row. One line naming the count and the extensions makes it greppable.
+        doomed = archives[keep - reserved :]
+        crossing = {p.suffixes[-1] for p in doomed} - {just_written.suffixes[-1]}
+        if crossing:
+            log.info(
+                "DR backup: keep-N is pruning %d archive(s) written with a different extension "
+                "(%s); expected on the first pass after a store key was configured or removed",
+                len(doomed),
+                ", ".join(sorted(crossing)),
+            )
         pruned = 0
-        for stale in archives[keep:]:
+        for stale in doomed:
             try:
                 stale.unlink()
                 pruned += 1
