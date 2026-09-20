@@ -390,3 +390,17 @@ def test_zip_member_name_is_refused_before_any_bytes_are_read() -> None:
     blob = _hostile_zip({"../bomb.dat": b"\x00" * 4_000_000})
     with pytest.raises(CompressionError, match="relative path component"):
         zip_decompress(blob, max_output_bytes=1000)
+
+
+@pytest.mark.parametrize("second_body", [b"first", b"second"])
+def test_zip_rejects_duplicate_member_names(second_body: bytes) -> None:
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("unique.txt", b"keep")
+        zf.writestr("duplicate.txt", b"first")
+        with pytest.warns(UserWarning, match="Duplicate name"):
+            zf.writestr("duplicate.txt", second_body)
+    with pytest.raises(CompressionError, match="duplicate") as caught:
+        zip_decompress(archive.getvalue(), max_output_bytes=None)
+    assert "duplicate.txt" not in str(caught.value)
+    assert second_body.decode() not in str(caught.value)
