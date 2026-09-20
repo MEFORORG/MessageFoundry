@@ -1332,7 +1332,14 @@ def test_all_three_acl_sites_are_still_wired(tmp_path: Path) -> None:
 # control instead: its emitting statement is deleted from a copy of the script and the guard must go
 # red.
 
-_UNINSTALL_FNS = ["Get-ConfigDirFromAppParameters", "Get-UninstallResidueNotice"]
+_UNINSTALL_FNS = [
+    "Get-ConfigDirFromAppParameters",
+    # Get-AccountResidueSpec holds the ONE rule for "does this account carry a residue, and how is it
+    # spelled for icacls", shared by the notice and by -RemoveAccountAces. The notice calls it, so it
+    # has to be dot-sourced alongside.
+    "Get-AccountResidueSpec",
+    "Get-UninstallResidueNotice",
+]
 
 _FULL_FACTS: dict[str, object] = {
     "ServiceName": "MessageFoundry",
@@ -1850,4 +1857,108 @@ def test_no_document_still_claims_only_the_logs_and_the_store_remain() -> None:
     )
     assert "-RemoveLogonRight" in service and "-RemoveAccountAces" in service, (
         "docs/SERVICE.md must document the two switches that take the reversible residues back"
+    )
+
+
+@pytest.mark.parametrize(
+    ("account", "sid", "has_account", "principal"),
+    [
+        # The installer's default: a per-service virtual account, named grants written.
+        (r"NT SERVICE\MessageFoundry", "S-1-5-80-4001", True, "*S-1-5-80-4001"),
+        # The -AllowLocalSystem opt-out, in its usual spelling.
+        ("LocalSystem", "", False, "LocalSystem"),
+        # THE ARM THAT MATTERS. Same account, different spelling. A NAME test says "this is an
+        # account with a named grant", and -RemoveAccountAces then issues
+        # `icacls <DataDir> /remove:g *S-1-5-18` -- stripping the SYSTEM entry the installer writes
+        # on EVERY install off the directory holding the logs and the message store.
+        (r"NT AUTHORITY\SYSTEM", "S-1-5-18", False, "*S-1-5-18"),
+        # A SID that did not resolve still counts as an account: over-reporting costs one icacls
+        # read, under-reporting is the defect this file exists to fix.
+        (r"DOMAIN\svc$", "", True, r"DOMAIN\svc$"),
+    ],
+)
+def test_the_account_residue_rule_is_decided_on_the_sid_not_the_spelling(
+    tmp_path: Path, account: str, sid: str, has_account: bool, principal: str
+) -> None:
+    """ONE rule, shared by the notice that PRINTS a removal command and the switch that RUNS one."""
+    assert _UNINSTALL is not None
+    body = (
+        f"  Get-AccountResidueSpec -ServiceAccount {_psq(account)} "
+        f"-ServiceAccountSid {_psq(sid)} | ConvertTo-Json -Compress\n"
+    )
+    got = json.loads(
+        _ok(_extract(_UNINSTALL, ["Get-AccountResidueSpec"], body), tmp_path)
+        .strip()
+        .splitlines()[-1]
+    )
+    assert got["HasAccount"] is has_account, (
+        f"{account!r} (SID {sid!r}) was classified HasAccount={got['HasAccount']}, expected "
+        f"{has_account}; a wrong answer here either hides a residue or removes SYSTEM's own entry"
+    )
+    assert got["Principal"] == principal, (
+        f"the icacls spelling for {account!r} was {got['Principal']!r}, expected {principal!r}"
+    )
+
+
+def test_the_notice_and_the_removal_agree_on_the_principal(tmp_path: Path) -> None:
+    """The rule above has two callers, and the whole point is that they cannot disagree.
+
+    A script that prints one ``icacls ... /remove:g X`` and runs another with a different X is the
+    #1704 shape wearing a fix: the operator's transcript and the host's state stop matching.
+    """
+    assert _UNINSTALL is not None
+    text = _UNINSTALL.read_text(encoding="utf-8")
+    assert text.count("Get-AccountResidueSpec -ServiceAccount") >= 2, (
+        "the residue rule is called from fewer than two sites, so one of the notice and the "
+        "removal switch is deriving the principal on its own again"
+    )
+    # The removal must pass the SAME variable the notice was handed, not rebuild it.
+    assert re.search(r"Remove-AccountAce -Path \$DataDir -Principal \$acePrincipal", text), (
+        "-RemoveAccountAces no longer runs the principal the notice prints"
+    )
+    assert not re.search(r'\$acePrincipal = if \(\$accountSid\) \{ "\*\$accountSid" \}', text), (
+        "the principal is being rebuilt at the removal site instead of shared"
+    )
+
+
+def test_a_holder_with_a_dollar_sign_survives_the_policy_rewrite(tmp_path: Path) -> None:
+    """secedit can export a holder by NAME, and a gMSA or computer account name ends in '$'.
+
+    '$' is a .NET substitution metacharacter in a -replace REPLACEMENT operand, so building the
+    rewritten row that way re-reads a holder as $&, $+ or $$ and feeds a mangled machine-wide
+    user-right row straight into `secedit /configure`.
+    """
+    got = _logon_right_arms(
+        tmp_path,
+        holders=["*S-1-5-80-4001", r"DOMAIN\ws-host$", "*S-1-5-32-544"],
+        sid="S-1-5-80-4001",
+    )
+    assert got["result"] is True, f"the removal did not run; warnings {got['warnings']}"
+    assert r"DOMAIN\ws-host$" in got["configured"], (
+        "a holder whose name ends in '$' was mangled or dropped by the rewrite -- the replacement "
+        f"operand is being read as substitution syntax:\n{got['configured']}"
+    )
+    assert "*S-1-5-80-4001" not in got["configured"], (
+        f"the account's own SID survived the rewrite:\n{got['configured']}"
+    )
+
+
+def test_the_notice_names_localdumps_separately_from_the_exclusion_list(tmp_path: Path) -> None:
+    """TWO independent WER surfaces. Windows evaluates LocalDumps separately from the exclusion
+    list, so an operator who clears ExcludedApplications alone still has per-image dump overrides in
+    force -- and a notice that named only one would have told them the host was back to normal."""
+    facts = dict(_FULL_FACTS)
+    facts["WerLocalDumps"] = ["python.exe"]
+    text = _notice(tmp_path, facts)
+    assert "ExcludedApplications" in text and "LocalDumps" in text, (
+        f"both WER surfaces must be named, not merged into one line:\n{text}"
+    )
+    # NEGATIVE: a host with no LocalDumps configuration must not be told it has one.
+    plain = _notice(tmp_path, _FULL_FACTS)
+    assert "LocalDumps" not in plain, (
+        f"LocalDumps is reported on a host where nothing measured it:\n{plain}"
+    )
+    # And the exclusion-list line must still fire on its own.
+    assert "ExcludedApplications" in plain, (
+        f"the exclusion-list surface stopped being named:\n{plain}"
     )

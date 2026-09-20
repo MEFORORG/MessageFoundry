@@ -543,7 +543,7 @@ list below says what it covers.
 | An access-control entry for the run-as account on `DataDir` **and** on the config directory | The installer grants both so the service can read config and write logs | `-RemoveAccountAces`, or `icacls "<dir>" /remove:g "*<SID>"` |
 | The `SeServiceLogonRight` ("Log on as a service") grant | NSSM's `ObjectName` does not grant it, so the installer does | `-RemoveLogonRight`, or secpol.msc under Local Policies, User Rights Assignment |
 | Inheritance turned off on `DataDir`, and (with `-LockConfigDir`) on the config directory plus its owner moved to Administrators | See below | `icacls "<dir>" /inheritance:e`, by hand |
-| Windows Error Reporting keys, when you installed with `-SuppressCrashDumps` | [Stated above](#suppress-windows-crash-dumps-of-the-engine-adr-0152-phase-0) — removing them switches PHI-carrying dumps back on | By hand, under that registry path |
+| Windows Error Reporting keys, when you installed with `-SuppressCrashDumps` — **two** surfaces, `ExcludedApplications` and `LocalDumps`, reported separately because Windows evaluates them independently | [Stated above](#suppress-windows-crash-dumps-of-the-engine-adr-0152-phase-0) — removing them switches PHI-carrying dumps back on | By hand, under that registry path |
 
 **Why the uninstaller does not put the permissions back.** Turning inheritance on again would hand
 the parent directory's principals read access to logs and a message store that can carry PHI — on
@@ -554,6 +554,11 @@ to one. The two switches exist for the residues that **are** reversible, and bot
 ```powershell
 .\scripts\service\uninstall-service.ps1 -RemoveLogonRight -RemoveAccountAces
 ```
+
+**Pass them on the uninstall run itself.** Both act on facts that only exist while the service is
+registered — the run-as account, its SID, the config directory. Once the service is gone the script
+exits at its "not installed" guard, so a second run with the switches does nothing. The inventory
+says so, and names the manual command for each.
 
 `-RemoveLogonRight` is safe for the installer's default per-service virtual account, whose SID
 belongs to this service alone. It warns first for any other account: a gMSA or a dedicated user may

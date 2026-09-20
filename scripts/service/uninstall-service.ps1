@@ -45,6 +45,15 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# EVERY native call in this script checks $LASTEXITCODE itself and decides what the code means - some
+# throw, the two removals below warn and carry on. $PSNativeCommandUseErrorActionPreference turns a
+# non-zero native exit into a TERMINATING error instead, which would make those warn-and-carry-on
+# branches unreachable: the script would die part-way through the cleanup, after the registration was
+# already gone and before the inventory printed. Measured on PowerShell 7.6.6: it defaults to $false,
+# so the exposure is an operator whose profile sets it, or a future default flip. Set explicitly
+# rather than relied on. Windows PowerShell 5.1 has no such variable; assigning it there is inert.
+$PSNativeCommandUseErrorActionPreference = $false
+
 $principal = [Security.Principal.WindowsPrincipal]::new(
     [Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -169,6 +178,31 @@ function Get-ConfigDirFromAppParameters {
     return ""
 }
 
+function Get-AccountResidueSpec {
+    <#
+      ONE RULE, TWO CALLERS: the notice that PRINTS a removal command and the switch that RUNS one.
+
+      Written twice, they drift, and the script then tells an operator a command different from the
+      one it ran itself - with nothing comparing the two. Returns both answers together:
+
+        HasAccount  - whether the installer wrote named grants for this run-as account at all. It
+                      writes them for everything except LocalSystem, which it covers with the
+                      well-known SYSTEM SID instead. Decided on the SID, not the spelling: a
+                      registration reading "NT AUTHORITY\SYSTEM" is the same account, and a name test
+                      would let the removal strip *S-1-5-18 off the directory holding the logs and
+                      the store. An unresolved SID counts as an account - over-reporting costs one
+                      icacls read, under-reporting is the defect this file exists to fix.
+        Principal   - how to spell that account for icacls. The SID form whenever one resolved,
+                      because a deleted service's virtual account name no longer translates.
+    #>
+    param([string]$ServiceAccount, [string]$ServiceAccountSid)
+    $has = [bool]$ServiceAccount -and
+        ($ServiceAccount -ne "LocalSystem") -and
+        ($ServiceAccountSid -ne "S-1-5-18")
+    $principal = if ($ServiceAccountSid) { "*$ServiceAccountSid" } else { $ServiceAccount }
+    return @{ HasAccount = $has; Principal = $principal }
+}
+
 function Get-UninstallResidueNotice {
     <#
       Build the inventory of what this uninstall leaves on the host (BACKLOG #1704).
@@ -208,6 +242,9 @@ function Get-UninstallResidueNotice {
         [string]$CachedNssm,
         # Image names found under the WER ExcludedApplications key.
         [string[]]$WerImages,
+        # Image names with their own key under WER LocalDumps. A SEPARATE surface: Windows evaluates
+        # it independently of the exclusion list, so clearing one leaves the other in force.
+        [string[]]$WerLocalDumps,
         # What -RemoveLogonRight / -RemoveAccountAces already took back, so the notice reports the
         # host as it now IS rather than listing a residue this run just cleared.
         [switch]$LogonRightRemoved,
@@ -217,26 +254,32 @@ function Get-UninstallResidueNotice {
         [string[]]$Unreadable
     )
 
-    $hasAccount = $ServiceAccount -and ($ServiceAccount -ne "LocalSystem")
-    # icacls resolves a SID spelling forever; it resolves a deleted service's account name never.
-    # NOT named $principal: the script scope already holds the WindowsPrincipal used by the
-    # elevation check, and shadowing that inside a function is a trap for whoever edits next.
-    $acePrincipal = if ($ServiceAccountSid) { "*$ServiceAccountSid" } else { $ServiceAccount }
+    # ONE rule for both, shared with the removal switches below. NOT named $principal: the script
+    # scope already holds the WindowsPrincipal used by the elevation check, and shadowing that inside
+    # a function is a trap for whoever edits next.
+    $spec = Get-AccountResidueSpec -ServiceAccount $ServiceAccount -ServiceAccountSid $ServiceAccountSid
+    $hasAccount = $spec.HasAccount
+    $acePrincipal = $spec.Principal
 
     $lines = @("", "Still on this host after removing '$ServiceName':")
 
+    # SAYS WHAT THE INSTALLER DID, NOT WHAT THE ACL NOW IS. Nothing here read that ACL, and the
+    # installer's lockdown is best-effort - it warns and returns when icacls fails, and it can report
+    # principals it could not strip. Asserting "access is SYSTEM and Administrators only" would put
+    # the reader off a check they may still need, which is the same false-premise defect this whole
+    # inventory exists to remove.
     $lines += "  Data directory   $DataDir"
-    $lines += "                   Holds the log files and the message store. The installer turned"
-    $lines += "                   inheritance off here and left access to SYSTEM and Administrators"
-    $lines += "                   only. This script leaves it that way on purpose: turning"
-    $lines += "                   inheritance back on would hand the parent directory's users read"
-    $lines += "                   access to logs that can carry patient data."
+    $lines += "                   Holds the log files and the message store. The installer turns"
+    $lines += "                   inheritance off here and locks the directory to SYSTEM and"
+    $lines += "                   Administrators; this script does not put that back, because"
+    $lines += "                   turning inheritance back on would hand the parent directory's"
+    $lines += "                   users read access to logs that can carry patient data. Read the"
+    $lines += "                   permissions yourself before you rely on them: icacls `"$DataDir`""
 
     if ($CachedNssm) {
         $lines += "  NSSM binary      $CachedNssm"
-        $lines += "                   Downloaded by the installer and used by this script a moment"
-        $lines += "                   ago, so it cannot delete it. Delete it by hand once you are"
-        $lines += "                   sure you are not reinstalling."
+        $lines += "                   The copy the installer downloaded. Delete it by hand once you"
+        $lines += "                   are sure you are not reinstalling."
     }
 
     if ($hasAccount) {
@@ -261,30 +304,49 @@ function Get-UninstallResidueNotice {
         if ($LogonRightRemoved) {
             $lines += "  Logon right      REMOVED - '$ServiceAccount' no longer holds 'Log on as a service'."
         } else {
+            # NOT "re-run this script". The registration is gone by the time these lines print, and a
+            # second run exits at the "is not installed - nothing to do" guard, so the switch has to
+            # be passed on the uninstall run itself. Sending an operator back to a command that does
+            # nothing is the same defect as the sentence this notice replaced.
             $lines += "  Logon right      '$ServiceAccount' still holds the 'Log on as a service' right"
-            $lines += "                   (SeServiceLogonRight). Re-run this script with"
-            $lines += "                   -RemoveLogonRight, or clear it in secpol.msc under Local"
-            $lines += "                   Policies, User Rights Assignment."
+            $lines += "                   (SeServiceLogonRight). Clear it in secpol.msc under Local"
+            $lines += "                   Policies, User Rights Assignment. Next time, pass"
+            $lines += "                   -RemoveLogonRight to this script on the uninstall run - it"
+            $lines += "                   cannot clear it afterwards, because the account it names is"
+            $lines += "                   only readable while the service is registered."
         }
     }
 
     if ($ConfigDir -and $ConfigInheritanceStripped) {
-        $lines += "  Config dir ACL   $ConfigDir has inheritance turned off, and install-service.ps1"
-        $lines += "                   -LockConfigDir also set its owner to Administrators."
-        $lines += "                   This script does not put that back, because nothing recorded"
-        $lines += "                   what the permissions and owner were before. Turn inheritance"
-        $lines += "                   back on yourself if you want it:"
+        # Inheritance is the only half that was MEASURED. Whether -LockConfigDir turned it off, and
+        # who owns the directory, were not read - and a directory an operator hardened themselves
+        # looks identical here. So this names the state and not its cause.
+        $lines += "  Config dir ACL   $ConfigDir has inheritance turned off. install-service.ps1"
+        $lines += "                   -LockConfigDir does that, and also sets the owner to"
+        $lines += "                   Administrators; this script checked neither the cause nor the"
+        $lines += "                   owner, and does not put either back, because nothing recorded"
+        $lines += "                   what they were before. Read them yourself, and turn"
+        $lines += "                   inheritance back on only if that was the state you started in:"
         $lines += "                     icacls `"$ConfigDir`" /inheritance:e"
     }
 
-    if ($WerImages -and $WerImages.Count -gt 0) {
-        $lines += "  Crash-dump keys  Windows Error Reporting keys for $($WerImages -join ', ') under"
+    $werAll = @(@($WerImages) + @($WerLocalDumps) | Where-Object { $_ } | Select-Object -Unique)
+    if ($werAll.Count -gt 0) {
+        $lines += "  Crash-dump keys  Windows Error Reporting keys for $($werAll -join ', ') under"
         $lines += "                   HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting."
-        $lines += "                   install-service.ps1 -SuppressCrashDumps wrote them, they apply"
-        $lines += "                   to every process of those names on this host, and they are left"
-        $lines += "                   on purpose: deleting them would switch crash dumps that can"
-        $lines += "                   carry patient data back on. Remove them by hand if you want"
-        $lines += "                   the host's original behaviour back."
+        if ($WerImages) {
+            $lines += "                     ExcludedApplications: $($WerImages -join ', ')"
+        }
+        if ($WerLocalDumps) {
+            # Named separately because Windows evaluates the two independently: clearing the
+            # exclusion list alone leaves the per-image dump overrides in force.
+            $lines += "                     LocalDumps:           $($WerLocalDumps -join ', ')"
+        }
+        $lines += "                   install-service.ps1 -SuppressCrashDumps writes these, they"
+        $lines += "                   apply to every process of those names on this host, and they"
+        $lines += "                   are left on purpose: deleting them would switch crash dumps"
+        $lines += "                   that can carry patient data back on. Remove them by hand if"
+        $lines += "                   you want the host's original behaviour back."
     }
 
     if ($Unreadable -and $Unreadable.Count -gt 0) {
@@ -325,8 +387,11 @@ function Remove-ServiceLogonRight {
     $sdb = Join-Path $env:TEMP "mefor-secedit-remove-$PID.sdb"
     try {
         # $LASTEXITCODE is session-wide and a failed LAUNCH never writes it, so it is cleared before
-        # each call and a $null afterwards is treated as "secedit did not run" - the same rule the
-        # nssm calls in both scripts follow.
+        # each call and a $null afterwards is treated as "secedit did not run" - the rule the nssm
+        # calls in both scripts follow. NOTE: install-service.ps1's Set-ServiceLogonRight runs the
+        # same two secedit calls WITHOUT this clear, so it can read the previous native command's
+        # code. That is a pre-existing gap in the grant path, not fixed here; filing it is the
+        # maintainer's, and this comment exists so the asymmetry is not read as parity.
         $global:LASTEXITCODE = $null
         & secedit /export /areas USER_RIGHTS /cfg $inf | Out-Null
         if ($null -eq $LASTEXITCODE -or $LASTEXITCODE -ne 0 -or -not (Test-Path $inf)) {
@@ -354,8 +419,16 @@ function Remove-ServiceLogonRight {
                 "it. Left in place - clear it by hand in secpol.msc if that is really what you want.")
             return $false
         }
-        $new = $lines -replace '^\s*SeServiceLogonRight\s*=.*$',
-            ("SeServiceLogonRight = " + ($kept -join ','))
+        # REBUILT LINE BY LINE, NOT WITH -replace. The replacement operand of -replace is .NET
+        # substitution syntax, where '$' is a metacharacter: a holder token containing one - secedit
+        # can export a gMSA or computer account by NAME, and those end in '$' - would be re-read as
+        # $&, $+ or $$ and silently mangle a machine-wide user-right row on its way into
+        # `secedit /configure`. A foreach carries the text through untouched.
+        $new = foreach ($line in $lines) {
+            if ($line -match '^\s*SeServiceLogonRight\s*=') {
+                "SeServiceLogonRight = " + ($kept -join ',')
+            } else { $line }
+        }
         Set-Content -Path $inf -Value $new -Encoding Unicode
         $global:LASTEXITCODE = $null
         & secedit /configure /db $sdb /cfg $inf /areas USER_RIGHTS | Out-Null
@@ -402,13 +475,6 @@ function Remove-AccountAce {
     return $true
 }
 
-# Find nssm: explicit path, PATH, or the auto-provisioned cache. Fall back to sc.exe if absent.
-if (-not $NssmPath) {
-    $cmd = Get-Command nssm -ErrorAction SilentlyContinue
-    $NssmPath = if ($cmd) { $cmd.Source } else { Join-Path $DataDir "bin\nssm.exe" }
-}
-$haveNssm = Test-Path $NssmPath
-
 # --- read the host BEFORE the registration goes (BACKLOG #1704) -------------------------------------
 # EVERY fact here stops being readable the moment the service is removed. The run-as account and the
 # registered command line live in the service's own registry key, which `nssm remove` deletes; and a
@@ -416,12 +482,16 @@ $haveNssm = Test-Path $NssmPath
 # a SID once the service it is named for is gone. Reading afterwards would produce an empty inventory
 # that looks exactly like a clean host, which is the failure this whole change is about.
 #
+# IT RUNS ABOVE THE NSSM RESOLUTION because -DataDir is corrected from the registration below, and
+# Resolve-Nssm's fallback joins "bin" onto whatever -DataDir holds at that moment.
+#
 # Nothing here throws. A read that fails is recorded in $unreadable and named in the notice, so a
 # thinner list is never mistaken for a shorter one.
 $unreadable = @()
 $objectName = ""
 $appParameters = ""
 $appExe = ""
+$appStdout = ""
 $svcKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
 try {
     $objectName = [string](Get-ItemProperty -Path $svcKey -Name ObjectName -ErrorAction Stop).ObjectName
@@ -434,18 +504,55 @@ try {
     $params = Get-ItemProperty -Path (Join-Path $svcKey "Parameters") -ErrorAction Stop
     $appParameters = [string]$params.AppParameters
     $appExe = [string]$params.Application
+    $appStdout = [string]$params.AppStdout
 } catch {
     $unreadable += ("the registered command line of '$ServiceName' ($($_.Exception.Message)) - so " +
-        "the config directory could not be named below")
+        "the config directory and the data directory below could not be checked against it")
 }
 $configDir = Get-ConfigDirFromAppParameters -AppParameters $appParameters
+# A read that SUCCEEDS and yields nothing is not a clean result. Without this the config-dir lines are
+# simply dropped and the notice looks complete, which is the defect this whole change is about.
+if ($appParameters -and -not $configDir) {
+    $unreadable += ("the config directory of '$ServiceName' - its registered command line carries no " +
+        "--config, so the directory holding an entry for the run-as account cannot be named here")
+}
 
-# The installer writes a named grant for any run-as account EXCEPT LocalSystem, which it covers with
-# the well-known SYSTEM SID instead. So "not LocalSystem" is exactly the condition under which an
-# orphaned entry and a logon right exist, read off the registration rather than guessed.
-$hasAccount = $objectName -and ($objectName -ne "LocalSystem")
+# -DataDir IS A PARAMETER WITH A DEFAULT, AND A DEFAULT IS A GUESS. An install that used
+# `-DataDir D:\mefor` leaves everything there, and an uninstall run without the same argument would
+# name C:\ProgramData\MessageFoundry throughout - the wrong directory in the one report written to
+# stop exactly that. The installer registers AppStdout as <DataDir>\logs\service.out.log, so the real
+# directory is two parents up. An explicit -DataDir always wins: the operator who passed it knows.
+if (-not $PSBoundParameters.ContainsKey('DataDir')) {
+    if ($appStdout) {
+        $derivedDataDir = Split-Path -Parent (Split-Path -Parent $appStdout)
+        if ($derivedDataDir) { $DataDir = $derivedDataDir }
+    } else {
+        $unreadable += ("the data directory of '$ServiceName' - the inventory below names the " +
+            "default '$DataDir', which is the wrong directory if the install used -DataDir")
+    }
+}
+
+# Find nssm: explicit path, PATH, or the auto-provisioned cache. Fall back to sc.exe if absent.
+$cachedNssm = Join-Path $DataDir "bin\nssm.exe"
+if (-not $NssmPath) {
+    $cmd = Get-Command nssm -ErrorAction SilentlyContinue
+    $NssmPath = if ($cmd) { $cmd.Source } else { $cachedNssm }
+}
+$haveNssm = Test-Path $NssmPath
+if (-not (Test-Path $cachedNssm)) { $cachedNssm = "" }
+
+# WHICH ACCOUNTS CARRY A RESIDUE, DECIDED BY SID RATHER THAN BY SPELLING. The installer writes named
+# grants for any run-as account except LocalSystem, which it covers with the well-known SYSTEM SID
+# instead. "LocalSystem" is only ONE spelling of that account though - a registration written by hand
+# or by another tool can read "NT AUTHORITY\SYSTEM" - and a name test would then let
+# -RemoveAccountAces issue `/remove:g *S-1-5-18`, stripping the SYSTEM entry that Set-SecureDataDirAcl
+# writes on EVERY install off the directory holding the logs and the store.
+#
+# A SID THAT DOES NOT RESOLVE IS TREATED AS AN ACCOUNT, deliberately. Over-reporting costs an operator
+# one icacls read; under-reporting is the defect this function exists to fix.
 $accountSid = ""
-if ($hasAccount) {
+$hasAccount = $false
+if ($objectName -and $objectName -ne "LocalSystem") {
     try {
         $accountSid = ([Security.Principal.NTAccount]$objectName).Translate(
             [Security.Principal.SecurityIdentifier]).Value
@@ -454,6 +561,11 @@ if ($hasAccount) {
             "name the account instead, and icacls may refuse that name once the service is gone")
     }
 }
+# ONE rule, the same call Get-UninstallResidueNotice makes. Both the command the notice PRINTS and the
+# command -RemoveAccountAces RUNS come from this, so they cannot disagree.
+$accountSpec = Get-AccountResidueSpec -ServiceAccount $objectName -ServiceAccountSid $accountSid
+$hasAccount = $accountSpec.HasAccount
+$acePrincipal = $accountSpec.Principal
 
 # Measured from the directory's own ACL, not inferred from a -LockConfigDir switch this script never
 # saw. AreAccessRulesProtected is true exactly when inheritance has been turned off.
@@ -467,29 +579,41 @@ if ($configDir) {
     }
 }
 
-$cachedNssm = Join-Path $DataDir "bin\nssm.exe"
-if (-not (Test-Path $cachedNssm)) { $cachedNssm = "" }
-
-# WER suppression is by IMAGE NAME and covers BOTH images the installer names: the launcher and the
-# interpreter a pip console script starts as a child. Only images actually present under
-# ExcludedApplications are reported, so a host that never ran -SuppressCrashDumps gets no line.
+# WER suppression is by IMAGE NAME and covers BOTH images the installer names: the launcher, and the
+# interpreter a pip console script starts as a child - which is the process that actually holds the
+# PHI heap. Only images actually present in the registry are reported, so a host that never ran
+# -SuppressCrashDumps gets no line.
+#
+# THE CANDIDATE NAMES ARE NOT PROBED ON DISK. An earlier version took python.exe only when it still
+# existed beside the launcher, which made the inventory depend on whether the venv had already been
+# deleted - and an operator decommissioning a box deletes it first. The registry is the thing that
+# survives, so the registry is what is read.
+#
+# BOTH SURFACES, because Set-CrashDumpSuppression writes two and they are evaluated independently: an
+# operator who clears ExcludedApplications alone still has per-image LocalDumps overrides in place.
+$werRoot = "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting"
 $werImages = @()
+$werLocalDumps = @()
 if ($appExe) {
     try {
-        $imageNames = @([IO.Path]::GetFileName($appExe))
-        $interpreter = Join-Path (Split-Path -Parent $appExe) "python.exe"
-        if (Test-Path $interpreter) { $imageNames += [IO.Path]::GetFileName($interpreter) }
-        $excludedKey = "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\ExcludedApplications"
+        $imageNames = @([IO.Path]::GetFileName($appExe), "python.exe") | Select-Object -Unique
+        $excludedKey = Join-Path $werRoot "ExcludedApplications"
         if (Test-Path $excludedKey) {
             $excludedProps = Get-ItemProperty -Path $excludedKey -ErrorAction Stop
-            foreach ($image in ($imageNames | Select-Object -Unique)) {
+            foreach ($image in $imageNames) {
                 if ($null -ne $excludedProps.PSObject.Properties[$image]) { $werImages += $image }
             }
         }
+        foreach ($image in $imageNames) {
+            if (Test-Path (Join-Path $werRoot "LocalDumps\$image")) { $werLocalDumps += $image }
+        }
     } catch {
-        $unreadable += ("the Windows Error Reporting exclusions ($($_.Exception.Message)) - check " +
-            "them by hand if you installed with -SuppressCrashDumps")
+        $unreadable += ("the Windows Error Reporting keys ($($_.Exception.Message)) - check them by " +
+            "hand under '$werRoot' if you installed with -SuppressCrashDumps")
     }
+} else {
+    $unreadable += ("the Windows Error Reporting keys - the registered image path could not be read, " +
+        "so nothing checked whether -SuppressCrashDumps left machine-wide keys under '$werRoot'")
 }
 
 Write-Host "Stopping '$ServiceName'..."
@@ -558,7 +682,8 @@ if ($RemoveAccountAces) {
     if (-not $hasAccount) {
         Write-Host "  ACEs   : the service ran as LocalSystem, so no named entry was ever written."
     } else {
-        $acePrincipal = if ($accountSid) { "*$accountSid" } else { $objectName }
+        # $acePrincipal is the value the notice PRINTS, derived once above. Recomputing it here is
+        # how a script comes to tell an operator a command different from the one it just ran.
         $dataAceRemoved = Remove-AccountAce -Path $DataDir -Principal $acePrincipal -What "data directory"
         if ($configDir) {
             $configAceRemoved = Remove-AccountAce -Path $configDir -Principal $acePrincipal -What "config directory"
@@ -579,6 +704,7 @@ Get-UninstallResidueNotice `
     -ConfigInheritanceStripped:$configProtected `
     -CachedNssm $cachedNssm `
     -WerImages $werImages `
+    -WerLocalDumps $werLocalDumps `
     -LogonRightRemoved:$logonRightRemoved `
     -DataAceRemoved:$dataAceRemoved `
     -ConfigAceRemoved:$configAceRemoved `
