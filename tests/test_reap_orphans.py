@@ -17,12 +17,25 @@ THE CONTROL LINE IS TESTED BECAUSE ITS ABSENCE IS INVISIBLE. A scan that finds n
 that could not look print the same empty candidate list. The control line is the only thing that
 separates them, so a run that omits it is a broken instrument that reads as a clean box.
 
-These tests drive the real script as a subprocess. They never pass ``-Kill``.
+Most of these tests drive the real script as a subprocess. They never pass ``-Kill``.
+
+THE SUBPROCESS TESTS ARE WINDOWS-ONLY, AND THE GATE IS PER-TEST RATHER THAN MODULE-WIDE. The
+script reads the process table with ``Get-CimInstance Win32_Process``; CIM/WMI is a Windows
+interface, so on the ubuntu CI leg -- where pwsh IS installed -- every run exits with
+``could not read the process table``. Making the script cross-platform is not the fix: the leak it
+detects is an MSYS-on-Windows defect, so a Linux process table has nothing to say about it.
+
+But the module must not skip WHOLE on Linux, because the assertions that read the script's TEXT
+need no process table and are the only thing guarding this script on the only Linux leg. A module
+that skips entirely there is a guard that cannot fail there. So the source-level tests carry no
+mark and run everywhere, and :data:`_needs_windows_process_table` gates only the tests that
+actually spawn the script.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -32,8 +45,17 @@ import pytest
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "coord" / "reap-orphans.ps1"
 
-pytestmark = pytest.mark.skipif(
-    shutil.which("pwsh") is None, reason="pwsh (PowerShell 7) not on PATH"
+# BOTH HALVES ARE LOAD-BEARING AND THEY FAIL DIFFERENTLY. With no pwsh on PATH the spawn raises
+# FileNotFoundError and the script is never reached; off Windows it IS reached, and gets as far as
+# the error quoted in the module docstring above.
+#
+# SPELLED LIKE ITS SIBLINGS ON PURPOSE. Measured over tests/: `os.name != "nt"` paired with this
+# same pwsh check is 39 of the 42 tooling-tier gates, every test_coord_*.py among them, against 3
+# for `sys.platform != "win32"` -- which is the engine tier's spelling. Identical semantics, so the
+# only thing at stake is whether a later sweep over the tier's 39 hand-copied gates finds this one.
+_needs_windows_process_table = pytest.mark.skipif(
+    shutil.which("pwsh") is None or os.name != "nt",
+    reason="reap-orphans.ps1 reads Win32_Process through CIM, so it needs pwsh on Windows",
 )
 
 
@@ -63,6 +85,7 @@ def default_json() -> dict[str, Any]:
     return payload
 
 
+@_needs_windows_process_table
 def test_a_default_run_reports_and_exits_clean(
     default_run: subprocess.CompletedProcess[str],
 ) -> None:
@@ -86,6 +109,7 @@ def test_the_report_only_banner_is_pinned_in_the_source_not_only_in_a_run() -> N
     assert "-Kill to terminate" in text
 
 
+@_needs_windows_process_table
 def test_the_default_run_says_it_is_report_only_when_it_found_something(
     default_run: subprocess.CompletedProcess[str],
 ) -> None:
@@ -99,6 +123,7 @@ def test_the_default_run_says_it_is_report_only_when_it_found_something(
         assert "-Kill" in default_run.stdout
 
 
+@_needs_windows_process_table
 def test_the_control_line_carries_all_three_numbers(default_json: dict[str, Any]) -> None:
     """A zero with no control beside it cannot be told apart from a scan that never looked."""
     control = default_json["control"]
@@ -112,6 +137,7 @@ def test_the_control_line_carries_all_three_numbers(default_json: dict[str, Any]
     assert control["Killed"] == 0
 
 
+@_needs_windows_process_table
 def test_the_control_reports_high_handle_processes_the_image_list_cannot_name(
     default_json: dict[str, Any],
 ) -> None:
@@ -131,22 +157,31 @@ def test_the_control_reports_high_handle_processes_the_image_list_cannot_name(
     assert control["HighHandleAnyParent"] <= control["TotalProcesses"]
 
 
-def test_every_candidate_carries_the_identity_fence_a_kill_would_recheck() -> None:
+def test_the_identity_fence_fields_are_pinned_in_the_source() -> None:
     """A pid alone does not name a process across time, and -Kill re-reads before it acts.
 
     The row has to carry what that recheck compares against -- the image name and the creation
     time -- or the fence has nothing to fence with and degrades into a bare pid kill.
 
-    THE ROW LOOP IS VACUOUS ON A BOX WITH NO ORPHANS, and an earlier docstring here claimed the
-    zero floor made sure it was not -- a provenance claim the evidence did not support. Candidate
-    counts at a zero floor were measured at 7, then 3, then 0 on the same machine within an hour.
-    So the deterministic half is asserted separately: the fields the fence needs are pinned from
-    the script's own source, and the loop checks their TYPES whenever the box happens to supply
-    rows.
+    THIS IS THE DETERMINISTIC HALF, SPLIT OUT SO IT STILL RUNS WHERE THE SCRIPT CANNOT. It was one
+    test with the row loop below, which meant the whole assertion died on the ubuntu leg together
+    with the subprocess -- leaving the fence pinned on Windows only.
     """
     text = SCRIPT.read_text(encoding="utf-8")
     for field in ("StartedTicks", "Handles", "Mutating"):
         assert field in text, f"the row no longer carries {field}, so a kill cannot recheck it"
+
+
+@_needs_windows_process_table
+def test_every_candidate_carries_the_identity_fence_a_kill_would_recheck() -> None:
+    """The run-side half of the fence check: the fields are present AND the right types.
+
+    THE ROW LOOP IS VACUOUS ON A BOX WITH NO ORPHANS, and an earlier docstring here claimed the
+    zero floor made sure it was not -- a provenance claim the evidence did not support. Candidate
+    counts at a zero floor were measured at 7, then 3, then 0 on the same machine within an hour.
+    So the field names are pinned from the source in the test above, and this loop checks their
+    TYPES whenever the box happens to supply rows.
+    """
     proc = run_script("-Json", "-MinAgeMinutes", "0")
     assert proc.returncode == 0, proc.stderr
     payload = json.loads(proc.stdout)
@@ -174,12 +209,14 @@ def test_a_kill_would_refuse_the_images_that_write() -> None:
     assert "-Force to override" in text
 
 
+@_needs_windows_process_table
 def test_a_default_run_kills_nothing_whatever_it_found(default_json: dict[str, Any]) -> None:
     assert default_json["control"]["Killed"] == 0
     for row in default_json["candidates"]:
         assert row["Action"] == "reported", row
 
 
+@_needs_windows_process_table
 def test_every_candidate_really_has_a_dead_parent_and_is_old_enough() -> None:
     """The parent check IS the safety argument, so it is asserted rather than described.
 
@@ -208,6 +245,7 @@ def test_every_candidate_really_has_a_dead_parent_and_is_old_enough() -> None:
         assert row["AgeMinutes"] >= 10, row
 
 
+@_needs_windows_process_table
 def test_raising_the_age_floor_can_only_shrink_the_candidate_set() -> None:
     """A monotonicity check, which is what catches an age comparison written the wrong way round.
 
@@ -225,6 +263,7 @@ def test_raising_the_age_floor_can_only_shrink_the_candidate_set() -> None:
     assert high_pids <= low_pids, f"a higher floor selected {high_pids - low_pids}"
 
 
+@_needs_windows_process_table
 def test_an_unknown_image_list_finds_nothing_and_still_prints_the_control() -> None:
     """A zero that is EXPECTED, paired with a control line that proves the scan ran.
 
@@ -239,11 +278,20 @@ def test_an_unknown_image_list_finds_nothing_and_still_prints_the_control() -> N
     assert payload["control"]["TotalProcesses"] > 0
 
 
+@_needs_windows_process_table
 def test_the_output_is_ascii_so_it_survives_a_cp1252_console(
     default_run: subprocess.CompletedProcess[str],
 ) -> None:
     """CLAUDE.md section 11. A glyph raises UnicodeEncodeError on a stock Windows console, which
-    would kill the run mid-report -- and this script is read while the box is already struggling."""
+    would kill the run mid-report -- and this script is read while the box is already struggling.
+
+    WINDOWS-ONLY IS NOT A GAP HERE, because this covers only what the source cannot show. A glyph
+    SPELLED in this script is caught on every leg by tests/test_cp1252_console_safety.py, which
+    walks scripts/**/*.ps1 with no platform gate. What that cannot see is a non-ASCII value the
+    script picks up at RUNTIME and prints -- a process name can carry one -- and seeing that needs
+    a real process table. A source-level copy of the central rule was drafted here and dropped:
+    that module's docstring names the per-file ASCII assert as the very pattern it replaced.
+    """
     assert default_run.stdout.isascii(), "non-ASCII in the report"
 
 
