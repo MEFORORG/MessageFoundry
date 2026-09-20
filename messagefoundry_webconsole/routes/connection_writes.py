@@ -17,6 +17,7 @@ from messagefoundry.api.models import (
     PendingApprovalResponse,
 )
 from messagefoundry.api.security import client_ip
+from messagefoundry.api.validation import ConnectionName
 from messagefoundry.auth import Identity, Permission
 
 from .. import pages
@@ -26,8 +27,30 @@ from .._auth import (
     require_ui,
     require_ui_step_up,
 )
+from ._common import CONNECTION_RULE, refuse
 
 _log = logging.getLogger(__name__)
+
+#: What a bulk outcome row says for a selection that is not a name this console could have rendered.
+#:
+#: The two bulk routes below read their names out of the POST BODY with ``parse_qsl``, so there is no
+#: FastAPI parameter to annotate and no automatic 422 to inherit. They call ``_common.refuse`` with
+#: the SAME ``CONNECTION_RULE`` the form routes and the golden table use, rather than minting a
+#: second adapter for one rule (BACKLOG #1740).
+#:
+#: Paired with a ``None`` target, so the row renders the fixed 'unrecognized selection' label, for
+#: the reason ``pages.decode_row_key`` already gives: a value that failed the rule did not come from
+#: the page, and reflecting it back would put unvetted input on the result table. The RESULT column
+#: still says which of the two refusals it was, so this is distinguishable from a malformed row key.
+#:
+#: The rule's own operator-facing sentence is not reused here: it explains a FORM field to someone
+#: correcting it, and a bulk result table has no field to correct.
+#:
+#: What it costs, since it is a real cost: a connection registered under a name the API rule rejects
+#: is refused here without being named. The JSON control routes already refuse that name too, so it
+#: is uncontrollable through the API either way, and the console is not the surface that has to
+#: report it.
+_NOT_A_CONNECTION_NAME = "not applied: not a valid connection name"
 
 # L3b: the queue purge is step-up-gated, so register it in the write-action allow-list — this is
 # the first extension of the registry L0b introduced (the step-up re-auth may auto-retry the
@@ -89,6 +112,26 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             if (role, name) in seen:
                 continue
             seen.add((role, name))
+            # BACKLOG #1740: the rule /connections/{name}/start declares for the same value. An
+            # OUTCOME ROW rather than a raise, because this is a capture-and-continue batch and one
+            # bad selection must not abort the rest. After the dedupe, so a selection repeated N
+            # times is still one row whether it is valid or not.
+            # The rule's own sentence is discarded here on purpose -- see _NOT_A_CONNECTION_NAME.
+            #
+            # Applied ONLY for an actor who is not channel-scoped, and that condition is the whole
+            # point. A channel-scoped actor's attempt on a name outside their scope is a security
+            # event the handler records through its own guard, and refusing here returns before it.
+            # MEASURED: a well-formed out-of-scope name writes one auth.channel_denied row naming
+            # the actor; with this check unconditional, a MALFORMED one wrote none -- so sending a
+            # bad name deleted your own security event. That is the defect purge-confirm's
+            # unannotated `dest` exists to avoid, and it must not come back in here.
+            #
+            # Nothing unvalidated reaches anything dangerous on that path: a scope holds only names
+            # that pass the rule, so a malformed name can never be in scope, and the handler denies
+            # and audits it before any store query.
+            if identity.allowed_channels is None and refuse(CONNECTION_RULE, name) is not None:
+                outcomes.append((None, _NOT_A_CONNECTION_NAME))
+                continue
             try:
                 # ADR 0150: `request` is the browser's (the console mounts in-process), so a
                 # per-channel denial names the operator's host, as the JSON and per-name console
@@ -106,7 +149,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
 
     @app.post("/ui/connections/{name}/flag")
     async def ui_set_connection_flag(
-        name: str,
+        # Annotated like the other per-name routes (BACKLOG #1740). This one is the reason not to
+        # leave it for later: it is the only one of the five that WRITES, reaching the
+        # comment-preserving connections.toml writer through core.set_connection_flag.
+        name: ConnectionName,
         request: Request,
         engine: Any = Depends(deps.get_engine),
         identity: Identity = Depends(require_ui(Permission.CONFIG_DEPLOY)),
@@ -142,6 +188,14 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         request: Request,
         engine: Any = Depends(deps.get_engine),
         identity: Identity = Depends(require_ui_step_up(Permission.MESSAGES_PURGE)),
+        # NOT annotated, unlike every other name on this surface, and the reason is an audit
+        # row. FastAPI validates a query parameter before the handler body, so a 422 here would
+        # return BEFORE the channel-scope branch below that calls core.audit_channel_denied --
+        # measured: a channel-scoped operator sending a malformed dest got 422 and zero audit rows,
+        # where a well-formed one gets 403 and a row naming them and their host (ADR 0150). Nothing
+        # is lost by leaving it unannotated: the eligibility loop below intersects dest with
+        # rr.outbound_quiesced(d), which admits only live outbound names -- a strictly narrower set
+        # than the name rule (BACKLOG #1740).
         dest: list[str] | None = Query(None),
         scope: str = Query("all", max_length=8),
     ) -> HTMLResponse:
@@ -206,6 +260,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             if value in seen_dest:
                 continue
             seen_dest.add(value)
+            # BACKLOG #1740, same shape as ui_bulk_control above. It also stops an unvetted body
+            # value reaching the result table, which the raw append below used to put there.
+            # Same shape and the same channel-scope carve-out as ui_bulk_control above.
+            if identity.allowed_channels is None and refuse(CONNECTION_RULE, value) is not None:
+                outcomes.append((None, _NOT_A_CONNECTION_NAME))
+                continue
             try:
                 result = await core.purge_connection(
                     value,
@@ -229,7 +289,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
 
     @app.post("/ui/connections/{name}/purge/{scope}")
     async def ui_purge_connection(
-        name: str,
+        # Annotated for the same reason as the three per-name controls in routes/core.py: the twin
+        # declares ConnectionName on this path segment, the console renders the name into the form
+        # action, and a hand-built URL is the only way to reach the 422 (BACKLOG #1740).
+        name: ConnectionName,
         scope: str,
         request: Request,
         engine: Any = Depends(deps.get_engine),

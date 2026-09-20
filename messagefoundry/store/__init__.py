@@ -17,6 +17,7 @@ from messagefoundry.store.base import (
     Row,
     Store,
     StoreLifecycle,
+    StoreNotFoundError,
     open_store,
     sqlite_settings,
 )
@@ -53,6 +54,7 @@ __all__ = [
     "Stage",
     "Store",
     "StoreLifecycle",
+    "StoreNotFoundError",
     "StreamingAttachmentsUnsupported",
     "StripResult",
     "open_store",

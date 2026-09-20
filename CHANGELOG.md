@@ -432,6 +432,21 @@ All notable changes to MessageFoundry are documented here. The format follows
   dead ACK path that nonetheless delivered everything still passes when `connections >= sent`; an
   intake floor cannot catch a fault whose signature is a high read with no ACKs. Bounding that arm
   needs its own change.
+- **`messagefoundry adr-analyze` exited 0 over an ADR directory that does not exist.** `Path.glob`
+  yields nothing and raises nothing for a missing directory, so a missing, non-directory, or
+  ADR-less `--adr-dir` produced zero reports and `AnalysisResult.ok = True` — the exact shape of a
+  clean run. Withdrawing the ADRs would have silently turned a failing advisory check into a
+  passing one. `AnalysisResult` now carries an `error` field, set to a line naming the directory
+  when it is missing, is not a directory, or holds no file matching the ADR glob; discovery also
+  drops a directory that happens to be named like an ADR, which the glob alone would have matched.
+  **Visible change:** `adr-analyze` now exits **2**, with or without `--strict`, when there is no
+  corpus to analyze — the same "could not start" code the CLI's other subcommands already spend on
+  a store that fails to open, and distinct from `--strict`'s own coverage-gap exit of 1. `--json`
+  output gains a permanent `error` key (`null` on a normal run), and `ok` is now
+  `error is None and not coverage_gaps`. The error line says what was looked for, not why nothing
+  matched: both `Path.exists` and `Path.glob` swallow `OSError`, so a directory the process cannot
+  read is indistinguishable here from one that is absent, and a message guessing between them would
+  send an operator after the wrong cause.
 
 ## [0.3.2] — 2026-07-28 — Early Access
 

@@ -12,6 +12,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Literal
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
 import httpx
@@ -1205,8 +1206,40 @@ def test_default_nav_renders_status_icons() -> None:
 _GIB = 1024**3
 
 
-def _sysinfo(disk_free: int, *, logs_free: int | None = None, pool_idle: int | None = None):
-    """A minimal SystemStatus for _derive_health tests — only the fields the rollup reads matter."""
+def _sysinfo(
+    disk_free: int | None,
+    *,
+    logs_free: int | None | Literal["unmeasured"] = None,
+    pool_idle: int | None = None,
+    channels: int = 2,
+    channels_running: int | None = None,
+    failed_names: list[str] | None = None,
+    failed_count: int | None = None,
+    uptime: float = 1.0,
+    journal_mode: str = "wal",
+):
+    """A minimal SystemStatus for _derive_health tests — only the fields the rollup reads matter.
+
+    ``channels`` defaults to a NONZERO deployed-inbound count on purpose (BACKLOG #1741): zero
+    deployed inbounds on a started engine is now itself a warn, so a zero default would make every
+    test below assert against an incidentally-warning engine. The zero case gets its own tests.
+
+    ``failed_count`` defaults to ``len(failed_names)`` and is passed separately only to build the
+    channel-scoped shape, where the caller sees the COUNT of failed inbounds but not every name.
+
+    A caller passing failures usually raises ``channels`` to cover them. That keeps the fixture
+    self-consistent (channels_failed is a SUBSET of channels_stopped, never a fourth bucket) — it
+    changes no assertion, because the rollup reads only total, failed, the names, and uptime.
+
+    ``logs_free`` carries all three log states in ONE argument (BACKLOG #1563), so the fixture
+    cannot express a contradiction: ``None`` = no log section at all (stdout-only), ``"unmeasured"``
+    = configured but the probe failed, an int = a measured figure. ``disk_free=None`` is the DB
+    drive's unmeasurable case. A ``0`` anywhere here is a real measured zero that must still alarm.
+
+    ``journal_mode`` is the BACKEND, because what ``disk_free=None`` means depends on it: it
+    defaults to SQLite's ``"wal"``, where a null can only be a failed local probe, and callers pass
+    ``"postgres"`` or a SQL Server recovery model for the disk the engine cannot see at all.
+    """
     from messagefoundry.api.models import (
         DbInfo,
         EngineInfo,
@@ -1216,28 +1249,37 @@ def _sysinfo(disk_free: int, *, logs_free: int | None = None, pool_idle: int | N
         SystemStatus,
     )
 
+    names = list(failed_names or [])
+    failed = failed_count if failed_count is not None else len(names)
+    running = channels_running if channels_running is not None else max(0, channels - failed)
+    if logs_free is None:
+        logs = None  # stdout-only: no log directory configured, so no section at all
+    elif logs_free == "unmeasured":
+        logs = LogInfo(path="l", size_bytes=None, disk_free_bytes=None)
+    else:
+        logs = LogInfo(path="l", size_bytes=1, disk_free_bytes=logs_free)
     return SystemStatus(
         engine=EngineInfo(
             version="0",
-            uptime_seconds=1.0,
+            uptime_seconds=uptime,
             pid=1,
-            channels_total=0,
-            channels_running=0,
-            channels_stopped=0,
+            channels_total=channels,
+            channels_running=running,
+            channels_stopped=channels - running,
             outbox_by_status={},
+            channels_failed=failed,
+            channels_failed_names=names,
         ),
         db=DbInfo(
             path="db",
             size_bytes=1,
             disk_free_bytes=disk_free,
-            journal_mode="wal",
+            journal_mode=journal_mode,
             messages=0,
             events=0,
             audit=0,
         ),
-        logs=None
-        if logs_free is None
-        else LogInfo(path="l", size_bytes=1, disk_free_bytes=logs_free),
+        logs=logs,
         pool=None
         if pool_idle is None
         else PoolInfo(
@@ -1270,6 +1312,144 @@ def test_derive_health_critical_on_very_low_disk() -> None:
 
     health, _ = _derive_health(_sysinfo(512 * 1024**2), None, None, None)  # 0.5 GiB free
     assert health == "down"
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "label"),
+    [
+        ({"disk_free": 0}, "db"),
+        ({"disk_free": 0, "journal_mode": "postgres"}, "db"),
+        ({"disk_free": 50 * _GIB, "logs_free": 0}, "logs"),
+    ],
+    ids=["db", "db-server-backend", "logs"],
+)
+def test_derive_health_still_critical_on_a_measured_zero_drive(
+    kwargs: dict[str, object], label: str
+) -> None:
+    """BACKLOG #1563's guard rail, and the reason the fix is not just "ignore falsy".
+
+    A drive the engine MEASURED at 0 bytes free is the real emergency this rule exists for, and it
+    must keep firing after unmeasurable values stop doing so. It holds because the rule tests
+    ``free is None`` — an identity check, never ``not free``. If any case here goes green, the fix
+    has silenced the alarm rather than narrowing it. The reason names WHICH drive, so the operator
+    knows which one to go and clear.
+
+    The ``db-server-backend`` arm is a REGRESSION guard, not a live path, and says so because the
+    id alone reads like end-to-end coverage of the server stores. No server store can emit a 0 any
+    more — both hardcode ``disk_free_bytes=None`` — so the only defect it can catch is the
+    discriminator being widened to skip server backends BEFORE the null check instead of inside it.
+    That would silence a measured figure on the strength of which store reported it, and the check
+    is cheap enough to keep for that one shape."""
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    health, reason = _derive_health(_sysinfo(**kwargs), None, None, None)  # type: ignore[arg-type]
+    assert health == "down"
+    assert reason == f"low disk ({label}): 0.0 GiB free"
+
+
+@pytest.mark.parametrize("journal_mode", ["postgres", "FULL", "SIMPLE", "BULK_LOGGED", "Full"])
+def test_derive_health_ignores_an_unmeasurable_db_disk_on_a_server_backend(
+    journal_mode: str,
+) -> None:
+    """BACKLOG #1563: both server stores hardcoded ``disk_free_bytes=0`` to mean "I cannot see this
+    disk", and every threshold here read that as a full drive — so a healthy Postgres or SQL Server
+    deployment WOULD come up with the engine-health heart pinned critical and a tooltip reading
+    "low disk (db): 0.0 GiB free". The value is now ``None``, and on a SERVER backend it is skipped,
+    claiming nothing — the engine was never meant to stat that disk.
+
+    Parametrized over both server spellings of ``journal_mode``, including SQL Server's three
+    recovery models and a lowercase one: the discriminator case-folds, because SQLite reports its
+    journal mode lowercase and SQL Server reports its recovery model uppercase."""
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    assert _derive_health(_sysinfo(None, journal_mode=journal_mode), None, None, None) == (
+        "ok",
+        None,
+    )
+
+
+@pytest.mark.parametrize(
+    "journal_mode", ["wal", "delete", "truncate", "persist", "memory", "off", "", "mysql"]
+)
+def test_derive_health_warns_on_an_unmeasurable_db_disk_on_a_local_backend(
+    journal_mode: str,
+) -> None:
+    """The other half of the rule, and the regression it was written against.
+
+    On the DEFAULT SQLite backend there is no not-applicable reading: ``_disk_free_bytes`` returns
+    ``None`` ONLY when a local ``shutil.disk_usage`` raised, so a null is a probe that FAILED on a
+    drive that should have been readable. Skipping it for every backend alike turned a real
+    emergency into a silent ``ok`` — SQLite holds its file handle open, so queries keep succeeding
+    while the parent directory's ACL or mount goes bad, and nothing else in the rollup would notice.
+
+    The five SQLite journal modes pin the module's claim that the two vocabularies cannot collide:
+    none of them may ever fall into ``_SERVER_DB_JOURNAL_MODES``.
+
+    ``"mysql"`` and ``""`` are the unrecognised arms. An unknown ``journal_mode`` counts as a LOCAL
+    disk and alarms, because silence is the failure this rule exists to prevent: a backend nobody
+    listed should read louder than it deserves, never quieter. ``""`` is the one arm that is a
+    judgement rather than a reading — it names no backend, and a SQL Server whose recovery-model
+    read came back empty reaches it too. Pinned here so that flipping it is a deliberate act with a
+    failing test behind it, not a quiet edit; see ``_SERVER_DB_JOURNAL_MODES`` for the reasoning."""
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    health, reason = _derive_health(_sysinfo(None, journal_mode=journal_mode), None, None, None)
+    assert health == "warn"
+    assert reason == "db directory missing or unreadable"
+
+
+@pytest.mark.parametrize("journal_mode", ["wal", "postgres"], ids=["sqlite", "server"])
+def test_derive_health_unmeasurable_disk_skips_only_itself(journal_mode: str) -> None:
+    """The skip is a ``continue``, not an early exit: an unmeasurable disk must not take the rest of
+    the rollup down with it. An engine with a failed inbound still warns and still names the inbound
+    — otherwise #1563's fix would have blinded the heart to everything else.
+
+    Both backends are covered, because they reach this line by different routes: the server one
+    appends no disk issue at all, the SQLite one appends its own warn and must still lose the
+    tooltip to the connection failure. Insertion order IS that tie-break, so this pins it."""
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    health, reason = _derive_health(
+        _sysinfo(None, failed_names=["IB_ACME_ADT"], journal_mode=journal_mode), None, None, None
+    )
+    assert health == "warn"
+    assert reason == "inbound IB_ACME_ADT failed to start"
+
+
+def test_derive_health_warns_on_an_unmeasurable_log_drive() -> None:
+    """A configured log directory the engine could not measure is a WARN, not a skip.
+
+    A log directory has no not-applicable case: the operator configured that path, so a null there
+    is always a failed probe. Skipping it would have traded #1563's loud wrong answer for a silent
+    one, leaving a vanished log directory reading green forever. The DB drive reaches the same
+    answer on the default SQLite backend for the same reason; only a server backend's DB null is
+    genuinely not-applicable, and ``journal_mode`` is what tells those apart."""
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    health, reason = _derive_health(_sysinfo(50 * _GIB, logs_free="unmeasured"), None, None, None)
+    assert health == "warn"
+    assert reason == "log directory missing or unreadable"
+
+
+def test_derive_health_ok_when_no_log_dir_is_configured() -> None:
+    """The control for the warn above: stdout-only (``logs is None``) is a deliberate configuration,
+    not a failed probe, and must stay silent. If this ever warns, the fix has started treating "the
+    operator wanted no log directory" as "the log directory is broken"."""
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    assert _derive_health(_sysinfo(50 * _GIB, logs_free=None), None, None, None) == ("ok", None)
+
+
+def test_bytes_renders_an_unmeasured_value_as_words_not_a_quantity() -> None:
+    """BACKLOG #1563, the on-screen half. The Engine Status page prints "Disk free" straight from
+    ``DbInfo``, so a server backend's unmeasurable figure must not fall through to "0 B" — an
+    operator reading that sees a disk emergency, when in fact nobody looked. A real zero still
+    renders as a quantity, because that one IS a measurement."""
+    from messagefoundry_webconsole.pages.monitoring import _bytes
+
+    assert _bytes(None) == "nothing measured"
+    assert _bytes(0) == "0 B"
+    assert _bytes(10 * 1024**3) == "10.0 GiB"
 
 
 def test_derive_health_down_when_store_unreachable() -> None:
@@ -1315,6 +1495,114 @@ def test_derive_health_worst_issue_wins_not_composite() -> None:
     dr = DrStatus(enabled=True, active=True, threshold="P1", activation_mode="manual")
     health, reason = _derive_health(_sysinfo(512 * 1024**2, pool_idle=0), dr, None, None)
     assert health == "down" and reason is not None and "low disk" in reason
+
+
+def test_derive_health_warns_on_a_failed_inbound_and_names_it() -> None:
+    """BACKLOG #1741 act 1: a deployed inbound that failed to start is at least warn, naming it.
+
+    The heart used to read ok over exactly this — an MLLP inbound on an occupied port — while the
+    dashboard row beside it already said "failed"."""
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    health, reason = _derive_health(
+        _sysinfo(50 * _GIB, failed_names=["IB_ACME_ADT"]), None, None, None
+    )
+    assert health == "warn"
+    assert reason == "inbound IB_ACME_ADT failed to start"
+
+
+def test_derive_health_failed_inbound_reason_lists_several_then_truncates() -> None:
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    _, two = _derive_health(
+        _sysinfo(50 * _GIB, channels=5, failed_names=["A", "B"]), None, None, None
+    )
+    assert two == "2 inbound connections failed to start: A, B"
+    # The reason renders into a title= attribute, so a wide outage truncates rather than listing all.
+    _, many = _derive_health(
+        _sysinfo(50 * _GIB, channels=9, failed_names=["A", "B", "C", "D", "E"]), None, None, None
+    )
+    assert many == "5 inbound connections failed to start: A, B, C, and 2 more"
+
+
+def test_derive_health_failed_inbound_warns_without_a_name_for_a_scoped_caller() -> None:
+    """A channel-scoped operator gets the COUNT but no name (/connections hides an out-of-scope
+    inbound's name, and the heart must not be a side channel around that) — and still gets the warn,
+    which is the whole point of surfacing the count separately."""
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    health, reason = _derive_health(
+        _sysinfo(50 * _GIB, channels=4, failed_names=[], failed_count=2), None, None, None
+    )
+    assert health == "warn"
+    assert reason == "2 inbound connections failed to start"
+    # A SINGLE hidden failure must not read "1 inbound connections" — the plural head is shared, so
+    # the singular case needs its own text on the no-name branch too.
+    _, one = _derive_health(
+        _sysinfo(50 * _GIB, channels=4, failed_names=[], failed_count=1), None, None, None
+    )
+    assert one == "1 inbound connection failed to start"
+
+
+def test_derive_health_warns_when_no_inbound_is_deployed() -> None:
+    """BACKLOG #1741 act 2: zero deployed inbounds on a started engine is warn — the heart used to
+    read ok over an engine listening on nothing ("0/0 running")."""
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    health, reason = _derive_health(_sysinfo(50 * _GIB, channels=0), None, None, None)
+    assert health == "warn"
+    assert reason == "no inbound connections deployed"
+
+
+def test_derive_health_no_inbound_warn_keys_on_total_not_running() -> None:
+    """A cluster standby binds no listeners BY DESIGN, so channels_running == 0 is correct there.
+    Keying act 2 on running would paint every standby permanently warn; it keys on channels_total."""
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    standby = _sysinfo(50 * _GIB, channels=3, channels_running=0)
+    assert standby.engine.channels_running == 0 and standby.engine.channels_total == 3
+    assert _derive_health(standby, None, None, None) == ("ok", None)
+
+
+def test_derive_health_no_inbound_warn_waits_for_a_started_engine() -> None:
+    """uptime_seconds == 0 means /status has no engine.started_at yet. An engine still coming up is
+    not "listening on nothing", so act 2 holds its warn rather than flashing one on every restart."""
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    assert _derive_health(_sysinfo(50 * _GIB, channels=0, uptime=0.0), None, None, None) == (
+        "ok",
+        None,
+    )
+
+
+def test_derive_health_connection_issues_lose_to_a_worse_one() -> None:
+    """Both #1741 rules are warn, so a critical disk still wins the heart — worst issue wins,
+    unchanged. Run for each rule: a failed inbound, then a graph with no inbound at all."""
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    crit = 512 * 1024**2  # 0.5 GiB free
+    for sysinfo in (
+        _sysinfo(crit, channels=1, failed_names=["IB_A"]),
+        _sysinfo(crit, channels=0),
+    ):
+        health, reason = _derive_health(sysinfo, None, None, None)
+        assert health == "down" and reason is not None and "low disk" in reason
+
+
+def test_derive_health_connection_issue_wins_the_tie_against_another_warn() -> None:
+    """At EQUAL severity the reason is the first issue appended, and the connection rules are
+    appended first on purpose — a feed that is not listening is more actionable than "on the DR
+    box". Pins the tie-break, which is encoded only in list order inside _derive_health."""
+    from messagefoundry.api.models import DrStatus
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    dr = DrStatus(enabled=True, active=True, threshold="P1", activation_mode="manual")
+    # 3 GiB free is a warn, DR-active is a warn, a failed inbound is a warn — all three fire.
+    health, reason = _derive_health(
+        _sysinfo(3 * _GIB, channels=2, failed_names=["IB_A"], pool_idle=0), dr, None, None
+    )
+    assert health == "warn"
+    assert reason == "inbound IB_A failed to start"
 
 
 def test_worst_severity_ranks_critical_highest() -> None:
@@ -5522,9 +5810,12 @@ async def test_bulk_control_bad_action_404(engine: Engine) -> None:
         assert r.status_code == 404
 
 
-async def test_bulk_control_escapes_and_labels_bad_selection(engine: Engine) -> None:
-    # An undecodable key -> the fixed 'unrecognized selection' label (never the raw bytes). A DECODABLE
-    # key whose name carries markup -> the name rendered ESCAPED (no live script reaches the browser).
+async def test_bulk_control_labels_both_kinds_of_bad_selection(engine: Engine) -> None:
+    # Two shapes, two fixed labels, neither reflecting the submitted bytes. An UNDECODABLE key gets
+    # 'unrecognized selection'. A key that decodes to a name the connection-name rule refuses gets the
+    # not-a-valid-name label (BACKLOG #1740) -- this used to render the name ESCAPED instead, which was
+    # sound but weaker: the value now never reaches the page at all. That moved the escaping claim to
+    # test_outcomes_table_escapes_a_name_it_is_handed below, where the page builder still owns it.
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
@@ -5537,8 +5828,24 @@ async def test_bulk_control_escapes_and_labels_bad_selection(engine: Engine) -> 
         )
         assert r.status_code == 200
         assert "unrecognized selection" in r.text
-        assert "<script>alert(1)</script>" not in r.text  # escaped, never reflected raw
-        assert "&lt;script&gt;" in r.text
+        assert "not applied: not a valid connection name" in r.text
+        # Neither raw NOR escaped: a refused name is not placed on the page in any form.
+        assert "<script>alert(1)</script>" not in r.text
+        assert "&lt;script&gt;" not in r.text
+
+
+def test_outcomes_table_escapes_a_name_it_is_handed() -> None:
+    """The escaping claim, at the level that still owns it. The two bulk ROUTES now refuse a name
+    carrying markup before it reaches a render, so a route-level test can no longer exercise this --
+    but ``_outcomes_table`` escapes every target it is given, and deleting the route assertion
+    without putting this here would have dropped the property silently."""
+    from messagefoundry_webconsole.pages.connections import bulk_control_result, purge_result
+
+    outcomes = [("<script>alert(1)</script>", "applied"), (None, "not applied")]
+    for markup in (bulk_control_result("start", outcomes), purge_result("all", outcomes)):
+        assert "<script>alert(1)</script>" not in markup
+        assert "&lt;script&gt;alert(1)&lt;/script&gt;" in markup
+        assert "unrecognized selection" in markup
 
 
 # --- reset-many (bulk counter reset) ---------------------------------------------------------------
@@ -5714,9 +6021,11 @@ async def test_purge_bulk_dual_control_aggregates_pending(engine: Engine, tmp_pa
         )  # dual-control per dest (out1 quiesced -> reaches the gate)
 
 
-async def test_purge_bulk_escapes_markup_dest(engine: Engine) -> None:
-    # A ?dest carrying markup renders ESCAPED on the result page (never reflected raw). With no runner
-    # the dest is unknown -> 404 captured; either way the name is only ever placed via el()/rows_table.
+async def test_purge_bulk_refuses_a_markup_dest(engine: Engine) -> None:
+    # A posted dest carrying markup is REFUSED by the connection-name rule and becomes its own outcome
+    # row, so the value is never placed on the result page -- raw or escaped (BACKLOG #1740). It used to
+    # be rendered escaped, which was sound but put an unvetted body value on the page; the page-builder
+    # escaping it relied on is pinned by test_outcomes_table_escapes_a_name_it_is_handed.
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
@@ -5725,8 +6034,9 @@ async def test_purge_bulk_escapes_markup_dest(engine: Engine) -> None:
             c, "/ui/connections/purge-bulk", [("scope", "all"), ("dest", "<script>x</script>")]
         )
         assert r.status_code == 200
+        assert "not applied: not a valid connection name" in r.text
         assert "<script>x</script>" not in r.text
-        assert "&lt;script&gt;" in r.text
+        assert "&lt;script&gt;" not in r.text
 
 
 # --- W4-5 (ADR 0142): the browser federated-login legs ---------------------------------------------

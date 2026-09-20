@@ -146,6 +146,15 @@ transport = "mllp"
   without quotes. An `env()` reference is also accepted, but give it a `cast` for a non-string setting:
   an environment value arrives as text and an **uncast** ref hands the connector that text. An inline
   `default =` is held to the setting's type here, because a default is **not** converted by `cast`.
+  A setting whose type is a **table** or an **array** — `headers`, `odbc_params`,
+  `capture_response_headers`, `proxy_no_proxy` — is held to its shape, so `headers = 5` is refused;
+  where the entries have a readable type it is held to those too, one level in, so
+  `headers = { X-Key = 5 }` is refused naming the entry key, and a bad array item is named by index.
+  Write an array as `["a", "b"]`; a bare string is not an array, even where one string is all you
+  want. The entry check is **not** a guarantee that every value in a table was examined — an `env()`
+  reference written inside one is left to the connector's own rules. No refusal ever repeats the
+  value — a `[settings]` value can be a credential, and the message reaches the operator log and the
+  support bundle.
   The remaining connectors (`X12`/`FHIR`/`DICOM`/`DICOMweb`/`Email`/`Direct`/
   `Loopback`/`PassThrough`) are **code-first only** today — declare them in a `.py` module. A name
   declared in **both** a `.py` module and `connections.toml` is a hard error (no silent shadowing).
@@ -902,7 +911,7 @@ upload chokepoint enforces a fixed policy independent of the directory-source po
   path returns **HTTP 415** — both metadata-only-audited, so a PHI body is never persisted or logged.
   (There is **no** antivirus/content-malware scan on the upload path — the `ScanRejected` pre-ingest
   scan-hook seam applies only to the `File(...)`/remote directory sources above, not to HTTP uploads.)
-- **Consent affordance (ASVS 14.2.8).** The `/ui/uploaded-logs/upload` form states, above its submit
+- **Consent affordance (ASVS 14.2.8).** The `/ui/uploaded-logs/upload-form` page states, above its submit
   button, that the original filename and the uploader's username are stored and shown to the uploader
   and to authorized operators holding `files:access_any`, and recorded in the audit log — **submitting
   the form is the consent**; the POST `/uploads` OpenAPI docstring states the same for programmatic
@@ -1068,6 +1077,14 @@ than blocking the FIFO lane on a request the endpoint will never accept.
 **Security.** Redirects are **refused** (a 3xx can't divert PHI to another host — ASVS 15.3.2), the URL
 scheme is constrained to `http`/`https`, and the outbound host is gated by the fail-closed
 `[egress].allowed_http` allowlist (WP-11c). Standard library only (`urllib`) — no new dependency.
+
+**No credentials inside an endpoint URL (BACKLOG #1793).** A URL of the form `https://user:password@host/`
+is refused when the connector is built. The error names the setting and never the password. This covers
+at least `url` on REST, SOAP, FHIR, DICOMweb and `FhirLookup`, plus `oauth2_token_url`, `smart_token_url`
+and `[ai].endpoint`. The shape never worked: `urllib` does not send URL userinfo as auth, and its error
+text carried the password into `last_error`. Put credentials in `basic_user`/`basic_password` or
+`bearer_token` (or the `oauth2_*`/`smart_*` settings), each via `env()`. `proxy_url` is not refused,
+because a forward proxy URL may carry its own credentials.
 
 **Idempotency — operator responsibility.** Delivery is **at-least-once**, so a retry **re-sends** the
 request. The receiving endpoint **must be idempotent** (an idempotency key, a natural upsert, or a
@@ -2718,7 +2735,7 @@ reading this page already applies to a file the scan never opened.
 | SMART token endpoint (`smart_token_url`) | `smart_timeout_seconds` 30 s | the response is context-managed; the token is cached in memory | a mint failure fails the delivery | **single-shot** — re-minted only on the next attempt or a `401` |
 | OAuth2 token endpoint (`oauth2_token_url`) | `oauth2_timeout_seconds` 30 s | as SMART | as SMART | **single-shot** |
 | AI broker (`[ai].endpoint`) | 60 s — a **hard-coded module constant, not operator-configurable** (`[ai]` has no timeout field) | the response is context-managed; the call runs off the event loop via `to_thread` | a mis-configuration, an un-allowlisted host, or an HTTP error raises to the API route | **single-shot** — one POST per assist, no retry |
-| DR backup destination (`[backup].destination`, ADR 0049) | **no engine-owned timeout** — filesystem / SMB-redirector I/O, the same posture as the File connector | handles are context-managed; the archive is fsync'd then verified before the run counts | a failed or verify-failed run is logged + audited, never counted as a good backup when pruning | **single-shot per scheduled pass** — retried only by the next daily pass |
+| DR backup destination (`[backup].destination`, ADR 0049) | **no engine-owned timeout** — filesystem / SMB-redirector I/O, the same posture as the File connector | handles are context-managed; the archive is fsync'd, then verified, and only then renamed onto its canonical name | a failed or verify-failed run is logged + audited and keeps a `.failed` name, so it is never a keep-N candidate — in that prune or any later one (ADR 0049) | **single-shot per scheduled pass** — retried only by the next daily pass |
 | Vault Transit — store DEK unwrap (`MEFOR_STORE_VAULT_ADDR`, `[store].key_provider = vault`, ADR 0019) | **30 s, inherited — not MEFOR-owned.** The client is built as `hvac.Client(url=…, token=…)` with **no timeout argument**, so the bound is `hvac.adapters.Adapter.__init__`'s own `timeout=30` default (`requests` itself has **no** default timeout — without hvac's, this hop would block forever). `hvac>=2.3.0` is the pinned floor; **no MEFOR setting exists** | the `hvac` client is short-lived per unwrap | **fail-closed** — the store refuses to open | **single-shot** — one request per unwrap |
 | Vault Transit — bulk at-rest cipher (`MEFOR_STORE_TRANSIT_KEY`, `[store].cipher_provider = vault_transit`, ADR 0138) | **30 s, inherited — not MEFOR-owned**: the same no-timeout `hvac` client build, so the same `hvac.adapters.Adapter` `timeout=30` default applies to **every cell round trip** | a **single long-lived** `hvac.Client` held for the store's lifetime (`TransitCipher.__init__`), not per operation | a per-operation failure raises `CipherError` at runtime — it does **not** refuse to open the store | **single-shot** per cell; the stage's own re-claim is what retries |
 | Vault KV v2 (`MEFOR_SECRETS_VAULT_ADDR`) | **30 s, inherited — not MEFOR-owned**: the same `hvac.Client(url=…, token=…)` construction with no timeout argument, so the same `hvac.adapters.Adapter` `timeout=30` default applies | as Transit | **fail-closed** — the connector refuses to build | **single-shot** — one request per read |

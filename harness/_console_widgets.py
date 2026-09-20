@@ -339,8 +339,13 @@ class _MessagesSnapshot:
 class MessagesPanel(QWidget):
     """A filterable message list with configurable columns (show/hide, reorder, sort, persisted).
 
-    ``refresh(audit=True)`` records a PHI summary-display audit when the Summary column is visible
-    and autosizes columns; the auto-refresh timer calls ``refresh()`` (no audit, no resize)."""
+    ``refresh(autosize=True)`` is the user-initiated form (the Refresh button, Enter in a filter box)
+    and re-fits the columns to the new rows; the auto-refresh timer calls ``refresh()``, which leaves
+    the operator's column widths alone.
+
+    PHI-summary access auditing is **not** a client concern: the engine audits every list response
+    that returns non-redacted summaries, whatever this panel sends and whether or not the Summary
+    column is visible. There is no opt-in to pass."""
 
     error = Signal(str)
     message_selected = Signal(str)
@@ -356,7 +361,6 @@ class MessagesPanel(QWidget):
         "Summary",
         "Metadata",
     ]
-    _SUMMARY_COL = 6
 
     def __init__(self, client: EngineClient, *, poll_client: EngineClient | None = None) -> None:
         super().__init__()
@@ -367,7 +371,8 @@ class MessagesPanel(QWidget):
         # A refresh requested WHILE one is in flight is latched here (not dropped) and re-fired when
         # the in-flight read finishes, so a filter change (set_channel_filter / Enter / the Connections
         # 'Logs' link) or a post-replay refresh can't leave the filter box and the list mismatched —
-        # which would never self-heal with auto-refresh off. None = none pending; bool = pending audit.
+        # which would never self-heal with auto-refresh off. None = none pending; bool = the pending
+        # request's autosize flag.
         self._pending: bool | None = None
         self._loaded = False  # autosize columns on the first (and user-initiated) loads
 
@@ -383,14 +388,14 @@ class MessagesPanel(QWidget):
         self._field_path_filter = QLineEdit()
         self._field_path_filter.setPlaceholderText("HL7 field (e.g. PID-3)")
         refresh = QPushButton("Refresh")
-        refresh.clicked.connect(lambda: self.refresh(audit=True))
+        refresh.clicked.connect(lambda: self.refresh(autosize=True))
         for box in (
             self._channel_filter,
             self._status_filter,
             self._content_filter,
             self._field_path_filter,
         ):
-            box.returnPressed.connect(lambda: self.refresh(audit=True))
+            box.returnPressed.connect(lambda: self.refresh(autosize=True))
 
         filters = QHBoxLayout()
         filters.addWidget(QLabel("Search"))
@@ -416,29 +421,27 @@ class MessagesPanel(QWidget):
         self._status_filter.clear()
         self._content_filter.clear()
         self._field_path_filter.clear()
-        self.refresh(audit=True)
+        self.refresh(autosize=True)
 
-    def refresh(self, *, audit: bool = False) -> None:
+    def refresh(self, *, autosize: bool = False) -> None:
         # Read the message list OFF the main thread (the 200-row read is the heaviest console query,
         # and a slow/wedged engine would otherwise freeze the GUI for the whole call). The query
         # parameters are read from the filter widgets HERE, on the main thread, then handed to the
         # worker — the worker must never touch a widget.
         if self._loading:
             # Don't pile up on a slow engine, but don't lose a filter change either — latch it
-            # (OR-merge the audit flag) so it re-fires once the in-flight read completes.
-            self._pending = audit if self._pending is None else (self._pending or audit)
+            # (OR-merge the autosize flag) so it re-fires once the in-flight read completes.
+            self._pending = autosize if self._pending is None else (self._pending or autosize)
             return
         self._pending = None
-        summary_shown = not self._table.isColumnHidden(self._SUMMARY_COL)
         channel = self._channel_filter.text().strip() or None
         status = self._status_filter.text().strip() or None
         content = self._content_filter.text().strip() or None
         field_path = self._field_path_filter.text().strip() or None
-        audit_summary = audit and summary_shown
         self._loading = True
         self._runner.submit(
-            lambda: self._fetch(channel, status, content, field_path, audit_summary),
-            on_done=lambda snap: self._apply(snap, autosize=audit),
+            lambda: self._fetch(channel, status, content, field_path),
+            on_done=lambda snap: self._apply(snap, autosize=autosize),
             on_error=self._on_error,
         )
 
@@ -457,9 +460,9 @@ class MessagesPanel(QWidget):
         """Re-fire a refresh that was latched while one was in flight. Returns True if it did."""
         if self._pending is None:
             return False
-        audit = self._pending
+        autosize = self._pending
         self._pending = None
-        self.refresh(audit=audit)
+        self.refresh(autosize=autosize)
         return True
 
     def _fetch(
@@ -468,7 +471,6 @@ class MessagesPanel(QWidget):
         status: str | None,
         content: str | None,
         field_path: str | None,
-        audit_summary: bool,
     ) -> _MessagesSnapshot:
         """Runs on a worker thread — only blocking I/O, no widget access.
 
@@ -490,9 +492,7 @@ class MessagesPanel(QWidget):
                 if search.truncated:
                     count += " — narrow your filters (scan cap hit)"
                 return _MessagesSnapshot(list(search.messages), count, search.truncated, None)
-            result = self._poll.list_messages(
-                channel_id=channel, status=status, limit=200, audit_summary=audit_summary
-            )
+            result = self._poll.list_messages(channel_id=channel, status=status, limit=200)
             return _MessagesSnapshot(
                 list(result.messages),
                 f"{len(result.messages)} shown of {result.total}",
