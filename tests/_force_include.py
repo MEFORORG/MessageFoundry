@@ -32,12 +32,18 @@ none could check it** -- the backend is a build-isolation dependency and is inst
 interpreter here. At the pinned ``hatchling==1.32.0`` every ``[build-system]`` table names:
 
 * ``src/hatchling/builders/config.py:679`` is the ``in self.target_config`` test above;
-* ``src/hatchling/builders/plugin/interface.py:209`` is ``recurse_forced_files``, and it never calls
-  ``include_path`` -- which ``recurse_selected_project_files`` does at ``:204``. That is why
-  ``exclude`` cannot filter a force-included file, and why the harness map is enumerated rather than
-  excluded (BACKLOG #1702).
+* ``src/hatchling/builders/plugin/interface.py`` calls ``include_path`` at exactly two sites, ``:204``
+  in ``recurse_project_files`` and ``:269`` in ``recurse_explicit_files``. ``recurse_forced_files``
+  (``:209``) is neither, which is why ``exclude`` cannot filter a force-included file and why the
+  harness map is enumerated rather than excluded (BACKLOG #1702).
 
-Retire the question the same way if the pin moves::
+**"Unfiltered" is the wrong word for that last one, and the overstatement is worth not inheriting.**
+``recurse_forced_files`` does filter, just not by anything an author configures: ``EXCLUDED_DIRECTORIES``
+at ``:222`` and ``EXCLUDED_FILES`` at ``:226``, both fixed lists, against a plain ``os.path`` walk. The
+true statement is narrower and is the one that matters -- **no include or exclude OPTION reaches a
+force-included path.**
+
+Re-read it the same way if the pin moves, rather than trusting the line numbers above::
 
     pip download hatchling==1.32.0 --no-deps --no-binary :all: -d .
 
