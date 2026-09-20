@@ -81,6 +81,33 @@ foreach ($name in @('install-net-helper.ps1', 'uninstall-net-helper.ps1')) {{
 }}
 $report['parse'] = $parse
 
+# Every service-name parameter: the ValidatePattern literal it declares, and what its declaration
+# ACTUALLY binds. The two are asked separately on purpose -- matching text is not a matching
+# decision, and `param(...)` is the only thing that can answer the second question.
+$names = @{{}}
+foreach ($name in @('install-net-helper.ps1', 'uninstall-net-helper.ps1')) {{
+  $path = Join-Path {_psq(str(_DIR))} $name
+  $ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$null, [ref]$null)
+  foreach ($p in $ast.ParamBlock.Parameters) {{
+    $pname = $p.Name.VariablePath.UserPath
+    if ($pname -notmatch 'ServiceName$') {{ continue }}
+    $attr = @($p.Attributes | Where-Object {{ $_.TypeName.Name -eq 'ValidatePattern' }})
+    $row = @{{ pattern = $null }}
+    if ($attr.Count -eq 1) {{ $row['pattern'] = $attr[0].PositionalArguments[0].Value }}
+    # Bind the REAL declaration, lifted verbatim out of the script's own param block.
+    foreach ($probe in @(
+        @{{ key = 'spaced'; value = 'MessageFoundry Prod' }},
+        @{{ key = 'quoted'; value = "MessageFoundry'" }})) {{
+      $sb = [scriptblock]::Create("param($($p.Extent.Text))`n`$$pname")
+      $splat = @{{ $pname = $probe.value }}
+      try {{ $null = & $sb @splat; $row[$probe.key] = $true }}
+      catch {{ $row[$probe.key] = $false }}
+    }}
+    $names["$name::$pname"] = $row
+  }}
+}}
+$report['service_names'] = $names
+
 $ast = [System.Management.Automation.Language.Parser]::ParseFile(
     {_psq(str(_UNINSTALL))}, [ref]$null, [ref]$null)
 $defined = [bool]$ast.Find({{ $args[0] -is
@@ -203,6 +230,54 @@ def test_the_uninstaller_releases_the_address_only_when_asked(
         "the node that holds the VIP, and nothing takes it over -- the helper that would have "
         "re-bound it elsewhere is what is being removed."
     )
+
+
+def test_both_scripts_take_the_same_service_names(ast_report: dict[str, object]) -> None:
+    """Whatever the installer will accept as a service name, the uninstaller must accept too.
+
+    ONE DEFINITION, ``messagefoundry/service.py``'s ``_SAFE_SERVICE_NAME``, and two literal copies of
+    it in ``param()`` blocks. The copies cannot be dot-sourced away: a PowerShell attribute argument
+    must be a compile-time constant, and ``[ValidatePattern($pattern)]`` is refused at parse with
+    *"Attribute argument must be a constant or a script block"*. So the copies are pinned here
+    instead, which is what makes them one definition rather than three.
+
+    The pattern is there because both names are interpolated into a WQL filter, where a single quote
+    ends the literal. A space cannot, and ``install-service.ps1`` puts no validation on its own
+    ``-ServiceName`` -- so an engine installed as ``MessageFoundry Prod`` is a name the node really
+    can carry. A tighter pattern on one side makes that helper installable and not removable, and it
+    fails at parameter binding, before the script can explain itself.
+
+    BOTH HALVES ARE ASKED. Equal text is not an equal decision, so the harness also BINDS each
+    declaration verbatim; and "it accepts a space" would be equally true of a parameter with no
+    validation at all, so the quote must still be refused.
+    """
+    rows = ast_report["service_names"]
+    assert isinstance(rows, dict)
+    expected = svc._SAFE_SERVICE_NAME.pattern
+    assert set(rows) == {
+        "install-net-helper.ps1::ServiceName",
+        "install-net-helper.ps1::EngineServiceName",
+        "uninstall-net-helper.ps1::ServiceName",
+    }, (
+        "CONTROL FAILED: the harness found a different set of service-name parameters than this "
+        f"guard was aimed at ({sorted(rows)}) -- re-aim it, do not relax it"
+    )
+    for key, row in sorted(rows.items()):
+        assert isinstance(row, dict)
+        assert row["pattern"] == expected, (
+            f"{key} validates against {row['pattern']!r}, not messagefoundry/service.py's "
+            f"_SAFE_SERVICE_NAME ({expected!r}). Both scripts must take the same names: a helper "
+            "installed under a name one of them rejects cannot be removed by the other."
+        )
+        assert row["spaced"] is True, (
+            f"{key} refuses 'MessageFoundry Prod' at parameter binding. install-service.ps1 puts no "
+            "validation on its own -ServiceName and a space is legal in a Windows service name."
+        )
+        assert row["quoted"] is False, (
+            f"CONTROL FAILED: {key} accepts a single quote. The name is interpolated into a WQL "
+            "filter, where a quote ends the literal -- and an unvalidated parameter would pass the "
+            "space assertion above for the wrong reason."
+        )
 
 
 @pytest.mark.parametrize("name", ["install-net-helper.ps1", "uninstall-net-helper.ps1"])

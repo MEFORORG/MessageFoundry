@@ -46,26 +46,6 @@ _MANUAL_ROWS: tuple[tuple[str, str, str], ...] = (
 )
 
 
-def _settings_error_detail(exc: Exception) -> str:
-    """Render a settings-load failure WITHOUT echoing any configured value.
-
-    A verify report is written to disk (``--report-md``/``--report-json``) and pasted into tickets, so
-    a pydantic ``ValidationError`` must contribute only its field path + message — never ``input``,
-    which for ``[auth].ad_bind_password`` or a store DSN would put a credential in the artifact.
-    """
-    from pydantic import ValidationError
-
-    if isinstance(exc, ValidationError):
-        rows = [
-            f"{'.'.join(str(part) for part in err['loc']) or '<root>'}: {err['msg']}"
-            for err in exc.errors()[:5]
-        ]
-        extra = "" if len(exc.errors()) <= 5 else f" (+{len(exc.errors()) - 5} more)"
-        return "; ".join(rows) + extra
-    # Our own model validators raise plain ValueError with hand-authored text naming the key.
-    return str(exc)
-
-
 def _load_settings(service_config: str | None) -> tuple[ServiceSettings | None, str | None]:
     """Load the service settings, returning ``(settings, error)``.
 
@@ -77,15 +57,21 @@ def _load_settings(service_config: str | None) -> tuple[ServiceSettings | None, 
     This used to collapse both into a bare ``None``, so every dependent row read "no service settings
     — pass --service-config", sending an operator to look for a missing file that was usually present
     and simply broken. The reason is now surfaced (see the ``config.load`` row).
+
+    The reason is rendered by :func:`~messagefoundry.config.settings.settings_error_detail`, which
+    used to be a private copy here. A verify report is written to disk (``--report-md``/
+    ``--report-json``) and pasted into tickets, so the detail must never carry ``input`` -- the value
+    a failing ``[store]`` or ``[auth]`` section was given, which is where the env-supplied secrets
+    are. That reasoning applies to every caller that shows a load failure, not just this one.
     """
     from pydantic import ValidationError
 
-    from messagefoundry.config.settings import load_settings
+    from messagefoundry.config.settings import load_settings, settings_error_detail
 
     try:
         return load_settings(config_path=service_config), None
     except (FileNotFoundError, ValueError, ValidationError) as exc:
-        return None, _settings_error_detail(exc)
+        return None, settings_error_detail(exc)
 
 
 def _writable_dir(settings: ServiceSettings | None) -> Path:

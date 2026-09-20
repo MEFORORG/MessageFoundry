@@ -5338,18 +5338,30 @@ def _cluster_vip(args: argparse.Namespace) -> int:
 
     Prints config only -- never message data (PHI-safe). Exit 2 and a ``{"error": ...}`` line on a
     config that will not load, mirroring ``ai-policy``, so a caller parsing stdout as JSON sees the
-    reason rather than an empty read. ``OSError`` is in the catch because a ``--service-config`` that
-    names a DIRECTORY passes ``Path.exists()`` and then raises ``IsADirectoryError`` on open -- an
-    easy typo for the file inside it, and a traceback there would leave stdout empty and the caller
-    reporting "printed nothing" instead of the reason."""
+    reason rather than an empty read. ``OSError`` is in the catch, and ``OSError`` is what the catch
+    has to name: a ``--service-config`` that names a DIRECTORY passes ``Path.exists()`` and then
+    raises on open, as ``IsADirectoryError`` on POSIX and as ``PermissionError`` on Windows (measured
+    2026-09-20: ``[Errno 13] Permission denied``) -- which is the platform this installer runs on, so
+    narrowing this to the POSIX spelling would put the traceback back on every node that has one. It
+    is an easy typo for the file inside the directory, and a traceback there would leave stdout empty
+    and the caller reporting "printed nothing" instead of the reason.
+
+    THE ERROR IS RENDERED, NEVER STRINGIFIED. ``str(ValidationError)`` carries ``input_value=`` for
+    each failing field, and an ``after``-mode section validator's input is the whole section mapping
+    -- so a ``[store]`` missing ``server`` renders the env-supplied ``MEFOR_STORE_PASSWORD`` into
+    this line. The installer then puts that line in a ``throw`` (``Get-VipSettings``: "Could not read
+    [cluster.vip]: ..."), which lands in the operator's transcript and in whatever captured the
+    install. :func:`~messagefoundry.config.settings.settings_error_detail` gives the field path and
+    the message and no configured value; ``tests/test_cli_cluster_vip.py`` pins it with a planted
+    secret."""
     from pydantic import ValidationError
 
-    from messagefoundry.config.settings import load_settings
+    from messagefoundry.config.settings import load_settings, settings_error_detail
 
     try:
         settings = load_settings(config_path=args.service_config)
     except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
-        print(json.dumps({"error": str(exc)}))
+        print(json.dumps({"error": settings_error_detail(exc)}))
         return 2
 
     vip = settings.cluster.vip
