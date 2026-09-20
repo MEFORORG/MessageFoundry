@@ -33,6 +33,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._force_include import wheel_force_include
+
 _ROOT = Path(__file__).resolve().parent.parent
 
 #: Distributions this repository builds that are **not yet published to any index**. Until a name is
@@ -102,14 +104,18 @@ def _packaged_import_trees() -> frozenset[str]:
     definition of which trees ship, free to drift from the build. Reading the target rather than the
     source is what makes this survive either map shape -- the console still maps one whole directory,
     while the harness maps nineteen entries one by one (BACKLOG #1702).
+
+    The map itself comes from ``tests/_force_include``. This walked the TOML by hand until BACKLOG
+    #1836, and it read one table fewer than the ``#1702`` guard did: a distribution using the global
+    ``[tool.hatch.build.force-include]`` spelling would have dropped out of the tree set here, and the
+    only symptom is `test_every_packaged_distribution_has_its_code_tree_scanned` finding one fewer
+    tree to demand coverage of -- which is a quieter scan, not a failure.
     """
-    trees: set[str] = set()
-    for pyproject in sorted((_ROOT / "packaging").glob("*/pyproject.toml")):
-        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
-        wheel = data.get("tool", {}).get("hatch", {}).get("build", {}).get("targets", {})
-        include = wheel.get("wheel", {}).get("force-include", {})
-        trees.update(str(target).split("/")[0] for target in include.values())
-    return frozenset(trees)
+    return frozenset(
+        target.split("/")[0]
+        for pyproject in sorted((_ROOT / "packaging").glob("*/pyproject.toml"))
+        for target in wheel_force_include(pyproject).values()
+    )
 
 
 #: Not install instructions, and excluded with a reason rather than silently.
@@ -150,7 +156,20 @@ def test_every_packaged_distribution_has_its_code_tree_scanned() -> None:
     """
     scanned = _shipped_files()
     trees = {"messagefoundry"} | _packaged_import_trees()
-    assert len(trees) >= 3, f"the packaging parse found only {sorted(trees)} -- it broke"
+    # DERIVED FROM DISCOVERY, not the constant 3 this pinned until BACKLOG #1836. A constant floor
+    # only catches the set NARROWING. Add a distribution whose tree this module never sees and 3 is
+    # still satisfied by the three that were already here, so the new tree is simply never demanded
+    # -- which is the #1193 blind spot arriving by a different door. Tying the floor to the projects
+    # actually discovered makes that case red instead.
+    projects = sorted((_ROOT / "packaging").glob("*/pyproject.toml"))
+    assert len(projects) >= 2, f"the packaging glob matched {projects} -- it broke"
+    assert len(trees) > len(projects), (
+        f"{len(projects)} distributions under packaging/ contributed only {sorted(trees)} import "
+        f"tree(s) beside the engine's own. Each is expected to force-include one tree from the repo "
+        f"root. A distribution that ships its package from INSIDE its own project directory "
+        f"contributes none and is a legitimate exception -- excuse it here by name, with the reason, "
+        f"when the first one lands. Until then this is a distribution that dropped out of the scan."
+    )
     empty = sorted(
         tree
         for tree in trees
