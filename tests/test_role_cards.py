@@ -161,18 +161,52 @@ def script_parameters(hook: Path) -> set[str]:
         assertion then failed saying the hook no longer declares its parameter, which is the
         instrument failing while blaming the subject.
     """
-    # An attribute may itself contain brackets -- `[OutputType([string])]` -- so the attribute
-    # arm allows one level of nesting. A flat `[^\]]+` stops at the inner `]` and the whole match
-    # fails, which is the third shape in the docstring.
-    attribute = r"\[(?:[^\[\]]|\[[^\[\]]*\])*\]"
-    block = re.search(
-        r"\[CmdletBinding\([^)]*\)\](?:\s*" + attribute + r")*\s*param\((.*?)^\)",
-        read(hook),
-        re.S | re.M,
-    )
-    if block is None:
+    # THE ATTRIBUTE RUN AND THE `param(` BODY ARE SCANNED BY BRACKET DEPTH, NOT MATCHED BY A
+    # REGEX. The regex that did this wrote the attribute arm as `\[(?:[^\[\]]|\[[^\[\]]*\])*\]`
+    # and then starred it again inside `(?:\s*...)*`, so a near-miss backtracked exponentially:
+    # CodeQL `py/redos`, high severity, on this file. A depth scan cannot backtrack. It also
+    # drops the old pattern's `^\)` requirement that the closing paren sit at column 0, which was
+    # a formatting rule the hook was never told about, and it handles an attribute nested to any
+    # depth -- `[OutputType([string])]` -- rather than the one level the regex allowed.
+    text = read(hook)
+    head = re.search(r"\[CmdletBinding\([^)]*\)\]", text)
+    if head is None:
         return set()
-    body = re.sub(r"#[^\n]*", "", block.group(1))
+
+    def past_balanced(src: str, i: int, opener: str, closer: str) -> int | None:
+        """Index just past the balanced run starting at `i`, or None if it never closes."""
+        depth = 0
+        while i < len(src):
+            if src[i] == opener:
+                depth += 1
+            elif src[i] == closer:
+                depth -= 1
+                if depth == 0:
+                    return i + 1
+            i += 1
+        return None
+
+    # Walk the optional attribute run between `[CmdletBinding()]` and `param`.
+    cursor = head.end()
+    while True:
+        nxt = cursor
+        while nxt < len(text) and text[nxt].isspace():
+            nxt += 1
+        if nxt >= len(text) or text[nxt] != "[":
+            cursor = nxt
+            break
+        end = past_balanced(text, nxt, "[", "]")
+        if end is None:
+            return set()
+        cursor = end
+
+    if not text.startswith("param(", cursor):
+        return set()
+    body_start = cursor + len("param(")
+    body_end = past_balanced(text, cursor + len("param"), "(", ")")
+    if body_end is None:
+        return set()
+    body = re.sub(r"#[^\n]*", "", text[body_start : body_end - 1])
     return set(re.findall(r"(?:\[[\w\[\]]+\]\s*)*\$(\w+)\s*(?:=|,|\)|$)", body, re.M))
 
 
