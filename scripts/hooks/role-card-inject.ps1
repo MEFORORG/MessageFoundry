@@ -85,6 +85,11 @@ try { $null = [Console]::In.ReadToEnd() } catch { }
 
 $MarkerRelPath = '.claude/seat.local.txt'
 $RoleCopyRelPath = '.claude/ROLE.local.md'
+if ($env:KORUS_AGENT -eq 'codex') {
+    if (-not $env:KORUS_STATE_REL) { throw 'Codex state path missing; use scripts/codex/invoke.ps1.' }
+    $MarkerRelPath = "$env:KORUS_STATE_REL/seat.local.txt"
+    $RoleCopyRelPath = "$env:KORUS_STATE_REL/ROLE.local.md"
+}
 
 function Write-Note {
     param([string] $Text)
