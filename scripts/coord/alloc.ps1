@@ -150,7 +150,7 @@ if ($List) {
 }
 
 # -ShowFloor allocates nothing, so there is no claim for a title to be recorded against.
-if (-not $Title -and -not $ShowFloor) { throw "-Title is required (it is recorded with the claim, so a sibling session can see what the number is for)." }
+if (-not $Title -and -not $ShowFloor) { throw "-Title is required (it is recorded with the allocation, so a sibling session can see what the number is for)." }
 
 # `git branch --show-current` prints NOTHING on a detached HEAD, so `& git ...` yields $null (not "")
 # -- calling .Trim() on it here threw *before* the detached-HEAD fallback below could run. Null-check first.
@@ -171,7 +171,7 @@ if ($For) {
     # separators today, so this is belt and braces -- but the recorded value is a field nothing pins,
     # and deriving it two different ways is how the two definitions start drifting.
     $target = (& git -C $For rev-parse --path-format=absolute --show-toplevel 2>$null)
-    if (-not $target) { throw "-For '$For' is not inside a git worktree, so a claim recorded to it could never be committed." }
+    if (-not $target) { throw "-For '$For' is not inside a git worktree, so an allocation recorded to it could never be committed." }
     $target = $target.Trim()
     # SAME CLONE, CHECKED. The registry lives under this clone's common dir, so a claim recorded to a
     # worktree of a DIFFERENT clone is stranded the instant it is written: that clone has its own
@@ -179,7 +179,7 @@ if ($For) {
     $targetCommon = (& git -C $target rev-parse --path-format=absolute --git-common-dir 2>$null)
     if (-not $targetCommon) { throw "-For '$For' has no resolvable git common dir." }
     if (($targetCommon.Trim() -replace '\\', '/').TrimEnd('/') -ine ($common -replace '\\', '/').TrimEnd('/')) {
-        throw "-For '$target' belongs to a DIFFERENT clone. Its allocations live in that clone's own registry, so a claim written here would never be found."
+        throw "-For '$target' belongs to a DIFFERENT clone. Its allocations live in that clone's own registry, so an allocation written here would never be found."
     }
     $ownerRepo = $target
     $ownerBranch = & git -C $target branch --show-current
@@ -475,7 +475,7 @@ if ($NoFetch) {
     Write-Host "WARNING: -NoFetch. The floor below came from refs this clone ALREADY HAD." -ForegroundColor Yellow
     Write-Host "         A number allocated in another clone, on a branch nobody here has fetched," -ForegroundColor Yellow
     Write-Host "         reads FREE -- and the ledger gate will then pass on BOTH sides, because each" -ForegroundColor Yellow
-    Write-Host "         registry genuinely holds its own claim. Nothing downstream reports it." -ForegroundColor Yellow
+    Write-Host "         registry genuinely holds its own allocation. Nothing downstream reports it." -ForegroundColor Yellow
     Write-Host "         Say in the PR why you skipped the fetch." -ForegroundColor Yellow
 }
 else {
@@ -638,7 +638,15 @@ for ($i = $start; $i -lt $start + 500; $i++) {
         Write-Host "  heading : ## $name. $Title"
         Write-Host "  file    : docs/BACKLOG.md"
     }
-    Write-Host "  claimed by: $ownerRepo [$ownerBranch]"
+    # SAY WHICH REGISTER THIS IS (BACKLOG #1768). This line used to label the owner with the CLAIM
+    # register's verb -- claim.ps1's word for something else entirely. An allocation reserves a NUMBER so two sessions
+    # cannot pick the same one, a claim reserves the WORK so two sessions cannot build the same row.
+    # A reader who saw "claimed" here reasonably concluded the row was claimed and did not run
+    # claim.ps1 -Take, which is a collision the allocator cannot prevent and does not report.
+    Write-Host "  allocated to: $ownerRepo [$ownerBranch]"
+    Write-Host "  NOTE: this reserves the NUMBER only, never the WORK. The work claim is the other"
+    Write-Host "        register and is taken against a BACKLOG ITEM, not against this number:"
+    Write-Host "        scripts\coord\claim.ps1 -Take <backlog item> -Note '<what>'"
 
     # -For is a deliberate redirection, so the surprise note below (which fires on the ACCIDENTAL kind)
     # would be noise. Say the useful thing instead: which tree has to do the committing.
@@ -658,7 +666,7 @@ for ($i = $start; $i -lt $start + 500; $i++) {
         $a = ($cwdTop.Trim() -replace '\\', '/').TrimEnd('/')
         $b = ($repo -replace '\\', '/').TrimEnd('/')
         if ($a -ine $b) {
-            Write-Host "  NOTE: your shell is in $a, but this allocator lives in $b, so the claim is recorded" -ForegroundColor Yellow
+            Write-Host "  NOTE: your shell is in $a, but this allocator lives in $b, so the allocation is recorded" -ForegroundColor Yellow
             Write-Host "        to $b. COMMIT FROM THERE -- the ledger gate keys entitlement on the worktree" -ForegroundColor Yellow
             Write-Host "        named above and will refuse the commit anywhere else." -ForegroundColor Yellow
         }
