@@ -69,6 +69,25 @@
 # silent hole. It is not in this change because the suppression list has to exist before the
 # inversion lands, and building it is a larger piece of work than the two measured spellings.
 #
+# A ROOT IS A PATH, NOT A STRING, AND AN OPTION IS A GRAMMAR, NOT A NAME. Two families of bypass
+# were measured on 2026-09-20 against the committed guard, and each one had the same cause: a test
+# that compared SPELLINGS where it should have compared the thing the spelling names.
+#
+#   Path spelling. `/.`, `//` and `/./` are not the literal string `/`, so three walks of the root
+#   were allowed. Patching those three would have left `/..`, `/.//`, `///`, `/tmp/../proc`,
+#   `/proc\registry` and `find /pro'c'` open, so the fix folds the operand instead -- Get-Operand
+#   and Get-NormalizedPath below carry the rules and the measurement each one rests on.
+#
+#   Option grammar. `--regexp=foo` and `-rm5` were both allowed, and for opposite reasons: the
+#   long form's `=` hid the option's NAME behind its value, and the short bundle's attached digit
+#   hid the `-r` inside it. Both are read structurally now, in the grep branch below.
+#
+# WHAT IS STILL OPEN ON THE OPTION AXIS, NAMED SO IT IS NOT MISTAKEN FOR COVERAGE. GNU getopt_long
+# accepts any unambiguous ABBREVIATION of a long option, so `grep --rec pattern /proc` is a
+# recursive walk this guard reads as a plain one. It is left open because the abbreviation set is
+# the whole option table rather than a list -- a real piece of work, on the same fail-open axis the
+# program list sits on, and not something to half-do here.
+#
 # WIRING IS NOT ASSERTED HERE ON PURPOSE. Whether this script is referenced by a PreToolUse matcher
 # is a property of settings.json, not of this file.
 # The after-the-fact half is scripts/coord/reap-orphans.ps1; the structural sibling this follows is
@@ -176,23 +195,113 @@ function Hide-QuotedSpans([string]$Text) {
     return $sb.ToString()
 }
 
-# A token as the shell would hand it to the program: surrounding quotes removed, nothing else. The
-# walk roots below are compared as whole strings, so `find "/"` and `find /` must produce the same
-# operand.
+# A token as the shell would hand it to the program: quote characters removed wherever they appear
+# in the word, nothing else. The walk roots below are compared as whole strings, so `find "/"` and
+# `find /` must produce the same operand.
+#
+# ***QUOTES ARE REMOVED THROUGHOUT THE WORD, NOT JUST FROM ITS ENDS.*** Stripping only a matched
+# outer pair shipped a fail-open that was measured: `find /''`, `find /""`, `find '/'""` and
+# `find /pro'c'` were all ALLOWED, because the concatenated spellings have no matched outer pair
+# and so reached the comparison with their quote characters still in them. The shell removes quotes
+# everywhere in a word, which is what this loop now does. An unterminated quote loses its delimiter
+# too; that word cannot reach program position anyway, because the blanked view's first token
+# carries a quote and the segment is skipped before this is called.
 function Get-Operand([string]$Token) {
-    $t = $Token
-    if ($t.Length -ge 2) {
-        $a = $t[0]; $b = $t[$t.Length - 1]
-        if (($a -ceq '"' -and $b -ceq '"') -or ($a -ceq "'" -and $b -ceq "'")) {
-            $t = $t.Substring(1, $t.Length - 2)
+    # Almost no token carries a quote, and this hook pays for its loops on every shell call.
+    if ($Token.IndexOf('"') -lt 0 -and $Token.IndexOf("'") -lt 0) { return $Token }
+    $sb = New-Object System.Text.StringBuilder
+    $quote = $null
+    foreach ($ch in $Token.ToCharArray()) {
+        if ($null -ne $quote) {
+            if ($ch -ceq $quote) { $quote = $null } else { [void]$sb.Append($ch) }
+            continue
         }
+        if ($ch -ceq '"' -or $ch -ceq "'") { $quote = $ch; continue }
+        [void]$sb.Append($ch)
     }
-    return $t
+    return $sb.ToString()
 }
 
-# The two roots this guard exists for, and ONLY these. `/proc/<anything>` counts: a walk of one
-# process's synthetic directory is the same pump, just started lower down.
-function Test-MsysWalkRoot([string]$Operand) {
+# Fold a path operand to the spelling the resolver would reach, as a PURE STRING decision: `\` read
+# as a separator, repeated separators collapsed, `.` segments dropped, `..` segments popped, and a
+# trailing separator gone. The filesystem is never touched and no symlink is resolved -- this runs
+# on the hot path of every shell call, and a stat here would be paid by every command that merely
+# contains the word "find".
+#
+# ***EVERY RULE HERE IS A MEASUREMENT, NOT AN ASSUMPTION ABOUT POSIX.*** Measured 2026-09-20 against
+# this machine's Git Bash, with `ls` (bounded, one level) rather than a walk:
+#
+#   /.  /./  /.//  ///    the MSYS root        -- dot segments and 3+ slashes collapse
+#   /..  /tmp/..  /c/..   the MSYS root        -- `..` is resolved LEXICALLY, not through the mount
+#                                                 table, so textual popping matches the resolver
+#                                                 exactly and costs no false deny
+#   /proc/../tmp          /tmp                 -- and so a `..` that leaves /proc must ALLOW again
+#   /proc\registry        the registry mount   -- listing it returned the six HKEY_* roots, so a
+#                                                 backslash really is a separator here
+#   //  //.               the NETWORK root     -- `ls //` listed `wsl$`. EXACTLY two leading slashes
+#                                                 are the UNC namespace, which is why they are NOT
+#                                                 collapsed and get their own verdict below
+#   //proc                nothing              -- a UNC host named "proc", not the /proc mount, so
+#                                                 it must stay ALLOWED
+#   /PROC  /Proc          nothing              -- the mount is case-SENSITIVE, so the comparisons
+#                                                 below stay case-sensitive; folding case would only
+#                                                 add false denies
+function Get-NormalizedPath([string]$Operand) {
+    if (-not $Operand) { return $Operand }
+    # ***A BACKSLASH IS A SEPARATOR ONLY IN A TOKEN ALREADY SPELLED AS A PATH.*** In bash a lone
+    # backslash is an ESCAPE, so reading every `\` as `/` denies things that were never walks, and
+    # three were measured doing exactly that before this line went in: `find . \` (a line
+    # continuation) and `find . \( -name a -o -name b \)` (find's own grouping) both left a bare `\`
+    # in path position that folded to the root, and `find \proc` folded to /proc when bash would
+    # have handed find the relative name `proc`. Requiring a `/` or a `:` already in the token keeps
+    # the measured bypass -- `/proc\registry`, whose listing returned the six HKEY_* roots -- and
+    # costs no coverage: a leading backslash does not reach the MSYS root at all, measured the same
+    # day, `ls -d '\proc'` and `ls -d '\proc\registry'` both failing with No such file or directory.
+    $p = if ($Operand.IndexOf('/') -ge 0 -or $Operand.IndexOf(':') -ge 0) {
+        $Operand.Replace('\', '/')
+    } else { $Operand }
+    $prefix = ''
+    if ($p -cmatch '^//(?!/)') { $prefix = '//' }
+    elseif ($p.StartsWith('/')) { $prefix = '/' }
+    $parts = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($seg in $p.Split([char]47)) {
+        if ($seg -ceq '' -or $seg -ceq '.') { continue }
+        if ($seg -ceq '..') {
+            if ($parts.Count -gt 0 -and $parts[$parts.Count - 1] -cne '..') {
+                $parts.RemoveAt($parts.Count - 1)
+                continue
+            }
+            # At a root, `..` is the root. In a RELATIVE path it cannot be resolved without the
+            # tree, so it is kept -- and a path that keeps a leading `..` can never equal a root.
+            if ($prefix) { continue }
+            $parts.Add('..')
+            continue
+        }
+        $parts.Add($seg)
+    }
+    $joined = $parts -join '/'
+    if ($prefix) { return $prefix + $joined }
+    if (-not $joined) { return '.' }
+    return $joined
+}
+
+# The roots this guard exists for, and ONLY these. Returns 'msys' for the MSYS root or its synthetic
+# /proc (`/proc/<anything>` counts: a walk of one process's synthetic directory is the same pump,
+# just started lower down), 'net' for the MSYS network root, or $null for anything bounded.
+function Get-WalkRootKind([string]$Operand) {
+    $p = Get-NormalizedPath $Operand
+    if ($p -ceq '//') { return 'net' }
+    if (($p -ceq '/') -or ($p -ceq '/proc') -or $p.StartsWith('/proc/')) { return 'msys' }
+    return $null
+}
+
+# ***THE PRUNE SIDE READS THE LITERAL OPERAND AND MUST NOT NORMALIZE.*** find's `-path` is a GLOB
+# matched against the path string find itself generates, and find generates `/proc` -- never
+# `/./proc` and never `/proc\`. Normalizing here would turn a pattern that matches NOTHING into an
+# exemption, and an exemption is the direction that fails open (the deny side can only over-deny,
+# which is visible; the suppression side goes silent). So `find / -path /./proc -prune -o -name x`
+# stays a DENY even though `/./proc` and `/proc` name the same directory.
+function Test-ProcPrunePattern([string]$Operand) {
     return ($Operand -ceq '/') -or ($Operand -ceq '/proc') -or $Operand.StartsWith('/proc/')
 }
 
@@ -245,19 +354,32 @@ try {
     # which shifts everything after it and turns a deny into a miss. Measured by inspection of the
     # two grammars: with --color listed, 'grep -r --color pattern /proc' read /proc as the pattern
     # and allowed.
+    # grep's two lists are LONG-form only: the short options live in the per-character cluster read
+    # below, where `efmABCDd` is the same set spelled as characters. Keeping the short spellings
+    # here as well would be a second statement of one fact, kept in step by nothing.
     $XARGS_VALUE_OPTS = '^(-I|-n|-L|-P|-s|-d|-E|-a|--max-args|--max-lines|--max-procs|--delimiter|--arg-file)$'
-    $GREP_VALUE_OPTS = '^(-e|-f|-m|-A|-B|-C|-D|-d|--regexp|--file|--max-count|--after-context|--before-context|--context|--devices|--directories|--include|--exclude|--exclude-dir|--binary-files|--label)$'
-    $GREP_PATTERN_OPTS = '^(-e|-f|--regexp|--file)$'
+    $GREP_VALUE_OPTS = '^(--regexp|--file|--max-count|--after-context|--before-context|--context|--devices|--directories|--include|--exclude|--exclude-dir|--binary-files|--label)$'
+    $GREP_PATTERN_OPTS = '^(--regexp|--file)$'
 
     # THE MEASUREMENT LIVES ONCE. It was written out in both deny branches, so a re-measurement
     # would have updated one arm and left the other asserting a superseded number -- the shape
-    # CLAUDE.md section 11 forbids (state a load-bearing fact once).
+    # CLAUDE.md section 11 forbids (state a load-bearing fact once). The uninterruptibility half is
+    # split out for the same reason: it is true of BOTH roots below, so it must not be re-spelled
+    # inside each one's cause.
+    $UNSTOPPABLE = "It cannot be interrupted reliably either, because killing a bash wrapper " +
+                   "leaves its grandchildren running. "
     $WHY = "/proc/registry, /proc/registry32 and /proc/registry64 are the Windows registry " +
            "mounted as filesystem trees, so reading them opens a kernel handle per registry key " +
            "and HKEY_CLASSES_ROOT alone is effectively unbounded: measured 2026-09-20, a walk of " +
-           "one mount passed 30,000 machine-wide handles in 15 seconds and was still climbing, " +
-           "and it cannot be interrupted reliably because killing a bash wrapper leaves its " +
-           "grandchildren running. "
+           "one mount passed 30,000 machine-wide handles in 15 seconds and was still climbing. " +
+           $UNSTOPPABLE
+    # THE NETWORK ROOT IS A DIFFERENT MECHANISM AND MUST NOT BORROW THE REGISTRY ONE. Exactly two
+    # leading slashes are the UNC namespace in Git Bash, not the MSYS root, so a deny here that
+    # named the registry mounts would rest on a premise that is false for the command in front of
+    # the reader (CLAUDE.md section 11, SDS-3.7).
+    $WHY_NET = "In Git Bash exactly two leading slashes are the UNC namespace rather than the " +
+               "MSYS root: measured 2026-09-20, 'ls //' listed the network root, so the walk " +
+               "enumerates network and WSL shares with no bound. " + $UNSTOPPABLE
 
     foreach ($b in $bounds) {
         if ($b[1] -le 0) { continue }
@@ -321,7 +443,7 @@ try {
             $pruned = $false
             for ($n = 0; $n -lt $exprTokens.Count - 1; $n++) {
                 if (($exprTokens[$n] -ieq '-path' -or $exprTokens[$n] -ieq '-wholename') -and
-                    (Test-MsysWalkRoot (Get-Operand $exprTokens[$n + 1])) -and
+                    (Test-ProcPrunePattern (Get-Operand $exprTokens[$n + 1])) -and
                     ($exprTokens -ccontains '-prune')) {
                     $pruned = $true
                     break
@@ -333,6 +455,12 @@ try {
             # find's own leading global options, which sit BEFORE the path operands. `-D` always
             # takes a SEPARATE word (there is no attached form for it), so it consumes two; `-O`
             # is always attached to its level.
+            #
+            # THE TWO OPTION SHAPES THAT BROKE THE grep BRANCH DO NOT ARISE HERE, checked rather
+            # than assumed: find has no short-option CLUSTER (`-HL` is not `-H -L`) and no long
+            # option carrying a value with `=` that could sit in front of a path. So the whole of
+            # find's option grammar is these three lines, and the path loop below starts where
+            # they stop.
             while ($k -lt $tokens.Count) {
                 $t = Get-Operand $tokens[$k]
                 if ($t -cmatch '^-[HLP]$') { $k++; continue }
@@ -345,7 +473,13 @@ try {
             while ($k -lt $tokens.Count) {
                 $t = Get-Operand $tokens[$k]
                 if ($t.StartsWith('-') -or $t -ceq '(' -or $t -ceq '!' -or $t -ceq ',') { break }
-                if (Test-MsysWalkRoot $t) {
+                $kind = Get-WalkRootKind $t
+                if ($kind -ceq 'net') {
+                    Deny ("BLOCKED: 'find $t' walks the MSYS network root. " + $WHY_NET +
+                          "Do one of these instead: use the Glob tool; or name the share you " +
+                          "mean and bound the depth, as in 'find //server/share -maxdepth 3'.")
+                }
+                if ($kind -ceq 'msys') {
                     Deny ("BLOCKED: 'find $t' walks the MSYS root. " + $WHY +
                           "Do one of these instead: use the Glob tool; or name a real root and " +
                           "bound the depth, as in 'find ./src -maxdepth 4 -name *.py'; or put " +
@@ -369,35 +503,88 @@ try {
             while ($k -lt $tokens.Count) {
                 $t = Get-Operand $tokens[$k]
                 if (-not $endOfOptions -and $t -ceq '--') { $endOfOptions = $true; $k++; continue }
-                if (-not $endOfOptions -and $t.StartsWith('-') -and $t.Length -gt 1) {
-                    # -r, -R, and any single-dash CLUSTER containing either. No other GNU grep
-                    # short option spells r, so a cluster carrying one is a recursive walk.
-                    if ($t -cmatch '^-[A-Za-z]*[rR][A-Za-z]*$') { $recursive = $true }
-                    if ($t -imatch '^--(recursive|dereference-recursive)$') { $recursive = $true }
-                    if ($t -imatch '^--directories=recurse$') { $recursive = $true }
-                    if ($t -cmatch $GREP_PATTERN_OPTS) { $patternTaken = $true }
+
+                # ------------------------------------------------ a LONG option
+                # ***THE VALUE MAY BE ATTACHED WITH `=` OR BE THE NEXT WORD, AND THE TWO DECIDE
+                # DIFFERENT THINGS.*** Matching the whole token against a name list shipped a
+                # fail-open that was measured: `grep -r --regexp=foo /proc` was ALLOWED, because
+                # `--regexp=foo` matched neither list, so the pattern was never marked taken and
+                # `/proc` was read as the pattern instead of as a target. Split at the first `=`
+                # first: the NAME decides what the option is, and whether a value was attached
+                # decides whether the next word belongs to it.
+                if (-not $endOfOptions -and $t.StartsWith('--')) {
+                    $eq = $t.IndexOf('=')
+                    $name = if ($eq -ge 0) { $t.Substring(0, $eq) } else { $t }
+                    $attached = if ($eq -ge 0) { $t.Substring($eq + 1) } else { $null }
+                    if ($name -imatch '^--(recursive|dereference-recursive)$') { $recursive = $true }
+                    if ($name -ieq '--directories' -and $null -ne $attached -and
+                        $attached -ieq 'recurse') { $recursive = $true }
+                    if ($name -cmatch $GREP_PATTERN_OPTS) { $patternTaken = $true }
                     $k++
-                    if ($t -cmatch $GREP_VALUE_OPTS) {
-                        if ($k -lt $tokens.Count) {
-                            # `-d recurse` is `-r` spelled long-hand, and GNU grep accepts the
-                            # long option with its value as a SEPARATE word too. Testing only the
-                            # short spelling let `grep --directories recurse pattern /proc`
-                            # through: the value was consumed here without being read, so the
-                            # scan saw an option-only grep and never set $recursive.
-                            if (($t -ceq '-d' -or $t -ieq '--directories') -and
-                                (Get-Operand $tokens[$k]) -ieq 'recurse') { $recursive = $true }
-                            $k++
-                        }
+                    if ($null -eq $attached -and $name -cmatch $GREP_VALUE_OPTS -and
+                        $k -lt $tokens.Count) {
+                        # `-d recurse` is `-r` spelled long-hand, and GNU grep accepts the long
+                        # option with its value as a SEPARATE word too. Testing only the short
+                        # spelling let `grep --directories recurse pattern /proc` through: the
+                        # value was consumed here without being read, so the scan saw an
+                        # option-only grep and never set $recursive.
+                        if ($name -ieq '--directories' -and
+                            (Get-Operand $tokens[$k]) -ieq 'recurse') { $recursive = $true }
+                        $k++
                     }
                     continue
                 }
+
+                # ------------------------------------------------ a SHORT-option cluster
+                # ***READ THE CLUSTER CHARACTER BY CHARACTER.*** Testing the whole token against
+                # `^-[A-Za-z]*[rR][A-Za-z]*$` shipped a fail-open that was measured: `grep -rm5 foo
+                # /proc` was ALLOWED, because the digit in the attached value of `-m` broke the
+                # all-letters shape and the `-r` inside the bundle went unseen. `-rA2`, `-rC3` and
+                # `-r5` failed the same way. A per-character read also gets the OTHER direction
+                # right, which the old shape got only by luck: in `grep -er foo /proc` the `r` is
+                # the ARGUMENT of `-e`, so that command really is non-recursive and must stay
+                # ALLOWED -- the walk it looks like is a walk it never does.
+                if (-not $endOfOptions -and $t.StartsWith('-') -and $t.Length -gt 1) {
+                    $chars = $t.Substring(1)
+                    $valueShort = $null
+                    for ($c = 0; $c -lt $chars.Length; $c++) {
+                        $ch = [string]$chars[$c]
+                        if ($ch -cmatch '^[rR]$') { $recursive = $true; continue }
+                        # Anything not taking a value -- including a `-NUM` context shortcut --
+                        # carries no argument and cannot shift the reading, so it is skipped.
+                        if ($ch -cnotmatch '^[efmABCDd]$') { continue }
+                        if ($ch -cmatch '^[ef]$') { $patternTaken = $true }
+                        $rest = $chars.Substring($c + 1)
+                        if ($rest) {
+                            if ($ch -ceq 'd' -and $rest -ieq 'recurse') { $recursive = $true }
+                        } else {
+                            $valueShort = $ch
+                        }
+                        # The remainder of the cluster is this option's value, never more flags.
+                        break
+                    }
+                    $k++
+                    if ($null -ne $valueShort -and $k -lt $tokens.Count) {
+                        if ($valueShort -ceq 'd' -and
+                            (Get-Operand $tokens[$k]) -ieq 'recurse') { $recursive = $true }
+                        $k++
+                    }
+                    continue
+                }
+
                 if (-not $patternTaken) { $patternTaken = $true; $k++; continue }
                 $targets.Add($t)
                 $k++
             }
             if ($recursive) {
                 foreach ($t in $targets) {
-                    if (Test-MsysWalkRoot $t) {
+                    $kind = Get-WalkRootKind $t
+                    if ($kind -ceq 'net') {
+                        Deny ("BLOCKED: 'grep -r $t' walks the MSYS network root. " + $WHY_NET +
+                              "Do one of these instead: use the Grep tool; or name the share you " +
+                              "mean, as in 'grep -rn pattern //server/share'.")
+                    }
+                    if ($kind -ceq 'msys') {
                         Deny ("BLOCKED: 'grep -r $t' walks the MSYS root. " + $WHY +
                               "Do one of these instead: use the Grep tool; or name a real " +
                               "directory, as in 'grep -rn pattern ./src'.")

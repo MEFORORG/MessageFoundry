@@ -352,6 +352,213 @@ def test_a_prune_that_names_only_one_registry_mount_still_allows_and_why() -> No
     assert_allowed(run_guard(bash("find / -path /proc/registry -prune -o -print")))
 
 
+# ============================================ DENY: a root spelled a way the string test missed
+
+# THE FIVE THE BRIEF NAMED ARE THE FIRST FIVE ROWS, AND THEY ARE THE SMALLEST PART OF THIS BLOCK.
+# Each was driven against the committed guard and came back ALLOW. Pinning only those five would
+# close five holes and leave the FAMILY open, so the rest of the list is the family: every spelling
+# that resolves to the MSYS root or to /proc without being the literal string the guard compared.
+#
+# WHAT EACH SPELLING ACTUALLY RESOLVES TO WAS MEASURED, NOT ASSUMED (2026-09-20, `ls` at one level
+# rather than a walk). The guard's Get-NormalizedPath header carries the readings; they are not
+# copied here (CLAUDE.md section 11). Two are worth naming because they look contrived and are not:
+# `/tmp/..` really is the MSYS root, because MSYS resolves `..` lexically rather than through the
+# mount table; and `/proc\registry` really is the registry mount, because listing it returned the
+# six HKEY_* roots.
+NORMALIZED_ROOT_DENY = [
+    # The five measured bypasses, exactly as they were driven.
+    pytest.param("find /. -name x", id="measured-dot-root"),
+    pytest.param("find // -name x", id="measured-double-slash"),
+    pytest.param("find /./ -name x", id="measured-dot-slash-root"),
+    pytest.param("grep -r --regexp=foo /proc", id="measured-long-regexp-equals"),
+    pytest.param("grep -rm5 foo /proc", id="measured-bundled-r-with-attached-value"),
+    # Dot segments, anywhere in the path.
+    pytest.param("find /./proc -name x", id="dot-before-proc"),
+    pytest.param("find /proc/. -name x", id="trailing-dot-segment"),
+    pytest.param("find /proc/./registry -name x", id="dot-inside-proc"),
+    pytest.param("find /.// -name x", id="dot-then-repeated-separator"),
+    # Repeated separators. THREE or more collapse to the MSYS root; exactly two do not, and that
+    # case is the network root, asserted separately below.
+    pytest.param("find /// -name x", id="triple-slash"),
+    pytest.param("find ///// -name x", id="five-slashes"),
+    pytest.param("find /proc// -name x", id="repeated-separator-inside-proc"),
+    # Parent segments. At a root, `..` is the root.
+    pytest.param("find /.. -name x", id="parent-of-the-root"),
+    pytest.param("find /tmp/.. -name x", id="parent-of-a-mount"),
+    pytest.param("find /proc/registry/.. -name x", id="parent-back-up-into-proc"),
+    pytest.param("find /tmp/../proc -name x", id="parent-then-down-into-proc"),
+    # A backslash, in a token already spelled as a path.
+    pytest.param(r"find /proc\registry -name x", id="backslash-separator-into-the-registry"),
+    pytest.param(r"grep -r foo /proc\registry", id="backslash-separator-under-a-recursive-grep"),
+    # Quote concatenation. The shell removes quotes throughout a word, so none of these reach the
+    # program with a quote in them -- but the guard used to strip only a matched OUTER pair.
+    pytest.param("find /'' -name x", id="root-with-an-empty-single-quoted-tail"),
+    pytest.param('find /"" -name x', id="root-with-an-empty-double-quoted-tail"),
+    pytest.param("find '/'\"\" -name x", id="root-spelled-in-two-quoted-pieces"),
+    pytest.param("find /pro'c' -name x", id="proc-spelled-in-two-quoted-pieces"),
+    pytest.param("grep -r foo /''", id="quoted-concatenation-under-a-recursive-grep"),
+    # The same folding under the grep branch and through the wrappers the guard already handles.
+    pytest.param("grep -r foo /.", id="recursive-grep-on-the-dot-root"),
+    pytest.param("grep -r foo /./proc", id="recursive-grep-on-a-dotted-proc"),
+    pytest.param("ls | xargs find /. -name x", id="folded-root-behind-xargs"),
+    pytest.param("cd sub && find /./proc", id="folded-proc-behind-a-cd"),
+    pytest.param("echo starting\nfind /..", id="folded-root-after-a-newline"),
+]
+
+
+@pytest.mark.parametrize("command", NORMALIZED_ROOT_DENY)
+def test_a_root_spelled_another_way_is_still_denied(command: str) -> None:
+    assert_denied(run_guard(bash(command)))
+
+
+# ============================================ DENY: an option grammar the name test missed
+
+# TWO SHAPES, AND THEY FAIL IN OPPOSITE DIRECTIONS. A long option carrying its value with `=` hides
+# the option's NAME behind that value, so the name never matches a list and the pattern is never
+# marked taken -- which makes the guard read the TARGET as the pattern and find no target at all. A
+# short bundle hides `-r` among other letters, and an attached numeric value breaks any test that
+# expects the bundle to be all letters. Every row here was ALLOWED by the committed guard.
+OPTION_GRAMMAR_DENY = [
+    # Long form, value attached with `=`.
+    pytest.param("grep -r --regexp=foo /proc", id="regexp-equals-after-r"),
+    pytest.param("grep --regexp=foo -r /proc", id="regexp-equals-before-r"),
+    pytest.param("grep -R --regexp=foo /proc", id="regexp-equals-with-capital-R"),
+    pytest.param("grep -r --file=pats.txt /proc", id="file-equals"),
+    pytest.param("grep --recursive --regexp=foo /", id="regexp-equals-with-the-long-recursive"),
+    # Short bundle, value attached.
+    pytest.param("grep -rm5 foo /proc", id="bundled-max-count"),
+    pytest.param("grep -rA2 foo /proc", id="bundled-after-context"),
+    pytest.param("grep -rB2 foo /proc", id="bundled-before-context"),
+    pytest.param("grep -rC3 foo /proc", id="bundled-context"),
+    pytest.param("grep -r5 foo /proc", id="bundled-numeric-context-shortcut"),
+    pytest.param("grep -drecurse foo /proc", id="directories-action-attached-to-its-letter"),
+    # Short bundle, value as the next word: the value must be stepped over, not read as a target.
+    pytest.param("grep -rm 5 foo /proc", id="bundled-max-count-with-a-separate-value"),
+    pytest.param("grep -rd recurse foo /proc", id="bundled-directories-with-a-separate-value"),
+    pytest.param("grep -rf pats.txt /proc", id="bundled-pattern-file"),
+]
+
+
+@pytest.mark.parametrize("command", OPTION_GRAMMAR_DENY)
+def test_a_recursive_grep_hidden_in_the_option_grammar_is_denied(command: str) -> None:
+    assert_denied(run_guard(bash(command)))
+
+
+# ============================================ DENY: the network root, with its OWN reason
+
+
+# EXACTLY TWO LEADING SLASHES ARE NOT THE MSYS ROOT, and folding them into it would have been the
+# easy way to make `find //` deny. Measured 2026-09-20: `ls //` listed the network root, and
+# `ls -d //proc` failed outright, so `//proc` is a UNC host named "proc" and not the /proc mount.
+# The walk is still unbounded and still uninterruptible, so it is still a deny -- but under a cause
+# that is true of it. A deny message asserting the registry mounts for this command would be a
+# control resting on a false premise (CLAUDE.md section 11, SDS-3.7), which is why the last
+# assertion here is a NEGATIVE one.
+@pytest.mark.parametrize(
+    "command",
+    ["find // -name x", "find //. -name x", "grep -r foo //"],
+    ids=["find", "dot", "grep"],
+)
+def test_the_network_root_denies_under_its_own_cause(command: str) -> None:
+    reason = assert_denied(run_guard(bash(command)))
+    assert "network root" in reason
+    assert "two leading slashes" in reason
+    assert "registry" not in reason, (
+        "the network root is the UNC namespace, not the registry mounts: this message would "
+        f"hand the reader a cause that is false for the command they ran -- {reason!r}"
+    )
+    assert reason.isascii(), f"non-ASCII in the network deny message: {reason!r}"
+
+
+# ============================================ the two claims that did NOT reproduce
+
+
+# THESE TWO WERE REPORTED AS BYPASSES AND WERE ALREADY DENIED. They are pinned rather than dropped,
+# because the fix above rewrote both code paths they run through -- the prune exemption now reads a
+# LITERAL operand while the walk root is folded, and a later tidy-up that unified the two would
+# silently turn the first of these into an exemption.
+def test_a_prune_on_a_path_that_matches_nothing_was_already_denied() -> None:
+    assert_denied(run_guard(bash("find / -path /nonexistent -prune -o -name x -print")))
+
+
+def test_a_trailing_separator_on_proc_was_already_denied() -> None:
+    assert_denied(run_guard(bash("find /proc/ -name x")))
+
+
+# ============================================ the prune side must NOT be folded
+
+# ***`-path` IS A GLOB MATCHED AGAINST THE PATH find ITSELF GENERATES, AND find GENERATES `/proc`.***
+# So `-path /./proc` and `-path /..` match nothing, the walk proceeds, and the command must stay a
+# DENY. Folding the operand here -- the obvious symmetry with the walk-root side -- would turn a
+# pattern that matches nothing into an exemption, and an exemption is the direction that goes
+# silent. This is the control for that symmetry.
+PRUNE_NOT_FOLDED_DENY = [
+    pytest.param("find / -path /./proc -prune -o -name x -print", id="dotted-prune-pattern"),
+    pytest.param(r"find / -path /proc\registry -prune -o -name x", id="backslash-prune-pattern"),
+    pytest.param("find / -path /.. -prune -o -name x -print", id="parent-prune-pattern"),
+    pytest.param("find / -wholename //proc -prune -o -name x", id="double-slash-prune-pattern"),
+]
+
+
+@pytest.mark.parametrize("command", PRUNE_NOT_FOLDED_DENY)
+def test_a_prune_pattern_that_matches_nothing_is_not_an_exemption(command: str) -> None:
+    assert_denied(run_guard(bash(command)))
+
+
+# ============================================ ALLOW: what the folding must NOT catch
+
+# OVER-DENYING IS THE WORSE FAILURE HERE, because a guard that refuses real work gets switched off
+# and then protects nothing. THREE ROWS IN THIS LIST WERE MEASURED DENYING mid-change, by a first
+# cut that read every `\` as a separator: `find . \` (a line continuation), `find . \( ... \)`
+# (find's own grouping, which splits at the paren and leaves a bare `\` in path position) and
+# `find \proc`. They are kept as rows rather than as a note, because the cheapest way to pass the
+# backslash deny row above is exactly the rule that broke these.
+#
+# The rest are the resolver's own answers, measured the same day: `//proc` and `/PROC` do not exist,
+# and `/proc/../tmp` is `/tmp`.
+FOLDING_ALLOW = [
+    pytest.param("find . \\", id="a-line-continuation-leaves-a-bare-backslash"),
+    pytest.param("find . \\( -name a -o -name b \\) -print", id="finds-own-grouping-parens"),
+    pytest.param(r"find \proc -name x", id="a-leading-backslash-reaches-no-root"),
+    pytest.param(r"find \\proc\registry -name x", id="an-all-backslash-path-reaches-no-root"),
+    pytest.param("find //proc -name x", id="a-unc-host-that-is-not-the-proc-mount"),
+    pytest.param(r"find //server\share -maxdepth 2", id="a-real-unc-share"),
+    pytest.param("find /PROC -name x", id="the-proc-mount-is-case-sensitive"),
+    pytest.param("find /proc/../tmp -name x", id="a-parent-that-leaves-proc-for-a-real-root"),
+    pytest.param("find /c/work/../repo -maxdepth 2", id="a-parent-inside-a-real-tree"),
+    pytest.param("find ./x/../y -name z", id="a-parent-in-a-relative-path"),
+    # A drive letter, not a home directory: the leak gate blocks a tracked `C:\Users\<name>` even
+    # as a placeholder, and the guard only cares that the token carries a `:` and is not a root.
+    pytest.param(r"cat C:\work\notes.txt", id="a-windows-drive-path"),
+    # `-er` is `-e` taking `r` as its PATTERN, so this grep is not recursive and cannot walk. The
+    # old whole-token regex called it recursive and denied it for the wrong reason; reading the
+    # bundle character by character is what gets both directions right.
+    pytest.param("grep -er foo /proc", id="an-r-that-is-the-argument-of-e"),
+    pytest.param("grep -m5 foo /proc/version", id="a-bundled-value-with-no-recursion"),
+    pytest.param("grep --regexp=foo /proc/version", id="long-regexp-equals-with-no-recursion"),
+    pytest.param("grep -A2 foo /proc/cpuinfo", id="context-option-with-no-recursion"),
+]
+
+
+@pytest.mark.parametrize("command", FOLDING_ALLOW)
+def test_the_folding_does_not_reach_a_bounded_command(command: str) -> None:
+    assert_allowed(run_guard(bash(command)))
+
+
+# ============================================ the corpora must not quietly shrink
+
+
+# A PARAMETRIZED LIST FAILS LOUDLY WHEN A ROW STOPS HOLDING AND SILENTLY WHEN A ROW IS DELETED.
+# Deleting one is the cheapest way to make a weakened guard green again, and nothing else in this
+# module would report it. So the counts are pinned: add a row and this number moves in the same
+# edit, which is a reviewable line in the diff rather than an absence.
+def test_the_bypass_corpora_are_the_size_they_were_measured_at() -> None:
+    assert len(NORMALIZED_ROOT_DENY) == 28
+    assert len(OPTION_GRAMMAR_DENY) == 14
+    assert len(PRUNE_NOT_FOLDED_DENY) == 4
+    assert len(FOLDING_ALLOW) == 15
+
+
 # ================================================================== the guard must stay fail-open
 
 
