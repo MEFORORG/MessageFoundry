@@ -146,6 +146,15 @@ transport = "mllp"
   without quotes. An `env()` reference is also accepted, but give it a `cast` for a non-string setting:
   an environment value arrives as text and an **uncast** ref hands the connector that text. An inline
   `default =` is held to the setting's type here, because a default is **not** converted by `cast`.
+  A setting whose type is a **table** or an **array** — `headers`, `odbc_params`,
+  `capture_response_headers`, `proxy_no_proxy` — is held to its shape, so `headers = 5` is refused;
+  where the entries have a readable type it is held to those too, one level in, so
+  `headers = { X-Key = 5 }` is refused naming the entry key, and a bad array item is named by index.
+  Write an array as `["a", "b"]`; a bare string is not an array, even where one string is all you
+  want. The entry check is **not** a guarantee that every value in a table was examined — an `env()`
+  reference written inside one is left to the connector's own rules. No refusal ever repeats the
+  value — a `[settings]` value can be a credential, and the message reaches the operator log and the
+  support bundle.
   The remaining connectors (`X12`/`FHIR`/`DICOM`/`DICOMweb`/`Email`/`Direct`/
   `Loopback`/`PassThrough`) are **code-first only** today — declare them in a `.py` module. A name
   declared in **both** a `.py` module and `connections.toml` is a hard error (no silent shadowing).
