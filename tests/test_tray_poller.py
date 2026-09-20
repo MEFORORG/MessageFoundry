@@ -345,6 +345,56 @@ def test_a_first_tick_failure_does_not_spend_the_startup_no_toast_exemption() ->
     assert first_real.toast is None  # still the *first* real reading: never toast on startup
 
 
+def test_run_itself_does_not_fold_the_failed_tick_into_tracking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Drive `_run`, because the arms above cannot see where the fallback is actually used.
+
+    They call `_unknown_result()` directly, and that method cannot fold by construction -- so
+    they all stay green if `_run` goes back to calling `advance` itself. This is the one arm that
+    fails on that, and it is the regression this repair exists to prevent.
+    """
+    monkeypatch.setattr(state_mod, "POLL_BASE_S", 0.001)  # 3 bounded ticks, not a spin
+    clock = iter([0.0, 10.0, 40.0])
+    scm: Iterator[ScmReading | None] = iter(
+        [ScmReading(ScmState.RUNNING), None, ScmReading(ScmState.RUNNING)]
+    )
+
+    def reader(_name: str) -> ScmReading:
+        reading = next(scm)
+        if reading is None:
+            raise OSError("QueryServiceStatusEx blew up")
+        return reading
+
+    published: list[PollResult] = []
+
+    def on_update(result: PollResult) -> None:
+        published.append(result)
+        if len(published) == 3:
+            poller._stop.set()  # end the loop from outside the guarded region
+
+    client = httpx.Client(base_url=_ENGINE_URL)
+    poller = StatusPoller(
+        TrayConfig(engine_url=_ENGINE_URL, service_name="MessageFoundry"),
+        on_update=on_update,
+        scm_reader=reader,
+        health_probe=lambda _c: HealthProbe.DOWN,  # SCM RUNNING with /health dark all the way
+        ui_probe=lambda _c: UiProbe.UNKNOWN,
+        clock=lambda: next(clock),
+    )
+    poller._client = client
+    try:
+        poller._run()
+    finally:
+        client.close()
+
+    assert [r.snapshot.state for r in published] == [
+        TrayState.STARTING,  # t=0, inside the boot grace
+        TrayState.UNKNOWN,  # t=10, the tick that raised
+        TrayState.WEDGED,  # t=40, measured from t=0 because the failed tick held the anchor
+    ]
+
+
 # --- a tick that outlives stop() must neither log nor publish ----------------
 
 
@@ -371,8 +421,10 @@ def test_a_tick_raising_after_stop_is_recorded_as_shutdown_not_as_a_fault(
     httpx then raises a bare RuntimeError, which `probe_health`/`probe_ui` do not catch (they
     catch only httpx.HTTPError). Claiming a fault for that would put an ERROR traceback in
     tray.log on every clean exit, and publishing it would repaint a torn-down shell after
-    `run()` has returned. It is still recorded, at DEBUG: the branch is reached by *any*
-    exception raised inside the join window, so a real defect there must not vanish.
+    `run()` has returned. It is still recorded, at INFO: the branch is reached by *any*
+    exception raised inside the join window, so a real defect there must not vanish. INFO and
+    not DEBUG because `_setup_logging` pins the root logger to INFO and the tray offers no way
+    to lower it -- a DEBUG record here would be a control that never fires.
     """
     caplog.set_level(logging.DEBUG, logger=_POLLER_LOGGER)
     published: list[PollResult] = []
@@ -390,8 +442,10 @@ def test_a_tick_raising_after_stop_is_recorded_as_shutdown_not_as_a_fault(
     records = [r for r in caplog.records if r.name == _POLLER_LOGGER]
     assert published == []  # nothing repainted after run() returned
     assert [r for r in records if r.levelno >= logging.ERROR] == []  # no fault claimed
-    assert [r.levelno for r in records] == [logging.DEBUG]  # but not swallowed silently either
-    assert records[0].exc_info is not None  # with the traceback, for whoever turns DEBUG on
+    # Exactly one record, at a level tray.log actually writes, naming the exception. Asserting
+    # the level pins the fix for the unreachable-DEBUG defect: a record below INFO is invisible.
+    assert [r.levelno for r in records] == [logging.INFO]
+    assert "RuntimeError" in records[0].getMessage()  # the repr, so the cause survives
 
 
 def test_a_successful_tick_that_outlives_stop_does_not_publish() -> None:

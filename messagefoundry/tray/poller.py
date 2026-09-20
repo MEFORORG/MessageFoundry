@@ -177,21 +177,28 @@ class StatusPoller:
             now = self._clock()
             try:
                 result = self.poll_once(now)
-            except Exception:  # supervisory boundary -- see the module docstring
+            except Exception as exc:  # supervisory boundary -- see the module docstring
                 if self._stop.is_set():
                     # `stop()` sets the event, joins for _STOP_JOIN_TIMEOUT_S, then closes the
                     # probe client; two probes at DEFAULT_TIMEOUT_S can outlast that join, and
                     # httpx then raises a bare RuntimeError through `probe_health`/`probe_ui`,
                     # which catch only httpx.HTTPError. That is the shutdown, not a fault, so it
                     # does not warrant an ERROR traceback on every clean exit. It is still
-                    # recorded: this branch is reached by *any* exception raised inside the join
-                    # window, so a genuine defect landing there must not vanish silently.
-                    log.debug("tray status poll raised while stopping", exc_info=True)
+                    # recorded at INFO -- the level `_setup_logging` pins the root logger to, and
+                    # the tray offers no way to lower it -- because this branch is reached by
+                    # *any* exception raised inside the join window, so a genuine defect landing
+                    # there must not vanish. One line and a repr, not a traceback: enough to say
+                    # what happened without reading as a failure on a clean exit.
+                    log.info("tray status poll raised while stopping: %r", exc)
                 else:
                     log.exception("tray status poll raised; publishing UNKNOWN for this tick")
                 result = self._unknown_result()
             if self._stop.is_set():
-                return  # a tick that outlived `stop()` must not repaint an already torn-down shell
+                # Best-effort, not a guarantee: `stop()` can still land between this check and
+                # the call below. It is worth having anyway, because it closes the wide case (a
+                # tick already in flight when stop() was called), and the residual race is benign
+                # -- `winshell._post` no-ops on a torn-down window handle.
+                return
             try:
                 self._on_update(result)
             except Exception:  # a UI callback must never kill the poll loop (supervisory boundary)
@@ -233,6 +240,13 @@ class StatusPoller:
         reduces an unqueryable SCM with both probes dark to
         :data:`~messagefoundry.tray.state.TrayState.UNKNOWN`, so the reducer needs no failure case
         of its own.
+
+        The accepted cost: holding the anchors means a failed tick is a blind window, and a
+        service that restarts entirely inside one leaves ``running_since`` pointing at the
+        *previous* run, so the first tick after it can read WEDGED while the engine is really
+        just booting. That is the better trade in both directions -- it self-corrects on the next
+        tick once ``/health`` answers, whereas clearing the anchors defeats stuck detection for
+        as long as the failures continue.
         """
         return PollResult(
             snapshot=self._build_snapshot(_UNKNOWN_STATE, _UNKNOWN_INPUTS),
