@@ -241,6 +241,36 @@ function Test-IsOurStatusLine {
     return ((($Command -split "`r?`n", 2)[0]).Trim()) -ceq "# $script:UsageStatusLineMarker"
 }
 
+function Test-IsPortableWiredCommand {
+    <#
+    .SYNOPSIS
+        Is this wired command in the shell-portable shape -- the one bash can actually run?
+    .DESCRIPTION
+        A statusLine is executed by bash on a box where Git Bash exists, and the schema carries no
+        `shell` field to override that. The commands this installer wrote before that was understood are
+        PowerShell -- an assignment, a `Test-Path` guard, an if/else -- and bash refuses them with a
+        syntax error, so the collector never ran. This predicate separates "wired and runnable" from
+        "wired and inert", which is a distinction no path comparison can make: the old and new commands
+        can name the same collector and the same publish path and still differ on whether either is
+        ever reached.
+
+        DELIBERATELY A SHAPE TEST, NOT A PARSE. Shelling out to `bash -n` from a predicate that runs
+        inside an installer, an audit and a reader would make all three depend on a bash being present
+        to answer a question about a string. The command this script emits is a single `pwsh` exec on
+        the line after the marker, so that is what is recognised. Anything else -- legacy or
+        hand-edited -- reads as not-portable, which is the safe direction: it prompts a re-install that
+        rewrites the line, rather than blessing a command nobody has checked.
+
+        The REAL parse check lives in tests/test_coord_usage.py, which runs the emitted command through
+        bash -n. That is where it belongs: once, against the emitter, rather than on every status bar.
+    #>
+    param([string]$Command)
+    if ([string]::IsNullOrWhiteSpace($Command)) { return $false }
+    $lines = $Command -split "`r?`n"
+    if ($lines.Count -lt 2) { return $false }
+    return ($lines[1].Trim()) -like 'pwsh -NoProfile -File *'
+}
+
 function Get-WiredStateDir {
     <#
     .SYNOPSIS
@@ -259,6 +289,16 @@ function Get-WiredStateDir {
     #>
     param([string]$Command)
     if ([string]::IsNullOrWhiteSpace($Command)) { return $null }
+    # TWO SHAPES ARE ON DISK, SO TWO SHAPES ARE READ. The current command is a single portable exec
+    # (`-StateDir '<path>'`); commands written before that fix carry a PowerShell `$d = '<path>'`
+    # assignment. Reading only the new one would report a genuinely-wired legacy root as WIRED_LEGACY --
+    # "no -StateDir" -- which is the opposite of true and would send an operator to re-run an installer
+    # over a root whose publish path was never in doubt. These parsers describe what a file SAYS, and
+    # both sentences are still being said.
+    $m = [regex]::Match($Command, "-StateDir '([^']*)'")
+    if ($m.Success) { return $m.Groups[1].Value }
+    # Legacy only. `''` was a PowerShell-escaped apostrophe in that shape, so it is unescaped here;
+    # the current shape refuses an apostrophe at emit time rather than encode one ambiguously.
     $m = [regex]::Match($Command, "\`$d = '((?:[^']|'')*)'")
     if (-not $m.Success) { return $null }
     return ($m.Groups[1].Value -replace "''", "'")
@@ -271,6 +311,10 @@ function Get-WiredCollectorPath {
     #>
     param([string]$Command)
     if ([string]::IsNullOrWhiteSpace($Command)) { return $null }
+    # Both shapes, for the reason given on Get-WiredStateDir. The current command names the collector
+    # as `-File '<path>'`; the legacy one assigned it to `$s` first.
+    $m = [regex]::Match($Command, "-File '([^']*)'")
+    if ($m.Success) { return $m.Groups[1].Value }
     $m = [regex]::Match($Command, "\`$s = '((?:[^']|'')*)'")
     if (-not $m.Success) { return $null }
     return ($m.Groups[1].Value -replace "''", "'")

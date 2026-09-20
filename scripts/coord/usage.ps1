@@ -183,7 +183,12 @@ function Get-StatusLineDiagnosis([string]$Root, [string]$ReadingFrom) {
     if ($o.wired_collector -and -not (Test-Path -LiteralPath $o.wired_collector)) {
         $o.state = "WIRED_COLLECTOR_MISSING"
         $o.line = "WIRED (ours) but the collector it names is absent: $($o.wired_collector)"
-        $o.remedy = @("The status bar shows 'mefor-usage: collector missing' and nothing publishes.",
+        # NOT "the status bar shows 'mefor-usage: collector missing'" ANY MORE. That marker came from a
+        # PowerShell Test-Path guard in the wired command, and the command is run by bash, which never
+        # reached the guard. The wired command is now a single exec, so a missing collector surfaces as
+        # an empty status bar and a pwsh error -- telling an operator to look for a string nothing emits
+        # sends them hunting for a symptom that cannot appear.
+        $o.remedy = @("The status bar is empty and nothing publishes; pwsh reports the missing file.",
             "Advance the primary checkout, or re-install to point at a collector that exists.")
         return $o
     }
@@ -193,6 +198,18 @@ function Get-StatusLineDiagnosis([string]$Root, [string]$ReadingFrom) {
         # the original defect relocated rather than fixed.
         $o.state = "WIRED_ELSEWHERE"
         $o.line = "WIRED (ours) but it publishes to $($o.wired_state_dir), and this session reads $ReadingFrom. WAITING WILL NOT FIX THIS."
+        $o.remedy = $reinstall
+        return $o
+    }
+    # LAST, SO IT ONLY EVER INTERCEPTS THE "EVERYTHING AGREES" VERDICT -- the one that must not be
+    # wrong. Every arm above describes a command that disagrees with this root; this one describes a
+    # command that agrees with it perfectly and still cannot execute, because it is PowerShell sitting
+    # in a slot bash runs. That combination is what made this reader say WIRED_HERE on four roots for
+    # weeks while nothing had ever published, and it is precisely the "confidently wrong" this file's
+    # header names: it converts "I should check" into "I already know".
+    if (-not (Test-IsPortableWiredCommand $cmd)) {
+        $o.state = "WIRED_UNRUNNABLE"
+        $o.line = "WIRED (ours) and pointed at the right place, but the command is PowerShell and a statusLine runs through bash -- bash exits 2 on it, so it has never run."
         $o.remedy = $reinstall
         return $o
     }
@@ -433,7 +450,7 @@ $states = @($five.state, $seven.state)
 # states, or the prose and the exit code describe different situations -- the two-instruments-
 # disagreeing defect this whole change exists to remove, reproduced inside one script.
 $dxUntrusted = @("WIRED_ELSEWHERE", "WIRED_LEGACY", "WIRED_COLLECTOR_MISSING", "FOREIGN_STATUSLINE",
-    "NOT_WIRED_NO_SETTINGS", "NOT_WIRED_NO_STATUSLINE")
+    "NOT_WIRED_NO_SETTINGS", "NOT_WIRED_NO_STATUSLINE", "WIRED_UNRUNNABLE")
 
 $overall = if ($states -contains "CRITICAL") { "CRITICAL" }
 elseif ($states -contains "WARN") { "WARN" }

@@ -484,7 +484,9 @@ def test_the_installed_command_actually_runs_the_collector(tmp_path: Path) -> No
     state = tmp_path / "mefor-usage"
     # The publish path is baked into the command, so assert it points where this root reads — a
     # recomputed expectation would agree with a wrong wiring.
-    assert f"$d = '{state}'" in cmd, f"the wired command names no per-root publish path: {cmd!r}"
+    assert f"-StateDir '{state}'" in cmd, (
+        f"the wired command names no per-root publish path: {cmd!r}"
+    )
 
     payload = json.dumps({"session_id": "wired", "rate_limits": {"five_hour": window(55.0, 3600)}})
     proc = subprocess.run(
@@ -498,6 +500,212 @@ def test_the_installed_command_actually_runs_the_collector(tmp_path: Path) -> No
     assert proc.returncode == 0, proc.stderr
     assert "55" in proc.stdout, f"the wired command produced no reading: {proc.stdout!r}"
     assert (state / "latest.json").exists(), "the wired command ran but published nothing"
+
+
+# ------------------------------------------------------- the shell that actually runs the statusLine
+#
+# THE DEFECT THESE TESTS EXIST FOR. Claude Code runs a statusLine through **bash** on a box where Git
+# Bash is present -- the binary resolves ``bash``, and unlike a hook the statusLine schema carries no
+# ``shell`` or ``args`` field to say otherwise. The installer emitted **PowerShell**: a ``$s = '...'``
+# assignment, a ``Test-Path`` guard, an if/else. bash cannot parse any of it, so the collector had
+# never run on a single root.
+#
+# NOTHING CAUGHT IT, AND THAT IS THE POINT. The installer wrote the key; ``-Status`` read the key back;
+# ``usage.ps1`` reported WIRED_HERE; every test asserted the marker was present. Six instruments agreed
+# on a string that could not execute, because every one of them asked "does this command say the right
+# thing" and none asked "can the shell that runs it read it at all".
+#
+# So these tests PARSE the emitted command with the real shells. A test that matches a marker, a path,
+# or any substring would have passed against the broken string -- the old ones did -- and must not be
+# what stands here.
+
+BASH = shutil.which("bash")
+
+# The exact shape the installer emitted before this was understood, kept as a CONTROL. A parse check
+# that never fails is indistinguishable from one that is not running: if this string starts parsing
+# clean under bash, the instrument has stopped discriminating and the test below is worthless.
+LEGACY_POWERSHELL_COMMAND = (
+    "# mefor-usage\n"
+    "$s = 'C:\\x\\usage-collect.ps1'; $d = 'C:\\y\\mefor-usage'; "
+    "if (Test-Path -LiteralPath $s) { & pwsh -NoProfile -File $s -StateDir $d } "
+    "else { Write-Output 'mefor-usage: collector missing' }"
+)
+
+
+def install_at(settings: Path) -> None:
+    """Wire one settings file and let a non-zero exit fail loudly (``check=True``).
+
+    ``-SettingsPath`` puts the config root at the file's own directory, so the wired publish path is
+    ``<dir>/mefor-usage`` and nothing can reach the real user-level state.
+    """
+    subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(INSTALL),
+            "-SettingsPath",
+            str(settings),
+            "-CollectorPath",
+            str(COLLECT),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=True,
+    )
+
+
+def bash_parses(command: str) -> subprocess.CompletedProcess[str]:
+    """Parse-only (``-n``): does bash accept this string as a program? It is never executed."""
+    assert BASH is not None
+    return subprocess.run(
+        [BASH, "-n", "-c", command],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+    )
+
+
+def pwsh_parses(command: str) -> subprocess.CompletedProcess[str]:
+    """Parse-only, via the PowerShell AST parser. Nothing is executed.
+
+    THE SUBJECT TRAVELS IN THE ENVIRONMENT, not in the command line. Passing it as an argument means
+    quoting a string full of quotes through two parsers to ask a question about parsing -- the first
+    version did, died on its own ``-args``, and then FAILED ITS CONTROL AND ITS SUBJECT ALIKE. Both
+    arms were red for the same irrelevant reason, which is how a broken instrument imitates a real
+    finding. An env var is read verbatim and is parsed by nothing on the way in.
+    """
+    script = (
+        "$e = $null; "
+        "$null = [System.Management.Automation.Language.Parser]::ParseInput("
+        "$env:MEFOR_PARSE_SUBJECT, [ref]$null, [ref]$e); "
+        "if ($e.Count) { $e | ForEach-Object { $_.Message }; exit 1 }; exit 0"
+    )
+    return subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
+        env={**os.environ, "MEFOR_PARSE_SUBJECT": command},
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+    )
+
+
+@pytest.mark.skipif(BASH is None, reason="no bash on PATH to parse the statusLine with")
+def test_the_wired_command_parses_under_the_bash_that_actually_runs_it(tmp_path: Path) -> None:
+    """THE REGRESSION GUARD. Emit the production string and hand it to bash as a program.
+
+    Paired with its own control, because a parse check that cannot fail proves nothing: the historical
+    PowerShell command must be REFUSED by the same instrument in the same run. If both arms pass, the
+    check has gone blind and this test fails on the control, not on the product.
+    """
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}", encoding="utf-8")
+    install_at(settings)
+    cmd = wired(settings)
+
+    control = bash_parses(LEGACY_POWERSHELL_COMMAND)
+    assert control.returncode != 0, (
+        "THE CONTROL DID NOT FIRE. bash accepted the PowerShell command this test exists to reject, "
+        "so a clean result below would say nothing about the emitted string."
+    )
+
+    got = bash_parses(cmd)
+    assert got.returncode == 0, (
+        f"the wired statusLine is not a program bash can parse, so it will never run.\n"
+        f"  command: {cmd!r}\n  bash said: {got.stderr.strip()}"
+    )
+
+
+@pytest.mark.skipif(BASH is None, reason="no bash on PATH to run the statusLine with")
+def test_the_wired_command_runs_under_bash_and_publishes(tmp_path: Path) -> None:
+    """Parsing is necessary, not sufficient. Drive the verbatim string through bash the way Claude Code
+    does -- JSON on stdin -- and require a reading on stdout and a file on disk."""
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}", encoding="utf-8")
+    install_at(settings)
+    cmd = wired(settings)
+
+    payload = json.dumps({"session_id": "bash", "rate_limits": {"five_hour": window(55.0, 3600)}})
+    assert BASH is not None
+    proc = subprocess.run(
+        [BASH, "-c", cmd],
+        input=payload,
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "55" in proc.stdout, f"the wired command produced no reading under bash: {proc.stdout!r}"
+    assert (tmp_path / "mefor-usage" / "latest.json").exists(), (
+        "the wired command ran under bash but published nothing"
+    )
+
+
+def test_the_wired_command_also_parses_under_powershell(tmp_path: Path) -> None:
+    """BOTH SHELLS, DELIBERATELY. bash runs the statusLine only because Git Bash is installed; remove it
+    and the slot goes back to PowerShell. A command correct in exactly one shell trades this defect for
+    its mirror image, so the emitted string is required to parse in both.
+
+    Its own control: bash's apostrophe escaping (``'a'\\''b'``) is a PowerShell parse error, so the
+    instrument is shown to discriminate before its verdict is read.
+    """
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}", encoding="utf-8")
+    install_at(settings)
+    cmd = wired(settings)
+
+    control = pwsh_parses("pwsh -File 'a'\\''b'")
+    assert control.returncode != 0, (
+        "THE CONTROL DID NOT FIRE. The PowerShell parser accepted a bash-only escape, so a clean "
+        "result below would say nothing."
+    )
+
+    got = pwsh_parses(cmd)
+    assert got.returncode == 0, (
+        f"the wired statusLine no longer parses under PowerShell: {cmd!r}\n{got.stdout}"
+    )
+
+
+def test_an_apostrophe_in_a_path_is_refused_rather_than_quoted_ambiguously(tmp_path: Path) -> None:
+    """NO ESCAPE MEANS THE SAME THING TO BOTH SHELLS, so the installer refuses instead of guessing.
+
+    Measured: ``'a''b'`` is ``a'b`` to PowerShell and ``ab`` to bash; bash's own ``'a'\\''b'`` is a
+    PowerShell parse error. Picking either would silently wire a path that differs from the one the
+    operator named -- the same class of defect as emitting the wrong shell's syntax.
+    """
+    collector = tmp_path / "o'brien" / "usage-collect.ps1"
+    collector.parent.mkdir(parents=True)
+    collector.write_text("param($StateDir)\n", encoding="utf-8")
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}", encoding="utf-8")
+
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(INSTALL),
+            "-SettingsPath",
+            str(settings),
+            "-CollectorPath",
+            str(collector),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+    )
+    assert proc.returncode != 0, "an unquotable path was accepted"
+    assert "apostrophe" in (proc.stdout + proc.stderr).lower()
+    assert "statusLine" not in json.loads(settings.read_text(encoding="utf-8")), (
+        "the refusal still wrote a statusLine"
+    )
 
 
 # ------------------------------------------------------------- config roots and the publish partition
@@ -743,8 +951,8 @@ def test_each_root_is_wired_to_its_own_publish_path_and_they_do_not_bleed(
     b = wired(fake_home / ".claude-account-2" / "settings.json")
     pa = str(fake_home / ".claude-account-1" / "mefor-usage")
     pb = str(fake_home / ".claude-account-2" / "mefor-usage")
-    assert f"$d = '{pa}'" in a
-    assert f"$d = '{pb}'" in b
+    assert f"-StateDir '{pa}'" in a
+    assert f"-StateDir '{pb}'" in b
     assert pb not in a and pa not in b, "one root's wired command names another root's publish path"
 
 
@@ -953,6 +1161,86 @@ def test_status_reports_a_legacy_command_as_its_own_state(fake_home: Path) -> No
     )
     proc = install("-Status", pin=pin, home=fake_home, collector=None)
     assert "legacy command, no -StateDir" in proc.stdout
+
+
+# ------------------------------------------------------ the emitter and its readers, locked together
+#
+# THE SECOND HALF OF THE bash DEFECT. Changing the emitted shape is a one-line edit; the parsers that
+# READ that shape back live in another file (config-roots.ps1) and are used by three callers --
+# ``-Status``, ``-Uninstall`` and ``usage.ps1``. Change the emitter alone and every one of them starts
+# describing a correctly-wired root as legacy or unrecognised, while the root is in fact perfect.
+#
+# Every -Status/-Uninstall test above builds its command as a LITERAL, so all of them would keep
+# passing through exactly that break. These are the round trips: install for real, then read back with
+# the shipped readers.
+
+
+def test_status_recognises_the_command_the_installer_just_wrote(fake_home: Path) -> None:
+    """EMITTER AND PARSER, IN ONE RUN. Nothing here is a literal, so a shape change that misses
+    ``Get-WiredStateDir``/``Get-WiredCollectorPath`` lands on this test instead of on an operator whose
+    correctly-wired root is reported as legacy.
+    """
+    pin = fake_home / ".claude-account-1"
+    assert install("-ConfigDir", str(pin), pin=None, home=fake_home).returncode == 0
+
+    proc = install("-Status", pin=pin, home=fake_home, collector=None)
+    assert proc.returncode == 0, proc.stdout
+    assert str(pin / "mefor-usage") in proc.stdout, (
+        f"-Status did not read this root's publish path back out of the command it just wrote:"
+        f"\n{proc.stdout}"
+    )
+    assert str(COLLECT) in proc.stdout, "-Status did not read the collector back"
+    for wrong in ("legacy command", "command shape not recognised", "ELSEWHERE"):
+        assert wrong not in proc.stdout, (
+            f"-Status called its own freshly-written command {wrong!r}:\n{proc.stdout}"
+        )
+
+
+def test_uninstall_removes_the_command_the_installer_just_wrote(fake_home: Path) -> None:
+    """The mirror round trip. An ownership test that stopped matching the emitted shape would leave the
+    statusLine on disk while printing NOT PRESENT and exiting 0 -- an operator believing they turned
+    the collector off while it kept running."""
+    pin = fake_home / ".claude-account-1"
+    assert install("-ConfigDir", str(pin), pin=None, home=fake_home).returncode == 0
+    assert "statusLine" in json.loads((pin / "settings.json").read_text(encoding="utf-8"))
+
+    proc = install("-ConfigDir", str(pin), "-Uninstall", pin=None, home=fake_home, collector=None)
+    assert proc.returncode == 0, proc.stdout
+    assert "removed: 1" in proc.stdout, (
+        f"-Uninstall did not recognise its own command:\n{proc.stdout}"
+    )
+    assert "statusLine" not in json.loads((pin / "settings.json").read_text(encoding="utf-8")), (
+        "-Uninstall reported success and left the statusLine behind"
+    )
+
+
+def test_the_reader_refuses_to_call_an_unrunnable_command_healthy(fake_home: Path) -> None:
+    """usage.ps1's WIRED_HERE means "wired, and pointed where I am reading". On the four roots this
+    defect was found on, that was TRUE and the collector had still never run, because the command was
+    PowerShell in a slot bash executes. A verdict that cannot see the difference is the "confidently
+    wrong" this whole file exists to prevent.
+    """
+    pin = fake_home / ".claude-account-1"
+    state = pin / "mefor-usage"
+    (pin / "settings.json").write_text(
+        json.dumps(
+            {
+                "statusLine": {
+                    "type": "command",
+                    "command": (
+                        f"# mefor-usage\n$s = '{COLLECT}'; $d = '{state}'; "
+                        "if (Test-Path -LiteralPath $s) "
+                        "{ & pwsh -NoProfile -File $s -StateDir $d } else { x }"
+                    ),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    _, parsed, _ = reader("-StateDir", str(state), "-Json", pin=pin)
+    assert parsed["statusline_state"] == "WIRED_UNRUNNABLE", (
+        "the reader called a command bash cannot parse healthy"
+    )
 
 
 def test_uninstall_names_the_roots_it_actually_removed_from(fake_home: Path) -> None:

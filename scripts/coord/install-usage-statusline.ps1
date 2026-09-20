@@ -44,8 +44,15 @@
     WHY THE WIRED COMMAND POINTS AT AN ABSOLUTE PATH rather than resolving the repo per invocation: the
     statusLine runs on every assistant message behind a 300ms debounce, and a `git rev-parse` per fire
     is latency on the render path for a value that never changes. The trade is that moving or deleting
-    the checkout breaks it -- so the wired command TESTS FOR THE SCRIPT and degrades to a quiet marker
-    instead of erroring into the status bar on every message.
+    the checkout breaks it, and it now breaks LOUDLY: the wired command is a single `pwsh` exec, so a
+    missing collector is a non-zero exit and a line on stderr.
+
+    IT USED TO CARRY A `Test-Path` GUARD that degraded to a quiet `mefor-usage: collector missing`
+    marker instead. That guard was written in PowerShell, the statusLine slot is run by bash, and bash
+    exits 2 on the whole command -- so the soft landing never landed anything, on any root, ever. A
+    guard that only works in a shell that never runs it is not a compensating control; it is a sentence
+    that reads like one. The portable single-exec form (see New-WiredCommand) has no branch to write it
+    in, and `-Status` plus usage.ps1 both already report a collector path that does not resolve.
 
     refreshInterval is set because statusLine updates are EVENT-DRIVEN -- a new assistant message,
     /compact, a permission-mode change -- and go silent when a session is idle. Anthropic's own docs
@@ -193,15 +200,56 @@ function Get-Ownership($Settings) {
 }
 
 function New-WiredCommand([string]$Collector, [string]$StateDir) {
-    # The guard is inline so a missing script degrades to a marker rather than erroring into the status
-    # bar on every single message -- a statusLine that shouts an exception is worse than one that says
-    # nothing. $d is a VARIABLE at the call site, not an interpolation, which is what makes a state dir
-    # containing spaces safe.
+    <#
+    .SYNOPSIS
+        The statusLine command, written in the ONLY syntax both shells read the same way.
+    .DESCRIPTION
+        CLAUDE CODE RUNS A statusLine THROUGH bash ON THIS BOX, NOT THROUGH PowerShell. The binary
+        resolves `bash` when Git Bash is present, and unlike a hook the statusLine schema carries no
+        `shell` or `args` field to say otherwise. This function used to emit PowerShell -- a `$s = '...'`
+        assignment, a `Test-Path` guard and an if/else -- which bash cannot parse at all. Measured, one
+        variable, paired:
+
+            as wired:  rc=2, `bash: -c: line 2: syntax error near unexpected token '{'`
+            corrected: rc=0, publishes latest.json
+
+        So the collector had never run on ANY root, and nothing reported it: the installer wrote the key,
+        `-Status` read the key back, and every check downstream confirmed a string that could not execute.
+        A gate that only ever asks "is the marker there" cannot see this, which is why the test added
+        beside this change PARSES the emitted command with bash rather than matching it.
+
+        THREE PROPERTIES, AND EACH IS LOAD-BEARING:
+
+        1. The `# mefor-usage` marker line stays. It is how Test-IsOurStatusLine recognises our own
+           statusLine, and bash ignores a comment, so it costs nothing to keep.
+        2. Single quotes are FULLY LITERAL in both shells, so one quoting rule covers both.
+        3. It is a single exec with no shell-specific syntax -- no assignment, no `if`, no `&` call
+           operator. That is what makes it survive if Git Bash is ever removed and the slot goes back to
+           PowerShell. It is verified under BOTH parsers, not just the one that runs today.
+
+        THE Test-Path GUARD IS GONE, DELIBERATELY. A missing collector now yields a non-zero rc and a
+        stderr line from pwsh instead of a quiet `collector missing` marker. That is a real trade and it
+        goes the right way: the guard's whole value was a soft landing, and it bought that by being
+        written in a syntax the shell could not read -- so it never landed anything. A loud failure that
+        works beats a soft one that does not, and `-Status` and `usage.ps1` both already report a
+        collector path that does not resolve.
+    #>
+    # NO PORTABLE ESCAPE EXISTS FOR AN EMBEDDED APOSTROPHE, so refuse rather than emit a string that
+    # means two different things. Measured: `'a''b'` is `a'b` to PowerShell (doubling escapes) and `ab`
+    # to bash (the doubling just closes and reopens the string, dropping the character). bash's own
+    # form, `'a'\''b'`, is a parse error to PowerShell. There is no spelling that satisfies both, and
+    # quietly picking one would wire a path that silently differs from the one the operator named --
+    # the exact class of defect this function was just fixed for.
+    foreach ($p in @($Collector, $StateDir)) {
+        if ($p -like "*'*") {
+            Stop-Cannot ("a path containing an apostrophe cannot be wired: $p`n" +
+                "  The statusLine runs through bash here, and no single-quote escaping means the same " +
+                "thing to bash and to PowerShell, so this script will not guess. Move the checkout or " +
+                "the config root to a path without an apostrophe.")
+        }
+    }
     return "# $MARKER`n" +
-    "`$s = '$($Collector -replace "'", "''")'; " +
-    "`$d = '$($StateDir  -replace "'", "''")'; " +
-    "if (Test-Path -LiteralPath `$s) { & pwsh -NoProfile -File `$s -StateDir `$d } " +
-    "else { Write-Output '${MARKER}: collector missing' }"
+    "pwsh -NoProfile -File '$Collector' -StateDir '$StateDir'"
 }
 
 # --- resolve the target set, ONCE ------------------------------------------------------------------
@@ -469,6 +517,14 @@ foreach ($t in $targets) {
             # produced a block reading "published somewhere else / was: <path> / now: <the same path>"
             # -- the publish path had not moved at all, the COLLECTOR had. A line that contradicts the
             # two lines under it is the same defect this whole change exists to remove.
+            #
+            # THE SHAPE IS REPORTED AS AN EXTRA LINE, NOT AS THE REASON, and that ordering is the whole
+            # lesson of this block. Making it the first branch DID pass the shape fact along, and broke
+            # the rule written above: `$why` has to explain the `was:`/`now:` lines under it, so a
+            # legacy command that ALSO published elsewhere rendered as "was written in PowerShell /
+            # was: <path A> / now: <path B>" -- a reason that explains neither path. Both facts are
+            # true and only one of them answers "why do these two lines differ", so the other gets its
+            # own line rather than displacing it.
             $why = if (-not $wasState) {
                 "carried no -StateDir, so the collector chose its own default at run time"
             }
@@ -483,6 +539,10 @@ foreach ($t in $targets) {
             }
             Write-Host "  REWIRED    $($t.Settings)"
             Write-Host "             replaced a $MARKER statusLine that $why"
+            if (-not (Test-IsPortableWiredCommand $existing)) {
+                Write-Host "             it was also PowerShell, and a statusLine runs through bash -- bash exits 2 on it,"
+                Write-Host "             so that command had never run. This rewrite is what makes this root publish at all."
+            }
             Write-Host "             was: $(if ($wasState) { $wasState } else { '(no -StateDir -- the collector chose its own default)' })"
             Write-Host "             now: $stateDir"
             if ($wasColl -and $wasColl -ne $CollectorPath) {
