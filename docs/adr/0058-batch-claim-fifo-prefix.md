@@ -1,6 +1,6 @@
 # ADR 0058 — Batch-claim the contiguous due head-prefix on the INGRESS/ROUTED FIFO claim path
 
-**Status:** Proposed · **Date:** 2026-06-30
+**Status:** Accepted -- **built** (opt-in; `ADR 0058` is cited from `pipeline/engine.py` and `config/settings.py`) · **Date:** 2026-06-30
 **Relates-to:** ADR 0001 (staged pipeline), ADR 0055 (SQLite group committer / poison-guard AC-2),
 ADR 0057 (B1 inline fast-path + G6 ingress-attempts ceiling), issue #285 (no-READPAST per-lane FIFO).
 

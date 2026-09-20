@@ -34,9 +34,10 @@ import logging
 import os
 import re
 import secrets
+import threading
 import time
 from collections.abc import Awaitable, Callable, Iterator
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Protocol
 
@@ -61,6 +62,55 @@ _SECONDS_PER_DAY = 86_400
 # audited; it is not used to locate anything on disk.
 _FILENAME_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _MAX_FILENAME = 255
+
+# The temp-file name one atomic write mints, and the ONLY temp shape the orphan sweep will unlink
+# (BACKLOG #1678). Minting and matching sit together deliberately: the sweep DELETES what this
+# matches, so a pattern drifting wider than the writer's own spelling would start removing an
+# operator's stray files. Shape: a leading dot, the 32-hex file_id, the target's suffix, this write's
+# own random tag, ``.tmp``.
+_TMP_TOKEN_BYTES = 4
+_ORPHAN_TMP_RE = re.compile(
+    rf"^\.[0-9a-f]{{32}}(?:{re.escape(_BLOB_SUFFIX)}|{re.escape(_META_SUFFIX)})"
+    rf"\.[0-9a-f]{{{_TMP_TOKEN_BYTES * 2}}}\.tmp\Z"
+)
+
+# How stale a leftover must look before the orphan sweep will remove it. This is a floor for a
+# leftover from a process that DIED mid-write, NOT the mechanism that protects a live write — that is
+# ``_inflight_names``, which is an exact identity test. An hour matches the default prune cadence and
+# sits far outside any single write, which is bounded by ``max_bytes``.
+_ORPHAN_MIN_AGE_SECONDS = 3600.0
+
+# Every filename a write in THIS process is currently holding: an atomic write's temp from the moment
+# it is created until its ``os.replace`` lands, and a save's blob from its own write until its sidecar
+# lands. The orphan sweep skips these outright, so it never has to reason about timing for a race it
+# can see. Writes run in ``asyncio.to_thread`` worker threads and a sweep runs in another, so the
+# guard is a ``threading.Lock``, not an ``asyncio`` one.
+#
+# The key is the bare NAME, not a path: every file here is a direct child of one uploads root, names
+# carry 32 hex bits of file_id (plus 8 more for a temp), and keying on the name sidesteps every
+# resolved-vs-unresolved and Windows-case normalization question. Two stores over different roots
+# cannot realistically collide, and if they did the effect is to SKIP a delete, which is the safe
+# direction.
+_inflight_lock = threading.Lock()
+_inflight_names: set[str] = set()
+
+
+@contextlib.contextmanager
+def _inflight(name: str) -> Iterator[None]:
+    """Hold ``name`` in the in-flight set for the duration of the block (see ``_inflight_names``)."""
+    with _inflight_lock:
+        _inflight_names.add(name)
+    try:
+        yield
+    finally:
+        with _inflight_lock:
+            _inflight_names.discard(name)
+
+
+def _is_inflight(name: str) -> bool:
+    """Is a write in this process currently holding ``name``?"""
+    with _inflight_lock:
+        return name in _inflight_names
 
 
 class UploadError(Exception):
@@ -312,6 +362,20 @@ class ResealResult:
 
     resealed: int = 0
     skipped: int = 0
+
+
+@dataclass(frozen=True)
+class PruneResult:
+    """What one :meth:`UploadStore.prune_expired` pass did.
+
+    ``pruned`` is the aged (blob, meta) pairs it deleted, carried whole because the caller writes one
+    ``upload.prune`` audit row per file from that metadata. ``orphans_removed`` counts the write
+    leftovers the same pass swept (BACKLOG #1678); those have no metadata by definition — a leftover
+    is precisely a file whose sidecar never landed — so they are a count here and a WARNING in the
+    log, not audit rows."""
+
+    pruned: list[UploadedFileMeta] = field(default_factory=list)
+    orphans_removed: int = 0
 
 
 class UploadQuotaLedger(Protocol):
@@ -583,8 +647,21 @@ class UploadStore:
             blob_ct = self._encrypt_blob(data, file_id)
             meta_ct = self._encrypt_meta(meta)
             # Atomic-ish write: tmp + os.replace so a reader never sees a half-written ciphertext.
-            _atomic_write_text(root, blob_path, blob_ct)
-            _atomic_write_text(root, meta_path, meta_ct)
+            #
+            # The two writes are ordered body-then-sidecar because the sidecar is the listing key, so
+            # the pair is invisible until it is whole. The cost is a window where the body exists
+            # alone, and a failure inside it used to leave that body behind permanently: no sweep
+            # walks anything but `_iter_sidecars`, which yields `.meta` names only (BACKLOG #1678).
+            # Remove it here rather than leave it for the orphan sweep, which cannot run for an hour.
+            # `BaseException` so a cancellation cleans up too; the original failure is re-raised.
+            with _inflight(blob_path.name):
+                _atomic_write_text(root, blob_path, blob_ct)
+                try:
+                    _atomic_write_text(root, meta_path, meta_ct)
+                except BaseException:
+                    with contextlib.suppress(OSError):
+                        blob_path.unlink(missing_ok=True)
+                    raise
             return meta
 
         # One critical section per process: quota check + write. See _quota_lock in __init__.
@@ -866,18 +943,25 @@ class UploadStore:
 
     async def prune_expired(
         self, *, now: float | None = None, retention_days: int | None = None
-    ) -> list[UploadedFileMeta]:
+    ) -> PruneResult:
         """Age-based retention sweep (ASVS 5.2.4): delete every (blob, meta) pair whose ``uploaded_at`` is
-        older than ``retention_days`` (default: the configured ``retention_days``) and return the pruned
-        metadata rows (for the ``upload.prune`` audit — ``file_id`` + ``uploader`` only, never content).
+        older than ``retention_days`` (default: the configured ``retention_days``), then sweep the write
+        leftovers no other pass can reach. Returns a :class:`PruneResult` — the pruned metadata rows (for
+        the ``upload.prune`` audit: ``file_id`` + ``uploader`` only, never content) plus the orphan count.
 
-        Idempotent: a re-run finds the already-deleted pairs gone and returns ``[]``. Undecryptable/foreign
-        sidecars are skipped (never pruned — a rotated-away key must not silently destroy data). Runs off
-        the event loop; the periodic runner + the opportunistic save-time sweep both drive it."""
+        Idempotent: a re-run finds the already-deleted pairs gone and returns an empty pass.
+        Undecryptable/foreign sidecars are skipped (never pruned — a rotated-away key must not silently
+        destroy data). Runs off the event loop; the periodic runner + the opportunistic save-time sweep
+        both drive it.
+
+        The orphan sweep runs AFTER the age pass and against the same ``now``, so a pair whose body
+        outlived its own prune (the sidecar unlinked, the body's unlink refused) is collected in the
+        same call rather than waiting an hour for the next one."""
         days = self._retention_days if retention_days is None else max(1, int(retention_days))
-        cutoff = (time.time() if now is None else now) - days * _SECONDS_PER_DAY
+        at = time.time() if now is None else now
+        cutoff = at - days * _SECONDS_PER_DAY
 
-        def _prune() -> list[UploadedFileMeta]:
+        def _prune() -> PruneResult:
             pruned: list[UploadedFileMeta] = []
             for meta in self._scan_metas_sync():
                 if meta.uploaded_at >= cutoff:
@@ -890,9 +974,78 @@ class UploadStore:
                 blob_path.unlink(missing_ok=True)
                 meta_path.unlink(missing_ok=True)
                 pruned.append(meta)
-            return pruned
+            return PruneResult(pruned=pruned, orphans_removed=self._sweep_orphans_sync(now=at))
 
         return await asyncio.to_thread(_prune)
+
+    def _sweep_orphans_sync(self, *, now: float) -> int:
+        """Remove the write leftovers no other pass can reach, and return how many went (BACKLOG #1678).
+
+        Two shapes, both meaning a write that started and never landed: a ``.<id>.<suffix>.<tag>.tmp``
+        whose ``os.replace`` never ran, and an ``<id>.blob`` whose sidecar was never written. Neither is
+        reachable through :meth:`_iter_sidecars`, which yields ``.meta`` names only, so
+        :meth:`list_files`, :meth:`prune_expired` and :meth:`reseal_to_active` all walk straight past
+        them: a partial body would otherwise sit in the uploads root for the life of the directory,
+        outside the retention window this module promises, and (under a configured key) as ciphertext
+        ``rotate-key`` would never re-seal.
+
+        **This pass UNLINKS, so it refuses anything it cannot positively identify as ours.** A name
+        matching neither exact shape is an operator's own file and is never touched, the same way
+        :meth:`_iter_sidecars` skips it. A ``.blob`` whose sidecar exists but cannot be DECRYPTED is
+        kept, because :meth:`_iter_sidecars` yields that sidecar without opening it — a rotated-away key
+        can no more destroy data here than it can in the age pass.
+
+        **A live write is safe by IDENTITY, not by age.** ``_inflight_names`` holds every name a write
+        in this process currently holds, and a held name is skipped outright, so the threshold never
+        adjudicates a race this process can see. ``_ORPHAN_MIN_AGE_SECONDS`` is the floor for everything
+        else — a leftover the registry cannot see comes from a process that DIED mid-write (every
+        in-process failure, cancellation included, now cleans up after itself), or from a sibling engine
+        shard sharing this ``uploads_dir``.
+
+        **That second case is the residual, stated precisely.** A sibling shard whose single write — one
+        write, bounded by ``max_bytes`` — has been stalled for longer than the floor could have its temp
+        removed underneath it. Its ``os.replace`` then raises and its ``save`` fails cleanly: nothing is
+        published half-written, nothing is left behind, and the operator retries. An hour against a
+        25 MiB default bound is far outside that window."""
+        root = self._root
+        if not root.is_dir():
+            return 0
+        cutoff = now - _ORPHAN_MIN_AGE_SECONDS
+        # A sidecar is the listing key, so an id with one is reachable and this pass is not about it.
+        reachable = {fid for fid, _ in self._iter_sidecars()}
+        removed = 0
+        for entry in root.iterdir():
+            name = entry.name
+            stem = name[: -len(_BLOB_SUFFIX)] if name.endswith(_BLOB_SUFFIX) else ""
+            if _ORPHAN_TMP_RE.match(name):
+                kind = "temp file"
+            elif _FILE_ID_RE.match(stem):
+                if stem in reachable:
+                    continue
+                kind = "body with no sidecar"
+            else:
+                continue  # not one of ours — never touched
+            if _is_inflight(name):
+                continue  # a write in this process is holding it right now
+            try:
+                if entry.stat().st_mtime > cutoff:
+                    continue  # too young to be certain it is abandoned
+                entry.unlink()
+            except OSError as exc:
+                # Already gone (a sibling shard's sweep), held open by another process, or not a file
+                # at all. Never fatal — the next pass retries. The NAME is safe to log: a file_id and
+                # a random tag, never a body.
+                _log.debug("uploaded-logs orphan sweep left %s alone: %s", name, exc)
+                continue
+            removed += 1
+            # ASCII only in the message itself: a stock Windows cp1252 console raises
+            # UnicodeEncodeError on the em dashes this module's prose uses freely.
+            _log.warning(
+                "uploaded-logs: removed an abandoned %s (%s): a write started and never landed",
+                kind,
+                name,
+            )
+        return removed
 
 
 # One prune sweep per hour is ample for a day-granularity retention window (the opportunistic save-time
@@ -963,19 +1116,20 @@ class UploadRetentionRunner:
         except TimeoutError:
             pass
 
-    async def run_once(self, now: float | None = None) -> list[UploadedFileMeta]:
+    async def run_once(self, now: float | None = None) -> PruneResult:
         """Run one prune sweep for ``now`` (default: the injected clock), auditing each pruned file. The
         audit callback (contractually) never raises, but be defensive — one bad audit call must not abort
-        the remaining prunes."""
-        pruned = await self._store.prune_expired(now=self._clock() if now is None else now)
-        for meta in pruned:
+        the remaining prunes. The pass's orphan count rides back in the result; it is logged by the sweep
+        and carries no metadata to audit (see :class:`PruneResult`)."""
+        result = await self._store.prune_expired(now=self._clock() if now is None else now)
+        for meta in result.pruned:
             if self._audit is None:
                 continue
             try:
                 await self._audit(meta)
             except Exception:
                 _log.warning("uploaded-logs prune audit failed for %s", meta.file_id, exc_info=True)
-        return pruned
+        return result
 
 
 def _reencrypt_value(cipher: AesGcmCipher, stored: str, aad: bytes) -> str:
@@ -992,11 +1146,28 @@ def _reencrypt_value(cipher: AesGcmCipher, stored: str, aad: bytes) -> str:
 
 
 def _atomic_write_text(root: Path, path: Path, text: str) -> None:
-    """Write ``text`` to ``path`` via a temp file + ``os.replace`` (atomic on the same dir), owner-only."""
-    tmp = root / f".{path.name}.{secrets.token_hex(4)}.tmp"
-    tmp.write_text(text, encoding="utf-8")
-    with contextlib.suppress(OSError):
-        os.chmod(
-            tmp, 0o600
-        )  # best-effort (Windows / restricted FS) — directory ACL is the backstop
-    os.replace(tmp, path)
+    """Write ``text`` to ``path`` via a temp file + ``os.replace`` (atomic on the same dir), owner-only.
+
+    **On any failure the temp is removed rather than left behind (BACKLOG #1678).** Without this, a
+    write that raises — disk full is the realistic trigger and the blob is the large write — leaves a
+    partial, PHI-bearing ciphertext in the uploads root that NO sweep can reach: ``list_files``,
+    ``prune_expired`` and ``reseal_to_active`` all walk ``_iter_sidecars``, which yields ``.meta``
+    names only. Catching ``BaseException`` is deliberate and matches ``config/connections_edit.py``'s
+    twin: a cancellation must clean up too, and the original failure is re-raised untouched. The
+    unlink's own errors are suppressed so a cleanup problem can never mask the real cause.
+
+    The name is held in ``_inflight_names`` for the whole window, so a concurrent orphan sweep in this
+    process skips it by identity instead of guessing from its age."""
+    tmp = root / f".{path.name}.{secrets.token_hex(_TMP_TOKEN_BYTES)}.tmp"
+    with _inflight(tmp.name):
+        try:
+            tmp.write_text(text, encoding="utf-8")
+            with contextlib.suppress(OSError):
+                os.chmod(
+                    tmp, 0o600
+                )  # best-effort (Windows / restricted FS) — directory ACL is the backstop
+            os.replace(tmp, path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                tmp.unlink(missing_ok=True)
+            raise
