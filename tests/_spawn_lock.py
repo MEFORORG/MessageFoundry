@@ -48,10 +48,27 @@ WHAT THIS DOES NOT COVER, recorded so the next reader does not assume the tier i
 ``scripts/coord/overlap.ps1`` defaults ``ParallelLimit = 16`` and several manifest files invoke it,
 each able to hold 16 runspaces spawning ``git``; ``test_announce_hook.py`` runs a 2-way pwsh pool.
 Those are unwrapped: they were found by sweeping the tier, not by CI evidence, and this change
-deliberately does not wrap on a hunch. Roughly 66 other files in the tier launch ``pwsh`` without
+deliberately does not wrap on a hunch. Roughly 65 other files in the tier launch ``pwsh`` without
 taking the shared side at all, so a storm does not wait for them. The missing abstraction is a shared
 ``run_pwsh`` launcher that every site uses; until that exists, ``_note`` below is what makes the next
 occurrence tell you which of those gaps it came from.
+
+ONE OF THOSE GAPS HAS SINCE PRODUCED ITS OWN CI EVIDENCE AND IS NOW WRAPPED, which is the mechanism
+this paragraph predicted rather than an exception to it. ``tests/test_coord_usage.py`` failed
+``main``'s harness leg four times in eleven runs on 2026-09-19, always as a single launch starving
+past its 60-second ceiling, and its 21 ``pwsh`` CALL SITES were routed through ``run_single`` on that
+evidence. Its two ``bash`` sites were not, by the ``_LOCKED_INTERPRETERS`` rule below. SITES ARE NOT
+LAUNCHES: five of the 21 sit inside shared helpers that the file's tests call about 117 times, so the
+wrapped population is roughly 140 launches. Size anything against the launches, never against 21.
+
+TWO OF THOSE FOUR JOB LOGS WERE READ AND THEY BLAME DIFFERENT LAUNCHES, which is the limb that
+matters: the last ``usage.ps1`` reader in job 105984649514, a middle
+``install-usage-statusline.ps1`` in job 105958065037. The same test had already completed several
+``pwsh`` launches before the one that starved, so a first-launch cold start is refuted rather than
+untested. The 4-of-11 rate is as reported with this change's brief; only the two jobs above were
+re-read here. ``tests/test_worktree_prune_merged.py`` is the next candidate by exposure and has no such
+evidence yet: its ``test_disqualifiers`` arms are the tier's longest tests at 102-106s against a 120s
+per-test bound. Sweeping it in on that alone is the hunch this paragraph refuses.
 
 EVERY FAILURE MODE HERE DEGRADES TO TODAY'S BEHAVIOUR, WHICH IS THE PROPERTY THAT MAKES IT SAFE TO
 LAND. No lock directory, a saturated wait, a stale entry reaped while its owner is in fact alive, an
@@ -124,6 +141,36 @@ from typing import Any, Final, cast
 #: waiter hold anything: it registers its reader ticket only once the turnstile is clear, so a long
 #: wait cannot be reaped by ``_READER_STALE_S`` and cannot stall a storm's drain.
 #:
+#: IT CAN PUSH A TEST PAST **PYTEST'S** TIMEOUT, THOUGH, AND THAT IS THE BOUND THAT LIMITS ADOPTION.
+#: The paragraph above is about ``subprocess.run(timeout=)`` and says nothing about the per-test
+#: clock, which keeps running through the wait: the tooling tier runs ``--timeout=120`` and every
+#: launch a test makes is charged to that one budget. So the question before wrapping a file is not
+#: whether a launch survives, it is whether the TEST's own runtime plus its waits fit.
+#:
+#: WAITS, PLURAL, AND THE SINGULAR IS THE TRAP. "A waiter queues behind at most one burst" is a
+#: property of ONE LAUNCH, and it holds: ``--dist loadfile`` puts the bursts in one file on one
+#: worker, so they never overlap each other. It does NOT bound a TEST. ``test_session_mail.py``
+#: fires three bursts per job, so a test making four or five launches over a minute can meet burst 1
+#: before its second launch and burst 2 before its fifth, and pay each wait separately. Do not size
+#: an adoption decision on one wait.
+#:
+#: WHAT THAT RULES OUT TODAY. ``tests/test_coord_usage.py`` had to split its 8-launch, 90.88s test
+#: into five arms before its launches could take the shared side at all (BACKLOG #1304), and
+#: ``tests/test_worktree_prune_merged.py`` at 102-106s per test is not a candidate as it stands.
+#: Neither split makes an arm SAFE against the 90s ceiling -- it cannot, while the ceiling is flat --
+#: it only moves the arms from cannot-fit to usually-fits, with the fail-open below as the floor.
+#:
+#: THE LOCAL DEFAULT IS TIGHTER THAN THE TIER'S, WHICH IS THE CASE A CI-ONLY READING MISSES.
+#: ``pyproject.toml`` sets ``--timeout=60`` repo-wide, so a developer running a wrapped file beside
+#: ``test_session_mail.py`` has a 60s per-test budget against a 90s wait ceiling: the wait alone can
+#: exhaust it before a process starts. On CI the tier overrides to 120 and this does not bite.
+#:
+#: MAKING THE WAIT BUDGET-AWARE -- capping it at the test's remaining pytest time instead of a flat
+#: ceiling -- is the change that would lift all of this, and it is unbuilt. Until it is, raising
+#: ``_SINGLE_WAIT_S`` on fresh storm evidence is not the free move the paragraph above makes it look:
+#: ``tests/test_spawn_lock.py`` pins it only from BELOW, so a raise past the per-test timeout would
+#: pass every existing assertion and make wrapped tests killable during a storm.
+#:
 #: WAITING IS ALSO CHEAPER THAN THE FAILURE IT REPLACES. The poll exits the instant the turnstile
 #: clears, so a run with no storm in flight pays nothing at all. The observed failure cost 30s of
 #: waiting plus a 45s timeout; waiting the storm out instead costs its remaining seconds plus a
@@ -138,6 +185,27 @@ _SINGLE_WAIT_S: Final = 90.0
 #: Longest a storm will wait for in-flight single launches to drain before starting anyway. A single
 #: hold is one ``pwsh`` launch, bounded by its caller at 45s but observed at a ~2s median, so this is
 #: generous. Proceeding early costs only the overlap we have today.
+#:
+#: THE ~2s MEDIAN DOES NOT COVER THE WHOLE POPULATION, and the replacement figure is a BOUND rather
+#: than a measurement, said plainly so nobody sizes against it as if it were one.
+#: ``tests/test_coord_usage.py``'s requirement-4 test ran 8 launches in 90.88s on windows-2025 (run
+#: 35472705438), which is 11.4s per launch AVERAGED, with the test's own Python work, file writes and
+#: fixture setup charged in. The heavy launches there -- the installer, and a ``usage.ps1`` that walks
+#: a home directory -- are therefore somewhere ABOVE 11.4s, not at it, since the same file's other
+#: launches are cheaper. Nobody has timed a single launch in isolation. What is established is that
+#: the tail is several times the ~2s median this constant was sized on.
+#:
+#: IT IS STILL NOT RAISED, and the reason is the drain's shape rather than the launch cost. Under
+#: ``--dist loadfile`` a file's tests run sequentially on one worker, so one worker holds at most one
+#: ticket at a time: adding call sites raises the chance a burst arrives mid-launch, and adds no
+#: ticket to drain. A drain that does time out proceeds unsynchronised, which is the pre-lock
+#: baseline, so the cost of this constant being small is bounded by what we already had.
+#:
+#: READ ``spawn_burst`` BEFORE TREATING THIS AS A DRAIN BUDGET, because it is not only that. One
+#: ``deadline`` is set from this constant BEFORE the turnstile-acquire loop and then reused by the
+#: drain loop, so a burst that spends 6s contending for the gate has 9s left to drain. A reader
+#: sizing "how long may a drain wait" against 15.0 is reading a number the acquire may already have
+#: spent. Splitting the two budgets is a real change and is not made here.
 _BURST_DRAIN_S: Final = 15.0
 
 #: A reader entry older than this is treated as abandoned. The longest legitimate hold is one gate

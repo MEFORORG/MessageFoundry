@@ -16,6 +16,7 @@ import logging
 import posixpath
 import ssl
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -126,6 +127,18 @@ class _FakeClient(_RemoteClient):
     def remove(self, path: str) -> None:
         self.ops.append(("remove", path))
         self.files.pop(path, None)
+
+    def dispose_unless_changed(self, path: str, expected_size: int, dest: str | None) -> int | None:
+        # #116: a real client stats then renames/removes on one connection. The stored body's length
+        # is what a stat reports; the listing's `sizes` override models a lying LISTING, not a stat.
+        # Delegates to rename/remove so their recorded ops and injected failures stay as they were.
+        if path in self.files and len(self.files[path]) != expected_size:
+            return len(self.files[path])
+        if dest is None:
+            self.remove(path)
+        else:
+            self.rename(path, dest)
+        return None
 
     def ensure_dir(self, remote_dir: str) -> bool:
         # #114: the contract now reports whether THIS call created the directory, so the caller can log
@@ -412,6 +425,10 @@ class _StubSftpFile:
         self.read_total += len(chunk)
         return chunk
 
+    def stat(self) -> SimpleNamespace:
+        # #116: the retrieve reads the handle's size on each side of the transfer.
+        return SimpleNamespace(st_size=len(self.body))
+
     def __enter__(self) -> _StubSftpFile:
         return self
 
@@ -435,6 +452,13 @@ class _StubFtp:
         self.body = body
         self.written = 0
         self.blocksize: int | None = None
+
+    def voidcmd(self, cmd: str) -> str:
+        return "200 OK"
+
+    def size(self, path: str) -> int:
+        # #116: the retrieve reads SIZE on each side of the transfer.
+        return len(self.body)
 
     def retrbinary(self, cmd: str, callback: Any, blocksize: int = 8192) -> None:
         self.blocksize = blocksize

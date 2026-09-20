@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import http.client
 import json
 import logging
 import secrets
@@ -72,6 +73,7 @@ from messagefoundry.transports.rest import (
     refuse_cleartext_credentials,
     refuse_cleartext_egress,
     refuse_unrevoked_verified_hop,
+    refuse_url_credentials,
     refuse_verify_off,
 )
 
@@ -196,6 +198,7 @@ class DicomWebDestination(DestinationConnector):
             raise ValueError(
                 f"DICOMweb destination 'url' must be http or https, got scheme {scheme!r}"
             )
+        refuse_url_credentials(url, "DICOMweb destination 'url'")
         self.base_url = url
         study_uid = s.get("study_uid")
         self.study_uid: str | None = str(study_uid) if study_uid else None
@@ -408,6 +411,12 @@ class DicomWebDestination(DestinationConnector):
             raise DeliveryError(
                 f"DICOMweb {_redact_url(self.base_url)} unreachable: {exc.reason}"
             ) from exc
+        except (ValueError, http.client.InvalidURL) as exc:
+            # BACKLOG #1793: the probe is the test-connection reply, so an escaped InvalidURL put its
+            # text -- which can hold a password -- in front of anyone holding connections:test.
+            raise DeliveryError(
+                f"DICOMweb {_redact_url(self.base_url)} rejected an invalid request value"
+            ) from exc
         except (TimeoutError, OSError) as exc:
             raise DeliveryError(f"DICOMweb {_redact_url(self.base_url)} failed: {exc}") from exc
 
@@ -448,9 +457,11 @@ class DicomWebDestination(DestinationConnector):
             raise DeliveryError(
                 f"DICOMweb {_redact_url(self.base_url)} unreachable: {exc.reason}"
             ) from exc
-        except ValueError as exc:
+        except (ValueError, http.client.InvalidURL) as exc:
             # urllib rejected an illegal request value (a CRLF in a header/URL slipped past the guard). A
             # retry re-sends the same request → permanent. PHI-safe: redacted url only.
+            # BACKLOG #1793: InvalidURL is named for the reason rest.py's _post gives. Its text could
+            # hold a password, and it reached queue.last_error.
             raise NegativeAckError(
                 f"DICOMweb {_redact_url(self.base_url)} rejected an invalid request value",
                 code="bad-request-value",

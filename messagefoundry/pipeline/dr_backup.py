@@ -8,8 +8,9 @@ a **leader-gated, daily-clock** background singleton that, on its schedule (and 
 store — it never claims/mutates/resets/completes a staged-queue row), bundles a copy of the loaded
 config dir, encrypts the whole thing to a single ``.mfbak`` AES-256-GCM archive **keyed by the existing
 store DEK** (ADR 0019 KeyProvider), writes it to a configured **local/UNC** destination (no cloud
-target), applies keep-N retention, runs a **lightweight restore-verify** (open + ``integrity_check`` +
-row-count), and records **one PHI-free ``dr_backup`` audit row** per run. On failure it raises
+target), runs a **lightweight restore-verify** (open + ``integrity_check`` + row-count), **publishes
+the canonical archive name by atomic rename** once every configured check has passed, applies keep-N
+retention, and records **one PHI-free ``dr_backup`` audit row** per run. On failure it raises
 ``AlertSink.backup_failed`` and records a ``dr_backup`` ERROR row, leaving any prior good archive intact.
 
 **Boundary (BACKLOG #52).** The store snapshot applies only to ``[store].backend = "sqlite"`` (the box
@@ -87,6 +88,31 @@ _STORE_MEMBER = "store.db"
 _CONFIG_PREFIX = "config/"
 _MANIFEST_MEMBER = "manifest.json"
 
+#: Suffixes that hold an archive OUT of the keep-N candidate set (BACKLOG #1587).
+#:
+#: **The canonical name means this archive passed every check this instance was configured to run.**
+#: So the bytes go to ``<canonical>.part`` and the canonical name is published by an atomic rename
+#: afterwards: with ``verify_after_backup`` on, once the restore-verify passes; with it off,
+#: write-completion is the bar and the rename follows the completed, fsynced write. An archive that
+#: fails its verify is kept for diagnosis under ``<canonical>.failed``.
+#:
+#: Neither suffixed name can match :meth:`BackupRunner._prune_keep_n`'s pattern, which ends in the
+#: archive extension — which is exactly why an archive that never earns the canonical name can never
+#: spend a retention slot.
+#:
+#: **Both suffixes name a PHI-bearing file that NOTHING in the engine expires**, and that is the
+#: price of the line above: a file keep-N cannot see is a file keep-N cannot prune. A ``.failed``
+#: archive is left deliberately, for diagnosis. A ``.part`` is left by any abort between the write
+#: and the rename — a dropped UNC share, a cancelled verify when the engine stops mid-backup, a
+#: rename that fails — and on a box that restarts during its backup window those accumulate, one
+#: full-size archive per incident. Clearing both is the operator's, and ``docs/PHI.md`` lists them
+#: among the tiers with no retention rather than implying keep-N covers them.
+#:
+#: This is still strictly better than what it replaced: before BACKLOG #1587 those same aborts left
+#: a TRUNCATED file wearing the canonical name, which keep-N then counted as a good backup.
+_STAGING_SUFFIX = ".part"
+_FAILED_SUFFIX = ".failed"
+
 #: ASVS 5.2.3 restore-extract bound: refuse to stream a single tar member larger than this out of an
 #: archive during restore-verify (defends the temp-dir extract against a forged archive that declares — or
 #: streams — an absurd member size). Generous enough for a real single-box SQLite store snapshot; the
@@ -125,6 +151,14 @@ _MAX_RESTORE_MEMBER_BYTES = 16 * 1024 * 1024 * 1024  # 16 GiB
 #: ``chunk_size`` of plaintext, so a ``.mfbak`` is strictly LARGER than what it decrypts to. The format
 #: cannot amplify, which is also why this is not a decompression-bomb defence.
 _MAX_RESTORE_PLAINTEXT_BYTES = 2 * _MAX_RESTORE_MEMBER_BYTES
+
+#: ASVS 5.2.3 manifest-read bound (BACKLOG #1570): refuse to read a ``manifest.json`` member larger
+#: than this out of an archive. The store member is STREAMED to disk under its own cap; the manifest
+#: is the one member parsed into memory (``json.loads`` holds the decoded object on top of the raw
+#: bytes), so an unbounded read here is the only place a forged archive could balloon the verifying
+#: process's memory. 1 MiB is roughly 100x the largest manifest this writer produces — a fixed field
+#: set plus one row count per table in :data:`_VERIFY_TABLES`.
+_MAX_MANIFEST_BYTES = 1024 * 1024  # 1 MiB
 
 
 class BackupError(RuntimeError):
@@ -292,7 +326,11 @@ class BackupRunner:
     async def run_once(
         self, now: float | None = None, *, force_config_only: bool = False
     ) -> BackupResult | None:
-        """Run a single backup pass: snapshot → bundle → encrypt → write → verify → prune → audit.
+        """One backup pass: snapshot → bundle → encrypt → write → verify → publish → prune → audit.
+
+        ``publish`` is the atomic rename onto the canonical archive name. It sits AFTER the verify
+        on purpose, and that ordering is what keeps a failed archive out of keep-N (BACKLOG #1587);
+        the rule it follows is stated once, at :data:`_STAGING_SUFFIX`.
 
         Leader-gated (AC-12): a non-leader returns ``None`` without touching the store or the shared
         destination (so in a cluster exactly one node backs up). On success records a ``dr_backup`` audit
@@ -348,10 +386,13 @@ class BackupRunner:
         stamp = _utc_stamp(now)
         inst = _safe_segment(self._instance) or "instance"
         archive_path = dest_dir / f"mefor-backup-{inst}-{stamp}{ext}"
-        if (
-            archive_path.exists()
-        ):  # extremely unlikely (1s granularity) — never clobber a prior archive
-            raise BackupError("write", f"archive already exists: {archive_path}")
+        # The bytes are written HERE, not at the canonical name; see _STAGING_SUFFIX for the rule.
+        staging_path = archive_path.with_name(archive_path.name + _STAGING_SUFFIX)
+        for occupied in (archive_path, staging_path):
+            # Extremely unlikely (1s granularity) — never clobber a prior archive, nor a staging
+            # file some other pass is still writing.
+            if occupied.exists():
+                raise BackupError("write", f"archive already exists: {occupied}")
 
         # Build everything under one temp dir. The CONSISTENT SNAPSHOT must run on the ENGINE event loop
         # (store.snapshot_to serialises on the store lock and drives aiosqlite, which is bound to this
@@ -375,7 +416,7 @@ class BackupRunner:
             try:
                 snapshot_sha256, row_counts, archive_bytes = await asyncio.to_thread(
                     self._build_archive_blocking,
-                    archive_path=archive_path,
+                    out_path=staging_path,
                     snap_path=snap_path,
                     key=key,
                     key_id=key_id,
@@ -394,7 +435,7 @@ class BackupRunner:
             # standalone restore-verify of an OLDER archive — run_restore_verify, AC-5).
             verify = await asyncio.to_thread(
                 _verify_archive_blocking,
-                archive_path=str(archive_path),
+                archive_path=str(staging_path),
                 keys=[key] if key is not None else [],
                 full=s.full_restore_verify,
                 allow_unencrypted=s.allow_unencrypted,
@@ -403,16 +444,25 @@ class BackupRunner:
                 store_settings=self._store_settings,
             )
             if not verify.ok:
-                # A verify FAIL means the archive is unusable — but it must NOT be counted as the latest
-                # good backup when pruning (so a failing backup never evicts the last good one, AC-6). We
-                # leave the (bad) archive on disk for diagnosis and skip the prune, then fail loudly.
+                # A verify FAIL means the archive is unusable, so it never earns the canonical name
+                # (AC-6). Skipping only THIS run's prune — what this path used to do — does not
+                # achieve that: the bad archive kept the canonical name, so the NEXT run's prune
+                # counted it as a retention slot and evicted an older GOOD copy instead
+                # (BACKLOG #1587). Deferring the eviction one run is not preventing it.
+                kept = self._keep_failed_archive(staging_path, archive_path)
                 raise BackupError(
                     "verify",
-                    f"restore-verify {verify.status}: {verify.reason or 'archive did not verify'}",
+                    f"restore-verify {verify.status}: "
+                    f"{verify.reason or 'archive did not verify'} "
+                    f"(kept for diagnosis as {kept.name}; it holds no retention slot, and nothing "
+                    "in the engine expires it)",
                 )
 
-        # keep-N prune runs only AFTER a verified-good archive, so the new good one is never the thing
-        # pruned and a verify-failed archive is never the "latest good" anchor (AC-6).
+        # Only now does the archive earn the canonical name.
+        self._publish_archive(staging_path, archive_path)
+
+        # keep-N prune runs only after that rename, so the candidate set contains this archive and
+        # every earlier archive that also passed — and nothing that failed (AC-6).
         pruned = self._prune_keep_n(dest_dir, inst, ext)
 
         return BackupResult(
@@ -451,22 +501,81 @@ class BackupRunner:
                 exc_info=True,
             )
 
+    # --- publishing the canonical name ---------------------------------------
+
+    def _publish_archive(self, staging_path: Path, archive_path: Path) -> None:
+        """Publish a completed archive under its canonical name, by atomic rename.
+
+        The rule that decides WHEN this may be called is stated once, at :data:`_STAGING_SUFFIX`.
+        What this method adds: until the rename lands, nothing at the destination carries a name
+        keep-N counts, so a crash mid-write leaves an excluded ``.part`` file rather than a
+        truncated file wearing an archive's name."""
+        try:
+            os.replace(staging_path, archive_path)
+        except OSError as exc:
+            # Name the staging file. This arm strands an archive that PASSED every check under a
+            # name keep-N cannot see, so an operator who is not told where it is has no way to find
+            # a good backup that the run reported as failed.
+            raise BackupError(
+                "write",
+                f"could not publish the completed archive as {archive_path.name}: "
+                f"{safe_exc(exc)} (the verified archive is at {staging_path.name})",
+            ) from exc
+
+    def _keep_failed_archive(self, staging_path: Path, archive_path: Path) -> Path:
+        """Move a verify-failed archive to its diagnostic name; return where it ended up.
+
+        **Kept, never deleted** — the archive that would not verify is the evidence for why it would
+        not. This is the half of the write-temp-then-publish pattern that deliberately diverges from
+        :class:`~messagefoundry.transports.file.FileDestination`, which unlinks its temp in a
+        ``finally``: a dropped delivery file is debris, a DR archive that failed its restore-verify
+        is a diagnosis.
+
+        The consequence, stated rather than quietly bounded: the name is outside the keep-N
+        candidate set, so **nothing in the engine ever expires it**. A run of verify failures
+        accumulates sealed archives at the destination until an operator clears them. Auto-deleting
+        them on some second cap would defeat keeping them at all, and pruning them by keep-N is the
+        defect this whole path exists to fix. ``docs/PHI.md`` carries the same caveat beside the
+        keep-N claim, because these files are PHI-bearing (sealed under the store DEK, exactly like
+        a good archive — the at-rest protection is unchanged; only the retention bound is)."""
+        failed_path = archive_path.with_name(archive_path.name + _FAILED_SUFFIX)
+        try:
+            os.replace(staging_path, failed_path)
+        except OSError:
+            # The staging suffix is excluded from keep-N too, so a failed rename still leaves the
+            # archive outside the candidate set — the diagnosis just has a less obvious filename.
+            # Log it and return the real path; this must never displace the verify failure the
+            # caller is about to raise.
+            log.warning(
+                "DR backup: could not rename the verify-failed archive to %s; it stays at %s",
+                failed_path.name,
+                staging_path.name,
+                exc_info=True,
+            )
+            return staging_path
+        return failed_path
+
     # --- archive build (worker thread; no event loop, no store await) --------
 
     def _build_archive_blocking(
         self,
         *,
-        archive_path: Path,
+        out_path: Path,
         snap_path: Path | None,
         key: bytes | None,
         key_id: str | None,
         config_only: bool,
         now: float,
     ) -> tuple[str, dict[str, int], int]:
-        """tar(store.db + config/ + manifest.json) → stream-encrypt to ``archive_path``. Runs entirely
+        """tar(store.db + config/ + manifest.json) → stream-encrypt to ``out_path``. Runs entirely
         OFF the event loop (the consistent snapshot at ``snap_path`` was already taken on the loop by the
         caller). Returns ``(snapshot_sha256, row_counts, archive_bytes)``. The tar goes to a temp file
-        (not RAM) so a multi-GB store never sits in memory; the codec then streams it to the archive."""
+        (not RAM) so a multi-GB store never sits in memory; the codec then streams it to the archive.
+
+        ``out_path`` is the STAGING path, not the canonical archive name — the caller publishes that
+        name by rename once the archive has passed every configured check (see :data:`_STAGING_SUFFIX`).
+        The final ``fsync`` below is what makes that rename safe to treat as the publish point when
+        ``verify_after_backup`` is off: the bytes are durable before the name appears."""
         snapshot_sha256 = ""
         row_counts: dict[str, int] = {}
         if snap_path is not None:
@@ -504,8 +613,8 @@ class BackupRunner:
                 info.mtime = int(now)
                 tar.addfile(info, io.BytesIO(manifest_bytes))
 
-            archive_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(tar_path, "rb") as src, open(archive_path, "wb") as dst:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(tar_path, "rb") as src, open(out_path, "wb") as dst:
                 if key is not None:
                     # ASVS 11.3.4: every DR frame is an AES-GCM invocation under the SAME store DEK, so
                     # it consumes the same birthday budget. Record the count here (the worker thread
@@ -520,7 +629,7 @@ class BackupRunner:
                         dst.write(buf)
                 dst.flush()
                 os.fsync(dst.fileno())
-        archive_bytes = archive_path.stat().st_size
+        archive_bytes = out_path.stat().st_size
         return snapshot_sha256, row_counts, archive_bytes
 
     def _add_config_dir(self, tar: tarfile.TarFile) -> None:
@@ -540,17 +649,35 @@ class BackupRunner:
     def _prune_keep_n(self, dest_dir: Path, inst: str, ext: str) -> int:
         """Delete this instance's archives beyond the newest ``retention_keep`` at the destination.
         ``0`` = keep all. Only archives this runner writes (same instance prefix + extension) are
-        candidates, so an operator's unrelated files at the destination are never touched. The just-
-        written verified-good archive is the newest, so it is always within the kept set."""
+        candidates, so an operator's unrelated files at the destination are never touched.
+
+        The candidate set is the CANONICAL name and nothing else, which is what stops a bad archive
+        spending a retention slot: the caller publishes that name only to an archive that passed
+        every configured check, so this method is called with the just-published archive as the
+        newest candidate and every earlier PASSING archive behind it."""
         keep = self._settings.retention_keep
         if keep <= 0:
             return 0
         prefix = f"mefor-backup-{inst}-"
-        # Anchor the glob to the EXACT _utc_stamp shape (YYYYMMDDThhmmssZ) + extension, not a loose
-        # f"{prefix}*{ext}". A loose `*` would also match a stray diagnostic like
-        # `mefor-backup-dev-<stamp>.corrupt.mfbak` (the `*` spans the `.corrupt`), so a left-behind
-        # verify-failed file could be counted toward keep-N and evict a good archive. The anchored
-        # pattern matches only the canonical archives this runner writes.
+        # Two independent things keep a bad archive out of this set, and they are not equally
+        # load-bearing:
+        #
+        # 1. The WRITE PATH. A staging or verify-failed archive carries a `.part` / `.failed`
+        #    suffix AFTER the extension, so it cannot match a pattern that ends in `ext` — anchored
+        #    or loose. This is the half that actually fixes BACKLOG #1587.
+        # 2. The ANCHORING. Pinning the middle to the exact _utc_stamp shape (YYYYMMDDThhmmssZ)
+        #    rather than a loose f"{prefix}*{ext}" additionally rejects a name carrying an extra
+        #    token BEFORE the extension, which a `*` would span and count.
+        #
+        # The comment here used to justify (2) with a `mefor-backup-dev-<stamp>.corrupt.mfbak` file
+        # "left behind" by the verify path. That attribution was wrong — no engine path has ever
+        # written a `.corrupt.mfbak`, and before the fix above the verify path left its failure at
+        # the CANONICAL name, which is the defect, not a name the anchoring could have caught. The
+        # name itself is real, though: `tests/test_restore_verify.py`, `tests/test_dr_seeding.py`
+        # and `tests/test_cli_backup_dispatch.py` each write one beside a live archive via
+        # `with_suffix(".corrupt.mfbak")`. So (2) is not hypothetical margin — a loose glob would
+        # count those fixtures — it is simply protecting against a different name than the comment
+        # claimed.
         pattern = f"{prefix}????????T??????Z{ext}"
         archives = sorted(
             (p for p in dest_dir.glob(pattern) if p.is_file()),
@@ -1081,11 +1208,39 @@ def _read_manifest_from_tar(tar_path: Path) -> dict[str, object]:
     # ASVS 5.2.3: pin the UNCOMPRESSED reader ("r:", not "r"). The writer only ever writes an
     # uncompressed tar, so auto-detecting/decompressing gzip/bz2/xz here is pure attack surface (a
     # decompression-bomb vector) — "r:" refuses a compressed archive with tarfile.ReadError.
+    #
+    # ASVS 5.2.3 bound (BACKLOG #1570). The manifest is the one member parsed INTO MEMORY rather
+    # than streamed to disk (json.loads holds the decoded object on top of the raw bytes), so it
+    # needs a cap of its own; _extract_member bounds the store member separately.
+    #
+    # Two checks, and they are NOT independent — said plainly so nobody re-derives a stronger claim
+    # from the shape. In random-access mode ("r:") tarfile bounds the reader it hands back by the
+    # member's declared `size`, so the read can never return more than that: reject an over-cap
+    # `size` first and the length check below cannot fire. Each check bounds memory on its own (the
+    # first refuses before reading; the second reads at most cap+1 whatever the header claims), and
+    # keeping both means neither the header nor the read is the single point the bound rests on.
+    # What it does NOT buy is a defence against "a lying stream" — for this reader there is no such
+    # thing, because the header IS the stream bound.
+    #
+    # Scope, stated so it is not over-claimed: on the encrypted path this read is
+    # POST-AUTHENTICATION. `decrypt_stream` has already verified every AES-GCM frame tag under the
+    # store DEK, so reaching this line means the archive was sealed by a holder of the key. The cap
+    # is defence in depth — against a locally damaged or tampered archive, and against the
+    # `allow_unencrypted` plaintext path, which has no tag to check. It is NOT a pre-auth exposure.
     with tarfile.open(tar_path, "r:") as tar:
-        member = tar.extractfile(_MANIFEST_MEMBER)
+        info = tar.getmember(_MANIFEST_MEMBER)  # KeyError when absent, as before
+        if info.size > _MAX_MANIFEST_BYTES:
+            raise tarfile.TarError(
+                f"archive manifest exceeds the read cap ({_MAX_MANIFEST_BYTES} bytes)"
+            )
+        member = tar.extractfile(info)
         if member is None:
             return {}
-        data = member.read()
+        data = member.read(_MAX_MANIFEST_BYTES + 1)
+        if len(data) > _MAX_MANIFEST_BYTES:
+            raise tarfile.TarError(
+                f"archive manifest stream exceeds the read cap ({_MAX_MANIFEST_BYTES} bytes)"
+            )
     obj = json.loads(data)
     return obj if isinstance(obj, dict) else {}
 
