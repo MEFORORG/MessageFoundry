@@ -325,12 +325,6 @@ _INVALID_URL_USERINFO = re.compile(r"(nonnumeric port: ')[^\r\n]{1,256}@")
 #: keeps a window's worth of it.
 _REDACT_WINDOW = 64 * 1024
 
-#: The most tokens :data:`_NAME_RUN` can join into one match (``X(\s+X){1,3}``). The cut consumes one
-#: of them — whatever the window split — so the walk below drops at most three more, and three is
-#: exactly enough: a run straddling the cut has at least one token past it, so at most three of its
-#: tokens are on the kept side.
-_NAME_RUN_MAX_TOKENS = 4
-
 #: The characters :func:`_clamp` may cut at. Whitespace is the boundary because a pattern survives a
 #: cut when it either cannot contain whitespace at all or still matches with its tail gone:
 #: :data:`_HL7_FIELD_RUN` and :data:`_DATE_RUN` are built from classes that exclude ``\s`` outright,
@@ -362,6 +356,11 @@ _NAME_RUN_MAX_TOKENS = 4
 #: safe: a narrower cut set only means the cut falls further back and drops more, so a Unicode space it
 #: misses costs over-redaction and never coverage.
 _CUT_CHARS = whitespace
+
+#: :data:`_CUT_CHARS` as a set, for the single-character membership tests the walk in
+#: :func:`_drop_trailing_name_tokens` makes. Derived from the same name, so the two can never disagree
+#: about what a boundary is.
+_CUT_CHAR_SET = frozenset(_CUT_CHARS)
 
 
 def _clamp_marker(dropped: int) -> str:
@@ -419,6 +418,68 @@ def _last_cut(text: str, end: int) -> int:
     return max(text.rfind(char, 0, end) for char in _CUT_CHARS)
 
 
+def _drop_trailing_name_tokens(text: str, cut: int) -> int:
+    """``cut`` moved back past **every** whole token :data:`_NAME_RUN` could have joined across it.
+
+    The walk runs while :func:`_ends_with_name_token` holds and stops at the first token that fails
+    it. **A fixed number of steps is wrong, and three was the number this shipped with.** Dropping a
+    token strands *its* own left partner — the one that was only over :data:`_NAME_RUN`'s two-token
+    threshold because of the token just dropped — so any fixed budget leaves the run one token short
+    at the boundary. Reproduced at the shipped window on ``SMITH DOE JANE ROE`` cut after ``ROE``: the
+    three-step walk dropped ``ROE``, ``JANE`` and ``DOE``, and ``SMITH`` then stood alone under the
+    threshold and survived a scrub the **unbounded** redactor performed. That is the leak class
+    BACKLOG #1576 exists to close, reopened inside the fix for it.
+
+    **What makes stopping here safe is a property, not a count:** the last token of the kept head is
+    not name-shaped at its end, so no :data:`_NAME_RUN` match can span the cut at all. Every match the
+    unbounded scan would have made therefore lies wholly inside the head, where it still matches, or
+    wholly inside what was dropped. Pairings to that token's *left* are untouched — the cut cannot
+    reach them.
+
+    **And the work is still bounded by the window, which is the whole point of BACKLOG #1576.** The
+    walk visits each character of what it drops a constant number of times and never revisits one:
+    each iteration consumes ``text[start:cut]`` and the next begins at ``start``, so the regions are
+    disjoint and ``cut`` strictly decreases. The total is one backward pass over the dropped suffix
+    plus the single token it stops on — linear in the window, the same class as the scan it protects,
+    and it cannot exceed it because the window bounds the input.
+
+    **So the loop body must not scan from the string's start, and the obvious spelling does — both
+    halves of it.** The shipped three-step version paired ``text[:cut].rstrip(...)`` with
+    :func:`_last_cut`. That slice copies ``cut`` characters, and ``_last_cut`` is six
+    :meth:`str.rfind` calls that run to index 0 whenever the text holds no tab or newline — ordinary
+    for a peer's one-line field. Three of each is a constant; one per token is quadratic in the
+    window, which is exactly the cost class this change exists to bound. Index walking keeps both
+    inside the region being dropped. Measured best-of-3 on a 64 KiB window of nothing but ``AA``
+    tokens — 21,820 of them, the most a window can hold — the two walks agree on the answer and cost
+    **6.2 ms here against 630 ms spelled with ``_last_cut``**.
+
+    **That overturns one earlier decision, on its own measurement.** Stepping over a whitespace run a
+    character at a time was rejected for :meth:`str.rstrip`, and on a 64 KiB run of spaces stepping
+    does cost 1.6 ms against 0.2 ms. It is taken anyway: ``rstrip`` needs the ``text[:cut]`` slice,
+    which is the quadratic half above, and 1.4 ms inside a bounded window buys away a cost that grows
+    with the peer's input.
+
+    **The price is over-redaction, and the ceiling on it moved.** A fixed budget dropped at most three
+    tokens; this drops a contiguous name-shaped run of any length, so a window that is nothing but
+    such tokens is dropped whole and the answer is the note alone. That is the same trade
+    :data:`_CUT_CHARS` already takes at the boundary, and it loses no diagnostic: a run long enough to
+    trigger it is a run the unbounded redactor would have scrubbed to :data:`_REDACTED` anyway. The
+    walk stops at the first token that fails the test, so ordinary prose behind the cut is untouched."""
+    while cut:
+        end = cut
+        while end and text[end - 1] in _CUT_CHAR_SET:
+            end -= 1  # step over a whitespace RUN: _NAME_RUN joins its tokens with `\s+`
+        if not end:
+            return cut  # nothing but whitespace behind the cut, so no token to judge
+        start = end
+        while start and text[start - 1] not in _CUT_CHAR_SET:
+            start -= 1
+        if not _ends_with_name_token(text[start:end]):
+            return cut
+        cut = start
+    return cut
+
+
 def _clamp(text: str, window: int) -> tuple[str, int]:
     """``(head, dropped)`` — ``text`` cut to at most ``window`` characters at a whitespace boundary,
     and how many characters that cost. See :data:`_CUT_CHARS` for which patterns that boundary covers
@@ -434,29 +495,18 @@ def _clamp(text: str, window: int) -> tuple[str, int]:
     fragment. :data:`_CUT_CHARS` carries the per-pattern argument for what a whitespace cut covers.
 
     **Then the walk, which is there for :data:`_NAME_RUN`** — a pattern a whitespace cut can split
-    while leaving a match-killing remainder behind. A bare cut through ``DOE JANE`` leaves
-    ``DOE`` standing under its two-token threshold. Up to :data:`_NAME_RUN_MAX_TOKENS` - 1 further
-    name-shaped tokens are dropped whole; the cost is over-redaction of a few tokens at a boundary
-    64 KiB into a string nobody is reading that far down."""
+    while leaving a match-killing remainder behind. A bare cut through ``DOE JANE`` leaves ``DOE``
+    standing under its two-token threshold, so the neighbouring name-shaped tokens are dropped whole.
+    :func:`_drop_trailing_name_tokens` carries how far that walk goes and why it is still bounded; the
+    cost is over-redaction of a few tokens at a boundary 64 KiB into a string nobody is reading that
+    far down."""
     if len(text) <= window:
         return text, 0
     # -1 when the window held no whitespace at all, which must yield nothing rather than text[:-1].
     cut = max(_last_cut(text, window), 0)
     # The window split a token unless it happened to land on whitespace. Either way that token is
-    # already gone, and it counts against the run budget: a straddling _NAME_RUN has at least one
-    # token past the cut, so at most _NAME_RUN_MAX_TOKENS - 1 of it can remain on this side.
-    for _ in range(_NAME_RUN_MAX_TOKENS - 1):
-        if not cut:
-            break
-        # Step over a whitespace RUN, or the walk stops on the empty token inside one. `rstrip` and
-        # not a character loop for the same reason as _ends_with_name_token: the run's length is the
-        # peer's to choose, so an interpreter-level walk over it is a second unbounded cost inside the
-        # fix for the first. Measured on a 64 KiB run of spaces: 1.89 ms stepping, 0.23 ms stripping.
-        end = len(text[:cut].rstrip(_CUT_CHARS))
-        start = _last_cut(text, end) + 1
-        if not _ends_with_name_token(text[start:end]):
-            break
-        cut = start
+    # already gone; the walk continues from there through the rest of the run it belonged to.
+    cut = _drop_trailing_name_tokens(text, cut)
     return text[:cut], len(text) - cut
 
 

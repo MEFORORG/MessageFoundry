@@ -72,6 +72,24 @@ def _hostile_detail() -> str:
     return (unit * (_HOSTILE_DETAIL_CHARS // len(unit) + 1))[:_HOSTILE_DETAIL_CHARS]
 
 
+def _hostile_control_id() -> str:
+    """The same hostile field, shaped for **MSA-2**, which means it may hold no ``|``.
+
+    **A field separator inside a field ENDS it, and that is how the MSA-2 arm went vacuous.** Built
+    from :func:`_hostile_detail`, the reply read ``MSA|AA|PID|1||Z999...``, so ``MSA-2`` parsed to the
+    three characters ``PID``: the bound never ran, the length assertion passed on a 3-character field,
+    and the identifier assertions passed because no identifier was ever in the field being asserted
+    about. The separator is dropped rather than escaped so the identifiers stay in the shape ``redact``
+    would catch, which is what makes their absence meaningful.
+
+    Everything else that makes the fixture hostile is kept: the same identifiers as
+    :data:`_IDENTIFIERS`, whitespace so the clamp has real boundaries to cut at rather than dropping
+    the field whole, and the same size."""
+    unit = "PID^1^^Z9998887^^^H^MR^^DOE^JANE^Q^^19800101^F patient DOE JANE rejected "
+    assert "|" not in unit, "a field separator would end MSA-2 and make every arm below vacuous"
+    return (unit * (_HOSTILE_DETAIL_CHARS // len(unit) + 1))[:_HOSTILE_DETAIL_CHARS]
+
+
 def _dest(port: int, **overrides: object) -> MLLPDestination:
     settings: dict[str, object] = {
         "host": "127.0.0.1",
@@ -230,8 +248,13 @@ async def test_a_hostile_ack_control_id_is_bounded_too() -> None:
 
     **This is the sibling the first cut of the fix missed**, and it is the failure mode a call-site
     bound has: bounding one field and leaving the one twenty lines above it. Both go through
-    ``_bounded_ack_field`` now, so they cannot drift apart again."""
-    peer = _NakPeer("", raw_ack=_ack_with_control_id("AA", _hostile_detail()))
+    ``_bounded_ack_field`` now, so they cannot drift apart again.
+
+    The fixture is :func:`_hostile_control_id` and not :func:`_hostile_detail` for the reason that
+    function carries: a ``|`` in the payload ends MSA-2, and this arm asserted nothing for as long as
+    it used one."""
+    hostile = _hostile_control_id()
+    peer = _NakPeer("", raw_ack=_ack_with_control_id("AA", hostile))
     await peer.start()
     dest = _dest(peer.port, verify_ack_control_id=True)
     try:
@@ -243,6 +266,20 @@ async def test_a_hostile_ack_control_id_is_bounded_too() -> None:
 
     message = str(raised.value)
     assert "ACK control-id mismatch" in message
+    # THE NON-VACUITY CONTROL. Every assertion below is satisfied by a field that never arrived, and
+    # a field separator in the fixture is exactly how it fails to: MSA-2 would parse to `PID` and the
+    # bound would never run. Assert the peer really sent a frame-cap-sized MSA-2 before asserting
+    # what the bound did to it.
+    assert len(peer.received) == 1, "the frame must have reached the peer"
+    sent_msa2 = (peer.raw_ack or "").split("\r")[1].split("|")[2]
+    assert sent_msa2 == hostile, (
+        f"the reply's MSA-2 is {len(sent_msa2)} characters, not the {len(hostile)} sent: a field "
+        f"separator in the fixture ended the field early and the bound never ran"
+    )
+    assert len(hostile) > _MAX_NAK_DETAIL_CHARS * 100, (
+        f"the hostile control id is only {len(hostile)} characters, which the bound would not have "
+        f"had to cut -- this arm no longer measures a bound"
+    )
     assert len(message) < _MAX_NAK_DETAIL_CHARS + 300, (
         f"the mismatch message is {len(message)} characters; MSA-2 reached it unbounded"
     )

@@ -7,6 +7,7 @@ safe_name() derives a safe label for a partner-chosen file name, which redact() 
 
 from __future__ import annotations
 
+import random
 import re
 import time
 from collections.abc import Callable
@@ -757,8 +758,25 @@ def _filler(chars: int) -> str:
 
 
 def _over_window(tail: str) -> str:
-    """Filler plus ``tail``, sized so the window's cut falls inside ``tail``."""
-    return _filler(redaction._REDACT_WINDOW - len(tail) // 2) + tail
+    """Filler plus ``tail``, sized so the window's cut falls inside ``tail``.
+
+    **The cut is not at ``_REDACT_WINDOW``, and sizing to that number is how this helper silently
+    stopped positioning anything.** ``clamp_untrusted`` reserves ``_CLAMP_MARKER_BUDGET`` for its note
+    and takes it off the CUT, so the real boundary is 74 characters earlier. Sized to the window
+    instead, every fixture's tail began after the cut and was dropped wholesale: the token walk never
+    ran, ``_ends_with_name_token`` never returned True anywhere in this suite, and the two arms that
+    name the walk asserted absence for the wrong reason. Both numbers are read from the module rather
+    than restated, so moving either moves this.
+
+    The tail ends ON the boundary, so the cut lands at its last whitespace. The trailing run is
+    non-whitespace on purpose: it carries the string past the window -- without it a budget-aware
+    fixture is under the window and is not clamped at all -- while offering no later place to cut."""
+    cut = redaction._REDACT_WINDOW - redaction._CLAMP_MARKER_BUDGET
+    assert any(char in redaction._CUT_CHARS for char in tail), (
+        f"{tail!r} holds no whitespace, so the cut cannot land inside it and this fixture would "
+        f"position nothing"
+    )
+    return _filler(cut - len(tail)) + tail + "Q" * redaction._REDACT_WINDOW
 
 
 def test_the_fence_a_naive_prefix_truncation_leaks_the_name() -> None:
@@ -784,6 +802,32 @@ def test_clamp_closes_the_fence_it_was_built_against() -> None:
     assert "DOE" not in redact(clamp_untrusted(leaky))
 
 
+def test_the_over_window_fixture_really_puts_the_cut_inside_the_tail() -> None:
+    """THE POSITIVE CONTROL for every arm ``_over_window`` builds, and the one this file was missing.
+
+    Sized to ``_REDACT_WINDOW`` rather than to the boundary the clamp actually uses, the helper put
+    every tail 74 characters PAST the cut. The tail was dropped wholesale, the token walk never ran,
+    and each absence arm below passed for a reason that had nothing to do with what it names. **An
+    absence assertion cannot tell a working walk from a fixture that never reached it**, so the
+    position is asserted here, in two lines that fail when it moves: the cut lands inside the tail,
+    and the walk then actually fires."""
+    tail = " DOE JANE tail"
+    text = _over_window(tail)
+    tail_start = len(text) - redaction._REDACT_WINDOW - len(tail)
+    assert text[tail_start : tail_start + len(tail)] == tail
+    assert len(text) > redaction._REDACT_WINDOW, "the fixture is not over the window at all"
+
+    cut = redaction._last_cut(text, redaction._REDACT_WINDOW - redaction._CLAMP_MARKER_BUDGET)
+    assert cut > tail_start, (
+        f"the cut landed at {cut}, before the tail at {tail_start}: the fixture drops its tail "
+        f"wholesale and every arm built on it is vacuous"
+    )
+    assert redaction._drop_trailing_name_tokens(text, cut) < cut, (
+        "the cut is inside the tail but the walk dropped nothing, so _ends_with_name_token still "
+        "never returns True in this suite"
+    )
+
+
 def test_clamp_does_not_strand_a_name_run_split_by_the_cut() -> None:
     """``_NAME_RUN`` spans whitespace, so a whitespace cut alone can still strand it: ``DOE JANE`` cut
     between its tokens leaves ``DOE`` under the two-token threshold. The token walk drops the
@@ -791,6 +835,28 @@ def test_clamp_does_not_strand_a_name_run_split_by_the_cut() -> None:
     and the test to apply to a new one."""
     out = redact(clamp_untrusted(_over_window(" DOE JANE SMITH tail")))
     assert "DOE" not in out and "JANE" not in out and "SMITH" not in out
+
+
+def test_the_walk_does_not_strand_a_name_the_unbounded_redactor_scrubs() -> None:
+    """THE ARM THE WALK WAS REBUILT FOR: clamping must never keep a token that not clamping scrubs.
+
+    The walk used to stop after a fixed three tokens, on the reasoning that ``_NAME_RUN`` joins at
+    most four and the cut consumes one. **Dropping a token strands its own left partner**, which was
+    over the two-token threshold only because of the token just dropped, so no fixed budget is a fixed
+    point. Four name tokens behind the cut is the smallest case that shows it: the walk spent its
+    three steps on ``ROE``, ``JANE`` and ``DOE``, and ``SMITH`` was left standing alone -- kept by the
+    bound, scrubbed without it.
+
+    The third assertion is the direction that must not regress: the fix is the clamped path catching
+    up to the unbounded one, never the unbounded one being loosened to agree with it."""
+    text = _over_window(" SMITH DOE JANE ROE ")
+
+    assert "SMITH" not in redact(text), (
+        "the unbounded redactor no longer scrubs this run, so the arm below cannot distinguish a "
+        "closed leak from a fixture the redactor was never going to catch"
+    )
+    assert "SMITH" not in redact(clamp_untrusted(text))
+    assert "SMITH" not in safe_text(text, limit=100_000)
 
 
 def test_clamp_steps_over_a_whitespace_run_between_name_tokens() -> None:
@@ -919,6 +985,118 @@ def test_control_the_same_inputs_are_expensive_unbounded() -> None:
     assert best > _SCAN_BUDGET_SECONDS, (
         f"the unbounded scan cost only {best:.4f}s, under the {_SCAN_BUDGET_SECONDS}s budget the "
         f"bounded arm clears -- this fixture no longer discriminates and the budget needs re-deriving"
+    )
+
+
+#: The corpus the property arm below draws from. **Whole tokens, not characters.** The leak needs a
+#: RUN of adjacent name-shaped tokens behind the cut, and a uniform character alphabet essentially
+#: never builds one: the first cut of that arm drew characters, and its own control found zero leaks
+#: on the KNOWN-LEAKY walk -- which made its zero on the fixed walk worth nothing.
+_FUZZ_TOKENS = (
+    "SMITH", "DOE", "JANE", "ROE", "AA", "BB", "MR", "ADT",
+    "Smith", "Doe", "Jane", "Ab",
+    "ok", "rejected", "patient", "x", "12", "1980-05-05",
+    "a^b", "P|Q", "100^^^H^MR", "-", "(DOE", "DOE)",
+)  # fmt: skip
+
+
+def _fuzz_text(rand: random.Random) -> str:
+    parts: list[str] = []
+    for _ in range(rand.randint(0, 25)):
+        parts.append(rand.choice(_FUZZ_TOKENS))
+        parts.append(rand.choice((" ", " ", " ", "  ", "\t", "\n")))
+    return "".join(parts)
+
+
+def _three_step_clamp(text: str, window: int) -> tuple[str, int]:
+    """``_clamp`` with the walk PR 1319 shipped: at most three tokens, then stop.
+
+    Kept as the positive control for the arm below and for nothing else. An absence arm over a random
+    corpus is worthless until something shows the corpus can produce the thing being asserted absent,
+    and the honest something is the defect itself."""
+    if len(text) <= window:
+        return text, 0
+    cut = max(redaction._last_cut(text, window), 0)
+    for _ in range(3):
+        if not cut:
+            break
+        end = len(text[:cut].rstrip(redaction._CUT_CHARS))
+        start = redaction._last_cut(text, end) + 1
+        if not redaction._ends_with_name_token(text[start:end]):
+            break
+        cut = start
+    return text[:cut], len(text) - cut
+
+
+def _clamp_leaks(clamp: Callable[[str, int], tuple[str, int]], trials: int) -> int:
+    """How many trials keep a token through ``clamp`` that the UNBOUNDED redactor scrubs."""
+    rand = random.Random(1576)  # seeded: a flaky PHI arm gets muted, so this one cannot flake
+    leaks = 0
+    for _ in range(trials):
+        text = _fuzz_text(rand)
+        head, dropped = clamp(text, rand.randint(1, max(len(text), 1)))
+        if not dropped:
+            continue
+        if set(redact(head).split()) - set(redact(text).split()):
+            leaks += 1
+    return leaks
+
+
+def test_no_token_survives_the_clamp_that_the_unbounded_scan_scrubs() -> None:
+    """THE LEAK PROPERTY, over a corpus rather than the one reproduction that exposed it.
+
+    The rule the arms above are instances of: clamping may drop anything, and may over-redact
+    freely, but it may never KEEP a token the unbounded redactor would have scrubbed. That is what
+    BACKLOG #1576 must not trade away for its bound.
+
+    The control is the pre-fix walk on the same seed and the same corpus, because an absence over
+    random input proves nothing until something proves the input can produce the thing. Measured at
+    1,500 trials: 0 here against 31 on the three-step walk.
+
+    **WHAT THIS CORPUS REACHES, which is less than the rule it checks.** ``_fuzz_text`` joins whole
+    tokens with whitespace, so it exercises leaks that turn on where the cut falls BETWEEN tokens --
+    the name-run class the walk exists for. It cannot reach a leak that turns on text the window
+    never sees: a clamp that drops the ``MSH`` declaring custom delimiters leaves
+    ``_sniff_delimiters`` nothing to read, and no token list produces that because the dependency is
+    on the whole text rather than on a span. It carries no ``_INVALID_URL_USERINFO`` literal either.
+    Both are known open gaps recorded on the pull request, and the control shares the blind spot, so
+    a zero here is evidence about the walk and about nothing else."""
+    shipped = _clamp_leaks(redaction._clamp, 1_500)
+    control = _clamp_leaks(_three_step_clamp, 1_500)
+    assert control, (
+        "the pre-fix walk leaked nothing on this corpus, so the corpus cannot produce the defect "
+        "and the assertion below is vacuous -- re-check _FUZZ_TOKENS before trusting a zero"
+    )
+    assert not shipped, f"{shipped} of 1,500 trials kept a token the unbounded scan scrubs"
+
+
+def test_the_token_walk_is_bounded_by_the_window_not_by_the_peer() -> None:
+    """THE OTHER HALF OF THE LEAK FIX, and the one an absence arm cannot see.
+
+    The walk drops name-shaped tokens until it meets one that is not, rather than a fixed three, so
+    the PEER chooses how many steps it takes. That is only safe while each step's work stays inside
+    the region being dropped. Spelled the obvious way -- ``text[:cut].rstrip(...)`` paired with
+    ``_last_cut`` -- each step copies from index 0 and rescans from index 0, and the walk is quadratic
+    in the window: the exact cost class BACKLOG #1576 exists to bound, rebuilt inside the fix for it.
+
+    The fixture is the most steps a window can buy: the shortest legal ALLCAPS token plus one space,
+    21,820 of them, with a non-whitespace run behind so the cut lands at the end of the run and the
+    walk has to travel the whole way back. Measured best-of-3 on the author's box, 6.2 ms here against
+    630 ms for the ``_last_cut`` spelling, which is why the budget separates them at all."""
+    window = redaction._REDACT_WINDOW - redaction._CLAMP_MARKER_BUDGET
+    run = ("AA " * (window // 3 + 1))[:window]
+    hostile = run + "Q" * 200_000
+
+    best = _best_of(lambda: clamp_untrusted(hostile))
+    assert best < _SCAN_BUDGET_SECONDS, (
+        f"clamping {len(run)} characters of name-shaped tokens cost {best:.4f}s of the event loop "
+        f"against a {_SCAN_BUDGET_SECONDS}s budget -- the walk is no longer linear in the window"
+    )
+    # Non-vacuity: a walk that stopped early would be fast for the wrong reason. Every token here is
+    # name-shaped back to index 0, so a walk that ran to completion keeps nothing but the note.
+    assert clamp_untrusted(hostile).strip().startswith("[redaction bound:"), (
+        "the walk stopped before the start of the run, so this fixture is not measuring a full-window "
+        "walk and the budget above proves nothing about one"
     )
 
 
