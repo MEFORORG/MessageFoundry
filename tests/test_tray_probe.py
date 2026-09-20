@@ -348,6 +348,172 @@ def test_tray_probe_bound_is_generous_for_health_and_far_under_the_apiclient() -
     )
 
 
+# --- the bounded-read guard, and what it is allowed to see (BACKLOG #1577, narrowed by #1831) ---
+
+#: Verbs that belong to an HTTP client and to essentially nothing else a probe would be holding. A
+#: call to one of these outside ``_get_bounded`` is an unbounded read whatever the receiver is, so
+#: the sweep over them is as broad as it ever was.
+_CLIENT_ONLY_VERBS = frozenset(
+    {"post", "put", "patch", "delete", "head", "options", "request", "stream"}
+)
+
+#: ...and the two an ordinary Python object answers to as well: ``dict.get`` and ``generator.send``.
+#: Swept on any receiver, ``body.get("status")`` in ``classify_health`` was indistinguishable from
+#: ``client.get(url)`` -- a false positive worked around at the call site, which is how a guard gets
+#: deleted by the next reader who does not know why it exists (BACKLOG #1831). These two are flagged
+#: only where the receiver could be holding a client.
+_AMBIGUOUS_VERBS = frozenset({"get", "send"})
+
+#: Call targets that hand an httpx client back. A name assigned from one of these holds a client
+#: even though nothing annotates it.
+_CLIENT_FACTORIES = frozenset({"httpx.Client", "httpx.AsyncClient", "make_probe_client"})
+
+
+def _names_a_client(annotation: ast.expr | None) -> bool:
+    """Does ``annotation`` name an httpx client -- ``httpx.Client``, ``AsyncClient``, a union?
+
+    Spelled against the unparsed text rather than the node shape so a union, an optional or a plain
+    ``Client`` import all read the same. mypy runs strict over this package, so every parameter that
+    takes a client carries an annotation saying so -- that is what makes an annotation a reliable
+    discriminator here and not a guess.
+    """
+    return annotation is not None and "Client" in ast.unparse(annotation)
+
+
+def _builds_a_client(node: ast.expr) -> bool:
+    """Is ``node`` an expression that constructs an httpx client?"""
+    return isinstance(node, ast.Call) and ast.unparse(node.func) in _CLIENT_FACTORIES
+
+
+def _client_bearing_names(tree: ast.Module) -> set[str]:
+    """Names in this module that may be holding a client, by any route the module itself shows."""
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        # ``import httpx`` -- ``httpx.get(url)`` is an unbounded read with no client in sight.
+        if isinstance(node, ast.Import):
+            names |= {
+                (alias.asname or alias.name).split(".")[0]
+                for alias in node.names
+                if alias.name.split(".")[0] == "httpx"
+            }
+        elif isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] == "httpx":
+            names |= {alias.asname or alias.name for alias in node.names}
+        # ``def probe_health(client: httpx.Client)`` -- the shape every probe in this module uses.
+        elif isinstance(node, ast.arg) and _names_a_client(node.annotation):
+            names.add(node.arg)
+        # ``c = make_probe_client(url)`` -- annotated or not.
+        elif isinstance(node, ast.Assign | ast.AnnAssign):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            annotated = isinstance(node, ast.AnnAssign) and _names_a_client(node.annotation)
+            if annotated or (node.value is not None and _builds_a_client(node.value)):
+                names |= {t.id for t in targets if isinstance(t, ast.Name)}
+    return names
+
+
+def _bound_names(tree: ast.Module) -> set[str]:
+    """Every name this module binds, by any statement form.
+
+    The complement is what matters: a name used as a receiver and bound NOWHERE here came from
+    somewhere this walk cannot see, and :func:`_may_hold_a_client` treats that as a client.
+    """
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            names.add(node.id)  # assignment, for/with target, walrus, comprehension
+        elif isinstance(node, ast.arg):
+            names.add(node.arg)
+        elif isinstance(node, ast.alias):
+            names.add((node.asname or node.name).split(".")[0])
+        elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            names.add(node.name)
+        elif isinstance(node, ast.ExceptHandler):
+            if node.name:  # `except E as e` binds; a bare `except E` binds nothing
+                names.add(node.name)
+        elif isinstance(node, ast.Global | ast.Nonlocal):
+            names.update(node.names)
+    return names
+
+
+def _may_hold_a_client(receiver: ast.expr, client_names: set[str], bound_names: set[str]) -> bool:
+    """Could ``receiver`` be an httpx client? Answered so that UNKNOWN reads as YES.
+
+    Three things clear, and nothing else does: a plain name this module binds to a non-client, an
+    attribute of one whose last segment is not itself client-named, and an expression that is not a
+    value at all (a literal, a subscript, a comprehension). Everything else -- a client name, a name
+    or chain-root nothing here binds, a client built inline -- is treated as a client.
+
+    The asymmetry is the design. A false positive costs a workaround at a call site and, eventually,
+    somebody deleting the guard; a false negative costs the unbounded read BACKLOG #1577 closed. So
+    the unknown cases go to the flagging side and the clearing side is enumerated, not inferred.
+    """
+    if isinstance(receiver, ast.Name):
+        return receiver.id in client_names or receiver.id not in bound_names
+    if isinstance(receiver, ast.Attribute):
+        # The LAST segment is the value being called, so that is the one to judge:
+        # ``self._client.get(...)`` is a client, ``client.headers.get(...)`` is a mapping ON one.
+        # Judging the root instead would flag every mapping an httpx client exposes -- the same
+        # false positive one level up.
+        if receiver.attr.lower().endswith("client"):
+            return True
+        root: ast.expr = receiver
+        while isinstance(root, ast.Attribute):
+            root = root.value
+        # ...but a chain rooted in a name nothing here binds came from outside this walk.
+        return isinstance(root, ast.Name) and root.id not in bound_names
+    if isinstance(receiver, ast.Call):
+        return _builds_a_client(receiver)
+    return False  # a literal, a subscript, a comprehension: nothing that holds a client
+
+
+def _unbounded_reads(source: str) -> list[str]:
+    """Every call in ``source`` that issues a request without going through ``_get_bounded``."""
+    tree = ast.parse(source)
+    bounded = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_get_bounded"
+    ]
+    assert bounded, "tray/probe.py defines no `_get_bounded`; this guard is aimed at nothing"
+    inside_helper = {n for root in bounded for n in ast.walk(root)}
+    client_names = _client_bearing_names(tree)
+    bound_names = _bound_names(tree)
+
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if node in inside_helper or not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Attribute):
+            continue
+        ambiguous = func.attr in _AMBIGUOUS_VERBS and _may_hold_a_client(
+            func.value, client_names, bound_names
+        )
+        if func.attr in _CLIENT_ONLY_VERBS or ambiguous:
+            found.append(f"line {node.lineno}: `{ast.unparse(func)}(...)`")
+    return found
+
+
+def _probe_source() -> str:
+    return Path(inspect.getfile(probe_module)).read_text(encoding="utf-8")
+
+
+def _flags_the_plant(body: str) -> bool:
+    """Plant ``body`` in the real probe source and report whether the guard flags THAT LINE.
+
+    Two things, and the second is the one that makes an arm mean something. The plant goes into real
+    ``tray/probe.py`` source, so no arm can pass against a toy tree that has drifted from it.
+    And the verdict is keyed on the planted line, not on the finding list being non-empty: a bare
+    ``assert found`` answers "did the guard flag anything", which is a different sentence from "did
+    the guard flag this", and it stays green off an unrelated defect elsewhere in the module. That
+    not hypothetical -- while this was being written, a real ``client.get`` planted in ``probe_ui``
+    reddened the negative-control arms too, because they were reading the whole list.
+    """
+    frame = f"\n\ndef _planted(client: httpx.Client, body: dict[str, str]) -> object:\n    {body}\n"
+    source = _probe_source() + frame
+    lineno = source[: source.rindex(f"    {body}")].count("\n") + 1
+    return any(finding.startswith(f"line {lineno}:") for finding in _unbounded_reads(source))
+
+
 def test_every_request_in_the_probe_module_goes_through_the_bounded_helper() -> None:
     """Frozen (AST): ``_get_bounded`` is a helper a future probe has to REMEMBER to call, and this
     is what stops that being the weak link.
@@ -360,33 +526,89 @@ def test_every_request_in_the_probe_module_goes_through_the_bounded_helper() -> 
     the unbounded read BACKLOG #1577 closed, and nothing else in the module would notice.
 
     Mutation: add ``client.get("/version")`` anywhere in tray/probe.py. Red: the call is named."""
-    source = Path(inspect.getfile(probe_module)).read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    bounded = {
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "_get_bounded"
-    }
-    inside_helper = {n for root in bounded for n in ast.walk(root)}
+    assert _unbounded_reads(_probe_source()) == []
 
-    verbs = {
-        "get",
-        "post",
-        "put",
-        "patch",
-        "delete",
-        "head",
-        "options",
-        "request",
-        "stream",
-        "send",
-    }
-    for node in ast.walk(tree):
-        if node in inside_helper or not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        if isinstance(func, ast.Attribute) and func.attr in verbs:
-            raise AssertionError(
-                f"tray/probe.py line {node.lineno} issues `.{func.attr}(...)` outside "
-                "`_get_bounded`; every probe read must go through the bounded helper"
-            )
+
+@pytest.mark.parametrize(
+    "planted",
+    [
+        'return client.get("/version")',  # the canonical regression BACKLOG #1577 closed
+        'return client.send(client.build_request("GET", "/version"))',
+        'return client.post("/version", json={})',  # an unambiguous verb, unchanged sweep
+        'return client.stream("GET", "/version")',
+        'return httpx.get("http://127.0.0.1:8765/version")',  # no client named at all
+        'return make_probe_client("http://x").get("/version")',  # built inline
+        'return _POLLER_CLIENT.get("/version")',  # a name this module never binds: fail closed
+        'return _state.poller.get("/version")',  # ...and so does a chain rooted in one
+        'return body.client.get("/version")',  # a client-named attribute on a BOUND root
+        'return client.headers.get("x") or client.get("/version")',  # legal beside illegal
+    ],
+)
+def test_the_narrowed_guard_still_catches_a_real_unbounded_read(planted: str) -> None:
+    """POSITIVE CONTROL for the narrowing. Narrowing a guard is how a guard stops working, so every
+    shape the broad sweep caught has to be shown still caught -- not reasoned about.
+
+    Every arm is a shape the broad sweep flagged, and the arms are deliberately non-overlapping so a
+    red names which rule stopped working. The three ways a client reaches a call site without being
+    a plainly annotated local are separated on purpose: ``_POLLER_CLIENT`` is an unbound NAME,
+    ``_state.poller`` is a chain rooted in one, and ``body.client`` is a client-named attribute on a
+    root this module DOES bind -- only the last exercises the attribute spelling by itself.
+
+    Mutation: make ``_may_hold_a_client`` return ``False`` for an unbound name. Red: the
+    ``_POLLER_CLIENT`` arm alone, which is the point of separating it from ``_state.poller``."""
+    assert _flags_the_plant(planted), (
+        f"the guard did not flag {planted!r}; a real unbounded read now passes it"
+    )
+
+
+@pytest.mark.parametrize(
+    "planted",
+    [
+        'return body.get("status")',  # BACKLOG #1831: the false positive that started this
+        'return body.get("status", "")',
+        'return {"a": 1}.get("a")',
+        'return client.headers.get("x")',  # a mapping ON a client is not a client
+        'return body.headers.get("x")',  # ...and neither is an attribute of a plain value
+    ],
+)
+def test_the_guard_leaves_ordinary_python_alone(planted: str) -> None:
+    """NEGATIVE CONTROL. A guard that flagged everything would pass the arms above uniformly.
+
+    ``body`` is the measured case (BACKLOG #1831): it is annotated, it is not a client, and sweeping
+    ``.get`` on any receiver made it indistinguishable from ``client.get(url)``. The cost was not
+    the red -- it was the workaround the red bought at the call site, and a reader who meets one of
+    those without the reason concludes the guard is noise.
+
+    The two ``.headers`` arms are the level-up form of the same mistake, and one of them was a live
+    false positive in the first cut of this narrowing: a mapping ON a client is not a client, so
+    judging an attribute chain by its ROOT rather than its last segment reintroduces the bug.
+
+    Mutation: sweep ``_AMBIGUOUS_VERBS`` on any receiver, as before. Red: every arm here."""
+    assert not _flags_the_plant(planted), (
+        f"the guard flagged {planted!r}; ordinary Python is reddening a guard about HTTP reads"
+    )
+
+
+def test_classify_health_may_read_the_status_value_without_tripping_the_guard() -> None:
+    """The narrowing measured on the real call site, not a planted frame (BACKLOG #1831).
+
+    ``classify_health`` tests key PRESENCE today. Reading the VALUE is the obvious next edit, and it
+    is spelled ``body.get("status")``; before the narrowing that spelling reddened this file, so the
+    call site had to be written around the guard instead. This asserts the substitution is clean,
+    which is the whole claim -- it does not make it, and must not: whether ``/health`` is classified
+    on the key or the value is a behaviour question, decided elsewhere.
+
+    The verdict is keyed on the substituted LINE rather than on the finding list being empty, for
+    the reason :func:`_flags_the_plant` gives: an unrelated unbounded read elsewhere in the module
+    would otherwise red this arm too, and a reader would go looking at ``classify_health``."""
+    source = _probe_source()
+    before = '    if status_code == 200 and isinstance(body, dict) and "status" in body:'
+    after = '    if status_code == 200 and isinstance(body, dict) and body.get("status") == "ok":'
+    assert before in source, "classify_health was respelled; re-aim this arm at its live shape"
+    lineno = source[: source.index(before)].count("\n") + 1
+    flagged = [
+        f
+        for f in _unbounded_reads(source.replace(before, after))
+        if f.startswith(f"line {lineno}:")
+    ]
+    assert not flagged, f"the guard still refuses classify_health the status value: {flagged}"
