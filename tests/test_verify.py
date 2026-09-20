@@ -926,7 +926,7 @@ _RAW_ADT = (
 
 
 async def _seed_message(settings: StoreSettings, *, control_id: str, status: MessageStatus) -> str:
-    handle = await open_store(settings)
+    handle = await open_store(settings, create=True)  # the seed provisions; the checks must not
     try:
         return await handle.record_received(
             channel_id="verify-test", raw=_RAW_ADT, status=status, control_id=control_id
