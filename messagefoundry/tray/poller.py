@@ -12,11 +12,11 @@ fallback only -- it is kept out of every piece of cross-tick memory, for the rea
 :meth:`StatusPoller._unknown_result`.
 
 The guarded region is the whole of the tick that reads the world: the monotonic clock read that
-opens it and the three injected probes behind :meth:`StatusPoller.poll_once`. Everything after it
-is pure reduction over that tick's own result, so there is nothing left outside the guard for an
-injected dependency to break. Repeated failures are logged with a backoff
-(:meth:`StatusPoller._record_poll_failure`) so a poll that never recovers cannot push the evidence
-of its own first failure out of a rotating log.
+opens it and the three injected probes behind :meth:`StatusPoller.poll_once`. What runs *after
+that guard closes* is the cadence computation and the wait, pure over the tick's own result, so
+no injected dependency is left outside it. Both of the loop's guards -- the tick and the update
+callback -- log through a :class:`_FailureRun`, which states there why a per-pass traceback
+cannot be left unthrottled on a loop this one's cadence.
 
 The timing that turns raw readings into :class:`~messagefoundry.tray.state.ProbeInputs` — the boot-grace clock and
 stuck-pending detection — is the **pure** :func:`advance`, keyed to a **monotonic** ``now`` so a
@@ -56,13 +56,69 @@ log = logging.getLogger("messagefoundry.tray.poller")
 TOAST_MIN_INTERVAL_S = 30.0
 _STOP_JOIN_TIMEOUT_S = 3.0
 
-# A poll that keeps failing writes its traceback on the 1st, 2nd, 4th, 8th ... consecutive tick.
-# Geometric, so the record count over a failure run grows as the log of its length: at the 5s
-# base cadence a failing tick publishes UNKNOWN every 5s, so a day of continuous failure writes
-# about fifteen tracebacks instead of about seventeen thousand. That is the difference between
-# `tray.log` keeping days of history and rotating its 1 MB x 3 window out within hours -- and the
-# record that rotates out first is the one naming the original cause.
-_FAILURE_LOG_GROWTH = 2
+
+def _is_emission(n: int) -> bool:
+    """True on the 1st, 2nd, 4th, 8th ... of something -- that is, when ``n`` is a power of two."""
+    return n & (n - 1) == 0
+
+
+@dataclass(frozen=True)
+class _FailureRun:
+    """A run of consecutive failures of one thing, logged with a backoff. Immutable.
+
+    Emissions go on the 1st, 2nd, 4th, 8th ... failure *of a cause*. Geometric, because the loop
+    retries on a fixed cadence and an unthrottled traceback per pass is what collapses a
+    rotating log: at :data:`~messagefoundry.tray.state.POLL_BASE_S` a thing that stays broken
+    writes on the order of seventeen thousand tracebacks a day into the 1 MB x 3 ``tray.log``
+    that ``tray.__main__._setup_logging`` opens, rotating the whole window out within hours --
+    and the first record to go is the one naming the original cause. Backed off it is about
+    fifteen a day, and the original cause survives.
+
+    The consecutive count rides in every message, which is what makes the suppression legible:
+    a record reading ``consecutive failures: 512`` says on its face that 511 went unwritten, so
+    a reader is never misled into treating the log as a complete list of attempts.
+
+    A *changed* cause is never held back, because it is the only record in a long run carrying
+    anything the reader does not already have. **That bounds what the backoff can promise**: the
+    cause is keyed on the exception's type and message, so one whose message varies every pass
+    (an embedded handle, address or errno detail) reads as a new cause each time and is not
+    throttled at all. That is the deliberate trade -- the alternative, a bound that holds under
+    a churning message, can only be had by suppressing a changed cause, and a backoff that hides
+    a new fault behind an old one is worth less than no backoff.
+
+    A value object for the same reason :class:`Tracking` is one: three pieces of cross-call
+    memory only ever meaningful together, so one rebind is the whole state change and one
+    default is the whole reset.
+    """
+
+    count: int = 0  # consecutive failures, whatever the cause; 0 whenever the thing is healthy
+    signature: tuple[str, str] | None = None  # exception type and message of the current cause
+    cause_run: int = 0  # failures since the cause last changed -- what the schedule counts
+
+    def record(self, exc: Exception, message: str) -> _FailureRun:
+        """The run after one more failure, having logged it unless the backoff holds it back."""
+        signature = (type(exc).__name__, str(exc))
+        # A changed cause starts its own schedule rather than inheriting where the previous one
+        # had got to. Carrying the old position forward would log a new fault once and then go
+        # silent for as many passes again -- deep in a long run, hundreds -- which is the
+        # opposite of never holding a new cause back.
+        cause_run = self.cause_run + 1 if signature == self.signature else 1
+        if _is_emission(cause_run):
+            # The count is the WHOLE run, not this cause's share: an operator reading the record
+            # needs to know how long the thing has been failing, not just since it changed how.
+            log.error("%s (consecutive failures: %d)", message, self.count + 1, exc_info=exc)
+        return _FailureRun(self.count + 1, signature, cause_run)
+
+    def clear(self, what: str) -> _FailureRun:
+        """The healthy run, noting how long the old one lasted if there was one to close.
+
+        That line is what keeps the backoff honest. Without it an absence of recent tracebacks
+        has two readings -- recovered, or still failing and merely gone quiet -- and nothing in
+        the log tells them apart. One line per run, so it cannot itself become the flood.
+        """
+        if self.count:
+            log.info("tray %s recovered after %d consecutive failures", what, self.count)
+        return _FailureRun()
 
 
 @dataclass(frozen=True)
@@ -180,9 +236,8 @@ class StatusPoller:
         self._tracking = Tracking()
         self._last_state: TrayState | None = None
         self._last_toast_at: float | None = None
-        self._poll_failures = 0  # consecutive raising ticks; 0 whenever the poll is healthy
-        self._poll_failure_signature: tuple[str, str] | None = None
-        self._next_failure_log = 1  # the run length at which the next traceback is written
+        self._poll_failures = _FailureRun()
+        self._callback_failures = _FailureRun()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -222,10 +277,12 @@ class StatusPoller:
                     # what happened without reading as a failure on a clean exit.
                     log.info("tray status poll raised while stopping: %r", exc)
                 else:
-                    self._record_poll_failure(exc)
+                    self._poll_failures = self._poll_failures.record(
+                        exc, "tray status poll raised; publishing UNKNOWN for this tick"
+                    )
                 result = self._unknown_result()
             else:
-                self._clear_poll_failures()
+                self._poll_failures = self._poll_failures.clear("status poll")
             if self._stop.is_set():
                 # Best-effort, not a guarantee: `stop()` can still land between this check and
                 # the call below. It is worth having anyway, because it closes the wide case (a
@@ -234,56 +291,29 @@ class StatusPoller:
                 return
             try:
                 self._on_update(result)
-            except Exception:  # a UI callback must never kill the poll loop (supervisory boundary)
-                log.exception("tray status callback raised")
+            except Exception as exc:  # a UI callback must never kill the loop (supervisory)
+                if self._stop.is_set():
+                    # The same shutdown window the poll guard above handles, reached the same
+                    # way: `stop()` can land between that `is_set` check and this call, and the
+                    # callback then repaints a torn-down shell. Claiming a fault for that would
+                    # put an ERROR traceback in tray.log on every clean exit. INFO for the same
+                    # reason it is INFO there -- any exception raised in the window lands here,
+                    # so a genuine defect must not vanish.
+                    log.info("tray status callback raised while stopping: %r", exc)
+                else:
+                    # Backed off for the reason the poll path is, and it has to be: a callback
+                    # that raises once (torn-down window handle, iconset load failure) raises
+                    # every tick, on the same cadence, into the same rotating log. Left
+                    # unthrottled it would rotate out the very evidence the poll path's backoff
+                    # exists to preserve, so that guarantee would hold only while this sibling
+                    # happened to be quiet.
+                    self._callback_failures = self._callback_failures.record(
+                        exc, "tray status callback raised"
+                    )
+            else:
+                self._callback_failures = self._callback_failures.clear("status callback")
             interval = next_poll_seconds(result.snapshot.state, result.inputs.wait_hint_s)
             self._stop.wait(interval)
-
-    def _record_poll_failure(self, exc: Exception) -> None:
-        """Log a failing tick, backing off so a poll that never recovers cannot flood the log.
-
-        The consecutive count in the message is what makes the suppression legible: a record
-        reading ``consecutive failures: 512`` says on its face that 511 ticks went unwritten, so
-        a reader is never misled into treating the log as a complete list of attempts.
-
-        A *changed* cause is never held back. The threshold the previous cause raised says
-        nothing about a new one, and the new one is the only record in a long run that carries
-        anything the reader does not already have.
-
-        The accepted cost is a poll that **flaps** -- fails, recovers, fails again -- because
-        each run starts over and so logs its own first tick. That is the right call: a failure
-        recurring after a recovery is a new event, and the unbounded case this backoff exists
-        for is the poll that simply stays broken.
-        """
-        signature = (type(exc).__name__, str(exc))
-        self._poll_failures += 1
-        if signature != self._poll_failure_signature:
-            self._poll_failure_signature = signature
-            self._next_failure_log = self._poll_failures
-        if self._poll_failures < self._next_failure_log:
-            return
-        log.error(
-            "tray status poll raised; publishing UNKNOWN for this tick (consecutive failures: %d)",
-            self._poll_failures,
-            exc_info=exc,
-        )
-        self._next_failure_log = self._poll_failures * _FAILURE_LOG_GROWTH
-
-    def _clear_poll_failures(self) -> None:
-        """Close out a run of failing ticks. Silent unless there was one.
-
-        This line is what keeps the backoff honest. Without it an absence of recent tracebacks
-        has two readings -- the poll recovered, or it is still failing and has merely gone quiet
-        -- and nothing in the log tells them apart. One line per run, so it cannot itself become
-        the flood the backoff was added to stop.
-        """
-        if self._poll_failures:
-            log.info(
-                "tray status poll recovered after %d consecutive failures", self._poll_failures
-            )
-        self._poll_failures = 0
-        self._poll_failure_signature = None
-        self._next_failure_log = 1
 
     def poll_once(self, now: float) -> PollResult:
         """Read all probes once and produce a :class:`PollResult`. Does I/O via the injected deps."""

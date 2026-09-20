@@ -8,6 +8,7 @@ import logging
 import queue
 import time
 from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 
 import httpx
 import pytest
@@ -266,9 +267,7 @@ def test_poll_thread_survives_a_raising_tick_and_publishes_unknown(
     # The row asked for the failure to be *logged*, not just absorbed. Without this the whole test
     # stays green with the `log.exception` line deleted, and a silent swallow is the defect the
     # row's own measurement describes -- output going nowhere under `pythonw`.
-    failures = [
-        r for r in caplog.records if r.name == _POLLER_LOGGER and r.levelno >= logging.ERROR
-    ]
+    failures = _faults(caplog)
     assert len(failures) == 1
     assert "publishing UNKNOWN" in failures[0].getMessage()
     # Read whichever field carries the traceback, because which one that is depends on whether
@@ -415,15 +414,33 @@ def test_a_first_tick_failure_does_not_spend_the_startup_no_toast_exemption() ->
     assert first_real.toast is None  # still the *first* real reading: never toast on startup
 
 
-def _scripted_reader(script: Sequence[ScmReading | None]) -> Callable[[str], ScmReading]:
-    """SCM readings from a fixed script; ``None`` raises the OSError a failing tick stands for.
+@pytest.fixture
+def fast_poll(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Collapse every cadence, so an arm driving `_run` is bounded ticks and not sleeps.
+
+    All three, not just the base: `next_poll_seconds` clamps a STARTING or STOPPING tick to
+    ``POLL_PENDING_MIN_S`` and up, so an arm whose script never reaches UNKNOWN would still
+    sleep a second per tick with only the base patched.
+    """
+    monkeypatch.setattr(state_mod, "POLL_BASE_S", 0.001)
+    monkeypatch.setattr(state_mod, "POLL_PENDING_MIN_S", 0.001)
+    monkeypatch.setattr(state_mod, "POLL_PENDING_MAX_S", 0.001)
+
+
+def _scripted_reader(
+    script: Sequence[ScmReading | BaseException | None],
+) -> Callable[[str], ScmReading]:
+    """SCM readings from a fixed script. ``None`` is the ordinary failing tick.
+
+    An exception instance is raised as given, for the arms that need to vary the *cause*
+    between ticks rather than just fail.
 
     Running dry calls `pytest.fail`, which raises a **BaseException** and so sails through
     `_run`'s ``except Exception`` supervisory boundary. A bare `next()` raises `StopIteration`,
     and that *is* an `Exception` -- so the boundary absorbs it, the loop publishes one more
-    UNKNOWN and runs on, turning "this test outran its script" into a runaway loop or a
-    baffling state mismatch. That swallow already applies to a scripted reader today, because
-    `poll_once` has always been inside the guard.
+    UNKNOWN and runs on, turning "this arm outran its script" into a runaway loop or a
+    baffling state mismatch. That swallow already applied to a scripted reader before this
+    branch, because `poll_once` has always been inside the guard.
     """
     remaining = iter(script)
 
@@ -434,6 +451,8 @@ def _scripted_reader(script: Sequence[ScmReading | None]) -> Callable[[str], Scm
             pytest.fail("the poll loop asked for an unscripted SCM reading")
         if reading is None:
             raise OSError("QueryServiceStatusEx blew up")
+        if isinstance(reading, BaseException):
+            raise reading
         return reading
 
     return reader
@@ -462,17 +481,20 @@ def _scripted_clock(script: Sequence[float | None]) -> Callable[[], float]:
     return clock
 
 
+@contextmanager
 def _looping_poller(
     scm_reader: Callable[[str], ScmReading],
     *,
     stop_after: int,
     clock: Callable[[], float] = time.monotonic,
-) -> tuple[StatusPoller, httpx.Client, list[PollResult]]:
+    callback: Callable[[PollResult], None] | None = None,
+) -> Iterator[tuple[StatusPoller, list[PollResult]]]:
     """A poller for driving `_run` on the calling thread, stopping after `stop_after` publishes.
 
     ``/health`` is dark and ``/ui`` unknown throughout, so a RUNNING service ages STARTING ->
     WEDGED across the script. The stop is armed from inside `on_update`, which runs *outside*
-    the guarded region, so arming it can never be mistaken for the tick failing.
+    the tick's guarded region, so arming it can never be mistaken for the tick failing --
+    and it is armed before `callback` runs, so a callback that raises still ends the loop.
     """
     published: list[PollResult] = []
     client = httpx.Client(base_url=_ENGINE_URL)
@@ -481,6 +503,8 @@ def _looping_poller(
         published.append(result)
         if len(published) >= stop_after:  # `>=`, so an unscripted extra tick still ends the loop
             poller._stop.set()
+        if callback is not None:
+            callback(result)
 
     poller = StatusPoller(
         TrayConfig(engine_url=_ENGINE_URL, service_name="MessageFoundry"),
@@ -491,16 +515,17 @@ def _looping_poller(
         clock=clock,
     )
     poller._client = client
-    return poller, client, published
+    try:
+        yield poller, published
+    finally:
+        client.close()
 
 
 def _failure_detail(record: logging.LogRecord) -> str:
-    """The exception a failure record carries, read from whichever field survived redaction.
+    """The exception a record carries, from whichever field survived the PHI `RedactionFilter`.
 
-    `logging_setup._install_phi_filters` installs `RedactionFilter`, which renders `exc_info`
-    into `exc_text` and then clears `exc_info` on purpose. Whether it is installed depends on
-    what else in the process configured engine logging, so reading one field alone passes when
-    this file runs on its own and fails under the full suite.
+    Why that varies is set out on the `exc_info or exc_text` assertion in
+    `test_poll_thread_survives_a_raising_tick_and_publishes_unknown` above.
     """
     if record.exc_text:
         return record.exc_text
@@ -509,28 +534,23 @@ def _failure_detail(record: logging.LogRecord) -> str:
 
 
 def _faults(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """The poller's own records at ERROR or above -- a failure it is claiming, not narrating."""
     return [r for r in caplog.records if r.name == _POLLER_LOGGER and r.levelno >= logging.ERROR]
 
 
-def test_run_itself_does_not_fold_the_failed_tick_into_tracking(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_run_itself_does_not_fold_the_failed_tick_into_tracking(fast_poll: None) -> None:
     """Drive `_run`, because the arms above cannot see where the fallback is actually used.
 
     They call `_unknown_result()` directly, and that method cannot fold by construction -- so
     they all stay green if `_run` goes back to calling `advance` itself. This is the one arm that
     fails on that, and it is the regression this repair exists to prevent.
     """
-    monkeypatch.setattr(state_mod, "POLL_BASE_S", 0.001)  # 3 bounded ticks, not a spin
-    poller, client, published = _looping_poller(
+    with _looping_poller(
         _scripted_reader([ScmReading(ScmState.RUNNING), None, ScmReading(ScmState.RUNNING)]),
         stop_after=3,
         clock=_scripted_clock([0.0, 10.0, 40.0]),
-    )
-    try:
+    ) as (poller, published):
         poller._run()
-    finally:
-        client.close()
 
     assert [r.snapshot.state for r in published] == [
         TrayState.STARTING,  # t=0, inside the boot grace
@@ -539,9 +559,7 @@ def test_run_itself_does_not_fold_the_failed_tick_into_tracking(
     ]
 
 
-def test_the_poll_thread_outlives_a_clock_that_raises(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_the_poll_thread_outlives_a_clock_that_raises(fast_poll: None) -> None:
     """The clock read opens the tick, so it belongs inside the supervisory boundary.
 
     `clock` is a public constructor dependency, ranking with the three probes: any caller may
@@ -554,16 +572,15 @@ def test_the_poll_thread_outlives_a_clock_that_raises(
     It also pins the other half: the failed tick must not reach `advance`, so t=40 is still
     measured from t=0 and the wedged engine is still reported as wedged.
     """
-    monkeypatch.setattr(state_mod, "POLL_BASE_S", 0.001)
-    poller, client, published = _looping_poller(
-        _scripted_reader([ScmReading(ScmState.RUNNING)] * 3),
+    # Two readings, not three: the clock raises before `poll_once` is entered on the middle
+    # tick, so the reader is consulted twice. A spare reading would let an extra loop pass be
+    # consumed silently, disarming the dry-script guard `_scripted_reader` exists to provide.
+    with _looping_poller(
+        _scripted_reader([ScmReading(ScmState.RUNNING)] * 2),
         stop_after=3,
         clock=_scripted_clock([0.0, None, 40.0]),  # the second tick's clock read blows up
-    )
-    try:
+    ) as (poller, published):
         poller._run()  # must return, not carry the injected clock's OSError out of the thread
-    finally:
-        client.close()
 
     assert [r.snapshot.state for r in published] == [
         TrayState.STARTING,  # t=0, inside the boot grace
@@ -572,29 +589,22 @@ def test_the_poll_thread_outlives_a_clock_that_raises(
     ]
 
 
-# --- a poll that never recovers must not flood tray.log ---------------------
+# --- a loop guard that never recovers must not flood tray.log ---------------
 
 
 def test_a_permanently_failing_poll_backs_its_traceback_logging_off(
-    monkeypatch: pytest.MonkeyPatch,
+    fast_poll: None,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """One traceback per tick is what collapses the rotation window, so the emissions back off.
+    """One traceback per tick is what collapses the rotation window, so emissions back off.
 
-    `tray.log` is a 1 MB x 3 rotating file (`tray.__main__._setup_logging`) and a failing tick
-    publishes UNKNOWN, whose cadence is the 5s base. A poll that stays broken therefore writes
-    on the order of 17,000 tracebacks a day, which rotates the whole three-file window out in a
-    few hours -- and what it rotates out is the *first* traceback, the one naming the original
-    cause. The backoff emits on the 1st, 2nd, 4th, 8th ... consecutive tick instead.
+    The arithmetic -- cadence, log size, how long the window survives unthrottled -- is on
+    `_FailureRun`, where the policy lives.
     """
-    monkeypatch.setattr(state_mod, "POLL_BASE_S", 0.001)
-    caplog.set_level(logging.DEBUG, logger=_POLLER_LOGGER)
+    caplog.set_level(logging.ERROR, logger=_POLLER_LOGGER)
 
-    poller, client, published = _looping_poller(_scripted_reader([None] * 10), stop_after=10)
-    try:
+    with _looping_poller(_scripted_reader([None] * 10), stop_after=10) as (poller, published):
         poller._run()
-    finally:
-        client.close()
 
     faults = _faults(caplog)
     assert len(published) == 10  # every tick still publishes UNKNOWN; only the logging backs off
@@ -605,28 +615,48 @@ def test_a_permanently_failing_poll_backs_its_traceback_logging_off(
     assert "consecutive failures: 8" in faults[-1].getMessage()
 
 
-def test_a_recovered_poll_records_how_long_it_was_failing(
-    monkeypatch: pytest.MonkeyPatch,
+def test_a_failing_update_callback_backs_off_the_same_way(
+    fast_poll: None,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The recovery line is what keeps the backoff honest.
+    """The callback guard shares the loop, the cadence and the log, so it shares the backoff.
 
-    Without it, an absence of recent tracebacks has two readings -- the poll recovered, or it
-    is still failing and has merely gone quiet -- and the log offers nothing to tell them
-    apart. One line per run of failures, so it cannot itself become the flood.
+    Throttling only the poll path would leave that path's guarantee resting on this sibling
+    happening to be quiet: a callback that raises once (a torn-down window handle, an iconset
+    that will not load) raises every tick, and rotates out the preserved evidence just as
+    effectively as the poll path's own tracebacks would have.
     """
-    monkeypatch.setattr(state_mod, "POLL_BASE_S", 0.001)
+    caplog.set_level(logging.ERROR, logger=_POLLER_LOGGER)
+
+    def boom(_result: PollResult) -> None:
+        raise RuntimeError("the tray window handle is gone")
+
+    with _looping_poller(
+        _scripted_reader([ScmReading(ScmState.RUNNING)] * 10), stop_after=10, callback=boom
+    ) as (poller, published):
+        poller._run()
+
+    faults = _faults(caplog)
+    assert len(published) == 10  # the loop ran on: the callback guard is still a boundary
+    assert len(faults) == 4  # and the same 1, 2, 4, 8 shape, not one traceback per tick
+    assert "tray status callback raised" in faults[-1].getMessage()  # the callback, not the poll
+    assert "consecutive failures: 8" in faults[-1].getMessage()
+
+
+def test_a_recovered_poll_records_how_long_it_was_failing(
+    fast_poll: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Why the recovery line exists is on `_FailureRun.clear`; this pins that it is emitted."""
     caplog.set_level(logging.INFO, logger=_POLLER_LOGGER)
 
-    poller, client, published = _looping_poller(
+    with _looping_poller(
         _scripted_reader([None, None, None, ScmReading(ScmState.RUNNING)]), stop_after=4
-    )
-    try:
+    ) as (poller, published):
         poller._run()
-    finally:
-        client.close()
 
     assert published[-1].snapshot.state is not TrayState.UNKNOWN  # the poll really did recover
+    # INFO exactly, not `>=`: the run's own ERROR tracebacks are not what this arm is reading.
     recoveries = [
         r.getMessage()
         for r in caplog.records
@@ -636,7 +666,7 @@ def test_a_recovered_poll_records_how_long_it_was_failing(
 
 
 def test_a_new_failure_cause_is_never_suppressed_by_the_backoff(
-    monkeypatch: pytest.MonkeyPatch,
+    fast_poll: None,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A backoff that hid a *changed* cause behind an old one would be worse than no backoff.
@@ -645,24 +675,71 @@ def test_a_new_failure_cause_is_never_suppressed_by_the_backoff(
     the fifth tick, so a purely count-based backoff would swallow the new cause -- the one
     record in the whole run that carries information the reader does not already have.
     """
-    monkeypatch.setattr(state_mod, "POLL_BASE_S", 0.001)
-    caplog.set_level(logging.DEBUG, logger=_POLLER_LOGGER)
+    caplog.set_level(logging.ERROR, logger=_POLLER_LOGGER)
 
-    causes: Iterator[str] = iter(["scm unreachable"] * 4 + ["access denied"])
-
-    def reader(_name: str) -> ScmReading:
-        raise OSError(next(causes))
-
-    poller, client, _published = _looping_poller(reader, stop_after=5)
-    try:
+    script = [OSError("scm unreachable") for _ in range(4)] + [OSError("access denied")]
+    with _looping_poller(_scripted_reader(script), stop_after=5) as (poller, _published):
         poller._run()
-    finally:
-        client.close()
 
     faults = _faults(caplog)
     assert len(faults) == 4  # 1, 2 and 4 under the first cause, then 5 because the cause changed
     assert "access denied" in _failure_detail(faults[-1])
     assert "consecutive failures: 5" in faults[-1].getMessage()  # emitted early, not held to 8
+
+
+def test_a_changed_cause_gets_its_own_schedule_not_the_old_one_s_position(
+    fast_poll: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Emitting a new cause once and then going quiet is not "never held back".
+
+    Eight failures of one cause, then four of another. The schedule counts failures of the
+    *current cause*, so the second one is logged on its own 1st, 2nd and 4th. Were the position
+    carried across the change instead, the new cause would be logged once and then suppressed
+    for as many passes again as the old run had reached -- hundreds, deep in a long run -- which
+    is the shape the never-hold-back rule exists to forbid.
+    """
+    caplog.set_level(logging.ERROR, logger=_POLLER_LOGGER)
+
+    script = [OSError("scm unreachable") for _ in range(8)]
+    script += [OSError("access denied") for _ in range(4)]
+    with _looping_poller(_scripted_reader(script), stop_after=12) as (poller, _published):
+        poller._run()
+
+    faults = _faults(caplog)
+    # Four under the first cause (its 1st, 2nd, 4th, 8th) and three under the second (1st, 2nd,
+    # 4th), which fall at overall failures 9, 10 and 12. Carrying the position across the change
+    # instead would stop this list at 9.
+    counts = [int(f.getMessage().rsplit(": ", 1)[1].rstrip(")")) for f in faults]
+    assert counts == [1, 2, 4, 8, 9, 10, 12]
+    assert "access denied" in _failure_detail(faults[-1])  # and it is the new cause throughout
+
+
+def test_a_callback_raising_after_stop_is_recorded_as_shutdown_not_as_a_fault(
+    fast_poll: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The callback guard's twin of the poll guard's shutdown branch, for the same race.
+
+    `stop()` can land between `_run`'s stop check and the callback call, and the callback then
+    repaints a torn-down shell. Claiming a fault for that would write an ERROR traceback into
+    tray.log on every clean exit -- which is exactly what the poll path's own stop branch was
+    added to prevent, one screen up in the same function.
+    """
+    caplog.set_level(logging.DEBUG, logger=_POLLER_LOGGER)
+
+    def boom(_result: PollResult) -> None:  # `stop_after=1` armed the stop before this ran
+        raise RuntimeError("Cannot repaint, as the shell window has been destroyed.")
+
+    with _looping_poller(
+        _scripted_reader([ScmReading(ScmState.RUNNING)]), stop_after=1, callback=boom
+    ) as (poller, _published):
+        poller._run()
+
+    records = [r for r in caplog.records if r.name == _POLLER_LOGGER]
+    assert _faults(caplog) == []  # no fault claimed on a clean exit
+    assert [r.levelno for r in records] == [logging.INFO]  # at a level tray.log actually writes
+    assert "RuntimeError" in records[0].getMessage()  # the repr, so the cause survives
 
 
 # --- a tick that outlives stop() must neither log nor publish ----------------

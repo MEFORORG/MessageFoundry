@@ -172,9 +172,33 @@ any runtime change (the app only *loads* the files).
 
 ## Logs
 
-The tray logs to `%LOCALAPPDATA%\MessageFoundry\tray.log` (rotating, INFO). It records startup, the
-resolved config, state **transitions** (never per-tick), user actions, and elevation outcomes — and
-never a message body, a token, or PHI (it has none by construction).
+The tray logs to `%LOCALAPPDATA%\MessageFoundry\tray.log` (rotating, INFO). It records at least
+startup, the resolved config, state **transitions** (never per-tick), user actions, elevation
+outcomes, and the status-check failures below — and never a message body, a token, or PHI (it has
+none by construction).
+
+When a status check fails, or the icon update that follows it fails, the tray logs the error with a
+traceback and keeps running. **Those tracebacks are deliberately not written on every attempt.** A
+check that stays broken retries every few seconds, so one traceback per attempt would fill the
+rotating log within hours and push out the first one — the record naming the original cause. So the
+tray writes the 1st, 2nd, 4th, 8th and so on, and each record ends with the number of consecutive
+failures it stands for:
+
+```
+ERROR ... tray status poll raised; publishing UNKNOWN for this tick (consecutive failures: 512)
+```
+
+Read that as: it has now failed 512 times in a row, and the 511 attempts since the previous record
+were not written. A cause that **changes** is never held back — the new one starts its own count,
+so a second fault appearing during a long failure is logged straight away rather than hidden behind
+the first. When the checks recover, the tray writes one line saying how long the run lasted:
+
+```
+INFO  ... tray status poll recovered after 512 consecutive failures
+```
+
+That line is the one to look for before concluding the tray is healthy: without it, no recent
+traceback could equally mean recovered or still failing and merely gone quiet.
 
 ## Dependencies
 
