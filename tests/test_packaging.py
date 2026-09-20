@@ -13,14 +13,23 @@ The build backend pin (BACKLOG #1546) is the second guard. PEP 517 build isolati
 ``[build-system].requires`` names, fresh, on every build, and release.yml runs those builds inside the
 jobs that publish. Nothing in PR CI executes release.yml, so a pin that loosens would first be seen
 at a tag. Pure text checks, no network.
+
+Shipped-content integrity (BACKLOG #1702) is the third. Every distribution this repo builds carried a
+nested ``CLAUDE.md`` -- maintainer process text, not product -- out to whoever installed it, and neither
+the sdist allowlist nor release.yml's leak grep objected, because both ask whether a member sits inside
+the package tree and the instructions file does. Build config plus the git index, no build and no
+network: the third guard shells out to ``git ls-files``, which the first two do not.
 """
 
 from __future__ import annotations
 
+import functools
 import re
+import subprocess
 import tomllib
 from importlib.resources import files
 from pathlib import Path
+from typing import Any
 
 _REPO = Path(__file__).resolve().parents[1]
 
@@ -48,6 +57,282 @@ def test_py_typed_marker_ships_in_the_package() -> None:
     assert marker.is_file(), (
         "messagefoundry/py.typed is missing from the installed package — external mypy won't see the "
         "engine as typed (PEP 561). It must sit next to messagefoundry/__init__.py and ship in the wheel."
+    )
+
+
+# --- BACKLOG #1702: no distribution may ship this repository's own Claude Code instructions -------
+#
+# A nested CLAUDE.md is maintainer process text. Measured on be51821227170b583bc26885ab1a86d80ee0e9c0,
+# before the fix: the engine wheel carried `messagefoundry/CLAUDE.md` among 305 members, the engine
+# sdist among 306, and the harness wheel carried `harness/CLAUDE.md` among 101. The console wheel
+# happened to be clean only because `messagefoundry_webconsole/` has no such file yet.
+#
+# The two distributions need DIFFERENT fixes, for a reason recorded once, where somebody would act on
+# it: above the wheel target in packaging/messagefoundry-harness/pyproject.toml.
+
+#: The nested instructions file. One exact basename, not a characterisation of the class: it is the
+#: only such file this repository ships, and a wider pattern would start excluding product files.
+_INSTRUCTIONS_FILE = "CLAUDE.md"
+
+#: The harness distribution's project directory -- its `force-include` sources are written relative
+#: to this, which is why resolving needs it.
+_HARNESS_PROJECT = _REPO / "packaging" / "messagefoundry-harness"
+
+
+@functools.cache
+def _tracked(*prefixes: str) -> frozenset[str]:
+    """Repo-relative POSIX paths git tracks under any of ``prefixes``.
+
+    The tracked tree, not a filesystem walk: a walk picks up whatever a local run left behind, and the
+    question here is what a CLEAN checkout hands the build. The residual that choice accepts:
+    ``recurse_forced_files`` walks the FILESYSTEM and consults no .gitignore, so a gitignored file
+    inside a whole-mapped directory does reach a wheel built on the machine that has it. That is a
+    pre-existing property of any whole-directory mapping, not something this model can see.
+
+    Cached because it is a subprocess, called once per force-including distribution and again by the
+    per-distribution tests. Nothing here writes to the index mid-run.
+    """
+    out = subprocess.run(
+        ["git", "-C", str(_REPO), "ls-files", "-z", "--", *prefixes],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    return frozenset(p for p in out.split("\0") if p)
+
+
+def _hatch_build(pyproject: Path) -> dict[str, Any]:
+    """The ``[tool.hatch.build]`` table, or an empty one."""
+    data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    build: dict[str, Any] = data.get("tool", {}).get("hatch", {}).get("build", {})
+    return build
+
+
+def _wheel_force_include(pyproject: Path) -> dict[str, str]:
+    """The map that reaches the WHEEL, resolved the way hatchling resolves it.
+
+    ``BuilderConfig.force_include`` reads the TARGET table when it carries the key and otherwise falls
+    back to the global ``[tool.hatch.build]`` one. Reading only the target table would skip a
+    distribution that used the global spelling -- the natural choice when one map should serve two
+    targets -- and skipping is silent.
+    """
+    build = _hatch_build(pyproject)
+    target: dict[str, str] = build.get("targets", {}).get("wheel", {}).get("force-include", {})
+    fallback: dict[str, str] = build.get("force-include", {})
+    return target or fallback
+
+
+def _repo_relative(pyproject: Path, source: str) -> str:
+    """A ``force-include`` source as a repo-relative POSIX path.
+
+    Sources are written relative to the PROJECT directory (``../../harness/load``) and the build reads
+    them from there, so resolving against that directory is the only faithful reading. Both the ship
+    emulator and the rename check go through here: two spellings of this rule could drift apart, and
+    then the rename check would be validating a mapping the emulator never used.
+    """
+    resolved = (pyproject.parent / source).resolve()
+    try:
+        return resolved.relative_to(_REPO).as_posix()
+    except ValueError:  # hatchling accepts an absolute or `~` source; this model does not.
+        raise AssertionError(
+            f"{pyproject.relative_to(_REPO).as_posix()} force-includes {source!r}, which resolves to "
+            f"{resolved} -- outside the repository. Map only paths inside the checkout, or these "
+            f"guards cannot model what the wheel would carry."
+        ) from None
+
+
+def _force_include_sources(pyproject: Path) -> frozenset[str]:
+    """The repo-relative paths a ``force-include`` map pulls from."""
+    return frozenset(
+        _repo_relative(pyproject, source) for source in _wheel_force_include(pyproject)
+    )
+
+
+def _shipped_by(sources: frozenset[str], tracked: frozenset[str]) -> frozenset[str]:
+    """The tracked files a ``force-include`` map ships, by hatchling's own rule.
+
+    ``recurse_forced_files`` yields a named FILE outright and walks a named DIRECTORY whole. Nothing
+    else filters it, which is the property this whole section exists because of.
+    """
+    return frozenset(
+        path
+        for path in tracked
+        if path in sources or any(path.startswith(f"{src}/") for src in sources)
+    )
+
+
+def test_no_packaged_wheel_force_includes_the_repository_instructions() -> None:
+    """Generic over ``packaging/*``, so the next distribution is covered the day it lands.
+
+    Mutation: restore ``force-include = {"../../harness" = "harness"}``. Red: named below, because the
+    whole-directory source then sweeps in ``harness/CLAUDE.md``.
+    """
+    # Reuses this module's own discovery, minus the engine at the root: the engine has no wheel
+    # force-include (its package tree is WALKED, not mapped), and a second glob here would be a second
+    # definition of which distributions exist, free to drift from the one above.
+    pyprojects = [p for p in _build_pyprojects() if p.parent != _REPO]
+    assert len(pyprojects) >= 2, f"the packaging discovery matched {pyprojects} -- it broke"
+
+    problems: list[str] = []
+    seen = 0
+    mapped = 0
+    for pyproject in pyprojects:
+        sources = _force_include_sources(pyproject)
+        if not sources:
+            # A distribution whose package sits inside its own project directory needs no force-include,
+            # and demanding one would red it for the wrong reason. It is then covered the engine's way,
+            # by `exclude`, which does reach an ordinary package tree.
+            continue
+        mapped += 1
+        shipped = _shipped_by(sources, _tracked(*{source.split("/")[0] for source in sources}))
+        # POSITIVE CONTROL, per distribution: the emulator must actually find files in this tree, or
+        # its silence about CLAUDE.md means nothing.
+        assert shipped, f"{pyproject.relative_to(_REPO).as_posix()} ships zero tracked files"
+        seen += len(shipped)
+        problems.extend(p for p in sorted(shipped) if Path(p).name == _INSTRUCTIONS_FILE)
+
+    assert not problems, (
+        f"packaged wheels force-include this repository's own Claude Code instructions: {problems}. "
+        f"`exclude` does NOT reach a force-included file in hatchling -- enumerate the force-include "
+        f"map instead, the way packaging/messagefoundry-harness/pyproject.toml does."
+    )
+    # Liveness, both halves: at least the harness and the console still arrive by force-include, and
+    # the emulator still sees a real tree through each. They contribute 96 and 38 shipped files (the
+    # harness tracks 97, one of which is the CLAUDE.md the map now omits), so a floor well under 134
+    # catches a glob or a resolve that quietly stopped matching without pinning a number that moves.
+    assert mapped >= 2, f"only {mapped} distribution(s) force-include anything -- the parse broke"
+    assert seen >= 100, f"the scan across all distributions saw only {seen} shipped files"
+
+
+def test_the_harness_wheel_ships_every_harness_file_but_its_instructions() -> None:
+    """The standing per-new-file tax of the enumerated map, made loud rather than silent.
+
+    Mutation: delete any ``"../../harness/<x>"`` line from the harness wheel target. Red: names ``<x>``.
+    """
+    tracked = _tracked("harness")
+    assert len(tracked) >= 50, (
+        f"git tracks only {len(tracked)} files under harness/ -- the read broke"
+    )
+    assert f"harness/{_INSTRUCTIONS_FILE}" in tracked, (
+        "harness/CLAUDE.md is no longer tracked, so this test proves nothing about excluding it"
+    )
+
+    shipped = _shipped_by(_force_include_sources(_HARNESS_PROJECT / "pyproject.toml"), tracked)
+    # By BASENAME at any depth, not the one top-level path. The root CLAUDE.md invites a nested
+    # CLAUDE.md in a subpackage, and harness/load/ is still mapped whole; pinning the top-level path
+    # here would put this test in direct contradiction with the one above the day such a file lands,
+    # with no build-config change able to green both.
+    expected = {path for path in tracked if Path(path).name != _INSTRUCTIONS_FILE}
+
+    missing = sorted(expected - shipped)
+    assert not missing, (
+        f"the harness wheel would not ship these tracked files: {missing}. Add each to "
+        f"[tool.hatch.build.targets.wheel.force-include] in packaging/messagefoundry-harness/"
+        f"pyproject.toml. harness/load/profile.py resolves its profiles by path at run time, so a "
+        f"dropped .toml there breaks `messagefoundry-harness list-profiles` for an installed user."
+    )
+
+
+def test_no_force_include_entry_outlives_the_file_it_names() -> None:
+    """The other half of the tax, and the one that fails at the TAG rather than here.
+
+    hatchling does not filter a force-include source for existence -- ``recurse_forced_files`` raises
+    ``FileNotFoundError: Forced include not found: <path>`` outright. Nothing in PR CI runs a build, so
+    deleting ``harness/scenarios.py`` without editing the map goes green the whole way to
+    ``release-harness``, which then fails mid-release. The whole-directory map this replaced could not
+    fail that way, so the enumeration introduced it and this assertion is what pays for it.
+
+    Tracked rather than merely present on disk: a source pointing at a local artifact would build here
+    and not on a clean checkout.
+
+    Mutation: delete ``harness/window.py`` (leaving its map entry). Red: names the entry.
+    """
+    stale: list[str] = []
+    checked = 0
+    for pyproject in [p for p in _build_pyprojects() if p.parent != _REPO]:
+        sources = _force_include_sources(pyproject)
+        if not sources:
+            continue
+        tracked = _tracked(*{source.split("/")[0] for source in sources})
+        for source in sorted(sources):
+            checked += 1
+            if source in tracked or any(path.startswith(f"{source}/") for path in tracked):
+                continue
+            stale.append(f"{pyproject.relative_to(_REPO).as_posix()} -> {source}")
+
+    assert checked >= 15, f"only {checked} force-include sources were checked -- the parse broke"
+    assert not stale, (
+        f"these force-include sources name nothing git tracks: {stale}. hatchling raises "
+        f"FileNotFoundError on the first one at build time, so this would first be seen inside the "
+        f"release job. Remove the entry, or restore the path it names."
+    )
+
+
+def test_the_harness_force_include_maps_every_source_to_its_own_path() -> None:
+    """A rename in the map would ship a module at the wrong import path, and nothing else would notice.
+
+    Enumerating turned one mapping into nineteen, and each one is a chance to mistype the target. The
+    invariant is that the wheel mirrors the tree: ``../../harness/<x>`` lands at ``harness/<x>``.
+    """
+    pyproject = _HARNESS_PROJECT / "pyproject.toml"
+    include = _wheel_force_include(pyproject)
+    assert len(include) >= 10, (
+        f"the harness force-include map has {len(include)} entries -- too few"
+    )
+    wrong = {
+        source: target
+        for source, target in include.items()
+        if _repo_relative(pyproject, source) != target
+    }
+    assert not wrong, f"these force-include entries rename what they ship: {wrong}"
+
+
+def test_the_engine_excludes_its_nested_instructions_from_every_build_target() -> None:
+    """The engine half, which `exclude` DOES reach -- both its targets run files through `include_path`.
+
+    Two ways this goes wrong quietly, and both are asserted. The pattern must be SLASHLESS, for the
+    gitignore-semantics reason and the measurement recorded beside it in pyproject.toml. And no TARGET
+    may declare an ``exclude`` of its own without the pattern: ``BuilderConfig.exclude_spec`` checks the
+    target table FIRST and reads ``exclude`` from there alone, so hatchling REPLACES the global list
+    rather than merging it -- an ordinary ``exclude = ["*.pyc"]`` added to the sdist target would drop
+    this exclusion entirely and republish the file.
+
+    Reads the config rather than a built artifact, deliberately: building here would put the
+    ``hatchling==1.32.0`` pin in a fourth place, while the test below already asserts every
+    ``[build-system]`` table agrees on it. The artifact-level check belongs at release time.
+
+    Mutation: change the pattern to ``/CLAUDE.md``, empty the list, or add
+    ``exclude = ["*.pyc"]`` to ``[tool.hatch.build.targets.sdist]``.
+    """
+    build = _hatch_build(_REPO / "pyproject.toml")
+    excluded: list[str] = build.get("exclude", [])
+    assert _INSTRUCTIONS_FILE in excluded, (
+        f"[tool.hatch.build].exclude in the root pyproject.toml must carry the bare "
+        f"{_INSTRUCTIONS_FILE!r}; it carries {excluded}. Without it the engine wheel and sdist both "
+        f"publish messagefoundry/CLAUDE.md, which the sdist allowlist and release.yml's "
+        f"`^messagefoundry/` leak grep both pass because it sits inside the package tree."
+    )
+    targets: dict[str, Any] = build.get("targets", {})
+    assert targets, "the root pyproject declares no build targets -- the parse broke"
+    overriding = {
+        name: table["exclude"]
+        for name, table in targets.items()
+        if isinstance(table, dict)
+        and "exclude" in table
+        and _INSTRUCTIONS_FILE not in table["exclude"]
+    }
+    assert not overriding, (
+        f"these build targets declare their own `exclude`, which REPLACES the global one rather than "
+        f"adding to it, so {_INSTRUCTIONS_FILE!r} is no longer filtered for them: {overriding}. Repeat "
+        f"the pattern in each such list, or move the target's patterns up into [tool.hatch.build]."
+    )
+    # Liveness: the exclusion must still have something to exclude. Any depth under the package, so a
+    # move WITHIN messagefoundry/ does not red this -- only the file disappearing does, and then the
+    # right answer really is to drop the pattern or repoint it.
+    guarded = sorted(p for p in _tracked("messagefoundry") if Path(p).name == _INSTRUCTIONS_FILE)
+    assert guarded, (
+        f"no {_INSTRUCTIONS_FILE} is tracked under messagefoundry/, so this exclusion now guards "
+        f"nothing -- drop it or repoint it"
     )
 
 

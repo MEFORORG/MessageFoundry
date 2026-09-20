@@ -1277,10 +1277,53 @@ jobs:
     # worker buys queueing rather than throughput. This experiment is what tests it. THE CAPS ARE SIZED
     # AGAINST THE BOUND, NOT AGAINST THE READING, so they hold even if the reading is wrong.
     #
-    # NO FIGURE HERE IS AN -n 3 OBSERVATION. There are none; the first lands on this change's own run.
+    # THE -n 3 OBSERVATIONS ARE NOW IN, and the paragraph they replace said there were none because
+    # the first had not yet landed. THREE windows-2025 job logs read on 2026-09-19, all at
+    # TOOLING_WORKERS=3 (the value is echoed in each job's own step log, so this is not inferred from
+    # the file). Two of `main`'s four reds that day, plus one green; the other two reds were reported
+    # rather than re-read here:
+    #
+    #   1409.14s  23.5 min  red    run 35475462069  job 105984649514  coord_usage 60s starvation
+    #   1433.55s  23.9 min  red    run 35465858823  job 105958065037  coord_usage 60s starvation
+    #   1457.82s  24.3 min  GREEN  run 35472705438  job 105976506178
+    #
+    # THE TWO REDS ARE #1304 BUT NOT THE SIGNATURE SPELLED OUT ABOVE, and the two must not be fused.
+    # That paragraph's signature is `PWSH LAUNCH TIMED OUT after 45s` out of the worktree-gate files,
+    # which take the spawn lock. These two are `subprocess.TimeoutExpired ... timed out after 60
+    # seconds` out of tests/test_coord_usage.py, which did NOT take it until the change carrying this
+    # comment. Same defect -- a launch that never returns -- at a different ceiling, in a different
+    # file, with a different coverage status. Only the coord_usage failure was observed in these runs.
+    #
+    # All three rows are the pytest clock, read from the job log's own summary line, so they are
+    # comparable with the pytest-clock rows above and NOT with the step-clock ones.
+    #
     # READ THE STEP'S DURATION, NOT ONLY ITS CONCLUSION -- a green -n 3 run that costs 7 extra minutes
     # on every harness PR is a different verdict from a green one that costs nothing, and the pass/fail
-    # alone cannot tell them apart.
+    # alone cannot tell them apart. COMPARE GREEN WITH GREEN, because a red row partly measures the
+    # failure: the one -n 3 green is 24.3 minutes against the worst -n 4 green at 21.3, so -n 3 costs
+    # ABOUT 3 MINUTES. That is the only cost figure here; it is stated once and not restated below.
+    # It sits well under the 28.4-minute pessimistic bound the caps were sized against and under the
+    # 29-minute re-derive trigger, so the caps hold and neither moves.
+    #
+    # THAT 3 MINUTES INHERITS AN UNVERIFIED ROW, which is the caveat to carry. The 21.3-minute -n 4
+    # green is one of the two "reported, not re-read" rows the paragraph above warns about. Against
+    # the only RE-READ -n 4 green (1128.00s, 18.8 min) the cost would be 5.5 minutes instead. One
+    # green sample per arm is an order of magnitude, not a mean, and the wider figure is the one to
+    # assume if only one can be.
+    #
+    # THE VERDICT IS THAT -n 3 DID NOT CLEAR #1304, which is what the experiment existed to test. The
+    # hypothesis stated on TOOLING_WORKERS below -- that a 4-vCPU runner oversubscribed by 4 workers is
+    # the condition under which a single pwsh launch starves -- does not survive it: the leg starved a
+    # launch at 3 workers in both reds read. READ THE LIMIT OF THAT: the starving file was unwrapped at
+    # the time, so these reds show the oversubscription fix is not SUFFICIENT on its own; they do not
+    # show worker count is irrelevant. The cause that does hold is the one tests/_spawn_lock.py
+    # measured -- a single launch in flight beside a 16-process pwsh storm -- and the fix is to keep
+    # the two apart rather than to resize the tier. See BACKLOG #1304.
+    #
+    # WHETHER TO KEEP -n 3 IS NOT DECIDED HERE, deliberately: it costs what the green-to-green figure
+    # above says and buys nothing measured against the failure it was aimed at, but reverting it is
+    # BACKLOG #1109's call on #1109's evidence, not a side effect of the #1304 fix. Left running so
+    # the reverting change reads a tier whose #1304 noise has been removed.
     #
     # RE-DERIVE IF a GREEN Windows run of this tier is ever observed above 29 minutes at whatever worker
     # count it is actually running, or if TOOLING_WORKERS changes. 29, not the old 25, and the reason is
@@ -1739,7 +1782,48 @@ jobs:
             echo "tooling_matrix=$TOOLING_DOCS" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # Remaining case: pull_request. Compute the path-based filters from the PR diff.
+          # Remaining cases: ANY event not returned above. Compute the path-based filters from the diff.
+          # Today that is pull_request and merge_group; it is written as a residual rather than a list
+          # because the list is what went wrong -- see the next paragraph, and SDS-3.6.
+          #
+          # THE SECOND EVENT IS A DEFECT, AND IT IS STATED HERE BECAUSE THIS IS WHERE IT LIVES -- the
+          # gates that mislead a reader are elsewhere, but they only mislead because of this line
+          # (BACKLOG #1830, which is FILED IN THE INTERNAL LEDGER AND NOT YET MERGED THERE -- so the
+          # citation may not resolve yet). This comment used to read "Remaining case: pull_request",
+          # naming the one event the code below is written for. merge_group falls through to here too,
+          # and `BASE_SHA` is `github.event.pull_request.base.sha`, which is EMPTY on merge_group.
+          # `git diff --name-only "...HEAD"` with an empty left side resolves to HEAD...HEAD: exit 0,
+          # ZERO output. Verified by RUNNING it rather than reasoning about it -- 2026-08-26, recorded
+          # in 080fb235b as a residual, and re-measured 2026-09-19.
+          #
+          # SO EVERY PATH FILTER THIS JOB COMPUTES IS FALSE ON A QUEUE ENTRY -- that follows from the
+          # empty base, not from a sample. `code` is true there only because an empty diff takes the
+          # `-z "$changed"` arm far below. The corroborating observation is narrower and is stated as
+          # such: on three merge_group runs sampled 2026-09-19, `ide`, `tooling` and `docker-smoke`
+          # each skipped.
+          #
+          # WHAT IT MEANS FOR A GATE ELSEWHERE IN THIS FILE, which is the part worth carrying away. An
+          # `if:` of the shape `... || github.event_name == 'merge_group' || needs.changes.outputs.X ==
+          # 'true'` is NOT diff-sensitive in the queue: the merge_group arm is the only one that can be
+          # true there, so the job is unconditionally forced and the X arm decides nothing.
+          # `sqlserver-store` and `postgres-store` both have exactly that shape today.
+          #
+          # NOT FIXED HERE, AND #1830 CARRIES WHY IT IS NOT A ONE-LINE CHANGE. Reading the base from
+          # `github.event.merge_group.base_sha` makes EVERY filter real at once, and that is not a
+          # latency win. Measured 2026-09-19 over the last 80 merges to main, and BOTH figures are
+          # stated with their scope because neither is the whole of its quantity:
+          #   * `tooling` would fire on at least 56 percent of single-PR entries and at least 94
+          #     percent of 5-deep ones. LOWER BOUNDS -- measured against the PATH arm of the `tooling`
+          #     filter only; its second arm (`grep -qxFf tests/tooling_manifest.txt`) can only widen
+          #     them. For what that tier costs, see its own note above the `tooling` output; it is
+          #     measured there and is deliberately not repeated here (SDS-3.5).
+          #   * against that, the two server-DB jobs would be SKIPPED on 52/33/22/13/7 percent of
+          #     entries at stack depths 1/2/3/4/5. The mean is about a quarter, but the deep end is
+          #     where ubuntu contention actually bites and there the saving is 7 to 13 percent, so
+          #     the mean is the wrong number to compare against the cost above.
+          # It must also FAIL LOUDLY on a base that is empty or unreachable, because a silent empty
+          # diff degrades a path gate into skipping everything while still reading as path-gated,
+          # which is the defect this comment exists to stop hiding.
           changed=$(git diff --name-only "$BASE_SHA...HEAD")
           # NB: the tests/test_(...) alternation MUST list every file the sqlserver-store /
           # postgres-store pytest steps below run (the ADR 0057/0058/0060/0066 throughput levers AND
@@ -3270,6 +3354,18 @@ jobs:
       # line the harness tier would stop gating merges the moment it stopped being part of `test`. It IS
       # path-gated (unlike webconsole), so it skips on most PRs -- and a skipped need is not a failure
       # to the `contains(needs.*.result, ...)` check below, which is the behaviour wanted.
+      #
+      # THAT LAST CLAUSE IS TRUE OF A PULL REQUEST AND NOT OF A QUEUE ENTRY, and the difference is not
+      # visible from here. On a pull request a skipped need means path-gated-and-irrelevant; inside the
+      # merge queue it means NOT TESTED, because `changes` computes an empty diff there and so skips
+      # every path-gated job regardless of content. ONE EXCEPTION, so this is not read as an absolute:
+      # `windows-service-smoke` also carries `&& github.repository == '...'`, so on a FORK it skips for
+      # a deliberate cost reason that has nothing to do with this defect.
+      #
+      # The fact is stated once, at the `changes`
+      # job's "Remaining cases" comment; BACKLOG #1830 measured it and carries the fix. Nothing about
+      # this roll-up is wrong -- it is `if: always()` and still reports, which is what lets the five
+      # gated legs be path-gated at all. Only the inference "it skipped, so it did not need to run" is.
       - tooling
     runs-on: ubuntu-latest
     steps:

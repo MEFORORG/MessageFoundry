@@ -56,6 +56,7 @@ from messagefoundry.transports.rest import (
     _NO_REDIRECT_OPENER,
     _redact_url,
     find_outbound_length_violation,
+    refuse_url_credentials,
 )
 
 if TYPE_CHECKING:  # only for the from-settings factory annotation
@@ -130,6 +131,7 @@ class AiBroker:
         scheme = urllib.parse.urlsplit(endpoint).scheme.lower()
         if scheme not in ("http", "https"):
             raise AiBrokerError(f"[ai].endpoint must be http or https, got scheme {scheme!r}")
+        refuse_url_credentials(endpoint, "[ai].endpoint", use="[ai].api_key", error=AiBrokerError)
         if not api_key:
             raise AiBrokerError(
                 "engine-brokered AI requires an '[ai].api_key' (the LLM credential, via MEFOR_AI_API_KEY)"

@@ -72,6 +72,52 @@ def route_to_h(msg: Message) -> list[str]:
     return picked
 
 
+def route_to_h_tuple(msg: Message) -> tuple[str, ...]:
+    picked = ("h",)
+    return picked
+
+
+def route_to_h_set(msg: Message) -> set[str]:
+    picked = {"h"}
+    return picked
+
+
+def route_to_h_generator(msg: Message) -> Iterator[str]:
+    yield "h"
+
+
+class _SinglePassIterable:
+    """Iterable but NOT an Iterator -- `__iter__` hands back a stored generator, so it is one-shot.
+
+    The shape the first cut of BACKLOG #1694 got wrong: `isinstance(x, Iterator)` is False and
+    `isinstance(x, Iterable)` is True, so an Iterable-gated observer WALKS it and the real routing
+    then finds it empty. The traced run delivered 0 where the untraced run delivered 1.
+    """
+
+    def __init__(self, *items: str) -> None:
+        self._gen = (i for i in items)
+
+    def __iter__(self) -> Iterator[str]:
+        return self._gen
+
+
+class _GetItemOnly:
+    """Iterable by the legacy sequence protocol only: `isinstance(x, Iterable)` is False."""
+
+    def __init__(self, *items: str) -> None:
+        self._items = items
+
+    def __getitem__(self, index: int) -> str:
+        return self._items[index]
+
+
+class _HostileStr(str):
+    """A genuine handler name -- it equals and hashes as ``"h"`` -- whose ``__str__`` raises."""
+
+    def __str__(self) -> str:  # pragma: no cover - raising IS the behaviour under test
+        raise RuntimeError("hostile __str__")
+
+
 def handle_transform(msg: Message) -> Send:
     mrn = msg["PID-3.1"]  # a PHI-bearing local
     msg["MSH-3"] = "FOUNDRY"  # a msg field write on this line
@@ -128,6 +174,114 @@ def test_gate_byte_identical_disposition_and_routing() -> None:
     # per-invocation routing/sends
     assert _router_invocation(traced)["routed_to"] == ["h"]
     assert _handler_invocation(traced)["sends"] == [{"outbound": "out"}]
+
+
+def test_routed_to_reports_a_tuple_or_set_router() -> None:
+    """BACKLOG #1694: `routed_to` follows `_handler_names`, which takes any non-str iterable.
+
+    A tuple- or set-returning Router routes for real -- `plain.handlers` proves it on the same run
+    -- so a trace saying `routed_to: []` beside it contradicts the run it is observing."""
+    for route in (route_to_h_tuple, route_to_h_set):
+        reg = _registry(route, {"h": handle_transform})
+        plain = dry_run(reg, ADT_A01)
+        traced = trace_dry_run(reg, ADT_A01)
+
+        assert plain.handlers == ["h"], route.__name__
+        assert _router_invocation(traced)["routed_to"] == ["h"], route.__name__
+        # The gate this row is really about: the trace agrees with the untraced run.
+        assert _router_invocation(traced)["routed_to"] == plain.handlers, route.__name__
+        # `lazy_result` is emitted only when true, so its ABSENCE is the non-degraded case.
+        assert "lazy_result" not in _router_invocation(traced), route.__name__
+
+
+def test_routed_to_never_invents_a_name_the_run_did_not_route_to() -> None:
+    """ADR 0072 gate 1b: the trace may say LESS than the run did, never something different.
+
+    `_handler_names` passes elements through uncoerced, so `str()` in the observer manufactures
+    names: `b"h"` materialises to `[104]` for the real routing and traced as `['104']`, and
+    `range(2)` traced as `['0', '1']`. `return msg["PID-5.1"].encode()` reaches it in one keystroke.
+    Found by an independent review of the first cut, which shipped exactly that coercion.
+    """
+    for returned in (b"h", bytearray(b"h"), memoryview(b"h"), range(2)):
+        reg = _registry(lambda msg, r=returned: r, {"h": handle_transform})  # type: ignore[misc]
+        traced = trace_dry_run(reg, ADT_A01)
+        inv = _router_invocation(traced)
+        assert inv["routed_to"] == [], f"{returned!r} invented {inv['routed_to']}"
+        assert inv["lazy_result"] is True, f"{returned!r} was dropped without declaring it"
+
+
+def test_routed_to_does_not_stringify_a_name_and_so_cannot_raise_on_one() -> None:
+    """A str subclass with a raising `__str__` is still a valid handler name.
+
+    Coercing it turned a delivering run into an ERROR -- a gate 1a break, since the untraced run
+    delivers. Emitting elements that are ALREADY `str`, uncoerced, never calls `__str__` at all.
+    """
+    reg_plain = _registry(lambda msg: (_HostileStr("h"),), {"h": handle_transform})
+    plain = dry_run(reg_plain, ADT_A01)
+    reg_traced = _registry(lambda msg: (_HostileStr("h"),), {"h": handle_transform})
+    traced = trace_dry_run(reg_traced, ADT_A01)
+
+    assert plain.disposition.value == "received"
+    assert traced["disposition"] == plain.disposition.value
+    assert traced["handlers"] == plain.handlers
+    assert _router_invocation(traced)["routed_to"] == ["h"]
+
+
+def test_routed_to_does_not_drain_a_single_pass_iterable_that_is_not_an_iterator() -> None:
+    """The carve-out's real subject is SINGLE-PASS, and `isinstance(x, Iterator)` does not test it.
+
+    THIS IS THE ARM THAT PINS THE ALLOWLIST. An Iterable-gated observer walks `_SinglePassIterable`,
+    the real routing then finds it exhausted, and the traced run reports `unrouted` with zero
+    deliveries while the untraced run delivers one. Worse, `lazy_result` did not fire, so the single
+    case where the tracer actually broke the run was the one case it failed to declare.
+    """
+    reg_plain = _registry(lambda msg: _SinglePassIterable("h"), {"h": handle_transform})
+    plain = dry_run(reg_plain, ADT_A01)
+    reg_traced = _registry(lambda msg: _SinglePassIterable("h"), {"h": handle_transform})
+    traced = trace_dry_run(reg_traced, ADT_A01)
+
+    # Byte-identical: the observer consumed nothing.
+    assert plain.handlers == ["h"]
+    assert traced["handlers"] == plain.handlers
+    assert traced["disposition"] == plain.disposition.value
+    assert len(traced["sends"]) == len(plain.deliveries) == 1
+    # ...and the omission is declared rather than read as a Router that selected nothing.
+    inv = _router_invocation(traced)
+    assert inv["routed_to"] == []
+    assert inv["lazy_result"] is True
+
+
+def test_routed_to_declares_rather_than_silently_skips_a_getitem_only_sequence() -> None:
+    """`isinstance(x, Iterable)` is False for it, yet `_handler_names`' `list()` routes it fine.
+
+    So the trace cannot report it, which is allowed -- but it must SAY so. Reporting `[]` with no
+    `lazy_result` is the original #1694 defect wearing a different shape."""
+    reg_plain = _registry(lambda msg: _GetItemOnly("h"), {"h": handle_transform})
+    plain = dry_run(reg_plain, ADT_A01)
+    reg_traced = _registry(lambda msg: _GetItemOnly("h"), {"h": handle_transform})
+    traced = trace_dry_run(reg_traced, ADT_A01)
+
+    assert plain.handlers == ["h"]
+    assert traced["handlers"] == plain.handlers
+    inv = _router_invocation(traced)
+    assert inv["routed_to"] == []
+    assert inv["lazy_result"] is True
+
+
+def test_routed_to_still_declines_to_drain_a_generator_router() -> None:
+    """The one shape that stays empty, and it is declared rather than silent.
+
+    Draining the one-shot iterator here would leave the real routing nothing to materialise, so the
+    traced run would deliver 0 where the untraced run delivers 1. `lazy_result` says so."""
+    reg = _registry(route_to_h_generator, {"h": handle_transform})
+    plain = dry_run(reg, ADT_A01)
+    traced = trace_dry_run(reg, ADT_A01)
+
+    assert plain.handlers == ["h"]
+    assert _router_invocation(traced)["routed_to"] == []
+    assert _router_invocation(traced)["lazy_result"] is True
+    # Byte-identical despite the empty routed_to: the tracer did not consume the generator.
+    assert traced["handlers"] == plain.handlers == ["h"]
 
 
 def _two_out_registry(handle) -> Registry:  # type: ignore[no-untyped-def]

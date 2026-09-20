@@ -396,7 +396,9 @@ async def test_open_store_audit_chain_keyed_in_transit(
     from messagefoundry.store.base import open_store
 
     db = tmp_path / "audit.db"
-    store = await open_store(StoreSettings(path=str(db), cipher_provider="vault_transit"))
+    store = await open_store(
+        StoreSettings(path=str(db), cipher_provider="vault_transit"), create=True
+    )
     assert isinstance(store, MessageStore)  # narrow the Store protocol to the concrete SQLite store
     try:
         assert store._audit_mac_key is None  # no key material in engine heap
@@ -423,7 +425,9 @@ async def test_transit_audit_chain_detects_tampering(
     from messagefoundry.store.base import open_store
 
     db = tmp_path / "audit2.db"
-    store = await open_store(StoreSettings(path=str(db), cipher_provider="vault_transit"))
+    store = await open_store(
+        StoreSettings(path=str(db), cipher_provider="vault_transit"), create=True
+    )
     assert isinstance(store, MessageStore)  # narrow the Store protocol to the concrete SQLite store
     try:
         await store.record_audit("login", actor="u")
@@ -445,7 +449,8 @@ async def test_default_aesgcm_audit_chain_is_unchanged(tmp_path: Path) -> None:
     from messagefoundry.store.base import open_store
 
     db = tmp_path / "plain.db"
-    store = await open_store(StoreSettings(path=str(db)))  # default aesgcm/identity — no Transit
+    # default aesgcm/identity — no Transit
+    store = await open_store(StoreSettings(path=str(db)), create=True)
     assert isinstance(store, MessageStore)  # narrow the Store protocol to the concrete SQLite store
     try:
         assert store._audit_mac_fn is None  # the new seam is dormant on the default path
@@ -504,7 +509,9 @@ async def test_live_open_store_audit_chain_keyed_in_transit(tmp_path: Path) -> N
     from messagefoundry.store.base import open_store
 
     db = tmp_path / "live-audit.db"
-    store = await open_store(StoreSettings(path=str(db), cipher_provider="vault_transit"))
+    store = await open_store(
+        StoreSettings(path=str(db), cipher_provider="vault_transit"), create=True
+    )
     assert isinstance(store, MessageStore)  # narrow the Store protocol to the concrete SQLite store
     try:
         assert store._audit_mac_key is None  # no in-heap MAC key
@@ -528,7 +535,7 @@ async def test_live_open_store_lands_dek_free_at_rest(tmp_path: Path) -> None:
 
     db = tmp_path / "transit.db"
     settings = StoreSettings(path=str(db), cipher_provider="vault_transit")
-    store = await open_store(settings)
+    store = await open_store(settings, create=True)
     assert isinstance(store, MessageStore)  # narrow the Store protocol to the concrete SQLite store
     try:
         assert isinstance(store._cipher, TransitCipher)  # the seam built the Transit cipher
@@ -581,7 +588,7 @@ async def test_rotation_refuses_rather_than_reporting_zero_under_a_provider_ciph
     """
     from messagefoundry.store.base import open_store
 
-    store = await open_store(StoreSettings(path=str(tmp_path / "refuse.db")))
+    store = await open_store(StoreSettings(path=str(tmp_path / "refuse.db")), create=True)
     assert isinstance(store, MessageStore)
     try:
         store._cipher = _StubProviderCipher()  # type: ignore[assignment]
@@ -600,7 +607,7 @@ async def test_rotation_still_reports_zero_for_the_identity_cipher(tmp_path: Pat
     """
     from messagefoundry.store.base import open_store
 
-    store = await open_store(StoreSettings(path=str(tmp_path / "identity.db")))
+    store = await open_store(StoreSettings(path=str(tmp_path / "identity.db")), create=True)
     assert isinstance(store, MessageStore)
     try:
         assert isinstance(store._cipher, IdentityCipher)  # no key configured on this path

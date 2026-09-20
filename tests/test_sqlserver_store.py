@@ -403,6 +403,21 @@ async def test_stats_and_metrics(store) -> None:
     assert metrics.destinations[("IB", "OB1")].queue_depth == 1
     db = await store.db_status()
     assert db.messages == 1
+    # BACKLOG #1563: the remote server's disk is not ours to stat, so this is the "unmeasurable"
+    # None and never 0 — 0 is the console's critical-disk alarm, which pinned the engine-health
+    # heart red on every healthy SQL Server deployment. The whole server-side fix is this one
+    # literal, and nothing else asserted it at all. This module is gated like its Postgres twin, so
+    # the pin holds on the SQL Server leg only — that is the sole place the real backend runs, and
+    # a default run still cannot tell the literal from a 0. Naming the limit rather than implying
+    # this guards every run.
+    assert db.disk_free_bytes is None
+    # Non-empty is the engine-side fact a reader of the null above depends on: this backend names
+    # itself through `journal_mode` (the recovery model), and the "" fallback here means the
+    # sys.databases read came back empty, so the row says nothing about which store answered.
+    # Deliberately asserts only that, not WHICH model — the set of recovery models a console might
+    # recognise is that console's policy, and restating it in the engine suite would let the two
+    # drift apart while both stayed green.
+    assert db.journal_mode
     ok, _ = await store.integrity_check()
     assert ok is True
 

@@ -103,6 +103,7 @@ __all__ = [
     "SearchTarget",
     "Store",
     "StoreLifecycle",
+    "StoreNotFoundError",
     "StreamingAttachmentsUnsupported",
     "backend_supports_reference_sets",
     "make_spec",
@@ -1906,9 +1907,11 @@ class AuthStore(Protocol):
         **The inverse of the #1015 guard, and the direction that guard cannot look.** That check
         resolves a user by USERNAME and asks whether *this account* carries a different subject --
         so it constrains WHICH subject may bind to a given account, and is structurally incapable of
-        seeing a SECOND ACCOUNT already holding the same subject. Nothing else could see it either:
-        measured, there is no UNIQUE constraint naming the federated columns on any of the three
-        backends (0/0/0, against 13/8/10 total UNIQUE declarations as the positive control).
+        seeing a SECOND ACCOUNT already holding the same subject. The database enforces the same rule
+        underneath -- every backend declares a filtered UNIQUE ``ux_users_federated_subject`` -- and
+        this lookup is what lets the caller answer cleanly instead of surfacing that refusal as an
+        integrity error. :meth:`AuthService._complete_ad_login`'s subject-exclusivity guard carries
+        why that pairing is worded the way it is, and what it replaced.
 
         Deliberately a lookup rather than a scan: it sits on the federated login path, and
         ``list_users()`` would make every sign-in O(number of accounts).
@@ -2071,13 +2074,53 @@ def build_store_cipher(settings: StoreSettings) -> Cipher:
     return make_cipher(resolve_active_key(settings), retired, write_v2=settings.aad_bind)
 
 
+class StoreNotFoundError(RuntimeError):
+    """:func:`open_store` was pointed at an absent SQLite store without ``create=True`` (BACKLOG
+    #1780). ``path`` is the absent file, as configured."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        super().__init__(
+            f"no SQLite store at {path}: refusing to create one "
+            "(check [store].path or --db; `messagefoundry serve` creates the store on its first run)"
+        )
+
+
+def _absent_sqlite_store(settings: StoreSettings) -> Path | None:
+    """The configured SQLite path when nothing is there, else ``None``.
+
+    ``:memory:`` puts nothing on disk, so it has no file to be absent. Only ``FileNotFoundError``
+    counts as absent. Any other stat failure, such as a permission error on an ancestor, is left for
+    the open to report, because SQLite could not have created a file there either. The verifier keeps
+    a stricter twin, ``verify/smoke.py::missing_sqlite_store`` (``is_file``), so that it can refuse
+    without importing the store stack."""
+    if settings.backend is not StoreBackend.SQLITE or settings.path == ":memory:":
+        return None
+    path = Path(settings.path)
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return path
+    except OSError:
+        pass
+    return None
+
+
 async def open_store(
     settings: StoreSettings,
     *,
+    create: bool = False,
     message_events: str = "all",
     posture: HopPosture | None = None,
 ) -> Store:
     """Open the store for the configured backend — the single backend-selection seam.
+
+    ``create`` (BACKLOG #1780) must be passed ``True`` by a caller that provisions a store: ``serve``'s
+    first run and the ``provision-admin`` bootstrap. Otherwise an absent SQLite file raises
+    :class:`StoreNotFoundError` before anything connects, because SQLite's connect would create it and
+    the schema ensure would fill it. It governs creation only: an existing file is still migrated, and
+    the server backends ignore it (they never ``CREATE DATABASE``, but do build the schema into any
+    database that exists).
 
     ``sqlite`` is the default; ``postgres`` is a production server-DB backend with single-node parity
     (lazy-imported, needs the ``postgres`` extra); ``sqlserver`` is a production server-DB backend,
@@ -2093,6 +2136,9 @@ async def open_store(
     clamps the ``MEFOR_ALLOW_INSECURE_TLS`` escape on a production-PHI hop (decision 2). ``None`` (SQLite —
     no TLS — or a backup/restore utility / test) leaves it unclamped, byte-identical to pre-#200.
     """
+    # Before the cipher, so a refusal never waits on a key provider (a Vault round trip).
+    if not create and (absent := _absent_sqlite_store(settings)) is not None:
+        raise StoreNotFoundError(absent)
     # The at-rest cipher via the single build_store_cipher seam: ADR 0019 key sourcing + the ADR 0138
     # cipher_provider dispatch. Default `aesgcm` is the in-process AES-256-GCM keyring (active + retired
     # decrypt-only, write_v2=aad_bind — which now defaults ON, so new writes are cell-bound mfenc:v2;

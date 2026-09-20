@@ -4555,9 +4555,10 @@ def _admin_unlock(args: argparse.Namespace) -> int:
     except (FileNotFoundError, ValueError, ValidationError) as exc:
         return _emit_error(str(exc), as_json=args.json)
 
-    # The same M-31 guard _audit_verify carries, and it matters identically here: a SQLite store is
-    # CREATED on open, so a typo'd path would yield a fresh empty DB and report "no such user" --
-    # which reads as "you got the username wrong" when the truth is "you got the DATABASE wrong".
+    # The same M-31 guard _audit_verify carries. Before #1780 a SQLite store was CREATED on open, so a
+    # typo'd path yielded a fresh empty DB and a false "no such user". open_store now refuses an absent
+    # file itself; this guard stays first because it says "you got the DATABASE wrong" in this
+    # command's words, where the seam's refusal would surface as an unhandled StoreNotFoundError.
     if settings.store.backend == StoreBackend.SQLITE and not Path(settings.store.path).exists():
         return _emit_error(
             f"no store at {settings.store.path} — refusing to create one and report a false "
@@ -4673,7 +4674,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
         return _emit_error(str(exc), as_json=args.json)
 
     async def run() -> tuple[ProvisionedAdministrator, str]:
-        store = await open_store(settings.store)
+        # create=True (BACKLOG #1780): this bootstrap runs before the first serve, see the note below.
+        store = await open_store(settings.store, create=True)
         try:
             outcome = await AuthService(store, settings.auth).provision_first_administrator(
                 username=args.username,
@@ -4738,10 +4740,11 @@ def _refuse_a_store_that_is_not_an_audit_log(
     """Exit code 2 when a SQLite ``--db`` cannot be a real audit log, else ``None`` (BACKLOG #1669).
 
     Two ways it cannot be one, and the second is the one that used to pass: the file is ABSENT (a
-    typo'd path, which ``open_store`` would create), or the file EXISTS but carries no ``audit_log``
-    table. A zero-byte file is the second case -- it is a valid, empty SQLite database, so every
-    existence check says yes, and ``open_store`` then runs the schema migration INTO the file that
-    was supposed to be the evidence and reports a clean chain of nothing.
+    typo'd path, which ``open_store`` created before #1780 and now refuses by default), or the file
+    EXISTS but carries no ``audit_log`` table. A zero-byte file is the second case -- it is a valid,
+    empty SQLite database, so every existence check says yes (the #1780 seam refusal included), and
+    ``open_store`` then runs the schema migration INTO the file that was supposed to be the evidence
+    and reports a clean chain of nothing.
 
     The probe opens a ``mode=ro`` URI on stdlib ``sqlite3``, which is load-bearing twice over: a
     read-only handle can neither create the file nor migrate it, so the check cannot write to the
@@ -5132,7 +5135,7 @@ def _backup(args: argparse.Namespace) -> int:
     from messagefoundry.config.settings import load_settings
     from messagefoundry.pipeline.dr_backup import BackupError, BackupResult
     from messagefoundry.pipeline.dr_backup import BackupRunner as _BackupRunner
-    from messagefoundry.store.base import open_store
+    from messagefoundry.store.base import StoreNotFoundError, open_store
 
     cli: dict[str, dict[str, object]] = {}
     if args.db is not None:
@@ -5178,6 +5181,9 @@ def _backup(args: argparse.Namespace) -> int:
         result = asyncio.run(run())
     except BackupError as exc:
         return _emit_error(f"backup failed ({exc.kind}): {exc}", as_json=args.json)
+    except StoreNotFoundError as exc:  # #1780: could not start, so exit 2 like #1670 below
+        _emit_error(str(exc), as_json=args.json)
+        return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
     if result is None:  # leader-gated no-op (never on the single-node CLI path) — defensive
@@ -6023,10 +6029,20 @@ def _emit_store_open_error(exc: sqlite3.DatabaseError, path: str, *, as_json: bo
 
 
 def _emit_error(message: str, *, as_json: bool) -> int:
+    """Report a command failure on the right stream and return its exit code.
+
+    Text goes to **stderr**. A shell redirect of a command's output --
+    ``messagefoundry validate --config x > report.txt`` -- must not swallow the reason the command
+    failed into the file it was writing, and ``2>/dev/null`` must be able to silence diagnostics
+    without silencing results (BACKLOG #1673).
+
+    JSON stays on **stdout**, deliberately. Under ``--json`` the error object IS the command's
+    machine-readable output: a consumer piping to ``jq`` reads it there, and the non-zero exit code
+    is what tells it apart from a success payload."""
     if as_json:
         print(json.dumps({"error": message}))
     else:
-        print(f"error: {message}")
+        print(f"error: {message}", file=sys.stderr)
     return 1
 
 

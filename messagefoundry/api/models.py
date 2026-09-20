@@ -772,7 +772,10 @@ class EngineKpis(BaseModel):
 class DbInfo(BaseModel):
     path: str
     size_bytes: int  # db file + -wal + -shm
-    disk_free_bytes: int
+    # None = unmeasurable -- see DbStatus.disk_free_bytes (BACKLOG #1563). Required, not defaulted
+    # like `synchronous` below: that default exists for wire compatibility, and this field has never
+    # been optional on the wire, so a caller must say which of the two it means.
+    disk_free_bytes: int | None
     journal_mode: str
     messages: int
     events: int
@@ -787,11 +790,18 @@ class LogInfo(BaseModel):
     """App-log storage metering for the configured ``[logging].log_dir`` (#50), mirroring
     :class:`DbInfo`'s DB-side ``size_bytes`` / ``disk_free_bytes``. **Metadata only — never any log
     content** (no PHI). Present only when a log directory is configured; when the engine logs to stdout
-    (captured off-process by NSSM) the ``logs`` field on :class:`SystemStatus` is ``None``."""
+    (captured off-process by NSSM) the ``logs`` field on :class:`SystemStatus` is ``None``.
+
+    **Three states, deliberately, and they used to be two** (BACKLOG #1563). ``logs is None`` means no
+    log directory is CONFIGURED. A ``LogInfo`` whose fields are ``None`` means one is configured but
+    the metering PROBE failed. A field holding ``0`` is a real measured zero. Collapsing the middle
+    case into a bare ``None`` hid a vanished log directory behind the stdout-only answer."""
 
     path: str
-    size_bytes: int  # total bytes of regular files under the log directory (one level)
-    disk_free_bytes: int  # free space on the log directory's filesystem
+    # None = unmeasurable (see DbStatus.disk_free_bytes). The two halves fail independently: a
+    # readable directory on an unstattable mount yields a size with no free space, and vice versa.
+    size_bytes: int | None  # total bytes of regular files under the log directory (one level)
+    disk_free_bytes: int | None  # free space on the log directory's filesystem
 
 
 class LogSinkInfo(BaseModel):
