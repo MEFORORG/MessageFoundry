@@ -1671,12 +1671,64 @@ def test_the_guard_boundary_scrubs_a_reason_handed_to_it_directly(
     )
 
 
-def test_a_long_diagnostic_is_bounded_before_it_reaches_the_credential_patterns() -> None:
-    # The bound is enforced in _safe_diagnostic rather than asserted about callers, because the
-    # rolled-aside limb is a filesystem path from a subclass seam and is not safe_exc-truncated.
-    # A guarantee resting on what callers happen to pass is the false-premise shape; this pins it.
-    bounded = logging_guard._safe_diagnostic("x" * 50_000)
-    assert len(bounded) == logging_guard._DIAGNOSTIC_LIMIT
-    # …and escaping happens BEFORE the slice, so a string of control characters cannot expand past
-    # the bound on its way to the regular expressions.
-    assert len(logging_guard._safe_diagnostic("\x00" * 50_000)) == logging_guard._DIAGNOSTIC_LIMIT
+def test_the_scrubs_run_in_the_handler_chains_order_and_the_reverse_would_leak() -> None:
+    # ORDER, AND IT IS A CORRECTNESS PROPERTY RATHER THAN A STYLE ONE. _install_phi_filters installs
+    # CredentialScrubFilter BEFORE ControlCharScrubFilter. Reversing it here does not merely diverge
+    # from the chain, it DEFEATS the credential pass: the patterns are whitespace-delimited, so the
+    # escape turns the LF between "bearer" and the token into a literal backslash-n and the pattern
+    # no longer matches. The second assertion is the control that proves the first is load-bearing.
+    from messagefoundry.controlchars import scrub_control_chars
+    from messagefoundry.secretscrub import scrub_credentials
+
+    hostile = "auth retry failed: bearer\nZXlKaGJHY2lPaUpJVXpJMU5pSjk.synthetic-token-value"
+
+    assert "synthetic-token-value" not in logging_guard._safe_diagnostic(hostile)
+    assert "synthetic-token-value" in scrub_credentials(scrub_control_chars(hostile)), (
+        "the reversed order no longer leaks, so this test has stopped measuring the order"
+    )
+
+
+def test_a_credential_straddling_the_output_bound_is_masked_before_it_is_cut() -> None:
+    # The bound is applied LAST, after both scrubs, and that is the correctness point. Slicing
+    # BEFORE the credential pass cuts the trailing "@" that _DSN_PASSWORD needs, the pattern then
+    # matches nothing, and the surviving PREFIX of the password is published to every consumer.
+    limit = logging_guard._DIAGNOSTIC_LIMIT
+    dsn = "postgres://mefor_svc:s3cr3t-pw@dbhost:5432/mefor"
+    straddling = "q" * (limit - 27) + dsn
+
+    scrubbed = logging_guard._safe_diagnostic(straddling)
+    assert "s3cr3t" not in scrubbed
+    assert len(scrubbed) == limit  # …and the output is still bounded
+
+
+def test_scrubbing_an_already_scrubbed_reason_changes_nothing() -> None:
+    # The mixin scrubs, then the guard scrubs again at its boundary. That second call is only
+    # harmless if this holds: a masked credential must not expand the string past the bound on the
+    # first pass and then lose its tail to the slice on the second, which would truncate an
+    # operator's last_event mid-word with nothing reporting it.
+    limit = logging_guard._DIAGNOSTIC_LIMIT
+    crowded = "q" * (limit - 54) + "reopen failed for postgres://mefor_svc:s3cr3t-pw@dbhost"
+
+    once = logging_guard._safe_diagnostic(crowded)
+    assert logging_guard._safe_diagnostic(once) == once
+
+
+def test_the_fallback_cannot_raise_on_a_diagnostic_that_is_not_a_string() -> None:
+    # The whole contract of this module is that a broken log sink never becomes an application
+    # exception. ``_roll`` is a subclass seam and the guard's stage methods are public, so a caller
+    # can hand in something that is not a str; the fallback must not itself raise while handling it.
+    assert logging_guard._safe_diagnostic(12345) == logging_guard._DIAGNOSTIC_DROPPED  # type: ignore[arg-type]
+    assert logging_guard._safe_path(object()) == logging_guard._DIAGNOSTIC_DROPPED  # type: ignore[arg-type]
+
+
+def test_a_legitimate_path_is_not_rewritten_by_the_credential_patterns() -> None:
+    # WHY THE PATH LIMB TAKES _safe_path, NOT _safe_diagnostic. /status publishes rolled_aside so an
+    # operator can find the broken file. Running a path through the credential patterns lets a
+    # directory segment ending in a credential word swallow the rest of the path, so /status would
+    # name a file that does not exist -- during the incident this guard exists for.
+    path = "/var/log/mefor/secret=1/app.log.broken-x"
+
+    assert logging_guard._safe_path(path) == path
+    assert logging_guard._safe_diagnostic(path) != path, (
+        "the credential patterns no longer rewrite this path, so the split has stopped being needed"
+    )

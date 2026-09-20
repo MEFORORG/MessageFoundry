@@ -105,27 +105,32 @@ def strip_control_chars(text: str) -> str:
 # silently does not apply to the other. Measured: _is_control_char 33 code points, this table 32,
 # symmetric difference {0x09}. One code point of divergence is a subtraction, not a different
 # predicate -- unlike the parsing/sniff.py carve-out the module docstring keeps separate.
-_CTRL_TRANSLATION: dict[int, str] = {0x0A: "\\n", 0x0D: "\\r"}
+#
 # RANGE 0x100, NOT 0x80, AND THAT IS THE DIFFERENCE BETWEEN A REAL FOLD AND A COSMETIC ONE. The
-# alphabet is C0+DEL today, so both bounds produce the identical 32 entries -- proved by the
-# byte-identity check in the commit. But `_is_control_char`'s docstring names widening to C1
-# (U+0080-U+009F) as the deliberate change this shared module exists to make cheap, and a 0x80 bound
-# would silently NOT follow it: the escape table would keep the old alphabet while every other call
-# site moved, which is the exact two-copy drift limb 3 removes. Iterating past the current boundary
-# costs 128 predicate calls at import and makes the widening propagate by construction.
-for _i in range(0x100):
-    # TAB IS THE ONLY SUBTRACTION and test_tab_is_the_only_control_character_left_intact pins it.
-    # CR/LF are excluded from this loop because they get readable escapes above, not because they
-    # are tolerated -- they are the injection vector this whole table exists for.
-    if _is_control_char(chr(_i)) and _i not in (0x09, 0x0A, 0x0D):
-        _CTRL_TRANSLATION[_i] = f"\\x{_i:02x}"
+# alphabet is C0+DEL today, so both bounds produce the identical 32 entries. But
+# `_is_control_char`'s docstring names widening to C1 (U+0080-U+009F) as the deliberate change this
+# shared module exists to make cheap, and a 0x80 bound would silently NOT follow it: the escape
+# table would keep the old alphabet while every other call site moved, which is the exact two-copy
+# drift limb 3 removes. Iterating past the current boundary costs 128 predicate calls at import and
+# makes the widening propagate by construction.
+#
+# TAB IS THE ONLY SUBTRACTION and test_tab_is_the_only_control_character_left_intact pins it. CR/LF
+# are excluded from the comprehension because they get the readable escapes below, not because they
+# are tolerated -- they are the injection vector this whole table exists for. A comprehension rather
+# than a `for` loop so the index does not survive as a module global: this is a leaf every other
+# module imports, and it should export nothing it did not mean to.
+_CTRL_TRANSLATION: dict[int, str] = {0x0A: "\\n", 0x0D: "\\r"} | {
+    cp: f"\\x{cp:02x}"
+    for cp in range(0x100)
+    if _is_control_char(chr(cp)) and cp not in (0x09, 0x0A, 0x0D)
+}
 
 
 def scrub_control_chars(text: str) -> str:
     """Escape C0 control characters and DEL (tab kept as benign whitespace) so no part of ``text`` can
     begin a new physical line or drive a terminal.
 
-    The single definition of that translation, with three callers for three reasons.
+    The single definition of that translation, reached for at least three kinds of call site.
     ``logging_setup.ControlCharScrubFilter`` applies it to every record on a configured handler. A
     caller that assembles a record's content from an untrusted BYTE stream needs it at the point of
     assembly, because "one peer write is one log record" is that caller's own framing contract and

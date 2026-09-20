@@ -1621,7 +1621,11 @@ def test_the_log_escape_table_is_the_controlchars_alphabet_minus_tab() -> None:
     """
     from messagefoundry.controlchars import _CTRL_TRANSLATION, _is_control_char
 
-    alphabet = {cp for cp in range(0x80) if _is_control_char(chr(cp))}
+    # RANGE 0x100, matching the table's own build range. It used to stop at 0x80, which made this
+    # test assert the opposite of what it claims: widen `_is_control_char` to C1 (the deliberate
+    # change the module exists to make cheap) and the table follows, `alphabet` does not, and the
+    # second assertion fails saying controlchars had been widened alone -- naming the wrong side.
+    alphabet = {cp for cp in range(0x100) if _is_control_char(chr(cp))}
     escaped = set(_CTRL_TRANSLATION)
 
     assert alphabet - escaped == {0x09}, (
