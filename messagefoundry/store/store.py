@@ -974,7 +974,11 @@ class DbStatus:
 
     path: str
     size_bytes: int  # db file + -wal + -shm
-    disk_free_bytes: int  # free space on the DB's drive
+    # Free space on the DB's drive, or None when this process CANNOT measure it -- a remote server
+    # backend whose disk is not ours to stat, or a failed ``disk_usage`` call. ``None`` and ``0`` are
+    # different facts and must stay so: 0 is a MEASURED empty drive and has to keep raising the
+    # operator-health alarm, while None carries no claim about the drive at all (BACKLOG #1563).
+    disk_free_bytes: int | None
     journal_mode: str
     messages: int
     events: int
@@ -9428,11 +9432,13 @@ class MessageStore:
                 total += p.stat().st_size
         return total
 
-    def _disk_free_bytes(self) -> int:
+    def _disk_free_bytes(self) -> int | None:
+        """Free bytes on the DB's drive; ``None`` when the probe failed — see
+        :attr:`DbStatus.disk_free_bytes` for why that is not ``0`` (BACKLOG #1563)."""
         try:
             return shutil.disk_usage(Path(self.path).resolve().parent).free
         except OSError:
-            return 0
+            return None
 
     # --- retention / purge + maintenance (PHI.md §8, ASVS 14.2.x) -------------
 
