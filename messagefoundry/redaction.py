@@ -37,9 +37,10 @@ cuts an over-long string to :data:`_REDACT_WINDOW` first.
 **Redacting ``text[:limit]`` is the obvious form of that and it leaks.** A cut lands mid-run, strands
 the surviving fragment below the two-delimiter threshold :data:`_HL7_FIELD_RUN` needs or the two-token
 threshold :data:`_NAME_RUN` needs, and the patient name the pattern existed to catch walks through
-into the log. So the cut is made where no pattern here can straddle it and the tokens it could have
-split are dropped whole — never emitted in part. Over-redaction at the boundary is the deliberate
-price.
+into the log. So the cut is made at whitespace, and the tokens :data:`_NAME_RUN` could have split are
+dropped whole — never emitted in part. Over-redaction at the boundary is the deliberate price.
+:data:`_CUT_CHARS` carries the per-pattern argument: which patterns a whitespace cut covers, which it
+does not, and the test to apply to the next one added.
 
 Pure stdlib (``re``, ``hashlib``, ``string``), so it can be used from any engine package.
 """
@@ -330,17 +331,36 @@ _REDACT_WINDOW = 64 * 1024
 #: tokens are on the kept side.
 _NAME_RUN_MAX_TOKENS = 4
 
-#: The characters :func:`_clamp` may cut at. Whitespace is the boundary because it is the one place
-#: three of the four patterns provably cannot cross: :data:`_HL7_FIELD_RUN` and :data:`_DATE_RUN` are
-#: built from classes that exclude ``\s`` outright, and :data:`_HL7_SEGMENT` goes on matching from its
-#: own header whatever is cut off its tail. Only :data:`_NAME_RUN` spans whitespace, and the token walk
-#: in :func:`_clamp` is there for that one pattern.
+#: The characters :func:`_clamp` may cut at. Whitespace is the boundary because a pattern survives a
+#: cut when it either cannot contain whitespace at all or still matches with its tail gone:
+#: :data:`_HL7_FIELD_RUN` and :data:`_DATE_RUN` are built from classes that exclude ``\s`` outright,
+#: and :data:`_HL7_SEGMENT` goes on matching from its own header whatever is cut off its tail.
+#: :data:`_NAME_RUN` has neither property, and the token walk in :func:`_clamp` is there for it.
+#:
+#: **A pattern with a REQUIRED tail past a space has neither property, and this module has one.**
+#: :data:`_INVALID_URL_USERINFO` (BACKLOG #1793) landed after this cut was designed. It is head-anchored
+#: like :data:`_HL7_SEGMENT`, but its trailing ``@`` is required rather than optional, so a cut inside
+#: its span does not shorten the match — it kills it, and the password head before the cut is written
+#: out. Reproduced on this module: in a 64 KiB-plus string whose last whitespace before the window falls
+#: between two space-separated halves of the quoted password, the first half survives, where an
+#: unclamped :func:`redact` would have scrubbed it and a clamped one does not. The walk below does not
+#: cover it — :func:`_ends_with_name_token` asks a name-shaped question. For an ENDPOINT URL the
+#: construction-time refusal in ``transports/rest.py`` ``refuse_url_credentials`` is the primary control
+#: and is untouched, so this is a gap in its backstop at one boundary; that refusal deliberately does
+#: not screen a ``proxy_url``, which legitimately carries its own credentials, so do not read it as
+#: covering every arm.
+#:
+#: **The test a new pattern has to pass, which is a property and not a count:** if a cut at a space
+#: falls inside your span, does what is left still MATCH you? Answer it, and pin the answer beside the
+#: other properties of this cut in ``tests/test_redaction.py`` under *bounding the input*. A count of
+#: how many patterns are covered went stale here the first time the module grew one, and nothing
+#: reported it.
 #:
 #: ``string.whitespace`` searched with :meth:`str.rfind`, rather than ``\s`` through the regex engine:
 #: a right-to-left search is what this needs and ``re`` only scans left to right. The stdlib name is
 #: also the claim — ASCII whitespace, a strict subset of ``\s``, which is the direction that stays
-#: safe: every character in it is one the patterns cannot cross, and a Unicode space it misses only
-#: means the cut falls further back and drops more.
+#: safe: a narrower cut set only means the cut falls further back and drops more, so a Unicode space it
+#: misses costs over-redaction and never coverage.
 _CUT_CHARS = whitespace
 
 
@@ -400,22 +420,21 @@ def _last_cut(text: str, end: int) -> int:
 
 
 def _clamp(text: str, window: int) -> tuple[str, int]:
-    """``(head, dropped)`` — ``text`` cut to at most ``window`` characters at a boundary no pattern in
-    this module can straddle, and how many characters that cost.
+    """``(head, dropped)`` — ``text`` cut to at most ``window`` characters at a whitespace boundary,
+    and how many characters that cost. See :data:`_CUT_CHARS` for which patterns that boundary covers
+    and which it does not.
 
     ``dropped == 0`` means the text fit and ``head is text``, so every caller is byte-identical to its
     pre-#1576 self on everything short enough to read.
 
-    **The cut ALWAYS lands on whitespace or on zero, and never at an arbitrary offset.** A whitespace
-    cut is what covers :data:`_HL7_SEGMENT`, :data:`_HL7_FIELD_RUN` and :data:`_DATE_RUN`: none of them
-    can contain whitespace, and the segment goes on matching from its header however much of its tail
-    is gone. Cut anywhere else and a run carrying two delimiters can lose one of them and fall under
+    **The cut ALWAYS lands on whitespace or on zero, and never at an arbitrary offset.** Cut anywhere
+    else and a run carrying two delimiters can lose one of them and fall under
     :data:`_HL7_FIELD_RUN`'s threshold — which is the leak this whole change exists to avoid, rebuilt
     inside the fix for it. A window holding no whitespace at all therefore yields nothing rather than a
-    fragment.
+    fragment. :data:`_CUT_CHARS` carries the per-pattern argument for what a whitespace cut covers.
 
-    **Then the walk, which is there for :data:`_NAME_RUN` alone** — the one pattern that spans
-    whitespace, so the one a whitespace cut can still split. A bare cut through ``DOE JANE`` leaves
+    **Then the walk, which is there for :data:`_NAME_RUN`** — a pattern a whitespace cut can split
+    while leaving a match-killing remainder behind. A bare cut through ``DOE JANE`` leaves
     ``DOE`` standing under its two-token threshold. Up to :data:`_NAME_RUN_MAX_TOKENS` - 1 further
     name-shaped tokens are dropped whole; the cost is over-redaction of a few tokens at a boundary
     64 KiB into a string nobody is reading that far down."""

@@ -211,9 +211,10 @@ class RedactionFilter(logging.Filter):
     event loop — and its input is a whole rendered traceback whose length a remote peer chooses. A
     negative acknowledgment at a 16 MiB frame cap would have charged the loop the better part of a
     second per record.
-    :func:`~messagefoundry.redaction.redact_untrusted` cuts each field first, at a boundary no
-    redaction pattern can straddle, so the bound cannot strand the fragment a threshold-based pattern
-    would then miss. Head-first is the right end for a traceback: Python renders the frames before the
+    :func:`~messagefoundry.redaction.redact_untrusted` cuts each field first, at a whitespace boundary
+    chosen so the bound does not strand the fragment a threshold-based pattern would then miss — see
+    :data:`~messagefoundry.redaction._CUT_CHARS` for which patterns that covers and which it does
+    not. Head-first is the right end for a traceback: Python renders the frames before the
     exception message, so what a bound drops is the peer-sized payload and what it keeps is the part
     an operator reads.
 

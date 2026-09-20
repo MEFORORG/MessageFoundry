@@ -785,9 +785,10 @@ def test_clamp_closes_the_fence_it_was_built_against() -> None:
 
 
 def test_clamp_does_not_strand_a_name_run_split_by_the_cut() -> None:
-    """``_NAME_RUN`` is the one pattern that spans whitespace, so a whitespace cut alone can still
-    strand it: ``DOE JANE`` cut between its tokens leaves ``DOE`` under the two-token threshold. The
-    token walk drops the neighbours whole."""
+    """``_NAME_RUN`` spans whitespace, so a whitespace cut alone can still strand it: ``DOE JANE`` cut
+    between its tokens leaves ``DOE`` under the two-token threshold. The token walk drops the
+    neighbours whole. It is not the only such pattern in the module -- ``_CUT_CHARS`` names the other
+    and the test to apply to a new one."""
     out = redact(clamp_untrusted(_over_window(" DOE JANE SMITH tail")))
     assert "DOE" not in out and "JANE" not in out and "SMITH" not in out
 

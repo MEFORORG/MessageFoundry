@@ -12,8 +12,8 @@ negative acknowledgment at the cap depending on the shape of the text, against a
 
 **Not fixed by slicing.** A cut at an arbitrary offset strands a fragment under the redactor's
 thresholds -- one delimiter where ``_HL7_FIELD_RUN`` needs two -- and the surname walks into the log.
-``clamp_untrusted`` cuts where no pattern can straddle; ``tests/test_redaction.py`` holds that
-measurement.
+``clamp_untrusted`` cuts at whitespace instead; ``redaction._CUT_CHARS`` carries the per-pattern
+argument for what that covers, and ``tests/test_redaction.py`` holds the measurement.
 
 The peers here are real loopback ``asyncio.start_server`` receivers and the deliveries are real
 ``MLLPDestination.send`` calls, so these arms exercise the shipped path rather than ``_check_ack``
