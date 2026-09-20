@@ -5,27 +5,13 @@ r"""Tests for the unbounded-filesystem-scan PreToolUse guard.
 The guard (``scripts/hooks/block-unbounded-fs-scan.ps1``) denies a shell command that would walk
 the MSYS root or its synthetic ``/proc``, and passes everything else silently.
 
-WHAT IT IS PROTECTING, MEASURED 2026-09-20. Git Bash's ``/`` is ``C:\Program Files\Git``. Its
-``/proc`` holds 32 entries and three of them -- ``/proc/registry``, ``/proc/registry32`` and
-``/proc/registry64`` -- are the Windows registry mounted as filesystem trees by the MSYS2 runtime.
-A walk opens a kernel handle per registry key, and ``HKEY_CLASSES_ROOT`` alone is effectively
-unbounded. Paired arms on one ``find.exe`` binary, handles sampled every 3 seconds:
+WHAT IT IS PROTECTING: Git Bash's ``/proc`` carries three Windows-registry mounts, and walking one
+opens a kernel handle per registry key without bound. The 2026-09-20 measurement, its paired arms
+and the machine-wide totals live in the guard's own header and are deliberately not copied here --
+a re-measurement should have one prose arm to update, not three (CLAUDE.md section 11).
 
-    find /proc/registry                         7,619 -> 15,590 -> 22,185 -> 26,594 -> 30,471,
-                                                still climbing when the arm was stopped
-    find /proc, all 3 registry mounts pruned    exited at once, 3,866 lines, no handle growth
-    find /proc -maxdepth 2                      exited at once, 302 lines
-    find /                                      flat at about 205 handles until it REACHES /proc
-
-The pruned arm is what makes the other one evidence: the same walk over the same tree with three
-directories skipped is free, so the registry mounts are the whole of the effect and nothing else
-about ``/proc`` matters. Machine-wide before cleanup: 4,183,509 handles, 4,620 MB of paged pool
-out of 32.5 GB of RAM, a 10-second test run taking 26 minutes.
-
-AND AN INTERRUPT CANNOT STOP ONE, which is why this is a DENY and not a timeout. Killing a
-``bash.exe`` wrapper does not kill its grandchildren: measured on a
-claude -> bash -> bash -> bash -> python -> python chain, killing the innermost bash left both
-pythons alive, reparented to a dead pid.
+An interrupt cannot stop such a walk, which is why this is a DENY and not a timeout. That half is
+stated in ``scripts/coord/reap-orphans.ps1``, the after-the-fact companion.
 
 THE ALLOW SIDE IS WHERE THIS GUARD CAN GO WRONG QUIETLY. A pattern for ``find`` also matches the
 word inside ``echo findings``, a Windows path spelled ``C:\find\notes.txt``, and
@@ -216,6 +202,53 @@ def test_the_walk_is_caught_through_a_leading_cd_or_an_xargs(command: str) -> No
 def test_the_powershell_tool_is_screened_too() -> None:
     """The matcher wiring this guard selects both shell tools, so the guard must judge both."""
     assert_denied(run_guard(bash("find /proc", tool="PowerShell")))
+
+
+# ================================================== DENY: the fail-opens a critic measured
+
+# EVERY ROW HERE WAS ALLOWED BY THE COMMITTED GUARD AND IS NOW DENIED. They are kept as a block,
+# with their mechanism named, because each one is a shape a reader would call contrived until they
+# see that it was found by driving the real hook rather than by reasoning about it.
+#
+# Rows 1-2: the heredoc opener was matched on the RAW line, so a `<<` inside a quoted pattern, and
+#           the second `<` of a `<<<` herestring, each set a terminator word that never appeared
+#           again -- blanking every later line, the real walk included.
+# Rows 3-5: the segment splitter had no case for command substitution or a subshell, so the walk
+#           sat somewhere program position never looked.
+# Row 6:    the prune exemption was a substring match with no trailing boundary, so a path that
+#           merely STARTS with /proc satisfied it.
+# Row 7:    the same substring match read a shell COMMENT. This is the one that matters: the deny
+#           message hands the agent the exact text `-path /proc -prune -o`, so pasting the advice
+#           into a comment turned the retry into an exemption.
+# Row 8:    `-d recurse` was recognised only in its short spelling, so the long option's value was
+#           consumed without being read and the walk read as non-recursive.
+MEASURED_FAIL_OPENS = [
+    pytest.param('grep -rn "x << y" .\nfind /proc', id="quoted-shift-then-walk"),
+    pytest.param("bash <<< 'hello'\nfind /proc", id="herestring-then-walk"),
+    pytest.param("echo $(find /proc)", id="command-substitution"),
+    pytest.param("echo `find /proc`", id="backtick-substitution"),
+    pytest.param("(find /proc)", id="subshell"),
+    pytest.param("find / -path /procurement -prune -o -print", id="prune-on-a-lookalike-path"),
+    pytest.param(
+        "find / -name x # use -path /proc -prune -o instead", id="prune-named-only-in-a-comment"
+    ),
+    pytest.param("grep --directories recurse pattern /proc", id="long-directories-recurse"),
+]
+
+
+@pytest.mark.parametrize("command", MEASURED_FAIL_OPENS)
+def test_a_measured_fail_open_is_now_denied(command: str) -> None:
+    assert_denied(run_guard(bash(command)))
+
+
+def test_a_real_heredoc_is_still_blanked_so_the_fix_did_not_cost_the_allow_side() -> None:
+    """The control for rows 1-2 above. Tightening the opener must not stop it finding a real one.
+
+    Without this, the cheapest way to pass those two rows is to disable the heredoc pass entirely,
+    which would deny every commit that documents this guard.
+    """
+    assert_allowed(run_guard(bash("cat >> docs/X.md <<'EOF'\nfind /proc leaks.\nEOF")))
+    assert_allowed(run_guard(bash("cat >> docs/X.md <<EOF\nfind /proc leaks.\nEOF")))
 
 
 # ================================================================== ALLOW: bounded work

@@ -70,10 +70,30 @@ def test_a_default_run_reports_and_exits_clean(
     assert "control:" in default_run.stdout
 
 
+def test_the_report_only_banner_is_pinned_in_the_source_not_only_in_a_run() -> None:
+    """THE RUN-CONDITIONAL VERSION OF THIS TEST WAS ENVIRONMENT-DEPENDENT, WHICH IS WHY IT MOVED.
+
+    The banner only prints when the box happens to have orphans. A test guarded on that asserts
+    nothing on a clean box -- and a critic measured exactly that, zero candidates -- so deleting
+    "REPORT ONLY" from the script would have stayed green everywhere except on whichever machine
+    happened to be dirty. A test that reds by luck gets deleted rather than fixed.
+
+    Reading the source pins the contract deterministically. The run-side check below still drives
+    the real output when there is any.
+    """
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert "REPORT ONLY" in text
+    assert "-Kill to terminate" in text
+
+
 def test_the_default_run_says_it_is_report_only_when_it_found_something(
     default_run: subprocess.CompletedProcess[str],
 ) -> None:
-    """The banner has to name the mode, because the table alone reads like a kill log."""
+    """The banner has to name the mode, because the table alone reads like a kill log.
+
+    VACUOUS ON A CLEAN BOX, and that is stated rather than hidden: with no candidates the banner
+    never prints and neither assertion runs. The deterministic half is the source check above.
+    """
     if "Stranded MSYS tool processes" in default_run.stdout:
         assert "REPORT ONLY" in default_run.stdout
         assert "-Kill" in default_run.stdout
@@ -100,26 +120,58 @@ def test_the_control_reports_high_handle_processes_the_image_list_cannot_name(
     A python.exe or rg.exe walking the registry mounts leaks handles identically and is on no
     image list, so a zero candidate count must not be readable as "nothing is leaking". The handle
     floor is reported beside the count, because a bare count means nothing without its threshold.
+
+    COUNTED OVER THE WHOLE TABLE, not just the orphans -- so the bound here is the process total.
+    A dead-parent-only count read zero during an incident, when the runaway's session is still
+    alive, which is precisely when an operator runs this.
     """
     control = default_json["control"]
-    assert isinstance(control["DeadParentOverHandleFloor"], int)
+    assert isinstance(control["HighHandleAnyParent"], int)
     assert control["HandleFloor"] > 0
-    assert control["DeadParentOverHandleFloor"] <= control["DeadParentAnyAge"]
+    assert control["HighHandleAnyParent"] <= control["TotalProcesses"]
 
 
 def test_every_candidate_carries_the_identity_fence_a_kill_would_recheck() -> None:
     """A pid alone does not name a process across time, and -Kill re-reads before it acts.
 
     The row has to carry what that recheck compares against -- the image name and the creation
-    time -- or the fence has nothing to fence with and degrades into a bare pid kill. Driven at a
-    zero floor so the assertions see rows on an ordinary box rather than passing over an empty list.
+    time -- or the fence has nothing to fence with and degrades into a bare pid kill.
+
+    THE ROW LOOP IS VACUOUS ON A BOX WITH NO ORPHANS, and an earlier docstring here claimed the
+    zero floor made sure it was not -- a provenance claim the evidence did not support. Candidate
+    counts at a zero floor were measured at 7, then 3, then 0 on the same machine within an hour.
+    So the deterministic half is asserted separately: the fields the fence needs are pinned from
+    the script's own source, and the loop checks their TYPES whenever the box happens to supply
+    rows.
     """
-    payload = json.loads(run_script("-Json", "-MinAgeMinutes", "0").stdout)
+    text = SCRIPT.read_text(encoding="utf-8")
+    for field in ("StartedTicks", "Handles", "Mutating"):
+        assert field in text, f"the row no longer carries {field}, so a kill cannot recheck it"
+    proc = run_script("-Json", "-MinAgeMinutes", "0")
+    assert proc.returncode == 0, proc.stderr
+    payload = json.loads(proc.stdout)
     assert "SkippedPidRecycled" in payload["control"]
+    assert "SkippedMutatingImage" in payload["control"]
     for row in payload["candidates"]:
         assert isinstance(row["StartedTicks"], int), row
         assert isinstance(row["Handles"], int), row
+        assert isinstance(row["Mutating"], bool), row
         assert row["Name"], row
+
+
+def test_a_kill_would_refuse_the_images_that_write() -> None:
+    """The safety argument is about OUTPUT, and a writer breaks it in a way no parent check sees.
+
+    A stranded git.exe killed mid index-pack leaves .git/index.lock behind and wedges every later
+    git call in that repository; sed -i and sort -o leave a truncated temp file. Those images are
+    still REPORTED -- narrowing detection would hide the leak this script exists to find -- but
+    -Kill alone must refuse them. Asserted from the source because no test here ever passes -Kill.
+    """
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert "$MUTATING" in text
+    for image in ("git.exe", "sed.exe", "sort.exe", "sh.exe", "bash.exe", "xargs.exe"):
+        assert image in text
+    assert "-Force to override" in text
 
 
 def test_a_default_run_kills_nothing_whatever_it_found(default_json: dict[str, Any]) -> None:
@@ -131,9 +183,14 @@ def test_a_default_run_kills_nothing_whatever_it_found(default_json: dict[str, A
 def test_every_candidate_really_has_a_dead_parent_and_is_old_enough() -> None:
     """The parent check IS the safety argument, so it is asserted rather than described.
 
-    A dead parent means no session is left to consume the output, so killing destroys no work
-    product. If a candidate ever appears whose parent is alive, the predicate has inverted and the
-    script would be proposing to kill something a peer is still waiting on.
+    A dead parent means no session is left to consume the output. If a candidate ever appears
+    whose parent is alive, the predicate has inverted and the script would be proposing to kill
+    something a peer is still waiting on. (A dead parent is NOT on its own a promise that killing
+    destroys nothing -- the writer case is the test above.)
+
+    VACUOUS WHEN THE BOX HAS NO ORPHANS, like every row loop in this module. It is kept because it
+    is the only thing that catches an inverted predicate, and a false PASS here is a report nobody
+    acts on rather than a kill nobody wanted.
 
     THE CONTROL IS TAKEN TWICE, BEFORE AND AFTER, AND ONLY THE INTERSECTION COUNTS. A single read
     cannot separate "this parent is alive" from "this pid was recycled in the second since the
@@ -157,8 +214,12 @@ def test_raising_the_age_floor_can_only_shrink_the_candidate_set() -> None:
     Measured, not reasoned: both runs read the same box seconds apart, so a floor of one day
     cannot select a process that a floor of ten minutes rejected.
     """
-    low = json.loads(run_script("-Json", "-MinAgeMinutes", "10").stdout)
-    high = json.loads(run_script("-Json", "-MinAgeMinutes", "1440").stdout)
+    low_proc = run_script("-Json", "-MinAgeMinutes", "10")
+    high_proc = run_script("-Json", "-MinAgeMinutes", "1440")
+    assert low_proc.returncode == 0, low_proc.stderr
+    assert high_proc.returncode == 0, high_proc.stderr
+    low = json.loads(low_proc.stdout)
+    high = json.loads(high_proc.stdout)
     low_pids = {r["Pid"] for r in low["candidates"]}
     high_pids = {r["Pid"] for r in high["candidates"]}
     assert high_pids <= low_pids, f"a higher floor selected {high_pids - low_pids}"

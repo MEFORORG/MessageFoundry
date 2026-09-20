@@ -96,7 +96,9 @@ function Deny {
 # and are read there as program position. Written against the shape of the sibling guard's pass in
 # block-blanket-git-stage.ps1 rather than dot-sourced from it.
 #
-# ***THIS IS NOW THE SECOND COPY, AND THE SIBLING'S REASON FOR KEEPING ITS OWN NO LONGER HOLDS.***
+# ***THIS AND Hide-QuotedSpans BELOW ARE BOTH SECOND COPIES, AND THE SIBLING'S REASON FOR KEEPING
+# ITS OWN NO LONGER HOLDS.*** Naming only one of them would send whoever acts on this note to
+# extract half the seam and leave the other half diverging.
 # That file says it is "one function with one caller for exactly that reason" and should be
 # replaced by a shared helper when BACKLOG #1332 settles. A second caller is the event that
 # retires that argument, so read this as a debt rather than a decision. The two copies have
@@ -105,23 +107,45 @@ function Deny {
 # tests/test_claude_settings_contract.py globs scripts/hooks/*.ps1 and demands every file there be
 # wired, installer-wired, or listed as deliberately unwired -- so a LIBRARY in that directory needs
 # a new entry on a list whose own comment says growth is the signal, not the workaround.
-function Hide-HeredocBodies([string]$Text) {
+#
+# ***THE OPENER IS FOUND ON THE QUOTE-MASKED TEXT AND THE DELIMITER IS READ FROM THE RAW TEXT.***
+# Doing both on one view is wrong in opposite directions, and the raw-only version shipped a
+# fail-open that was measured: `grep -rn "x << y" .` followed by a newline and `find /proc` was
+# ALLOWED, because `<< y` inside a quoted pattern set the terminator to a word that never appears
+# again, so every later line -- the real walk included -- was blanked away. `bash <<< 'hello'` did
+# the same through the herestring operator. But masking first and reading the delimiter from the
+# masked text loses it outright: `<<'EOF'` masks to `<<'   '`. Both views preserve LENGTH, so the
+# opener's offset in one is its offset in the other, which is what lets each question be asked of
+# the view that can answer it.
+#
+# TWO MORE BOUNDS, both of them the safe direction. `<<<` is excluded outright, and the delimiter
+# must start with a letter or underscore, so an arithmetic shift (`$((1<<2))`) opens nothing. A
+# heredoc written with no space before it (`cat<<EOF`) is therefore missed, which costs a possible
+# false DENY on a heredoc whose body quotes this rule -- visible and reportable, never a hole.
+function Hide-HeredocBodies([string]$Text, [string]$Masked) {
     # This hook runs as a fresh pwsh on EVERY shell tool call, so the common case pays for the
     # uncommon one unless it is short-circuited. Almost no command contains a heredoc.
-    if ($Text.IndexOf('<<') -lt 0) { return $Text }
-    $lines = $Text -split "`n", 0
+    if ($Masked.IndexOf('<<') -lt 0) { return $Masked }
+    $rawLines = $Text.Split([char]10)
+    $maskedLines = $Masked.Split([char]10)
     $out = New-Object 'System.Collections.Generic.List[string]'
     $terminator = $null
-    foreach ($line in $lines) {
+    for ($n = 0; $n -lt $maskedLines.Count; $n++) {
+        $line = $maskedLines[$n]
         if ($null -ne $terminator) {
             if ($line.Trim() -ceq $terminator) { $terminator = $null; $out.Add($line) }
             else { $out.Add(' ' * $line.Length) }
             continue
         }
         $out.Add($line)
-        $m = [regex]::Match($line, '<<-?\s*(?:''([^'']+)''|"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))')
-        if ($m.Success) {
-            $terminator = @($m.Groups[1].Value, $m.Groups[2].Value, $m.Groups[3].Value) |
+        $m = [regex]::Match($line, '(?:^|\s)(?<!<)<<(?!<)-?[ \t]*')
+        if (-not $m.Success) { continue }
+        # The delimiter word itself, taken from the RAW line at the offset the masked line found.
+        $raw = $rawLines[$n]
+        $rest = $raw.Substring([Math]::Min($m.Index + $m.Length, $raw.Length))
+        $d = [regex]::Match($rest, '^(?:''([^'']+)''|"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))')
+        if ($d.Success) {
+            $terminator = @($d.Groups[1].Value, $d.Groups[2].Value, $d.Groups[3].Value) |
                 Where-Object { $_ } | Select-Object -First 1
         }
     }
@@ -192,13 +216,20 @@ try {
     # into $scan is the same offset into $cmd: the blanked view answers "where does a command start
     # and what program is it", where quoted text must not count, and the raw view answers "what are
     # this command's operands", where a quoted token is an ordinary argument.
-    $scan = Hide-QuotedSpans (Hide-HeredocBodies $cmd)
+    # Quotes first, then heredoc bodies -- see Hide-HeredocBodies' header for why the order matters
+    # and why it needs both views.
+    $scan = Hide-HeredocBodies $cmd (Hide-QuotedSpans $cmd)
 
     # Judge each shell-separated simple command on its own, so `cd X && find /proc` is still caught
     # and `echo hi | xargs find /` is reached through the pipe.
     $bounds = New-Object 'System.Collections.Generic.List[int[]]'
     $cursor = 0
-    foreach ($m in [regex]::Matches($scan, '(\|\||&&|[;|&\n])')) {
+    # `(` and `)` and the backtick are separators too, and they are not cosmetic: without them
+    # `echo $(find /proc)`, a backtick substitution and a `( find /proc )` subshell all put the walk
+    # somewhere program position never looks, and each was measured ALLOWED. Splitting on them costs
+    # nothing -- a segment starting mid-expression, such as the `-name x` after a `\(` group, is not
+    # a program name and is skipped.
+    foreach ($m in [regex]::Matches($scan, '(\|\||&&|[;|&\n()`])')) {
         $bounds.Add(@($cursor, ($m.Index - $cursor)))
         $cursor = $m.Index + $m.Length
     }
@@ -271,17 +302,32 @@ try {
             # produce one, so a spelling missing here costs a false deny -- noisy and visible --
             # rather than a silent hole.
             #
-            # READ FROM THE RAW VIEW, DELIBERATELY. On the blanked view `-path '/proc'` reads as
-            # `-path '    '` and a legitimately quoted path would stop exempting, which is a
-            # realistic false deny. The cost is that quoted text could spell an exemption it does
-            # not perform -- but that needs `-path /proc` AND `-prune` written inside an argument
-            # on the same command as a real walk, which nobody types by accident.
-            # The cheap literal decides first: a segment with no -prune in it never reaches the
-            # alternation.
-            if ($rawSeg.IndexOf('-prune') -ge 0 -and
-                $rawSeg -imatch '-(?:path|wholename)\s+["'']?/proc') {
-                continue
+            # ***READ AS TOKENS, NOT AS A SUBSTRING OF THE SEGMENT.*** A regex over the raw text
+            # exempted two things it should not have, both measured: `find / -path /procurement
+            # -prune -o -print` matched because the pattern had no trailing boundary, and
+            # `find / -name x # use -path /proc -prune -o instead` matched because the COMMENT
+            # satisfied both halves. The second is the dangerous one -- this guard's own deny
+            # message tells the agent to write exactly that text, so pasting the advice into a
+            # comment would have turned the retry into an exemption.
+            #
+            # Comments are cut first (bash starts one at a `#` that begins a word), then `-path`
+            # or `-wholename` must be a real token whose NEXT token is exactly /proc or below it,
+            # and `-prune` must be its own token.
+            $exprTokens = @()
+            foreach ($tk in $tokens) {
+                if ($tk.StartsWith('#')) { break }
+                $exprTokens += $tk
             }
+            $pruned = $false
+            for ($n = 0; $n -lt $exprTokens.Count - 1; $n++) {
+                if (($exprTokens[$n] -ieq '-path' -or $exprTokens[$n] -ieq '-wholename') -and
+                    (Test-MsysWalkRoot (Get-Operand $exprTokens[$n + 1])) -and
+                    ($exprTokens -ccontains '-prune')) {
+                    $pruned = $true
+                    break
+                }
+            }
+            if ($pruned) { continue }
 
             $k = $i + 1
             # find's own leading global options, which sit BEFORE the path operands. `-D` always
@@ -333,8 +379,13 @@ try {
                     $k++
                     if ($t -cmatch $GREP_VALUE_OPTS) {
                         if ($k -lt $tokens.Count) {
-                            # `-d recurse` is `-r` spelled long-hand.
-                            if ($t -ceq '-d' -and (Get-Operand $tokens[$k]) -ieq 'recurse') { $recursive = $true }
+                            # `-d recurse` is `-r` spelled long-hand, and GNU grep accepts the
+                            # long option with its value as a SEPARATE word too. Testing only the
+                            # short spelling let `grep --directories recurse pattern /proc`
+                            # through: the value was consumed here without being read, so the
+                            # scan saw an option-only grep and never set $recursive.
+                            if (($t -ceq '-d' -or $t -ieq '--directories') -and
+                                (Get-Operand $tokens[$k]) -ieq 'recurse') { $recursive = $true }
                             $k++
                         }
                     }

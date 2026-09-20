@@ -12,18 +12,28 @@
     whatever MSYS tool was mid-run, and the orphan's parent is dead -- no pipe ever closes, no
     SIGPIPE ever arrives, and it runs until something stops it.
 
-    WHAT IT COSTS WHEN THE STRANDED TOOL IS WALKING /proc. /proc/registry, /proc/registry32 and
-    /proc/registry64 are the Windows registry mounted as filesystem trees by the MSYS2 runtime, so
-    a walk opens a kernel handle per registry key and HKEY_CLASSES_ROOT alone is effectively
-    unbounded. Measured the same day: 'find /proc/registry' passed 30,000 machine-wide handles in
-    15 seconds and was still climbing; machine-wide before cleanup, 4,183,509 handles and 4,620 MB
-    of paged pool out of 32.5 GB of RAM, with a 10-second test run taking 26 minutes.
-    scripts/hooks/block-unbounded-fs-scan.ps1 is the before-the-fact half; this is the after.
+    WHAT IT COSTS WHEN THE STRANDED TOOL IS WALKING /proc: a kernel handle per Windows registry
+    key, without bound. The measurement, the paired arms that attribute it to the three registry
+    mounts, and the machine-wide totals are stated ONCE, in the header of
+    scripts/hooks/block-unbounded-fs-scan.ps1 -- the before-the-fact half of this pair. They are
+    not repeated here, because a re-measurement would then have two prose arms to keep in step and
+    nothing checking them (CLAUDE.md section 11: state a load-bearing fact once and link to it).
 
-    THE PARENT CHECK IS THE WHOLE TEST. A dead parent means no session is left to consume the
-    output, so killing destroys no work product. A LIVE parent means something may still be
-    waiting on it, and this script never touches those at any age -- not with -Kill, not with
-    -Force.
+    THE PARENT CHECK IS THE WHOLE TEST FOR WHETHER ANYONE IS LISTENING. A dead parent means no
+    session is left to consume the OUTPUT. A LIVE parent means something may still be waiting on
+    it, and this script never touches those at any age -- not with -Kill, not with -Force.
+
+    ***BUT "NOBODY IS LISTENING" IS NOT "NOTHING IS BEING WRITTEN", AND THE TWO WERE CONFLATED
+    HERE.*** That argument holds for a read-only walker -- find, grep, rg, tail, head -- and fails
+    for every writer on the default list below. A stranded git.exe killed mid index-pack or gc
+    leaves .git/index.lock or gc.pid behind and wedges every later git call in that repository;
+    sed -i and sort -o leave a truncated temp file where the original was; sh.exe, bash.exe and
+    xargs.exe are running arbitrary commands, so the damage is unbounded. A dead parent says
+    nothing about what a process is still writing to disk.
+
+    So the two roles are split. EVERY listed image is REPORTED. Only the read-only ones are killed
+    by -Kill; a mutating one is skipped and named, and needs -Force on top. Detection is unchanged
+    -- this narrows what gets terminated, never what gets seen.
 
     A PID IS NOT AN IDENTITY ACROSS TIME. Windows reuses pids, and the scan happens seconds before
     the kill, so -Kill re-reads each pid and compares the image name and the creation time against
@@ -86,7 +96,11 @@ try {
     # sit inside a confident zero.
     $all = @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, Name, CreationDate, HandleCount -EA Stop)
 } catch {
-    Write-Error "reap-orphans: could not read the process table ($($_.Exception.Message)). Nothing was examined, so nothing can be concluded."
+    # NOT Write-Error: $ErrorActionPreference is Stop, which promotes it to a terminating error, so
+    # the composed sentence would have come out as a stack trace and the exit below would never
+    # have run. This branch fires when the box is already struggling, which is the worst moment to
+    # hand an operator a trace instead of a sentence.
+    [Console]::Error.WriteLine("reap-orphans: could not read the process table ($($_.Exception.Message)). Nothing was examined, so nothing can be concluded.")
     exit 1
 }
 
@@ -103,6 +117,14 @@ $now = Get-Date
 # nothing below ever widens what -Kill targets, it only widens what gets REPORTED.
 $HANDLE_FLOOR = 10000
 
+# Images that WRITE. See the .DESCRIPTION: these are reported like any other candidate, and -Kill
+# alone refuses them. Read as "at least these" -- a writer missing from this list is killed as
+# though it were read-only, so err toward adding.
+$MUTATING = @{}
+foreach ($n in @('git.exe', 'sed.exe', 'sort.exe', 'sh.exe', 'bash.exe', 'xargs.exe', 'awk.exe', 'gawk.exe')) {
+    $MUTATING[$n] = $true
+}
+
 # --- One pass over the table, producing the control numbers and the candidate set ---------------
 # ONE traversal, not three. The dead-parent predicate used to be written twice -- once for the
 # control and once for the candidates -- and the control exists precisely to validate the candidate
@@ -116,14 +138,19 @@ $HANDLE_FLOOR = 10000
 $totalProcesses = $all.Count
 $msysAliveCount = 0
 $deadParentAnyAge = 0
-$highHandleDeadParent = 0
+$highHandleAnyParent = 0
 $candidates = [System.Collections.Generic.List[object]]::new()
 foreach ($p in $all) {
     $isMsys = $imageSet.ContainsKey([string]$p.Name)
     if ($isMsys) { $msysAliveCount++ }
+    # COUNTED OVER THE WHOLE TABLE, NOT JUST THE ORPHANS. Restricting it to dead-parent processes
+    # made the number useless in the case an operator actually runs this: DURING an incident the
+    # runaway's session and its bash wrapper are usually still alive, so a dead-parent-only count
+    # reads zero and gets read as "nothing is leaking" -- the exact inference the line it prints
+    # tells the reader not to make.
+    if ([int]$p.HandleCount -ge $HANDLE_FLOOR) { $highHandleAnyParent++ }
     if ($alivePids.ContainsKey([int]$p.ParentProcessId)) { continue }
     $deadParentAnyAge++
-    if ([int]$p.HandleCount -ge $HANDLE_FLOOR) { $highHandleDeadParent++ }
     if (-not $isMsys) { continue }
     # A process with no readable creation time is treated as AGE ZERO, which excludes it from the
     # candidate set. The unknown direction has to be the safe one, for the reason above.
@@ -161,6 +188,7 @@ $rows = @(
             Name         = $p.Name
             ParentPid    = [int]$p.ParentProcessId
             Handles      = [int]$p.HandleCount
+            Mutating     = $MUTATING.ContainsKey([string]$p.Name)
             # The identity fence's other half. A pid alone does not name a process across time.
             StartedTicks = if ($null -ne $p.CreationDate) { ([datetime]$p.CreationDate).Ticks } else { 0 }
             AgeMinutes   = [math]::Round($_.Age, 1)
@@ -178,8 +206,14 @@ $rows = @(
 $killed = 0
 $skippedPort = 0
 $skippedIdentity = 0
+$skippedMutating = 0
 if ($Kill) {
     foreach ($r in $rows) {
+        if ($r.Mutating -and -not $Force) {
+            $r.Action = 'skipped (this image writes; killing it can leave a lock or a truncated file; -Force to override)'
+            $skippedMutating++
+            continue
+        }
         if ($r.PortState -cne 'none' -and -not $Force) {
             $r.Action = if ($r.PortState -ceq 'unknown') { 'skipped (listener table unreadable; -Force to override)' }
                         else { 'skipped (holds a listening TCP port; -Force to override)' }
@@ -191,16 +225,19 @@ if ($Kill) {
         # inherit its number. A pid is not an identity across time, so the image name and the
         # creation time are checked again and a mismatch SKIPS. The sibling presence.ps1 keeps the
         # same fence for the same reason: 2 of 3 IDE lock files on this host named dead processes.
+        # NOT $now -- that name holds the scan timestamp every age above was computed from, and
+        # reusing it here silently replaced a DateTime with an array of CIM objects. It happened to
+        # be harmless only because the candidate pass finishes before this loop starts.
         try {
-            $now = @(Get-CimInstance Win32_Process -Filter "ProcessId = $($r.Pid)" -Property ProcessId, Name, CreationDate -EA Stop)
+            $reread = @(Get-CimInstance Win32_Process -Filter "ProcessId = $($r.Pid)" -Property ProcessId, Name, CreationDate -EA Stop)
         } catch {
-            $now = @()
+            $reread = @()
         }
         $sameProcess = (
-            $now.Count -eq 1 -and
-            ([string]$now[0].Name) -ieq ([string]$r.Name) -and
-            ($null -ne $now[0].CreationDate) -and
-            (([datetime]$now[0].CreationDate).Ticks -eq $r.StartedTicks)
+            $reread.Count -eq 1 -and
+            ([string]$reread[0].Name) -ieq ([string]$r.Name) -and
+            ($null -ne $reread[0].CreationDate) -and
+            (([datetime]$reread[0].CreationDate).Ticks -eq $r.StartedTicks)
         )
         if (-not $sameProcess) {
             $r.Action = 'skipped (pid no longer names the process that was scanned)'
@@ -224,7 +261,7 @@ $control = [pscustomobject]@{
     TotalProcesses          = $totalProcesses
     MsysToolsAlive          = $msysAliveCount
     DeadParentAnyAge        = $deadParentAnyAge
-    DeadParentOverHandleFloor = $highHandleDeadParent
+    HighHandleAnyParent     = $highHandleAnyParent
     HandleFloor             = $HANDLE_FLOOR
     MinAgeMinutes           = $MinAgeMinutes
     ListenerTable           = $listenerTable
@@ -232,6 +269,7 @@ $control = [pscustomobject]@{
     Killed                  = $killed
     SkippedHoldingAPort     = $skippedPort
     SkippedPidRecycled      = $skippedIdentity
+    SkippedMutatingImage    = $skippedMutating
     KillRequested           = [bool]$Kill
 }
 
@@ -259,15 +297,20 @@ Write-Host ("control: {0} processes total, {1} MSYS-tool processes alive, {2} de
     $control.TotalProcesses, $control.MsysToolsAlive, $control.DeadParentAnyAge, $control.MinAgeMinutes)
 # THE HANDLE NUMBER IS THE ONE THIS SCRIPT'S IMAGE LIST CANNOT REACH. A walker whose image is not
 # on the list -- a python.exe, an rg.exe -- leaks handles identically and is otherwise invisible
-# here, so a zero above must not read as "nothing is leaking".
-Write-Host ("control: {0} of those dead-parent processes hold {1} or more handles, whatever their image." -f `
-    $control.DeadParentOverHandleFloor, $control.HandleFloor)
+# here, so a zero above must not read as "nothing is leaking". Counted over EVERY process, live
+# parent or not, because during an incident the runaway's session is usually still running.
+Write-Host ("control: {0} processes anywhere on this box hold {1} or more handles, whatever their image or parent." -f `
+    $control.HighHandleAnyParent, $control.HandleFloor)
 if ($listenerTable -ceq 'unreadable') {
     Write-Host "control: the listening-port table could not be read, so every candidate is treated as holding a port. -Kill alone will skip them all."
 }
 if ($Kill) {
-    Write-Host ("control: killed {0}, skipped {1} holding a listening port, skipped {2} whose pid no longer names the scanned process." -f `
-        $killed, $skippedPort, $skippedIdentity)
+    Write-Host ("control: killed {0}; skipped {1} holding a listening port, {2} whose pid no longer names the scanned process, {3} whose image writes." -f `
+        $killed, $skippedPort, $skippedIdentity, $skippedMutating)
+    # A KILL CAN STRAND SOMETHING THIS RUN COULD NOT SEE. Killing a bash.exe does not kill its
+    # grandchildren -- that is the whole premise of this script -- so a child younger than the age
+    # floor survives its parent's death, newly orphaned and invisible to the run that orphaned it.
+    Write-Host "control: re-run after the age floor has elapsed. Killing a parent strands its own children, and a child under the floor was not a candidate this pass."
 }
 Write-Host ""
 exit 0
