@@ -15,6 +15,9 @@ Neutral (stdlib-only) so both :mod:`messagefoundry.config` (name validation) and
 Being the neutral leaf is also why :func:`_system_exe` lives here rather than beside the elevated
 callers: :mod:`messagefoundry.service` imports it, so the two modules share one System32 pin instead
 of drifting apart (BACKLOG #1680). It is private, and it has an importer — do not read it as dead.
+:func:`parse_service_state` is shared the same way and for the same reason -- it lived here and in
+:mod:`messagefoundry.service` as two identical copies, so the defect BACKLOG #1556 names had to be
+fixed twice. See :data:`_STATE_LINE` for what that defect was.
 """
 
 from __future__ import annotations
@@ -91,14 +94,47 @@ def is_safe_service_name(name: str) -> bool:
     return bool(name) and bool(_SAFE_SERVICE_NAME.match(name))
 
 
+# `sc query` prints one field per line, and the run state is the STATE field, whose value is the
+# numeric SCM code followed by that code's name:
+#
+#     STATE              : 4  RUNNING  (STOPPABLE, PAUSABLE, ACCEPTS_SHUTDOWN)
+#
+# Anchor on that line. Searching the whole output for the bare word instead reads the service's own
+# name, its display name and the capability flags as if they were the state (BACKLOG #1556): a
+# service named `AcmeRunningSync` reads as running whatever it is doing, and every genuinely running
+# service prints STOPPABLE and ACCEPTS_SHUTDOWN on the very same line.
+#
+# Two limits come with anchoring here, both deliberate. `sc` localizes this field name, so on a
+# non-English host nothing matches and the verdict is `unknown` -- the same verdict the whole-output
+# search gave there, and a wrong-but-confident one is worse. And the FIRST match wins, so output
+# listing several services reports the first; every caller in this package passes one validated
+# service name, and `parse_service_state` is documented for that output.
+_STATE_LINE = re.compile(r"^[ \t]*STATE[ \t]*:[ \t]*(?:(\d+)[ \t]+)?(\w+)", re.MULTILINE)
+
+# SCM service-state codes (`winsvc.h`, SERVICE_STOPPED / SERVICE_STOP_PENDING / SERVICE_RUNNING).
+# The code is read in preference to the word because the SCM defines it. `sc` always prints the
+# code, so the word table is reached only by output that omits it and never on this package's own
+# path -- it is a fallback, not the normal case. Only the two verdicts this module reports are
+# mapped, so a paused,
+# starting or continuing service reads as `unknown` -- the caller is told the state is not one it
+# knows, rather than being handed the nearest of the two it does.
+_STATE_CODES = {1: "stopped", 3: "stopped", 4: "running"}
+_STATE_WORDS = {"STOPPED": "stopped", "STOP_PENDING": "stopped", "RUNNING": "running"}
+
+
 def parse_service_state(sc_output: str) -> ServiceState:
-    """Map ``sc query`` output to ``running`` / ``stopped`` / ``unknown``."""
-    text = sc_output.upper()
-    if "RUNNING" in text:
-        return "running"
-    if "STOP" in text:  # STOPPED or STOP_PENDING
-        return "stopped"
-    return "unknown"
+    """Map the output of ``sc query <one service name>`` to ``running`` / ``stopped`` / ``unknown``.
+
+    Reads the **STATE field**, never the whole output -- see :data:`_STATE_LINE` for what a
+    substring search over everything ``sc`` prints gets wrong, and for the two limits that come
+    with anchoring there (a localized host, and multi-service output)."""
+    match = _STATE_LINE.search(sc_output.upper())
+    if match is None:
+        return "unknown"
+    code, word = match.groups()
+    if code is not None:
+        return _STATE_CODES.get(int(code), "unknown")
+    return _STATE_WORDS.get(word, "unknown")
 
 
 def _query(name: str) -> ServiceState:

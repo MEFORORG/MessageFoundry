@@ -31,10 +31,12 @@ from pathlib import Path
 
 import messagefoundry
 
-# The one System32 pin, shared with the read-only sibling — see `_system_exe` there for why every
-# program name has to be absolute. Private by convention, not by layer: service_status is the
-# stdlib-only neutral leaf, so importing it here crosses nothing.
-from messagefoundry.service_status import _system_dir, _system_exe
+# The one System32 pin and the one `sc query` state parser, both shared with the read-only sibling
+# -- see `_system_exe` there for why every program name has to be absolute, and `_STATE_LINE` for
+# why the parser reads the STATE field and what it costs when it does not. Private by convention,
+# not by layer: service_status is the stdlib-only neutral leaf, so importing it here crosses
+# nothing.
+from messagefoundry.service_status import _system_dir, _system_exe, parse_service_state
 
 # sc.exe is a console program; launched from the GUI process (pythonw has no console) each call
 # would briefly pop a console window — on the Status page's state poll that means a terminal
@@ -101,18 +103,11 @@ def is_safe_environment(name: str) -> bool:
     return bool(_SAFE_ENV_NAME.match(name))
 
 
-def parse_service_state(sc_output: str) -> str:
-    """Map ``sc query`` output to ``running`` / ``stopped`` / ``unknown``."""
-    text = sc_output.upper()
-    if "RUNNING" in text:
-        return "running"
-    if "STOP" in text:  # STOPPED or STOP_PENDING
-        return "stopped"
-    return "unknown"
-
-
 def service_state(name: str) -> str:
-    """``running`` | ``stopped`` | ``not installed`` | ``unavailable`` (non-Windows / no ``sc``)."""
+    """``running`` | ``stopped`` | ``unknown`` | ``not installed`` | ``unavailable``.
+
+    ``unavailable`` is non-Windows, an unsafe name, or no ``sc``; ``unknown`` is a service in a
+    state this module does not report (paused, starting) or ``sc`` output it cannot read."""
     if sys.platform != "win32":
         return "unavailable"
     if not _is_safe_service_name(name):
@@ -283,6 +278,20 @@ def install_script_path() -> Path | None:
     if pkg is None:
         return None
     script = Path(pkg).resolve().parents[1] / "scripts" / "service" / "install-service.ps1"
+    return script if script.exists() else None
+
+
+def uninstall_script_path() -> Path | None:
+    """Locate ``scripts/service/uninstall-service.ps1`` in the (editable-installed) repo.
+
+    The mirror of :func:`install_script_path`. Nothing launches the uninstaller from here (an
+    operator runs it directly); this exists so the policy guards over the service scripts can locate
+    both halves the same way, instead of one of them reaching for a relative path of its own.
+    """
+    pkg = messagefoundry.__file__
+    if pkg is None:
+        return None
+    script = Path(pkg).resolve().parents[1] / "scripts" / "service" / "uninstall-service.ps1"
     return script if script.exists() else None
 
 

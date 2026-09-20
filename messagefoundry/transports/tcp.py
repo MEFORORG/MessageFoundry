@@ -450,6 +450,8 @@ class TcpSource(SourceConnector):
         # port changed REACHABILITY (raw TCP had no rate control in any configuration), never the
         # default -- a stock raw-TCP inbound still has no rate bound.
         self.max_messages_per_second, self.message_burst = _pacing_settings(s)
+        # Carried only so a pacing report can name this connection (BACKLOG #290).
+        self._pacing_name = config.name or ""
         # Per-connection peer-IP allowlist (Tier 4 operability): refuse a non-listed peer at accept.
         # Absent/empty = no restriction. Mirrors MLLPSource.
         sa = s.get("source_ip_allowlist")
@@ -568,7 +570,9 @@ class TcpSource(SourceConnector):
             await self._emit_event("established", peer_host=peer_host)
             try:
                 decoder = self.codec.decoder(max_frame_bytes=self.max_frame_bytes)
-                pacer = _MessagePacer.for_rate(self.max_messages_per_second, self.message_burst)
+                pacer = _MessagePacer.for_rate(
+                    self.max_messages_per_second, self.message_burst, name=self._pacing_name
+                )
                 while True:
                     # ASVS 2.4.1 / 15.2.2 — the wait is BEFORE the read, never around the handler.
                     if pacer is not None:

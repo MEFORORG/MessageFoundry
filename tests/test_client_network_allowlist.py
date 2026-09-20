@@ -523,11 +523,60 @@ async def test_health_stays_reachable_and_echoes_the_observed_address(engine: En
     assert resp.status_code == 200
     body = resp.json()
     assert body["observed_client"] == "192.168.9.9"
-    # The tray's classify_health keys on status_code == 200 and "status" in body — still true.
+    # The tray's classify_health keys on status_code == 200 plus the WHOLE tokenless key set --
+    # status, version, observed_client (BACKLOG #1715; it used to key on "status" alone). Echoing
+    # the observed address fills a key that is already there rather than adding one, so the
+    # allow-listed body carries the same three names as the stock one below.
     assert body["status"] == "ok"
-    from messagefoundry.tray.probe import HealthProbe, classify_health
+    from messagefoundry.tray.probe import ENGINE_HEALTH_KEYS, HealthProbe, classify_health
 
+    assert ENGINE_HEALTH_KEYS.issubset(body)
     assert classify_health(200, body) is HealthProbe.OK
+
+
+async def test_stock_health_reads_as_the_engine_and_a_generic_responder_does_not(
+    engine: Engine,
+) -> None:
+    """BACKLOG #1715, both arms, against the REAL app in-process. The mirror of the test above
+    against the DEFAULT app -- no ``allowed_client_networks``, so no observed address is echoed.
+
+    Arm one is the one that matters: a fix proving only that a foreign body is rejected would have
+    broken the tray for its actual job, and nothing else in the tray suite builds the engine's own
+    ``/health`` to find out. Arm two is its negative control -- a classifier that answered OK to
+    everything passes arm one alone.
+
+    ONE test rather than two so the arms cannot drift apart: both read the same ``body``, which
+    makes agreement structural instead of asserted. Cheap, too -- no bound port, no service, no
+    certificate, and one engine build rather than two.
+
+    The VALUES below are this app shape's (auth unconfigured, so a tokenless caller gets no
+    version). An engine with ``[auth] enabled = false`` fills ``version`` in for the same tokenless
+    call -- same three KEYS, different values, which is exactly why the tray keys on the names."""
+    app = _app(engine, [])
+    async with _client(app, "127.0.0.1") as c:
+        resp = await c.get("/health")
+    assert resp.status_code == 200
+    body = resp.json()
+
+    from messagefoundry.tray.probe import ENGINE_HEALTH_KEYS, HealthProbe, classify_health
+
+    # Subset BEFORE exact equality, so this diagnostic can actually print: equality implies the
+    # subset, so the reverse order makes the tray-specific message unreachable.
+    assert ENGINE_HEALTH_KEYS.issubset(body), (
+        f"the tray requires {sorted(ENGINE_HEALTH_KEYS)} and /health sent {sorted(body)}; the "
+        "tray's required set must stay a subset of what the route actually serves"
+    )
+    assert classify_health(200, body) is HealthProbe.OK
+    assert body == {"status": "ok", "version": None, "observed_client": None}, (
+        "the /health payload moved. Only the KEY SET above is load-bearing for the tray, and "
+        "`classify_health` is containment, so ADDING a Health field is allowed by design -- widen "
+        "this pin deliberately rather than reaching for it as a fix"
+    )
+
+    # Arm two. The generic body is pinned against the real one, so the control cannot go vacuous.
+    generic = {"status": "ok"}
+    assert generic != body, "the control is only a control if the two bodies differ"
+    assert classify_health(200, generic) is HealthProbe.FOREIGN
 
 
 async def test_posture_publishes_the_denial_counters(engine: Engine) -> None:

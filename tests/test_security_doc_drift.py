@@ -128,7 +128,9 @@ _UI_WEAKER_THAN_JSON_EQUIVALENT = frozenset(
         ("GET", "/ui/uploaded-logs/file/{file_id}/resend-confirm"),
         ("POST", "/ui/connections/{name}/flag"),
         ("POST", "/ui/messages/search/presets/{preset_id}/delete"),
-        ("POST", "/ui/uploaded-logs/upload"),
+        # BACKLOG #1739 removed ("POST", "/ui/uploaded-logs/upload"): it now carries
+        # `require_ui_step_up`, so the derivation below no longer flags it. See docs/SECURITY.md
+        # item 3 of the behavioural-differences block.
     }
 )
 
@@ -457,6 +459,11 @@ _CONTEXTUAL_REVIEWED_NON_INPUTS = frozenset(
         # WP #285 (ASVS 6.7.1): the optional SHA-256 integrity pin over the OIDC CA anchor above —
         # an integrity control on trust material, not a consumer/environment access-decision input.
         "oidc_tls_ca_cert_pin",
+        # BACKLOG #299: the optional CRL checked against the IdP's certificate on the same back-channel
+        # hop. Sits with its two siblings above for the same reason — it decides whether the ENGINE
+        # trusts the IdP's certificate, not what the engine decides about a request it receives. A
+        # certificate it rejects never yields an identity at all.
+        "oidc_tls_crl_file",
         # ASVS 6.4.5 arm 2: how long BEFORE the bootstrap deadline to start reminding an operator that
         # the unclaimed first-run credential is about to be retired. Purely the timing of an advisory
         # ALERT — no login, session or authorization outcome turns on it (contrast its sibling
@@ -1023,15 +1030,37 @@ def test_ui_gate_divergences_are_exactly_the_reviewed_set() -> None:
         )
 
 
+def _console_calls(function_name: str) -> bool:
+    """Whether any module under ``messagefoundry_webconsole/`` CALLS ``function_name``.
+
+    An AST call walk, deliberately not a substring scan over the source. A text probe CANNOT FAIL in
+    the direction that matters here: BACKLOG #1738 put ``enforce_phi_read_hop`` into two ``_auth.py``
+    docstrings as well as into the gate, so a later refactor that deleted the call and left the prose
+    would keep a substring probe True, let the caller below take the parity branch, and stop requiring
+    ``docs/SECURITY.md`` to re-disclose a gap that had reopened.
+    """
+    for module in (_ROOT / "messagefoundry_webconsole").rglob("*.py"):
+        for node in ast.walk(ast.parse(module.read_text(encoding="utf-8"))):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Name) and func.id == function_name:
+                return True
+            if isinstance(func, ast.Attribute) and func.attr == function_name:
+                return True
+    return False
+
+
 def test_ui_plane_states_the_phi_read_hop_gap() -> None:
-    """``enforce_phi_read_hop`` has no console call site, so the ADR 0092 refusal does not apply to
-    the ``/ui`` browse routes. Asserted both ways, so the disclosure is removed when parity lands."""
+    """``require_ui``'s ``phi`` arm calls ``enforce_phi_read_hop``, so the ADR 0092 refusal DOES apply
+    to the ``/ui`` PHI routes (BACKLOG #1738). Asserted both ways, so the disclosure comes back if the
+    call is ever removed.
+
+    It pins the DISCLOSURE only. It issues no request and cannot observe WHERE in the gate the refusal
+    lands; the console suite's
+    ``test_the_refusal_lands_after_identity_so_a_visitor_still_gets_the_login_page`` pins that."""
     pytest.importorskip("messagefoundry_webconsole")
-    console = _ROOT / "messagefoundry_webconsole"
-    charges = any(
-        "enforce_phi_read_hop" in module.read_text(encoding="utf-8")
-        for module in console.rglob("*.py")
-    )
+    charges = _console_calls("enforce_phi_read_hop")
     block = _section(_doc_text(), _H_UI_ROUTE_MAP)
     stated = "does not apply on the `/ui` browse routes" in block
     if charges:
@@ -1040,7 +1069,7 @@ def test_ui_plane_states_the_phi_read_hop_gap() -> None:
         )
     else:
         assert stated, (
-            "enforce_phi_read_hop appears nowhere in messagefoundry_webconsole, so the /ui PHI browse "
+            "no module in messagefoundry_webconsole CALLS enforce_phi_read_hop, so the /ui PHI browse "
             "routes get the per-actor budget but not the posture-keyed refusal. Say so."
         )
 

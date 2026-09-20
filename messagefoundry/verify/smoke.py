@@ -106,18 +106,36 @@ def _classify_self_smoke(disposition: MessageStatus, summary: str) -> CheckResul
     rid, title = "smoke.self", "Self smoke (dry-run routing)"
     if disposition is Disposition.RECEIVED:
         return CheckResult(rid, title, Status.PASS, summary)  # the preview's delivering outcome
+    if disposition is Disposition.NOT_DEPLOYED:
+        # Its own arm and its own remedy, which is the whole point of the member (BACKLOG #1690
+        # split it out of FILTERED so this gate could stop reading a decline as an author's filter).
+        # The Router and the Handler both did their job here, so the two remedies below are both
+        # wrong for it: re-pointing ``--inbound`` finds a different feed for a feed that was fine,
+        # and looking at the filter finds a filter that did not fire.
+        return CheckResult(
+            rid,
+            title,
+            Status.FAIL,
+            f"{summary} — a handler ran and produced a Send, but every destination it addressed is "
+            "present-but-not-deployed, so nothing would be delivered; deploy the outbound "
+            "connection(s) the Handler sends to, or send to one that is already deployed",
+        )
     if disposition is Disposition.UNROUTED:
         reason = "the Router selected no handler, so nothing would be delivered"
     elif disposition is Disposition.FILTERED:
-        reason = (
-            "handlers ran but produced no delivery (a filter returned nothing, or every destination "
-            "is present-but-not-deployed)"
-        )
+        # No longer "or every destination is present-but-not-deployed": that outcome is
+        # ``NOT_DEPLOYED`` above, and naming it here too is what made the two indistinguishable.
+        reason = "handlers ran but produced no delivery — a filter returned nothing"
     else:
         # Fail closed, and deliberately WITHOUT the remedy below. This arm exists for a member added
-        # after this function — ``disposition_for`` cannot reach it today — and re-pointing
-        # ``--inbound`` is not something that flag could act on for such a member. A confident wrong
-        # remedy, at the one moment an operator is reading this row, is worse than none.
+        # after this function: ``disposition_for`` returns exactly RECEIVED, UNROUTED, FILTERED and
+        # NOT_DEPLOYED, and all four are handled above. Re-pointing ``--inbound`` is not something
+        # that flag could act on for an unforeseen member, and a confident wrong remedy, at the one
+        # moment an operator is reading this row, is worse than none.
+        #
+        # This comment used to claim ``disposition_for`` could not reach any member here. That
+        # stopped being true when #1690 added NOT_DEPLOYED, and the arm silently became the handler
+        # for a live outcome it was never written for -- correct verdict, no usable next step.
         return CheckResult(
             rid,
             title,

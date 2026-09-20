@@ -26,7 +26,7 @@ import json
 import logging
 import sqlite3  # stdlib; the exception the store-opening subcommands translate (#1670) + the ro probe (#1669)
 import sys
-import tomllib  # stdlib; used to classify a malformed <env>.toml at serve startup (clean error, not a traceback)
+import tomllib  # stdlib; classifies a malformed SERVICE-config TOML (_env_dir_name + `security show`)
 from pathlib import (
     Path,
 )  # stdlib, imported at interpreter startup — no cost to the fast subcommands
@@ -41,6 +41,36 @@ from messagefoundry.logging_setup import (
     configure_stderr_logging,
     query_sntp_offset,
 )
+
+
+class _VersionAction(argparse.Action):
+    """``--version``: print the version AND the package directory that answered (BACKLOG #1677).
+
+    The working directory precedes the venv's editable ``.pth`` entry on ``sys.path``, so running from
+    a directory that holds another tracked copy of ``messagefoundry/`` resolves the import to THAT
+    copy. There is no error, and nothing in the output says which tree answered, so an instrument that
+    trusts the run reports a self-consistent wrong answer.
+
+    A CUSTOM ACTION RATHER THAN ``action="version"`` WITH AN EMBEDDED NEWLINE. argparse's own version
+    action routes its text through ``HelpFormatter._fill_text``, which re-wraps it into a single
+    width-dependent paragraph: the newline is collapsed and the path lands mid-line at whatever column
+    the terminal happens to be. Printing the two lines here keeps them apart at any width -- which is
+    also why the test for this asserts on the presence of the path token, never on a line index.
+
+    ``Path(__file__).parent`` IS the package directory -- this module lives inside it -- so answering
+    the question needs no new import and no ``importlib`` lookup.
+    """
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: object,
+        option_string: str | None = None,
+    ) -> None:
+        _safe_print(f"messagefoundry {__version__}")
+        _safe_print(f"package: {Path(__file__).resolve().parent}")
+        parser.exit()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -59,8 +89,38 @@ def main(argv: list[str] | None = None) -> int:
             except (ValueError, OSError):
                 pass
 
+    # The last-resort hooks are a PROCESS property, so they are installed here, once, for every
+    # subcommand (BACKLOG #1674). `last_resort` states the ASVS 16.5.4 guarantee that an unhandled
+    # error can never escape as a raw traceback quoting a PHI-bearing value; until this call site they
+    # were installed inside `_serve` only, leaving the other 32 subcommands unguarded. `dryrun`,
+    # `audit-verify` and `backup` open the store, so an uncaught exception from one of them is the
+    # case that could carry a field value.
+    #
+    # INSTALLING THE HOOK CHANGES NO EXIT CODE: the interpreter still exits 1 after calling
+    # `sys.excepthook`. That is why this shape was taken over the alternative of wrapping the dispatch
+    # and exiting 2, which would have made every CLI exit-code assertion in the suite a fresh question.
+    #
+    # LATE IMPORT, DELIBERATELY. Two `tests/test_config_anchoring.py` monkeypatches target the module
+    # attribute `messagefoundry.last_resort.install_excepthook`; importing the name at module scope
+    # here would bind it before they can patch it, and they would silently stop applying.
+    from messagefoundry.last_resort import install_excepthook, install_thread_excepthook
+
+    install_excepthook()
+    # The sibling hook for every OTHER thread (BACKLOG #1055), which had the identical serve-only gap.
+    # sys.excepthook does not cover them, and the engine runs non-asyncio threads whose except clauses
+    # are deliberately narrow -- the sandbox session's raw stdout reader catches only OSError -- so
+    # anything else would otherwise reach the stdlib default and print an unredacted traceback to the
+    # NSSM-captured stderr.
+    install_thread_excepthook()
+
     parser = argparse.ArgumentParser(prog="messagefoundry", description=__doc__)
-    parser.add_argument("--version", action="version", version=f"messagefoundry {__version__}")
+    parser.add_argument(
+        "--version",
+        action=_VersionAction,
+        nargs=0,
+        default=argparse.SUPPRESS,
+        help="print the version and the package directory that answered",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     serve = sub.add_parser("serve", help="run the engine + localhost API")
@@ -218,6 +278,13 @@ def main(argv: list[str] | None = None) -> int:
         help="promote the ADR 0144 handler-security lint to a blocking (required) check",
     )
     check.add_argument(
+        "--allow-empty-config",
+        action="store_true",
+        help="accept a config directory that declares no connections (BACKLOG #1648). Without it "
+        "the validate check fails on one, the way serve and reload refuse it. Scoped to `check` — "
+        "serve has no opt-out",
+    )
+    check.add_argument(
         "--handler-security-allow",
         action="append",
         default=None,
@@ -233,7 +300,10 @@ def main(argv: list[str] | None = None) -> int:
         "open clarifications (Secure Development Standards section 5)",
     )
     adr_analyze.add_argument(
-        "--adr-dir", default="docs/adr", help="ADR directory (default: docs/adr)"
+        "--adr-dir",
+        default="docs/adr",
+        help="ADR directory (default: docs/adr). Exits 2, with or without --strict, if it is "
+        "missing, is not a directory, or holds no ADR",
     )
     adr_analyze.add_argument(
         "--repo-root",
@@ -1746,6 +1816,7 @@ def _serve(args: argparse.Namespace) -> int:
             tls_ca_file=settings.logging.forward_tls_ca_file,
             tls_verify=settings.logging.forward_tls_verify,
             tls_client_cert=settings.logging.forward_tls_client_cert,
+            tls_crl_file=settings.logging.forward_tls_crl_file,
         )
         if settings.logging.forward_enabled and settings.logging.forward_host
         else None
@@ -3077,29 +3148,61 @@ def _serve(args: argparse.Namespace) -> int:
     import os
 
     from messagefoundry.config.environments import load_environment_values
+    from messagefoundry.config.wiring import WiringError
+    from messagefoundry.redaction import safe_exc
 
     def env_values() -> dict[str, Any]:
-        return load_environment_values(
-            base_dir=env_base,
-            dir_name=settings.environments.dir,
-            environment=env_name,
-            environ=os.environ,
-        )
+        # Guarded HERE because this is the one site that knows the value file's PATH, and because this
+        # closure is the Engine's env_values_provider: it is re-invoked on EVERY reload, not only at
+        # startup. Unguarded, a malformed environments/<env>.toml escaped a reload as a raw
+        # TOMLDecodeError, which POST /config/reload answers as a 500 with no audit row, since that
+        # route arms ConfigReloadDenied, FileNotFoundError and WiringError only (BACKLOG #1652).
+        # WiringError is the type both the serve gate below and that route already understand, so
+        # raising it puts an unreadable value file in the same audited 422 arm as every other bad
+        # config. load_environment_values itself stays unguarded: its other callers are out of scope.
+        #
+        # What travels, MEASURED against this repo's safe_exc rather than assumed, because a premise
+        # is what a leak control rests on (SDS-3.7). The file's PATH is named deliberately -- it is
+        # the one thing the operator acts on. tomllib NEVER echoes a VALUE: every shape reports a
+        # position instead ("Illegal character '\n' (at line 1, column 36)", "Invalid value (at line
+        # 1, column 15)"). It DOES echo a KEY or TABLE name in the duplicate shapes ("Duplicate
+        # inline table key 'epic_mrn_key'", "Cannot declare ('db_prod',) twice"), and redact() does
+        # not scrub a lone lowercase identifier -- so a key name can reach this message. That is
+        # accepted: a key name is the diagnosis the operator needs, no configured secret is a key,
+        # and the CONTAINMENT that matters holds anyway -- POST /config/reload renders a constant
+        # body and a constant audit detail, so nothing from this sentence reaches either. safe_exc
+        # keeps the exception type and bounds the length.
+        try:
+            return load_environment_values(
+                base_dir=env_base,
+                dir_name=settings.environments.dir,
+                environment=env_name,
+                environ=os.environ,
+            )
+        except (ValueError, RecursionError, OSError) as exc:
+            # ValueError covers tomllib.TOMLDecodeError and UnicodeDecodeError; RecursionError covers
+            # a deeply nested value file (measured on 3.14: `a = ` + 600 `[` recurses past the limit,
+            # and RecursionError derives from RuntimeError). The gate below now catches WiringError
+            # ONLY, so a shape missing from this tuple reaches the operator as the bare traceback that
+            # gate exists to prevent. No TypeError here, unlike the engine-side guard: that one wraps
+            # an embedder's arbitrary callable, while this one wraps our own call into a function that
+            # returns a dict or raises.
+            raise WiringError(
+                f"could not read environment values from {env_file}: {safe_exc(exc)}"
+            ) from exc
 
     # ADR 0050 anchoring diagnostics. Emitted ONCE here at startup (NOT inside env_values(), which is
     # re-invoked on every reload), and they log resolved file PATHS only — never env() values or
     # bodies — so they are PHI-safe at INFO/WARNING. The one eager env_values() evaluation here is the
     # only place the empty-values (NSSM-silent-miss) state is observable; the provider re-reads later.
-    # Guard it: a malformed/unreadable <env>.toml makes tomllib raise here (TOMLDecodeError/OSError) —
+    # Guard it: a malformed/unreadable <env>.toml makes tomllib raise inside env_values() —
     # without this, that surfaced as a raw traceback (the lazy lifespan used to swallow it). Route it to
-    # a clean error like every other serve gate. The value file is named (path only, PHI-safe).
+    # a clean error like every other serve gate. env_values() now wraps that as a WiringError which
+    # already names the value file (path only, PHI-safe), so print it rather than re-stating the path.
     try:
         env_values_empty = not env_values()
-    except (tomllib.TOMLDecodeError, ValueError, OSError) as exc:
-        print(
-            f"error: could not read environment values from {env_file}: {exc}",
-            file=sys.stderr,
-        )
+    except WiringError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 2
     # Drive the diagnostics off the MERGED root (effective_root), so a file/env-set [environments].base_dir
     # raises the AC-3 fail-loud + AC-4 cross-root WARNING exactly like an explicit --project-root (ADR §1
@@ -3122,6 +3225,10 @@ def _serve(args: argparse.Namespace) -> int:
     # exactly as before. The supervisor spawns one such process per shard with its own --db and --port.
     registry_filter = None
     if args.shard is not None:
+        # WiringError is also bound above (env_values), and this local re-import is deliberate: the
+        # shard closure below raises it, so binding it here keeps this block self-contained. Relying
+        # on the earlier binding would make an unrelated reorder turn the no-split-store refusal into
+        # a NameError, on a path only `serve --shard` against a mismatched store reaches.
         from messagefoundry.config.wiring import Registry, WiringError
         from messagefoundry.pipeline.sharding import (
             filter_registry_for_shard,
@@ -3348,15 +3455,10 @@ def _serve(args: argparse.Namespace) -> int:
             from messagefoundry.api.tls_client_cert import client_cert_http_protocol_class
 
             run_kwargs["http"] = client_cert_http_protocol_class()
-    from messagefoundry.last_resort import install_excepthook, install_thread_excepthook
-    from messagefoundry.redaction import safe_exc
 
-    install_excepthook()  # last-resort main-thread hook: an uncaught exception logs PHI-redacted (16.5.4)
-    # The sibling hook for every OTHER thread (BACKLOG #1055). sys.excepthook does not cover them, and
-    # the engine runs non-asyncio threads whose except clauses are deliberately narrow — the sandbox
-    # session's raw stdout reader catches only OSError — so anything else would otherwise reach the
-    # stdlib default and print an unredacted traceback to the NSSM-captured stderr.
-    install_thread_excepthook()
+    # The last-resort sys/threading excepthooks are already in force here: `main()` installs them for
+    # every subcommand (BACKLOG #1674). The asyncio loop handler is separate and is installed by the
+    # serving lifespan, inside the running loop.
     try:
         uvicorn.run(app, host=settings.api.host, port=settings.api.port, **run_kwargs)
     except Exception as exc:  # last-resort: log an abnormal server exit PHI-redacted, then re-raise
@@ -3449,7 +3551,10 @@ def _graph(args: argparse.Namespace) -> int:
         return resolved
     config_dir, _ = resolved
     try:
-        reg = load_config(config_dir)
+        # allow_empty: `graph` REPORTS a graph, it does not gate one (BACKLOG #1648), and its edges
+        # come from Routers and Handlers, which a connection-less config still has. Refusing here
+        # would make the reporting surface go dark on the config an operator most wants to look at.
+        reg = load_config(config_dir, allow_empty=True)
     except WiringError as exc:
         return _emit_error(str(exc), as_json=args.json)
     # Edges come from the one authoritative static extractor (ADR 0091 D1): AST-first with the
@@ -4103,7 +4208,10 @@ def _cert_inventory(args: argparse.Namespace) -> int:
         from messagefoundry.config.wiring import WiringError, load_config
 
         try:
-            reg = load_config(args.config)
+            # allow_empty: a read-only inventory (BACKLOG #1648). Refusing here would also drop the
+            # API / service-caller cert pairs resolved from settings just above, so an operator would
+            # lose unrelated expiry output because the graph happens to declare no connection.
+            reg = load_config(args.config, allow_empty=True)
         except (WiringError, FileNotFoundError, OSError) as exc:
             return _cert_fail(f"cannot load --config: {exc}", as_json=args.json)
         pairs.extend(
@@ -5266,6 +5374,7 @@ def _check(args: argparse.Namespace) -> int:
         # <root>/<env_dir>/<env>.toml exists; pass it on so the build check READS the values from there
         # too, rather than from wherever the shell happens to be (BACKLOG #1062).
         project_root=args.project_root,
+        allow_empty_config=args.allow_empty_config,
     )
     if args.json:
         _print_json(report.to_json(), compact=True)
@@ -5282,13 +5391,35 @@ def _check(args: argparse.Namespace) -> int:
 def _adr_analyze(args: argparse.Namespace) -> int:
     """Advisory spec-driven ADR coverage (Secure Development Standards §5). Reports acceptance-
     criteria→test link coverage, Accepted ADRs missing criteria, and open ``- [ ]`` clarifications.
-    Exits 0 unless ``--strict`` and a linked test/fixture is missing — no new blocking gate by default."""
+
+    Two exit codes, and which one a condition gets is the point of the split. A *finding* is
+    advisory: a missing linked test/fixture exits 0, or 1 under ``--strict``. An *absent corpus* —
+    :attr:`~messagefoundry.adr_analyze.AnalysisResult.error`, defined at
+    :func:`~messagefoundry.adr_analyze.analyze_adrs` — exits **2 with or without ``--strict``**,
+    because the analyzer never ran. 2 and not 1 keeps "could not start" apart from "ran and
+    reported a problem", the same split :func:`_emit_store_open_error` spends 2 on; and not 0
+    because this subcommand is otherwise unfailable by default, so a withdrawn ADR set would
+    silently turn a failing report into a passing one.
+
+    That split is between this command's own codes. It does **not** separate 2 from argparse's own
+    usage-error 2, so a caller that must tell a withdrawn corpus from a mistyped flag has to read
+    the output, not the code. Every subcommand here inherits that, ``--json`` disambiguates it, and
+    widening it was not worth a third code."""
     from messagefoundry.adr_analyze import analyze_adrs
 
     result = analyze_adrs(args.adr_dir, repo_root=args.repo_root)
     if args.json:
         _print_json(result.to_json(), compact=True)
-    else:
+    if result.error is not None:
+        # JSON on stdout XOR the human line on stderr. Emitting both would reorder under `2>&1`: a
+        # piped stdout is block-buffered and stderr is not, so the error line would land ahead of
+        # the JSON and break the parse it was meant to protect. The JSON body is the full report
+        # with `error` inside it, and so is NOT _emit_store_open_error's bare {"error": ...}: `ok`
+        # has to stay readable for a consumer that branches on it and nothing else.
+        if not args.json:
+            print(f"error: {result.error}", file=sys.stderr)  # not _safe_print; see its docstring
+        return 2
+    if not args.json:
         with_criteria = sum(1 for r in result.reports if r.has_criteria)
         _safe_print(
             f"ADRs analyzed: {len(result.reports)} ({with_criteria} with acceptance criteria)"
@@ -5361,7 +5492,12 @@ def _connection(args: argparse.Namespace) -> int:
     )
 
     def validate(config_dir: Path) -> None:
-        registry = load_config(config_dir)
+        # allow_empty: this is an AUTHORING surface, and removing the last connection is a legitimate
+        # editing step, not an invalid edit (BACKLOG #1648). Refusing here would leave an operator
+        # unable to clear connections.toml through the CLI/GUI at all — they would have to hand-edit
+        # the file the tool exists to own. The empty-graph refusal stays where the graph is RUN or
+        # GATED: load_config's default, the engine reload, and `messagefoundry check`.
+        registry = load_config(config_dir, allow_empty=True)
         build_check_registry(
             registry,
             inbound_bind_host=settings.inbound.bind_host,
@@ -5491,7 +5627,11 @@ def _impact(args: argparse.Namespace) -> int:
         return _emit_error("--apply is only valid with --rename-to", as_json=args.json)
 
     try:
-        registry = load_config(args.config)
+        # allow_empty: `impact` is the CLI front door to the SAME rename/delete pre-flight
+        # `codeset_edit` runs (BACKLOG #1648), and reverse-dependency analysis over Routers,
+        # Handlers and code sets needs no connection. Exempting the pre-flight and refusing here
+        # would leave the two disagreeing about the same config.
+        registry = load_config(args.config, allow_empty=True)
     except (WiringError, FileNotFoundError, OSError) as exc:
         return _emit_error(str(exc), as_json=args.json)
 
@@ -5852,7 +5992,13 @@ def _security(args: argparse.Namespace) -> int:
 
 def _safe_print(line: str) -> None:
     """Print a line, re-encoding to stdout's codec with replacement so a non-cp1252 character (an
-    ADR's em-dash or ``≥``) never crashes the human output on a legacy Windows console."""
+    ADR's em-dash or ``≥``) never crashes the human output on a legacy Windows console.
+
+    STDOUT ONLY, AND DO NOT EXTEND IT TO STDERR. ``sys.stdout`` carries ``surrogateescape``, which
+    still raises on an unencodable codepoint; ``sys.stderr`` carries ``backslashreplace`` and never
+    raises. So stderr needs no protection, and routing an error line through this would be a
+    downgrade: it would blank a character stderr prints as a readable escape, handing an operator a
+    path they cannot paste back. ``tests/test_cp1252_console_safety.py`` measures that asymmetry."""
     enc = getattr(sys.stdout, "encoding", None) or "utf-8"
     sys.stdout.write(line.encode(enc, "replace").decode(enc) + "\n")
 
@@ -5883,10 +6029,20 @@ def _emit_store_open_error(exc: sqlite3.DatabaseError, path: str, *, as_json: bo
 
 
 def _emit_error(message: str, *, as_json: bool) -> int:
+    """Report a command failure on the right stream and return its exit code.
+
+    Text goes to **stderr**. A shell redirect of a command's output --
+    ``messagefoundry validate --config x > report.txt`` -- must not swallow the reason the command
+    failed into the file it was writing, and ``2>/dev/null`` must be able to silence diagnostics
+    without silencing results (BACKLOG #1673).
+
+    JSON stays on **stdout**, deliberately. Under ``--json`` the error object IS the command's
+    machine-readable output: a consumer piping to ``jq`` reads it there, and the non-zero exit code
+    is what tells it apart from a success payload."""
     if as_json:
         print(json.dumps({"error": message}))
     else:
-        print(f"error: {message}")
+        print(f"error: {message}", file=sys.stderr)
     return 1
 
 
