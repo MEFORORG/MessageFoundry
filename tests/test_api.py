@@ -9,6 +9,7 @@ a lifespan-managed app, which owns its engine on the client's own loop."""
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -238,7 +239,7 @@ async def test_audit_and_event_detail_never_contain_message_body(
     )
     await client.get(f"/messages/{mid}")  # view → 'viewed' event
     await client.get(f"/messages/{mid}/outbound")  # transformed-body view → 'outbound.read' audit
-    await client.get("/messages", params={"audit_summary": "true"})  # summary display → audited
+    await client.get("/messages")  # exposes the summary → server-audited, no opt-in
     blobs = [a["detail"] or "" for a in await engine.store.list_audit()]
     blobs += [e["detail"] or "" for e in await engine.store.events_for(mid)]
     # 'MSH|' / 'PID|' only appear in a raw HL7 body, never in legitimate audit metadata.
@@ -637,13 +638,15 @@ async def test_summary_audit_coalescer_rolls_over_with_count() -> None:
     assert any(r[1] == "bob" for r in store.rows)
 
 
-async def test_audit_summary_skips_when_no_summaries(
+async def test_no_summary_audit_when_the_listed_messages_have_no_summaries(
     engine: Engine, client: httpx.AsyncClient
 ) -> None:
+    """Summary auditing is server-enforced (M-5), but it is driven by what the response actually
+    EXPOSES: a list carrying no summaries exposes no PHI, so it records no audit row."""
     await engine.store.enqueue_message(
         channel_id="ch1", raw=ADT, deliveries=[("archive", ADT)]
     )  # no summary
-    await client.get("/messages", params={"audit_summary": "true"})
+    await client.get("/messages")
     assert len(await engine.store.list_audit()) == 0
 
 
@@ -911,12 +914,7 @@ async def test_connection_operations(
     assert (await client.post("/connections/nope/start")).status_code == 404
 
     # Stop the outbound → delivery pauses and the idle lane quiesces (zero in-flight); status → 'stopped'.
-    assert (await client.post("/connections/out1/stop")).json()["running"] is False
-    for _ in range(200):
-        if rr.outbound_quiesced("out1"):
-            break
-        await asyncio.sleep(0.02)
-    assert rr.outbound_quiesced("out1") is True
+    await _quiesced_stopped_outbound(engine, client)
     assert rr.outbound_status("out1") == "stopped"
 
     # A queued delivery to the STOPPED outbound stays PENDING (never delivered) and can now be purged.
@@ -924,23 +922,37 @@ async def test_connection_operations(
     assert (await client.post("/connections/out1/purge")).json()["cancelled"] == 1
 
 
-async def _started_outbound_engine(engine: Engine, tmp_path: Path) -> None:
-    """Attach a one-inbound→one-outbound FILE graph and start the runner (so the pooled delivery
-    dispatcher exists for outbound pause/quiesce)."""
-    inbox = tmp_path / "in"
-    inbox.mkdir()
+async def _quiesced_stopped_outbound(engine: Engine, client: httpx.AsyncClient) -> None:
+    """Stop ``out1`` and wait for the lane to quiesce — the precondition purge requires."""
+    rr = engine.registry_runner
+    assert rr is not None
+    assert (await client.post("/connections/out1/stop")).json()["running"] is False
+    for _ in range(200):
+        if rr.outbound_quiesced("out1"):
+            break
+        await asyncio.sleep(0.02)
+    assert rr.outbound_quiesced("out1") is True
+
+
+async def _started_outbound_engine(engine: Engine, tmp_path: Path, inbounds: int = 1) -> None:
+    """Attach an N-inbound→one-outbound FILE graph and start the runner (so the pooled delivery
+    dispatcher exists for outbound pause/quiesce). ``inbounds`` defaults to 1; raise it to give one
+    shared outbound several inbound edges."""
     (tmp_path / "out").mkdir()
     reg = Registry()
-    reg.add_inbound(
-        InboundConnection(
-            "in1",
-            ConnectionSpec(
-                ConnectorType.FILE,
-                {"directory": str(inbox), "pattern": "*.hl7", "poll_seconds": 0.05},
-            ),
-            router="r",
+    for n in range(1, inbounds + 1):
+        inbox = tmp_path / f"in{n}"
+        inbox.mkdir()
+        reg.add_inbound(
+            InboundConnection(
+                f"in{n}",
+                ConnectionSpec(
+                    ConnectorType.FILE,
+                    {"directory": str(inbox), "pattern": "*.hl7", "poll_seconds": 0.05},
+                ),
+                router="r",
+            )
         )
-    )
     reg.add_outbound(
         OutboundConnection(
             "out1", ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path / "out")})
@@ -950,6 +962,28 @@ async def _started_outbound_engine(engine: Engine, tmp_path: Path) -> None:
     reg.add_handler("h", lambda m: Send("out1", m))
     engine.add_registry(reg)
     await engine.start()
+
+
+async def _out1_rows(client: httpx.AsyncClient) -> list[dict[str, object]]:
+    """Every /connections row whose control target is out1 — standalone or traffic-derived."""
+    return [r for r in (await client.get("/connections")).json() if r["destination"] == "out1"]
+
+
+async def _await_out1_edges(
+    client: httpx.AsyncClient, expected: set[str]
+) -> list[dict[str, object]]:
+    """Poll until out1's rows are keyed by exactly the ``expected`` inbound names, then return them.
+
+    A traffic edge is keyed off the outbox metrics, which appear once the delivery row is written — so
+    a bounded poll rather than a sleep. It returns the WHOLE out1 set, letting the caller assert the
+    standalone row went away rather than merely that an edge arrived; on a timeout it returns whatever
+    is there, so the caller's own assertion reports the mismatch."""
+    for _ in range(200):
+        rows = await _out1_rows(client)
+        if {r["channel_id"] for r in rows} == expected:
+            return rows
+        await asyncio.sleep(0.02)
+    return await _out1_rows(client)
 
 
 async def test_outbound_purge_stopping_window_is_409(
@@ -969,27 +1003,36 @@ async def test_outbound_purge_stopping_window_is_409(
     assert (await client.post("/connections/out1/purge")).status_code == 409
 
 
-async def test_connections_standalone_paused_no_edge_outbound_row(
+async def test_connections_standalone_no_edge_outbound_row_survives_start(
     engine: Engine, client: httpx.AsyncClient, tmp_path: Path
 ) -> None:
-    # A no-traffic outbound (no inbound→outbound edge metric) is INVISIBLE on /connections while running,
-    # but once operator-paused it must surface as a STANDALONE destination row so an idle paused lane stays
-    # visible + selectable. Its purge-eligibility (`paused`) is INDEPENDENT of the display status:
-    # 'stopping' (paused, not yet quiesced) → paused False; 'stopped' (quiesced) → paused True.
+    # BACKLOG #1568. A no-traffic outbound (no inbound→outbound edge metric) must carry a STANDALONE
+    # destination row in EVERY state, RUNNING INCLUDED, because that row is what a browser client reads
+    # its Start/Stop/Restart target from. An earlier form listed only the paused states, so starting an
+    # idle outbound deleted the very control that stops it again: on a deploying site an operator would
+    # have had to fall back to the JSON API to get the lane back.
+    #
+    # The `paused` field stays INDEPENDENT of the display status, and that is a SEPARATE property this
+    # test goes on pinning: 'running' → paused False, 'stopping' (paused, an in-flight head not yet
+    # drained) → paused False, 'stopped' (quiesced) → paused True. Only the last is purge-eligible.
     await _started_outbound_engine(engine, tmp_path)
     rr = engine.registry_runner
     assert rr is not None
 
-    # Running + no traffic: out1 has no edge, so it is absent from the connections list.
-    running_names = {r["name"] for r in (await client.get("/connections")).json()}
-    assert "out1 ▸ out" not in running_names
+    # Running + no traffic: the row is there, and it names out1 as the control target.
+    running = await _out1_rows(client)
+    assert len(running) == 1  # exactly one standalone destination row
+    assert running[0]["role"] == "destination"
+    assert running[0]["channel_id"] == "out1"  # standalone: keyed by the outbound, not an inbound
+    assert running[0]["status"] == "running"
+    assert running[0]["paused"] is False  # delivering → NOT purge-eligible
 
     # The 'stopping' window (paused, an in-flight head not yet drained) — reproduced deterministically the
     # same white-box way as test_outbound_purge_stopping_window_is_409 (paused WITHOUT quiescence set).
     rr._outbound_paused.add("out1")
     assert rr.outbound_status("out1") == "stopping"
-    stopping = [r for r in (await client.get("/connections")).json() if r["destination"] == "out1"]
-    assert len(stopping) == 1  # exactly one standalone destination row
+    stopping = await _out1_rows(client)
+    assert len(stopping) == 1  # still exactly one row — not one per state
     assert stopping[0]["role"] == "destination"
     assert stopping[0]["status"] == "stopping"
     assert stopping[0]["paused"] is False  # not yet quiesced → NOT purge-eligible
@@ -1001,10 +1044,108 @@ async def test_connections_standalone_paused_no_edge_outbound_row(
             break
         await asyncio.sleep(0.02)
     assert rr.outbound_status("out1") == "stopped"
-    stopped = [r for r in (await client.get("/connections")).json() if r["destination"] == "out1"]
+    stopped = await _out1_rows(client)
     assert len(stopped) == 1
     assert stopped[0]["status"] == "stopped"
     assert stopped[0]["paused"] is True  # quiesced → purge-eligible
+
+
+async def test_connections_idle_outbound_is_startable_and_stoppable_from_its_own_row(
+    engine: Engine, client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    # BACKLOG #1568, the acceptance the row asks for: start an idle outbound, see a RUNNING row, then
+    # stop it again from that row's target — with no message ever sent. It drives the same control
+    # routes a browser posts to, so it measures the operator's whole path rather than the row builder
+    # alone; asserting on the row builder only would leave the control unmeasured, which is exactly the
+    # gap the defect lived in.
+    await _started_outbound_engine(engine, tmp_path)
+    rr = engine.registry_runner
+    assert rr is not None
+    await rr.stop_outbound("out1")
+    for _ in range(200):
+        if rr.outbound_quiesced("out1"):
+            break
+        await asyncio.sleep(0.02)
+    assert (await _out1_rows(client))[0]["status"] == "stopped"
+
+    assert (await client.post("/connections/out1/start")).status_code == 200
+    started = await _out1_rows(client)
+    assert len(started) == 1
+    assert started[0]["status"] == "running"
+
+    # The Stop the defect removed: it targets the SAME name the running row carries.
+    assert (await client.post(f"/connections/{started[0]['destination']}/stop")).status_code == 200
+    for _ in range(200):
+        if rr.outbound_quiesced("out1"):
+            break
+        await asyncio.sleep(0.02)
+    assert (await _out1_rows(client))[0]["status"] == "stopped"
+
+
+async def test_connections_first_traffic_replaces_the_standalone_outbound_row(
+    engine: Engine, client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    # BACKLOG #1568: once the first message gives out1 a traffic edge, the standalone row must give way
+    # to the edge row rather than sit beside it. The `oname in emitted_dests` dedupe is what does that,
+    # and without this arm a regression there would show as a duplicated lane on the dashboard — two
+    # rows for one connection, each with its own checkbox.
+    await _started_outbound_engine(engine, tmp_path)
+    before = await _out1_rows(client)
+    assert [r["channel_id"] for r in before] == ["out1"]  # standalone, keyed by the outbound
+
+    await engine.store.enqueue_message(channel_id="in1", raw=ADT, deliveries=[("out1", ADT)])
+    after = await _await_out1_edges(client, {"in1"})
+    assert [r["channel_id"] for r in after] == ["in1"]  # one row, now keyed by the inbound edge
+
+
+async def test_connections_one_outbound_with_two_inbound_edges_is_not_also_standalone(
+    engine: Engine, client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    # BACKLOG #1568: a shared outbound carries one row PER EDGE, and the dedupe has to hold when there
+    # is more than one of them — a set membership test that passed on a single edge could still be
+    # wrong here. Both edges present and no standalone row beside them.
+    await _started_outbound_engine(engine, tmp_path, inbounds=2)
+    for channel in ("in1", "in2"):
+        await engine.store.enqueue_message(channel_id=channel, raw=ADT, deliveries=[("out1", ADT)])
+    rows = await _await_out1_edges(client, {"in1", "in2"})
+    assert sorted(r["channel_id"] for r in rows) == ["in1", "in2"]
+    assert all(r["role"] == "destination" for r in rows)
+
+
+async def test_connections_standalone_row_reads_stopped_when_the_graph_is_down(
+    engine: Engine, client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    """A standalone row must not say "running" on a node whose graph has been torn down.
+
+    ``outbound_status`` reports "running" for any lane merely ABSENT from ``_outbound_paused`` — it
+    never consults the runner's own ``running`` flag (``/status`` documents the same trap at its KPI
+    split, which is why that block uses ``outbound_running``). The shape that reaches the API is the
+    ADR 0157 demoted follower: ``Engine._stop_graph`` stops ONLY the runner and the node keeps serving
+    as standby. Before #1568 an edge-less outbound produced no row at all there, so the contradiction
+    below is one this fix would have INTRODUCED had the ``rr.running`` gate been left out.
+
+    The discriminating assertion is the last one: it reads BOTH halves of a single payload, so a
+    regression cannot pass by agreeing with itself. Drop the gate in ``list_connections`` and the
+    source row still reads "stopped" while the destination row flips to "running"."""
+    await _started_outbound_engine(engine, tmp_path)
+    rr = engine.registry_runner
+    assert rr is not None
+    assert (await _out1_rows(client))[0]["status"] == "running"
+
+    await rr.stop()  # the demote shape: graph down, store + API still serving
+    assert rr.running is False
+    assert rr.outbound_status("out1") == "running"  # the raw tri-state, ungated — the trap itself
+    assert rr.outbound_running("out1") is False  # what the lane is ACTUALLY doing
+
+    # The row SURVIVES the teardown (that is #1568's whole point) and reports the lane honestly.
+    down = await _out1_rows(client)
+    assert len(down) == 1
+    assert down[0]["status"] == "stopped"
+    assert down[0]["paused"] is False  # never operator-paused, so still NOT purge-eligible
+
+    # One payload, both roles, no contradiction: nothing on this node is running.
+    rows = (await client.get("/connections")).json()
+    assert {r["role"]: r["status"] for r in rows} == {"source": "stopped", "destination": "stopped"}
 
 
 async def test_engine_not_started_returns_503(tmp_path: Path) -> None:
@@ -1013,6 +1154,98 @@ async def test_engine_not_started_returns_503(tmp_path: Path) -> None:
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         assert (await c.get("/health")).status_code == 200  # health needs no engine
         assert (await c.get("/channels")).status_code == 503
+
+
+async def test_purge_audits_every_completed_purge_including_zero_cancelled(
+    engine: Engine, client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    """BACKLOG #1641: the ungated purge path writes its own outcome row, ``cancelled=0`` included.
+
+    Why the zero-cancel row is unconditional — and what the GATED path does and does not record —
+    is stated once, on the write itself in ``purge_connection``. This test pins both halves of the
+    ambiguity that rationale turns on: cancelled=0 writes a row, a 409 does not."""
+    await _started_outbound_engine(engine, tmp_path)
+    await _quiesced_stopped_outbound(engine, client)
+
+    # Nothing queued: a real, completed purge that cancelled zero rows. Audited anyway, and the
+    # requested scope is carried through (a `top` purge and an `all` purge are different commands).
+    assert (await client.post("/connections/out1/purge?scope=top")).json()["cancelled"] == 0
+    rows = await engine.store.list_audit(action="connection_purge")
+    assert len(rows) == 1
+    assert json.loads(rows[0]["detail"] or "{}") == {
+        "connection": "out1",
+        "scope": "top",
+        "cancelled": 0,
+    }
+    # #1641 names the missing client alongside the missing outcome, so both are pinned here.
+    # "127.0.0.1" is httpx ASGITransport's default peer, which client_ip() reads off the scope.
+    assert rows[0]["actor"] == "system" and rows[0]["client"] == "127.0.0.1"
+    assert rows[0]["channel_id"] is None  # an outbound spans channels
+
+    # A purge that DOES cancel records the count.
+    await engine.store.enqueue_message(channel_id="in1", raw=ADT, deliveries=[("out1", ADT)])
+    assert (await client.post("/connections/out1/purge")).json()["cancelled"] == 1
+    rows = await engine.store.list_audit(action="connection_purge")
+    assert len(rows) == 2
+    assert json.loads(rows[0]["detail"] or "{}") == {
+        "connection": "out1",
+        "scope": "all",
+        "cancelled": 1,
+    }
+
+    # A REFUSED purge (409 — the outbound is running again) cancelled nothing and never ran, so it
+    # adds no row. This is the other half of the ambiguity: 409 stays silent, cancelled=0 does not.
+    assert (await client.post("/connections/out1/start")).json()["running"] is True
+    assert (await client.post("/connections/out1/purge")).status_code == 409
+    assert len(await engine.store.list_audit(action="connection_purge")) == 2
+
+
+async def test_connection_control_audits_the_resolved_role(
+    engine: Engine, client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    """BACKLOG #1642: start/stop/restart write a ``connection_control`` row naming the RESOLVED role.
+
+    Why the resolved role is recorded rather than ``_dual_role_control``'s ``role`` argument is
+    stated once, in the ``_record_control_audit`` docstring. These assertions pin the resolved
+    value, so a change back to the raw argument fails here."""
+    await _started_outbound_engine(engine, tmp_path)
+
+    # An INBOUND resolves to `source`, and the connection IS its channel.
+    assert (await client.post("/connections/in1/stop")).json()["running"] is False
+    rows = await engine.store.list_audit(action="connection_control")
+    assert len(rows) == 1
+    assert json.loads(rows[0]["detail"] or "{}") == {
+        "connection": "in1",
+        "action": "stop",
+        "role": "source",
+        "running": False,
+    }
+    assert rows[0]["channel_id"] == "in1"
+    assert rows[0]["actor"] == "system" and rows[0]["client"] == "127.0.0.1"
+
+    # An OUTBOUND resolves to `destination` and carries no channel.
+    assert (await client.post("/connections/out1/restart")).json()["running"] is True
+    rows = await engine.store.list_audit(action="connection_control")
+    assert len(rows) == 2
+    assert json.loads(rows[0]["detail"] or "{}") == {
+        "connection": "out1",
+        "action": "restart",
+        "role": "destination",
+        "running": True,
+    }
+    assert rows[0]["channel_id"] is None
+
+    # All three verbs are recorded, not just the two above.
+    assert (await client.post("/connections/in1/start")).json()["running"] is True
+    verbs = [
+        json.loads(a["detail"] or "{}")["action"]
+        for a in await engine.store.list_audit(action="connection_control")
+    ]
+    assert sorted(verbs) == ["restart", "start", "stop"]
+
+    # A 404 moved no lane, so it writes no row (the denial paths audit as auth.channel_denied).
+    assert (await client.post("/connections/nope/start")).status_code == 404
+    assert len(await engine.store.list_audit(action="connection_control")) == 3
 
 
 # --- websocket (sync TestClient against a lifespan-managed app) ---------------

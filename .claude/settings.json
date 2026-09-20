@@ -122,24 +122,6 @@
         ]
       }
     ],
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "pwsh",
-            "args": [
-              "-NoProfile",
-              "-NonInteractive",
-              "-File",
-              "${CLAUDE_PROJECT_DIR}/scripts/hooks/context-budget.ps1"
-            ],
-            "timeout": 15,
-            "statusMessage": "Reading this session context budget"
-          }
-        ]
-      }
-    ],
     "PreCompact": [
       {
         "hooks": [

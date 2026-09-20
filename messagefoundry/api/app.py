@@ -601,9 +601,28 @@ def _build_approval_gate(engine: Engine, settings: ApprovalsSettings) -> Approva
     gate = ApprovalGate(engine.store, settings)
 
     async def _replay(p: Mapping[str, Any]) -> dict[str, Any]:
+        # BACKLOG #1646: write the same dead_letter_replay row the inline route writes, so an
+        # auditor filtering on the action name sees the released replays too.
+        channel_id = p.get("channel_id")
+        destination_name = p.get("destination_name")
         requeued = await engine.replay_dead(
-            channel_id=p.get("channel_id"), destination_name=p.get("destination_name")
+            channel_id=channel_id, destination_name=destination_name
         )
+        if requeued:  # only when PHI was actually re-transmitted (review M-4), as inline
+            # `.get`, never p["requester"] the way _config_reload reads it below: a request
+            # persisted before the guard started capturing that key carries none, and a KeyError
+            # here would route a released replay into the ASVS 2.3.3 compensation path and record an
+            # operation that actually ran as failed. A zero-requeue release is not hidden by the
+            # guard above -- approval.approved carries this executor's own {"requeued": 0} result.
+            # The actor is the REQUESTER, matching the inline row; no `client` accompanies it, per
+            # _record_reload_audit's docstring (ADR 0150).
+            requester = p.get("requester")
+            await engine.store.record_audit(
+                "dead_letter_replay",
+                actor=str(requester) if requester else None,
+                channel_id=channel_id,
+                detail=json.dumps({"destination_name": destination_name, "requeued": requeued}),
+            )
         return {"requeued": requeued}
 
     async def _purge(p: Mapping[str, Any]) -> dict[str, Any]:
@@ -1100,12 +1119,48 @@ async def _audit_channel_denied(
     )
 
 
+async def _record_control_audit(
+    engine: Engine,
+    identity: Identity,
+    name: str,
+    action: str,
+    *,
+    role: str,
+    running: bool,
+    client: str | None,
+) -> None:
+    """Audit a completed start/stop/restart of a connection (BACKLOG #1642).
+
+    Written on the SUCCESS path only — the denial paths already write ``auth.channel_denied``, and a
+    409/404 means the lane never moved, so a row there would assert an action that did not happen.
+
+    ``role`` is the RESOLVED role of the branch that ran (``source`` for an inbound, ``destination``
+    for an outbound), never ``_dual_role_control``'s ``role`` ARGUMENT: that argument is ``None`` on
+    every bare-name JSON caller and a real value only on the console's bulk path, so recording it raw
+    would leave the same operation attributed two different ways and NULL on the commoner one.
+
+    ``channel_id`` follows the sibling ``connection_credential_test`` row: an inbound IS its channel,
+    while an outbound spans channels and so carries none.
+
+    ``client`` (ADR 0150) is REQUIRED, unlike the ``_audit_channel_denied`` sibling's optional one:
+    that helper is also handed to the console seam as a bare callback with no request in hand, while
+    every caller of this one already has the address resolved, so a default would only let a future
+    caller drop it silently."""
+    await engine.store.record_audit(
+        "connection_control",
+        actor=identity.username,
+        channel_id=name if role == "source" else None,
+        detail=json.dumps({"connection": name, "action": action, "role": role, "running": running}),
+        client=client,
+    )
+
+
 async def _run_connection_test(
     rr: RegistryRunner, name: str, direction: str
 ) -> ConnectionTestResult:
     """Build a fresh connector for ``name`` and probe its reachability, never disturbing the live one.
-    Reports a config (bad ``env()``/egress) or connectivity failure in the result rather than raising —
-    only an unexpected bug would 500. Closes the test connector afterward.
+    Reports a config (bad ``env()``/egress/settings) or connectivity failure in the result rather than
+    raising — only an unexpected bug would 500. Closes the test connector afterward.
 
     Every ``detail`` here is scrubbed and length-bounded, because it does not stay in the response: the
     route JSON-dumps it into ``audit_log.detail``, the one at-rest error column written **without** the
@@ -1143,6 +1198,10 @@ async def _run_connection_test(
     try:
         _direction, connector = rr.build_test_connector(name)
     except WiringError as exc:
+        # This catch is EXHAUSTIVE only because build_test_connector normalizes every build failure to
+        # WiringError; it did not always, and the escape cost more than a 500. The credential route's
+        # audit write sits AFTER this call, so a raise past here skipped the OUTCOME row on a
+        # security-relevant probe — the authz GRANT row still landed (BACKLOG #1824).
         return _result(supported=True, success=False, ms=0.0, detail=safe_text(str(exc)))
     start = time.monotonic()
     supported, success, detail = True, False, None
@@ -2082,23 +2141,38 @@ def create_app(
             }
             for name, reason in rr.filtered_connections().items():
                 standalone.setdefault(name, ("filtered", reason))
-            # Also surface any operator-paused OR not-deployed outbound with no failed/filtered/edge row
-            # yet, so a paused idle/no-edge lane stays visible + selectable (its purge-eligibility is the
-            # `paused` field below; the status is the live tri-state stopping/stopped, reason None — no
-            # failure). A not-deployed lane (#233, ADR 0111) is parked (paused+quiesced) just like a
-            # start-disabled one, so outbound_status reports "stopped" for it too — but it must surface as
-            # "not_deployed", never a silent "stopped", or a never-trafficked not-deployed lane is
-            # invisible (or worse, indistinguishable from a lane that SHOULD be running). Checked FIRST so
-            # deployed=False wins over the tri-state.
+            # Also surface EVERY configured outbound with no failed/filtered/edge row yet, so an
+            # idle/no-edge lane stays visible + selectable whatever it is currently doing (its
+            # purge-eligibility is the `paused` field below; the status is the live per-outbound state,
+            # reason None — no failure). A not-deployed lane (#233, ADR 0111) is parked (paused+quiesced)
+            # just like a start-disabled one, so outbound_status reports "stopped" for it too — but it
+            # must surface as "not_deployed", never a silent "stopped", or a never-trafficked
+            # not-deployed lane is invisible (or worse, indistinguishable from a lane that SHOULD be
+            # running). Checked FIRST so deployed=False wins over the live state.
+            #
+            # #1568: the status recorded here is the lane's CURRENT state, never a list of the states
+            # judged worth a row. An earlier form listed only the paused ones, so STARTING an idle
+            # outbound deleted its row — and that row carries the selection a browser client reads its
+            # Start/Stop/Restart target from, so on a deploying site the control would vanish at exactly
+            # the moment an operator reached for it and recovery would mean the JSON API. Recording the
+            # state unconditionally also means a state added later surfaces here with no edit.
+            #
+            # `rr.running` gates the tri-state because `outbound_status` reports "running" for any lane
+            # merely ABSENT from `_outbound_paused` — it never consults the graph flag (the same trap
+            # `/status` documents at its KPI split, which is why that block uses `outbound_running`).
+            # Ungated, a node whose graph is down but whose API still serves — the ADR 0157 demoted
+            # follower, where `_stop_graph` stops only the runner — would answer one `/connections` with
+            # "stopped" inbound rows beside "running" outbound ones. Before #1568 no such row existed on
+            # that node, so the contradiction would ship WITH this fix if the gate were left out.
             for oname, oc in reg.outbound.items():
                 if oname in standalone or oname in emitted_dests:
                     continue
-                if not oc.deployed:
-                    standalone[oname] = ("not_deployed", None)
-                    continue
-                ostatus = rr.outbound_status(oname)
-                if ostatus in ("stopping", "stopped"):
-                    standalone[oname] = (ostatus, None)
+                status = (
+                    "not_deployed"
+                    if not oc.deployed
+                    else (rr.outbound_status(oname) if rr.running else "stopped")
+                )
+                standalone[oname] = (status, None)
             for dname, (dstatus, dreason) in standalone.items():
                 if scoped:
                     continue  # channel-scoped users never see shared-outbound topology (see above)
@@ -2187,7 +2261,11 @@ def create_app(
                 # is a CONFIG change (flip deployed=true + reload + supply its env() values), not a
                 # runtime action. (stop never raises: an already-parked lane is a no-op.)
                 raise HTTPException(409, str(exc)) from None
-            return {"name": name, "running": rr.inbound_running(name)}
+            running = rr.inbound_running(name)
+            await _record_control_audit(
+                engine, identity, name, action, role="source", running=running, client=client
+            )
+            return {"name": name, "running": running}
         if rr is not None and want_out and name in rr.registry.outbound:
             # A shared outbound spans channels, so a channel-scoped user can't control one (mirrors purge).
             if identity.allowed_channels is not None:
@@ -2211,7 +2289,11 @@ def create_app(
                 # connector to build and no worker to resume; deploying it is a config change, not a
                 # runtime action. (stop never raises: an already-parked lane is a no-op.)
                 raise HTTPException(409, str(exc)) from None
-            return {"name": name, "running": rr.outbound_running(name)}
+            running = rr.outbound_running(name)
+            await _record_control_audit(
+                engine, identity, name, action, role="destination", running=running, client=client
+            )
+            return {"name": name, "running": running}
         # Neither an inbound nor an outbound (or no runner). Run the per-channel guard first so a scoped
         # user is 403'd for a name outside their scope (don't disclose existence), then 404.
         await _control_guard(engine, identity, name, client)
@@ -2499,6 +2581,30 @@ def create_app(
                     detail="held for a second approver (dual-control)",
                 )
         cancelled = await engine.store.cancel_queued(None, name, top_only=(scope == "top"))
+        # BACKLOG #1641: written UNCONDITIONALLY, cancelled=0 included. Deliberately NOT the
+        # `if requeued:` shape of the dead_letter_replay sibling: replay guards on "PHI was actually
+        # re-transmitted", but a purge that cancels nothing is still a completed destructive command
+        # against a live queue, and suppressing it leaves a zero-cancel purge indistinguishable from
+        # the 409s above, which changed nothing and wrote nothing.
+        #
+        # This row covers the UNGATED path ONLY. A dual-control purge returns 202 above and is
+        # executed later by the `_purge` executor in _build_approval_gate, which never re-enters this
+        # handler and writes no connection_purge row of its own. That path is not unaudited — the
+        # gate writes approval.requested / approval.approved, and the latter's detail carries the
+        # executor's {"cancelled": N} result — but those rows identify the operation only by
+        # approval_id: the connection NAME and the SCOPE live in the pending-approval row's params,
+        # not in the audit log. So a query of action='connection_purge' answers "which outbound, at
+        # what scope, cancelling how many" completely for ungated purges and not at all for gated
+        # ones, which still need a join back through approval_id. Closing that asymmetry is the
+        # sibling gap tracked for the _purge executor; it is deliberately not fixed here.
+        #
+        # No channel_id: purge targets an outbound, which spans every inbound feeding it.
+        await engine.store.record_audit(
+            "connection_purge",
+            actor=identity.username,
+            detail=json.dumps({"connection": name, "scope": scope, "cancelled": cancelled}),
+            client=client_ip(request),
+        )
         return PurgeResult(cancelled=cancelled)
 
     @app.post("/statistics/reset", response_model=StatsResetResult)
@@ -2981,7 +3087,21 @@ def create_app(
         ):  # dual-control: hold for a second approver when [approvals] gates replay
             pending = await gate.guard(
                 "dead_letter_replay",
-                {"channel_id": req.channel_id, "destination_name": req.destination_name},
+                {
+                    "channel_id": req.channel_id,
+                    "destination_name": req.destination_name,
+                    # KNOWN DUPLICATION of the `requester=` keyword below, not a pattern to copy
+                    # (BACKLOG #1646): `_replay` only ever sees this mapping, so the requester has
+                    # to be routed back through it to attribute the audit row it writes on release.
+                    # The config_reload guard already does the same, and connection_purge will need
+                    # it for the same parity. The real fix is an execution context on the Executor
+                    # signature -- ApprovalGate.approve already holds the requester and hands the
+                    # executor only the JSON params -- left as a follow-up because it changes all
+                    # three executors and both guard sites, which is a different row's scope. The
+                    # DISPLAY name is the right value (every audit actor here is one); the immutable
+                    # id stays the refusal's key and is deliberately not duplicated in beside it.
+                    "requester": identity.username,
+                },
                 requester=identity.username,
                 requester_user_id=identity.user_id,
                 client=client_ip(request),
@@ -5142,6 +5262,10 @@ def create_app(
     ) -> SystemStatus:
         now = time.time()
         total = running = 0
+        # BACKLOG #1741: the deployed inbounds that failed to build/bind at start (ADR 0031). The
+        # console's nav heart reads these — without them it reported "ok" over an engine listening on
+        # nothing. Names are scoped to the caller (see EngineInfo); the count is not.
+        failed_in: list[str] = []
         # Engine-wide KPI roll-up (#93): combined inbound + outbound endpoint counts with a
         # running/stopped breakdown (vs channels_*, which count inbound only).
         conn_total = conn_running = conn_not_deployed = 0
@@ -5158,6 +5282,10 @@ def create_app(
             out_deployed = [name for name, oc in rr.registry.outbound.items() if oc.deployed]
             total = len(in_deployed)
             running = sum(1 for name in in_deployed if rr.inbound_running(name))
+            # ADR 0031 start failures ONLY. A DR-parked connection (ADR 0048 / #61) lives in the
+            # DISJOINT filtered set and is deliberately excluded: parking is a run-profile decision,
+            # not a fault, and folding it in here would paint every DR-profiled engine degraded.
+            failed_in = [name for name in in_deployed if rr.connection_failed(name) is not None]
             # outbound_running (not outbound_status) so the running/stopped split gates on the engine
             # actually running AND the lane not operator-paused — consistent with inbound_running's
             # actually-started semantics (outbound_status reports "running" for any non-paused lane even
@@ -5261,6 +5389,13 @@ def create_app(
                 channels_running=running,
                 channels_stopped=total - running,
                 outbox_by_status=await engine.store.stats(),
+                channels_failed=len(failed_in),
+                # Scoped to the caller: an unscoped identity (allowed_channels is None) sees every
+                # name, a channel-scoped one only its own. `_user` keeps its historical underscore
+                # because both console call sites pass it by keyword across the UI seam.
+                channels_failed_names=[
+                    name for name in failed_in if _user.can_access_channel(name)
+                ],
             ),
             kpis=kpis,
             db=DbInfo(
