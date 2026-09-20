@@ -92,7 +92,7 @@ def main(argv: list[str] | None = None) -> int:
     # The last-resort hooks are a PROCESS property, so they are installed here, once, for every
     # subcommand (BACKLOG #1674). `last_resort` states the ASVS 16.5.4 guarantee that an unhandled
     # error can never escape as a raw traceback quoting a PHI-bearing value; until this call site they
-    # were installed inside `_serve` only, leaving the other 32 subcommands unguarded. `dryrun`,
+    # were installed inside `_serve` only, leaving the other 33 subcommands unguarded. `dryrun`,
     # `audit-verify` and `backup` open the store, so an uncaught exception from one of them is the
     # case that could carry a field value.
     #

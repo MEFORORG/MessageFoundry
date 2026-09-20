@@ -273,7 +273,11 @@ if (Test-Path $InstallDir) {
     $lines += "  Helper files     $InstallDir is gone; nothing to remove."
 }
 
-if ($registered -and ($registered -notlike "*$InstallDir*")) {
+# IndexOf and not -like: a path is not a wildcard pattern, and a '[' or ']' anywhere in $InstallDir
+# would make -like compare a character class instead of the text, reporting an nssm.exe that is in
+# the folder as living outside it.
+if ($registered -and
+    ($registered.IndexOf($InstallDir, [StringComparison]::OrdinalIgnoreCase) -lt 0)) {
     # The service was started from an nssm.exe outside the folder this script just reported on, so
     # saying "delete the folder" alone would leave a binary behind and nothing would say so.
     $lines += "  NSSM binary      The service was registered as: $registered"

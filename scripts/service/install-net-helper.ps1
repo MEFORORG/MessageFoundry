@@ -44,11 +44,16 @@ param(
     # (`Get-CimInstance Win32_Service -Filter "Name='$x'"`). A single quote in the value would end the
     # WQL literal, so the query either errors or matches a DIFFERENT service - and this script reads
     # the engine's run-as account out of that result and writes it into the helper's pipe ACL.
-    # messagefoundry/service.py's `_SAFE_SERVICE_NAME` gates the same class; this is the same idea in
-    # the same character set, minus the space Windows allows but neither script needs.
-    [ValidatePattern('^[A-Za-z0-9._-]+$')][string]$ServiceName = "MessageFoundryNetHelper",
+    #
+    # THE CHARACTER SET IS messagefoundry/service.py's `_SAFE_SERVICE_NAME`, SPACE INCLUDED, and the
+    # space is the part to leave alone. -EngineServiceName names the service the ENGINE's installer
+    # created, install-service.ps1 puts no validation on its own -ServiceName, and a space is legal
+    # there -- `_elevated_cmd_params` uses "My Engine" as its worked example. A tighter pattern here
+    # would make an engine installed as "MessageFoundry Prod" unnameable to this script, failing at
+    # parameter binding before anything ran. A space cannot end a WQL literal, so it costs nothing.
+    [ValidatePattern('^[A-Za-z0-9 ._-]+$')][string]$ServiceName = "MessageFoundryNetHelper",
     # The engine's service, read for its run-as account (the pipe's only non-administrator caller).
-    [ValidatePattern('^[A-Za-z0-9._-]+$')][string]$EngineServiceName = "MessageFoundry",
+    [ValidatePattern('^[A-Za-z0-9 ._-]+$')][string]$EngineServiceName = "MessageFoundry",
     # The engine executable, used only to read [cluster.vip]. Defaults to the repo venv, as
     # install-service.ps1's -AppExe does.
     [string]$AppExe,
@@ -70,9 +75,10 @@ param(
     [string]$NssmPath,
     # Install the files and the registration but leave the service stopped.
     [switch]$NoStart,
-    # Install even though a principal other than SYSTEM, Administrators, TrustedInstaller or CREATOR
-    # OWNER can write to -InstallDir. Whoever can write there can replace a binary that runs as
-    # SYSTEM, so this is refused by default.
+    # Install even though the folder check came back with something: a principal outside SYSTEM,
+    # Administrators, TrustedInstaller, CREATOR OWNER and OWNER RIGHTS can write to -InstallDir, it
+    # is OWNED by one, or its permissions could not be read at all. Whoever can write there can
+    # replace a binary that runs as SYSTEM, so all three are refused by default.
     [switch]$AllowBroadAcl
 )
 
@@ -255,14 +261,24 @@ function Get-BroadWriteHolders {
         $rights::WriteExtendedAttributes -bor $rights::Delete -bor $rights::DeleteSubdirectoriesAndFiles -bor
         $rights::ChangePermissions -bor $rights::TakeOwnership) -bor $genericAll -bor $genericWrite
     $found = @()
-    try { $acl = Get-Acl -Path $Path -ErrorAction Stop } catch {
-        # THROWN, NOT WARNED. install-service.ps1's sibling warns and returns empty, because there it
-        # reports on a lockdown that already happened. Here the empty result IS the verdict that lets
-        # a SYSTEM-launched binary be written, and "could not read the permissions" must not render
-        # as "the permissions are fine".
-        throw ("Could not read the permissions of '$Path' ($($_.Exception.Message)), so nothing " +
-            "established that only administrators can write there. Fix the path or pass " +
-            "-AllowBroadAcl to install without the check.")
+    # RETURNED AS A RESIDUE, NOT THROWN. An unreadable DACL is not "the folder is fine", so it has to
+    # reach the caller - but throwing from here made the caller's refusal message name -AllowBroadAcl
+    # as the escape when that switch is not consulted until AFTER this call. An operator following
+    # that instruction got the identical refusal: a dead end, and exactly the false-premise defect
+    # the rest of this script is written against. Returned as a finding instead, so the one decision
+    # about -AllowBroadAcl covers all three ways this can come back non-empty.
+    #
+    # -LiteralPath, NOT -Path. Measured: for a directory whose name holds '[' or ']', `Get-Acl -Path`
+    # returns $null WITHOUT raising, even under -ErrorAction Stop - so the catch never fires and the
+    # arms below read a null object.
+    $acl = $null
+    try { $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop } catch {
+        return @("the permissions of '$Path' could not be read ($($_.Exception.Message)), so " +
+            "nothing established who can write there")
+    }
+    if ($null -eq $acl) {
+        return @("the permissions of '$Path' could not be read (Get-Acl returned nothing), so " +
+            "nothing established who can write there")
     }
 
     # THE OWNER ARM, and the DACL alone is not the question. An owner holds WRITE_DAC implicitly, so
@@ -270,11 +286,22 @@ function Get-BroadWriteHolders {
     # this install is about to have the SCM start as SYSTEM. messagefoundry/config/wiring.py's
     # _evaluate_config_dacl carries the same arm for the same reason (SEC-003, CWE-732); a check
     # without it reports a clean folder for exactly that case.
+    #
+    # AND IT TAKES THE WELL-KNOWN ADMIN RIDs TOO, which the literal list cannot cover: that module's
+    # _WIN_ADMIN_RIDS records that the built-in Administrator (500), Domain Admins (512), Schema
+    # Admins (518) and Enterprise Admins (519) vary per domain. Without them a folder an admin ran
+    # `takeown` on, or one restored from a backup, is refused for being owned by an administrator.
     $ownerSid = $null
     try {
         $ownerSid = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
     } catch { $ownerSid = "$($acl.Owner)" }
-    if ($allowed -notcontains $ownerSid) {
+    # COMPARED AS TEXT, NOT CAST. A RID is a 32-bit UNSIGNED value and [int] is signed, so casting
+    # overflows on a real SID: measured, TrustedInstaller's last group is 2271478464 and
+    # `[int]"2271478464"` throws "Value was either too large or too small for an Int32" -- which
+    # under $ErrorActionPreference = "Stop" aborted this whole check on an ordinary Program Files
+    # folder. A string compare answers the only question being asked and cannot overflow.
+    $ownerRid = if ($ownerSid -match '-(\d+)$') { $Matches[1] } else { "" }
+    if (($allowed -notcontains $ownerSid) -and ($ownerRid -notin @("500", "512", "518", "519"))) {
         $found += "$($acl.Owner) (owner, so implicitly WRITE_DAC)"
     }
 
@@ -417,12 +444,12 @@ if ($clientSid -eq "S-1-5-18") {
 Write-Host "Installing the helper into '$InstallDir'..."
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 
-$broad = Get-BroadWriteHolders -Path $InstallDir
+$broad = @(Get-BroadWriteHolders -Path $InstallDir)
 if ($broad.Count -gt 0) {
-    $message = ("'$InstallDir' can be written by: $($broad -join '; '). Whoever can write there can " +
-        "replace mefor-net-helper.exe, its .conf or nssm.exe - each of which then runs as SYSTEM. " +
-        "Use a folder under Program Files, or fix the permissions, and re-run. Pass -AllowBroadAcl " +
-        "to install anyway.")
+    $message = ("'$InstallDir' did not come back administrator-only: $($broad -join '; '). Whoever " +
+        "can write there can replace mefor-net-helper.exe, its .conf or nssm.exe - each of which " +
+        "then runs as SYSTEM. Use a folder under Program Files, or fix the permissions, and " +
+        "re-run. Pass -AllowBroadAcl to install anyway.")
     if (-not $AllowBroadAcl) { throw $message }
     Write-Warning $message
 }
@@ -462,7 +489,22 @@ Copy-Item $SourceExe $TargetExe -Force
 # copy is the ordinary reinstall, and Copy-Item raises "cannot be copied onto itself" there -- which
 # under $ErrorActionPreference = "Stop" aborts AFTER the service has been stopped, leaving the node
 # with a stopped helper and no completed install.
-if ($NssmPath -ne $TargetNssm) { Copy-Item $NssmPath $TargetNssm -Force }
+#
+# A STRING COMPARE IS NOT ENOUGH, so the throw is caught as well. `-ne` on strings is
+# case-insensitive, which covers NSSM.EXE against nssm.exe, and Get-Item resolves a junction or an
+# 8.3 spelling to the same FullName - but neither closes every way one file has two names, and the
+# cost of missing one is an abort at the worst moment. Measured: the same-file copy raises
+# IOException, so the catch is the backstop that keeps this path from ending the install.
+$sameFile = $NssmPath -eq $TargetNssm
+if (-not $sameFile -and (Test-Path -LiteralPath $TargetNssm)) {
+    $sameFile = (Get-Item -LiteralPath $NssmPath).FullName -eq
+                (Get-Item -LiteralPath $TargetNssm).FullName
+}
+if (-not $sameFile) {
+    try { Copy-Item -LiteralPath $NssmPath -Destination $TargetNssm -Force } catch [IO.IOException] {
+        Write-Host "  NSSM   : '$NssmPath' is already the installed copy; left as it is."
+    }
+}
 
 # EVERY nssm CALL BELOW RUNS THE INSTALLED COPY, and this line is what makes that true. NSSM writes
 # the path of the nssm.exe that ran `install` into the service's own ImagePath, so registering with
