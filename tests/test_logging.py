@@ -1606,6 +1606,9 @@ def test_serve_time_sync_ok_within_threshold_starts_clean(
 # These tests pin the RELATIONSHIP rather than either set's contents, which is what survives a
 # deliberate widening: widen `_is_control_char` and the table follows automatically, and if it does
 # not, the first test goes red naming the code points that drifted.
+#
+# The table and the function both moved from `logging_setup` into `controlchars` on BACKLOG #1591;
+# that module's docstring says why. These tests import from the new home.
 
 
 def test_the_log_escape_table_is_the_controlchars_alphabet_minus_tab() -> None:
@@ -1616,8 +1619,7 @@ def test_the_log_escape_table_is_the_controlchars_alphabet_minus_tab() -> None:
     update a constant. This pins the SUBTRACTION, so a legitimate widening passes untouched and a
     divergence names its own code points.
     """
-    from messagefoundry.controlchars import _is_control_char
-    from messagefoundry.logging_setup import _CTRL_TRANSLATION
+    from messagefoundry.controlchars import _CTRL_TRANSLATION, _is_control_char
 
     alphabet = {cp for cp in range(0x80) if _is_control_char(chr(cp))}
     escaped = set(_CTRL_TRANSLATION)
@@ -1640,7 +1642,7 @@ def test_tab_is_the_only_control_character_left_intact() -> None:
     pass if tab were swapped for CR in the subtraction, because the difference would still be a
     single code point.
     """
-    from messagefoundry.logging_setup import _CTRL_TRANSLATION
+    from messagefoundry.controlchars import _CTRL_TRANSLATION
 
     assert 0x09 not in _CTRL_TRANSLATION, "tab must survive a log line unescaped"
     assert _CTRL_TRANSLATION[0x0A] == "\\n", "LF is the injection vector and must be escaped"
@@ -1650,10 +1652,13 @@ def test_tab_is_the_only_control_character_left_intact() -> None:
 
 
 def test_a_tab_survives_the_real_scrub_and_a_newline_does_not() -> None:
-    """Drives the shipped filter rather than the table, so the two cannot agree while the code differs."""
-    from messagefoundry.logging_setup import _CTRL_TRANSLATION
+    """Drives the shipped FUNCTION rather than the table, so the two cannot agree while the code
+    differs. It used to re-apply ``.translate(_CTRL_TRANSLATION)`` itself, which is a copy of the
+    function body and left any change to ``scrub_control_chars`` that is not a table change -- a
+    second pass, a guard, a length bound -- untested here."""
+    from messagefoundry.controlchars import scrub_control_chars
 
-    scrubbed = "before\tafter\nnext".translate(_CTRL_TRANSLATION)
+    scrubbed = scrub_control_chars("before\tafter\nnext")
     assert "\t" in scrubbed, "the tab was escaped; a log line lost its benign whitespace"
     assert "\n" not in scrubbed, "a real newline survived; one record can now forge a second line"
     assert scrubbed == "before\tafter\\nnext"

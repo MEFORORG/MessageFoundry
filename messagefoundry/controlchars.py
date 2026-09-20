@@ -9,14 +9,20 @@ files -- two in ``transports/fhir.py`` and one each in ``config/codeset_edit.py`
 and is the one #1239 named: a later hardening applied to one copy silently does not apply to the
 rest, and nothing reports the omission.
 
-THIS SHARES THE PREDICATE, NOT THE ACTION, AND THAT DISTINCTION IS THE DESIGN. #1239 ruled out
-"collapsing the call sites into one helper with a flag" because the differing wrappers are
+THE REFUSALS STAY AT THEIR CALL SITES; THE PREDICATE AND THE NEUTRALISERS LIVE HERE. #1239 ruled
+out "collapsing the call sites into one helper with a flag" because the differing wrappers are
 appropriate: a raise suits a path context, a bool suits a filter, and the exceptions differ by layer
 (``WiringError`` in config, a PHI-safe negative ACK in FHIR). So each call site keeps its own
-refusal and its own message; only the TEST moves here. A flag parameter would have re-created the
-coupling the item exists to remove, one indirection further away.
+refusal and its own message. A flag parameter would have re-created the coupling the item exists to
+remove, one indirection further away. What a call site CANNOT sensibly keep its own copy of is the
+alphabet, or a neutraliser derived from it -- so :func:`strip_control_chars` and
+:func:`scrub_control_chars` are here beside :func:`has_control_char`, all three built from the one
+predicate. (This paragraph replaced a "shares the predicate, not the action" thesis that its own
+module had already outgrown: a reader taking that literally puts the next neutraliser elsewhere,
+which is how the escape table came to live in ``logging_setup``.)
 
-TWO ACTIONS ARE PRESERVED ON PURPOSE, and one of them must never be "simplified" into the other:
+THE TWO NEUTRALISERS ARE DIFFERENT AND ONE MUST NEVER BE "SIMPLIFIED" INTO THE OTHER. Beside the
+refusals, that makes three actions over one predicate:
 
   * REJECT -- six sites. A control character in a value that reaches a URL path, a header, a
     filename or a config field is refused outright.
@@ -26,6 +32,14 @@ TWO ACTIONS ARE PRESERVED ON PURPOSE, and one of them must never be "simplified"
     attacker a real file. A header value has no such property -- removing CR/LF cannot redirect a
     request anywhere -- and ``rest.py`` already REJECTS a header NAME failing its RFC 7230 token
     check. Name-rejected, value-stripped, which is principled.
+  * ESCAPE -- every log line, :func:`scrub_control_chars`. Neither refuses nor deletes: it renders
+    the code point as a readable backslash escape, so one record cannot become two.
+
+WHY ESCAPE LIVES HERE, WHICH IS THE ONE FACT WORTH STATING ONCE (BACKLOG #1591). It was defined in
+``logging_setup`` until ``logging_guard`` needed it, and ``logging_setup`` imports
+``logging_guard`` -- so reaching upwards is a cycle and copying the table down is the two-copy drift
+``_is_control_char`` below exists to close. This module imports nothing, so it is the one place both
+can reach. Nothing else about that move is load-bearing; the other files cite this paragraph.
 
 DELIBERATELY NOT FOLDED IN. ``parsing/sniff.py`` tests the same code points but is a genuinely
 different predicate: it is byte-wise rather than character-wise and subtracts an allowlist, because
@@ -79,3 +93,47 @@ def strip_control_chars(text: str) -> str:
     docstring: this is NOT the general remedy and must not be substituted for a rejection.
     """
     return "".join(ch for ch in text if not _is_control_char(ch))
+
+
+# C0 control characters (and DEL) escaped to keep one log record on one line. CR/LF are the
+# log-injection vector; tab (0x09) is left intact as benign whitespace.
+#
+# THE ALPHABET IS _is_control_char's, MINUS TAB (BACKLOG #1273, limb 3), and THE SUBTRACTION IS
+# WRITTEN AS ONE rather than as a second table. It used to be re-derived in ``logging_setup`` as
+# `range(0x20)` plus a separate `0x7F` line. The two agreed, so nothing was mis-escaped; the cost is
+# the future-tense one #1239 named and #1253 acted on, that a later widening applied to one copy
+# silently does not apply to the other. Measured: _is_control_char 33 code points, this table 32,
+# symmetric difference {0x09}. One code point of divergence is a subtraction, not a different
+# predicate -- unlike the parsing/sniff.py carve-out the module docstring keeps separate.
+_CTRL_TRANSLATION: dict[int, str] = {0x0A: "\\n", 0x0D: "\\r"}
+# RANGE 0x100, NOT 0x80, AND THAT IS THE DIFFERENCE BETWEEN A REAL FOLD AND A COSMETIC ONE. The
+# alphabet is C0+DEL today, so both bounds produce the identical 32 entries -- proved by the
+# byte-identity check in the commit. But `_is_control_char`'s docstring names widening to C1
+# (U+0080-U+009F) as the deliberate change this shared module exists to make cheap, and a 0x80 bound
+# would silently NOT follow it: the escape table would keep the old alphabet while every other call
+# site moved, which is the exact two-copy drift limb 3 removes. Iterating past the current boundary
+# costs 128 predicate calls at import and makes the widening propagate by construction.
+for _i in range(0x100):
+    # TAB IS THE ONLY SUBTRACTION and test_tab_is_the_only_control_character_left_intact pins it.
+    # CR/LF are excluded from this loop because they get readable escapes above, not because they
+    # are tolerated -- they are the injection vector this whole table exists for.
+    if _is_control_char(chr(_i)) and _i not in (0x09, 0x0A, 0x0D):
+        _CTRL_TRANSLATION[_i] = f"\\x{_i:02x}"
+
+
+def scrub_control_chars(text: str) -> str:
+    """Escape C0 control characters and DEL (tab kept as benign whitespace) so no part of ``text`` can
+    begin a new physical line or drive a terminal.
+
+    The single definition of that translation, with three callers for three reasons.
+    ``logging_setup.ControlCharScrubFilter`` applies it to every record on a configured handler. A
+    caller that assembles a record's content from an untrusted BYTE stream needs it at the point of
+    assembly, because "one peer write is one log record" is that caller's own framing contract and
+    cannot depend on how the host process configured logging -- the ADR 0176 sandbox stderr relay.
+    :mod:`messagefoundry.logging_guard` needs it because its recovery notices bypass
+    ``Handler.handle`` by design, so no filter chain ever sees them (BACKLOG #1591).
+
+    Idempotent: the escaped forms contain no control characters. ``str.translate`` over a dict,
+    deliberately -- one C-level pass, no regex engine, no backtracking and no recursion, which is
+    what makes it safe on the log write guard's failure path."""
+    return text.translate(_CTRL_TRANSLATION)
