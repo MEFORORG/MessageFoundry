@@ -19,6 +19,7 @@ from messagefoundry import redaction
 from messagefoundry.redaction import (
     clamp_untrusted,
     redact,
+    redact_untrusted,
     safe_error,
     safe_exc,
     safe_name,
@@ -866,6 +867,192 @@ def test_clamp_steps_over_a_whitespace_run_between_name_tokens() -> None:
     assert "JANE" not in out
 
 
+# --- bounding the input: a credential span the cut broke (BACKLOG #1576, #1793) ---
+
+#: A synthetic password head for the arms below. **Lowercase-led and digit-tailed on purpose.** An
+#: ALLCAPS or Capitalized head is dropped by the NAME walk, so a fixture built from one would pass
+#: every arm here whether the credential walk existed or not.
+_PASSWORD_HEAD = "pw0rdhead1"
+
+
+def _split_credential_over_window() -> str:
+    """An ``http.client`` invalid-URL message whose quoted password carries a SPACE, sized so the
+    clamp's cut lands on exactly that space.
+
+    That is the whole defect. ``_INVALID_URL_USERINFO`` needs its trailing ``@``; the cut puts that
+    ``@`` past the window; the pattern that exists to scrub the password stops matching, and the head
+    before the cut is written out. A password can hold a space because ``http.client`` formats the
+    quoted "port" with ``'%s'`` -- whatever the userinfo decoded to goes out verbatim."""
+    cut = redaction._REDACT_WINDOW - redaction._CLAMP_MARKER_BUDGET
+    opening = " " + redaction._USERINFO_OPENER + _PASSWORD_HEAD + " "
+    return _filler(cut - len(opening)) + opening + "z" * 100 + "@host'" + " tail" * 30
+
+
+def _clamp_without_the_credential_walk(text: str, window: int) -> tuple[str, int]:
+    """``_clamp`` as it stood before this walk: the whitespace cut and the name walk, and nothing for a
+    span the cut broke. The positive control for the arm below and for nothing else."""
+    if len(text) <= window:
+        return text, 0
+    cut = max(redaction._last_cut(text, window), 0)
+    cut = redaction._drop_trailing_name_tokens(text, cut)
+    return text[:cut], len(text) - cut
+
+
+def test_the_credential_constants_still_describe_the_pattern_they_bound() -> None:
+    """THE DRIFT GATE for a duplication the module takes on purpose.
+
+    ``_INVALID_URL_USERINFO`` spells its opener and its tail bound out as literals rather than
+    interpolating ``_USERINFO_OPENER`` and ``_USERINFO_TAIL_MAX``, because
+    ``tests/test_security_static.py`` resolves every ``re.compile`` argument in the tree statically and
+    an f-string would record this one as a blind spot -- over the only pattern here that matches a
+    CREDENTIAL. The cost of that choice is two spellings, and this is what keeps them one fact.
+
+    **The clamp reads the constants and the scrub reads the pattern**, so a drift between them is not
+    a tidiness problem: ``_first_truncated_userinfo`` would search for an opener the pattern no longer
+    has, find nothing, and report a cut it never checked."""
+    pattern = redaction._INVALID_URL_USERINFO.pattern
+    assert pattern.startswith(f"({redaction._USERINFO_OPENER})"), (
+        f"_USERINFO_OPENER is not what the pattern opens with, so the clamp searches for a literal "
+        f"the scrub does not have: {pattern!r}"
+    )
+    assert f"{{1,{redaction._USERINFO_TAIL_MAX}}}@" in pattern, (
+        f"_USERINFO_TAIL_MAX is not the pattern's tail bound, so _USERINFO_SPAN understates or "
+        f"overstates how far back of a cut a span can start: {pattern!r}"
+    )
+    # The span is what bounds the search, so state it against the pattern rather than against itself.
+    longest = redaction._USERINFO_OPENER + "z" * redaction._USERINFO_TAIL_MAX + "@"
+    match = redaction._INVALID_URL_USERINFO.match(longest)
+    assert match is not None and match.end() == len(longest) == redaction._USERINFO_SPAN
+
+
+def test_the_split_credential_fixture_really_breaks_the_span_at_the_cut() -> None:
+    """THE POSITIVE CONTROL for the arms below, in the shape
+    ``test_the_over_window_fixture_really_puts_the_cut_inside_the_tail`` established. Each of those
+    asserts an absence, and an absence cannot tell a working walk from a fixture whose credential never
+    came near the cut. Four lines say where the cut actually lands."""
+    text = _split_credential_over_window()
+    assert len(text) > redaction._REDACT_WINDOW, "the fixture is not over the window at all"
+
+    cut = redaction._last_cut(text, redaction._REDACT_WINDOW - redaction._CLAMP_MARKER_BUDGET)
+    opener = text.rfind(redaction._USERINFO_OPENER, 0, cut)
+    assert opener >= 0, "the opener is not inside the window, so no span can straddle the cut"
+    assert text[opener + len(redaction._USERINFO_OPENER) : cut] == _PASSWORD_HEAD, (
+        "the cut no longer falls between the two halves of the quoted password"
+    )
+    assert "@" not in text[opener:cut], (
+        "the terminator is inside the head, so the span is not broken"
+    )
+
+
+def test_the_fence_a_whitespace_cut_hands_half_a_credential_to_the_log() -> None:
+    """THE DEFECT, on the shipped pattern rather than a strawman, pinned so nobody drops the second
+    walk as redundant with the first.
+
+    A whitespace cut is safe for a pattern that either cannot hold whitespace or still matches with
+    its tail gone. ``_INVALID_URL_USERINFO`` is neither: its trailing ``@`` is REQUIRED, so a cut
+    inside its span does not shorten the match, it kills it. The name walk cannot cover that --
+    ``_ends_with_name_token`` asks a name-shaped question, and this head is deliberately not
+    name-shaped."""
+    text = _split_credential_over_window()
+    head, dropped = _clamp_without_the_credential_walk(
+        text, redaction._REDACT_WINDOW - redaction._CLAMP_MARKER_BUDGET
+    )
+    assert dropped, "the control clamp dropped nothing, so it is not exercising a cut at all"
+    assert _PASSWORD_HEAD not in redact(text), (
+        "the unbounded redactor no longer scrubs this credential, so the arms below cannot tell a "
+        "closed leak from a fixture the pattern was never going to catch"
+    )
+    assert _PASSWORD_HEAD in redact(head), (
+        "the whitespace cut alone no longer strands the credential, so the fence this walk was built "
+        "against has moved and _drop_truncated_userinfo needs re-justifying"
+    )
+
+
+def test_the_clamp_drops_a_credential_span_its_own_cut_broke() -> None:
+    """The positive half of the arm above, through every entry point that clamps.
+
+    ``safe_text`` is listed separately because it calls ``_clamp`` directly rather than through
+    ``clamp_untrusted``, so a fix wired only into the public pairing would leave the stored
+    ``last_error`` leaking."""
+    text = _split_credential_over_window()
+    assert _PASSWORD_HEAD not in redact_untrusted(text)
+    assert _PASSWORD_HEAD not in redact(clamp_untrusted(text))
+    assert _PASSWORD_HEAD not in safe_text(text, limit=100_000)
+
+
+def test_one_credential_span_can_cover_a_second_opener_and_both_go() -> None:
+    """The tail is ``[^\\r\\n]``, so it spans whitespace and spans a second opener: one match can cover
+    several credentials. A walk that dropped only the opener nearest the cut would leave the first
+    one's password standing, which is why ``_first_truncated_userinfo`` returns the LEFTMOST straddling
+    opener rather than the last."""
+    cut = redaction._REDACT_WINDOW - redaction._CLAMP_MARKER_BUDGET
+    second_head = "second0head1"
+    opening = (
+        " "
+        + redaction._USERINFO_OPENER
+        + _PASSWORD_HEAD
+        + " "
+        + redaction._USERINFO_OPENER
+        + second_head
+        + " "
+    )
+    text = _filler(cut - len(opening)) + opening + "z" * 60 + "@host'" + " tail" * 30
+
+    assert _PASSWORD_HEAD not in redact(text) and second_head not in redact(text), (
+        "the unbounded redactor no longer covers both openers with one match, so this fixture is not "
+        "the case the leftmost rule exists for"
+    )
+    out = redact_untrusted(text)
+    assert _PASSWORD_HEAD not in out and second_head not in out
+
+
+def test_the_credential_walk_is_bounded_by_the_window_not_by_the_peer() -> None:
+    """THE COST HALF, in the shape ``test_the_token_walk_is_bounded_by_the_window_not_by_the_peer``
+    established: the PEER chooses how many passes the walk takes, so each pass has to stay inside the
+    region it drops.
+
+    It does, on two bounds that are both properties rather than counts. A pass searches one
+    ``_USERINFO_SPAN``-wide region behind the cut -- further back than that, a span ends inside the
+    head, where the head's bytes are the text's bytes and the match still stands. And a pass consumes
+    at least one opener, so the passes cannot outnumber the openers a window holds. The searched
+    regions OVERLAP between passes, unlike the token walk's, so the cost is passes times the span and
+    not one sweep of the window -- ``_drop_truncated_userinfo`` carries that correction.
+
+    **A sweep, because the cost is not monotone in the shape and one sample of it measures nothing.**
+    The fixture is the worst of a sweep of the gap between opener and terminator, in steps of 5 from
+    0 to 125: openers close enough together that a span reaches past the cut, far enough apart that a
+    pass steps back over only a few. A gap of 120 or more takes ONE pass and 0.05 ms, because past
+    that no span can reach an ``@`` beyond the cut. Measured on the author's box: 348 passes and
+    1.6 ms at the worst gap, against the same ``_SCAN_BUDGET_SECONDS`` the #1437 arms use."""
+    window = redaction._REDACT_WINDOW - redaction._CLAMP_MARKER_BUDGET
+    block = redaction._USERINFO_OPENER + "x" * 75 + "@"
+    hostile = (block * (window // len(block) + 2))[: window + 200] + "Q" * 200_000
+
+    best = _best_of(lambda: clamp_untrusted(hostile))
+    assert best < _SCAN_BUDGET_SECONDS, (
+        f"clamping a {window}-character wall of credential spans cost {best:.4f}s of the event loop "
+        f"against a {_SCAN_BUDGET_SECONDS}s budget -- the walk is no longer linear in the window"
+    )
+    # Non-vacuity: a walk that stopped after a pass or two would be fast for the wrong reason.
+    head, _ = redaction._clamp(hostile, window)
+    assert len(head) < redaction._USERINFO_SPAN, (
+        f"the walk stopped with {len(head)} characters still in hand, so this fixture is not "
+        f"measuring a full-window walk and the budget above proves nothing about one"
+    )
+
+
+def test_the_credential_walk_costs_an_ordinary_message_nothing() -> None:
+    """THE CONTROL the arms above need, and the one a careless run drops. Everything else here asserts
+    that a credential is ABSENT, and dropping the string wholesale would satisfy every one of them.
+
+    A complete span under the window is untouched by the walk and redacted by the pattern, so the
+    diagnostic still says WHERE the endpoint pointed -- which is the whole reason the host after the
+    ``@`` is kept."""
+    message = "InvalidURL: nonnumeric port: 'pw0rdhead1 more@ops.example'"
+    assert clamp_untrusted(message) == message
+    assert redact_untrusted(message) == "InvalidURL: nonnumeric port: '[redacted]@ops.example'"
+
+
 def test_clamp_never_cuts_inside_a_token() -> None:
     """A cut at an arbitrary offset is the leak in a second costume: it can take one delimiter off a
     two-delimiter run just as a prefix truncation does. The cut lands on whitespace or on nothing, so a
@@ -992,11 +1179,18 @@ def test_control_the_same_inputs_are_expensive_unbounded() -> None:
 #: RUN of adjacent name-shaped tokens behind the cut, and a uniform character alphabet essentially
 #: never builds one: the first cut of that arm drew characters, and its own control found zero leaks
 #: on the KNOWN-LEAKY walk -- which made its zero on the fixed walk worth nothing.
+#:
+#: **The credential message is a token here rather than a separate corpus**, so the arm below reaches
+#: both leak classes the cut has produced: the name run the walk was built for, and the span whose
+#: required ``@`` a cut destroys. It carries a space inside the quoted password on purpose -- that is
+#: the only shape a whitespace cut can break -- and the head is lowercase-led so the NAME walk is not
+#: what removes it.
 _FUZZ_TOKENS = (
     "SMITH", "DOE", "JANE", "ROE", "AA", "BB", "MR", "ADT",
     "Smith", "Doe", "Jane", "Ab",
     "ok", "rejected", "patient", "x", "12", "1980-05-05",
     "a^b", "P|Q", "100^^^H^MR", "-", "(DOE", "DOE)",
+    "nonnumeric port: 'pw0rd head1@host'",
 )  # fmt: skip
 
 
@@ -1049,23 +1243,31 @@ def test_no_token_survives_the_clamp_that_the_unbounded_scan_scrubs() -> None:
     freely, but it may never KEEP a token the unbounded redactor would have scrubbed. That is what
     BACKLOG #1576 must not trade away for its bound.
 
-    The control is the pre-fix walk on the same seed and the same corpus, because an absence over
-    random input proves nothing until something proves the input can produce the thing. Measured at
-    1,500 trials: 0 here against 31 on the three-step walk.
+    **Two controls, because the clamp now has two walks and one control cannot arm both.** Each is a
+    pre-fix spelling on the same seed and the same corpus, since an absence over random input proves
+    nothing until something proves the input can produce the thing. Measured at 1,500 trials: 0 here,
+    against 113 on the three-step name walk and 98 with the credential walk removed.
 
-    **WHAT THIS CORPUS REACHES, which is less than the rule it checks.** ``_fuzz_text`` joins whole
-    tokens with whitespace, so it exercises leaks that turn on where the cut falls BETWEEN tokens --
-    the name-run class the walk exists for. It cannot reach a leak that turns on text the window
-    never sees: a clamp that drops the ``MSH`` declaring custom delimiters leaves
-    ``_sniff_delimiters`` nothing to read, and no token list produces that because the dependency is
-    on the whole text rather than on a span. It carries no ``_INVALID_URL_USERINFO`` literal either.
-    Both are known open gaps recorded on the pull request, and the control shares the blind spot, so
-    a zero here is evidence about the walk and about nothing else."""
+    **The three-step number was 31 before the corpus grew an ``_INVALID_URL_USERINFO`` token.** The
+    rise is the corpus reaching a second leak class, not the name walk getting worse.
+
+    **WHAT THIS CORPUS REACHES, which is still less than the rule it checks.** ``_fuzz_text`` joins
+    whole tokens with whitespace, so it exercises leaks that turn on where the cut falls BETWEEN
+    tokens. It cannot reach a leak that turns on text the window never sees: a clamp that drops the
+    ``MSH`` declaring custom delimiters leaves ``_sniff_delimiters`` nothing to read, and no token
+    list produces that, because the dependency is on the whole text rather than on a span. That one
+    is a known open gap recorded on the pull request, and both controls share the blind spot, so a
+    zero here is evidence about the two walks and about nothing else."""
     shipped = _clamp_leaks(redaction._clamp, 1_500)
-    control = _clamp_leaks(_three_step_clamp, 1_500)
-    assert control, (
-        "the pre-fix walk leaked nothing on this corpus, so the corpus cannot produce the defect "
-        "and the assertion below is vacuous -- re-check _FUZZ_TOKENS before trusting a zero"
+    name_control = _clamp_leaks(_three_step_clamp, 1_500)
+    credential_control = _clamp_leaks(_clamp_without_the_credential_walk, 1_500)
+    assert name_control, (
+        "the pre-fix name walk leaked nothing on this corpus, so the corpus cannot produce that "
+        "defect and the assertion below is vacuous -- re-check _FUZZ_TOKENS before trusting a zero"
+    )
+    assert credential_control, (
+        "dropping the credential walk leaked nothing on this corpus, so the corpus no longer "
+        "produces a cut inside a quoted password -- re-check _FUZZ_TOKENS before trusting a zero"
     )
     assert not shipped, f"{shipped} of 1,500 trials kept a token the unbounded scan scrubs"
 

@@ -37,10 +37,15 @@ cuts an over-long string to :data:`_REDACT_WINDOW` first.
 **Redacting ``text[:limit]`` is the obvious form of that and it leaks.** A cut lands mid-run, strands
 the surviving fragment below the two-delimiter threshold :data:`_HL7_FIELD_RUN` needs or the two-token
 threshold :data:`_NAME_RUN` needs, and the patient name the pattern existed to catch walks through
-into the log. So the cut is made at whitespace, and the tokens :data:`_NAME_RUN` could have split are
-dropped whole — never emitted in part. Over-redaction at the boundary is the deliberate price.
+into the log. So the cut is made at whitespace, and the spans a whitespace cut can still break are
+dropped whole — never emitted in part. At least two patterns need that, each with a walk of its own:
+:data:`_NAME_RUN` under :func:`_drop_trailing_name_tokens`, and :data:`_INVALID_URL_USERINFO` under
+:func:`_drop_truncated_userinfo`. Over-redaction at the boundary is the deliberate price.
 :data:`_CUT_CHARS` carries the per-pattern argument: which patterns a whitespace cut covers, which it
-does not, and the test to apply to the next one added.
+does not, and the test to apply to the next one added. **"At least" rather than a count**, because a
+count here went stale the first time this module grew a pattern and nothing reported it, and because
+the register is a register of SPANS -- a dependency on the whole text rather than on a span is a
+different shape it cannot hold (:func:`_sniff_delimiters`, below).
 
 Pure stdlib (``re``, ``hashlib``, ``string``), so it can be used from any engine package.
 """
@@ -297,6 +302,21 @@ def _safe_suffixes(base: str) -> str:
     return "".join(reversed(kept))
 
 
+#: The literal ``http.client`` opens that message with, and the longest tail the pattern walks past it.
+#: **Named because the CLAMP needs both numbers**: it has to know how far back of a cut a span could
+#: have started (:data:`_USERINFO_SPAN`) and what to search for there
+#: (:func:`_first_truncated_userinfo`).
+#:
+#: **The pattern below SPELLS BOTH OUT again rather than interpolating them, and that is a gate's
+#: requirement rather than a style choice.** ``tests/test_security_static.py`` statically resolves
+#: every ``re.compile`` argument in this tree and pins the ones it cannot read as recorded blind
+#: spots. An f-string here makes the scanner blind to the one pattern in this module that matches a
+#: CREDENTIAL, which is the last one to hide from it. So the duplication is deliberate, and
+#: ``tests/test_redaction.py`` pins the two spellings against each other so they cannot drift --
+#: the same trade :data:`_SAFE_SUFFIXES` takes, for the same reason.
+_USERINFO_OPENER = "nonnumeric port: '"
+_USERINFO_TAIL_MAX = 256
+
 #: The password ``http.client`` quotes as a "port" when an endpoint URL carries userinfo: its
 #: ``InvalidURL("nonnumeric port: 'PW@host'")`` (BACKLOG #1793; the mechanism is on
 #: ``transports/rest.py`` ``refuse_url_credentials``). It is a CREDENTIAL, not PHI. It lives here
@@ -310,6 +330,12 @@ def _safe_suffixes(base: str) -> str:
 #: A password tail longer than the bound is NOT matched -- the construction-time refusal in
 #: ``transports/rest.py`` ``refuse_url_credentials`` is the primary control, and this is its backstop.
 _INVALID_URL_USERINFO = re.compile(r"(nonnumeric port: ')[^\r\n]{1,256}@")
+
+#: The widest match :data:`_INVALID_URL_USERINFO` can make: the opener, the longest tail it admits,
+#: and the ``@`` that closes it. An opener further back of a cut than this has its whole span inside
+#: the kept head, so the cut cannot have broken it -- which is what bounds the backward search in
+#: :func:`_first_truncated_userinfo` to a fixed region instead of the whole window.
+_USERINFO_SPAN = len(_USERINFO_OPENER) + _USERINFO_TAIL_MAX + 1
 
 
 # --- bounding the input (BACKLOG #1576) --------------------------------------
@@ -337,10 +363,14 @@ _REDACT_WINDOW = 64 * 1024
 #: its span does not shorten the match — it kills it, and the password head before the cut is written
 #: out. Reproduced on this module: in a 64 KiB-plus string whose last whitespace before the window falls
 #: between two space-separated halves of the quoted password, the first half survives, where an
-#: unclamped :func:`redact` would have scrubbed it and a clamped one does not. The walk below does not
-#: cover it — :func:`_ends_with_name_token` asks a name-shaped question. For an ENDPOINT URL the
-#: construction-time refusal in ``transports/rest.py`` ``refuse_url_credentials`` is the primary control
-#: and is untouched, so this is a gap in its backstop at one boundary; that refusal deliberately does
+#: unclamped :func:`redact` would have scrubbed it and a clamped one does not.
+#:
+#: **That paragraph ended "the walk below does not cover it" and recorded a live leak. It is covered
+#: now: :func:`_drop_truncated_userinfo` runs after the name walk and drops a span the cut broke.**
+#: The retracted half is kept because the SHAPE recurs — the walk really does not cover it, since
+#: :func:`_ends_with_name_token` asks a name-shaped question, and the fix is a second walk rather than
+#: a wider one. For an ENDPOINT URL the construction-time refusal in ``transports/rest.py``
+#: ``refuse_url_credentials`` is the primary control and is untouched; that refusal deliberately does
 #: not screen a ``proxy_url``, which legitimately carries its own credentials, so do not read it as
 #: covering every arm.
 #:
@@ -349,6 +379,20 @@ _REDACT_WINDOW = 64 * 1024
 #: other properties of this cut in ``tests/test_redaction.py`` under *bounding the input*. A count of
 #: how many patterns are covered went stale here the first time the module grew one, and nothing
 #: reported it.
+#:
+#: **Answer "no" and you need a walk of your own, not a wider :func:`_ends_with_name_token`.** The two
+#: walks ask different questions: the name one asks whether the head's last TOKEN could have paired
+#: rightward, and the userinfo one asks whether an opener inside the head has lost the ``@`` that
+#: completes it. A pattern whose span is head-anchored and bounded can copy
+#: :func:`_drop_truncated_userinfo` by naming its own opener and its own widest span; one that is
+#: neither needs a different argument about how far back to look.
+#:
+#: **A THIRD SHAPE IS OUT OF THIS REGISTER'S REACH ENTIRELY, and adding a walk for it would not
+#: work.** :func:`_sniff_delimiters` reads the WHOLE text, so a clamp that drops the ``MSH`` declaring
+#: a feed's real delimiters leaves the separator-aware pass nothing to read, and a run inside the head
+#: that :func:`redact` scrubs unclamped survives. The dependency is not on a span, so no amount of
+#: looking back from the cut finds it. It is a known open gap, recorded here and on the corpus arm in
+#: ``tests/test_redaction.py`` that also cannot reach it -- not a pattern this register covers.
 #:
 #: ``string.whitespace`` searched with :meth:`str.rfind`, rather than ``\s`` through the regex engine:
 #: a right-to-left search is what this needs and ``re`` only scans left to right. The stdlib name is
@@ -413,6 +457,22 @@ def _ends_with_name_token(token: str) -> bool:
     return len(token) >= 2 and token[-1] in ascii_uppercase and token[-2] in ascii_uppercase
 
 
+def _token_start(text: str, end: int) -> int:
+    """Index where the token ending at ``end`` begins — the first position after the :data:`_CUT_CHARS`
+    character before it, or ``0``.
+
+    **One spelling, because both walks in this module need it and what counts as a boundary may
+    move.** :data:`_CUT_CHARS` contemplates admitting a Unicode space; two copies of this loop sixty
+    lines apart would be two places to change and one place to forget.
+
+    An index walk rather than :meth:`str.rsplit` or a slice: the callers are walking backwards through
+    a region they are about to drop, and a slice copies from index 0 on every step, which is the
+    quadratic cost :func:`_drop_trailing_name_tokens` exists to avoid."""
+    while end and text[end - 1] not in _CUT_CHAR_SET:
+        end -= 1
+    return end
+
+
 def _last_cut(text: str, end: int) -> int:
     """Index of the last :data:`_CUT_CHARS` character in ``text[:end]``, or ``-1`` if there is none."""
     return max(text.rfind(char, 0, end) for char in _CUT_CHARS)
@@ -471,12 +531,82 @@ def _drop_trailing_name_tokens(text: str, cut: int) -> int:
             end -= 1  # step over a whitespace RUN: _NAME_RUN joins its tokens with `\s+`
         if not end:
             return cut  # nothing but whitespace behind the cut, so no token to judge
-        start = end
-        while start and text[start - 1] not in _CUT_CHAR_SET:
-            start -= 1
+        start = _token_start(text, end)
         if not _ends_with_name_token(text[start:end]):
             return cut
         cut = start
+    return cut
+
+
+def _first_truncated_userinfo(text: str, cut: int) -> int:
+    """Index of the leftmost :data:`_INVALID_URL_USERINFO` opener in ``text[:cut]`` whose match runs
+    past ``cut``, or ``-1`` when the cut broke none.
+
+    **Leftmost, because one match can cover several openers.** The tail is ``[^\\r\\n]``, which spans
+    whitespace and spans a second opener, so the span that starts first is the one whose loss takes the
+    most text with it; cutting back before it removes the later ones as well.
+
+    **Only a fixed region is searched, and that is what keeps this affordable.** A span is at most
+    :data:`_USERINFO_SPAN` characters, so an opener further back than that ends inside the head, where
+    the head's bytes are the text's bytes and the match still stands. Everything the cut can have
+    broken therefore sits in one bounded region behind it, whatever the peer's input is.
+
+    The question asked of each candidate is the shipping pattern's own, against the WHOLE text: a
+    candidate that does not match there is one :func:`redact` would not have scrubbed unclamped either,
+    so dropping it would buy nothing."""
+    pos = max(cut - _USERINFO_SPAN, 0)
+    while (start := text.find(_USERINFO_OPENER, pos, cut)) >= 0:
+        match = _INVALID_URL_USERINFO.match(text, start)
+        if match is not None and match.end() > cut:
+            return start
+        pos = start + 1
+    return -1
+
+
+def _drop_truncated_userinfo(text: str, cut: int) -> int:
+    """``cut`` moved back past every :data:`_INVALID_URL_USERINFO` span the cut would have broken.
+
+    **This is the second of the two walks :data:`_CUT_CHARS` describes, and it exists because a
+    whitespace cut is not enough for a pattern whose tail is required.** A password quoted with a space
+    in it puts a cut candidate inside the credential: the head keeps ``nonnumeric port: '`` and the
+    first half of the password, the ``@`` that completes the match is past the cut, and the pattern
+    that exists to scrub exactly that string no longer fires. Unclamped, :func:`redact` scrubs it. That
+    is the leak class BACKLOG #1576 exists to close, in the one pattern that arrived after the cut was
+    designed.
+
+    **A broken span is dropped whole rather than repaired**, and the cut goes back to the whitespace
+    boundary before the opener's own token, so the head still ends where :func:`_clamp` promises. The
+    name walk is re-run from there, because moving a cut back is exactly what can strand a
+    :data:`_NAME_RUN` partner, and re-running it is cheaper than reasoning that it cannot.
+
+    **The loop is necessary, not defensive.** A greedy tail reaches the last ``@`` in range, so an
+    EARLIER opener can own a span that swallows the one just dropped and still runs past the cut:
+    ``nonnumeric port: 'A nonnumeric port: 'B`` with the ``@`` past the window is one match unclamped,
+    covering both halves. Dropping only the rightmost opener would leave ``A`` standing.
+
+    **And it is bounded by the window, but NOT by the disjointness argument the walk above it uses,
+    and that distinction is the part to keep.** Two costs here, and only one of them is disjoint.
+    ``cut`` strictly decreases, so the backward scans for a token boundary do run over regions strictly
+    below the previous pass's and visit no character twice -- one pass over the dropped suffix in
+    total. The SEARCH does not: a pass that steps back past a single opener leaves the next pass's
+    :data:`_USERINFO_SPAN`-wide region overlapping this one by nearly all of it, so the search cost is
+    passes times the span rather than one pass over the window.
+
+    **That is still bounded, because both factors are.** The span is a constant, and a pass consumes
+    at least one opener, so the passes cannot exceed the openers a window holds. Measured over a sweep
+    of the gap between opener and terminator, in steps of 5 from 0 to 125, on 64 KiB of nothing but
+    credential spans: the worst is a 75-character gap at **348 passes and 1.6 ms**, against the 50 ms
+    the #1437 arms budget. A gap of 120 or more takes ONE pass -- past that the span cannot reach an
+    ``@`` beyond the cut at all -- so the cost is not monotone in the gap and a single sample of it
+    measures nothing. Pinned in ``tests/test_redaction.py`` under *bounding the input*."""
+    while cut:
+        start = _first_truncated_userinfo(text, cut)
+        if start < 0:
+            return cut
+        # Back to the start of the token the opener sits in, then one more: that index is the
+        # whitespace before it, which is the `_last_cut` convention -- the head ends just before it.
+        # A zero means no boundary at all behind the opener, so the answer is nothing.
+        cut = _drop_trailing_name_tokens(text, max(_token_start(text, start) - 1, 0))
     return cut
 
 
@@ -499,7 +629,12 @@ def _clamp(text: str, window: int) -> tuple[str, int]:
     standing under its two-token threshold, so the neighbouring name-shaped tokens are dropped whole.
     :func:`_drop_trailing_name_tokens` carries how far that walk goes and why it is still bounded; the
     cost is over-redaction of a few tokens at a boundary 64 KiB into a string nobody is reading that
-    far down."""
+    far down.
+
+    **Then the second walk, which is there for :data:`_INVALID_URL_USERINFO`** — a pattern a whitespace
+    cut can split while leaving a match-KILLING remainder behind, because its trailing ``@`` is
+    required rather than optional. A password quoted with a space in it is the case, and the head would
+    otherwise keep its first half. :func:`_drop_truncated_userinfo` drops the broken span whole."""
     if len(text) <= window:
         return text, 0
     # -1 when the window held no whitespace at all, which must yield nothing rather than text[:-1].
@@ -507,6 +642,9 @@ def _clamp(text: str, window: int) -> tuple[str, int]:
     # The window split a token unless it happened to land on whitespace. Either way that token is
     # already gone; the walk continues from there through the rest of the run it belonged to.
     cut = _drop_trailing_name_tokens(text, cut)
+    # After the name walk, not before it: that walk only ever moves the cut back, and moving it back
+    # is what breaks a span. This one re-runs the name walk itself wherever it moves the cut again.
+    cut = _drop_truncated_userinfo(text, cut)
     return text[:cut], len(text) - cut
 
 
