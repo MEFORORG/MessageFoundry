@@ -11,9 +11,11 @@ each measured 2026-09-06 and each guarded below:
 
   1. ROSTER. korus and this table have never matched, and neither leads the other. The MANAGER
      joined this table on 2026-09-10, when the owner retired the Console (BACKLOG #1529). The
-     SPECIAL seat joined on 2026-09-16, taking the table to six. The `elsewhere` bucket emptied
-     the same day by owner instruction, so the tests below guard its MECHANISM rather than an
-     occupant.
+     SPECIAL seat joined on 2026-09-16, taking the table to six. On 2026-09-19 the owner retired
+     the REGULATOR and added the WATCHDOG, which holds the table at six and is NOT its successor:
+     it measures whether reds are cleared and never says whose one is. The `elsewhere` bucket
+     emptied on 2026-09-16 by owner instruction, so the tests below guard its MECHANISM rather
+     than an occupant.
   2. PUSH AUTHORITY. korus's cards say pushing needs the owner. Section 5 carries the opposite as an
      anchored ruling, `refs/liaison/owner-ruling-20260829-push`.
   3. PLAYBOOK PATHS. korus's cards cite `roles/COMMON.md`. No such path exists in this checkout.
@@ -43,8 +45,9 @@ SETTINGS = _REPO / ".claude" / "settings.json"
 MARKER_RELPATH = ".claude/seat.local.txt"
 ROLE_COPY_RELPATH = ".claude/ROLE.local.md"
 
-#: Section 5's table governs. SIX seats since 2026-09-16, when the owner added SPECIAL.
-EXPECTED_SEATS = frozenset({"manager", "builder", "regulator", "steward", "lander", "special"})
+#: Section 5's table governs. SIX seats: SPECIAL joined 2026-09-16, and on 2026-09-19 the owner
+#: retired the REGULATOR and added the WATCHDOG, which is not its successor.
+EXPECTED_SEATS = frozenset({"manager", "builder", "watchdog", "steward", "lander", "special"})
 
 #: Seats live in korus and absent here. They must resolve to a card-less explanation, never to
 #: silence. EMPTY SINCE 2026-09-16 by owner instruction, and empty is the correct state -- so any
@@ -489,6 +492,122 @@ class TheConsoleRetirementSaysTheManagerIsNotARenameOfIt(unittest.TestCase):
             r"not a renamed console",
             "the check cannot tell the misleading sentence from a compliant one, so it guards "
             "nothing",
+        )
+
+
+class TheRegulatorRetirementDeniesTheWatchdogSucceededIt(unittest.TestCase):
+    """Owner instruction 2026-09-19. The Watchdog arrived the same day, which is the whole risk.
+
+    The Console's retirement needed a rename denial because a Manager arrived to be mistaken for
+    it. This one needs the SAME denial for a sharper reason: nothing replaced the Regulator at all,
+    so a reader who substitutes the Watchdog does not merely apply the wrong rules -- they wait for
+    a verdict that no seat now issues, and nothing times that wait out.
+
+    Without this class the notice is unguarded. Every other assertion in this file passes against a
+    notice trimmed to a bare "Retired 2026-09-19": the label is not live, it has no card, and the
+    reason clears the 20-character floor. The denial would vanish with nothing going red.
+    """
+
+    #: Every spelling of the seat that must resolve to a retirement rather than to silence.
+    SPELLINGS = frozenset({"regulator", "regulator1", "regulator-1", "reg"})
+
+    def test_every_regulator_spelling_resolves_to_a_retirement(self):
+        missing = sorted(self.SPELLINGS - set(seats()["retired"]))
+        self.assertEqual(
+            [],
+            missing,
+            f"these Regulator spellings resolve to nothing instead of a retirement: {missing}. "
+            "A label that matches no seat reads as a misspelling, not as a roster fact.",
+        )
+
+    def test_no_regulator_spelling_is_live_or_an_alias(self):
+        reachable = sorted(self.SPELLINGS & (set(seats()["live"]) | set(seats()["aliases"])))
+        self.assertEqual([], reachable, f"the Regulator is still reachable as: {reachable}")
+
+    def test_the_canonical_notice_says_nothing_replaced_it(self):
+        why = seats()["retired"]["regulator"].lower()
+        self.assertIn(
+            "nothing replaced it",
+            why,
+            "the notice retires the label without saying the seat was not replaced, so a reader "
+            "goes looking for the successor",
+        )
+
+    def test_the_notice_denies_the_watchdog_succeeded_it_by_name(self):
+        why = seats()["retired"]["regulator"].lower()
+        self.assertIn("watchdog", why, "the notice never names the seat it will be confused with")
+        self.assertRegex(
+            why,
+            r"not its successor",
+            "the notice names the Watchdog without denying the succession, which is worse than "
+            "not naming it: it reads as a handover note",
+        )
+
+    def test_the_notice_says_what_a_watchdog_returns_instead(self):
+        """A denial with no replacement behaviour beside it leaves the reader still waiting."""
+        why = seats()["retired"]["regulator"].lower()
+        self.assertIn(
+            "verdict",
+            why,
+            "the notice denies the succession but never says a Watchdog issues no verdict, so a "
+            "session can still send it a red and wait",
+        )
+
+    def test_the_watchdog_is_live_and_carries_its_own_card(self):
+        self.assertIn("watchdog", seats()["live"])
+        self.assertTrue((CARD_DIR / "watchdog.card.md").is_file())
+
+    def test_the_agreement_retires_the_regulator_rather_than_going_quiet(self):
+        """Deleting every mention would leave the stale documents unanswered and nothing to cite.
+
+        Matched over whitespace-collapsed text. A prose file rewraps whenever a word changes
+        length, so an assertion carrying a newline pins the wrap column rather than the sentence
+        and goes red on a reflow that changed nothing.
+        """
+        flat = " ".join(read(AGREEMENT).split())
+        self.assertIn(
+            "NO SEAT ATTRIBUTES A RED NOW",
+            flat,
+            "CLAUDE.md no longer states that nobody attributes a red, so a document routing a red "
+            "to a Regulator has nothing contradicting it",
+        )
+        self.assertIn(
+            "**not the Regulator's successor**",
+            flat,
+            "the agreement retires the seat without denying the Watchdog succeeded it",
+        )
+
+    def test_the_whitespace_collapse_can_still_fail(self):
+        """Control for the test above: collapsing must not make every string match."""
+        flat = " ".join(read(AGREEMENT).split())
+        self.assertNotIn("ZZQX NO SUCH SENTENCE", flat)
+
+    def test_no_card_sends_a_red_somewhere_for_a_ruling(self):
+        """The card outranks the agreement in a session's context, so the cards must agree too.
+
+        manager.card.md carried "the ruling on a red" in its not-owned list, which was true under
+        the old roster and implies a ruler under this one.
+        """
+        offenders = [
+            p.name
+            for p in card_paths()
+            if re.search(r"the ruling on a red\.", read(p))
+            and "nothing replaced it" not in read(p).lower()
+        ]
+        self.assertEqual(
+            [],
+            offenders,
+            f"these cards name a ruling on a red without saying nobody issues one: {offenders}",
+        )
+
+    def test_the_scan_would_fire_on_the_wording_that_caused_this(self):
+        """Positive control. Without it every assertion above passes against a rewritten notice."""
+        planted = "Retired 2026-09-19 by owner decision."
+        self.assertNotRegex(
+            planted.lower(),
+            r"not its successor",
+            "the check cannot tell a bare retirement from one that denies the succession, so it "
+            "guards nothing",
         )
 
 
