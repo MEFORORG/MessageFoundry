@@ -72,6 +72,20 @@ def route_to_h(msg: Message) -> list[str]:
     return picked
 
 
+def route_to_h_tuple(msg: Message) -> tuple[str, ...]:
+    picked = ("h",)
+    return picked
+
+
+def route_to_h_set(msg: Message) -> set[str]:
+    picked = {"h"}
+    return picked
+
+
+def route_to_h_generator(msg: Message) -> Iterator[str]:
+    yield "h"
+
+
 def handle_transform(msg: Message) -> Send:
     mrn = msg["PID-3.1"]  # a PHI-bearing local
     msg["MSH-3"] = "FOUNDRY"  # a msg field write on this line
@@ -128,6 +142,40 @@ def test_gate_byte_identical_disposition_and_routing() -> None:
     # per-invocation routing/sends
     assert _router_invocation(traced)["routed_to"] == ["h"]
     assert _handler_invocation(traced)["sends"] == [{"outbound": "out"}]
+
+
+def test_routed_to_reports_a_tuple_or_set_router() -> None:
+    """BACKLOG #1694: `routed_to` follows `_handler_names`, which takes any non-str iterable.
+
+    A tuple- or set-returning Router routes for real -- `plain.handlers` proves it on the same run
+    -- so a trace saying `routed_to: []` beside it contradicts the run it is observing."""
+    for route in (route_to_h_tuple, route_to_h_set):
+        reg = _registry(route, {"h": handle_transform})
+        plain = dry_run(reg, ADT_A01)
+        traced = trace_dry_run(reg, ADT_A01)
+
+        assert plain.handlers == ["h"], route.__name__
+        assert _router_invocation(traced)["routed_to"] == ["h"], route.__name__
+        # The gate this row is really about: the trace agrees with the untraced run.
+        assert _router_invocation(traced)["routed_to"] == plain.handlers, route.__name__
+        # `lazy_result` is emitted only when true, so its ABSENCE is the non-degraded case.
+        assert "lazy_result" not in _router_invocation(traced), route.__name__
+
+
+def test_routed_to_still_declines_to_drain_a_generator_router() -> None:
+    """The one shape that stays empty, and it is declared rather than silent.
+
+    Draining the one-shot iterator here would leave the real routing nothing to materialise, so the
+    traced run would deliver 0 where the untraced run delivers 1. `lazy_result` says so."""
+    reg = _registry(route_to_h_generator, {"h": handle_transform})
+    plain = dry_run(reg, ADT_A01)
+    traced = trace_dry_run(reg, ADT_A01)
+
+    assert plain.handlers == ["h"]
+    assert _router_invocation(traced)["routed_to"] == []
+    assert _router_invocation(traced)["lazy_result"] is True
+    # Byte-identical despite the empty routed_to: the tracer did not consume the generator.
+    assert traced["handlers"] == plain.handlers == ["h"]
 
 
 def _two_out_registry(handle) -> Registry:  # type: ignore[no-untyped-def]

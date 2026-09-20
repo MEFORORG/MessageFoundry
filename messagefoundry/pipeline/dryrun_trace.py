@@ -63,7 +63,7 @@ from __future__ import annotations
 
 import inspect
 import sys
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from time import perf_counter
@@ -160,17 +160,31 @@ def _sends_from(result: object) -> list[str]:
 
 
 def _routed_from(result: object) -> list[str]:
-    """Handler names in a Router's raw return (``list``/``str``/``None``).
+    """Handler names in a Router's raw return, by the rule the real routing uses.
 
-    A **generator** Router routes fine (``dryrun._handler_names`` materialises any non-``str``
-    iterable) but is reported as no ``routed_to`` here, for the same pure-observer reason as
-    :func:`_sends_from`: draining the one-shot iterator would leave the real routing nothing to
-    materialise. The invocation carries ``lazy_result`` so the omission is declared."""
+    That rule is :func:`messagefoundry.pipeline.dryrun._handler_names`: ``str`` is one name, ``None``
+    is none, and any other non-``str`` iterable is a sequence of names -- list, tuple, set. This read
+    only ``str`` and ``list``, so a Router returning a tuple or a set traced as an empty
+    ``routed_to`` while routing perfectly well, and the trace contradicted the run it was observing
+    (BACKLOG #1694). A tracer that disagrees with the untraced run is worse than no trace: the reader
+    has no way to tell which half is lying.
+
+    A **generator** Router is the one shape still reported as no ``routed_to``, for the pure-observer
+    reason :func:`_sends_from` gives -- draining the one-shot iterator would leave the real routing
+    nothing to materialise, so the traced run would deliver 0 where the untraced run delivers N. The
+    invocation carries ``lazy_result`` so that omission is declared rather than read as a Router that
+    selected nothing."""
+    if result is None:
+        return []
     if isinstance(result, str):
         return [result]
-    if isinstance(result, list):
-        return [str(name) for name in result]
-    return []
+    # Ordered BEFORE the Iterable arm: a generator is an Iterable too, and consuming it is the one
+    # thing a pure observer must not do.
+    if isinstance(result, Iterator):
+        return []
+    if not isinstance(result, Iterable):
+        return []
+    return [str(name) for name in result]
 
 
 # --- per-invocation recorder -------------------------------------------------
