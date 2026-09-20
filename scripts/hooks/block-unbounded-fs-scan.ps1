@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-# PreToolUse guard: deny a filesystem walk rooted at the MSYS root or at its synthetic /proc.
-# Reads the tool-call JSON on stdin; if the command would walk / or /proc it returns a "deny"
-# decision naming the bounded command to use instead. Anything else passes silently (exit 0).
-# Fail-OPEN on any error.
+# PreToolUse guard: deny a filesystem walk rooted at the MSYS root, at its synthetic /proc, or at
+# the MSYS network root. Reads the tool-call JSON on stdin; if the command would walk one of those
+# it returns a "deny" decision naming the bounded command to use instead. Anything else passes
+# silently (exit 0). Fail-OPEN on any error.
+#
+# The network root carries a DIFFERENT cause and says so; see $WHY_NET below.
 #
 # WHY THIS IS A MACHINE-WIDE RESOURCE PROBLEM, NOT A STYLE ONE. Git Bash's `/` is
 # C:\Program Files\Git and carries a synthetic /proc. /proc holds 32 entries, and THREE of them are
@@ -62,7 +64,12 @@
 # refused is allowed. The difference is only that this file ACCEPTS that exposure knowingly and
 # bounds it here, rather than avoiding it.
 #
-# THE DEEPER FIX, NOT TAKEN HERE. Apply Test-MsysWalkRoot to every non-option token of ANY program
+# A WALK ROOTED AT THE SEGMENT'S OWN `cd` IS ON THE SAME AXIS AND IS ALSO OPEN. `cd /proc && find .`
+# was measured ALLOWED: the splitter judges `find .` on its own and never reads the cd's operand.
+# It is named here because the splitter's comments talk about `cd X && find /proc`, which makes the
+# other direction read as covered when it is not.
+#
+# THE DEEPER FIX, NOT TAKEN HERE. Apply Get-WalkRootKind to every non-option token of ANY program
 # and move recognition entirely to the suppression side -- a list of programs that provably cannot
 # walk (`cat`, `head`, `tail`, `stat`, `readlink`, `echo`, `ls` without -R, `grep` without -r),
 # plus the prune escape. An unknown program would then cost a visible false deny instead of a
@@ -75,12 +82,18 @@
 #
 #   Path spelling. `/.`, `//` and `/./` are not the literal string `/`, so three walks of the root
 #   were allowed. Patching those three would have left `/..`, `/.//`, `///`, `/tmp/../proc`,
-#   `/proc\registry` and `find /pro'c'` open, so the fix folds the operand instead -- Get-Operand
-#   and Get-NormalizedPath below carry the rules and the measurement each one rests on.
+#   `find /pro'c'` and `find /pro\c` open, so the fix folds the operand instead -- Get-Operand and
+#   Get-NormalizedPath below carry the rules and the measurement each one rests on.
 #
 #   Option grammar. `--regexp=foo` and `-rm5` were both allowed, and for opposite reasons: the
 #   long form's `=` hid the option's NAME behind its value, and the short bundle's attached digit
 #   hid the `-r` inside it. Both are read structurally now, in the grep branch below.
+#
+# ***THE FOLD IS NOT THE WHOLE OF A ROOT, AND THE PRUNE EXEMPTION IS WHERE THAT BITES.*** `-path` is
+# a glob matched against the string find itself generates by appending to the LITERAL root, so an
+# exemption is only valid when the pattern starts with that literal root. Four more walks were
+# measured running under a `-path /proc -prune` that could never fire, `find /.` among them. The
+# scoping lives at the find deny site; the reason is written there.
 #
 # WHAT IS STILL OPEN ON THE OPTION AXIS, NAMED SO IT IS NOT MISTAKEN FOR COVERAGE. GNU getopt_long
 # accepts any unambiguous ABBREVIATION of a long option, so `grep --rec pattern /proc` is a
@@ -195,23 +208,55 @@ function Hide-QuotedSpans([string]$Text) {
     return $sb.ToString()
 }
 
-# A token as the shell would hand it to the program: quote characters removed wherever they appear
-# in the word, nothing else. The walk roots below are compared as whole strings, so `find "/"` and
-# `find /` must produce the same operand.
+# A token as the shell would hand it to the program: quote removal and backslash escaping applied,
+# nothing else. The walk roots below are compared as whole strings, so `find "/"` and `find /` must
+# produce the same operand.
 #
 # ***QUOTES ARE REMOVED THROUGHOUT THE WORD, NOT JUST FROM ITS ENDS.*** Stripping only a matched
 # outer pair shipped a fail-open that was measured: `find /''`, `find /""`, `find '/'""` and
 # `find /pro'c'` were all ALLOWED, because the concatenated spellings have no matched outer pair
-# and so reached the comparison with their quote characters still in them. The shell removes quotes
-# everywhere in a word, which is what this loop now does. An unterminated quote loses its delimiter
-# too; that word cannot reach program position anyway, because the blanked view's first token
-# carries a quote and the segment is skipped before this is called.
+# and so reached the comparison with their quote characters still in them. An unterminated quote
+# loses its delimiter too; that word cannot reach program position anyway, because the blanked
+# view's first token carries a quote and the segment is skipped before this is called.
+#
+# ***AND AN UNQUOTED BACKSLASH IS AN ESCAPE, WHICH IS WHERE THE FIRST CUT OF THIS FUNCTION WENT
+# WRONG.*** It left backslashes in place and let the path fold read them as separators, which is
+# wrong in BOTH directions and was measured that way. Four walks of /proc were allowed --
+# `find /\proc`, `find \/proc`, `find /pro\c` and `grep -r foo /\proc` -- because bash deletes the
+# backslash and hands the program `/proc`, while the guard compared a string still carrying it. And
+# `find /proc\registry` was DENIED with the registry cause although bash hands find
+# `/procregistry`, which does not exist. Deciding the escape HERE, where quoting is still visible,
+# is what makes both answers follow from one rule. Measured 2026-09-20 by printing the words bash
+# produces; the quoted spelling `find '/proc\registry'` keeps its backslash and is the one that
+# really reaches the registry mount.
 function Get-Operand([string]$Token) {
-    # Almost no token carries a quote, and this hook pays for its loops on every shell call.
-    if ($Token.IndexOf('"') -lt 0 -and $Token.IndexOf("'") -lt 0) { return $Token }
-    $sb = New-Object System.Text.StringBuilder
+    # Almost no token carries a quote or an escape, and this hook pays for its loops on every call.
+    if ($Token.IndexOf('"') -lt 0 -and $Token.IndexOf("'") -lt 0 -and
+        $Token.IndexOf('\') -lt 0) { return $Token }
+    $sb = [System.Text.StringBuilder]::new()
     $quote = $null
-    foreach ($ch in $Token.ToCharArray()) {
+    for ($n = 0; $n -lt $Token.Length; $n++) {
+        $ch = $Token[$n]
+        # Single quotes protect everything, the backslash included.
+        if ($quote -ceq "'") {
+            if ($ch -ceq "'") { $quote = $null } else { [void]$sb.Append($ch) }
+            continue
+        }
+        if ($ch -ceq '\') {
+            $next = if ($n + 1 -lt $Token.Length) { $Token[$n + 1] } else { $null }
+            if ($null -eq $quote) {
+                # Unquoted: the backslash guards the next character and is itself removed. A
+                # trailing one is a line continuation, so it leaves nothing behind.
+                if ($null -ne $next) { [void]$sb.Append($next); $n++ }
+                continue
+            }
+            # Inside double quotes bash keeps the backslash unless it guards one of " $ ` \ .
+            if ($next -ceq '"' -or $next -ceq '$' -or $next -ceq '`' -or $next -ceq '\') {
+                [void]$sb.Append($next); $n++; continue
+            }
+            [void]$sb.Append($ch)
+            continue
+        }
         if ($null -ne $quote) {
             if ($ch -ceq $quote) { $quote = $null } else { [void]$sb.Append($ch) }
             continue
@@ -237,7 +282,13 @@ function Get-Operand([string]$Token) {
 #                                                 exactly and costs no false deny
 #   /proc/../tmp          /tmp                 -- and so a `..` that leaves /proc must ALLOW again
 #   /proc\registry        the registry mount   -- listing it returned the six HKEY_* roots, so a
-#                                                 backslash really is a separator here
+#                                                 backslash IS a separator once a path has resolved
+#                                                 through the POSIX root. Reachable only QUOTED:
+#                                                 unquoted, bash eats the backslash (Get-Operand)
+#   /\proc  \proc  \       none of the above    -- a backslash in the leading position resolves
+#                                                 nothing, and a lone `\` is the current DRIVE root
+#                                                 rather than the MSYS one. So the conversion below
+#                                                 is anchored on a leading `/`
 #   //  //.               the NETWORK root     -- `ls //` listed `wsl$`. EXACTLY two leading slashes
 #                                                 are the UNC namespace, which is why they are NOT
 #                                                 collapsed and get their own verdict below
@@ -248,23 +299,15 @@ function Get-Operand([string]$Token) {
 #                                                 add false denies
 function Get-NormalizedPath([string]$Operand) {
     if (-not $Operand) { return $Operand }
-    # ***A BACKSLASH IS A SEPARATOR ONLY IN A TOKEN ALREADY SPELLED AS A PATH.*** In bash a lone
-    # backslash is an ESCAPE, so reading every `\` as `/` denies things that were never walks, and
-    # three were measured doing exactly that before this line went in: `find . \` (a line
-    # continuation) and `find . \( -name a -o -name b \)` (find's own grouping) both left a bare `\`
-    # in path position that folded to the root, and `find \proc` folded to /proc when bash would
-    # have handed find the relative name `proc`. Requiring a `/` or a `:` already in the token keeps
-    # the measured bypass -- `/proc\registry`, whose listing returned the six HKEY_* roots -- and
-    # costs no coverage: a leading backslash does not reach the MSYS root at all, measured the same
-    # day, `ls -d '\proc'` and `ls -d '\proc\registry'` both failing with No such file or directory.
-    $p = if ($Operand.IndexOf('/') -ge 0 -or $Operand.IndexOf(':') -ge 0) {
-        $Operand.Replace('\', '/')
-    } else { $Operand }
+    # The conversion is anchored on a LEADING SLASH, which is the one place the measurements above
+    # say a backslash reaches a walk root. `\`, `\proc` and `/\proc` were each driven at `ls` and
+    # resolved to nothing this guard is about, so folding them would only add false denies.
+    $p = if ($Operand.StartsWith('/')) { $Operand.Replace('\', '/') } else { $Operand }
     $prefix = ''
     if ($p -cmatch '^//(?!/)') { $prefix = '//' }
     elseif ($p.StartsWith('/')) { $prefix = '/' }
-    $parts = New-Object 'System.Collections.Generic.List[string]'
-    foreach ($seg in $p.Split([char]47)) {
+    $parts = [System.Collections.Generic.List[string]]::new()
+    foreach ($seg in $p.Split('/')) {
         if ($seg -ceq '' -or $seg -ceq '.') { continue }
         if ($seg -ceq '..') {
             if ($parts.Count -gt 0 -and $parts[$parts.Count - 1] -cne '..') {
@@ -285,13 +328,25 @@ function Get-NormalizedPath([string]$Operand) {
     return $joined
 }
 
-# The roots this guard exists for, and ONLY these. Returns 'msys' for the MSYS root or its synthetic
-# /proc (`/proc/<anything>` counts: a walk of one process's synthetic directory is the same pump,
-# just started lower down), 'net' for the MSYS network root, or $null for anything bounded.
+# The roots this guard exists for, and ONLY these. `/proc/<anything>` counts: a walk of one
+# process's synthetic directory is the same pump, just started lower down. STATED ONCE, because the
+# two callers below differ in what they FEED it and not in what a root is -- a copy in each would
+# let a later edit move one and leave the other, and the prune caller's disagreement would fail
+# open and silently (CLAUDE.md section 11).
+function Test-MsysRootSpelling([string]$Path) {
+    return ($Path -ceq '/') -or ($Path -ceq '/proc') -or $Path.StartsWith('/proc/')
+}
+
+# Returns 'msys' for the MSYS root or its synthetic /proc, 'net' for the MSYS network root, or
+# $null for anything bounded.
 function Get-WalkRootKind([string]$Operand) {
+    # A walk root is absolute, and the fold can only ever reach one from a leading `/` (the
+    # backslash rule above is anchored there too). Everything relative -- `.`, `./src`, `..`, a
+    # drive path -- is the common case, and this returns it without allocating anything.
+    if ($Operand.Length -eq 0 -or $Operand[0] -cne '/') { return $null }
     $p = Get-NormalizedPath $Operand
     if ($p -ceq '//') { return 'net' }
-    if (($p -ceq '/') -or ($p -ceq '/proc') -or $p.StartsWith('/proc/')) { return 'msys' }
+    if (Test-MsysRootSpelling $p) { return 'msys' }
     return $null
 }
 
@@ -300,9 +355,10 @@ function Get-WalkRootKind([string]$Operand) {
 # `/./proc` and never `/proc\`. Normalizing here would turn a pattern that matches NOTHING into an
 # exemption, and an exemption is the direction that fails open (the deny side can only over-deny,
 # which is visible; the suppression side goes silent). So `find / -path /./proc -prune -o -name x`
-# stays a DENY even though `/./proc` and `/proc` name the same directory.
+# stays a DENY even though `/./proc` and `/proc` name the same directory. The asymmetry lives in
+# the ARGUMENT -- folded there, literal here -- not in a second idea of what a root is.
 function Test-ProcPrunePattern([string]$Operand) {
-    return ($Operand -ceq '/') -or ($Operand -ceq '/proc') -or $Operand.StartsWith('/proc/')
+    return Test-MsysRootSpelling $Operand
 }
 
 try {
@@ -440,16 +496,15 @@ try {
                 if ($tk.StartsWith('#')) { break }
                 $exprTokens += $tk
             }
-            $pruned = $false
+            $prunePattern = $null
             for ($n = 0; $n -lt $exprTokens.Count - 1; $n++) {
                 if (($exprTokens[$n] -ieq '-path' -or $exprTokens[$n] -ieq '-wholename') -and
                     (Test-ProcPrunePattern (Get-Operand $exprTokens[$n + 1])) -and
                     ($exprTokens -ccontains '-prune')) {
-                    $pruned = $true
+                    $prunePattern = Get-Operand $exprTokens[$n + 1]
                     break
                 }
             }
-            if ($pruned) { continue }
 
             $k = $i + 1
             # find's own leading global options, which sit BEFORE the path operands. `-D` always
@@ -461,18 +516,27 @@ try {
             # option carrying a value with `=` that could sit in front of a path. So the whole of
             # find's option grammar is these three lines, and the path loop below starts where
             # they stop.
+            # `--` ends find's options, and GNU findutils really does accept it -- measured
+            # 2026-09-20, `find -- . -maxdepth 0` printed `.` and exited 0. Without this case the
+            # path loop below stopped at the leading `-`, and `find -- /proc -name x` was ALLOWED.
+            $endOfFindOptions = $false
             while ($k -lt $tokens.Count) {
                 $t = Get-Operand $tokens[$k]
+                if ($t -ceq '--') { $endOfFindOptions = $true; $k++; break }
                 if ($t -cmatch '^-[HLP]$') { $k++; continue }
                 if ($t -ceq '-D') { $k += 2; continue }
                 if ($t -cmatch '^-O') { $k++; continue }
                 break
             }
             # The path operands run until the expression starts. GNU find ends them at the first
-            # token that begins an expression: an option, a group, a negation or a comma.
+            # token that begins an expression: an option, a group, a negation or a comma. After a
+            # `--` the first operand is a path however it is spelled, so the leading-dash test is
+            # dropped for it alone.
             while ($k -lt $tokens.Count) {
                 $t = Get-Operand $tokens[$k]
-                if ($t.StartsWith('-') -or $t -ceq '(' -or $t -ceq '!' -or $t -ceq ',') { break }
+                if ((-not $endOfFindOptions -and $t.StartsWith('-')) -or
+                    $t -ceq '(' -or $t -ceq '!' -or $t -ceq ',') { break }
+                $endOfFindOptions = $false
                 $kind = Get-WalkRootKind $t
                 if ($kind -ceq 'net') {
                     Deny ("BLOCKED: 'find $t' walks the MSYS network root. " + $WHY_NET +
@@ -480,6 +544,18 @@ try {
                           "mean and bound the depth, as in 'find //server/share -maxdepth 3'.")
                 }
                 if ($kind -ceq 'msys') {
+                    # ***THE PRUNE EXEMPTION IS SCOPED TO THE ROOT IT CAN ACTUALLY BOUND, AND IT IS
+                    # CHECKED HERE RATHER THAN BEFORE THE LOOP.*** find builds the path it tests by
+                    # appending to the LITERAL root you gave it, so `-path P` can match something
+                    # only when P starts with that literal root. Exempting on the pattern alone was
+                    # measured letting four walks through: `find /. -path /proc -prune -o -name x
+                    # -print` generates `/./proc`, the glob matches nothing, and the registry walk
+                    # ran -- and this guard's own deny message hands the agent that exact text, so
+                    # an agent following the advice landed there. Same for `find /proc/.`,
+                    # `find /tmp/..` and `find /proc/registry -path /proc -prune`. The 'net' arm
+                    # above is deliberately decided FIRST: there is no /proc under the UNC
+                    # namespace, so pruning it bounds nothing there.
+                    if ($null -ne $prunePattern -and $prunePattern.StartsWith($t)) { $k++; continue }
                     Deny ("BLOCKED: 'find $t' walks the MSYS root. " + $WHY +
                           "Do one of these instead: use the Glob tool; or name a real root and " +
                           "bound the depth, as in 'find ./src -maxdepth 4 -name *.py'; or put " +
@@ -516,9 +592,15 @@ try {
                     $eq = $t.IndexOf('=')
                     $name = if ($eq -ge 0) { $t.Substring(0, $eq) } else { $t }
                     $attached = if ($eq -ge 0) { $t.Substring($eq + 1) } else { $null }
-                    if ($name -imatch '^--(recursive|dereference-recursive)$') { $recursive = $true }
-                    if ($name -ieq '--directories' -and $null -ne $attached -and
-                        $attached -ieq 'recurse') { $recursive = $true }
+                    # Long option NAMES are compared case-sensitively, like getopt_long's own
+                    # table: `grep --RECURSIVE foo /proc` is an unrecognised option that walks
+                    # nothing, and denying it would hand the reader the registry cause for a
+                    # command that never ran. The VALUE stays case-insensitive, which can only
+                    # over-deny.
+                    if ($name -cmatch '^--(recursive|dereference-recursive)$') { $recursive = $true }
+                    if ($name -ceq '--directories' -and $attached -ieq 'recurse') {
+                        $recursive = $true
+                    }
                     if ($name -cmatch $GREP_PATTERN_OPTS) { $patternTaken = $true }
                     $k++
                     if ($null -eq $attached -and $name -cmatch $GREP_VALUE_OPTS -and
@@ -528,7 +610,7 @@ try {
                         # spelling let `grep --directories recurse pattern /proc` through: the
                         # value was consumed here without being read, so the scan saw an
                         # option-only grep and never set $recursive.
-                        if ($name -ieq '--directories' -and
+                        if ($name -ceq '--directories' -and
                             (Get-Operand $tokens[$k]) -ieq 'recurse') { $recursive = $true }
                         $k++
                     }
