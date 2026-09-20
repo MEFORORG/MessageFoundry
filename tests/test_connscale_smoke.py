@@ -473,8 +473,10 @@ async def smoke_report() -> ConnScaleReport:
 # --- the properties, ONE NAME EACH ----------------------------------------------------------------
 #
 # BACKLOG #1331: these were one test named ``test_connscale_smoke_end_to_end`` over at least six
-# separate properties. It sits on three of the thirteen required contexts, so every occurrence is
-# merge-blocking -- and because one name covered all of them, TWO SEATS HITTING IT TWICE SAW TWO
+# separate properties. It sits on the `test` matrix contexts, which branch protection requires, so
+# every occurrence is merge-blocking (that count was written as "three of the thirteen" and the
+# denominator has since moved; `.github/required-contexts.txt` is the live answer) -- and because one
+# name covered all of them, TWO SEATS HITTING IT TWICE SAW TWO
 # UNRELATED BUGS RATHER THAN ONE RECURRING PROBLEM, and nobody owned it. The assertions below are
 # UNCHANGED; only their names are new. A failing context now says which property broke without
 # anyone reading the module.

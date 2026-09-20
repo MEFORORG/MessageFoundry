@@ -118,7 +118,8 @@ def test_raise_fstring_ignores_literal_only_concatenation(tmp_path: Path) -> Non
 
 
 def test_raise_fstring_ignores_bare_name_message(tmp_path: Path) -> None:
-    """``raise ValueError(msg)`` stays unflagged: a bare ``Name`` is resolved nowhere.
+    """``raise ValueError(msg)`` stays unflagged: this check passes no scope ``env``, so a bare
+    ``Name`` is not followed.
 
     A deliberate false negative, pinned so it cannot move silently. Reaching the interpolation that
     built ``msg`` is scope resolution, a separate concern from which message shapes this check reads.
@@ -171,3 +172,23 @@ def test_raise_fstring_ignores_argless_format_call(tmp_path: Path) -> None:
     result = _check_raise_fstring(tmp_path)
     assert result.ok is True and result.skipped is True
     assert "no interpolated raises" in result.detail
+
+
+def test_raise_fstring_flags_call_wrapped_interpolation(tmp_path: Path) -> None:
+    """A call wrapping an interpolation flags; a call wrapping a field read does not.
+
+    The shared predicate reads a call's arguments and receiver, so ``f"p {x}".upper()`` reaches the
+    f-string. ``str(msg["PID-5"])`` reaches only a subscript, which the predicate does not count, so
+    it stays the under-flag the check's docstring records. Both lines sit in one file so the pair
+    shows the rule, not two files the scanner might read differently.
+    """
+    _write(
+        tmp_path / "wrapped.py",
+        "def f(x, msg):\n"
+        "    raise ValueError(f'p {x}'.upper())\n"
+        "    raise ValueError(str(msg['PID-5']))\n",
+    )
+    result = _check_raise_fstring(tmp_path)
+    assert result.ok is True and result.skipped is False
+    assert "wrapped.py:2" in result.detail
+    assert "wrapped.py:3" not in result.detail

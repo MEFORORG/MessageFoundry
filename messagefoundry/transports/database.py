@@ -163,8 +163,10 @@ def _build_dsn(s: dict[str, Any], *, read_only: bool = False, attested: bool = F
     ``read_only`` (only the db_lookup pool sets it; destination/source omit it, keeping their DSN
     byte-identical) appends ``ApplicationIntent=ReadOnly`` so the connection advertises read-only intent
     — defense-in-depth for the ADR 0010 read-only carve-out, layered with the statement guard in
-    :func:`_require_read_only` (note: ApplicationIntent is only honored by a SQL Server Always-On read
-    replica, a no-op otherwise — the statement guard is the load-bearing control)."""
+    :func:`_require_read_only`. **Neither layer is read-only authority.** ApplicationIntent is honored
+    only by a SQL Server Always-On read replica and is a no-op otherwise, and a statement guard is a
+    shape test on text. The control that actually refuses a write is the privilege of the account this
+    DSN dials, which only the operator can set (``docs/CONNECTIONS.md``, BACKLOG #1574)."""
     encrypt = bool(s.get("encrypt", True))
     trust = bool(s.get("trust_server_certificate", False))
     if (trust or not encrypt) and not _weakened_tls_permitted(attested=attested):
@@ -557,50 +559,146 @@ def _build_connection(
     raise ValueError(f"DATABASE dialect must be 'sqlserver' or 'generic', got {dialect!r}")
 
 
-# A leading SQL line comment (`-- ...` to end of line) or block comment (`/* ... */`). Stripped (with
-# leading whitespace) before the read-only check so a commented preamble can't mask a write statement.
-_SQL_LEADING_COMMENT_RE = re.compile(r"^\s*(?:--[^\n]*\n|/\*.*?\*/)", re.DOTALL)
+# One bare SQL word token. The T-SQL sigils (`@var`, `@@ROWCOUNT`, `#temp`) are part of the token, so
+# `#delete` reads as one identifier rather than as the `DELETE` keyword.
+_SQL_WORD_RE = re.compile(r"[@#]{0,2}[A-Za-z_][A-Za-z0-9_$#@]*")
+
+# Write/authority keywords refused anywhere outside a string literal, a quoted identifier or a comment.
+# `INTO` is here because `SELECT ... INTO copy` writes a table while still opening with `SELECT`; the
+# CTE-terminal forms (`WITH c AS (...) DELETE ...`) fall to the same scan. DDL is included for the
+# reason a chained `DROP` is refused: a lookup has no business carrying it.
+_SQL_WRITE_KEYWORDS = frozenset(
+    {
+        "ALTER",
+        "CREATE",
+        "DELETE",
+        "DENY",
+        "DROP",
+        "EXEC",
+        "EXECUTE",
+        "GRANT",
+        "INSERT",
+        "INTO",
+        "MERGE",
+        "REVOKE",
+        "TRUNCATE",
+        "UPDATE",
+    }
+)
+
+# Keywords that are also ordinary scalar FUNCTIONS in at least one supported dialect, so a `(` directly
+# after one means a call rather than a statement: MySQL has `INSERT(str,pos,len,new)` and
+# `TRUNCATE(n,d)`. `EXEC`/`EXECUTE` are deliberately NOT here — T-SQL `EXEC('...')` is dynamic SQL,
+# the exact shape this gate exists to refuse.
+_SQL_FUNCTION_FORM_KEYWORDS = frozenset({"INSERT", "TRUNCATE"})
+
+_READ_ONLY_MESSAGE = (
+    "db_lookup statement must be a read-only SELECT/WITH query "
+    "(no writes, no EXEC, no multiple statements)"
+)
+
+
+def _scan_sql_tokens(statement: str) -> list[tuple[str, str]]:
+    """Tokenize ``statement`` into ``(kind, text)`` pairs, dropping comments and the contents of string
+    literals and quoted identifiers.
+
+    ``kind`` is ``"word"`` (text upper-cased) or ``"other"`` (one character, ``;`` included).
+    Single-quoted strings and double-quoted / ``[...]``-bracketed / backtick-quoted identifiers are
+    consumed whole, doubled-delimiter escapes included, so a keyword *inside* one is data and never a
+    token. T-SQL block comments nest, so the scan tracks depth.
+
+    An unterminated literal or comment raises :class:`DbLookupError`: the rest of such a statement
+    cannot be read, and guessing at it is how a shape-based gate gets bypassed."""
+    tokens: list[tuple[str, str]] = []
+    i, n = 0, len(statement)
+    while i < n:
+        ch = statement[i]
+        if ch.isspace():
+            i += 1
+            continue
+        if statement.startswith("--", i):
+            nl = statement.find("\n", i)
+            i = n if nl == -1 else nl + 1
+            continue
+        if statement.startswith("/*", i):
+            depth, i = 1, i + 2
+            while i < n and depth:
+                if statement.startswith("/*", i):
+                    depth, i = depth + 1, i + 2
+                elif statement.startswith("*/", i):
+                    depth, i = depth - 1, i + 2
+                else:
+                    i += 1
+            if depth:
+                raise DbLookupError(f"{_READ_ONLY_MESSAGE}; unterminated block comment")
+            continue
+        if ch in "'\"[`":
+            closer = "]" if ch == "[" else ch
+            i += 1
+            while True:
+                if i >= n:
+                    raise DbLookupError(f"{_READ_ONLY_MESSAGE}; unterminated quoted text")
+                if statement[i] == closer:
+                    if i + 1 < n and statement[i + 1] == closer:  # doubled = an escaped delimiter
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+            continue
+        m = _SQL_WORD_RE.match(statement, i)
+        if m:
+            tokens.append(("word", m.group(0).upper()))
+            i = m.end()
+            continue
+        tokens.append(("other", ch))
+        i += 1
+    return tokens
 
 
 def _require_read_only(statement: str) -> None:
     """Enforce the ADR 0010 db_lookup read-only carve-out at the statement layer (defense-in-depth with
     ``ApplicationIntent=ReadOnly`` + a recommended ``db_datareader``-only login).
 
-    After stripping any leading SQL comments/whitespace the statement must begin (case-insensitive) with
-    ``SELECT`` or ``WITH`` and must not chain a second statement (a ``;`` followed by more SQL). This is
-    a conservative lightweight gate, not a full SQL parser: it blocks ``INSERT``/``UPDATE``/``DELETE``/
-    ``MERGE``/``EXEC`` and multi-statement smuggling so a crash-replay of the transform can't silently
-    double-apply a write the at-least-once reliability model assumes is impossible. Raises
-    :class:`DbLookupError` (PHI-free — never echoes the statement text) on violation."""
-    stripped = statement
-    while True:
-        m = _SQL_LEADING_COMMENT_RE.match(stripped)
-        if not m:
-            break
-        stripped = stripped[m.end() :]
-    stripped = stripped.lstrip()
-    head = stripped[:6].upper()
-    if not (head.startswith("SELECT") or head.startswith("WITH")):
-        raise DbLookupError(
-            "db_lookup statement must be a read-only SELECT/WITH query "
-            "(no writes, no EXEC, no multiple statements)"
-        )
-    # Reject a chained second statement: any ';' followed by non-whitespace/non-comment text. A single
-    # trailing ';' (optionally followed by whitespace/comments) is fine.
-    for idx, ch in enumerate(stripped):
-        if ch != ";":
+    The statement is tokenized (:func:`_scan_sql_tokens`), so comments, string literals and quoted
+    identifiers are skipped, and then three rules apply:
+
+    1. it must *begin* (after comments and whitespace) with the word ``SELECT`` or ``WITH``;
+    2. no write or authority keyword (at least ``INSERT``/``UPDATE``/``DELETE``/``MERGE``/``INTO``/
+       ``EXEC``, plus DDL — :data:`_SQL_WRITE_KEYWORDS`) may appear outside a literal or a comment;
+    3. nothing may follow a ``;`` (no chained second statement); a trailing one is fine.
+
+    Rule 2 is what makes this a read-only test rather than a leading-token test. Opening with ``SELECT``
+    or ``WITH`` never implied the rest was a read: ``SELECT * INTO copy FROM patients`` writes a table,
+    ``WITH c AS (...) DELETE FROM patients`` writes through a CTE, and T-SQL needs no ``;`` between
+    statements, so ``SELECT 1 UPDATE patients SET mrn='X'`` is two statements that rule 3 cannot see.
+    All three passed the former leading-token gate (BACKLOG #1574, #1658).
+
+    This is still a lightweight gate and not a SQL parser, and a statement test is not read-only
+    *authority*: a keyword scan cannot follow a write executed on a linked server through a
+    pass-through literal, so the account itself should be read-only (``docs/CONNECTIONS.md``). Raises
+    :class:`DbLookupError` on violation. The message stays PHI-free — it never echoes statement text,
+    and any keyword it names comes from the fixed vocabulary above, never from operator data."""
+    tokens = _scan_sql_tokens(statement)
+    if not tokens or tokens[0] not in (("word", "SELECT"), ("word", "WITH")):
+        raise DbLookupError(_READ_ONLY_MESSAGE)
+    last = len(tokens) - 1
+    for index, (kind, text) in enumerate(tokens):
+        if kind != "word":
+            # A ';' is tolerated only as the final token (a statement terminator); anything after one
+            # is a second statement, whatever that statement starts with.
+            if text == ";" and index != last:
+                raise DbLookupError(_READ_ONLY_MESSAGE)
             continue
-        rest = stripped[idx + 1 :]
-        while True:
-            m = _SQL_LEADING_COMMENT_RE.match(rest)
-            if not m:
-                break
-            rest = rest[m.end() :]
-        if rest.strip():
-            raise DbLookupError(
-                "db_lookup statement must be a read-only SELECT/WITH query "
-                "(no writes, no EXEC, no multiple statements)"
-            )
+        if text not in _SQL_WRITE_KEYWORDS:
+            continue
+        if (
+            text in _SQL_FUNCTION_FORM_KEYWORDS
+            and index != last
+            and tokens[index + 1] == ("other", "(")
+        ):
+            continue  # a scalar function call that shares the keyword's name, not a statement
+        raise DbLookupError(f"{_READ_ONLY_MESSAGE}; found a '{text}' keyword")
     return None
 
 
@@ -1464,12 +1562,26 @@ class DatabaseLookupExecutor:
     ``DatabaseLookup`` specs (``env()``-resolved + ``[egress].allowed_db``-checked by the runner). Lazily
     opens one read-only ``aioodbc`` pool per named connection; :meth:`query` runs on the engine loop,
     while ``db_lookup`` bridges to it from the handler's worker thread via ``run_coroutine_threadsafe``.
-    Reuses the DATABASE connector's DSN build / named-parameter translation / SQLSTATE extraction. Pools
-    are autocommit — a lookup is read-only, so each query is its own implicit transaction; nothing here
-    writes. **Read-only is enforced** (ADR 0010), not merely documented: every statement is gated by
-    :func:`_require_read_only` (must begin SELECT/WITH, no chained writes/EXEC) and the pool DSN carries
-    ``ApplicationIntent=ReadOnly`` (``_build_dsn(read_only=True)``). Production / supported (SQL Server
-    via the ``[sqlserver]`` extra), like the DATABASE connector."""
+    Reuses the DATABASE connector's DSN build / named-parameter translation / SQLSTATE extraction.
+
+    **Read-only here is a statement test, not read-only authority, and the difference is load-bearing.**
+    Two layers sit in front of a lookup: :func:`_require_read_only` refuses a statement that does not
+    open with SELECT/WITH or that carries a write/EXEC keyword or a chained statement, and the pool DSN
+    carries ``ApplicationIntent=ReadOnly`` (``_build_dsn(read_only=True)``). Neither is authority.
+    ApplicationIntent is honored only by a SQL Server Always-On read replica and is a no-op elsewhere
+    (:func:`_build_dsn`), and pools here are opened **autocommit**, so a write that got past the
+    statement test would commit rather than be rolled back. What actually bounds this connection is the
+    privilege of the account it dials, which only the operator can set — see ``docs/CONNECTIONS.md``
+    (BACKLOG #1574). ADR 0010 states the same shape as a read-only *convention*: "the executor neither
+    commits nor exposes a write path."
+
+    Pools are autocommit because each lookup is a single self-contained read; T-SQL has no
+    ``SET TRANSACTION READ ONLY``, so there is no read-only transaction to open in its place.
+
+    Production / supported (SQL Server via the ``[sqlserver]`` extra), like the DATABASE connector.
+    ``db_lookup`` is SQL-Server-only: ``__init__`` calls :func:`_build_dsn` directly rather than the
+    :func:`_build_connection` dialect dispatcher, so the ``generic`` ODBC dialect the DATABASE connector
+    accepts is not reachable from here (ADR 0010, "SQL Server backend only")."""
 
     def __init__(self, connections: Mapping[str, Mapping[str, Any]]) -> None:
         # connections: name -> already-env-resolved settings (the runner substitutes env() first).
@@ -1518,8 +1630,10 @@ class DatabaseLookupExecutor:
         """Run ``statement`` against ``connection`` and return rows as ``{column: value}`` dicts.
 
         Always parameterized (``:name`` → positional ``?``, bound from ``params`` — a value can never
-        inject SQL) and **read-only enforced** (the statement must be a SELECT/WITH query — see
-        :func:`_require_read_only`). Raises :class:`DbLookupError` (PHI-free) on an unknown connection, a
+        inject SQL) and statement-gated: the text must pass :func:`_require_read_only` (a SELECT/WITH
+        query carrying no write keyword and no second statement) before anything executes. That gate is
+        a statement test, not read-only authority — see this class's docstring for what actually bounds
+        the connection. Raises :class:`DbLookupError` (PHI-free) on an unknown connection, a
         non-read-only statement, a missing parameter, or a DB/driver error — the transform worker turns
         it into that message's ``ERROR`` /
         dead-letter disposition. Runs on the engine loop (the handler thread bridges in via

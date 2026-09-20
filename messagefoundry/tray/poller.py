@@ -55,7 +55,7 @@ class Tracking:
     """Cross-tick memory the pure :func:`advance` carries forward (monotonic timestamps)."""
 
     running_since: float | None = None  # when SCM was first seen RUNNING this run
-    pending_since: float | None = None  # when the current pending state was entered
+    pending_since: float | None = None  # last reported progress in the current pending state
     last_checkpoint: int | None = None
     last_scm: ScmState | None = None
 
@@ -91,7 +91,8 @@ def advance(
 
     ``now`` must be a monotonic clock value. Grace windows are elapsed = ``now - since``; the boot
     grace is keyed to when SCM *entered* RUNNING (not to a user action), so a normal boot or NSSM
-    auto-restart does not flash WEDGED.
+    auto-restart does not flash WEDGED. The pending clock is keyed to the last *reported progress*,
+    so a healthy slow start that keeps advancing its checkpoint never ages into WEDGED.
     """
     st = reading.state
     prev = tracking.last_scm
@@ -103,12 +104,21 @@ def advance(
     )
 
     same_pending = st in _PENDING and prev is st
-    pending_since = (tracking.pending_since if same_pending else now) if st in _PENDING else None
 
     if same_pending and tracking.last_checkpoint is not None:
         checkpoint_advancing = reading.checkpoint > tracking.last_checkpoint
     else:
         checkpoint_advancing = True  # a freshly-entered pending state is assumed to be progressing
+
+    # ``dwWaitHint`` is the service's estimate for the NEXT checkpoint, not for the whole
+    # transition (Microsoft's DoStartSvc contract), so the pending clock re-anchors each time the
+    # checkpoint increases. Increase-only (``>`` above, never ``>=``): a service that reports the
+    # same checkpoint forever keeps its first anchor and still ages past the hint into WEDGED.
+    # ``checkpoint_advancing`` is the whole condition -- it is False only on a same-pending tick.
+    # STOP_PENDING re-anchors too, harmlessly: derive_state maps it to STOPPING either way.
+    pending_since = (
+        (now if checkpoint_advancing else tracking.pending_since) if st in _PENDING else None
+    )
 
     inputs = ProbeInputs(
         scm=st,

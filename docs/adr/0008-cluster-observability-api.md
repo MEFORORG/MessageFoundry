@@ -1,6 +1,7 @@
 # ADR 0008 — Read-only cluster observability API (`/cluster/status` + `/cluster/nodes`)
 
-- **Status:** Proposed (2026-06-14) — drafted on the owner's go; ratified-on-build. Closes the last
+- **Status:** Accepted (2026-06-14) — drafted on the owner's go and **ratified-on-build**; the build shipped
+  with this ADR, so the ratification condition is met. Closes the last
   Track B HA-clustering step: the coordination built in Steps 3–6b had no operator-visible surface.
   *(Update 2026-06-18: the horizontal **active-active** scale-out feature was dropped and its code
   removed — per-lane FIFO ownership / Step 5 below is gone, see the note there. The cluster is the

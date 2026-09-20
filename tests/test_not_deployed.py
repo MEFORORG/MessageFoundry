@@ -186,9 +186,11 @@ async def test_engine_starts_clean_with_a_not_deployed_outbound(store: MessageSt
     await runner.start()
     try:
         assert runner.running
-        assert runner.degraded_connections() == {}  # NOT degraded — the whole point
-        assert runner.connection_failed("OB_OFF") is None
-        assert runner.connection_filtered("OB_OFF") is None
+        assert (
+            not runner.degraded_inbound() and not runner.degraded_outbound()
+        )  # NOT degraded — the whole point
+        assert runner.outbound_failed("OB_OFF") is None
+        assert runner.outbound_filtered("OB_OFF") is None
         assert "OB_OFF" not in runner._destinations  # env() never resolved, no connector built
         assert runner.outbound_status("OB_OFF") == "stopped"
         assert not runner.outbound_running("OB_OFF")
@@ -240,7 +242,7 @@ async def test_not_deployed_inbound_is_not_bound_but_still_drains_its_backlog(
     await runner.start()
     try:
         assert not runner.inbound_running("IB")  # the listener is NOT bound
-        assert runner.connection_failed("IB") is None  # and that is not a fault
+        assert runner.inbound_failed("IB") is None  # and that is not a fault
         assert "IB" in runner._router_workers  # but the workers ARE armed...
         assert "IB" in runner._transform_workers
         # ...so the in-flight backlog drains all the way to the deployed destination.
@@ -270,7 +272,7 @@ async def test_deployed_false_wins_over_auto_start(store: MessageStore, tmp_path
         assert "OB_OFF" not in runner._workers  # the auto_start branch WOULD have spawned one
         assert "OB_OFF" not in runner._destinations
         assert not runner.inbound_running("IB_OFF")
-        assert runner.degraded_connections() == {}
+        assert not runner.degraded_inbound() and not runner.degraded_outbound()
     finally:
         await runner.stop()
 
@@ -547,7 +549,7 @@ async def test_operator_start_refuses_a_not_deployed_connection(
         # The refusal left nothing half-wired: no connector, no listener, no env() resolved.
         assert "OB_OFF" not in runner._destinations
         assert not runner.inbound_running("IB_OFF")
-        assert runner.degraded_connections() == {}
+        assert not runner.degraded_inbound() and not runner.degraded_outbound()
     finally:
         await runner.stop()
 
@@ -770,7 +772,8 @@ async def test_operator_start_restart_refuses_not_deployed_with_409(tmp_path: Pa
         # The refusals left nothing half-wired.
         assert "OB_OFF" not in engine.registry_runner._destinations  # type: ignore[union-attr]
         assert not engine.registry_runner.inbound_running("IB_OFF")  # type: ignore[union-attr]
-        assert engine.registry_runner.degraded_connections() == {}  # type: ignore[union-attr]
+        assert not engine.registry_runner.degraded_inbound()  # type: ignore[union-attr]
+        assert not engine.registry_runner.degraded_outbound()  # type: ignore[union-attr]
     finally:
         await engine.stop()
 

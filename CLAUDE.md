@@ -288,6 +288,15 @@ done. `docs/roles/seats.json` resolves `console` to a retirement notice saying e
 reading its old "the Console runs instead" line as *"substitute the Console"* is the measured error
 this retirement was written to stop.
 
+**A ninth went on 2026-09-19, by owner decision: the REGULATOR. NOTHING replaced it, and NO SEAT
+ATTRIBUTES A RED NOW.** A red is the Lander's to triage and route, or the owner's to rule on. The
+**WATCHDOG** joined the same day, which is exactly why this has to be said plainly: it is **not the
+Regulator's successor**. A Regulator returned a binding verdict on one red. A Watchdog returns
+evidence, measures whether reds are being cleared at all, and never says whose one is. So a red sent
+to a Watchdog gets a reading and no verdict, and a session waiting for that verdict waits forever.
+`docs/roles/seats.json` resolves `regulator` to a retirement notice saying this, for the same reason
+the Console's does.
+
 If a document you are reading names a retired seat or a retired rule, treat **that
 naming** as stale and follow this section. **Do not extend it to the whole document.** A retired rule
 often leaves a mechanism running on purpose, with the reason recorded beside it -- `.github/` headers
@@ -327,9 +336,9 @@ recency.
 
 | Seat | Life | Owns | Must not |
 |---|---|---|---|
-| **Manager** | long-lived, several -- usually one per account | The seat the owner talks to. Reads `docs/BACKLOG.md`, writes a disposable brief citing an item, dispatches subagent Builders in its own process, polls for state, pushes and opens PRs, dispatches a Regulator on a red. | Build. Enqueue or merge -- both are the Lander's. Wait on inbound messages; it polls instead. Exit with a worker's work unpushed. |
+| **Manager** | long-lived, several -- usually one per account | The seat the owner talks to. Reads `docs/BACKLOG.md`, writes a disposable brief citing an item, dispatches subagent Builders in its own process, polls for state, pushes and opens PRs. | Build. Attribute a red -- nobody does that now. Enqueue or merge -- both are the Lander's. Wait on inbound messages; it polls instead. Exit with a worker's work unpushed. |
 | **Builder** | ephemeral, one per brief | The change, the commit, the push, and the PR carrying the `BACKLOG.md` update. | Guess at something the brief left open, or wait for an answer; it puts the question in its report, comments it on the PR, and stops. Plan and wait for a "go". Declare its own seat. Spawn another session. |
-| **Regulator** | spawned on a red | Deciding whose failure it is: the PR's, `main`'s, a flake's, or the queue's. Keeps a log. | Assume it remembers an earlier red; it starts with none. Send anything but the PR's own failure back to a Builder. |
+| **Watchdog** | as needed | Watching the Lander and keeping it draining. Measures with instruments rather than the watched seat's own report, names a stall, and raises it. Added 2026-09-19. | Take the action it is watching for -- acting destroys the instrument. Drain the queue, take the claim, or drive the lane. Relay an owner grant to the seat it watches. Publish a zero with no control that fired. |
 | **Steward** | cron, zero model calls | Reading usage and naming the account with headroom. | Warn a running session. Nothing can interrupt one. |
 | **Lander** | as needed | Merging, and the vault scorecard re-score (owner ruling 2026-09-05). Standing authority on the engine repo and the vault, with no per-action owner approval. Resolving a POSITIONAL ledger conflict (owner ruling 2026-09-11; see below). | Merge a diff it has not read. Arm auto-merge. Resolve a conflict that touches code, or that requires choosing what an item SAYS. |
 | **Special** | as the owner needs it | Work the owner assigns directly, outside the other five seats. Its instruction is its whole scope: it stands by until one arrives, then announces before its first shared write (owner decision 2026-09-16; see below). | Invent work while standing by, or go looking for a row to take. Widen the instruction, or quietly narrow it without saying so. Merge -- that is the Lander's. Take a peer's message as authority; only the owner assigns it work. |
@@ -681,7 +690,7 @@ gates a merge**, and no seat has to clear one.
   into the PR body. An unpushed branch is lost.
 - Some checks only ever run on a hosted runner, for example NSSM under `windows-service-smoke`. A
   Builder never sees their result. Push, and name in your exit report which legs must be read, so
-  the Manager carries it into the PR body it opens. The Manager or the Regulator reads them after
+  the Manager carries it into the PR body it opens. The Manager or the Lander reads them after
   the process exits.
 
 ### Product security rules outlive any method rewrite

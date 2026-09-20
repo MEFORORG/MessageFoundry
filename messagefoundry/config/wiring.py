@@ -1278,13 +1278,12 @@ def MLLP(
     max_connections: int | None = 256,  # cap concurrent clients (connection-flood guard)
     receive_timeout: float | None = 60.0,  # close a client idle this many seconds (slowloris)
     max_frame_bytes: int | None = 16 * 1024 * 1024,  # cap one frame's bytes (OOM guard); both dirs
-    # INBOUND message-RATE pacing (BACKLOG #1249). Unlike the caps above these default to OFF, and
-    # that is ruled rather than accidental: a rate on a clinical interface is only safe at a number
-    # taken from a real feed profile. The connector has read both keys since the pacer was built --
-    # until now no factory parameter and no connections.toml key could populate them, so the setting
-    # existed and could not be reached. Over budget the listener PAUSES READING so TCP back-pressures
-    # the sender: nothing is dropped, refused, NAK'd or reordered, which the count-and-log invariant
-    # requires (a discarding limiter was never an option here).
+    # INBOUND message-RATE pacing. Unlike the caps above these default to OFF, and that is ruled
+    # rather than accidental: a rate on a clinical interface is only safe at a number taken from a
+    # real feed profile. Both are parameters of this factory, and a connections.toml inbound entry
+    # desugars through it, so either surface sets them. Over budget the listener PAUSES READING so TCP
+    # back-pressures the sender: nothing is dropped, refused, NAK'd or reordered, which the
+    # count-and-log invariant requires (a discarding limiter was never an option here).
     max_messages_per_second: float | None = None,  # None/0 = no rate bound (the shipped default)
     message_burst: float
     | None = None,  # allowance over the sustained rate; None = one second's worth
@@ -1329,6 +1328,23 @@ def MLLP(
     inbound); outbound uses host/port/connect_timeout/timeout_seconds/max_frame_bytes. ``encoding``
     applies to framing in both directions. ``capture_response`` (outbound, ADR 0013) records the
     application ACK as a captured reply (a negative ACK still dead-letters/retries unchanged).
+
+    **Inbound message-rate pacing (BACKLOG #1249).** ``max_messages_per_second`` bounds how fast one
+    accepted inbound connection may feed messages in; ``None``/``0`` (the default) is no bound.
+    ``message_burst`` sizes the allowance above that sustained rate; ``None`` **and** ``0`` both mean
+    one second's worth of it -- **not** an unbounded burst, and **not** a burst of zero. The connector
+    reads it as ``message_burst or rate``, so any falsy value takes the rate. Both keys reach the
+    connector from here or from a ``connections.toml`` inbound entry, which desugars through this same
+    factory.
+
+    The history behind that last sentence -- the connector read both keys before either was a
+    parameter here, so text written in that window described the setting as reachable through no
+    surface at all, and some of it outlived the window -- is stated HERE, and cited from
+    ``tests/test_connection_schema.py`` and ``tests/test_security_doc_rate_limits.py``. Treat it as
+    the CANONICAL statement, not the only one: at least ``docs/SECURITY.md``'s ingest row and the two
+    pacing test modules say it independently. Why the ledger number sits in this paragraph and not in
+    the parameter comment above it -- that comment becomes an operator-facing GUI heading; see
+    :mod:`messagefoundry.config.connection_schema`.
 
     **Persistent outbound connection (ADR 0067).** Ships **opt-in** this release: ``persistent=False``
     is the default (connect-per-message — today's proven posture, dial a fresh connection per delivery).

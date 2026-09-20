@@ -88,8 +88,22 @@
 REMOTE=$(git config --get mefor.durabilityRemote 2>/dev/null)
 [ -n "$REMOTE" ] || exit 0
 
-URL=$(git remote get-url "$REMOTE" 2>/dev/null)
-[ -n "$URL" ] || exit 0
+# EVERY URL THE PUSH COULD USE, NOT THE ONE A READER ASSUMES. `git remote get-url` returns
+# remote.<name>.url -- the FETCH url -- while the `git push` at the foot of this script resolves
+# remote.<name>.pushurl when one is set. Reading only the fetch url left the entire refusal
+# bypassable by one config line: `git remote set-url --push <name> <public>` on an otherwise private
+# remote force-pushed a rescue tag to the public repository on every commit, and this guard printed
+# nothing. Measured 2026-09-19 with two local bare repos: with the public spelling as the fetch url
+# the hook refused; moved to the pushurl, the same spelling reached the push with no refusal.
+#
+# So collect both sets and refuse if ANY of them names the public repository. `--push --all` falls
+# back to the fetch url when no pushurl is configured, so the two overlap in the ordinary case and
+# a duplicate costs one extra comparison.
+URLS=$(
+  git remote get-url --all "$REMOTE" 2>/dev/null
+  git remote get-url --push --all "$REMOTE" 2>/dev/null
+)
+[ -n "$URLS" ] || exit 0
 
 # Hard refusal for the canonical PUBLIC remote. This is a named-target check, not a general
 # visibility test -- there is no offline visibility test. It exists because the most likely
@@ -101,15 +115,65 @@ URL=$(git remote get-url "$REMOTE" 2>/dev/null)
 # prefix glob, so the hook began refusing the PRIVATE remote as though it were the public one --
 # and because the refusal is `exit 0`, every commit still succeeded with durability silently OFF.
 # The two repositories are now one suffix apart under one owner, so nothing before the end of the
-# path distinguishes them. Anchor on the end, and accept only the spellings git actually stores.
-case "$URL" in
-  *MEFORORG/MessageFoundry | *MEFORORG/MessageFoundry.git | *MEFORORG/MessageFoundry/)
-    echo "durability_push: REFUSING -- mefor.durabilityRemote names the canonical PUBLIC repo." >&2
-    echo "  A push there is publication, which is the gate this hook exists to avoid tripping." >&2
-    echo "  Nominate a private remote instead, then re-commit." >&2
-    exit 0
-    ;;
-esac
+# path distinguishes them.
+#
+# ANCHORING ALONE LEFT THE OTHER DIRECTION OPEN, AND THAT ONE IS WORSE. The first fix matched three
+# literal spellings, so `https://github.com/mefororg/messagefoundry.git` -- the same public
+# repository, differing only in case -- was ACCEPTED and pushed. Measured 2026-09-19 against the
+# then-current script. Over-refusing turns durability off quietly; under-refusing opens the
+# unreviewed publication path this guard is the only thing standing in front of, and GitHub resolves
+# owner and name case-insensitively, so that URL reaches the same repository.
+#
+# So normalise, then compare whole. One repository has several legitimate spellings -- https, ssh,
+# `git://`, scp-style `host:owner/name`, with or without `.git`, with or without a trailing slash --
+# and `.wiki` is stripped because a public repository's wiki is public too.
+#
+# NOT COVERED, DELIBERATELY: the host is not examined, so any host serving this owner and name is
+# refused exactly as before; and a GitHub rename redirect is invisible offline, per the header.
+# Everything this does not name is still trusted to the nomination.
+#
+# This matcher is the vault clone's, ported rather than reinvented (vault PR 1604). The two clones
+# carry separate copies of this script and nothing re-syncs them, which is why the anchor fix and
+# the case fix were each live on one side only.
+#
+# THE SUFFIXES ARE STRIPPED IN A LOOP, NOT ONCE EACH IN A FIXED ORDER. A single pass over
+# `/`, `.git`, `.wiki` leaves any other composition intact, and each survivor is an ACCEPT -- the
+# publishing direction. Measured 2026-09-19 against the one-pass version: `MessageFoundry//`,
+# `MessageFoundry.git//` and `MessageFoundry///` all escaped the refusal. The loop terminates
+# because every iteration removes at least one character.
+#
+# `[:upper:]`/`[:lower:]` rather than `A-Z`/`a-z`: POSIX defines tr's range endpoints in COLLATION
+# order, so under a locale whose collation interleaves cases the ranges do not map what they appear
+# to and an uppercase URL survives unchanged -- again an accept. A git hook inherits whatever
+# LC_ALL/LC_CTYPE the committing shell carries, and nothing here controls that.
+is_public_repo() {
+  _n=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  while :; do
+    case "$_n" in
+      */) _n=${_n%/}; continue ;;
+      *.git) _n=${_n%.git}; continue ;;
+      *.wiki) _n=${_n%.wiki}; continue ;;
+    esac
+    break
+  done
+  case "$_n" in
+    */mefororg/messagefoundry | *:mefororg/messagefoundry | mefororg/messagefoundry) return 0 ;;
+  esac
+  return 1
+}
+
+# A `while read` rather than `for`, so a URL containing whitespace is one candidate and not two.
+printf '%s
+' "$URLS" | while IFS= read -r _u; do
+  [ -n "$_u" ] || continue
+  is_public_repo "$_u" && exit 1
+  :
+done || {
+  echo "durability_push: REFUSING -- mefor.durabilityRemote names the canonical PUBLIC repo." >&2
+  echo "  A push there is publication, which is the gate this hook exists to avoid tripping." >&2
+  echo "  Nominate a private remote instead, then re-commit." >&2
+  exit 0
+}
 
 # NAMESPACE BY REPOSITORY. Two repositories push rescue tags to ONE remote -- the engine's `private`
 # and the vault's `origin` are the same GitHub repo -- so a tag keyed by branch name ALONE collides on

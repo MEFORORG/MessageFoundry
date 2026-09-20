@@ -58,6 +58,7 @@ from messagefoundry.transports.mllp import (
     InsecureHopGuard,
     _MessagePacer,
     _pacing_settings,
+    _peer_host,
 )
 
 __all__ = ["X12Source", "X12Destination"]
@@ -557,13 +558,26 @@ class X12Source(SourceConnector):
                 logger.warning("X12 server.wait_closed() exceeded shutdown grace; abandoning")
             self._server = None
 
+    async def _emit_event(
+        self, kind: str, *, peer_host: str | None = None, reason: str | None = None
+    ) -> None:
+        """Fire one connection event (Corepoint-style log, #46) to the injected sink, fail-soft — a
+        capture/store hiccup must never raise into the per-client loop. No-op when the sink is unset."""
+        sink = self.on_connection_event
+        if sink is None:
+            return
+        try:
+            await sink(kind, peer_host, reason)
+        except Exception as exc:
+            logger.warning("X12 connection-event emit failed: %s", safe_exc(exc))
+
     async def _drain_reply(self, writer: asyncio.StreamWriter) -> None:
         """Flush one already-written reply to the sender under :data:`_REPLY_DRAIN_GRACE`.
 
         Re-raises rather than handling the timeout, for the reason spelled out on
-        :meth:`TcpSource._drain_reply`. The delta here is the logging: unlike the MLLP and raw-TCP
-        listeners, ``X12Source`` emits no ADR 0021 ``connection_event`` at all, so this warning is
-        the whole of the engine-side evidence — without it the drop would leave no record anywhere.
+        :meth:`TcpSource._drain_reply`. The delta here is the logging: the outer arm's redacted
+        ``peer_reset`` says a peer went away but not which bound fired, and only here is the peer
+        still in hand to name.
         """
         try:
             await asyncio.wait_for(writer.drain(), _REPLY_DRAIN_GRACE)
@@ -581,6 +595,10 @@ class X12Source(SourceConnector):
         self._clients.add(writer)
         if task is not None:
             self._client_tasks.add(task)
+        peer_host = _peer_host(writer)
+        established = False  # paired with a single `closed` event on a clean/idle end
+        failed = False  # an error close is covered by its specific failure kind — don't double-emit
+        close_reason = "eof"
         try:
             if self.source_ip_allowlist is not None:
                 peer = writer.get_extra_info("peername")
@@ -588,10 +606,14 @@ class X12Source(SourceConnector):
                     logger.warning(
                         "X12 connection from %s refused: not in source_ip_allowlist", peer
                     )
+                    await self._emit_event("peer_not_allowlisted", peer_host=peer_host)
                     return  # not allowlisted — refuse (closed in the outer finally; _active untouched)
             if self.max_connections is not None and self._active >= self.max_connections:
+                await self._emit_event("at_capacity", peer_host=peer_host)
                 return  # at capacity — refuse the new client (closed in the outer finally)
             self._active += 1
+            established = True
+            await self._emit_event("established", peer_host=peer_host)
             try:
                 decoder = X12FrameReader(max_interchange_bytes=self.max_interchange_bytes)
                 pacer = _MessagePacer.for_rate(
@@ -605,6 +627,7 @@ class X12Source(SourceConnector):
                         try:
                             chunk = await asyncio.wait_for(reader.read(4096), self.receive_timeout)
                         except TimeoutError:
+                            close_reason = "idle_timeout"
                             break  # idle past receive_timeout — close the connection
                     else:
                         chunk = await reader.read(4096)
@@ -626,6 +649,13 @@ class X12Source(SourceConnector):
                         logger.warning(
                             "X12 interchange from %s over cap; closing connection: %s", peer, exc
                         )
+                        failed = True
+                        # TcpSource's kind name, reused deliberately: an X12 interchange IS this
+                        # listener's frame, and a second name for one condition would split the
+                        # documented vocabulary, the console filter and the operator's query.
+                        await self._emit_event(
+                            "frame_oversize", peer_host=peer_host, reason=safe_exc(exc)
+                        )
                         break  # drop the connection rather than buffer without bound
                     except OSError:
                         raise  # peer reset / write failure → handled by the outer OSError catch (quiet)
@@ -636,9 +666,14 @@ class X12Source(SourceConnector):
                         logger.error(
                             "X12 connection from %s failed unexpectedly: %s", peer, safe_exc(exc)
                         )
+                        failed = True
+                        await self._emit_event(
+                            "framing_error", peer_host=peer_host, reason=safe_exc(exc)
+                        )
                         break
-            except OSError:
-                pass  # peer reset; nothing to do but drop the connection
+            except OSError as exc:
+                failed = True  # peer reset; nothing to do but drop the connection
+                await self._emit_event("peer_reset", peer_host=peer_host, reason=safe_exc(exc))
             finally:
                 self._active -= 1
         finally:
@@ -652,6 +687,8 @@ class X12Source(SourceConnector):
                 await asyncio.wait_for(writer.wait_closed(), timeout=_CLIENT_SHUTDOWN_GRACE)
             except (TimeoutError, OSError):
                 pass
+            if established and not failed:
+                await self._emit_event("closed", peer_host=peer_host, reason=close_reason)
 
 
 register_destination(ConnectorType.X12, X12Destination)

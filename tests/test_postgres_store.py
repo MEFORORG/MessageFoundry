@@ -715,6 +715,14 @@ async def test_stats_and_metrics(store) -> None:
     assert metrics.destinations[("IB", "OB1")].queue_depth == 1
     db = await store.db_status()
     assert db.messages == 1 and db.journal_mode == "postgres"
+    # BACKLOG #1563: the remote server's disk is not ours to stat, so this is the "unmeasurable"
+    # None and never 0 — 0 is the console's critical-disk alarm, which pinned the engine-health
+    # heart red on every healthy Postgres deployment. The whole server-side fix is this one
+    # literal, and nothing else asserted it at all. This module is gated on MEFOR_TEST_POSTGRES,
+    # so the pin holds on the Postgres leg only — that is the sole place the real backend runs, and
+    # a default run still cannot tell the literal from a 0. Naming the limit rather than implying
+    # this guards every run.
+    assert db.disk_free_bytes is None
     ok, _ = await store.integrity_check()
     assert ok is True
 
