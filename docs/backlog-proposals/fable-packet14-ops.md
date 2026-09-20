@@ -304,9 +304,12 @@ boundary`, `dependency boundary tray`, `rules file wheel`.
   15 and 67, `CLAUDE.md` section 9 "fail-closed", closed #331's residual note.
 - **The `_DSN_PASSWORD` quadratic scan** documented in `support/redact.py` lines 108-114 is handed to
   packet 16 (bounded resources); no open item names it, and that packet files it or decides it is not
-  a defect. *Resolved 2026-09-14 under BACKLOG #1547: the scheme class carries a `{0,63}` bound in
-  both copies of the pattern. The hand-off stands as the record of what this packet decided; it is no
-  longer a live finding, and the line numbers above are stale by construction.*
+  a defect. *Resolved under BACKLOG #1547: both copies of the pattern carry a `(?<![a-z0-9+.\-])`
+  head in place of the `\b` that made the scan quadratic. A `{0,63}` bound on the scheme repetition
+  was tried first and taken back out, because `\b` anchors at the head of the whole unbroken run the
+  scheme sits in, so the bound stopped matching a DSN behind a 64-character run and published the
+  password in full. The hand-off stands as the record of what this packet decided; it is no longer a
+  live finding, and the line numbers above are stale by construction.*
 - **`dry_run` reporting `filtered` for a `deployed=False` outbound** where the engine records
   `NOT_DEPLOYED`, and `select_inbound`'s empty-registry message, are handed to packet 11 (dry-run).
 - **The package root loading `config` into every importer, including the tray**, is packet 1's P1-03
