@@ -63,11 +63,12 @@ the marker survives a crash, a compaction, an account switch, and a respawn.
 
 ### 2.2 The cards: `docs/roles/<seat>.card.md`
 
-One tracked file per live seat. Six of them: Manager, Builder, Regulator, Steward,
+One tracked file per live seat. Six of them: Manager, Builder, Watchdog, Steward,
 Lander, Special. (At the time of writing the first name was Console; the owner retired that seat on
-2026-09-10 and the Manager replaced it, BACKLOG #1529. One further seat was retired on 2026-09-05
-and is deliberately not named, here or anywhere else in this repository -- owner instruction
-2026-09-16.)
+2026-09-10 and the Manager replaced it, BACKLOG #1529. The third name was Regulator until
+2026-09-19, when the owner retired it and added the Watchdog; the Watchdog is an addition and
+**not** its successor. One further seat was retired on 2026-09-05 and is deliberately not named,
+here or anywhere else in this repository -- owner instruction 2026-09-16.)
 
 Each card is capped at **150 lines and 6 KB**. Only one is ever injected, so the cost
 to a session is about 1,500 tokens against the 60 KB `CLAUDE.md` already loaded.
@@ -161,13 +162,19 @@ Set-Content .claude\seat 'builder'
 
 ## 4. The roster, and which document governs it
 
-Six seats: **Manager, Builder, Regulator, Steward, Lander, Special.** That list comes from
+Six seats: **Manager, Builder, Watchdog, Steward, Lander, Special.** That list comes from
 section 5 of `CLAUDE.md`. The **Special** seat joined 2026-09-16 by owner decision, for work
 outside the other five; it is an addition, and nothing retired to make room for it. A different
 sixth seat existed until 2026-09-05, when the owner retired it along with the `reviewed` label and
 the review gate; it is deliberately unnamed. The **Console** held the Manager's place until 2026-09-10,
 when the owner retired it; the Manager is its replacement and **not a rename of it**, so a Console
 rule does not carry across (BACKLOG #1529).
+
+The **Regulator** held the third row until 2026-09-19, when the owner retired it. **Nothing replaced
+it, and no seat attributes a red now.** The **Watchdog** joined the same day and is an addition
+rather than a successor: it measures whether reds are being cleared and never says whose one is. The
+two moves are recorded separately here on purpose, because reading them as one rename is the error
+that would send a red to a Watchdog and wait for a verdict it does not issue.
 
 **The vault's `roles/README.md` disagrees, and it is the stale one.** Its table still
 lists Dispatcher, PM, Liaison, ASVS Tracker, Cleaner, Role manager and Process
@@ -177,10 +184,21 @@ settles this directly: a document naming a retired seat is stale, and section 5 
 So the cards are written against section 5's roster, using the vault playbooks only as
 raw material for the seats that survived.
 
-**One live seat has no playbook at all.** The Regulator has no file in korus `roles/`, so its
-card is written from section 5 alone, and the card says so rather than sending anyone looking for a
-longer version that does not exist. The Manager does have one, `roles/MANAGER.md`, and its card
-cites it.
+**Every live seat now has a korus playbook.** The Regulator was the one that did not, and it retired
+on 2026-09-19. The Watchdog that joined in its row does have one, `roles/WATCHDOG.md`, as does the
+Manager at `roles/MANAGER.md`, and both cards cite theirs.
+
+**A retired seat's playbook is not absent from korus, it is under `roles/retired/`,** and reading
+"no top-level file" as "no file" gets that backwards. Measured twice on 2026-09-19, independently and from
+different starting points, by this change and by the sitting Watchdog:
+`git ls-tree --name-only origin/main roles/retired/` in a korus clone returns ten files,
+`REGULATOR.md` among them, against 20 entries under `roles/` in total. Control, through the same
+command so it can fail on its own: `roles/NOTASEAT.md` returns empty. korus keeps them so a reader who remembers a seat finds it retired rather than
+missing. So the sentence above means the Regulator had no file in the LIVE `roles/` folder while it
+was rostered here, which is the drift this section records; it has a retired one now.
+
+List the korus `roles/` folder rather than typing a filename from memory. The seat set moves, and a
+missing playbook is the quietest failure here, because an absent file reports nothing at all.
 
 ---
 
