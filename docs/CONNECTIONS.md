@@ -1231,6 +1231,30 @@ The DSN is built as `DRIVER={odbc_driver};SERVER=<server>;[DATABASE={database};]
 > runs `SELECT 1` (works on PostgreSQL / MySQL / SQL Server; Oracle needs `SELECT 1 FROM DUAL`, so its
 > probe reports an error even though delivery works). Read-only `db_lookup` (ADR 0010) stays SQL-Server-only.
 
+#### Give `db_lookup` a read-only login
+
+**Point every `DatabaseLookup(...)` at an account that cannot write — a `db_datareader`-class login on
+the partner database.** That account is the only thing that makes a lookup read-only. The engine's two
+in-process layers are defence in depth and neither is authority:
+
+| Layer | What it does | What it cannot do |
+|---|---|---|
+| Statement gate (`_require_read_only`) | refuses a statement that does not open with `SELECT`/`WITH`, or that carries a write/`EXEC`/DDL keyword outside a literal or comment, or that chains a second statement | it reads text. A write executed on a linked server through a pass-through literal is opaque to it |
+| `ApplicationIntent=ReadOnly` on the DSN | advertises read-only intent | honored only by a SQL Server Always-On **read replica**; a no-op against any other server |
+
+Lookup pools are opened **autocommit**, so a write that got past the statement gate would commit rather
+than roll back. T-SQL has no `SET TRANSACTION READ ONLY`, so the engine cannot open a read-only
+transaction instead: on SQL Server the read-only mechanisms — a read-only database or filegroup, a
+snapshot, or `ApplicationIntent` against an availability-group replica — are all operator provisioning.
+
+Grant the lookup account `SELECT` on the objects the feed reads and nothing else. It needs no
+membership in `db_datawriter`, `db_ddladmin` or `db_owner`, and no `EXECUTE` unless a feed genuinely
+reads through a stored procedure — which this gate refuses anyway.
+
+> This is a **separate principal** from the engine's own store login. `[store]` settings govern the
+> database MessageFoundry writes its own messages to; a `DatabaseLookup` dials a partner database under
+> a credential the operator configures per connection.
+
 #### Static database credentials
 
 ASVS 13.2.1 asks that a backend hop authenticate with an individual service account, a short-term token
