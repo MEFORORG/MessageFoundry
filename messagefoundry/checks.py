@@ -56,9 +56,11 @@ settings/config that won't load).
 
 ``ruff`` and ``mypy`` are **advisory**: run only when installed (``shutil.which``) and never block —
 a non-developer author shouldn't be stopped by a lint nit. So is ``raise-fstring`` — an AST scan of the
-config-dir Router/Handler modules that flags ``raise <Exc>(f"...{var}...")``, the exact pattern that can
-carry free-text PHI past the exception-path redaction (``redaction.py``); it only ever **prints** a
-heuristic reminder of the "never put PHI in an exception message" convention, never blocks the gate.
+config-dir Router/Handler modules that flags a ``raise`` whose message interpolates a variable — at
+least the f-string, ``+`` concatenation, ``%`` formatting and ``.format(...)`` spellings — the
+pattern that can carry free-text PHI past the exception-path redaction (``redaction.py``); it only
+ever **prints** a heuristic reminder of the "never put PHI in an exception message" convention,
+never blocks the gate. ``_check_raise_fstring`` catalogues what it over- and under-flags.
 So is ``accepts-candidate`` — an AST scan that flags a ``@handler`` opening with a guard-filter
 (``if <cond>: return []``), a filter that belongs in an ``accepts=`` router-stage predicate (ADR 0084)
 where it costs 0 transactions instead of 2; also advisory (prints, never blocks).
@@ -147,6 +149,7 @@ def run_checks(
     service_config: str | Path | None = None,
     suppress_service_toml_search: bool = False,
     project_root: str | Path | None = None,
+    allow_empty_config: bool = False,
 ) -> CheckReport:
     """Run the gate against ``config_dir``; ``messages_dir`` enables the dry-run check when it has
     fixtures. Set ``run_lint=False`` to skip the advisory ruff/mypy pass. ``strict_handler_security``
@@ -168,9 +171,24 @@ def run_checks(
     ``load_settings``' CLI > env > file precedence overrides a file-set ``base_dir`` exactly as
     ``__main__.py``'s ``serve`` does. Left ``None`` the resolution is unchanged and still falls back to
     the process directory, so the documented ``check --config config`` invocation is untouched.
+
+    ``allow_empty_config`` (``--allow-empty-config``, BACKLOG #1648) drops the empty-graph rule from
+    the blocking validate leg.
+
+    A leg whose SUBJECT survives an empty graph drops the rule unconditionally instead, at its own
+    ``load_config`` — ``build-check``, ``reference-backend``, ``dead-config`` and ``send-target``.
+    Each of their skip arms delegates the reporting to ``validate``, and ``--allow-empty-config`` is
+    exactly when ``validate`` stops reporting it, so a leg that skipped there would be covered by
+    nothing — and its "config did not load" line would be false about a config that loaded. Use that
+    test when deciding for a new leg: ask whether it reads something a connection-less config still
+    has (Routers, Handlers, reference sets), not whether the flag was passed.
+
+    The remaining legs still load with the rule in force and do skip on an empty dir: they report on
+    connections, and there are none. The skip line they print says "config did not load", which is
+    inexact for this one cause; threading the keyword further was left out of scope.
     """
     results = [
-        _check_validate(config_dir),
+        _check_validate(config_dir, allow_empty=allow_empty_config),
         _check_dryrun(
             config_dir,
             messages_dir,
@@ -269,7 +287,12 @@ def _check_dead_config(config_dir: str | Path) -> CheckResult:
     from messagefoundry.config.wiring import WiringError, load_config
 
     try:
-        registry = load_config(config_dir)
+        # allow_empty: this leg's subject is the ROUTER/HANDLER reference graph, which exists whether
+        # or not a connection is declared (BACKLOG #1648). Without it the docstring's delegation
+        # above -- "a config dir that fails to load is left to validate" -- breaks under
+        # `--allow-empty-config`, because validate is then the one leg that does not report it, and
+        # the skip line would read "config did not load" about a config that loaded.
+        registry = load_config(config_dir, allow_empty=True)
     except (WiringError, OSError, ImportError, SyntaxError, ValueError):
         # A broken config is reported (blocking) by validate; the advisory never crashes the gate.
         return CheckResult(
@@ -303,7 +326,12 @@ def _check_send_target(config_dir: str | Path) -> CheckResult:
     from messagefoundry.config.wiring import WiringError, load_config
 
     try:
-        registry = load_config(config_dir)
+        # allow_empty: same reason as dead-config above (BACKLOG #1648). This leg judges literal
+        # Send()/Router targets against what is registered, and a connection-less config is exactly
+        # where EVERY such target dangles — the case most worth printing, not least. Letting the
+        # empty-graph refusal through would make `--allow-empty-config` silently disable the one leg
+        # that catches a dangling literal target.
+        registry = load_config(config_dir, allow_empty=True)
     except (WiringError, OSError, ImportError, SyntaxError, ValueError):
         return CheckResult(
             "send-target", ok=True, required=False, skipped=True, detail="config did not load"
@@ -330,12 +358,32 @@ def _check_send_target(config_dir: str | Path) -> CheckResult:
 
 
 def _check_raise_fstring(config_dir: str | Path) -> CheckResult:
-    """Advisory: flag ``raise <Exc>(f"...{var}...")`` in the config-dir Router/Handler modules — an
-    f-string ``raise`` that interpolates a variable, the one pattern that can carry **free-text PHI**
+    """Advisory: flag an interpolated ``raise`` message in the config-dir Router/Handler modules — a
+    ``raise`` whose message is built from a variable, the pattern that can carry **free-text PHI**
     past the exception-path redaction (``redaction.py``) into the stored ``last_error``/``detail`` and
-    the log. It is a heuristic reminder of the "never put PHI in an exception message" convention, not a
-    hard rule: a benign interpolation (``raise ValueError(f"port {p} in use")``) trips it too, so the
-    check is **advisory** (prints, never blocks).
+    the log. :func:`_is_dynamic_string` is the shared predicate and defines the shapes it reaches: at
+    least the f-string, ``+``, ``%`` and ``.format(...)`` spellings, which carry the same payload.
+
+    It is a heuristic reminder of the "never put PHI in an exception message" convention, not a hard
+    rule, so it is **advisory** (prints, never blocks) — which is what pays for both error directions,
+    measured against the predicate:
+
+    * Over-flags, at least. A benign interpolation (``raise ValueError(f"port {p} in use")``).
+      Arithmetic, since the first constructor argument need not be a string at all
+      (``raise ValueError(retry + 1)``). And *literal-only* messages that do not fold to a constant —
+      measured: ``"a %s" % ("b",)``, ``"a %s" % ["b"]``, ``"%(k)s" % {"k": "b"}`` (the folding helper
+      has no case for a tuple, list or dict operand), ``"a {}".format("b")`` (the ``.format`` branch
+      counts arguments without inspecting them) and ``"a" + f"b"`` (no case for a constant-only
+      f-string operand, which is why the same ``f"b"`` alone does not flag).
+    * Under-flags, at least. A message assigned to a local first (``m = f"bad {x}"``;
+      ``raise ValueError(m)``), because a bare ``Name`` is resolved nowhere — pinned by
+      ``test_raise_fstring_ignores_bare_name_message``, and widening *that* one is scope resolution
+      rather than this check. Measured and **not** deliberate, only unbuilt: a message in any
+      argument but the first positional (``raise FeedError("E01", f"p {x}")``,
+      ``raise FeedError(detail=f"p {x}")``), a ``*args`` splat (``raise ValueError(*parts)``), and an
+      interpolation wrapped in a call (``raise ValueError(f"p {x}".upper())``,
+      ``raise ValueError(str(msg["PID-5"]))``). :func:`_unsafe_lookup_hit` already reads keywords, a
+      second positional and a splat; this caller does not.
 
     Scans every ``*.py`` under ``config_dir`` (helpers included — a ``_*`` helper can ``raise`` too).
     A malformed module never crashes the gate (``SyntaxError``/``OSError`` → skip that file; ``validate``
@@ -358,20 +406,19 @@ def _check_raise_fstring(config_dir: str | Path) -> CheckResult:
                 continue
             args = node.exc.args
             first = args[0] if args else None
-            # An f-string with at least one ``{var}`` (FormattedValue); a constant-only f-string or a
-            # plain string literal is fine and not flagged.
-            if isinstance(first, ast.JoinedStr) and any(
-                isinstance(part, ast.FormattedValue) for part in first.values
-            ):
+            # Shared with the ADR 0144 lookup lint rather than re-implemented, so the two cannot
+            # drift on what counts as interpolation. Both directions of its error are advisory and
+            # catalogued in this function's docstring.
+            if first is not None and _is_dynamic_string(first):
                 hits.append(f"{path.name}:{node.lineno}")
     if not hits:
         return CheckResult(
-            "raise-fstring", ok=True, required=False, skipped=True, detail="no f-string raises"
+            "raise-fstring", ok=True, required=False, skipped=True, detail="no interpolated raises"
         )
     shown = ", ".join(hits[:5])
     more = f" (+{len(hits) - 5} more)" if len(hits) > 5 else ""
     detail = (
-        f"{len(hits)} f-string raise(s) interpolate a variable (heuristic PHI reminder — keep "
+        f"{len(hits)} raise(s) build the message by interpolation (heuristic PHI reminder — keep "
         f"identifiers out of exception messages): {shown}{more}"
     )
     return CheckResult("raise-fstring", ok=True, required=False, detail=detail)
@@ -717,7 +764,12 @@ def _is_dynamic_string(node: ast.expr) -> bool:
     ``{expr}`` / ``+`` or ``%`` with a variable operand / ``.format(...)`` with args) — the injection
     shape for a ``db_lookup``/``fhir_lookup`` query. A pure-literal concat folds to a constant and is
     not flagged. (A trusted-identifier concat like ``"select from " + TABLE`` still flags — SQL cannot
-    parameterize an identifier, so the concatenation nudge is intentional; ADR 0144 known FP.)"""
+    parameterize an identifier, so the concatenation nudge is intentional; ADR 0144 known FP.)
+
+    **Two callers, and tuning this moves both.** :func:`_unsafe_lookup_hit` passes a query string;
+    :func:`_check_raise_fstring` passes the first argument of any ``raise`` constructor, which need not
+    be a string. The SQL rationale above does not transfer to that caller — see its docstring for the
+    error directions it accepts."""
     if isinstance(node, ast.JoinedStr):
         return any(isinstance(part, ast.FormattedValue) for part in node.values)
     if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mod)):
@@ -1078,23 +1130,37 @@ def _check_handler_security(
     return CheckResult("handler-security", ok=not strict, required=strict, detail=detail)
 
 
-def _check_validate(config_dir: str | Path) -> CheckResult:
+def _check_validate(config_dir: str | Path, *, allow_empty: bool = False) -> CheckResult:
+    """The blocking validate leg. ``allow_empty`` (``--allow-empty-config``, BACKLOG #1648) drops the
+    empty-graph rule so a config dir that legitimately declares no connections — a scaffold, a
+    helper-only bundle — can still pass the gate. It is scoped to ``check``: ``serve`` refuses an
+    empty graph by design and has no opt-out."""
     from messagefoundry.config.wiring import load_config, validate_config
 
-    errors = [d for d in validate_config(config_dir) if d.severity == "error"]
+    errors = [
+        d for d in validate_config(config_dir, allow_empty=allow_empty) if d.severity == "error"
+    ]
     if errors:
         detail = f"{len(errors)} problem(s): " + "; ".join(
             f"{d.file or '-'}: {d.message}" for d in errors[:5]
         )
         return CheckResult("validate", ok=False, required=True, detail=detail)
-    # Say how many declared `encoding` values this pass actually probed (BACKLOG #1613): a pass that
-    # examined NOTHING and one that examined everything and found it good both report no problems.
-    # An env() ref carries no value at config time and NOTHING checks it later either, so the word is
-    # "unchecked" — see Registry.encoding_problems for where the resolved pass would belong.
+    # Say how many declared `encoding` values were probed, and BY WHICH PASS (BACKLOG #1613, #1767):
+    # a pass that examined NOTHING and one that examined everything and found it good both report no
+    # problems. Three populations, never collapsed into two — a literal probed here; an env() ref
+    # DEFERRED to the `build-check` line, which resolves it against this environment; and one left
+    # UNCHECKED on every path because its connection is not deployed, whose env() values ADR 0111
+    # forbids resolving anywhere. A census that folded the last two would read as a clean pass over
+    # values nothing had looked at, which is the false-green this line exists to prevent.
     # load_config here rather than a second return value out of validate_config, matching the sibling
     # checks above; the config is known to load, since every error diagnostic returned already.
-    checked, unchecked = load_config(config_dir).encoding_census()
-    census = f"encodings checked: {checked}, unchecked env() refs: {unchecked}"
+    checked, deferred, unchecked = load_config(
+        config_dir, allow_empty=allow_empty
+    ).encoding_census()
+    census = (
+        f"encodings checked: {checked}, env() refs deferred to build-check: {deferred}, "
+        f"unchecked: {unchecked}"
+    )
     return CheckResult("validate", ok=True, required=True, detail=f"no problems ({census})")
 
 
@@ -1468,7 +1534,11 @@ def _check_build(
             detail=f"settings did not load: {exc}",
         )
     try:
-        registry = load_config(config_dir)
+        # allow_empty: same reason as reference-backend (BACKLOG #1648) -- REQUIRED leg, and its skip
+        # arm delegates to the one leg `--allow-empty-config` silences. With zero connections there
+        # is nothing to build-check and it passes trivially, which is the honest answer; a skip line
+        # reading "config did not load" about a config that loaded is not.
+        registry = load_config(config_dir, allow_empty=True)
     except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
         # A broken graph is reported (blocking) by validate; don't double-fail here.
         return CheckResult(
@@ -2180,7 +2250,11 @@ def _check_reference_backend(
             detail=f"settings did not load: {exc}",
         )
     try:
-        registry = load_config(config_dir)
+        # allow_empty: this leg is REQUIRED and its subject is `registry.references`, which exists
+        # with zero connections declared (BACKLOG #1648). Its skip arm delegates to validate -- the
+        # one leg `--allow-empty-config` silences -- so without this the flag would silently disable
+        # a required check and print "config did not load" about a config that loaded.
+        registry = load_config(config_dir, allow_empty=True)
     except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
         return CheckResult(
             "reference-backend",

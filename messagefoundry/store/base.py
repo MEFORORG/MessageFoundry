@@ -1906,9 +1906,11 @@ class AuthStore(Protocol):
         **The inverse of the #1015 guard, and the direction that guard cannot look.** That check
         resolves a user by USERNAME and asks whether *this account* carries a different subject --
         so it constrains WHICH subject may bind to a given account, and is structurally incapable of
-        seeing a SECOND ACCOUNT already holding the same subject. Nothing else could see it either:
-        measured, there is no UNIQUE constraint naming the federated columns on any of the three
-        backends (0/0/0, against 13/8/10 total UNIQUE declarations as the positive control).
+        seeing a SECOND ACCOUNT already holding the same subject. The database enforces the same rule
+        underneath -- every backend declares a filtered UNIQUE ``ux_users_federated_subject`` -- and
+        this lookup is what lets the caller answer cleanly instead of surfacing that refusal as an
+        integrity error. :meth:`AuthService._complete_ad_login`'s subject-exclusivity guard carries
+        why that pairing is worded the way it is, and what it replaced.
 
         Deliberately a lookup rather than a scan: it sits on the federated login path, and
         ``list_users()`` would make every sign-in O(number of accounts).

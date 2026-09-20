@@ -783,8 +783,9 @@ class EngineClient:
         control_id: str | None = None,
         limit: int = 50,
         offset: int = 0,
-        audit_summary: bool = False,
     ) -> MessageList:
+        """List messages (newest first). PHI-summary access auditing is **server-enforced** and needs
+        no opt-in here: the engine audits every response that returns non-redacted summaries."""
         response = self._get(
             "/messages",
             channel_id=channel_id,
@@ -793,7 +794,6 @@ class EngineClient:
             control_id=control_id,
             limit=limit,
             offset=offset,
-            audit_summary=audit_summary or None,
         )
         return _decode(response, MessageList)
 
@@ -855,16 +855,16 @@ class EngineClient:
         destination_name: str | None = None,
         limit: int = 50,
         offset: int = 0,
-        audit_summary: bool = False,
     ) -> DeadLetterList:
-        """Dead-lettered deliveries (newest first), optionally scoped to an inbound/outbound."""
+        """Dead-lettered deliveries (newest first), optionally scoped to an inbound/outbound.
+
+        As with :meth:`list_messages`, PHI-summary access auditing is server-enforced, not opt-in."""
         response = self._get(
             "/dead-letters",
             channel_id=channel_id,
             destination_name=destination_name,
             limit=limit,
             offset=offset,
-            audit_summary=audit_summary or None,
         )
         return DeadLetterList.model_validate(response.json())
 
