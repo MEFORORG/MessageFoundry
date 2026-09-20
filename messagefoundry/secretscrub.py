@@ -437,7 +437,7 @@ def scrub_credentials(text: str, *, placeholder: str = CREDENTIAL_PLACEHOLDER) -
     The label survives on purpose: an operator reading a scrubbed line must still be able to tell WHICH
     credential the failing code was handling. Nothing else about the line is touched -- this is a
     credential pass, not a PHI pass (:mod:`messagefoundry.redaction` owns that) and not a control-char
-    pass (:func:`logging_setup.scrub_control_chars` owns that).
+    pass (:func:`messagefoundry.controlchars.scrub_control_chars` owns that).
 
     Idempotent, because a record dispatched to stdout *and* the off-box forwarder is filtered once per
     handler: the placeholder carries no credential word, no ``MEFOR_`` prefix and no ``://``, so a

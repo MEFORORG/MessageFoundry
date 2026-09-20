@@ -479,3 +479,63 @@ async def test_dry_run_reports_not_applied_and_swaps_nothing(tmp_path: Path) -> 
         assert "IB_OLD" in eng.registry_runner.registry.inbound  # still the running one
     finally:
         await eng.stop()
+
+
+# --- the empty graph is refused AFTER the shard filter too (BACKLOG #1648) ----
+
+
+async def test_reload_refuses_a_graph_the_shard_filter_emptied(tmp_path: Path) -> None:
+    """A reload whose config loads fine but whose SHARD FILTER empties the graph is refused.
+
+    This is why the post-filter check in ``reload_detail`` survived BACKLOG #1648. The new load-time
+    rule lives in ``Registry.validate``, which runs inside ``load_config`` -- BEFORE
+    ``self._registry_filter``. So the filter can empty a graph the load-time rule has already passed,
+    and deleting the post-filter copy (the row's filed step 3) would let a ``serve --shard`` process
+    swap in an empty graph with no refusal at all.
+
+    The reachable shape, and the one built here: a config that declares inbounds on shard ``a`` and
+    NO outbound (the shard filter keeps outbound connections, so it can only empty a graph that had
+    none), reloaded by a process filtering for shard ``b``. ``load_config`` accepts it -- it declares
+    connections -- and the filter then leaves nothing.
+
+    Falsified by deleting the post-filter check: ``pytest.raises`` goes red and the engine takes the
+    empty graph."""
+    from messagefoundry.pipeline.sharding import filter_registry_for_shard
+
+    old_in, old_out = tmp_path / "old-in", tmp_path / "old-out"
+    old_cfg = tmp_path / "old"
+    _write_config(
+        old_cfg, inbound_name="IB_OLD", outbound_name="OUT_OLD", inbox=old_in, outdir=old_out
+    )
+
+    shard_b = tmp_path / "shard-b"
+    shard_b.mkdir()
+    (shard_b / "cfg.py").write_text(
+        "from messagefoundry import inbound, router, File\n"
+        f"inbound('IB_A', File(directory={str(tmp_path / 'a-in')!r}, pattern='*.hl7', "
+        "poll_seconds=0.02), router='r', shard='a')\n"
+        "@router('r')\n"
+        "def route(msg):\n"
+        "    return []\n",
+        encoding="utf-8",
+    )
+    # The control for the whole test: this directory LOADS. Without it a mistake in the fixture
+    # would raise for the wrong reason and still satisfy the pytest.raises below.
+    assert load_config(shard_b).inbound.keys() == {"IB_A"}
+
+    eng = await Engine.create(
+        tmp_path / "e.db",
+        poll_interval=0.02,
+        registry_filter=lambda reg: filter_registry_for_shard(reg, "b"),
+    )
+    eng.add_registry(load_config(old_cfg))
+    await eng.start()
+    try:
+        with pytest.raises(WiringError, match="declares no connections"):
+            await eng.reload_detail(shard_b)
+
+        assert eng.registry_runner is not None
+        assert "IB_OLD" in eng.registry_runner.registry.inbound  # the old graph is untouched
+        assert await _delivers(old_in, old_out, name="SHARDEMPTYOLD")
+    finally:
+        await eng.stop()

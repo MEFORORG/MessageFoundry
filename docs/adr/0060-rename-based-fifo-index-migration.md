@@ -1,6 +1,6 @@
 # ADR 0060 — Rename-based migration for the re-keyed FIFO covering indexes (land ADR 0059's re-key on upgraded DBs)
 
-- Status: **Proposed**
+- Status: **Accepted** -- **built** (BACKLOG #676); `ADR 0060` is cited from the store migration path.
 - Date: 2026-06-30
 - Relates to: [ADR 0059](0059-seq-only-fifo-ordering.md) (seq-only per-lane FIFO ordering; #673) — **completes 0059's index re-key on *upgraded* DBs**; [ADR 0001](0001-staged-pipeline-architecture.md) (staged pipeline / `queue` table); [ADR 0055](0055-group-commit-durable-write.md) (group-committer); issue #285 (per-lane FIFO no-skip). Supersedes, for the two FIFO covering indexes, the same-name `CREATE INDEX IF NOT EXISTS` / `IF INDEXPROPERTY(...) IS NULL CREATE` guard that a re-keyed definition silently no-ops past on an upgraded DB.
 

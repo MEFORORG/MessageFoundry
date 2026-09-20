@@ -12,8 +12,12 @@ import httpx
 import pytest
 
 from messagefoundry.api import create_app
+from messagefoundry.auth import Role
+from messagefoundry.auth.identity import ALL_CHANNELS
+from messagefoundry.auth.service import AuthService
 from messagefoundry.config.environments import load_environment_values
 from messagefoundry.config.fingerprint import config_fingerprint
+from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 
 
@@ -240,6 +244,69 @@ async def test_reload_audit_records_fingerprint(tmp_path: Path) -> None:
             detail = json.loads(rows[-1]["detail"])
             assert detail["fingerprint"] == config_fingerprint(cfg)
             assert detail["files"] >= 1
+    finally:
+        await eng.stop()
+
+
+async def test_dry_run_reload_audits_config_reload_check_under_the_acting_user(
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #1643: the dry-run pre-flight leaves a ``config_reload_check`` row naming the caller.
+
+    RED when the ``config_reload_check`` ``record_audit`` call in ``api/app.py`` is deleted, or when
+    the dry-run arm stops auditing separately from the real-apply arm. No file under ``tests/`` or
+    ``packaging/messagefoundry-webconsole/tests/`` named that action before this test: the existing
+    dry-run test asserts only the response body, which does not move when the write is removed.
+
+    Authenticated rather than ``allow_no_auth``, which is what makes the ACTOR assertion mean
+    something -- under no-auth every row is written by the single ``system`` identity, so a route
+    auditing under a hardcoded name would pass. ``require_step_up`` is satisfied by the fresh login.
+
+    The negative control is in-test: the real (non-dry-run) apply writes ``config_reload`` through a
+    different call, so the two arms are pinned apart and a route collapsing them is caught.
+    """
+    pw = "Correct-Horse-Battery-Staple-9"
+    cfg = tmp_path / "cfg"
+    _write_valid_config(cfg, tmp_path / "in", tmp_path / "out")
+    eng = await Engine.create(tmp_path / "a.db", poll_interval=0.05, config_dir=cfg)
+    try:
+        service = AuthService(eng.store, AuthSettings(require_mfa=False))
+        await service.initialize()
+        uid = await service.create_local_user(
+            username="deployer",
+            password=pw,
+            display_name=None,
+            email=None,
+            roles=[Role.DEPLOYMENT.value],  # holds config:deploy, and only what this route needs
+            actor="test",
+        )
+        await service.set_channel_scope(uid, [ALL_CHANNELS], actor="test")
+        user = await service.store.get_user(uid)
+        assert user is not None and user.password_hash is not None
+        await service.store.set_password(
+            uid, password_hash=user.password_hash, must_change_password=False
+        )
+
+        transport = httpx.ASGITransport(app=create_app(eng, auth=service))
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            login = await c.post(
+                "/auth/login", json={"username": "deployer", "password": pw, "provider": "local"}
+            )
+            assert login.status_code == 200, login.text
+            h = {"Authorization": f"Bearer {login.json()['token']}"}
+
+            r = await c.post("/config/reload", json={"dry_run": True}, headers=h)
+            assert r.status_code == 200, r.text
+            assert r.json()["dry_run"] is True
+
+        rows = await eng.store.list_audit(action="config_reload_check")
+        assert rows, "a dry-run reload must leave a config_reload_check audit row"
+        assert [row["actor"] for row in rows] == ["deployer"]
+        detail = json.loads(rows[0]["detail"])
+        assert detail["dry_run"] is True
+        # The dry-run arm must not be recorded as a real apply -- that would report a validated-only
+        # pre-flight as a config deploy to every later reader of the audit trail.
+        assert not await eng.store.list_audit(action="config_reload")
     finally:
         await eng.stop()
 

@@ -1,6 +1,7 @@
 # ADR 0014 — Alerting rules engine
 
-- **Status:** Proposed (2026-06-14) — the configurable rules layer over the built alert notifier.
+- **Status:** Accepted (2026-06-14) — the configurable rules layer over the built alert notifier. **Built and
+  shipped**; `ADR 0014` is cited from `api/app.py`, `api/models.py` and `apiclient/client.py`.
 - **Built:** Yes — additive. A typed `AlertRule` model + `[alerts].rules` in
   [`config/settings.py`](../../messagefoundry/config/settings.py), and an `AlertRuleSet` the
   `NotifierAlertSink` consults in [`pipeline/alert_sinks.py`](../../messagefoundry/pipeline/alert_sinks.py).
