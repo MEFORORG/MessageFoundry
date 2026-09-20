@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -166,10 +167,18 @@ def test_the_identity_fence_fields_are_pinned_in_the_source() -> None:
     THIS IS THE DETERMINISTIC HALF, SPLIT OUT SO IT STILL RUNS WHERE THE SCRIPT CANNOT. It was one
     test with the row loop below, which meant the whole assertion died on the ubuntu leg together
     with the subprocess -- leaving the fence pinned on Windows only.
+
+    IT MATCHES THE ASSIGNMENT, NOT THE BARE NAME, BECAUSE THE BARE NAME COULD NOT FAIL. `"Mutating"
+    in text` is satisfied by `$skippedMutating` and `SkippedMutatingImage`, `"Handles"` by the
+    `$r.Handles` column in the report, and `"StartedTicks"` by the `-Kill` recheck that READS it --
+    so deleting the row field left all three green. Anchoring to `<Field> =` at the start of a line
+    ties each assertion to the line that actually builds the row.
     """
     text = SCRIPT.read_text(encoding="utf-8")
     for field in ("StartedTicks", "Handles", "Mutating"):
-        assert field in text, f"the row no longer carries {field}, so a kill cannot recheck it"
+        assert re.search(rf"^\s*{field}\s*=", text, re.M), (
+            f"the row no longer assigns {field}, so a kill cannot recheck it"
+        )
 
 
 @_needs_windows_process_table
@@ -201,11 +210,20 @@ def test_a_kill_would_refuse_the_images_that_write() -> None:
     git call in that repository; sed -i and sort -o leave a truncated temp file. Those images are
     still REPORTED -- narrowing detection would hide the leak this script exists to find -- but
     -Kill alone must refuse them. Asserted from the source because no test here ever passes -Kill.
+
+    IT READS THE $MUTATING LIST ITSELF, BECAUSE A WHOLE-FILE SEARCH COULD NOT FAIL. All six of
+    these images are ALSO in the $Image default that decides what counts as an MSYS tool, so
+    `image in text` stayed green with the entire $MUTATING block deleted -- which is the edit that
+    makes every writer -Kill eligible. Scoping the search to the list that populates $MUTATING is
+    what makes the deletion red.
     """
     text = SCRIPT.read_text(encoding="utf-8")
-    assert "$MUTATING" in text
+    listed = re.search(
+        r"foreach \(\$n in @\(([^)]*)\)\)\s*\{\s*\n\s*\$MUTATING\[\$n\] = \$true", text
+    )
+    assert listed, "the $MUTATING list is gone, so -Kill no longer refuses any writer"
     for image in ("git.exe", "sed.exe", "sort.exe", "sh.exe", "bash.exe", "xargs.exe"):
-        assert image in text
+        assert image in listed.group(1), f"{image} writes, but -Kill would no longer refuse it"
     assert "-Force to override" in text
 
 
