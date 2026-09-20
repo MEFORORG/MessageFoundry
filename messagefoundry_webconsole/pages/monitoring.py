@@ -100,8 +100,16 @@ def _contradiction(value: bool | None) -> str:
     return "YES — the read-out contradicts it" if value else "no — the read-out agrees"
 
 
-def _bytes(n: int) -> str:
-    """Render a byte count in a compact binary unit (KiB/MiB/GiB)."""
+def _bytes(n: int | None) -> str:
+    """Render a byte count in a compact binary unit (KiB/MiB/GiB).
+
+    ``None`` renders as words, never as a quantity: falling through to "0 B" would print the
+    on-screen half of BACKLOG #1563, since an operator reading "0 B" free on a remote SQL Server
+    sees a disk emergency where in fact nobody looked. The wording borrows ``_contradiction``'s
+    "nothing measured" rather than ``_opt``'s em dash, which reads as a missing row instead of an
+    unmeasured one, and rather than a fifth new spelling of unknown for the same table."""
+    if n is None:
+        return "nothing measured"
     size = float(n)
     for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
         if size < 1024 or unit == "TiB":
@@ -301,8 +309,16 @@ def _event_filter(connection: str, kind: str = "") -> Markup:
     )
 
 
-def events(rows: list[ConnectionEventInfo], *, connection: str = "", kind: str = "") -> Markup:
-    """The connection/transport event log (Corepoint-style, #46) — metadata only, newest first."""
+def events(
+    rows: list[ConnectionEventInfo], *, connection: str = "", kind: str = "", error: str = ""
+) -> Markup:
+    """The connection/transport event log (Corepoint-style, #46) — metadata only, newest first.
+
+    ``error`` renders a refusal banner above the table, the shape ``pages.messages`` uses: the filter
+    form comes back carrying what the operator typed and the route answers 400 rather than querying
+    under a filter the JSON twin would refuse (BACKLOG #1740). It also suppresses the "No events."
+    line, which would otherwise read as the result of a filter that was never applied.
+    """
     headers = ["When", "Connection", "Transport", "Dir", "Kind", "Peer", "Reason"]
     body = [
         [
@@ -316,13 +332,22 @@ def events(rows: list[ConnectionEventInfo], *, connection: str = "", kind: str =
         ]
         for e in rows
     ]
-    empty = el("p", "No events.", class_="muted") if not rows else Markup("")
+    # One page() call with a varying tail, rather than two that have to be kept in step by hand.
+    # On a refusal the tail is the banner ALONE -- no results table, not even its header row: the
+    # filter never ran, so any table under the banner reads as its result (BACKLOG #1740).
+    tail: list[object] = (
+        [el("p", error, class_="banner")]
+        if error
+        else [
+            el("p", "No events.", class_="muted") if not rows else Markup(""),
+            rows_table(headers, body),
+        ]
+    )
     return page(
         "Events",
         el("h1", "Events"),
         _event_filter(connection, kind),
-        empty,
-        rows_table(headers, body),
+        *tail,
         active="events",
     )
 

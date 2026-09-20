@@ -67,6 +67,7 @@ from messagefoundry.transports.rest import (
     enforce_outbound_length_limits,
     http_family_trust_anchor,
     refuse_cleartext_credential_hop,
+    refuse_url_credentials,
 )
 from messagefoundry.transports.signing import CompactJwtSigner
 
@@ -146,6 +147,12 @@ class SmartBackendTokenProvider:
         scheme = urllib.parse.urlsplit(token_url).scheme.lower()
         if scheme not in ("http", "https"):
             raise SmartAuthError(f"smart_token_url must be http or https, got scheme {scheme!r}")
+        refuse_url_credentials(
+            token_url,
+            "smart_token_url",
+            use="smart_client_id/smart_private_key",
+            error=SmartAuthError,
+        )
         # The client_assertion JWT is a credential, so this hop goes through the ONE posture-keyed
         # authority — exactly like its OAuth2 sibling in http_auth.py and the delivery cells. It used to
         # read the raw, UNCLAMPED `MEFOR_ALLOW_INSECURE_TLS`, which meant one process-wide environment

@@ -278,7 +278,7 @@ async def test_start_isolates_inbound_bind_failure_and_recovers(
 ) -> None:
     # ADR 0031: an inbound bind failure mid-start() is ISOLATED — start() does NOT raise, the engine
     # comes up (degraded), the already-built outbound stays, the failed inbound is reported in
-    # degraded_connections() + alerted, and a later restart (once the bind succeeds) clears + binds it.
+    # degraded_inbound() + alerted, and a later restart (once the bind succeeds) clears + binds it.
     from messagefoundry.pipeline import wiring_runner as wr
 
     reg = _inbound_registry("utf-8")
@@ -299,16 +299,16 @@ async def test_start_isolates_inbound_bind_failure_and_recovers(
         await runner.start()  # does NOT raise — the bad inbound is isolated
         assert runner.running  # engine is up, just degraded
         assert not runner.inbound_running("mllp_in")  # the failed listener isn't bound
-        assert "mllp_in" in runner.degraded_connections()
-        reason = runner.connection_failed("mllp_in")
+        assert "mllp_in" in runner.degraded_inbound()
+        reason = runner.inbound_failed("mllp_in")
         assert reason and "address already in use" in reason
         assert "out" in runner._destinations  # the healthy outbound still came up
         assert sink.stopped and sink.stopped[0][0] == "mllp_in"  # alerted
 
         await runner.restart_inbound("mllp_in")  # bind now succeeds → recovers
         assert runner.inbound_running("mllp_in")
-        assert runner.connection_failed("mllp_in") is None  # marker cleared
-        assert runner.degraded_connections() == {}
+        assert runner.inbound_failed("mllp_in") is None  # marker cleared
+        assert not runner.degraded_inbound() and not runner.degraded_outbound()
     finally:
         await runner.stop()
     assert not runner.running  # stop() is idempotent and leaves a clean slate

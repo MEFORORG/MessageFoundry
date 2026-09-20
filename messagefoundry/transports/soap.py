@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import http.client
 import io
 import logging
 import re
@@ -105,6 +106,7 @@ from messagefoundry.transports.rest import (
     refuse_cleartext_credentials,
     refuse_cleartext_egress,
     refuse_unrevoked_verified_hop,
+    refuse_url_credentials,
     refuse_verify_off,
 )
 from messagefoundry.transports.signing import MessageSigner, signer_from_destination
@@ -304,6 +306,7 @@ class SoapDestination(DestinationConnector):
         scheme = urllib.parse.urlsplit(url).scheme.lower()
         if scheme not in ("http", "https"):
             raise ValueError(f"SOAP destination 'url' must be http or https, got scheme {scheme!r}")
+        refuse_url_credentials(url, "SOAP destination 'url'")
         self.url = url
         self.timeout: float = float(s.get("timeout_seconds", 30.0))
         self.encoding: str = s.get("encoding", "utf-8")
@@ -800,6 +803,11 @@ class SoapDestination(DestinationConnector):
             return  # any other status (the host answered) → reachable
         except urllib.error.URLError as exc:
             raise DeliveryError(f"SOAP {_redact_url(self.url)} unreachable: {exc.reason}") from exc
+        except (ValueError, http.client.InvalidURL) as exc:
+            # BACKLOG #1793: the probe is the test-connection reply; see the same arm in _post.
+            raise DeliveryError(
+                f"SOAP {_redact_url(self.url)} rejected an invalid request value"
+            ) from exc
         except (TimeoutError, OSError) as exc:
             raise DeliveryError(f"SOAP {_redact_url(self.url)} failed: {exc}") from exc
 
@@ -890,6 +898,14 @@ class SoapDestination(DestinationConnector):
             ) from exc
         except urllib.error.URLError as exc:
             raise DeliveryError(f"SOAP {_redact_url(self.url)} unreachable: {exc.reason}") from exc
+        except (ValueError, http.client.InvalidURL) as exc:
+            # BACKLOG #1793: the same arm as rest.py's _post, and the same reasoning. Without it an
+            # InvalidURL escaped as an internal error, and its text could hold a password.
+            raise NegativeAckError(
+                f"SOAP {_redact_url(self.url)} rejected an invalid request value",
+                code="bad-request-value",
+                permanent=True,
+            ) from exc
         except (TimeoutError, OSError) as exc:
             raise DeliveryError(f"SOAP {_redact_url(self.url)} failed: {exc}") from exc
 

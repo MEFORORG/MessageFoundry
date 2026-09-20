@@ -59,7 +59,8 @@ def _diagnostic(code: str, exc: BaseException) -> str:
 
     * ``MF-BUNDLE-CFG-001`` -- the config did not wire up (``WiringError``).
     * ``MF-BUNDLE-CFG-002`` -- loading the config raised something else.
-    * ``MF-BUNDLE-DB-001`` -- the store could not be opened or queried.
+    * ``MF-BUNDLE-DB-001`` -- the store could not be opened or queried. With ``StoreNotFoundError``
+      no store exists at the configured path, and the bundle did not create one (BACKLOG #1780).
     * ``MF-BUNDLE-LOG-001`` -- the configured ``[logging].log_dir`` could not be listed.
     * ``MF-BUNDLE-LOG-002`` -- the newest app-log file could not be read.
 

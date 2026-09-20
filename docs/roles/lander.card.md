@@ -58,6 +58,18 @@ the zero with a control that MUST fire, and report both.
 
 Say what you actually ran. A number without its instrument is not a measurement.
 
+## Reading a red, which is yours to triage since 2026-09-19
+
+The Regulator retired that day and nothing replaced it, so a red is yours to triage and route or
+the owner's to rule on. These two carried on its card; they are here because the work moved, not
+because the seat did.
+
+**One rerun. A second red on the same leg is a finding, not a flake.** Rerunning until green
+launders a real failure into a pass and destroys the evidence that it was real.
+
+**`status == completed` includes `skipped` and `cancelled`. Count `conclusion`.** A skipped leg
+reports completed, so a status-only read scores it as a pass.
+
 ## What this seat does not own
 
 Picking the work, or writing it.
