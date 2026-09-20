@@ -4201,8 +4201,20 @@ class RegistryRunner:
             # gate-parked lane and not on one that only adds an outbound — the same repair, the same
             # reload, two outcomes, decided by an unrelated lane's park state. It would also refuse
             # door six SILENTLY, when the reason the ADR keeps door gates at all is that a refusal
-            # here pages with a cause. The memo keeps it at one probe and one page per reload, and
-            # the `_delivery_halted` guard keeps a HEALTHY reload from probing at all.
+            # here pages with a cause. The memo keeps it at AT MOST one probe and one page per reload,
+            # and the `_delivery_halted` guard keeps a HEALTHY reload from probing at all.
+            #
+            # AT MOST, not exactly: once the narrowing below excludes the lanes the halt already took
+            # down, a halted reload on a graph with no gate-parked and no added lane asks ZERO times.
+            # No recovery waits on that. `reload` restarts the inbound listeners at step 2, BEFORE it
+            # reaches this method, and `_start_inbound_unsafe` -> `_resume_inbound_processing` probes
+            # `_log_recovery_ok` itself -- so on any graph this reload brings an inbound up for, a
+            # repaired disk has already cleared the latch by the time these lanes are reconciled and a
+            # still-dead one has already paged. Where it brings none up, the lane is resumed by
+            # `start_outbound` / `restart_outbound`, and those probe at their own door: the outbound
+            # lanes this arm now skips are PAUSED, and nothing here could have resumed them anyway
+            # (`_unpark_outbound_lane` is a no-op outside `_gate_parked`), so the only thing the
+            # skipped probe would have changed is how soon the latch reads clear.
             #
             # The two doors then differ only in what they leave behind, which is the fail-closed shape
             # each needs. A lane the ENGINE parked keeps its `_gate_parked` marker — untouched,
@@ -4223,7 +4235,33 @@ class RegistryRunner:
             # `_outbound_paused`, so it takes the no-write path. Re-stopping an already-paused lane
             # would CLEAR its quiescence Event, flipping a drained lane's status back from 'stopped'
             # to 'stopping' and withdrawing its purge-eligibility for a reload that changed nothing.
-            if self._delivery_halted or name in self._gate_parked:
+            #
+            # NARROWED to the lane the halt has NOT already taken down, and it reuses the very
+            # membership test the paragraph above relies on. `_delivery_halted` is a PROCESS fact,
+            # true for every lane at once, so an un-narrowed read ran this `continue` for EVERY
+            # outbound in the graph -- including the lanes the halt itself paused, which stand at
+            # neither door. `_unpark_outbound_lane` is a no-op for a lane the halt left outside
+            # `_gate_parked`, so there is no resume there for a gate to refuse; what the `continue`
+            # skipped instead was the DR re-evaluation and the connector rebuild below.
+            #
+            # THE REBUILD IS THE HALF NO LATER RELOAD CAN REDO, which is what made the overreach
+            # unrecoverable rather than merely late. :meth:`reload` swaps `self.registry` BEFORE it
+            # calls this method, so the NEXT reload's `old` is the already-changed graph and its
+            # `old.outbound[name].spec != oc.spec` test reads False forever;
+            # :meth:`_ensure_destination_built` then returns early on the lane's live connector, so
+            # the operator's resume keeps the stale one too. MEASURED in both claim modes: an
+            # outbound retargeted at a new directory mid-halt delivered its retained row to the OLD
+            # target once the disk was repaired, while status, the console and the API all read the
+            # new one, and a second reload did not repair it -- it survived to process restart.
+            #
+            # Reconciling a PAUSED lane's connector resumes nothing and ships nothing. The claim
+            # gate refuses every row while the latch holds, the lane stays in `_outbound_paused`
+            # either way, and :meth:`build_check` has already constructed every connector in the
+            # new graph (side-effect-free by contract: no bind, no file I/O) at the top of this
+            # reload, before a single lane was touched.
+            if (
+                self._delivery_halted and name not in self._outbound_paused
+            ) or name in self._gate_parked:
                 if unpark_permitted is None:
                     unpark_permitted = self._outbound_start_permitted(name)
                 if not unpark_permitted:
@@ -4248,10 +4286,23 @@ class RegistryRunner:
             # so self._workers is always empty in pooled — judging "live" by worker presence would rebuild
             # every connector on every reload (dropping every warm MLLP socket / DB pool / SMART token).
             # In pooled a connector is live iff it is BUILT; the spec-mismatch elif below still rebuilds a
-            # genuinely-changed one. The per_lane branch is the exact negation of the old check (unchanged).
+            # genuinely-changed one.
+            #
+            # CONNECTOR-KEYED WHILE THE HALT HOLDS, for the same reason pooled is. A per_lane worker
+            # RETURNS at :meth:`_delivery_worker`'s claim gate while `_delivery_halted`, which is the
+            # halt's designed terminal state and not a crash -- the resume doors respawn it through
+            # `_start_outbound_unsafe`. Reading `worker.done()` as 'not live' there made every halted
+            # reload pop, `aclose()` and rebuild EVERY paused lane's connector, and respawn a worker
+            # that dies at that gate on its first tick, for a reload that changed nothing. MEASURED in
+            # both claim modes on a reload with the connector spec identical: `same_connector` False in
+            # per_lane against True in pooled, and True in per_lane once this disjunct was added.
+            # Besides the warm MLLP socket / DB pool / SMART token the line above is written to keep,
+            # that churn made the unguarded `await stale.aclose()` below newly reachable for a halted
+            # lane, where a raising close propagates into `reload`'s own except and rolls a routine
+            # reload's intake back.
             live = (
                 name in self._destinations
-                if self._claim_mode == "pooled"
+                if self._claim_mode == "pooled" or self._delivery_halted
                 else (worker is not None and not worker.done())
             )
             if not live:

@@ -137,7 +137,7 @@ holds. See *Consequences* for exactly what an operator sees change.
    cover a lane BUILT AFTER the halt (a reload adding an outbound), which is **door six**.
 
    **Door six is now gated, by widening door 4's gate rather than adding a seventh.**
-   `_reconcile_outbounds` asks `_outbound_start_permitted` once per reload while the latch holds, and
+   `_reconcile_outbounds` asks `_outbound_start_permitted` at most once per reload while the latch holds, and
    on a refusal routes an outbound it would have brought up through `_stop_outbound_unsafe` -- so the
    lane lands in the same paused state as every other one. One gate for both doors, because that
    helper is a PROBE and not a predicate: it re-validates the sinks by writing to them, it can clear
@@ -147,6 +147,34 @@ holds. See *Consequences* for exactly what an operator sees change.
    door gates. The two doors differ only in what they leave behind: an engine-parked lane keeps its
    `_gate_parked` marker for a later reload to lift, while an added lane is STOPPED, not parked,
    because a park would write the very marker that gate lifts the moment a probe succeeds.
+
+   **NARROWED after the fact, and the reason is measured.** The gate's `_delivery_halted` half now
+   carries `and name not in self._outbound_paused`. `_delivery_halted` is a PROCESS fact, true for
+   every lane at once, so the un-narrowed read ran the gate's `continue` for every outbound in the
+   graph -- including the lanes the halt itself had already taken down, which stand at neither door:
+   `_unpark_outbound_lane` is a no-op outside `_gate_parked`, so there was no resume there to refuse.
+   Past that `continue` sit the DR re-evaluation and the connector rebuild, and the rebuild is the
+   half nothing later can redo -- `reload` swaps `self.registry` BEFORE this method, so the next
+   reload's `old` is the already-changed graph, and `_ensure_destination_built` returns early on the
+   live connector. MEASURED in both claim modes: an outbound retargeted at a new directory mid-halt
+   kept the connector built for the OLD one and delivered its retained row there once the disk was
+   repaired, while status and the API read the new target, and it survived to process restart.
+   Pinned, red in both modes without the narrowing, by
+   `tests/test_log_write_guard.py::test_a_reload_that_retargets_a_lane_during_a_halt_still_rebuilds_its_connector`.
+
+   Falling through exposed a second reading the halt had made wrong. `live` is worker-keyed in
+   per_lane, and the claim gate RETURNS a halted lane's worker out, so every halted reload popped,
+   closed and rebuilt a warm connector and respawned a worker that died on its first tick. `live` is
+   now connector-keyed while the latch holds, as it already is in pooled. Measured on a reload with
+   the spec unchanged: the same connector object survives in both modes, matching what the
+   un-narrowed gate left behind.
+
+   So the count above is AT MOST one, not one: a halted reload on a graph with no gate-parked and no
+   added lane now asks zero times. No recovery waits on that probe. `reload` restarts the inbound
+   listeners at step 2, before `_reconcile_outbounds`, and `_start_inbound_unsafe` ->
+   `_resume_inbound_processing` probes `_log_recovery_ok` itself. Where a reload brings no inbound
+   up, the lanes this arm skips are PAUSED and only `start_outbound` / `restart_outbound` can resume
+   them, and those probe at their own door.
 
    Per-lane
    recovery is meaningless here anyway: the broken sink is process-global, so the moment one lane's

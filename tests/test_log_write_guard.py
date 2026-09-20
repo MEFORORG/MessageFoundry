@@ -1751,6 +1751,79 @@ async def test_a_reload_that_adds_an_outbound_into_a_dead_log_lands_it_paused(
         await runner.stop()
 
 
+@pytest.mark.parametrize("claim_mode", CLAIM_MODES)
+async def test_a_reload_that_retargets_a_lane_during_a_halt_still_rebuilds_its_connector(
+    store: MessageStore, tmp_path: Path, claim_mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # WHAT THE GATE MAY NOT SKIP. The reload's door gate covers two doors with one condition, and
+    # `_delivery_halted` is true for EVERY lane while the halt is latched — so its `continue` runs
+    # for every outbound in the graph, not only for the one the gate is about. Past that `continue`
+    # sit the DR re-evaluation and the connector rebuild, and the rebuild is the half a later reload
+    # cannot redo: `reload` swaps `self.registry` BEFORE `_reconcile_outbounds`, so the next reload's
+    # `old` is the already-swapped graph and its `old.outbound[name].spec != oc.spec` test is False
+    # forever. `_ensure_destination_built` returns early on a lane that HAS a connector, so the
+    # operator's resume keeps the stale one too. The lane delivers to the OLD target until restart.
+    #
+    # The registry swap itself is not gated and never was, so this is a divergence rather than a
+    # no-op: status, the console and the API all read the NEW host while the bytes go to the old one.
+    outdir, newdir, logdir = tmp_path / "out", tmp_path / "new", tmp_path / "logs"
+    for directory in (outdir, newdir, logdir):
+        directory.mkdir()
+    configure_logging("INFO", log_file=LogFile(path=str(logdir / "engine.log")))
+    runner = RegistryRunner(_e2e_registry(outdir), store, poll_interval=0.02, claim_mode=claim_mode)
+    await runner.start()
+    try:
+        assert runner._destinations[OUTBOUND].directory == outdir, "the rig never built the lane"
+
+        _kill_every_sink(logdir, monkeypatch)
+        logging.getLogger("t").warning("a record this engine cannot write anywhere")
+        assert await _until(lambda: runner._log_write_stopped), "the halt never fired"
+        # The halt pauses a LIVE lane through `_stop_outbound_unsafe`, which drops `_gate_parked` —
+        # so the reload below takes the gate on its `_delivery_halted` half alone. WAITED FOR rather
+        # than asserted: `_stop_all_for_log_failure` sets the latch BEFORE it takes the reload lock
+        # and awaits every inbound's unbind, so the pause lands strictly later than the latch does.
+        assert await _until(lambda: OUTBOUND in runner._outbound_paused), "the halt never paused it"
+        assert OUTBOUND not in runner._gate_parked
+
+        message_id = await _seed_an_outbound_row_behind_the_halt(store, "R2")
+
+        # The operator retargets the outbound (a changed directory here; a changed host, port or DSN
+        # on any other connector) and reloads, with nothing yet repaired.
+        await runner.reload(_e2e_registry(newdir))
+
+        assert runner.registry.outbound[OUTBOUND].spec.settings["directory"] == str(newdir)
+        assert runner._destinations[OUTBOUND].directory == newdir, (
+            "the halted reload swapped the registry and left the OLD connector live"
+        )
+
+        # A SECOND reload must not be what repairs it — by then `old` is the swapped graph, so a
+        # reload has no way left to notice the change. Run one anyway: it must be a no-op, and a
+        # no-op HERE means the SAME connector object, not an equal one. `live` below is worker-keyed
+        # in per_lane and the halt gate has already returned this lane's worker out, so a reload that
+        # read `worker.done()` as 'not live' would pop, close and rebuild a warm connector on every
+        # reload for the whole duration of the halt.
+        rebuilt = runner._destinations[OUTBOUND]
+        await runner.reload(_e2e_registry(newdir))
+        assert runner._destinations[OUTBOUND] is rebuilt, (
+            "an unchanged reload tore the halted lane's connector down and rebuilt it"
+        )
+
+        # THE CONSEQUENCE, end to end: the operator repairs the disk and resumes the lane through
+        # the door the halt leaves open, and the retained row must ship to the NEW target.
+        _revive_every_sink(logdir, monkeypatch)
+        await runner.start_outbound(OUTBOUND)
+        assert not runner._delivery_halted, "a repaired start left the latch closed"
+
+        assert await _until(lambda: any(newdir.iterdir()) or any(outdir.iterdir())), (
+            "the repaired resume never delivered the retained row"
+        )
+        assert [p.name for p in newdir.iterdir()] == ["R2.hl7"], "the row missed the new target"
+        assert list(outdir.iterdir()) == [], "the row shipped to the target the reload replaced"
+        assert await _until_processed(store, message_id), "delivered but never finalized"
+    finally:
+        await runner.stop()
+
+
 # --- the hair trigger on the DEFAULT sink, found by running the suite ---------
 
 
