@@ -671,12 +671,84 @@ function Build-Map {
 
             # --no-optional-locks: a plain `git status` REWRITES the index of the repo it inspects, and
             # this walks every peer worktree -- so merely asking "what is in flight" would mutate other
-            # sessions' checkouts. Read-only is mandatory for an observer.
+            # sessions' checkouts. Read-only is mandatory for an observer, and it binds the diff below
+            # for the same reason.
             #
             # RUN EVERY WALK, NEVER MEMOISED. See the note on $termCache: a working-tree edit moves
             # nothing cheap, so this spawn is the price of the signal the gate actually blocks on.
-            $dirty = @(& git -C $Job.Path --no-optional-locks status --porcelain 2>$null |
-                Where-Object { $_.Length -gt 3 } | ForEach-Object { $_.Substring(3).Trim('"') })
+            #
+            # -z, NOT the default line format, BECAUSE OF THE RENAME. Porcelain writes a rename on one
+            # line as `R  <old> -> <new>`, and taking Substring(3) of that yields the single literal
+            # string "old -> new" -- which equals NEITHER path. Dirty is matched by exact normalised
+            # equality (see MatchedDirty), so a session asking about either side of a peer's staged
+            # rename was told nobody was touching it. That is the failure direction this whole script
+            # exists to prevent, and it was the quiet one: an under-report prints nothing. Under -z the
+            # two paths arrive as SEPARATE NUL-terminated fields, new first and original second, and
+            # paths are never quoted -- which also retires the `.Trim('"')` that mangled any path
+            # porcelain chose to quote.
+            #
+            # The -join is load-bearing, not tidying: PowerShell splits a native command's stdout on
+            # newlines, so a path that CONTAINS one arrives as two elements and has to be put back
+            # together before the NUL split can see the real field boundaries.
+            $porcelain = (& git -C $Job.Path --no-optional-locks status --porcelain -z 2>$null) -join "`n"
+            $fields = @($porcelain -split "`0")
+            $dirty = @()
+            $eolSuspect = @()
+            for ($i = 0; $i -lt $fields.Count; $i++) {
+                $f = $fields[$i]
+                if ($f.Length -lt 4) { continue }   # `XY <path>`, so 4 is the shortest real entry
+                $xy = $f.Substring(0, 2)
+                $path = $f.Substring(3)
+                $dirty += $path
+                if ($xy.Contains('R') -or $xy.Contains('C')) {
+                    # BOTH SIDES, deliberately. The peer has emptied the old path and filled the new
+                    # one, so a session editing either collides. The original is the next field, and
+                    # carries no status prefix of its own.
+                    $i++
+                    if ($i -lt $fields.Count -and $fields[$i]) { $dirty += $fields[$i] }
+                    continue
+                }
+                # THE OTHER FAILURE DIRECTION, and it must not be fixed with the same instrument.
+                # ` M` means unmodified in the index, modified in the working tree -- and status
+                # answers that from the index stat and oid WITHOUT converting the content, so a file
+                # whose only change is CRLF-vs-LF reads as modified. --no-optional-locks means git may
+                # not even write the refreshed stat cache, so it re-reads that way on every walk.
+                # Measured against a fixture: a CRLF-only rewrite shows ` M` under `status --porcelain`
+                # while `git diff --name-only` reports the file as unchanged.
+                #
+                # ONLY ` M` is a suspect. Anything carrying a staged component (`MM`, `AM`, ...) is
+                # dirty whatever the working tree holds, and `??`/` D`/` T` cannot be content-compared
+                # at all.
+                if ($xy -eq ' M') { $eolSuspect += $path }
+            }
+            if ($eolSuspect.Count -gt 0) {
+                # ONE extra spawn per worktree that has an unstaged modification -- which is MOST
+                # non-clean peers, because ` M` is the ordinary state of a session mid-edit. Budget
+                # it that way rather than as a rare extra: this is also the one leg of the walk that
+                # is never memoised (see the note above), so it roughly doubles the un-memoised work
+                # on a dirty worktree. RE-MEASURE if the walk starts overrunning again -- a partial
+                # walk is itself an under-report, so paying for accuracy here can cost it elsewhere.
+                #
+                # `git diff` applies the repo's OWN declared eol policy (.gitattributes plus
+                # core.autocrlf), which makes it the right authority and `--ignore-cr-at-eol` the
+                # wrong one: that flag also acquits a file pinned `-text` precisely so its bytes stay
+                # exact, where a CRLF rewrite IS the change. Measured on a fixture carrying both:
+                # plain `--name-only` kept the pinned file and dropped the normalised one, while
+                # `--ignore-cr-at-eol` dropped both.
+                #
+                # SUPPRESSION IS THE UNDER-REPORTING DIRECTION, so it is gated on the command actually
+                # succeeding. A failed diff drops the acquittal and leaves the wider set -- the same
+                # choice the committed half above makes, for the same reason.
+                $changed = @(& git -C $Job.Path --no-optional-locks diff --name-only 2>$null)
+                if ($LASTEXITCODE -eq 0) {
+                    # Ordinal, not PowerShell's default: git paths are case-sensitive and a
+                    # case-insensitive comparer would acquit a path git never cleared.
+                    $acquitted = [System.Collections.Generic.HashSet[string]]::new(
+                        [string[]]$eolSuspect, [System.StringComparer]::Ordinal)
+                    $acquitted.ExceptWith([string[]]$changed)
+                    $dirty = @($dirty | Where-Object { -not $acquitted.Contains($_) })
+                }
+            }
             $r.Dirty = @($dirty | Where-Object { $_ } | Sort-Object -Unique)
         } catch { $r.Skipped = $true }
         return $r
