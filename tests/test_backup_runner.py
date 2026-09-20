@@ -412,6 +412,54 @@ async def test_keep_n_does_not_reserve_a_slot_for_an_archive_that_is_not_there(
     assert result.pruned == 0
 
 
+async def test_keep_n_orders_case_insensitively_where_its_glob_does(tmp_path, key_b64) -> None:
+    """The sort must fold case wherever `Path.glob` does, or it reads the newest as the oldest.
+
+    On Windows -- the platform this ships on -- `Path.glob` is case-INSENSITIVE, so an
+    all-uppercase archive name enters the candidate set. A case-SENSITIVE sort then compares `M`
+    (0x4D) against `m` (0x6D) at the FIRST character of the prefix, decides the ordering there, and
+    never reaches the timestamp. The newest archive sorts last and gets pruned.
+
+    MEANINGFUL ONLY ON WINDOWS, and it says so rather than pretending otherwise: on a
+    case-sensitive filesystem the uppercase name never matches the glob, so it is not a candidate,
+    and this test passes for a different and uninteresting reason. Stated because a test that
+    passes everywhere for two different reasons is one somebody will later trust on the wrong one.
+    """
+    dest = tmp_path / "backups"
+    dest.mkdir()
+    # Newest by timestamp, but first by a case-sensitive sort, so it is the one at risk.
+    newest_upper = dest / "MEFOR-BACKUP-DEV-20260109T000000Z.MFBAK"
+    older = [dest / f"mefor-backup-dev-2026010{i}T000000Z.mfbak" for i in (1, 2)]
+    for p in (newest_upper, *older):
+        p.write_bytes(b"archive")
+
+    # Decide BEFORE the run whether this platform makes the uppercase name a candidate. Deciding
+    # AFTERWARDS from the surviving files is what made the first version of this test
+    # unfalsifiable: when the defect fires that file is GONE, so a post-hoc "was it a candidate?"
+    # test reads False and skips the very assertion it guards.
+    glob_is_case_insensitive = any(
+        q.name == newest_upper.name for q in dest.glob("mefor-backup-dev-????????T??????Z.mfbak")
+    )
+
+    store = await _store_with_rows(tmp_path / "msg.db", key_b64)
+    runner = BackupRunner(
+        store,
+        _settings(dest, key_b64, retention_keep=3),
+        store_settings=_store_settings(tmp_path / "msg.db", key_b64),
+        config_dir=None,
+        instance="dev",
+    )
+    result = await runner.run_once(now=1000.0)
+    await store.close()
+    assert result is not None
+
+    if glob_is_case_insensitive:
+        assert newest_upper.exists(), (
+            "the newest archive by timestamp was pruned because the sort compared case before it "
+            "reached the stamp; the sort key must fold case wherever the glob does"
+        )
+
+
 async def test_widening_to_both_extensions_does_not_readmit_part_or_failed(
     tmp_path, key_b64
 ) -> None:
