@@ -2292,6 +2292,102 @@ async def test_purge_action_registered_in_stepup_allowlist(engine: Engine) -> No
     assert not is_safe_ui_action("/ui/connections/OB_X/purge/all?x=1")  # query rejected
 
 
+# The two behavioural arms of the single-connection purge's ``require_ui_step_up`` gate (BACKLOG
+# #1700). Its own docstring names the checks it re-applies -- MFA satisfied AND a recent password
+# step-up -- and until these landed NOTHING here exercised either one on this route.
+#
+# What DID cover the gate, measured on the pristine tree before these tests existed, is worth stating
+# so nobody deletes them as duplicates: swapping this route to plain ``require_ui`` reds two ENGINE-side
+# guards in tests/test_security_doc_drift.py -- the /ui route map's gate-NAME comparison against
+# docs/SECURITY.md, and ``test_ui_gate_divergences_are_exactly_the_reviewed_set``, which flags a /ui
+# route on ``require_ui`` whose same-permission JSON twin carries ``require_step_up``. Both are
+# STATIC: one compares a name to a doc, the other classifies a gate name. Neither drives the route.
+#
+# So they miss the weakening that keeps a ``require_ui*`` name other than the ``require_ui`` literal.
+# Measured: swapping this route to ``require_ui_reauth_only`` -- which turns the ASVS 6.3.3 MFA gate
+# OFF and keeps only the password window -- and updating the one doc row ran GREEN across the whole
+# console suite (609 passed, 3 skipped), all 42 doc-drift tests and the 6 golden-surface tests.
+# ``test_purge_mfa_pending_is_refused_and_audited`` below is the arm that reds it.
+
+
+async def test_purge_stale_stepup_redirects_to_reauth(engine: Engine) -> None:
+    """A stale step-up window must stop the single-connection purge before it reaches the handler.
+
+    The twin of ``test_purge_after_login_stepup_reaches_handler``: that one proves the gate LETS a
+    stepped-up operator through, which stays true with the gate deleted, so it can only ever fail
+    open. This is the arm that fails closed, and it is the coverage the BULK confirm page already had
+    (``test_purge_confirm_stale_stepup_redirects_to_reauth``) while the per-connection purge did not.
+
+    RED when the ``require_ui_step_up`` Depends on ``ui_purge_connection`` is removed: with no
+    freshness check the request reaches ``purge_connection``, which 404s on the unknown outbound.
+
+    ``require_mfa=False`` is the control, not a convenience. It makes ``mfa_satisfied`` True, so the
+    step-up window is the ONLY leg of the gate left that can produce this redirect -- otherwise an
+    MFA-pending session would 303 to the same place for the other reason and the test would pass
+    without measuring the window at all. The two asserts below pin that split explicitly.
+    """
+    service = AuthService(engine.store, AuthSettings(require_mfa=False, step_up_max_age_seconds=0))
+    await service.initialize()
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")  # zero-length window -> the fresh login is already stale
+        tok = c.cookies.get("mf_session")
+        assert tok is not None
+        assert await service.mfa_satisfied(tok) is True  # the MFA leg is NOT what refuses here
+        assert await service.has_recent_step_up(tok) is False  # the stale window is
+        r = await c.post(
+            "/ui/connections/OB_X/purge/all", headers={"Sec-Fetch-Site": "same-origin"}
+        )
+        assert r.status_code == 303, "a stale step-up reached the purge handler"
+        # The exact continuation, not just the prefix: the purge is registered auto_retry, so the
+        # operator must land back on the action they clicked rather than on a bare re-auth page.
+        assert r.headers["location"] == "/ui/reauth?next=/ui/connections/OB_X/purge/all"
+
+
+async def test_purge_mfa_pending_is_refused_and_audited(engine: Engine) -> None:
+    """The purge's other step-up leg: an MFA-PENDING session is refused, audited, and sent to re-auth.
+
+    Three assertions, each catching a different downgrade of this one route's gate:
+
+    * the 303 itself -- an MFA-pending session must not reach ``purge_connection``;
+    * the ``auth.mfa_denied`` row -- the ASVS 6.3.3 gate's own record. ``require_ui``'s
+      ``allow_mfa_pending`` switch turns the gate off AND the row with it, so this row is what
+      separates ``require_ui_step_up`` from ``require_ui_reauth_only``. Both redirect to the same
+      place for an unenrolled session (a pending session is deliberately given no step-up freshness
+      at login), so the row is the ONLY behavioural discriminator between them;
+    * the LOCATION -- plain ``require_ui`` passes no ``mfa_refusal`` and so sends the browser to
+      ``/ui/mfa``, losing the continuation. Only the step-up factory's refusal carries ``next=``.
+
+    RED under both measured downgrades: ``require_ui_reauth_only`` (no row) and ``require_ui``
+    (``/ui/mfa``, no continuation).
+    """
+    service = AuthService(engine.store, AuthSettings(require_mfa=True))
+    await service.initialize()
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        tok = c.cookies.get("mf_session")
+        # Control: this arm really is MFA-pending. Without it a sign-in that quietly started
+        # satisfying MFA would make the refusal below come from somewhere else entirely.
+        assert tok is not None and await service.mfa_satisfied(tok) is False
+        # Negative control: the sign-in audits, but it audits nothing of this action.
+        assert await engine.store.list_audit(action="auth.mfa_denied") == []
+        r = await c.post(
+            "/ui/connections/OB_X/purge/all", headers={"Sec-Fetch-Site": "same-origin"}
+        )
+        assert r.status_code == 303, "an MFA-pending session reached the purge handler"
+        assert r.headers["location"] == "/ui/reauth?next=/ui/connections/OB_X/purge/all"
+        rows = await engine.store.list_audit(action="auth.mfa_denied")
+        assert len(rows) == 1, "the MFA-pending purge attempt left no record"
+        assert rows[0]["actor"] == "op"
+        # Exact equality for the same reason the WebSocket twin asserts it: the row carries the PATH
+        # and nothing else, so a widening that put a query string into the hash chain fails here.
+        assert json.loads(str(rows[0]["detail"])) == {"path": "/ui/connections/OB_X/purge/all"}
+        # The MFA gate must stay ABOVE the permission loop: a denial row here would mean an
+        # unverified caller was told whether it holds messages:purge.
+        assert await engine.store.list_audit(action="auth.permission_denied") == []
+
+
 def test_connections_fragment_renders_selection_checkbox() -> None:
     from messagefoundry.api.models import ConnectionRow
     from messagefoundry_webconsole.pages import connections_fragment
