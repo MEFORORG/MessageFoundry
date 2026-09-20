@@ -92,6 +92,26 @@ def test_config_summary_broken_config_reports_error(tmp_path: Path) -> None:
     assert "error" in summary
 
 
+def test_config_summary_reports_a_connection_less_config_as_loaded(tmp_path: Path) -> None:
+    """A config that declares no connection LOADED — the bundle must not call that a load failure.
+
+    The bundle reports a graph, it does not gate one, so the #1648 empty-graph refusal is dropped
+    here: reporting ``loaded: False`` would send support looking for an import error that does not
+    exist, while the emptiness is already stated, and stated better, by the zero counts.
+
+    Falsified by dropping ``allow_empty=True`` from ``config_summary``'s ``load_config``."""
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "helpers.py").write_text(
+        'from messagefoundry import router\n\n@router("r")\ndef route(msg):\n    return []\n',
+        encoding="utf-8",
+    )
+    summary = config_summary(cfg)
+    assert summary["loaded"] is True
+    assert "error" not in summary
+    assert summary["counts"]["inbound"] == 0 and summary["counts"]["outbound"] == 0
+
+
 def test_log_tail_redacted_no_phi_no_secret(tmp_path: Path) -> None:
     # Build a fake settings object pointing at a log dir holding a line with PHI + a secret.
     from messagefoundry.config.settings import load_settings
@@ -281,7 +301,10 @@ def test_config_summary_wiring_error_drops_the_exception_message(
     """Sink (b): the ``WiringError`` arm. A config module can raise with anything in the string."""
     from messagefoundry.config import wiring
 
-    def boom(_config_dir: object) -> object:
+    # **_: config_summary passes allow_empty= (BACKLOG #1648); a stub that refused the keyword
+    # would raise TypeError and land in the CATCH-ALL arm, making this test assert CFG-002 while
+    # claiming to cover CFG-001.
+    def boom(_config_dir: object, **_: object) -> object:
         raise wiring.WiringError(_CFG_WIRING_PAYLOAD)
 
     monkeypatch.setattr(wiring, "load_config", boom)
@@ -301,7 +324,7 @@ def test_config_summary_unexpected_error_drops_the_exception_message(
     """Sink (a): the catch-all arm, which wraps whatever an arbitrary config module raised."""
     from messagefoundry.config import wiring
 
-    def boom(_config_dir: object) -> object:
+    def boom(_config_dir: object, **_: object) -> object:
         raise RuntimeError(_CFG_GENERIC_PAYLOAD)
 
     monkeypatch.setattr(wiring, "load_config", boom)
