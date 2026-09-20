@@ -56,21 +56,35 @@ async def _service(engine: Engine, settings: AuthSettings | None = None) -> Auth
     return service
 
 
+#: The address a no-peer client reports. This is httpx's own ASGITransport default, NAMED here
+#: rather than left implicit: httpx documents it only as "the client IP and port" and pyproject
+#: floors at httpx>=0.27, so a future default of None would silently revert every no-peer call site
+#: to the BACKLOG #1644 vacuity below with nothing going red. Pinning it keeps the value one this
+#: file chose.
+_DEFAULT_PEER = ("127.0.0.1", 123)
+
+
 def _client(
     engine: Engine, service: AuthService, *, peer: tuple[str, int] | None = None
 ) -> httpx.AsyncClient:
-    """``peer`` pins the ASGI scope's client address; omitted, httpx's own default stands.
+    """``peer`` pins the ASGI scope's client address; omitted, ``_DEFAULT_PEER`` stands.
 
-    That default is a real address (``("127.0.0.1", 123)``), NOT None, so the RBAC behaviour most of
-    this file asserts reads the same either way. Pass ``peer`` where the ADDRESS itself is under test
-    -- the ADR 0150 section below -- so the assertion compares a value this file chose.
+    Either way ``request.client`` is a REAL address and never None, which is what the ADR 0150 tests
+    further down need: an assertion on the audited ``client`` degenerates to ``None == None`` and
+    passes against unfixed code when the scope carries no client (BACKLOG #1644). Pass ``peer``
+    wherever the ADDRESS is the subject, so the assertion compares a value the test named.
 
-    Do not pass ``client=`` unconditionally to do it: ``client=None`` REPLACES that real default at
-    every call site, and an address assertion then degenerates to ``None == None`` and passes against
-    unfixed code -- the exact vacuity the ADR 0150 section exists to rule out (BACKLOG #1644)."""
-    app = create_app(engine, auth=service)
-    transport = (
-        httpx.ASGITransport(app=app) if peer is None else httpx.ASGITransport(app=app, client=peer)
+    Do not reach for ``client=None`` to mean "no peer" in THIS file: it would replace a real default
+    at ~62 call sites and make that vacuity the norm. Modelling an absent peer is legitimate in its
+    own right -- tests/test_client_network_allowlist.py does it deliberately, for the unknown-peer
+    deny path -- it is just never what a call site here wants.
+
+    The loopback default is not neutral for every gate, so do not read it as one:
+    ``client_network_allowed`` fails CLOSED on a None client and allows any loopback spelling
+    unconditionally. A test of ``[security].allowed_client_networks`` must therefore set ``peer``
+    explicitly rather than lean on either default."""
+    transport = httpx.ASGITransport(
+        app=create_app(engine, auth=service), client=_DEFAULT_PEER if peer is None else peer
     )
     return httpx.AsyncClient(transport=transport, base_url="http://t")
 

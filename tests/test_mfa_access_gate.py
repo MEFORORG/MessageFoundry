@@ -47,20 +47,25 @@ async def _service(engine: Engine, settings: AuthSettings | None = None) -> Auth
     return service
 
 
+#: httpx's own ASGITransport default, named rather than left implicit. ``_client`` in
+#: tests/test_api_auth.py carries the reasoning; this is the same constant for the same reason.
+_DEFAULT_PEER = ("127.0.0.1", 123)
+
+
 def _client(
     engine: Engine, service: AuthService, *, peer: tuple[str, int] | None = None
 ) -> httpx.AsyncClient:
-    """``peer`` pins the ASGI scope's client address; omitted, httpx's own default stands.
+    """``peer`` pins the ASGI scope's client address; omitted, ``_DEFAULT_PEER`` stands.
 
-    That default is a real address (``("127.0.0.1", 123)``), NOT None, so the gate behaviour most of
-    this file asserts reads the same either way. Pass ``peer`` whenever the address is under test.
+    Either way ``request.client`` is a real address and never None, so an assertion on the audited
+    ``client`` cannot degenerate to ``None == None`` and pass against unfixed code. Pass ``peer``
+    wherever the address is the subject.
 
-    Do not pass ``client=`` unconditionally to do it: ``client=None`` REPLACES that real default at
-    every call site, and an address assertion then degenerates to ``None == None`` and passes against
-    unfixed code (BACKLOG #1644)."""
-    app = create_app(engine, auth=service)
-    transport = (
-        httpx.ASGITransport(app=app) if peer is None else httpx.ASGITransport(app=app, client=peer)
+    The full rationale -- including when modelling an absent peer IS the right thing to do, and why
+    the loopback default is not neutral for the network allowlist -- is on ``_client`` in
+    tests/test_api_auth.py, stated once there rather than restated here (BACKLOG #1644)."""
+    transport = httpx.ASGITransport(
+        app=create_app(engine, auth=service), client=_DEFAULT_PEER if peer is None else peer
     )
     return httpx.AsyncClient(transport=transport, base_url="http://t")
 
