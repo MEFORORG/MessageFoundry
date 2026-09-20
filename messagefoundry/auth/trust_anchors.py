@@ -45,6 +45,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from messagefoundry.service_status import _system_exe
+
 if TYPE_CHECKING:
     from messagefoundry.config.settings import ApiSettings, AuthSettings
     from messagefoundry.store.base import Store
@@ -175,10 +177,15 @@ def dacl_is_owner_only(path: str | os.PathLike[str]) -> bool | None:
       that grants a write-capable right."""
     if os.name == "nt":
         try:
-            # icacls is a fixed system tool, invoked without a shell; the path is a single argv token,
-            # never a shell word (matches _secure_file's low-27/STORE-5 note). No modifying flags.
+            # icacls is pinned to its absolute System32 path and invoked without a shell; the path is
+            # a single argv token, never a shell word (matches _secure_file's low-27/STORE-5 note).
+            # No modifying flags. The pin is what makes "fixed system tool" true: CreateProcess
+            # resolves an unqualified name through a search path that reaches the caller's working
+            # directory, and this call's OUTPUT is what decides the verdict below, so a planted
+            # icacls.exe printing a clean DACL would turn a group-writable anchor into an accepted
+            # one (BACKLOG #1769).
             result = subprocess.run(  # nosec B603 B607
-                ["icacls", os.fspath(path)],
+                [_system_exe("icacls.exe"), os.fspath(path)],
                 check=False,
                 capture_output=True,
                 text=True,

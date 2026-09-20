@@ -31,13 +31,14 @@ from messagefoundry.config.wiring import (
     OutboundConnection,
     Registry,
     Send,
+    WiringError,
     _is_secret_setting,
     display_settings,
     env,
     redacted_settings,
 )
 from messagefoundry.pipeline import Engine
-from messagefoundry.transports import build_destination, build_source
+from messagefoundry.transports import build_destination, build_source, wincred
 from messagefoundry.transports.base import (
     DeliveryError,
     TestNotSupportedError,
@@ -695,6 +696,104 @@ async def test_post_test_is_audited(
     await client.post("/connections/IB_MLLP/test")
     rows = await engine.store.list_audit(limit=20)
     assert any(row["action"] == "connection_test" for row in rows)
+
+
+# --- the credential probe's BUILD failures (BACKLOG #1824) --------------------
+
+
+def _credential_registry(directory: str) -> Registry:
+    """A File inbound carrying an alternate-Windows credential — the only shape
+    ``POST /connections/{name}/test-credential`` accepts."""
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection(
+            "IB_CRED",
+            ConnectionSpec(
+                ConnectorType.FILE,
+                {
+                    "directory": directory,
+                    "credential_username": "svc",
+                    "credential_password": "pw",  # already env-resolved at this layer
+                },
+            ),
+            router="r",
+        )
+    )
+    reg.add_router("r", lambda m: [])
+    return reg
+
+
+async def test_post_test_credential_off_windows_reports_the_build_failure(
+    engine: Engine,
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An alt credential on a NON-WINDOWS host is a CONFIG error, so the probe reports it in the
+    result — it must not escape as a 500 (BACKLOG #1824).
+
+    ``CredentialUnsupportedError`` is raised inside ``build_test_connector`` (the File connector
+    builds its credential context in ``__init__``). It is a ``ValueError`` but NOT a ``WiringError``,
+    so before the build seam normalized it, it sailed past the route's ``except WiringError``.
+
+    ``is_supported`` is patched rather than the platform, so this runs on a Windows runner too —
+    off Windows it is already False and the patch is a no-op."""
+    monkeypatch.setattr(wincred, "is_supported", lambda: False)
+    engine.add_registry(_credential_registry(str(tmp_path / "share")))
+
+    r = await client.post("/connections/IB_CRED/test-credential")
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["supported"] is True  # it WAS testable; the configuration is what failed
+    assert body["success"] is False
+    assert body["direction"] == "in"
+    assert "require Windows" in body["detail"]
+
+
+async def test_post_test_credential_audits_a_build_failure(
+    engine: Engine,
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ``connection_credential_test`` audit row is written on a FAILED probe too (BACKLOG #1824).
+
+    This row is the probe's OUTCOME — did the credential reach the share. The authz GRANT row that
+    ``require_paced(CONNECTIONS_TEST)`` writes before the handler is a different record and survived
+    the 500; what a raise past ``_run_connection_test`` lost is the answer."""
+    monkeypatch.setattr(wincred, "is_supported", lambda: False)
+    engine.add_registry(_credential_registry(str(tmp_path / "share")))
+
+    await client.post("/connections/IB_CRED/test-credential")
+
+    rows = await engine.store.list_audit(limit=20)
+    cred_rows = [row for row in rows if row["action"] == "connection_credential_test"]
+    assert cred_rows, "a failed credential probe must still be audited"
+    assert json.loads(cred_rows[0]["detail"])["success"] is False
+
+
+def test_build_test_connector_normalizes_every_build_failure(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``build_test_connector`` raises ``WiringError`` for EVERY build failure — the guarantee that
+    makes the API's narrow ``except WiringError`` exhaustive (BACKLOG #1824).
+
+    Pinned at the seam rather than only through the route, because it is the seam that promises it:
+    the route is correct as long as this holds, and silently 500s the moment it does not. Mirrors
+    ``build_check_registry``, which normalizes the same way."""
+    monkeypatch.setattr(wincred, "is_supported", lambda: False)
+    engine.add_registry(_credential_registry(str(tmp_path / "share")))
+    rr = engine.registry_runner
+    assert rr is not None
+
+    with pytest.raises(WiringError):
+        rr.build_test_connector("IB_CRED")
+
+    # The control for the wrap: an unknown name is the caller's 404 and must NOT be swallowed into
+    # a WiringError. Without this, "everything is a WiringError" would also be true vacuously.
+    with pytest.raises(KeyError):
+        rr.build_test_connector("IB_NOPE")
 
 
 async def test_post_test_not_deployed_outbound_short_circuits(
