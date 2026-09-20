@@ -32,7 +32,7 @@ PROFILES_DIR = Path(__file__).parent / "profiles"
 #: outside the package: ``PROFILES_DIR`` is force-included whole into the harness wheel, and
 #: hatchling's ``recurse_forced_files`` walks the filesystem without reading .gitignore, so a file
 #: dropped in there ships to everyone who installs the harness even when git is told to skip it
-#: (BACKLOG #1833).
+#: (BACKLOG #1835).
 #:
 #: ``migration-local/`` rather than a new directory: it is already this repository's ignored tree for
 #: real-numbers, site-specific material, named as such by docs/LOAD-TESTING.md, profiles/README.md and

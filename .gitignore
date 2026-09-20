@@ -108,7 +108,7 @@ TRANSCRIPTS.md
 # Operator-local load/throughput profiles are NOT ignored here any more, and must never be again.
 # Two were, by name, at /harness/load/profiles/<name>.toml. That is a contradiction git cannot
 # report: hatchling's force-include walks the FILESYSTEM and reads no .gitignore, so a harness wheel
-# built on the machine holding those files shipped them, hosts and ports included (BACKLOG #1833).
+# built on the machine holding those files shipped them, hosts and ports included (BACKLOG #1835).
 # They belong in migration-local/profiles/, which /migration-local/ above already covers, which no
 # force-include source names, and which docs/LOAD-TESTING.md and harness/load/profiles/README.md
 # already name as the home for site-specific numbers. harness/load/profile.py reads that directory,

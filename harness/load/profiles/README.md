@@ -45,7 +45,7 @@ with `--load <path>`. Never commit one here, **and never drop one in this direct
 name either** — that was tried, and it shipped. The harness wheel force-includes this directory
 whole; hatchling's `recurse_forced_files` walks the filesystem and consults no `.gitignore`, and
 `exclude` does not reach a force-included file, so the wheel carries whatever is sitting here on the
-machine that built it (BACKLOG #1833). A guard test
+machine that built it (BACKLOG #1835). A guard test
 ([../../../tests/test_packaging.py](../../../tests/test_packaging.py)) now refuses a `.gitignore`
 entry that names a path inside a force-included tree. A guard test
 ([../../../tests/test_load_config.py](../../../tests/test_load_config.py)) asserts the shipped

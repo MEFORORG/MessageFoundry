@@ -14,7 +14,7 @@ The build backend pin (BACKLOG #1546) is the second guard. PEP 517 build isolati
 jobs that publish. Nothing in PR CI executes release.yml, so a pin that loosens would first be seen
 at a tag. Pure text checks, no network.
 
-The .gitignore/force-include contradiction (BACKLOG #1833) is the third. ``.gitignore`` is not a
+The .gitignore/force-include contradiction (BACKLOG #1835) is the third. ``.gitignore`` is not a
 packaging control, and nothing used to say so: two operator-local load profiles were ignored by name
 under ``harness/load/profiles/``, a directory the harness wheel force-includes, and hatchling's
 ``recurse_forced_files`` walks the FILESYSTEM without consulting .gitignore or any include/exclude
@@ -108,7 +108,7 @@ def test_every_build_system_pins_its_backend_exactly_and_they_agree() -> None:
     )
 
 
-# --- BACKLOG #1833: .gitignore must not name a path a wheel force-include ships -------------------
+# --- BACKLOG #1835: .gitignore must not name a path a wheel force-include ships -------------------
 #
 # The two mechanisms answer different questions and nothing reconciled them. git is asked what to
 # TRACK; hatchling's force-include is asked what to SHIP, and `recurse_forced_files` (hatchling
@@ -195,7 +195,7 @@ def _anchored_literal_ignores(text: str) -> list[tuple[int, str]]:
 def test_the_gitignore_parser_reads_the_shapes_this_guard_depends_on() -> None:
     """A parser that silently matched nothing would make the guard below pass forever.
 
-    The first two lines are the exact text #1833 removed from .gitignore. The rest are shapes the
+    The first two lines are the exact text #1835 removed from .gitignore. The rest are shapes the
     parser must NOT return, each for its own reason.
     """
     parsed = _anchored_literal_ignores(
@@ -226,7 +226,7 @@ def test_no_gitignore_entry_names_a_path_inside_a_force_included_tree() -> None:
     line, the path, and the distribution that would ship it.
 
     Both directions are contradictions and both are reported. An entry INSIDE a source is the shape
-    #1833 hit. An entry that is a PARENT of one (``/harness/``) would leave the whole mapped tree
+    #1835 hit. An entry that is a PARENT of one (``/harness/``) would leave the whole mapped tree
     untracked while the map still shipped whatever sat there.
     """
     roots = _force_include_roots()
@@ -236,7 +236,7 @@ def test_no_gitignore_entry_names_a_path_inside_a_force_included_tree() -> None:
 
     entries = _anchored_literal_ignores((_REPO / ".gitignore").read_text(encoding="utf-8"))
     # POSITIVE CONTROL, the other half: .gitignore really does carry anchored literal entries. 22 of
-    # them once #1833 removed its two; a floor well under that catches a parser which stopped matching
+    # them once #1835 removed its two; a floor well under that catches a parser which stopped matching
     # without pinning a count that moves on every ordinary edit.
     assert len(entries) >= 15, f"the .gitignore parse returned only {len(entries)} entries"
 
@@ -252,5 +252,5 @@ def test_no_gitignore_entry_names_a_path_inside_a_force_included_tree() -> None:
         f"source and reads no .gitignore, and `exclude` does not reach one either (BACKLOG #1702). Move "
         f"the file OUT of the mapped tree (migration-local/ is this repo's ignored tree for "
         f"site-specific material) "
-        f"rather than ignoring it where the build can still see it (BACKLOG #1833)."
+        f"rather than ignoring it where the build can still see it (BACKLOG #1835)."
     )

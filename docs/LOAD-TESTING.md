@@ -13,7 +13,7 @@ never touches the store.
 > and `--load <name>` resolves it, or run any path with `--load <path>`. **Never** put one under
 > `harness/load/profiles/`, even gitignored by name: the harness wheel force-includes that directory
 > whole, hatchling walks the filesystem without reading `.gitignore`, and the file ships to everyone
-> who installs the harness from a build on your machine (BACKLOG #1833). Generated traffic is
+> who installs the harness from a build on your machine (BACKLOG #1835). Generated traffic is
 > synthetic HL7 (the `messagefoundry` generators). Reports carry **metrics and metadata only** —
 > never message bodies or control-id lists.
 

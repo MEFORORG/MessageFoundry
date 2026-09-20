@@ -240,7 +240,7 @@ def test_get_profile_by_path(tmp_path: object) -> None:
     assert get_profile(str(path)).name == "smoke"
 
 
-# --- BACKLOG #1833: operator-local profiles, resolved outside the packaged tree -------------------
+# --- BACKLOG #1835: operator-local profiles, resolved outside the packaged tree -------------------
 #
 # These used to be dropped straight into PROFILES_DIR and ignored by name in .gitignore. That shipped
 # them: the harness wheel force-includes PROFILES_DIR whole, and hatchling walks the filesystem for a
