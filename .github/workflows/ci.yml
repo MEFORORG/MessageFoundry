@@ -1782,7 +1782,48 @@ jobs:
             echo "tooling_matrix=$TOOLING_DOCS" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # Remaining case: pull_request. Compute the path-based filters from the PR diff.
+          # Remaining cases: ANY event not returned above. Compute the path-based filters from the diff.
+          # Today that is pull_request and merge_group; it is written as a residual rather than a list
+          # because the list is what went wrong -- see the next paragraph, and SDS-3.6.
+          #
+          # THE SECOND EVENT IS A DEFECT, AND IT IS STATED HERE BECAUSE THIS IS WHERE IT LIVES -- the
+          # gates that mislead a reader are elsewhere, but they only mislead because of this line
+          # (BACKLOG #1830, which is FILED IN THE INTERNAL LEDGER AND NOT YET MERGED THERE -- so the
+          # citation may not resolve yet). This comment used to read "Remaining case: pull_request",
+          # naming the one event the code below is written for. merge_group falls through to here too,
+          # and `BASE_SHA` is `github.event.pull_request.base.sha`, which is EMPTY on merge_group.
+          # `git diff --name-only "...HEAD"` with an empty left side resolves to HEAD...HEAD: exit 0,
+          # ZERO output. Verified by RUNNING it rather than reasoning about it -- 2026-08-26, recorded
+          # in 080fb235b as a residual, and re-measured 2026-09-19.
+          #
+          # SO EVERY PATH FILTER THIS JOB COMPUTES IS FALSE ON A QUEUE ENTRY -- that follows from the
+          # empty base, not from a sample. `code` is true there only because an empty diff takes the
+          # `-z "$changed"` arm far below. The corroborating observation is narrower and is stated as
+          # such: on three merge_group runs sampled 2026-09-19, `ide`, `tooling` and `docker-smoke`
+          # each skipped.
+          #
+          # WHAT IT MEANS FOR A GATE ELSEWHERE IN THIS FILE, which is the part worth carrying away. An
+          # `if:` of the shape `... || github.event_name == 'merge_group' || needs.changes.outputs.X ==
+          # 'true'` is NOT diff-sensitive in the queue: the merge_group arm is the only one that can be
+          # true there, so the job is unconditionally forced and the X arm decides nothing.
+          # `sqlserver-store` and `postgres-store` both have exactly that shape today.
+          #
+          # NOT FIXED HERE, AND #1830 CARRIES WHY IT IS NOT A ONE-LINE CHANGE. Reading the base from
+          # `github.event.merge_group.base_sha` makes EVERY filter real at once, and that is not a
+          # latency win. Measured 2026-09-19 over the last 80 merges to main, and BOTH figures are
+          # stated with their scope because neither is the whole of its quantity:
+          #   * `tooling` would fire on at least 56 percent of single-PR entries and at least 94
+          #     percent of 5-deep ones. LOWER BOUNDS -- measured against the PATH arm of the `tooling`
+          #     filter only; its second arm (`grep -qxFf tests/tooling_manifest.txt`) can only widen
+          #     them. For what that tier costs, see its own note above the `tooling` output; it is
+          #     measured there and is deliberately not repeated here (SDS-3.5).
+          #   * against that, the two server-DB jobs would be SKIPPED on 52/33/22/13/7 percent of
+          #     entries at stack depths 1/2/3/4/5. The mean is about a quarter, but the deep end is
+          #     where ubuntu contention actually bites and there the saving is 7 to 13 percent, so
+          #     the mean is the wrong number to compare against the cost above.
+          # It must also FAIL LOUDLY on a base that is empty or unreachable, because a silent empty
+          # diff degrades a path gate into skipping everything while still reading as path-gated,
+          # which is the defect this comment exists to stop hiding.
           changed=$(git diff --name-only "$BASE_SHA...HEAD")
           # NB: the tests/test_(...) alternation MUST list every file the sqlserver-store /
           # postgres-store pytest steps below run (the ADR 0057/0058/0060/0066 throughput levers AND
@@ -3313,6 +3354,18 @@ jobs:
       # line the harness tier would stop gating merges the moment it stopped being part of `test`. It IS
       # path-gated (unlike webconsole), so it skips on most PRs -- and a skipped need is not a failure
       # to the `contains(needs.*.result, ...)` check below, which is the behaviour wanted.
+      #
+      # THAT LAST CLAUSE IS TRUE OF A PULL REQUEST AND NOT OF A QUEUE ENTRY, and the difference is not
+      # visible from here. On a pull request a skipped need means path-gated-and-irrelevant; inside the
+      # merge queue it means NOT TESTED, because `changes` computes an empty diff there and so skips
+      # every path-gated job regardless of content. ONE EXCEPTION, so this is not read as an absolute:
+      # `windows-service-smoke` also carries `&& github.repository == '...'`, so on a FORK it skips for
+      # a deliberate cost reason that has nothing to do with this defect.
+      #
+      # The fact is stated once, at the `changes`
+      # job's "Remaining cases" comment; BACKLOG #1830 measured it and carries the fix. Nothing about
+      # this roll-up is wrong -- it is `if: always()` and still reports, which is what lets the five
+      # gated legs be path-gated at all. Only the inference "it skipped, so it did not need to run" is.
       - tooling
     runs-on: ubuntu-latest
     steps:
