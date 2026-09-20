@@ -74,6 +74,7 @@ from messagefoundry.config.models import (
 )
 from messagefoundry.config.send_snapshot import snapshot_on_send_active
 from messagefoundry.parsing.message import Message, RawMessage, snapshot_payload
+from messagefoundry.secretscrub import scrub_credentials
 
 __all__ = [
     "ConnectionSpec",
@@ -776,9 +777,12 @@ def resolve_env_settings(settings: Mapping[str, Any], values: Mapping[str, Any])
 
     Resolution order per ref: the environment value (cast if a ``cast`` was given), else its
     ``default``, else it's *missing*. Raises a single :class:`WiringError` listing **all** problems
-    at once — both missing keys and values that fail their ``cast`` (naming setting/key/value) — so
-    the failure is loud and actionable, not a raw ``ValueError`` traceback that names nothing and
-    aborts on the first bad value (fail loud, never blank; review M-22)."""
+    at once — both missing keys and values that fail their ``cast`` (naming the setting and the key,
+    NEVER the value — BACKLOG #1183) — so
+    the failure is loud and actionable, not a raw traceback that names nothing and aborts on the
+    first bad value (fail loud, never blank; review M-22). A cast is an arbitrary callable, so
+    **every** exception it raises is caught and redacted, not just ``ValueError``/``TypeError``
+    (BACKLOG #1656; see the handler)."""
     resolved: dict[str, Any] = {}
     missing: list[str] = []
     bad: list[str] = []
@@ -791,7 +795,17 @@ def resolve_env_settings(settings: Mapping[str, Any], values: Mapping[str, Any])
                 else:
                     try:
                         resolved[name] = value.cast(raw)
-                    except (ValueError, TypeError) as exc:
+                    except Exception as exc:
+                        # BACKLOG #1656 limb 2: `Exception`, not `(ValueError, TypeError)`. A cast is
+                        # an arbitrary callable, so it can raise anything -- a `KeyError` from a
+                        # lookup-table cast was the measured case -- and a non-(ValueError, TypeError)
+                        # escaped this handler RAW, carrying the secret value in its own exception
+                        # text. That re-opened, for every other exception type, exactly the leak
+                        # BACKLOG #1183 closed for the ValueError arm. The redaction below is the
+                        # whole point of catching it, so it has to cover every way a cast can fail.
+                        # NEVER `BaseException`: a KeyboardInterrupt or SystemExit is not a cast
+                        # failure and must keep propagating.
+                        #
                         # NEVER the raw value: a MEFOR_VALUE_* env() setting carries store passwords
                         # and connector keys, and this string is raised at startup into the operator
                         # log, the support bundle and GET /logs/tail (BACKLOG #1183). The value used to
@@ -800,6 +814,14 @@ def resolve_env_settings(settings: Mapping[str, Any], values: Mapping[str, Any])
                         # dropping only the f-string half would still have leaked it. Name the setting,
                         # the key and the expected TYPE, which is the whole diagnostic an operator
                         # needs to go fix the value they already hold.
+                        #
+                        # The WiringError below is raised OUTSIDE this block ON PURPOSE, so it
+                        # carries neither `__cause__` nor `__context__`. Chaining it (`raise ... from
+                        # exc`) would put the redacted-away text back within reach: a rendered
+                        # traceback prints the chained exception in full, and that traceback goes to
+                        # the same operator log, support bundle and GET /logs/tail this handler
+                        # exists to keep the value out of. Do not "improve" the diagnostic by
+                        # chaining -- it re-opens BACKLOG #1183 through the traceback.
                         want = getattr(value.cast, "__name__", None) or type(value.cast).__name__
                         bad.append(
                             f"setting {name!r} (env {value.key!r}): value is not a valid {want} "
@@ -1256,13 +1278,12 @@ def MLLP(
     max_connections: int | None = 256,  # cap concurrent clients (connection-flood guard)
     receive_timeout: float | None = 60.0,  # close a client idle this many seconds (slowloris)
     max_frame_bytes: int | None = 16 * 1024 * 1024,  # cap one frame's bytes (OOM guard); both dirs
-    # INBOUND message-RATE pacing (BACKLOG #1249). Unlike the caps above these default to OFF, and
-    # that is ruled rather than accidental: a rate on a clinical interface is only safe at a number
-    # taken from a real feed profile. The connector has read both keys since the pacer was built --
-    # until now no factory parameter and no connections.toml key could populate them, so the setting
-    # existed and could not be reached. Over budget the listener PAUSES READING so TCP back-pressures
-    # the sender: nothing is dropped, refused, NAK'd or reordered, which the count-and-log invariant
-    # requires (a discarding limiter was never an option here).
+    # INBOUND message-RATE pacing. Unlike the caps above these default to OFF, and that is ruled
+    # rather than accidental: a rate on a clinical interface is only safe at a number taken from a
+    # real feed profile. Both are parameters of this factory, and a connections.toml inbound entry
+    # desugars through it, so either surface sets them. Over budget the listener PAUSES READING so TCP
+    # back-pressures the sender: nothing is dropped, refused, NAK'd or reordered, which the
+    # count-and-log invariant requires (a discarding limiter was never an option here).
     max_messages_per_second: float | None = None,  # None/0 = no rate bound (the shipped default)
     message_burst: float
     | None = None,  # allowance over the sustained rate; None = one second's worth
@@ -1307,6 +1328,23 @@ def MLLP(
     inbound); outbound uses host/port/connect_timeout/timeout_seconds/max_frame_bytes. ``encoding``
     applies to framing in both directions. ``capture_response`` (outbound, ADR 0013) records the
     application ACK as a captured reply (a negative ACK still dead-letters/retries unchanged).
+
+    **Inbound message-rate pacing (BACKLOG #1249).** ``max_messages_per_second`` bounds how fast one
+    accepted inbound connection may feed messages in; ``None``/``0`` (the default) is no bound.
+    ``message_burst`` sizes the allowance above that sustained rate; ``None`` **and** ``0`` both mean
+    one second's worth of it -- **not** an unbounded burst, and **not** a burst of zero. The connector
+    reads it as ``message_burst or rate``, so any falsy value takes the rate. Both keys reach the
+    connector from here or from a ``connections.toml`` inbound entry, which desugars through this same
+    factory.
+
+    The history behind that last sentence -- the connector read both keys before either was a
+    parameter here, so text written in that window described the setting as reachable through no
+    surface at all, and some of it outlived the window -- is stated HERE, and cited from
+    ``tests/test_connection_schema.py`` and ``tests/test_security_doc_rate_limits.py``. Treat it as
+    the CANONICAL statement, not the only one: at least ``docs/SECURITY.md``'s ingest row and the two
+    pacing test modules say it independently. Why the ledger number sits in this paragraph and not in
+    the parameter comment above it -- that comment becomes an operator-facing GUI heading; see
+    :mod:`messagefoundry.config.connection_schema`.
 
     **Persistent outbound connection (ADR 0067).** Ships **opt-in** this release: ``persistent=False``
     is the default (connect-per-message — today's proven posture, dial a fresh connection per delivery).
@@ -4114,28 +4152,68 @@ class Registry:
             raise WiringError(f"duplicate {kind} name: {name!r}")
         table[name] = value
 
-    def validate(self) -> None:
-        """Statically check references (inbound → router) and literal inbound port collisions."""
+    def validate(self, *, allow_empty: bool = False) -> None:
+        """Raise ``WiringError`` on the FIRST problem :meth:`graph_problems` reports.
+
+        ``allow_empty`` suppresses the empty-graph rule and nothing else. Only ``messagefoundry
+        check --allow-empty-config`` passes it (BACKLOG #1648); ``serve`` and the engine reload
+        never do, so an empty graph is refused on every path that would run it.
+        """
+        problem = next(self.graph_problems(allow_empty=allow_empty), None)
+        if problem is not None:
+            raise WiringError(problem)
+
+    @property
+    def declares_no_connections(self) -> bool:
+        """True when this graph would receive and send nothing (BACKLOG #1648).
+
+        The predicate on its own, because it has two readers that must not drift: the load-time rule
+        in :meth:`graph_problems`, and ``Engine.reload_detail``'s POST-shard-filter check, which is
+        a genuinely different moment (the filter can empty a graph the loader already passed) and
+        raises its own message naming the directory. Widening the rule must move both, so it lives
+        in one place even though the two messages deliberately differ.
+        """
+        return not self.inbound and not self.outbound
+
+    def graph_problems(self, *, allow_empty: bool = False) -> Iterator[str]:
+        """Every static problem in this graph, as human-readable messages, in report order.
+
+        The SINGLE rule list behind both validators (BACKLOG #1656). It **yields** rather than
+        raising because the two callers have deliberately different contracts: :meth:`validate`
+        stops at the first problem (the loader has nothing to hand the engine), while
+        :func:`validate_config` collects them all so an editor can show the full set at once.
+        A new rule belongs here, not in either caller — and so do the message strings, which
+        ``tests/test_wiring.py`` asserts by substring on both paths.
+        """
+        # An empty graph is a config the operator can start and watch do nothing: no listener binds,
+        # no destination drains, and every surface reports a healthy engine (BACKLOG #1648). The
+        # predicate is inbound AND outbound — deliberately the WIDER of the two shapes already in the
+        # tree, matching Engine.reload_detail — so an outbound-only config (a half-built graph, or one
+        # shard's slice viewed unfiltered) is still accepted here rather than newly refused.
+        if not allow_empty and self.declares_no_connections:
+            yield (
+                "config declares no connections — no inbound and no outbound connection is "
+                "declared, so this graph would receive and send nothing; declare one, or run "
+                "'messagefoundry init' to scaffold a starter config"
+            )
         for conn in self.inbound.values():
             if conn.router not in self.routers:
-                raise WiringError(
-                    f"inbound connection {conn.name!r} references unknown router {conn.router!r}"
-                )
+                yield f"inbound connection {conn.name!r} references unknown router {conn.router!r}"
         # An `accepts=` predicate keyed to no handler would silently never run (ADR 0084): the router
         # filter looks the predicate up BY handler name, so an orphan is dead code that reads as an
         # armed filter. Fail closed at load/`check` time. (add_handler cannot produce one; a registry
         # assembled by hand — a rebuild that drops a handler, a test — can.)
         for hname, pred in self.handler_accepts.items():
             if hname not in self.handlers:
-                raise WiringError(f"accepts= predicate declared for unknown handler {hname!r}")
-            _check_accepts_predicate(hname, pred)
-        problems = self.encoding_problems()
-        if problems:
-            raise WiringError(problems[0])
-        collisions = self.port_collisions()
-        if collisions:
-            port, first, second = collisions[0]
-            raise WiringError(f"inbound connections {first!r} and {second!r} both bind port {port}")
+                yield f"accepts= predicate declared for unknown handler {hname!r}"
+                continue
+            try:
+                _check_accepts_predicate(hname, pred)
+            except WiringError as exc:
+                yield str(exc)
+        yield from self.encoding_problems()
+        for port, first, second in self.port_collisions():  # low-13
+            yield f"inbound connections {first!r} and {second!r} both bind port {port}"
 
     def port_collisions(self) -> list[tuple[int, str, str]]:
         """Inbound listeners that bind a shared literal port on overlapping interfaces, as
@@ -5078,6 +5156,31 @@ def build_outbound_connection(
             "(0 = show 'waiting for reply' immediately)"
         )
     send_pace = spec.settings.get("send_min_interval_seconds")
+    if isinstance(send_pace, EnvRef):
+        # BACKLOG #1653. `send_min_interval_seconds: float | None` carries no `EnvRef` member and
+        # `build_schema()` reports `"env": false` for it, so an env() ref here is not a supported
+        # spelling and never was -- it is a pacing number, not a per-environment or secret value.
+        # Refuse it rather than skip the sign check below: NOTHING downstream would resolve it.
+        # `_resolve_send_pace` (pipeline/wiring_runner.py) reads `oc.spec.settings` UNRESOLVED at both
+        # of its call sites and calls `float(raw)`, so accepting the ref at wiring only MOVES the
+        # TypeError into outbound start -- a dead lane AFTER the sender has been ACKed, which is
+        # strictly worse than a load-time error.
+        #
+        # Refused HERE because this is the one choke point both authoring surfaces pass through, so
+        # code-first and connections.toml now give the identical error. They used to diverge: a raw
+        # TypeError escaping `validate`/`load` on the TOML surface (`_build_spec` wraps only the
+        # factory call), versus an opaque `_exec_module` WiringError naming no field on the
+        # code-first one.
+        raise WiringError(
+            # Keep the remedy SURFACE-NEUTRAL. This message is the one string both authoring
+            # surfaces share, so naming a Python spelling (`send_min_interval_seconds=0.5`) would
+            # hand a connections.toml author the wrong syntax and half-undo the point of refusing at
+            # this shared choke point.
+            f"outbound connection {name!r}: send_min_interval_seconds may not use env() "
+            f"(env {send_pace.key!r}) — it is a plain pacing interval in seconds, not a "
+            "per-environment or secret value. Give it a plain number (0.5), or omit it "
+            "for no pacing."
+        )
     if send_pace is not None and send_pace < 0:
         # BACKLOG #82: per-connection egress send pacing (min seconds between sends on this lane). A
         # negative interval is meaningless (None/0 = no pacing). Fail loud at wiring (dry-run / check).
@@ -5464,13 +5567,18 @@ def _loading(directory: Path, registry: Registry) -> Iterator[None]:
                 sys.modules.pop(name, None)
 
 
-def load_config(directory: str | Path) -> Registry:
+def load_config(directory: str | Path, *, allow_empty: bool = False) -> Registry:
     """Load every ``*.py`` config module in ``directory`` (sorted; ``_*`` skipped) into a Registry.
 
     Config modules are **executed** in-process with the engine's full privilege, so the source
     location is part of the trust boundary: :func:`_assert_safe_config_source` refuses a
     group/world-writable directory before any code runs. Blocking: an async caller (engine reload)
-    should run this via ``asyncio.to_thread`` so heavy user-config imports don't stall listeners."""
+    should run this via ``asyncio.to_thread`` so heavy user-config imports don't stall listeners.
+
+    ``allow_empty`` is passed straight to :meth:`Registry.validate` and suppresses the empty-graph
+    refusal only. It exists for ``messagefoundry check --allow-empty-config`` (BACKLOG #1648) and
+    is deliberately NOT reachable from ``serve``: a running engine must never start on a graph that
+    would receive and send nothing."""
     directory = Path(directory)
     # Fail loudly on a missing/typo'd dir: Path.glob() on a nonexistent dir yields nothing, so the
     # engine would otherwise start with an empty graph — a silently dead interface (review M-24).
@@ -5500,7 +5608,7 @@ def load_config(directory: str | Path) -> Registry:
     conn_file = directory / CONNECTIONS_FILE_NAME
     if conn_file.is_file():
         load_connections_file(conn_file, registry)
-    registry.validate()
+    registry.validate(allow_empty=allow_empty)
     return registry
 
 
@@ -6186,12 +6294,16 @@ def _exec_module(path: Path) -> None:
         raise WiringError(f"error loading config module {path.name}: {exc}") from exc
 
 
-def validate_config(directory: str | Path) -> list[Diagnostic]:
+def validate_config(directory: str | Path, *, allow_empty: bool = False) -> list[Diagnostic]:
     """Load ``directory`` best-effort and return **all** problems (not just the first).
 
     Unlike :func:`load_config`, a bad module is recorded and loading continues, and every
     unresolved ``inbound → router`` reference is reported — so an editor can show the full set
     at once. Returns ``[]`` when the config is valid.
+
+    ``allow_empty`` suppresses the empty-graph rule, for ``messagefoundry check
+    --allow-empty-config`` (BACKLOG #1648). The rules themselves live in
+    :meth:`Registry.graph_problems`, shared with :meth:`Registry.validate`.
     """
     directory = Path(directory)
     if not directory.is_dir():  # fail loudly, not silently empty (review M-24)
@@ -6203,6 +6315,10 @@ def validate_config(directory: str | Path) -> list[Diagnostic]:
         return [Diagnostic(message=str(exc), file=str(directory))]
     registry = Registry()
     diagnostics: list[Diagnostic] = []
+    # Tracked separately from `diagnostics` on purpose — see the empty-graph note at the end of this
+    # function. Only a source that could have DECLARED a connection counts: a module or
+    # connections.toml. A bad code-set table is a diagnostic that explains nothing about emptiness.
+    declaring_source_failed = False
     # Load reference tables first (so a module-top-level code_set(...) resolves during import). A
     # bad/duplicate table is recorded as a diagnostic, not raised, so the editor sees every problem.
     codesets_dir = directory / CODESETS_DIR_NAME
@@ -6216,6 +6332,7 @@ def validate_config(directory: str | Path) -> list[Diagnostic]:
                 _exec_module(path)
             except WiringError as exc:
                 diagnostics.append(Diagnostic(message=str(exc), file=str(path)))
+                declaring_source_failed = True
     # Merge connections.toml best-effort too (ADR 0007), so the editor sees TOML problems alongside the
     # *.py ones and the router/port checks below cover TOML-authored connections. Lazy import (cycle).
     from messagefoundry.config.connections_file import (
@@ -6228,33 +6345,64 @@ def validate_config(directory: str | Path) -> list[Diagnostic]:
         try:
             load_connections_file(conn_file, registry)
         except WiringError as exc:
-            diagnostics.append(Diagnostic(message=str(exc), file=str(conn_file)))
-    for conn in registry.inbound.values():
-        if conn.router not in registry.routers:
+            # Scrubbed like the arm below, and for the SAME reason: a WiringError out of the TOML
+            # loader is a project-authored TEMPLATE wrapped around somebody else's exception text.
+            # MEASURED: `[outbound.retry] max_attempts = "<value>"` reaches `_policy`
+            # (connections_file.py), which raises `WiringError(f"{where}: invalid {key} — {exc}")`
+            # around a pydantic ValidationError, and pydantic prints `input_value='<value>'`
+            # verbatim. So "this arm is ours, therefore it withholds the value" is FALSE -- only the
+            # template is ours. Both arms get the same treatment because both carry the same kind of
+            # text.
+            diagnostics.append(Diagnostic(message=scrub_credentials(str(exc)), file=str(conn_file)))
+            declaring_source_failed = True
+        except Exception as exc:
+            # BACKLOG #1653: the *.py arm above cannot leak an unexpected exception (`_exec_module`
+            # wraps whatever a module raises), but this one could -- the TOML loader converts only
+            # what it anticipates, so anything else escaped `validate_config` as a raw traceback and
+            # took the OTHER diagnostics with it. That breaks this function's contract (return ALL
+            # problems, raise none) and leaves the IDE with nothing to render. A loader gap is still
+            # a bug to fix at its source; reporting it as a diagnostic is what keeps the contract
+            # while it exists. `Exception`, never `BaseException`: a KeyboardInterrupt or SystemExit
+            # is not a config problem and must keep propagating.
+            #
+            # `exc` IS interpolated here, and it is scrubbed on the way out -- same as the arm
+            # above. An exception the loader never anticipated was worded by somebody else and can
+            # stringify whatever it was handed, including an inline credential from
+            # connections.toml. A `Diagnostic.message` is printed verbatim by `messagefoundry
+            # validate` and carried into `messagefoundry check` output, so it reaches CI logs.
+            #
+            # STATE WHAT THE SCRUB DOES AND DOES NOT DO, so nobody reads either arm as safe.
+            # MEASURED over three shapes: it replaces a LABELLED credential value (`password=<v>`)
+            # and it does NOT see pydantic's `input_value='<v>'` spelling, nor a bare unlabelled
+            # value (`KeyError: 'hunter2'`). It is a backstop that lowers the exposure, NOT a
+            # boundary, and nothing downstream may be built on it holding. The real fix for any
+            # instance is still to convert the failure at its source in the loader, which is why the
+            # exception TYPE is named: that name is the actionable half.
             diagnostics.append(
                 Diagnostic(
-                    message=f"inbound connection {conn.name!r} references unknown router "
-                    f"{conn.router!r}"
+                    message=scrub_credentials(
+                        f"{CONNECTIONS_FILE_NAME}: unexpected {type(exc).__name__} while "
+                        f"loading connections — {exc}"
+                    ),
+                    file=str(conn_file),
                 )
             )
-    # Mirror Registry.validate's `accepts=` checks as editor diagnostics (ADR 0084) — an orphan /
-    # non-callable / fail-open-state-reading predicate should surface in the IDE, not first at `serve`.
-    for hname, pred in registry.handler_accepts.items():
-        if hname not in registry.handlers:
-            diagnostics.append(
-                Diagnostic(message=f"accepts= predicate declared for unknown handler {hname!r}")
-            )
-            continue
-        try:
-            _check_accepts_predicate(hname, pred)
-        except WiringError as exc:
-            diagnostics.append(Diagnostic(message=str(exc)))
-    # Mirror Registry.encoding_problems as editor diagnostics (BACKLOG #1613).
-    diagnostics.extend(Diagnostic(message=m) for m in registry.encoding_problems())
-    for port, first, second in registry.port_collisions():  # low-13
-        diagnostics.append(
-            Diagnostic(
-                message=f"inbound connections {first!r} and {second!r} both bind port {port}"
-            )
-        )
+            # Set on BOTH connections.toml arms, not just the WiringError one: the file is a
+            # DECLARING source either way, so an empty graph after it failed to load is a
+            # derived symptom and must not be reported beside its own cause.
+            declaring_source_failed = True
+    # The graph rules are NOT re-implemented here (BACKLOG #1656): Registry.graph_problems is the
+    # one place the inbound->router, `accepts=` (ADR 0084), encoding (BACKLOG #1613), port-collision
+    # (low-13) and empty-graph (BACKLOG #1648) rules — and their exact message strings — live. This
+    # caller reports them all; Registry.validate raises the first.
+    #
+    # `declaring_source_failed` also absorbs the empty-graph rule: with a module or connections.toml
+    # broken, an empty graph is a DERIVED symptom, and printing it beside its own cause sends the
+    # reader after the wrong problem. It is deliberately NOT `bool(diagnostics)` — a diagnostic that
+    # cannot explain emptiness (a bad codesets/ table) must not hide a genuinely empty graph, and
+    # keying on the list would also couple this suppressor to `Diagnostic.severity`, which is a plain
+    # str field: a future warning-severity diagnostic would suppress the rule here while
+    # `checks._check_validate` filters it out, leaving its own `load_config` to raise unhandled.
+    problems = registry.graph_problems(allow_empty=allow_empty or declaring_source_failed)
+    diagnostics.extend(Diagnostic(message=m) for m in problems)
     return diagnostics

@@ -204,7 +204,7 @@ def test_backup_no_destination_errors(tmp_path, key_b64, capsys) -> None:
         ["backup", "--config", _config_dir(tmp_path), "--service-config", toml, "--db", str(db)]
     )
     assert rc == 1
-    out = capsys.readouterr().out
+    out = capsys.readouterr().err  # text-mode errors go to stderr (BACKLOG #1673)
     # No destination -> non-zero with a destination-naming error. Because _backup forces
     # [backup].enabled=true for the on-demand run, the settings validator ("enabled=true requires a
     # non-empty [backup].destination") fires at load_settings BEFORE _backup's own empty-destination
@@ -229,7 +229,8 @@ def test_backup_not_leader_returns_error(tmp_path, key_b64, capsys, monkeypatch)
         ["backup", "--config", _config_dir(tmp_path), "--service-config", toml, "--db", str(db)]
     )
     assert rc == 1
-    assert "backup did not run (not leader)" in capsys.readouterr().out
+    # text-mode errors go to stderr (BACKLOG #1673)
+    assert "backup did not run (not leader)" in capsys.readouterr().err
 
 
 # --- (5) BackupError surfaces as exit 1 with the failing kind ----------------
@@ -247,7 +248,7 @@ def test_backup_error_maps_to_exit_1(tmp_path, key_b64, capsys, monkeypatch) -> 
         ["backup", "--config", _config_dir(tmp_path), "--service-config", toml, "--db", str(db)]
     )
     assert rc == 1
-    out = capsys.readouterr().out
+    out = capsys.readouterr().err  # text-mode errors go to stderr (BACKLOG #1673)
     assert "backup failed (encrypt)" in out
 
 

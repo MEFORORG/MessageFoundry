@@ -37,7 +37,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum, StrEnum
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 
 from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
 from messagefoundry.config.db_lookup import DbLookupError
@@ -172,6 +172,13 @@ from messagefoundry.transports.mllp import build_ack
 from messagefoundry.transports.rest import PROXY_DEFAULT
 
 __all__ = ["NotDeployedError", "RegistryRunner", "ShardLaneOwnershipError"]
+
+type Direction = Literal["inbound", "outbound"]
+"""Which table a connection name was declared in. A name may be in BOTH (``Registry._add``
+enforces uniqueness per table, and the API's ``_dual_role_control`` carries a ``role=`` to
+disambiguate the pair), so every per-connection map that can hold an entry for either direction
+is keyed by ``(Direction, name)`` rather than by the bare name."""
+
 
 log = logging.getLogger(__name__)
 
@@ -979,20 +986,30 @@ class RegistryRunner:
         # success, so a retry storm emits one transition pair, not one per delivery. A partner reject
         # (NegativeAckError) is not a transport failure and never flips it.
         self._lane_healthy: dict[str, bool] = {}
-        # Connections that FAILED to build/bind at start (name → reason). A failed connection is
+        # Connections that FAILED to build/bind at start ((kind, name) → reason). A failed connection is
         # isolated, never fatal — the rest of the graph still comes up (a failed connection must not
         # crash the engine, ADR 0031). A failed OUTBOUND still gets its delivery worker, but with no
         # connector in _destinations, so rows routed to it are retried + alerted (never silently
         # dropped) and a reload/restart that builds it self-heals the lane; a failed INBOUND simply
         # isn't listening. Cleared when the connection later builds/binds (reload, start_inbound).
-        self._failed: dict[str, str] = {}
-        # Connections SKIPPED by the DR run-profile (#61, ADR 0048): name → reason (e.g. "DR profile
-        # threshold=critical: connection tier=normal is below threshold"). Distinct from _failed (ADR
-        # 0031): a filtered connection did not FAIL to build/bind — it was deliberately not started
+        #
+        # KEYED BY DIRECTION (see `Direction`), because under a bare-name key the two halves of a
+        # dual-role name aliased, in both directions: start() builds every outbound BEFORE any inbound,
+        # so the inbound's success pop ERASED its outbound namesake's real start failure and the engine
+        # reported itself healthy, while an operator restarting that outbound afterwards re-set the entry
+        # and made a status reader call the healthy inbound failed. Read it through the direction-scoped
+        # accessors (inbound_failed / outbound_failed), never by reaching in with a bare name.
+        self._failed: dict[tuple[Direction, str], str] = {}
+        # Connections SKIPPED by the DR run-profile (#61, ADR 0048): (kind, name) → reason (e.g. "DR
+        # profile threshold=critical: connection tier=normal is below threshold"). Distinct from _failed
+        # (ADR 0031): a filtered connection did not FAIL to build/bind — it was deliberately not started
         # because its resolved priority tier is below [dr].priority_threshold. Surfaced as
         # status:"filtered" on /connections + /connections/{name}/metadata so an operator can tell a
         # deliberately-parked DR feed from a broken one. Empty unless a DR run-profile is active.
-        self._filtered: dict[str, str] = {}
+        # Keyed by direction for the reason _failed above is, and here the two halves of a pair resolve
+        # INDEPENDENTLY (each reads its own ic.priority / oc.priority), so they can genuinely disagree
+        # about the threshold - a bare-name key silently gave one half's verdict to the other.
+        self._filtered: dict[tuple[Direction, str], str] = {}
         # Per-connection re-alert throttle: the earliest time a queue_buildup alert may fire again.
         self._next_buildup_alert: dict[str, float] = {}
         # Same per-connection re-alert throttle for the message_stall alert (#50), kept independent so a
@@ -1668,31 +1685,53 @@ class RegistryRunner:
         probe = getattr(connector, "waiting_for_reply", None)
         return bool(probe(time.monotonic())) if callable(probe) else False
 
-    def connection_failed(self, name: str) -> str | None:
-        """The failure reason if this connection failed to build/bind at start, else None. A failed
-        connection is isolated, not fatal (ADR 0031): the engine starts the rest of the graph and an
-        operator recovers it (fix the cause, then reload or — for an inbound — restart it)."""
-        return self._failed.get(name)
+    def inbound_failed(self, name: str) -> str | None:
+        """The failure reason if the INBOUND of this name failed to build/bind at start, else ``None``
+        (ADR 0031). A failed connection is isolated, not fatal: the engine starts the rest of the graph
+        and an operator recovers it (fix the cause, then reload or restart it)."""
+        return self._failed.get(("inbound", name))
 
-    def degraded_connections(self) -> dict[str, str]:
-        """Snapshot of ``{connection: reason}`` for connections that failed to start (ADR 0031).
-        Empty when every connection came up — the API/console use it to flag a degraded engine."""
-        return dict(self._failed)
+    def outbound_failed(self, name: str) -> str | None:
+        """The failure reason if the OUTBOUND of this name failed to build at start, else ``None``
+        (ADR 0031) - the outbound half of :meth:`inbound_failed`."""
+        return self._failed.get(("outbound", name))
 
-    def connection_filtered(self, name: str) -> str | None:
-        """The reason this connection was skipped by the DR run-profile (its resolved priority tier is
-        below ``[dr].priority_threshold``), else ``None`` (#61, ADR 0048). A filtered connection is
-        **not** failed (ADR 0031) — it was deliberately not started; the two are surfaced as the distinct
+    def degraded_inbound(self) -> dict[str, str]:
+        """Snapshot of ``{inbound: reason}`` for INBOUND connections that failed to bind (ADR 0031).
+        Empty when every inbound came up."""
+        return {name: reason for (kind, name), reason in self._failed.items() if kind == "inbound"}
+
+    def degraded_outbound(self) -> dict[str, str]:
+        """Snapshot of ``{outbound: reason}`` for OUTBOUND connections that failed to build (ADR 0031).
+        Empty when every outbound came up."""
+        return {name: reason for (kind, name), reason in self._failed.items() if kind == "outbound"}
+
+    def inbound_filtered(self, name: str) -> str | None:
+        """The reason the DR run-profile parked this INBOUND (its resolved priority tier is below
+        ``[dr].priority_threshold``), else ``None`` (#61, ADR 0048). A filtered connection is **not**
+        failed (ADR 0031) - it was deliberately not started; the two are surfaced as the distinct
         ``status:"filtered"`` vs ``status:"failed"`` so an operator can tell a parked DR feed from a
         broken one."""
-        return self._filtered.get(name)
+        return self._filtered.get(("inbound", name))
 
-    def filtered_connections(self) -> dict[str, str]:
-        """Snapshot of ``{connection: reason}`` for connections the DR run-profile parked below the
-        priority threshold (#61, ADR 0048). Empty unless a DR run-profile is active — the sibling of
-        :meth:`degraded_connections`, kept distinct so a parked DR feed is never confused with an
-        ADR-0031 failure."""
-        return dict(self._filtered)
+    def outbound_filtered(self, name: str) -> str | None:
+        """The reason the DR run-profile parked this OUTBOUND, else ``None`` (#61, ADR 0048) - the
+        outbound half of :meth:`inbound_filtered`."""
+        return self._filtered.get(("outbound", name))
+
+    def filtered_inbound(self) -> dict[str, str]:
+        """Snapshot of ``{inbound: reason}`` for INBOUNDs the DR run-profile parked below the priority
+        threshold (#61, ADR 0048). Empty unless a DR run-profile is active."""
+        return {
+            name: reason for (kind, name), reason in self._filtered.items() if kind == "inbound"
+        }
+
+    def filtered_outbound(self) -> dict[str, str]:
+        """Snapshot of ``{outbound: reason}`` for OUTBOUNDs the DR run-profile parked below the priority
+        threshold (#61, ADR 0048). Empty unless a DR run-profile is active."""
+        return {
+            name: reason for (kind, name), reason in self._filtered.items() if kind == "outbound"
+        }
 
     def resolved_priority(self, name: str) -> Priority:
         """The connection's resolved DR / priority tier (#61, ADR 0048): its own ``priority=`` override,
@@ -1707,7 +1746,7 @@ class RegistryRunner:
             return oc.priority or self._priority_default
         return self._priority_default
 
-    def _dr_filters_out(self, name: str, declared: Priority | None) -> bool:
+    def _dr_filters_out(self, name: str, declared: Priority | None, *, kind: Direction) -> bool:
         """Whether the DR run-profile parks this connection (its resolved tier is below the threshold).
 
         ``False`` when no DR run-profile is active (``_dr_threshold is None``) — every normal deployment,
@@ -1720,9 +1759,9 @@ class RegistryRunner:
             return False
         resolved = declared or self._priority_default
         if resolved.rank >= threshold.rank:
-            self._filtered.pop(name, None)  # at/above threshold — not parked
+            self._filtered.pop((kind, name), None)  # at/above threshold — not parked
             return False
-        self._filtered[name] = (
+        self._filtered[(kind, name)] = (
             f"DR run-profile threshold={threshold.value}: connection tier={resolved.value} is below "
             f"threshold — not started (status:filtered, ADR 0048)"
         )
@@ -1808,19 +1847,35 @@ class RegistryRunner:
         """Build a **fresh** connector for the named connection so it can be reachability-tested —
         never the live one in ``_sources``/``_destinations`` (probing the live connector would disturb
         running traffic). Resolves ``env()`` and enforces the ``[egress]`` allowlist fail-closed, the
-        same as a real build. Returns ``("in", source)`` or ``("out", destination)``. Raises
-        :class:`KeyError` if ``name`` isn't a connection, :class:`WiringError` on a bad ``env()`` /
-        egress. The caller closes the connector (``stop()`` / ``aclose()``) after testing."""
+        same as a real build. Returns ``("in", source)`` or ``("out", destination)``. The caller closes
+        the connector (``stop()`` / ``aclose()``) after testing.
+
+        Raises :class:`KeyError` if ``name`` isn't a connection, and :class:`WiringError` for EVERY
+        build failure — a bad ``env()`` / egress, and anything a connector constructor raises, which is
+        normalized here exactly as :func:`build_check_registry` normalizes the same seam. That
+        guarantee is the contract, not a courtesy: this docstring used to promise ``WiringError`` while
+        the body passed a connector's own exception straight through, so
+        :class:`~messagefoundry.transports.wincred.CredentialUnsupportedError` — a ``ValueError``, raised
+        when a File connection carries ``credential_*`` on a non-Windows host — escaped the API's
+        ``except WiringError`` as an unhandled 500 (BACKLOG #1824)."""
         ic = self.registry.inbound.get(name)
-        if ic is not None:
-            source_cfg = _source_config(ic, self._inbound_bind_host, self._env_values)
-            check_source_allowed(source_cfg, name, self._egress)
-            return "in", build_source(source_cfg)
         oc = self.registry.outbound.get(name)
-        if oc is not None:
-            dest_cfg = _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress)
-            check_egress_allowed(dest_cfg, self._egress)
-            return "out", build_destination(dest_cfg)
+        try:
+            if ic is not None:
+                source_cfg = _source_config(ic, self._inbound_bind_host, self._env_values)
+                check_source_allowed(source_cfg, name, self._egress)
+                return "in", build_source(source_cfg)
+            if oc is not None:
+                dest_cfg = _dest_config(
+                    oc, self._env_values, self._trust_anchor_policy, self._egress
+                )
+                check_egress_allowed(dest_cfg, self._egress)
+                return "out", build_destination(dest_cfg)
+        except WiringError:
+            raise
+        except Exception as exc:
+            raise WiringError(f"connector build failed: {exc}") from exc
+        # OUTSIDE the wrap on purpose: an unknown name is the caller's 404, not a build failure.
         raise KeyError(name)
 
     async def start_inbound(self, name: str) -> None:
@@ -2032,7 +2087,7 @@ class RegistryRunner:
         recorded failed + alerted and the resume still proceeds, so rows are retried via the
         connector-None path and a later fix + reload/restart self-heals — rather than 500ing the control
         route and leaving the operator with no status to read."""
-        if name in self._destinations or name in self._filtered:
+        if name in self._destinations or ("outbound", name) in self._filtered:
             return
         oc = self.registry.outbound.get(name)
         if oc is None or not oc.deployed:
@@ -2056,7 +2111,7 @@ class RegistryRunner:
             self._record_failed(name, exc, kind="outbound")
             return
         self._destinations[name] = connector
-        self._failed.pop(name, None)
+        self._failed.pop(("outbound", name), None)
 
     async def _aclose_quietly(self, connector: DestinationConnector | None, name: str) -> None:
         """Release whatever a BUILT-but-rejected connector allocated (a File alternate-credential worker
@@ -2286,6 +2341,13 @@ class RegistryRunner:
         # authentication requirement most needs to cover. No allow_insecure_bind is passed — a
         # cleartext escape hatch does not get to waive authentication.
         check_http_intake_auth(source_cfg, ic.name, posture=self._hop_posture)
+        # BACKLOG #1729, sited with the gates above because it shares their seam and nothing else does:
+        # this is the one point that sees an inbound's OWN streaming settings and the SERVICE-level
+        # aggregate budget together, on start, on reload, and on a runtime connection start. It is the
+        # odd one out of this block in two ways, both deliberate — it reads the InboundConnection rather
+        # than the built Source (stream_threshold_bytes is a wiring field, not a transport setting), and
+        # it WARNS where its neighbours refuse. See the function for why a refusal is not available here.
+        warn_unbudgeted_streaming_inbound(ic, budget=self._stream_inflight_budget)
         # #200 (ADR 0092): stamp the posture for the source build too (a DATABASE poll source keys its
         # weakened-TLS refusal on it), matching the exposure-check posture threading above.
         with active_hop_posture(self._hop_posture):
@@ -2359,11 +2421,11 @@ class RegistryRunner:
             raise
         self._sources[name] = source
         self._failed.pop(
-            name, None
+            ("inbound", name), None
         )  # bound successfully — clear any prior start failure (ADR 0031)
         # An operator that explicitly starts a DR-parked inbound (POST /connections/{name}/start) is
         # overriding the run-profile, so it is no longer "filtered" — clear that marker too (#61).
-        self._filtered.pop(name, None)
+        self._filtered.pop(("inbound", name), None)
         # Once the source is live, note (start-time only, never per-tick) that a poll source's intake
         # is leader-gated, so an operator reading the log knows only the leader polls this resource.
         if getattr(source, "polls_shared_resource", False):
@@ -2398,13 +2460,17 @@ class RegistryRunner:
         if source is not None:
             await source.stop()
 
-    def _record_failed(self, name: str, exc: BaseException, *, kind: str) -> None:
+    def _record_failed(self, name: str, exc: BaseException, *, kind: Direction) -> None:
         """Isolate a connection that failed to build/bind (ADR 0031): record the reason, log it
         loudly, and alert — the engine keeps the rest of the graph running. Reuses the AlertSink
         ``connection_stopped`` signal: its meaning ("this connection is down until an operator
-        intervenes") fits a startup failure exactly, so no new sink method is needed."""
+        intervenes") fits a startup failure exactly, so no new sink method is needed.
+
+        ``kind`` is part of the KEY, not just the log line (see ``_failed``). The alert still carries the
+        bare name: an alert row is addressed to the operator's connection, and the detail says which
+        direction failed to start."""
         reason = safe_exc(exc)
-        self._failed[name] = reason
+        self._failed[(kind, name)] = reason
         log.error(
             "%s connection %r failed to start — ISOLATED, engine continues (fix the cause, then "
             "reload%s): %s",
@@ -2842,12 +2908,12 @@ class RegistryRunner:
         # connector for a claimed row" path), so the count-and-log + at-least-once invariants hold: the
         # row is queued + retried + buildup-alerted, never silently dropped. status:"filtered" (not
         # "failed") tells the operator it was deliberately parked.
-        if self._dr_filters_out(name, oc.priority):
+        if self._dr_filters_out(name, oc.priority, kind="outbound"):
             self._destinations.pop(name, None)  # no live connector for a parked lane
             self._spawn_worker(name)
             return
         self._filtered.pop(
-            name, None
+            ("outbound", name), None
         )  # at/above threshold this run — clear any prior parked marker
         connector: DestinationConnector | None = None
         try:
@@ -2890,7 +2956,7 @@ class RegistryRunner:
             self._spawn_worker(name)  # drains→retries routed rows via the connector-None path
             return
         self._destinations[name] = connector
-        self._failed.pop(name, None)
+        self._failed.pop(("outbound", name), None)
         self._spawn_worker(name)
 
     async def start(self) -> None:
@@ -3005,10 +3071,10 @@ class RegistryRunner:
                     # still drains. The listener simply isn't accepting NEW work — the operator intent of
                     # a DR box running only its critical feeds. status:"filtered" (not "failed")
                     # distinguishes it from an ADR-0031 bind failure.
-                    if self._dr_filters_out(ic.name, ic.priority):
+                    if self._dr_filters_out(ic.name, ic.priority, kind="inbound"):
                         continue
                     self._filtered.pop(
-                        ic.name, None
+                        ("inbound", ic.name), None
                     )  # at/above threshold this run — clear the marker
                     try:
                         await self._start_inbound_unsafe(ic.name)
@@ -3069,7 +3135,7 @@ class RegistryRunner:
                     started,
                     total,
                     len(self._filtered),
-                    ", ".join(sorted(self._filtered)) or "(none)",
+                    ", ".join(f"{k} {n}" for k, n in sorted(self._filtered)) or "(none)",
                 )
             if self._failed:
                 log.warning(
@@ -3078,7 +3144,9 @@ class RegistryRunner:
                     len(self.registry.inbound),
                     len(self.registry.outbound),
                     len(self._failed),
-                    ", ".join(f"{n} ({r})" for n, r in self._failed.items()),
+                    # Named WITH the direction — an operator reading this has to know which half
+                    # of a dual-role name to go and fix.
+                    ", ".join(f"{k} {n} ({r})" for (k, n), r in sorted(self._failed.items())),
                 )
             else:
                 log.info(
@@ -3981,7 +4049,8 @@ class RegistryRunner:
             )  # BACKLOG #82 (see _start_outbound)
             self._simulate[name] = self._resolve_simulate(name, oc)
             worker = self._workers.get(name)
-            failed = name in self._failed  # ADR 0031: live worker, but no connector (start failed)
+            # ADR 0031: live worker, but no connector (start failed)
+            failed = self.outbound_failed(name) is not None
             # Present but NOT DEPLOYED (#233, ADR 0111) — checked FIRST, so deployed=False WINS over
             # auto_start. Unconditional (NOT keyed on the lane's live state, as the auto_start gate
             # below is): an operator start is a legitimate override of auto_start, but there is no
@@ -3994,7 +4063,7 @@ class RegistryRunner:
                 stale = self._destinations.pop(name, None)
                 if stale is not None:
                     await stale.aclose()
-                self._failed.pop(name, None)
+                self._failed.pop(("outbound", name), None)
                 self._park_outbound_lane(name)
                 continue
             # Per-connection auto-start (#115): a reload must not RESURRECT a start-disabled lane. It had
@@ -4009,7 +4078,7 @@ class RegistryRunner:
                 stale = self._destinations.pop(name, None)
                 if stale is not None:
                     await stale.aclose()
-                self._failed.pop(name, None)
+                self._failed.pop(("outbound", name), None)
                 self._park_outbound_lane(name)
                 if worker is None or worker.done():
                     self._spawn_worker(name)
@@ -4037,15 +4106,15 @@ class RegistryRunner:
             # below-threshold outbound keeps (or gets) its delivery worker but NO live connector — its
             # routed rows queue + back off + self-heal on the next full startup, exactly the parked-lane
             # behavior. Close any live connector from a prior (non-DR) run so it stops delivering.
-            if self._dr_filters_out(name, oc.priority):
+            if self._dr_filters_out(name, oc.priority, kind="outbound"):
                 stale = self._destinations.pop(name, None)
                 if stale is not None:
                     await stale.aclose()
-                self._failed.pop(name, None)
+                self._failed.pop(("outbound", name), None)
                 if worker is None or worker.done():
                     self._spawn_worker(name)
                 continue
-            self._filtered.pop(name, None)
+            self._filtered.pop(("outbound", name), None)
             # Per_lane has one delivery worker per outbound; pooled has ONE OUTBOUND dispatcher for all,
             # so self._workers is always empty in pooled — judging "live" by worker presence would rebuild
             # every connector on every reload (dropping every warm MLLP socket / DB pool / SMART token).
@@ -4069,7 +4138,7 @@ class RegistryRunner:
                     self._destinations[name] = build_destination(
                         _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress)
                     )
-                self._failed.pop(name, None)
+                self._failed.pop(("outbound", name), None)
                 self._spawn_worker(name)
             elif (
                 failed
@@ -4097,7 +4166,7 @@ class RegistryRunner:
                     self._destinations[name] = build_destination(
                         _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress)
                     )
-                self._failed.pop(name, None)
+                self._failed.pop(("outbound", name), None)
                 if old_conn is not None:
                     await old_conn.aclose()
             # else: unchanged & live → leave the worker/connector as-is.
@@ -4190,9 +4259,9 @@ class RegistryRunner:
                     # threshold (the profile is a per-run decision read at start/reload), so a
                     # below-threshold inbound stays parked (status:"filtered") and is not re-bound; its
                     # workers below still drain any backlog. No DR profile → byte-identical to before.
-                    if self._dr_filters_out(ic.name, ic.priority):
+                    if self._dr_filters_out(ic.name, ic.priority, kind="inbound"):
                         continue
-                    self._filtered.pop(ic.name, None)
+                    self._filtered.pop(("inbound", ic.name), None)
                     await self._start_inbound_unsafe(ic.name)
                 # 2b. Ensure the router + transform workers run for every inbound in the new graph.
                 # Workers read self.registry live, so a Router/Handler change applies to rows processed
@@ -5145,7 +5214,7 @@ class RegistryRunner:
             # outbound failed to build at start (ADR 0031) and its lane is degraded. Either
             # way RETRY the row (never strand/drop it) — it self-heals when a reload/restart
             # builds the connector — and alert on the growing backlog of a failed lane.
-            failure = self._failed.get(name)
+            failure = self.outbound_failed(name)
             detail = f"outbound failed to start: {failure}" if failure else "outbound reloading"
             retry_until = await self._mark_failed_and_arm(name, item.id, detail, retry)
             await self._maybe_alert_buildup(name)
@@ -5455,7 +5524,7 @@ class RegistryRunner:
         retry_until: float | None = None
         connector = self._destinations.get(name)
         if connector is None:
-            failure = self._failed.get(name)
+            failure = self.outbound_failed(name)
             detail = f"outbound failed to start: {failure}" if failure else "outbound reloading"
             retry_until = await self._mark_batch_failed_and_arm(name, ids, detail, retry)
             await self._maybe_alert_buildup(name)
@@ -7954,6 +8023,47 @@ def check_tcp_tls_exposure(
         "the cleartext risk on a trusted, firewalled network (refused even with the flag on a "
         "production-PHI instance — set tls_hop_attested=true if the segment is secured by other means)."
     )
+
+
+def warn_unbudgeted_streaming_inbound(ic: InboundConnection, *, budget: int) -> bool:
+    """Warn at listener start when ``ic`` enables the ADR 0105 over-threshold detach while
+    ``[inbound].stream_inflight_budget_bytes`` is unlimited (#149, BACKLOG #1729). Returns whether it
+    warned, so a caller (and a test) can tell "warned" from "nothing to say".
+
+    **It WARNS and never raises, and that scoping is the whole design decision here.** The backlog row
+    proposes refusing ``serve`` on a PHI-carrying environment in this state. That refusal is not
+    buildable as written: ``HopPosture.is_phi`` was retired (BACKLOG #1279) precisely because *every*
+    instance carries patient data, so "on a PHI-carrying environment" no longer selects a subset — the
+    refusal would fire on every streaming graph that is valid today, with no new opt-in gating it. That
+    is the shape docs/CONFIGURATION.md's ``require_memory_encryption_declaration`` row forbids ("a new
+    refusal fires only on a new opt-in"), whose single recorded exception (BACKLOG #326 / ADR 0140)
+    says in the same breath not to generalise it. A warning is outside that rule, and it is rung 1 of
+    the same ladder ADR 0152 climbs: the refusal stays available later behind a new opt-in setting.
+
+    Silent in both of the cases where there is nothing to say: a positive budget (the aggregate IS
+    bounded) and an inbound with no ``stream_threshold_bytes`` (the detach path is never reached, so
+    the budget bounds nothing that runs — which is why a stock graph is byte-identical and quiet).
+
+    **What it does NOT distinguish is an explicit ``0`` from an unset default**, and that is a
+    deliberate limit rather than an oversight. The exposure is identical either way, so for a warning
+    the distinction carries nothing; it would matter for a refusal, where an explicit ``0`` should read
+    as an audited opt-out the way ``[security].allow_keeping_phi_indefinitely`` does for retention. Any
+    future refusal has to thread ``model_fields_set`` down from the settings object, which reaches this
+    runner only through ``pipeline/engine.py`` and ``api/app.py``."""
+    if budget > 0 or ic.stream_threshold_bytes is None:
+        return False
+    log.warning(
+        "inbound %r enables very-large-document streaming (stream_threshold_bytes=%d) while "
+        "[inbound].stream_inflight_budget_bytes is 0 (unlimited in the AGGREGATE). A single body is "
+        "still bounded by this connection's max_message_bytes (%s), but the number of over-threshold "
+        "bodies buffered mid-detach at once is uncapped, so a burst of large documents is bounded only "
+        "by that size times the listener's connection limit. Set a positive "
+        "[inbound].stream_inflight_budget_bytes to bound the aggregate.",
+        ic.name,
+        ic.stream_threshold_bytes,
+        ic.max_message_bytes if ic.max_message_bytes is not None else "the engine 16 MiB ceiling",
+    )
+    return True
 
 
 def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:

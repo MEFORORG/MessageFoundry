@@ -68,6 +68,43 @@ def jobs_of(name: str) -> dict[str, dict[str, Any]]:
     return {k: (v or {}) for k, v in (load_workflow(name).get("jobs") or {}).items()}
 
 
+def on_block(parsed: dict[str, Any]) -> dict[str, Any]:
+    """A parsed workflow's ``on:`` triggers, normalised to ``{trigger: config}``.
+
+    TWO SPELLINGS OF THE KEY. YAML 1.1 resolves a BARE ``on:`` to the boolean ``True``, so
+    ``parsed["on"]`` is absent and a caller reading it gets ``None``. Nothing raises: every assertion
+    that reader then makes about the triggers passes against nothing, which is the shape a trigger
+    guard must not have. A QUOTED ``"on":`` parses as the string, so both keys have to be tried.
+
+    THREE SPELLINGS OF THE VALUE, and the two scalar ones are not hypothetical here:
+    ``dependabot-auto-merge.yml`` is ``on: pull_request``, a bare string. ``on: [push, pull_request]``
+    is a list. Both normalise to keys with a ``None`` config, so ``"schedule" in on_block(...)``
+    answers the same question whichever form a file uses -- which is what any sweep over every
+    workflow needs, and what a hard ``isinstance(block, dict)`` would have crashed on.
+
+    It lives beside ``jobs_of`` because it is the same kind of fact -- how a workflow file's structure
+    maps onto what GitHub does with it -- and because the hand-rolled copies had already drifted into
+    spellings that do not agree on the quoted case.
+    """
+    block = parsed.get(True, parsed.get("on"))
+    if isinstance(block, str):
+        return {block: None}
+    if isinstance(block, list):
+        return {str(trigger): None for trigger in block}
+    assert isinstance(block, dict), f"could not read the `on:` block -- got {block!r}"
+    # COPIED, so the return means the same thing whichever spelling the file used. The two branches
+    # above build a fresh dict; returning the parsed document's own sub-dict here would alias it for
+    # the mapping case alone, and a caller that edits what it got back would be reaching into the
+    # parse. Same argument as `reportable_contexts` below, and it becomes load-bearing the moment
+    # `load_workflow` is memoised.
+    return dict(block)
+
+
+def triggers_of(name: str) -> dict[str, Any]:
+    """The ``on:`` triggers of one workflow file, e.g. ``triggers_of("nightly-notice.yml")``."""
+    return on_block(load_workflow(name))
+
+
 def context_of(job_key: str, job: dict[str, Any]) -> str:
     """The status-check context string this job reports (still templated, if it is a matrix job)."""
     return str(job.get("name", job_key))
