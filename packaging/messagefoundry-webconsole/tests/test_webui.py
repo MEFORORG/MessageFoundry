@@ -3323,7 +3323,7 @@ async def test_stale_stepup_bounces_body_less_action_via_reauth(engine: Engine) 
     # (no reauth_next mapping) — and nothing is deleted until the retry actually runs.
     # require_mfa=False takes the MFA leg out of the gate, so the stale window below is what
     # redirects; without it _boss_client's unenrolled session is refused first with the SAME 303 and
-    # the window measures nothing (BACKLOG #1846). Reasoning, and the third new-IP leg that stays
+    # the window measures nothing (BACKLOG #1850). Reasoning, and the third new-IP leg that stays
     # unpinned: the docstring of test_purge_stale_stepup_redirects_to_reauth (BACKLOG #1700).
     service = AuthService(engine.store, AuthSettings(require_mfa=False, step_up_max_age_seconds=-1))
     await service.initialize()
@@ -3345,7 +3345,7 @@ async def test_stale_stepup_bounces_all_unlock_form_pages(engine: Engine) -> Non
     # path as next (a regression to plain require_ui would silently drop the step-up gate).
     # require_mfa=False takes the MFA leg out of the gate, so the stale window below is what
     # redirects; without it _boss_client's unenrolled session is refused first with the SAME 303 and
-    # the window measures nothing (BACKLOG #1846). Reasoning, and the third new-IP leg that stays
+    # the window measures nothing (BACKLOG #1850). Reasoning, and the third new-IP leg that stays
     # unpinned: the docstring of test_purge_stale_stepup_redirects_to_reauth (BACKLOG #1700).
     service = AuthService(engine.store, AuthSettings(require_mfa=False, step_up_max_age_seconds=-1))
     await service.initialize()
@@ -6028,7 +6028,7 @@ async def test_purge_confirm_lists_only_quiesced_and_validates_scope(
 async def test_purge_confirm_stale_stepup_redirects_to_reauth(engine: Engine) -> None:
     # require_mfa=False takes the MFA leg out of the gate, so the stale window below is what
     # redirects; without it this unenrolled fixture session is refused first with the SAME 303 and
-    # the window measured nothing (BACKLOG #1846). Reasoning, and the third new-IP leg that stays
+    # the window measured nothing (BACKLOG #1850). Reasoning, and the third new-IP leg that stays
     # unpinned: the docstring of test_purge_stale_stepup_redirects_to_reauth (BACKLOG #1700).
     # -1 replaces a 0 that sat exactly on has_recent_step_up's `elapsed <= max_age` boundary.
     service = AuthService(engine.store, AuthSettings(require_mfa=False, step_up_max_age_seconds=-1))
