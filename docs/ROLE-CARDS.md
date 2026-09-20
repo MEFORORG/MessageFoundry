@@ -189,9 +189,11 @@ on 2026-09-19. The Watchdog that joined in its row does have one, `roles/WATCHDO
 Manager at `roles/MANAGER.md`, and both cards cite theirs.
 
 **A retired seat's playbook is not absent from korus, it is under `roles/retired/`,** and reading
-"no top-level file" as "no file" gets that backwards. Measured 2026-09-19 by the sitting Watchdog and
-confirmed here: `roles/retired/` holds ten files, `REGULATOR.md` among them, against 20 entries under
-`roles/` in total. korus keeps them so a reader who remembers a seat finds it retired rather than
+"no top-level file" as "no file" gets that backwards. Measured twice on 2026-09-19, independently and from
+different starting points, by this change and by the sitting Watchdog:
+`git ls-tree --name-only origin/main roles/retired/` in a korus clone returns ten files,
+`REGULATOR.md` among them, against 20 entries under `roles/` in total. Control, through the same
+command so it can fail on its own: `roles/NOTASEAT.md` returns empty. korus keeps them so a reader who remembers a seat finds it retired rather than
 missing. So the sentence above means the Regulator had no file in the LIVE `roles/` folder while it
 was rostered here, which is the drift this section records; it has a retired one now.
 
