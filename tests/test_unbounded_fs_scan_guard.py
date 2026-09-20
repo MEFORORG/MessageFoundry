@@ -565,6 +565,14 @@ FOLDING_ALLOW = [
     pytest.param("find . \\( -name a -o -name b \\) -print", id="finds-own-grouping-parens"),
     pytest.param(r"find \proc -name x", id="a-leading-backslash-reaches-no-root"),
     pytest.param(r"find \\proc\registry -name x", id="an-all-backslash-path-reaches-no-root"),
+    # THESE TWO ARE THE ONLY ROWS THAT SEPARATE THE LEADING-SLASH ANCHOR FROM AN UNCONDITIONAL
+    # CONVERSION, and they were added because a mutation arm proved the anchor untested: breaking
+    # it left the whole module green. Every other backslash row loses its backslash to the shell
+    # before the fold sees it, so only a QUOTED backslash in leading position can tell the two
+    # rules apart. Both were driven at `ls`: `\proc` does not exist, and a lone `\` is the current
+    # DRIVE root rather than the MSYS one, which is outside this guard's stated subject.
+    pytest.param(r"find '\proc' -name x", id="a-quoted-leading-backslash"),
+    pytest.param(r"find '\' -name x", id="a-quoted-lone-backslash-is-the-drive-root"),
     pytest.param(r"find /proc\registry -name x", id="an-unquoted-escape-eaten-by-the-shell"),
     pytest.param(r'find "/\proc" -name x', id="a-quoted-backslash-in-leading-position"),
     pytest.param("find //proc -name x", id="a-unc-host-that-is-not-the-proc-mount"),
@@ -619,7 +627,7 @@ EXPECTED_ROW_COUNTS = {
     "NORMALIZED_ROOT_DENY": 29,
     "OPTION_GRAMMAR_DENY": 12,
     "PRUNE_INERT_DENY": 9,
-    "FOLDING_ALLOW": 18,
+    "FOLDING_ALLOW": 20,
 }
 
 

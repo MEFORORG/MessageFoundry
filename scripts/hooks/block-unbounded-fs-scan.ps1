@@ -297,12 +297,14 @@ function Get-Operand([string]$Token) {
 #   /PROC  /Proc          nothing              -- the mount is case-SENSITIVE, so the comparisons
 #                                                 below stay case-sensitive; folding case would only
 #                                                 add false denies
+#
+# ***THIS FUNCTION ASSUMES AN OPERAND THAT ALREADY STARTS WITH `/`, and its only caller enforces
+# that.*** The rule is stated at that guard rather than here: a first cut wrote it in both places,
+# and a mutation arm proved the copy here could be broken with the whole suite still green,
+# because the caller's test had already returned for every operand that would have exercised it.
 function Get-NormalizedPath([string]$Operand) {
     if (-not $Operand) { return $Operand }
-    # The conversion is anchored on a LEADING SLASH, which is the one place the measurements above
-    # say a backslash reaches a walk root. `\`, `\proc` and `/\proc` were each driven at `ls` and
-    # resolved to nothing this guard is about, so folding them would only add false denies.
-    $p = if ($Operand.StartsWith('/')) { $Operand.Replace('\', '/') } else { $Operand }
+    $p = $Operand.Replace('\', '/')
     $prefix = ''
     if ($p -cmatch '^//(?!/)') { $prefix = '//' }
     elseif ($p.StartsWith('/')) { $prefix = '/' }
@@ -340,9 +342,12 @@ function Test-MsysRootSpelling([string]$Path) {
 # Returns 'msys' for the MSYS root or its synthetic /proc, 'net' for the MSYS network root, or
 # $null for anything bounded.
 function Get-WalkRootKind([string]$Operand) {
-    # A walk root is absolute, and the fold can only ever reach one from a leading `/` (the
-    # backslash rule above is anchored there too). Everything relative -- `.`, `./src`, `..`, a
-    # drive path -- is the common case, and this returns it without allocating anything.
+    # ***THE LEADING SLASH IS THE WHOLE OF THE ENTRY RULE, AND IT LIVES HERE ALONE.*** It is doing
+    # two jobs at once. It is the measurement: `\`, `\proc`, `/\proc` and `C:\work` were each driven
+    # at `ls`, and none of them reaches the MSYS root or /proc, so a backslash only counts as a
+    # separator after a path has resolved through the POSIX root -- which is why the fold below may
+    # convert unconditionally. And it is the hot-path guard: `.`, `./src` and `..` are the common
+    # operands, and they return here without allocating a list or running a regex.
     if ($Operand.Length -eq 0 -or $Operand[0] -cne '/') { return $null }
     $p = Get-NormalizedPath $Operand
     if ($p -ceq '//') { return 'net' }
