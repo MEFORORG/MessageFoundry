@@ -902,7 +902,7 @@ upload chokepoint enforces a fixed policy independent of the directory-source po
   path returns **HTTP 415** — both metadata-only-audited, so a PHI body is never persisted or logged.
   (There is **no** antivirus/content-malware scan on the upload path — the `ScanRejected` pre-ingest
   scan-hook seam applies only to the `File(...)`/remote directory sources above, not to HTTP uploads.)
-- **Consent affordance (ASVS 14.2.8).** The `/ui/uploaded-logs/upload` form states, above its submit
+- **Consent affordance (ASVS 14.2.8).** The `/ui/uploaded-logs/upload-form` page states, above its submit
   button, that the original filename and the uploader's username are stored and shown to the uploader
   and to authorized operators holding `files:access_any`, and recorded in the audit log — **submitting
   the form is the consent**; the POST `/uploads` OpenAPI docstring states the same for programmatic

@@ -7524,7 +7524,7 @@ class PostgresStore:
         return DbStatus(
             path=self.path,
             size_bytes=int(size["b"]) if size and size["b"] is not None else 0,
-            disk_free_bytes=0,  # not readily available for a remote Postgres server
+            disk_free_bytes=None,  # a remote server's disk is not ours to stat; unmeasurable, not 0
             journal_mode="postgres",
             messages=await self._count("messages"),
             events=await self._count("message_events"),

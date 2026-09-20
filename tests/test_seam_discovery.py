@@ -149,8 +149,19 @@ def test_security_symbols_are_what_the_console_actually_imports(surface: Any) ->
     """Two-sided correction: the curated tuple was missing two symbols AND carrying five stale ones.
 
     The stale half is why ``messagefoundry/api/_ui_seam.py`` asserted the console imports six symbols
-    directly -- false for five of six."""
-    assert surface.security_symbols == ("client_ip", "enforce_phi_read_pacing", "get_auth")
+    directly -- false for five of six.
+
+    THIS TUPLE IS A PIN OVER A DISCOVERED SET, so it moves whenever the console adds or drops a
+    ``from messagefoundry.api.security import ...`` name -- the same companion edit a seam bump is.
+    ``enforce_phi_read_hop`` joined with the ADR 0092 PHI serve-hop refusal on /ui (BACKLOG #1738).
+    Update it to what discovery reports; never widen it to a membership check, because the whole
+    value here is that an UNNOTICED import shows up as a failure rather than as nothing."""
+    assert surface.security_symbols == (
+        "client_ip",
+        "enforce_phi_read_hop",
+        "enforce_phi_read_pacing",
+        "get_auth",
+    )
 
 
 def test_auth_service_properties_are_discovered_not_only_methods(surface: Any) -> None:

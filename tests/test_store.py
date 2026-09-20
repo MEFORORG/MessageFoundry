@@ -658,6 +658,25 @@ async def test_db_status_reports_counts_journal_size(store: MessageStore) -> Non
     assert st.journal_mode.lower() == "wal"
     assert st.size_bytes > 0
     assert st.path == store.path
+    # A real local drive is measurable, so this is a number — never the "unmeasurable" None.
+    assert st.disk_free_bytes is not None and st.disk_free_bytes > 0
+
+
+async def test_disk_free_bytes_is_none_when_unmeasurable_never_zero(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #1563: a failed ``disk_usage`` reports ``None``, not ``0``.
+
+    ``0`` is the console's critical-disk alarm, so returning it for "I could not measure this" turned
+    an unreadable mount point into a disk emergency. The two are different facts and the type now
+    says so; a drive that genuinely measures 0 free still returns 0 and still alarms."""
+
+    def boom(_path: object) -> object:
+        raise OSError("mount point unreadable")
+
+    monkeypatch.setattr("messagefoundry.store.store.shutil.disk_usage", boom)
+    assert store._disk_free_bytes() is None
+    assert (await store.db_status()).disk_free_bytes is None
 
 
 async def test_integrity_check_ok(store: MessageStore) -> None:

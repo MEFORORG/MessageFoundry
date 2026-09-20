@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 import messagefoundry.service as service_control
+from messagefoundry import service_status
 from messagefoundry.__main__ import main
 from messagefoundry.service import (
     _install_params,
@@ -81,6 +82,12 @@ def test_parse_service_state() -> None:
     assert parse_service_state("        STATE              : 4  RUNNING") == "running"
     assert parse_service_state("        STATE              : 1  STOPPED") == "stopped"
     assert parse_service_state("nonsense") == "unknown"
+
+
+def test_parse_service_state_is_the_sibling_modules_parser() -> None:
+    """One implementation, not two: this module re-exports the neutral leaf's parser. See
+    :data:`messagefoundry.service_status._STATE_LINE` for why a second copy is the hazard."""
+    assert parse_service_state is service_status.parse_service_state
 
 
 def test_service_state_for_missing_service() -> None:

@@ -118,8 +118,19 @@ running production engine gets the config validated before anything is quiesced)
 
 ### §5 Surfacing
 
-`RegistryRunner` exposes `connection_failed(name) -> str | None` and `degraded_connections() ->
-dict[str, str]`. `GET /connections` reports `status: "failed"` + an `error` reason on the affected
+`RegistryRunner` exposes exactly four accessors over the failure map, and every one of them names a
+direction: `inbound_failed(name) -> str | None`, `outbound_failed(name) -> str | None`,
+`degraded_inbound() -> dict[str, str]`, and `degraded_outbound() -> dict[str, str]`.
+
+**The map is keyed by `(Direction, name)`, not by name, and there is deliberately no direction-blind
+accessor.** A name may legitimately be both an inbound and an outbound (`Registry._add` enforces uniqueness
+per *table*, and the API's `_dual_role_control` already carries a `role=` to disambiguate the pair), and a
+bare-name key aliased the two halves in both directions: `start()` builds every outbound before any inbound,
+so the inbound's bound-successfully pop erased its outbound namesake's real start failure and the engine
+reported itself healthy, while an operator restarting that outbound afterwards re-set the entry and made a
+status reader call the healthy inbound failed. A direction-blind accessor kept beside the scoped ones would
+just be the short, obvious, wrong thing for the next reader to reach for, so there is none; the same rule
+and the same `Direction` key apply to the ADR 0048 DR-park map (`_filtered`). `GET /connections` reports `status: "failed"` + an `error` reason on the affected
 source/destination rows, and **emits a standalone row for a degraded outbound that has no traffic edge
 yet** (so a failed-at-start outbound is never invisible just because nothing has been routed to it).
 `GET /connections/{name}/metadata` carries the same `error`. The console connections table renders a
