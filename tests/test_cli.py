@@ -2754,3 +2754,43 @@ def test_version_reports_the_package_directory_that_answered(
     assert str(package_dir) in out, f"--version does not say which tree answered:\n{out}"
     # the reported directory is the real one, not a plausible string
     assert (package_dir / "__main__.py").is_file()
+
+
+# --- BACKLOG #1673: which stream a failure goes to ---------------------------------------------
+
+
+def _unloadable_config(tmp_path: Path) -> Path:
+    """A config dir `graph` cannot load, so its failure goes through `_emit_error`.
+
+    `validate` is the wrong vehicle here: it REPORTS diagnostics as its output rather than failing
+    through `_emit_error`, so it proves nothing about which stream an error takes."""
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    (cfg / "broken.py").write_text("this is not python (", encoding="utf-8")
+    return cfg
+
+
+def test_text_mode_error_goes_to_stderr(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """A text-mode failure must not land in the file a shell redirect is capturing.
+
+    `messagefoundry graph --config <broken> > report.txt` wrote the reason into report.txt and left
+    the terminal blank; `2>/dev/null` could not silence diagnostics without silencing results."""
+    assert main(["graph", "--config", str(_unloadable_config(tmp_path))]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == "", f"the failure reached stdout: {captured.out!r}"
+    assert captured.err.startswith("error: "), captured.err
+
+
+def test_json_mode_error_stays_on_stdout(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The other half, and it is deliberate: under --json the error object is the output.
+
+    A consumer pipes stdout to `jq` and reads the non-zero exit code to tell a failure from a
+    success payload, so moving this to stderr would break the machine-readable contract."""
+    assert main(["graph", "--config", str(_unloadable_config(tmp_path)), "--json"]) == 1
+    captured = capsys.readouterr()
+    assert captured.err == "", f"the JSON payload reached stderr: {captured.err!r}"
+    payload = json.loads(captured.out)
+    assert isinstance(payload, dict), payload
+    assert "error" in payload

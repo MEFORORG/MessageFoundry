@@ -974,7 +974,11 @@ class DbStatus:
 
     path: str
     size_bytes: int  # db file + -wal + -shm
-    disk_free_bytes: int  # free space on the DB's drive
+    # Free space on the DB's drive, or None when this process CANNOT measure it -- a remote server
+    # backend whose disk is not ours to stat, or a failed ``disk_usage`` call. ``None`` and ``0`` are
+    # different facts and must stay so: 0 is a MEASURED empty drive and has to keep raising the
+    # operator-health alarm, while None carries no claim about the drive at all (BACKLOG #1563).
+    disk_free_bytes: int | None
     journal_mode: str
     messages: int
     events: int
@@ -1611,6 +1615,29 @@ def _secure_file(path: Path, *, extra_read_grants: Sequence[str] | None = None) 
             os.chmod(path, _OWNER_ONLY)
     except OSError as exc:
         log.warning("could not restrict permissions on %s: %s", path, exc)
+
+
+async def _secure_file_async(path: Path, *, extra_read_grants: Sequence[str] | None = None) -> None:
+    """:func:`_secure_file` dispatched off the event loop — for the two callers that run ON one.
+
+    On Windows the restriction is an ``icacls`` subprocess, measured at 21 to 28 ms per file. Called
+    straight from a coroutine, that span is dead time for every other task on the loop: a deploying
+    site would see one such stall per secured file of every in-flight ACK, claim and delivery on each
+    DR backup, because ``snapshot_to`` runs on the SERVING loop by design (see
+    ``pipeline/dr_backup.py``, which keeps the consistent snapshot there and moves only the tar+AEAD
+    off it). ``MessageStore.open`` secures three files, but it completes before the API serves and
+    before any listener binds, so its stall has nothing to stall.
+
+    The synchronous :func:`_secure_file` stays the callable for every caller that is NOT on a loop —
+    the CLI key/cert writers, the lifespan bootstrap admin, and the ``config/*_edit.py`` writers
+    (whose one async caller already wraps the whole write in ``to_thread``). It is deliberately left
+    unrenamed and unmoved: ``tests/test_phi_at_rest_inventory.py`` asserts that token lives in this
+    module and in no other ``store/`` backend, and ``tests/test_cli.py`` patches it by that name.
+
+    ``_secure_file`` is resolved through the module global when the call is made, so a test that
+    patches the name is honoured through this wrapper too.
+    """
+    await asyncio.to_thread(_secure_file, path, extra_read_grants=extra_read_grants)
 
 
 def _opt_float(value: Any) -> float | None:
@@ -2567,6 +2594,8 @@ class MessageStore:
             await cls._migrate(db)
             await db.commit()
             # Tighten permissions now that the file (and its WAL siblings) exist — they hold PHI.
+            # Off the loop (BACKLOG #1634): three files, each an icacls subprocess on Windows. Open
+            # completes before anything is serving, so this one is consistency rather than a fix.
             if str(path) != ":memory:":
                 main = Path(path)
                 for f in (
@@ -2575,7 +2604,7 @@ class MessageStore:
                     main.with_name(main.name + "-shm"),
                 ):
                     if f.exists():
-                        _secure_file(f)
+                        await _secure_file_async(f)
             store = cls(
                 db,
                 path=path,
@@ -9403,11 +9432,13 @@ class MessageStore:
                 total += p.stat().st_size
         return total
 
-    def _disk_free_bytes(self) -> int:
+    def _disk_free_bytes(self) -> int | None:
+        """Free bytes on the DB's drive; ``None`` when the probe failed — see
+        :attr:`DbStatus.disk_free_bytes` for why that is not ``0`` (BACKLOG #1563)."""
         try:
             return shutil.disk_usage(Path(self.path).resolve().parent).free
         except OSError:
-            return 0
+            return None
 
     # --- retention / purge + maintenance (PHI.md §8, ASVS 14.2.x) -------------
 
@@ -9926,7 +9957,9 @@ class MessageStore:
         # Tighten the snapshot file's permissions: it is a full copy of the (PHI-bearing) store. The
         # encrypted .mfbak the BackupRunner wraps it in is the at-rest protection, but the transient
         # plaintext snapshot must not be world-readable either.
-        _secure_file(dest)
+        # Off the loop (BACKLOG #1634): this is the call that matters. A DR backup runs on the SERVING
+        # loop, so a synchronous icacls here stalls every in-flight ACK, claim and delivery with it.
+        await _secure_file_async(dest)
 
     async def stats(self) -> dict[str, int]:
         """Outbound-queue depth by status — feeds the monitoring/queue-depth view. Scoped to outbound

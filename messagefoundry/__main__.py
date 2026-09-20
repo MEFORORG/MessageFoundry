@@ -278,6 +278,13 @@ def main(argv: list[str] | None = None) -> int:
         help="promote the ADR 0144 handler-security lint to a blocking (required) check",
     )
     check.add_argument(
+        "--allow-empty-config",
+        action="store_true",
+        help="accept a config directory that declares no connections (BACKLOG #1648). Without it "
+        "the validate check fails on one, the way serve and reload refuse it. Scoped to `check` — "
+        "serve has no opt-out",
+    )
+    check.add_argument(
         "--handler-security-allow",
         action="append",
         default=None,
@@ -293,7 +300,10 @@ def main(argv: list[str] | None = None) -> int:
         "open clarifications (Secure Development Standards section 5)",
     )
     adr_analyze.add_argument(
-        "--adr-dir", default="docs/adr", help="ADR directory (default: docs/adr)"
+        "--adr-dir",
+        default="docs/adr",
+        help="ADR directory (default: docs/adr). Exits 2, with or without --strict, if it is "
+        "missing, is not a directory, or holds no ADR",
     )
     adr_analyze.add_argument(
         "--repo-root",
@@ -3541,7 +3551,10 @@ def _graph(args: argparse.Namespace) -> int:
         return resolved
     config_dir, _ = resolved
     try:
-        reg = load_config(config_dir)
+        # allow_empty: `graph` REPORTS a graph, it does not gate one (BACKLOG #1648), and its edges
+        # come from Routers and Handlers, which a connection-less config still has. Refusing here
+        # would make the reporting surface go dark on the config an operator most wants to look at.
+        reg = load_config(config_dir, allow_empty=True)
     except WiringError as exc:
         return _emit_error(str(exc), as_json=args.json)
     # Edges come from the one authoritative static extractor (ADR 0091 D1): AST-first with the
@@ -4195,7 +4208,10 @@ def _cert_inventory(args: argparse.Namespace) -> int:
         from messagefoundry.config.wiring import WiringError, load_config
 
         try:
-            reg = load_config(args.config)
+            # allow_empty: a read-only inventory (BACKLOG #1648). Refusing here would also drop the
+            # API / service-caller cert pairs resolved from settings just above, so an operator would
+            # lose unrelated expiry output because the graph happens to declare no connection.
+            reg = load_config(args.config, allow_empty=True)
         except (WiringError, FileNotFoundError, OSError) as exc:
             return _cert_fail(f"cannot load --config: {exc}", as_json=args.json)
         pairs.extend(
@@ -5352,6 +5368,7 @@ def _check(args: argparse.Namespace) -> int:
         # <root>/<env_dir>/<env>.toml exists; pass it on so the build check READS the values from there
         # too, rather than from wherever the shell happens to be (BACKLOG #1062).
         project_root=args.project_root,
+        allow_empty_config=args.allow_empty_config,
     )
     if args.json:
         _print_json(report.to_json(), compact=True)
@@ -5368,13 +5385,35 @@ def _check(args: argparse.Namespace) -> int:
 def _adr_analyze(args: argparse.Namespace) -> int:
     """Advisory spec-driven ADR coverage (Secure Development Standards §5). Reports acceptance-
     criteria→test link coverage, Accepted ADRs missing criteria, and open ``- [ ]`` clarifications.
-    Exits 0 unless ``--strict`` and a linked test/fixture is missing — no new blocking gate by default."""
+
+    Two exit codes, and which one a condition gets is the point of the split. A *finding* is
+    advisory: a missing linked test/fixture exits 0, or 1 under ``--strict``. An *absent corpus* —
+    :attr:`~messagefoundry.adr_analyze.AnalysisResult.error`, defined at
+    :func:`~messagefoundry.adr_analyze.analyze_adrs` — exits **2 with or without ``--strict``**,
+    because the analyzer never ran. 2 and not 1 keeps "could not start" apart from "ran and
+    reported a problem", the same split :func:`_emit_store_open_error` spends 2 on; and not 0
+    because this subcommand is otherwise unfailable by default, so a withdrawn ADR set would
+    silently turn a failing report into a passing one.
+
+    That split is between this command's own codes. It does **not** separate 2 from argparse's own
+    usage-error 2, so a caller that must tell a withdrawn corpus from a mistyped flag has to read
+    the output, not the code. Every subcommand here inherits that, ``--json`` disambiguates it, and
+    widening it was not worth a third code."""
     from messagefoundry.adr_analyze import analyze_adrs
 
     result = analyze_adrs(args.adr_dir, repo_root=args.repo_root)
     if args.json:
         _print_json(result.to_json(), compact=True)
-    else:
+    if result.error is not None:
+        # JSON on stdout XOR the human line on stderr. Emitting both would reorder under `2>&1`: a
+        # piped stdout is block-buffered and stderr is not, so the error line would land ahead of
+        # the JSON and break the parse it was meant to protect. The JSON body is the full report
+        # with `error` inside it, and so is NOT _emit_store_open_error's bare {"error": ...}: `ok`
+        # has to stay readable for a consumer that branches on it and nothing else.
+        if not args.json:
+            print(f"error: {result.error}", file=sys.stderr)  # not _safe_print; see its docstring
+        return 2
+    if not args.json:
         with_criteria = sum(1 for r in result.reports if r.has_criteria)
         _safe_print(
             f"ADRs analyzed: {len(result.reports)} ({with_criteria} with acceptance criteria)"
@@ -5447,7 +5486,12 @@ def _connection(args: argparse.Namespace) -> int:
     )
 
     def validate(config_dir: Path) -> None:
-        registry = load_config(config_dir)
+        # allow_empty: this is an AUTHORING surface, and removing the last connection is a legitimate
+        # editing step, not an invalid edit (BACKLOG #1648). Refusing here would leave an operator
+        # unable to clear connections.toml through the CLI/GUI at all — they would have to hand-edit
+        # the file the tool exists to own. The empty-graph refusal stays where the graph is RUN or
+        # GATED: load_config's default, the engine reload, and `messagefoundry check`.
+        registry = load_config(config_dir, allow_empty=True)
         build_check_registry(
             registry,
             inbound_bind_host=settings.inbound.bind_host,
@@ -5577,7 +5621,11 @@ def _impact(args: argparse.Namespace) -> int:
         return _emit_error("--apply is only valid with --rename-to", as_json=args.json)
 
     try:
-        registry = load_config(args.config)
+        # allow_empty: `impact` is the CLI front door to the SAME rename/delete pre-flight
+        # `codeset_edit` runs (BACKLOG #1648), and reverse-dependency analysis over Routers,
+        # Handlers and code sets needs no connection. Exempting the pre-flight and refusing here
+        # would leave the two disagreeing about the same config.
+        registry = load_config(args.config, allow_empty=True)
     except (WiringError, FileNotFoundError, OSError) as exc:
         return _emit_error(str(exc), as_json=args.json)
 
@@ -5938,7 +5986,13 @@ def _security(args: argparse.Namespace) -> int:
 
 def _safe_print(line: str) -> None:
     """Print a line, re-encoding to stdout's codec with replacement so a non-cp1252 character (an
-    ADR's em-dash or ``≥``) never crashes the human output on a legacy Windows console."""
+    ADR's em-dash or ``≥``) never crashes the human output on a legacy Windows console.
+
+    STDOUT ONLY, AND DO NOT EXTEND IT TO STDERR. ``sys.stdout`` carries ``surrogateescape``, which
+    still raises on an unencodable codepoint; ``sys.stderr`` carries ``backslashreplace`` and never
+    raises. So stderr needs no protection, and routing an error line through this would be a
+    downgrade: it would blank a character stderr prints as a readable escape, handing an operator a
+    path they cannot paste back. ``tests/test_cp1252_console_safety.py`` measures that asymmetry."""
     enc = getattr(sys.stdout, "encoding", None) or "utf-8"
     sys.stdout.write(line.encode(enc, "replace").decode(enc) + "\n")
 
@@ -5969,10 +6023,20 @@ def _emit_store_open_error(exc: sqlite3.DatabaseError, path: str, *, as_json: bo
 
 
 def _emit_error(message: str, *, as_json: bool) -> int:
+    """Report a command failure on the right stream and return its exit code.
+
+    Text goes to **stderr**. A shell redirect of a command's output --
+    ``messagefoundry validate --config x > report.txt`` -- must not swallow the reason the command
+    failed into the file it was writing, and ``2>/dev/null`` must be able to silence diagnostics
+    without silencing results (BACKLOG #1673).
+
+    JSON stays on **stdout**, deliberately. Under ``--json`` the error object IS the command's
+    machine-readable output: a consumer piping to ``jq`` reads it there, and the non-zero exit code
+    is what tells it apart from a success payload."""
     if as_json:
         print(json.dumps({"error": message}))
     else:
-        print(f"error: {message}")
+        print(f"error: {message}", file=sys.stderr)
     return 1
 
 

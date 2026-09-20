@@ -887,7 +887,10 @@ Ending a pilot is a **PHI-disposal** event. `uninstall-service.ps1` removes the 
 **deliberately leaves the store and logs on disk**. To tear down cleanly:
 
 1. **Graceful drain + stop**, confirm no in-flight work remains.
-2. **Uninstall the service** (`scripts\service\uninstall-service.ps1`).
+2. **Uninstall the service** (`scripts\service\uninstall-service.ps1`). Read the inventory it
+   prints: removing the registration leaves the data directory, permissions naming the run-as
+   account, a user right and more, each with the command that clears it
+   ([SERVICE.md](SERVICE.md#uninstall)).
 3. **Securely dispose of all PHI-bearing artifacts:** the store (`.db` + `-wal` + `-shm`), any
    PostgreSQL database/backups, **File-connector spill directories**, the `logs` directory, every
    **backup copy**, and the **encryption key / DPAPI key file**.

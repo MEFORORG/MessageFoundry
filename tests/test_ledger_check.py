@@ -28,9 +28,36 @@ README_HEAD = "# Architecture Decision Records\n\n| ADR | Decision | Status |\n|
 
 
 def git(repo: Path, *args: str) -> str:
+    """Run git and return stdout, TOLERATING a non-zero exit.
+
+    Tolerance is deliberate and load-bearing: the merge in
+    test_MAIN_merged_INTO_another_seats_branch_is_committable is SUPPOSED to conflict, and git exits 1
+    when it does. Do not add check=True here.
+
+    What tolerance costs is that a broken git is indistinguishable from a command with no output, so
+    anything that builds a PATH from this must use git_read() below instead.
+    """
     proc = subprocess.run(
         ["git", "-C", str(repo), *args], capture_output=True, text=True, check=False
     )
+    return proc.stdout
+
+
+def git_read(repo: Path, *args: str) -> str:
+    """Read a value out of git, raising with stderr when git fails, for anything that builds a path.
+
+    ***THE TOLERANT HELPER ABOVE RETURNS "" ON ANY FAILURE, AND "" IS NOT AN ERROR TO Path().***
+    Measured 2026-09-18: every git call in one suite run returned empty, `Path("") / "mefor-coord"` is
+    a RELATIVE path, and five claim records were written to the checkout root instead of the temp repo.
+    The run reported no problem from the write itself, because the write succeeded.
+    """
+    proc = subprocess.run(
+        ["git", "-C", str(repo), *args], capture_output=True, text=True, check=False
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"git {' '.join(args)} failed in {repo} (exit {proc.returncode}): {proc.stderr.strip()}"
+        )
     return proc.stdout
 
 
@@ -72,13 +99,22 @@ def allocate(
     `omit_branch` reproduces a LEGACY record written before the allocator recorded one, so the
     path-only behaviour stays pinned.
     """
-    common = git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
-    top = git(repo, "rev-parse", "--path-format=absolute", "--show-toplevel").strip()
-    d = Path(common) / "mefor-coord" / "alloc" / kind
+    common = git_read(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+    top = git_read(repo, "rev-parse", "--path-format=absolute", "--show-toplevel").strip()
+    # ***THE ROOT MUST BE ABSOLUTE, AND `--path-format=absolute` IS A REQUEST, NOT A GUARANTEE.***
+    # A relative base here does not fail -- it silently retargets the write at the pytest process's
+    # cwd, i.e. this checkout, which is how five records leaked on 2026-09-18. git_read() covers the
+    # failure case; this covers a git that succeeds and answers relatively anyway.
+    root = Path(common)
+    assert root.is_absolute(), (
+        f"git reported a non-absolute common dir ({common!r}); writing a claim under it would land "
+        f"in the pytest cwd ({Path.cwd()}) rather than in {repo}"
+    )
+    d = root / "mefor-coord" / "alloc" / kind
     d.mkdir(parents=True, exist_ok=True)
     claim: dict[str, str] = {"number": number, "kind": kind, "worktree": str(worktree or top)}
     if not omit_branch:
-        claim["branch"] = branch or git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip()
+        claim["branch"] = branch or git_read(repo, "rev-parse", "--abbrev-ref", "HEAD").strip()
     (d / f"{number}.json").write_text(json.dumps(claim), encoding="utf-8")
 
 
