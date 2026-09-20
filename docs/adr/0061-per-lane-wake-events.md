@@ -1,6 +1,7 @@
 # ADR 0061 — Per-lane wake events (targeted worker wakeup, default-OFF)
 
-**Status:** Proposed · **Date:** 2026-06-30
+**Status:** Accepted -- **built**, default-OFF behind `[pipeline].per_lane_wake` (`config/settings.py`,
+`api/app.py`). Accepted records that the code shipped; it does **not** promote the flag. · **Date:** 2026-06-30
 **Relates-to:** ADR 0001 (staged pipeline — split router/transform/delivery stages), ADR 0013 Increment 2 (loopback re-ingress / response worker), ADR 0055 (group committer — reliability-core default-OFF precedent + poison-guard), ADR 0057 (B1 inline fast-path — the fused `_work.set()` at `wiring_runner.py:2052`), ADR 0058 (batch-claim — default-OFF `[store]` knob precedent), ADR 0059 (seq-only per-lane FIFO — "exactly ONE serial writer per (stage, lane-key)", asserted at `wiring_runner.py:1141-1152`), issue #285 (no-READPAST per-lane FIFO), CLAUDE.md §2 "Reliability invariant" / "Concurrency = asyncio", docs/throughput-roadmap.md B12, B11 `EmptyClaimCounters` (`wiring_runner.py:155`).
 
 ---
