@@ -4411,33 +4411,62 @@ class AuthService:
     # --- audit ---------------------------------------------------------------
 
     async def audit_permission_denied(
-        self, identity: Identity, permission: Permission, path: str
+        self,
+        identity: Identity,
+        permission: Permission,
+        path: str,
+        *,
+        client: str | None = None,
     ) -> None:
+        """Audit an access refused because the caller lacks ``permission``.
+
+        ``client`` is the caller's address; :meth:`_audit` states what a NULL one asserts. The three
+        authorization methods gained it because they are only ever reached FROM a request, so every
+        row they wrote used to assert the false half of that contract (BACKLOG #1644). It defaults to
+        NULL for a caller that genuinely has none — which means a caller that HAS an address and omits
+        it writes the very row this exists to stop."""
         await self._audit(
             "auth.permission_denied",
             actor=identity.username,
             detail=_json({"permission": permission.value, "path": path}),
+            client=client,
         )
 
-    async def audit_mfa_denied(self, identity: Identity, path: str) -> None:
+    async def audit_mfa_denied(
+        self, identity: Identity, path: str, *, client: str | None = None
+    ) -> None:
         """Audit an access refused because the session's second factor is still PENDING (ASVS 6.3.3).
 
         Needed because the MFA gate sits ABOVE the permission loop: without its own row, a stolen
         password-only token could enumerate the whole authenticated surface and leave the audit log
         completely silent — :meth:`audit_permission_denied` never fires, since the request is refused
         before any permission is evaluated. The gate must stay above the loop (below it, the refusal
-        would leak whether the caller holds the permission), so the audit row is the fix."""
+        would leak whether the caller holds the permission), so the audit row is the fix.
+
+        ``client``: see :meth:`audit_permission_denied`. It carries more weight here than there — by
+        the paragraph above, this row is the only evidence a stolen password-only token was used at
+        all, so the address is the half of it an incident responder acts on."""
         await self._audit(
             "auth.mfa_denied",
             actor=identity.username,
             detail=_json({"path": path}),
+            client=client,
         )
 
     async def audit_permission_granted(
-        self, identity: Identity, permission: Permission, path: str
+        self,
+        identity: Identity,
+        permission: Permission,
+        path: str,
+        *,
+        client: str | None = None,
     ) -> None:
         """Twin of :meth:`audit_permission_denied` for the authorization-GRANT side (BACKLOG #195a,
         ASVS 16.3.2). Writes one hash-chained audit row naming who was allowed to reach a route.
+
+        ``client``: see :meth:`audit_permission_denied`. The shipped default writes this row on EVERY
+        authenticated request (the ``audit_all_authz`` paragraph below), so its NULL client was not a
+        margin case — it was the bulk of the table.
 
         WHICH grants arrive here is the API layer's call, and ``[diagnostics].audit_all_authz``
         governs it. On the shipped default that is the authenticated surface at large, reads and
@@ -4450,6 +4479,7 @@ class AuthService:
             "auth.permission_granted",
             actor=identity.username,
             detail=_json({"permission": permission.value, "path": path}),
+            client=client,
         )
 
     async def _audit(
