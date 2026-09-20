@@ -27,9 +27,13 @@ reads ``self.build_config``, so a target table that declares an EMPTY map means 
 does not re-open the global one. The difference is narrow and it is exactly the kind of thing one
 shared reader exists to get right once.
 
-**Not covered here, deliberately:** which distributions exist. Both call sites glob ``packaging/*``
-for their own reasons, each written down where it happens, and folding those together would decide a
-question this module was not asked.
+**Not covered here, deliberately:** which distributions exist. The two force-include readers each
+glob ``packaging/*`` for their own reasons, written down where they happen, and folding those
+together would decide a question this module was not asked. **That split is safe for a reason, not
+by luck:** the readings could disagree silently because every liveness floor stayed satisfied either
+way, whereas a NARROWING of discovery reds on both sides -- each floor is tight against the two
+distributions that exist. The widening case used to be the silent one, and the derived floor in
+``test_every_packaged_distribution_has_its_code_tree_scanned`` is what closed it.
 """
 
 from __future__ import annotations
