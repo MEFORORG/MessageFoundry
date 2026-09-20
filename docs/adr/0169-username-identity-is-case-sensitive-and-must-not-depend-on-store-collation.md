@@ -3,7 +3,7 @@
 
 # ADR 0169 — Username identity is case-sensitive, and no identity decision may depend on store collation
 
-- **Status:** Proposed (2026-08-20) — **the fix is built.** BACKLOG #1268 shipped both limbs on 2026-08-20:
+- **Status:** Accepted (2026-08-20) — **the fix is built.** BACKLOG #1268 shipped both limbs on 2026-08-20:
   `users.username` now pins `COLLATE Latin1_General_100_BIN2` ([`store/sqlserver.py`](../../messagefoundry/store/sqlserver.py))
   and the bootstrap-retirement gate no longer depends on store collation. **Residual:** the `users` DDL is
   creation-guarded, so an existing SQL Server database keeps the collation it was created with.

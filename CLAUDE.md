@@ -288,6 +288,15 @@ done. `docs/roles/seats.json` resolves `console` to a retirement notice saying e
 reading its old "the Console runs instead" line as *"substitute the Console"* is the measured error
 this retirement was written to stop.
 
+**A ninth went on 2026-09-19, by owner decision: the REGULATOR. NOTHING replaced it, and NO SEAT
+ATTRIBUTES A RED NOW.** A red is the Lander's to triage and route, or the owner's to rule on. The
+**WATCHDOG** joined the same day, which is exactly why this has to be said plainly: it is **not the
+Regulator's successor**. A Regulator returned a binding verdict on one red. A Watchdog returns
+evidence, measures whether reds are being cleared at all, and never says whose one is. So a red sent
+to a Watchdog gets a reading and no verdict, and a session waiting for that verdict waits forever.
+`docs/roles/seats.json` resolves `regulator` to a retirement notice saying this, for the same reason
+the Console's does.
+
 If a document you are reading names a retired seat or a retired rule, treat **that
 naming** as stale and follow this section. **Do not extend it to the whole document.** A retired rule
 often leaves a mechanism running on purpose, with the reason recorded beside it -- `.github/` headers
@@ -327,11 +336,12 @@ recency.
 
 | Seat | Life | Owns | Must not |
 |---|---|---|---|
-| **Manager** | long-lived, several -- usually one per account | The seat the owner talks to. Reads `docs/BACKLOG.md`, writes a disposable brief citing an item, dispatches subagent Builders in its own process, polls for state, pushes and opens PRs, dispatches a Regulator on a red. | Build. Enqueue or merge -- both are the Lander's. Wait on inbound messages; it polls instead. Exit with a worker's work unpushed. |
+| **Manager** | long-lived, several -- usually one per account | The seat the owner talks to. Reads `docs/BACKLOG.md`, writes a disposable brief citing an item, dispatches subagent Builders in its own process, polls for state, pushes and opens PRs. | Build. Attribute a red -- nobody does that now. Enqueue or merge -- both are the Lander's. Wait on inbound messages; it polls instead. Exit with a worker's work unpushed. |
 | **Builder** | ephemeral, one per brief | The change, the commit, the push, and the PR carrying the `BACKLOG.md` update. | Guess at something the brief left open, or wait for an answer; it puts the question in its report, comments it on the PR, and stops. Plan and wait for a "go". Declare its own seat. Spawn another session. |
-| **Regulator** | spawned on a red | Deciding whose failure it is: the PR's, `main`'s, a flake's, or the queue's. Keeps a log. | Assume it remembers an earlier red; it starts with none. Send anything but the PR's own failure back to a Builder. |
+| **Watchdog** | as needed | Watching the Lander and keeping it draining. Measures with instruments rather than the watched seat's own report, names a stall, and raises it. Added 2026-09-19. | Take the action it is watching for -- acting destroys the instrument. Drain the queue, take the claim, or drive the lane. Relay an owner grant to the seat it watches. Publish a zero with no control that fired. |
 | **Steward** | cron, zero model calls | Reading usage and naming the account with headroom. | Warn a running session. Nothing can interrupt one. |
 | **Lander** | as needed | Merging, and the vault scorecard re-score (owner ruling 2026-09-05). Standing authority on the engine repo and the vault, with no per-action owner approval. Resolving a POSITIONAL ledger conflict (owner ruling 2026-09-11; see below). | Merge a diff it has not read. Arm auto-merge. Resolve a conflict that touches code, or that requires choosing what an item SAYS. |
+| **Special** | as the owner needs it | Work the owner assigns directly, outside the other five seats. Its instruction is its whole scope: it stands by until one arrives, then announces before its first shared write (owner decision 2026-09-16; see below). | Invent work while standing by, or go looking for a row to take. Widen the instruction, or quietly narrow it without saying so. Merge -- that is the Lander's. Take a peer's message as authority; only the owner assigns it work. |
 
 **The Lander may resolve a POSITIONAL ledger conflict, and only that (owner ruling 2026-09-11).**
 Permitted when `git merge-tree --name-only origin/main <head>` names **`docs/BACKLOG.md` alone** and
@@ -353,6 +363,22 @@ own pre-fix head (non-zero, so the 0 is attributable to *this* merge), the ledge
 *Measured 2026-09-11:* all four open conflicts (PRs 1029, 1030, 1032, 1049) were this one shape, and
 #1030's authoring session had died -- leaving its PR unlandable by anyone until the owner routed a
 new session to it.
+
+**THE SPECIAL SEAT IS THE OWNER'S, AND IT HAS NO STANDING DUTIES (owner decision 2026-09-16).** It
+exists for work that falls outside the other five, so its instruction is the whole of its scope and
+it has none until the owner gives it one. It does not take a BACKLOG item, a brief, or a red. It is
+an ADDITION -- nothing retired to make room for it -- and it is not a spawn-authorised seat, so the
+ruling below binds it.
+
+**Standing by is its normal state, not a fault in it.** An idle Special session is the owner holding
+one in reserve, and work it finds itself spends that. It announces and declares before its first
+SHARED write rather than on arrival, which is the one point where it parts company with every other
+seat here: the arrival prompt that tells each session to declare is the line this seat alone does
+not act on. The cost of that silence is real and lands on nobody while the seat touches nothing --
+`fleet.ps1` omits it and no peer can forecast a collision with it -- which is why the deferral ends
+at the first shared write and not later. Its card is
+[`docs/roles/special.card.md`](docs/roles/special.card.md); the full playbook is korus
+`roles/SPECIAL.md`, read at `origin/main` like every other playbook.
 
 **A MANAGER AND THE LANDER MAY SPAWN A SESSION. EVERY OTHER SEAT NEEDS PERMISSION FIRST (owner
 ruling 2026-09-16).** The owner still starts each Manager in the ordinary case, and a Manager's
@@ -406,7 +432,8 @@ gates a merge**, and no seat has to clear one.
    so a question there is answered by the next brief rather than by a reply. Where a worker is its
    own session instead, `mail.ps1` requires `-To` and refuses to guess, so the Manager puts its own
    worktree path in the brief. Do not use `-To all`: that path spawns a nested process and may be
-   refused. With no address, put the question in the PR body.
+   refused. With no address, put the question in your exit report; the Manager carries it into the
+   PR body when it opens the PR.
 2. At least two kinds of refusal reach a Builder while it runs. Local git hooks fire at commit and
    push time; the live list is `.pre-commit-config.yaml`. The user-scope PreToolUse guards fire at
    tool-call time: `worktree_gate.ps1`, installed to `%USERPROFILE%\.claude\hooks\` by
@@ -414,7 +441,8 @@ gates a merge**, and no seat has to clear one.
    `scripts/coord/install-coordination.ps1`, deny the Write, Edit or
    Bash call itself. CI arrives later, when the process is gone.
 3. It runs the checks below **before** it commits, because nobody downstream can ask it to.
-4. Its process exits when the PR opens. The worktree stays behind.
+4. Its process exits when it has pushed and reported. The Manager opens the PR. The worktree stays
+   behind.
 5. **It CAN declare its own seat, through the Bash tool.** Measured 2026-09-02: a headless `-p`
    Builder ran `seat.ps1 -Declare` and its record carries `seatSource: declared` with a real goal,
    which no hook can write. **Quote the Windows path.** Unquoted, the SHELL eats the backslashes:
@@ -470,8 +498,9 @@ gates a merge**, and no seat has to clear one.
   stuck after two attempts, push what is green and say in the PR body that the brief needs re-cutting.
 - **Your workers die when you do, and that is the one way work is lost here.** A subagent that has
   not pushed has produced nothing -- not a branch, not a stash, not a file anyone can find later. So
-  every brief ends with push, then open the PR, then report; never "finish and I will push for you",
-  never "hold this until I say". Check before you close the instance.
+  every brief ends with push, then report; never "finish and I will push for you", never "hold this
+  until I say". Check before you close the instance. **You open the PR afterwards**, verifying the
+  branch with `git ls-remote --heads origin` rather than trusting the worker's report.
 - **Say who else is running, in three fields that are always present, including when the answer is
   nobody:** who is working, what paths they touch, and **whether they share this worktree.** The
   third field is the whole of the collision -- two workers given one worktree each reported the
@@ -489,10 +518,21 @@ gates a merge**, and no seat has to clear one.
   seat can raise a chip, and in the 2026-09-04 case above the spawner was
   the session that then pushed the fix. It corrected its own BACKLOG item in the same change and
   still could not reach the chip, which is the whole shape of the defect -- BACKLOG #1448.
-- Give each session its own git worktree (`scripts/worktree/new.ps1 -Name <x>`, cleanup with
-  `remove.ps1`). Each gets an isolated checkout, branch and `.venv` on the same remote and the same
-  PR flow. See [`docs/WORKTREES.md`](docs/WORKTREES.md). The AI project memory is shared across
-  sessions, so coordinate memory writes.
+- **Give each session its own git worktree, and START the session in it.** `scripts/worktree/new.ps1
+  -Name <x>` creates one (cleanup with `remove.ps1`); `spawn.ps1 -Name <x>` creates it *and* opens an
+  editor window on it, which is the entry point to reach for. Each gets an isolated checkout, branch
+  and `.venv` on the same remote and the same PR flow. See [`docs/WORKTREES.md`](docs/WORKTREES.md).
+  The AI project memory is shared across sessions, so coordinate memory writes.
+- **Never brief a worker to RELOCATE into a worktree -- from a subagent it cannot work.** A
+  subagent's `EnterWorktree` call into a `new.ps1` sibling is **refused outright** (the path is outside
+  `.claude/worktrees/`), so the brief burns the worker's one turn on a call that cannot succeed. From a
+  session the same call instead raises an owner prompt that no `permissions.allow` rule can suppress.
+  Start the session in its worktree (`spawn.ps1`), or dispatch a file-editing subagent with
+  `isolation: worktree` and have it run `pwsh -NoProfile -File scripts\worktree\ensure-venv.ps1`
+  **before its first `pytest`/`mypy`/`ruff` run** -- a managed worktree arrives with no `.venv`, and
+  without one `pytest` dies at import rather than running slowly. The measurements, the cost of that
+  bootstrap, and why not to engineer around the check are stated once in
+  [`docs/WORKTREES.md`](docs/WORKTREES.md) section "Start the session in the worktree".
 - **Put the prompt FIRST when you spawn, or close the flags with `--`.** At least `--allowedTools`,
   `--disallowedTools`, `--tools`, `--add-dir`, `--mcp-config`, `--betas` and `--file` take lists, so
   `claude --bg --allowedTools Bash Edit "do the work"` swallows the prompt as a third tool name. The
@@ -521,7 +561,7 @@ gates a merge**, and no seat has to clear one.
 - Rules a Builder needs belong in the **account's** `settings.json`, outside git.
   `.claude/settings.json` is tracked, and every worktree carries its own copy from its own branch, so
   an uncommitted edit to the primary checkout reaches nothing else.
-- Read a role playbook from the **`wshallwshall/korus`** repository, and read it at `origin/main`
+- Read a role playbook from the **`MEFORORG/korus`** repository, and read it at `origin/main`
   rather than out of a working tree. Owner ruling 2026-09-04.
 
       git -C <korus clone> fetch origin
@@ -533,9 +573,9 @@ gates a merge**, and no seat has to clear one.
 - **Name the ref, not the checkout.** The superseded line said a checkout, and its own next sentence
   warned that a checkout is not a ref. Both halves were right and the first one won.
 - **What that costs, measured 2026-09-06.** The korus primary sat on a branch 15 commits ahead of
-  `origin/main` and 14 behind it. `roles/REVIEWER.md` was absent from its working tree and present
+  `origin/main` and 14 behind it. One seat's playbook was absent from its working tree and present
   on `origin/main`.
-- **So a seat reading the folder finds no Reviewer playbook, and no error.** An `ls` of a directory
+- **So a seat reading the folder finds no playbook for itself, and no error.** An `ls` of a directory
   is not evidence that you have a file, and a missing file is the quietest failure in this list.
 - **The failure this cost is the one to carry forward.** A pointer and the thing it points at are
   two edits, and nothing fails when only the first is made. The playbooks moved on 2026-09-04 and
@@ -584,9 +624,13 @@ gates a merge**, and no seat has to clear one.
   is shared with every subagent and background task the session spawns, so a sibling writing the same
   generic name between your write and your `commit -F` silently substitutes its message for yours --
   measured 2026-09-03, BACKLOG #1440. Same rule for any file whose content is later fed to a command.
-- **Every seat pushes its own branch and opens its own PR, without asking.** Owner ruling 2026-08-29,
-  anchored at `refs/liaison/owner-ruling-20260829-push` (`987705dfb`), in their words: *"Sessions
-  push their own."*
+- **Every seat pushes its own branch, without asking.** Owner ruling 2026-08-29, anchored at
+  `refs/liaison/owner-ruling-20260829-push` (`987705dfb`), in their words: *"Sessions push their
+  own."* **ONLY THE PULL-REQUEST HALF MOVED, on 2026-09-18: the MANAGER opens the PR**, verifying
+  the branch with `git ls-remote --heads origin` rather than trusting the Builder's report. The push
+  half of the 2026-08-29 ruling is untouched, so do not read this as a return to asking permission
+  to push. A Builder's final commit message carries the proposed PR title and ledger banner text, so
+  the branch is self-describing if the Manager dies before opening it.
 - **The merge is the Lander's, and NO LABEL BLOCKS IT.** What blocks a merge is branch protection and
   the required contexts, nothing else. **Reading a diff before merging it is still the job; no check
   now asks whether you did.** That asymmetry is the point: a label records that a step *happened*, not
@@ -632,13 +676,22 @@ gates a merge**, and no seat has to clear one.
 
 - New behavior gets a test. Run, in order: `ruff check` + `ruff format --check`, `mypy` (strict),
   `pytest` (with `QT_QPA_PLATFORM=offscreen` for the PySide6 harness tests).
+- **Then review your own diff with the `code-review` SUBAGENT, at effort `xhigh`, named explicitly.**
+  Ruff is style, mypy is types, pytest is regression, and `/simplify` above is a quality pass that
+  points at `code-review` for bugs -- none of them looks for a NEW correctness defect. **Say
+  "subagent", not "a review":** without the `Agent` tool `code-review` degrades to one inline pass,
+  so the looser word lets the degraded form read as compliance. Cap repair at **two rounds**, then
+  ship with the critic notes in your exit report. korus `roles/BUILDER.md` section 4c is the source
+  of record for the reasoning and the traps; do not restate them here.
 - `pre-commit` does not run mypy. Run it by hand before you commit, or strict typing first fails in
   CI, after your process is gone.
 - If the full suite will not finish inside your turn, run the tests covering your change and push.
-  Record in the PR body which checks you ran and which you skipped. An unpushed branch is lost.
+  Record in your exit report which checks you ran and which you skipped, for the Manager to carry
+  into the PR body. An unpushed branch is lost.
 - Some checks only ever run on a hosted runner, for example NSSM under `windows-service-smoke`. A
-  Builder never sees their result. Push, open the PR, and name in the body which legs must be read.
-  The Manager or the Regulator reads them after the process exits.
+  Builder never sees their result. Push, and name in your exit report which legs must be read, so
+  the Manager carries it into the PR body it opens. The Manager or the Lander reads them after
+  the process exits.
 
 ### Product security rules outlive any method rewrite
 
@@ -656,7 +709,8 @@ gates a merge**, and no seat has to clear one.
   uncommitted edit, a force-push and `reset --hard` are not recoverable. What needs the
   owner is an action git cannot undo. Examples: writing outside the worktree, a DB migration against
   a real store, a global install. A Builder cannot ask, so it must not take one. If your brief
-  requires one, stop, push what is green, and say so in the PR body. Adding a dependency is not in
+  requires one, stop, push what is green, and say so in your exit report, which the Manager carries
+  into the PR body. Adding a dependency is not in
   this class: follow §7, edit `pyproject.toml` and re-lock. Parameterize SQL; catch exceptions
   specifically (§6).
 
@@ -786,8 +840,18 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
   **THE ONE HOLDOUT IS RETIRED, AND IT LEFT BY MIGRATION RATHER THAN BY EDIT (BACKLOG #1250).** It was
   a machine-parsed contract: `docs/BACKLOG.md` and `docs/archive/backlog/BACKLOG-CLOSED.md` encoded
   item status as a banner alphabet, `scripts/docs/backlog_status_check.py` defined it, and
-  `.github/workflows/backlog-hygiene.yml` quoted it. All four went to the maintainer-internal
+  `.github/workflows/backlog-hygiene.yml` quoted it. The PARSING went to the maintainer-internal
   repository on 2026-09-13 with the ledger itself.
+
+  **TWO OF THOSE FOUR FILES ARE STILL TRACKED HERE, AND DELETING ONE OF THEM WEDGES EVERY PULL
+  REQUEST.** This paragraph previously read "all four went", which invites a tidier to remove a merge
+  gate. Measured 2026-09-16 with `git ls-files`: `BACKLOG-CLOSED.md` and `backlog_status_check.py` are
+  gone, `docs/BACKLOG.md` is still tracked as a stub, and `.github/workflows/backlog-hygiene.yml` is
+  still tracked **because its `name:` is a REQUIRED status-check context in branch protection**. The
+  job itself is a deliberate no-op that prints why it has nothing to check. Deleting it, renaming it,
+  or dropping either trigger makes the context never report -- and a required context that never
+  reports does not fail, it WEDGES, in the queue and out of it. Retiring it is a branch-protection
+  change, not an in-repo edit. That file's own header is the source of record; read it first.
 
   **SO NO GLYPH IN THIS REPOSITORY CARRIES MACHINE-PARSED MEANING ANY MORE, AND THE RULE ABOVE IS NOW
   UNCONDITIONAL HERE.** Nothing reads a status banner; nothing may start.

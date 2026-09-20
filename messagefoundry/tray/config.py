@@ -113,13 +113,90 @@ def _valid_host(host: str) -> bool:
     return bool(_VALID_HOST.match(host))
 
 
+def _split_command_line(command_line: str) -> list[str]:
+    """Split a Windows command-line *argument* string the way ``CommandLineToArgvW`` does.
+
+    NSSM stores ``AppParameters`` verbatim, so a path with a space is quoted there exactly as it is
+    on a command line. ``str.split()`` used to tokenize it, which kept the quote characters and
+    still split inside them: ``--service-config "C:\\Program Files\\MF\\x.toml"`` became the two
+    dead fragments ``"C:\\Program`` and ``Files\\MF\\x.toml"``, the settings then read as absent,
+    and the tray fell back to its default for the served scheme (BACKLOG #1565). A quoted path with
+    no space broke identically — the defect is the quoting, not the space.
+
+    ``shlex`` cannot stand in for this, in either mode. ``posix=False`` keeps the quote characters
+    and still splits inside them; ``posix=True`` eats the backslashes, turning the unquoted
+    ``C:\\data\\x.toml`` that works today into ``C:datax.toml``. So the Win32 rules are implemented
+    here in pure Python: this module's core does no OS-specific I/O and is unit-testable on any OS,
+    which rules out reaching into ``shell32`` through ctypes.
+
+    The rules are the ones ``CommandLineToArgvW`` applies after ``argv[0]``: space and tab separate
+    arguments outside quotes; ``2n`` backslashes before a quote yield ``n`` backslashes and toggle
+    the quoted run; ``2n+1`` yield ``n`` backslashes and a literal quote; backslashes not before a
+    quote are literal; ``""`` inside a quoted run is one literal quote and ends the run. Unbalanced
+    quoting is tolerated — the run just ends with the string.
+
+    **Which parser to mirror is a real question, and the answer was measured.** NSSM hands
+    ``AppParameters`` to ``CreateProcess``, so the *engine's* own ``sys.argv`` comes from the C
+    runtime, and the MSVCRT rules differ from these on exactly one point: a doubled quote inside a
+    run stays quoted there and ends the run here. It does not reach anything this file acts on — a
+    quote is not a legal Windows filename character, :data:`_VALID_HOST` rejects it, and ``--port``
+    goes through ``int()``. Checked against a real child process on twelve command lines: every one
+    carrying a path, a host or a port agreed, and the three that diverged were built only of quotes.
+
+    ``tests/test_tray_config.py`` pins this against ``shell32.CommandLineToArgvW`` itself on the
+    Windows leg, so the rules above are checked rather than believed.
+    """
+    args: list[str] = []
+    i = 0
+    n = len(command_line)
+    while i < n:
+        while i < n and command_line[i] in " \t":
+            i += 1
+        if i >= n:
+            break
+        buf: list[str] = []
+        in_quotes = False
+        while i < n:
+            ch = command_line[i]
+            if ch == "\\":
+                run = i
+                while run < n and command_line[run] == "\\":
+                    run += 1
+                slashes = run - i
+                if run < n and command_line[run] == '"':
+                    buf.append("\\" * (slashes // 2))
+                    if slashes % 2:  # an odd count escapes the quote itself
+                        buf.append('"')
+                        run += 1
+                else:  # an even count leaves the quote to toggle the run below
+                    buf.append("\\" * slashes)
+                i = run
+                continue
+            if ch == '"':
+                if in_quotes and command_line.startswith('""', i):
+                    buf.append('"')  # a doubled quote is one literal quote, and it ends the run
+                    i += 1
+                in_quotes = not in_quotes
+                i += 1
+                continue
+            if not in_quotes and ch in " \t":
+                break
+            buf.append(ch)
+            i += 1
+        args.append("".join(buf))
+    return args
+
+
 def _iter_options(app_parameters: str, wanted: frozenset[str]) -> Iterator[tuple[str, str]]:
     """Yield ``(flag, value)`` for each ``--flag value`` / ``--flag=value`` in a command line.
 
     Tolerant and side-effect-free: unknown tokens are skipped, a trailing flag with no value is
     dropped. ``wanted`` keeps the consume-the-next-token rule from swallowing an unrelated token.
+
+    The ``=`` split runs on the already-dequoted token, so ``--service-config="C:\\P F\\x.toml"``
+    and ``--service-config "C:\\P F\\x.toml"`` reach the same value.
     """
-    toks = app_parameters.split()
+    toks = _split_command_line(app_parameters)
     i = 0
     while i < len(toks):
         tok = toks[i]

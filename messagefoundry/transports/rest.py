@@ -72,7 +72,7 @@ from messagefoundry.transports.base import (
     encode_wire_body,
     register_destination,
 )
-from messagefoundry.transports.bounded_read import read_bounded, read_bounded_text
+from messagefoundry.transports.bounded_read import drain_bounded, read_bounded_text
 from messagefoundry.transports.signing import MessageSigner, signer_from_destination
 
 __all__ = [
@@ -94,6 +94,7 @@ __all__ = [
     "refuse_cleartext_credentials",
     "refuse_cleartext_egress",
     "refuse_unrevoked_verified_hop",
+    "refuse_url_credentials",
     "refuse_verify_off",
 ]
 
@@ -399,10 +400,60 @@ def _expiry_relaxed_opener(
 
 def _redact_url(url: str) -> str:
     """``scheme://host[:port]/path`` only — drops query/userinfo so a token or PHI in the query
-    string never reaches a log line."""
+    string never reaches a log line.
+
+    A port that is not a number is DROPPED, never echoed, and never raised (BACKLOG #1793). A password
+    holding an unencoded ``/`` makes ``urlsplit`` read its head as the port, and ``SplitResult.port``
+    raises a ``ValueError`` that quotes it. Every classified ``except`` arm calls this, so a raise here
+    would escape that arm unclassified, carrying the password head with it."""
     p = urllib.parse.urlsplit(url)
-    port = f":{p.port}" if p.port else ""
+    try:
+        port = f":{p.port}" if p.port else ""
+    except ValueError:
+        port = ""
     return f"{p.scheme}://{p.hostname or ''}{port}{p.path}"
+
+
+def refuse_url_credentials(
+    url: str,
+    setting: str,
+    *,
+    use: str = "basic_user/basic_password or bearer_token",
+    error: type[ValueError] = ValueError,
+) -> None:
+    """Refuse an endpoint URL that carries a credential, at CONSTRUCTION time (BACKLOG #1793).
+
+    WHY IT IS REFUSED RATHER THAN SUPPORTED. urllib never turns URL userinfo into an ``Authorization``
+    header. It hands ``user:pw@host`` to ``http.client`` as the HOST, which reads ``pw@host`` as the
+    port and raises ``InvalidURL("nonnumeric port: 'pw@host'")``. With an explicit port the lookup fails
+    on a host that still holds the password, and through a plain-http forward proxy the password goes
+    out in the request line and the ``Host`` header. So the shape never authenticated anything, and its
+    error text carried the password into ``queue.last_error`` and the test-connection reply.
+
+    TWO CHECKS, because ``urlsplit`` misses one shape. An ``@`` in the authority is userinfo; it is
+    tested after unquoting because urllib unquotes the host, so ``%40`` leaks exactly like ``@``. A port
+    that is not a number is what a password holding an unencoded ``/``, ``?`` or ``#`` looks like: the
+    authority stops there, no ``@`` is seen, and the password's head becomes the port. An EMPTY port
+    (``host:/``) passes, because ``urlsplit`` reads it as no port and ``http.client`` as the default.
+
+    ``proxy_url`` is deliberately NOT screened here: a forward-proxy URL legitimately carries its own
+    credentials, and #1207 masks them for display.
+
+    PHI- and secret-safe: names the setting, never the URL or any part of it. ``error`` keeps each
+    seam's own ``ValueError`` subclass, so a caller catching ``HttpAuthError`` still catches this."""
+    p = urllib.parse.urlsplit(url)
+    if "@" in urllib.parse.unquote(p.netloc):
+        raise error(
+            f"{setting} must not carry credentials in the URL (the user:password@ part); "
+            f"set them in {use} instead"
+        )
+    try:
+        p.port  # noqa: B018 - evaluated only for the ValueError a non-numeric port raises
+    except ValueError:
+        raise error(
+            f"{setting} has a port that is not a number from 0 to 65535. A password written "
+            f"into the URL can cause this; set credentials in {use} instead"
+        ) from None
 
 
 # --- posture-keyed insecure-hop enforcement (#200, ADR 0092) -----------------------------------
@@ -944,7 +995,9 @@ def enforce_signature_header_limits(signer: object | None, *, connector: str) ->
 # byte-identical.
 
 #: Sentinel ``proxy_url`` value meaning "Use the OS/environment default web proxy" (getproxies()), #112.
-_PROXY_DEFAULT = "default"
+#: PUBLIC because the ``[egress].allowed_proxy`` gate in ``pipeline/wiring_runner.py`` has to exempt it
+#: (it names no address at config time), and a second copy of the literal would be free to drift.
+PROXY_DEFAULT = "default"
 
 
 def _normalize_no_proxy(value: Any) -> tuple[str, ...]:
@@ -1150,7 +1203,7 @@ def proxy_config_from_settings(
         return None
     bypass = _normalize_no_proxy(s.get("proxy_no_proxy"))
     proxy_url = str(raw).strip()
-    if proxy_url.lower() == _PROXY_DEFAULT:
+    if proxy_url.lower() == PROXY_DEFAULT:
         # "Use Default Web Proxy" — explicit creds are meaningless here (the system proxy carries its own),
         # so reject the ambiguous combo rather than silently drop a configured credential.
         if s.get("proxy_user") or s.get("proxy_password") or s.get("proxy_auth_type"):
@@ -1323,6 +1376,7 @@ class RestDestination(DestinationConnector):
         scheme = urllib.parse.urlsplit(url).scheme.lower()
         if scheme not in ("http", "https"):
             raise ValueError(f"REST destination 'url' must be http or https, got scheme {scheme!r}")
+        refuse_url_credentials(url, "REST destination 'url'")
         self.url = url
         self.method: str = str(s.get("method", "POST")).upper()
         self.timeout: float = float(s.get("timeout_seconds", 30.0))
@@ -1417,8 +1471,16 @@ class RestDestination(DestinationConnector):
         # a forward proxy carried as opener handlers, or the ECH sidecar the request is re-addressed to.
         # #1176: before this, the ECH case passed `proxy=None` and nothing else, so the token hop went
         # DIRECT and leaked the authorization server's SNI while the payload hop was routed.
+        # #1794 (#1660's third configuration): the client trust anchor travels the same way, so the
+        # credential-bearing hop verifies against the instance `[tls]` policy the delivery hop below has
+        # honoured since #1180. Pass the POLICY, never the `anchor` this method resolves for the delivery
+        # opener further down: the provider resolves its own against the TOKEN url, for the reason
+        # `oauth2_cc_provider_from_settings` records.
         self._token_provider = bearer_provider_from_settings(
-            s, proxy=self._proxy, ech_sidecar=self._ech_sidecar
+            s,
+            proxy=self._proxy,
+            ech_sidecar=self._ech_sidecar,
+            trust_anchor_policy=config.trust_anchor_policy,
         )
         if self._token_provider is not None:
             # The SMART bearer is injected per-request in _post, so the static-header cleartext check
@@ -1603,7 +1665,7 @@ class RestDestination(DestinationConnector):
             with self._opener.open(req, timeout=self.timeout) as resp:
                 # ASVS 15.2.2: the probe body is discarded, but an unbounded drain would let a
                 # reachability check be turned into a memory exhaustion.
-                read_bounded(resp, connector=f"REST {_redact_url(self.url)} probe")
+                drain_bounded(resp, connector=f"REST {_redact_url(self.url)} probe")
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):
                 raise DeliveryError(
@@ -1612,6 +1674,11 @@ class RestDestination(DestinationConnector):
             return  # any other status (the host answered) → reachable
         except urllib.error.URLError as exc:  # DNS / connection refused / TLS / timeout
             raise DeliveryError(f"REST {_redact_url(self.url)} unreachable: {exc.reason}") from exc
+        except (ValueError, http.client.InvalidURL) as exc:
+            # BACKLOG #1793: classified like _post's arm, so the probe reply carries no urllib text.
+            raise DeliveryError(
+                f"REST {_redact_url(self.url)} rejected an invalid request value"
+            ) from exc
         except (TimeoutError, OSError) as exc:
             raise DeliveryError(f"REST {_redact_url(self.url)} failed: {exc}") from exc
 

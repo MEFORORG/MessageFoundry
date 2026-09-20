@@ -16,6 +16,13 @@ from .. import pages
 from .._auth import (
     require_ui,
 )
+from ._common import (
+    ACTIVE_ALERTS_LIMIT,
+    UI_BODY_FILTER_RULES,
+    blank_to_none,
+    check_filters,
+    for_echo,
+)
 
 
 def register(app: FastAPI, deps: UiDeps) -> None:
@@ -36,7 +43,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # skipped, so require_ui re-asserts the permissions the same way the other /ui routes do).
         # Pass every param explicitly: calling the handler directly (not via Depends) leaves
         # its Query(...) defaults unresolved, so limit must be a real int here.
-        instances = await core.list_active_alerts(engine=engine, identity=identity, limit=200)
+        instances = await core.list_active_alerts(
+            engine=engine, identity=identity, limit=ACTIVE_ALERTS_LIMIT
+        )
         config = await core.alerts_rules(request, _user=identity)
         return HTMLResponse(pages.alerts(instances, config))
 
@@ -45,22 +54,42 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         request: Request,
         engine: Any = Depends(deps.get_engine),
         identity: Identity = Depends(require_ui(Permission.MONITORING_READ)),
+        # Body-validated rather than annotated, as on ui_messages: `connection` is a free-text input
+        # on this page's own filter form, so a refusal has to come back as the form carrying what the
+        # operator typed. `kind` rides the same request from a select, and splitting the two shapes
+        # across one form is what BACKLOG #1740 avoided here.
         connection: str | None = Query(None, max_length=256),
         kind: str | None = Query(None, max_length=64),
     ) -> HTMLResponse:
         # L6b (#75 parity): expose the JSON handler's event-kind filter (a single kind from
         # the fixed dropdown → a one-element kinds list; blank/unknown = no filter).
+        # BACKLOG #1740: both filters, against the rules GET /events declares for the same two
+        # items -- judged on what ARRIVED, not on the for_echo'd copy below, which has had its
+        # control characters stripped and would therefore pass a rule the raw value fails.
+        refusal = check_filters(
+            UI_BODY_FILTER_RULES["/ui/events"], {"connection": connection, "kind": kind}
+        )
+        conn, evt_kind = for_echo(connection), for_echo(kind)
+        if refusal is not None:
+            # No rows: the filter was never applied, and a table under a refusal banner would read
+            # as the result of the filter the operator typed.
+            return HTMLResponse(
+                pages.events([], connection=conn, kind=evt_kind, error=refusal), status_code=400
+            )
         kinds = [kind] if kind else None
         rows = await core.list_connection_events(
             engine=engine,
             identity=identity,
-            connection=connection,
+            # blank_to_none: the handler's channel guard runs on any value that is not None,
+            # so a submitted-but-empty connection box made a channel-scoped operator 403 and wrote
+            # a false auth.channel_denied row naming them, every time they used this form.
+            connection=blank_to_none(connection),
             kind=kinds,
             since=None,
             limit=100,
             request=request,
         )
-        return HTMLResponse(pages.events(rows, connection=connection or "", kind=kind or ""))
+        return HTMLResponse(pages.events(rows, connection=conn, kind=evt_kind))
 
     async def _flow_data(request: Request, engine: Any, identity: Identity) -> tuple[Any, Any]:
         """Fetch the two read-only monitoring:read sources for the Flow & trends page (BACKLOG #76):

@@ -191,8 +191,11 @@ def test_dryrun_redacts_bodies_by_default(
 # never raises, so `error` is null there and the assertion over it asserts nothing. These fixtures ship
 # their own handler that DOES raise, quoting PID-5 and PID-3 the way an author debugging a feed does.
 #
-# PHI: every value here is synthetic (CLAUDE.md §9). The raise is built by concatenation, not an
-# f-string, so the advisory `raise-fstring` check does not flag the probe it exists to model.
+# PHI: every value here is synthetic (CLAUDE.md §9). The raise is built by concatenation, which the
+# advisory `raise-fstring` check now DOES flag (it reads the `+` spelling as well as the f-string).
+# That costs these fixtures nothing: the check only ever prints, and its detail carries a filename
+# and line number, never the message text. The assertions below are about `redact` on the dryrun and
+# check surfaces, which is a separate path from the lint.
 PHI_RAISER_CONFIG = """\
 # SPDX-License-Identifier: AGPL-3.0-or-later
 from messagefoundry import File, handler, inbound, router
@@ -277,6 +280,69 @@ def test_dryrun_show_phi_still_yields_the_raised_text(
     assert rc == 0
     error = json.loads(capsys.readouterr().out)[0]["error"]
     assert "DOE^JANE^Q" in error and "900123456^^^H^MR" in error
+
+
+# --- BACKLOG #1692: dryrun prints a Handler's declared metadata writes ----------------------------
+#
+# A SetMeta key and value are both message-derived in the general case, so this fixture builds each
+# from a PID field the way an author tagging a message does. Synthetic data only (CLAUDE.md §9).
+META_WRITER_CONFIG = """\
+# SPDX-License-Identifier: AGPL-3.0-or-later
+from messagefoundry import File, SetMeta, handler, inbound, router
+
+inbound("IB_TEST", File(directory="in"), router="r")
+
+
+@router("r")
+def route(msg):
+    return ["h"]
+
+
+@handler("h")
+def h(msg):
+    return [SetMeta("patient " + str(msg["PID-5"]), "mrn " + str(msg["PID-3"]))]
+"""
+
+
+def _meta_writer(tmp_path: Path) -> tuple[str, str]:
+    """A config dir whose handler declares one ``SetMeta``, plus the message file ``dryrun`` wants."""
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "IB_TEST.py").write_text(META_WRITER_CONFIG, encoding="utf-8")
+    fixtures = tmp_path / "messages" / "IB_TEST"
+    fixtures.mkdir(parents=True)
+    message = fixtures / "a.hl7"
+    message.write_bytes(PHI_RAISER_MESSAGE.encode("utf-8"))
+    return str(cfg), str(message)
+
+
+def test_dryrun_prints_meta_ops_redacted_by_default(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The CLI emits a ``meta_ops`` key, and redacts both members without ``--show-phi``.
+
+    Before BACKLOG #1692 the output dict had no ``meta_ops`` key at all, and the field behind it was
+    never populated, so a Handler's ``SetMeta`` was invisible on this surface.
+    """
+    cfg, message = _meta_writer(tmp_path)
+    assert main(["dryrun", "--config", cfg, "--messages", message, "--json"]) == 0
+    out = capsys.readouterr().out
+    ops = json.loads(out)[0]["meta_ops"]
+    # The instrument has to have observed a SetMeta at all, or the absences below prove nothing.
+    assert len(ops) == 1, f"the fixture handler declared no SetMeta: {ops!r}"
+    assert "redacted" in ops[0]["key"] and "redacted" in ops[0]["value"]
+    for token in PHI_TOKENS:
+        assert token not in out, f"{token!r} reached dryrun stdout"
+
+
+def test_dryrun_show_phi_yields_the_declared_meta_op(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The opt-in arm: ``--show-phi`` returns the key and value the Handler actually declared."""
+    cfg, message = _meta_writer(tmp_path)
+    assert main(["dryrun", "--config", cfg, "--messages", message, "--json", "--show-phi"]) == 0
+    ops = json.loads(capsys.readouterr().out)[0]["meta_ops"]
+    assert ops == [{"key": "patient DOE^JANE^Q", "value": "mrn 900123456^^^H^MR"}]
 
 
 def test_check_redacts_a_raised_exception_and_offers_no_opt_in(
@@ -2574,3 +2640,157 @@ def test_audit_verify_exits_2_on_a_file_that_is_not_a_database(tmp_path: Path) -
     assert proc.returncode == 2, f"rc={proc.returncode}\n{proc.stderr}"
     assert "cannot open the store" in proc.stderr
     assert "Traceback" not in proc.stderr, "a raw traceback reached the operator"
+
+
+# --- the last-resort excepthooks are a process property, not a `serve` one (BACKLOG #1674) ----------
+#
+# THE ROW'S OWN REPRODUCTION NO LONGER REPRODUCES, AND THAT IS NOT EVIDENCE THE ROW IS CLOSED.
+# It named `audit-verify --db <directory>` printing a `sqlite3.OperationalError` traceback; BACKLOG
+# #1670 translated that to a clean line and exit 2, and the test directly above pins it. What #1670
+# fixed is one subcommand's handling of one exception class. What #1674 is about is the guarantee
+# `last_resort` states for EVERY unhandled error in the process, which stayed installed inside
+# `_serve` alone. So these probe the PROPERTY -- is the hook in place for a non-serve subcommand --
+# rather than re-running a repro that a neighbouring fix has since cleaned up.
+
+
+def test_a_non_serve_subcommand_installs_both_last_resort_hooks(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Both hooks, because `install_thread_excepthook` had the identical serve-only gap: a non-main
+    thread's escaping exception goes to `threading.excepthook` and nowhere else, so installing the
+    sync hook alone leaves the engine's narrow-except drain threads unredacted.
+
+    The originals go back in a `finally`, because these are process-wide: pytest restores
+    `threading.excepthook` itself per test, but not `sys.excepthook` (its `unraisableexception`
+    plugin guards `sys.unraisablehook`, which is a different surface).
+    """
+    import sys
+    import threading
+
+    from messagefoundry import last_resort
+
+    sys_hook, thread_hook = sys.excepthook, threading.excepthook
+    try:
+        sys.excepthook, threading.excepthook = sys.__excepthook__, threading.__excepthook__
+
+        assert main(["hl7schema", "--json"]) == 0
+        capsys.readouterr()  # the schema payload is not what this test is about
+
+        assert sys.excepthook is last_resort._excepthook, (
+            "a non-serve subcommand ran with the stock sys.excepthook: an uncaught exception would "
+            "print a raw traceback that can quote a PHI-bearing value (ASVS 16.5.4)"
+        )
+        assert threading.excepthook is last_resort._thread_excepthook, (
+            "the thread hook was not installed, so an exception escaping a non-main thread's run() "
+            "still reaches the stdlib default"
+        )
+    finally:
+        sys.excepthook, threading.excepthook = sys_hook, thread_hook
+
+
+def test_an_uncaught_exception_in_a_non_serve_subcommand_prints_no_traceback(
+    tmp_path: Path,
+) -> None:
+    """End to end, in a CHILD interpreter, because `sys.excepthook` only fires at the interpreter's
+    top level -- inside pytest the exception never gets there, so an in-process check would assert
+    nothing. A dispatch entry is replaced with a raiser: that is the only honest way to produce an
+    *unhandled* exception now that every shipped subcommand's known escapes are handled.
+
+    The exit code is asserted UNCHANGED at 1. Installing an excepthook does not alter it -- the
+    interpreter still exits 1 once the hook returns -- which is exactly why this shape was taken over
+    the row's alternative of wrapping the dispatch and exiting 2.
+    """
+    import subprocess
+    import sys
+
+    driver = tmp_path / "raise_in_a_subcommand.py"
+    driver.write_text(
+        "import messagefoundry.__main__ as m\n"
+        "def _boom(args):\n"
+        "    raise RuntimeError('synthetic failure carrying DOE^JANE')\n"
+        "m._DISPATCH['hl7schema'] = _boom\n"
+        "raise SystemExit(m.main(['hl7schema', '--json']))\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [sys.executable, str(driver)],
+        cwd=tmp_path,  # away from the repo, so no stray ./messagefoundry.toml is picked up
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 1, f"rc={proc.returncode}\n{proc.stderr}"
+    assert "Traceback" not in proc.stderr, "a raw traceback reached the operator"
+    assert "last-resort: uncaught exception" in proc.stderr, (
+        "the error vanished instead of being logged -- the guarantee is redact-and-report, not drop"
+    )
+
+
+# --- `--version` says which tree answered (BACKLOG #1677) -------------------------------------------
+
+
+def test_version_reports_the_package_directory_that_answered(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Why a shadowing copy of the package can answer at all is stated once, on `_VersionAction`.
+
+    ASSERTS ON THE PRESENCE OF THE PATH TOKEN, NEVER ON A LINE INDEX, and that is not fussiness. The
+    obvious implementation -- a newline inside `action="version"`'s text -- yields no second line at
+    all, for the reason `_VersionAction`'s docstring gives, so a test keyed to `lines[1]` would pass
+    on the author's terminal and be a coin flip everywhere else.
+    """
+    import messagefoundry.__main__ as main_module
+    from messagefoundry import __version__
+
+    with pytest.raises(SystemExit) as exc:
+        main(["--version"])
+    assert exc.value.code == 0
+
+    out = capsys.readouterr().out
+    package_dir = Path(main_module.__file__).resolve().parent
+    # two independent claims: the version is still reported, AND the tree that answered is named.
+    # (`"messagefoundry" in out` would NOT be a second claim -- the path already contains it.)
+    assert f"messagefoundry {__version__}" in out, out
+    assert str(package_dir) in out, f"--version does not say which tree answered:\n{out}"
+    # the reported directory is the real one, not a plausible string
+    assert (package_dir / "__main__.py").is_file()
+
+
+# --- BACKLOG #1673: which stream a failure goes to ---------------------------------------------
+
+
+def _unloadable_config(tmp_path: Path) -> Path:
+    """A config dir `graph` cannot load, so its failure goes through `_emit_error`.
+
+    `validate` is the wrong vehicle here: it REPORTS diagnostics as its output rather than failing
+    through `_emit_error`, so it proves nothing about which stream an error takes."""
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    (cfg / "broken.py").write_text("this is not python (", encoding="utf-8")
+    return cfg
+
+
+def test_text_mode_error_goes_to_stderr(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """A text-mode failure must not land in the file a shell redirect is capturing.
+
+    `messagefoundry graph --config <broken> > report.txt` wrote the reason into report.txt and left
+    the terminal blank; `2>/dev/null` could not silence diagnostics without silencing results."""
+    assert main(["graph", "--config", str(_unloadable_config(tmp_path))]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == "", f"the failure reached stdout: {captured.out!r}"
+    assert captured.err.startswith("error: "), captured.err
+
+
+def test_json_mode_error_stays_on_stdout(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The other half, and it is deliberate: under --json the error object is the output.
+
+    A consumer pipes stdout to `jq` and reads the non-zero exit code to tell a failure from a
+    success payload, so moving this to stderr would break the machine-readable contract."""
+    assert main(["graph", "--config", str(_unloadable_config(tmp_path)), "--json"]) == 1
+    captured = capsys.readouterr()
+    assert captured.err == "", f"the JSON payload reached stderr: {captured.err!r}"
+    payload = json.loads(captured.out)
+    assert isinstance(payload, dict), payload
+    assert "error" in payload

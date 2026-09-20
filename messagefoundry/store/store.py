@@ -35,6 +35,7 @@ independently, so overlapping id sets are reachable in normal operation. They no
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import hmac
 import json
@@ -59,7 +60,7 @@ from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Final, Protocol, runtime_checkable
+from typing import Any, Final, NoReturn, Protocol, runtime_checkable
 from uuid import uuid4
 
 import aiosqlite
@@ -118,29 +119,34 @@ _RELEASE_CHUNK = 500
 # fixed parameters; the chunks run inside the reset's single transaction, so atomicity is unchanged.
 _RESET_LANE_CHUNK = 500
 
-# How long a writer-transaction unwind waits for its shielded ROLLBACK before giving up on it. A
+# How long a transaction unwind waits for its shielded ROLLBACK before giving up on it. A
 # cancellation is usually a shutdown, so the unwind must never be able to hang shutdown on a worker
 # thread that is wedged on the abandoned statement. 5s matches the SQL Server store's
 # `_DIRTY_CLOSE_TIMEOUT` (ADR 0159) and the read pool's `busy_timeout`, so the store's three
 # "stop waiting on a stuck connection" bounds agree rather than each carrying its own number.
-_WRITER_ROLLBACK_TIMEOUT = 5.0
+_ROLLBACK_TIMEOUT = 5.0
 
 
-def _drain_detached_rollback(fut: asyncio.Future[None]) -> None:
+def _drain_detached_rollback(role: str, fut: asyncio.Future[None]) -> None:
     """Retrieve a detached rollback's outcome so asyncio does not log it as never-retrieved."""
     if fut.cancelled():
         return
     exc = fut.exception()
     if exc is not None:
-        log.warning("sqlite: detached writer rollback failed: %s", exc)
+        log.warning("sqlite: detached %s rollback failed: %s", role, exc)
 
 
-async def _unwind_writer_txn(db: aiosqlite.Connection) -> bool:
-    """Roll the open writer transaction back while the caller unwinds. Returns ``True`` if a further
-    cancellation was swallowed to finish the job.
+async def _unwind_txn(db: aiosqlite.Connection, *, role: str) -> bool:
+    """Roll the open transaction on ``db`` back while the caller unwinds. Returns ``True`` if a
+    further cancellation was swallowed to finish the job.
+
+    ``role`` is ``"writer"`` or ``"read"`` and only names the connection in the log lines. The
+    mechanism is deliberately identical for both — see *why both roles wait* below.
 
     Called from :func:`_writer_txn` with the writer lock STILL HELD, so no other writer can take the
-    connection mid-rollback.
+    connection mid-rollback, and from :meth:`MessageStore._read` on a borrowed pooled connection this
+    task still owns — it goes back to the queue only after this helper returns — so no other reader
+    can take it either.
 
     The rollback is **shielded** because a cancellation is the common reason we are here, and an
     unshielded ``await`` on the cancelled task's own stack is cancelled at once — leaving exactly the
@@ -148,23 +154,32 @@ async def _unwind_writer_txn(db: aiosqlite.Connection) -> bool:
     on a worker thread that may still be stuck on the abandoned statement.
 
     A FURTHER cancellation (shutdown cancels a task, then the gather cancels it again) is swallowed
-    and the wait resumes for what is left of the bound. This is where SQLite parts company with the
+    and the wait resumes for what is left of the bound.
+
+    **Why both roles wait rather than returning early.** This is where SQLite parts company with the
     pooled SQL Server path (ADR 0159's ``_release_dirty``, which swallows the second cancel and
-    returns immediately): there the connection is already quarantined out of the pool, so returning
-    early is safe. Here there is exactly ONE writer connection behind one lock, so returning early
-    would release the lock over a half-open transaction and the next writer would inherit it."""
+    returns immediately): there the connection is already quarantined OUT of the pool, so returning
+    early strands nothing. Neither SQLite connection can be quarantined. The writer is exactly ONE
+    connection behind one lock, so returning early would release the lock over a half-open
+    transaction and the next writer would inherit it. The read pool is a FIXED
+    :class:`asyncio.Queue` filled once at ``open()`` with **no reopen path**, so dropping a
+    connection rather than healing it would shrink the pool permanently, and dropping all
+    ``_READ_POOL_SIZE`` of them would park every later read forever — silently, and strictly worse
+    than the half-open transaction it was avoiding (BACKLOG #1635). Waiting out the bound is the only
+    remedy available to either role, so do not port the quarantine here."""
     loop = asyncio.get_running_loop()
     rollback = asyncio.ensure_future(db.rollback())
-    deadline = loop.time() + _WRITER_ROLLBACK_TIMEOUT
+    deadline = loop.time() + _ROLLBACK_TIMEOUT
     swallowed_cancel = False
     while True:
         remaining = deadline - loop.time()
         if remaining <= 0:
-            rollback.add_done_callback(_drain_detached_rollback)
+            rollback.add_done_callback(functools.partial(_drain_detached_rollback, role))
             log.warning(
-                "sqlite: writer rollback did not complete within %.1fs; it will finish detached and"
-                " the next writer may inherit an open transaction",
-                _WRITER_ROLLBACK_TIMEOUT,
+                "sqlite: %s rollback did not complete within %.1fs; it will finish detached and the"
+                " next user of this connection may inherit an open transaction",
+                role,
+                _ROLLBACK_TIMEOUT,
             )
             return swallowed_cancel
         try:
@@ -175,8 +190,23 @@ async def _unwind_writer_txn(db: aiosqlite.Connection) -> bool:
             swallowed_cancel = True  # re-cancelled mid-unwind; keep waiting out the bound
             continue
         except Exception:  # noqa: BLE001 — a rollback failure must not mask the original failure
-            log.warning("sqlite: writer rollback failed", exc_info=True)
+            log.warning("sqlite: %s rollback failed", role, exc_info=True)
         return swallowed_cancel
+
+
+async def _unwind_and_raise(db: aiosqlite.Connection, exc: BaseException, *, role: str) -> NoReturn:
+    """Unwind ``db``'s open transaction, then re-raise ``exc`` — or a cancellation if one landed
+    mid-unwind.
+
+    A cancellation swallowed by :func:`_unwind_txn` while an ORDINARY failure was rolling back must
+    not be dropped: re-raising only the original would leave the task running through a shutdown, so
+    the cancellation wins and carries the original failure as its cause.
+
+    One definition, shared by :func:`_writer_txn` and :meth:`MessageStore._read`, because both have
+    exactly this obligation and a second copy is how the two drift apart. It never returns."""
+    if await _unwind_txn(db, role=role) and not isinstance(exc, asyncio.CancelledError):
+        raise asyncio.CancelledError from exc
+    raise exc
 
 
 @asynccontextmanager
@@ -213,13 +243,7 @@ async def _writer_txn(db: aiosqlite.Connection, lock: asyncio.Lock) -> AsyncIter
             await db.execute("BEGIN")
             yield
         except BaseException as exc:
-            swallowed_cancel = await _unwind_writer_txn(db)
-            if swallowed_cancel and not isinstance(exc, asyncio.CancelledError):
-                # A cancellation landed while we were rolling an ORDINARY failure back. Re-raising
-                # only that failure would drop the cancellation and leave the task running through a
-                # shutdown, so the cancellation wins and carries the original failure as its cause.
-                raise asyncio.CancelledError from exc
-            raise
+            await _unwind_and_raise(db, exc, role="writer")
 
 
 class _GroupPoisoned(Exception):  # noqa: N818 — control-flow signal, not an error condition
@@ -950,7 +974,11 @@ class DbStatus:
 
     path: str
     size_bytes: int  # db file + -wal + -shm
-    disk_free_bytes: int  # free space on the DB's drive
+    # Free space on the DB's drive, or None when this process CANNOT measure it -- a remote server
+    # backend whose disk is not ours to stat, or a failed ``disk_usage`` call. ``None`` and ``0`` are
+    # different facts and must stay so: 0 is a MEASURED empty drive and has to keep raising the
+    # operator-health alarm, while None carries no claim about the drive at all (BACKLOG #1563).
+    disk_free_bytes: int | None
     journal_mode: str
     messages: int
     events: int
@@ -1587,6 +1615,29 @@ def _secure_file(path: Path, *, extra_read_grants: Sequence[str] | None = None) 
             os.chmod(path, _OWNER_ONLY)
     except OSError as exc:
         log.warning("could not restrict permissions on %s: %s", path, exc)
+
+
+async def _secure_file_async(path: Path, *, extra_read_grants: Sequence[str] | None = None) -> None:
+    """:func:`_secure_file` dispatched off the event loop — for the two callers that run ON one.
+
+    On Windows the restriction is an ``icacls`` subprocess, measured at 21 to 28 ms per file. Called
+    straight from a coroutine, that span is dead time for every other task on the loop: a deploying
+    site would see one such stall per secured file of every in-flight ACK, claim and delivery on each
+    DR backup, because ``snapshot_to`` runs on the SERVING loop by design (see
+    ``pipeline/dr_backup.py``, which keeps the consistent snapshot there and moves only the tar+AEAD
+    off it). ``MessageStore.open`` secures three files, but it completes before the API serves and
+    before any listener binds, so its stall has nothing to stall.
+
+    The synchronous :func:`_secure_file` stays the callable for every caller that is NOT on a loop —
+    the CLI key/cert writers, the lifespan bootstrap admin, and the ``config/*_edit.py`` writers
+    (whose one async caller already wraps the whole write in ``to_thread``). It is deliberately left
+    unrenamed and unmoved: ``tests/test_phi_at_rest_inventory.py`` asserts that token lives in this
+    module and in no other ``store/`` backend, and ``tests/test_cli.py`` patches it by that name.
+
+    ``_secure_file`` is resolved through the module global when the call is made, so a test that
+    patches the name is honoured through this wrapper too.
+    """
+    await asyncio.to_thread(_secure_file, path, extra_read_grants=extra_read_grants)
 
 
 def _opt_float(value: Any) -> float | None:
@@ -2540,9 +2591,20 @@ class MessageStore:
             await db.execute("PRAGMA foreign_keys=ON")
             await db.execute("PRAGMA busy_timeout=5000")
             await db.executescript(_SCHEMA)
-            await cls._migrate(db)
-            await db.commit()
+            # BACKLOG #1586: the migrations run in ONE transaction, so an interrupted run leaves no
+            # trace. Outside one, each ALTER ... ADD COLUMN commits on its own, and a failure before
+            # its paired backfill leaves the column present -- the next open's column-missing guard
+            # then skips that backfill for good. The transaction opens exactly here and no earlier:
+            # before the PRAGMAs, foreign_keys=ON is a silent no-op and journal_mode=WAL raises;
+            # before executescript, its implicit COMMIT ends the transaction before _migrate runs.
+            # _writer_txn rolls back on BaseException; the lock is a fresh one because nothing else
+            # can reach this connection yet.
+            async with _writer_txn(db, asyncio.Lock()):
+                await cls._migrate(db)
+                await db.commit()
             # Tighten permissions now that the file (and its WAL siblings) exist — they hold PHI.
+            # Off the loop (BACKLOG #1634): three files, each an icacls subprocess on Windows. Open
+            # completes before anything is serving, so this one is consistency rather than a fix.
             if str(path) != ":memory:":
                 main = Path(path)
                 for f in (
@@ -2551,7 +2613,7 @@ class MessageStore:
                     main.with_name(main.name + "-shm"),
                 ):
                     if f.exists():
-                        _secure_file(f)
+                        await _secure_file_async(f)
             store = cls(
                 db,
                 path=path,
@@ -2628,15 +2690,29 @@ class MessageStore:
         """Yield a connection to run a read on without taking the write lock (lockfree-reads).
 
         Pooled path (file-backed WAL): borrow a read-only connection and wrap the block in one deferred
-        read transaction, so every statement in the block sees a single consistent WAL snapshot taken at
-        ``BEGIN`` and concurrent writes can't interleave. The transaction is always closed
+        read transaction, so every statement in the block sees a single consistent WAL snapshot and
+        concurrent writes can't interleave. ``BEGIN`` is DEFERRED, so the snapshot opens at the block's
+        FIRST statement rather than at the ``BEGIN`` itself — what the block gets is one snapshot, not a
+        snapshot of the instant it was entered. The transaction is always closed
         (``COMMIT``/``ROLLBACK``) before the connection returns to the pool, so the next borrower starts
         a *fresh* snapshot (a read always reflects the latest committed write) and never pins the WAL.
+
+        **"Always closed" means on BaseException too, and the ``BEGIN``'s own await is inside the guard
+        for a reason.** aiosqlite runs that ``BEGIN`` on a worker thread, so it lands whether or not the
+        awaiting task survives; a cancellation delivered there used to unwind past a handler that only
+        began *after* the ``BEGIN``, and the connection went back into the pool holding an open
+        transaction. Every later borrower's ``BEGIN`` would then raise "cannot start a transaction
+        within a transaction" from that same unguarded position, so the pool would never heal: one such
+        cancellation would permanently fail one read in ``_READ_POOL_SIZE`` on a deploying site
+        (BACKLOG #1635). The unwind goes through :func:`_unwind_txn` — shielded and bounded — because a
+        bare ``await conn.execute("ROLLBACK")`` is itself cancellable, and a second cancellation landing
+        on it would return the poisoned connection anyway.
 
         Fallback path (``:memory:``, no pool): reads share the single writer connection, serialized under
         ``self._lock`` — the pre-pool behaviour, required because ``:memory:`` can't be reached by a
         second connection. Callers must therefore never invoke a ``_read()`` method while already
-        holding ``self._lock`` (none do)."""
+        holding ``self._lock`` (none do). There is no ``BEGIN`` on this path at all, so a test that means
+        to exercise the snapshot or the unwind must use a FILE-backed store."""
         pool = self._read_pool
         if pool is None:
             async with self._lock:
@@ -2644,14 +2720,15 @@ class MessageStore:
             return
         conn = await pool.get()
         try:
-            await conn.execute("BEGIN")
             try:
+                await conn.execute("BEGIN")
                 yield conn
                 await conn.execute("COMMIT")
-            except BaseException:
-                await conn.execute("ROLLBACK")
-                raise
+            except BaseException as exc:
+                await _unwind_and_raise(conn, exc, role="read")
         finally:
+            # Synchronous on purpose: the unwind above has already finished, and `put_nowait` has no
+            # await for a further cancellation to land on, so the connection cannot be stranded.
             pool.put_nowait(conn)
 
     async def _run_grouped(
@@ -3703,16 +3780,14 @@ class MessageStore:
         # seq/rowid but KEPT the names ix_queue_fifo_in/out with CREATE IF NOT EXISTS — so an upgraded DB
         # silently keeps its old created_at-trailing index and never adopts the seq-only claim's index.
         # Drop the old-named indexes and build the seq-trailing ones under a NEW name (so name-existence is
-        # a correct discriminator). This is NOT a transactional swap on SQLite — Python's sqlite3 auto-
-        # commits DDL — but it does not need to be: the FIFO index is CORRECTNESS-NEUTRAL (the claim orders
-        # by rowid and names no index, ADR 0059), so a crash in the DROP→CREATE gap leaves a lane
-        # transiently unindexed (claims stay correct, just slower) and the next open's idempotent re-run
-        # (DROP IF EXISTS / CREATE IF NOT EXISTS) converges to the seq-trailing pair. This runs at open,
-        # before serving, so the transient gap is never observed by a live claim. DROP-old before
-        # CREATE-new so the on-disk FIFO index count never doubles; a fresh DB no-ops the drops and a
-        # re-opened migrated DB no-ops everything. (The server backends run the same swap inside a real
-        # schema transaction, so they additionally get atomicity — see ADR 0060 / sqlserver.py /
-        # postgres.py.)
+        # a correct discriminator). The swap is atomic now that `open` runs this whole method in one
+        # transaction (BACKLOG #1586), as it already was on the server backends (ADR 0060 /
+        # sqlserver.py / postgres.py). It never depended on that: the FIFO index is CORRECTNESS-NEUTRAL
+        # (the claim orders by rowid and names no index, ADR 0059), so any partial index state still
+        # claims correctly, just slower, and the next open's idempotent re-run (DROP IF EXISTS / CREATE
+        # IF NOT EXISTS) converges to the seq-trailing pair. DROP-old before CREATE-new so the on-disk
+        # FIFO index count never doubles; a fresh DB no-ops the drops and a re-opened migrated DB
+        # no-ops everything.
         await db.execute("DROP INDEX IF EXISTS ix_queue_fifo_in")
         await db.execute("DROP INDEX IF EXISTS ix_queue_fifo_out")
         await db.execute(
@@ -9364,11 +9439,13 @@ class MessageStore:
                 total += p.stat().st_size
         return total
 
-    def _disk_free_bytes(self) -> int:
+    def _disk_free_bytes(self) -> int | None:
+        """Free bytes on the DB's drive; ``None`` when the probe failed — see
+        :attr:`DbStatus.disk_free_bytes` for why that is not ``0`` (BACKLOG #1563)."""
         try:
             return shutil.disk_usage(Path(self.path).resolve().parent).free
         except OSError:
-            return 0
+            return None
 
     # --- retention / purge + maintenance (PHI.md §8, ASVS 14.2.x) -------------
 
@@ -9887,7 +9964,9 @@ class MessageStore:
         # Tighten the snapshot file's permissions: it is a full copy of the (PHI-bearing) store. The
         # encrypted .mfbak the BackupRunner wraps it in is the at-rest protection, but the transient
         # plaintext snapshot must not be world-readable either.
-        _secure_file(dest)
+        # Off the loop (BACKLOG #1634): this is the call that matters. A DR backup runs on the SERVING
+        # loop, so a synchronous icacls here stalls every in-flight ACK, claim and delivery with it.
+        await _secure_file_async(dest)
 
     async def stats(self) -> dict[str, int]:
         """Outbound-queue depth by status — feeds the monitoring/queue-depth view. Scoped to outbound

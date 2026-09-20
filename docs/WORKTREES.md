@@ -21,8 +21,12 @@ a new branch `alerts` (off `origin/main`, the freshly fetched remote tip — so 
 can't seed it), then bootstraps `..\MessageFoundry-alerts\.venv` with
 
 ```
-pip install --constraint constraints.lock -e ".[dev,harness,fhir,dicom,x12,xml,webauthn]" -e packaging/messagefoundry-webconsole
+pip install --constraint constraints.lock -e ".[dev,harness,fhir,dicom,x12,xml,webauthn,vault]" -e packaging/messagefoundry-webconsole
 ```
+
+That install is `scripts\worktree\ensure-venv.ps1`'s, which `new.ps1` calls -- see
+[Start the session in the worktree](#start-the-session-in-the-worktree) for why it is reachable on its
+own.
 
 **That is CI's install line, and a test holds it there.** `ci.yml`'s test leg installs the same extras
 and the same web console package, and `tests/test_worktree_venv_extras_parity.py` compares the two and
@@ -90,6 +94,84 @@ in parallel without touching each other's files.
 
 > **One-step shortcut:** `scripts\worktree\spawn.ps1 -Name alerts` runs `new.ps1` **and** opens a VS Code
 > window on the new worktree, so you just start the second chat in that window. Same flags as `new.ps1`.
+
+## Start the session in the worktree
+
+**Create the worktree, then start the session IN it** -- the One-step shortcut above does both. A
+session that starts somewhere else and then moves itself is the case this section exists to prevent.
+
+### Relocating does not work from a brief, and costs an owner prompt from a session
+
+`EnterWorktree` behaves differently depending on who calls it, and neither outcome is one you want.
+Measured against the CLI (2.1.246):
+
+| Caller | What happens |
+|---|---|
+| A **subagent** (working directory pinned at launch) | **Refused outright**: `Cannot enter worktree: <path> is not under <primary>\.claude\worktrees.` It never reaches a permission decision, so nobody is asked and nothing can allow it. |
+| A **session** (not pinned) | On first entry from its launch directory it may target any path in `git worktree list`, which includes every sibling. That reaches the permission check and **asks the owner**. |
+
+So briefing a worker to relocate into a `new.ps1` sibling is not merely expensive, it is
+**ineffective** -- the call cannot succeed, and the brief burns the worker's one turn on it. From a
+session the same call raises a dialog offering only **Deny** and **Allow once**: the decision carries
+`classifierApprovable: false`, so no `permissions.allow` rule matches it and there is no "don't ask
+again" row to click.
+
+**The cost is MISATTRIBUTED, which is why this is a rule and not a note.** A worker that hits the
+refusal does not read it as a bad brief. It reads it as something it did wrong, and quietly routes
+around it. Reported 2026-09-16 by a manager whose builder addendum offered relocation as one of two
+options: two of its three builders spent a call discovering the refusal, and one wrote back "so I made
+every file change through Bash, as your addendum's second option". That is a worker working around
+what it believed was its own error. **A brief that cannot succeed produces a worker that doubts a
+correct brief** -- and the manager, reading the refusals as builder trouble, was slow to see the brief
+was at fault. Bounded at three builders only because the reports kept coming.
+
+**Do not engineer around the check.** Making an outside path *resolve* as managed -- a directory
+junction, say -- defeats a deliberate safety control instead of fixing anything.
+
+One caveat, stated because the mechanism is inferred rather than read from the code: a subagent is
+always pinned, so the measurement cannot separate "subagent" from "pinned working directory" as the
+cause. The observed behaviour is what these rules rest on.
+
+### A file-editing subagent: `isolation: worktree`, then bootstrap before the first check
+
+Dispatch it with `isolation: worktree`. It gets its own **managed** worktree, so it never relocates and
+nothing prompts.
+
+**That worktree arrives with no `.venv`**, and without one `pytest` does not run slowly against the
+wrong interpreter -- it **dies at import**. The worker cannot then run the checks its brief requires,
+and the first real signal arrives in CI after its process is gone. Have it run
+
+```powershell
+pwsh -NoProfile -File scripts\worktree\ensure-venv.ps1
+```
+
+**before its first `pytest`, `mypy` or `ruff` run** -- not at the top of every brief. On a worktree that
+already has an environment the script prints one line and returns, but a **fresh** managed worktree
+always takes the full install: measured here, **47 seconds and 887 MB** with a warm pip cache. A worker
+that runs no checks should not pay that, and 39 of the 86 nested worktrees on this machine would.
+
+**Keeping managed worktrees inherits a staleness mode the sibling pattern did not have.** The script
+decides freshness by file EXISTENCE, so a venv is only as current as the day it was built. A
+disposable sibling made and removed inside a day never meets a `constraints.lock` bump. A managed
+worktree is likelier to be **kept** -- that is much of its appeal -- and a kept one outlives lock bumps
+while the script correctly reports nothing to do. So if you keep them, **delete `.venv` and re-run** is
+a habit rather than a footnote: reach for it whenever a reused worktree gives a lint or type result CI
+disagrees with. There is deliberately no `-Force`; an untested refresh path on a script whose contract
+is "run it and it does the right thing" is a second, quieter way for it to lie.
+
+Raised 2026-09-16 by a manager who had just removed five same-day siblings and pointed out that the
+trap does not reach that pattern at all -- which is the point: this recommendation moves people onto
+the population where it does.
+
+Why the two populations differ, measured 2026-09-16: **21 of 22** `new.ps1` siblings carried a usable
+`.venv`, against **47 of 86** harness-created worktrees. `new.ps1` bootstraps one; the harness creates a
+checkout and installs nothing. Skipping the bootstrap is a false green, for the reason given under
+[Create one](#create-one) above.
+
+### A session a person starts: create first, start second
+
+Use the One-step shortcut above and start the chat in the window it opens. Nothing needs relocating, so
+nothing prompts.
 
 ## Remove one
 
@@ -195,7 +277,41 @@ scripts\worktree\prune-merged.ps1                   # dry run: the decision tabl
 scripts\worktree\prune-merged.ps1 -Apply            # remove the ones that pass every check
 scripts\worktree\prune-merged.ps1 -Apply -Name pins # also confirm that one past the activity veto
 scripts\worktree\prune-merged.ps1 -Json             # machine-readable decisions + the fence receipt
+scripts\worktree\prune-merged.ps1 -ReapVenvs        # ALSO report reapable .venv dirs. Deletes nothing.
 ```
+
+### `-ReapVenvs` reports virtualenvs and removes none of them
+
+A `.venv` is **rebuildable** state — `.venv/` is gitignored, `constraints.lock` is tracked, and
+[`new.ps1`](../scripts/worktree/new.ps1) rebuilds with `pip install --constraint constraints.lock`.
+Deleting one costs a rebuild; deleting a worktree costs work. Different blast radii, so different
+gates — and **there is no venv deletion path in this script at all**, not behind `-Apply`, not behind
+a confirmation. An adversarial review returned `NEEDS_A_GUARD` on every reaper proposed, so the dry
+run ships first and is meant to run for a week before anything destructive is written.
+
+A venv is reported **reapable** only when nine conjuncts hold. `C1` venv-present, `C2` rebuildable
+(`constraints.lock` — **not** `uv.lock`, which sits beside it, is also a real lockfile, and is read
+by no install here), `C3` fence-available, `C4` unlocked, `C5` unoccupied, `C6` clean, `C7` idle,
+`C8` merged, `C9` **unowned**. `C1`–`C8` are the worktree rule above, reused rather than re-derived —
+with one deliberate drop, recorded here because nothing else records it: the worktree pass also
+vetoes a tree that *contains* another registered worktree, and the venv pass does not, because
+removing a parent orphans its children and deleting only `.venv` cannot.
+
+`C9` is new and it is the one the other eight miss. The owning session id is the six-hex token a
+Claude-managed slug carries; the conjunct looks for `<config-root>/projects/*<id>*/*.jsonl` across
+every `.claude*` root and holds the venv unless the newest write is older than `-IdleHours`. **No id
+parsed and no transcript found both mean SKIP** — absence of a transcript is the absence of evidence,
+not proof of death. Measured: nine idle venvs of about 8.0 GB belonged to a session that had written
+a transcript 4.4 hours before the sweep, and `C1`–`C8` cleared every one of them.
+
+The pass reaches trees `-Apply` never will, including the `.claude/worktrees` population, which is
+where most of the bytes are. That is safe **only** because it removes nothing; arming a removal would
+have to answer the population question again from scratch.
+
+Every count it prints carries its denominator, and "nobody was reapable" and "the check could not
+run" print different things — the second refuses the whole pass, because an empty list from a check
+that could not look is not a clean result. That refusal exits **2**, or **1** when the same run also
+removed a worktree — a refusal code must never read as a run that did nothing.
 
 ### The rule is `merged AND clean AND NOT occupied`
 
@@ -212,9 +328,15 @@ Occupancy is checked by two independent signals, and **either one vetoes**:
 1. **The liveness fence** — [`scripts/coord/occupancy.ps1`](../scripts/coord/occupancy.ps1), the same
    matcher `presence.ps1` uses. It maps each registered session's cwd onto a worktree and fences it on
    pid + process start time. A session in a **nested** worktree vetoes its ancestor too.
-2. **Recent activity** (`-IdleHours`, default **36**) — the newest mtime of the worktree's *private*
+2. **Recent activity** (`-IdleHours`, default **72**) — the newest mtime of the worktree's *private*
    git metadata (`index`, `HEAD`, `logs/HEAD`, …), not the working files. This is the signal that does
    **not** depend on a recorded cwd.
+
+**The default was 36 until 2026-09-17, and the old number's own measurement is why it moved.** The
+largest idle reading ever taken on a worktree somebody was demonstrably in was **34.4h**, against a
+36h window — 1.6h of margin on the only signal that sees a session writing in by absolute path. That
+is a coincidence, not a margin. 72h is that worst measured reading doubled, and it outlives a
+weekend, which 36 did not. The cost is fewer removals, which is the cheap direction here.
 
 Both are re-read **immediately before each removal**, not just when the table was built — a gh round
 trip per candidate plus every prior removal is a real window, and it is the window the incident
@@ -225,11 +347,14 @@ can *prove* a session is gone — a `DEAD`/`STALE`/absent verdict is the absence
 permission. And **if the fence cannot look at all, nothing is pruned**: an empty roster and an
 unreadable one produce the same empty answer, so availability is asserted explicitly — at least one
 config root with a registry, at least one readable record, **and no record that cannot be placed**.
-That last one matters more than it sounds. Two shapes qualify — a file that will not parse, and one
-that parses but carries no `cwd` — and both used to be dropped by a silent `continue`, appearing in no
-count at all. Neither can be placed in *or* cleared from any candidate, and a file caught
-*half-written* is exactly what a session that launched a second ago looks like. An unavailable fence
-turns every candidate into a SKIP and exits **2**. There is deliberately no override flag.
+That last one matters more than it sounds. Three shapes qualify — a file that will not parse, a
+record that parses but carries no `cwd`, and a record whose `cwd` is a checkout of *this* repo that
+`git worktree list` no longer carries, whether that directory is still on disk or gone. Each used to
+be dropped by a silent `continue`, appearing in no count at all, and the third went on being dropped
+after the fix for the first two. The incident above produced that shape in its still-on-disk form.
+None can be placed in *or* cleared from any candidate, and a file caught *half-written* is exactly
+what a session that launched a second ago looks like. An unavailable fence turns every candidate
+into a SKIP and exits **2**. There is deliberately no override flag.
 
 ### The candidate set is siblings only — and "sibling" is not a prefix match
 
@@ -286,11 +411,58 @@ the directory is gone or re-registered — as is any unregistered `<repo>-*` dir
 pointer still names this repo.
 
 Exit codes, **highest severity wins**: `0` nothing wrong; `1` something was attempted and failed
-without destroying anything; `2` **refused** — nothing was attempted because safety could not be
-established (wrong cwd, unavailable fence, a `-Name` that matched nothing); `3` **orphaned** — a
-directory is broken on disk right now. `3` outranks `2` because damage on disk outranks a refusal to
-act. In the JSON receipt `counts.orphaned` is a *subset* of `counts.failed` (`failedNonOrphan` is
-spelled out alongside it); `removed + failed + skipped` covers every candidate exactly once.
+without destroying anything; `2` **refused** — something you asked for was not attempted, because
+safety could not be established; `3` **orphaned** — a directory is broken on disk right now. `3`
+outranks `2` because damage on disk outranks a refusal to act. In the JSON receipt `counts.orphaned`
+is a *subset* of `counts.failed` (`failedNonOrphan` is spelled out alongside it); `removed + failed +
+skipped` covers every candidate exactly once.
+
+**`2` is per-request, and its causes are not a closed list.** The line above read *"nothing was
+attempted (wrong cwd, unavailable fence, a `-Name` that matched nothing)"*. The list went stale
+silently: `-ReapVenvs` added four refusal causes of its own — the fence down, transcript roots
+unreadable, no config root carrying a `projects/` directory, and `-IdleHours 0` emptying both idle
+windows — and it did not move. Read `2` as "some request of yours was refused", and read
+`counts.removed` for what the run did.
+
+**A tail line names the outcome it is reporting, never the run's code.** Each explanation at the
+foot of the report opens `REFUSED:`, `FAILED:` or `ORPHANED:` — the same words the preamble
+refusals and the per-candidate failures already use. They used to open `Exit 2:`, which was true
+only while all of them were nested inside "if the run exited 2". Prefixing the run's actual code
+instead would attribute it: on a run with the fence down **and** a broken directory, `Exit 3: the
+occupancy fence was unavailable` sends you to fix a fence that was only ever worth `2`. The run's
+code is in the `Done.` summary and in `$LASTEXITCODE`, which are the only places that ever knew it.
+
+**`2` does still mean nothing was removed, and this page said otherwise for one commit.** The
+paragraph above read *"The universal is false on its own terms too: a fence that dies part way
+through the apply loop sets `2` over removals that already landed ... the mid-run fence death does
+not [report `1`]"*. No such run exists. Seven sites can produce `2`, and not one of them can
+co-occur with a removal:
+
+| Site | Why a removal cannot have happened |
+|---|---|
+| three bare exits in the preamble | a negative `-IdleHours`, not a repository, not the primary checkout — all before a candidate set exists |
+| the decision-pass fence check | an unavailable fence adds a SKIP reason to **every** candidate, so the prunable set is empty and the apply loop never runs |
+| the mid-loop fence check | the fence is read **once**, on the line above the loop, and nothing inside re-reads it — so a fence that is down skips the first candidate and every later one |
+| the `-Name` and `-ReapVenvs` guards | both explicitly conditioned on something having been removed, and both report `1` when it has |
+
+Measured over the parsed script rather than by grep, because a grep for `^\s*exit` misses four
+keywords and any wrapper that reads the exit variable. Classifying every `Exit`, `Return`, `Throw`,
+`Break` and `Continue` statement by whether an ancestor is a `FunctionDefinitionAst` gives 89 —
+outside a function 5 `Exit`, 1 `Throw`, 20 `Continue` and 2 `Return`; inside one 47 `Return`, 13
+`Continue` and 1 `Break`.
+
+The 2 `Return`s outside a function are not script-level either, and the distinction is worth the
+sentence because anyone re-running that predicate will meet them: they are the `return $true` /
+`return $false` of the `$matchesName` scriptblock literal, returning from that scriptblock.
+Counting a `ScriptBlockExpressionAst` as a nesting level too moves exactly those two rows and
+nothing else. This paragraph published that broader reading — *"49 `Return` ... nested"* — while
+naming the narrower predicate, so a reader who followed the stated method got a different table.
+
+What the argument rests on survives both readings: **0 `Exit` sits inside a function** under
+either, so no `exit` in the file is scoped to anything narrower than the process, and the two that
+end an ordinary run are both `exit $exit`. The standing pin is
+`test_a_fence_that_dies_mid_run_refuses_and_says_so`, which kills the fence between the decision
+pass and the removal pass and asserts `counts.removed == 0` beside the `2`.
 
 **A removal releases the work claims the worktree held.** A claim ([`claim.ps1`](../scripts/coord/claim.ps1))
 lives under `<git-common-dir>/mefor-coord/claims/`, beside the *shared* object store, so it outlives the
@@ -910,10 +1082,49 @@ message shape, nowhere else.
 per session. It stays silent, and keeps its powder dry, when there's nobody to tell. A `/clear` or a
 resume mints a new session id, so a 30-minute per-checkout cooldown suppresses the immediate re-announce.
 
-**Expect about half the roster to be unreachable.** `presence.ps1` is authoritative for who **exists**;
-`list_sessions` is authoritative only for who can be **messaged**, and the two disagree. The cap is
-therefore a budget of *delivered* messages the model tops up past unreachable peers, rather than a
-candidate list the hook trims.
+**Expect most of the roster to be unmessageable, and no longer unreached.** `presence.ps1` is
+authoritative for who **exists**; `list_sessions` is authoritative only for who the model can
+**message**, and the two disagree badly. Measured on this repo 2026-09-14: 10 live peers, 3 reachable,
+`list_sessions` returning exactly the 3 on this login. The MCP cap is therefore a budget of *delivered*
+messages the model tops up past unmessageable peers, rather than a candidate list the hook trims.
+
+**The other 7 are announced to by the hook itself, over the mail lane.** A peer on another login, or on a
+surface the Desktop app never spawned, is unaddressable by the model's tools no matter how well the model
+is instructed: no instruction can conjure a session id that does not exist in the caller's namespace. So
+the hook mails those peers directly through
+[`scripts/coord/mail.ps1`](../scripts/coord/mail.ps1), which is a file write in
+`<git-common-dir>/mefor-coord/` and is blind to both login and surface. Those peers render as **MAILED**
+in the roster, meaning *already announced to, do nothing*. `mail.ps1` was built for exactly these two
+cases and names them both in its own header; the two components shipped separately and the hook contained
+**zero** references to mail until 2026-09-14.
+
+Four properties of that lane, each of which cost a measurement:
+
+- **It runs before the `NO_PEERS` exit, and that order is the feature.** The new-peer set is computed from
+  *messageable* peers alone, so a fleet in which every peer is cross-login would otherwise take that exit
+  having announced nothing at all.
+- **It shells out to `mail.ps1` rather than writing the inbox file.** `mail.ps1` refuses an oversized body
+  or an overlong line **loudly**; the enforcing copy in
+  [`mail-drain.ps1`](../scripts/hooks/mail-drain.ps1) **truncates silently** at the far end. Bypassing the
+  sender trades a refusal you can see for a mid-sentence cut you cannot.
+- **The body wraps to 90 columns and hard-cuts unbreakable tokens.** The receiver refuses any line over
+  240 characters. An ordinary one-line intent of ~370 characters refused all 7 of a peer's sends on
+  2026-09-14, and the envelope this hook dictates says `intent: <one line>`, so the hook cannot pass its
+  own prescribed text through the lane unmodified.
+- **The intent comes from the claim note, never from the user's prompt.** The hook *has* the prompt in its
+  payload. Mailing it would copy arbitrary user text into a peer's transcript that nothing here can
+  delete, which `mail.ps1`'s body rule forbids outright. No claim note is reported as *not declared*
+  rather than filled in from the worktree name.
+
+**Three bounds, and the clock is the one that matters.** This is `UserPromptSubmit`, whose timeout is 15 s
+and whose failure mode is a **blocked user prompt** rather than degraded coordination. One send costs
+0.76-1.32 s wall clock (mean 0.98 over three spawns, warm idle host, 2026-09-14) and the peer lookup has
+already spent ~1.0 s, so an uncapped fan-out to 7 peers is 8-10 s of that 15 s. `-MaxMailPerPrompt`
+bounds the fan-out (3), `-MaxMailTotal` bounds the session (12), and `-MailBudgetMs` bounds the **wall
+clock** (6000). Only the last survives ten sessions draining the same directory at once: a count cap
+cannot bound time. Announces also carry a 120-minute TTL rather than `mail.ps1`'s 72-hour default,
+because an announce is worth nothing stale and would otherwise hold a drain slot for three days against a
+5-per-injection cap.
 
 **Reachability is an exact `cwd` match and nothing else — never `isRunning`.** That flag means *"executing
 a turn right now"*, so as a reachability test it reads **backwards**: `false` is an idle peer that answers,
@@ -926,7 +1137,12 @@ rate, when it was a count of who happened to be mid-turn.
 **State, receipts and the kill switch.** `<git-common-dir>/mefor-coord/announce/` holds one
 `<session-id>.json` marker per session (delete it to force a re-announce), `receipts/<key>.tsv` — one
 line per **decision**, carrying its outcome code — and `sent/<key>.tsv`, which the *model* writes with
-what it actually delivered. All reaped after 7 days. **To turn announce off for this repo immediately, in
+what it actually delivered. All reaped after 7 days. The marker's `known`/`sent` track the MCP lane and
+`mailed`/`mailSent` track the mail lane, separately, because the two have different bounds and different
+senders. A receipt's `mail=` field is what **this process** sent and `msg=` is what the **model** was asked
+to send; the outcome code `ANNOUNCED_MAIL` means the cross-account half went out with no messageable peer
+in the fleet, which a bare `NO_PEERS` would have reported as nothing happening. Receipts are `v=2` from
+2026-09-14, so a reader can tell a v1 receipt's *absent* mail count from a v2 receipt's zero. **To turn announce off for this repo immediately, in
 every live session, create `<git-common-dir>/mefor-coord/announce/OFF`.** Hook wiring only takes effect in
 newly started sessions and `$env:MEFOR_ANNOUNCE_DISABLE` is invisible to an already-running session
 process, so the file is the only switch that reaches sessions that are already running. Remove it to
@@ -943,6 +1159,17 @@ pwsh -NoProfile -File scripts\coord\install-coordination.ps1 -Only UserPromptSub
 `-SelfTest` shows what it would do right now without doing it, and without writing anything. `-Only
 UserPromptSubmit -Uninstall` removes announce alone, leaving the collision gate and the SessionStart
 banner armed.
+
+**Pass `-AsLogin` to any hand-run, or the diagnostic reports an upper bound as a measurement.** A hand-run
+carries no session id, so it cannot resolve its own login, so the login filter goes **off** and every
+cross-login peer renders reachable. Measured on the live fleet 2026-09-14: the same roster read
+`reachable=9` without it and `reachable=3` with it, and only the second matches what `list_sessions`
+returned. With a stated login it also prints the mail split, which is the only way to see the
+cross-account half without sending anything.
+
+```powershell
+pwsh -NoProfile -File scripts\hooks\announce-session.ps1 -SelfTest -AsLogin acct-1
+```
 
 **Cost, stated rather than discovered.** Measured on this host: the shim costs ~0.5 s on every user
 prompt in *every* repo on the machine; the peer lookup adds ~1.0 s on the prompts where it actually runs,

@@ -46,7 +46,12 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 from messagefoundry.config.models import ConnectorType, Destination, SignatureAlgorithm
-from messagefoundry.config.tls_policy import InsecureHopRefused
+from messagefoundry.config.tls_policy import (
+    SYSTEM_TRUST_ANCHOR,
+    InsecureHopRefused,
+    TrustAnchor,
+    TrustAnchorPolicy,
+)
 from messagefoundry.transports.base import DeliveryError
 from messagefoundry.transports.bounded_read import MAX_TOKEN_RESPONSE_BYTES, read_bounded_text
 
@@ -60,7 +65,9 @@ from messagefoundry.transports.rest import (
     cleartext_acceptance_from_settings,
     ech_readdressed_request,
     enforce_outbound_length_limits,
+    http_family_trust_anchor,
     refuse_cleartext_credential_hop,
+    refuse_url_credentials,
 )
 from messagefoundry.transports.signing import CompactJwtSigner
 
@@ -127,12 +134,25 @@ class SmartBackendTokenProvider:
         # ClientHello. Mutually exclusive with ``proxy`` (refused at connector construction). None
         # (default) -> byte-identical.
         ech_sidecar: str | None = None,
+        # #1660 (#1180, ADR 0093): the client trust anchor for the TOKEN hop, already resolved against
+        # the token host by :func:`token_provider_from_settings`. The data hop has carried one since
+        # #1180 and this hop did not, so an internal-CA authorization server failed every mint with an
+        # opaque URLError and a ``pinned`` policy was silently not honoured on the hop that carries the
+        # credential. The default is the OS trust store -- the same value #1180's own default resolves
+        # to, so a direct test construction and an unconfigured instance are byte-identical.
+        trust_anchor: TrustAnchor = SYSTEM_TRUST_ANCHOR,
     ) -> None:
         if not token_url:
             raise SmartAuthError("SMART Backend Services requires a 'smart_token_url' setting")
         scheme = urllib.parse.urlsplit(token_url).scheme.lower()
         if scheme not in ("http", "https"):
             raise SmartAuthError(f"smart_token_url must be http or https, got scheme {scheme!r}")
+        refuse_url_credentials(
+            token_url,
+            "smart_token_url",
+            use="smart_client_id/smart_private_key",
+            error=SmartAuthError,
+        )
         # The client_assertion JWT is a credential, so this hop goes through the ONE posture-keyed
         # authority — exactly like its OAuth2 sibling in http_auth.py and the delivery cells. It used to
         # read the raw, UNCLAMPED `MEFOR_ALLOW_INSECURE_TLS`, which meant one process-wide environment
@@ -182,9 +202,16 @@ class SmartBackendTokenProvider:
         token_proxy = (
             proxy.for_host(urllib.parse.urlsplit(token_url).hostname or "") if proxy else None
         )
+        # #1660: a PER-PROVIDER opener whenever the token hop needs a handler the shared one lacks (a
+        # forward proxy) OR a trust anchor that ``narrows`` -- read through the one ``narrows``
+        # predicate, exactly as the four HTTP-family destinations do, so the token hop cannot drift
+        # from them. Neither -> the shared opener, unmutated (ADR 0126), byte-identical.
         self._opener: urllib.request.OpenerDirector = (
-            _no_redirect_opener(*token_proxy.opener_handlers())
-            if token_proxy is not None
+            _no_redirect_opener(
+                *(token_proxy.opener_handlers() if token_proxy is not None else ()),
+                trust_anchor=trust_anchor,
+            )
+            if token_proxy is not None or trust_anchor.narrows
             else _NO_REDIRECT_OPENER
         )
         self._proxy_auth: dict[str, str] = (
@@ -379,7 +406,11 @@ def smart_auth_configured(s: Mapping[str, Any]) -> bool:
 
 
 def token_provider_from_settings(
-    s: Mapping[str, Any], *, proxy: ProxyConfig | None = None, ech_sidecar: str | None = None
+    s: Mapping[str, Any],
+    *,
+    proxy: ProxyConfig | None = None,
+    ech_sidecar: str | None = None,
+    trust_anchor_policy: TrustAnchorPolicy | None = None,
 ) -> SmartBackendTokenProvider | None:
     """The :class:`SmartBackendTokenProvider` for an already-``env()``-resolved settings mapping, or
     ``None`` when SMART auth is off.
@@ -390,15 +421,20 @@ def token_provider_from_settings(
     (ADR 0043) — both inject the minted bearer per request off-loop past the queue boundary. ``proxy``
     (ADR 0126) routes the token-endpoint POST through the connection's forward proxy; ``ech_sidecar``
     (#1176, ADR 0139) re-addresses it to the connection's loopback ECH sidecar instead. The two are
-    mutually exclusive by construction."""
+    mutually exclusive by construction.
+
+    ``trust_anchor_policy`` (#1660) is the instance-wide ``[tls]`` policy the caller already holds --
+    off its ``Destination`` for an outbound, threaded in explicitly for a ``FhirLookup``, which has
+    none. ``None`` (a direct test construction) resolves to the OS trust store, byte-identical."""
     if not smart_auth_configured(s):
         return None
     # ADR 0153: the same per-connection declaration the delivery hop carries, mirrored into these
     # resolved settings by the runner's _dest_config (with the connection name, so the acceptance audit
     # record names the declaration). Read exactly as the OAuth2 sibling does.
     accepted = cleartext_acceptance_from_settings(s)
+    token_url = str(s.get("smart_token_url") or "")
     return SmartBackendTokenProvider(
-        token_url=str(s.get("smart_token_url") or ""),
+        token_url=token_url,
         client_id=str(s.get("smart_client_id") or ""),
         private_key=str(s.get("smart_private_key") or ""),
         algorithm=SignatureAlgorithm(str(s.get("smart_algorithm", "RS384"))),
@@ -418,6 +454,13 @@ def token_provider_from_settings(
         connection=accepted[2],
         proxy=proxy,  # ADR 0126: forward-proxy the token-endpoint POST
         ech_sidecar=ech_sidecar,  # #1176: ...or re-address it to the ECH sidecar (ADR 0139)
+        # #1660: resolved against the TOKEN url, not the connection's data url -- the authorization
+        # server is frequently a different host from the FHIR/REST endpoint, and both the loopback
+        # exemption and the internal-vs-public decision key on the host actually being dialled. The
+        # connection's own ``tls_ca_file`` still wins verbatim, exactly as it does on the data hop.
+        trust_anchor=http_family_trust_anchor(
+            s, url=token_url, trust_anchor_policy=trust_anchor_policy
+        ),
     )
 
 
@@ -429,8 +472,11 @@ def token_provider_from_destination(
     SMART auth is OFF (``None``) unless ``smart_token_url`` is present (and ``smart_enabled`` is not
     ``False``), so every existing outbound is byte-identical. Settings arrive already ``env()``-resolved
     (the runner substitutes them before building the connector), exactly like the ``sign_*`` path.
-    ``proxy`` (ADR 0126) routes the token-endpoint POST through the connection's forward proxy."""
-    return token_provider_from_settings(config.settings, proxy=proxy)
+    ``proxy`` (ADR 0126) routes the token-endpoint POST through the connection's forward proxy;
+    #1660 threads the outbound's instance ``[tls]`` trust-anchor policy onto the token hop."""
+    return token_provider_from_settings(
+        config.settings, proxy=proxy, trust_anchor_policy=config.trust_anchor_policy
+    )
 
 
 def with_smart_backend(

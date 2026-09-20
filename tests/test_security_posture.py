@@ -51,19 +51,19 @@ _SECURITY = "security.yml"
 # .github/required-contexts.txt below, so "blocking" is a checked claim rather than a label.
 _BLOCKING_SECURITY_JOBS = frozenset(
     {
-        "pip-audit",
-        "npm-audit",
-        "bandit",
-        "gitleaks",
-        "semgrep",
-        "crypto-inventory",
-        "forbidden-content",
         # The two composite roll-ups, PROMOTED 2026-09-15 out of _PENDING_PROMOTION_SECURITY_JOBS
         # after the owner added both contexts to branch protection. Recording a context is what drags
         # its job under every rule in this module for the first time, so this line is the point at
         # which the composites are graded like the seven scans they duplicate rather than like staged
-        # work nobody grades. They stay here THROUGH the overlap: both sets are required at once, and
-        # the seven above come out at consolidation step 3 (docs/CI.md).
+        # work nobody grades.
+        #
+        # SINCE 2026-09-16 THEY ARE THE ONLY BLOCKING JOBS IN security.yml. The seven original scans --
+        # pip-audit, npm-audit, bandit, gitleaks, semgrep, crypto-inventory, forbidden-content -- were
+        # listed here until the owner removed their contexts from branch protection at about 18:45Z that
+        # day (consolidation step 4, taken before step 3). They are now in
+        # _SUPERSEDED_SECURITY_JOBS below. They were NOT deleted from the workflow; this module would
+        # red if they had been, because `test_every_security_job_is_classified` asserts set equality
+        # over every job in the file.
         "repo-scan",
         "dependency-and-secret-scan",
     }
@@ -84,6 +84,50 @@ _ADVISORY_SECURITY_JOBS = frozenset({"sbom", "trivy"})
 # discard its findings.
 _ADVISORY_BY_PLACEMENT_SECURITY_JOBS = frozenset({"released-line-audit"})
 
+# SUPERSEDED: hard-failing, reporting on EVERY pull request, and deliberately NOT required -- because a
+# required COMPOSITE now runs the same scan. Added 2026-09-16, when the owner removed these seven
+# contexts from branch protection (consolidation step 4, taken before step 3; docs/CI.md).
+#
+# WHY THIS IS NOT ONE OF THE THREE BUCKETS ABOVE, checked rather than argued:
+#
+#   * not _ADVISORY_SECURITY_JOBS      -- those MUST carry `continue-on-error: true`. These must NOT:
+#                                         they still scan for real and a finding must still redden the
+#                                         job, because `repo-scan`'s copy of that scan is the gate and
+#                                         a red original is how a human notices the copy would fail.
+#   * not _ADVISORY_BY_PLACEMENT       -- that bucket asserts the job CANNOT report on a pull request
+#                                         (schedule/dispatch-only `if:`). These have no `if:` at all
+#                                         and report on every one. Filing them there would have made
+#                                         `test_advisory_by_placement_jobs_cannot_run_on_a_pull_request`
+#                                         red, which is the assertion that keeps that bucket honest.
+#   * not _PENDING_PROMOTION           -- that bucket points FORWARD: not required YET, and must become
+#                                         required. These point the other way. Sharing the list would
+#                                         give one name two opposite meanings, which is the confusion
+#                                         every classification in this module exists to prevent.
+#
+# THIS IS A STAGING BUCKET AND IT MUST EMPTY. It exists only for the window between consolidation step
+# 4 (done) and step 3 (deleting the seven jobs). While it is non-empty the repository pays seven runner
+# slots a run for scans that gate nothing -- the cost of having inverted the step order, and the cheaper
+# of the two windows on offer. Emptying it means deleting the seven jobs from security.yml; nothing
+# requires their contexts, so that deletion can no longer wedge a pull request.
+#
+# WHAT MAKES THE POSTURE SAFE, and it is a checked claim, not a reassurance:
+# tests/test_security_composite_parity.py asserts each composite's copy of a scan body is
+# BYTE-IDENTICAL to the original's. So every assertion this repository makes about one of these seven
+# steps is an assertion about a string the required composite shares. That is also what licenses the
+# nine negative controls written about these scans to be re-pointed at the composite contexts in
+# tests/negative_controls.toml rather than deleted.
+_SUPERSEDED_SECURITY_JOBS = frozenset(
+    {
+        "pip-audit",
+        "npm-audit",
+        "bandit",
+        "gitleaks",
+        "semgrep",
+        "crypto-inventory",
+        "forbidden-content",
+    }
+)
+
 # PENDING PROMOTION: hard-failing, running on every pull request, and NOT YET in branch protection --
 # the transient fourth posture that step 1 of the security-job consolidation creates. The two
 # composites run the same scans as the seven jobs they will replace, and
@@ -98,8 +142,8 @@ _ADVISORY_BY_PLACEMENT_SECURITY_JOBS = frozenset({"released-line-audit"})
 #
 # WHY THE OVERLAP EXISTS AT ALL. A required status context is a JOB NAME. Deleting the seven while
 # protection still names them wedges every pull request in the repository, and moving protection
-# first, to names nothing yet reports, wedges it identically. The workflow header carries the four
-# steps in order.
+# first, to names nothing yet reports, wedges it identically. `security.yml` carries the step list
+# above the composite jobs, with an amendment recording which steps have been taken.
 #
 # THE BUCKET IS EMPTY AS OF 2026-09-15 and the mechanism is kept for the next staged job. The owner
 # added both composite contexts to branch protection, a pull request recorded them in
@@ -109,10 +153,17 @@ _ADVISORY_BY_PLACEMENT_SECURITY_JOBS = frozenset({"released-line-audit"})
 # made those two halves one change, and it is what reddened when only the file was edited.
 #
 # WHAT IT DID NOT FORCE, AND MUST NOT: deleting the seven original jobs. Its failure message used to
-# name that as part of the same change, which is wrong and would wedge the repository -- protection
-# still requires all seven ORIGINAL contexts alongside the composites, so deleting their jobs leaves
-# seven required contexts nothing can report. That is consolidation steps 3 and 4, it needs a branch
-# protection edit in the same window, and docs/CI.md carries the ordering hazard.
+# name that as part of the same change, which was wrong AT THE TIME and would have wedged the
+# repository -- protection then named all seven ORIGINAL contexts alongside the composites, so
+# deleting their jobs would have left contexts nothing can report. That is consolidation step 3.
+#
+# THE HAZARD IS GONE AND THE RULE IS NOT. Branch protection no longer names the seven (that was
+# step 4, taken 2026-09-16 AHEAD of step 3 rather than after it), so the deletion can no longer wedge
+# anything and needs no protection edit beside it -- `.github/required-contexts.txt` is the record,
+# and docs/CI.md carries the ordering hazard for the next staged context. What still must not happen
+# is this bucket's forcing function reaching for that deletion: promoting a pending job and deleting
+# a superseded one are different changes, and the reason to keep them apart never depended on the
+# hazard that has since lapsed.
 #
 # WHILE THIS LIST IS EMPTY THE THREE `pending_promotion` TESTS BELOW ARE DORMANT, and that is said
 # plainly rather than left to be discovered: a loop over an empty set cannot fail. They are kept
@@ -123,6 +174,17 @@ _ADVISORY_BY_PLACEMENT_SECURITY_JOBS = frozenset({"released-line-audit"})
 # that cannot go vacuous is `test_every_security_job_is_classified`: it asserts SET EQUALITY over
 # every job in the workflow, so emptying this bucket is only legal if each name landed in another.
 _PENDING_PROMOTION_SECURITY_JOBS: frozenset[str] = frozenset()
+
+#: Every job this module grades, whatever its posture. `test_every_security_job_is_classified`
+#: asserts this is SET-EQUAL to the workflow's real job keys, which is what lets other rules build on
+#: it: a job added to security.yml cannot silently fall outside anything derived from this name.
+_ALL_GRADED_SECURITY_JOBS = (
+    _BLOCKING_SECURITY_JOBS
+    | _ADVISORY_SECURITY_JOBS
+    | _ADVISORY_BY_PLACEMENT_SECURITY_JOBS
+    | _SUPERSEDED_SECURITY_JOBS
+    | _PENDING_PROMOTION_SECURITY_JOBS
+)
 
 # Job-level `if:` expressions that CANNOT skip the job on a pull_request, with the reason each is safe.
 # Anything else on a required job is a way for the context to silently not report.
@@ -193,19 +255,128 @@ def test_every_security_job_is_classified() -> None:
     quietly stop covering the file it is named for.
     """
     actual = set(jobs_of(_SECURITY))
-    classified = (
-        _BLOCKING_SECURITY_JOBS
-        | _ADVISORY_SECURITY_JOBS
-        | _ADVISORY_BY_PLACEMENT_SECURITY_JOBS
-        | _PENDING_PROMOTION_SECURITY_JOBS
-    )
+    classified = _ALL_GRADED_SECURITY_JOBS
     print(f"[security-posture] classified {len(classified)} of {len(actual)} jobs in {_SECURITY}")
     assert actual == classified, (
         f"security.yml jobs are not all classified.\n"
         f"  unclassified (add to _BLOCKING_SECURITY_JOBS, _ADVISORY_SECURITY_JOBS, "
-        f"_ADVISORY_BY_PLACEMENT_SECURITY_JOBS or _PENDING_PROMOTION_SECURITY_JOBS): "
+        f"_ADVISORY_BY_PLACEMENT_SECURITY_JOBS, _SUPERSEDED_SECURITY_JOBS or "
+        f"_PENDING_PROMOTION_SECURITY_JOBS): "
         f"{sorted(actual - classified)}\n"
         f"  named here but gone from the workflow: {sorted(classified - actual)}"
+    )
+
+
+def test_no_job_is_in_two_posture_buckets() -> None:
+    """The buckets make OPPOSITE assertions, so an overlap is a contradiction, not a duplicate.
+
+    `test_every_security_job_is_classified` compares a UNION against the workflow's jobs, and a union
+    cannot see a name filed twice -- the set equality holds either way. That matters most for the pair
+    this repository actually confused: a job left in `_BLOCKING_SECURITY_JOBS` while also listed as
+    `_SUPERSEDED_SECURITY_JOBS` would be asserted both to be in the required set and not to be, and
+    whichever assertion ran first would decide which of two contradictory claims the suite reported.
+    """
+    buckets = {
+        "_BLOCKING_SECURITY_JOBS": _BLOCKING_SECURITY_JOBS,
+        "_ADVISORY_SECURITY_JOBS": _ADVISORY_SECURITY_JOBS,
+        "_ADVISORY_BY_PLACEMENT_SECURITY_JOBS": _ADVISORY_BY_PLACEMENT_SECURITY_JOBS,
+        "_SUPERSEDED_SECURITY_JOBS": _SUPERSEDED_SECURITY_JOBS,
+        "_PENDING_PROMOTION_SECURITY_JOBS": _PENDING_PROMOTION_SECURITY_JOBS,
+    }
+    overlaps = [
+        f"{job!r} is in both {a} and {b}"
+        for i, (a, first) in enumerate(buckets.items())
+        for b, second in list(buckets.items())[i + 1 :]
+        for job in sorted(first & second)
+    ]
+    assert not overlaps, (
+        "a security.yml job is filed under two postures, which assert contradictory things about it:\n  "
+        + "\n  ".join(overlaps)
+    )
+
+
+def test_superseded_jobs_are_not_required() -> None:
+    """The whole claim of the bucket. A superseded job that is still required is misfiled, not retired.
+
+    This is the arm that would have caught the 2026-09-16 drift from the other side: while the seven
+    sat in `_BLOCKING_SECURITY_JOBS` and protection still named them, nothing here was wrong. The
+    moment the register drops them, being listed as blocking becomes false -- and if a future
+    protection edit puts one back, this test reddens rather than the repository quietly running a
+    required gate that this module grades as retired.
+    """
+    required = set(required_contexts())
+    jobs = jobs_of(_SECURITY)
+    still_required = sorted(
+        context_of(k, jobs[k])
+        for k in _SUPERSEDED_SECURITY_JOBS
+        if context_of(k, jobs[k]) in required
+    )
+    assert not still_required, (
+        f"{still_required} is classified SUPERSEDED but is still in .github/required-contexts.txt. "
+        "Either branch protection took the context back -- in which case move the job key to "
+        "_BLOCKING_SECURITY_JOBS, which is what subjects it to the rules for required gates -- or the "
+        "register is wrong. Do not leave it in both lists."
+    )
+
+
+def test_superseded_jobs_carry_no_continue_on_error() -> None:
+    """Off the merge path is NOT findings discarded -- the same rule the by-placement bucket carries.
+
+    A superseded scan is the early warning for its own replacement: the composite runs a byte-identical
+    copy, so a finding the original reports is a finding the required composite will report too. Neuter
+    the original and that warning goes silent while the job still shows a green tick.
+    """
+    jobs = jobs_of(_SECURITY)
+    for key in sorted(_SUPERSEDED_SECURITY_JOBS):
+        job = jobs[key]
+        assert job.get("continue-on-error") in (None, False), (
+            f"security.yml job {key!r} is superseded but must still go red on a finding; it now "
+            "declares continue-on-error, which discards them. It is already outside branch protection, "
+            "so there is nothing continue-on-error can protect here -- delete the job instead "
+            "(consolidation step 3)."
+        )
+        for step in job.get("steps") or []:
+            name = (step or {}).get("name") or (step or {}).get("uses") or "<unnamed step>"
+            assert (step or {}).get("continue-on-error") in (None, False), (
+                f"security.yml job {key!r}, step {name!r} declares continue-on-error"
+            )
+
+
+def test_every_superseded_job_is_consolidated_by_a_required_composite() -> None:
+    """ "Superseded" names a REPLACEMENT, and this is the assertion that it exists and still gates.
+
+    Without it the bucket is a place to park a job whose context somebody dropped, and the seven scans
+    would leave the merge path with nothing recording that anything took them over. The mapping is
+    read from tests/test_security_composite_parity.py, which is also what asserts the copied bodies are
+    byte-identical -- so the claim "the same scan still gates" rests on one mapping, not two.
+    """
+    from tests.test_security_composite_parity import _COMPOSITES
+
+    required = set(required_contexts())
+    jobs = jobs_of(_SECURITY)
+    consolidated_by = {
+        original: composite
+        for composite, originals in _COMPOSITES.items()
+        for original in originals
+    }
+    orphans: list[str] = []
+    for key in sorted(_SUPERSEDED_SECURITY_JOBS):
+        composite = consolidated_by.get(key)
+        if composite is None:
+            orphans.append(f"{key!r} is consolidated by no composite in _COMPOSITES")
+        elif composite not in jobs:
+            orphans.append(
+                f"{key!r} names composite {composite!r}, which is not a job in {_SECURITY}"
+            )
+        elif context_of(composite, jobs[composite]) not in required:
+            orphans.append(
+                f"{key!r} is superseded by {composite!r}, whose context is NOT required -- the scan "
+                "left the merge path and nothing replaced it"
+            )
+    assert not orphans, (
+        "a superseded security.yml job has no required composite carrying its scan:\n  "
+        + "\n  ".join(orphans)
+        + "\nA scan that stopped gating and was not taken over is coverage lost, not consolidated."
     )
 
 
@@ -374,15 +545,22 @@ def test_required_jobs_carry_no_continue_on_error() -> None:
     # change in the collapse — a matrix split, or a context that quietly stops resolving — forces a
     # look here instead of passing on a self-consistent count.
     #
-    # 15/13 since 2026-09-15, when the owner added `security.yml`'s two composite roll-ups to branch
-    # protection (consolidation step 2, docs/CI.md) -- two new contexts backed by two new distinct
-    # jobs. It was 13/11 from 2026-09-04, when the owner retired the review requirement and
-    # `a reviewer has read this` came off branch protection; 14/12 from 2026-08-31 (BACKLOG #1404),
-    # when that context was armed; and 13/11 before that. One collapse throughout: ci.yml's `test`
-    # matrix reports 3 contexts from 1 job, so 15 - 2 = 13.
+    # 8/6 since 2026-09-16, when the owner removed the seven original `security.yml` scan contexts from
+    # branch protection (consolidation step 4, taken BEFORE step 3; docs/CI.md). It was 15/13 from
+    # 2026-09-15, when the owner added the two composite roll-ups (step 2); 13/11 from 2026-09-04, when
+    # the owner retired the review requirement and `a reviewer has read this` came off branch
+    # protection; 14/12 from 2026-08-31 (BACKLOG #1404), when that context was armed; and 13/11 before
+    # that. One collapse throughout: ci.yml's `test` matrix reports 3 contexts from 1 job, so 8 - 2 = 6.
     #
-    # THE COUNT WILL DROP TO 8/6 AT CONSOLIDATION STEP 3, when the seven original scan jobs are
-    # deleted and their contexts come off protection. Expect to edit this line then; it is not drift.
+    # 8/6 IS THE FIGURE THE PREVIOUS COMMENT PREDICTED, and it arrived by the other half of the change.
+    # That comment read "THE COUNT WILL DROP TO 8/6 AT CONSOLIDATION STEP 3, when the seven original
+    # scan jobs are deleted and their contexts come off protection" -- it assumed the deletion and the
+    # protection edit would land together. Only the protection edit landed. The count is the same
+    # either way, because a deleted job and a job whose context is no longer required are both absent
+    # from `_required_jobs()`; but the seven jobs are still in the workflow, still running, and still
+    # graded by this module under `_SUPERSEDED_SECURITY_JOBS`. A predicted number arriving for an
+    # unpredicted reason is worth the note: the pin cannot tell those two states apart, and the
+    # classification is what does.
     #
     # THIS MODULE READS THE CANONICAL FILE, NOT THE SERVER, so a context that reaches protection and
     # not the file is not examined here. That file's own header states the ordering rule -- protection
@@ -402,8 +580,8 @@ def test_required_jobs_carry_no_continue_on_error() -> None:
         f"[security-posture] examined {examined} distinct jobs backing "
         f"{len(required_contexts())} required contexts"
     )
-    assert examined == 13, (
-        f"expected the {len(required_contexts())} required contexts to resolve to 13 distinct jobs "
+    assert examined == 6, (
+        f"expected the {len(required_contexts())} required contexts to resolve to 6 distinct jobs "
         f"(the 3 `test` legs share one matrix job); got {examined}. If the workflow layout genuinely "
         "changed, update this count."
     )
@@ -494,23 +672,42 @@ def test_required_jobs_declare_no_skippable_job_level_if() -> None:
 # accurate about the triggers", it is "the header must not describe them at all" -- an accurate second
 # definition is still a second definition, and it is free to go stale the next time the first one
 # moves. This exact arm moving twice is the argument, not a counterexample to it.
-_HEADER_DENIAL = re.compile(r"\bno\s+(pull_request|push|schedule|cron|workflow_dispatch)\b", re.I)
+#: `merge_group` was missing from this list until the required-set tripwire below was built, and it
+#: is the arm with the worst consequence: security.yml's `on:` block marks it DO NOT REMOVE, because
+#: a required context whose workflow lacks it never reports on a queue entry and NOTHING merges. A
+#: header paragraph denying that arm was the one shape this detector could not see.
+_HEADER_DENIAL = re.compile(
+    r"\bno\s+(pull_request|push|schedule|cron|workflow_dispatch|merge_group)\b", re.I
+)
+
+#: POSITIVE CONTROLS. The first is the verbatim historical claim. The second is CONSTRUCTED, not
+#: historical, and is labelled so rather than being passed off as a second sighting: it exercises the
+#: line-wrap path that `_prose` added to this detector, which the one-line historical control cannot
+#: reach. Without it, reverting `_prose` to a no-op would leave this test passing its control while
+#: silently losing the coverage that change exists for.
 _HISTORICAL_DENIAL = "# NO push-to-main trigger (dropped for CI cost): every push to main is an"
+_CONSTRUCTED_WRAPPED_DENIAL = "# this workflow declares no\n# merge_group trigger at all"
 
 
-def _header_block(text: str) -> str:
-    """Every line of the workflow before the `on:` key -- the header comment block.
+def _block_above(text: str, key: str) -> str:
+    """Every line of ``text`` above the first line that is exactly ``key`` at column 0.
 
-    Located by CONSTRUCT (the first line that is exactly `on:` at column 0), never by line number:
-    this header has been edited repeatedly and any anchor into it would be stale within a release.
+    Located by CONSTRUCT, never by line number: security.yml's comment blocks are edited repeatedly
+    and any anchor into them would be stale within a release. One helper rather than one per key, so
+    a later fix to the locator cannot be made to one caller and missed on the other.
     """
     lines = text.splitlines()
     for i, line in enumerate(lines):
-        if line.rstrip() == "on:":
+        if line.rstrip() == key:
             return "\n".join(lines[:i])
     raise AssertionError(
-        "security.yml has no `on:` key at column 0 -- the header cannot be located"
+        f"no `{key}` line at column 0 in the workflow passed -- that block cannot be located"
     )
+
+
+def _header_block(text: str) -> str:
+    """Every line of the workflow before the `on:` key -- the header comment block."""
+    return _block_above(text, "on:")
 
 
 def _declared_events(name: str) -> set[str]:
@@ -558,18 +755,220 @@ def test_the_security_header_does_not_contradict_its_own_triggers() -> None:
 
     # LIVE POSITIVE CONTROL: the detector must still fire on the text this test was written for. An
     # absence claim below is evidence only because this line proves the instrument is not blind.
-    assert _HEADER_DENIAL.search(_HISTORICAL_DENIAL), (
-        "the header-denial detector no longer matches the historical claim it was built for, so its "
-        "silence on the current header proves nothing. Fix the pattern, not this assertion."
-    )
+    for control in (_HISTORICAL_DENIAL, _CONSTRUCTED_WRAPPED_DENIAL):
+        assert _HEADER_DENIAL.search(_prose(control)), (
+            "the header-denial detector no longer matches a claim it was built for, so its silence "
+            f"on the current header proves nothing. Fix the pattern, not this assertion:\n{control}"
+        )
 
-    found = _HEADER_DENIAL.search(header)
+    # `_prose` rather than the raw header, added with the required-set tripwire below and for the
+    # blind spot measured there: a denial wrapped across two comment lines ("there is" / "# no push
+    # trigger") is one sentence to a reader and unmatchable to a line-anchored pattern. The shape
+    # this detector exists for can wrap exactly like the one that did.
+    found = _HEADER_DENIAL.search(_prose(header))
     assert found is None, (
         f"security.yml's header denies the {found.group(1)!r} trigger its own `on:` block declares "
         f"(events: {sorted(events)}). Two descriptions of the trigger set, free to disagree -- and "
         "the header is where the continue-on-error trap is documented, so a paragraph a reader can "
         "check and find false costs the whole block its credibility. DELETE the header claim; do not "
         "soften it. The `on:` block is the single definition."
+    )
+
+
+# --- the preamble must not become a second definition of the REQUIRED SET (BACKLOG #1705) ---------
+#
+# Same defect as the trigger tripwire above, one field over. The required set is defined once, by
+# branch protection, and mirrored once, in `.github/required-contexts.txt`. `security.yml`'s preamble
+# carried a second copy in two places -- the header said every job here except `sbom` and `trivy`
+# gated a merge, and the timeout-reasoning block said the file owned a numbered share of the required
+# contexts.
+#
+# HOW LONG EACH SURVIVED, because the two numbers say different things and averaging them would lose
+# the sharper one. The MEMBERSHIP claim landed in f4ed79572 (2026-07-29) and died on 2026-09-16: two
+# months. The SIZE claim -- "SEVEN of the thirteen" -- landed in cb309b4e5 (2026-09-09) and was
+# already false on 2026-09-14, when the set went to fifteen: about FIVE DAYS, and it died one
+# protection move earlier than the membership claim did. A claim carrying a number rots faster than
+# one carrying a rule, which is the argument for refusing the shape rather than correcting it.
+#
+# WHAT MAKES THIS WORTH A TRIPWIRE RATHER THAN A CORRECTION IS HOW THEY DIED: with no edit to this
+# workflow at all. Branch protection moved and every word in the preamble stayed as it was, so
+# nothing in the file's own history marks the day either went false. A guard whose trigger is
+# somebody editing the claim cannot see that; refusing the SHAPE can, because the shape is what a
+# future editor would reach for.
+#
+# WHY IT IS NOT A CORRECTED ENUMERATION. A right answer here is still a second definition, free to go
+# stale the next time the first one moves -- the argument `test_the_security_header_does_not_
+# contradict_its_own_triggers` makes about an accurate trigger paragraph, unchanged. The required set
+# has moved repeatedly, so this is the field where that argument is strongest.
+#
+# SCOPE, STATED PLAINLY: the PREAMBLE only -- everything above the `jobs:` key. Job bodies below it
+# say "this is a REQUIRED context" in several places and are not in scope here: they are per-job
+# rather than an enumeration, and MOST of them sit in a scan body that
+# `tests/test_security_composite_parity.py` holds byte-identical between an original job and its
+# composite copy, where the claim is TRUE. That is "most", not "every" -- parity compares `run:`
+# strings, so a job-level comment above `steps:` is held by nothing, and the change that added this
+# guard found SEVEN such comments labelled "BLOCKING" on jobs that gate nothing and relabelled them
+# HARD-FAILING. Consolidation step 3 deletes the originals and takes the copies with them. Like the
+# trigger tripwire, this catches known shapes and is not a proof of consistency about English.
+_NUMBER_WORD = (
+    r"\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|"
+    r"fifteen|sixteen|seventeen|eighteen|nineteen|twenty"
+)
+_GRADED_JOB_NAMES = "|".join(re.escape(job) for job in sorted(_ALL_GRADED_SECURITY_JOBS))
+_PREAMBLE_REQUIRED_SET_CLAIM = re.compile(
+    # "Every job here except `sbom` and `trivy` is a REQUIRED context" -- a membership enumeration.
+    # `[^.]` cannot cross a sentence boundary, and `_prose` below makes a paragraph break one too, so
+    # the window cannot wander out of the sentence that was actually written.
+    r"\b(?:every|each|all)\s+(?:of\s+the\s+)?jobs?\b[^.]{0,120}?\brequired\s+(?:status\s+)?"
+    r"(?:contexts?|checks?)\b"
+    # "SEVEN of the thirteen required contexts", "two of the jobs here are required status checks",
+    # "the seven required jobs here" -- a size claim. The gap after `of` is a bounded run rather than
+    # one word: "two OF THE JOBS IN THIS FILE ARE required status checks" is the same claim.
+    rf"|\b(?:{_NUMBER_WORD})\s+(?:of\s+[^.]{{0,40}}?)?required\s+(?:status\s+)?"
+    r"(?:contexts?|checks?|jobs?)\b"
+    # "bandit, semgrep and gitleaks are required contexts", and the same claim written the other way
+    # round -- enumeration by NAMING, which is the form an editor told "do not write a corrected
+    # enumeration" reaches for next. BOTH directions, because only testing one is how a detector
+    # comes to cover the phrasing its author happened to imagine. Built from the posture buckets
+    # rather than a literal list, so a job added to this workflow is covered the day it is classified
+    # instead of the day somebody remembers this pattern.
+    rf"|\b(?:{_GRADED_JOB_NAMES})\b[^.]{{0,80}}?"
+    r"\brequired\s+(?:status\s+)?(?:contexts?|checks?)\b"
+    rf"|\brequired\s+(?:status\s+)?(?:contexts?|checks?)\b[^.]{{0,80}}?\b(?:{_GRADED_JOB_NAMES})\b",
+    re.IGNORECASE,
+)
+
+#: LIVE POSITIVE CONTROLS, verbatim from the text this guard was built against, comment markers and
+#: line wraps included -- a claim wrapped across two comment lines is the shape that actually
+#: occurred, so the detector has to be proved able to cross one. The retired wording lives HERE
+#: rather than being quoted back in the workflow, because quoting it there would trip the guard.
+_HISTORICAL_REQUIRED_SET_CLAIMS = (
+    "#   READ THAT LAST SENTENCE AS A TRAP, not a procedure. Every job here except `sbom` and "
+    "`trivy` is a\n#   REQUIRED context, and GitHub reports a continue-on-error job as SUCCESS",
+    "# WORST CASE: it owns SEVEN of the thirteen required contexts, so a hang here does not merely",
+    "# these are roughly 3x the observed steady state, rounded up, with a floor of 10 minutes -- the "
+    "seven\n# required jobs here run 7 to 79 SECONDS each",
+)
+
+
+def _preamble_block(text: str) -> str:
+    """Every line of the workflow above the `jobs:` key.
+
+    Wider than ``_header_block`` on purpose -- the second stale enumeration sat in the
+    timeout-reasoning block, which is below `on:` and above `jobs:`.
+    """
+    return _block_above(text, "jobs:")
+
+
+def _prose(text: str) -> str:
+    """Comment text as flat prose: `#` markers dropped, non-comment lines and blank comment lines
+    turned into sentence boundaries, runs of whitespace collapsed.
+
+    TWO FAILURES THIS EXISTS FOR, and they pull opposite ways. A claim wrapped across two comment
+    lines reads as one sentence to a human and as ``...the seven\\n# required jobs...`` to a regex,
+    so a line-anchored detector misses the very text it was written for -- measured here, on the
+    third positive control above, before this helper existed. Flattening fixes that and creates the
+    opposite hazard: with every newline gone, a bounded window can splice two unrelated paragraphs
+    (or a paragraph and the YAML beneath it) into a sentence nobody wrote, and the failure message
+    then quotes the author text they did not write. So a blank comment line and any non-comment line
+    become a ``.``, which every pattern above already treats as a hard stop.
+
+    THAT BOUNDS PARAGRAPH AND YAML SPLICES, NOT EVERY SPLICE. Two adjacent non-blank comment lines
+    are joined, which is the whole point for a wrapped sentence and means adjacent list items are
+    joined too. Claimed narrowly on purpose: the guard is a known-shape tripwire, and a docstring
+    promising more than the code does is the defect this module keeps finding elsewhere.
+    """
+    out: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("#"):
+            out.append(".")  # YAML, not prose -- a boundary, never spliced into a sentence.
+            continue
+        body = re.sub(r"^\s*#\s?", "", line)
+        out.append(body if body.strip() else ".")
+    return re.sub(r"\s+", " ", " ".join(out))
+
+
+#: No trailing `\b`: this repository routinely writes `2026-09-16T18:45Z`, and requiring a word
+#: boundary after the day would read that as undated and red a record carrying the very date the
+#: failure message asks for.
+_DATE = re.compile(r"\b20\d\d-\d\d-\d\d")
+
+
+def _undated_required_set_claims(prose: str) -> list[str]:
+    """Required-set claims in ``prose`` whose own sentence carries no date.
+
+    A DATED CLAIM IS ALLOWED, AND THAT IS THE RULE RATHER THAN A HOLE GRUDGINGLY LEFT IN ONE. The
+    defect this guard exists for is a claim that went false with nothing marking the day -- the
+    reader of a stale sentence had no way to know it had expired. A date is exactly what supplies
+    that, so "on 2026-07-30 ten required contexts sat on disabled workflows" is a record and must not
+    red this gate; a repository whose house style is dated history would work around a guard that
+    refused them, which is worse than the guard not existing.
+
+    THE COST IS NAMED RATHER THAN HIDDEN: "as of <date>, this file owns two of the eight required
+    contexts" passes. It is still a second definition and it will still go stale. It will go stale
+    VISIBLY, carrying the date it was true, which is the property the undated ones lacked. That is
+    the whole of the trade.
+
+    THE WINDOW IS THE PARAGRAPH, NOT THE SENTENCE, and that is a correction rather than a
+    convenience. A period is not a sentence boundary in this prose: `.github/required-contexts.txt`
+    carries two of them, and the FIRST version of this helper split on any period -- so a record
+    reading "the owner moved protection on <date>; `.github/required-contexts.txt` then recorded
+    seven required contexts" had its date cut off behind `contexts.txt` and was flagged as undated.
+    That put this rule in direct collision with the pointer assertion below, which requires that
+    filename in the same preamble. ``_prose`` emits paragraph and YAML breaks as a standalone ``.``
+    token, which a filename's dots never are, so those are what bound the window.
+    """
+    paragraph_break = re.compile(r"(?:^|(?<= ))\.(?:$|(?= ))")
+    bounds = [0, *(m.end() for m in paragraph_break.finditer(prose)), len(prose)]
+    found: list[str] = []
+    for match in _PREAMBLE_REQUIRED_SET_CLAIM.finditer(prose):
+        start = max(b for b in bounds if b <= match.start())
+        end = min(b for b in bounds if b >= match.end())
+        if not _DATE.search(prose[start:end]):
+            found.append(match.group(0))
+    return found
+
+
+def test_the_security_preamble_does_not_restate_the_required_set() -> None:
+    """The preamble must name no required-set membership and no required-set size.
+
+    Non-vacuous two ways: the preamble is located by construct and asserted substantial, and every
+    historical claim is fired at the detector in the same run, so the absence claim below is evidence
+    rather than a silence.
+
+    THE POINTER ASSERTION IS A FLOOR AND IS SAID SO RATHER THAN OVERSOLD. It fails only if the
+    preamble stops naming ``.github/required-contexts.txt`` ANYWHERE, and other paragraphs name that
+    file for their own reasons -- so it would not catch someone deleting just the paragraph that
+    answers "which of these jobs gates a merge". It is kept because the failure it does catch is real
+    and cheap to hold; what it is not is a proof that the reader is still sent somewhere.
+    """
+    preamble = _preamble_block((WORKFLOWS / _SECURITY).read_text(encoding="utf-8"))
+    assert len(preamble.splitlines()) > 20, (
+        f"security.yml's preamble came back as {len(preamble.splitlines())} lines. That is a locator "
+        "failure, not a short preamble -- this assertion would otherwise pass over nothing."
+    )
+
+    for control in _HISTORICAL_REQUIRED_SET_CLAIMS:
+        assert _undated_required_set_claims(_prose(control)), (
+            "the required-set detector no longer matches a claim it was built for, so its silence on "
+            f"the current preamble proves nothing. Fix the pattern, not this assertion:\n{control}"
+        )
+
+    found = _undated_required_set_claims(_prose(preamble))
+    assert not found, (
+        f"security.yml's preamble states required-set membership or size again: {found}. "
+        "Branch protection defines that set and .github/required-contexts.txt mirrors it; a copy "
+        "here is a second definition that goes stale when the first one moves, with no edit to this "
+        "file to mark the day (BACKLOG #1705). POINT AT THE CANONICAL FILE; do not write a corrected "
+        "enumeration and do not write a count. If this is a dated historical record rather than a "
+        "live claim, say the date in the same sentence -- that is what distinguishes the two."
+    )
+
+    assert "required-contexts.txt" in preamble, (
+        "security.yml's preamble no longer points at .github/required-contexts.txt. Removing the "
+        "stale enumeration is only half the fix -- a reader asking which of these jobs gates a merge "
+        "still needs to be sent to the file that answers it."
     )
 
 
