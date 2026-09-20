@@ -114,13 +114,20 @@ def _normalise(part: str) -> str:
     to stop. Measured: all four of ``CLAUDE.md ``, ``CLAUDE.md.``, ``.claude./x`` and ``.claude /x``
     passed the first version of this rule.
 
-    CASEFOLD, NOT ``lower()``. The two differ, and ``lower()`` is the weaker: ``agentſ.md``
-    (U+017F LATIN SMALL LETTER LONG S) casefolds to exactly ``agents.md`` and lowercases to itself,
+    CASEFOLD, NOT ``lower()``. The two differ, and ``lower()`` is the weaker: a filename spelling
+    ``agents.md`` with U+017F (LATIN SMALL LETTER LONG S) in place of the ``s`` casefolds to exactly
+    ``agents.md`` and lowercases to itself,
     so it passed while the module docstring and this project's own test name both said "case-folded".
     That mismatch between prose and code is the defect; the prose was right.
 
+    BOTH CHARACTERS ABOVE ARE NAMED BY CODE POINT RATHER THAN WRITTEN, and that is a rule here
+    rather than a preference: tests/test_cp1252_console_safety.py refuses any non-cp1252 character
+    in a file under ``scripts/`` that does not reconfigure ``sys.stdout``, because printing one
+    aborts a stock Windows console with UnicodeEncodeError. This docstring cost that gate a red
+    when the characters were written literally. Do not helpfully restore them.
+
     This is NOT a claim to normalise away every equivalent spelling. A homoglyph (Cyrillic
-    ``а`` for ``a``) still passes, and no case-insensitive matcher catches one -- the scope
+    U+0430 for the Latin ``a``) still passes, and no case-insensitive matcher catches one -- the scope
     paragraph in the module docstring says so, and it stays true.
     """
     return part.rstrip(". ").casefold()
