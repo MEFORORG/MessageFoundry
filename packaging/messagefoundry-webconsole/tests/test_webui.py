@@ -2292,6 +2292,54 @@ async def test_purge_action_registered_in_stepup_allowlist(engine: Engine) -> No
     assert not is_safe_ui_action("/ui/connections/OB_X/purge/all?x=1")  # query rejected
 
 
+async def test_purge_stale_stepup_redirects_to_reauth(engine: Engine) -> None:
+    """A stale step-up window must stop the single-connection purge before it reaches the handler.
+
+    BACKLOG #1700. ``require_ui_step_up``'s own docstring names THREE checks it re-applies: MFA
+    satisfied, a recent password step-up, and new-client-IP contextual risk. This drives the SECOND.
+    The MFA leg is driven by ``test_ui_mfa_denial_audit.py`` (the purge is a row on its factory-shape
+    table); the new-IP leg is driven nowhere, and saying so is the point of counting them here.
+
+    The twin of ``test_purge_after_login_stepup_reaches_handler``: that one proves the gate LETS a
+    stepped-up operator through, which stays true with the gate deleted, so it can only ever fail
+    open. This is the arm that fails closed.
+
+    RED when the route's gate is SWAPPED for one without the freshness check -- measured with plain
+    ``require_ui``, which reaches ``purge_connection`` and 404s on the unknown outbound. Stated as a
+    swap rather than a deletion because deleting the ``Depends`` also deletes the ``identity`` the
+    handler passes on, so the route would fail to build and prove nothing.
+
+    ``require_mfa=False`` is a control, not a convenience: it makes ``mfa_satisfied`` True so the MFA
+    leg cannot be what redirects. The third leg is inert only because ``admin_new_ip_step_up``
+    defaults False -- if that default is ever flipped, as ``require_mfa`` itself was under BACKLOG
+    #187, this test keeps passing on the new-IP leg and stops measuring the window. The two asserts
+    below pin the split that is pinnable today.
+    """
+    # -1, not 0: has_recent_step_up compares `elapsed <= max_age`, so 0 needs elapsed to be strictly
+    # positive and a backwards clock step would flip it. -1 is unconditionally stale, and is what the
+    # sibling stale-window tests in this file already use.
+    service = AuthService(engine.store, AuthSettings(require_mfa=False, step_up_max_age_seconds=-1))
+    await service.initialize()
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")  # negative window -> the fresh login is already stale
+        tok = c.cookies.get("mf_session")
+        assert tok is not None
+        assert await service.mfa_satisfied(tok) is True  # the MFA leg is NOT what refuses here
+        assert await service.has_recent_step_up(tok) is False  # the stale window is
+        r = await c.post(
+            "/ui/connections/OB_X/purge/all", headers={"Sec-Fetch-Site": "same-origin"}
+        )
+        # The LOCATION is the assertion that carries the property: a SUCCESSFUL purge also answers
+        # 303 (RedirectResponse("/ui")), so the status alone would not say the gate refused. The
+        # exact continuation, not just the /ui/reauth prefix: the purge is registered auto_retry, so
+        # the operator must land back on the action they clicked, not on a bare re-auth page.
+        assert r.headers.get("location") == "/ui/reauth?next=/ui/connections/OB_X/purge/all", (
+            "a stale step-up was not sent to re-auth carrying the purge it interrupted"
+        )
+        assert r.status_code == 303
+
+
 def test_connections_fragment_renders_selection_checkbox() -> None:
     from messagefoundry.api.models import ConnectionRow
     from messagefoundry_webconsole.pages import connections_fragment
