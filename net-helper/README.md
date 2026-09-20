@@ -75,6 +75,43 @@ command, then checks that the binary requires administrator and loads no DLL fro
 
 These steps are what a Windows administrator would do once the engine calls the helper.
 
+### A script does the per-node steps
+
+[`scripts/service/install-net-helper.ps1`](../scripts/service/install-net-helper.ps1) runs the per-node
+steps below, and [`uninstall-net-helper.ps1`](../scripts/service/uninstall-net-helper.ps1) takes the
+registration back off. Run both from an elevated PowerShell.
+
+```powershell
+.\install-net-helper.ps1 -HelperSource ..\..\net-helper\out -NssmPath C:\tools\nssm.exe
+```
+
+It does three things the manual steps leave to you.
+
+- **It writes `address`, `interface` and `mask` from the engine's own `[cluster.vip]`**, read with
+  `messagefoundry cluster-vip --json`. Typing them a second time is how the two drift, and the helper
+  refuses a request that does not match its file exactly.
+- **It writes `client_account` as a SID**, resolved from the engine service's run-as account. A SID
+  survives a rename, and it skips the name translation that fails outright on a LocalSystem engine.
+- **It reads `-InstallDir`'s owner and its access list** and refuses to install when anyone outside
+  SYSTEM, Administrators, TrustedInstaller, CREATOR OWNER and OWNER RIGHTS can write there or owns
+  it. That is what it checks, and it is narrower than
+  [Keep the helper's files where only administrators can write](#keep-the-helpers-files-where-only-administrators-can-write)
+  asks of you: it says nothing about the files already in the folder, or about the parent it
+  inherits from. Pass `-AllowBroadAcl` to install anyway.
+
+It does not download NSSM. The pinned archive and its SHA-256 live in `install-service.ps1`, and a
+second copy of that pin would be a second thing to keep current, so steps 1 to 4 of
+[Prepare the files once](#prepare-the-files-once-on-any-machine) are still yours to run. Skip that
+section's steps 5 and 6: the script writes its own `mefor-net-helper.conf` into `-InstallDir` from
+the engine, and never reads the one you would copy from the example.
+
+The uninstaller **does not release the address by default**. On the node holding the VIP, releasing it
+during an uninstall drops a live address and nothing takes it over, because the helper that would have
+re-bound it elsewhere is what you are removing. Pass `-ReleaseAddress` to release it; without it, the
+script reports the address as still bound and prints the command.
+
+The steps below are the record of what the script does, and what to do when it cannot run.
+
 ### `pip install messagefoundry` does not install the helper
 
 The helper would ship as its own release artifact, beside the engine's wheel. An administrator would

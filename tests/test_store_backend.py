@@ -15,7 +15,7 @@ from messagefoundry.store import MessageStore, Store, open_store, sqlite_setting
 
 async def test_open_store_sqlite_returns_working_store(tmp_path: Path) -> None:
     store = await open_store(
-        StoreSettings(path=str(tmp_path / "s.db"), synchronous=SqliteSync.FULL)
+        StoreSettings(path=str(tmp_path / "s.db"), synchronous=SqliteSync.FULL), create=True
     )
     try:
         assert isinstance(store, Store)  # runtime_checkable protocol

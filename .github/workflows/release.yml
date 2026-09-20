@@ -119,6 +119,9 @@ jobs:
           ls -l dist/
 
       - name: Leak gate — sdist MUST be package-only (private-doc/PHI publish guard)
+        # Referenced by the artifact-upload step's `if:` below — a rejection there must not be
+        # handed out as a downloadable workflow artifact. Keep the id if you rename the step.
+        id: leak-gate
         run: |
           # WITHOUT [tool.hatch.build.targets.sdist].only-include, hatchling sweeps the whole repo into
           # the sdist and this workflow uploads it to PUBLIC PyPI — which leaked docs/security/* and other
@@ -256,11 +259,45 @@ jobs:
           # Print the COUNT, not just a word: a green log line has to show the gate inspected something.
           echo "sdist is package-only: inspected $count members in $sd, none outside the allowlist"
 
+      # PAIRED WITH THE ALLOWLIST ABOVE, and it asks the other question (BACKLOG #1832). The gate
+      # above asks WHERE a member sits; its allowlist is a path regex. It cannot ask WHAT KIND of file
+      # something is, which is why `messagefoundry/CLAUDE.md` — this project's instructions to its own
+      # coding agents — matched the `messagefoundry/` branch and shipped to PyPI on every release from
+      # 0.1.0 to 0.2.15. Widening the regex would not have helped: the next internal note inside the
+      # package tree passes a location test identically. So the pair is allowlist-by-location plus
+      # DENYLIST-by-name, and the denylist is also what reaches the WHEEL — the step above reads
+      # `dist/*.tar.gz` only, so the engine wheel had no member gate at all.
+      #
+      # The rule lives in the script, not here, so the console and harness jobs share one copy instead
+      # of carrying two bash transcriptions that drift. Stdlib only, and it runs before the wheel smoke
+      # for the obvious reason: nothing downstream should touch an archive that is about to be refused.
+      - name: Member gate — no distribution may ship a maintainer-internal file (sdist AND wheel)
+        run: python scripts/release/forbidden_members.py 'dist/*.tar.gz' 'dist/*.whl'
+
       - name: Smoke-check the built wheel (clean venv → import + version)
         run: |
           python -m venv /tmp/relsmoke
           /tmp/relsmoke/bin/pip install --quiet dist/*.whl
-          built=$(/tmp/relsmoke/bin/python -c "import messagefoundry; print(messagefoundry.__version__)")
+          # `-I` IS THE CHECK, not decoration. The interpreter was already the clean venv, which reads
+          # as sufficient and is not: for `python -c` sys.path[0] is the empty string — the CURRENT
+          # WORKING DIRECTORY — and this job's cwd is the checkout, so `import messagefoundry`
+          # resolved to the checkout's SOURCE TREE rather than to the wheel just installed. A wheel
+          # missing the package entirely still printed a version and exited 0, so the one step whose
+          # whole job is to prove the artifact imports could not fail. Measured both ways (a planted
+          # source tree, flags on and off) in tests/test_release_pipeline.py.
+          # `-I` over `-P`: -P drops only the cwd and leaves PYTHONPATH and the user site-packages as
+          # two more routes back onto sys.path; -I is -P plus -E plus -s, so one flag closes all three
+          # and this step needs none of them. A `cd` out of the checkout would work too, but this same
+          # step later reads constraints.lock and dist/*.whl by RELATIVE path, so it would need a
+          # subshell and would break quietly on a later edit.
+          built=$(/tmp/relsmoke/bin/python -I -c "import messagefoundry; print(messagefoundry.__version__)")
+          # An empty read is the same false green one layer down: the import succeeded and told us
+          # nothing. The tag guard below would catch it (Version("") is unparseable), but the
+          # workflow_dispatch dry-run — the arm that exists to validate this path BEFORE a tag — would
+          # not, so fail here where both arms see it.
+          if [ -z "$built" ]; then
+            echo "::error::the wheel smoke read an EMPTY __version__ from the installed wheel, so it proved nothing"; exit 1
+          fi
           echo "built version: $built"
           # On a tag push, the built version MUST equal the tag (single-source check).
           #
@@ -477,7 +514,38 @@ jobs:
           fi
 
       - name: Upload artifacts (dry-run / always)
-        if: always()
+        # `always()` EXCEPT a leak-gate rejection, which is the one failure this step must not carry
+        # past the gate. The gate refuses to PUBLISH an archive holding non-package files; this step
+        # then uploaded the whole of dist/ regardless, so on a packaging regression a deploying
+        # project's rejected sdist WOULD stay downloadable as a workflow artifact to any signed-in
+        # reader of this public repository — the one archive the release declined to ship would be
+        # the one it handed out. Enumerated at the time of writing: this is the ONLY step in this job
+        # that runs after a gate failure (every other later step carries no `if:`, or one that ANDs
+        # with the implicit success(); release-harness is `needs: release` and release-webconsole is
+        # gated on a mutually exclusive ref), so the singular wording is the finding.
+        # Every OTHER failure mode keeps the always() behaviour this step exists for: a build, sign,
+        # SBOM, release or publish failure still uploads whatever dist/ holds.
+        # DELIBERATELY THE WHOLE STEP'S OUTCOME, not just its leak branch. The gate exits non-zero
+        # from several paths and only one of them is "a member is outside the allowlist" — the rest
+        # are "the listing did not succeed / did not cover the file / is not our archive". Narrowing
+        # the exclusion to the leak branch would hand out an archive in exactly the cases where the
+        # gate proved it COULD NOT INSPECT it, which inverts this gate's own founding rule: decide on
+        # evidence of a listing, never on the absence of matches. The cost is that a dry run whose
+        # sdist is merely truncated yields no download; the gate's error names the cause and a
+        # re-dispatch is cheap, so pay it.
+        # `outcome`, not `conclusion` — conclusion is read AFTER continue-on-error, so adding
+        # `continue-on-error` to the gate would silently turn a rejection back into a success here.
+        #
+        # ONE HOLE IS LEFT OPEN ON PURPOSE, AND IT IS NOT CLOSED BY THIS LINE. A run where the gate
+        # NEVER EXECUTED leaves the context empty, and '' != 'failure' is true — so if `build` writes
+        # the sdist and then fails, dist/ uploads with nothing having listed it. That is NOT "an
+        # archive the gate rejected", but it is also not one the gate cleared. `== 'success'` would
+        # close it and would additionally withhold the artifact on a plain build failure, which is
+        # always() behaviour this step is meant to keep. The `!=` form is the narrower change and is
+        # what is built; the trade is recorded here rather than left for someone to rediscover.
+        # tests/test_release_pipeline.py pins the gate itself as unconditional and free of
+        # `continue-on-error`, which are the two ways the skipped-gate case could be made common.
+        if: always() && steps.leak-gate.outcome != 'failure'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: release-artifacts
@@ -547,6 +615,13 @@ jobs:
           # project dir and is pulled in via force-include, so an sdist would not be self-contained.
           python -m build --wheel ./packaging/messagefoundry-webconsole --outdir webconsole-dist
           ls -l webconsole-dist/
+
+      # The same gate the engine job runs, on this job's own output (BACKLOG #1832). This job had NO
+      # member gate before: its only check was a version comparison, so any file the force-include
+      # swept in shipped unexamined. Shares the engine's script rather than re-deriving the denylist,
+      # because two copies of a rule are two rules.
+      - name: Member gate — no distribution may ship a maintainer-internal file
+        run: python scripts/release/forbidden_members.py 'webconsole-dist/*.whl'
 
       - name: Smoke-check the console wheel (version == the console's OWN __version__ == tag)
         run: |
@@ -676,6 +751,14 @@ jobs:
           # wheel suffices. Version is read from messagefoundry/__init__.py (lockstep with the engine).
           python -m build --wheel ./packaging/messagefoundry-harness --outdir harness-dist
           ls -l harness-dist/
+
+      # THE ARTIFACT THAT MOST NEEDS THIS, and the one that had no gate at all (BACKLOG #1832, #1702).
+      # `harness/` is FORCE-INCLUDED from the repo root, and hatchling's `exclude` does not filter a
+      # force-included tree — so unlike the engine sdist, the harness wheel has no build-time defence
+      # to fall back on, and `harness/CLAUDE.md` was inside it by construction. #1702 fixed the build
+      # config; this is the release-time backstop, and for this distribution it is the only one.
+      - name: Member gate — no distribution may ship a maintainer-internal file
+        run: python scripts/release/forbidden_members.py 'harness-dist/*.whl'
 
       - name: Smoke-check the harness wheel (version == engine == tag)
         run: |

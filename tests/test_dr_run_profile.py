@@ -90,15 +90,15 @@ async def test_startup_filters_below_threshold(store: MessageStore, tmp_path: Pa
         # The critical inbound is listening; the normal one is parked (filtered), NOT listening, NOT failed.
         assert runner.inbound_running("in_crit")
         assert not runner.inbound_running("in_norm")
-        assert "in_norm" in runner.filtered_connections()
-        assert runner.connection_filtered("in_norm") is not None
-        assert runner.connection_failed("in_norm") is None  # filtered != failed (AC-4)
-        assert "in_crit" not in runner.filtered_connections()
+        assert "in_norm" in runner.filtered_inbound()
+        assert runner.inbound_filtered("in_norm") is not None
+        assert runner.inbound_failed("in_norm") is None  # filtered != failed (AC-4)
+        assert "in_crit" not in runner.filtered_inbound()
         # The critical outbound built (a live connector); the low one is parked.
-        assert "out_low" in runner.filtered_connections()
-        assert "out_crit" not in runner.filtered_connections()
+        assert "out_low" in runner.filtered_outbound()
+        assert "out_crit" not in runner.filtered_outbound()
         # No connection is recorded as a fault (filtered is a deliberate skip, not a failure).
-        assert runner.degraded_connections() == {}
+        assert not runner.degraded_inbound() and not runner.degraded_outbound()
     finally:
         await runner.stop()
 
@@ -116,7 +116,7 @@ async def test_no_dr_threshold_starts_everything(store: MessageStore, tmp_path: 
     await runner.start()
     try:
         assert runner.inbound_running("in_low")  # a low-priority feed runs normally (no DR profile)
-        assert runner.filtered_connections() == {}
+        assert not runner.filtered_inbound() and not runner.filtered_outbound()
     finally:
         await runner.stop()
 
@@ -163,7 +163,7 @@ async def test_filtered_inbound_drains_backlog(store: MessageStore, tmp_path: Pa
         # The listener is parked (filtered), but the workers run and drain the pre-seeded backlog to the
         # (critical) outbound, finalizing the message — proving the dark feed's residue is not stranded.
         assert not runner.inbound_running("in_norm")
-        assert "in_norm" in runner.filtered_connections()
+        assert "in_norm" in runner.filtered_inbound()
 
         async def _processed() -> bool:
             return bool(
@@ -179,5 +179,48 @@ async def test_filtered_inbound_drains_backlog(store: MessageStore, tmp_path: Pa
             assert elapsed < 10.0, "filtered inbound's backlog did not drain"
         # The delivered file exists too.
         assert (outdir / "MSG1.hl7").exists()
+    finally:
+        await runner.stop()
+
+
+async def test_same_name_inbound_and_outbound_park_independently(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    # The DR park marker is keyed by DIRECTION, for the same reason the ADR 0031 failure marker is: a
+    # name may be both an inbound and an outbound (Registry._add is per-table), and here the two halves
+    # resolve against the threshold INDEPENDENTLY - each reads its own priority - so they can genuinely
+    # disagree. start() builds every outbound before any inbound, so under a bare-name key the
+    # at/above-threshold inbound's clear-the-marker pop ERASED its below-threshold outbound namesake's
+    # park: the parked destination reported no status:"filtered" and no reason, and rows routed to it
+    # queued behind a connector-less lane with nothing saying it was parked on purpose.
+    port = _free_port()
+    reg = Registry()
+    reg.add_inbound(
+        build_inbound_connection("SHARED", MLLP(port=port), router="r", priority=Priority.CRITICAL)
+    )
+    reg.add_outbound(
+        build_outbound_connection(
+            "SHARED",
+            ConnectionSpec(
+                ConnectorType.FILE, {"directory": str(tmp_path), "filename": "{MSH-10}.hl7"}
+            ),
+            priority=Priority.LOW,
+        )
+    )
+    reg.add_router("r", lambda m: [])
+    runner = RegistryRunner(reg, store, poll_interval=0.02, dr_threshold=Priority.CRITICAL)
+    await runner.start()
+    try:
+        # The critical inbound binds; the low outbound is parked, and says so.
+        assert runner.inbound_running("SHARED")
+        assert runner.inbound_filtered("SHARED") is None
+        assert runner.filtered_inbound() == {}
+        reason = runner.outbound_filtered("SHARED")
+        assert reason and "below" in reason
+        assert runner.filtered_outbound() == {"SHARED": reason}
+        # Parked is not failed, in either direction (AC-4).
+        assert not runner.degraded_inbound() and not runner.degraded_outbound()
+        # A parked outbound has no live connector, and the inbound namesake must not make one appear.
+        assert "SHARED" not in runner._destinations
     finally:
         await runner.stop()

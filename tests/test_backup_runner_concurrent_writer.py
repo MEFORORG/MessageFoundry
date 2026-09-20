@@ -27,6 +27,7 @@ from pathlib import Path
 
 import pytest
 
+import messagefoundry.store.store as store_mod
 from messagefoundry.store import MessageStore
 from messagefoundry.store.crypto import make_cipher
 
@@ -113,7 +114,7 @@ def _sqlite_count(db_path: Path, table: str) -> int:
 
 @pytest.mark.parametrize("snapshot_method", ["vacuum_into", "online_backup"])
 async def test_snapshot_serializes_concurrent_writer_and_stays_consistent(
-    tmp_path: Path, snapshot_method: str
+    tmp_path: Path, snapshot_method: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from messagefoundry.store.crypto import generate_key
 
@@ -133,10 +134,30 @@ async def test_snapshot_serializes_concurrent_writer_and_stays_consistent(
         # writer makes essentially NO forward progress DURING the snapshot — at most the single write
         # already in flight when the snapshot grabbed the lock can finish. TRUE for BOTH methods
         # (deterministic from the `async with self._lock` that wraps both branches; not a timing bound).
+        #
+        # MEASURE THE LOCK-HELD REGION, NOT THE WHOLE CALL (BACKLOG #1634, SDS-3.8). `snapshot_to`
+        # releases the lock and THEN restricts the copy's permissions, and since #1634 that
+        # restriction is an `await` — so the writer legitimately resumes before the call returns, and
+        # a count taken after it answers a different question than the one asserted here. The probe
+        # sits on `_secure_file_async` because the coroutine reaches it from the lock release with no
+        # await in between: it records the count AT the boundary, deterministically, before it hands
+        # off to the thread. Reading the count after `snapshot_to` returned measured 32 rows of
+        # perfectly correct post-lock progress as a serialization failure.
+        at_lock_release: list[int] = []
+        real_secure = store_mod._secure_file_async
+
+        async def _probe(path: object, **kw: object) -> None:
+            at_lock_release.append(writer.count)
+            await real_secure(path, **kw)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(store_mod, "_secure_file_async", _probe)
+
         c0 = writer.count
         dest = tmp_path / "snap.db"
         await store.snapshot_to(dest, method=snapshot_method)
-        advanced = writer.count - c0
+        monkeypatch.undo()
+        assert at_lock_release, "snapshot_to no longer restricts the snapshot file"
+        advanced = at_lock_release[0] - c0
         assert advanced <= 1, (
             f"{snapshot_method}: the writer advanced {advanced} rows DURING the snapshot; the store "
             f"write lock should have blocked it for the snapshot's full duration"

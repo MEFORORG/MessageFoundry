@@ -11,6 +11,7 @@ delivered message with its disposition.
 from __future__ import annotations
 
 import socket
+import sys
 import threading
 import time
 from collections.abc import Iterator
@@ -26,6 +27,10 @@ from harness.monitor import MonitorPanel  # noqa: E402
 from messagefoundry.api import create_managed_app  # noqa: E402
 
 ADT = "MSH|^~\\&|APP|FAC|RAPP|RFAC|20260604||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
+
+#: How long the fixture waits for uvicorn to report ``started``. A module constant so the
+#: leak regression below can drive the timeout path in well under a second instead of ten.
+_START_TIMEOUT_SECONDS = 10.0
 
 
 def _free_port() -> int:
@@ -69,12 +74,17 @@ def server(tmp_path: Path) -> Iterator[tuple[str, Path]]:
     uv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
     thread = threading.Thread(target=uv.run, daemon=True)
     thread.start()
-    deadline = time.time() + 10
-    while not uv.started:
-        time.sleep(0.05)
-        if time.time() > deadline:
-            raise RuntimeError("server did not start")
+    # The try opens HERE, immediately after the thread exists, not after the wait succeeds.
+    # The start timeout used to raise from outside it, so the one exit path that fires on a
+    # loaded machine -- the flaky one -- left a live uvicorn thread holding a bound port and an
+    # open handle under `tmp_path` for the rest of the pytest worker's life (BACKLOG #1515).
+    # `test_harness_scenarios.server` already had this right; this is that shape.
     try:
+        deadline = time.time() + _START_TIMEOUT_SECONDS
+        while not uv.started:
+            time.sleep(0.05)
+            if time.time() > deadline:
+                raise RuntimeError("server did not start")
         yield f"http://127.0.0.1:{port}", inbox
     finally:
         uv.should_exit = True
@@ -247,3 +257,47 @@ def _has_message(panel: MonitorPanel, qapp: Any) -> bool:
     panel._messages.refresh()  # user-initiated re-query (GUI thread)
     qapp.processEvents()
     return panel._messages._table.rowCount() > 0
+
+
+# --- BACKLOG #1515: the fixture's own teardown ---------------------------------------------------
+
+
+class _NeverStartingServer:
+    """A uvicorn.Server stand-in whose ``started`` never flips, so the fixture hits its timeout.
+
+    ``run`` blocks until ``should_exit`` is set, which is exactly how the real server's thread
+    behaves -- so if the fixture forgets to set it, the thread stays alive and the assertion below
+    catches the leak rather than a shutdown that happened for some other reason.
+    """
+
+    def __init__(self, config: Any) -> None:
+        self.started = False
+        self.should_exit = False
+
+    def run(self) -> None:
+        while not self.should_exit:
+            time.sleep(0.01)
+
+
+def test_server_fixture_stops_its_thread_when_startup_times_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The timeout path must tear the thread down, not raise past it.
+
+    A leaked uvicorn thread is a daemon: it survives the test, keeps its port bound and keeps a
+    handle open under `tmp_path`, and nothing reports it. The fixture is the thing under test here,
+    so it is driven directly as a generator.
+    """
+    monkeypatch.setattr(uvicorn, "Server", _NeverStartingServer)
+    monkeypatch.setattr(uvicorn, "Config", lambda *a, **k: None)
+    monkeypatch.setattr(sys.modules[__name__], "_START_TIMEOUT_SECONDS", 0.3)
+
+    before = {t.ident for t in threading.enumerate()}
+    gen = server.__wrapped__(tmp_path)  # type: ignore[attr-defined]
+    with pytest.raises(RuntimeError, match="server did not start"):
+        next(gen)
+
+    leaked = [t for t in threading.enumerate() if t.ident not in before and t.is_alive()]
+    # join(timeout=10) has already run inside the fixture's finally, so a thread still alive here
+    # was never asked to stop.
+    assert leaked == [], f"the fixture leaked {len(leaked)} live thread(s): {leaked}"
