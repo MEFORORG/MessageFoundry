@@ -366,9 +366,8 @@ _CLIENT_ONLY_VERBS = frozenset(
 #: only where the receiver could be holding a client.
 _AMBIGUOUS_VERBS = frozenset({"get", "send"})
 
-#: Module-local call targets that hand an httpx client back, named so :func:`_inert_functions`
-#: can exclude them: everything else defined here is judged inert by its own return annotation,
-#: and a factory would otherwise clear itself.
+#: Call targets that hand an httpx client back. :func:`_client_functions` adds any module-local
+#: function whose own return annotation names one; everything else is judged inert.
 _CLIENT_FACTORIES = frozenset({"httpx.Client", "httpx.AsyncClient", "make_probe_client"})
 
 
@@ -390,34 +389,44 @@ class _Names(NamedTuple):
     non_client: frozenset[str]
     #: Every name the module binds at all. Used only to judge an attribute chain's ROOT.
     bound: frozenset[str]
-    #: Module-local functions that do not hand a client back.
-    inert_functions: frozenset[str]
+    #: Call targets that COULD hand a client back: the known factories, plus any module-local
+    #: function whose own return annotation names one.
+    client_functions: frozenset[str]
 
 
-def _inert_functions(tree: ast.Module) -> frozenset[str]:
-    """Module-local functions whose result cannot be a client, by their own return annotation."""
-    return frozenset(
+def _client_functions(tree: ast.Module) -> frozenset[str]:
+    """Call targets that could hand a client back, by their own return annotation."""
+    return _CLIENT_FACTORIES | frozenset(
         node.name
         for node in ast.walk(tree)
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
-        and node.name not in _CLIENT_FACTORIES
-        and not _names_a_client(node.returns)
+        and _names_a_client(node.returns)
     )
 
 
-def _is_inert(value: ast.expr, inert_functions: frozenset[str]) -> bool:
+def _is_inert(value: ast.expr, client_functions: frozenset[str]) -> bool:
     """Is ``value`` an expression this module SHOWS is not a client?
 
-    A literal or a display holds what it says. A call to a module-local function whose return
-    annotation does not name a client cannot hand one back under mypy strict. Nothing else here
-    resolves, and anything that does not resolve is treated as a client by the caller.
+    A literal or a display holds what it says. A CALL is inert unless it could hand a client back,
+    which in a stdlib-plus-httpx module (ADR 0113) means one of two things: its target NAMES a
+    client (case-insensitively, so an alias counts), or it is a known factory or a module-local
+    function whose own return annotation names one.
+
+    **A call was originally inert only when it named a module-local function, and that was measured
+    wrong.** Census over ``messagefoundry/``: the rule flagged 292 of 1401 ambiguous-verb calls, and
+    **191 of those 292 were a name assigned from a call it simply could not resolve** -- a dict from
+    ``dict(...)``, ``json.loads(...)``, any import. None of those can produce a client, and
+    ``headers = dict(response.headers)`` is the kind of line ``probe.py`` grows next. Asking whether
+    a call COULD hand back a client, rather than whether this module happens to define it, is the
+    same inversion the docstring on :func:`_module_names` describes, applied one level down.
     """
     if isinstance(value, ast.Constant | ast.Dict | ast.List | ast.Set | ast.Tuple | ast.JoinedStr):
         return True
     if isinstance(value, ast.ListComp | ast.DictComp | ast.SetComp | ast.GeneratorExp):
         return True
     if isinstance(value, ast.Call):
-        return ast.unparse(value.func) in inert_functions
+        target = ast.unparse(value.func)
+        return target not in client_functions and "client" not in target.lower()
     return False
 
 
@@ -433,7 +442,7 @@ def _module_names(tree: ast.Module) -> _Names:
     silent bypass. Asking instead what the module SHOWS a name holding makes an unenumerated form
     fail closed by construction rather than by diligence.
     """
-    inert = _inert_functions(tree)
+    client_functions = _client_functions(tree)
     non_client: set[str] = set()
     bound: set[str] = set()
     for node in ast.walk(tree):
@@ -456,9 +465,13 @@ def _module_names(tree: ast.Module) -> _Names:
         elif isinstance(node, ast.Assign | ast.AnnAssign):
             annotated_client = isinstance(node, ast.AnnAssign) and _names_a_client(node.annotation)
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            if not annotated_client and node.value is not None and _is_inert(node.value, inert):
+            if (
+                not annotated_client
+                and node.value is not None
+                and _is_inert(node.value, client_functions)
+            ):
                 non_client |= {t.id for t in targets if isinstance(t, ast.Name)}
-    return _Names(frozenset(non_client), frozenset(bound), inert)
+    return _Names(frozenset(non_client), frozenset(bound), client_functions)
 
 
 def _may_hold_a_client(receiver: ast.expr, names: _Names) -> bool:
@@ -474,7 +487,7 @@ def _may_hold_a_client(receiver: ast.expr, names: _Names) -> bool:
     the unknown cases go to the flagging side, and the fallthrough at the bottom is a flag, not a
     clear -- an earlier cut had it the other way and let a subscripted client through.
     """
-    if _is_inert(receiver, names.inert_functions):
+    if _is_inert(receiver, names.client_functions):
         return False
     if isinstance(receiver, ast.Name):
         return receiver.id not in names.non_client
@@ -571,7 +584,24 @@ def test_every_request_in_the_probe_module_goes_through_the_bounded_helper() -> 
     the unbounded read BACKLOG #1577 closed, and nothing else in the module would notice.
 
     Mutation: add ``client.get("/version")`` anywhere in tray/probe.py. Red: the call is named."""
-    assert _unbounded_reads(_probe_source()) == []
+    found = _unbounded_reads(_probe_source())
+    assert not found, (
+        f"tray/probe.py issues {len(found)} read(s) outside `_get_bounded`: {found}\n"
+        "\n"
+        "IF THAT IS A REAL HTTP READ, route it through `_get_bounded` -- an unbounded one lets a "
+        "process squatting the engine's port drive the tray's memory one poll at a time "
+        "(ASVS 15.2.2, BACKLOG #1577).\n"
+        "\n"
+        "IF IT IS A DICT OR MAPPING READ, this is the guard's KNOWN false-positive class and the "
+        "fix is here, not at your call site. `.get`/`.send` clear only on a receiver this module "
+        "SHOWS holding something inert, so a name bound by a `for` target, a comprehension, a "
+        "subscript, or an assignment from an expression that does not resolve will flag. Measured "
+        "over messagefoundry/: 13.2% of ambiguous-verb calls, zero of them in this module. Widen "
+        "`_is_inert` and re-run the parametrized arms in this file -- they exist so a widening "
+        "that reopens a real hole reds immediately. DO NOT work around it at the call site and DO "
+        "NOT delete the guard: a workaround the next reader meets without the reason is exactly "
+        "how BACKLOG #1831 started."
+    )
 
 
 @pytest.mark.parametrize(
