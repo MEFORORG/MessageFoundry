@@ -365,13 +365,14 @@ that status, and this tier must not be cited as if it did.
   shape a neutered canary actually produces) or any other code fails the job before the real scan
   runs. Stated as an exact code deliberately: an earlier revision tested "did it succeed?", and since
   a canary run can never exit 0, that test was dead code which accepted exit 2 as proof.
-- **An advisory job can be ignored, and today nothing pages on it.** `nightly-notice.yml` opens an
-  issue only for the workflow named `CI`, so a red DAST nightly surfaces in the Actions tab and
-  nowhere else; the workflow has no `pull_request` arm and is not a required context, so nothing on a
-  PR reflects it either. That is a known, accepted gap for increment 1, recorded here rather than
-  left to be discovered — widening the notice workflow is a follow-up, not part of this change. The
-  compensating design is that the half which must not rot — the detector's ability to fail — lives in
-  the required test legs, not in the nightly.
+- **An advisory job can be ignored, and the follow-up this recorded has since landed.** As written for
+  increment 1 this read: "`nightly-notice.yml` opens an issue only for the workflow named `CI`, so a
+  red DAST nightly surfaces in the Actions tab and nowhere else ... widening the notice workflow is a
+  follow-up, not part of this change." That widening was BACKLOG #318: `nightly-notice.yml` watches
+  `DAST` and a scheduled red now opens one deduplicated issue that closes itself on recovery. The rest
+  of the paragraph still holds — the workflow has no `pull_request` arm and is not a required context,
+  so nothing on a PR reflects it. The compensating design is unchanged: the half which must not rot —
+  the detector's ability to fail — lives in the required test legs, not in the nightly.
 
 **Out of scope**
 

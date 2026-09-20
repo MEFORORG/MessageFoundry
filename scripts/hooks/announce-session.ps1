@@ -711,7 +711,14 @@ try {
             $ranked += [pscustomobject]@{ P = $p; Reason = $reason }
         }
         $reachable = @($ranked | Where-Object { -not $_.Reason } | ForEach-Object { $_.P })
-        $unreachable = @($ranked | Where-Object { $_.Reason })
+        # NAME THE CHANNEL IN THE VARIABLE. Every reason assigned above is a fact about the MCP
+        # session-messaging tool and nothing else: a surface it cannot enumerate, a login it cannot
+        # see, a peer that cannot take a session message. The repo's file-based mail channel
+        # (scripts/coord/mail.ps1) reaches all three, because it addresses a WORKTREE PATH under
+        # .git/mefor-coord/, which every config root shares, rather than a session the MCP must
+        # resolve. The former bare name, "unreachable", taught the opposite to this code's own readers
+        # and then to the roster it prints, so the name carries its channel now.
+        $mcpUnreachable = @($ranked | Where-Object { $_.Reason })
 
         if ($SelfTest) {
             # READ-ONLY AND WRITE-FREE, unconditionally. It never dispatches on marker state, never takes
@@ -728,11 +735,11 @@ try {
             Write-Output "  marker state found  : $st"
             # THE MAIL SPLIT, computed here because -SelfTest exits before section 16b ever runs. Same
             # predicate as that section; if the two ever diverge the diagnostic is lying about the feature.
-            $wouldMail = @($unreachable | Where-Object {
+            $wouldMail = @($mcpUnreachable | Where-Object {
                     ([string]$_.P.Cwd) -and
                     ($_.Reason -like 'different login*' -or $_.Reason -like '*cannot enumerate this surface*')
                 })
-            Write-Output "  mail lane  : $($wouldMail.Count) of $($unreachable.Count) unreachable peer(s) are mailable"
+            Write-Output "  mail lane  : $($wouldMail.Count) of $($mcpUnreachable.Count) unreachable peer(s) are mailable"
             Write-Output "               (cap $MaxMailPerPrompt per prompt, $MaxMailTotal per session, ${MailBudgetMs}ms wall clock)"
             foreach ($w in $wouldMail) { Write-Output "               would mail: $(Get-Clean ([string]$w.P.Worktree) 40)" }
             if ($loginStated) {
@@ -758,7 +765,9 @@ try {
                 Write-Output "        hand-run, and the ancestry walk sees a shell). The list below may"
                 Write-Output "        therefore include this session. That cannot happen on the real path."
             }
-            Write-Output "  peers=$($others.Count) reachable=$($reachable.Count) unreachable=$($unreachable.Count)"
+            # BOTH COUNTS CARRY THEIR CHANNEL. A bare reachable/unreachable pair in a diagnostic reads
+            # as a fleet-wide verdict, which is the same false inference the roster's legend taught.
+            Write-Output "  peers=$($others.Count) mcp-reachable=$($reachable.Count) mcp-unreachable=$($mcpUnreachable.Count)"
             foreach ($r in $ranked) {
                 $verdict = if ($r.Reason) { "SKIP  ($($r.Reason))" } else { 'MESSAGE' }
                 Write-Output ("    {0,-24} {1}" -f (Get-Clean ([string]$r.P.Worktree) 24), $verdict)
@@ -808,7 +817,7 @@ try {
         # ONLY the two reasons mail.ps1's header names. An unattended peer is deliberately absent: its
         # filter is flagged UNEXERCISED at the top of this file, and mail's own staleness argument cuts
         # against waking a scheduled run with an announce it cannot act on.
-        $mailable = @($unreachable | Where-Object {
+        $mailable = @($mcpUnreachable | Where-Object {
                 ([string]$_.P.Cwd) -and
                 ($_.Reason -like 'different login*' -or $_.Reason -like '*cannot enumerate this surface*') -and
                 ($mailKnown -notcontains (Get-Norm ([string]$_.P.Cwd)))
@@ -908,7 +917,7 @@ try {
                 $listed += [pscustomobject]@{ P = $r; Reason = 'over the cap for this round; it will be offered again'; Target = $false }
             }
         }
-        foreach ($u in $unreachable) {
+        foreach ($u in $mcpUnreachable) {
             if ($listed.Count -ge $MaxListed) { break }
             # $mailKnown spans the whole session, not just this prompt, so a peer mailed three prompts ago
             # still reads MAILED rather than reverting to SKIP.

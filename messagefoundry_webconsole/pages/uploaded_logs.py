@@ -87,7 +87,11 @@ def uploaded_logs(data: UploadedFileList, *, error: str = "") -> Markup:
         parts.append(el("p", text(error), class_="banner"))
     parts.extend(
         [
-            el("p", el("a", "Upload a file →", href="/ui/uploaded-logs/upload", class_="btn-link")),
+            # The FORM page, not the POST path (BACKLOG #1739).
+            el(
+                "p",
+                el("a", "Upload a file →", href="/ui/uploaded-logs/upload-form", class_="btn-link"),
+            ),
             rows_table(
                 ["File", "Uploaded by", "Format", "Size", "Messages", "When", ""],
                 rows,

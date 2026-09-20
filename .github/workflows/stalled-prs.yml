@@ -13,7 +13,8 @@ name: Stalled PRs
 # already passed. Nothing re-syncs it and nothing reports it.
 #
 # WHY NO EXISTING SIGNAL CATCHES IT. Every other signal is a check OUTCOME, and no check has failed —
-# that is the whole problem. `nightly-notice.yml` watches CI runs and there is no failing run to watch.
+# that is the whole problem. `nightly-notice.yml` watches this workflow too, but it reacts to a run's
+# CONCLUSION and there is no failing run to react to.
 # The author's last signal was a full pass, so they have no reason to look. A green dashboard and a
 # wedged repository are indistinguishable unless something asks "can this still merge at all?".
 #
