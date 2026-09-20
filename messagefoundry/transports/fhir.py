@@ -60,8 +60,8 @@ from messagefoundry.transports.base import (
     register_destination,
 )
 from messagefoundry.transports.bounded_read import (
-    ResponseTooLargeError,
-    read_bounded,
+    EgressReplyError,
+    drain_bounded,
     read_bounded_text,
 )
 
@@ -641,7 +641,7 @@ class FhirDestination(DestinationConnector):
                 # ASVS 15.2.2: the probe body is discarded, but draining it unbounded would let a
                 # reachability check be turned into a memory exhaustion. A CapabilityStatement is the
                 # largest honest reply here and sits far under the 16 MiB ceiling.
-                read_bounded(resp, connector=f"FHIR {_redact_url(self.base_url)} probe")
+                drain_bounded(resp, connector=f"FHIR {_redact_url(self.base_url)} probe")
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):
                 raise DeliveryError(
@@ -734,9 +734,12 @@ class FhirDestination(DestinationConnector):
                     connector=f"FHIR {_redact_url(self.base_url)} error body",
                     encoding=self.encoding,
                 )
-            except ResponseTooLargeError:
+            except EgressReplyError:
+                # The FAMILY, not just the byte bound: a truncated error body is equally unusable
+                # and equally worth a named warning. Catching the member sent it to the bare
+                # `except Exception` below, where the operator got no signal at all.
                 logger.warning(
-                    "FHIR %s returned an HTTP %s error body over the response bound; "
+                    "FHIR %s returned an HTTP %s error body the engine could not read whole; "
                     "classifying on the status alone",
                     _redact_url(self.base_url),
                     exc.code,
@@ -1108,9 +1111,12 @@ class FhirLookupExecutor:
                 )
                 status = int(getattr(resp, "status", 200))
                 return read_body, status
-        except ResponseTooLargeError as exc:
+        except EgressReplyError as exc:
             # A FhirLookupError, not a delivery error: this read runs inside a Handler, so there is
-            # no message to dead-letter and the Handler sees the failure directly.
+            # no message to dead-letter and the Handler sees the failure directly. Caught as the
+            # FAMILY so a refusal added beside the byte bound cannot escape a Handler as a raw
+            # DeliveryError -- the sandbox worker catches only (DbLookupError, FhirLookupError), so
+            # one that slips past here is reclassified as a handler crash.
             raise FhirLookupError(f"fhir_lookup on {connection!r}: {exc}") from exc
         except urllib.error.HTTPError as exc:
             if token is not None and exc.code == 401:
@@ -1183,8 +1189,8 @@ class FhirLookupExecutor:
             with self._opener[connection].open(req, timeout=self._timeout[connection]) as resp:
                 # ASVS 15.2.2: the probe body is discarded, but an unbounded drain would let a
                 # reachability check be turned into a memory exhaustion.
-                read_bounded(resp, connector=f"FHIR {_redact_url(base)} lookup probe")
-        except ResponseTooLargeError as exc:
+                drain_bounded(resp, connector=f"FHIR {_redact_url(base)} lookup probe")
+        except EgressReplyError as exc:
             raise FhirLookupError(f"FhirLookup {connection!r}: {exc}") from exc
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):

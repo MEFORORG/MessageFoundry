@@ -41,7 +41,7 @@ from typing import Any
 
 from messagefoundry.auth.oidc.jwks import _MAX_JWKS_BYTES
 from messagefoundry.auth.trust_anchors import AnchorSpec, enforce_anchor
-from messagefoundry.config.tls_policy import harden_cipher_suites
+from messagefoundry.config.tls_policy import harden_cipher_suites, harden_crl_check
 
 __all__ = ["build_idp_opener", "jwks_fetcher"]
 
@@ -72,6 +72,7 @@ def build_idp_opener(
     *,
     pin: str | None = None,
     enforcing: bool = True,
+    crl_file: str | None = None,
 ) -> urllib.request.OpenerDirector:
     """Build the verifying, no-redirect opener used for BOTH IdP legs (token endpoint + JWKS).
 
@@ -86,6 +87,14 @@ def build_idp_opener(
     #285 (ASVS 6.7.1): when ``ca_cert_file`` is set, its integrity is preflighted at this construction
     point — an optional SHA-256 ``pin`` (``[auth].oidc_tls_ca_cert_pin``) that does not match refuses
     always, and a group/world-writable DACL refuses when ``enforcing`` (``[security].enforcement``).
+
+    BACKLOG #299: ``crl_file`` (``[auth].oidc_tls_crl_file``) turns on leaf revocation checking against
+    the IdP's certificate. It is this hop's OWN knob rather than an inheritance of ``[tls].crl_file``,
+    because this opener resolves no trust anchor — an instance-wide CRL never reaches the context built
+    here, and reporting it as covering this handshake would be the per-hop scoping error that item
+    warns about. A revoked IdP certificate matters more here than on a data hop: this is the leg that
+    carries the client secret, the authorization code and the identity assertion, so accepting a
+    revoked-but-unexpired IdP cert would be an authentication-material exposure.
     """
     if ca_cert_file:
         enforce_anchor(
@@ -102,6 +111,11 @@ def build_idp_opener(
     )
     ctx.check_hostname = True
     ctx.verify_mode = ssl.CERT_REQUIRED
+    # BACKLOG #299: revocation checking, loaded after the trust store is final so harden_crl_check's
+    # "the CRL really landed" assertion answers for the store this handshake uses. Both branches above
+    # verify, so there is no CERT_NONE arm to guard against here.
+    if crl_file:
+        harden_crl_check(ctx, crl_file)
     # Assert forward secrecy on the FINAL context (ASVS 12.1.2): this hop carries the client secret,
     # the authorization code and the identity assertion, so a recorded session that a future key
     # compromise could decrypt is an authentication-material exposure, not just a confidentiality one.

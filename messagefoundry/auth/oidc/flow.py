@@ -287,14 +287,24 @@ def exchange_code(
         headers=headers,
         method="POST",
     )
+    # Both raises sit OUTSIDE their handlers on purpose. `raise ... from None` clears `__cause__`
+    # but leaves `__context__` populated, so the HTTPError — a readable response object whose body
+    # may echo the request params, this POST's client secret among them — would still be reachable
+    # by a chain-walking handler. See `encode_wire_body` in transports/base.py.
+    http_status: int | None = None
+    unreachable: str | None = None
     try:
         with opener.open(req, timeout=timeout) as resp:  # noqa: S310 — see above
             body = resp.read(_MAX_TOKEN_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as exc:
         # Read the RFC 6749 error code only; never the body verbatim (may echo request params).
-        raise FlowError(f"token endpoint returned HTTP {exc.code}") from None
+        http_status = exc.code
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise FlowError(f"token endpoint unreachable: {type(exc).__name__}") from None
+        unreachable = type(exc).__name__
+    if http_status is not None:
+        raise FlowError(f"token endpoint returned HTTP {http_status}")
+    if unreachable is not None:
+        raise FlowError(f"token endpoint unreachable: {unreachable}")
     if len(body) > _MAX_TOKEN_RESPONSE_BYTES:
         raise FlowError("token endpoint response exceeds the size bound")
     try:

@@ -280,6 +280,62 @@ def test_an_UNARMED_hook_pushes_nothing_and_the_commit_stands(armed: tuple[Path,
     assert git(bare, "for-each-ref", "--format=%(refname)") == "", "pushed without being armed"
 
 
+def _commit_capturing(repo: Path, text: str) -> str:
+    """Commit and RETURN the hook's output. ``commit()`` above asserts on it and throws it away."""
+    (repo / "a.txt").write_text(text, encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True, timeout=TIMEOUT
+    )
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "commit", "-qm", text.strip()],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+    )
+    assert proc.returncode == 0, "THE HOOK FAILED A COMMIT\n" + proc.stdout + proc.stderr
+    return proc.stdout + proc.stderr
+
+
+# The host is deliberately `.invalid` in both arms below. The hook's refusal matches the TAIL of
+# the URL, so the host is not part of what is under test, and a real one would either reach the
+# network from a unit test or, for the allowed arm, push to a live repository.
+_PUBLIC_URLS = (
+    "https://github.invalid/MEFORORG/MessageFoundry.git",
+    "https://github.invalid/MEFORORG/MessageFoundry",
+    "git@github.invalid:MEFORORG/MessageFoundry.git",
+)
+
+
+@pytest.mark.parametrize("url", _PUBLIC_URLS)
+def test_the_canonical_PUBLIC_remote_is_refused_in_every_spelling(
+    armed: tuple[Path, Path], url: str
+) -> None:
+    """The misconfiguration this refusal exists for: nominating the remote that is already there."""
+    repo, _bare = armed
+    git(repo, "remote", "set-url", "priv", url)
+
+    assert "REFUSING" in _commit_capturing(repo, "one\n")
+
+
+def test_the_PRIVATE_vault_under_THE_SAME_OWNER_is_not_refused(armed: tuple[Path, Path]) -> None:
+    """THE REGRESSION ARM, and the failure it pins was silent in the worst way.
+
+    The refusal was a PREFIX glob, ``*MEFORORG/MessageFoundry*``, written when the only thing under
+    that organization was the public engine. On 2026-09-19 the private vault was transferred in and
+    became ``MEFORORG/MessageFoundry-vault``, which the prefix matches. The hook then refused the
+    PRIVATE remote as though it were the public one, and because the refusal is ``exit 0`` every
+    commit still succeeded -- durability silently off, with the terminal reporting nothing a person
+    would read as a fault.
+
+    The two repositories are now one suffix apart under one owner, so nothing before the end of the
+    path tells them apart.
+    """
+    repo, _bare = armed
+    git(repo, "remote", "set-url", "priv", "https://github.invalid/MEFORORG/MessageFoundry-vault")
+
+    assert "REFUSING" not in _commit_capturing(repo, "one\n")
+
+
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh (PowerShell 7) not on PATH")
 def test_a_hook_written_ref_is_still_readable_AFTER_the_branch_is_deleted(
     armed: tuple[Path, Path], tmp_path: Path

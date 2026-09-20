@@ -54,7 +54,7 @@ from messagefoundry.transports.base import (
     NegativeAckError,
     register_destination,
 )
-from messagefoundry.transports.bounded_read import read_bounded, read_bounded_text
+from messagefoundry.transports.bounded_read import drain_bounded, read_bounded_text
 from messagefoundry.transports.dicom import recover_dicom_object_bytes
 
 # Reuse REST's hardened HTTP plumbing — same transports/ package, same no-redirect + TLS posture (NOT a
@@ -400,7 +400,7 @@ class DicomWebDestination(DestinationConnector):
                 # unreachability check be turned into a memory exhaustion. Over-cap raises
                 # ResponseTooLargeError (a DeliveryError), which the operator sees as a failed
                 # "test connection" rather than as a reachable host.
-                read_bounded(resp, connector=f"DICOMweb {_redact_url(self.base_url)} probe")
+                drain_bounded(resp, connector=f"DICOMweb {_redact_url(self.base_url)} probe")
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):
                 raise DeliveryError(

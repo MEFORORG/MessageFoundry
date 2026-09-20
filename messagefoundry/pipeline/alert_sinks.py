@@ -401,12 +401,16 @@ class WebhookTransport:
         # same reason as the length gate above. An over-cap reply raises ResponseTooLargeError, which
         # the notifier's fan-out treats like any other failed sink send: the alert is not delivered
         # here, and the engine's own message flow is untouched.
-        from messagefoundry.transports.bounded_read import read_bounded
+        from messagefoundry.transports.bounded_read import drain_bounded
 
         # The no-redirect opener (not urllib.request.urlopen) so a 3xx can't divert the POST (15.3.2).
         with _NO_REDIRECT_OPENER.open(req, timeout=self.timeout) as resp:
-            # Drain (bounded) so the connection can be reused/closed cleanly.
-            read_bounded(resp, connector=f"alert webhook {host}")
+            # Drain (bounded) so the connection can be reused/closed cleanly. The body is discarded,
+            # so completeness is not checked: the POST has already been accepted by this point, and
+            # failing the drain on a short reply would report an alert as undelivered when the host
+            # took it. The byte bound still applies -- an unbounded drain is a memory exhaustion
+            # whether or not anyone reads the bytes.
+            drain_bounded(resp, connector=f"alert webhook {host}")
 
 
 def send_plain_email(

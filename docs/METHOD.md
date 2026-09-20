@@ -17,7 +17,7 @@ is defined here and nowhere else, so other pages point at this line rather than 
 |---|---|---|
 | Manager | Long-lived, several at once | The seat the owner talks to. Reads the record and writes a brief citing an item, dispatches subagent workers, then polls. The record is two ledgers, and NEITHER IS IN THIS REPOSITORY any more: the item ledger moved to the maintainer-internal repo (BACKLOG #1250), and the `wshallwshall/claude-multisession` issues track KORUS itself. Nothing pushes to it. |
 | Builder | One brief, then exits | Works, commits, pushes, opens the PR, and stops. That is you, most of the time. |
-| Regulator | Spawned on a red | Decides whose failure a red belongs to: the PR's, main's, a flake, or the queue's. Only a PR's own failure comes back to a Builder. |
+| Watchdog | As needed | Watches the Lander and keeps it draining. Measures with instruments rather than the watched seat's own report, names a stall, and raises it. It never drains, never takes the claim, and never says whose a red is. Added 2026-09-19. |
 | Steward | A cron, no model calls | Reads account usage and names the account with headroom. It cannot interrupt a running session. |
 | Lander | Standing authority | Enqueues and merges. Both, since the Console's retirement. |
 
@@ -216,8 +216,9 @@ When the server set moves, move that file and the pinned count in `tests/test_re
 in the same PR. That pin only fails when somebody edits the file. A server move that nobody mirrors
 turns a required test leg red for everyone.
 
-You will not see CI while you run, so you cannot triage a red yourself. The Regulator decides whose
-it is.
+You will not see CI while you run, so you cannot triage a red yourself. **Nobody attributes a red
+now.** The Regulator retired 2026-09-19 and nothing replaced it: a red is the Lander's to triage and
+route, or the owner's to rule on. Do not wait for a verdict; no seat issues one.
 If your brief already names a red and says it belongs to the PR, that judgement is made and the fix
 is yours.
 
@@ -244,8 +245,10 @@ named files, and the two **merge clean**. It has fired three times here. Full re
 
 ## A PR's state is a join over three clocks
 
-**This section is for the Manager, the Regulator and the Lander. A Builder never evaluates it,
-because its process exits before any run reports.**
+**This section is for the Manager, the Lander, and the Watchdog because it reads merge state to
+tell a draining queue from a stalled one. A Builder never evaluates it, because its process exits
+before any run reports.** The Watchdog is here on that reading duty, not as the Regulator's
+replacement: that seat retired 2026-09-19 and nothing took its ruling.
 
 `mergeStateStatus` alone will mislead you. It reports `BEHIND` or `DIRTY` in preference to `BLOCKED`.
 A seat that triages on that field will push and wedge the PR further from green.

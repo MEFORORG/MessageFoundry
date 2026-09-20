@@ -150,7 +150,8 @@ def test_init_refuses_nonempty_dir(tmp_path: Path, capsys: pytest.CaptureFixture
     (tmp_path / "x.txt").write_text("hi", encoding="utf-8")
     rc = main(["init", str(tmp_path)])
     assert rc == 1
-    assert "not empty" in capsys.readouterr().out
+    # text-mode errors go to stderr (BACKLOG #1673)
+    assert "not empty" in capsys.readouterr().err
 
 
 # --- BACKLOG #1318: what `init` writes, the loader must accept ---------------------------------

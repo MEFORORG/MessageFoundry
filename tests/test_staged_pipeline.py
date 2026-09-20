@@ -208,10 +208,53 @@ async def test_dead_ingress_row_finalizes_message_error(store: MessageStore) -> 
     assert (await store.get_message(mid))["status"] == MessageStatus.ERROR.value
 
 
+async def test_replay_of_a_message_with_no_queue_rows_changes_nothing(store: MessageStore) -> None:
+    """``replay``'s ``if cur.rowcount:`` guard, on the input class the erased-body suite cannot reach.
+
+    ``tests/test_replay_purged_body.py`` pins the same guard for a message whose rows EXIST and whose
+    bodies retention erased. A FILTERED (or UNROUTED) message reaches it by a different route: it has
+    no queue rows at all, so ``stuck`` is 0, replay falls through to the RE-SEND branch, and the
+    UPDATE matches nothing. Drop the guard and the status write and the audit event would still run,
+    flipping a deliberately-filtered message to ROUTED and logging a ``replayed`` event for rows that
+    were never there — a false disposition an operator reading the timeline would act on
+    (BACKLOG #1633).
+
+    The delivered CONTROL is not padding: "0 rows requeued, nothing moved" is also what a replay
+    broken outright looks like, so the second half proves the call still works in this store.
+    """
+    mid = await store.enqueue_ingress(channel_id="IB", raw=RAW)
+    item = await _claim_ingress(store, "IB")
+    assert item is not None
+    await store.handoff(
+        ingress_id=item.id,
+        message_id=mid,
+        channel_id="IB",
+        deliveries=[],
+        disposition=MessageStatus.FILTERED,
+    )
+    assert await store.outbox_for(mid) == []  # the input class, asserted rather than assumed
+
+    assert await store.replay(mid) == 0
+    assert (await store.get_message(mid))["status"] == MessageStatus.FILTERED.value
+    assert "replayed" not in [e["event"] for e in await store.events_for(mid)]
+
+    # Control: a message that DOES have a row still replays, so the zero above is about this input.
+    other = await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB_A", "p")])
+    assert await store.replay(other) == 1
+    assert "replayed" in [e["event"] for e in await store.events_for(other)]
+
+
 # --- per-stage recovery ------------------------------------------------------
 
 
-async def test_reset_stale_inflight_recovers_all_stages(store: MessageStore) -> None:
+async def test_reset_stale_inflight_recovers_ingress_and_outbound(store: MessageStore) -> None:
+    # Named for the two stages it actually seeds. It used to be called "..._recovers_all_stages",
+    # which claimed cover it does not have: there are FOUR stages and this seeds ingress and outbound
+    # only, so a regression at the routed or response stage would not have reddened it (BACKLOG
+    # #1633). All four ARE covered, by
+    # tests/test_ownership_scoped_reset.py::test_global_default_recovers_all_stages_and_lanes, whose
+    # _seed_all_lanes seeds every Stage value across two lanes each. This stays as the compact
+    # stage=None smoke check beside its scoped sibling below.
     # An inflight ingress row AND an inflight outbound row both revert to pending in one all-stages call.
     mid1 = await store.enqueue_ingress(channel_id="IB", raw=RAW)
     await _claim_ingress(store, "IB")  # leaves an inflight ingress row
@@ -1068,7 +1111,7 @@ async def test_ack_after_delivered_global_default_rejected_at_start(tmp_path: Pa
         try:
             assert runner.running
             assert not runner.inbound_running("IB")
-            reason = runner.connection_failed("IB")
+            reason = runner.inbound_failed("IB")
             assert reason and "not yet implemented" in reason
             # the guard is still the sole defense and still fires loud for a direct caller:
             with pytest.raises(WiringError, match="not yet implemented"):

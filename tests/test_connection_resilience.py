@@ -159,6 +159,8 @@ async def test_problem_connection_does_not_block_engine_restart(
     await asyncio.wait_for(runner2.start(), timeout=5.0)
     try:
         assert runner2.running and runner2.inbound_running("mllp_in")
-        assert runner2.degraded_connections() == {}  # nothing carried over as failed
+        assert (
+            not runner2.degraded_inbound() and not runner2.degraded_outbound()
+        )  # nothing carried over as failed
     finally:
         await runner2.stop()

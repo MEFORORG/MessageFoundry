@@ -470,7 +470,9 @@ class HttpSource(SourceConnector):
         #: pace()/settle() for the same reason — there is no next read on this connection to settle
         #: against. Distinct from the injected `intake_rate_limiter`, which REFUSES failed auth
         #: attempts with a 429; this one only ever waits.
-        self._pacer = _MessagePacer.for_rate(self.max_messages_per_second, self.message_burst)
+        self._pacer = _MessagePacer.for_rate(
+            self.max_messages_per_second, self.message_burst, name=config.name or ""
+        )
         # Per-connection peer-IP allowlist (Tier 4): refuse a non-listed peer at accept (fail-closed).
         # Absent/empty = no restriction. Mirrors MLLPSource.
         sa = s.get("source_ip_allowlist")
