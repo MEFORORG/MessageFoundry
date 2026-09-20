@@ -40,7 +40,14 @@ These presets model the *shape* of a large estate (one big ADT hub fanning out, 
 hubs) with **generic, synthetic** values only. They name no real partner, site code, host, IP, or
 message volume; the weights are an illustrative ADT-dominant shape, not any real site's percentages.
 A real-numbers profile (if you ever build one) belongs **only** in the git-ignored `migration-local/`
-tree and is run via `--load <path>`; never commit one here. A guard test
+tree: put it at `migration-local/profiles/<name>.toml` and `--load <name>` finds it, or run any path
+with `--load <path>`. Never commit one here, **and never drop one in this directory gitignored by
+name either** — that was tried, and it shipped. The harness wheel force-includes this directory
+whole; hatchling's `recurse_forced_files` walks the filesystem and consults no `.gitignore`, and
+`exclude` does not reach a force-included file, so the wheel carries whatever is sitting here on the
+machine that built it (BACKLOG #1833). A guard test
+([../../../tests/test_packaging.py](../../../tests/test_packaging.py)) now refuses a `.gitignore`
+entry that names a path inside a force-included tree. A guard test
 ([../../../tests/test_load_config.py](../../../tests/test_load_config.py)) asserts the shipped
 profiles + load config carry none of a denylist of real tokens. Generated traffic is synthetic HL7
 (the `messagefoundry` generators); run artifacts carry metrics only — never message bodies.
