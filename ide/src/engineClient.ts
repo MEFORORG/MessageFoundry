@@ -81,10 +81,14 @@ export function setEngineTrustAnchor(url: string, pem: string | undefined): void
   }
 }
 
-/** Drop every registered anchor. `engineTrust.ts` calls this before each refresh, so a target the
- *  user edits away from does not leave its certificate registered for the life of the window. */
-export function clearEngineTrustAnchors(): void {
+/** Drop every registered anchor, and report whether there WAS one. `engineTrust.ts` calls this before
+ *  each refresh, so a target the user edits away from does not leave its certificate registered for
+ *  the life of the window. The return value is what tells that caller the trust state changed even
+ *  when the refresh ends up registering nothing — dropping an anchor is a change worth re-probing. */
+export function clearEngineTrustAnchors(): boolean {
+  const had = trustAnchors.size > 0;
   trustAnchors.clear();
+  return had;
 }
 
 /**

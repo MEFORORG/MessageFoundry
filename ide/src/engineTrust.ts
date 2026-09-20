@@ -8,7 +8,7 @@ import * as vscode from "vscode";
 import { engineUrl, environments, isExecGated, runJson, serviceConfig, workspaceDir } from "./cli";
 import { clearEngineTrustAnchors, setEngineTrustAnchor } from "./engineClient";
 import { engineLog } from "./engineLog";
-import { parseApiTls, schemeMismatch, trustAnchorFor } from "./engineTrustModel";
+import { parseApiTls, schemeMismatch, trustAnchorForTarget } from "./engineTrustModel";
 import type { ApiTlsFacts } from "./engineTrustModel";
 import { readCapped } from "./symbolIndex";
 
@@ -29,21 +29,31 @@ const MAX_PEM_BYTES = 512 * 1024;
  * fails with a trust error carrying the remedy (`trustRemedy`), which is a better outcome than a
  * half-configured client and is why nothing here throws.
  *
- * Resolves to true when an anchor was registered, so the caller can re-probe rather than leave a
- * stale verdict on screen.
+ * Resolves to true when what the client TRUSTS changed — an anchor registered, or a live one dropped
+ * — so the caller can re-probe rather than leave a stale verdict on screen. Dropping counts because a
+ * retarget to a remote engine registers nothing and still invalidates the verdict on screen.
  */
 export async function refreshEngineTrust(): Promise<boolean> {
   // The same guard the three sibling CLI calls in extension.ts use. Without it, opening a loose .py
   // file with no folder spawns a Python interpreter for a command that can only fail: isExecGated()
   // is false when there is no workspace, so it does not cover this on its own.
-  if (!workspaceDir() || isExecGated()) {
+  //
+  // Captured ONCE, and every use below is this constant. The workspace is both the cwd the reading is
+  // taken in and the base a relative certificate path is resolved against, so two calls that could
+  // disagree would silently resolve the path against a directory the command never ran in.
+  //
+  // `!workspace`, not `workspace === undefined`: an empty string must fail the guard too. It would
+  // otherwise reach `path.join("", …)`, whose result is relative, and a relative path is read against
+  // the extension host's own cwd — the defect the resolution below exists to remove.
+  const workspace = workspaceDir();
+  if (!workspace || isExecGated()) {
     return false;
   }
 
   // Drop every anchor first. Editing `messagefoundry.engineUrl` across hosts would otherwise leave
   // the previous host's certificate registered for the life of the extension host, so a target the
   // user moves away from and back to would be trusted from a cached read rather than a fresh one.
-  clearEngineTrustAnchors();
+  const hadAnchor = clearEngineTrustAnchors();
 
   let payload: unknown;
   try {
@@ -52,18 +62,35 @@ export async function refreshEngineTrust(): Promise<boolean> {
     // from the workspace the same way alertEditor.ts runs `alert list`.
     payload = await runJson<unknown>(
       ["cert", "inventory", "--service-config", serviceConfig()],
-      workspaceDir(),
+      workspace,
     );
   } catch {
-    return false; // no engine, no TOML, an older CLI — all "we learned nothing"
+    // No engine, no TOML, an older CLI — all "we learned nothing". The anchors are gone either way,
+    // so this still reports a change when there was one to report.
+    return hadAnchor;
   }
 
   const facts = parseApiTls(payload);
   const url = engineUrl();
-  const pem = readAnchorPem(trustAnchorFor(facts));
+  // The TARGET and the workspace go into the decision, not just the facts. Computing the file here
+  // and choosing whom to register it for separately is what let a local certificate become a remote
+  // engine's trust anchor, so the two arrive together or not at all. The decision also carries WHY it
+  // declined, because re-deriving that here is the same split the bug came from.
+  const decision = trustAnchorForTarget(facts, url, workspace);
+  const anchorFile = decision.kind === "anchor" ? decision.file : undefined;
+  const pem = anchorFile === undefined ? undefined : readAnchorPem(anchorFile);
   setEngineTrustAnchor(url, pem);
   if (pem !== undefined) {
-    engineLog().info(`trusting the engine certificate at ${trustAnchorFor(facts)} for ${url}`);
+    engineLog().info(`trusting the engine certificate at ${anchorFile} for ${url}`);
+  } else if (decision.kind === "notLocal") {
+    // The engine named a usable certificate and the model declined it because the target is not
+    // loopback. Say so, for the reason warnAboutUnanchoredTargets says it below: a silently
+    // unanchored target fails later with no explanation the user can act on. The REMEDY is not
+    // repeated here — `trustRemedy` owns that wording and delivers it when the request itself fails.
+    engineLog().info(
+      `${url} is not a loopback address, so messagefoundry.serviceConfig — which describes the ` +
+        `LOCAL engine — is not used to trust it.`,
+    );
   }
 
   const mismatch = schemeMismatch(facts, url);
@@ -71,11 +98,19 @@ export async function refreshEngineTrust(): Promise<boolean> {
     engineLog().warn(mismatch);
   }
   warnAboutUnanchoredTargets(facts);
-  return pem !== undefined;
+  // `|| hadAnchor`, because DROPPING one is also a change to what the client trusts. Without it,
+  // retargeting `messagefoundry.engineUrl` from the loopback engine to a remote one clears a live
+  // anchor and then reports "nothing happened", so the status bar keeps the stale verdict until the
+  // next 15-second poll.
+  return pem !== undefined || hadAnchor;
 }
 
 /**
  * Read a certificate PEM, or `undefined` if it is unreadable or over {@link MAX_PEM_BYTES}.
+ *
+ * `anchor` arrives ABSOLUTE, from {@link trustAnchorForTarget}. It has to: `readCapped` ends in a bare
+ * `fs.openSync`, which resolves a relative path against the extension host's own cwd — a directory
+ * that has nothing to do with the workspace the inventory reading was taken in.
  *
  * `readCapped` rather than a statSync/readFileSync pair: it resolves the path ONCE and checks the
  * size against that descriptor, which is the CodeQL `js/file-system-race` fix `symbolIndex.ts`
@@ -89,6 +124,18 @@ function readAnchorPem(anchor: string | undefined): string | undefined {
   const pem = readCapped(anchor, MAX_PEM_BYTES);
   if (pem === undefined) {
     engineLog().warn(`could not read the engine certificate at ${anchor} — not trusting it`);
+    return undefined;
+  }
+  // A readable file is not yet a certificate, and the difference is invisible downstream: Node's
+  // `tls.createSecureContext` treats a FALSY `ca` as "use the default roots", so an empty or
+  // truncated file would register an anchor that silently does nothing while this function's caller
+  // logs "trusting the engine certificate" and reports success. Check the one marker every PEM chain
+  // carries. A DER file fails it, correctly — `readCapped` decodes utf8, so DER never worked here.
+  if (!pem.includes("-----BEGIN CERTIFICATE-----")) {
+    engineLog().warn(
+      `the engine certificate at ${anchor} is not PEM (no BEGIN CERTIFICATE block) — not trusting it`,
+    );
+    return undefined;
   }
   return pem;
 }

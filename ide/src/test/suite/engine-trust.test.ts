@@ -25,6 +25,7 @@ import {
   parseApiTls,
   schemeMismatch,
   trustAnchorFor,
+  trustAnchorForTarget,
   trustRemedy,
 } from "../../engineTrustModel";
 
@@ -109,6 +110,89 @@ suite("engineTrustModel — reading the engine's own answer (BACKLOG #1695)", ()
       /tls_terminated_upstream/,
       "a client that assumes https breaks the one topology the engine deliberately leaves plaintext",
     );
+  });
+});
+
+suite("which target may have the local certificate, and where that file is", () => {
+  // The composition `engineTrust.ts` calls. `engine-trust-shell.test.ts` drives it through the real
+  // refresh against real files; this block pins the decision matrix itself.
+  const WS = path.resolve(path.sep, "ws");
+  const LOCAL_ABS = path.join(WS, "state", "api-generated-cert.pem");
+
+  function factsFor(cert: string): ReturnType<typeof parseApiTls> {
+    return parseApiTls({
+      api_tls: { scheme: "https", source: "operator", cert, cert_present: true },
+    });
+  }
+
+  test("every loopback spelling is anchored; everything else is refused as notLocal", () => {
+    const facts = factsFor(LOCAL_ABS);
+    for (const local of ["https://127.0.0.1:8765", "https://localhost:8765", "https://[::1]:8765"]) {
+      assert.deepStrictEqual(
+        trustAnchorForTarget(facts, local, WS),
+        { kind: "anchor", file: LOCAL_ABS },
+        local,
+      );
+    }
+    // NEGATIVE CONTROL. `messagefoundry.serviceConfig` describes the LOCAL engine, so handing its
+    // certificate to any of these anchors a file belonging to a different server — and `ca` REPLACES
+    // Node's default root store, so a valid public chain would stop verifying.
+    for (const remote of [
+      "https://prod.example.com:8765",
+      "https://10.0.0.7:8765",
+      "https://127.0.0.1.evil.example:8765",
+      "not a url",
+    ]) {
+      assert.deepStrictEqual(trustAnchorForTarget(facts, remote, WS), { kind: "notLocal" }, remote);
+    }
+  });
+
+  test("a relative path is resolved against the workspace; an absolute one is left alone", () => {
+    // The engine passes an operator's `[api].tls_cert_file` through UNCHANGED, so a relative operator
+    // path arrives verbatim and must be resolved against the directory `cert inventory` ran in.
+    assert.deepStrictEqual(
+      trustAnchorForTarget(factsFor("certs/server.pem"), "https://127.0.0.1:8765", WS),
+      { kind: "anchor", file: path.join(WS, "certs", "server.pem") },
+    );
+    assert.deepStrictEqual(
+      trustAnchorForTarget(factsFor(LOCAL_ABS), "https://127.0.0.1:8765", WS),
+      { kind: "anchor", file: LOCAL_ABS },
+    );
+  });
+
+  test("no anchor can escape the workspace through a process cwd", () => {
+    // The win32 case that separates `path.resolve` from join/normalize: resolve('C:\\ws',
+    // 'D:certs\\server.pem') returns 'D:\\certs\\server.pem' — it drops the workspace because the
+    // devices differ and falls back to that DRIVE's cwd (process.env['=D:']), which is the
+    // extension-host-cwd read this whole function exists to remove. Asserted as a property rather
+    // than a literal so it holds on both platforms.
+    for (const odd of ["D:certs\\server.pem", "certs/../certs/server.pem", "./server.pem"]) {
+      const decision = trustAnchorForTarget(factsFor(odd), "https://127.0.0.1:8765", WS);
+      assert.strictEqual(decision.kind, "anchor", odd);
+      assert.ok(
+        decision.kind === "anchor" && decision.file.startsWith(WS),
+        `${odd} resolved outside the workspace: ${JSON.stringify(decision)}`,
+      );
+    }
+  });
+
+  test("nothing anchorable is 'nothing', not 'notLocal' — the two reasons stay apart", () => {
+    // The shell logs on `notLocal` only. Folding these into it would tell a user with an engine that
+    // has simply never started that their loopback URL is not a loopback address.
+    const notYet = parseApiTls({
+      api_tls: { scheme: "https", source: "generated", cert: "/s/c.pem", cert_present: false },
+    });
+    const upstream = parseApiTls({
+      api_tls: { scheme: "http", source: "upstream", cert: null, cert_present: false },
+    });
+    for (const [facts, url] of [
+      [notYet, "https://127.0.0.1:8765"],
+      [upstream, "http://127.0.0.1:8765"],
+      [undefined, "https://127.0.0.1:8765"],
+      [notYet, "https://prod.example.com:8765"], // remote AND nothing to anchor: nothing wins
+    ] as const) {
+      assert.deepStrictEqual(trustAnchorForTarget(facts, url, WS), { kind: "nothing" }, url);
+    }
   });
 });
 
