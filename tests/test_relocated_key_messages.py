@@ -32,16 +32,18 @@ _ENGINE = pathlib.Path(__file__).resolve().parents[1] / "messagefoundry"
 # Sites tolerated today, keyed by (path, old spelling) with the count as a CEILING. A ceiling rather than an
 # equality so a fix that REMOVES one does not red the test -- PR 593 removes two from __main__.py.
 _BUDGET: dict[tuple[str, str], int] = {
-    # Describe the posture that triggered a refusal; the remediation is elsewhere or absent.
     # The ([ai].data_class, 2) row that sat here is GONE with BACKLOG #1279: the key left the
     # relocation map (it was removed, not relocated) and both sites in __main__.py went with it, so
     # the row could never be read again -- a budget entry for a spelling the scanner no longer knows.
-    ("messagefoundry/__main__.py", "[ai].production"): 2,
-    ("messagefoundry/__main__.py", "[api].host"): 3,
-    ("messagefoundry/__main__.py", "[api].public_origin"): 6,
-    ("messagefoundry/__main__.py", "[api].serve_ui"): 3,
-    ("messagefoundry/api/app.py", "[api].serve_ui"): 1,
-    ("messagefoundry/config/settings.py", "[api].public_origin"): 2,
+    #
+    # THE [api] AND [ai] ROWS ARE GONE TOO, graded and reworded under #1361 rather than tolerated.
+    # Every one of them was actionable misdirection, not description: `--host` help named [api].host
+    # as the file key the flag overrides, the DEBUG refusal said "set [ai].production=false", the /ui
+    # refusal said "Bind [api].host to a loopback address", and app.py said "set [api].serve_ui=false"
+    # -- four instructions that die at load. The rest named [api].public_origin as the subject of a
+    # value complaint, which sends an operator to a key they cannot have set: the only file route to
+    # that value is [security].web_console_public_address, which desugars into the internal field.
+    # They now name the [security] spelling, matching the already-fixed OIDC refusal in settings.py.
     # Name the relocated SWITCH to explain why a connection was refused, while the fix they give is
     # [egress].allowed_db / allowed_http -- keys that did NOT move, so the remediation works.
     ("messagefoundry/pipeline/reference_sync.py", "[egress].deny_by_default"): 1,

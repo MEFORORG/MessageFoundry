@@ -6145,8 +6145,8 @@ def create_app(
             # if this drifts back to an extra that does not exist or a name nobody has claimed.
             raise RuntimeError(
                 "serve_ui requires the web console, which is not installed. It ships as a separate "
-                "distribution: `pip install messagefoundry-webconsole`, or set [api].serve_ui=false "
-                "to run JSON-only."
+                "distribution: `pip install messagefoundry-webconsole`, or set "
+                "[security].serve_web_console=false to run JSON-only."
             ) from exc
 
         # Assert the seam BEFORE building the deps bundle (review fix): a package that changed the
