@@ -186,9 +186,17 @@ raw material for the seats that survived.
 
 **Every live seat now has a korus playbook.** The Regulator was the one that did not, and it retired
 on 2026-09-19. The Watchdog that joined in its row does have one, `roles/WATCHDOG.md`, as does the
-Manager at `roles/MANAGER.md`, and both cards cite theirs. List the korus `roles/` folder rather
-than typing a filename from memory: the seat set moves, and a missing playbook file is the quietest
-failure here, because an absent file reports nothing at all.
+Manager at `roles/MANAGER.md`, and both cards cite theirs.
+
+**A retired seat's playbook is not absent from korus, it is under `roles/retired/`,** and reading
+"no top-level file" as "no file" gets that backwards. Measured 2026-09-19 by the sitting Watchdog and
+confirmed here: `roles/retired/` holds ten files, `REGULATOR.md` among them, against 20 entries under
+`roles/` in total. korus keeps them so a reader who remembers a seat finds it retired rather than
+missing. So the sentence above means the Regulator had no file in the LIVE `roles/` folder while it
+was rostered here, which is the drift this section records; it has a retired one now.
+
+List the korus `roles/` folder rather than typing a filename from memory. The seat set moves, and a
+missing playbook is the quietest failure here, because an absent file reports nothing at all.
 
 ---
 
