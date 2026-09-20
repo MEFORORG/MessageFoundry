@@ -270,7 +270,14 @@ def test_poll_thread_survives_a_raising_tick_and_publishes_unknown(
     ]
     assert len(failures) == 1
     assert "publishing UNKNOWN" in failures[0].getMessage()
-    assert failures[0].exc_info is not None  # a traceback, not a bare one-line error
+    # Read whichever field carries the traceback, because which one that is depends on whether
+    # anything else in the process has configured engine logging. `RedactionFilter` renders
+    # `exc_info` into `exc_text` and then sets `exc_info` to None on purpose -- "clear exc_info in
+    # BOTH paths so no formatter (even a custom one ignoring exc_text) can re-render the raw
+    # exception" (`logging_setup._install_phi_filters`, installed on every handler). caplog holds
+    # that same mutated record, so asserting on `exc_info` alone passes when this file runs on its
+    # own and fails under the full suite, which is what reddened all three CI legs.
+    assert failures[0].exc_info or failures[0].exc_text  # a traceback, not a bare one-line error
 
 
 # --- the UNKNOWN stand-in is a display fallback, not a state transition ------
