@@ -315,8 +315,9 @@ async def test_reply_write_drain_is_bounded(monkeypatch: pytest.MonkeyPatch) -> 
     for as long as it liked, with nothing to time it out. ``X12Destination``'s own drains were
     already bounded by ``self.timeout``, so the inbound reply was the outlier, not the convention.
 
-    Unlike the MLLP and raw-TCP listeners, ``X12Source`` emits no ADR 0021 ``connection_event`` at
-    all, so there is no ``peer_reset`` to assert here — the slot and the socket are the evidence.
+    The drop is released down the outer ``OSError`` arm, which since BACKLOG #1665 emits a
+    ``peer_reset`` connection event — asserted below, because the slot and the socket alone cannot
+    tell a caller *why* the connection went.
     """
     # The release the fix rides on, asserted rather than assumed: were TimeoutError to stop being an
     # OSError, _on_client's existing arm would miss it and the slot would leak, while the outcome
@@ -326,7 +327,13 @@ async def test_reply_write_drain_is_bounded(monkeypatch: pytest.MonkeyPatch) -> 
     async def reply_handler(raw: bytes) -> str:
         return _interchange(sender="ACKSENDER")  # a verbatim 997/TA1-shaped reply
 
+    events: list[str] = []
+
+    async def capture(kind: str, peer_host: str | None, reason: str | None) -> None:
+        events.append(kind)
+
     source = _source(max_connections=1)
+    source.on_connection_event = capture
     await source.start(reply_handler)
     # Bound the reply write ONLY. Shrinking _CLIENT_SHUTDOWN_GRACE instead would also shrink the
     # teardown measured at the end, and a stop() that returned fast because its own grace was 0.05 s
@@ -341,6 +348,9 @@ async def test_reply_write_drain_is_bounded(monkeypatch: pytest.MonkeyPatch) -> 
         await asyncio.wait_for(client, timeout=2.0)
         assert peer.closed  # dropped, not left open on a peer that had stopped reading
         assert source._active == 0  # ... and the max_connections slot went back
+        # Pins the order and the absence of anything else; a failure must not also be reported as a
+        # clean "closed" (BACKLOG #1665, mirroring the raw-TCP twin's assertion).
+        assert events == ["established", "peer_reset"]
     finally:
         started = asyncio.get_running_loop().time()
         await asyncio.wait_for(source.stop(), timeout=5.0)
