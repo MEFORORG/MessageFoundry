@@ -5400,16 +5400,27 @@ def settings_error_detail(exc: Exception) -> str:
     A LONG VALUE IS NOT SAFER: pydantic abbreviates a long ``input_value`` repr from the middle, so a
     32-character password loses its head and discloses its tail.
 
-    THIS IS THE RENDERER TO REACH FOR, AND SIX CALLERS STILL DO NOT REACH FOR IT. Measured over
+    THIS IS THE RENDERER TO REACH FOR, AND FIVE CALLERS STILL DO NOT REACH FOR IT. Measured over
     ``messagefoundry/__main__.py`` at ``f6d2c7bef``, the commit BACKLOG #1523 landed as: of 20
     ``except`` arms naming ``ValidationError``, 7 render ``str(exc)`` in the handler --
     ``_admin_unlock``, ``_provision_admin``, ``_backup``, ``_restore_verify``, ``_ai_policy``,
-    ``_cluster_vip`` and ``_connection``. This change fixes the sixth; the other six stand, and five
-    of them reach the operator through ``_emit_error``. ``ai-policy`` was RUN and confirmed to
-    disclose a planted ``MEFOR_STORE_PASSWORD`` on the same config
-    ``tests/test_cli_cluster_vip.py`` plants one against. The rest were read, not run, so this
-    counts arms rather than confirmed disclosures. That sweep is NOT part of #1523 and is stated
-    rather than done, so nobody reads this docstring as covering it.
+    ``_cluster_vip`` and ``_connection``. #1523 fixed ``_cluster_vip``.
+
+    ``_ai_policy`` IS NOW FIXED TOO, and this paragraph said "the other six stand" until it was.
+    That correction is written here rather than folded away because the stale list is the hazard the
+    paragraph exists to name: a reader checking whether ``ai-policy`` still discloses would have
+    found its own name on a to-do list and stopped. Re-measured with the same instrument over the
+    same file, ``origin/main`` at ``19c98e023`` still gave 20 arms and the 6 the sentence above
+    implies; with ``_ai_policy`` rendered through this function it gives 20 and **five** --
+    ``_admin_unlock``, ``_provision_admin``, ``_backup``, ``_restore_verify`` and ``_connection`` --
+    and ALL FIVE now reach the operator through ``_emit_error`` (it was five of six before, and
+    ``_ai_policy`` was the one that printed its own JSON instead).
+
+    ``ai-policy`` was RUN and confirmed to disclose a planted ``MEFOR_STORE_PASSWORD`` on the same
+    config ``tests/test_cli_cluster_vip.py`` plants one against; ``tests/test_cli_ai_policy.py`` now
+    holds that case. The remaining five were read, not run, so this counts arms rather than confirmed
+    disclosures. That sweep is NOT part of #1523 and is stated rather than done, so nobody reads this
+    docstring as covering it.
     """
     from pydantic import ValidationError
 
