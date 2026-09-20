@@ -802,3 +802,37 @@ def test_a_line_ending_only_rewrite_is_not_reported_as_dirty(
     assert rows[0]["MatchedDirty"] is True, (
         f"a real uncommitted edit must still report MatchedDirty: {rows[0]['Dirty']}"
     )
+
+
+def test_the_acquittal_compares_like_with_like_on_a_non_ascii_path(
+    classification_peer: tuple[Path, Path], tmp_path: Path
+) -> None:
+    """THE ACQUITTAL'S OWN UNDER-REPORT, found by review and pinned here because it is invisible.
+
+    The two commands do not agree on how to spell a path. ``status --porcelain -z`` emits it raw;
+    ``diff --name-only`` C-quotes anything non-ASCII, because ``core.quotePath`` defaults on. Compare
+    the raw form against the quoted one and every non-ASCII path looks absent from the diff, so a
+    REAL uncommitted edit is acquitted and drops out of Dirty -- silently, and only for the files
+    whose names happen to carry an accent.
+
+    Measured before the second fix, on this fixture: status gave the path raw, plain
+    ``diff --name-only`` gave ``"r\\303\\251sum\\303\\251.md"``, and the acquittal count went to 1.
+    """
+    primary, peer = classification_peer
+    name = "r\u00e9sum\u00e9.md"
+    (peer / name).write_bytes(b"base\n")
+    git(peer, "add", name)
+    git(peer, "commit", "-qm", "add a non-ascii path")
+    (peer / name).write_bytes(b"base\nreally changed\n")
+
+    quoted = git(peer, "--no-optional-locks", "diff", "--name-only").strip()
+    assert quoted.startswith('"'), (
+        "the control did not fire: git stopped quoting non-ASCII paths in diff --name-only, so the "
+        f"mismatch this test exists for is not reachable. diff said {quoted!r}"
+    )
+
+    rows = query(primary, tmp_path, name)
+    assert rows, f"a real uncommitted edit to {name!r} was dropped from the map entirely"
+    assert rows[0]["MatchedDirty"] is True, (
+        f"a real uncommitted edit to a non-ASCII path must report MatchedDirty: {rows[0]['Dirty']}"
+    )

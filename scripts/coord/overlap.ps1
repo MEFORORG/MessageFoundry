@@ -690,8 +690,20 @@ function Build-Map {
             # The -join is load-bearing, not tidying: PowerShell splits a native command's stdout on
             # newlines, so a path that CONTAINS one arrives as two elements and has to be put back
             # together before the NUL split can see the real field boundaries.
-            $porcelain = (& git -C $Job.Path --no-optional-locks status --porcelain -z 2>$null) -join "`n"
-            $fields = @($porcelain -split "`0")
+            $rawStatus = @(& git -C $Job.Path --no-optional-locks status --porcelain -z 2>$null)
+            # A FAILED STATUS IS NOT A CLEAN TREE. Empty stdout with a non-zero exit, read as
+            # "nothing in flight", emits the row as walked-and-clean -- the under-report this script
+            # exists to prevent, wearing an all-clear. Reporting it unwalked routes it to the PARTIAL
+            # banner instead, which is what the surrounding design already does with a body failure.
+            #
+            # ARGUED, NOT OBSERVED, and worth saying so. Two attempts to break a peer worktree --
+            # deleting its `.git` file, then deleting its admin dir under `.git/worktrees/` -- both
+            # still exited 0, because `git -C` walks UP to the enclosing repository and answers about
+            # THAT one. So this guard covers a failure nobody here has reproduced. It is kept because
+            # it costs one comparison and can only ever widen the answer; do not read it as evidence
+            # that the failure happens.
+            if ($LASTEXITCODE -ne 0) { $r.Skipped = $true; return $r }
+            $fields = @(($rawStatus -join "`n") -split "`0")
             $dirty = @()
             $eolSuspect = @()
             for ($i = 0; $i -lt $fields.Count; $i++) {
@@ -701,33 +713,60 @@ function Build-Map {
                 $path = $f.Substring(3)
                 $dirty += $path
                 if ($xy.Contains('R') -or $xy.Contains('C')) {
-                    # BOTH SIDES, deliberately. The peer has emptied the old path and filled the new
-                    # one, so a session editing either collides. The original is the next field, and
-                    # carries no status prefix of its own.
+                    # The ORIGINAL path is the next field and carries no status prefix of its own, so
+                    # it is CONSUMED either way: left in place the loop would re-read it as a status
+                    # entry and slice three characters off a real path.
+                    #
+                    # A RENAME then reports BOTH sides, because the peer has emptied the old path and
+                    # filled the new one, so a session editing either collides. A COPY reports only
+                    # the destination: its source is byte-for-byte what it always was, and blocking
+                    # an edit to it would be exactly the needless stand-down this change removes.
+                    #
+                    # The COPY half is unreproduced. `status.renames=copies` plus a staged exact copy
+                    # still reported `A `, not `C `, so no fixture here has ever driven this branch.
+                    # It is defensive, and it is strictly narrower than the both-sides handling it
+                    # replaced, so an unreachable branch costs nothing either way.
                     $i++
-                    if ($i -lt $fields.Count -and $fields[$i]) { $dirty += $fields[$i] }
+                    if ($xy.Contains('R') -and $i -lt $fields.Count -and $fields[$i]) {
+                        $dirty += $fields[$i]
+                    }
                     continue
                 }
                 # THE OTHER FAILURE DIRECTION, and it must not be fixed with the same instrument.
                 # ` M` means unmodified in the index, modified in the working tree -- and status
                 # answers that from the index stat and oid WITHOUT converting the content, so a file
-                # whose only change is CRLF-vs-LF reads as modified. --no-optional-locks means git may
-                # not even write the refreshed stat cache, so it re-reads that way on every walk.
-                # Measured against a fixture: a CRLF-only rewrite shows ` M` under `status --porcelain`
-                # while `git diff --name-only` reports the file as unchanged.
+                # whose only change is CRLF-vs-LF reads as modified. Measured against a fixture: the
+                # rewrite shows ` M` under `status --porcelain` while `git diff --name-only` reports
+                # the file as unchanged -- and it STAYS that way. A plain `git status` allowed to
+                # write its own index reports it too, so this is not an artifact of
+                # --no-optional-locks and no number of repeat walks clears it.
                 #
                 # ONLY ` M` is a suspect. Anything carrying a staged component (`MM`, `AM`, ...) is
                 # dirty whatever the working tree holds, and `??`/` D`/` T` cannot be content-compared
                 # at all.
                 if ($xy -eq ' M') { $eolSuspect += $path }
             }
-            if ($eolSuspect.Count -gt 0) {
-                # ONE extra spawn per worktree that has an unstaged modification -- which is MOST
+            # DEADLINE-GATED, unlike the terms above, because this is the FIFTH git spawn the body
+            # can make and the walk's overshoot bound is the slowest single worktree already in
+            # flight (see $deadline). Dropping the acquittal once the clock has run out keeps that
+            # bound where the design put it, and it degrades by over-reporting, which is the safe
+            # direction.
+            $overtime = $Deadline -and [datetime]::UtcNow -ge $Deadline
+            if ($eolSuspect.Count -gt 0 -and -not $overtime) {
+                # ONE extra spawn per worktree carrying an unstaged modification -- which is MOST
                 # non-clean peers, because ` M` is the ordinary state of a session mid-edit. Budget
-                # it that way rather than as a rare extra: this is also the one leg of the walk that
-                # is never memoised (see the note above), so it roughly doubles the un-memoised work
-                # on a dirty worktree. RE-MEASURE if the walk starts overrunning again -- a partial
-                # walk is itself an under-report, so paying for accuracy here can cost it elsewhere.
+                # it that way rather than as a rare extra, and note it lands on the one leg of the
+                # walk that is never memoised.
+                #
+                # RE-MEASURED 2026-09-20 over the real 170-worktree fleet, five INTERLEAVED paired
+                # runs against the pre-fix script: 5.00s vs 5.50s on the mean, 3.64s vs 3.73s on the
+                # best run, inside the budget on every run. THE EFFECT IS SMALLER THAN THE NOISE --
+                # one arm alone ranged 3.6s to 8.6s and two of the five paired deltas came out
+                # NEGATIVE -- so read a few hundred milliseconds as a ceiling, not as a figure. A
+                # blocked (non-interleaved) first attempt reported 17%, which is what that spread
+                # buys you. Re-measure before adding a second spawn here: the budget is what stops a
+                # partial walk, and a partial walk is itself the under-report this all exists to
+                # prevent.
                 #
                 # `git diff` applies the repo's OWN declared eol policy (.gitattributes plus
                 # core.autocrlf), which makes it the right authority and `--ignore-cr-at-eol` the
@@ -739,8 +778,17 @@ function Build-Map {
                 # SUPPRESSION IS THE UNDER-REPORTING DIRECTION, so it is gated on the command actually
                 # succeeding. A failed diff drops the acquittal and leaves the wider set -- the same
                 # choice the committed half above makes, for the same reason.
-                $changed = @(& git -C $Job.Path --no-optional-locks diff --name-only 2>$null)
+                #
+                # -z ON THE DIFF TOO, and it is not symmetry for its own sake: the two spellings have
+                # to MATCH or the comparison acquits on a mismatch it should have called a hit.
+                # `diff --name-only` C-quotes a non-ASCII path (core.quotePath defaults on) while
+                # `status -z` emits it raw. Measured on a fixture: status gave `resume.md` with acute
+                # accents, plain diff gave the `"r\303\251sum\303\251.md"` escape, they compared
+                # unequal, and a REAL uncommitted edit was acquitted straight out of Dirty. Under -z
+                # both sides are raw and the acquittal count goes 1 to 0.
+                $rawDiff = @(& git -C $Job.Path --no-optional-locks diff --name-only -z 2>$null)
                 if ($LASTEXITCODE -eq 0) {
+                    $changed = @(($rawDiff -join "`n") -split "`0" | Where-Object { $_ })
                     # Ordinal, not PowerShell's default: git paths are case-sensitive and a
                     # case-insensitive comparer would acquit a path git never cleared.
                     $acquitted = [System.Collections.Generic.HashSet[string]]::new(
