@@ -8,8 +8,10 @@ import ast
 import inspect
 import json
 import ssl
+import textwrap
 from collections.abc import Iterator
 from pathlib import Path
+from typing import NamedTuple
 
 import httpx
 import pytest
@@ -364,8 +366,9 @@ _CLIENT_ONLY_VERBS = frozenset(
 #: only where the receiver could be holding a client.
 _AMBIGUOUS_VERBS = frozenset({"get", "send"})
 
-#: Call targets that hand an httpx client back. A name assigned from one of these holds a client
-#: even though nothing annotates it.
+#: Module-local call targets that hand an httpx client back, named so :func:`_inert_functions`
+#: can exclude them: everything else defined here is judged inert by its own return annotation,
+#: and a factory would otherwise clear itself.
 _CLIENT_FACTORIES = frozenset({"httpx.Client", "httpx.AsyncClient", "make_probe_client"})
 
 
@@ -380,74 +383,103 @@ def _names_a_client(annotation: ast.expr | None) -> bool:
     return annotation is not None and "Client" in ast.unparse(annotation)
 
 
-def _builds_a_client(node: ast.expr) -> bool:
-    """Is ``node`` an expression that constructs an httpx client?"""
-    return isinstance(node, ast.Call) and ast.unparse(node.func) in _CLIENT_FACTORIES
+class _Names(NamedTuple):
+    """What the module shows about the names it uses, for :func:`_may_hold_a_client`."""
+
+    #: Names this module SHOWS holding a non-client. The ONLY thing that clears a bare name.
+    non_client: frozenset[str]
+    #: Every name the module binds at all. Used only to judge an attribute chain's ROOT.
+    bound: frozenset[str]
+    #: Module-local functions that do not hand a client back.
+    inert_functions: frozenset[str]
 
 
-def _client_bearing_names(tree: ast.Module) -> set[str]:
-    """Names in this module that may be holding a client, by any route the module itself shows."""
-    names: set[str] = set()
-    for node in ast.walk(tree):
-        # ``import httpx`` -- ``httpx.get(url)`` is an unbounded read with no client in sight.
-        if isinstance(node, ast.Import):
-            names |= {
-                (alias.asname or alias.name).split(".")[0]
-                for alias in node.names
-                if alias.name.split(".")[0] == "httpx"
-            }
-        elif isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] == "httpx":
-            names |= {alias.asname or alias.name for alias in node.names}
-        # ``def probe_health(client: httpx.Client)`` -- the shape every probe in this module uses.
-        elif isinstance(node, ast.arg) and _names_a_client(node.annotation):
-            names.add(node.arg)
-        # ``c = make_probe_client(url)`` -- annotated or not.
-        elif isinstance(node, ast.Assign | ast.AnnAssign):
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            annotated = isinstance(node, ast.AnnAssign) and _names_a_client(node.annotation)
-            if annotated or (node.value is not None and _builds_a_client(node.value)):
-                names |= {t.id for t in targets if isinstance(t, ast.Name)}
-    return names
+def _inert_functions(tree: ast.Module) -> frozenset[str]:
+    """Module-local functions whose result cannot be a client, by their own return annotation."""
+    return frozenset(
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+        and node.name not in _CLIENT_FACTORIES
+        and not _names_a_client(node.returns)
+    )
 
 
-def _bound_names(tree: ast.Module) -> set[str]:
-    """Every name this module binds, by any statement form.
+def _is_inert(value: ast.expr, inert_functions: frozenset[str]) -> bool:
+    """Is ``value`` an expression this module SHOWS is not a client?
 
-    The complement is what matters: a name used as a receiver and bound NOWHERE here came from
-    somewhere this walk cannot see, and :func:`_may_hold_a_client` treats that as a client.
+    A literal or a display holds what it says. A call to a module-local function whose return
+    annotation does not name a client cannot hand one back under mypy strict. Nothing else here
+    resolves, and anything that does not resolve is treated as a client by the caller.
     """
-    names: set[str] = set()
+    if isinstance(value, ast.Constant | ast.Dict | ast.List | ast.Set | ast.Tuple | ast.JoinedStr):
+        return True
+    if isinstance(value, ast.ListComp | ast.DictComp | ast.SetComp | ast.GeneratorExp):
+        return True
+    if isinstance(value, ast.Call):
+        return ast.unparse(value.func) in inert_functions
+    return False
+
+
+def _module_names(tree: ast.Module) -> _Names:
+    """Read the module once and answer what :func:`_may_hold_a_client` needs.
+
+    **The clearing side is enumerated, and that is the whole design (BACKLOG #1831).** An earlier
+    cut enumerated the CLIENT-bearing bindings instead and cleared every other bound name, which
+    conflates knowing a name EXISTS with knowing what it HOLDS. Measured: `with make_probe_client(u)
+    as c`, `for c in clients`, `c, _x = make_probe_client(u), None` and a walrus all bound a real
+    client that the guard then let through, because none of them is a parameter or a simple
+    assignment. Every binding form Python has, or that this walk simply failed to enumerate, was a
+    silent bypass. Asking instead what the module SHOWS a name holding makes an unenumerated form
+    fail closed by construction rather than by diligence.
+    """
+    inert = _inert_functions(tree)
+    non_client: set[str] = set()
+    bound: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-            names.add(node.id)  # assignment, for/with target, walrus, comprehension
-        elif isinstance(node, ast.arg):
-            names.add(node.arg)
+            bound.add(node.id)  # assignment, for/with target, walrus, comprehension
         elif isinstance(node, ast.alias):
-            names.add((node.asname or node.name).split(".")[0])
+            bound.add((node.asname or node.name).split(".")[0])
         elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
-            names.add(node.name)
+            bound.add(node.name)
         elif isinstance(node, ast.ExceptHandler):
             if node.name:  # `except E as e` binds; a bare `except E` binds nothing
-                names.add(node.name)
+                bound.add(node.name)
         elif isinstance(node, ast.Global | ast.Nonlocal):
-            names.update(node.names)
-    return names
+            bound.update(node.names)
+        elif isinstance(node, ast.arg):
+            bound.add(node.arg)
+            # mypy runs strict here, so a parameter that takes a client says so.
+            if node.annotation is not None and not _names_a_client(node.annotation):
+                non_client.add(node.arg)
+        elif isinstance(node, ast.Assign | ast.AnnAssign):
+            annotated_client = isinstance(node, ast.AnnAssign) and _names_a_client(node.annotation)
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if not annotated_client and node.value is not None and _is_inert(node.value, inert):
+                non_client |= {t.id for t in targets if isinstance(t, ast.Name)}
+    return _Names(frozenset(non_client), frozenset(bound), inert)
 
 
-def _may_hold_a_client(receiver: ast.expr, client_names: set[str], bound_names: set[str]) -> bool:
+def _may_hold_a_client(receiver: ast.expr, names: _Names) -> bool:
     """Could ``receiver`` be an httpx client? Answered so that UNKNOWN reads as YES.
 
-    Three things clear, and nothing else does: a plain name this module binds to a non-client, an
-    attribute of one whose last segment is not itself client-named, and an expression that is not a
-    value at all (a literal, a subscript, a comprehension). Everything else -- a client name, a name
-    or chain-root nothing here binds, a client built inline -- is treated as a client.
+    Two things clear, and nothing else does: an expression the module SHOWS is inert, and a bare
+    name it shows bound to something inert. A name it binds without showing what to, a name it does
+    not bind at all, an attribute whose last segment is client-named, a subscript, a call that is
+    not provably inert -- all read as a client.
 
     The asymmetry is the design. A false positive costs a workaround at a call site and, eventually,
     somebody deleting the guard; a false negative costs the unbounded read BACKLOG #1577 closed. So
-    the unknown cases go to the flagging side and the clearing side is enumerated, not inferred.
+    the unknown cases go to the flagging side, and the fallthrough at the bottom is a flag, not a
+    clear -- an earlier cut had it the other way and let a subscripted client through.
     """
+    if _is_inert(receiver, names.inert_functions):
+        return False
     if isinstance(receiver, ast.Name):
-        return receiver.id in client_names or receiver.id not in bound_names
+        return receiver.id not in names.non_client
+    if isinstance(receiver, ast.NamedExpr):
+        return _may_hold_a_client(receiver.value, names)  # `(c := make_probe_client(u)).get(...)`
     if isinstance(receiver, ast.Attribute):
         # The LAST segment is the value being called, so that is the one to judge:
         # ``self._client.get(...)`` is a client, ``client.headers.get(...)`` is a mapping ON one.
@@ -459,10 +491,8 @@ def _may_hold_a_client(receiver: ast.expr, client_names: set[str], bound_names: 
         while isinstance(root, ast.Attribute):
             root = root.value
         # ...but a chain rooted in a name nothing here binds came from outside this walk.
-        return isinstance(root, ast.Name) and root.id not in bound_names
-    if isinstance(receiver, ast.Call):
-        return _builds_a_client(receiver)
-    return False  # a literal, a subscript, a comprehension: nothing that holds a client
+        return not (isinstance(root, ast.Name) and root.id in names.bound)
+    return True  # a subscript, an await, a call that builds who knows what
 
 
 def _unbounded_reads(source: str) -> list[str]:
@@ -471,12 +501,11 @@ def _unbounded_reads(source: str) -> list[str]:
     bounded = [
         node
         for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "_get_bounded"
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name == "_get_bounded"
     ]
     assert bounded, "tray/probe.py defines no `_get_bounded`; this guard is aimed at nothing"
     inside_helper = {n for root in bounded for n in ast.walk(root)}
-    client_names = _client_bearing_names(tree)
-    bound_names = _bound_names(tree)
+    names = _module_names(tree)
 
     found: list[str] = []
     for node in ast.walk(tree):
@@ -485,9 +514,7 @@ def _unbounded_reads(source: str) -> list[str]:
         func = node.func
         if not isinstance(func, ast.Attribute):
             continue
-        ambiguous = func.attr in _AMBIGUOUS_VERBS and _may_hold_a_client(
-            func.value, client_names, bound_names
-        )
+        ambiguous = func.attr in _AMBIGUOUS_VERBS and _may_hold_a_client(func.value, names)
         if func.attr in _CLIENT_ONLY_VERBS or ambiguous:
             found.append(f"line {node.lineno}: `{ast.unparse(func)}(...)`")
     return found
@@ -502,25 +529,34 @@ _PLANT_SIG = "client: httpx.Client, body: dict[str, str]"
 
 
 def _flags_the_plant(body: str, sig: str = _PLANT_SIG) -> bool:
-    """Plant ``body`` in the real probe source and report whether the guard flags THAT LINE.
+    """Plant ``body`` in the real probe source and report whether the guard flags THE PLANT.
 
     Two things, and the second is the one that makes an arm mean something. The plant goes into real
     ``tray/probe.py`` source, so no arm can pass against a toy tree that has drifted from it.
-    And the verdict is keyed on the planted line, not on the finding list being non-empty: a bare
+    And the verdict is keyed on the planted REGION, not on the finding list being non-empty: a bare
     ``assert found`` answers "did the guard flag anything", which is a different sentence from "did
     the guard flag this", and it stays green off an unrelated defect elsewhere in the module. That
     was not hypothetical -- while this was being written, a real ``client.get`` planted in
     ``probe_ui`` reddened the negative-control arms too, because they were reading the whole list.
+
+    ``body`` may be several statements: it is dedented and re-indented into the frame, and the
+    verdict is any finding BELOW the frame's ``def``. An earlier cut matched one exact line with
+    ``rindex`` and so could only express a single-line arm -- which is part of why the binding-form
+    holes had no arm to catch them.
 
     ``sig`` is the planted frame's parameter list, so an arm can carry the annotation an existing
     function actually has. It APPENDS a frame and never rewrites an existing one: a guard test that
     pins some other function's current spelling reds the day somebody legitimately edits that line,
     and on this module those edits belong to other sessions.
     """
-    frame = f"\n\ndef _planted({sig}) -> object:\n    {body}\n"
-    source = _probe_source() + frame
-    lineno = source[: source.rindex(f"    {body}")].count("\n") + 1
-    return any(finding.startswith(f"line {lineno}:") for finding in _unbounded_reads(source))
+    source = _probe_source()
+    planted = textwrap.indent(textwrap.dedent(body).strip("\n"), "    ")
+    frame = f"\n\ndef _planted({sig}) -> object:\n{planted}\n"
+    def_line = source.count("\n") + 3  # two blank lines, then the `def`
+    return any(
+        int(finding.split()[1].rstrip(":")) > def_line
+        for finding in _unbounded_reads(source + frame)
+    )
 
 
 def test_every_request_in_the_probe_module_goes_through_the_bounded_helper() -> None:
@@ -567,6 +603,37 @@ def test_the_narrowed_guard_still_catches_a_real_unbounded_read(planted: str) ->
     ``_POLLER_CLIENT`` arm alone, which is the point of separating it from ``_state.poller``."""
     assert _flags_the_plant(planted), (
         f"the guard did not flag {planted!r}; a real unbounded read now passes it"
+    )
+
+
+@pytest.mark.parametrize(
+    ("form", "planted"),
+    [
+        ("with-bound", 'with make_probe_client("http://x") as c:\n    return c.get("/version")'),
+        ("for-bound", 'for c in clients:\n    return c.get("/version")\nreturn None'),
+        ("walrus", 'return (c := make_probe_client("http://x")).get("/version")'),
+        ("tuple-unpacked", 'c, _x = make_probe_client("http://x"), None\nreturn c.get("/version")'),
+        ("subscripted", 'return clients[0].get("/version")'),
+    ],
+)
+def test_the_guard_catches_a_client_reached_by_any_binding_form(form: str, planted: str) -> None:
+    """The regression this file actually shipped, and the reason the clearing side is enumerated.
+
+    The first cut of BACKLOG #1831 resolved client names from PARAMETERS and SIMPLE ASSIGNMENTS
+    only, then cleared every other name the module bound. All five forms below hold a real client,
+    all five were caught by the pre-narrowing sweep, and all five were MEASURED passing the narrowed
+    guard -- with ``c = make_probe_client(u)`` and ``c: httpx.Client`` still caught, so the binding
+    form alone decided. The first is the idiomatic httpx spelling and the one this very file uses.
+
+    Nothing in the suite could see it: the arms above cover parameters, unbound names, chain roots,
+    inline construction and attributes, and the plant helper could express only ONE LINE, so no
+    statement-shaped arm was writable. 50 tests passed over the hole.
+
+    Mutation: clear a bare name on ``receiver.id in bound_names`` instead of on
+    ``not in non_client_names``. Red: every arm here, with the arms above still green."""
+    assert _flags_the_plant(planted, "clients: list[object]"), (
+        f"a client bound by {form} passes the guard; the narrowing dropped a shape the broad "
+        "sweep caught, which is the one thing BACKLOG #1831 was not allowed to do"
     )
 
 
