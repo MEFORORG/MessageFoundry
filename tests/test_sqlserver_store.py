@@ -403,6 +403,21 @@ async def test_stats_and_metrics(store) -> None:
     assert metrics.destinations[("IB", "OB1")].queue_depth == 1
     db = await store.db_status()
     assert db.messages == 1
+    # BACKLOG #1563: the remote server's disk is not ours to stat, so this is the "unmeasurable"
+    # None and never 0 — 0 is the console's critical-disk alarm, which pinned the engine-health
+    # heart red on every healthy SQL Server deployment. The whole server-side fix is this one
+    # literal, and nothing else asserted it at all. This module is gated like its Postgres twin, so
+    # the pin holds on the SQL Server leg only — that is the sole place the real backend runs, and
+    # a default run still cannot tell the literal from a 0. Naming the limit rather than implying
+    # this guards every run.
+    assert db.disk_free_bytes is None
+    # Non-empty is the engine-side fact a reader of the null above depends on: this backend names
+    # itself through `journal_mode` (the recovery model), and the "" fallback here means the
+    # sys.databases read came back empty, so the row says nothing about which store answered.
+    # Deliberately asserts only that, not WHICH model — the set of recovery models a console might
+    # recognise is that console's policy, and restating it in the engine suite would let the two
+    # drift apart while both stayed green.
+    assert db.journal_mode
     ok, _ = await store.integrity_check()
     assert ok is True
 
@@ -4491,3 +4506,23 @@ async def test_session_rotation_contract(store) -> None:
     from tests._session_rotation_contract import assert_session_rotation_contract
 
     await assert_session_rotation_contract(store)
+
+
+# --- the per-message finalize lock, under real concurrency -----------------------------------------
+
+
+async def test_concurrent_mark_done_finalizes_processed_every_round(store) -> None:
+    """Both destinations of ONE message complete at the same moment, every round -> PROCESSED.
+
+    Pins the per-message ``sp_getapplock`` finalize lock as the SINGLE authority on disposition.
+    ``tests/_finalize_race_contract`` carries the property, the mechanism and the measurement behind
+    the round count; the shared module is what keeps this leg and the Postgres one asking the same
+    question rather than two hand-synced copies drifting apart.
+
+    THIS BACKEND'S NUMBER IS UNMEASURED. The 30 rounds were measured against Postgres, whose lock is
+    a different mechanism under a different snapshot rule. What this leg establishes on a real SQL
+    Server, nobody has yet read -- the gated ``sqlserver-store`` CI job carries its first result.
+    """
+    from tests._finalize_race_contract import assert_concurrent_finalize_reaches_processed
+
+    await assert_concurrent_finalize_reaches_processed(store)

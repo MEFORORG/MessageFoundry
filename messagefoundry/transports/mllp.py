@@ -116,6 +116,12 @@ DEFAULT_RECEIVE_TIMEOUT = 60.0  # seconds — close inbound sockets idle this lo
 #: mechanism exists and an operator opts in with their own number. The cell stays `partial` on the
 #: shipped default and the record says why; that is the honest outcome, not a disappointing one.
 DEFAULT_MAX_MESSAGES_PER_SECOND: float | None = None
+
+#: Seconds between operator-facing pacing reports on ONE pacer (BACKLOG #290). Pacing is silent by
+#: construction — it never drops, NAKs or errors — so without a report an operator cannot tell a
+#: paced interface from a slow one. A pacer in deficit is consulted on every read, so the report is
+#: throttled to this window; see :meth:`_MessagePacer._note_paced`.
+_PACING_REPORT_SECONDS = 60.0
 # On stop()/reload, established clients are closed and their handlers given this long to finish an
 # in-flight commit before the connection tasks are cancelled — bounds shutdown so a peer holding a
 # connection open can't hang it (review H-2).
@@ -1400,9 +1406,19 @@ class _MessagePacer:
     and drives it with :meth:`deficit` / :meth:`charge`. There is no flag and no branch in here.
     """
 
-    __slots__ = ("_capacity", "_last", "_pending_wait", "_rate", "_tokens")
+    __slots__ = (
+        "_capacity",
+        "_last",
+        "_name",
+        "_paced_count",
+        "_paced_seconds",
+        "_pending_wait",
+        "_rate",
+        "_report_at",
+        "_tokens",
+    )
 
-    def __init__(self, rate: float, burst: float, *, now: float) -> None:
+    def __init__(self, rate: float, burst: float, *, now: float, name: str = "") -> None:
         self._rate = rate
         self._capacity = max(burst, 1.0)
         self._tokens = self._capacity
@@ -1410,6 +1426,16 @@ class _MessagePacer:
         #: Debt owed before the next read, in seconds. PRIVATE, and settled only through pace() —
         #: a consult-then-clear a caller performs by hand is an invariant restated once per loop.
         self._pending_wait = 0.0
+        #: The declaring inbound's name, carried only so a pacing report can NAME the connection an
+        #: operator has to go and look at (the :attr:`Source.name` precedent). "" when unwired.
+        self._name = name
+        #: Applied-delay tally since the last report, reset by each report.
+        self._paced_count = 0
+        self._paced_seconds = 0.0
+        #: Next monotonic stamp a report may be emitted at. Starts at ``now`` so the FIRST time
+        #: pacing engages is reported immediately — that transition is the event an operator most
+        #: needs, and holding it back for a window would hide it behind the throttle.
+        self._report_at = now
 
     def charge(self, messages: int, *, now: float) -> float:
         """Charge ``messages`` and return the seconds to wait before reading again (0.0 if none).
@@ -1433,6 +1459,7 @@ class _MessagePacer:
         """
         if (wait := self._pending_wait) > 0.0:
             self._pending_wait = 0.0
+            self._note_paced(wait)
             await asyncio.sleep(wait)
 
     def settle(self, messages: int) -> None:
@@ -1451,16 +1478,61 @@ class _MessagePacer:
         connections has to recompute it at read time instead. Delegates to :meth:`charge` rather
         than re-deriving the arithmetic, so the two can never disagree.
         """
-        return self.charge(0, now=now)
+        owed = self.charge(0, now=now)
+        if owed > 0.0:
+            self._note_paced(owed, now=now)
+        return owed
+
+    def _note_paced(self, seconds: float, *, now: float | None = None) -> None:
+        """Tally one APPLIED read delay and report it to the operator, throttled.
+
+        Called from the two places a wait is actually acted on — :meth:`pace` for the stream pair and
+        :meth:`deficit` for the listener pair — never from :meth:`charge`, which both of those route
+        through and which ``deficit`` consults on every read. Counting in ``charge`` would tally the
+        same outstanding debt once per consult and report a number that is not a count of anything.
+
+        **Why pacing needs a voice at all.** The control is otherwise entirely invisible: it never
+        drops, NAKs, refuses or errors, so a paced interface looks to the operator exactly like a
+        slow one, and nothing is written anywhere. The 2026-08-11 ruling ships
+        :data:`DEFAULT_MAX_MESSAGES_PER_SECOND` OFF *because* a safe number can only come from a
+        site's own feed profile — and a site cannot tune a number it has no way to watch engage.
+        Reporting is the half that makes the opt-in posture usable; it changes no default and paces
+        nothing differently.
+
+        Throttled to one line per :data:`_PACING_REPORT_SECONDS` because a pacer that is in deficit
+        is consulted on every read, and an unthrottled line would restate one fact thousands of
+        times. WARNING rather than INFO: a clinical interface being held back is an operator-facing
+        condition, not routine chatter.
+
+        **Metadata only.** The connection name, a count, a duration and the configured rate — never a
+        frame, a peer address, or a byte of the body being paced (PHI.md; CLAUDE.md section 9).
+        """
+        self._paced_count += 1
+        self._paced_seconds += seconds
+        stamp = time.monotonic() if now is None else now
+        if stamp < self._report_at:
+            return
+        logger.warning(
+            "inbound message pacing engaged on %s: %d read delay(s) totalling %.3fs "
+            "(max_messages_per_second=%g). The sender is being held back, not refused — no message "
+            "is dropped. Raise the rate if this feed is legitimate.",
+            self._name or "<unnamed inbound>",
+            self._paced_count,
+            self._paced_seconds,
+            self._rate,
+        )
+        self._paced_count = 0
+        self._paced_seconds = 0.0
+        self._report_at = stamp + _PACING_REPORT_SECONDS
 
     @classmethod
-    def for_rate(cls, rate: float | None, burst: float) -> _MessagePacer | None:
+    def for_rate(cls, rate: float | None, burst: float, *, name: str = "") -> _MessagePacer | None:
         """Build a pacer, or ``None`` when no rate is configured — the shipped default.
 
         The single place the off-default is honoured, so the four intakes that pace cannot drift
         apart on what "unset" means. See :data:`DEFAULT_MAX_MESSAGES_PER_SECOND` for why off.
         """
-        return cls(rate, burst, now=time.monotonic()) if rate else None
+        return cls(rate, burst, now=time.monotonic(), name=name) if rate else None
 
 
 def _pacing_settings(settings: Mapping[str, Any]) -> tuple[float | None, float]:
@@ -1499,6 +1571,8 @@ class MLLPSource(SourceConnector):
         # Message-rate pacing. Absent -> OFF, unlike the caps above; see _pacing_settings and
         # DEFAULT_MAX_MESSAGES_PER_SECOND for why that deviation is deliberate and ruled.
         self.max_messages_per_second, self.message_burst = _pacing_settings(s)
+        # Carried only so a pacing report can name this connection (BACKLOG #290).
+        self._pacing_name = config.name or ""
         # Per-connection peer-IP allowlist (Tier 4 operability): when set, a connecting peer whose IP
         # is not listed is refused at accept time. Absent/empty = no restriction.
         sa = s.get("source_ip_allowlist")
@@ -1634,7 +1708,9 @@ class MLLPSource(SourceConnector):
             await self._emit_event("established", peer_host=peer_host)
             try:
                 decoder = MLLPDecoder(max_frame_bytes=self.max_frame_bytes)
-                pacer = _MessagePacer.for_rate(self.max_messages_per_second, self.message_burst)
+                pacer = _MessagePacer.for_rate(
+                    self.max_messages_per_second, self.message_burst, name=self._pacing_name
+                )
                 while True:
                     # ASVS 2.4.1 / 15.2.2 — the wait is BEFORE the read, never around the handler.
                     if pacer is not None:

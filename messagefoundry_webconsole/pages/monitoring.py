@@ -100,8 +100,16 @@ def _contradiction(value: bool | None) -> str:
     return "YES — the read-out contradicts it" if value else "no — the read-out agrees"
 
 
-def _bytes(n: int) -> str:
-    """Render a byte count in a compact binary unit (KiB/MiB/GiB)."""
+def _bytes(n: int | None) -> str:
+    """Render a byte count in a compact binary unit (KiB/MiB/GiB).
+
+    ``None`` renders as words, never as a quantity: falling through to "0 B" would print the
+    on-screen half of BACKLOG #1563, since an operator reading "0 B" free on a remote SQL Server
+    sees a disk emergency where in fact nobody looked. The wording borrows ``_contradiction``'s
+    "nothing measured" rather than ``_opt``'s em dash, which reads as a missing row instead of an
+    unmeasured one, and rather than a fifth new spelling of unknown for the same table."""
+    if n is None:
+        return "nothing measured"
     size = float(n)
     for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
         if size < 1024 or unit == "TiB":

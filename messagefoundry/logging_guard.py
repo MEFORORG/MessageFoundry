@@ -46,8 +46,25 @@ scope available. See ADR 0162 section 4.
   sink's own stream, never to the last-resort channel. The stderr last-resort line carries the sink
   label and a :func:`~messagefoundry.redaction.safe_exc` reason and **nothing from the record**. The
   guard also never raises the service level to DEBUG.
-* **Stdlib only, no engine imports.** The guard is reachable from ``logging_setup`` (which every
-  process configures) and must not drag ``pipeline``/``store``/``api`` in behind it.
+* **The guard scrubs its OWN diagnostics, because nothing downstream reliably will (BACKLOG
+  #1591).** THE CONSUMER LIST, stated here once and referred to rather than repeated: a failure
+  reason travels to (1) the notice written onto the rolled sink, (2) ``GET /status``'s
+  ``last_event``, (3) the ``AlertSink`` page, and (4) the stderr last-resort line. **Not one of them
+  is guaranteed the handler filter chain.** (1) is written by ``_emit_direct``, deliberately below
+  ``Handler.handle``; (2) and (4) never touch the logging tree at all; (3) reaches the tree only in
+  the DEFAULT sink, which happens to ``log.warning`` it — the email/webhook notifier an operator
+  configures for exactly this failure does not. So the scrub belongs **where the string is built**
+  (:func:`_safe_reason`, :func:`_escape_only`), which serves all four at once — never at the notice
+  writer, which would close (1) and leave three open. It is NOT repeated at
+  :class:`LogWriteGuard`'s boundary: :func:`_safe_diagnostic` is not idempotent, and that function
+  measures what a second pass costs.
+* **Stdlib, plus LEAVES only — never ``pipeline``/``store``/``api``.** The guard is reachable from
+  ``logging_setup``, which every process configures, and must not drag the engine in behind it. The
+  engine modules it does import are imported for their definitions and import nothing from this
+  package in turn: :mod:`~messagefoundry.redaction`, :mod:`~messagefoundry.controlchars`,
+  :mod:`~messagefoundry.secretscrub`. None imports ``logging_setup``, which imports THIS module;
+  :mod:`~messagefoundry.controlchars` records why the escape table had to move down rather than be
+  reached upwards from here. A new import here has to clear the same bar: a leaf, for a definition.
 """
 
 from __future__ import annotations
@@ -63,7 +80,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, TextIO
 
+# Bound at MODULE scope, not inlined: that is what lets a test force the scrubber itself to raise
+# and assert the notice is emitted anyway, with no production test hook (BACKLOG #1591).
+from messagefoundry.controlchars import scrub_control_chars
 from messagefoundry.redaction import safe_exc
+from messagefoundry.secretscrub import scrub_credentials
 
 __all__ = [
     "GuardedFileHandler",
@@ -199,7 +220,14 @@ class LogWriteGuard:
         otherwise roll forever — one rename, one fresh file and one escalation per log record. Past
         :data:`_MAX_ROLLS_PER_WINDOW` rolls inside :data:`_ROLL_FLAP_WINDOW_SECONDS` the sink is
         declared unwritable instead: a log you must replace every few seconds is not a working log,
-        and stage 2 is the honest verdict on it."""
+        and stage 2 is the honest verdict on it.
+
+        **PRECONDITION: ``reason`` and ``rolled_aside`` arrive ALREADY SCRUBBED** (BACKLOG #1591).
+        Build them with :func:`_safe_reason` and :func:`_escape_only`, as
+        :meth:`_GuardedSinkMixin.handleError` does. This method cannot enforce it by re-scrubbing:
+        :func:`_safe_diagnostic` is **not idempotent** and its own docstring measures what a second
+        pass costs — the value published here would then disagree with the notice already written on
+        the sink. A scrub that damages correct input is not a safety net."""
         with self._lock:
             previous = self._sinks.get(sink)
             now = time.monotonic()
@@ -217,6 +245,8 @@ class LogWriteGuard:
                 rolled_aside=rolled_aside,
             )
         if streak > _MAX_ROLLS_PER_WINDOW:
+            # The precondition holds through this join: ``reason`` arrived scrubbed and everything
+            # appended is a literal plus two formatted numbers, so nothing new needs escaping.
             self.record_unwritable(
                 sink,
                 reason=(
@@ -241,7 +271,9 @@ class LogWriteGuard:
         one sink (the default, stdout-only) the two questions coincide and the halt fires exactly as
         before. The sink is still recorded unwritable, still alerted and still shown on
         ``/status`` — visibility is unconditional; only the ENFORCEMENT is conditioned on the thing
-        the enforcement is about."""
+        the enforcement is about.
+
+        ``reason`` arrives already scrubbed; :meth:`record_rollover` states that precondition."""
         with self._lock:
             previous = self._sinks.get(sink)
             already_down = previous is not None and previous.state == "unwritable"
@@ -260,7 +292,8 @@ class LogWriteGuard:
             # the one message that mattered.
             return
         _last_resort(
-            f"LOG SINK {sink} IS UNWRITABLE after a rollover attempt: {reason}"
+            f"LOG SINK {_escape_only(sink, fallback=_LABEL_DROPPED)} IS UNWRITABLE "
+            f"after a rollover attempt: {reason}"
             + ("" if all_down else "; another sink is still writable, so nothing is being stopped")
         )
         self._fire(
@@ -337,7 +370,12 @@ class LogWriteGuard:
         try:
             callback(event)
         except Exception as exc:  # never-raise: we are already handling a logging failure
-            _last_resort(f"log-sink escalation for {event.sink} failed: {safe_exc(exc)}")
+            # Scrubbed for the reason the stage strings are: this line goes straight to stderr,
+            # below every handler filter (BACKLOG #1591).
+            _last_resort(
+                f"log-sink escalation for {_escape_only(event.sink, fallback=_LABEL_DROPPED)} "
+                f"failed: {_safe_reason(exc)}"
+            )
 
 
 #: The guard the current process's handlers are wired to. Installed by ``configure_logging``.
@@ -381,7 +419,12 @@ def _last_resort(message: str) -> None:
 
     Deliberately NOT a ``logging`` call: the logging tree is what just failed, and re-entering it is
     how a broken sink becomes an infinite loop. Carries the sink label and reason only; **no record
-    content ever reaches this line.**"""
+    content ever reaches this line.**
+
+    **The scrub is at the callers, not in here, and that is not an oversight.**
+    :func:`_guarded` reports its own failure through THIS function, so calling it from here would
+    make a permanently-raising scrubber recurse without bound — the same shape as re-entering the
+    logging tree. Every caller escapes what it interpolates, the sink label included."""
     stream = sys.stderr
     if stream is None:  # a pythonw.exe-style process with no stderr
         return
@@ -390,6 +433,131 @@ def _last_resort(message: str) -> None:
         # would turn a logging failure into an application crash.
         stream.write(f"messagefoundry: {message}\n")
         stream.flush()
+
+
+#: Ceiling on what the guard stores in :class:`LogSinkStatus` and publishes over ``GET /status``.
+#: Applied LAST, after both scrubs, and that ordering is the correctness point rather than a detail:
+#: slicing BEFORE the credential pass can cut the terminator a pattern needs -- truncating
+#: ``postgres://u:pw@host`` mid-password leaves ``_DSN_PASSWORD`` no trailing ``@`` to match, and the
+#: prefix of the secret is then published unmasked. Slicing an already-escaped string can at worst
+#: cut ``\xNN`` short, which cannot produce a control character.
+_DIAGNOSTIC_LIMIT = 1000
+
+#: Returned when the scrubbers themselves raise. A literal, with nothing at all from the input and
+#: no ``len()`` or other call that could raise a second time inside the handler for the first.
+_DIAGNOSTIC_DROPPED = "<diagnostic dropped: the scrubbers raised>"
+
+
+#: The fallback for a PATH, kept distinct from :data:`_DIAGNOSTIC_DROPPED` because ``GET /status``
+#: presents ``rolled_aside`` as the file an operator opens to recover the broken log. A sentence
+#: about scrubbers reads like a filename there and is not one. Same reasoning for the sink LABEL,
+#: which names the row on ``/status`` and in the alert.
+_PATH_DROPPED = "<rolled-aside path unavailable>"
+_LABEL_DROPPED = "<unnameable sink>"
+
+
+def _guarded(scrub: Callable[[str], str], text: str, *, fallback: str) -> str:
+    """Run ``scrub``, bound the result, and NEVER raise — the shared never-raise core (BACKLOG #1591).
+
+    **Emit anyway if the scrub itself fails.** A guard that goes silent because its own scrubber
+    raised is worse than one reporting a degraded string: the operator would lose the fact that a log
+    sink broke at all. The degradation is reported rather than swallowed — ``fallback`` reaches every
+    consumer of the string, and the stderr last-resort channel names the exception type. That call is
+    itself suppressed, because a never-raise contract that formats an f-string first is not one; and
+    every ``fallback`` is a bare literal for the same reason, so a caller passing something that is
+    not a ``str`` cannot turn a log-write failure into an application crash.
+
+    The slice is applied AFTER the scrub, and that ordering is a correctness point rather than a
+    detail: slicing BEFORE the credential pass can cut the terminator a pattern needs — truncating
+    ``postgres://u:pw@host`` mid-password leaves ``_DSN_PASSWORD`` no trailing ``@`` to match, and
+    the prefix of the secret is then published unmasked. Slicing an already-escaped string can at
+    worst cut a ``\\xNN`` escape short, which cannot produce a control character."""
+    try:
+        return scrub(text)[:_DIAGNOSTIC_LIMIT]
+    except Exception as exc:
+        with contextlib.suppress(Exception):
+            # ascii() renders the class name with every control character escaped, so even a
+            # pathological type cannot put a raw newline on the last-resort channel.
+            _last_resort(
+                f"a log-sink diagnostic could not be scrubbed ({ascii(type(exc).__name__)}); "
+                "a placeholder was substituted"
+            )
+        return fallback
+
+
+def _scrub_diagnostic(text: str) -> str:
+    """Mask credential values, then escape control characters — **in the handler chain's order**.
+
+    ``_install_phi_filters`` installs ``CredentialScrubFilter`` BEFORE ``ControlCharScrubFilter``,
+    and reversing it here would not merely diverge, it would DEFEAT the credential pass: the patterns
+    are whitespace-delimited, so ``bearer<LF>tok...`` matches while the escaped ``bearer\\ntok...``
+    does not — the token would then reach every consumer in plaintext. The order this module needs is
+    the order the chain already uses, for the same reason."""
+    return scrub_control_chars(scrub_credentials(text))
+
+
+def _safe_diagnostic(text: str) -> str:
+    """Make an exception-derived string safe to publish to the guard's consumers (BACKLOG #1591).
+
+    **CALL IT EXACTLY ONCE, WHERE THE STRING IS BUILT. IT IS NOT IDEMPOTENT**, and the reason is the
+    same coupling that fixes the order above: escaping removes the whitespace the credential value
+    class terminates on. ``password=hunter2<LF>rest of it`` scrubs to
+    ``password=<placeholder>\\nrest of it``; run that through again and ``_CREDENTIAL_KV`` sees no
+    whitespace after the placeholder, so it swallows the escape and everything up to the next real
+    space. A second pass therefore EATS the diagnostic rather than costing nothing. An earlier
+    revision of this row scrubbed again at :meth:`LogWriteGuard.record_rollover` as belt and braces;
+    that made ``/status`` disagree with the notice already written on the sink, so the belt was
+    removed and the precondition written down instead.
+
+    **What it adds to :func:`safe_exc`.** ``safe_exc`` redacts HL7-shaped PHI and truncates; it does
+    **not** touch control characters and does not know the credential vocabulary. On the ordinary
+    logging path those two are handler filters (``_install_phi_filters``), and the guard's own
+    strings do not reliably reach them — see the module docstring's consumer list. So an ``OSError``
+    whose message carried a CR LF pair used to forge a whole log line on the rolled sink.
+
+    **Which filters of that chain this stands in for, and which it does not.**
+    ``RedactionFilter`` is covered by :func:`safe_exc`, which :func:`_safe_reason` applies with it;
+    ``CredentialScrubFilter`` and ``ControlCharScrubFilter`` are composed by
+    :func:`_scrub_diagnostic`. ``CredentialQueryScrubFilter`` is scoped to a URL query string (OIDC
+    ``code``/``state``), and the sinks this module guards are stdout and a local file, neither of
+    which yields a diagnostic containing a request URL. **A guarded sink that could — an HTTP or
+    syslog-collector sink — must revisit this.** The composition is not derived from the chain, so
+    ``test_the_guards_scrub_composition_still_covers_the_installed_filter_chain`` pins the membership
+    rather than leaving the next divergence to be noticed.
+
+    **The input is bounded by construction, not by trust.** ``scrub_credentials`` runs regular
+    expressions that are super-linear in the worst case, and this is the one code path in the engine
+    that executes while logging is already broken. Every call site reaches this through
+    :func:`_safe_reason`, so the input is always :func:`safe_exc` output and already truncated."""
+    return _guarded(_scrub_diagnostic, text, fallback=_DIAGNOSTIC_DROPPED)
+
+
+def _escape_only(text: str, *, fallback: str) -> str:
+    """Escape control characters and nothing else — for the two strings that are NOT diagnostics.
+
+    The rolled-aside PATH and the SINK LABEL both reach the notice, ``GET /status`` and the stderr
+    last-resort line, and both can carry the forged-line hazard: a newline is a legal filename
+    character on POSIX, ``_roll`` is a documented subclass seam, and ``register`` takes an arbitrary
+    label. Neither may go through the credential patterns. A path is not a credential-bearing
+    diagnostic and those patterns would rewrite a legitimate one — a directory segment ending in a
+    credential word followed by ``:`` or ``=`` has the rest of the path replaced by the placeholder,
+    so ``/status`` would name a file that does not exist, during the incident this guard is for.
+
+    Unlike :func:`_safe_diagnostic` this IS idempotent: escaping adds no control characters, so a
+    second pass finds nothing to do. When a value IS hostile the escaped form deliberately stops
+    being the literal: an operator un-escaping one path beats a notice that can forge a log line."""
+    return _guarded(scrub_control_chars, text, fallback=fallback)
+
+
+def _safe_reason(exc: BaseException | None) -> str:
+    """The guard's one way to turn a caught exception into a publishable reason string.
+
+    Written once so the pairing cannot be half-applied: :func:`safe_exc` alone leaves the control
+    characters and the credentials, :func:`_safe_diagnostic` alone leaves the PHI and the length
+    unbounded, and a fifth diagnostic added later gets both by reaching for this name."""
+    if exc is None:
+        return "log write failed (no exception recorded)"
+    return _safe_diagnostic(safe_exc(exc))
 
 
 # The mixin needs ``stream`` / ``terminator`` / ``format`` from the concrete handler it is mixed into.
@@ -443,12 +611,16 @@ class _GuardedSinkMixin(_SinkBase):
             return
         self._reentry.active = True
         try:
-            exc = sys.exception()
-            reason = (
-                safe_exc(exc) if exc is not None else "log write failed (no exception recorded)"
-            )
+            # SCRUBBED HERE, WHERE IT IS BUILT, AND NOWHERE ELSE (BACKLOG #1591). The notice below is
+            # written by ``_emit_direct``, so no handler filter will ever see it, and the three other
+            # consumers of this string take it from the guard unchanged. See the module docstring.
+            reason = _safe_reason(sys.exception())
             try:
+                # The path is the notice's OTHER interpolated limb, so it is escaped on the same
+                # terms -- a half-scrubbed notice is a control resting on a false premise.
                 rolled_aside = self._roll()
+                if rolled_aside:
+                    rolled_aside = _escape_only(rolled_aside, fallback=_PATH_DROPPED)
                 # STAGE 1 is only complete once the REPLACEMENT has actually accepted a write. Both
                 # writes below go to the fresh stream; either raising means the replacement is no
                 # better than the file it replaced, which is precisely the Stage 2 condition.
@@ -459,9 +631,13 @@ class _GuardedSinkMixin(_SinkBase):
                 )
                 self._rewrite(record)
             except Exception as roll_exc:
+                # ``_safe_reason``, not a bare ``safe_exc``: the guard scrubs nothing of its own, so
+                # each limb of the join has to arrive scrubbed. Bounding them SEPARATELY is also
+                # what keeps the stage-2 cause -- the operationally important half -- from being the
+                # part a single bound on the composed string would cut.
                 self._guard.record_unwritable(
                     self._sink_label,
-                    reason=f"{reason}; the replacement failed too: {safe_exc(roll_exc)}",
+                    reason=f"{reason}; the replacement failed too: {_safe_reason(roll_exc)}",
                 )
                 return
             self._guard.record_rollover(self._sink_label, reason=reason, rolled_aside=rolled_aside)
