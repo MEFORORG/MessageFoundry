@@ -6,18 +6,41 @@
 
 .DESCRIPTION
     Stops the service (Ctrl+C, letting the engine drain connections) and removes its NSSM
-    registration. Log files and the message store under -DataDir are left in place.
+    registration.
+
+    Removing the registration does NOT return the host to its pre-install state. The installer
+    also grants a user right, writes access-control entries naming the run-as account, turns
+    inheritance off on the data directory, caches an NSSM binary, and (with -SuppressCrashDumps)
+    writes machine-wide Windows Error Reporting keys. None of that is undone here by default, so
+    this script reads the host before it removes the registration and prints an inventory of what
+    it found still in place, with the command to clear each one.
+
+    Two of them can be taken back on request, because both need elevation an operator may not have
+    later: -RemoveLogonRight drops the "Log on as a service" right, and -RemoveAccountAces drops
+    the run-as account's entry from the data and config directories.
 
     Run from an elevated (Administrator) PowerShell prompt.
 
 .EXAMPLE
     .\uninstall-service.ps1
+
+.EXAMPLE
+    .\uninstall-service.ps1 -RemoveLogonRight -RemoveAccountAces
 #>
 [CmdletBinding()]
 param(
     [string]$NssmPath,
     [string]$ServiceName = "MessageFoundry",
-    [string]$DataDir = "C:\ProgramData\MessageFoundry"
+    [string]$DataDir = "C:\ProgramData\MessageFoundry",
+    # Opt-in: take the "Log on as a service" right back off the run-as account. Default OFF because
+    # a SHARED account (a gMSA running several services, a dedicated user reused elsewhere) needs
+    # the right for those too, and removing it stops them starting with error 1069. Safe for the
+    # installer's default per-service virtual account, whose SID belongs to this service alone.
+    [switch]$RemoveLogonRight,
+    # Opt-in: remove the run-as account's access-control entry from the data directory and the
+    # config directory. The account is gone once the registration is, so the entry is orphaned -
+    # but removing it is still a permission change on directories that may outlive this service.
+    [switch]$RemoveAccountAces
 )
 
 $ErrorActionPreference = "Stop"
@@ -123,12 +146,351 @@ function Stop-ServiceAndConfirm {
 }
 # END Stop-ServiceAndConfirm
 
+function Get-ConfigDirFromAppParameters {
+    <#
+      Pull the --config value out of the command line NSSM stores as AppParameters.
+
+      The uninstaller takes no -Config, so the config directory is only knowable by reading it back
+      off the registration - and only BEFORE the registration is removed. Without it the notice can
+      say an orphaned entry exists but not where, which is the half of an inventory an operator
+      cannot act on.
+
+      The installer quotes the path (it can contain spaces), so the quoted form is tried first; the
+      bare form covers a registration written by hand. Returns an empty string when there is no
+      --config, which is the honest answer - a guessed default would name a directory that may have
+      nothing to do with this install.
+    #>
+    param([string]$AppParameters)
+    if (-not $AppParameters) { return "" }
+    $m = [regex]::Match($AppParameters, '--config\s+"([^"]*)"')
+    if ($m.Success) { return $m.Groups[1].Value }
+    $m = [regex]::Match($AppParameters, '--config\s+(\S+)')
+    if ($m.Success) { return $m.Groups[1].Value }
+    return ""
+}
+
+function Get-UninstallResidueNotice {
+    <#
+      Build the inventory of what this uninstall leaves on the host (BACKLOG #1704).
+
+      WHAT THIS REPLACES: one line reading "Logs and the message store were left in place." That is
+      a COMPLETENESS CLAIM, and it was wrong in at least six ways - the installer also grants
+      SeServiceLogonRight, writes an access-control entry for the run-as account on the data dir AND
+      on the config dir, turns inheritance off on the data dir (and, with -LockConfigDir, on the
+      config dir plus its owner), caches nssm.exe under the data dir, and with -SuppressCrashDumps
+      writes machine-wide WER keys. An operator reading the old line would believe the host was back
+      to where it started.
+
+      EVERY LINE IS DRIVEN BY A FACT THE CALLER MEASURED, never by a default. A fact that could not
+      be read produces no line and is named in -Unreadable instead, so the notice never asserts
+      something nobody checked. The one bias is deliberate and stated: an account is treated as
+      carrying access-control entries whenever the run-as account is not LocalSystem, because that
+      is exactly when install-service.ps1 writes them. Over-reporting costs an operator one icacls
+      read; under-reporting is the defect this function exists to fix.
+
+      IT RETURNS LINES RATHER THAN PRINTING THEM so the content can be read back and tested. A
+      function that writes to the host can only be checked by scanning the script's own text, and
+      the text of an explanation is indistinguishable from the text of a message.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ServiceName,
+        [Parameter(Mandatory)][string]$DataDir,
+        # The run-as account read off the registration. "LocalSystem" (or empty) means the installer
+        # wrote no named grant, so there is no orphaned entry and no user right to report.
+        [string]$ServiceAccount,
+        # Resolved BEFORE the removal. Once the service is gone a per-service virtual account no
+        # longer translates, so the SID is the spelling of the account that still works in icacls.
+        [string]$ServiceAccountSid,
+        [string]$ConfigDir,
+        # Measured from the config dir's own ACL, not assumed from a switch this script never saw.
+        [switch]$ConfigInheritanceStripped,
+        # Path of the cached NSSM binary, only when it is actually on disk.
+        [string]$CachedNssm,
+        # Image names found under the WER ExcludedApplications key.
+        [string[]]$WerImages,
+        # What -RemoveLogonRight / -RemoveAccountAces already took back, so the notice reports the
+        # host as it now IS rather than listing a residue this run just cleared.
+        [switch]$LogonRightRemoved,
+        [switch]$DataAceRemoved,
+        [switch]$ConfigAceRemoved,
+        # Named where a read failed, so a thin notice is never mistaken for a clean host.
+        [string[]]$Unreadable
+    )
+
+    $hasAccount = $ServiceAccount -and ($ServiceAccount -ne "LocalSystem")
+    # icacls resolves a SID spelling forever; it resolves a deleted service's account name never.
+    # NOT named $principal: the script scope already holds the WindowsPrincipal used by the
+    # elevation check, and shadowing that inside a function is a trap for whoever edits next.
+    $acePrincipal = if ($ServiceAccountSid) { "*$ServiceAccountSid" } else { $ServiceAccount }
+
+    $lines = @("", "Still on this host after removing '$ServiceName':")
+
+    $lines += "  Data directory   $DataDir"
+    $lines += "                   Holds the log files and the message store. The installer turned"
+    $lines += "                   inheritance off here and left access to SYSTEM and Administrators"
+    $lines += "                   only. This script leaves it that way on purpose: turning"
+    $lines += "                   inheritance back on would hand the parent directory's users read"
+    $lines += "                   access to logs that can carry patient data."
+
+    if ($CachedNssm) {
+        $lines += "  NSSM binary      $CachedNssm"
+        $lines += "                   Downloaded by the installer and used by this script a moment"
+        $lines += "                   ago, so it cannot delete it. Delete it by hand once you are"
+        $lines += "                   sure you are not reinstalling."
+    }
+
+    if ($hasAccount) {
+        if ($DataAceRemoved) {
+            $lines += "  Data dir entry   REMOVED - '$ServiceAccount' no longer has an entry on $DataDir."
+        } else {
+            $lines += "  Data dir entry   '$ServiceAccount' still has read/write on $DataDir."
+            $lines += "                   Remove it with:"
+            $lines += "                     icacls `"$DataDir`" /remove:g `"$acePrincipal`""
+        }
+
+        if ($ConfigDir) {
+            if ($ConfigAceRemoved) {
+                $lines += "  Config dir entry REMOVED - '$ServiceAccount' no longer has an entry on $ConfigDir."
+            } else {
+                $lines += "  Config dir entry '$ServiceAccount' still has read on $ConfigDir."
+                $lines += "                   Remove it with:"
+                $lines += "                     icacls `"$ConfigDir`" /remove:g `"$acePrincipal`""
+            }
+        }
+
+        if ($LogonRightRemoved) {
+            $lines += "  Logon right      REMOVED - '$ServiceAccount' no longer holds 'Log on as a service'."
+        } else {
+            $lines += "  Logon right      '$ServiceAccount' still holds the 'Log on as a service' right"
+            $lines += "                   (SeServiceLogonRight). Re-run this script with"
+            $lines += "                   -RemoveLogonRight, or clear it in secpol.msc under Local"
+            $lines += "                   Policies, User Rights Assignment."
+        }
+    }
+
+    if ($ConfigDir -and $ConfigInheritanceStripped) {
+        $lines += "  Config dir ACL   $ConfigDir has inheritance turned off, and install-service.ps1"
+        $lines += "                   -LockConfigDir also set its owner to Administrators."
+        $lines += "                   This script does not put that back, because nothing recorded"
+        $lines += "                   what the permissions and owner were before. Turn inheritance"
+        $lines += "                   back on yourself if you want it:"
+        $lines += "                     icacls `"$ConfigDir`" /inheritance:e"
+    }
+
+    if ($WerImages -and $WerImages.Count -gt 0) {
+        $lines += "  Crash-dump keys  Windows Error Reporting keys for $($WerImages -join ', ') under"
+        $lines += "                   HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting."
+        $lines += "                   install-service.ps1 -SuppressCrashDumps wrote them, they apply"
+        $lines += "                   to every process of those names on this host, and they are left"
+        $lines += "                   on purpose: deleting them would switch crash dumps that can"
+        $lines += "                   carry patient data back on. Remove them by hand if you want"
+        $lines += "                   the host's original behaviour back."
+    }
+
+    if ($Unreadable -and $Unreadable.Count -gt 0) {
+        $lines += ""
+        $lines += "  This list covers what this script could read on this host. It could NOT read:"
+        foreach ($u in $Unreadable) { $lines += "    - $u" }
+        $lines += "  Check those by hand before you call the host clean."
+    }
+
+    return $lines
+}
+
+function Remove-ServiceLogonRight {
+    <#
+      Take SeServiceLogonRight back off $Sid, mirroring install-service.ps1's Set-ServiceLogonRight
+      in reverse: export USER_RIGHTS, drop the SID from the row, re-import.
+
+      IT TAKES A SID, NOT A NAME, and the caller resolves it BEFORE the registration is removed. A
+      per-service virtual account is named by the service; with the service gone the name no longer
+      translates, and a resolve attempted here would fail on exactly the default install.
+
+      EXACT TOKEN MATCHING, for the reason the installer's grant states: a SID that is a string
+      prefix of another (RID 110 against 1100) would make a substring test drop the wrong account's
+      right.
+
+      IT REFUSES TO EMPTY THE ROW. If this SID is the only holder, writing back an empty
+      SeServiceLogonRight takes the right away from every account the row covers, which on a real
+      host includes the ones other services log on with. That is a far larger change than the one
+      asked for, so it stops and says so instead.
+
+      Returns $true only when secedit reported the re-import succeeded.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Account,
+        [Parameter(Mandatory)][string]$Sid
+    )
+    $inf = Join-Path $env:TEMP "mefor-secedit-remove-$PID.inf"
+    $sdb = Join-Path $env:TEMP "mefor-secedit-remove-$PID.sdb"
+    try {
+        # $LASTEXITCODE is session-wide and a failed LAUNCH never writes it, so it is cleared before
+        # each call and a $null afterwards is treated as "secedit did not run" - the same rule the
+        # nssm calls in both scripts follow.
+        $global:LASTEXITCODE = $null
+        & secedit /export /areas USER_RIGHTS /cfg $inf | Out-Null
+        if ($null -eq $LASTEXITCODE -or $LASTEXITCODE -ne 0 -or -not (Test-Path $inf)) {
+            Write-Warning ("secedit export failed (exit $LASTEXITCODE), so the 'Log on as a " +
+                "service' right for '$Account' was NOT removed. Clear it in secpol.msc under " +
+                "Local Policies, User Rights Assignment.")
+            return $false
+        }
+        $lines = Get-Content $inf
+        $row = $lines | Where-Object { $_ -match '^\s*SeServiceLogonRight\s*=' } | Select-Object -First 1
+        if (-not $row) {
+            Write-Host "  Right  : no account holds SeServiceLogonRight; nothing to remove."
+            return $false
+        }
+        $value = ($row -replace '^\s*SeServiceLogonRight\s*=', '')
+        $held = @($value -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        $kept = @($held | Where-Object { $_ -ne ("*" + $Sid) -and $_ -ne $Sid })
+        if ($kept.Count -eq $held.Count) {
+            Write-Host "  Right  : '$Account' does not hold SeServiceLogonRight; nothing to remove."
+            return $false
+        }
+        if ($kept.Count -eq 0) {
+            Write-Warning ("'$Account' is the ONLY account holding 'Log on as a service' on this " +
+                "host, so removing it would take the right from every service that logs on with " +
+                "it. Left in place - clear it by hand in secpol.msc if that is really what you want.")
+            return $false
+        }
+        $new = $lines -replace '^\s*SeServiceLogonRight\s*=.*$',
+            ("SeServiceLogonRight = " + ($kept -join ','))
+        Set-Content -Path $inf -Value $new -Encoding Unicode
+        $global:LASTEXITCODE = $null
+        & secedit /configure /db $sdb /cfg $inf /areas USER_RIGHTS | Out-Null
+        if ($null -eq $LASTEXITCODE -or $LASTEXITCODE -ne 0) {
+            Write-Warning ("secedit configure failed (exit $LASTEXITCODE), so the 'Log on as a " +
+                "service' right for '$Account' was NOT removed. Clear it in secpol.msc under " +
+                "Local Policies, User Rights Assignment.")
+            return $false
+        }
+        Write-Host "  Right  : removed SeServiceLogonRight from '$Account'." -ForegroundColor Green
+        return $true
+    } finally {
+        Remove-Item $inf, $sdb -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Remove-AccountAce {
+    <#
+      Drop one principal's access-control entry from $Path - the reverse of the installer's grant.
+
+      $Principal is the SID spelling ("*S-1-...") whenever the caller resolved one, because a
+      deleted service's account name no longer translates and icacls would refuse it.
+
+      /remove:g removes ALLOW entries only, so this can never widen access: the worst outcome is
+      that nothing matched, which icacls reports as success. Returns $true only on a real exit 0.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Principal,
+        [Parameter(Mandatory)][string]$What
+    )
+    if (-not (Test-Path $Path)) {
+        Write-Host "  ACEs   : $What '$Path' is gone; nothing to remove."
+        return $false
+    }
+    $global:LASTEXITCODE = $null
+    & icacls $Path /remove:g $Principal | Out-Null
+    if ($null -eq $LASTEXITCODE -or $LASTEXITCODE -ne 0) {
+        Write-Warning ("Could not remove '$Principal' from the $What '$Path' (icacls exit " +
+            "$LASTEXITCODE). Remove it by hand: icacls `"$Path`" /remove:g `"$Principal`"")
+        return $false
+    }
+    Write-Host "  ACEs   : removed '$Principal' from the $What '$Path'." -ForegroundColor Green
+    return $true
+}
+
 # Find nssm: explicit path, PATH, or the auto-provisioned cache. Fall back to sc.exe if absent.
 if (-not $NssmPath) {
     $cmd = Get-Command nssm -ErrorAction SilentlyContinue
     $NssmPath = if ($cmd) { $cmd.Source } else { Join-Path $DataDir "bin\nssm.exe" }
 }
 $haveNssm = Test-Path $NssmPath
+
+# --- read the host BEFORE the registration goes (BACKLOG #1704) -------------------------------------
+# EVERY fact here stops being readable the moment the service is removed. The run-as account and the
+# registered command line live in the service's own registry key, which `nssm remove` deletes; and a
+# per-service virtual account (NT SERVICE\<ServiceName>, the installer's default) stops translating to
+# a SID once the service it is named for is gone. Reading afterwards would produce an empty inventory
+# that looks exactly like a clean host, which is the failure this whole change is about.
+#
+# Nothing here throws. A read that fails is recorded in $unreadable and named in the notice, so a
+# thinner list is never mistaken for a shorter one.
+$unreadable = @()
+$objectName = ""
+$appParameters = ""
+$appExe = ""
+$svcKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+try {
+    $objectName = [string](Get-ItemProperty -Path $svcKey -Name ObjectName -ErrorAction Stop).ObjectName
+} catch {
+    $unreadable += ("the run-as account of '$ServiceName' ($($_.Exception.Message)) - check " +
+        "'$DataDir' and your config directory for an orphaned entry, and secpol.msc for a stray " +
+        "'Log on as a service' grant")
+}
+try {
+    $params = Get-ItemProperty -Path (Join-Path $svcKey "Parameters") -ErrorAction Stop
+    $appParameters = [string]$params.AppParameters
+    $appExe = [string]$params.Application
+} catch {
+    $unreadable += ("the registered command line of '$ServiceName' ($($_.Exception.Message)) - so " +
+        "the config directory could not be named below")
+}
+$configDir = Get-ConfigDirFromAppParameters -AppParameters $appParameters
+
+# The installer writes a named grant for any run-as account EXCEPT LocalSystem, which it covers with
+# the well-known SYSTEM SID instead. So "not LocalSystem" is exactly the condition under which an
+# orphaned entry and a logon right exist, read off the registration rather than guessed.
+$hasAccount = $objectName -and ($objectName -ne "LocalSystem")
+$accountSid = ""
+if ($hasAccount) {
+    try {
+        $accountSid = ([Security.Principal.NTAccount]$objectName).Translate(
+            [Security.Principal.SecurityIdentifier]).Value
+    } catch {
+        $unreadable += ("the SID of '$objectName' ($($_.Exception.Message)) - the commands below " +
+            "name the account instead, and icacls may refuse that name once the service is gone")
+    }
+}
+
+# Measured from the directory's own ACL, not inferred from a -LockConfigDir switch this script never
+# saw. AreAccessRulesProtected is true exactly when inheritance has been turned off.
+$configProtected = $false
+if ($configDir) {
+    try {
+        $configProtected = [bool](Get-Acl -Path $configDir -ErrorAction Stop).AreAccessRulesProtected
+    } catch {
+        $unreadable += ("the permissions of the config directory '$configDir' " +
+            "($($_.Exception.Message))")
+    }
+}
+
+$cachedNssm = Join-Path $DataDir "bin\nssm.exe"
+if (-not (Test-Path $cachedNssm)) { $cachedNssm = "" }
+
+# WER suppression is by IMAGE NAME and covers BOTH images the installer names: the launcher and the
+# interpreter a pip console script starts as a child. Only images actually present under
+# ExcludedApplications are reported, so a host that never ran -SuppressCrashDumps gets no line.
+$werImages = @()
+if ($appExe) {
+    try {
+        $imageNames = @([IO.Path]::GetFileName($appExe))
+        $interpreter = Join-Path (Split-Path -Parent $appExe) "python.exe"
+        if (Test-Path $interpreter) { $imageNames += [IO.Path]::GetFileName($interpreter) }
+        $excludedKey = "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\ExcludedApplications"
+        if (Test-Path $excludedKey) {
+            $excludedProps = Get-ItemProperty -Path $excludedKey -ErrorAction Stop
+            foreach ($image in ($imageNames | Select-Object -Unique)) {
+                if ($null -ne $excludedProps.PSObject.Properties[$image]) { $werImages += $image }
+            }
+        }
+    } catch {
+        $unreadable += ("the Windows Error Reporting exclusions ($($_.Exception.Message)) - check " +
+            "them by hand if you installed with -SuppressCrashDumps")
+    }
+}
 
 Write-Host "Stopping '$ServiceName'..."
 # BOTH stop paths - nssm and the SCM fallback - ran without checking anything and without reading the
@@ -160,4 +522,65 @@ if ($haveNssm) {
     if ($LASTEXITCODE -ne 0) { throw "sc.exe delete failed (exit $LASTEXITCODE)" }
 }
 
-Write-Host "Removed '$ServiceName'. Logs and the message store were left in place." -ForegroundColor Green
+Write-Host "Removed '$ServiceName'." -ForegroundColor Green
+
+# --- the two residues an operator can hand back to this script (BACKLOG #1704) ----------------------
+# Both run AFTER the registration is gone, against facts read BEFORE it: the service must not lose the
+# right or the entry while it is still registered to use them.
+#
+# NOTHING ELSE IS TAKEN BACK, AND THAT IS A DECISION RATHER THAN AN OMISSION. Turning inheritance back
+# on would hand the parent directory's principals read access to logs and a message store that can
+# carry patient data, and nothing recorded what the permissions were before the installer changed
+# them - so a "restore" would be inventing a state, not returning to one. The notice names those and
+# gives the command, which leaves the choice with the operator who knows the host.
+$logonRightRemoved = $false
+$dataAceRemoved = $false
+$configAceRemoved = $false
+
+if ($RemoveLogonRight) {
+    if (-not $hasAccount) {
+        Write-Host "  Right  : the service ran as LocalSystem, which was never granted the right."
+    } elseif (-not $accountSid) {
+        Write-Warning ("Cannot remove the 'Log on as a service' right: '$objectName' did not " +
+            "resolve to a SID before the registration was removed. Clear it in secpol.msc under " +
+            "Local Policies, User Rights Assignment.")
+    } else {
+        if ($objectName -ne "NT SERVICE\$ServiceName") {
+            Write-Warning ("'$objectName' is not this service's own virtual account, so it may log " +
+                "other services on as well. Removing the right stops those starting (error 1069). " +
+                "Check what else uses it before you rely on this.")
+        }
+        $logonRightRemoved = Remove-ServiceLogonRight -Account $objectName -Sid $accountSid
+    }
+}
+
+if ($RemoveAccountAces) {
+    if (-not $hasAccount) {
+        Write-Host "  ACEs   : the service ran as LocalSystem, so no named entry was ever written."
+    } else {
+        $acePrincipal = if ($accountSid) { "*$accountSid" } else { $objectName }
+        $dataAceRemoved = Remove-AccountAce -Path $DataDir -Principal $acePrincipal -What "data directory"
+        if ($configDir) {
+            $configAceRemoved = Remove-AccountAce -Path $configDir -Principal $acePrincipal -What "config directory"
+        } else {
+            Write-Warning ("The config directory could not be read off the registration, so its " +
+                "entry for '$objectName' was left. Remove it with: icacls `"<config dir>`" " +
+                "/remove:g `"$acePrincipal`"")
+        }
+    }
+}
+
+Get-UninstallResidueNotice `
+    -ServiceName $ServiceName `
+    -DataDir $DataDir `
+    -ServiceAccount $objectName `
+    -ServiceAccountSid $accountSid `
+    -ConfigDir $configDir `
+    -ConfigInheritanceStripped:$configProtected `
+    -CachedNssm $cachedNssm `
+    -WerImages $werImages `
+    -LogonRightRemoved:$logonRightRemoved `
+    -DataAceRemoved:$dataAceRemoved `
+    -ConfigAceRemoved:$configAceRemoved `
+    -Unreadable $unreadable |
+    ForEach-Object { Write-Host $_ }
