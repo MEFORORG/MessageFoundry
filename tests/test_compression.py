@@ -404,3 +404,26 @@ def test_zip_rejects_duplicate_member_names(second_body: bytes) -> None:
         zip_decompress(archive.getvalue(), max_output_bytes=None)
     assert "duplicate.txt" not in str(caught.value)
     assert second_body.decode() not in str(caught.value)
+
+
+def test_zip_duplicate_directories_do_not_collide_with_file_mapping() -> None:
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("d/", b"")
+        with pytest.warns(UserWarning, match="Duplicate name"):
+            zf.writestr("d/", b"")
+        zf.writestr("d/a.txt", b"payload")
+    assert zip_decompress(archive.getvalue(), max_output_bytes=7, max_entries=3) == {
+        "d/a.txt": b"payload"
+    }
+
+
+def test_zip_directory_entries_still_count_toward_member_cap() -> None:
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("d/", b"")
+        with pytest.warns(UserWarning, match="Duplicate name"):
+            zf.writestr("d/", b"")
+        zf.writestr("d/a.txt", b"payload")
+    with pytest.raises(CompressionError, match="3 members, over the 2-member cap"):
+        zip_decompress(archive.getvalue(), max_output_bytes=None, max_entries=2)
