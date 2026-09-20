@@ -54,7 +54,7 @@ from messagefoundry.logging_guard import (
     LogWriteGuard,
     set_active_guard,
 )
-from messagefoundry.redaction import redact
+from messagefoundry.redaction import redact_untrusted
 
 # THE OTHER LEAF IMPORTED FOR ITS DEFINITION (BACKLOG #1478): the credential-label vocabulary, held in
 # one place so the write-time filters here and the read-time support-bundle redactor cannot disagree
@@ -245,25 +245,56 @@ class RedactionFilter(logging.Filter):
     multi-token name runs (e.g. ``DOE JANE``) are scrubbed even without HL7 delimiters — so this flows
     through to both the stdout handler and the off-box forwarder by construction. The remaining residual
     is an adversarially-crafted *single-token* or non-name-shaped identifier, for which the "never put
-    PHI in an exception message" convention remains the control (see :mod:`messagefoundry.redaction`)."""
+    PHI in an exception message" convention remains the control (see :mod:`messagefoundry.redaction`).
+
+    **EVERY FIELD IS BOUNDED BEFORE IT IS SCANNED (BACKLOG #1576).** This filter had no ceiling at all,
+    and it is the worst place in the engine not to have one: a ``logging.Filter`` is synchronous by the
+    stdlib's contract, so it runs on whatever thread emitted the record — for the engine, the asyncio
+    event loop — and its input is a whole rendered traceback whose length a remote peer chooses. A
+    negative acknowledgment at a 16 MiB frame cap would have charged the loop the better part of a
+    second per record.
+    :func:`~messagefoundry.redaction.redact_untrusted` cuts each field first, at a boundary no
+    redaction pattern can straddle, so the bound cannot strand the fragment a threshold-based pattern
+    would then miss. Head-first is the right end for a traceback: Python renders the frames before the
+    exception message, so what a bound drops is the peer-sized payload and what it keeps is the part
+    an operator reads.
+
+    **The bound reaches the three filters installed after this one too, and by order rather than by
+    their own code.** :class:`CredentialScrubFilter` and :class:`CredentialQueryScrubFilter` walk the
+    same fields, and ``secretscrub``'s DSN-password pattern is itself superlinear over dotted text.
+    They are bounded today only because this filter runs first and writes the clamped text back onto
+    the record. That is a real property of :func:`_install_phi_filters`'s ORDER, not an accident — and
+    it is why the order argument there is a correctness argument, not a preference.
+
+    *Two residuals, stated rather than hidden.*
+
+    **The RENDER is still unbounded, only the SCAN is bounded.**
+    ``Formatter.formatException`` joins the exception's message into a traceback string before this
+    filter can clamp anything, and that is a linear string copy no pattern-level bound reaches.
+    Measured on a 16 MiB message: render 58.6 ms, clamp 0.1 ms, scan 0.9 ms — against a 255.5 ms scan
+    before the bound, so the filter went from about 314 ms to about 60 ms and what remains is the
+    render. Bounding it means consuming ``traceback.format_exception`` lazily and stopping at the
+    window, which is a change to traceback rendering rather than to redaction, and is not in BACKLOG
+    #1576.
+
+    **A record can be clamped twice and differ between sinks.** Redaction can lengthen its input
+    (``||`` becomes a ten-character placeholder), so a crafted record whose REDACTED form still
+    exceeds the window is clamped again on the second handler's pass. Both sinks hold redacted text;
+    the difference is length, never PHI."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        message = record.getMessage()
-        scrubbed = redact(message)
-        if scrubbed != message:
-            record.msg = scrubbed
-            record.args = ()
-        # The realistic PHI vector is a chained exception carrying a raw body. Render the traceback
-        # (chained causes included by default) and redact it; clear exc_info in BOTH paths so no
-        # formatter (even a custom one ignoring exc_text) can re-render the raw exception.
-        if record.exc_text:
-            record.exc_text = redact(record.exc_text)
-            record.exc_info = None
-        elif record.exc_info:
-            record.exc_text = redact(_EXC_RENDERER.formatException(record.exc_info))
-            record.exc_info = None
-        if record.stack_info:
-            record.stack_info = redact(record.stack_info)
+        # The realistic PHI vector is a chained exception carrying a raw body, so render the traceback
+        # (chained causes included by default) before the walk, and clear exc_info UNCONDITIONALLY so
+        # no formatter -- even a custom one ignoring exc_text -- can re-render the raw exception.
+        #
+        # THEN THE SHARED WALK, WHICH THIS FILTER WAS THE LAST TO JOIN (#1576). It hand-copied
+        # `_rewrite_record`'s body, which is the shape BACKLOG #1478 records as a defect: four filters
+        # with four copies, and the one field missing from one of them was invisible to a reviewer
+        # comparing four `filter` methods. #1576 would have added a second thing to remember per field.
+        if not record.exc_text and record.exc_info:
+            record.exc_text = _EXC_RENDERER.formatException(record.exc_info)
+        record.exc_info = None
+        _rewrite_record(record, redact_untrusted)
         return True
 
 
@@ -365,7 +396,9 @@ class JsonFormatter(logging.Formatter):
             # Defensive: RedactionFilter normally pre-renders + redacts exc_text and clears exc_info,
             # so this branch is dead on the configured handlers. If JsonFormatter is ever attached to a
             # filter-less handler, redact here too so PHI safety doesn't depend on call-site discipline.
-            payload["exception"] = redact(self.formatException(record.exc_info))
+            # Bounded for the same reason and on the same terms as the filter's own call (#1576): a
+            # filter-less handler is exactly the one with nothing upstream to have clamped it already.
+            payload["exception"] = redact_untrusted(self.formatException(record.exc_info))
         if record.stack_info:
             payload["stack"] = record.stack_info
         return json.dumps(payload, ensure_ascii=False)

@@ -9,12 +9,20 @@ from __future__ import annotations
 
 import re
 import time
+from collections.abc import Callable
 
 import pytest
 from _phi_log_capture import IDENTIFIER_SHAPED_NAMES, SAFE_NAME_SUFFIXES
 
 from messagefoundry import redaction
-from messagefoundry.redaction import redact, safe_error, safe_exc, safe_name, safe_text
+from messagefoundry.redaction import (
+    clamp_untrusted,
+    redact,
+    safe_error,
+    safe_exc,
+    safe_name,
+    safe_text,
+)
 
 ADT = (
     "MSH|^~\\&|SENDINGAPP|FAC|RECV|RFAC|20260604||ADT^A01|MSG1|P|2.5.1\r"
@@ -138,9 +146,13 @@ _PRE_GUARD_FIELD_RUN = re.compile(r"[^\s|^~&]*+[|^~&][^\s|^~&]*+(?:[|^~&][^\s|^~
 #: whitespace, so an ``mfb64:v1:`` payload (ADR 0028) quoted into an exception message or a rendered
 #: traceback is ONE token to this scan. 16,000 characters is a 12 KiB attachment, which is a small one.
 #:
-#: **The real input is not capped, so this is a floor on the worst case rather than the worst case.**
-#: ``safe_text`` truncates AFTER ``redact`` has run, and the logging handler filter in
-#: ``messagefoundry.logging_setup`` redacts whole rendered tracebacks with no bound at all.
+#: **The real input IS capped now, at ``_REDACT_WINDOW`` (BACKLOG #1576), and this fixture sits under
+#: that cap on purpose.** It used to be a floor on the worst case rather than the worst case, because
+#: ``safe_text`` truncated AFTER ``redact`` had run and the logging handler filter redacted whole
+#: rendered tracebacks with no bound at all. Both clamp their input first now, so the worst case a
+#: pattern here can be charged is one window — and 16,000 characters is a quarter of one, which keeps
+#: these arms measuring the SCAN rather than the bound that now precedes it. Raising this above the
+#: window would silently convert them into tests of ``_clamp``.
 _HOSTILE_RUN_CHARS = 16_000
 
 #: The one line both cost arms are measured against, sitting between the two costs. The margins run in
@@ -181,18 +193,24 @@ def _longest_token(text: str) -> int:
     return max(len(run) for run in re.split(r"[\s|^~&]", text))
 
 
-def _redact_seconds(reps: int) -> float:
-    """Best-of-``reps`` seconds for the shipping ``redact`` on the hostile message.
+def _best_of(work: Callable[[], object], reps: int = 3) -> float:
+    """Best-of-``reps`` seconds for ``work``.
 
     The MINIMUM is the noise-free estimate: a scheduling hiccup can only inflate a sample, never
-    deflate one, so one slow slice on a loaded runner cannot fake a red."""
-    text = _hostile_free_text()
+    deflate one, so one slow slice on a loaded runner cannot fake a red. Every cost arm in this file
+    shares it, so the sampling rule is argued once and a change to it lands everywhere."""
     best = float("inf")
     for _ in range(reps):
         start = time.perf_counter()
-        redaction.redact(text)
+        work()
         best = min(best, time.perf_counter() - start)
     return best
+
+
+def _redact_seconds(reps: int) -> float:
+    """Best-of-``reps`` seconds for the shipping ``redact`` on the hostile message."""
+    text = _hostile_free_text()
+    return _best_of(lambda: redaction.redact(text), reps)
 
 
 def test_the_hostile_fixture_is_actually_hostile() -> None:
@@ -220,10 +238,14 @@ def test_a_delimiter_free_run_stays_inside_the_scan_budget() -> None:
 
     ``redact`` is installed as a **logging handler filter** (``messagefoundry.logging_setup``), so it
     runs synchronously on whatever emitted the record, which for the engine is the asyncio event loop.
-    Its input is a whole rendered traceback and is not bounded: ``safe_text``'s ``limit`` truncates
-    AFTER ``redact`` has run. A quadratic scan here is a whole-engine stall, not a slow log line, and
-    the run is attacker-influenceable because a Router or Handler can raise with a message built from
-    the received body (ADR 0028 base64 carriage makes that body one token).
+    A quadratic scan here is a whole-engine stall, not a slow log line, and the run is
+    attacker-influenceable because a Router or Handler can raise with a message built from the received
+    body (ADR 0028 base64 carriage makes that body one token).
+
+    The input is bounded to one window before it reaches this scan now (BACKLOG #1576), so a quadratic
+    scan would cost a window rather than a frame cap. That is a smaller stall, not an acceptable one —
+    a window of the shape below is 64 KiB, sixteen times this fixture — which is why the guard #1437
+    put in stays and this arm stays with it.
 
     **This replaced a one-sample wall-clock assertion, and both halves of it were wrong.** The old arm
     took a single sample of an input whose longest token was one character and compared it to a bare
@@ -476,11 +498,7 @@ def test_the_separator_sniff_stays_inside_the_scan_budget() -> None:
     custom = _custom_delimiter_message(300)
 
     for label, text in (("ops text", ops_block), ("300-segment custom message", custom)):
-        best = float("inf")
-        for _ in range(5):
-            start = time.perf_counter()
-            redact(text)
-            best = min(best, time.perf_counter() - start)
+        best = _best_of(lambda text=text: redact(text), 5)  # type: ignore[misc]
         assert best < _SCAN_BUDGET_SECONDS, (
             f"redacting {len(text)} characters of {label} cost {best:.4f}s of the event loop against "
             f"a {_SCAN_BUDGET_SECONDS}s budget"
@@ -723,3 +741,185 @@ def test_safe_error_defaults_closed() -> None:
 
 def test_safe_error_is_exported() -> None:
     assert "safe_error" in redaction.__all__
+
+
+# --- bounding the input: clamp_untrusted (BACKLOG #1576) ----------------------
+
+#: A filler token carrying no delimiter, no digit and no name shape, so a fixture built from it
+#: measures the BOUND and nothing else. Whitespace between the tokens is the point: it gives ``_clamp``
+#: real boundaries to cut at, which is the case an operator actually sees. A fixture of one solid run
+#: has no boundary anywhere and is dropped whole, which passes every leak arm below vacuously.
+_FILLER = "ordinary-ops-filler "
+
+
+def _filler(chars: int) -> str:
+    return (_FILLER * (chars // len(_FILLER) + 1))[:chars]
+
+
+def _over_window(tail: str) -> str:
+    """Filler plus ``tail``, sized so the window's cut falls inside ``tail``."""
+    return _filler(redaction._REDACT_WINDOW - len(tail) // 2) + tail
+
+
+def test_the_fence_a_naive_prefix_truncation_leaks_the_name() -> None:
+    """THE MEASUREMENT THE WHOLE DESIGN RESTS ON, pinned so nobody "simplifies" ``_clamp`` back into
+    ``text[:window]``.
+
+    ``redact(text[:window])`` is the obvious bound and it is the wrong one. The cut lands inside a
+    field run, the surviving fragment carries ONE delimiter where ``_HL7_FIELD_RUN`` needs two, and the
+    surname walks through into the log. This arm asserts the leak on the SHIPPED redactor, so it is a
+    statement about the pattern rather than about a strawman."""
+    window = redaction._REDACT_WINDOW
+    leaky = _filler(window - 4) + " DOE^JANE^M trailing"
+    assert "DOE" in redact(leaky[:window]), (
+        "the naive truncation no longer strands a fragment, so the fence this design was built "
+        "against has moved and _clamp's extra work needs re-justifying"
+    )
+
+
+def test_clamp_closes_the_fence_it_was_built_against() -> None:
+    """The positive half of the arm above: the same input, through the shipped bound, keeps nothing."""
+    window = redaction._REDACT_WINDOW
+    leaky = _filler(window - 4) + " DOE^JANE^M trailing"
+    assert "DOE" not in redact(clamp_untrusted(leaky))
+
+
+def test_clamp_does_not_strand_a_name_run_split_by_the_cut() -> None:
+    """``_NAME_RUN`` is the one pattern that spans whitespace, so a whitespace cut alone can still
+    strand it: ``DOE JANE`` cut between its tokens leaves ``DOE`` under the two-token threshold. The
+    token walk drops the neighbours whole."""
+    out = redact(clamp_untrusted(_over_window(" DOE JANE SMITH tail")))
+    assert "DOE" not in out and "JANE" not in out and "SMITH" not in out
+
+
+def test_clamp_steps_over_a_whitespace_run_between_name_tokens() -> None:
+    """``_NAME_RUN`` joins its tokens with ``\\s+``, so the walk has to step over a whitespace RUN. A
+    walk that stopped on the empty token inside one would leave ``JANE`` standing."""
+    out = redact(clamp_untrusted(_over_window(" patient JANE   SMITHTAIL")))
+    assert "JANE" not in out
+
+
+def test_clamp_never_cuts_inside_a_token() -> None:
+    """A cut at an arbitrary offset is the leak in a second costume: it can take one delimiter off a
+    two-delimiter run just as a prefix truncation does. The cut lands on whitespace or on nothing, so a
+    field run with no whitespace after it is dropped whole rather than halved."""
+    window = redaction._REDACT_WINDOW
+    out = redact(clamp_untrusted(_filler(100) + " A^B^C" + "Q" * (window * 2)))
+    assert "A^B" not in out and "B^C" not in out
+
+
+def test_clamp_yields_nothing_when_the_window_holds_no_boundary() -> None:
+    """The honest end of the same rule. One solid run offers no safe cut anywhere, so the answer is the
+    note alone -- over-redaction, never a fragment."""
+    window = redaction._REDACT_WINDOW
+    clamped = clamp_untrusted("MRN123456^H^MR" + "A" * (window + 100))
+    assert "MRN123456" not in clamped
+    assert clamped.strip().startswith("[redaction bound:")
+
+
+def test_clamp_is_idempotent_because_two_handlers_filter_one_record() -> None:
+    """``_install_phi_filters`` attaches a chain per handler, so a record going to stdout AND the
+    off-box forwarder is scrubbed twice. A bound that re-cut on the second pass would ship two sinks
+    two different strings. Idempotence comes from the result fitting the window, not from recognising
+    the note -- see the arm below for why that distinction is load-bearing."""
+    once = clamp_untrusted(_over_window(" DOE^JANE^M trailing"))
+    assert len(once) <= redaction._REDACT_WINDOW
+    assert clamp_untrusted(once) == once
+
+
+def test_a_peer_cannot_bypass_the_bound_by_writing_the_note_into_its_payload() -> None:
+    """The obvious way to make the clamp idempotent is to look for its own note and return early. A
+    remote peer writes the text of an MSA-3, so it can write that note -- and a bound a peer can switch
+    off is not a bound. The length check cannot be spoofed."""
+    note = clamp_untrusted(_over_window(" tail"))[-60:]
+    hostile = _filler(redaction._REDACT_WINDOW * 2) + note
+    assert len(clamp_untrusted(hostile)) <= redaction._REDACT_WINDOW
+
+
+def test_clamp_reports_what_it_dropped_without_becoming_redactable() -> None:
+    """The note has to survive ``redact`` unchanged, or re-applying ``safe_text`` at the store-layer
+    chokepoint would rewrite it and break the fixed point. So: no delimiter pair, no capitalized token
+    that could pair into a name run, and a separator in the count so an eight-digit one is not read as
+    a bare ``YYYYMMDD`` by ``_DATE_RUN``."""
+    note = redaction._clamp_marker(19_800_505)
+    assert redact(note) == note
+    assert "19_800_505" in note
+
+
+def test_clamp_leaves_anything_short_enough_to_read_byte_identical() -> None:
+    """The ordinary case is every case an operator sees. ``dropped == 0`` must mean untouched, or this
+    change would be a rewrite of every stored ``last_error`` rather than a bound on a hostile one."""
+    for text in ("connection refused: timeout after 5s", "", ADT, "y" * 5000):
+        assert clamp_untrusted(text) == text
+
+
+def test_the_bound_does_not_cost_a_normal_message_its_redaction() -> None:
+    """THE CONTROL a careless run drops. Every arm above asserts that something is ABSENT, and dropping
+    the whole input satisfies all of them at once. This says the redactor still works on the input it
+    was built for."""
+    out = safe_text(f"router error near {ADT}")
+    for token in ("DOE", "JANE", "100^^^H^MR", "19800101"):
+        assert token not in out
+    assert out.startswith("router error near MSH|[redacted]")
+    assert "[redaction bound:" not in out
+    assert "DOE" not in safe_text("patient DOE JANE dob 1980-05-05 not found")
+    assert safe_text("hl7 version 2.5.1 != expected 2.3") == "hl7 version 2.5.1 != expected 2.3"
+
+
+def test_safe_text_reports_the_two_counts_apart() -> None:
+    """``(+N chars)`` is redacted text held back; the note is raw characters never scanned. Adding them
+    would report a total in neither unit. Both appear when both happened."""
+    out = safe_text(_over_window(" tail"), limit=40)
+    assert "…(+" in out and "[redaction bound:" in out
+
+
+#: The three 16 MiB shapes the cost arms use, built on demand.
+#:
+#: **Built by a factory rather than passed as ``parametrize`` VALUES**, because pytest renders a
+#: parameter into the test id: three 16 MiB strings as values produced a 168 MB report and a
+#: ``ValueError`` out of ``os`` on the path built from one. The id is the label now.
+_FRAME_CAP_SHAPES = {
+    "segment-shaped": lambda: "PID|1||100^^^H^MR||DOE^JANE^M||19800505|F\r" * 400_000,
+    "delimiter-free prose": lambda: "the quick brown fox jumped over it " * 500_000,
+    "one solid run": lambda: "A" * 16_000_000,
+}
+
+
+@pytest.mark.parametrize("label", sorted(_FRAME_CAP_SHAPES))
+def test_a_frame_cap_sized_input_no_longer_buys_the_event_loop(label: str) -> None:
+    """THE ROW'S ACCEPTANCE ARM: event-loop responsiveness against an input a remote peer sizes.
+
+    A negative acknowledgment's MSA-3 runs to the 16 MiB frame cap, and ``safe_text`` scanned all of it
+    before truncating to 200 characters. Measured unbounded on the author's box: 0.29 s for the
+    segment shape and 0.78 s for prose, which matches the 0.53-0.94 s band measured independently on
+    another. Bounded, the same inputs cost 1.2 ms and 3.1 ms.
+
+    The budget is ``_SCAN_BUDGET_SECONDS`` -- the same line the #1437 cost arms use, so a regression
+    that reopened the scan would fail here at the same threshold it fails there -- and best-of-3
+    because a scheduling hiccup can only inflate a sample."""
+    text = _FRAME_CAP_SHAPES[label]()
+    assert len(text) >= 16_000_000
+    best = _best_of(lambda: safe_text(text))
+    assert best < _SCAN_BUDGET_SECONDS, (
+        f"safe_text on {len(text)} characters of {label} cost {best:.4f}s of the event loop against "
+        f"a {_SCAN_BUDGET_SECONDS}s budget"
+    )
+
+
+def test_control_the_same_inputs_are_expensive_unbounded() -> None:
+    """Non-vacuity for the arm above, in the shape ``test_the_hostile_fixture_is_actually_hostile``
+    established: without it, a fast ``safe_text`` would be equally consistent with a fixture too cheap
+    to measure anything. ``redact`` is called directly, which is what ``safe_text`` did before the
+    bound."""
+    # The shape from the table above, not a re-typed copy of it: a control has to measure the same
+    # fixture as the arm it controls, and a duplicated literal is free to drift out from under it.
+    text = _FRAME_CAP_SHAPES["delimiter-free prose"]()
+    best = _best_of(lambda: redact(text))
+    assert best > _SCAN_BUDGET_SECONDS, (
+        f"the unbounded scan cost only {best:.4f}s, under the {_SCAN_BUDGET_SECONDS}s budget the "
+        f"bounded arm clears -- this fixture no longer discriminates and the budget needs re-deriving"
+    )
+
+
+def test_clamp_untrusted_is_exported() -> None:
+    assert "clamp_untrusted" in redaction.__all__

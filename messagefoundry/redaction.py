@@ -27,7 +27,21 @@ the heuristic rather than inside it: a partner names a drop ``MRN123456789_ADT.h
 whitespace between the tokens and :data:`_DATE_RUN` needs a word boundary that ``_`` does not give. A
 name is derived at the call site instead of pattern-matched after the fact (BACKLOG #1748).
 
-Pure stdlib (``re`` + ``hashlib``), so it can be used from any engine package.
+**THE INPUT IS BOUNDED BEFORE IT IS SCANNED, AND THE CUT IS THE WHOLE DIFFICULTY (BACKLOG #1576).** A
+remote peer chooses the length: an MLLP negative acknowledgment's MSA-3 runs to the frame cap, and a
+Router that quotes the received body raises a message the body's size. The scan is linear (BACKLOG
+#1437) and linear is not free — measured on a 16 MiB input, 0.29 s of segment-shaped text and 0.78 s
+of delimiter-free prose, every millisecond of it on the asyncio event loop. :func:`clamp_untrusted`
+cuts an over-long string to :data:`_REDACT_WINDOW` first.
+
+**Redacting ``text[:limit]`` is the obvious form of that and it leaks.** A cut lands mid-run, strands
+the surviving fragment below the two-delimiter threshold :data:`_HL7_FIELD_RUN` needs or the two-token
+threshold :data:`_NAME_RUN` needs, and the patient name the pattern existed to catch walks through
+into the log. So the cut is made where no pattern here can straddle it and the tokens it could have
+split are dropped whole — never emitted in part. Over-redaction at the boundary is the deliberate
+price.
+
+Pure stdlib (``re``, ``hashlib``, ``string``), so it can be used from any engine package.
 """
 
 from __future__ import annotations
@@ -35,8 +49,17 @@ from __future__ import annotations
 import hashlib
 import re
 from functools import lru_cache
+from string import ascii_lowercase, ascii_uppercase, whitespace
 
-__all__ = ["redact", "safe_error", "safe_exc", "safe_name", "safe_text"]
+__all__ = [
+    "clamp_untrusted",
+    "redact",
+    "redact_untrusted",
+    "safe_error",
+    "safe_exc",
+    "safe_name",
+    "safe_text",
+]
 
 _REDACTED = "[redacted]"
 #: Max characters of a (redacted) exception message to keep — a raw HL7 body is long, so bound what
@@ -68,10 +91,16 @@ _HL7_SEGMENT = re.compile(r"\b([A-Z][A-Z0-9]{2})\|[^\r\n]*")
 #: ``.`` and ``:`` are word boundaries but are also inside ``[^\s|^~&]``, so ``\b`` would drop them
 #: from the front of a redacted span.
 #:
-#: This matters because the input is not bounded. :func:`safe_text` truncates *after* :func:`redact`
-#: has run, and the logging handler filter in :mod:`messagefoundry.logging_setup` redacts whole
-#: rendered tracebacks with no bound at all — on whatever thread emitted the record, which for the
-#: engine is the asyncio event loop.
+#: This matters because the scan runs on whatever thread emitted the record, which for the engine is
+#: the asyncio event loop.
+#:
+#: **The input is no longer unbounded, and that does not retire the guard (BACKLOG #1576).** It used to
+#: be: :func:`safe_text` truncated *after* this pattern had run, and the logging handler filter in
+#: :mod:`messagefoundry.logging_setup` redacted whole rendered tracebacks with no bound at all.
+#: :func:`clamp_untrusted` now cuts both to :data:`_REDACT_WINDOW` first. But that window is three
+#: orders of magnitude above what a diagnostic needs, deliberately, so a quadratic scan across it
+#: would still stall the loop. **Linear is what makes a window that generous affordable**, and the
+#: bound is what keeps a linear scan from being charged 16 MiB of a peer's choosing.
 _HL7_FIELD_RUN = re.compile(r"(?<![^\s|^~&])[^\s|^~&]*+[|^~&][^\s|^~&]*+(?:[|^~&][^\s|^~&]*+)+")
 
 #: A **date / birthdate run** in free text: an ISO ``YYYY-MM-DD`` / US ``MM-DD-YYYY`` (``-`` or ``/``
@@ -267,6 +296,170 @@ def _safe_suffixes(base: str) -> str:
     return "".join(reversed(kept))
 
 
+# --- bounding the input (BACKLOG #1576) --------------------------------------
+
+#: How much of an over-long string :func:`clamp_untrusted` lets the scan see. Three orders of magnitude
+#: above :data:`_DEFAULT_LIMIT`, so no diagnostic anybody writes on purpose is ever cut, and small
+#: enough that the worst-shaped input costs the event loop single-digit milliseconds: measured on this
+#: module's own patterns, 64 KiB is 1.6 ms of segment-shaped text and about 3 ms of delimiter-free
+#: prose, against 0.29 s and 0.78 s for the same shapes at a 16 MiB MLLP frame cap.
+#:
+#: The number bounds the SCAN, not the answer: :func:`safe_text` still cuts its result to
+#: :data:`_DEFAULT_LIMIT`, and a caller that keeps the whole redacted text (the logging handler filter)
+#: keeps a window's worth of it.
+_REDACT_WINDOW = 64 * 1024
+
+#: The most tokens :data:`_NAME_RUN` can join into one match (``X(\s+X){1,3}``). The cut consumes one
+#: of them — whatever the window split — so the walk below drops at most three more, and three is
+#: exactly enough: a run straddling the cut has at least one token past it, so at most three of its
+#: tokens are on the kept side.
+_NAME_RUN_MAX_TOKENS = 4
+
+#: The characters :func:`_clamp` may cut at. Whitespace is the boundary because it is the one place
+#: three of the four patterns provably cannot cross: :data:`_HL7_FIELD_RUN` and :data:`_DATE_RUN` are
+#: built from classes that exclude ``\s`` outright, and :data:`_HL7_SEGMENT` goes on matching from its
+#: own header whatever is cut off its tail. Only :data:`_NAME_RUN` spans whitespace, and the token walk
+#: in :func:`_clamp` is there for that one pattern.
+#:
+#: ``string.whitespace`` searched with :meth:`str.rfind`, rather than ``\s`` through the regex engine:
+#: a right-to-left search is what this needs and ``re`` only scans left to right. The stdlib name is
+#: also the claim — ASCII whitespace, a strict subset of ``\s``, which is the direction that stays
+#: safe: every character in it is one the patterns cannot cross, and a Unicode space it misses only
+#: means the cut falls further back and drops more.
+_CUT_CHARS = whitespace
+
+
+def _clamp_marker(dropped: int) -> str:
+    """The note put in place of what :func:`_clamp` dropped.
+
+    Written so :func:`redact` passes it through untouched, which keeps the fixed-point property
+    :func:`safe_text` relies on: no ``|^~&`` pair, no capitalized token that could pair into a
+    :data:`_NAME_RUN`, and the count carries ``_`` separators so an eight-digit one can never be read
+    as a bare ``YYYYMMDD`` by :data:`_DATE_RUN`.
+
+    **No leading separator, because the right one differs by caller and one of them is not a space.**
+    :func:`clamp_untrusted` hands its result to :func:`redact`, and :data:`_HL7_SEGMENT` matches
+    ``[^\\r\\n]*`` — to end of LINE, not to end of token — so a clamped head that opens a segment-like
+    line swallows a space-joined note into its own ``[redacted]``. Measured while building this, on a
+    record of unbroken ``PID|…`` text: an 8 MiB message rendered as ``PID|[redacted]`` with no sign it
+    had been cut. A newline is outside that class and ends the match. :func:`safe_text` appends AFTER
+    redaction, where nothing can reach the note, and uses a space so a stored ``last_error`` stays one
+    line."""
+    return f"[redaction bound: dropped {dropped:_d} more chars unscanned]"
+
+
+#: Room reserved for :func:`_clamp_marker` and its joiner inside the window, so a clamped string is
+#: never longer than the window that produced it and re-clamping it is a no-op. **Idempotence is
+#: load-bearing, not tidiness:** ``_install_phi_filters`` attaches one filter chain per handler, so a
+#: record going to both stdout and the off-box forwarder is scrubbed twice and the two sinks must not
+#: disagree.
+#:
+#: **Derived, not hand-tuned.** The widest note this can produce carries the largest count a string
+#: length can be, so build that one and measure it. A literal here would state a rule the code did not
+#: perform, and re-wording the note could overrun it silently.
+_CLAMP_MARKER_BUDGET = len(_clamp_marker(2**63 - 1)) + 1  # + the newline joiner
+
+
+def _ends_with_name_token(token: str) -> bool:
+    """Whether ``token`` ends with something :data:`_NAME_RUN` could join to a *following* token across
+    the whitespace after it — ``[A-Z][a-z]+`` or ``[A-Z]{2,}`` sitting at the token's end.
+
+    The token's END is the question because the whitespace that follows it is where the cut fell. It
+    asks about a trailing shape rather than the whole token so a run that starts mid-token is still
+    seen: ``(DOE JANE`` is a name run to :data:`_NAME_RUN` (``\\b`` sits after the bracket), and a
+    whole-token test would have kept ``(DOE`` behind at the cut.
+
+    **Not the one-line regex that says the same thing.** Anchored
+    ``(?:[A-Z][a-z]+|[A-Z]{2,})\\Z`` is retried at every offset in the token, which is quadratic in the
+    token length — the exact cost this whole change exists to bound, reintroduced inside the fix for
+    it. :meth:`str.rstrip` is the right-to-left scan this wants and it reads each character once."""
+    stem = token.rstrip(ascii_lowercase)
+    if len(stem) < len(token):  # a trailing [a-z]+ run, so the shape can only be [A-Z][a-z]+
+        return bool(stem) and stem[-1] in ascii_uppercase
+    return len(token) >= 2 and token[-1] in ascii_uppercase and token[-2] in ascii_uppercase
+
+
+def _last_cut(text: str, end: int) -> int:
+    """Index of the last :data:`_CUT_CHARS` character in ``text[:end]``, or ``-1`` if there is none."""
+    return max(text.rfind(char, 0, end) for char in _CUT_CHARS)
+
+
+def _clamp(text: str, window: int) -> tuple[str, int]:
+    """``(head, dropped)`` — ``text`` cut to at most ``window`` characters at a boundary no pattern in
+    this module can straddle, and how many characters that cost.
+
+    ``dropped == 0`` means the text fit and ``head is text``, so every caller is byte-identical to its
+    pre-#1576 self on everything short enough to read.
+
+    **The cut ALWAYS lands on whitespace or on zero, and never at an arbitrary offset.** A whitespace
+    cut is what covers :data:`_HL7_SEGMENT`, :data:`_HL7_FIELD_RUN` and :data:`_DATE_RUN`: none of them
+    can contain whitespace, and the segment goes on matching from its header however much of its tail
+    is gone. Cut anywhere else and a run carrying two delimiters can lose one of them and fall under
+    :data:`_HL7_FIELD_RUN`'s threshold — which is the leak this whole change exists to avoid, rebuilt
+    inside the fix for it. A window holding no whitespace at all therefore yields nothing rather than a
+    fragment.
+
+    **Then the walk, which is there for :data:`_NAME_RUN` alone** — the one pattern that spans
+    whitespace, so the one a whitespace cut can still split. A bare cut through ``DOE JANE`` leaves
+    ``DOE`` standing under its two-token threshold. Up to :data:`_NAME_RUN_MAX_TOKENS` - 1 further
+    name-shaped tokens are dropped whole; the cost is over-redaction of a few tokens at a boundary
+    64 KiB into a string nobody is reading that far down."""
+    if len(text) <= window:
+        return text, 0
+    # -1 when the window held no whitespace at all, which must yield nothing rather than text[:-1].
+    cut = max(_last_cut(text, window), 0)
+    # The window split a token unless it happened to land on whitespace. Either way that token is
+    # already gone, and it counts against the run budget: a straddling _NAME_RUN has at least one
+    # token past the cut, so at most _NAME_RUN_MAX_TOKENS - 1 of it can remain on this side.
+    for _ in range(_NAME_RUN_MAX_TOKENS - 1):
+        if not cut:
+            break
+        # Step over a whitespace RUN, or the walk stops on the empty token inside one. `rstrip` and
+        # not a character loop for the same reason as _ends_with_name_token: the run's length is the
+        # peer's to choose, so an interpreter-level walk over it is a second unbounded cost inside the
+        # fix for the first. Measured on a 64 KiB run of spaces: 1.89 ms stepping, 0.23 ms stripping.
+        end = len(text[:cut].rstrip(_CUT_CHARS))
+        start = _last_cut(text, end) + 1
+        if not _ends_with_name_token(text[start:end]):
+            break
+        cut = start
+    return text[:cut], len(text) - cut
+
+
+def clamp_untrusted(text: str, *, window: int = _REDACT_WINDOW) -> str:
+    """``text`` bounded to ``window`` characters for a scan, with a note naming what was dropped.
+
+    **Call this on anything a remote peer sizes before handing it to :func:`redact`** — a rendered
+    traceback, a reply field, a Router's own ``raise``. :func:`redact` is linear but not free, and it
+    runs synchronously on whatever thread emitted the record, which for the engine is the asyncio event
+    loop. A negative acknowledgment at a 16 MiB frame cap would otherwise charge the loop the better
+    part of a second (module docstring), for a diagnostic whose useful part is its first line.
+
+    Idempotent: the result is never longer than ``window`` (:data:`_CLAMP_MARKER_BUDGET` is reserved
+    for the note), so clamping it again returns it unchanged. That matters because a record dispatched
+    to two handlers is filtered twice and the two sinks must agree. Deliberately NOT done by
+    recognising the note in the text — a peer can write that literal into its payload, and a bypass a
+    peer controls is not a bound."""
+    if len(text) <= window:
+        return text
+    # The budget comes off the CUT, never off this guard. A result is head + note, so it fits `window`
+    # and the guard hands it back untouched on the next pass. Cutting straight to `window` instead
+    # would leave every result in the `window - budget` to `window` band -- above its own cut, below
+    # its own guard -- and re-cut it on every pass, which is what the first version of this shipped.
+    head, dropped = _clamp(text, max(window - _CLAMP_MARKER_BUDGET, 0))
+    return f"{head}\n{_clamp_marker(dropped)}"  # newline, not space: see _clamp_marker
+
+
+def redact_untrusted(text: str, *, window: int = _REDACT_WINDOW) -> str:
+    """:func:`redact` over :func:`clamp_untrusted` — bound the input, then scrub it.
+
+    **The pairing has a name so a call site cannot hold half of it.** The two halves are separately
+    useful (the MLLP outbound clamps a reply field it does not scrub), but every caller that scans
+    peer-sized text wants both, and ``redact(text)`` alone is a silent reopening of BACKLOG #1576 that
+    reads like ordinary code. One name is what makes the bound reviewable at the call site."""
+    return redact(clamp_untrusted(text, window=window))
+
+
 def redact(text: str) -> str:
     """Scrub HL7 segment/field content (potential PHI) from free text, keeping segment IDs, then apply a
     conservative free-text heuristic for delimiter-free identifiers. Conservative (errs toward over-
@@ -307,10 +500,25 @@ def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
     errors, a ``last_error`` built at the store layer, a connector's reply-parse note). HL7-shaped content
     is scrubbed (:func:`redact`) and the result truncated. Idempotent on already-:func:`safe_text`'d
     input (``redact`` is a fixed point once delimiter runs are gone), so it is safe to re-apply as a
-    store-layer chokepoint over values a caller may already have scrubbed."""
-    message = redact(text).strip()
+    store-layer chokepoint over values a caller may already have scrubbed.
+
+    **``limit`` bounds the ANSWER; :data:`_REDACT_WINDOW` bounds the WORK (BACKLOG #1576).** That was
+    one number's job before and it could only do half of it: the truncation runs *after*
+    :func:`redact`, so a remote peer sizing the input bought an unbounded scan on the event loop for a
+    200-character result. :func:`_clamp` cuts the input first. It is emphatically **not**
+    ``redact(text[:limit])`` — the module docstring says why that form leaks the name it was meant to
+    catch.
+
+    The two counts stay separate and each is exactly true: ``(+N chars)`` is redacted text this call
+    held back, and the bound note is raw characters no pattern ever looked at. One total would add a
+    redacted length to an unredacted one and report a number that is neither. Nothing is dropped in the
+    ordinary case, so the ordinary result is byte-identical to its pre-#1576 self."""
+    head, dropped = _clamp(text, _REDACT_WINDOW)
+    message = redact(head).strip()
     if len(message) > limit:
         message = f"{message[:limit]}…(+{len(message) - limit} chars)"
+    if dropped:
+        message = f"{message} {_clamp_marker(dropped)}"
     return message
 
 
