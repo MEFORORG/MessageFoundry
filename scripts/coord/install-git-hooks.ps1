@@ -77,6 +77,18 @@ $pushMarker = "MessageFoundry push guard"
 # push one. It is also the only hook here installed VERBATIM rather than as a shim -- it has no Python
 # payload to locate, so there is nothing for a shim to resolve.
 $postCommit = Join-Path $hooksDir "post-commit"
+# AND post-merge, FROM THE SAME SCRIPT. post-commit fires on `git commit`; a merge or a `git pull`
+# that fast-forwards or creates a merge commit fires post-merge instead, so without this one an
+# entire class of commit is made durable by nothing.
+#
+# THIS FILE ALREADY EXISTED ON THIS BOX AND THIS INSTALLER DID NOT KNOW IT. Measured 2026-09-19 in
+# the engine clone: .git/hooks/post-merge was byte-identical to the VAULT clone's copy of
+# durability_push.sh and three weeks older than the post-commit beside it -- written by the vault's
+# installer, which has always managed both. -Status never mentioned it, -Arm never replaced it and
+# -Uninstall never removed it, so it sat there carrying the pre-2026-09-19 matcher that refuses the
+# private vault. A `git pull` in that clone printed the refusal while the post-commit beside it was
+# current. An unmanaged hook is worse than an absent one: it runs, and no audit here can see it.
+$postMerge = Join-Path $hooksDir "post-merge"
 $durabilityMarker = "MessageFoundry durability hook"
 
 # The .py PAYLOADS the install path below Copy-Items into $hooksDir, listed for -Status to audit. The
@@ -160,19 +172,60 @@ if ($Status) {
     # design (fail-safe by absence), and reporting it as INSTALLED alone would be the same
     # manufactured confidence the check in scripts/coord/unbacked_check.ps1 exists to avoid.
     $durInstalled = (Test-Path $postCommit) -and ((Get-Content $postCommit -Raw -EA SilentlyContinue) -match [regex]::Escape($durabilityMarker))
+    $durMergeInstalled = (Test-Path $postMerge) -and ((Get-Content $postMerge -Raw -EA SilentlyContinue) -match [regex]::Escape($durabilityMarker))
     $durRemote = (& git -C $RepoRoot config --get mefor.durabilityRemote)
     Write-Host "post-commit: $(if ($durInstalled) { 'INSTALLED (durability hook)' } elseif (Test-Path $postCommit) { 'present, but NOT ours' } else { 'NOT INSTALLED' })"
-    if ($durInstalled -and -not $durRemote) {
+    Write-Host "post-merge : $(if ($durMergeInstalled) { 'INSTALLED (durability hook)' } elseif (Test-Path $postMerge) { 'present, but NOT ours' } else { 'NOT INSTALLED' })"
+    if ($durInstalled -ne $durMergeInstalled) {
+        Write-Host "             ^ THE TWO DISAGREE. They are the same script and a commit reaches one or" -ForegroundColor Yellow
+        Write-Host "               the other depending on whether it came from a commit or a merge, so one" -ForegroundColor Yellow
+        Write-Host "               installed alone leaves that whole class of commit covered by nothing." -ForegroundColor Yellow
+        Write-Host "               Re-run with -Arm." -ForegroundColor Yellow
+    }
+
+    # CONTENT PARITY, because the marker above is not content. The marker is one line in a header
+    # that changes maybe once in months, so it reads INSTALLED across an arbitrarily old copy --
+    # and the matcher that decides whether this hook publishes lives in the body. This is the same
+    # measurement the $payloads loop below makes for the .py hooks; the durability hook is outside
+    # that list because it is installed VERBATIM rather than as a shim beside a payload, so it was
+    # getting no parity check at all. Measured 2026-09-19: .git/hooks/post-merge here was three
+    # weeks older than the post-commit beside it and carried a matcher that refuses this clone's
+    # private remote, while -Status printed INSTALLED for it and nothing else.
+    $shortSha = { param($h) if ($h) { $h.Substring(0, 12).ToLowerInvariant() } else { "(absent)" } }
+    $durSrcSha = Get-HookPayloadHash (Join-Path $RepoRoot "scripts/hooks/durability_push.sh")
+    foreach ($pair in @(@{ n = "post-commit"; p = $postCommit }, @{ n = "post-merge "; p = $postMerge })) {
+        $iSha = Get-HookPayloadHash $pair.p
+        if (-not $iSha) { continue }
+        Write-Host "durability : $($pair.n)  installed $(& $shortSha $iSha) / source $(& $shortSha $durSrcSha)"
+        if ($iSha -ne $durSrcSha) {
+            Write-Host "             ^ STALE. The copy that RUNS is not the one in this checkout, so every" -ForegroundColor Red
+            Write-Host "               rule in it -- including which remotes it refuses to publish to -- is" -ForegroundColor Red
+            Write-Host "               whatever it was when it was installed. Re-run with -Arm." -ForegroundColor Red
+            Write-Host "               Read the branch you are on first: arming from a checkout that PREDATES" -ForegroundColor Red
+            Write-Host "               the installed copy downgrades it for every worktree of this clone." -ForegroundColor Red
+        }
+    }
+
+    if (($durInstalled -or $durMergeInstalled) -and -not $durRemote) {
         Write-Host "             ^ INSTALLED BUT NOT ARMED. mefor.durabilityRemote is unset, so the hook" -ForegroundColor Yellow
         Write-Host "               exits 0 without pushing. Nothing is being made durable. Arm it with:" -ForegroundColor Yellow
         Write-Host "                 git config mefor.durabilityRemote <private-remote>" -ForegroundColor Yellow
         Write-Host "               Confirm the remote is PRIVATE first: gh repo view <owner>/<repo> --json visibility" -ForegroundColor Yellow
-    } elseif ($durInstalled -and $durRemote) {
-        $durUrl = (& git -C $RepoRoot remote get-url $durRemote 2>$null)
-        if (-not $durUrl) {
+    } elseif (($durInstalled -or $durMergeInstalled) -and $durRemote) {
+        # BOTH URL SETS, for the same reason the hook reads both: `git remote get-url` returns the
+        # FETCH url and `git push` resolves remote.<name>.pushurl when one is set. Reading only the
+        # fetch url here would print `armed -> <private>` in plain text while every commit pushed to
+        # whatever the pushurl named. `--push --all` falls back to the fetch url when no pushurl is
+        # configured, so the two overlap in the ordinary case.
+        $durUrls = @(
+            (& git -C $RepoRoot remote get-url --all $durRemote 2>$null)
+            (& git -C $RepoRoot remote get-url --push --all $durRemote 2>$null)
+        ) | Where-Object { $_ } | Select-Object -Unique
+        $durUrl = ($durUrls -join ', ')
+        if (-not $durUrls) {
             Write-Host "             ^ ARMED at remote '$durRemote', which DOES NOT EXIST in this repo." -ForegroundColor Red
             Write-Host "               The hook exits 0 silently, so this looks identical to working." -ForegroundColor Red
-        } elseif ($durUrl -match 'MEFORORG/MessageFoundry(\.git)?/?$') {
+        } elseif ($durUrls | Where-Object { $_ -match '(^|[/:])MEFORORG/MessageFoundry(\.wiki)?(\.git)?/*$' }) {
             # ANCHORED ON THE END, and the unanchored version misreported for real. This read
             # `-match 'MEFORORG/MessageFoundry'` until 2026-09-19, when the private vault was
             # transferred into the same organization as MEFORORG/MessageFoundry-vault. A substring
@@ -180,6 +233,24 @@ if ($Status) {
             # canonical repo -- in red, with a remedy that would have pointed them away from the
             # correct target. Keep this in step with the case arms in scripts/hooks/durability_push.sh:
             # the two answer the same question and must not disagree.
+            #
+            # THE BOUNDARY BEFORE THE OWNER IS LOAD-BEARING, in the over-refusing direction. Without
+            # `(^|[/:])` this matched any owner whose name merely ENDS in the public one --
+            # `example.invalid/somemefororg/messagefoundry` -- and -Status then told that operator in
+            # red that nothing was being published while the hook was happily pushing there. A
+            # compensating control resting on a false premise is the defect CLAUDE.md sec. 11 names
+            # (SDS-3.7). `/*$` rather than `/?$` for the same reason the hook loops its strips: a
+            # doubled trailing slash is a legal spelling and one `?` does not reach it.
+            #
+            # `.wiki` IS OPTIONAL HERE BECAUSE THE HOOK STRIPS IT. A public repository's wiki is
+            # public too, so the hook refuses `...MessageFoundry.wiki.git`; without this arm -Status
+            # would call that same URL safely armed while the hook silently refused every commit --
+            # the two disagreeing is the exact failure this comment block was written to prevent.
+            #
+            # CASE IS COVERED BY THE OPERATOR, NOT BY THE PATTERN: PowerShell's `-match` is
+            # case-insensitive by default, which is what the hook's `tr 'A-Z' 'a-z'` buys on the
+            # other side. Do not "tighten" this to `-cmatch` -- that would reopen the fail-open half
+            # on `mefororg/messagefoundry`, which is the direction that publishes.
             Write-Host "             ^ POINTED AT THE PUBLIC CANONICAL REPO. The hook refuses this target," -ForegroundColor Red
             Write-Host "               so nothing is being made durable AND nothing is being published." -ForegroundColor Red
         } else {
@@ -205,7 +276,6 @@ if ($Status) {
     #
     # Both payloads are reported every run, never just the offender: the install path copies both, so
     # "re-install to fix this one" is the wrong mental model of what re-running does.
-    $shortSha = { param($h) if ($h) { $h.Substring(0, 12).ToLowerInvariant() } else { "(absent)" } }
     foreach ($payload in $payloads) {
         $srcPy = Join-Path $RepoRoot "scripts\hooks\$payload"
         $dstPy = Join-Path $hooksDir $payload
@@ -325,6 +395,11 @@ if ($Uninstall) {
         Write-Host "Push guard pre-push hook REMOVED." -ForegroundColor Yellow
         $removed = $true
     }
+    if ((Test-Path $postMerge) -and ((Get-Content $postMerge -Raw) -match [regex]::Escape($durabilityMarker))) {
+        Remove-Item -LiteralPath $postMerge -Force
+        Write-Host "Durability post-merge hook REMOVED." -ForegroundColor Yellow
+        $removed = $true
+    }
     if ((Test-Path $postCommit) -and ((Get-Content $postCommit -Raw) -match [regex]::Escape($durabilityMarker))) {
         Remove-Item -LiteralPath $postCommit -Force
         Write-Host "Durability post-commit hook REMOVED. New commits are single-copy again until pushed." -ForegroundColor Yellow
@@ -339,6 +414,9 @@ if ((Test-Path $commitMsg) -and ((Get-Content $commitMsg -Raw) -notmatch [regex]
 }
 if ((Test-Path $prePush) -and ((Get-Content $prePush -Raw) -notmatch [regex]::Escape($pushMarker))) {
     throw "A pre-push hook that is not ours already exists at $prePush. Refusing to overwrite it -- merge them by hand."
+}
+if ((Test-Path $postMerge) -and ((Get-Content $postMerge -Raw) -notmatch [regex]::Escape($durabilityMarker))) {
+    throw "A post-merge hook that is not ours already exists at $postMerge. Refusing to overwrite it -- merge them by hand."
 }
 if ((Test-Path $postCommit) -and ((Get-Content $postCommit -Raw) -notmatch [regex]::Escape($durabilityMarker))) {
     throw "A post-commit hook that is not ours already exists at $postCommit. Refusing to overwrite it -- merge them by hand."
@@ -441,6 +519,7 @@ exec "$PY" "$HOOK_DIR/push_guard.py" "$@"
 # separate, deliberate, per-repository act. -Status reports installed and armed as two different
 # things, because only one of them protects anything.
 Copy-Item (Join-Path $RepoRoot "scripts\hooks\durability_push.sh") $postCommit -Force
+Copy-Item (Join-Path $RepoRoot "scripts\hooks\durability_push.sh") $postMerge -Force
 
 # --- pre-commit's generated shim: DIAGNOSE, never write -------------------------------------------
 # This script deliberately does NOT touch .git/hooks/pre-commit. pre-commit owns that file alone, and
@@ -485,7 +564,7 @@ Copy-Item (Join-Path $RepoRoot "scripts\hooks\durability_push.sh") $postCommit -
 # and that run is the venv's.
 
 # Git for Windows does not need the exec bit, but a WSL/Linux checkout of the same repo would.
-if ($IsLinux -or $IsMacOS) { & chmod +x $commitMsg; & chmod +x $prePush; & chmod +x $postCommit }
+if ($IsLinux -or $IsMacOS) { & chmod +x $commitMsg; & chmod +x $prePush; & chmod +x $postCommit; & chmod +x $postMerge }
 
 Write-Host ""
 Write-Host "MessageFoundry hooks INSTALLED." -ForegroundColor Green
@@ -494,6 +573,7 @@ Write-Host "               $(Join-Path $hooksDir 'claim_check.py')   (claim gate
 Write-Host "  pre-push   : $prePush"
 Write-Host "               $(Join-Path $hooksDir 'push_guard.py')    (refuses a direct push to main)"
 Write-Host "  post-commit: $postCommit  (durability hook)"
+Write-Host "  post-merge : $postMerge  (durability hook, same script)"
 Write-Host "  governs    : all $(@(& git -C $RepoRoot worktree list).Count) worktree(s) of this repo, immediately"
 Write-Host ""
 
