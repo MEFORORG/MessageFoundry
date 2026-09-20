@@ -434,7 +434,7 @@ jobs:
         with:
           python-version: "3.14"
       - name: Set up uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
       - name: Qt headless system deps
         # BOUNDED AND RETRIED. Unguarded, this step turns an external apt-mirror hiccup into a
         # blocked merge queue: measured 2026-08-18, three hangs across two attempts on three
@@ -680,7 +680,7 @@ jobs:
         with:
           python-version: "3.14"
       - name: Set up uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
       - name: Qt headless system deps
         # BOUNDED AND RETRIED. Unguarded, this step turns an external apt-mirror hiccup into a
         # blocked merge queue: measured 2026-08-18, three hangs across two attempts on three

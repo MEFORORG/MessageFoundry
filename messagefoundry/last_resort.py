@@ -16,14 +16,16 @@ loop handler sees only loop tasks/callbacks, ``sys.excepthook`` only the main th
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import sys
 import threading
 from types import TracebackType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from messagefoundry.redaction import safe_exc
+
+if TYPE_CHECKING:  # annotations only -- see the runtime note on install_loop_exception_handler
+    import asyncio
 
 _log = logging.getLogger("messagefoundry.last_resort")
 
@@ -40,7 +42,26 @@ def _handle_loop_exception(loop: asyncio.AbstractEventLoop, context: dict[str, A
 
 def install_loop_exception_handler(loop: asyncio.AbstractEventLoop | None = None) -> None:
     """Route otherwise-unhandled asyncio task/callback exceptions through ``safe_exc`` → the log.
-    Call from within the running loop (the serving lifespan does this at startup)."""
+    Call from within the running loop (the serving lifespan does this at startup).
+
+    ``asyncio`` IS IMPORTED HERE, NOT AT MODULE SCOPE, AND THAT IS A COST DECISION. Since BACKLOG
+    #1674 the CLI installs the sync and thread hooks from ``main()`` for **every** subcommand, so
+    importing this module is now on the fast introspection path (``validate``, ``hl7schema``,
+    ``lens schema``) that ``__main__``'s docstring promises to keep cheap. The package root does not
+    load ``asyncio``, so at module scope it was a net-new import. Measured on Windows/3.14 against a
+    documented 335-399 ms budget for those subcommands, marginal cost of importing this module with
+    the root already loaded: **30.3 / 31.8 / 40.2 ms at module scope, 0.46 / 0.47 / 0.48 ms here**
+    (1 module added instead of the whole ``asyncio`` tree). ``threading`` is already loaded by the
+    root, so that half was always free; this half was not.
+
+    MEASURE THIS WITH WARM BYTECODE. The first import after editing this file recompiles it and read
+    31.2 ms -- indistinguishable from the regression this removes, and it is an artifact of the edit.
+
+    The two loop functions are the only users, they run only under ``serve``, and ``serve`` has
+    already paid for ``asyncio`` through uvicorn by the time either is called.
+    """
+    import asyncio
+
     (loop or asyncio.get_running_loop()).set_exception_handler(_handle_loop_exception)
 
 

@@ -16,6 +16,12 @@ from fastapi import HTTPException, Request, status
 
 _log = logging.getLogger(__name__)
 
+#: How many active alert instances the /ui alerts page asks for. Shared because TWO modules render
+#: that page -- ``routes/monitoring.py`` for the page itself and ``routes/monitoring_writes.py`` when
+#: a write is refused (BACKLOG #1744). Two copies would drift, and the refusal would then show the
+#: operator a shorter list than the page they came from.
+ACTIVE_ALERTS_LIMIT = 200
+
 
 async def _form_pairs(request: Request) -> list[tuple[str, str]]:
     # stdlib urlencoded-form parsing (no python-multipart dep), like /ui/login. Pair order is

@@ -43,11 +43,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from messagefoundry.config.tls_policy import harden_cipher_suites
+from messagefoundry.config.tls_policy import harden_cipher_suites, harden_crl_check
 
-# A LEAF MODULE, imported for its DEFINITION rather than its behaviour (BACKLOG #1273). controlchars
-# imports nothing from this package, so there is no cycle -- checked by import, not assumed.
-from messagefoundry.controlchars import _is_control_char
+# The escape table and this function were DEFINED here until BACKLOG #1591 and now live in
+# controlchars, which imports nothing and is therefore reachable from ``logging_guard`` too. That
+# module's docstring carries the reasoning; this is now an ordinary import of a leaf.
+from messagefoundry.controlchars import scrub_control_chars
 from messagefoundry.logging_guard import (
     GuardedFileHandler,
     GuardedStreamHandler,
@@ -72,7 +73,6 @@ __all__ = [
     "set_runtime_level",
     "current_log_level",
     "silence_phi_prone_dependency_loggers",
-    "scrub_control_chars",
     "ControlCharScrubFilter",
     "RedactionFilter",
     "JsonFormatter",
@@ -96,54 +96,12 @@ LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 # Logger names uvicorn configures itself; we route them through the root handler.
 _UVICORN_LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.access")
 
-# C0 control characters (and DEL) escaped to keep one log record on one line. CR/LF are the
-# log-injection vector; tab (0x09) is left intact as benign whitespace.
-#
-# THE ALPHABET IS controlchars._is_control_char's, MINUS TAB (BACKLOG #1273, limb 3). It used to be
-# re-derived here as `range(0x20)` plus a separate `0x7F` line -- a second statement of the same set
-# in a codebase whose controlchars module exists precisely to state it once. The two agreed, so
-# nothing was mis-escaped; the cost is the future-tense one #1239 named and #1253 acted on, that a
-# later widening applied to one copy silently does not apply to the other.
-#
-# THE SUBTRACTION IS THE POINT, so it is written as one. Documenting this as "excluded" and leaving
-# the copy was considered and is refuted by the residual block on #1273: the parsing/sniff.py
-# carve-out earns its separate definition by being BYTE-wise and subtracting a whole allowlist,
-# while this is CHARACTER-wise, escapes CR/LF rather than tolerating them, and differs by EXACTLY
-# ONE code point. Measured: controlchars 33 code points, this table 32, symmetric difference {0x09}.
-# One code point of divergence is a subtraction, not a different predicate.
-_CTRL_TRANSLATION: dict[int, str] = {0x0A: "\\n", 0x0D: "\\r"}
-# RANGE 0x100, NOT 0x80, AND THAT IS THE DIFFERENCE BETWEEN A REAL FOLD AND A COSMETIC ONE. The
-# alphabet is C0+DEL today, so both bounds produce the identical 32 entries -- proved by the
-# byte-identity check in the commit. But `_is_control_char`'s docstring names widening to C1
-# (U+0080-U+009F) as the deliberate change this shared module exists to make cheap, and a 0x80 bound
-# would silently NOT follow it: the escape table would keep the old alphabet while every other call
-# site moved, which is the exact two-copy drift limb 3 removes. Iterating past the current boundary
-# costs 128 predicate calls at import and makes the widening propagate by construction.
-for _i in range(0x100):
-    # TAB IS THE ONLY SUBTRACTION and test_tab_is_the_only_control_character_left_intact pins it.
-    # CR/LF are excluded from this loop because they get readable escapes above, not because they
-    # are tolerated -- they are the injection vector this whole table exists for.
-    if _is_control_char(chr(_i)) and _i not in (0x09, 0x0A, 0x0D):
-        _CTRL_TRANSLATION[_i] = f"\\x{_i:02x}"
-
 #: Stamped on every physical line of a record's ``exc_text``/``stack_info`` (BACKLOG #335). A traceback
 #: is multi-line by nature, so collapsing it the way the rendered message is collapsed would cost the
 #: operator the readability an incident depends on. Its line breaks are kept and every line is indented
 #: instead, so no traceback line starts at column 0 and none can impersonate the ``_LOG_FORMAT`` record
 #: prefix (ASVS 16.4.1 — the readability call ADR 0034 §1 deferred).
 _CONTINUATION_PREFIX = "    | "
-
-
-def scrub_control_chars(text: str) -> str:
-    """Escape C0 control characters and DEL (tab kept as benign whitespace) so no part of ``text`` can
-    begin a new physical line or drive a terminal.
-
-    The single definition of that translation. :class:`ControlCharScrubFilter` applies it to every
-    record on a configured handler; a caller that assembles a record's content from an untrusted BYTE
-    stream needs it at the point of assembly, because "one peer write is one log record" is that
-    caller's own framing contract and cannot depend on how the host process configured logging — today
-    the ADR 0176 sandbox stderr relay. Idempotent: the escaped forms contain no control characters."""
-    return text.translate(_CTRL_TRANSLATION)
 
 
 def _scrub_block(text: str) -> str:
@@ -380,8 +338,9 @@ class SyslogForward:
     connection-oriented protocols (see :func:`configure_logging`). ``fmt`` is ``"json"`` or ``"text"``
     and is independent of the stdout format. The ``tls_*`` fields apply only when ``protocol == "tls"``:
     ``tls_ca_file`` is the PEM trust anchor (only that CA is trusted; system roots are not loaded),
-    ``tls_verify`` toggles certificate + hostname verification (default on), and ``tls_client_cert`` is
-    an optional PEM cert+key chain for mutual TLS."""
+    ``tls_verify`` toggles certificate + hostname verification (default on), ``tls_client_cert`` is
+    an optional PEM cert+key chain for mutual TLS, and ``tls_crl_file`` (BACKLOG #299) is an optional
+    CRL that turns on leaf revocation checking against the collector's certificate."""
 
     host: str
     port: int = 514
@@ -390,6 +349,7 @@ class SyslogForward:
     tls_ca_file: str | None = None
     tls_verify: bool = True
     tls_client_cert: str | None = None
+    tls_crl_file: str | None = None
 
 
 #: Socket timeout (seconds) pinned on a **TCP** off-box forwarder.
@@ -523,6 +483,13 @@ def _build_tls_context(forward: SyslogForward) -> ssl.SSLContext:
     if forward.tls_client_cert is not None:
         # Mutual TLS: a single PEM carrying both the client cert and its key (keyfile defaults to it).
         ctx.load_cert_chain(certfile=forward.tls_client_cert)
+    if forward.tls_verify and forward.tls_crl_file is not None:
+        # BACKLOG #299: revocation checking against the collector's certificate. Guarded on tls_verify
+        # because the opt-out arm above is CERT_NONE -- there is no chain to check a CRL against, and
+        # setting the flag there would refuse every collector while claiming a check. It loads after
+        # the CA and any client chain so harden_crl_check's "the CRL really landed" assertion answers
+        # for the final trust store.
+        harden_crl_check(ctx, forward.tls_crl_file)
     # Assert forward secrecy LAST, so it sees the final suite list (ASVS 12.1.2). This runs on the
     # tls_verify=False arm too: that opt-out drops peer AUTHENTICATION, and the log records still cross
     # the network encrypted, so the suite list still decides whether a recorded session stays private.
