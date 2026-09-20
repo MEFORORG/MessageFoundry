@@ -33,8 +33,18 @@ param(
     # PATTERN-VALIDATED because the name is interpolated into a WQL filter below
     # (`Get-CimInstance Win32_Service -Filter "Name='$ServiceName'"`). A single quote would end the
     # WQL literal and the query would error or match a different service, whose image path this
-    # script then reports as the helper's. Same character set as the installer's.
-    [ValidatePattern('^[A-Za-z0-9._-]+$')][string]$ServiceName = "MessageFoundryNetHelper",
+    # script then reports as the helper's.
+    #
+    # THE CHARACTER SET IS messagefoundry/service.py's `_SAFE_SERVICE_NAME`, SPACE INCLUDED, which is
+    # install-net-helper.ps1's set exactly. It has to be: whatever the installer accepts as a name,
+    # this has to accept back, or a helper installed as "MessageFoundry Prod" is unremovable through
+    # this script - refused at parameter binding, before it can say why. This read "^[A-Za-z0-9._-]+$"
+    # until BACKLOG #1523's third review round, and that was the defect.
+    #
+    # The two literals cannot be collapsed into one: a PowerShell attribute argument must be a
+    # compile-time constant, so `[ValidatePattern($pattern)]` is a parse error. They are pinned to
+    # the Python definition by tests/test_net_helper_install_scripts.py instead.
+    [ValidatePattern('^[A-Za-z0-9 ._-]+$')][string]$ServiceName = "MessageFoundryNetHelper",
     # Where install-net-helper.ps1 put the files. Read for mefor-net-helper.conf, which is the only
     # record on the node of which address the helper was scoped to.
     [string]$InstallDir = "C:\Program Files\MessageFoundry\net-helper",
