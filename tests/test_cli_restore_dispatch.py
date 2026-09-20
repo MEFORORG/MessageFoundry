@@ -25,6 +25,7 @@ import pytest
 from messagefoundry.__main__ import main
 from messagefoundry.pipeline import dr_backup
 from messagefoundry.store import MessageStore
+from messagefoundry.store.backup_codec import decrypt_stream
 from messagefoundry.store.crypto import generate_key, make_cipher
 
 # Synthetic body + summary planted in the seeded store; asserted to NEVER surface on stdout.
@@ -57,13 +58,21 @@ async def _seed_store(db: Path, key_b64: str | None) -> None:
     await store.close()
 
 
-def _config_dir(tmp_path: Path) -> str:
-    """A minimal config bundle (one module) so the archive carries a real config member."""
+def _config_dir(tmp_path: Path, *, plant: dict[str, bytes] | None = None) -> str:
+    """A minimal config bundle (one module) so the archive carries a real config member.
+
+    ``plant`` adds extra files under the config dir, which the backup writer includes verbatim
+    (`_add_config_dir` takes every regular file) -- used to build a member that collides with a restore
+    destination."""
     d = tmp_path / "config"
     d.mkdir()
     (d / "feed.py").write_text("# a router lives here\n", encoding="utf-8")
     (d / "codesets").mkdir()
     (d / "codesets" / "sex.csv").write_text("M,Male\n", encoding="utf-8")
+    for rel, body in (plant or {}).items():
+        target = d / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(body)
     return str(d)
 
 
@@ -98,7 +107,12 @@ def _assert_phi_free(out: str) -> None:
 
 
 def _make_archive(
-    tmp_path: Path, key_b64: str | None, capsys, *, config: bool = True
+    tmp_path: Path,
+    key_b64: str | None,
+    capsys,
+    *,
+    config: bool = True,
+    plant: dict[str, bytes] | None = None,
 ) -> tuple[str, str]:
     """Run a real backup and return ``(archive_path, service_toml_path)``."""
     db = tmp_path / "msg.db"
@@ -107,7 +121,7 @@ def _make_archive(
     argv = [
         "backup",
         "--config",
-        _config_dir(tmp_path) if config else str(tmp_path / "empty-config"),
+        _config_dir(tmp_path, plant=plant) if config else str(tmp_path / "empty-config"),
         "--service-config",
         toml,
         "--db",
@@ -400,6 +414,178 @@ def test_restore_config_to_refuses_non_empty_dir(tmp_path, key_b64, capsys) -> N
     assert rc == 1
     assert "non-empty" in capsys.readouterr().out
     assert (cfg / "mine.py").exists()
+
+
+def test_restore_refuses_a_config_member_aimed_at_the_restored_store(
+    tmp_path, key_b64, capsys
+) -> None:
+    # P1 (BACKLOG #1717): `--to D/store.db --config-to D` passed every emptiness check, because both
+    # destinations really were absent when they were read. The restore then published the verified
+    # store at D/store.db and extracted the config bundle over the top of it, so the archive's own
+    # `config/store.db` member -- a plain file in the operator's config dir, which the backup writer
+    # includes like any other -- replaced the database that had just passed integrity_check and the
+    # row-count compare, and the summary still reported the pre-overwrite counts.
+    #
+    # Measured at 85c77e398 before the fix: rc 0, row_counts {"messages": 1, ...}, store_bytes 372736,
+    # and 28 bytes of `CONFIG-MEMBER-NOT-A-DATABASE` at the --to path.
+    planted = b"CONFIG-MEMBER-NOT-A-DATABASE"
+    archive, toml = _make_archive(tmp_path, key_b64, capsys, plant={"store.db": planted})
+    newdir = tmp_path / "restored"
+    dest = newdir / "store.db"
+
+    rc = main(
+        [
+            "restore",
+            archive,
+            "--to",
+            str(dest),
+            "--config-to",
+            str(newdir),
+            "--service-config",
+            toml,
+        ]
+    )
+    assert rc == 1
+    # Human output, not --json: the paths are compared verbatim, and JSON would escape the separators.
+    out = capsys.readouterr().out
+    assert "where this restore publishes the store" in out
+    assert str(dest) in out  # the colliding path is named
+    # Refused BEFORE the store was extracted, so nothing was published and nothing was clobbered: no
+    # store at the --to path, and no half-written config bundle beside it.
+    assert not dest.exists()
+    assert list(newdir.iterdir()) == []
+
+
+def test_restore_refuses_a_colliding_config_member_whatever_the_case(
+    tmp_path, key_b64, capsys
+) -> None:
+    # The same collision spelled in a different case. os.path.normcase is the identity function on
+    # POSIX, so folding case with it would miss case-insensitive macOS and every case-insensitive
+    # mount. The refusal folds case unconditionally instead, and this asserts the same answer on every
+    # platform rather than branching on one that cannot be read from normcase.
+    archive, toml = _make_archive(tmp_path, key_b64, capsys, plant={"store.db": b"planted"})
+    dest = tmp_path / "restored" / "store.db"
+    shouted = tmp_path / "RESTORED"
+
+    rc = main(
+        [
+            "restore",
+            archive,
+            "--to",
+            str(dest),
+            "--config-to",
+            str(shouted),
+            "--service-config",
+            toml,
+        ]
+    )
+    assert rc == 1
+    assert "where this restore publishes the store" in capsys.readouterr().out
+    assert not dest.exists()
+
+
+def test_restore_allows_one_directory_for_the_store_and_the_config(
+    tmp_path, key_b64, capsys
+) -> None:
+    # The false-refusal guard on the fix above. `--to D/store.db --config-to D` is the one-directory
+    # form the early-adopter drill documents, and it is perfectly safe for an ordinary archive whose
+    # bundle is feed.py plus codesets. The refusal asks whether a MEMBER collides, not the much broader
+    # "does --config-to contain --to", so this must still succeed and the store must still read back.
+    archive, toml = _make_archive(tmp_path, key_b64, capsys)
+    newdir = tmp_path / "restored"
+    dest = newdir / "store.db"
+
+    rc = main(
+        [
+            "restore",
+            archive,
+            "--to",
+            str(dest),
+            "--config-to",
+            str(newdir),
+            "--service-config",
+            toml,
+            "--json",
+        ]
+    )
+    assert rc == 0
+    payload = _json_line(capsys.readouterr().out)
+    assert payload["config_files"] == 2
+    assert (newdir / "feed.py").read_text(encoding="utf-8") == "# a router lives here\n"
+    count, raw = asyncio.run(_read_back(dest, key_b64))
+    assert count == 1 and raw == _RAW_BODY  # the store survived the bundle landing beside it
+
+
+def test_restore_refuses_a_config_dest_under_the_store_path(tmp_path, key_b64, capsys) -> None:
+    # The mirror shape: `--to D --config-to D/cfg`. Both destinations are absent, so the emptiness
+    # checks pass; the store is then published as the regular FILE D, and the bundle's
+    # mkdir(parents=True) cannot create a directory beneath it. Before the fix that was an uncaught
+    # FileExistsError -- a CLI traceback with a restored store already sitting at D, and a retry
+    # blocked by the never-overwrite refusal. No legitimate invocation has this shape.
+    archive, toml = _make_archive(tmp_path, key_b64, capsys)
+    dest = tmp_path / "restored"
+    rc = main(
+        [
+            "restore",
+            archive,
+            "--to",
+            str(dest),
+            "--config-to",
+            str(dest / "cfg"),
+            "--service-config",
+            toml,
+        ]
+    )
+    assert rc == 1
+    assert "sits under the restored store's own path" in capsys.readouterr().out
+    assert not dest.exists()  # refused before any decrypt
+
+
+def test_restore_refuses_a_config_dest_that_is_an_existing_file(tmp_path, key_b64, capsys) -> None:
+    # `any(config_dest.iterdir())` on a FILE raises NotADirectoryError, which is not a BackupError and
+    # so escaped the CLI handler as a traceback. An operator who types a file path where a directory
+    # belongs gets the refusal the check exists to produce.
+    archive, toml = _make_archive(tmp_path, key_b64, capsys)
+    not_a_dir = tmp_path / "typo.toml"
+    not_a_dir.write_text("# a file, not a directory\n", encoding="utf-8")
+
+    rc = main(
+        [
+            "restore",
+            archive,
+            "--to",
+            str(tmp_path / "restored.db"),
+            "--config-to",
+            str(not_a_dir),
+            "--service-config",
+            toml,
+        ]
+    )
+    assert rc == 1
+    assert "names an existing file" in capsys.readouterr().out
+    assert not_a_dir.read_text(encoding="utf-8") == "# a file, not a directory\n"
+
+
+def test_restore_config_bundle_never_overwrites_an_existing_file(tmp_path, key_b64, capsys) -> None:
+    # The backstop under the refusals above, exercised directly on the extractor: a config member must
+    # not land on a file that is already there, whatever route put it there. Drives
+    # _restore_config_members rather than the CLI, because the up-front refusals make the collision
+    # unreachable from the command line by design -- which is the point of them.
+    archive, _toml = _make_archive(tmp_path, key_b64, capsys)
+    cfg = tmp_path / "bundle"
+    cfg.mkdir()
+    (cfg / "feed.py").write_bytes(b"mine, and older")
+
+    # Decrypt the real archive to the plain tar the extractor consumes, under the same DEK.
+    tar = tmp_path / "plain.tar"
+    with open(archive, "rb") as src, open(tar, "wb") as dst:
+        decrypt_stream(src, dst, base64.b64decode(key_b64))
+
+    with pytest.raises(dr_backup.BackupError) as excinfo:
+        dr_backup._restore_config_members(tar, cfg)
+    assert excinfo.value.kind == "restore"
+    assert "refusing to overwrite the existing file" in str(excinfo.value)
+    assert (cfg / "feed.py").read_bytes() == b"mine, and older"  # untouched
 
 
 def test_restore_config_to_refuses_when_archive_has_no_config(tmp_path, key_b64, capsys) -> None:

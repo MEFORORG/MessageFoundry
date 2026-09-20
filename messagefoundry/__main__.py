@@ -788,7 +788,8 @@ def main(argv: list[str] | None = None) -> int:
         "--config-to",
         default=None,
         help="also restore the archive's config bundle into this directory (must be empty or absent). "
-        "Refused when the archive carries no config bundle",
+        "Refused when the archive carries no config bundle, or when one of its members would be "
+        "written over the store this restore places at --to",
     )
     restore.add_argument(
         "--service-config",

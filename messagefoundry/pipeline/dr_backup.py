@@ -1066,7 +1066,10 @@ async def run_restore(
 
     ``config_dest`` additionally restores the archive's ``config/`` bundle into that directory. It is a
     **refusal**, not a no-op, when the archive carries no config member: an operator who asked for the
-    config back and silently got an empty directory would believe the config was restored."""
+    config back and silently got an empty directory would believe the config was restored. The bundle is
+    written AFTER the store, so a member aimed at the store's own path would overwrite it: that is
+    refused before the store is extracted (see :func:`_refuse_colliding_config_members`), as is a
+    ``config_dest`` sitting under ``dest_store_path`` (:func:`_refuse_config_dest_under_the_store`)."""
     import base64
 
     keys = [
@@ -1161,6 +1164,12 @@ def _restore_blocking(
                 "#52) — it carries no store to restore; restore the database from the DBA's own backup "
                 "and use --config-to for the config bundle",
             )
+        # Before the store is extracted, let alone published: a config member aimed at the store's own
+        # path is a destination refusal, and finding it here costs neither the extract nor a restore
+        # that half-finished (BACKLOG #1717).
+        if config_dest is not None:
+            _refuse_colliding_config_members(tar_path, dest_store_path, config_dest)
+
         try:
             # The BOUNDED extractor: its declared-size and streamed-byte caps are what keep a forged
             # archive from exhausting the staging dir (ASVS 5.2.3).
@@ -1220,19 +1229,128 @@ def _verify_extracted_store(snap: Path, manifest: dict[str, object]) -> dict[str
 def _refuse_existing_destination(dest_store_path: Path, config_dest: Path | None) -> None:
     """Refuse every destination that already holds something, BEFORE any decrypt work. Restoring over a
     live store is unrecoverable and a CLI cannot ask for permission, so the answer is no and the message
-    names the path the operator must move or choose differently."""
+    names the path the operator must move or choose differently.
+
+    The last arm refuses a pair of destinations that are individually empty and still collide, because
+    this restore writes BOTH of them: see :func:`_refuse_config_dest_under_the_store`. Its mirror image
+    needs the archive's member list and so runs later, in :func:`_refuse_colliding_config_members`."""
     for path in (
         dest_store_path,
         *(dest_store_path.with_name(dest_store_path.name + s) for s in _SIDECAR_SUFFIXES),
     ):
         if path.exists():
             raise BackupError("destination", _OVERWRITE_REFUSAL.format(path=path))
-    if config_dest is not None and config_dest.exists() and any(config_dest.iterdir()):
-        raise BackupError(
-            "destination",
-            f"refusing to restore the config bundle into the non-empty directory {config_dest} — "
-            "choose an empty or absent --config-to path",
+    if config_dest is not None:
+        # is_file() BEFORE iterdir(): a --config-to that names an existing FILE is a typo to report, and
+        # iterdir() on one raises NotADirectoryError, which escapes the CLI's BackupError handler as a
+        # traceback.
+        if config_dest.is_file():
+            raise BackupError(
+                "destination",
+                f"--config-to names an existing file at {config_dest}, not a directory — choose an "
+                "empty or absent directory for the config bundle",
+            )
+        if config_dest.is_dir() and any(config_dest.iterdir()):
+            raise BackupError(
+                "destination",
+                f"refusing to restore the config bundle into the non-empty directory {config_dest} — "
+                "choose an empty or absent --config-to path",
+            )
+        _refuse_config_dest_under_the_store(dest_store_path, config_dest)
+
+
+def _refuse_config_dest_under_the_store(dest_store_path: Path, config_dest: Path) -> None:
+    """Refuse a ``--config-to`` directory at or under the ``--to`` store's own path.
+
+    ``--to D --config-to D/cfg`` passes both emptiness checks, because both destinations really are
+    absent when they are read. The restore then publishes the verified store as the regular file ``D``,
+    and the config bundle's ``mkdir(parents=True)`` needs ``D`` to be a directory -- so it dies with an
+    uncaught ``FileExistsError`` while a restored store already sits at ``D`` and the retry is blocked by
+    the never-overwrite refusal.
+
+    No legitimate invocation has this shape: a directory cannot live under a regular file. Refusing the
+    pair up front costs nothing and there is no decrypt to waste. The other direction (a ``--config-to``
+    that CONTAINS the store) is a real invocation and is checked per member instead, against the
+    archive's own member list -- see :func:`_refuse_colliding_config_members`."""
+    if not _is_within(dest_store_path, config_dest):
+        return
+    raise BackupError(
+        "destination",
+        f"refusing to restore the config bundle into {config_dest}, which sits under the restored "
+        f"store's own path {dest_store_path} — the store is written first, as a file, so the bundle "
+        "could not be created beneath it. Choose a --config-to directory outside the --to path",
+    )
+
+
+def _refuse_colliding_config_members(
+    tar_path: Path, dest_store_path: Path, config_dest: Path
+) -> None:
+    """Refuse an archive whose config bundle would land ON a file this restore publishes.
+
+    This is the control for the P1 (BACKLOG #1717). ``--to D/store.db --config-to D`` passes every
+    emptiness check, because both destinations really are absent when they are read. The restore then
+    publishes the verified store at ``D/store.db`` and extracts the config bundle over the top of it, so
+    a ``config/store.db`` member -- which the backup writer happily includes, since
+    :meth:`BackupRunner._add_config_dir` takes every regular file under the config dir -- replaces the
+    database that just passed ``integrity_check`` and the row-count compare. The summary still reports
+    the pre-overwrite counts, so the operator is told a store was restored that is no longer there.
+
+    It asks the PRECISE question -- does a member's output path equal one this restore writes -- rather
+    than the proxy "does ``--config-to`` contain ``--to``". The proxy would refuse
+    ``--to /srv/dr/store.db --config-to /srv/dr``, which is the one-directory form the early-adopter
+    drill documents and which is perfectly safe for an archive with no colliding member.
+
+    Run before the store is extracted, so a refusal costs neither the extract nor a half-finished
+    restore. Traversal names are compared like any other: a ``../store.db`` member resolving back onto
+    the store is the same collision, and refusing it here beats refusing it after placement. The
+    exclusive create in :func:`_restore_config_members` is the backstop under this, not the control."""
+    published = {
+        _norm_for_compare(p)
+        for p in (
+            dest_store_path,
+            *(dest_store_path.with_name(dest_store_path.name + s) for s in _SIDECAR_SUFFIXES),
         )
+    }
+    try:
+        with tarfile.open(tar_path, "r:") as tar:
+            for member in tar.getmembers():
+                if not member.isfile() or not member.name.startswith(_CONFIG_PREFIX):
+                    continue
+                out = config_dest / member.name[len(_CONFIG_PREFIX) :]
+                if _norm_for_compare(out) not in published:
+                    continue
+                raise BackupError(
+                    "destination",
+                    f"the archive's config bundle carries a member that would be written to {out}, "
+                    f"which is where this restore publishes the store ({dest_store_path}) — it would "
+                    "overwrite the database this restore just verified, and the summary would still "
+                    "report the verified row counts. Choose a --config-to directory that does not "
+                    "contain the --to path",
+                )
+    except (OSError, ValueError, tarfile.TarError) as exc:
+        # The same catch-all shape :func:`_verify_archive_blocking` uses. ValueError is in it because
+        # this reads ATTACKER-SUPPLIED member names into ``Path``: a name the platform cannot parse
+        # must be a refusal, not a traceback out of a check whose whole job is to refuse.
+        raise BackupError("restore", safe_exc(exc)) from exc
+
+
+def _norm_for_compare(path: Path) -> Path:
+    """``path`` resolved and lower-cased, for comparison against another destination path.
+
+    Neither path need exist yet, so the comparison has to be lexical; ``resolve`` first, so ``..``, a
+    relative spelling and a symlinked destination all reduce to one form.
+
+    Case is folded UNCONDITIONALLY, not via :func:`os.path.normcase`, which is the identity function on
+    POSIX and would therefore miss case-insensitive macOS and every case-insensitive mount. The cost is
+    a false refusal where two paths differing only in case really are two files; that costs the operator
+    a rename, where a missed collision costs the restored database. ``lower`` rather than ``casefold``
+    because ``casefold`` maps ``ss`` onto the sharp s and would fuse two genuinely distinct paths."""
+    return Path(str(path.resolve()).lower())
+
+
+def _is_within(root: Path, path: Path) -> bool:
+    """Is ``path`` at or under ``root``? Both reduced by :func:`_norm_for_compare` first."""
+    return _norm_for_compare(path).is_relative_to(_norm_for_compare(root))
 
 
 def _place_restored_store(src: Path, dest: Path) -> int:
@@ -1333,9 +1451,31 @@ def _restore_config_members(tar_path: Path, config_dest: Path) -> int:
             src = tar.extractfile(member)
             if src is None:
                 continue
-            out.parent.mkdir(parents=True, exist_ok=True)
+            # A forged archive can carry `config/a` as a regular file AND `config/a/b` under it. Both
+            # pass the name gate, and the second one's mkdir then re-raises FileExistsError because the
+            # existing path is not a directory -- uncaught all the way out to a CLI traceback.
+            try:
+                out.parent.mkdir(parents=True, exist_ok=True)
+            except (FileExistsError, NotADirectoryError) as exc:
+                raise BackupError(
+                    "restore",
+                    f"archive carries a config member at {member.name} whose parent directory "
+                    "collides with a member already extracted as a file",
+                ) from exc
             streamed = 0
-            with open(out, "wb") as fh:
+            # EXCLUSIVE create, so a member can never land on a file that is already there. The
+            # overlapping-destination refusal is the control for the case that made this reachable
+            # (BACKLOG #1717); this is the backstop, and it also covers a forged archive carrying the
+            # same member name twice, where the second copy would otherwise silently replace the first.
+            try:
+                fh = open(out, "xb")  # noqa: SIM115 -- the `with` below owns it
+            except FileExistsError as exc:
+                raise BackupError(
+                    "restore",
+                    f"refusing to overwrite the existing file at {out} while restoring the config "
+                    "bundle",
+                ) from exc
+            with fh:
                 while True:
                     buf = src.read(1024 * 1024)
                     if not buf:
