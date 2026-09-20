@@ -6023,10 +6023,20 @@ def _emit_store_open_error(exc: sqlite3.DatabaseError, path: str, *, as_json: bo
 
 
 def _emit_error(message: str, *, as_json: bool) -> int:
+    """Report a command failure on the right stream and return its exit code.
+
+    Text goes to **stderr**. A shell redirect of a command's output --
+    ``messagefoundry validate --config x > report.txt`` -- must not swallow the reason the command
+    failed into the file it was writing, and ``2>/dev/null`` must be able to silence diagnostics
+    without silencing results (BACKLOG #1673).
+
+    JSON stays on **stdout**, deliberately. Under ``--json`` the error object IS the command's
+    machine-readable output: a consumer piping to ``jq`` reads it there, and the non-zero exit code
+    is what tells it apart from a success payload."""
     if as_json:
         print(json.dumps({"error": message}))
     else:
-        print(f"error: {message}")
+        print(f"error: {message}", file=sys.stderr)
     return 1
 
 
