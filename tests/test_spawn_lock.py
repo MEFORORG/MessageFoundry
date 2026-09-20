@@ -282,6 +282,48 @@ def test_the_storm_counts_are_unchanged() -> None:
     assert DRAINS == 8, "DRAINS moved; the same argument applies"
 
 
+def test_a_wrapped_file_does_not_quietly_grow_an_unwrapped_pwsh_launch() -> None:
+    """THE CONVENTION IN A DOCSTRING, MADE INTO A GATE -- BACKLOG #1304.
+
+    ``tests/test_coord_usage.py`` reds ``main``'s harness leg when one of its ``pwsh`` launches
+    starves, and the fix routed all 21 of them through ``run_single``. Nothing stopped a 22nd being
+    added next to them as a bare ``subprocess.run(["pwsh", ...])``: it would pass review by
+    resembling its neighbours, and rejoin the population that produced the reds. ``run_single``'s own
+    docstring makes the general point -- "A convention in a docstring would not have held that line."
+
+    PARSED, NOT GREPPED. A regex over the source counts matches in comments and docstrings, and this
+    module's files are heavily commented ABOUT ``subprocess.run(["pwsh"``, so a text search reports
+    the prose and fails. The AST sees calls only.
+
+    This gates the file that has CI evidence, not the tier. Wrapping the other ~65 launcher files is
+    the unbuilt ``run_pwsh`` abstraction the module docstring names; a gate that demanded it here
+    would fail on work nobody has scheduled.
+    """
+    import ast
+
+    source = Path(__file__).resolve().parent / "test_coord_usage.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+
+    offenders: list[int] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or ast.unparse(node.func) != "subprocess.run":
+            continue
+        if not node.args:
+            continue
+        first = node.args[0]
+        if isinstance(first, (ast.List, ast.Tuple)) and first.elts:
+            head = first.elts[0]
+            if isinstance(head, ast.Constant) and str(head.value).lower() in {"pwsh", "powershell"}:
+                offenders.append(node.lineno)
+
+    assert not offenders, (
+        f"{source.name} launches pwsh through subprocess.run at line(s) {offenders} instead of "
+        "run_single, so that launch does not take the shared side of the spawn lock and a storm "
+        "will not wait for it (BACKLOG #1304). Use run_single, or state in the file why this launch "
+        "is exempt and relax this gate deliberately."
+    )
+
+
 def test_the_single_wait_outlasts_the_storm_window_ci_measured() -> None:
     """THE CEILING MUST EXCEED THE STORM, and nothing caught it the first time it did not.
 

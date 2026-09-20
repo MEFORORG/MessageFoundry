@@ -333,8 +333,12 @@ named them, and the `refs/vault/**` trio was named by no tracked file at all.
 
 Reflogs record **two direct-URL `git fetch` commands, 45 seconds apart on 2026-07-28**, against
 `github.com/wshallwshall/MessageFoundry` — the maintainer's private vault repository, renamed to
-`wshallwshall/MessageFoundry-vault` on 2026-09-05. The URL above is left as the reflog recorded it,
-because that is the artifact this section is reading. One passed explicit
+`wshallwshall/MessageFoundry-vault` on 2026-09-05 and then transferred into the organization on
+2026-09-19, where it now lives at `MEFORORG/MessageFoundry-vault`. The URL above is left as the reflog
+recorded it, and the 2026-09-05 name is left beside it, because those are the artifacts this section is
+reading; both still resolve through GitHub's permanent redirects, which is exactly why
+`scripts/quality/stale_repo_slug_check.py` pins this file at two retired paths rather than exempting it.
+One passed explicit
 per-branch refspecs writing into `refs/remotes/vault/`; the other passed a wildcard writing into
 `refs/remotes/vaultall/`. **No remote named `vault` or `vaultall` was ever configured** — `git remote -v`
 has only ever listed `origin` — so no refspec could advance them and no `--prune` could ever have reached

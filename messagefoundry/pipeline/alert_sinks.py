@@ -321,12 +321,26 @@ class WebhookTransport:
         # built out of the connector-construction gate (notifier_from_settings, in the app lifespan), so
         # the posture is threaded explicitly; None (a direct/test construction) falls back to the
         # unclamped escape — byte-identical to the pre-#329 bare read.
+        #
+        # No refusal here prints the URL (BACKLOG #1793). A Slack or Teams hook carries its secret in
+        # the PATH, and a userinfo URL carries a password, and redact() keeps both. The userinfo screen
+        # runs first so no later message can reach one. This sink is built outside the connector gate,
+        # so the transports' own construction refusal never saw this URL. Imported lazily to keep this
+        # module's import cost unchanged for the far commoner non-webhook sinks.
+        from messagefoundry.transports.rest import (
+            enforce_outbound_length_limits,
+            refuse_url_credentials,
+        )
+
+        refuse_url_credentials(
+            url, "[alerts].webhook_url", use="the path token the webhook service issues"
+        )
         scheme = urllib.parse.urlsplit(url).scheme.lower()
         if scheme not in ("http", "https"):
-            raise ValueError(f"webhook url must be http or https, got scheme {scheme!r}")
+            raise ValueError(f"[alerts].webhook_url must be http or https, got scheme {scheme!r}")
         if scheme == "http" and not weakened_tls_escape_permitted(posture):
             raise ValueError(
-                f"webhook url {url!r} uses plaintext http; refused unless "
+                "[alerts].webhook_url uses plaintext http; refused unless "
                 f"{INSECURE_TLS_ESCAPE_ENV} is set (dev/trusted-network only) — use https"
             )
         if scheme == "http":
@@ -337,10 +351,7 @@ class WebhookTransport:
             )
         # ASVS 4.2.5: bound the webhook URL. Construction-only is sufficient here and not a shortcut:
         # the URL is operator config and the sole header is a fixed ``Content-Type``, so nothing is
-        # added between here and the wire. Imported lazily to keep the module's import cost unchanged
-        # for the far commoner non-webhook sinks.
-        from messagefoundry.transports.rest import enforce_outbound_length_limits
-
+        # added between here and the wire.
         enforce_outbound_length_limits(url, {"Content-Type": "application/json"})
         self.url = url
         self.timeout = timeout
@@ -366,10 +377,14 @@ class WebhookTransport:
         # read. With the scheme provably http/https here, the Request nosec is justified.
         split = urllib.parse.urlsplit(self.url)
         if split.scheme.lower() not in ("http", "https"):
-            raise ValueError(f"webhook url must be http or https, got scheme {split.scheme!r}")
+            raise ValueError(
+                f"[alerts].webhook_url must be http or https, got scheme {split.scheme!r}"
+            )
         host = (split.hostname or "").lower()
         if self.allowed_hosts and host not in self.allowed_hosts:
-            raise ValueError(f"webhook host {host!r} is not in the configured allowlist")
+            raise ValueError(
+                f"[alerts].webhook_url host {host!r} is not in [alerts].webhook_allowed_hosts"
+            )
         # Never serialize INTERNAL routing keys (``_``-prefixed: e.g. the #146 ``_recipients`` override)
         # onto the wire — the fan-out loop pops them before send, but strip defensively so a webhook
         # payload can never carry recipient addresses / internal metadata even if a key slips through.
@@ -386,12 +401,16 @@ class WebhookTransport:
         # same reason as the length gate above. An over-cap reply raises ResponseTooLargeError, which
         # the notifier's fan-out treats like any other failed sink send: the alert is not delivered
         # here, and the engine's own message flow is untouched.
-        from messagefoundry.transports.bounded_read import read_bounded
+        from messagefoundry.transports.bounded_read import drain_bounded
 
         # The no-redirect opener (not urllib.request.urlopen) so a 3xx can't divert the POST (15.3.2).
         with _NO_REDIRECT_OPENER.open(req, timeout=self.timeout) as resp:
-            # Drain (bounded) so the connection can be reused/closed cleanly.
-            read_bounded(resp, connector=f"alert webhook {host}")
+            # Drain (bounded) so the connection can be reused/closed cleanly. The body is discarded,
+            # so completeness is not checked: the POST has already been accepted by this point, and
+            # failing the drain on a short reply would report an alert as undelivered when the host
+            # took it. The byte bound still applies -- an unbounded drain is a memory exhaustion
+            # whether or not anyone reads the bytes.
+            drain_bounded(resp, connector=f"alert webhook {host}")
 
 
 def send_plain_email(
