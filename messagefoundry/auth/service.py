@@ -624,6 +624,9 @@ class AuthService:
                 settings.oidc_tls_ca_cert_file,
                 pin=settings.oidc_tls_ca_cert_pin,
                 enforcing=self._trust_anchors_enforcing,
+                # BACKLOG #299: revocation checking against the IdP certificate. This hop resolves no
+                # trust anchor, so it carries its own CRL setting rather than inheriting [tls].crl_file.
+                crl_file=settings.oidc_tls_crl_file,
             )
             self._oidc_jwks = oidc.JwksCache(
                 jwks_fetcher(settings.oidc_jwks_uri or "", self._oidc_opener),
@@ -1830,8 +1833,18 @@ class AuthService:
             # BACKLOG #1256: SUBJECT-EXCLUSIVITY, the direction #1015's guard cannot look. That guard
             # resolves by username and asks whether THIS ACCOUNT holds a different subject; it is
             # structurally incapable of seeing a SECOND ACCOUNT already bound to the subject now
-            # presenting. Nothing else sees it either -- measured, no UNIQUE constraint names these
-            # columns on any backend (0/0/0, positive control 13/8/10 total UNIQUE declarations).
+            # presenting.
+            #
+            # This is the FRIENDLY half of a two-layer control, not the only thing standing here.
+            # `ux_users_federated_subject` carries the same rule on all three backends and is the
+            # layer that holds under concurrency; the except-block below renders its refusal as this
+            # same outcome. This check exists so the sequential case gets a clean answer rather than
+            # an integrity error.
+            #
+            # Until BACKLOG #1472 this said, with a measurement, that no UNIQUE constraint named
+            # these columns on any backend. True when taken and false once the index landed -- and
+            # by then it invited the one wrong reading: that nothing but this check-then-act stood
+            # between one subject and two accounts.
             #
             # Without this, one verified identity could come to own two accounts: bind as `alice`,
             # have the directory resolve you to `bob` later, and both rows carry your subject with

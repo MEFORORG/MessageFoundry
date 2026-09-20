@@ -101,6 +101,9 @@ async def test_source_select_closes_its_cursor_before_release() -> None:
     src._acquire_timeout = 5.0  # type: ignore[attr-defined]
     src._poll_sql = "SELECT 1"  # type: ignore[attr-defined]
     src._poll_max_rows = db.DEFAULT_MAX_ITEMS_PER_POLL  # type: ignore[attr-defined]
+    # _select decodes each row under the open cursor (BACKLOG #1662), so it reads body_column to
+    # check the static config case once per poll. None = the whole-row JSON body.
+    src._body_column = None  # type: ignore[attr-defined]
 
     await src._select()
     assert "close:select" in log, f"the poll cursor was never closed; log={log}"

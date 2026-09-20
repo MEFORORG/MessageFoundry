@@ -49,10 +49,10 @@ tests/test_ci_tooling_gate.py
 tests/test_ci_venv_pinning.py
 tests/test_claim_check.py
 tests/test_claim_shared_registry.py
-tests/test_context_budget_hook.py
 tests/test_coord_alloc_floor.py
 tests/test_coord_fleet_fetch_clock.py
 tests/test_durability_hook_provenance.py
+tests/test_durability_hook_remote_guard.py
 tests/test_gate_ci_mirror_parity.py
 tests/test_hook_prose_folding.py
 tests/test_hook_prose_folding_push_ledger.py
@@ -144,7 +144,9 @@ tests/test_steer_inject.py
 tests/test_testpaths_webconsole_coverage.py
 tests/test_workflow_concurrency_keys.py
 tests/test_workflow_local_action_check.py
+tests/test_workflow_pipefail_screen.py
 tests/test_workflow_shell_syntax.py
+tests/test_worktree_ensure_venv.py
 tests/test_worktree_gate_command_parsing.py
 tests/test_worktree_gate_control_plane.py
 tests/test_worktree_gate_default_reposfile.py

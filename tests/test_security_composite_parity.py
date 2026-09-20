@@ -2,18 +2,28 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The composite security jobs must be byte-identical to the jobs they will replace.
 
-WHY THERE ARE TWO COPIES AT ALL. ``security.yml`` owns SEVEN of the thirteen required status
-contexts, and each of them is a separate job that acquires a separate runner slot. Five of the seven
-finish inside 55 seconds, so seven slot acquisitions buy about four minutes of scanning against a
-measured ceiling of 20 concurrent runners -- and healthy pull requests have been evicted from the
-merge queue for want of one. Consolidating the seven into two composites removes five acquisitions
-per run at no coverage cost.
+WHY THERE ARE TWO COPIES AT ALL. ``security.yml`` ran SEVEN separate scan jobs, each acquiring its
+own runner slot, and each of the seven was a required status context when this consolidation began.
+Five of the seven finish inside 55 seconds, so seven slot acquisitions buy about four minutes of
+scanning against a measured ceiling of 20 concurrent runners -- and healthy pull requests have been
+evicted from the merge queue for want of one. Consolidating the seven into two composites removes
+five acquisitions per run at no coverage cost.
 
 A REQUIRED CONTEXT IS A JOB NAME, so the consolidation cannot be one edit. Deleting the seven jobs
 while branch protection still names them wedges every pull request in the repository -- protection
 waits forever for a context nothing produces -- and moving protection first, to names nothing yet
 reports, wedges it the same way. So the composites land ALONGSIDE the originals, branch protection
-moves, and only then are the originals deleted. The workflow header carries the four steps.
+moves, and only then are the originals deleted. ``security.yml`` carries the step list above the
+composite jobs.
+
+THE SEVEN NO LONGER GATE A MERGE, AND THIS MODULE IS WHAT MAKES THAT SAFE. The owner removed their
+context names from branch protection on 2026-09-16, ahead of the deletion rather than after it, so
+today the seven hard-fail and report on every pull request while a composite is what protection
+reads. The claim carrying that posture is this module's: each composite's copy of a scan is
+byte-identical to the original, so the scan that stopped gating is the same string as the one that
+now gates. ``.github/required-contexts.txt`` is the record of which contexts protection holds, and
+it is not restated here -- an in-repo copy of that set is what went stale in ``security.yml``'s own
+header (BACKLOG #1705).
 
 WHAT THIS MODULE IS FOR. During the overlap the file carries two copies of every scan, and a
 duplicated gate is a gate free to drift: the copy that branch protection eventually reads could
