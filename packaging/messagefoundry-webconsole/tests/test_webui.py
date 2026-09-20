@@ -5810,9 +5810,12 @@ async def test_bulk_control_bad_action_404(engine: Engine) -> None:
         assert r.status_code == 404
 
 
-async def test_bulk_control_escapes_and_labels_bad_selection(engine: Engine) -> None:
-    # An undecodable key -> the fixed 'unrecognized selection' label (never the raw bytes). A DECODABLE
-    # key whose name carries markup -> the name rendered ESCAPED (no live script reaches the browser).
+async def test_bulk_control_labels_both_kinds_of_bad_selection(engine: Engine) -> None:
+    # Two shapes, two fixed labels, neither reflecting the submitted bytes. An UNDECODABLE key gets
+    # 'unrecognized selection'. A key that decodes to a name the connection-name rule refuses gets the
+    # not-a-valid-name label (BACKLOG #1740) -- this used to render the name ESCAPED instead, which was
+    # sound but weaker: the value now never reaches the page at all. That moved the escaping claim to
+    # test_outcomes_table_escapes_a_name_it_is_handed below, where the page builder still owns it.
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
@@ -5825,8 +5828,24 @@ async def test_bulk_control_escapes_and_labels_bad_selection(engine: Engine) -> 
         )
         assert r.status_code == 200
         assert "unrecognized selection" in r.text
-        assert "<script>alert(1)</script>" not in r.text  # escaped, never reflected raw
-        assert "&lt;script&gt;" in r.text
+        assert "not applied: not a valid connection name" in r.text
+        # Neither raw NOR escaped: a refused name is not placed on the page in any form.
+        assert "<script>alert(1)</script>" not in r.text
+        assert "&lt;script&gt;" not in r.text
+
+
+def test_outcomes_table_escapes_a_name_it_is_handed() -> None:
+    """The escaping claim, at the level that still owns it. The two bulk ROUTES now refuse a name
+    carrying markup before it reaches a render, so a route-level test can no longer exercise this --
+    but ``_outcomes_table`` escapes every target it is given, and deleting the route assertion
+    without putting this here would have dropped the property silently."""
+    from messagefoundry_webconsole.pages.connections import bulk_control_result, purge_result
+
+    outcomes = [("<script>alert(1)</script>", "applied"), (None, "not applied")]
+    for markup in (bulk_control_result("start", outcomes), purge_result("all", outcomes)):
+        assert "<script>alert(1)</script>" not in markup
+        assert "&lt;script&gt;alert(1)&lt;/script&gt;" in markup
+        assert "unrecognized selection" in markup
 
 
 # --- reset-many (bulk counter reset) ---------------------------------------------------------------
@@ -6002,9 +6021,11 @@ async def test_purge_bulk_dual_control_aggregates_pending(engine: Engine, tmp_pa
         )  # dual-control per dest (out1 quiesced -> reaches the gate)
 
 
-async def test_purge_bulk_escapes_markup_dest(engine: Engine) -> None:
-    # A ?dest carrying markup renders ESCAPED on the result page (never reflected raw). With no runner
-    # the dest is unknown -> 404 captured; either way the name is only ever placed via el()/rows_table.
+async def test_purge_bulk_refuses_a_markup_dest(engine: Engine) -> None:
+    # A posted dest carrying markup is REFUSED by the connection-name rule and becomes its own outcome
+    # row, so the value is never placed on the result page -- raw or escaped (BACKLOG #1740). It used to
+    # be rendered escaped, which was sound but put an unvetted body value on the page; the page-builder
+    # escaping it relied on is pinned by test_outcomes_table_escapes_a_name_it_is_handed.
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
@@ -6013,8 +6034,9 @@ async def test_purge_bulk_escapes_markup_dest(engine: Engine) -> None:
             c, "/ui/connections/purge-bulk", [("scope", "all"), ("dest", "<script>x</script>")]
         )
         assert r.status_code == 200
+        assert "not applied: not a valid connection name" in r.text
         assert "<script>x</script>" not in r.text
-        assert "&lt;script&gt;" in r.text
+        assert "&lt;script&gt;" not in r.text
 
 
 # --- W4-5 (ADR 0142): the browser federated-login legs ---------------------------------------------

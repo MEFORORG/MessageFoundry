@@ -309,8 +309,16 @@ def _event_filter(connection: str, kind: str = "") -> Markup:
     )
 
 
-def events(rows: list[ConnectionEventInfo], *, connection: str = "", kind: str = "") -> Markup:
-    """The connection/transport event log (Corepoint-style, #46) — metadata only, newest first."""
+def events(
+    rows: list[ConnectionEventInfo], *, connection: str = "", kind: str = "", error: str = ""
+) -> Markup:
+    """The connection/transport event log (Corepoint-style, #46) — metadata only, newest first.
+
+    ``error`` renders a refusal banner above the table, the shape ``pages.messages`` uses: the filter
+    form comes back carrying what the operator typed and the route answers 400 rather than querying
+    under a filter the JSON twin would refuse (BACKLOG #1740). It also suppresses the "No events."
+    line, which would otherwise read as the result of a filter that was never applied.
+    """
     headers = ["When", "Connection", "Transport", "Dir", "Kind", "Peer", "Reason"]
     body = [
         [
@@ -324,13 +332,22 @@ def events(rows: list[ConnectionEventInfo], *, connection: str = "", kind: str =
         ]
         for e in rows
     ]
-    empty = el("p", "No events.", class_="muted") if not rows else Markup("")
+    # One page() call with a varying tail, rather than two that have to be kept in step by hand.
+    # On a refusal the tail is the banner ALONE -- no results table, not even its header row: the
+    # filter never ran, so any table under the banner reads as its result (BACKLOG #1740).
+    tail: list[object] = (
+        [el("p", error, class_="banner")]
+        if error
+        else [
+            el("p", "No events.", class_="muted") if not rows else Markup(""),
+            rows_table(headers, body),
+        ]
+    )
     return page(
         "Events",
         el("h1", "Events"),
         _event_filter(connection, kind),
-        empty,
-        rows_table(headers, body),
+        *tail,
         active="events",
     )
 
