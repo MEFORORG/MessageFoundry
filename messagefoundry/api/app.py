@@ -5273,9 +5273,9 @@ def create_app(
             if cps is not None
             else None
         )
-        # App-log disk metering (#50), alongside the DB metrics — only when a log dir is configured.
-        # Run the blocking stat()s off the event loop (the DB metering is itself off-loop in the store);
-        # None when stdout-only or the directory is unreadable, so /status never raises on it.
+        # App-log disk metering (#50), alongside the DB metrics. Blocking stat()s, so off the event
+        # loop; it never raises, so /status does not either. `None` means stdout-only and NOTHING
+        # else -- see LogInfo for the three states (BACKLOG #1563).
         logs = await asyncio.to_thread(_log_storage, getattr(request.app.state, "log_dir", None))
         # No-network version-update signal (#30, ADR 0026): the engine's latest local diff (version
         # strings only, no PHI). None when [update_check] is disabled / no pass has run — additive, so
