@@ -963,8 +963,8 @@ class ApiSettings(_Section):
             or parts.fragment
         ):
             raise ValueError(
-                "[api].public_origin must be a bare origin like 'https://ops.example.com' "
-                "(scheme + host, no path/query/fragment)"
+                "[security].web_console_public_address must be a bare origin like "
+                "'https://ops.example.com' (scheme + host, no path/query/fragment)"
             )
         # Lowercase scheme + host (case-insensitive per RFC 3986 §3.2.2) so the same-origin comparison
         # is reliable regardless of how the admin cased it or how the browser sends the Origin.
@@ -1073,8 +1073,9 @@ class ApiSettings(_Section):
                 pass  # a DNS name — HSTS is notable, nothing to refuse
             else:
                 raise ValueError(
-                    f"[api].public_origin {self.public_origin!r} is an IP literal while a TLS posture "
-                    "is declared. RFC 6797 §8.1.1 forbids a browser from noting an IP-literal host as "
+                    f"[security].web_console_public_address {self.public_origin!r} is an IP literal "
+                    "while a TLS posture is declared. RFC 6797 §8.1.1 forbids a browser from noting "
+                    "an IP-literal host as "
                     "an HSTS host, so the Strict-Transport-Security header would be silently "
                     "discarded and the console would have no HTTPS-downgrade protection (ASVS 3.4.1). "
                     "Use a DNS hostname for the console — a dedicated subdomain, since "

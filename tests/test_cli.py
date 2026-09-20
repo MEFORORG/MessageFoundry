@@ -1666,7 +1666,10 @@ def test_serve_ui_http_public_origin_refused_with_declared_tls(
         '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.2"]\n',
     )
     assert rc == 2
-    assert "public_origin is http://" in capsys.readouterr().err
+    # Anchored on the relocation map, not a literal, for the reason _relocated_public_origin_key
+    # gives: #1361 reworded this refusal off the rejected `[api].public_origin` spelling, and a
+    # hard-coded key here would have to be chased again at the next relocation.
+    assert f"{_relocated_public_origin_key()} is http://" in capsys.readouterr().err
 
 
 def test_serve_ui_warns_on_undeclared_proxy_signal(
