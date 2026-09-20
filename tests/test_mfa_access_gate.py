@@ -50,12 +50,18 @@ async def _service(engine: Engine, settings: AuthSettings | None = None) -> Auth
 def _client(
     engine: Engine, service: AuthService, *, peer: tuple[str, int] | None = None
 ) -> httpx.AsyncClient:
-    """``peer`` sets the ASGI scope's client address, which ``httpx.ASGITransport`` otherwise omits.
+    """``peer`` pins the ASGI scope's client address; omitted, httpx's own default stands.
 
-    Omitted, ``request.client`` is None — fine for the gate behaviour most of this file asserts, and
-    fatal for anything asserting the audited ``client``, which would then compare None to None and
-    pass against unfixed code (BACKLOG #1644). Pass a peer whenever the address is under test."""
-    transport = httpx.ASGITransport(app=create_app(engine, auth=service), client=peer)
+    That default is a real address (``("127.0.0.1", 123)``), NOT None, so the gate behaviour most of
+    this file asserts reads the same either way. Pass ``peer`` whenever the address is under test.
+
+    Do not pass ``client=`` unconditionally to do it: ``client=None`` REPLACES that real default at
+    every call site, and an address assertion then degenerates to ``None == None`` and passes against
+    unfixed code (BACKLOG #1644)."""
+    app = create_app(engine, auth=service)
+    transport = (
+        httpx.ASGITransport(app=app) if peer is None else httpx.ASGITransport(app=app, client=peer)
+    )
     return httpx.AsyncClient(transport=transport, base_url="http://t")
 
 
