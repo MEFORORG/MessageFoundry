@@ -154,7 +154,10 @@ def _force_include_roots() -> dict[str, str]:
     covering that distribution.
     """
     roots: dict[str, str] = {}
-    for pyproject in sorted(_REPO.glob("packaging/*/pyproject.toml")):
+    # _build_pyprojects() rather than a second glob: it is the module's one statement of which
+    # distributions exist, written so a new one is covered the day it lands. The root project is
+    # dropped because its package tree is WALKED, not mapped, so it declares no force-include.
+    for pyproject in (p for p in _build_pyprojects() if p.parent != _REPO):
         label = pyproject.relative_to(_REPO).as_posix()
         for source in _wheel_force_include_map(pyproject):
             resolved = (pyproject.parent / source).resolve()

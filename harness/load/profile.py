@@ -45,14 +45,16 @@ PROFILES_DIR = Path(__file__).parent / "profiles"
 LOCAL_PROFILES_SUBPATH = Path("migration-local") / "profiles"
 
 
-def local_profiles_dir() -> Path:
-    """The operator-local profile directory for THIS process's working directory.
+def local_profiles_dir(cwd: Path | None = None) -> Path:
+    """The operator-local profile directory under ``cwd``, defaulting to the process's own.
 
     A function, not a module constant: the CWD can change between import and call (pytest's
     ``monkeypatch.chdir``, a harness launched from elsewhere), and a constant would freeze whichever
-    directory happened to be current at import time.
+    directory happened to be current at import time. The optional ``cwd`` matches the idiom every
+    other CWD-dependent entry point in ``harness/load`` already uses (``connscale/runner.py``,
+    ``estate/runner.py``, ``failover.py``, ``multishard.py``, ``shardcert.py``).
     """
-    return Path.cwd() / LOCAL_PROFILES_SUBPATH
+    return (cwd or Path.cwd()) / LOCAL_PROFILES_SUBPATH
 
 
 _LOAD_KEYS = frozenset(
@@ -271,23 +273,21 @@ def list_profiles() -> dict[str, str]:
     that hid the difference would invite treating it as one.
     """
     out: dict[str, str] = {}
-    for path in sorted(PROFILES_DIR.glob("*.toml")):
-        if path.name.startswith("connscale"):
+    # One scan over both directories rather than two copies of it. The `connscale` skip has to stay
+    # in step with list_connscale_profiles() and tests/test_load_config.py, and a rule spelled twice
+    # inside one function is a rule that gets updated once.
+    for directory, label in ((PROFILES_DIR, ""), (local_profiles_dir(), " (operator-local)")):
+        if not directory.is_dir():
             continue
-        try:
-            out[load_profile(path).name] = load_profile(path).description
-        except LoadProfileError:
-            out[path.stem] = "(invalid profile)"
-    local = local_profiles_dir()
-    if local.is_dir():
-        for path in sorted(local.glob("*.toml")):
+        for path in sorted(directory.glob("*.toml")):
             if path.name.startswith("connscale"):
                 continue
             try:
                 profile = load_profile(path)
-                out[profile.name] = f"{profile.description} (operator-local)".lstrip()
             except LoadProfileError:
-                out[path.stem] = "(invalid operator-local profile)"
+                out[path.stem] = f"(invalid profile){label}"
+                continue
+            out[profile.name] = f"{profile.description}{label}".lstrip()
     return out
 
 
