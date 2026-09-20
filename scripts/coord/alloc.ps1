@@ -50,6 +50,12 @@
     Numbers are never reclaimed. An abandoned branch holds its number forever and the sequence develops
     holes. That is deliberate: holes are free, collisions are not.
 
+    BECAUSE OF THAT, IT IS RE-ENTRANT: a re-run for the same OWNER and the same TITLE prints the number
+    already recorded instead of minting a second one (BACKLOG #1703). The duplicate a re-run used to
+    mint was a permanent hole that named nothing, and nothing anywhere reported it. The reuse check
+    keys on the recorded `worktree`, which is ledger_check.py's own primary key, and it runs before the
+    pre-flight fetch -- reasoning, and why it deliberately ignores the branch, at the block itself.
+
     -For NAMES THE OWNER AT BIRTH. IT IS NOT A TRANSFER VERB, AND THE DIFFERENCE IS THE WHOLE ARGUMENT.
     A claim records the tree that will COMMIT the number, and by default that is the tree the allocator
     runs in. When one seat allocates on another seat's behalf -- a Manager reading the backlog and
@@ -185,6 +191,99 @@ if ($For) {
     $ownerBranch = & git -C $target branch --show-current
     if ([string]::IsNullOrWhiteSpace($ownerBranch)) { $ownerBranch = "detached@" + (& git -C $target rev-parse --short HEAD) }
     $ownerBranch = $ownerBranch.Trim()
+}
+
+# RE-ENTRANCY: A RE-RUN FOR ONE OWNER AND ONE TITLE HANDS BACK THE NUMBER IT ALREADY HAS (BACKLOG #1703).
+#
+# Allocation below is a pure test-and-set with no memory of the CALLER, so running the same command
+# twice minted two numbers. The second is dead on arrival -- nothing is ever filed at it, and "numbers
+# are never reclaimed" (header above) makes that hole permanent and unreportable. It is not a rare
+# mistake either: docs/LEDGER-GATE.md counts 19 titles on the maintainer clone already holding more
+# than one number, and unwinding one of them cost a dead number, a second record with a
+# character-identical title, and renumbering the citations that had already been written.
+#
+# THE KEY IS THE RECORDED OWNER, WHICH IS THE GATE'S OWN PRIMARY KEY, AND THAT IS THE WHOLE ARGUMENT.
+# `ledger_check.py::owns` accepts a commit when the recorded `worktree` matches, so a number handed
+# back here is one the gate will accept from the tree that asked for it. Keying on anything `owns`
+# does not consult would return a number its holder could not commit -- which is the failure -For
+# exists to prevent, arrived at from the other direction.
+#
+# IT DOES NOT CONSULT THE BRANCH, THOUGH `owns` HAS A BRANCH FALLBACK (BACKLOG #1282). That fallback
+# is unreachable while the recorded path still matches, and `git worktree add --force` can put two
+# trees on one branch -- so matching on branch here could hand tree B a number tree A is actively
+# holding. THE TWO ERRORS ARE NOT SYMMETRIC: failing to match costs a hole, which is exactly the
+# status quo this block improves on, and matching wrongly costs a collision. Holes are free,
+# collisions are not, so the check is deliberately the narrow one.
+#
+# IT RUNS BEFORE THE PRE-FLIGHT FETCH, AND THAT PLACEMENT IS LOAD-BEARING, NOT AN OPTIMISATION. A
+# reuse issues no number, so it needs no floor and no remote. Placed after the fetch, an offline box
+# or a clone whose ref lock is held would REFUSE -- correctly, for an allocation -- a caller that was
+# only asking which number it already holds. The documented way past that refusal is -NoFetch, and
+# the way past it that a hurried reader takes is to allocate again, which is this defect.
+#
+# -ShowFloor IS EXCLUDED. It allocates nothing, it does not require -Title, and its contract is to
+# print the floor; short-circuiting it would make the inspector answer a different question. The
+# same reasoning puts this block after the -List early return, which stays offline and reads only
+# the local registry.
+if (-not $ShowFloor) {
+    $ownerKey = ($ownerRepo -replace '\\', '/').TrimEnd('/')
+    $titleKey = $Title.Trim()
+    # Normalised exactly as the -List block above and `owns` both normalise it. A third spelling of
+    # one comparison is how the definitions start to drift, and this one decides whether a number is
+    # re-issued.
+    $existing = @(
+        foreach ($f in (Get-ChildItem $alloc -Filter *.json -EA SilentlyContinue)) {
+            $rec = $null
+            try {
+                $rec = Get-Content $f.FullName -Raw | ConvertFrom-Json
+            } catch {
+                $rec = $null
+            }
+            # WARN ON THE OUTCOME, NOT ON THE EXCEPTION. A record this check could not read is
+            # indistinguishable from an absent one, and "no match" is precisely what mints the
+            # duplicate this block exists to prevent -- so it must announce itself. The empty file is
+            # the shape to expect, because the atomic CreateNew below makes the file BEFORE anything is
+            # written into it and a process killed in between leaves exactly one. MEASURED: an empty
+            # file does not throw here -- `ConvertFrom-Json` yields $null and the catch never runs -- so
+            # a warning hung off the catch alone was silent on the only case it was written for.
+            if ($null -eq $rec) {
+                Write-Host "WARNING: an allocation record could not be read, so it was not matched against" -ForegroundColor Yellow
+                Write-Host "         this title. If the number you want is in it, this run may issue a second" -ForegroundColor Yellow
+                Write-Host "         one: $($f.FullName)" -ForegroundColor Yellow
+            }
+            elseif ((("$($rec.worktree)" -replace '\\', '/').TrimEnd('/') -ieq $ownerKey) -and
+                ("$($rec.title)".Trim() -ieq $titleKey)) { $rec }
+        }
+    )
+    if ($existing.Count -gt 0) {
+        # LOWEST NUMBER WINS, SORTED NUMERICALLY AND NOT BY THE D4 FILENAME. The first number issued is
+        # the one any citation already written is most likely to name, and lexical order stops agreeing
+        # with numeric order the moment a number passes 9999 -- silently, by answering with a different
+        # record than the one that was meant.
+        $hit = $existing | Sort-Object { [int]$_.number } | Select-Object -First 1
+        $recordedTitle = "$($hit.title)"
+
+        Write-Host ""
+        Write-Host "REUSING ADR $($hit.number) -- this owner already holds a number for this title." -ForegroundColor Green
+        if ($existing.Count -gt 1) {
+            $all = (($existing | Sort-Object { [int]$_.number } | ForEach-Object { $_.number }) -join ', ')
+            Write-Host "NOTE: it holds $($existing.Count) of them for this title: $all. They predate this" -ForegroundColor Yellow
+            Write-Host "      check and cannot be reclaimed. File the work at $($hit.number); the rest stay holes." -ForegroundColor Yellow
+        }
+        # THE SLUG COMES FROM THE RECORDED TITLE, NOT FROM $Title. The title match is case-insensitive
+        # and trims, so the two can legitimately differ -- and the file the FIRST run named is the one
+        # that may already exist on disk. Naming a second spelling would send the operator to create a
+        # duplicate of their own ADR.
+        $slug = ($recordedTitle.ToLowerInvariant() -replace '[^a-z0-9]+', '-').Trim('-')
+        Write-Host "  file  : docs/adr/$($hit.number)-$slug.md"
+        Write-Host "  index : add its row to docs/adr/README.md in the SAME commit (the gate checks)."
+        Write-Host "  title : $recordedTitle"
+        Write-Host "  allocated to: $($hit.worktree) [$($hit.branch)] -- COMMIT FROM THERE, the gate keys entitlement on it."
+        Write-Host "  NOTHING NEW WAS ALLOCATED. A second number for one piece of work is a permanent hole,"
+        Write-Host "        so a re-run hands back the first. If this really is a DIFFERENT ADR, give it a"
+        Write-Host "        different title -- the title is also the filename, so they should differ anyway."
+        exit 0
+    }
 }
 
 # FLOOR = max over (origin/main) U (every local + remote ref) U (existing allocations).

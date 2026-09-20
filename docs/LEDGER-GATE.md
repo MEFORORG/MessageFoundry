@@ -266,6 +266,15 @@ refusal text now names the recorded worktree and branch and lists the three reco
 *(Those last two pairs are written without the `#` sigil on purpose: the numbers are allocated, but
 their items are still in an unmerged pull request, so a live cross-reference would dangle today.)*
 
+**`alloc.ps1` is re-entrant now, which closes the cheapest limb of this (BACKLOG #1703).** Re-running
+it with the same title from the same worktree prints the number already recorded and allocates
+nothing, so the reflex that produced those pairs no longer spends a number by itself.
+
+**That is not a recovery for the rows below, and reading it as one would spend a number.** The reuse
+check keys on the recorded `worktree`, which is what `owns()` keys on first, so it can only hand back
+a number recorded to the tree you are standing in. A number recorded to some *other* tree — which is
+what a refusal is usually telling you — still needs one of the rows in the table.
+
 **Read the state first, then pick the row.** `scripts/coord/alloc_strand_sweep.py` is read-only and
 prints, for every allocation, which worktree can still commit it:
 
@@ -306,7 +315,7 @@ the gate correctly refuses a commit nobody can make from the right place. That i
 claim is born pointing at the wrong tree, which is the third limb #1414 does not name.
 
 ```powershell
-pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind backlog -Title "<title>" -For <builder-worktree>
+pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind adr -Title "<title>" -For <builder-worktree>
 ```
 
 **`-For` is not the `-Reassign` this file declined, and the difference is the whole argument.** A
