@@ -497,7 +497,11 @@ def _probe_source() -> str:
     return Path(inspect.getfile(probe_module)).read_text(encoding="utf-8")
 
 
-def _flags_the_plant(body: str) -> bool:
+#: The frame a planted arm is given: one name annotated as a client, one that plainly is not.
+_PLANT_SIG = "client: httpx.Client, body: dict[str, str]"
+
+
+def _flags_the_plant(body: str, sig: str = _PLANT_SIG) -> bool:
     """Plant ``body`` in the real probe source and report whether the guard flags THAT LINE.
 
     Two things, and the second is the one that makes an arm mean something. The plant goes into real
@@ -505,10 +509,15 @@ def _flags_the_plant(body: str) -> bool:
     And the verdict is keyed on the planted line, not on the finding list being non-empty: a bare
     ``assert found`` answers "did the guard flag anything", which is a different sentence from "did
     the guard flag this", and it stays green off an unrelated defect elsewhere in the module. That
-    not hypothetical -- while this was being written, a real ``client.get`` planted in ``probe_ui``
-    reddened the negative-control arms too, because they were reading the whole list.
+    was not hypothetical -- while this was being written, a real ``client.get`` planted in
+    ``probe_ui`` reddened the negative-control arms too, because they were reading the whole list.
+
+    ``sig`` is the planted frame's parameter list, so an arm can carry the annotation an existing
+    function actually has. It APPENDS a frame and never rewrites an existing one: a guard test that
+    pins some other function's current spelling reds the day somebody legitimately edits that line,
+    and on this module those edits belong to other sessions.
     """
-    frame = f"\n\ndef _planted(client: httpx.Client, body: dict[str, str]) -> object:\n    {body}\n"
+    frame = f"\n\ndef _planted({sig}) -> object:\n    {body}\n"
     source = _probe_source() + frame
     lineno = source[: source.rindex(f"    {body}")].count("\n") + 1
     return any(finding.startswith(f"line {lineno}:") for finding in _unbounded_reads(source))
@@ -589,26 +598,23 @@ def test_the_guard_leaves_ordinary_python_alone(planted: str) -> None:
     )
 
 
-def test_classify_health_may_read_the_status_value_without_tripping_the_guard() -> None:
-    """The narrowing measured on the real call site, not a planted frame (BACKLOG #1831).
+def test_the_guard_permits_classify_healths_own_signature_reading_the_status_value() -> None:
+    """The arm ``classify_health`` is waiting on, written so it pins nothing that session will edit.
 
-    ``classify_health`` tests key PRESENCE today. Reading the VALUE is the obvious next edit, and it
-    is spelled ``body.get("status")``; before the narrowing that spelling reddened this file, so the
-    call site had to be written around the guard instead. This asserts the substitution is clean,
-    which is the whole claim -- it does not make it, and must not: whether ``/health`` is classified
-    on the key or the value is a behaviour question, decided elsewhere.
+    ``classify_health(status_code: int | None, body: object)`` tests key PRESENCE today; reading the
+    VALUE is the obvious next edit and it is spelled ``body.get("status")``. Under the old sweep that
+    spelling reddened this file, which is the whole of BACKLOG #1831.
 
-    The verdict is keyed on the substituted LINE rather than on the finding list being empty, for
-    the reason :func:`_flags_the_plant` gives: an unrelated unbounded read elsewhere in the module
-    would otherwise red this arm too, and a reader would go looking at ``classify_health``."""
-    source = _probe_source()
-    before = '    if status_code == 200 and isinstance(body, dict) and "status" in body:'
-    after = '    if status_code == 200 and isinstance(body, dict) and body.get("status") == "ok":'
-    assert before in source, "classify_health was respelled; re-aim this arm at its live shape"
-    lineno = source[: source.index(before)].count("\n") + 1
-    flagged = [
-        f
-        for f in _unbounded_reads(source.replace(before, after))
-        if f.startswith(f"line {lineno}:")
-    ]
-    assert not flagged, f"the guard still refuses classify_health the status value: {flagged}"
+    The annotation is the reason this is not just another negative-control arm. Those plant into a
+    frame whose ``body`` is a ``dict[str, str]``; ``classify_health``'s is a bare ``object``, and a
+    reader is entitled to ask whether the resolver treats the two differently. It does not -- neither
+    is client-bearing -- and that is asserted rather than argued.
+
+    **It plants a frame instead of rewriting the real line, deliberately.** An earlier cut of this
+    substituted ``classify_health``'s current text and asserted on the result, which pinned a line
+    BACKLOG #1715 is claimed to change. That arm would have gone red on ``main`` the day #1715
+    landed, blaming this guard for somebody else's correct edit. A guard must not make another
+    session's work look like a regression."""
+    assert not _flags_the_plant(
+        'return body.get("status")', "status_code: int | None, body: object"
+    )
