@@ -1552,7 +1552,31 @@ def _strict_ca_and_leaf(tmp_path: Path) -> tuple[Path, Path, Path]:
 
 
 def _verifying_client_ctx(ca: Path) -> ssl.SSLContext:
-    return ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=str(ca))
+    ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=str(ca))
+    # THE FLOOR IS PINNED RATHER THAN INHERITED, AND THE PIN IS A RUNTIME NO-OP. Measured on
+    # CPython 3.14.6 / OpenSSL 3.5.7: `ssl.create_default_context().minimum_version` is ALREADY
+    # `TLSVersion.TLSv1_2` (771). Python 3.10 made `PROTOCOL_TLS`, `PROTOCOL_TLS_CLIENT` and
+    # `PROTOCOL_TLS_SERVER` use TLS 1.2 as their minimum version, `create_default_context` builds a
+    # `PROTOCOL_TLS_CLIENT` context, and this project requires >=3.14 -- so the line below assigns
+    # the value that was already there. What it buys is the guarantee being STATED IN THE SOURCE
+    # instead of inherited from an interpreter default.
+    #
+    # WHY THAT MATTERS HERE: CodeQL's `py/insecure-protocol` model hardcodes the PRE-3.10 answer.
+    # `SslDefaultContextCreation.getProtocol` in the query's own Ssl.qll returns TLSv1 and TLSv1_1
+    # among the versions `create_default_context` allows, and a static analyser cannot read the
+    # runtime default -- so the single `wrap_socket` call these client contexts reach inside
+    # `_handshake` was reported HIGH, naming all three of them as sources.
+    # `ContextSetVersion` in that same model makes
+    # `ctx.minimum_version = ssl.TLSVersion.TLSv1_2` a ProtocolRestriction over every version
+    # `lessThan` it, clearing exactly those two bits, and it is the remediation the rule's own help
+    # page prescribes. So this is ADR 0034's `Fix` disposition, not another dismissal.
+    #
+    # Nothing in this file wants a weak client. The tests that MEASURE a refused protocol build
+    # their own context (see messagefoundry/config/tls_probe.py for the one place that deliberately
+    # offers 1.0/1.1, and ADR 0034's 2026-07-29 amendment for why that one is a `won't fix`).
+    # The other two client contexts below carry the same pin and point back here.
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    return ctx
 
 
 #: Key-exchange groups OUTSIDE `APPROVED_KEX_GROUPS` that a client can pin via `set_ecdh_curve`.
@@ -2025,14 +2049,17 @@ def test_the_minted_certificate_verifies_against_itself_as_a_ca_file(tmp_path: P
         api.model_copy(update={"tls_cert_file": cert, "tls_key_file": key})
     )
     client = ssl.create_default_context(cafile=cert)
+    client.minimum_version = ssl.TLSVersion.TLSv1_2  # pinned floor -- see _verifying_client_ctx
     assert client.verify_mode is ssl.CERT_REQUIRED  # verification stays ON; only the anchor changed
     assert _handshake(server, client, client_cert=None, server_hostname=api.host)
 
     # NEGATIVE CONTROL: the stock trust store does NOT accept it, which is the defect being fixed
     # (Node reports the same refusal as DEPTH_ZERO_SELF_SIGNED_CERT). Without this arm the assertion
     # above could pass on a client that verifies nothing.
+    stock = ssl.create_default_context()
+    stock.minimum_version = ssl.TLSVersion.TLSv1_2  # pinned floor -- see _verifying_client_ctx
     with pytest.raises(ssl.SSLError, match="self.signed|unable to get local issuer"):
-        _handshake(server, ssl.create_default_context(), client_cert=None, server_hostname=api.host)
+        _handshake(server, stock, client_cert=None, server_hostname=api.host)
 
 
 def test_a_failed_cert_write_leaves_no_orphaned_key(
