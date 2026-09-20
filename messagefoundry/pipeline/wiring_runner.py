@@ -7383,13 +7383,13 @@ def check_source_allowed(source: Source, name: str, egress: EgressSettings) -> N
     if egress.deny_by_default:
         if source.type is ConnectorType.DATABASE and not egress.allowed_db:
             raise WiringError(
-                f"inbound {name!r}: [egress].deny_by_default is set and [egress].allowed_db is empty "
-                "— list the DATABASE server to permit it"
+                f"inbound {name!r}: [security].block_unlisted_outbound is set and "
+                "[egress].allowed_db is empty — list the DATABASE server to permit it"
             )
         if source.type is ConnectorType.REMOTEFILE and not egress.allowed_remote:
             raise WiringError(
-                f"inbound {name!r}: [egress].deny_by_default is set and [egress].allowed_remote is "
-                "empty — list the REMOTEFILE host to permit it"
+                f"inbound {name!r}: [security].block_unlisted_outbound is set and "
+                "[egress].allowed_remote is empty — list the REMOTEFILE host to permit it"
             )
     if source.type is ConnectorType.DATABASE and egress.allowed_db:
         host = str(source.settings.get("server", ""))
@@ -7427,8 +7427,8 @@ def check_lookup_allowed(name: str, settings: Mapping[str, Any], egress: EgressS
     ``[egress].deny_by_default`` an empty ``allowed_db`` refuses the lookup outright."""
     if egress.deny_by_default and not egress.allowed_db:
         raise WiringError(
-            f"DatabaseLookup {name!r}: [egress].deny_by_default is set and [egress].allowed_db is "
-            "empty — list the lookup server to permit it"
+            f"DatabaseLookup {name!r}: [security].block_unlisted_outbound is set and "
+            "[egress].allowed_db is empty — list the lookup server to permit it"
         )
     if egress.allowed_db:
         host = str(settings.get("server", ""))
@@ -7571,8 +7571,8 @@ def check_fhir_lookup_allowed(
     _check_forward_proxy_egress(f"FhirLookup {name!r}", settings, egress.allowed_proxy)
     if egress.deny_by_default and not egress.allowed_http:
         raise WiringError(
-            f"FhirLookup {name!r}: [egress].deny_by_default is set and [egress].allowed_http is "
-            "empty — list the FHIR host to permit it"
+            f"FhirLookup {name!r}: [security].block_unlisted_outbound is set and "
+            "[egress].allowed_http is empty — list the FHIR host to permit it"
         )
     if egress.allowed_http:
         url = str(settings.get("url", ""))
@@ -8097,8 +8097,9 @@ def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
             dest.type.value,
         )
         raise WiringError(
-            f"outbound {dest.name!r}: [egress].deny_by_default is set and no allowlist permits a "
-            f"{dest.type.value} destination — add it to the matching [egress].allowed_* list"
+            f"outbound {dest.name!r}: [security].block_unlisted_outbound is set and no allowlist "
+            f"permits a {dest.type.value} destination — add it to the matching [egress].allowed_* "
+            "list"
         )
     if dest.type is ConnectorType.MLLP and egress.allowed_mllp:
         host = str(dest.settings.get("host", "127.0.0.1"))
