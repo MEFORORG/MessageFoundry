@@ -118,6 +118,7 @@ tests/test_private_paths_stay_ignored.py
 tests/test_push_guard.py
 tests/test_quality_advisory_invariants.py
 tests/test_quality_record_scope_claims.py
+tests/test_reap_orphans.py
 tests/test_release_member_gate.py
 tests/test_required_contexts.py
 tests/test_required_contexts_drift.py
@@ -142,6 +143,7 @@ tests/test_stale_repo_slug_check.py
 tests/test_stalled_prs.py
 tests/test_steer_inject.py
 tests/test_testpaths_webconsole_coverage.py
+tests/test_unbounded_fs_scan_guard.py
 tests/test_workflow_concurrency_keys.py
 tests/test_workflow_local_action_check.py
 tests/test_workflow_pipefail_screen.py
