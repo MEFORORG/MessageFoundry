@@ -126,10 +126,10 @@ _GHA_EXPR = re.compile(r"\$\{\{.*?\}\}", re.DOTALL)
 #:
 #: ANCHORED TO THE START OF A LINE, so an unquoted mention -- ``echo set -o pipefail`` -- cannot
 #: answer for the shell. Blanking already handles the quoted, here-document and commented forms; it
-#: cannot handle this one, because the words really are live shell. Measured over the corpus: all 31
-#: real declarations sit at the start of their line, so the anchor costs nothing today. A declaration
-#: written mid-line (``foo && set -o pipefail``) now reads as unguarded, which is the over-reporting
-#: direction and visible to whoever hits it.
+#: cannot handle this one, because the words really are live shell. Measured over the corpus: every
+#: real declaration sits at the start of its line (35 of 35, last counted for BACKLOG #1544 half A),
+#: so the anchor costs nothing today. A declaration written mid-line (``foo && set -o pipefail``)
+#: now reads as unguarded, which is the over-reporting direction and visible to whoever hits it.
 #:
 #: IT IS NOT A SCOPE CHECK, and the anchor does not make it one. An indented declaration is accepted
 #: wherever it sits, so a ``set -o pipefail`` inside an ``if`` branch, a subshell or a function body
@@ -1230,8 +1230,8 @@ def test_the_baseline_is_not_stale() -> None:
 
     A baseline that outlives its sites is the quiet failure here: the line stops matching anything,
     nothing reports it, and the list grows into a record of what USED to be wrong. It is also how a
-    fix from another branch gets noticed: when one guards a grandfathered step, its line stops
-    resolving and this test names it.
+    fix gets noticed, on this branch or another: when one guards a grandfathered step, its line
+    stops resolving and this test names it.
     """
     result = scan()
     assert_liveness(result)
@@ -1289,6 +1289,11 @@ def test_the_needs_walk_reaches_jobs_the_flat_resolution_cannot() -> None:
     jobs -- ``changes``, ``sqlserver-store`` and ``load-test-sqlserver`` -- sit behind ``CI gate``'s
     ``needs:``, and ``CI gate`` itself runs no pipeline, so the flat resolution reaches NONE of them.
     That is the shape BACKLOG #1544 was filed on, confirmed here rather than quoted.
+
+    BACKLOG #1544 half A then guarded ``sqlserver-store`` and ``load-test-sqlserver``, so the last
+    assertion below now stands on ``changes`` alone. That job is unguarded ON PURPOSE --
+    ``_ALLOWLIST_JOBS`` says why -- so the day this reds, find out why ``changes`` stopped counting
+    before taking the message's advice to delete the walk.
 
     An earlier revision of this docstring counted a fourth site, ``ci.yml`` ``test`` ``Doc guards``,
     and credited the flat resolution with reaching it. That was wrong in the instrument, not in the
