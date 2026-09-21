@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import importlib
+import json
 import socket
 import ssl
 import subprocess
@@ -168,10 +169,56 @@ def test_self_smoke_missing_config_skips() -> None:
 
 
 def test_self_smoke_ambiguous_inbound_skips() -> None:
-    # samples/config has several inbounds; with none chosen, the smoke skips and lists them.
+    # samples/config has several inbounds; with none chosen, the smoke skips and lists them. This is
+    # the ONE inbound-selection failure that stays a SKIP: the operator has a choice to make, and
+    # nothing is wrong with the deployment (BACKLOG #1707).
     r = smoke.smoke_self("samples/config")
-    assert r.status is Status.SKIP
-    assert "inbound" in r.detail.lower()
+    assert r.status is Status.SKIP, r.detail
+    assert "choose one" in r.detail
+    assert "IB_ACME_ADT" in r.detail
+    assert "--inbound" in r.detail  # how to choose, not only that a choice is owed
+
+
+def test_self_smoke_unknown_inbound_fails() -> None:
+    """A typo in ``--inbound`` is a deployment defect, not a choice left open (BACKLOG #1707).
+
+    The no-delivery FAIL tells an operator to re-point ``--inbound``, so a typo in that remedy must
+    not read green.
+    """
+    r = smoke.smoke_self("samples/config", inbound="IB_TYPO")
+    assert r.status is Status.FAIL, r.detail
+    assert "'IB_TYPO'" in r.detail  # names the name that was not found
+    assert "IB_ACME_ADT" in r.detail  # and the names that were, so the fix is one read away
+
+
+@pytest.mark.parametrize("inbound", [None, "IB_ANY"], ids=["unnamed", "named"])
+def test_self_smoke_zero_inbounds_fails(tmp_path: Path, inbound: str | None) -> None:
+    """A config that loads with no inbound connection FAILs (BACKLOG #1707).
+
+    The fixture declares one outbound and nothing else. A directory with no connection at all never
+    reaches ``select_inbound`` now, because the loader refuses it first (BACKLOG #1648). An
+    outbound-only config still loads, which ``tests/test_wiring.py`` pins, so it is the shape that
+    reaches the selection step with nothing to pick. With a name given, the empty config is still
+    the reported cause: the missing name is only its symptom.
+    """
+    from messagefoundry.config.wiring import load_config
+
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "OB_ONLY.py").write_text(
+        "from messagefoundry import MLLP, outbound\n"
+        'outbound("OB_ONLY", MLLP(host="127.0.0.1", port=2602))\n',
+        encoding="utf-8",
+    )
+    # Positive control: the fixture LOADS and has no inbound. Without it, a future loader rule that
+    # refused this shape would red the assertions below while pointing at the smoke.
+    reg = load_config(cfg)
+    assert not reg.inbound and "OB_ONLY" in reg.outbound
+
+    r = smoke.smoke_self(str(cfg), inbound=inbound)
+    assert r.status is Status.FAIL, r.detail
+    # NoInboundError's own words, which the loader's empty-graph refusal does not contain.
+    assert "no inbound connection, so there is nothing to simulate" in r.detail
 
 
 def test_self_smoke_routes_synthetic_adt() -> None:
@@ -193,7 +240,7 @@ def test_self_smoke_routes_synthetic_adt() -> None:
 
 
 def _write_smoke_config(tmp_path: Path, *, route: str, handle: str) -> str:
-    """A one-module config dir whose Router returns ``route`` and whose Handler returns ``handle``."""
+    """A one-module config dir whose Router returns ``route`` and whose Handler body is ``handle``."""
     cfg = tmp_path / "config"
     cfg.mkdir()
     (cfg / "IB_SMOKE.py").write_text(
@@ -212,7 +259,7 @@ def route(msg):
 
 @handler("h")
 def handle(msg):
-    return {handle}
+    {handle}
 """,
         encoding="utf-8",
     )
@@ -226,8 +273,8 @@ def handle(msg):
 @pytest.mark.parametrize(
     ("route", "handle", "disposition", "handlers", "reason"),
     [
-        ("[]", 'Send("OB_SMOKE", msg)', MessageStatus.UNROUTED, 0, "no handler"),
-        ('["h"]', "None", MessageStatus.FILTERED, 1, "no delivery"),
+        ("[]", 'return Send("OB_SMOKE", msg)', MessageStatus.UNROUTED, 0, "no handler"),
+        ('["h"]', "return None", MessageStatus.FILTERED, 1, "no delivery"),
     ],
     ids=["unrouted", "filtered"],
 )
@@ -256,6 +303,83 @@ def test_self_smoke_fails_without_a_delivery(
     assert reason in r.detail  # the FAIL text names why, not just the verdict
 
 
+# ---- self smoke: a FAIL detail is written to disk, so it is redacted (BACKLOG #1779) -----------
+#
+# `verify --report-md` / `--report-json` write each row's `detail` to a file, and a verify report is
+# pasted into tickets. The smoke's input is the synthetic message, but the text in an error is
+# whatever a Router/Handler chose to put there, and quoting a field is the commonest way to debug.
+
+
+def test_self_smoke_redacts_a_handler_error_before_it_reaches_a_report(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A Handler's ``raise`` quoting whole PID-5 and PID-3 fields must not reach either report file.
+
+    ``dryrun``, ``dryrun --trace`` and ``check`` already pass ``DryRunResult.error`` through
+    ``safe_error`` (BACKLOG #1668). The smoke was the fourth consumer, and it writes report files
+    that are made to be pasted into tickets.
+
+    Whole fields only. A single component such as ``msg["PID-3.1"]`` is one token with no HL7
+    delimiter, which is the residual ``messagefoundry/redaction.py`` documents, so it passes through.
+    This test does not claim otherwise.
+    """
+    # Concatenation, not an f-string, as tests/test_cli.py PHI_RAISER_CONFIG does: the advisory
+    # `raise-fstring` check would otherwise flag the probe it exists to model.
+    raise_phi = 'raise ValueError("bad patient " + str(msg["PID-5"]) + " mrn " + str(msg["PID-3"]))'
+    cfg = _write_smoke_config(tmp_path, route='["h"]', handle=raise_phi)
+    # The synthetic message's own family name and MRN (smoke._SYNTHETIC_ADT_A01_SEGMENTS, PID-5/3).
+    phi = ("ZZZTEST", "6824181")
+
+    # Positive control: the error at the SOURCE carries both values. Without this, their absence
+    # below could mean a Handler that never quoted them rather than a redaction that worked.
+    from messagefoundry.config.wiring import load_config
+    from messagefoundry.pipeline.dryrun import dry_run
+
+    raw_error = dry_run(load_config(cfg), smoke.synthetic_message()).error
+    assert raw_error is not None and all(v in raw_error for v in phi), raw_error
+
+    md, js = tmp_path / "verify.md", tmp_path / "verify.json"
+    argv = ["verify", "--section", "smoke", "--smoke", "self", "--config", str(cfg)]
+    argv += ["--inbound", "IB_SMOKE", "--report-md", str(md), "--report-json", str(js)]
+    # Still a FAIL: redaction decides what the row SAYS, never whether it fails. The exit code alone
+    # would also be 1 if some OTHER row failed, so the smoke row's own status is read from the report.
+    assert main(argv) == 1
+    written = {
+        "report-md": md.read_text(encoding="utf-8"),
+        "report-json": js.read_text(encoding="utf-8"),
+        "stdout": capsys.readouterr().out,
+    }
+    rows = {row["id"]: row for row in json.loads(written["report-json"])["results"]}
+    assert rows["smoke.self"]["status"] == Status.FAIL.value, rows["smoke.self"]
+    for where, text in written.items():
+        for value in phi:
+            assert value not in text, (where, value)
+        # The diagnostic survives. The stage prefix and the author's own words are what an operator
+        # ran the tool to read; only the HL7-shaped runs inside them are cut.
+        assert "router/handler error: bad patient" in text, where
+
+
+def test_self_smoke_redacts_an_unexpected_dry_run_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exception escaping ``dry_run`` is ERROR, keeps its type, and loses its HL7 content.
+
+    Two properties in one run. The row is ERROR and not SKIP, because only the ambiguous-inbound
+    case skips now and a stray ``ValueError`` used to land in the old catch-all SKIP. And the text is
+    redacted, because an exception raised while a message is being processed can quote it.
+    """
+    import messagefoundry.pipeline.dryrun as dryrun_mod
+
+    def _boom(*_args: object, **_kwargs: object) -> object:
+        raise ValueError("bad segment PID|1||6824181^^^HOSP^MR||ZZZTEST^SYNTHETIC^C")
+
+    monkeypatch.setattr(dryrun_mod, "dry_run", _boom)
+    r = smoke.smoke_self("samples/config", inbound="IB_ACME_ADT")
+    assert r.status is Status.ERROR, r.detail
+    assert "ValueError" in r.detail
+    assert "6824181" not in r.detail and "ZZZTEST" not in r.detail, r.detail
+
+
 def test_classify_self_smoke() -> None:
     """The classifier itself, including the arm that must not exist: a silent PASS.
 
@@ -276,13 +400,31 @@ def test_classify_self_smoke() -> None:
         # from MAINHOSP, so a Router keyed on another feed declines it legitimately.
         assert "--inbound" in r.detail, bad
 
+    # NOT_DEPLOYED has its own arm now (BACKLOG #1714, packet 14 P14-09). It used to reach the
+    # fail-closed arm below, which got the VERDICT right and left the operator no next step -- and
+    # `disposition_for` returns it for real, for a routed run whose every Send addressed a
+    # present-but-not-deployed destination (BACKLOG #1690).
+    nd = smoke._classify_self_smoke(MessageStatus.NOT_DEPLOYED, "SUMMARY")
+    assert nd.status is Status.FAIL
+    assert nd.detail.startswith("SUMMARY ")
+    # A remedy, and specifically NOT the unrouted/filtered one: the Router and the Handler both did
+    # their job, so re-pointing `--inbound` would send the operator after a feed that was fine.
+    assert "--inbound" not in nd.detail
+    # Both spellings are chosen to DISCRIMINATE. A bare `"deploy" in detail.lower()` would not:
+    # the fail-closed arm this replaced said "NOT_DEPLOYED is not a delivering outcome", which
+    # contains the word and none of the advice.
+    assert "deploy the outbound" in nd.detail
+    assert "present-but-not-deployed" in nd.detail
+
+    # FILTERED must no longer claim the outcome above as one of its own meanings -- naming it in
+    # both places is what made a decline indistinguishable from an author's filter.
+    filtered = smoke._classify_self_smoke(MessageStatus.FILTERED, "SUMMARY")
+    assert "present-but-not-deployed" not in filtered.detail
+
     # FAIL CLOSED. Each of these must fail NAMING itself rather than fall through to the PASS arm --
-    # that fall-through is the defect, so the fix must not leave a door in. NOT_DEPLOYED is no longer
-    # hypothetical: `disposition_for` started returning it for a routed run whose every Send addressed
-    # a present-but-not-deployed destination (BACKLOG #1690), and this arm is what already handled it
-    # correctly -- no delivery, so no PASS, and no "--inbound" remedy that flag could act on. Splitting
-    # it out with a reason of its own is packet 14's P14-09, a separate item.
-    for unknown in (MessageStatus.ERROR, MessageStatus.NOT_DEPLOYED, MessageStatus.ROUTED):
+    # that fall-through is the defect, so the fix must not leave a door in. These are the members
+    # `disposition_for` does not return, so this arm has no usable remedy to offer and gives none.
+    for unknown in (MessageStatus.ERROR, MessageStatus.ROUTED):
         r = smoke._classify_self_smoke(unknown, "SUMMARY")
         assert r.status is Status.FAIL, unknown
         assert unknown.value.upper() in r.detail, unknown
@@ -908,7 +1050,7 @@ _RAW_ADT = (
 
 
 async def _seed_message(settings: StoreSettings, *, control_id: str, status: MessageStatus) -> str:
-    handle = await open_store(settings)
+    handle = await open_store(settings, create=True)  # the seed provisions; the checks must not
     try:
         return await handle.record_received(
             channel_id="verify-test", raw=_RAW_ADT, status=status, control_id=control_id
@@ -1011,6 +1153,18 @@ def test_a_missing_explicit_config_path_fails_rather_than_skipping(tmp_path: Pat
     results = run_verify(
         sections=["store"], smoke_mode="none", service_config=str(tmp_path / "nope.toml")
     )
+    load = [r for r in results if r.id == "config.load"]
+    assert load and load[0].status is Status.FAIL
+    assert exit_code(results) == 1
+
+
+def test_a_directory_given_as_the_config_path_fails_rather_than_crashing(tmp_path: Path) -> None:
+    """A directory reaches load_settings's open, so `verify` must report it, not crash on it.
+
+    The mechanism is stated once at messagefoundry.__main__._load_service_settings. This asserts
+    the config.load ROW and the exit code rather than the exception class, because the class
+    differs by platform and this leg runs on both."""
+    results = run_verify(sections=["store"], smoke_mode="none", service_config=str(tmp_path))
     load = [r for r in results if r.id == "config.load"]
     assert load and load[0].status is Status.FAIL
     assert exit_code(results) == 1

@@ -253,6 +253,89 @@ async def test_trailing_semicolon_select_allowed(monkeypatch: pytest.MonkeyPatch
     assert pool.cursor_obj.executed is not None
 
 
+# --- write-shaped statements that still OPEN with SELECT/WITH (BACKLOG #1574, #1658) ---------
+#
+# Each of these passed the former leading-token gate: it read the first six characters and then only
+# looked for a ';'. Opening with SELECT or WITH never meant the rest was a read, and T-SQL needs no
+# ';' between statements, so the chain shapes below are two statements the ';' rule cannot see.
+
+
+@pytest.mark.parametrize(
+    "stmt",
+    [
+        # #1574: SELECT ... INTO writes a table while opening with SELECT.
+        "SELECT * INTO staging_copy FROM patients",
+        "select mrn, name into #tmp from patients",
+        # #1574: a CTE preamble followed by a terminal write.
+        "WITH doomed AS (SELECT id FROM patients) "
+        "DELETE FROM patients WHERE id IN (SELECT id FROM doomed)",
+        "WITH c AS (SELECT 1 AS x) UPDATE patients SET mrn='X' FROM c",
+        "WITH c AS (SELECT 1 AS x) INSERT INTO audit SELECT x FROM c",
+        # #1658: a chained write with NO semicolon between the statements.
+        "SELECT 1 UPDATE patients SET mrn='X'",
+        "SELECT mrn FROM p WHERE id=1 DELETE FROM p",
+        "SELECT 1 MERGE t USING s ON t.id=s.id WHEN MATCHED THEN DELETE",
+        "SELECT 1 EXEC sp_who",
+        "SELECT 1 DROP TABLE patients",
+        # EXEC of dynamic SQL is a statement, not the scalar-function form the gate tolerates.
+        "SELECT 1 EXEC('DELETE FROM patients')",
+        # A comment preamble cannot mask any of it.
+        "-- harmless preamble\nSELECT * INTO copy FROM patients",
+        "/* harmless preamble */ SELECT * INTO copy FROM patients",
+    ],
+)
+async def test_write_shaped_select_and_cte_rejected(
+    monkeypatch: pytest.MonkeyPatch, stmt: str
+) -> None:
+    pool = _patch_pool(monkeypatch, columns=["x"])
+    ex = DatabaseLookupExecutor(_CONN)
+    with pytest.raises(DbLookupError, match="read-only SELECT/WITH"):
+        await ex.query("clarity", stmt, None)
+    assert pool.cursor_obj.executed is None  # the write never reached/committed
+
+
+@pytest.mark.parametrize(
+    "stmt",
+    [
+        # An unreadable remainder is refused rather than guessed at.
+        "SELECT 1 /* never closed",
+        "SELECT 'never closed",
+        "SELECT [never closed",
+        # The first token must be the whole word, not a prefix of a longer one.
+        "SELECTX 1",
+        "WITHOUT ROWID",
+    ],
+)
+def test_unreadable_or_non_select_head_rejected(stmt: str) -> None:
+    with pytest.raises(DbLookupError, match="read-only SELECT/WITH"):
+        database._require_read_only(stmt)
+
+
+@pytest.mark.parametrize(
+    "stmt",
+    [
+        # The benign CTE contract (shipped, pinned above) restated against the predicate directly.
+        "WITH cte AS (SELECT 1 AS c) SELECT * FROM cte",
+        "WITH c AS (SELECT 1 AS x) SELECT * FROM c;",
+        # A write keyword INSIDE a literal or a quoted identifier is data, not a statement.
+        "SELECT npi FROM provider WHERE note = 'DELETE FROM patients'",
+        "SELECT note FROM t WHERE note = 'a;b'",
+        "SELECT [delete] FROM t",
+        'SELECT "update" FROM t',
+        # A write keyword is only a keyword as a whole word.
+        "SELECT update_ts, deleted_flag, into_bin FROM t",
+        # MySQL's scalar INSERT()/TRUNCATE() share a keyword's name but are calls, not statements.
+        "SELECT INSERT('abc', 1, 1, 'z') AS s",
+        "SELECT TRUNCATE(1.234, 2) AS s",
+        # Comments are skipped wherever they sit, and T-SQL block comments nest.
+        "SELECT 1; -- trailing note",
+        "SELECT /* nested /* deep */ still */ 1",
+    ],
+)
+def test_read_only_statements_still_admitted(stmt: str) -> None:
+    assert database._require_read_only(stmt) is None
+
+
 def test_lookup_dsn_is_read_only() -> None:
     # The db_lookup pool advertises ApplicationIntent=ReadOnly; the destination default does NOT (so the
     # DATABASE destination/source DSN stays byte-identical).

@@ -59,7 +59,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.parsing.message import emit_raw_separators
 from messagefoundry.parsing.peek import HL7PeekError, Peek, normalize
-from messagefoundry.redaction import safe_exc
+from messagefoundry.redaction import clamp_untrusted, safe_exc
 from messagefoundry.timezone import hl7_now
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -141,6 +141,30 @@ _CLIENT_SHUTDOWN_GRACE = 5.0
 # may take to leave, versus how long teardown waits for in-flight handlers — and a test that bounds
 # one must not silently shrink the other.
 _ACK_DRAIN_GRACE = _CLIENT_SHUTDOWN_GRACE
+
+#: Characters of a negative acknowledgment's MSA-3 that reach the :class:`NegativeAckError` message
+#: (BACKLOG #1576). MSA-3 is *Text Message* — a human-readable reason for the rejection — and the
+#: consumers of it are a log line, a dead-letter row's ``last_error`` and an alert, each of which
+#: redacts and then truncates to :data:`~messagefoundry.redaction._DEFAULT_LIMIT` (200) anyway. Five
+#: times that is room for a peer to name the offending segment and then some.
+#:
+#: **The bound belongs here rather than only downstream because the length is the PEER's to choose.**
+#: ``receive_max_bytes`` caps the ACK frame, not this field inside it, so MSA-3 arrives sized to the
+#: frame cap — 16 MiB by default — and redaction is a linear event-loop scan that would be charged all
+#: of it. Bounding at the read keeps the peer's string out of the exception text, the store write and
+#: the log, not merely out of the scan.
+_MAX_NAK_DETAIL_CHARS = 1024
+
+
+def _bounded_ack_field(value: str | None) -> str:
+    """A peer-chosen ACK field, bounded for the exception message it is about to be written into
+    (BACKLOG #1576).
+
+    One helper for both fields that reach a raise, so the two cannot drift: adding the bound to MSA-3
+    and leaving MSA-2 beside it is the shape this fix arrived in, and the shape a review caught.
+    ``clamp_untrusted`` and not a slice -- cutting at an arbitrary offset strands a fragment under the
+    redactor's thresholds and walks the identifier into the log downstream."""
+    return clamp_untrusted(value or "", window=_MAX_NAK_DETAIL_CHARS)
 
 
 # --- posture-keyed cleartext-hop refusal (#200, ADR 0092) --------------------------------------
@@ -1336,8 +1360,13 @@ class MLLPDestination(DestinationConnector):
                 # unreadable OWN MSH-10 skips correlation (nothing to correlate), per the design decision.
                 ack_control_id = ack.field("MSA-2")
                 if ack_control_id != sent_control_id:
+                    # BACKLOG #1576, same defect as MSA-3 below: MSA-2 is peer-chosen and frame-cap
+                    # sized too, and it is interpolated into this raise. Clamped HERE and not at the
+                    # read above, because the comparison must see the field the peer actually sent --
+                    # bounding first would silently correlate a long control id against its own prefix.
                     raise DeliveryError(
-                        f"ACK control-id mismatch: MSA-2={ack_control_id!r} "
+                        f"ACK control-id mismatch: "
+                        f"MSA-2={_bounded_ack_field(ack_control_id)!r} "
                         f"!= sent MSH-10={sent_control_id!r}"
                     )
             if self.capture_response:
@@ -1347,7 +1376,19 @@ class MLLPDestination(DestinationConnector):
                     detail=f"MSA-1={msa1}",
                 )
             return None
-        detail = ack.field("MSA-3") or ""
+        # BACKLOG #1576: the peer sizes MSA-3, and it reached the frame cap unbounded. Every consumer
+        # downstream redacts this text, and redaction is a linear scan on the event loop, so an
+        # unbounded field here is an unbounded stall there — measured, 0.29 s to 0.78 s per negative
+        # acknowledgment at a 16 MiB cap depending on shape. Bound it at READ time, where it is still a
+        # field and not yet an exception message half the engine will re-render: the 16 MiB string is
+        # never copied into the raise, the dead-letter row, or the alert.
+        #
+        # _MAX_NAK_DETAIL_CHARS, not the redaction module's own window, because this is not a
+        # traceback: MSA-3 is a human-readable reason and a peer that answers with a megabyte is
+        # echoing our payload back at us, not explaining anything. Clamped rather than sliced --
+        # slicing at an arbitrary offset strands a fragment under the redactor's thresholds and walks
+        # the identifier straight into the log, which is the whole defect #1576 was filed on.
+        detail = _bounded_ack_field(ack.field("MSA-3"))
         # A negative ACK is a *partner rejection*, not a transport failure: the message reached the
         # peer, which said no. It is NOT captured — it routes through the existing NegativeAckError
         # failure policy (dead-letter on a permanent reject / retry on a transient error), unchanged by

@@ -12,6 +12,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Literal
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
 import httpx
@@ -816,12 +817,21 @@ async def test_edit_stale_stepup_redirects_get_and_post_to_edit_form(engine: Eng
     # With an expired step-up window BOTH the GET editor and the body-carrying POST bounce to
     # /ui/reauth pointing at the /edit FORM page — never at the POST path (a re-POST across re-auth
     # would drop the edited body). No child is minted from the bounced request.
-    service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=-1))
+    # require_mfa=False takes the MFA leg out of require_ui_step_up, so the stale window below is
+    # what redirects; without it this unenrolled session is refused first with the SAME 303 and the
+    # same Location, and the window measured nothing (BACKLOG #1851). Reasoning, and the third
+    # new-IP leg that stays unpinned: the docstring of
+    # test_purge_stale_stepup_redirects_to_reauth (BACKLOG #1700).
+    service = AuthService(engine.store, AuthSettings(require_mfa=False, step_up_max_age_seconds=-1))
     await service.initialize()
     await _add(service, "op", Role.OPERATOR)
     mid = await _seed(engine)
     async with _client(engine, service) as c:
-        await _cookie_login(c, "op")
+        await _cookie_login(c, "op")  # negative window -> the fresh login is already stale
+        tok = c.cookies.get("mf_session")
+        assert tok is not None
+        assert await service.mfa_satisfied(tok) is True  # the MFA leg is NOT what refuses here
+        assert await service.has_recent_step_up(tok) is False  # the stale window is
         r = await c.get(f"/ui/messages/{mid}/edit")
         assert r.status_code == 303
         assert r.headers["location"] == f"/ui/reauth?next=/ui/messages/{mid}/edit"
@@ -1206,15 +1216,16 @@ _GIB = 1024**3
 
 
 def _sysinfo(
-    disk_free: int,
+    disk_free: int | None,
     *,
-    logs_free: int | None = None,
+    logs_free: int | None | Literal["unmeasured"] = None,
     pool_idle: int | None = None,
     channels: int = 2,
     channels_running: int | None = None,
     failed_names: list[str] | None = None,
     failed_count: int | None = None,
     uptime: float = 1.0,
+    journal_mode: str = "wal",
 ):
     """A minimal SystemStatus for _derive_health tests — only the fields the rollup reads matter.
 
@@ -1228,6 +1239,15 @@ def _sysinfo(
     A caller passing failures usually raises ``channels`` to cover them. That keeps the fixture
     self-consistent (channels_failed is a SUBSET of channels_stopped, never a fourth bucket) — it
     changes no assertion, because the rollup reads only total, failed, the names, and uptime.
+
+    ``logs_free`` carries all three log states in ONE argument (BACKLOG #1563), so the fixture
+    cannot express a contradiction: ``None`` = no log section at all (stdout-only), ``"unmeasured"``
+    = configured but the probe failed, an int = a measured figure. ``disk_free=None`` is the DB
+    drive's unmeasurable case. A ``0`` anywhere here is a real measured zero that must still alarm.
+
+    ``journal_mode`` is the BACKEND, because what ``disk_free=None`` means depends on it: it
+    defaults to SQLite's ``"wal"``, where a null can only be a failed local probe, and callers pass
+    ``"postgres"`` or a SQL Server recovery model for the disk the engine cannot see at all.
     """
     from messagefoundry.api.models import (
         DbInfo,
@@ -1241,6 +1261,12 @@ def _sysinfo(
     names = list(failed_names or [])
     failed = failed_count if failed_count is not None else len(names)
     running = channels_running if channels_running is not None else max(0, channels - failed)
+    if logs_free is None:
+        logs = None  # stdout-only: no log directory configured, so no section at all
+    elif logs_free == "unmeasured":
+        logs = LogInfo(path="l", size_bytes=None, disk_free_bytes=None)
+    else:
+        logs = LogInfo(path="l", size_bytes=1, disk_free_bytes=logs_free)
     return SystemStatus(
         engine=EngineInfo(
             version="0",
@@ -1257,14 +1283,12 @@ def _sysinfo(
             path="db",
             size_bytes=1,
             disk_free_bytes=disk_free,
-            journal_mode="wal",
+            journal_mode=journal_mode,
             messages=0,
             events=0,
             audit=0,
         ),
-        logs=None
-        if logs_free is None
-        else LogInfo(path="l", size_bytes=1, disk_free_bytes=logs_free),
+        logs=logs,
         pool=None
         if pool_idle is None
         else PoolInfo(
@@ -1297,6 +1321,144 @@ def test_derive_health_critical_on_very_low_disk() -> None:
 
     health, _ = _derive_health(_sysinfo(512 * 1024**2), None, None, None)  # 0.5 GiB free
     assert health == "down"
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "label"),
+    [
+        ({"disk_free": 0}, "db"),
+        ({"disk_free": 0, "journal_mode": "postgres"}, "db"),
+        ({"disk_free": 50 * _GIB, "logs_free": 0}, "logs"),
+    ],
+    ids=["db", "db-server-backend", "logs"],
+)
+def test_derive_health_still_critical_on_a_measured_zero_drive(
+    kwargs: dict[str, object], label: str
+) -> None:
+    """BACKLOG #1563's guard rail, and the reason the fix is not just "ignore falsy".
+
+    A drive the engine MEASURED at 0 bytes free is the real emergency this rule exists for, and it
+    must keep firing after unmeasurable values stop doing so. It holds because the rule tests
+    ``free is None`` — an identity check, never ``not free``. If any case here goes green, the fix
+    has silenced the alarm rather than narrowing it. The reason names WHICH drive, so the operator
+    knows which one to go and clear.
+
+    The ``db-server-backend`` arm is a REGRESSION guard, not a live path, and says so because the
+    id alone reads like end-to-end coverage of the server stores. No server store can emit a 0 any
+    more — both hardcode ``disk_free_bytes=None`` — so the only defect it can catch is the
+    discriminator being widened to skip server backends BEFORE the null check instead of inside it.
+    That would silence a measured figure on the strength of which store reported it, and the check
+    is cheap enough to keep for that one shape."""
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    health, reason = _derive_health(_sysinfo(**kwargs), None, None, None)  # type: ignore[arg-type]
+    assert health == "down"
+    assert reason == f"low disk ({label}): 0.0 GiB free"
+
+
+@pytest.mark.parametrize("journal_mode", ["postgres", "FULL", "SIMPLE", "BULK_LOGGED", "Full"])
+def test_derive_health_ignores_an_unmeasurable_db_disk_on_a_server_backend(
+    journal_mode: str,
+) -> None:
+    """BACKLOG #1563: both server stores hardcoded ``disk_free_bytes=0`` to mean "I cannot see this
+    disk", and every threshold here read that as a full drive — so a healthy Postgres or SQL Server
+    deployment WOULD come up with the engine-health heart pinned critical and a tooltip reading
+    "low disk (db): 0.0 GiB free". The value is now ``None``, and on a SERVER backend it is skipped,
+    claiming nothing — the engine was never meant to stat that disk.
+
+    Parametrized over both server spellings of ``journal_mode``, including SQL Server's three
+    recovery models and a lowercase one: the discriminator case-folds, because SQLite reports its
+    journal mode lowercase and SQL Server reports its recovery model uppercase."""
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    assert _derive_health(_sysinfo(None, journal_mode=journal_mode), None, None, None) == (
+        "ok",
+        None,
+    )
+
+
+@pytest.mark.parametrize(
+    "journal_mode", ["wal", "delete", "truncate", "persist", "memory", "off", "", "mysql"]
+)
+def test_derive_health_warns_on_an_unmeasurable_db_disk_on_a_local_backend(
+    journal_mode: str,
+) -> None:
+    """The other half of the rule, and the regression it was written against.
+
+    On the DEFAULT SQLite backend there is no not-applicable reading: ``_disk_free_bytes`` returns
+    ``None`` ONLY when a local ``shutil.disk_usage`` raised, so a null is a probe that FAILED on a
+    drive that should have been readable. Skipping it for every backend alike turned a real
+    emergency into a silent ``ok`` — SQLite holds its file handle open, so queries keep succeeding
+    while the parent directory's ACL or mount goes bad, and nothing else in the rollup would notice.
+
+    The five SQLite journal modes pin the module's claim that the two vocabularies cannot collide:
+    none of them may ever fall into ``_SERVER_DB_JOURNAL_MODES``.
+
+    ``"mysql"`` and ``""`` are the unrecognised arms. An unknown ``journal_mode`` counts as a LOCAL
+    disk and alarms, because silence is the failure this rule exists to prevent: a backend nobody
+    listed should read louder than it deserves, never quieter. ``""`` is the one arm that is a
+    judgement rather than a reading — it names no backend, and a SQL Server whose recovery-model
+    read came back empty reaches it too. Pinned here so that flipping it is a deliberate act with a
+    failing test behind it, not a quiet edit; see ``_SERVER_DB_JOURNAL_MODES`` for the reasoning."""
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    health, reason = _derive_health(_sysinfo(None, journal_mode=journal_mode), None, None, None)
+    assert health == "warn"
+    assert reason == "db directory missing or unreadable"
+
+
+@pytest.mark.parametrize("journal_mode", ["wal", "postgres"], ids=["sqlite", "server"])
+def test_derive_health_unmeasurable_disk_skips_only_itself(journal_mode: str) -> None:
+    """The skip is a ``continue``, not an early exit: an unmeasurable disk must not take the rest of
+    the rollup down with it. An engine with a failed inbound still warns and still names the inbound
+    — otherwise #1563's fix would have blinded the heart to everything else.
+
+    Both backends are covered, because they reach this line by different routes: the server one
+    appends no disk issue at all, the SQLite one appends its own warn and must still lose the
+    tooltip to the connection failure. Insertion order IS that tie-break, so this pins it."""
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    health, reason = _derive_health(
+        _sysinfo(None, failed_names=["IB_ACME_ADT"], journal_mode=journal_mode), None, None, None
+    )
+    assert health == "warn"
+    assert reason == "inbound IB_ACME_ADT failed to start"
+
+
+def test_derive_health_warns_on_an_unmeasurable_log_drive() -> None:
+    """A configured log directory the engine could not measure is a WARN, not a skip.
+
+    A log directory has no not-applicable case: the operator configured that path, so a null there
+    is always a failed probe. Skipping it would have traded #1563's loud wrong answer for a silent
+    one, leaving a vanished log directory reading green forever. The DB drive reaches the same
+    answer on the default SQLite backend for the same reason; only a server backend's DB null is
+    genuinely not-applicable, and ``journal_mode`` is what tells those apart."""
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    health, reason = _derive_health(_sysinfo(50 * _GIB, logs_free="unmeasured"), None, None, None)
+    assert health == "warn"
+    assert reason == "log directory missing or unreadable"
+
+
+def test_derive_health_ok_when_no_log_dir_is_configured() -> None:
+    """The control for the warn above: stdout-only (``logs is None``) is a deliberate configuration,
+    not a failed probe, and must stay silent. If this ever warns, the fix has started treating "the
+    operator wanted no log directory" as "the log directory is broken"."""
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    assert _derive_health(_sysinfo(50 * _GIB, logs_free=None), None, None, None) == ("ok", None)
+
+
+def test_bytes_renders_an_unmeasured_value_as_words_not_a_quantity() -> None:
+    """BACKLOG #1563, the on-screen half. The Engine Status page prints "Disk free" straight from
+    ``DbInfo``, so a server backend's unmeasurable figure must not fall through to "0 B" — an
+    operator reading that sees a disk emergency, when in fact nobody looked. A real zero still
+    renders as a quantity, because that one IS a measurement."""
+    from messagefoundry_webconsole.pages.monitoring import _bytes
+
+    assert _bytes(None) == "nothing measured"
+    assert _bytes(0) == "0 B"
+    assert _bytes(10 * 1024**3) == "10.0 GiB"
 
 
 def test_derive_health_down_when_store_unreachable() -> None:
@@ -1450,15 +1612,6 @@ def test_derive_health_connection_issue_wins_the_tie_against_another_warn() -> N
     )
     assert health == "warn"
     assert reason == "inbound IB_A failed to start"
-
-
-def test_worst_severity_ranks_critical_highest() -> None:
-    from messagefoundry_webconsole.routes.status import _worst_severity
-
-    assert _worst_severity(["info", "critical", "warning"]) == "critical"
-    assert _worst_severity(["info", "warning"]) == "warning"
-    assert _worst_severity(["info"]) == "info"
-    assert _worst_severity([]) is None
 
 
 def test_dashboard_has_connections_filter_box() -> None:
@@ -1808,7 +1961,9 @@ def test_alerts_builder_escapes_hostile() -> None:
                 count=3,
                 reason="<script>alert(1)</script>",
             )
-        ]
+        ],
+        total=1,
+        worst_severity="critical",
     )
     config = AlertsConfig(
         webhook_configured=False,
@@ -2060,7 +2215,9 @@ def test_alerts_builder_renders_write_controls() -> None:
                 last_seen=0.0,
                 count=1,
             )
-        ]
+        ],
+        total=1,
+        worst_severity="critical",
     )
     config = AlertsConfig(
         webhook_configured=False,
@@ -2137,6 +2294,54 @@ async def test_purge_action_registered_in_stepup_allowlist(engine: Engine) -> No
     assert is_safe_ui_action("/ui/connections/OB_X/purge/top")
     assert not is_safe_ui_action("/ui/connections/OB_X/purge/some")  # bad scope
     assert not is_safe_ui_action("/ui/connections/OB_X/purge/all?x=1")  # query rejected
+
+
+async def test_purge_stale_stepup_redirects_to_reauth(engine: Engine) -> None:
+    """A stale step-up window must stop the single-connection purge before it reaches the handler.
+
+    BACKLOG #1700. ``require_ui_step_up``'s own docstring names THREE checks it re-applies: MFA
+    satisfied, a recent password step-up, and new-client-IP contextual risk. This drives the SECOND.
+    The MFA leg is driven by ``test_ui_mfa_denial_audit.py`` (the purge is a row on its factory-shape
+    table); the new-IP leg is driven nowhere, and saying so is the point of counting them here.
+
+    The twin of ``test_purge_after_login_stepup_reaches_handler``: that one proves the gate LETS a
+    stepped-up operator through, which stays true with the gate deleted, so it can only ever fail
+    open. This is the arm that fails closed.
+
+    RED when the route's gate is SWAPPED for one without the freshness check -- measured with plain
+    ``require_ui``, which reaches ``purge_connection`` and 404s on the unknown outbound. Stated as a
+    swap rather than a deletion because deleting the ``Depends`` also deletes the ``identity`` the
+    handler passes on, so the route would fail to build and prove nothing.
+
+    ``require_mfa=False`` is a control, not a convenience: it makes ``mfa_satisfied`` True so the MFA
+    leg cannot be what redirects. The third leg is inert only because ``admin_new_ip_step_up``
+    defaults False -- if that default is ever flipped, as ``require_mfa`` itself was under BACKLOG
+    #187, this test keeps passing on the new-IP leg and stops measuring the window. The two asserts
+    below pin the split that is pinnable today.
+    """
+    # -1, not 0: has_recent_step_up compares `elapsed <= max_age`, so 0 needs elapsed to be strictly
+    # positive and a backwards clock step would flip it. -1 is unconditionally stale, and is what the
+    # sibling stale-window tests in this file already use.
+    service = AuthService(engine.store, AuthSettings(require_mfa=False, step_up_max_age_seconds=-1))
+    await service.initialize()
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")  # negative window -> the fresh login is already stale
+        tok = c.cookies.get("mf_session")
+        assert tok is not None
+        assert await service.mfa_satisfied(tok) is True  # the MFA leg is NOT what refuses here
+        assert await service.has_recent_step_up(tok) is False  # the stale window is
+        r = await c.post(
+            "/ui/connections/OB_X/purge/all", headers={"Sec-Fetch-Site": "same-origin"}
+        )
+        # The LOCATION is the assertion that carries the property: a SUCCESSFUL purge also answers
+        # 303 (RedirectResponse("/ui")), so the status alone would not say the gate refused. The
+        # exact continuation, not just the /ui/reauth prefix: the purge is registered auto_retry, so
+        # the operator must land back on the action they clicked, not on a bare re-auth page.
+        assert r.headers.get("location") == "/ui/reauth?next=/ui/connections/OB_X/purge/all", (
+            "a stale step-up was not sent to re-auth carrying the purge it interrupted"
+        )
+        assert r.status_code == 303
 
 
 def test_connections_fragment_renders_selection_checkbox() -> None:
@@ -2628,9 +2833,17 @@ async def test_stale_stepup_redirects_body_post_to_unlock_form(engine: Engine) -
     # THE reauth_next mapping: with an expired step-up window, the body-carrying POST /ui/users is
     # redirected to /ui/reauth pointing at its FORM PAGE (/ui/users/new) — never at the POST path —
     # and the form GET itself bounces the same way (its own path IS the unlock target).
-    service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=-1))
+    # require_mfa=False takes the MFA leg out of require_ui_step_up, so the stale window below is
+    # what redirects; without it _boss_client's unenrolled session is refused first with the SAME
+    # 303 and the window measured nothing (BACKLOG #1851). Reasoning, and the third new-IP leg that
+    # stays unpinned: the docstring of test_purge_stale_stepup_redirects_to_reauth (BACKLOG #1700).
+    service = AuthService(engine.store, AuthSettings(require_mfa=False, step_up_max_age_seconds=-1))
     await service.initialize()
     async with _boss_client(engine, service) as c:
+        tok = c.cookies.get("mf_session")
+        assert tok is not None
+        assert await service.mfa_satisfied(tok) is True  # the MFA leg is NOT what refuses here
+        assert await service.has_recent_step_up(tok) is False  # the stale window is
         r = await c.post(
             "/ui/users",
             data={"username": "x", "password": PW},
@@ -3120,10 +3333,18 @@ async def test_ad_group_map_asymmetric_rows_never_cross_bind(engine: Engine) -> 
 async def test_stale_stepup_bounces_body_less_action_via_reauth(engine: Engine) -> None:
     # A body-less auto-retry action under a stale window 303s to /ui/reauth carrying ITS OWN path
     # (no reauth_next mapping) — and nothing is deleted until the retry actually runs.
-    service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=-1))
+    # require_mfa=False takes the MFA leg out of the gate, so the stale window below is what
+    # redirects; without it _boss_client's unenrolled session is refused first with the SAME 303 and
+    # the window measures nothing (BACKLOG #1850). Reasoning, and the third new-IP leg that stays
+    # unpinned: the docstring of test_purge_stale_stepup_redirects_to_reauth (BACKLOG #1700).
+    service = AuthService(engine.store, AuthSettings(require_mfa=False, step_up_max_age_seconds=-1))
     await service.initialize()
     await _add(service, "u9", Role.VIEWER)
     async with _boss_client(engine, service) as c:
+        tok = c.cookies.get("mf_session")
+        assert tok is not None
+        assert await service.mfa_satisfied(tok) is True  # the MFA leg is NOT what refuses here
+        assert await service.has_recent_step_up(tok) is False  # the stale window is
         uid = await _uid(service, "u9")
         r = await c.post(f"/ui/users/{uid}/delete", headers={"Sec-Fetch-Site": "same-origin"})
         assert r.status_code == 303
@@ -3134,19 +3355,28 @@ async def test_stale_stepup_bounces_body_less_action_via_reauth(engine: Engine) 
 async def test_stale_stepup_bounces_all_unlock_form_pages(engine: Engine) -> None:
     # Every unlock FORM page is step-up-gated: a stale window 303s each to /ui/reauth with its own
     # path as next (a regression to plain require_ui would silently drop the step-up gate).
-    service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=-1))
+    # require_mfa=False takes the MFA leg out of the gate, so the stale window below is what
+    # redirects; without it _boss_client's unenrolled session is refused first with the SAME 303 and
+    # the window measures nothing (BACKLOG #1850). Reasoning, and the third new-IP leg that stays
+    # unpinned: the docstring of test_purge_stale_stepup_redirects_to_reauth (BACKLOG #1700).
+    service = AuthService(engine.store, AuthSettings(require_mfa=False, step_up_max_age_seconds=-1))
     await service.initialize()
     await _add(service, "u9", Role.VIEWER)
     async with _boss_client(engine, service) as c:
+        tok = c.cookies.get("mf_session")
+        assert tok is not None
+        assert await service.mfa_satisfied(tok) is True  # the MFA leg is NOT what refuses here
+        assert await service.has_recent_step_up(tok) is False  # the stale window is
         uid = await _uid(service, "u9")
         for path in (f"/ui/users/{uid}", "/ui/roles/new", "/ui/ad-groups"):
             r = await c.get(path)
             assert r.status_code == 303, path
             assert r.headers["location"] == f"/ui/reauth?next={path}", path
-        # The custom-role edit form too (its role id is percent-encoded in the redirect).
+        # The custom-role edit form too. Pin the percent-encoding the comment used to only claim:
+        # _reauth_redirect quotes with safe="/", so the role id's colon rides as %3A.
         r = await c.get("/ui/roles/custom:x/edit")
         assert r.status_code == 303
-        assert r.headers["location"].startswith("/ui/reauth?next=")
+        assert r.headers["location"] == "/ui/reauth?next=/ui/roles/custom%3Ax/edit"
 
 
 async def test_users_read_only_role_cannot_reach_admin_writes(engine: Engine) -> None:
@@ -3551,16 +3781,57 @@ async def test_mfa_confirm_form_is_unlock_reentry(engine: Engine) -> None:
 
 
 async def test_stale_reauth_only_bounces_to_reauth(engine: Engine) -> None:
-    # require_ui_reauth_only under a stale window: enroll (body-less) carries its own path; the
-    # body-carrying verify maps to its unlock confirm form via reauth_next.
+    # require_ui_reauth_only_action under a stale window: enroll (body-less) carries its own path;
+    # the body-carrying verify maps to its unlock confirm form via reauth_next.
+    #
+    # NOT the require_mfa=False shape of the step-up twins (BACKLOG #1850), and the _action suffix
+    # in that factory name is the load-bearing part. Its base passes allow_mfa_pending=True
+    # precisely so an un-enrolled account can reach the route that enrolls it -- there is no MFA leg
+    # to take out, and require_mfa=False would pin nothing here. Under ADR 0077 the gate reads
+    # has_action_step_up, never has_recent_step_up, so the negative window is load-bearing only
+    # through the GRANT's TTL, which _grant_action_step_up sets to now + step_up_max_age_seconds.
+    # So each lane below is driven TWICE (BACKLOG #1851): an ungranted arm, which bounces under
+    # every window and therefore measures the window not at all, and a minted arm, which bounces
+    # only because the negative window expired the grant on its way out of the mint.
     service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=-1))
     await service.initialize()
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
+        # Arm 1, ungranted and window-independent, kept when the minted arm was added. The ENROLL
+        # half of it is driven independently by test_require_mfa_unenrolled_can_enroll_end_to_end
+        # under a DEFAULT window -- which is also the proof that the -1 above changed nothing here
+        # before arm 2 existed. The VERIFY half is why this arm stays: every other verify POST in
+        # this file mints a grant first, to get past this very refusal. That is a census of the
+        # file, not a proof about the suite, so re-measure before deleting the arm.
         r = await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
         assert r.status_code == 303
         assert r.headers["location"] == "/ui/reauth?next=/ui/account/mfa/enroll"
+        # Arm 2: a grant IS minted, and the negative window has already expired it. Not read back
+        # with has_action_step_up -- that read POPS the grant (single-use), so checking it here
+        # would consume what the route must find and the gate would go untested. The re-auth
+        # response is the non-destructive evidence instead: 200 plus the auto-submit form for a
+        # body-less auto_retry action, 303 to the target for an unlock one. BOTH halves are
+        # asserted, because a WRONG password also answers 200 -- pages.reauth carrying an error.
+        minted = await _mint_action(c, "/ui/account/mfa/enroll")
+        assert minted.status_code == 200
+        assert 'action="/ui/account/mfa/enroll"' in minted.text
+        r = await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
+        assert r.status_code == 303
+        assert r.headers["location"] == "/ui/reauth?next=/ui/account/mfa/enroll"
+        # The verify lane, both arms again. Its grant binds to the REGISTERED confirm action, never
+        # to the body-carrying verify path -- deliberately not a continuation, so /ui/reauth would
+        # mint nothing for it. That is the same mapping reauth_next applies to the refusal.
+        r = await c.post(
+            "/ui/account/mfa/verify",
+            data={"code": "123456"},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 303
+        assert r.headers["location"] == "/ui/reauth?next=/ui/account/mfa/confirm"
+        minted = await _mint_action(c, "/ui/account/mfa/confirm")
+        assert minted.status_code == 303
+        assert minted.headers["location"] == "/ui/account/mfa/confirm"
         r = await c.post(
             "/ui/account/mfa/verify",
             data={"code": "123456"},
@@ -4339,6 +4610,19 @@ async def test_webauthn_rp_fail_closed_legible(engine: Engine) -> None:
     # AC-7: public_origin unset + request-derivation disallowed (the declared-proxy topology) —
     # ceremonies fail closed with the shared notice on every surface, never a redirect loop.
     pytest.importorskip("webauthn")
+    # BACKLOG #1361: PINNED AGAINST THE RELOCATION MAP, NOT A REMEMBERED LITERAL. `[api].public_origin`
+    # is the INTERNAL field this code reads; ADR 0118 relocated the OPERATOR-FACING key and
+    # `_reject_relocated_keys` REFUSES the old spelling as file or env input, so a notice naming it
+    # hands the operator a remediation that dies at load. Asserting some literal here would pass just
+    # as well after the next relocation moved the key again -- the notice and the loader would drift
+    # apart silently, which is the defect the pin exists to stop. Same shape, and the same reasoning,
+    # as tests/test_api_tls.py::test_the_refusal_names_a_key_the_loader_actually_accepts.
+    from messagefoundry.config.settings import _RELOCATED_TO_SECURITY
+
+    # The SECTION is part of the remediation: "[api].web_console_public_address" is the right key in a
+    # section the loader still refuses, and a bare-key assertion would pass on it. So pin the spelling an
+    # operator can actually paste into messagefoundry.toml.
+    expected_key = f"[security].{_RELOCATED_TO_SECURITY[('api', 'public_origin')]}"
     service = await _service(engine)
     await _add(service, "boss", Role.ADMINISTRATOR)
     transport = httpx.ASGITransport(
@@ -4347,10 +4631,14 @@ async def test_webauthn_rp_fail_closed_legible(engine: Engine) -> None:
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         await _cookie_login(c, "boss")
         r = await c.get("/ui/account")
-        assert "public_origin is not set" in r.text
+        assert expected_key in r.text
+        # The OLD spelling must be ABSENT, so a revert reds HERE -- on the rendered page a user
+        # actually reads -- and not only in the #1361 static census.
+        assert "[api].public_origin" not in r.text
         await _mint_action(c, "/ui/account/webauthn/enroll")  # 7.5.1: enroll is action-bound
         r = await c.post("/ui/account/webauthn/enroll", headers=_SFS)
-        assert r.status_code == 409 and "public_origin is not set" in r.text
+        assert r.status_code == 409 and expected_key in r.text
+        assert "[api].public_origin" not in r.text
         r = await c.post("/ui/reauth/webauthn", json={"response": {}}, headers=_SFS)
         assert r.status_code == 409 and r.json()["error"] == "rp_unavailable"
 
@@ -5037,6 +5325,14 @@ async def test_sessions_posts_reject_cross_site(engine: Engine) -> None:
 async def test_revoke_one_stale_bounces_to_reauth(engine: Engine) -> None:
     # A stale window 303s the terminate POST to /ui/reauth carrying its OWN path as next, and
     # nothing is revoked until the retry actually runs (the registration makes the continuation work).
+    #
+    # NOT the require_mfa=False shape of the step-up twins (BACKLOG #1850): this route rides
+    # require_ui_reauth_only_action, whose base passes allow_mfa_pending=True, so there is no MFA leg
+    # to take out and require_mfa=False would pin nothing. Under ADR 0077 the gate reads
+    # has_action_step_up -- never has_recent_step_up -- so the negative window is load-bearing only
+    # through the GRANT minted below, which _grant_action_step_up deadlines at
+    # now + step_up_max_age_seconds, i.e. already expired. The mint is the CONTROL, not setup: drop
+    # it and the POST bounces for want of ANY grant, which it does under any window (BACKLOG #1851).
     service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=-1))
     await service.initialize()
     await _add(service, "op", Role.OPERATOR)
@@ -5045,16 +5341,28 @@ async def test_revoke_one_stale_bounces_to_reauth(engine: Engine) -> None:
         await _cookie_login(c, "op")
         op_id = await _uid(service, "op")
         other_id = hash_token(other.token or "")
-        r = await c.post(
-            f"/ui/account/sessions/{other_id}/revoke", headers={"Sec-Fetch-Site": "same-origin"}
-        )
+        path = f"/ui/account/sessions/{other_id}/revoke"
+        # No ungranted arm here, deliberately: test_sessions_revoke_one already asserts that
+        # refusal under a DEFAULT window, which is also the proof that the -1 above changed nothing
+        # before this mint existed. Do not re-add a grant-less POST. Why the grant is evidenced by
+        # the re-auth response rather than read back, and why both halves are checked:
+        # test_stale_reauth_only_bounces_to_reauth.
+        minted = await _mint_action(c, path)
+        assert minted.status_code == 200
+        assert f'action="{path}"' in minted.text
+        r = await c.post(path, headers={"Sec-Fetch-Site": "same-origin"})
+        # The LOCATION carries the property: a SUCCESSFUL revoke also answers 303, to
+        # /ui/account/sessions?m=revoked, so the status alone would not say the gate refused.
         assert r.status_code == 303
-        assert r.headers["location"] == f"/ui/reauth?next=/ui/account/sessions/{other_id}/revoke"
+        assert r.headers["location"] == f"/ui/reauth?next={path}"
         remaining = {s.token_hash for s in await service.store.list_sessions(op_id)}
         assert other_id in remaining  # nothing revoked yet
 
 
 async def test_revoke_others_stale_bounces_to_reauth(engine: Engine) -> None:
+    # The revoke-others twin of the per-session test above, and the same correction applies: the
+    # negative window bites through the ADR 0077 GRANT's TTL, not through has_recent_step_up, so the
+    # _mint_action below is what puts the window under test (BACKLOG #1851). Reasoning: that twin.
     service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=-1))
     await service.initialize()
     await _add(service, "op", Role.OPERATOR)
@@ -5062,11 +5370,16 @@ async def test_revoke_others_stale_bounces_to_reauth(engine: Engine) -> None:
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
         op_id = await _uid(service, "op")
-        r = await c.post(
-            "/ui/account/sessions/revoke-others", headers={"Sec-Fetch-Site": "same-origin"}
-        )
+        path = "/ui/account/sessions/revoke-others"
+        # Ungranted arm: test_sessions_revoke_others, under a default window. See the twin above.
+        minted = await _mint_action(c, path)
+        assert minted.status_code == 200
+        assert f'action="{path}"' in minted.text
+        r = await c.post(path, headers={"Sec-Fetch-Site": "same-origin"})
+        # The LOCATION, again: a SUCCESSFUL revoke-others also answers 303, to
+        # /ui/account/sessions?m=signed_out_others.
         assert r.status_code == 303
-        assert r.headers["location"] == "/ui/reauth?next=/ui/account/sessions/revoke-others"
+        assert r.headers["location"] == f"/ui/reauth?next={path}"
         assert len(await service.store.list_sessions(op_id)) == 2  # both still present
 
 
@@ -5473,6 +5786,28 @@ async def test_nav_status_route_counts_active_alerts_worst_severity(engine: Engi
         }  # worst of warning+critical
 
 
+async def test_nav_status_sees_a_critical_past_the_first_page_of_alerts(engine: Engine) -> None:
+    """BACKLOG #1564, measured through the real route. The bell derived its count AND its severity from
+    ``list_active_alerts(limit=200)``, so 200 warnings plus one OLDER critical reported
+    ``count=200, severity=warning`` -- the critical fell off the newest-first page, and the label said
+    nothing about having truncated. Both numbers now come from the store's scoped aggregate, so the
+    page limit cannot bound either one."""
+    await engine.store.upsert_alert_instance(
+        event_type="dead_letter", connection="in1", severity="critical", now=1.0
+    )
+    for i in range(200):
+        await engine.store.upsert_alert_instance(
+            event_type=f"queue_depth_{i}", connection="in2", severity="warning", now=100.0 + i
+        )
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        r = await c.get("/ui/nav-status")
+        assert r.status_code == 200, r.text
+        assert r.json()["alerts"] == {"count": 201, "severity": "critical"}
+
+
 # --- bulk-control (dual-role start/stop/restart over a selection) ----------------------------------
 
 
@@ -5657,9 +5992,12 @@ async def test_bulk_control_bad_action_404(engine: Engine) -> None:
         assert r.status_code == 404
 
 
-async def test_bulk_control_escapes_and_labels_bad_selection(engine: Engine) -> None:
-    # An undecodable key -> the fixed 'unrecognized selection' label (never the raw bytes). A DECODABLE
-    # key whose name carries markup -> the name rendered ESCAPED (no live script reaches the browser).
+async def test_bulk_control_labels_both_kinds_of_bad_selection(engine: Engine) -> None:
+    # Two shapes, two fixed labels, neither reflecting the submitted bytes. An UNDECODABLE key gets
+    # 'unrecognized selection'. A key that decodes to a name the connection-name rule refuses gets the
+    # not-a-valid-name label (BACKLOG #1740) -- this used to render the name ESCAPED instead, which was
+    # sound but weaker: the value now never reaches the page at all. That moved the escaping claim to
+    # test_outcomes_table_escapes_a_name_it_is_handed below, where the page builder still owns it.
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
@@ -5672,8 +6010,24 @@ async def test_bulk_control_escapes_and_labels_bad_selection(engine: Engine) -> 
         )
         assert r.status_code == 200
         assert "unrecognized selection" in r.text
-        assert "<script>alert(1)</script>" not in r.text  # escaped, never reflected raw
-        assert "&lt;script&gt;" in r.text
+        assert "not applied: not a valid connection name" in r.text
+        # Neither raw NOR escaped: a refused name is not placed on the page in any form.
+        assert "<script>alert(1)</script>" not in r.text
+        assert "&lt;script&gt;" not in r.text
+
+
+def test_outcomes_table_escapes_a_name_it_is_handed() -> None:
+    """The escaping claim, at the level that still owns it. The two bulk ROUTES now refuse a name
+    carrying markup before it reaches a render, so a route-level test can no longer exercise this --
+    but ``_outcomes_table`` escapes every target it is given, and deleting the route assertion
+    without putting this here would have dropped the property silently."""
+    from messagefoundry_webconsole.pages.connections import bulk_control_result, purge_result
+
+    outcomes = [("<script>alert(1)</script>", "applied"), (None, "not applied")]
+    for markup in (bulk_control_result("start", outcomes), purge_result("all", outcomes)):
+        assert "<script>alert(1)</script>" not in markup
+        assert "&lt;script&gt;alert(1)&lt;/script&gt;" in markup
+        assert "unrecognized selection" in markup
 
 
 # --- reset-many (bulk counter reset) ---------------------------------------------------------------
@@ -5789,15 +6143,25 @@ async def test_purge_confirm_lists_only_quiesced_and_validates_scope(
 
 
 async def test_purge_confirm_stale_stepup_redirects_to_reauth(engine: Engine) -> None:
-    service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=0))
+    # require_mfa=False takes the MFA leg out of the gate, so the stale window below is what
+    # redirects; without it this unenrolled fixture session is refused first with the SAME 303 and
+    # the window measured nothing (BACKLOG #1850). Reasoning, and the third new-IP leg that stays
+    # unpinned: the docstring of test_purge_stale_stepup_redirects_to_reauth (BACKLOG #1700).
+    # -1 replaces a 0 that sat exactly on has_recent_step_up's `elapsed <= max_age` boundary.
+    service = AuthService(engine.store, AuthSettings(require_mfa=False, step_up_max_age_seconds=-1))
     await service.initialize()
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
-        await _cookie_login(c, "op")  # step-up window is zero-length -> immediately stale
+        await _cookie_login(c, "op")  # negative window -> the fresh login is already stale
+        tok = c.cookies.get("mf_session")
+        assert tok is not None
+        assert await service.mfa_satisfied(tok) is True  # the MFA leg is NOT what refuses here
+        assert await service.has_recent_step_up(tok) is False  # the stale window is
         r = await c.get("/ui/connections/purge-confirm", params={"scope": "all", "dest": "out1"})
         assert r.status_code == 303
-        loc = r.headers["location"]
-        assert loc.startswith("/ui/reauth") and "purge-confirm" in loc  # unlock re-auth, not a 403
+        # The EXACT continuation: this GET passes no reauth_next, so _reauth_redirect falls back to
+        # quote(request.url.path), which drops scope/dest -- the operator re-picks after re-auth.
+        assert r.headers["location"] == "/ui/reauth?next=/ui/connections/purge-confirm"
 
 
 async def test_purge_bulk_per_dest_409_unknown_and_scope(engine: Engine, tmp_path: Path) -> None:
@@ -5849,9 +6213,11 @@ async def test_purge_bulk_dual_control_aggregates_pending(engine: Engine, tmp_pa
         )  # dual-control per dest (out1 quiesced -> reaches the gate)
 
 
-async def test_purge_bulk_escapes_markup_dest(engine: Engine) -> None:
-    # A ?dest carrying markup renders ESCAPED on the result page (never reflected raw). With no runner
-    # the dest is unknown -> 404 captured; either way the name is only ever placed via el()/rows_table.
+async def test_purge_bulk_refuses_a_markup_dest(engine: Engine) -> None:
+    # A posted dest carrying markup is REFUSED by the connection-name rule and becomes its own outcome
+    # row, so the value is never placed on the result page -- raw or escaped (BACKLOG #1740). It used to
+    # be rendered escaped, which was sound but put an unvetted body value on the page; the page-builder
+    # escaping it relied on is pinned by test_outcomes_table_escapes_a_name_it_is_handed.
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
@@ -5860,8 +6226,9 @@ async def test_purge_bulk_escapes_markup_dest(engine: Engine) -> None:
             c, "/ui/connections/purge-bulk", [("scope", "all"), ("dest", "<script>x</script>")]
         )
         assert r.status_code == 200
+        assert "not applied: not a valid connection name" in r.text
         assert "<script>x</script>" not in r.text
-        assert "&lt;script&gt;" in r.text
+        assert "&lt;script&gt;" not in r.text
 
 
 # --- W4-5 (ADR 0142): the browser federated-login legs ---------------------------------------------

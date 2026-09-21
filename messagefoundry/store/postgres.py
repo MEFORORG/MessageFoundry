@@ -117,10 +117,13 @@ from messagefoundry.store.privilege import (
     postgres_excess,
 )
 from messagefoundry.store.store import (
+    _ACTIVE_ALERT_STATUS_SQL,
+    _ALERT_SEVERITY_RANK_SQL,
     MESSAGE_EVENT_KINDS,
     NOT_DEPLOYED_EVENT,
     REINGRESS_TARGET_PREFIX,
     AlertInstance,
+    AlertSummary,
     CapturedResponse,
     ClaimedHeads,
     ClaimProcStatus,
@@ -149,6 +152,7 @@ from messagefoundry.store.store import (
     Stage,
     UserRecord,
     WebAuthnCredential,
+    _alert_summary,
     _finite_cutoff,  # backlog #106: keep-forever cutoff clamp
     _opt_float,
     audit_mac_bytes,
@@ -4428,7 +4432,7 @@ class PostgresStore:
         allowed_channels: Sequence[str] | None = None,
     ) -> list[AlertInstance]:
         limit = max(1, min(limit, 1000))  # server-side clamp
-        where = ["status IN ('open','acknowledged')"]
+        where = [_ACTIVE_ALERT_STATUS_SQL]
         params: list[Any] = []
         if allowed_channels is not None:
             _append_channel_scope_pg(where, params, "connection", allowed_channels)
@@ -4442,6 +4446,27 @@ class PostgresStore:
             *params,
         )
         return [self._alert_instance_row(r) for r in rows]
+
+    async def summarize_active_alert_instances(
+        self, *, allowed_channels: Sequence[str] | None = None
+    ) -> AlertSummary:
+        # BACKLOG #1564 — see the SQLite twin: same active predicate, same RBAC scope, aggregate over
+        # every row in scope rather than over a page. The rank CASE is shared so it cannot drift.
+        where = [_ACTIVE_ALERT_STATUS_SQL]
+        params: list[Any] = []
+        if allowed_channels is not None:
+            _append_channel_scope_pg(where, params, "connection", allowed_channels)
+        clause = " WHERE " + " AND ".join(where)
+        # `_fetchone`, NOT `self._pool.fetchrow`: the bounded helper, so this borrow is capped by
+        # [store].acquire_timeout (BACKLOG #1052). The nav bell polls roughly every 15s from every open
+        # tab, so an unbounded borrow here would hang the poll on a saturated pool instead of failing
+        # fast -- and the route's degrade path only runs if the await returns.
+        row = await self._fetchone(
+            f"SELECT COUNT(*) AS n, MAX({_ALERT_SEVERITY_RANK_SQL}) AS worst"
+            f" FROM alert_instance{clause}",
+            *params,
+        )
+        return _alert_summary(row)
 
     async def get_alert_instance(
         self, alert_id: int, *, allowed_channels: Sequence[str] | None = None
@@ -7524,7 +7549,7 @@ class PostgresStore:
         return DbStatus(
             path=self.path,
             size_bytes=int(size["b"]) if size and size["b"] is not None else 0,
-            disk_free_bytes=0,  # not readily available for a remote Postgres server
+            disk_free_bytes=None,  # a remote server's disk is not ours to stat; unmeasurable, not 0
             journal_mode="postgres",
             messages=await self._count("messages"),
             events=await self._count("message_events"),

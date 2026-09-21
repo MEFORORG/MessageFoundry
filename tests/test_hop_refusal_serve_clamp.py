@@ -61,7 +61,7 @@ async def test_serve_refuses_prod_phi_cleartext_tcp_outbound(store: MessageStore
     runner = RegistryRunner(reg, store, poll_interval=0.02, hop_posture=PROD_PHI)
     await runner.start()
     try:
-        degraded = runner.degraded_connections()
+        degraded = runner.degraded_outbound()
         assert "OB_TCP" in degraded
         assert "InsecureHopRefused" in degraded["OB_TCP"] or "no verified TLS" in degraded["OB_TCP"]
     finally:
@@ -88,8 +88,8 @@ async def test_serve_allows_declared_cleartext_http_outbound(store: MessageStore
     runner = RegistryRunner(reg, store, poll_interval=0.02, hop_posture=PROD_PHI)
     await runner.start()
     try:
-        assert runner.connection_failed("OB_REST") is None  # lane built + live, not refused
-        assert "OB_REST" not in runner.degraded_connections()
+        assert runner.outbound_failed("OB_REST") is None  # lane built + live, not refused
+        assert "OB_REST" not in runner.degraded_outbound()
     finally:
         await runner.stop()
 
@@ -103,7 +103,7 @@ async def test_serve_degrades_synthetic_cleartext_http_outbound(store: MessageSt
     runner = RegistryRunner(reg, store, poll_interval=0.02, hop_posture=SYNTHETIC_ENFORCING)
     await runner.start()
     try:
-        assert "OB_REST" in runner.degraded_connections()
+        assert "OB_REST" in runner.degraded_outbound()
     finally:
         await runner.stop()
 
@@ -117,7 +117,7 @@ async def test_serve_prod_phi_still_refuses_cleartext_http(store: MessageStore) 
     runner = RegistryRunner(reg, store, poll_interval=0.02, hop_posture=PROD_PHI)
     await runner.start()
     try:
-        assert "OB_REST" in runner.degraded_connections()
+        assert "OB_REST" in runner.degraded_outbound()
     finally:
         await runner.stop()
 
@@ -142,7 +142,7 @@ async def test_reload_rebuild_stamps_posture_no_spurious_refusal(store: MessageS
             )
         )
         await runner.reload(reg1)  # must not raise InsecureHopRefused
-        assert runner.connection_failed("OB_REST") is None
+        assert runner.outbound_failed("OB_REST") is None
     finally:
         await runner.stop()
 

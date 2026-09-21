@@ -1309,3 +1309,656 @@ def test_all_three_acl_sites_are_still_wired(tmp_path: Path) -> None:
     for fn in _ACL_CALLS:
         calls = [c for c in facts["commands"] if c["name"] == fn]
         assert len(calls) == 1, f"expected exactly one {fn} call, found {len(calls)}"
+
+
+# --- the uninstaller's inventory of what it leaves (BACKLOG #1704) --------------------------------
+# It printed one line: "Logs and the message store were left in place." That is a COMPLETENESS
+# CLAIM, and the host disagrees with it in at least six places -- the SeServiceLogonRight grant, the
+# run-as account's entry on the DATA dir, the same account's entry on the CONFIG dir, the
+# inheritance strip on the data dir (and on the config dir under -LockConfigDir, with its owner
+# moved to Administrators), the cached bin\nssm.exe, and the machine-wide WER keys that
+# -SuppressCrashDumps writes. docs/SERVICE.md and docs/USER-GUIDE.md repeated the same claim.
+#
+# THE ROW NAMES FOUR. The data-directory entry and the WER keys are the two it does not, and the
+# arms below cover all six -- an enumeration in a row is not a specification (SDS-3.6).
+#
+# THE NOTICE RETURNS LINES RATHER THAN PRINTING THEM, which is what makes these behavioural. A scan
+# over the script's TEXT cannot tell a message from the comment that explains it: the function's own
+# docstring quotes the sentence it replaced.
+#
+# EVERY ARM CARRIES ITS OWN NEGATIVE. A notice that hard-coded all six lines would satisfy any "does
+# it mention X" test, so each fact is dropped in turn and the matching line must DISAPPEAR while the
+# others stay. The unconditional data-directory line has no fact to drop, so it gets the literal
+# control instead: its emitting statement is deleted from a copy of the script and the guard must go
+# red.
+
+_UNINSTALL_FNS = [
+    "Get-ConfigDirFromAppParameters",
+    # Get-AccountResidueSpec holds the ONE rule for "does this account carry a residue, and how is it
+    # spelled for icacls", shared by the notice and by -RemoveAccountAces. The notice calls it, so it
+    # has to be dot-sourced alongside.
+    "Get-AccountResidueSpec",
+    "Get-UninstallResidueNotice",
+]
+
+_FULL_FACTS: dict[str, object] = {
+    "ServiceName": "MessageFoundry",
+    "DataDir": r"C:\ProgramData\MessageFoundry",
+    "ServiceAccount": r"NT SERVICE\MessageFoundry",
+    "ServiceAccountSid": "S-1-5-80-4001",
+    "ConfigDir": r"D:\mefor\config",
+    "ConfigInheritanceStripped": True,
+    "CachedNssm": r"C:\ProgramData\MessageFoundry\bin\nssm.exe",
+    "WerImages": ["messagefoundry.exe", "python.exe"],
+}
+
+# One needle per residue, each chosen to appear on that residue's line and nowhere else -- which is
+# what lets the drop-the-fact arms distinguish "this line went" from "the notice emptied".
+_NEEDLE = {
+    "data_dir": "Data directory",
+    "cached_nssm": r"bin\nssm.exe",
+    "data_ace": "Data dir entry",
+    "config_ace": "Config dir entry",
+    "logon_right": "Log on as a service",
+    "config_inheritance": "/inheritance:e",
+    "wer": "Windows Error Reporting",
+}
+
+
+def _ps_arg(name: str, value: object) -> str:
+    """One PowerShell named argument.
+
+    A [switch] takes the COLON form. Written ``-Name $true`` the value binds positionally instead
+    and the switch stays off, so every boolean arm would silently test the same fact set.
+    """
+    if isinstance(value, bool):
+        return f"-{name}:" + ("$true" if value else "$false")
+    if isinstance(value, (list, tuple)):
+        return f"-{name} @(" + ", ".join(_psq(str(v)) for v in value) + ")"
+    return f"-{name} {_psq(str(value))}"
+
+
+def _notice(tmp_path: Path, facts: dict[str, object], *, script: Path | None = None) -> str:
+    """Run Get-UninstallResidueNotice over one fact set and return its lines as one string.
+
+    ``Out-String -Width`` rather than bare output: the host wraps at the console width when stdout
+    is redirected, and a wrapped icacls command would fail an assertion for a reason that has
+    nothing to do with the notice.
+    """
+    path = script if script is not None else _UNINSTALL
+    assert path is not None
+    args = " ".join(_ps_arg(k, v) for k, v in facts.items())
+    body = f"  @(Get-UninstallResidueNotice {args}) | Out-String -Width 500\n"
+    return _ok(_extract(path, _UNINSTALL_FNS, body), tmp_path)
+
+
+def test_the_notice_names_every_residue_the_installer_leaves(tmp_path: Path) -> None:
+    """All six, with the command an operator can act on -- not "logs and the store"."""
+    text = _notice(tmp_path, _FULL_FACTS)
+    for residue, needle in _NEEDLE.items():
+        assert needle in text, (
+            f"the uninstall notice does not name the {residue} residue ({needle!r}); an operator "
+            f"would believe the host was back to its pre-install state:\n{text}"
+        )
+    # Naming a leftover without a way to clear it is half an inventory.
+    assert 'icacls "C:\\ProgramData\\MessageFoundry" /remove:g' in text, (
+        f"the notice must give the command that removes the data-dir entry:\n{text}"
+    )
+    assert 'icacls "D:\\mefor\\config" /remove:g' in text, (
+        f"the notice must give the command that removes the config-dir entry:\n{text}"
+    )
+    assert "-RemoveLogonRight" in text, (
+        f"the notice must point at the switch that clears the logon right:\n{text}"
+    )
+    assert "left in place" not in text.lower(), (
+        f"the completeness claim this row is about is back in the notice:\n{text}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("dropped", "gone", "kept"),
+    [
+        # Drop the cached binary: only the NSSM line goes.
+        ({"CachedNssm": ""}, ["cached_nssm"], ["data_dir", "data_ace", "logon_right", "wer"]),
+        # A LocalSystem install was never given a named grant or the logon right, so all three
+        # account residues go -- and nothing else may go with them.
+        (
+            {"ServiceAccount": "LocalSystem", "ServiceAccountSid": ""},
+            ["data_ace", "config_ace", "logon_right"],
+            ["data_dir", "cached_nssm", "config_inheritance", "wer"],
+        ),
+        # No config dir could be read off the registration: its two lines go, the data dir's stay.
+        (
+            {"ConfigDir": ""},
+            ["config_ace", "config_inheritance"],
+            ["data_dir", "data_ace", "logon_right", "wer"],
+        ),
+        # Inheritance measured intact: the -LockConfigDir line goes, the config ENTRY line stays.
+        (
+            {"ConfigInheritanceStripped": False},
+            ["config_inheritance"],
+            ["config_ace", "data_ace", "logon_right"],
+        ),
+        # No image is excluded, so this host never ran -SuppressCrashDumps.
+        ({"WerImages": []}, ["wer"], ["data_dir", "data_ace", "config_ace"]),
+    ],
+)
+def test_each_line_is_driven_by_a_measured_fact(
+    tmp_path: Path, dropped: dict[str, object], gone: list[str], kept: list[str]
+) -> None:
+    """THE NEGATIVE CONTROL FOR THE ARM ABOVE.
+
+    A notice that printed all six lines unconditionally would pass every "does it name X" check and
+    would send an operator after an entry that is not there. So each fact is dropped in turn: its
+    line must disappear, and the ``kept`` set must survive -- which is what stops a "fix" that
+    simply empties the notice from passing.
+    """
+    facts = dict(_FULL_FACTS)
+    facts.update(dropped)
+    text = _notice(tmp_path, facts)
+    for residue in gone:
+        assert _NEEDLE[residue] not in text, (
+            f"dropping {sorted(dropped)} left the {residue} line in place ({_NEEDLE[residue]!r}), "
+            f"so the notice reports a residue nobody measured:\n{text}"
+        )
+    for residue in kept:
+        assert _NEEDLE[residue] in text, (
+            f"dropping {sorted(dropped)} also removed the {residue} line, which it has nothing to "
+            f"do with:\n{text}"
+        )
+
+
+def test_the_residue_guard_reddens_when_a_line_is_deleted(tmp_path: Path) -> None:
+    """THE LITERAL FALSIFIABILITY CONTROL, for the one line no fact can switch off.
+
+    The data-directory residue is unconditional -- the installer always locks that directory -- so
+    the drop-a-fact arms cannot reach it. Delete its emitting statement from a COPY of the script
+    and the guard must go red. A guard over a list of strings is exactly the kind that passes
+    because some other line happens to carry the same words.
+    """
+    assert _UNINSTALL is not None
+    source = _UNINSTALL.read_text(encoding="utf-8")
+    emit = '    $lines += "  Data directory   $DataDir"'
+    assert source.count(emit) == 1, (
+        "the data-directory line is no longer emitted by exactly one statement, so this control "
+        "cannot aim at it -- re-point it before trusting the arms above"
+    )
+    mutated = tmp_path / "uninstall-mutated.ps1"
+    mutated.write_text(source.replace(emit, ""), encoding="utf-8")
+
+    text = _notice(tmp_path, _FULL_FACTS, script=mutated)
+    assert _NEEDLE["data_dir"] not in text, (
+        "deleting the data-directory statement did NOT change the notice, so the assertion that "
+        f"the notice names it is satisfied by some other line:\n{text}"
+    )
+    # The mutation must be surgical, or the control proves only that a broken function prints less.
+    assert _NEEDLE["logon_right"] in text, (
+        f"the mutated copy stopped rendering the rest of the notice too:\n{text}"
+    )
+
+
+def test_a_cleared_residue_is_reported_as_cleared_not_as_remaining(tmp_path: Path) -> None:
+    """-RemoveLogonRight / -RemoveAccountAces change the HOST, so they must change the report.
+
+    A notice that still told an operator to run the icacls command after this script had already
+    run it is the same defect pointing the other way.
+    """
+    facts = dict(_FULL_FACTS)
+    facts.update({"LogonRightRemoved": True, "DataAceRemoved": True, "ConfigAceRemoved": True})
+    text = _notice(tmp_path, facts)
+    assert text.count("REMOVED") >= 3, (
+        f"the notice must report what this run actually took back:\n{text}"
+    )
+    assert "/remove:g" not in text, (
+        f"the notice still tells the operator to remove entries this run already removed:\n{text}"
+    )
+    assert "-RemoveLogonRight" not in text, (
+        f"the notice still offers the switch that has just run:\n{text}"
+    )
+    # The residues the switches do NOT touch must survive, or "cleared" has become "silent".
+    assert _NEEDLE["config_inheritance"] in text and _NEEDLE["wer"] in text, (
+        f"clearing the two reversible residues hid the ones that remain:\n{text}"
+    )
+
+
+def test_the_commands_name_the_sid_when_one_was_resolved(tmp_path: Path) -> None:
+    """A deleted service's virtual account no longer translates, so icacls refuses its NAME.
+
+    The SID was resolved before the registration went; the printed command has to use it. Falling
+    back to the name is right only when nothing resolved, and it is still the best available.
+    """
+    with_sid = _notice(tmp_path, _FULL_FACTS)
+    assert '/remove:g "*S-1-5-80-4001"' in with_sid, (
+        f"the removal command must use the SID spelling that still resolves:\n{with_sid}"
+    )
+    facts = dict(_FULL_FACTS)
+    facts["ServiceAccountSid"] = ""
+    without = _notice(tmp_path, facts)
+    assert '/remove:g "NT SERVICE\\MessageFoundry"' in without, (
+        f"with no SID the command must still name the account, not an empty principal:\n{without}"
+    )
+    assert '/remove:g ""' not in without, (
+        f"an unresolved SID produced a command with no principal at all:\n{without}"
+    )
+
+
+def test_a_read_that_failed_is_named_rather_than_silently_shortening_the_list(
+    tmp_path: Path,
+) -> None:
+    """SDS-3.6. The defect being fixed is a completeness claim, so its replacement must not make
+    one: a notice built from reads that failed is SHORTER, and a shorter list looks exactly like a
+    cleaner host."""
+    facts = dict(_FULL_FACTS)
+    facts["Unreadable"] = ["the run-as account of 'MessageFoundry' (access denied)"]
+    text = _notice(tmp_path, facts)
+    assert "could NOT read" in text, (
+        f"a failed read must be declared, not absorbed into a shorter list:\n{text}"
+    )
+    assert "the run-as account of 'MessageFoundry' (access denied)" in text, (
+        f"the notice must name WHAT it could not read:\n{text}"
+    )
+    clean = _notice(tmp_path, _FULL_FACTS)
+    assert "could NOT read" not in clean, (
+        f"the caution block fires when nothing failed, so it carries no information:\n{clean}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("parameters", "expected"),
+    [
+        (
+            r'serve --config "C:\repo\samples\config" --db "C:\d\m.db" --env prod',
+            r"C:\repo\samples\config",
+        ),
+        (r'serve --config "D:\path with spaces\cfg" --port 8765', r"D:\path with spaces\cfg"),
+        (r"serve --config C:\bare\cfg --env dev", r"C:\bare\cfg"),
+        (r'serve --db "C:\d\m.db" --env prod', ""),
+        ("", ""),
+    ],
+)
+def test_the_config_dir_is_read_back_off_the_registration(
+    tmp_path: Path, parameters: str, expected: str
+) -> None:
+    """The uninstaller takes no -Config, so the only way to NAME the directory holding an orphaned
+    entry is the command line NSSM stored -- and only before the registration is deleted.
+
+    An absent --config yields an empty string rather than a guessed default: naming a directory
+    that may have nothing to do with this install is worse than saying nothing.
+    """
+    assert _UNINSTALL is not None
+    body = f"  Get-ConfigDirFromAppParameters -AppParameters {_psq(parameters)}\n"
+    got = _ok(_extract(_UNINSTALL, _UNINSTALL_FNS, body), tmp_path).strip()
+    assert got == expected, f"parsed {got!r} from {parameters!r}, expected {expected!r}"
+
+
+def test_the_facts_are_read_before_the_registration_is_removed(tmp_path: Path) -> None:
+    """ORDER IS THE DEFECT HERE, the way it was in #1554.
+
+    Every fact the notice needs dies with the registration: the run-as account and the command line
+    live in the service's registry key, which ``nssm remove`` deletes. A read moved below the
+    removal returns nothing and renders an EMPTY inventory -- indistinguishable from a clean host.
+    """
+    assert _UNINSTALL is not None
+    body = """
+  $cmds = @(foreach ($c in $ast.FindAll({ $args[0] -is
+      [System.Management.Automation.Language.CommandAst] }, $true)) {
+    [pscustomobject]@{ name = $c.GetCommandName(); start = $c.Extent.StartOffset
+                       line = $c.Extent.StartLineNumber; text = $c.Extent.Text }
+  })
+  @($cmds) | ConvertTo-Json -Depth 4 -Compress
+"""
+    cmds = json.loads(_ok(_extract(_UNINSTALL, [], body), tmp_path).strip().splitlines()[-1])
+    if isinstance(cmds, dict):
+        cmds = [cmds]
+    removals = [
+        c
+        for c in cmds
+        if (c["name"] or "").endswith("sc.exe") or "remove $ServiceName confirm" in c["text"]
+    ]
+    assert removals, (
+        "CONTROL FAILED: neither the nssm removal nor the sc.exe fallback was located, so an "
+        "ordering result here would mean nothing"
+    )
+    first_removal = min(c["start"] for c in removals)
+    reads = [c for c in cmds if c["name"] in ("Get-ItemProperty", "Get-ConfigDirFromAppParameters")]
+    assert reads, "nothing reads the registration before it is removed"
+    late = [c for c in reads if c["start"] > first_removal]
+    assert not late, (
+        f"the registration is read at line(s) {[c['line'] for c in late]}, AFTER it has been "
+        "removed -- those reads return nothing and the notice renders empty"
+    )
+
+
+# --- the two switches issue the reverse operations (BACKLOG #1704) --------------------------------
+# WHAT THESE PROVE AND WHAT THEY DO NOT. secedit and icacls are SHADOWED, so these arms witness the
+# command the script ISSUES and the policy file it writes. They say nothing about whether Windows
+# accepts either: both need elevation, and the uninstaller's own Administrator guard means no
+# unelevated runner can reach the real thing. Read them as "the reverse operation is correctly
+# formed", never as "the right was removed". The end-to-end half belongs to windows-service-smoke.
+
+_SECEDIT_FN = "Remove-ServiceLogonRight"
+_ACE_FN = "Remove-AccountAce"
+
+_OTHER_SID = "S-1-5-80-400"  # a STRING PREFIX of S-1-5-80-4001, deliberately
+
+
+def _logon_right_arms(tmp_path: Path, *, holders: list[str], sid: str) -> dict:
+    """Run Remove-ServiceLogonRight against a stubbed secedit whose policy holds ``holders``."""
+    assert _UNINSTALL is not None
+    inf = ["[Unicode]", "Unicode=yes", "[Privilege Rights]"]
+    if holders:
+        inf.append("SeServiceLogonRight = " + ",".join(holders))
+    inf.append("[Version]")
+    inf_ps = "@(" + ", ".join(_psq(line) for line in inf) + ")"
+    body = rf"""
+  # $env:TEMP is where the function writes its policy export; on a Linux runner it is unset and
+  # Join-Path would throw before a single assertion ran.
+  $env:TEMP = {_psq(str(tmp_path))}
+  $script:Configured = ''
+  $script:ConfigureCalls = 0
+  $script:ExportCalls = 0
+  function secedit {{
+    $a = @($args)
+    if ($a -contains '/export') {{
+      $script:ExportCalls++
+      $i = [array]::IndexOf($a, '/cfg')
+      Set-Content -Path $a[$i + 1] -Value {inf_ps} -Encoding Unicode
+    }} elseif ($a -contains '/configure') {{
+      $script:ConfigureCalls++
+      $i = [array]::IndexOf($a, '/cfg')
+      $script:Configured = ((Get-Content $a[$i + 1]) -join ' | ')
+    }}
+    $global:LASTEXITCODE = 0
+  }}
+  $warnings = @()
+  $result = $null
+  $outputs = 0
+  $emitted = & {{ {_SECEDIT_FN} -Account 'NT SERVICE\MessageFoundry' -Sid {_psq(sid)} }} 3>&1 6>$null
+  foreach ($o in @($emitted)) {{
+    if ($o -is [System.Management.Automation.WarningRecord]) {{ $warnings += "$o" }}
+    else {{ $result = $o; $outputs++ }}
+  }}
+  [pscustomobject]@{{
+    result = [bool]$result; outputs = $outputs; warnings = @($warnings)
+    exportCalls = $script:ExportCalls; configureCalls = $script:ConfigureCalls
+    configured = $script:Configured
+  }} | ConvertTo-Json -Depth 4 -Compress
+"""
+    parsed: dict = json.loads(
+        _ok(_extract(_UNINSTALL, [_SECEDIT_FN], body), tmp_path).strip().splitlines()[-1]
+    )
+    parsed["warnings"] = [w for w in (parsed.get("warnings") or []) if w]
+    return parsed
+
+
+def test_the_logon_right_switch_rewrites_the_policy_without_the_accounts_sid(
+    tmp_path: Path,
+) -> None:
+    """The reverse of install-service.ps1's grant: the SID leaves the row, the other holders stay."""
+    got = _logon_right_arms(
+        tmp_path,
+        holders=["*S-1-5-80-4001", "*S-1-5-32-544", f"*{_OTHER_SID}"],
+        sid="S-1-5-80-4001",
+    )
+    assert got["exportCalls"] == 1, "the current policy must be exported before it is rewritten"
+    assert got["configureCalls"] == 1, (
+        "the rewritten policy must be re-imported with secedit /configure; got "
+        f"{got['configureCalls']} calls"
+    )
+    assert got["result"] is True, (
+        f"a successful removal must report True; warnings were {got['warnings']}"
+    )
+    assert got["outputs"] == 1, (
+        f"the helper must return ONE boolean; {got['outputs']} objects means a caller assigning it "
+        "holds an array, and `if (-not $x)` on an array is false however the call went"
+    )
+    assert "*S-1-5-80-4001" not in got["configured"], (
+        f"the account's SID survived the rewrite:\n{got['configured']}"
+    )
+    # POSITIVE CONTROL: emptying the row would satisfy the assertion above and strip the right from
+    # every service on the host.
+    assert "*S-1-5-32-544" in got["configured"], (
+        f"another holder was dropped along with the account:\n{got['configured']}"
+    )
+    assert f"*{_OTHER_SID}" in got["configured"], (
+        "a SID that is a STRING PREFIX of the removed one was dropped too -- the row must be "
+        f"matched by exact token, not by substring:\n{got['configured']}"
+    )
+
+
+def test_the_logon_right_switch_refuses_to_empty_the_right_for_everyone(tmp_path: Path) -> None:
+    """The sole-holder case. Writing back an empty SeServiceLogonRight takes the right from every
+    account the row covers, which is a far larger change than the one asked for."""
+    got = _logon_right_arms(tmp_path, holders=["*S-1-5-80-4001"], sid="S-1-5-80-4001")
+    assert got["result"] is False, "the sole-holder case must not report a successful removal"
+    assert got["configureCalls"] == 0, (
+        "the policy was re-imported with an EMPTY SeServiceLogonRight, which takes the right away "
+        "from every service on the host"
+    )
+    assert any("ONLY account" in w for w in got["warnings"]), (
+        f"the refusal must say why, or it reads as a silent failure; got {got['warnings']}"
+    )
+
+
+def test_a_right_the_account_does_not_hold_is_a_no_op(tmp_path: Path) -> None:
+    """POSITIVE CONTROL the other way: nothing is rewritten when there is nothing to remove, so a
+    re-run cannot disturb a host it already cleaned."""
+    got = _logon_right_arms(tmp_path, holders=["*S-1-5-32-544"], sid="S-1-5-80-4001")
+    assert got["result"] is False, "reporting a removal that did not happen is the #1704 shape"
+    assert got["configureCalls"] == 0, "the policy must not be rewritten when nothing changes"
+
+
+def test_the_ace_switch_issues_the_reverse_icacls_call(tmp_path: Path) -> None:
+    """``icacls <dir> /remove:g <principal>`` -- the reverse of the installer's grant.
+
+    /remove:g removes ALLOW entries only, so the worst case is that nothing matched. A /deny or a
+    /grant here would be a different operation wearing this switch's name.
+    """
+    assert _UNINSTALL is not None
+    target = tmp_path / "datadir"
+    target.mkdir()
+    body = rf"""
+  $script:Calls = @()
+  function icacls {{
+    $script:Calls += ,@($args | ForEach-Object {{ "$_" }})
+    $global:LASTEXITCODE = 0
+  }}
+  $result = & {{ {_ACE_FN} -Path {_psq(str(target))} -Principal '*S-1-5-80-4001' `
+      -What 'data directory' }} 6>$null
+  [pscustomobject]@{{ result = [bool]$result; calls = @($script:Calls) }} |
+      ConvertTo-Json -Depth 4 -Compress
+"""
+    got = json.loads(_ok(_extract(_UNINSTALL, [_ACE_FN], body), tmp_path).strip().splitlines()[-1])
+    calls = got["calls"]
+    if calls and isinstance(calls[0], str):
+        calls = [calls]
+    assert len(calls) == 1, f"expected exactly one icacls call, got {calls}"
+    args = calls[0]
+    assert args[0] == str(target), f"the call must target the directory it was given: {args}"
+    assert "/remove:g" in args, (
+        f"the reverse operation must be /remove:g -- a grant or a deny is a different change: {args}"
+    )
+    assert "*S-1-5-80-4001" in args, f"the principal must be named on the call: {args}"
+    assert not any(a in ("/grant", "/grant:r", "/deny", "/inheritance:r") for a in args), (
+        f"the removal issued a permission change beyond dropping the entry: {args}"
+    )
+    assert got["result"] is True, "a clean icacls exit must be reported as a removal"
+
+
+def test_a_missing_directory_is_not_reported_as_a_removal(tmp_path: Path) -> None:
+    """POSITIVE CONTROL. A directory the operator already deleted must not make the notice claim an
+    entry was cleared -- that is the false-completeness shape again, one level down."""
+    assert _UNINSTALL is not None
+    body = rf"""
+  $script:Calls = 0
+  function icacls {{ $script:Calls++; $global:LASTEXITCODE = 0 }}
+  $result = & {{ {_ACE_FN} -Path {_psq(str(tmp_path / "gone"))} -Principal '*S-1-5-80-4001' `
+      -What 'config directory' }} 6>$null
+  [pscustomobject]@{{ result = [bool]$result; calls = $script:Calls }} |
+      ConvertTo-Json -Depth 4 -Compress
+"""
+    got = json.loads(_ok(_extract(_UNINSTALL, [_ACE_FN], body), tmp_path).strip().splitlines()[-1])
+    assert got["result"] is False, "a directory that is not there cannot have had an entry removed"
+    assert got["calls"] == 0, "icacls must not be run against a path that does not exist"
+
+
+def test_both_switches_are_declared_and_wired(tmp_path: Path) -> None:
+    """CALL-SITE guard, the complaint #1699 made about this file: a correct helper proves nothing if
+    the script never calls it."""
+    assert _UNINSTALL is not None
+    text = _UNINSTALL.read_text(encoding="utf-8")
+    for switch in ("RemoveLogonRight", "RemoveAccountAces"):
+        assert re.search(rf"\[switch\]\${switch}\b", text), f"-{switch} is not declared"
+    body = """
+  $cmds = @(foreach ($c in $ast.FindAll({ $args[0] -is
+      [System.Management.Automation.Language.CommandAst] }, $true)) {
+    [pscustomobject]@{ name = $c.GetCommandName(); text = $c.Extent.Text }
+  })
+  @($cmds) | ConvertTo-Json -Depth 4 -Compress
+"""
+    cmds = json.loads(_ok(_extract(_UNINSTALL, [], body), tmp_path).strip().splitlines()[-1])
+    if isinstance(cmds, dict):
+        cmds = [cmds]
+    names = [c["name"] for c in cmds]
+    assert names.count(_SECEDIT_FN) == 1, (
+        f"expected one {_SECEDIT_FN} call, found {names.count(_SECEDIT_FN)}"
+    )
+    assert names.count(_ACE_FN) == 2, (
+        "the account's entry is written on BOTH the data dir and the config dir, so both must be "
+        f"removable; found {names.count(_ACE_FN)} {_ACE_FN} calls"
+    )
+    notice = [c for c in cmds if c["name"] == "Get-UninstallResidueNotice"]
+    assert len(notice) == 1, f"expected one Get-UninstallResidueNotice call, found {len(notice)}"
+    for fact in ("-DataDir", "-ServiceAccount", "-ConfigDir", "-CachedNssm", "-WerImages"):
+        assert fact in notice[0]["text"], (
+            f"the notice is called without {fact}, so that residue can never be reported: "
+            f"{notice[0]['text']}"
+        )
+
+
+def test_no_document_still_claims_only_the_logs_and_the_store_remain() -> None:
+    """The false claim was in three places, and fixing the script alone leaves two standing.
+
+    Matched with whitespace COLLAPSED: both sentences wrap in their source, so a one-line grep for
+    either returns zero and reads as already fixed.
+    """
+    root = Path(__file__).resolve().parents[1]
+    for rel in ("docs/SERVICE.md", "docs/USER-GUIDE.md"):
+        flat = " ".join((root / rel).read_text(encoding="utf-8").split())
+        assert "message store under `DataDir` are left in place" not in flat, (
+            f"{rel} still tells an operator that the logs and the store are all that remains"
+        )
+        assert "leaves logs + store in place" not in flat, (
+            f"{rel} still summarises the uninstall as leaving only the logs and the store"
+        )
+    service = " ".join((root / "docs" / "SERVICE.md").read_text(encoding="utf-8").split())
+    assert "SeServiceLogonRight" in service, (
+        "docs/SERVICE.md's uninstall section must name the user right that survives an uninstall"
+    )
+    assert "-RemoveLogonRight" in service and "-RemoveAccountAces" in service, (
+        "docs/SERVICE.md must document the two switches that take the reversible residues back"
+    )
+
+
+@pytest.mark.parametrize(
+    ("account", "sid", "has_account", "principal"),
+    [
+        # The installer's default: a per-service virtual account, named grants written.
+        (r"NT SERVICE\MessageFoundry", "S-1-5-80-4001", True, "*S-1-5-80-4001"),
+        # The -AllowLocalSystem opt-out, in its usual spelling.
+        ("LocalSystem", "", False, "LocalSystem"),
+        # THE ARM THAT MATTERS. Same account, different spelling. A NAME test says "this is an
+        # account with a named grant", and -RemoveAccountAces then issues
+        # `icacls <DataDir> /remove:g *S-1-5-18` -- stripping the SYSTEM entry the installer writes
+        # on EVERY install off the directory holding the logs and the message store.
+        (r"NT AUTHORITY\SYSTEM", "S-1-5-18", False, "*S-1-5-18"),
+        # A SID that did not resolve still counts as an account: over-reporting costs one icacls
+        # read, under-reporting is the defect this file exists to fix.
+        (r"DOMAIN\svc$", "", True, r"DOMAIN\svc$"),
+    ],
+)
+def test_the_account_residue_rule_is_decided_on_the_sid_not_the_spelling(
+    tmp_path: Path, account: str, sid: str, has_account: bool, principal: str
+) -> None:
+    """ONE rule, shared by the notice that PRINTS a removal command and the switch that RUNS one."""
+    assert _UNINSTALL is not None
+    body = (
+        f"  Get-AccountResidueSpec -ServiceAccount {_psq(account)} "
+        f"-ServiceAccountSid {_psq(sid)} | ConvertTo-Json -Compress\n"
+    )
+    got = json.loads(
+        _ok(_extract(_UNINSTALL, ["Get-AccountResidueSpec"], body), tmp_path)
+        .strip()
+        .splitlines()[-1]
+    )
+    assert got["HasAccount"] is has_account, (
+        f"{account!r} (SID {sid!r}) was classified HasAccount={got['HasAccount']}, expected "
+        f"{has_account}; a wrong answer here either hides a residue or removes SYSTEM's own entry"
+    )
+    assert got["Principal"] == principal, (
+        f"the icacls spelling for {account!r} was {got['Principal']!r}, expected {principal!r}"
+    )
+
+
+def test_the_notice_and_the_removal_agree_on_the_principal(tmp_path: Path) -> None:
+    """The rule above has two callers, and the whole point is that they cannot disagree.
+
+    A script that prints one ``icacls ... /remove:g X`` and runs another with a different X is the
+    #1704 shape wearing a fix: the operator's transcript and the host's state stop matching.
+    """
+    assert _UNINSTALL is not None
+    text = _UNINSTALL.read_text(encoding="utf-8")
+    assert text.count("Get-AccountResidueSpec -ServiceAccount") >= 2, (
+        "the residue rule is called from fewer than two sites, so one of the notice and the "
+        "removal switch is deriving the principal on its own again"
+    )
+    # The removal must pass the SAME variable the notice was handed, not rebuild it.
+    assert re.search(r"Remove-AccountAce -Path \$DataDir -Principal \$acePrincipal", text), (
+        "-RemoveAccountAces no longer runs the principal the notice prints"
+    )
+    assert not re.search(r'\$acePrincipal = if \(\$accountSid\) \{ "\*\$accountSid" \}', text), (
+        "the principal is being rebuilt at the removal site instead of shared"
+    )
+
+
+def test_a_holder_with_a_dollar_sign_survives_the_policy_rewrite(tmp_path: Path) -> None:
+    """secedit can export a holder by NAME, and a gMSA or computer account name ends in '$'.
+
+    '$' is a .NET substitution metacharacter in a -replace REPLACEMENT operand, so building the
+    rewritten row that way re-reads a holder as $&, $+ or $$ and feeds a mangled machine-wide
+    user-right row straight into `secedit /configure`.
+    """
+    got = _logon_right_arms(
+        tmp_path,
+        holders=["*S-1-5-80-4001", r"DOMAIN\ws-host$", "*S-1-5-32-544"],
+        sid="S-1-5-80-4001",
+    )
+    assert got["result"] is True, f"the removal did not run; warnings {got['warnings']}"
+    assert r"DOMAIN\ws-host$" in got["configured"], (
+        "a holder whose name ends in '$' was mangled or dropped by the rewrite -- the replacement "
+        f"operand is being read as substitution syntax:\n{got['configured']}"
+    )
+    assert "*S-1-5-80-4001" not in got["configured"], (
+        f"the account's own SID survived the rewrite:\n{got['configured']}"
+    )
+
+
+def test_the_notice_names_localdumps_separately_from_the_exclusion_list(tmp_path: Path) -> None:
+    """TWO independent WER surfaces. Windows evaluates LocalDumps separately from the exclusion
+    list, so an operator who clears ExcludedApplications alone still has per-image dump overrides in
+    force -- and a notice that named only one would have told them the host was back to normal."""
+    facts = dict(_FULL_FACTS)
+    facts["WerLocalDumps"] = ["python.exe"]
+    text = _notice(tmp_path, facts)
+    assert "ExcludedApplications" in text and "LocalDumps" in text, (
+        f"both WER surfaces must be named, not merged into one line:\n{text}"
+    )
+    # NEGATIVE: a host with no LocalDumps configuration must not be told it has one.
+    plain = _notice(tmp_path, _FULL_FACTS)
+    assert "LocalDumps" not in plain, (
+        f"LocalDumps is reported on a host where nothing measured it:\n{plain}"
+    )
+    # And the exclusion-list line must still fire on its own.
+    assert "ExcludedApplications" in plain, (
+        f"the exclusion-list surface stopped being named:\n{plain}"
+    )

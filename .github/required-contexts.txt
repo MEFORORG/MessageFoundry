@@ -63,38 +63,68 @@
 # `tests/test_required_contexts_drift.py` pins the wiring so the job cannot be deleted silently;
 # giving its red a consumer is an alerting design over shared CI, still not done.
 #
-# Two non-context settings also moved and are recorded because they change
-# merge semantics (both re-read at 2026-09-04 19:05 CDT, `strict` and `enforce_admins` both TRUE):
+# Two non-context settings also change merge semantics and are described here. They are NOT recorded
+# the same way, and the asymmetry is deliberate: `strict` carries a value, `enforce_admins` does not.
 #
 #   strict = TRUE  -- a PR must be up to date with `main` before it can merge. This closes the
 #                     stale-green hole: previously a PR validated against an older base could merge
 #                     without revalidation, so a semantic conflict with a newer `main` (a test that
-#                     reads a file the other PR changed) could land red on main.
-#   enforce_admins = TRUE -- an admin's direct push to `main` is refused by the server, not merely by
-#                     the local hook. It was ON from 2026-07-28, turned OFF on 2026-07-29 through the
-#                     escape hatch in scripts/hooks/push_guard.py (for when a permanently red required
-#                     check blocks every merge), and READ BACK AS TRUE on 2026-08-31.
+#                     reads a file the other PR changed) could land red on main. Re-read 2026-09-04
+#                     19:05 CDT.
+#   enforce_admins -- WHEN ON, an admin's direct push to `main` is refused by the server and not
+#                     merely by the local hook; WHEN OFF, the hook is the only thing refusing it.
+#                     THE VALUE IS DELIBERATELY NOT WRITTEN DOWN, HERE OR ANYWHERE IT CAN BE HELPED.
+#                     Read it:
 #
-#                     THE HOOK ITSELF IS ALREADY CORRECTED. scripts/hooks/push_guard.py's module
-#                     docstring and its user-facing warning were rewritten in this same change, and
-#                     the string that told a pusher "enforce_admins is OFF" no longer exists anywhere
-#                     in the tree.
+#                         gh api repos/MEFORORG/MessageFoundry/branches/main/protection/enforce_admins
 #
-#                     THREE OTHER PLACES STILL CARRY THE OFF VALUE AND ARE STALE:
-#                       * tests/test_push_guard.py's header -- "OFF again as of 2026-07-29".
-#                       * scripts/coord/install-git-hooks.ps1's push-guard comment -- "enforce_admins
-#                         is false, so the owner bypasses all of it".
-#                       * .github/workflows/branch-leak-scan.yml's header, which lists re-enabling
-#                         enforce_admins as the outstanding half of BACKLOG #1034 and so reads as work
-#                         to do rather than work already done. The point it supports survives: the
-#                         setting governs PROTECTED BRANCHES, so it still does nothing about a leak
-#                         riding an ordinary feature branch.
-#                     They are left alone here rather than swept in, because each sits in a security
-#                     control's own prose and deserves its own review -- and because they err toward
-#                     over-warning, telling a pusher the server will not stop them when it now will.
-#                     Naming them is not the fix; it is the pointer, so the next reader does not have
-#                     to re-measure to find out which copy is true. `git grep -n enforce_admins` is
-#                     the whole census.
+#                     THAT ENDPOINT IS ADMIN-ONLY AND ITS REFUSAL LOOKS LIKE AN ANSWER. Reading branch
+#                     protection needs admin on the repository; GitHub answers a protection endpoint it
+#                     will not show you with 404, not 403, which reads as "there is no protection here"
+#                     rather than "you may not look". That is the dangerous direction -- it suggests a
+#                     direct push to `main` would be accepted. Treat anything that is not a JSON body
+#                     as NOT MEASURED. The same command is the pointer in scripts/hooks/push_guard.py,
+#                     tests/test_push_guard.py, scripts/coord/install-git-hooks.ps1 and
+#                     .github/workflows/branch-leak-scan.yml; the caveat is stated once, here.
+#
+#                     WHY NO COPY. Nothing in this repository reconciles this
+#                     setting against the server -- `scripts/ci/check_required_contexts_drift.py`
+#                     compares the CONTEXT SET and says so in its own docstring -- and it has moved
+#                     repeatedly: ON 2026-07-28, OFF 2026-07-29 through the escape hatch in
+#                     scripts/hooks/push_guard.py (for when a permanently red required check blocks
+#                     every merge), read back TRUE 2026-08-31. Every in-repo copy went stale at least
+#                     once, and they went stale in BOTH directions over their life. Over-stating
+#                     protection invites `--no-verify` on the belief that something downstream still
+#                     catches the push; under-stating it is a false statement delivered at the moment
+#                     of action. Neither direction is safe, which is the argument against keeping a
+#                     copy rather than for correcting one again.
+#
+#                     THE SAME ARGUMENT REACHES `strict`, AND IT IS NOT APPLIED THERE. That setting is
+#                     no better reconciled -- the drift script's docstring excludes it by name too --
+#                     and docs/CI.md carries a second copy of it. Its value above is a DATED READING,
+#                     not a claim about now; read it from the same endpoint before relying on it. The
+#                     asymmetry is history, not principle: `enforce_admins` was measured stale and
+#                     repaired, `strict` has not been.
+#
+#                     WHAT THIS BLOCK USED TO SAY, because the shape recurs and the replacement is
+#                     the point. It read "THREE OTHER PLACES STILL CARRY THE OFF VALUE AND ARE STALE"
+#                     and named tests/test_push_guard.py, scripts/coord/install-git-hooks.ps1 and
+#                     .github/workflows/branch-leak-scan.yml, then declined to sweep them in. Naming a
+#                     stale copy is a pointer, not a fix -- and a pointer whose targets get fixed goes
+#                     false itself, which this one did, in the same change that fixed them. All three
+#                     now state what the setting DOES and name the command above instead of quoting an
+#                     answer.
+#
+#                     THE CENSUS IS `git grep -n enforce_admins`, and that command is the control --
+#                     not any list written here, which is the thing that just rotted. A hit asserting
+#                     a VALUE is what to look at. AT LEAST TWO remain, both outside the three repaired
+#                     above and both left by scope rather than by judgment: scripts/hooks/push_guard.py's
+#                     module DOCSTRING states the setting with its measurement date and hangs the
+#                     escape-hatch reasoning off it, and docs/CI.md quotes a dated API transcript
+#                     carrying it. RUN THE CENSUS rather than trusting this sentence to have stayed
+#                     complete -- an enumeration here is the liability the paragraph above describes,
+#                     and this one is deliberately written as a floor. Whether either should become a
+#                     pointer is unfiled.
 #
 # This file is not the enforcement -- the server is. It is the CHECKED-IN CLAIM that every in-repo
 # statement must agree with, which is what `tests/test_required_contexts.py` asserts. When branch
@@ -114,13 +144,20 @@
 # it, no `if:` gated on a non-PR event) BEFORE it lands here or in branch protection.
 
 # --- ci.yml ---------------------------------------------------------------------------------------
-# `CI gate` (ci.yml, job `ci-gate`) is a ROLL-UP, not a test. It is `if: always()` over EIGHT legs
-# and fails if any of them failed or was cancelled:
+# `CI gate` (ci.yml, job `ci-gate`) is a ROLL-UP, not a test. It is `if: always()` over the legs
+# below and fails if any of them failed or was cancelled:
 #
 #   PATH-GATED or nightly -- these cannot be required directly (see below):
 #     sqlserver-store, postgres-store, load-test, load-test-sqlserver, windows-service-smoke, changes
+#     packaging-build   (BACKLOG #1840 -- builds every distribution and runs the release member gate
+#                        over the real artifacts; path-gated on packaging config, forced on push-to-main)
 #   NOT path-gated -- these RUN ON EVERY PULL REQUEST and are the two most likely to report:
 #     webconsole, tooling
+#
+# NO COUNT IS WRITTEN HERE ON PURPOSE. This block said "EIGHT legs" until `packaging-build` made it
+# nine, and a number in prose is a second claim about the `needs:` list that nothing reconciles --
+# the exact drift #1300 filed, one level up from the names it fixed. The names below ARE reconciled,
+# by tests/test_required_contexts.py, and that test deliberately asserts no count for the same reason.
 #
 # THE SECOND GROUP WAS ABSENT FROM THIS FILE UNTIL BACKLOG #1300, AND THAT IS THE FAILURE THIS FILE
 # EXISTS TO PREVENT. This file's whole purpose is to be the checked-in answer to "does this check

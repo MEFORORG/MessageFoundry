@@ -37,7 +37,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum, StrEnum
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 
 from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
 from messagefoundry.config.db_lookup import DbLookupError
@@ -67,7 +67,12 @@ from messagefoundry.config.models import (
     StallThreshold,
 )
 from messagefoundry.config.run_context import RunContext, run_contexts
-from messagefoundry.config.settings import DeliverySettings, EgressSettings, StoreBackend
+from messagefoundry.config.settings import (
+    BLOCK_UNLISTED_OUTBOUND_IN_FORCE,
+    DeliverySettings,
+    EgressSettings,
+    StoreBackend,
+)
 from messagefoundry.config.tls_policy import (
     HopPosture,
     TrustAnchorPolicy,
@@ -169,9 +174,16 @@ from messagefoundry.transports.base import (
 from messagefoundry.transports.database import DatabaseLookupExecutor
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.mllp import build_ack
-from messagefoundry.transports.rest import PROXY_DEFAULT
+from messagefoundry.transports.rest import PROXY_DEFAULT, refuse_url_credentials
 
 __all__ = ["NotDeployedError", "RegistryRunner", "ShardLaneOwnershipError"]
+
+type Direction = Literal["inbound", "outbound"]
+"""Which table a connection name was declared in. A name may be in BOTH (``Registry._add``
+enforces uniqueness per table, and the API's ``_dual_role_control`` carries a ``role=`` to
+disambiguate the pair), so every per-connection map that can hold an entry for either direction
+is keyed by ``(Direction, name)`` rather than by the bare name."""
+
 
 log = logging.getLogger(__name__)
 
@@ -979,20 +991,30 @@ class RegistryRunner:
         # success, so a retry storm emits one transition pair, not one per delivery. A partner reject
         # (NegativeAckError) is not a transport failure and never flips it.
         self._lane_healthy: dict[str, bool] = {}
-        # Connections that FAILED to build/bind at start (name → reason). A failed connection is
+        # Connections that FAILED to build/bind at start ((kind, name) → reason). A failed connection is
         # isolated, never fatal — the rest of the graph still comes up (a failed connection must not
         # crash the engine, ADR 0031). A failed OUTBOUND still gets its delivery worker, but with no
         # connector in _destinations, so rows routed to it are retried + alerted (never silently
         # dropped) and a reload/restart that builds it self-heals the lane; a failed INBOUND simply
         # isn't listening. Cleared when the connection later builds/binds (reload, start_inbound).
-        self._failed: dict[str, str] = {}
-        # Connections SKIPPED by the DR run-profile (#61, ADR 0048): name → reason (e.g. "DR profile
-        # threshold=critical: connection tier=normal is below threshold"). Distinct from _failed (ADR
-        # 0031): a filtered connection did not FAIL to build/bind — it was deliberately not started
+        #
+        # KEYED BY DIRECTION (see `Direction`), because under a bare-name key the two halves of a
+        # dual-role name aliased, in both directions: start() builds every outbound BEFORE any inbound,
+        # so the inbound's success pop ERASED its outbound namesake's real start failure and the engine
+        # reported itself healthy, while an operator restarting that outbound afterwards re-set the entry
+        # and made a status reader call the healthy inbound failed. Read it through the direction-scoped
+        # accessors (inbound_failed / outbound_failed), never by reaching in with a bare name.
+        self._failed: dict[tuple[Direction, str], str] = {}
+        # Connections SKIPPED by the DR run-profile (#61, ADR 0048): (kind, name) → reason (e.g. "DR
+        # profile threshold=critical: connection tier=normal is below threshold"). Distinct from _failed
+        # (ADR 0031): a filtered connection did not FAIL to build/bind — it was deliberately not started
         # because its resolved priority tier is below [dr].priority_threshold. Surfaced as
         # status:"filtered" on /connections + /connections/{name}/metadata so an operator can tell a
         # deliberately-parked DR feed from a broken one. Empty unless a DR run-profile is active.
-        self._filtered: dict[str, str] = {}
+        # Keyed by direction for the reason _failed above is, and here the two halves of a pair resolve
+        # INDEPENDENTLY (each reads its own ic.priority / oc.priority), so they can genuinely disagree
+        # about the threshold - a bare-name key silently gave one half's verdict to the other.
+        self._filtered: dict[tuple[Direction, str], str] = {}
         # Per-connection re-alert throttle: the earliest time a queue_buildup alert may fire again.
         self._next_buildup_alert: dict[str, float] = {}
         # Same per-connection re-alert throttle for the message_stall alert (#50), kept independent so a
@@ -1143,12 +1165,19 @@ class RegistryRunner:
         # Per-inbound rather than one process-wide flag because the RE-ARM is per-connection: a
         # restart of inbound A must not silently re-arm B's processing while B's listener stays down.
         self._log_halted: set[str] = set()
+        # The DELIVERY tier's counterpart is :attr:`_delivery_halted`, a derived read below rather
+        # than a field here — see that property for why the tier links to the process latch instead
+        # of restating it.
         self._running = False
         self._reload_lock = asyncio.Lock()  # serialize concurrent reloads
         # B11 read-only worker-loop instrumentation: empty-claim counts (router/transform/delivery),
         # split into idle-poll re-SELECTs vs per-commit wake-fanout (the thundering herd). Surfaced via
         # /stats; default 0, so byte-identical when the connection-scale harness never reads it.
         self._empty_claims = EmptyClaimCounters()
+        # #122 (ADR 0189): OUTBOUND rows the pooled claim gate refused because the delivery tier was
+        # halted. See :attr:`halted_claim_gate_hits` for what a non-zero reading does and does not
+        # establish; it is the one signal this latch structurally cannot get from an enumeration.
+        self._halted_claim_gate_hits = 0
         # Bench-gated per-delivery phase timing (default OFF). Resolved ONCE here (not per delivery) so
         # the per-item body is a single bool check when off — no perf_counter, no allocation. BOTH the
         # pooled OUTBOUND StageDispatcher (_dispatch_delivery) and the per_lane _delivery_worker flow
@@ -1192,6 +1221,32 @@ class RegistryRunner:
         reads these to surface the connection-scale wall signals; nothing in the engine mutates routing
         from them."""
         return self._empty_claims
+
+    @property
+    def halted_claim_gate_hits(self) -> int:
+        """OUTBOUND rows the POOLED claim gate refused because :attr:`_delivery_halted` held (#122,
+        ADR 0189). Read-only; the ``/stats`` route surfaces it and nothing in the engine reads it back.
+
+        **What it is FOR: the one thing a latch cannot enumerate.** The latch's whole argument is that
+        counting doors is a completeness claim nobody can verify. That argument cuts both ways — it
+        also means nobody can verify that every door is now gated. A lane can only reach this gate if
+        some path brought it up UNPAUSED while the halt held, which is exactly what a missing door
+        looks like from the outside. This is the only signal that reports one.
+
+        **A non-zero reading is not automatically a defect, and the qualifier is load-bearing.** The
+        latch is set before :meth:`_stop_all_for_log_failure` takes the reload lock and pauses the
+        lanes, so a claim already in flight across that window lands here legitimately — a small,
+        BOUNDED count at the moment of the halt is the documented pause lag, not a door. What names a
+        door is a count that KEEPS CLIMBING while the halt holds: a paused lane is never claimed, so
+        every later hit is a lane that is not paused.
+
+        **POOLED ONLY, and zero is therefore NOT a clean bill** (the same shape as
+        ``claim_lock_timeouts``). The per_lane worker's gate is at its loop TOP, above the claim, so
+        nothing to count reaches a claim there — and it deliberately stays uncounted rather than being
+        made to tick at the loop top, because every running per_lane worker passes that gate once at
+        halt time and the resulting floor would bury the signal. A per_lane engine reports zero
+        forever; do not render that as "no door is missing"."""
+        return self._halted_claim_gate_hits
 
     @property
     def coordinator(self) -> ClusterCoordinator:
@@ -1624,19 +1679,60 @@ class RegistryRunner:
             raise KeyError(name)
 
     def _mark_outbound_quiesced(self, name: str) -> None:
-        """Pooled dispatcher ``on_lane_paused`` callback: the outbound ``name`` lane reached PAUSED
-        (drained to zero in-flight). Set its quiescence Event so ``outbound_quiesced`` / ``outbound_status``
-        report 'stopped' (the purge precondition). Get-or-create so a pause on a never-seen lane still
-        signals."""
+        """The outbound ``name`` lane has DRAINED to zero in-flight. Set its quiescence Event so
+        ``outbound_quiesced`` / ``outbound_status`` report 'stopped' (the purge precondition).
+        Get-or-create so a pause on a never-seen lane still signals.
+
+        One helper for both claim modes, because the fact is one fact and a second spelling of it is
+        how the two drift: the pooled dispatcher calls this as its ``on_lane_paused`` callback, and
+        the per_lane :meth:`_delivery_worker` calls it at BOTH its loop-top exits — the operator-pause
+        gate and the #122 halt gate above it. The halt gate was the one that did not, and a lane that
+        stops claiming without signalling reads as 'stopping' for the life of the process."""
         self._outbound_quiesced.setdefault(name, asyncio.Event()).set()
+
+    @property
+    def _delivery_halted(self) -> bool:
+        """THE DELIVERY TIER'S ONE QUESTION: may this process deliver at all? (#122, ADR 0189.)
+
+        The counterpart of :attr:`_log_halted` for the delivery tier, read at the CLAIM GATE in both
+        claim modes — :meth:`_delivery_worker`'s loop top (per_lane) and :meth:`_dispatch_delivery`
+        (pooled) — because that is the point every delivery passes through whichever door started the
+        lane. Before it, the rule could only be re-asserted at each DOOR into resuming delivery, and
+        four of those were found one at a time, each only after the previous fix shipped:
+        ``start_outbound``, ``restart_outbound``, a ``stop()``+``start()`` teardown, and the reload's
+        :meth:`_unpark_outbound_lane`. An enumeration of doors is a completeness claim nobody can
+        verify; a claim gate is not. The four door gates are KEPT as defence in depth — they fail fast
+        with an operator-legible page — and this is the backstop behind them.
+
+        **DERIVED, not a second flag, and that is deliberate (SDS-3.5).** "This process cannot log and
+        has fail-closed" is one load-bearing fact and :attr:`_log_write_stopped` already states it:
+        both halt sites set it (:meth:`_stop_all_for_log_failure`, :meth:`start`) and the only path
+        that clears it is :meth:`_log_recovery_ok`, which re-tests the sinks by WRITING to them. A
+        parallel bool set and cleared at the same four moments would be state that must agree with
+        this one, with nothing checking that it does.
+
+        **It survives a teardown, which is the whole point.** :meth:`_teardown_body` clears
+        ``_outbound_paused`` on purpose (an operator pause is in-memory and must not outlive the
+        process's graph), and the halt's own pause went with it — which is exactly how the third and
+        fourth doors resumed delivery into a dead log. ``_log_write_stopped`` is not cleared there, so
+        neither is this.
+
+        Delivery is halted iff a halt has fired and no recovery has re-validated the sinks since, so
+        the ``continue`` log-write policy (which fail-closes nothing) reads False here throughout."""
+        return self._log_write_stopped
 
     def outbound_running(self, name: str) -> bool:
         """Whether the named outbound is actively delivering (operator intent): the engine is running
         AND the outbound is not operator-paused. Raises :class:`KeyError` for a name that is neither a
         declared nor a draining outbound, so the API 404s an unknown connection (mirrors
-        :meth:`inbound_running`'s membership semantics + the outbound control handlers)."""
+        :meth:`inbound_running`'s membership semantics + the outbound control handlers).
+
+        **False for every lane while :attr:`_delivery_halted`**, whatever the pause set says. A lane a
+        door never gated (or one an unguarded path brought up) is not in ``_outbound_paused`` and was
+        reporting as actively delivering while the claim gate refused every row — the console's own
+        running/stopped split reading the opposite of what the engine does."""
         self._validate_outbound(name)
-        return self._running and name not in self._outbound_paused
+        return self._running and not self._delivery_halted and name not in self._outbound_paused
 
     def outbound_quiesced(self, name: str) -> bool:
         """Whether a PAUSED outbound has fully DRAINED to zero in-flight — the PURGE precondition. True
@@ -1650,10 +1746,26 @@ class RegistryRunner:
         return ev is not None and ev.is_set()
 
     def outbound_status(self, name: str) -> str:
-        """Tri-state delivery status for one outbound: 'running' (not paused), 'stopping' (paused, an
+        """Delivery status for one outbound: 'log_halted' (#122 — this process cannot write its
+        application log, so NO lane delivers), 'running' (not paused), 'stopping' (paused, an
         in-flight head still resolving — the quiescence Event not yet set), or 'stopped' (paused AND
         quiesced — zero in-flight, safe to purge). A name not in ``_outbound_paused`` → 'running' (the
-        status-plumbing caller already special-cases failed/filtered; a real unknown 404s on control)."""
+        status-plumbing caller already special-cases failed/filtered; a real unknown 404s on control).
+
+        **'log_halted' is FIRST and process-wide, because the halt is (ADR 0189).** The cause is a
+        root-logger handler set with no per-connection attribution to narrow it with, so while
+        :attr:`_delivery_halted` holds, every lane this process owns is down for that one reason. It
+        used to read as 'stopped' — the halt takes a lane down by pausing it, and a pause is what an
+        OPERATOR does — which told an operator the lane was waiting for them to press start, when what
+        it was waiting for was a writable disk. Reporting the cause is also the only way the fifth-door
+        case is visible at all: a lane an unguarded path brought up is not in ``_outbound_paused``, so
+        it would have read 'running' while the claim gate refused every one of its rows.
+
+        Purge-eligibility is unaffected and deliberately separate: :meth:`outbound_quiesced` still
+        answers off the pause set, so a halted-and-quiesced lane stays purgeable (the API surfaces
+        that as its own ``paused`` field, never collapsed into this string)."""
+        if self._delivery_halted:
+            return "log_halted"
         if name not in self._outbound_paused:
             return "running"
         return "stopped" if self.outbound_quiesced(name) else "stopping"
@@ -1668,31 +1780,53 @@ class RegistryRunner:
         probe = getattr(connector, "waiting_for_reply", None)
         return bool(probe(time.monotonic())) if callable(probe) else False
 
-    def connection_failed(self, name: str) -> str | None:
-        """The failure reason if this connection failed to build/bind at start, else None. A failed
-        connection is isolated, not fatal (ADR 0031): the engine starts the rest of the graph and an
-        operator recovers it (fix the cause, then reload or — for an inbound — restart it)."""
-        return self._failed.get(name)
+    def inbound_failed(self, name: str) -> str | None:
+        """The failure reason if the INBOUND of this name failed to build/bind at start, else ``None``
+        (ADR 0031). A failed connection is isolated, not fatal: the engine starts the rest of the graph
+        and an operator recovers it (fix the cause, then reload or restart it)."""
+        return self._failed.get(("inbound", name))
 
-    def degraded_connections(self) -> dict[str, str]:
-        """Snapshot of ``{connection: reason}`` for connections that failed to start (ADR 0031).
-        Empty when every connection came up — the API/console use it to flag a degraded engine."""
-        return dict(self._failed)
+    def outbound_failed(self, name: str) -> str | None:
+        """The failure reason if the OUTBOUND of this name failed to build at start, else ``None``
+        (ADR 0031) - the outbound half of :meth:`inbound_failed`."""
+        return self._failed.get(("outbound", name))
 
-    def connection_filtered(self, name: str) -> str | None:
-        """The reason this connection was skipped by the DR run-profile (its resolved priority tier is
-        below ``[dr].priority_threshold``), else ``None`` (#61, ADR 0048). A filtered connection is
-        **not** failed (ADR 0031) — it was deliberately not started; the two are surfaced as the distinct
+    def degraded_inbound(self) -> dict[str, str]:
+        """Snapshot of ``{inbound: reason}`` for INBOUND connections that failed to bind (ADR 0031).
+        Empty when every inbound came up."""
+        return {name: reason for (kind, name), reason in self._failed.items() if kind == "inbound"}
+
+    def degraded_outbound(self) -> dict[str, str]:
+        """Snapshot of ``{outbound: reason}`` for OUTBOUND connections that failed to build (ADR 0031).
+        Empty when every outbound came up."""
+        return {name: reason for (kind, name), reason in self._failed.items() if kind == "outbound"}
+
+    def inbound_filtered(self, name: str) -> str | None:
+        """The reason the DR run-profile parked this INBOUND (its resolved priority tier is below
+        ``[dr].priority_threshold``), else ``None`` (#61, ADR 0048). A filtered connection is **not**
+        failed (ADR 0031) - it was deliberately not started; the two are surfaced as the distinct
         ``status:"filtered"`` vs ``status:"failed"`` so an operator can tell a parked DR feed from a
         broken one."""
-        return self._filtered.get(name)
+        return self._filtered.get(("inbound", name))
 
-    def filtered_connections(self) -> dict[str, str]:
-        """Snapshot of ``{connection: reason}`` for connections the DR run-profile parked below the
-        priority threshold (#61, ADR 0048). Empty unless a DR run-profile is active — the sibling of
-        :meth:`degraded_connections`, kept distinct so a parked DR feed is never confused with an
-        ADR-0031 failure."""
-        return dict(self._filtered)
+    def outbound_filtered(self, name: str) -> str | None:
+        """The reason the DR run-profile parked this OUTBOUND, else ``None`` (#61, ADR 0048) - the
+        outbound half of :meth:`inbound_filtered`."""
+        return self._filtered.get(("outbound", name))
+
+    def filtered_inbound(self) -> dict[str, str]:
+        """Snapshot of ``{inbound: reason}`` for INBOUNDs the DR run-profile parked below the priority
+        threshold (#61, ADR 0048). Empty unless a DR run-profile is active."""
+        return {
+            name: reason for (kind, name), reason in self._filtered.items() if kind == "inbound"
+        }
+
+    def filtered_outbound(self) -> dict[str, str]:
+        """Snapshot of ``{outbound: reason}`` for OUTBOUNDs the DR run-profile parked below the priority
+        threshold (#61, ADR 0048). Empty unless a DR run-profile is active."""
+        return {
+            name: reason for (kind, name), reason in self._filtered.items() if kind == "outbound"
+        }
 
     def resolved_priority(self, name: str) -> Priority:
         """The connection's resolved DR / priority tier (#61, ADR 0048): its own ``priority=`` override,
@@ -1707,7 +1841,7 @@ class RegistryRunner:
             return oc.priority or self._priority_default
         return self._priority_default
 
-    def _dr_filters_out(self, name: str, declared: Priority | None) -> bool:
+    def _dr_filters_out(self, name: str, declared: Priority | None, *, kind: Direction) -> bool:
         """Whether the DR run-profile parks this connection (its resolved tier is below the threshold).
 
         ``False`` when no DR run-profile is active (``_dr_threshold is None``) — every normal deployment,
@@ -1720,9 +1854,9 @@ class RegistryRunner:
             return False
         resolved = declared or self._priority_default
         if resolved.rank >= threshold.rank:
-            self._filtered.pop(name, None)  # at/above threshold — not parked
+            self._filtered.pop((kind, name), None)  # at/above threshold — not parked
             return False
-        self._filtered[name] = (
+        self._filtered[(kind, name)] = (
             f"DR run-profile threshold={threshold.value}: connection tier={resolved.value} is below "
             f"threshold — not started (status:filtered, ADR 0048)"
         )
@@ -2048,7 +2182,7 @@ class RegistryRunner:
         recorded failed + alerted and the resume still proceeds, so rows are retried via the
         connector-None path and a later fix + reload/restart self-heals — rather than 500ing the control
         route and leaving the operator with no status to read."""
-        if name in self._destinations or name in self._filtered:
+        if name in self._destinations or ("outbound", name) in self._filtered:
             return
         oc = self.registry.outbound.get(name)
         if oc is None or not oc.deployed:
@@ -2072,7 +2206,7 @@ class RegistryRunner:
             self._record_failed(name, exc, kind="outbound")
             return
         self._destinations[name] = connector
-        self._failed.pop(name, None)
+        self._failed.pop(("outbound", name), None)
 
     async def _aclose_quietly(self, connector: DestinationConnector | None, name: str) -> None:
         """Release whatever a BUILT-but-rejected connector allocated (a File alternate-credential worker
@@ -2382,11 +2516,11 @@ class RegistryRunner:
             raise
         self._sources[name] = source
         self._failed.pop(
-            name, None
+            ("inbound", name), None
         )  # bound successfully — clear any prior start failure (ADR 0031)
         # An operator that explicitly starts a DR-parked inbound (POST /connections/{name}/start) is
         # overriding the run-profile, so it is no longer "filtered" — clear that marker too (#61).
-        self._filtered.pop(name, None)
+        self._filtered.pop(("inbound", name), None)
         # Once the source is live, note (start-time only, never per-tick) that a poll source's intake
         # is leader-gated, so an operator reading the log knows only the leader polls this resource.
         if getattr(source, "polls_shared_resource", False):
@@ -2421,13 +2555,17 @@ class RegistryRunner:
         if source is not None:
             await source.stop()
 
-    def _record_failed(self, name: str, exc: BaseException, *, kind: str) -> None:
+    def _record_failed(self, name: str, exc: BaseException, *, kind: Direction) -> None:
         """Isolate a connection that failed to build/bind (ADR 0031): record the reason, log it
         loudly, and alert — the engine keeps the rest of the graph running. Reuses the AlertSink
         ``connection_stopped`` signal: its meaning ("this connection is down until an operator
-        intervenes") fits a startup failure exactly, so no new sink method is needed."""
+        intervenes") fits a startup failure exactly, so no new sink method is needed.
+
+        ``kind`` is part of the KEY, not just the log line (see ``_failed``). The alert still carries the
+        bare name: an alert row is addressed to the operator's connection, and the detail says which
+        direction failed to start."""
         reason = safe_exc(exc)
-        self._failed[name] = reason
+        self._failed[(kind, name)] = reason
         log.error(
             "%s connection %r failed to start — ISOLATED, engine continues (fix the cause, then "
             "reload%s): %s",
@@ -2865,12 +3003,12 @@ class RegistryRunner:
         # connector for a claimed row" path), so the count-and-log + at-least-once invariants hold: the
         # row is queued + retried + buildup-alerted, never silently dropped. status:"filtered" (not
         # "failed") tells the operator it was deliberately parked.
-        if self._dr_filters_out(name, oc.priority):
+        if self._dr_filters_out(name, oc.priority, kind="outbound"):
             self._destinations.pop(name, None)  # no live connector for a parked lane
             self._spawn_worker(name)
             return
         self._filtered.pop(
-            name, None
+            ("outbound", name), None
         )  # at/above threshold this run — clear any prior parked marker
         connector: DestinationConnector | None = None
         try:
@@ -2913,7 +3051,7 @@ class RegistryRunner:
             self._spawn_worker(name)  # drains→retries routed rows via the connector-None path
             return
         self._destinations[name] = connector
-        self._failed.pop(name, None)
+        self._failed.pop(("outbound", name), None)
         self._spawn_worker(name)
 
     async def start(self) -> None:
@@ -3028,10 +3166,10 @@ class RegistryRunner:
                     # still drains. The listener simply isn't accepting NEW work — the operator intent of
                     # a DR box running only its critical feeds. status:"filtered" (not "failed")
                     # distinguishes it from an ADR-0031 bind failure.
-                    if self._dr_filters_out(ic.name, ic.priority):
+                    if self._dr_filters_out(ic.name, ic.priority, kind="inbound"):
                         continue
                     self._filtered.pop(
-                        ic.name, None
+                        ("inbound", ic.name), None
                     )  # at/above threshold this run — clear the marker
                     try:
                         await self._start_inbound_unsafe(ic.name)
@@ -3092,7 +3230,7 @@ class RegistryRunner:
                     started,
                     total,
                     len(self._filtered),
-                    ", ".join(sorted(self._filtered)) or "(none)",
+                    ", ".join(f"{k} {n}" for k, n in sorted(self._filtered)) or "(none)",
                 )
             if self._failed:
                 log.warning(
@@ -3101,7 +3239,9 @@ class RegistryRunner:
                     len(self.registry.inbound),
                     len(self.registry.outbound),
                     len(self._failed),
-                    ", ".join(f"{n} ({r})" for n, r in self._failed.items()),
+                    # Named WITH the direction — an operator reading this has to know which half
+                    # of a dual-role name to go and fix.
+                    ", ".join(f"{k} {n} ({r})" for (k, n), r in sorted(self._failed.items())),
                 )
             else:
                 log.info(
@@ -3982,10 +4122,10 @@ class RegistryRunner:
         send at most fails and retries — outbounds are idempotent). An outbound dropped by ``new`` is
         left running so rows already queued to it still drain. Connector builds here cannot fail —
         :meth:`_build_check` already validated them before any quiesce."""
-        # #122 (ADR 0162) THE DOOR A RELOAD OPENS INTO RESUMING DELIVERY: `_unpark_outbound_lane`
-        # below, on a lane the ENGINE parked that the halt therefore skipped — :meth:`start_outbound`
-        # carries that mechanism, and its "says nothing about the lane the halt never touched"
-        # paragraph is what this gate closes.
+        # #122 (ADR 0162) THE DOORS A RELOAD OPENS INTO RESUMING DELIVERY, and there are TWO — the
+        # `_unpark_outbound_lane` below, and the lane this reload ADDS (ADR 0189 door six). One gate
+        # below covers both; it carries the reasoning, and :meth:`start_outbound` carries the
+        # mechanism behind the first.
         #
         # MEMOISED because :meth:`_outbound_start_permitted` must be asked at most once per operator
         # action and that helper's docstring says why. None = not asked yet; a reload with no parked
@@ -4004,7 +4144,8 @@ class RegistryRunner:
             )  # BACKLOG #82 (see _start_outbound)
             self._simulate[name] = self._resolve_simulate(name, oc)
             worker = self._workers.get(name)
-            failed = name in self._failed  # ADR 0031: live worker, but no connector (start failed)
+            # ADR 0031: live worker, but no connector (start failed)
+            failed = self.outbound_failed(name) is not None
             # Present but NOT DEPLOYED (#233, ADR 0111) — checked FIRST, so deployed=False WINS over
             # auto_start. Unconditional (NOT keyed on the lane's live state, as the auto_start gate
             # below is): an operator start is a legitimate override of auto_start, but there is no
@@ -4017,7 +4158,7 @@ class RegistryRunner:
                 stale = self._destinations.pop(name, None)
                 if stale is not None:
                     await stale.aclose()
-                self._failed.pop(name, None)
+                self._failed.pop(("outbound", name), None)
                 self._park_outbound_lane(name)
                 continue
             # Per-connection auto-start (#115): a reload must not RESURRECT a start-disabled lane. It had
@@ -4032,7 +4173,7 @@ class RegistryRunner:
                 stale = self._destinations.pop(name, None)
                 if stale is not None:
                     await stale.aclose()
-                self._failed.pop(name, None)
+                self._failed.pop(("outbound", name), None)
                 self._park_outbound_lane(name)
                 if worker is None or worker.done():
                     self._spawn_worker(name)
@@ -4046,37 +4187,127 @@ class RegistryRunner:
             # own semantics (queued rows RETRIED, status:"filtered") to a clean, unpaused lane.
             #
             # REFUSED while a #122 halt is in force and the log is still unwritable (see the memo at
-            # the top of this method). Fail closed by leaving the lane exactly as it was — parked,
-            # connector-less, rows retained PENDING — so `continue` rather than a rebuild that would
-            # warm a connector for a lane that may not deliver. Recoverable: the marker is untouched,
-            # so the next reload on a repaired log lifts it.
-            if name in self._gate_parked:
+            # the top of this method), and the SAME refusal covers both of this method's doors.
+            #
+            # DOOR SIX (ADR 0189) is the `_delivery_halted` half of the condition: the lane this
+            # reload BRINGS UP that no door ever gated. An outbound the new graph ADDS is in neither
+            # `_gate_parked` nor `_outbound_paused`, so the un-park question was never asked about it
+            # and the branches below would build its connector and arm its lane — which the reload's
+            # own `notify_work` then seeds READY. No bytes ship (the claim gate refuses every row,
+            # which is the whole point of the latch); what the lane does instead is reach that gate
+            # once per `_WORKER_ERROR_BACKOFF_SECONDS` for the halt's whole duration, at the cost the
+            # ADR's *Negative / risks* states. Option 4's rejection named this case ("a lane BUILT
+            # AFTER the halt ... which is door six") and did not close it.
+            #
+            # ONE GATE FOR BOTH, rather than a raw `_delivery_halted` read beside this one, because
+            # `_outbound_start_permitted` is a PROBE and not a predicate: it re-validates the sinks by
+            # WRITING to them, it can CLEAR the latch, and a refusal PAGES. Reading the latch raw here
+            # would mean a repaired disk lifts the halt on a reload that happens to touch a
+            # gate-parked lane and not on one that only adds an outbound — the same repair, the same
+            # reload, two outcomes, decided by an unrelated lane's park state. It would also refuse
+            # door six SILENTLY, when the reason the ADR keeps door gates at all is that a refusal
+            # here pages with a cause. The memo keeps it at AT MOST one probe and one page per reload,
+            # and the `_delivery_halted` guard keeps a HEALTHY reload from probing at all.
+            #
+            # AT MOST, not exactly: once the narrowing below excludes the lanes the halt already took
+            # down, a halted reload on a graph with no gate-parked and no added lane asks ZERO times.
+            # No recovery waits on that. `reload` restarts the inbound listeners at step 2, BEFORE it
+            # reaches this method, and `_start_inbound_unsafe` -> `_resume_inbound_processing` probes
+            # `_log_recovery_ok` itself -- so on any graph this reload brings an inbound up for, a
+            # repaired disk has already cleared the latch by the time these lanes are reconciled and a
+            # still-dead one has already paged. Where it brings none up, the lane is resumed by
+            # `start_outbound` / `restart_outbound`, and those probe at their own door: the outbound
+            # lanes this arm now skips are PAUSED, and nothing here could have resumed them anyway
+            # (`_unpark_outbound_lane` is a no-op outside `_gate_parked`), so the only thing the
+            # skipped probe would have changed is how soon the latch reads clear.
+            #
+            # The two doors then differ only in what they leave behind, which is the fail-closed shape
+            # each needs. A lane the ENGINE parked keeps its `_gate_parked` marker — untouched,
+            # connector-less, rows retained PENDING — so a later reload on a repaired log lifts it. A
+            # lane this reload would have brought up goes DOWN through :meth:`_pause_delivery_lanes`,
+            # which owns HOW the halt takes a delivery lane down and says a third copy of that loop is
+            # how the two halts drift. It routes through `_stop_outbound_unsafe`, NOT
+            # `_park_outbound_lane`, and that difference is the fix: a park writes `_gate_parked`,
+            # which this very gate LIFTS the moment a probe succeeds, so a parked lane would re-open
+            # the hole one reload later off a marker this method wrote itself. Stopping leaves it in
+            # exactly the state the halt left every other lane in, so the only reachable spin path
+            # collapses into the ordinary paused one. Reusing the helper also inherits its per-lane
+            # `except`, so a lane that refuses to pause is logged and the rest of this reload's
+            # outbounds still reconcile instead of the raise aborting the loop partway down the list.
+            #
+            # The membership test is what separates them, and it is the caller's filter exactly as in
+            # :meth:`_stop_all_for_log_failure`: every `_gate_parked` lane is already in
+            # `_outbound_paused`, so it takes the no-write path. Re-stopping an already-paused lane
+            # would CLEAR its quiescence Event, flipping a drained lane's status back from 'stopped'
+            # to 'stopping' and withdrawing its purge-eligibility for a reload that changed nothing.
+            #
+            # NARROWED to the lane the halt has NOT already taken down, and it reuses the very
+            # membership test the paragraph above relies on. `_delivery_halted` is a PROCESS fact,
+            # true for every lane at once, so an un-narrowed read ran this `continue` for EVERY
+            # outbound in the graph -- including the lanes the halt itself paused, which stand at
+            # neither door. `_unpark_outbound_lane` is a no-op for a lane the halt left outside
+            # `_gate_parked`, so there is no resume there for a gate to refuse; what the `continue`
+            # skipped instead was the DR re-evaluation and the connector rebuild below.
+            #
+            # THE REBUILD IS THE HALF NO LATER RELOAD CAN REDO, which is what made the overreach
+            # unrecoverable rather than merely late. :meth:`reload` swaps `self.registry` BEFORE it
+            # calls this method, so the NEXT reload's `old` is the already-changed graph and its
+            # `old.outbound[name].spec != oc.spec` test reads False forever;
+            # :meth:`_ensure_destination_built` then returns early on the lane's live connector, so
+            # the operator's resume keeps the stale one too. MEASURED in both claim modes: an
+            # outbound retargeted at a new directory mid-halt delivered its retained row to the OLD
+            # target once the disk was repaired, while status, the console and the API all read the
+            # new one, and a second reload did not repair it -- it survived to process restart.
+            #
+            # Reconciling a PAUSED lane's connector resumes nothing and ships nothing. The claim
+            # gate refuses every row while the latch holds, the lane stays in `_outbound_paused`
+            # either way, and :meth:`build_check` has already constructed every connector in the
+            # new graph (side-effect-free by contract: no bind, no file I/O) at the top of this
+            # reload, before a single lane was touched.
+            if (
+                self._delivery_halted and name not in self._outbound_paused
+            ) or name in self._gate_parked:
                 if unpark_permitted is None:
                     unpark_permitted = self._outbound_start_permitted(name)
                 if not unpark_permitted:
+                    if name not in self._outbound_paused:
+                        self._pause_delivery_lanes([name])
                     continue
             self._unpark_outbound_lane(name)
             # DR run-profile (#61, ADR 0048): a reload re-evaluates against the threshold. A
             # below-threshold outbound keeps (or gets) its delivery worker but NO live connector — its
             # routed rows queue + back off + self-heal on the next full startup, exactly the parked-lane
             # behavior. Close any live connector from a prior (non-DR) run so it stops delivering.
-            if self._dr_filters_out(name, oc.priority):
+            if self._dr_filters_out(name, oc.priority, kind="outbound"):
                 stale = self._destinations.pop(name, None)
                 if stale is not None:
                     await stale.aclose()
-                self._failed.pop(name, None)
+                self._failed.pop(("outbound", name), None)
                 if worker is None or worker.done():
                     self._spawn_worker(name)
                 continue
-            self._filtered.pop(name, None)
+            self._filtered.pop(("outbound", name), None)
             # Per_lane has one delivery worker per outbound; pooled has ONE OUTBOUND dispatcher for all,
             # so self._workers is always empty in pooled — judging "live" by worker presence would rebuild
             # every connector on every reload (dropping every warm MLLP socket / DB pool / SMART token).
             # In pooled a connector is live iff it is BUILT; the spec-mismatch elif below still rebuilds a
-            # genuinely-changed one. The per_lane branch is the exact negation of the old check (unchanged).
+            # genuinely-changed one.
+            #
+            # CONNECTOR-KEYED WHILE THE HALT HOLDS, for the same reason pooled is. A per_lane worker
+            # RETURNS at :meth:`_delivery_worker`'s claim gate while `_delivery_halted`, which is the
+            # halt's designed terminal state and not a crash -- the resume doors respawn it through
+            # `_start_outbound_unsafe`. Reading `worker.done()` as 'not live' there made every halted
+            # reload pop, `aclose()` and rebuild EVERY paused lane's connector, and respawn a worker
+            # that dies at that gate on its first tick, for a reload that changed nothing. MEASURED in
+            # both claim modes on a reload with the connector spec identical: `same_connector` False in
+            # per_lane against True in pooled, and True in per_lane once this disjunct was added.
+            # Besides the warm MLLP socket / DB pool / SMART token the line above is written to keep,
+            # that churn made the unguarded `await stale.aclose()` below newly reachable for a halted
+            # lane, where a raising close propagates into `reload`'s own except and rolls a routine
+            # reload's intake back.
             live = (
                 name in self._destinations
-                if self._claim_mode == "pooled"
+                if self._claim_mode == "pooled" or self._delivery_halted
                 else (worker is not None and not worker.done())
             )
             if not live:
@@ -4092,7 +4323,7 @@ class RegistryRunner:
                     self._destinations[name] = build_destination(
                         _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress)
                     )
-                self._failed.pop(name, None)
+                self._failed.pop(("outbound", name), None)
                 self._spawn_worker(name)
             elif (
                 failed
@@ -4120,7 +4351,7 @@ class RegistryRunner:
                     self._destinations[name] = build_destination(
                         _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress)
                     )
-                self._failed.pop(name, None)
+                self._failed.pop(("outbound", name), None)
                 if old_conn is not None:
                     await old_conn.aclose()
             # else: unchanged & live → leave the worker/connector as-is.
@@ -4213,9 +4444,9 @@ class RegistryRunner:
                     # threshold (the profile is a per-run decision read at start/reload), so a
                     # below-threshold inbound stays parked (status:"filtered") and is not re-bound; its
                     # workers below still drain any backlog. No DR profile → byte-identical to before.
-                    if self._dr_filters_out(ic.name, ic.priority):
+                    if self._dr_filters_out(ic.name, ic.priority, kind="inbound"):
                         continue
-                    self._filtered.pop(ic.name, None)
+                    self._filtered.pop(("inbound", ic.name), None)
                     await self._start_inbound_unsafe(ic.name)
                 # 2b. Ensure the router + transform workers run for every inbound in the new graph.
                 # Workers read self.registry live, so a Router/Handler change applies to rows processed
@@ -4978,6 +5209,27 @@ class RegistryRunner:
         # coalesces further rows inside _process_delivery_batch; those are not tracked here.
         claimed: list[str] = []
         while not self._stop.is_set():
+            # #122 (ADR 0189) THE CLAIM GATE, per_lane half: the application log is unwritable and this
+            # process has fail-closed, so this lane must not deliver no matter which door started it.
+            # Return BEFORE the claim so no row is left INFLIGHT — the same terminal state
+            # :meth:`_router_worker`'s gate leaves, and re-armed the same way (a door that finds the
+            # log working clears the latch and respawns this worker). Placed ABOVE the operator-pause
+            # gate because a halted lane that is ALSO paused must not sit in _wait_for_resume: a
+            # resume would release it straight into a claim.
+            #
+            # SIGNAL QUIESCENCE ON THE WAY OUT, and that is not tidiness — it is the half of the halt
+            # the operator can see. The halt takes a lane down through _stop_outbound_unsafe, which
+            # CLEARS this lane's quiescence Event and leaves the setting to the pause gate below; this
+            # gate sits ABOVE that gate and RETURNS, so the Event stayed cleared and no later caller
+            # could set it — the worker that owns the gate is gone. outbound_quiesced() then reads
+            # False forever: the console shows an in-flight head that does not exist, and the purge
+            # that would clear the rows the halt promises to RETAIN is refused with nothing left to
+            # wait for. Zero rows are in flight here for exactly the reason the pause gate below
+            # relies on — this is the loop TOP, above the claim, and the prior iteration's items have
+            # all resolved — so the signal states a fact rather than papering over one.
+            if self._delivery_halted:
+                self._mark_outbound_quiesced(name)
+                return
             try:
                 # Connection controls: loop-top operator-PAUSE gate, BEFORE the claim. When paused, signal
                 # quiescence (the <=1 in-flight _process_delivery_item below already finished on the prior
@@ -4985,7 +5237,7 @@ class RegistryRunner:
                 # block on the per-lane resume Event. COOPERATIVE — never a task.cancel; mirrors the
                 # _stop.is_set() loop guard. The in-flight item ALWAYS finishes before the loop re-checks.
                 if name in self._outbound_paused:
-                    self._outbound_quiesced.setdefault(name, asyncio.Event()).set()
+                    self._mark_outbound_quiesced(name)
                     woken = await self._wait_for_resume(name)
                     continue
                 # FIFO (default): claim only the due head — a backing-off head blocks the lane
@@ -5168,7 +5420,7 @@ class RegistryRunner:
             # outbound failed to build at start (ADR 0031) and its lane is degraded. Either
             # way RETRY the row (never strand/drop it) — it self-heals when a reload/restart
             # builds the connector — and alert on the growing backlog of a failed lane.
-            failure = self._failed.get(name)
+            failure = self.outbound_failed(name)
             detail = f"outbound failed to start: {failure}" if failure else "outbound reloading"
             retry_until = await self._mark_failed_and_arm(name, item.id, detail, retry)
             await self._maybe_alert_buildup(name)
@@ -5478,7 +5730,7 @@ class RegistryRunner:
         retry_until: float | None = None
         connector = self._destinations.get(name)
         if connector is None:
-            failure = self._failed.get(name)
+            failure = self.outbound_failed(name)
             detail = f"outbound failed to start: {failure}" if failure else "outbound reloading"
             retry_until = await self._mark_batch_failed_and_arm(name, ids, detail, retry)
             await self._maybe_alert_buildup(name)
@@ -6834,6 +7086,28 @@ class RegistryRunner:
         return result
 
     async def _dispatch_delivery(self, lane: str, item: OutboxItem) -> LaneItemResult:
+        # #122 (ADR 0189) THE CLAIM GATE, pooled half: the same one question the per_lane delivery
+        # worker asks at its loop top, asked here because the runner does not own the pooled claim —
+        # this adapter is the first runner-owned code a claimed OUTBOUND row reaches, and it is
+        # upstream of BOTH the plain and the batch send seams below.
+        #
+        # RESCHEDULE rather than mark_failed, and PARK rather than STOP. A log-write halt is a
+        # machinery fault, not the message's (ADR 0070 fix A's reasoning verbatim): mark_failed would
+        # spend a retry and, under a finite max_attempts, eventually write terminal DEAD on a row that
+        # was never sent. A plain release_claimed leaves the head past-due, so the ~0.25 s sweep
+        # re-readies it and the gate re-fires ~4x/s for as long as the disk stays broken; dating it
+        # into the future collapses that to the backoff cadence. STOP would be worse than a park in
+        # one specific way — resume_lane only re-arms a PAUSED lane, so a later start_outbound could
+        # not lift a STOPPED one, while a PARKED lane's own timer unparks it.
+        if self._delivery_halted:
+            # Counted, because reaching this line means SOME path armed an unpaused lane while the
+            # halt held — the missing-door signal the latch cannot get by enumeration. See
+            # :attr:`halted_claim_gate_hits` for why a small count at the halt is expected and a
+            # climbing one is not.
+            self._halted_claim_gate_hits += 1
+            park_until = time.time() + _WORKER_ERROR_BACKOFF_SECONDS
+            await self.store.reschedule_claimed([item.id], park_until)
+            return LaneItemResult(LaneResultKind.RETRY, park_until)
         # BACKLOG #82: pace this lane's egress BEFORE the send seam (mirrors the per_lane worker) so one
         # hook covers the single-message AND batch bodies in the POOLED claim mode too.
         await self._pace_outbound(lane)
@@ -7337,13 +7611,13 @@ def check_source_allowed(source: Source, name: str, egress: EgressSettings) -> N
     if egress.deny_by_default:
         if source.type is ConnectorType.DATABASE and not egress.allowed_db:
             raise WiringError(
-                f"inbound {name!r}: [egress].deny_by_default is set and [egress].allowed_db is empty "
-                "— list the DATABASE server to permit it"
+                f"inbound {name!r}: {BLOCK_UNLISTED_OUTBOUND_IN_FORCE} and "
+                "[egress].allowed_db is empty — list the DATABASE server to permit it"
             )
         if source.type is ConnectorType.REMOTEFILE and not egress.allowed_remote:
             raise WiringError(
-                f"inbound {name!r}: [egress].deny_by_default is set and [egress].allowed_remote is "
-                "empty — list the REMOTEFILE host to permit it"
+                f"inbound {name!r}: {BLOCK_UNLISTED_OUTBOUND_IN_FORCE} and "
+                "[egress].allowed_remote is empty — list the REMOTEFILE host to permit it"
             )
     if source.type is ConnectorType.DATABASE and egress.allowed_db:
         host = str(source.settings.get("server", ""))
@@ -7381,8 +7655,8 @@ def check_lookup_allowed(name: str, settings: Mapping[str, Any], egress: EgressS
     ``[egress].deny_by_default`` an empty ``allowed_db`` refuses the lookup outright."""
     if egress.deny_by_default and not egress.allowed_db:
         raise WiringError(
-            f"DatabaseLookup {name!r}: [egress].deny_by_default is set and [egress].allowed_db is "
-            "empty — list the lookup server to permit it"
+            f"DatabaseLookup {name!r}: {BLOCK_UNLISTED_OUTBOUND_IN_FORCE} and "
+            "[egress].allowed_db is empty — list the lookup server to permit it"
         )
     if egress.allowed_db:
         host = str(settings.get("server", ""))
@@ -7437,8 +7711,16 @@ def _check_credential_token_url_egress(
     is a no-op. Call only when ``allowed_http`` is non-empty (matching the host gate's own guard)."""
     for key, what in _CREDENTIAL_EGRESS_URL_KEYS:
         token_url = str(settings.get(key, "") or "")
-        if token_url and not _http_egress_allowed(token_url, allowed_http):
-            host = urllib.parse.urlsplit(token_url).hostname or ""
+        if not token_url:
+            continue
+        refuse_url_credentials(
+            token_url,
+            f"{label} {key}",
+            use="the connection's client credential settings",
+            error=WiringError,
+        )
+        if not _http_egress_allowed(token_url, allowed_http):
+            host = _egress_host_label(token_url)
             log.warning(
                 "egress denied: %s %s host %r not in [egress].allowed_http",
                 label,
@@ -7492,7 +7774,7 @@ def _check_forward_proxy_egress(
             "list is deny-by-default, unlike the [egress].allowed_* destination lists)"
         )
     if not _http_egress_allowed(proxy_url, allowed_proxy):
-        host = urllib.parse.urlsplit(proxy_url).hostname or ""
+        host = _egress_host_label(proxy_url)
         log.warning(
             "egress denied: %s forward proxy host %r not in [egress].allowed_proxy", label, host
         )
@@ -7517,15 +7799,16 @@ def check_fhir_lookup_allowed(
     _check_forward_proxy_egress(f"FhirLookup {name!r}", settings, egress.allowed_proxy)
     if egress.deny_by_default and not egress.allowed_http:
         raise WiringError(
-            f"FhirLookup {name!r}: [egress].deny_by_default is set and [egress].allowed_http is "
-            "empty — list the FHIR host to permit it"
+            f"FhirLookup {name!r}: {BLOCK_UNLISTED_OUTBOUND_IN_FORCE} and "
+            "[egress].allowed_http is empty — list the FHIR host to permit it"
         )
     if egress.allowed_http:
         url = str(settings.get("url", ""))
+        refuse_url_credentials(url, f"FhirLookup {name!r} 'url'", error=WiringError)
         if not _http_egress_allowed(
             url, egress.allowed_http
         ):  # same host[:port] matching as the FHIR outbound
-            host = urllib.parse.urlsplit(url).hostname or url
+            host = _egress_host_label(url)
             log.warning(
                 "connect denied: FhirLookup %r host %r not in [egress].allowed_http", name, host
             )
@@ -8036,13 +8319,21 @@ def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
     if dest.type in _HTTP_FAMILY_DEST_TYPES:
         _check_forward_proxy_egress(f"outbound {dest.name!r}", dest.settings, egress.allowed_proxy)
     if egress.deny_by_default and not _allowlist_for(dest.type, egress):
+        # Names the switch the way the raise below does, not the internal field. NSSM captures stderr
+        # to files, so this log line is a forensic surface an operator reads -- and "under
+        # deny_by_default", sitting beside "[egress] allowlist" in one sentence, reads as a settable
+        # [egress] key. It is not: ADR 0118 relocated it, and writing it there is refused at next
+        # start with "unrecognized config key(s)" (BACKLOG #1361). The spelling guard in
+        # tests/test_relocated_key_messages.py cannot see this line -- it reads print, add_argument
+        # and *Error constructors only -- so the fix is here rather than left for a red.
         log.warning(
-            "egress denied: outbound %r %s has no [egress] allowlist under deny_by_default",
+            "egress denied: outbound %r %s has no [egress] allowlist while %s",
             dest.name,
             dest.type.value,
+            BLOCK_UNLISTED_OUTBOUND_IN_FORCE,
         )
         raise WiringError(
-            f"outbound {dest.name!r}: [egress].deny_by_default is set and no allowlist permits a "
+            f"outbound {dest.name!r}: {BLOCK_UNLISTED_OUTBOUND_IN_FORCE} and no allowlist permits a "
             f"{dest.type.value} destination — add it to the matching [egress].allowed_* list"
         )
     if dest.type is ConnectorType.MLLP and egress.allowed_mllp:
@@ -8121,8 +8412,9 @@ def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
         # DICOMWEB (STOW-RS) folds into the HTTP host-check branch: it stores its endpoint under "url"
         # (the same key Rest()/FHIR() use), so the host gate reads it unchanged (ADR 0025 §6.4).
         url = str(dest.settings.get("url", ""))
+        refuse_url_credentials(url, f"outbound {dest.name!r} 'url'", error=WiringError)
         if not _http_egress_allowed(url, egress.allowed_http):
-            host = urllib.parse.urlsplit(url).hostname or ""
+            host = _egress_host_label(url)
             log.warning(
                 "egress denied: outbound %r %s host %r not in [egress].allowed_http",
                 dest.name,
@@ -8225,15 +8517,35 @@ def _dir_egress_allowed(directory: str, allowed: list[str]) -> bool:
     return False
 
 
+def _egress_host_label(url: str) -> str:
+    """The host an egress refusal may print (BACKLOG #1793). urllib unquotes the host, so one that
+    holds an ``@`` once unquoted is userinfo written as ``%40``, and printing it prints the password.
+
+    Every egress check runs BEFORE ``build_destination``, so the construction refusal in
+    ``transports/`` never speaks first. The data, token and FhirLookup arms therefore also call
+    ``refuse_url_credentials`` up front, for a refusal that names the setting. The proxy arm cannot,
+    since a proxy may carry its own userinfo, and this label is what keeps its message clean."""
+    host = urllib.parse.urlsplit(url).hostname or ""
+    return "(withheld: it holds a credential)" if "@" in urllib.parse.unquote(host) else host
+
+
 def _http_egress_allowed(url: str, allowed: list[str]) -> bool:
     """True if ``url``'s host (and port, when an allow entry pins one) is on the allowlist — the same
-    ``host`` / ``host:port`` matching as MLLP."""
+    ``host`` / ``host:port`` matching as MLLP.
+
+    A port ``urlsplit`` cannot read is NOT allowed, and this never raises (BACKLOG #1793). The
+    ``ValueError`` from ``.port`` quotes the port text, and a password holding an unencoded ``/``,
+    ``?`` or ``#`` ends the authority early, so its head IS that text. ``redact()`` does not match it."""
     parts = urllib.parse.urlsplit(url)
+    try:
+        port = parts.port
+    except ValueError:
+        return False
     host = (parts.hostname or "").lower()
     for entry in allowed:
         allow_host, _, allow_port = entry.partition(":")
         if allow_host.strip().lower() == host and (
-            not allow_port or str(parts.port) == allow_port.strip()
+            not allow_port or str(port) == allow_port.strip()
         ):
             return True
     return False

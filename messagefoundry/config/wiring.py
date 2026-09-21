@@ -1278,13 +1278,12 @@ def MLLP(
     max_connections: int | None = 256,  # cap concurrent clients (connection-flood guard)
     receive_timeout: float | None = 60.0,  # close a client idle this many seconds (slowloris)
     max_frame_bytes: int | None = 16 * 1024 * 1024,  # cap one frame's bytes (OOM guard); both dirs
-    # INBOUND message-RATE pacing (BACKLOG #1249). Unlike the caps above these default to OFF, and
-    # that is ruled rather than accidental: a rate on a clinical interface is only safe at a number
-    # taken from a real feed profile. The connector has read both keys since the pacer was built --
-    # until now no factory parameter and no connections.toml key could populate them, so the setting
-    # existed and could not be reached. Over budget the listener PAUSES READING so TCP back-pressures
-    # the sender: nothing is dropped, refused, NAK'd or reordered, which the count-and-log invariant
-    # requires (a discarding limiter was never an option here).
+    # INBOUND message-RATE pacing. Unlike the caps above these default to OFF, and that is ruled
+    # rather than accidental: a rate on a clinical interface is only safe at a number taken from a
+    # real feed profile. Both are parameters of this factory, and a connections.toml inbound entry
+    # desugars through it, so either surface sets them. Over budget the listener PAUSES READING so TCP
+    # back-pressures the sender: nothing is dropped, refused, NAK'd or reordered, which the
+    # count-and-log invariant requires (a discarding limiter was never an option here).
     max_messages_per_second: float | None = None,  # None/0 = no rate bound (the shipped default)
     message_burst: float
     | None = None,  # allowance over the sustained rate; None = one second's worth
@@ -1329,6 +1328,23 @@ def MLLP(
     inbound); outbound uses host/port/connect_timeout/timeout_seconds/max_frame_bytes. ``encoding``
     applies to framing in both directions. ``capture_response`` (outbound, ADR 0013) records the
     application ACK as a captured reply (a negative ACK still dead-letters/retries unchanged).
+
+    **Inbound message-rate pacing (BACKLOG #1249).** ``max_messages_per_second`` bounds how fast one
+    accepted inbound connection may feed messages in; ``None``/``0`` (the default) is no bound.
+    ``message_burst`` sizes the allowance above that sustained rate; ``None`` **and** ``0`` both mean
+    one second's worth of it -- **not** an unbounded burst, and **not** a burst of zero. The connector
+    reads it as ``message_burst or rate``, so any falsy value takes the rate. Both keys reach the
+    connector from here or from a ``connections.toml`` inbound entry, which desugars through this same
+    factory.
+
+    The history behind that last sentence -- the connector read both keys before either was a
+    parameter here, so text written in that window described the setting as reachable through no
+    surface at all, and some of it outlived the window -- is stated HERE, and cited from
+    ``tests/test_connection_schema.py`` and ``tests/test_security_doc_rate_limits.py``. Treat it as
+    the CANONICAL statement, not the only one: at least ``docs/SECURITY.md``'s ingest row and the two
+    pacing test modules say it independently. Why the ledger number sits in this paragraph and not in
+    the parameter comment above it -- that comment becomes an operator-facing GUI heading; see
+    :mod:`messagefoundry.config.connection_schema`.
 
     **Persistent outbound connection (ADR 0067).** Ships **opt-in** this release: ``persistent=False``
     is the default (connect-per-message — today's proven posture, dial a fresh connection per delivery).
@@ -2712,18 +2728,67 @@ def _is_db_proc_call(statement_lower: str) -> bool:
 
 
 def _reject_envref_odbc_params(odbc_params: Mapping[str, Any] | None) -> None:
-    """Refuse an ``env()`` ref inside ``odbc_params`` (#66). Nested settings are NOT env-resolved (only
-    top-level ones are — see :func:`resolve_env_settings`), so an ``EnvRef`` here would stringify to a
-    broken literal at connect. Fail loud at authoring, pointing to the top-level ``username``/``password``
-    fields (which ARE env-resolved + secret-redacted) for a per-environment/secret value."""
+    """Refuse an ``env()`` ref inside ``odbc_params`` (#66), in **both** spellings. Nested settings are
+    NOT env-resolved (only top-level ones are — see :func:`resolve_env_settings`), so an env ref here
+    would stringify to a broken literal at connect. Fail loud at authoring, pointing to the top-level
+    ``username``/``password`` fields (which ARE env-resolved + secret-redacted) for a
+    per-environment/secret value.
+
+    The two spellings reach this function as **different objects**, and testing only the first let the
+    second through (BACKLOG #1806). Code-first ``odbc_params={"PWD": env("acme_pw")}`` arrives as an
+    :class:`EnvRef`. A ``connections.toml`` ``[settings.odbc_params]`` inline table arrives as a **raw
+    dict** — :func:`parse_env_setting` decodes only *top-level* settings values and does not descend, so
+    ``PWD = { env = "acme_pw", default = "…" }`` is copied through verbatim. Both factories that take
+    ``odbc_params`` are reachable from a TOML table (see :mod:`messagefoundry.config.connections_file`),
+    so that raw dict used to pass unrefused and stringify into the DSN with its fallback attached.
+
+    At least one further position exists and is not nested: ``odbc_params = { env = "..." }`` names
+    the *whole table*, which IS a top-level settings value, so ``parse_env_setting`` decodes it to an
+    :class:`EnvRef`. That object has no ``items()``, and the resulting :class:`AttributeError` is
+    neither a ``TypeError`` nor a ``ValueError``, so ``connections_file._build_spec`` did not convert
+    it — the operator got a bare traceback. The mapping check below makes that a typed
+    :class:`WiringError` instead; ``_build_odbc_dsn`` already refuses a non-mapping at connect, so
+    this only moves an existing refusal earlier. It does **not** make the refusal name the connection
+    or the file: ``_build_spec`` re-raises a factory ``WiringError`` unwrapped, ahead of the arm that
+    adds that context, so every factory refusal is un-located in the same way.
+
+    From ``connections.toml``, the loader's type check (``connections_file._check_setting_types``,
+    BACKLOG #1809) runs before this function, and where it refuses, its message names the
+    connection. What it lets through reaches the mapping check below, as does every code-first call,
+    which that check never sees. Which whole-table shapes land where is pinned in
+    ``tests/test_odbc_params_envref_toml_shape.py``.
+
+    **The residual is a marker one container deep**, and it is deliberately still open here: a dict
+    carrying ``env`` plus an unrecognised key, or a marker inside a list, fails ``set(v) <=
+    _ENVREF_KEYS`` and reaches ``_build_odbc_dsn``, which ``str()``-splices it into the DSN with any
+    ``default`` attached. Closing it means refusing every non-scalar ``odbc_params`` value (no ODBC
+    keyword takes a container), which is a wider rule than mirroring the decoder and wants its own
+    row rather than being folded in here.
+
+    Offenders are reported as **keys only**; the refusal must never echo the value, which may be a
+    fallback secret. The non-mapping arm reports the type name for the same reason."""
+    if odbc_params is None:
+        return
+    # Ahead of the empty-table short-circuit on purpose: `odbc_params = ""` is falsy AND not a table,
+    # and `_build_odbc_dsn`'s `or {}` would otherwise read it as "no params" with no diagnostic.
+    if not isinstance(odbc_params, Mapping):
+        raise WiringError(
+            "Database odbc_params must be a table of ODBC keyword -> value pairs, not "
+            f"{type(odbc_params).__name__} — write it as a table (TOML "
+            "[settings.odbc_params], or a Python dict). An env() reference naming the whole table "
+            "is refused here too; put a credential/password in the top-level username/password "
+            "fields (env-resolved + redacted)."
+        )
     if not odbc_params:
         return
-    offenders = sorted(k for k, v in odbc_params.items() if isinstance(v, EnvRef))
+    offenders = sorted(k for k, v in odbc_params.items() if _is_nested_envref(v))
     if offenders:
         raise WiringError(
             f"Database odbc_params may not use env() ({', '.join(offenders)}) — nested settings are "
-            "not env-resolved. Put a credential/password in the top-level username/password fields "
-            "(env-resolved + redacted); odbc_params carries only static driver keywords."
+            "not env-resolved, in either spelling (a code-first env() ref, or a connections.toml "
+            'inline table like PWD = { env = "acme_pw" }). Put a credential/password in the top-level '
+            "username/password fields (env-resolved + redacted); odbc_params carries only static "
+            "driver keywords."
         )
 
 

@@ -394,9 +394,22 @@ class AlertSuspendRequest(RequestModel):
 
 
 class AlertInstanceList(BaseModel):
-    """The active (open + acknowledged) operator-alert instances, newest ``last_seen`` first (ADR 0044)."""
+    """The active (open + acknowledged) operator-alert instances, newest ``last_seen`` first (ADR 0044),
+    plus the store-computed aggregate over **every** such instance in the caller's scope."""
 
+    #: This page of instances — at most ``limit`` of them.
     alerts: list[AlertInstanceInfo]
+    #: Active instances in scope, counted in the store and NOT bounded by ``limit`` (BACKLOG #1564).
+    #:
+    #: **``total`` is a SECOND read, not a count of** ``alerts``, so the two are separate snapshots and
+    #: ``len(alerts) <= total`` is NOT guaranteed: a concurrent ack or resolve between them can leave a
+    #: full page beside a smaller total. Do not render "len(alerts) of total" off this pair without
+    #: clamping — the sibling listings that use that phrasing count and page in one query, and this one
+    #: does not. The nav alert bell is unaffected: it reads ``total`` alone and no rows at all.
+    total: int
+    #: The worst severity among all ``total`` of them, or ``None`` when there are none. Ranked in the
+    #: store; ``store.AlertSummary`` carries why neither field may be derived from ``alerts``.
+    worst_severity: str | None
 
 
 class DeadLetterReplayRequest(RequestModel):
@@ -505,7 +518,7 @@ class ConnectionRow(BaseModel):
     channel_name: str
     destination: str | None  # destination name; None for the source row
     name: str  # display name
-    status: str  # "running" | "stopping" (outbound: operator-paused, an in-flight head still draining) | "stopped" (outbound: paused AND quiesced) | "failed" (start failed, ADR 0031) | "filtered" (DR run-profile parked it below [dr].priority_threshold, #61 ADR 0048) | "draining" | "not_deployed" (present in the graph but deployed=false, #233 ADR 0111 — never wired, deploying it is a config change; distinct from "stopped", which SHOULD be running)
+    status: str  # "running" | "stopping" (outbound: operator-paused, an in-flight head still draining) | "stopped" (outbound: paused AND quiesced) | "failed" (start failed, ADR 0031) | "filtered" (DR run-profile parked it below [dr].priority_threshold, #61 ADR 0048) | "draining" | "not_deployed" (present in the graph but deployed=false, #233 ADR 0111 — never wired, deploying it is a config change; distinct from "stopped", which SHOULD be running) | "log_halted" (outbound: the engine cannot write its application log and has fail-closed, so NO lane delivers, #122 ADR 0189 — process-wide and NOT an operator pause; the fix is the disk, not this row's start button)
     direction: str  # "in" (source) | "out" (destination)
     method: str  # connection method/protocol, e.g. MLLP / File / TCP / REST
     peer: str | None  # MLLP host or file directory
@@ -632,6 +645,12 @@ class StatsResponse(BaseModel):
     # this model takes Pydantic's default extra='ignore', so an undeclared kwarg is dropped SILENTLY
     # and /stats would never grow the field.
     fenced_writes: int = 0
+    # #122 (ADR 0189): OUTBOUND rows the pooled claim gate refused while the delivery tier was halted.
+    # The runner property of the same name owns the reading rule; the two things an operator must not
+    # infer from this number are that a small count is a defect (the latch is set before the lanes are
+    # paused, so a claim in flight across that window lands here legitimately) and that zero is a clean
+    # bill (POOLED ONLY — a per_lane engine reports zero forever).
+    halted_claim_gate_hits: int = 0
 
 
 class MetricsHistorySample(BaseModel):
@@ -656,8 +675,9 @@ class GraphNode(BaseModel):
     """One node in the by-name data-flow graph (BACKLOG #76, ADR 0065 amendment). ``kind`` is one of
     ``inbound``/``router``/``handler``/``outbound``; ``status`` is the LIVE connection status for an
     inbound/outbound node (``running``/``stopping``/``stopped``/``failed``/``filtered``/``draining``/
-    ``not_deployed``) and ``None`` for a router/handler node. Names + status only — no PHI. The colour a
-    console derives from ``status`` is live-derived, never operator-assigned (that is BACKLOG #79)."""
+    ``not_deployed``/``log_halted``) and ``None`` for a router/handler node. Names + status only — no
+    PHI. The colour a console derives from ``status`` is live-derived, never operator-assigned (that is
+    BACKLOG #79)."""
 
     name: str
     kind: str
@@ -772,7 +792,10 @@ class EngineKpis(BaseModel):
 class DbInfo(BaseModel):
     path: str
     size_bytes: int  # db file + -wal + -shm
-    disk_free_bytes: int
+    # None = unmeasurable -- see DbStatus.disk_free_bytes (BACKLOG #1563). Required, not defaulted
+    # like `synchronous` below: that default exists for wire compatibility, and this field has never
+    # been optional on the wire, so a caller must say which of the two it means.
+    disk_free_bytes: int | None
     journal_mode: str
     messages: int
     events: int
@@ -787,11 +810,18 @@ class LogInfo(BaseModel):
     """App-log storage metering for the configured ``[logging].log_dir`` (#50), mirroring
     :class:`DbInfo`'s DB-side ``size_bytes`` / ``disk_free_bytes``. **Metadata only — never any log
     content** (no PHI). Present only when a log directory is configured; when the engine logs to stdout
-    (captured off-process by NSSM) the ``logs`` field on :class:`SystemStatus` is ``None``."""
+    (captured off-process by NSSM) the ``logs`` field on :class:`SystemStatus` is ``None``.
+
+    **Three states, deliberately, and they used to be two** (BACKLOG #1563). ``logs is None`` means no
+    log directory is CONFIGURED. A ``LogInfo`` whose fields are ``None`` means one is configured but
+    the metering PROBE failed. A field holding ``0`` is a real measured zero. Collapsing the middle
+    case into a bare ``None`` hid a vanished log directory behind the stdout-only answer."""
 
     path: str
-    size_bytes: int  # total bytes of regular files under the log directory (one level)
-    disk_free_bytes: int  # free space on the log directory's filesystem
+    # None = unmeasurable (see DbStatus.disk_free_bytes). The two halves fail independently: a
+    # readable directory on an unstattable mount yields a size with no free space, and vice versa.
+    size_bytes: int | None  # total bytes of regular files under the log directory (one level)
+    disk_free_bytes: int | None  # free space on the log directory's filesystem
 
 
 class LogSinkInfo(BaseModel):

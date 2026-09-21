@@ -13,6 +13,7 @@ import asyncio
 import logging
 import socket
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -31,6 +32,11 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, Stage
+
+if TYPE_CHECKING:  # the API rig below imports these lazily, inside the tests that use them
+    import httpx
+
+    from messagefoundry.auth.service import AuthService
 
 ADT = (
     "MSH|^~\\&|SENDINGAPP|SENDINGFAC|RECV|RFAC|20260604||ADT^A01|MSG1|P|2.5.1\r"
@@ -97,15 +103,59 @@ async def _wait_processed(store: MessageStore, channel_id: str, timeout: float =
             raise AssertionError(f"no PROCESSED message for channel {channel_id!r} within timeout")
 
 
-def _file_inbound(inbox: Path) -> InboundConnection:
+def _file_inbound(inbox: Path, name: str = "file_in") -> InboundConnection:
     return InboundConnection(
-        "file_in",
+        name,
         ConnectionSpec(
             ConnectorType.FILE,
             {"directory": str(inbox), "pattern": "*.hl7", "poll_seconds": 0.02},
         ),
         router="r",
     )
+
+
+def _env_broken_outbound(
+    name: str = "bad_out", *, retry: RetryPolicy | None = None, **settings: object
+) -> OutboundConnection:
+    """An outbound whose ``env()`` cannot resolve, so it fails to BUILD at start (the real-world
+    unresolved-SOAP-cert shape). The ADR 0031 isolation fixture this file turns on."""
+    return OutboundConnection(
+        name,
+        ConnectionSpec(ConnectorType.FILE, {"directory": env("out_dir"), **settings}),
+        retry=retry,
+    )
+
+
+_VIEWER_PW = "a-strong-test-passphrase"
+
+
+async def _provision_viewer(service: AuthService) -> None:
+    """Create the viewer the two API tests below log in as, scoped to the whole estate."""
+    from messagefoundry.auth import Role
+
+    uid = await service.create_local_user(
+        username="vw",
+        password=_VIEWER_PW,
+        display_name=None,
+        email=None,
+        roles=[Role.VIEWER.value],
+        actor="test",
+    )
+    # BACKLOG #1152: an unset channel scope now DENIES. Grant the estate explicitly so this fixture
+    # still stands for an operator who has been provisioned; the channel axis itself is exercised in
+    # tests/test_channel_rbac.py.
+    await service.set_channel_scope(uid, [ALL_CHANNELS], actor="test")
+    u = await service.store.get_user(uid)
+    assert u is not None and u.password_hash is not None
+    await service.store.set_password(uid, password_hash=u.password_hash, must_change_password=False)
+
+
+async def _viewer_headers(client: httpx.AsyncClient) -> dict[str, str]:
+    """Log the provisioned viewer in over the ASGI transport and return its bearer header."""
+    r = await client.post(
+        "/auth/login", json={"username": "vw", "password": _VIEWER_PW, "provider": "local"}
+    )
+    return {"Authorization": f"Bearer {r.json()['token']}"}
 
 
 def _free_port() -> int:
@@ -130,8 +180,8 @@ async def test_duplicate_inbound_port_isolates_the_loser(store: MessageStore) ->
     await runner.start()
     try:
         assert runner.running
-        assert set(runner.degraded_connections()) == {"b"}  # 'a' bound first; 'b' is the loser
-        assert "already bound by 'a'" in (runner.connection_failed("b") or "")
+        assert set(runner.degraded_inbound()) == {"b"}  # 'a' bound first; 'b' is the loser
+        assert "already bound by 'a'" in (runner.inbound_failed("b") or "")
         assert runner.inbound_running("a") and not runner.inbound_running("b")
     finally:
         await runner.stop()
@@ -153,8 +203,8 @@ async def test_inbound_on_reserved_api_port_isolated(store: MessageStore) -> Non
     await runner.start()
     try:
         assert runner.running
-        assert "a" in runner.degraded_connections()
-        assert "reserved for" in (runner.connection_failed("a") or "")
+        assert "a" in runner.degraded_inbound()
+        assert "reserved for" in (runner.inbound_failed("a") or "")
         assert not runner.inbound_running("a")
     finally:
         await runner.stop()
@@ -170,16 +220,9 @@ async def test_failed_outbound_isolated_retries_and_recovers(
     inbox.mkdir()
     reg = Registry()
     reg.add_inbound(_file_inbound(inbox))
+    # short backoff, so the stuck row redelivers fast once the lane recovers
     reg.add_outbound(
-        OutboundConnection(
-            "bad_out",
-            ConnectionSpec(
-                ConnectorType.FILE, {"directory": env("out_dir"), "filename": "{MSH-10}.hl7"}
-            ),
-            retry=RetryPolicy(
-                backoff_seconds=0.05
-            ),  # short, so the stuck row redelivers fast on recovery
-        )
+        _env_broken_outbound(retry=RetryPolicy(backoff_seconds=0.05), filename="{MSH-10}.hl7")
     )
     reg.add_router("r", lambda m: ["h"])
     reg.add_handler("h", lambda m: Send("bad_out", m))
@@ -189,7 +232,7 @@ async def test_failed_outbound_isolated_retries_and_recovers(
     try:
         # Engine is up despite the broken outbound.
         assert runner.running
-        reason = runner.connection_failed("bad_out")
+        reason = runner.outbound_failed("bad_out")
         assert reason and "out_dir" in reason  # the unresolved env key is named in the reason
         assert "bad_out" not in runner._destinations  # no live connector
         assert sink.stopped and sink.stopped[0][0] == "bad_out"  # alerted at start
@@ -217,8 +260,8 @@ async def test_failed_outbound_isolated_retries_and_recovers(
         good.add_router("r", lambda m: ["h"])
         good.add_handler("h", lambda m: Send("bad_out", m))
         await runner.reload(good)
-        assert runner.connection_failed("bad_out") is None  # marker cleared
-        assert runner.degraded_connections() == {}
+        assert runner.outbound_failed("bad_out") is None  # marker cleared
+        assert not runner.degraded_inbound() and not runner.degraded_outbound()
         assert "bad_out" in runner._destinations  # connector built in place
 
         # The previously-stuck message now DELIVERS — proving the queued row was retried, not lost. The
@@ -262,8 +305,8 @@ async def test_file_validate_directory_isolates_missing_dir(
     await runner.start()
     try:
         assert runner.running  # isolated, not fatal
-        assert "file_in" in runner.degraded_connections()
-        assert "SourceStartupError" in (runner.connection_failed("file_in") or "")
+        assert "file_in" in runner.degraded_inbound()
+        assert "SourceStartupError" in (runner.inbound_failed("file_in") or "")
         assert not runner.inbound_running("file_in")
         assert not missing.exists()  # the no-mkdir probe never created it
     finally:
@@ -283,7 +326,7 @@ async def test_file_validate_directory_off_defers_missing_dir(
     await runner.start()
     try:
         assert runner.running
-        assert runner.degraded_connections() == {}
+        assert not runner.degraded_inbound() and not runner.degraded_outbound()
         assert runner.inbound_running("file_in")  # bound; validation deferred to run time
     finally:
         await runner.stop()
@@ -320,8 +363,8 @@ async def test_file_outbound_validate_directory_isolates_missing_dir(
     await runner.start()
     try:
         assert runner.running  # isolated, not fatal
-        assert "file_out" in runner.degraded_connections()
-        assert "DestinationStartupError" in (runner.connection_failed("file_out") or "")
+        assert "file_out" in runner.degraded_outbound()
+        assert "DestinationStartupError" in (runner.outbound_failed("file_out") or "")
         assert "file_out" not in runner._destinations  # no live connector
         assert sink.stopped and sink.stopped[0][0] == "file_out"  # alerted at start
         assert not missing.exists()  # the no-mkdir probe never fabricated it
@@ -350,7 +393,9 @@ async def test_file_outbound_validate_directory_off_defers_missing_dir(
     with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.file"):
         await runner.start()
         try:
-            assert runner.degraded_connections() == {}  # validation deferred — the lane is clean
+            assert (
+                not runner.degraded_inbound() and not runner.degraded_outbound()
+            )  # validation deferred — the lane is clean
             assert "file_out" in runner._destinations
             (inbox / "a.hl7").write_bytes(ADT.encode("utf-8"))
             await _until(lambda: (outdir / "MSG1.hl7").exists())
@@ -380,8 +425,8 @@ async def test_valid_graph_starts_without_degradation(store: MessageStore, tmp_p
     await runner.start()
     try:
         assert runner.running
-        assert runner.degraded_connections() == {}
-        assert runner.connection_failed("file_out") is None
+        assert not runner.degraded_inbound() and not runner.degraded_outbound()
+        assert runner.outbound_failed("file_out") is None
         (inbox / "a.hl7").write_bytes(ADT.encode("utf-8"))
         await _until(lambda: (outdir / "MSG1.hl7").exists())
     finally:
@@ -394,7 +439,6 @@ async def test_connections_api_reports_degraded_outbound(tmp_path: Path) -> None
     import httpx
 
     from messagefoundry.api import create_app
-    from messagefoundry.auth import Role
     from messagefoundry.auth.service import AuthService
     from messagefoundry.config.settings import AuthSettings
     from messagefoundry.pipeline import Engine
@@ -404,51 +448,107 @@ async def test_connections_api_reports_degraded_outbound(tmp_path: Path) -> None
     reg = Registry()
     reg.add_inbound(_file_inbound(inbox))
     reg.add_router("r", lambda m: [])
-    reg.add_outbound(
-        OutboundConnection(
-            "bad_out",
-            ConnectionSpec(ConnectorType.FILE, {"directory": env("out_dir")}),
-        )
-    )
+    reg.add_outbound(_env_broken_outbound())
 
-    pw = "a-strong-test-passphrase"
     engine = await Engine.create(tmp_path / "api.db", poll_interval=0.02)
     engine.add_registry(reg)
     try:
         service = AuthService(engine.store, AuthSettings(require_mfa=False))
         await service.initialize()
-        uid = await service.create_local_user(
-            username="vw",
-            password=pw,
-            display_name=None,
-            email=None,
-            roles=[Role.VIEWER.value],
-            actor="test",
-        )
-        # BACKLOG #1152: an unset channel scope now DENIES. Grant the estate explicitly so this
-        # fixture still stands for an operator who has been provisioned; the channel axis itself
-        # is exercised in tests/test_channel_rbac.py.
-        await service.set_channel_scope(uid, [ALL_CHANNELS], actor="test")
-        u = await service.store.get_user(uid)
-        assert u is not None and u.password_hash is not None
-        await service.store.set_password(
-            uid, password_hash=u.password_hash, must_change_password=False
-        )
+        await _provision_viewer(service)
         await engine.start()  # degraded — does NOT raise (ADR 0031)
         assert engine.registry_runner is not None
-        assert "bad_out" in engine.registry_runner.degraded_connections()
+        assert "bad_out" in engine.registry_runner.degraded_outbound()
 
         transport = httpx.ASGITransport(app=create_app(engine, auth=service))
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
-            r = await c.post(
-                "/auth/login", json={"username": "vw", "password": pw, "provider": "local"}
-            )
-            headers = {"Authorization": f"Bearer {r.json()['token']}"}
+            headers = await _viewer_headers(c)
             rows = (await c.get("/connections", headers=headers)).json()
         failed = [row for row in rows if row["status"] == "failed" and "bad_out" in row["name"]]
         assert failed, f"no failed bad_out row in {rows}"
         assert failed[0]["direction"] == "out"
         assert "out_dir" in (failed[0]["error"] or "")
+    finally:
+        await engine.stop()
+
+
+async def test_same_name_inbound_and_outbound_do_not_alias_the_failure(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    # Registry._add enforces name uniqueness PER TABLE, so one name may legitimately be both an inbound
+    # and an outbound (_dual_role_control already disambiguates the pair with role=). The ADR 0031
+    # failure map must therefore key by DIRECTION. Keyed by bare name it aliased, and start() makes the
+    # erasure the default case: every outbound is built BEFORE any inbound, so the inbound's
+    # bound-successfully pop silently deleted its outbound namesake's real start failure and the engine
+    # reported itself healthy. This is the regression guard for that erasure.
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    reg = Registry()
+    reg.add_inbound(_file_inbound(inbox, "SHARED"))
+    reg.add_outbound(_env_broken_outbound("SHARED"))
+    reg.add_router("r", lambda m: [])
+    runner = RegistryRunner(reg, store, poll_interval=0.02, env_values={})
+    await runner.start()
+    try:
+        assert runner.running
+        # The inbound bound AFTER the outbound failed, and did not erase it.
+        assert runner.inbound_running("SHARED")
+        reason = runner.outbound_failed("SHARED")
+        assert reason and "out_dir" in reason
+        assert runner.degraded_outbound() == {"SHARED": reason}
+        # And the inverse: the outbound's failure must not answer for the healthy inbound. This is the
+        # direction a status reader trips over — an inbound-only counter built on the direction-blind
+        # accessor would report this engine's listening inbound as failed.
+        assert runner.inbound_failed("SHARED") is None
+    finally:
+        await runner.stop()
+
+
+async def test_connections_api_does_not_report_a_healthy_inbound_as_failed(tmp_path: Path) -> None:
+    # The same collision as seen through /connections: the destination row is "failed" with the reason,
+    # while the source row of the SAME name reports the live inbound honestly. Keyed by bare name the
+    # dashboard could not tell the two halves apart in either direction.
+    import httpx
+
+    from messagefoundry.api import create_app
+    from messagefoundry.auth.service import AuthService
+    from messagefoundry.config.settings import AuthSettings
+    from messagefoundry.pipeline import Engine
+
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    reg = Registry()
+    reg.add_inbound(_file_inbound(inbox, "SHARED"))
+    reg.add_outbound(_env_broken_outbound("SHARED"))
+    reg.add_router("r", lambda m: [])
+
+    engine = await Engine.create(tmp_path / "api.db", poll_interval=0.02)
+    engine.add_registry(reg)
+    try:
+        service = AuthService(engine.store, AuthSettings(require_mfa=False))
+        await service.initialize()
+        await _provision_viewer(service)
+        await engine.start()  # degraded on the outbound half — does NOT raise (ADR 0031)
+        transport = httpx.ASGITransport(app=create_app(engine, auth=service))
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            headers = await _viewer_headers(c)
+            rows = (await c.get("/connections", headers=headers)).json()
+            graph = (await c.get("/graph/edges", headers=headers)).json()
+            engine_info = (await c.get("/status", headers=headers)).json()["engine"]
+        sources = [row for row in rows if row["direction"] == "in"]
+        dests = [row for row in rows if row["direction"] == "out"]
+        assert len(sources) == 1 and sources[0]["status"] != "failed", sources
+        assert sources[0]["error"] is None
+        assert len(dests) == 1 and dests[0]["status"] == "failed", dests
+        assert "out_dir" in (dests[0]["error"] or "")
+        # /graph/edges keys its nodes by (kind, name) already; its two status helpers must agree.
+        by_kind = {(n["kind"], n["name"]): n["status"] for n in graph["nodes"]}
+        assert by_kind[("inbound", "SHARED")] != "failed"
+        assert by_kind[("outbound", "SHARED")] == "failed"
+        # /status counts failed INBOUNDS for the nav heart (#1741). The failed half here is the
+        # outbound, so the listening inbound of the same name must not be counted or named.
+        assert engine_info["channels_failed"] == 0, engine_info
+        assert engine_info["channels_failed_names"] == []
     finally:
         await engine.stop()
 
@@ -504,7 +604,8 @@ async def test_status_reports_failed_inbounds_and_scopes_their_names(tmp_path: P
 
         await engine.start()  # degraded — does NOT raise (ADR 0031)
         assert engine.registry_runner is not None
-        assert set(engine.registry_runner.degraded_connections()) == {"loser"}
+        assert set(engine.registry_runner.degraded_inbound()) == {"loser"}
+        assert not engine.registry_runner.degraded_outbound()
 
         transport = httpx.ASGITransport(app=create_app(engine, auth=service))
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:

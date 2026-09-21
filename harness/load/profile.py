@@ -28,6 +28,35 @@ LOOP_MODES = frozenset({"open", "closed"})
 
 PROFILES_DIR = Path(__file__).parent / "profiles"
 
+#: Where an operator's OWN profiles live, relative to the current working directory. Deliberately
+#: outside the package: ``PROFILES_DIR`` is force-included whole into the harness wheel, and
+#: hatchling's ``recurse_forced_files`` walks the filesystem without reading .gitignore, so a file
+#: dropped in there ships to everyone who installs the harness even when git is told to skip it
+#: (BACKLOG #1835).
+#:
+#: ``migration-local/`` rather than a new directory: it is already this repository's ignored tree for
+#: real-numbers, site-specific material, named as such by docs/LOAD-TESTING.md, profiles/README.md and
+#: docs/CI-SELFHOSTED-RUNNER.md. A second location for the same thing is how two conventions start
+#: disagreeing. What is new is only the ``profiles/`` subdirectory and the lookup below, which give
+#: the bare name somewhere to resolve; running one by full path already worked and still does.
+#:
+#: Relative to the CWD rather than the package, because an installed harness has no checkout: the
+#: operator runs it from their own directory.
+LOCAL_PROFILES_SUBPATH = Path("migration-local") / "profiles"
+
+
+def local_profiles_dir(cwd: Path | None = None) -> Path:
+    """The operator-local profile directory under ``cwd``, defaulting to the process's own.
+
+    A function, not a module constant: the CWD can change between import and call (pytest's
+    ``monkeypatch.chdir``, a harness launched from elsewhere), and a constant would freeze whichever
+    directory happened to be current at import time. The optional ``cwd`` matches the idiom every
+    other CWD-dependent entry point in ``harness/load`` already uses (``connscale/runner.py``,
+    ``estate/runner.py``, ``failover.py``, ``multishard.py``, ``shardcert.py``).
+    """
+    return (cwd or Path.cwd()) / LOCAL_PROFILES_SUBPATH
+
+
 _LOAD_KEYS = frozenset(
     {
         "name",
@@ -234,27 +263,55 @@ def load_profile_text(text: str, *, where: str = "<text>") -> LoadProfile:
 
 
 def list_profiles() -> dict[str, str]:
-    """Built-in profile name → description, read from ``harness/load/profiles/*.toml``. ``connscale*``
-    profiles are a DIFFERENT schema ([connscale], not [load]) consumed by the ``--connscale`` CLI, so
-    they are skipped here rather than reported as invalid load profiles."""
+    """Profile name → description: the built-ins under ``harness/load/profiles/*.toml``, plus any
+    operator-local ones under :func:`local_profiles_dir`. ``connscale*`` profiles are a DIFFERENT
+    schema ([connscale], not [load]) consumed by the ``--connscale`` CLI, so they are skipped here
+    rather than reported as invalid load profiles.
+
+    An operator-local entry is LABELLED as one. The two sets are listed together because that is the
+    menu a reader needs, but a profile sized for one site is not a shipped built-in and a listing
+    that hid the difference would invite treating it as one.
+    """
     out: dict[str, str] = {}
-    for path in sorted(PROFILES_DIR.glob("*.toml")):
-        if path.name.startswith("connscale"):
+    # One scan over both directories rather than two copies of it. The `connscale` skip has to stay
+    # in step with list_connscale_profiles() and tests/test_load_config.py, and a rule spelled twice
+    # inside one function is a rule that gets updated once.
+    for directory, label in ((PROFILES_DIR, ""), (local_profiles_dir(), " (operator-local)")):
+        if not directory.is_dir():
             continue
-        try:
-            out[load_profile(path).name] = load_profile(path).description
-        except LoadProfileError:
-            out[path.stem] = "(invalid profile)"
+        for path in sorted(directory.glob("*.toml")):
+            if path.name.startswith("connscale"):
+                continue
+            try:
+                profile = load_profile(path)
+            except LoadProfileError:
+                out[path.stem] = f"(invalid profile){label}"
+                continue
+            out[profile.name] = f"{profile.description}{label}".lstrip()
     return out
 
 
 def get_profile(name_or_path: str) -> LoadProfile:
-    """Resolve a built-in profile name or a filesystem path to a :class:`LoadProfile`."""
+    """Resolve a filesystem path, an operator-local profile name, or a built-in name.
+
+    A name carried by BOTH directories raises rather than picking one. Either precedence is a silent
+    wrong answer half the time: built-in-wins ignores the file the operator just wrote, and
+    local-wins reshapes a named run (``smoke`` is a CI gate) for anyone who happens to be standing in
+    the wrong directory. A full path is always unambiguous and stays available.
+    """
     candidate = Path(name_or_path)
     if candidate.exists():
         return load_profile(candidate)
     builtin = PROFILES_DIR / f"{name_or_path}.toml"
-    if builtin.exists():
+    local = local_profiles_dir() / f"{name_or_path}.toml"
+    if builtin.is_file() and local.is_file():
+        raise LoadProfileError(
+            f"profile {name_or_path!r} is ambiguous: it is both a built-in ({builtin}) and an "
+            f"operator-local profile ({local}). Rename the local one, or pass a full path."
+        )
+    if local.is_file():
+        return load_profile(local)
+    if builtin.is_file():
         return load_profile(builtin)
     choices = ", ".join(sorted(list_profiles())) or "(none)"
     raise LoadProfileError(f"unknown profile {name_or_path!r}; built-ins: {choices}")

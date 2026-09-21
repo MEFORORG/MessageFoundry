@@ -175,7 +175,9 @@ It blocks a commit that:
 1. **reuses an ADR number already on `origin/main`** — unless the file is a **declared companion** (its
    basename is named inside that number's existing index row; ADR 0013 is exactly this, and is *correct* —
    one number, one row, two files, deliberately);
-2. **adds an ADR or BACKLOG number that was not allocated to this worktree**;
+2. **adds an ADR or BACKLOG number that was not allocated to this worktree** — unless the staged bytes
+   match a blob that path already carried on the base's history, which is a **restore** of a number the
+   base lost rather than a new allocation ([below](#restoring-a-number-the-base-lost-backlog-1468));
 3. **adds an ADR with no row in `docs/adr/README.md`**; or
 4. leaves **duplicate index rows** for one number.
 
@@ -260,14 +262,38 @@ per number, so "missing" would have to be unforgeable).
 named `alloc.ps1` and nothing else. `alloc.ps1` issues a **new** number, so a seat that hit a
 *correct* refusal was steered into spending a second number and abandoning the first — and claims are
 never released, so that hole is permanent. **Measured on the maintainer clone, 2026-09-03: 19 titles
-hold more than one number**, including [#1297](#1297)/[#1298](#1298), backlog 1422/1423 and 1425/1426. The
+hold more than one number**, including #1297/#1298, backlog 1422/1423 and 1425/1426. The
 refusal text now names the recorded worktree and branch and lists the three recoveries below.
 
 *(Those last two pairs are written without the `#` sigil on purpose: the numbers are allocated, but
 their items are still in an unmerged pull request, so a live cross-reference would dangle today.)*
 
+**`alloc.ps1` is re-entrant now, which closes the cheapest limb of this (BACKLOG #1703).** Re-running
+it with the same title for the same owner prints the number already recorded and allocates nothing,
+so the reflex that spends a second number on one title no longer does so by itself.
+
+**It covers ADR numbers only, which is not the half the pairs above are drawn from.** Every pair
+named there is a *backlog* number, and `-Kind backlog` has been refused at parameter binding since
+the ledger left this repository (BACKLOG #1250, #1754) — so re-entrancy cannot be read as a control
+over the population that measurement describes. It prevents the same mistake in the one namespace
+this allocator can still issue into.
+
+**It is a recovery for exactly one of the rows below, and not for the others.** The check keys on the
+recorded `worktree`, so it hands back a number recorded to the owner you are asking as. That owner is
+the tree you are standing in — or, with `-For`, the tree you name, which makes
+`alloc.ps1 -Title "<the recorded title>" -For <recorded worktree>` a way to recover a number stranded
+in another live worktree of this clone without spending a new one. It cannot help when the recorded
+title is not the one you would type, and it does nothing for a worktree that is gone: those still
+need the rows in the table.
+
 **Read the state first, then pick the row.** `scripts/coord/alloc_strand_sweep.py` is read-only and
 prints, for every allocation, which worktree can still commit it:
+
+> **That script is NOT in this repository — it left with the ledger tooling (BACKLOG #1250, #1754),
+> along with `tests/test_coord_alloc_strand_sweep.py` cited below.** Run the three commands from the
+> maintainer-internal clone. They are kept here because the recovery table under them is keyed on the
+> sweep's own verdict words, which nothing else prints. The 19-titles measurement above is dated and
+> stands on its own; only the instrument moved.
 
 ```bash
 python scripts/coord/alloc_strand_sweep.py --detail       # every unlanded claim, and where to commit it
@@ -306,7 +332,7 @@ the gate correctly refuses a commit nobody can make from the right place. That i
 claim is born pointing at the wrong tree, which is the third limb #1414 does not name.
 
 ```powershell
-pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind backlog -Title "<title>" -For <builder-worktree>
+pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind adr -Title "<title>" -For <builder-worktree>
 ```
 
 **`-For` is not the `-Reassign` this file declined, and the difference is the whole argument.** A
@@ -322,6 +348,90 @@ had stopped anyone committing. A claim in a **different clone** is invisible too
 clone has its own registry. And `--titles` both under-reports (a re-file whose wording changed does
 not pair) and over-reports (`#240`–`#247` pair because the allocator was simply run twice), so a pair
 is a **disputed number**, not a confirmed strand, until someone reads it.
+
+## Restoring a number the base lost (BACKLOG #1468)
+
+**The gate had two verbs, and a third case fits neither.** **Allocate** mints a fresh number.
+**Recover** hands an existing claim back to the tree entitled to it, which is the section above.
+**Restore** is neither: the number is not free and it is not contested. It was **spent on this exact
+document**, and `origin/main` has since lost the file.
+
+A base can reach that state. Nothing in this gate polices an ADR deletion -- `check_adrs` says so
+outright, because git already prints `D docs/adr/0084-x.md` in the diffstat -- so a revert, a bad merge
+resolution, or a plain delete all remove one.
+
+**The refusal was never the harm. The remedy was.** Re-adding the file landed on the ownership rule,
+which refused it and printed *"allocate a new number"*. Renumbering a document that has already been
+cited is worse than the hole it avoids, and this file states that trade in its own words further down:
+renumbering *"would only make stale citations resolve uniquely and WRONGLY, which is worse than
+resolving ambiguously."* So the gate's printed advice corrupted the ledger it guards -- silently, and
+only for readers downstream, which is the collision's own signature reached from the other direction.
+
+### What the gate accepts, and why it cannot be asserted
+
+A restore passes the ownership rule when the **staged bytes match a blob that same path already
+carried on the base's history**. That is a fact about history. A committer cannot manufacture it
+without writing to the base's history, and content satisfying it is, by construction, content the base
+used to have there.
+
+| shape | why not |
+|---|---|
+| an `alloc.ps1 -Restore <n>` verb | rewrites the claim to name whoever asks -- the `-Reassign` this file declined, under a new name. It also mints a record for a number nobody allocated. |
+| *"the NUMBER was once on the base"* | keys on the number alone, so one past deletion opens `0084-anything.md` forever. A permanent per-number hole that nothing reports. |
+| bytes and path, read from history | what shipped. Unforgeable, and the path anchor keeps the differently-named-file signature outside the door. |
+
+Three properties carry the argument that this opens no hole:
+
+- **It fails closed.** Any git error, any spec naming nothing, any doubt refuses -- which is the status
+  quo. That is the difference from the third alternative the section above records as declined, which
+  *"fails OPEN once per number, so 'missing' would have to be unforgeable"*.
+- **It writes nothing.** No claim is created, and no existing claim's owner is changed. The
+  non-transferable rule is untouched, the same way `-For` leaves it untouched.
+- **It cannot reach a live number.** It is only consulted once the number is absent from the base, and
+  the allocator emits `max + 1` over a ratcheted floor and never fills a hole -- so no sibling can be
+  holding a number the base has already spent.
+
+**It never runs in CI**, and not by choice: its only caller sits inside the `not self.ci` ownership arm
+that CI already skips. A restore still meets the collision rule and the index-row rule in CI, unchanged.
+
+### A negative result is not always an absence
+
+**The local clone is not guaranteed to hold the history either, and an earlier draft of this section
+claimed it was.** Measured on a managed worktree of this repository: `git rev-parse
+--is-shallow-repository` returns **true**, and only **900** commits are reachable from `origin/main`.
+Past a graft boundary `git rev-list` reports no commits and **exits 0** -- byte-identical to *"the base
+never held this number"*.
+
+Answering the second on evidence for neither would steer a genuine restore into `alloc.ps1`, which is
+the number-burn this carve-out exists to stop, reached through its own blind spot. So the walk reports
+**why** it found nothing, and a truncated history refuses with its own text naming `git fetch --deepen`
+rather than denying the restore. The walk is also capped, and hitting the cap reports the same way.
+
+### Restoring with edits takes two commits
+
+The bytes must match **exactly**, so a restore that also amends the document is refused -- with its own
+text, naming this section. Split it:
+
+```powershell
+# Find the last commit that touched the file, then take the file from its parent.
+git log -1 --format=%H origin/main -- docs/adr/0084-x.md
+git checkout <that sha>^ -- docs/adr/0084-x.md
+```
+
+Then **commit it together with its `docs/adr/README.md` row** -- a restore drops the row with the file,
+and the index-row rule fires on a restore exactly as it does on a new ADR, which is how 0077, 0079 and
+0080 went missing in the first place. Edit the document in a **second** commit: an amended file is no
+longer an `ADD`, so this rule does not look at it again.
+
+**Read `<that sha>^` as a hint, not a recipe.** It is first-parent only, so if the commit that dropped
+the ADR was a merge whose first parent already lacked the file, that parent does not carry it either.
+Walk `git log --format=%H origin/main -- <path>` until you find a commit whose tree has the file.
+
+**Measured, and the number bounds how urgent this is:** across the 900 commits of `origin/main` this
+clone can reach, **no ADR file has ever been deleted** -- positive control, the same query shape finds
+181 ADR adds. The checkout is shallow, so that zero is bounded by depth rather than by history. The
+case is **latent here**, and the carve-out is what makes the first one land correctly rather than
+evidence that one has landed.
 
 ## The ref store, and the cleanup of 2026-08-05
 
@@ -452,6 +562,10 @@ are safe.
 - **It does not stop two sessions building the same thing** under two different numbers. Duplicated work
   has no file conflict and no number conflict; nothing here sees it.
 - **Numbers leak.** An abandoned branch's number is never reclaimed. Accepted, deliberately.
+- **A restore must be byte-exact, and only the ADR half has one.** Restoring with edits takes two
+  commits ([below](#restoring-a-number-the-base-lost-backlog-1468)). Backlog numbers are allocated in
+  the maintainer-internal repository and refused here, so nothing in this file reaches the gate that
+  governs one.
 - **It governs ADR and BACKLOG numbers only.** Any other shared sequence (a migration version, say) would
   need its own `-Kind`.
 
@@ -493,13 +607,21 @@ merely quiet.
 vendor forum thread, another project's tracker. They match a naive scan and are not this rule's
 subject.
 
-### Enforcement
+### Enforcement, which moved with the ledger
+
+> **`scripts/docs/dangling_citation_check.py` is NOT in this repository — it left with the ledger
+> tooling (BACKLOG #1250, #1754), along with its test. `tests/test_doc_guards_lane.py` records the
+> drop from the documentation-only guard list in `.github/workflows/ci.yml`. Run it from the
+> maintainer-internal clone.** The paragraph below describes what it does where it now lives.
+> **Nothing here resolves a backlog `#N` citation, because the ledger it would resolve against is not
+> in this repository** ([`BACKLOG.md`](BACKLOG.md)). So the rule above is the whole control on this
+> side, and "fail-closed" is that script's own exit-code default, not a gate standing here.
 
 `scripts/docs/dangling_citation_check.py` reports unresolved citations and keys its exit code on the
 **live shape** — above the floor, and not foreign — rather than on a raw hit count, so the inert cases
 are reported without failing anything. **It is fail-closed by default**, with `--advisory` as the
-explicit escape. Note its stated coverage bound: it sees this repository only, and **not** the private
-companion repository.
+explicit escape. Its stated coverage bound is one repository: a run covers the clone it runs in and no
+other, so the maintainer-internal clone and this repository are never checked by the same run.
 
 **Enforcement does not replace the rule.** A checker can only find what has already been written; the
 rule is what stops it being written.

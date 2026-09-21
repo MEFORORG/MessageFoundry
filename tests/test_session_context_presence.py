@@ -31,9 +31,14 @@ pytestmark = pytest.mark.skipif(
     reason="session-context.ps1 needs pwsh on Windows",
 )
 
-# Printed unconditionally, before any worktree or presence logic runs. Its presence in stdout is the
-# signal that the hook produced real context rather than dying early.
-ALWAYS_PRINTED = "[MessageFoundry] This project prefers Ultracode"
+# The first thing the hook prints once it has real context. This fixture's repo has two worktrees, so
+# the parallel-session block always runs here and its header is the signal that the hook produced
+# context rather than dying early.
+#
+# It was the unconditional Ultracode preference banner until 2026-09-20, when the owner had that
+# preference removed from every session. Nothing is printed unconditionally now, so the marker has to
+# come from a block this fixture guarantees.
+ALWAYS_PRINTED = "[PARALLEL SESSION"
 
 
 def _git(cwd: Path, *args: str) -> None:
@@ -90,7 +95,6 @@ def test_banner_survives_a_missing_presence_script(staged: Path) -> None:
     proc = run_context(staged)
     assert proc.returncode == 0
     assert ALWAYS_PRINTED in proc.stdout
-    assert "PARALLEL SESSION" in proc.stdout
     assert "LIVE sessions" not in proc.stdout  # degraded, not crashed
 
 
@@ -101,7 +105,6 @@ def test_banner_survives_a_presence_script_that_throws(staged: Path) -> None:
     proc = run_context(staged)
     assert proc.returncode == 0
     assert ALWAYS_PRINTED in proc.stdout
-    assert "PARALLEL SESSION" in proc.stdout
     assert "LIVE sessions" not in proc.stdout
 
 

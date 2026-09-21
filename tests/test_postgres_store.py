@@ -715,6 +715,14 @@ async def test_stats_and_metrics(store) -> None:
     assert metrics.destinations[("IB", "OB1")].queue_depth == 1
     db = await store.db_status()
     assert db.messages == 1 and db.journal_mode == "postgres"
+    # BACKLOG #1563: the remote server's disk is not ours to stat, so this is the "unmeasurable"
+    # None and never 0 — 0 is the console's critical-disk alarm, which pinned the engine-health
+    # heart red on every healthy Postgres deployment. The whole server-side fix is this one
+    # literal, and nothing else asserted it at all. This module is gated on MEFOR_TEST_POSTGRES,
+    # so the pin holds on the Postgres leg only — that is the sole place the real backend runs, and
+    # a default run still cannot tell the literal from a 0. Naming the limit rather than implying
+    # this guards every run.
+    assert db.disk_free_bytes is None
     ok, _ = await store.integrity_check()
     assert ok is True
 
@@ -3776,6 +3784,8 @@ async def test_summary_access_census_survives_and_coalesces_pg(store) -> None:
 
 
 async def test_alert_instance_lifecycle_pg(store) -> None:
+    from messagefoundry.store.store import AlertSummary
+
     # first fire opens one `open` instance (count 1, first_seen==last_seen).
     await store.upsert_alert_instance(
         event_type="connection_error", connection="OB_X", severity="critical", now=100.0
@@ -3803,6 +3813,18 @@ async def test_alert_instance_lifecycle_pg(store) -> None:
     assert got.acked_by == "scott" and got.acked_at == 200.0
     assert await store.ack_alert_instance(999999, actor="scott") is False
     assert await store.count_open_alerts_by_connection() == {"OB_Y": 1}
+    # BACKLOG #1564: run the scoped aggregate on a REAL server. The generated severity CASE, the
+    # `AS n`/`AS worst` aliases, the dialect scope bind and the row unpack never execute under the
+    # SQLite suite, so a dialect error in this leg is discoverable nowhere else.
+    assert await store.summarize_active_alert_instances() == AlertSummary(
+        total=2, worst_severity="critical"
+    )
+    assert await store.summarize_active_alert_instances(allowed_channels=["OB_Y"]) == AlertSummary(
+        total=1, worst_severity="critical"
+    )
+    assert await store.summarize_active_alert_instances(allowed_channels=[]) == AlertSummary(
+        total=0, worst_severity=None
+    )
     # an acknowledged re-fire folds in (count++) but does NOT pop back to open.
     await store.upsert_alert_instance(
         event_type="connection_error", connection="OB_X", severity="critical", now=210.0

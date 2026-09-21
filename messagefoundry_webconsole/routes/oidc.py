@@ -194,7 +194,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if not public_origin:
             # The redirect_uri is derived from public_origin, never from the Host header — a
             # client-forwardable Host would let an attacker steer where the IdP sends the code.
-            _log.warning("federated sign-in unavailable: [api].public_origin is not set")
+            _log.warning(
+                "federated sign-in unavailable: [security].web_console_public_address is not set"
+            )
             return RedirectResponse("/ui/login?e=oidc_unavailable", status_code=303)
         try:
             flow_id, authorization_url = await auth.begin_oidc_login(

@@ -824,6 +824,47 @@ try {
     }
 
     Write-RecordAtomic -Path $recPath -Object $rec
+    # ------------------------------------------------------------ the role-card marker
+    # A DECLARATION ALSO WRITES `.claude/seat.local.txt`, BECAUSE NOTHING ELSE DOES AND THE CARD
+    # HOOK READS NOTHING ELSE. This script writes the fleet episode record; `role-card-inject.ps1`
+    # resolves a seat from the marker file and from `$env:KORUS_SEAT`, and never from the record.
+    # Two stores, no bridge: a session that did exactly what the SessionStart prompt told it to do
+    # got a record and no card, and the failure was silent at the next session start.
+    #
+    # Measured 2026-09-19: 165 of 171 worktrees on this box carried no marker at all, and the only
+    # sessions that had one had typed it by hand on the /seat skill's instruction.
+    #
+    # THE CANONICAL LABEL IS WRITTEN, NOT THE TYPED ONE, so `-Seat mgr` leaves a marker that reads
+    # `manager` and resolves in one step next session.
+    #
+    # NOTHING IS WRITTEN WHEN THE LABEL RESOLVES TO NO LIVE SEAT. A retired or unknown label already
+    # gets a loud stderr notice below; leaving a marker the card hook will refuse would move that
+    # failure to the next session start and make it quiet again.
+    #
+    # THE MARKER CANNOT RIDE INTO A COMMIT: `.gitignore` carries `/.claude/*` with one negation, for
+    # `settings.json`. Verified with `git check-ignore -v`. Do not add a second negation.
+    if ($Declare -and $Seat -and $seatRoster.Canonical) {
+        try {
+            $markerPath = Join-Path $wt '.claude/seat.local.txt'
+            $markerDir = Split-Path -Parent $markerPath
+            if (-not (Test-Path -LiteralPath $markerDir)) {
+                New-Item -ItemType Directory -Path $markerDir -Force | Out-Null
+            }
+            Set-Content -LiteralPath $markerPath -Value $seatRoster.Canonical `
+                -Encoding utf8NoBOM -NoNewline -EA Stop
+        }
+        catch {
+            # Rule 2: nothing here may throw out of this script. A declaration that recorded but
+            # could not leave a marker is still a declaration, and saying so beats losing it.
+            Write-WriterError -Stage 'marker' -Message $_.Exception.Message
+            try {
+                [System.Console]::Error.WriteLine(
+                    "seat.ps1: recorded the declaration, but could not write .claude/seat.local.txt " +
+                    "($($_.Exception.Message)). No role card will be injected here until it exists.")
+            }
+            catch { }
+        }
+    }
 
     # Said AFTER the write, so the declaration is safely recorded before anything is said about it.
     # Not gated on -Record/-Prompt: a retired seat arriving through a hook is the same defect as one

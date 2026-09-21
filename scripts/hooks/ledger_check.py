@@ -34,9 +34,15 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 ADR_FILE = re.compile(r"^docs/adr/(\d{4})-[^/]+\.md$")
 INDEX_ROW = re.compile(r"^\|\s*\[(\d{4})\]", re.M)
+
+#: How far back the restore carve-out (BACKLOG #1468) will look for a blob one ADR path once carried.
+#: Bounded because this runs inside a pre-commit hook; see Ledger._history_of_this_number, which
+#: REPORTS hitting this cap rather than reporting "not found".
+RESTORE_HISTORY_DEPTH = 200
 
 # THE BACKLOG HALF OF THIS GATE IS RETIRED (BACKLOG #1250, BACKLOG #1754).
 #
@@ -89,6 +95,59 @@ def _obj_exists(spec: str) -> bool:
         ["git", "cat-file", "-e", spec], capture_output=True
     )
     return probe.returncode == 0
+
+
+def _blob_id(spec: str) -> str | None:
+    """The object id a ``<rev>:<path>`` (or staged ``:<path>``) spec names, or None if it names nothing.
+
+    Separate from :func:`git` for the same reason :func:`_obj_exists` is: a spec that names nothing is
+    an ANSWER here, not a failure, and :func:`git` raises on every non-zero exit deliberately. The
+    caller (BACKLOG #1468) compares two of these for equality, so returning None on a miss is what
+    keeps a miss from ever comparing equal to another miss.
+    """
+    probe = subprocess.run(  # nosec B603 B607 - fixed argv, no shell
+        ["git", "rev-parse", "--verify", "--quiet", spec],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if probe.returncode != 0:
+        return None
+    return (probe.stdout or "").strip() or None
+
+
+class _RestoreEvidence(NamedTuple):
+    """What one bounded history walk established about an ADR number (BACKLOG #1468).
+
+    Three states, not two, because "the base never held this number" and "I could not see far enough
+    to tell" are different answers that the same empty result set produces.
+    """
+
+    #: The staged bytes match a blob this exact path already carried. The pass condition.
+    restores_lost_bytes: bool
+    #: Some file existed at this number within the walk. Words the refusal; never grants one.
+    number_is_historical: bool
+    #: The walk hit a shallow graft or its own cap, so a negative above is NOT evidence of absence.
+    truncated: bool
+
+
+def _clone_is_shallow() -> bool:
+    """Is this clone grafted? A negative history result means something different when it is.
+
+    Measured on a managed worktree of this repository: `--is-shallow-repository` returns true and only
+    900 commits are reachable from origin/main, so an ADR deleted before the graft is invisible to any
+    walk. Probed rather than assumed, and any failure reads as "shallow" -- the direction that makes
+    the caller word its refusal more cautiously rather than less.
+    """
+    probe = subprocess.run(  # nosec B603 B607 - fixed argv, no shell
+        ["git", "rev-parse", "--is-shallow-repository"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    return probe.returncode != 0 or (probe.stdout or "").strip() != "false"
 
 
 def _safe_for_message(value: object, limit: int = 400) -> str:
@@ -234,6 +293,54 @@ class Ledger:
         """Does ``path`` already exist on a commit this merge is bringing in?"""
         return any(_obj_exists(f"{parent}:{path}") for parent in self._merge_parents())
 
+    # -- restoring a number the base LOST ------------------------------------------------------------
+    #
+    # THE GATE HAD TWO VERBS AND A THIRD CASE FITS NEITHER (BACKLOG #1468). Allocate mints a fresh
+    # number; recover hands an existing claim back to the tree entitled to it. A RESTORE is neither:
+    # the number was SPENT on this exact document and the base has since lost the file.
+    #
+    # ***THE REASONING LIVES IN docs/LEDGER-GATE.md, "Restoring a number the base lost", AND IS NOT
+    # REPEATED HERE.*** Why the predicate reads history rather than trusting the committer, which two
+    # shapes were rejected for doing the opposite, and why this opens no hole are stated there once.
+    # An earlier draft of this block restated all of it, and the two copies had already contradicted
+    # each other on the shallow-clone question by the time anyone read them -- which is the failure
+    # CLAUDE.md section 11 (SDS-3.5) names, arriving as a defect rather than as a principle.
+    #
+    # WHAT BELONGS HERE IS WHAT A READER OF THIS CODE CANNOT SEE FROM THE DOC:
+    #
+    #   it fails closed        every uncertain answer is False, and False is the status quo refusal.
+    #   it never runs in CI    its only caller sits inside the `not self.ci` ownership arm.
+    #   it costs nothing on    the caller is the last conjunct of a chain that has already decided to
+    #     a passing commit     refuse, and ONE walk answers both questions the refusal needs.
+    #   a negative is not      a shallow clone and a saturated cap both report no commits and exit 0,
+    #     always an absence    so the walk returns WHY it found nothing. See _RestoreEvidence.
+    def _history_of_this_number(self, path: str, number: str) -> _RestoreEvidence:
+        """What the base's history says about this ADR number, in one bounded walk.
+
+        Bounded on purpose: an ADR file is touched a handful of times, and an unbounded walk would put
+        a per-commit cost inside a pre-commit hook. The bound is REPORTED rather than assumed away --
+        see :class:`_RestoreEvidence`, whose ``exhausted`` flag is what stops the refusal text claiming
+        the base never held bytes it simply did not walk far enough to see.
+        """
+        try:
+            commits = git(
+                "rev-list",
+                f"--max-count={RESTORE_HISTORY_DEPTH}",
+                self.base,
+                "--",
+                f"docs/adr/{number}-*.md",
+            ).split()
+        except OSError:  # pragma: no cover - defensive; an unreadable base is never a restore
+            return _RestoreEvidence(False, False, False)
+        staged = _blob_id(f":{path}")
+        restores = staged is not None and any(
+            _blob_id(f"{commit}:{path}") == staged for commit in commits
+        )
+        # "I found nothing" and "I could not look" must not share an answer. A shallow clone is the
+        # measured case; a walk that hit its own cap is the other.
+        truncated = (not commits and _clone_is_shallow()) or len(commits) >= RESTORE_HISTORY_DEPTH
+        return _RestoreEvidence(restores, bool(commits), truncated)
+
     # -- ownership -----------------------------------------------------------------------------------
     def owns(self, kind: str, number: str) -> bool:
         """Was this number allocated to THIS worktree by scripts/coord/alloc.ps1?
@@ -349,6 +456,56 @@ class Ledger:
         ]
         return "\n      ".join(lines)
 
+    def _ownership_refusal(self, number: str, seen: _RestoreEvidence) -> tuple[str, str, str]:
+        """Word an ownership refusal against what history actually showed (BACKLOG #1468).
+
+        ***THE REMEDY NEVER BUILDS A SHELL COMMAND OUT OF A REPO-CONTROLLED VALUE, AND AN EARLIER
+        DRAFT OF THIS DID.*** It printed ``git checkout $(git rev-list -1 <base> -- <path>)^ -- <path>``
+        with the staged path interpolated. ``ADR_FILE`` admits ``[^/]+`` before ``.md``, so a file named
+        ``0002-x$(id).md`` put a live command substitution inside a block this gate tells an agent to
+        run -- and :func:`_safe_for_message` does not defend against that. It folds control characters
+        so a value cannot forge a SECOND remedy block (BACKLOG #1040); it does not quote, so ``$( )``,
+        backticks and ``;`` pass straight through. Folding is not escaping, and a command is not prose.
+        The exact commands live in docs/LEDGER-GATE.md, where nothing is interpolated at all.
+
+        ***IT ALWAYS APPENDS :meth:`ownership_remedy`, INCLUDING ON THE RESTORE WORDING.*** A claim
+        record can outlive the commit that landed the number and still name a LIVE worktree, so
+        "nobody can be holding a number the base already spent" is true of the ALLOCATOR and false of
+        the registry. Dropping the recover-first advice on this branch would have re-introduced the
+        BACKLOG #1414 number-burn through the door opened to close it.
+        """
+        where = self.alloc / "adr" / (number + ".json")
+        remedy = self.ownership_remedy("adr", number)
+        if seen.truncated:
+            return (
+                f"ADR {number} cannot be checked against {self.base} -- the history is TRUNCATED",
+                f"This clone cannot see far enough back to tell whether {self.base} ever carried this "
+                "number, so a genuine restore and an invented number look identical here. Refusing, "
+                "because guessing in the other direction hands out a number that is already spent.",
+                "deepen the clone, then retry:\n"
+                "          git fetch --deepen=1000 origin\n"
+                "      If this is NOT a restore, the number simply needs allocating:\n"
+                f"      {remedy}",
+            )
+        if seen.number_is_historical:
+            return (
+                f"ADR {number} is a RESTORE, but not of the bytes {self.base} lost",
+                f"{self.base} once carried an ADR at this number and no longer does. The staged file "
+                "matches no blob its own path held, and the gate cannot tell a restore from a reuse by "
+                "the number alone.",
+                "restore the file EXACTLY first -- same path, same bytes -- with its index row, then\n"
+                "      amend it in a SECOND commit; an amended file is no longer an ADD, so this rule\n"
+                "      does not look at it again. The commands are in docs/LEDGER-GATE.md,\n"
+                "      'Restoring a number the base lost'.\n"
+                f"      If a claim record still names a live tree, prefer that route:\n      {remedy}",
+            )
+        return (
+            f"ADR {number} was not allocated to this worktree",
+            f"Nothing in {where} names {self.repo}. A sibling session may be holding this number "
+            "right now.",
+            remedy,
+        )
+
     # -- rules ---------------------------------------------------------------------------------------
     def check_adrs(self) -> None:
         """ADR rules -- now the only rules this gate has. See the retirement note at the top.
@@ -402,12 +559,18 @@ class Ledger:
                 and not self.owns("adr", number)
                 and not self._carried_by_a_merge_parent(path)
             ):
-                self.fail(
-                    f"ADR {number} was not allocated to this worktree",
-                    f"Nothing in {self.alloc / 'adr' / (number + '.json')} names {self.repo}. A sibling "
-                    "session may be holding this number right now.",
-                    self.ownership_remedy("adr", number),
-                )
+                # LAST, AND THE ORDER IS THE COST CONTROL. Everything above is cheap or memoized; the
+                # history walk is not. Reaching it means the commit was already headed for a refusal,
+                # so the walk is never paid on a passing commit (BACKLOG #1468).
+                #
+                # ***IT MUST NOT `continue`, AND WRITING IT THAT WAY ONCE IS WHY THIS SAYS SO.*** The
+                # index-row rule below is the second half of THIS iteration, and a restore needs its
+                # row back exactly as much as a new ADR does -- that row is how 0077, 0079 and 0080
+                # went missing. Skipping the loop body on a granted restore would have shipped the
+                # dropped-row defect through the restore door.
+                seen = self._history_of_this_number(path, number)
+                if not seen.restores_lost_bytes:
+                    self.fail(*self._ownership_refusal(number, seen))
 
             # Only ADDED files are checked for an index row: three legacy ADRs (0077/0079/0080) shipped
             # without one, and failing every unrelated commit over old debt is how a gate gets uninstalled.

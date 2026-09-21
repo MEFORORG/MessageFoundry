@@ -341,8 +341,9 @@ async def test_idempotent_reopen_is_stable(store: Any) -> None:
 
 
 async def test_partial_migration_converges_and_stays_correct(tmp_path: Path) -> None:
-    """SQLite auto-commits DDL (legacy isolation), so a crash mid-migration can leave a PARTIAL index
-    state (some old dropped, some new created). B10 does NOT rely on atomicity here — the FIFO index is
+    """A PARTIAL index state (some old dropped, some new created) must stay safe. The swap has run
+    inside open's migration transaction since BACKLOG #1586, but a store written before that, or edited
+    by hand, can still hold one. B10 does NOT rely on atomicity here — the FIFO index is
     correctness-neutral and the migration is idempotent — so ANY partial state (a) still claims in strict
     seq order and (b) converges to the seq-trailing pair on the next open. Construct a representative
     mid-crash partial state (old-in dropped + new-in created, but old-out still present + new-out missing)

@@ -14,6 +14,28 @@ build-backend = "hatchling.build"
 [tool.hatch.version]
 path = "messagefoundry/__init__.py"
 
+[tool.hatch.build]
+# THE SDIST ALLOWLIST BELOW NAMES `CLAUDE.md` AND DID NOT KEEP IT OUT (BACKLOG #1702). It keeps out the
+# ROOT CLAUDE.md; `messagefoundry/CLAUDE.md` is the NESTED one and it sits INSIDE the allowlisted
+# package tree, so the allowlist and release.yml's `^messagefoundry/` leak grep both pass it. Measured
+# on be51821227170b583bc26885ab1a86d80ee0e9c0: the wheel carried it among 305 members and the sdist
+# among 306; with this exclusion, 304 and 305, each losing that file and nothing else. "Package-only"
+# and "no maintainer process text" are two different properties and only the first was being checked.
+#
+# The pattern must stay SLASHLESS. hatchling matches `exclude` with gitignore semantics, so `CLAUDE.md`
+# matches at any depth while `/CLAUDE.md` is anchored at the project root -- measured, the anchored
+# spelling leaves the nested file in the wheel while looking entirely correct.
+#
+# Global rather than per-target, so it covers the wheel (which walks the package tree) and the sdist
+# (whose `only-include` still runs each file through the same `include_path` filter). DO NOT give a
+# target its own `exclude` without repeating this pattern in it: hatchling REPLACES this list rather
+# than merging, so a per-target list silently drops the exclusion. Pinned by
+# tests/test_packaging.py::test_the_engine_excludes_its_nested_instructions_from_every_build_target.
+#
+# This is the whole fix for the ENGINE. The HARNESS wheel needed a different one, for a reason recorded
+# above its own wheel target in packaging/messagefoundry-harness/pyproject.toml.
+exclude = ["CLAUDE.md"]
+
 # sdist file selection — an ALLOWLIST, not hatchling's default whole-repo VCS sweep. WITHOUT this,
 # `python -m build` packs every git-tracked file (docs/, tests/, scripts/, CLAUDE.md, .claude/ …) into the
 # sdist, and release.yml uploads that sdist to PUBLIC PyPI — which shipped the private security-posture
