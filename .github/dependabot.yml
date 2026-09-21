@@ -168,3 +168,32 @@ updates:
       ide-security:
         applies-to: security-updates
         patterns: ["*"]
+
+  # NO ENTRY for `/.github/actions/cla-assistant-lite`, and the absence is a DECISION rather than an
+  # oversight (BACKLOG #1578). That directory vendors the archived `contributor-assistant/github-action`
+  # as a compiled ncc/webpack bundle, and the upstream lockfile it was built from is committed beside
+  # it as `upstream-package-lock.json` so an auditor can scan the declared closure.
+  #
+  # Dependabot's job in this file is REMEDIATION -- it opens the PR that moves the pin. Here there is
+  # no pin to move: changing a dependency version means REBUILDING the bundle, which needs a Node
+  # toolchain this repository does not carry, and re-vendoring from an archived upstream that will
+  # never publish the fix. An entry would open bump PRs against a lockfile with no build behind it,
+  # and an unmergeable weekly PR is worse than none -- it trains a reviewer to close Dependabot PRs
+  # unread, which is the one habit this whole file depends on not forming.
+  #
+  # THE FILENAME IS PART OF THE SAME DECISION. GitHub's dependency graph ingests `package-lock.json`
+  # anywhere in the repository, independently of this file, so the stock name would raise the same
+  # unactionable alerts through a door `dependabot.yml` does not control. The `upstream-` prefix keeps
+  # the lockfile readable by a tool an auditor POINTS at it and invisible to one that SCANS for
+  # manifests.
+  #
+  # WHAT THAT COSTS, STATED PLAINLY BECAUSE AN EARLIER DRAFT HERE DID NOT. It read "Detection is not
+  # waived, it is relocated", naming docs/SUPPLY-CHAIN.md's audit commands and
+  # `tests/test_cla_action_provenance.py`. That was false, and falsely reassuring. No workflow runs
+  # osv-scanner; trivy runs only against the container image (which does not copy `.github/`) and the
+  # Dockerfile. And the test is a CHANGE detector -- it fails when the bundle moves without its
+  # record, and has no view of advisories at all. So VULNERABILITY detection over this closure is
+  # MANUAL AND UNSCHEDULED: somebody runs the command in the README or nobody does. A compensating
+  # control resting on a false premise is the defect CLAUDE.md section 11 (SDS-3.7) forbids, so the
+  # gap is recorded rather than papered over. Bounded by where the bundle runs: CI only, never
+  # shipped in a wheel, sdist or deployment.

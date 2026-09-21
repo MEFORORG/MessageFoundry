@@ -467,7 +467,7 @@ def test_allowed_smtp_deny_by_default_refuses_empty() -> None:
     # deny-by-default: an EMAIL destination with no allowed_smtp list is refused (fail-closed), exactly
     # like every other egress type.
     e = EgressSettings(deny_by_default=True)
-    with pytest.raises(Exception, match="deny_by_default"):
+    with pytest.raises(Exception, match="block_unlisted_outbound"):
         check_egress_allowed(_email_dest("smtp.partner.org"), e)
 
 

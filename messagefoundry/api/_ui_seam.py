@@ -151,6 +151,16 @@ from typing import Any
 #: ``factor_binding_is_blocked`` entry above, and it forces a bump for the same reason. Unnumbered:
 #: the ``vN`` labels are retired as identifiers (#1220 above); the digest is the identifier.
 #:
+#: BACKLOG #1564: ``AlertInstanceList`` gained a REQUIRED ``total: int`` and ``worst_severity: str |
+#: None`` -- the store-computed aggregate over every active instance in the caller's scope -- and
+#: ``routes/status.py``'s nav-status poll reads BOTH unconditionally to colour the alert bell. NOT
+#: additive with a default, for the reason the ``UploadedFileList.scope`` entry above gives: a console
+#: carrying that render against an engine without the fields would pass the handshake and then
+#: AttributeError. A default would be worse than the skew here, because ``total=0`` renders a
+#: confident "no alerts" -- the silent-wrong class this item exists to remove. NO ``CoreHandlers``
+#: field was added: the aggregate rides the existing ``list_active_alerts``, so this bump is a DTO
+#: field-set change only. Unnumbered: the ``vN`` labels are retired as identifiers (#1220 above).
+#:
 #: ADR 0090 / BACKLOG #1500: ``CoreHandlers`` gained ``resend_message`` — the resend-to-an-alternate-
 #: outbound handler the /ui message-detail affordance calls, closing ADR 0090's residual (a). A NEW
 #: REQUIRED field on a frozen slotted dataclass with no default, so a console carrying that render
@@ -163,7 +173,7 @@ from typing import Any
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "0cd51dcdb86fc483"
+ENGINE_UI_SEAM: str = "75c4117d21fd0b98"
 
 
 @dataclass(frozen=True, slots=True)
