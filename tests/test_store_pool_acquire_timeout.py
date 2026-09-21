@@ -361,9 +361,11 @@ def test_postgres_borrows_outside_the_bounded_helper_are_pinned() -> None:
     a new bypass landed and the note is now too generous."""
     store_sites = _unbounded_borrow_sites("messagefoundry/store/postgres.py")
     cluster_sites = _unbounded_borrow_sites("messagefoundry/pipeline/cluster.py")
-    assert (len(store_sites), len(cluster_sites)) == (38, 10), (
-        "the measured population of pool borrows OUTSIDE the bounded helper moved from 38 (store)"
-        " + 10 (cluster), measured 2026-08-10. Re-read the CONNECTIONS.md scope note before changing"
+    # 38 on 2026-08-10; 37 on 2026-09-18, when the connection-event writer moved inside the helper
+    # (BACKLOG #1731). The CONNECTIONS.md note says "at least", so that drop left it true as written.
+    assert (len(store_sites), len(cluster_sites)) == (37, 10), (
+        "the measured population of pool borrows OUTSIDE the bounded helper moved from 37 (store)"
+        " + 10 (cluster), measured 2026-09-18. Re-read the CONNECTIONS.md scope note before changing"
         " this number. Sites scanned:\n" + "\n".join(store_sites + cluster_sites)
     )
 
