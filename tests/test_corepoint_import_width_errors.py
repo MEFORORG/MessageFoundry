@@ -196,6 +196,29 @@ _UNCOMPILABLE = {
 }
 
 
+def _compiler_refuses(source: str) -> bool:
+    """Does THIS CPython build actually refuse this source?
+
+    Only the recursion arm needs asking, and its limit is not a knob this test can turn. Measured
+    2026-09-21 on CPython 3.14.6 (Windows): a 20,000-term chain raises and a 5,000-term chain does
+    not, and that boundary moves for NEITHER ``sys.setrecursionlimit(100)`` NOR a 256 KB thread
+    stack -- so it is a compiled-in C recursion limit, not the interpreter's counter and not a stack
+    this process can size. A build whose limit clears the chain (the reported case is the Linux
+    default 8 MB stack) compiles it cleanly, and the arm would then assert a refusal that never
+    happened.
+
+    Probing keeps the arm a REAL compiler refusal wherever the build produces one, which is the
+    property ``_UNCOMPILABLE`` exists to have. The alternatives were worse: monkeypatching
+    ``compile`` downgrades every platform to a double, and deleting the arm drops coverage that
+    works here. Where the build does not refuse, there is no conversion to test -- the arm is
+    vacuous, not failing."""
+    try:
+        compile(source, "<probe>", "exec")
+    except BaseException:  # noqa: BLE001 - any refusal counts; which class is the test's subject
+        return True
+    return False
+
+
 @pytest.mark.parametrize("case", sorted(_UNCOMPILABLE))
 def test_every_uncompilable_source_class_is_refused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
@@ -206,6 +229,10 @@ def test_every_uncompilable_source_class_is_refused(
     than simulate it. The surrogate arm is the one that caught a real gap: ``UnicodeEncodeError`` is
     a ``ValueError``, so a tuple naming only the three obvious classes let it escape."""
     source, expected = _UNCOMPILABLE[case]
+    if not _compiler_refuses(source):
+        pytest.skip(
+            f"this CPython build compiles the {case!r} source, so there is no refusal to convert"
+        )
 
     def broken(channel: Channel) -> str:
         return source

@@ -1288,9 +1288,21 @@ def _split_branches(steps: list[Step]) -> tuple[tuple[Step, ...], tuple[Control,
 # The accept-and-drop this used to describe is FIXED: ``import_corepoint`` now compiles every generated
 # module before writing it (:func:`_verify_compilable`), so crossing the wall is a reported
 # ``CorepointImportError`` and a non-zero exit instead of a bad file written under a success report.
-# What is still open is whether the importer should BOUND branch width at all: a limit low enough to
-# stay clear of the wall would refuse a legitimate long ``ElseIf`` chain, so that needs a width-limit
-# decision, not a default.
+# WHETHER TO BOUND BRANCH WIDTH WAS THE OPEN QUESTION, AND IT IS ANSWERED: DO NOT. The fear was that
+# a limit low enough to stay clear of the wall would refuse a legitimate long ``ElseIf`` chain. That
+# is a claim about how wide a REAL export gets, which nobody had measured -- the wall was quoted
+# precisely while the number that actually decides the question was assumed. Measured 2026-09-21
+# against a real production Corepoint export (4.3 MB, roughly 500x the test fixture), walked with
+# this module's own ``parse_package``: 206 branching constructs, WIDEST SIBLING CHAIN 5, median 2,
+# the ten widest all between 3 and 5. Against a wall near 5,950 that is about three orders of
+# magnitude of headroom, so a width bound would protect nothing and is not worth its risk.
+#
+# n=1: one export from one site, and it is the only real one that was available. The conclusion
+# survives a site two orders of magnitude wider, but do not read 5 as a surveyed maximum -- it is one
+# measurement, and a second export is what would upgrade it.
+#
+# The guard that DOES matter is the post-condition above, which is not a limit at all: it refuses
+# nothing legitimate and fires only on source this module could not itself parse.
 _MAX_NESTING = 100
 
 
