@@ -1300,11 +1300,24 @@ class _SummaryAuditCoalescer:
             await self._emit(store, a, sc, win_hour, win_count, win_masked)
 
     async def flush(self, store: Store) -> None:
-        """Emit every pending window (e.g. on engine shutdown) so an active window isn't lost."""
+        """Emit every pending window (e.g. on engine shutdown) so an active window isn't lost.
+
+        Every window is attempted even when one write fails, and the failures are raised together
+        afterwards. The dict is cleared first, so stopping at the first error would drop every window
+        after it with no trace (BACKLOG #1640)."""
         windows = list(self._windows.items())
         self._windows.clear()
+        errors: list[Exception] = []
         for (a, sc), win in windows:
-            await self._emit(store, a, sc, win["hour"], win["count"], win.get("masked", 0))
+            try:
+                await self._emit(store, a, sc, win["hour"], win["count"], win.get("masked", 0))
+            except Exception as exc:  # re-raised below, grouped; the caller decides what to do
+                errors.append(exc)
+        if errors:
+            raise ExceptionGroup(
+                f"{len(errors)} of {len(windows)} summary-access windows could not be written",
+                errors,
+            )
 
     @staticmethod
     async def _emit(
@@ -7093,16 +7106,15 @@ def create_managed_app(
             # BEFORE engine.stop(), because that ends in store.close() and the emit needs the store.
             # Guarded like the reaper above: a store error here must not skip engine.stop(), or the
             # non-daemon aiosqlite worker keeps the process alive and a lost audit row becomes a hung
-            # service. getattr because an app built without create_app's state has no auditor.
-            summary_auditor = getattr(app.state, "summary_auditor", None)
-            if summary_auditor is not None:
-                try:
-                    await summary_auditor.flush(store)
-                except Exception:
-                    _log.exception(
-                        "summary-access coalescer: the shutdown flush failed, so the open "
-                        "window's audit row is lost; continuing the teardown"
-                    )
+            # service. Read directly, not through getattr: create_app always sets the auditor, so a
+            # rename should fail loudly inside this guard rather than silently skip the flush.
+            try:
+                await app.state.summary_auditor.flush(store)
+            except Exception:
+                _log.exception(
+                    "summary-access coalescer: the shutdown flush failed, so at least one open "
+                    "window's audit row is lost; continuing the teardown"
+                )
             await engine.stop()
             # B11: shut down the harness-only instrumented executor (None in production / other tests).
             # The engine is stopped (no more to_thread work), so a non-blocking shutdown is clean.
