@@ -25,6 +25,7 @@ permanent holes in a shared registry.
 
 from __future__ import annotations
 
+import ctypes
 import os
 import re
 import shutil
@@ -335,6 +336,14 @@ def test_the_adr_sweep_is_invariant_under_the_console_code_page(
     first version of this case passed under cp932 with the defect fully present -- it was measured
     doing exactly that. So 0100's body is varied until its blob id ENDS in a lead byte (0x81-0xFE),
     which puts the hazard next to 0999's entry by construction rather than by luck.
+
+    **CHCP GETS A CONSOLE OF ITS OWN, AND THE CASE CHECKS BOTH HALVES OF THAT.** ``chcp`` sets the
+    page of the whole CONSOLE, not of one process. Run in pytest's own console, it switched every
+    xdist worker sharing that console to cp932 and never switched it back. A pwsh launched by another
+    test then wrote an ellipsis as ``0x81 0x63``, cp1252 cannot decode 0x81, and ``subprocess``'s
+    stderr reader died -- so ``test_worktree_selfheal_wiring.py`` got ``stderr=None`` and a
+    TypeError. The chcp report is checked too: without it, a chcp that changed nothing would pass
+    here under every page.
     """
     repo = _checkout(tmp_path / f"cp{codepage}", {"0100-primer.md": "# Primer\n"})
 
@@ -347,25 +356,53 @@ def test_the_adr_sweep_is_invariant_under_the_console_code_page(
     assert int(oid[-2:], 16) >= 0x81, f"fixture blob id {oid} does not end in a DBCS lead byte"
 
     script = repo / "scripts" / "coord" / "alloc.ps1"
+    kernel32 = ctypes.windll.kernel32
+    shared = (kernel32.GetConsoleOutputCP(), kernel32.GetConsoleCP())
     # shell=True, NOT ["cmd", "/c", ...]. The list form makes Python quote the whole command as one
     # argument and cmd.exe then hands pwsh the quotes as part of the filename -- measured, it fails
     # identically under EVERY code page, which would have read as "the sweep is broken everywhere"
     # rather than as a quoting bug in the test.
     proc = subprocess.run(
-        f'chcp {codepage} >nul && pwsh -NoProfile -NonInteractive -File "{script}" '
-        "-ShowFloor -Kind adr",
+        f'chcp {codepage} && pwsh -NoProfile -NonInteractive -File "{script}" -ShowFloor -Kind adr',
         shell=True,
         cwd=str(repo),
         capture_output=True,
         text=True,
+        # A new console with no window, so chcp reaches only cmd and the pwsh it starts. Measured:
+        # pwsh under this flag reports the page chcp set.
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    after = (kernel32.GetConsoleOutputCP(), kernel32.GetConsoleCP())
+    # Blame chcp only for a move TO its own page. A sibling worker can move this console too -- at
+    # least three repo scripts set it to 65001 -- and plain equality would red here for that.
+    leaked = after[0] == codepage and shared[0] != codepage
+    if leaked:
+        # Put the page back before failing, so a regression reds THIS case rather than crashing
+        # whichever test launches pwsh next.
+        kernel32.SetConsoleOutputCP(shared[0])
+        kernel32.SetConsoleCP(shared[1])
+    assert not leaked, (
+        f"chcp {codepage} changed the console this pytest process shares with its xdist siblings, "
+        f"from (output, input) {shared} to {after}. Any pwsh they launch now writes in that page."
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
+    # chcp prints "Active code page: N" -- in the UI language, so match the number, not the words.
+    chcp_line = proc.stdout.partition("\n")[0]
+    assert re.match(rf"\D*{codepage}\b", chcp_line), (
+        f"chcp did not report switching to {codepage}, so this case is not measuring a "
+        f"{codepage} console:\n{proc.stdout}\n{proc.stderr}"
+    )
     match = re.search(r"^floor\s*:\s*(\d+)$", proc.stdout, re.MULTILINE)
     assert match, f"no floor line under code page {codepage}:\n{proc.stdout}\n{proc.stderr}"
     assert int(match.group(1)) == 999, (
         f"code page {codepage} changed the ADR floor to {match.group(1)}. The sweep is reading "
         "bytes the console decoder can damage; it must read text git has already decoded."
     )
+    if shared == (0, 0):
+        pytest.skip(
+            f"the sweep held under code page {codepage}, but this process has no console, so the "
+            "check that chcp left the shared console alone had nothing to measure"
+        )
 
 
 def test_an_adr_kept_as_a_directory_still_holds_its_number(tmp_path: Path) -> None:
