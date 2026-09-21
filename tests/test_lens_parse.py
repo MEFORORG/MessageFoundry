@@ -468,8 +468,8 @@ def test_module_with_no_handlers_returns_empty() -> None:
 def test_generated_handler_round_trips_through_lens(tmp_path: Path) -> None:
     """A ``messagefoundry import corepoint`` module round-trips through the lens with no whole-file
     refusal: every mapped vocabulary call classifies into an ``action``/``lookup`` row, the return into
-    a ``send`` row, and an unmapped-action TODO stub degrades in place to a ``code`` row (ADR 0086 AC-4;
-    the correctness gate that closes the import ↔ lens loop)."""
+    a ``send`` row, and an unmapped-action TODO marker degrades in place to a ``code`` row (ADR 0086
+    AC-4; the correctness gate that closes the import ↔ lens loop)."""
     from messagefoundry.corepoint_import import import_corepoint
 
     fixture = REPO_ROOT / "tests" / "fixtures" / "corepoint" / "acme_adt.json"
@@ -496,7 +496,7 @@ def test_generated_handler_round_trips_through_lens(tmp_path: Path) -> None:
         "delete_segment",
     }
     assert [r["call"] for r in rows if r["kind"] == "lookup"] == ["code_lookup"]
-    # The unmapped ItemCustomScript TODO + stub is exactly one in-place code row, never a refusal.
+    # The unmapped ItemCustomScript TODO marker is exactly one in-place code row, never a refusal.
     assert kinds.count("code") == 1
     # The handler still ends in a recognized send row.
     sends = [r for r in rows if r["kind"] == "send"]

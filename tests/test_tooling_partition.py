@@ -109,6 +109,13 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         "test_escape_sequence_check.py",
         "test_external_link_interstitial.py",
         "test_licence_header_gate.py",
+        # Scans the TRACKED messagefoundry/ and harness/ trees for files the release member gate
+        # would refuse, so an engine commit adding one is exactly the diff it has to catch
+        # (BACKLOG #1840). Listed as tooling it would be deselected on the engine legs AND unreached
+        # by the tooling path gate, which is the silent-coverage-loss case this list exists for.
+        # It loads scripts/release/forbidden_members.py by path; that is the RULE it reads, not its
+        # subject.
+        "test_packaged_tree_denylist.py",
         "test_packaging.py",
         "test_release_pipeline.py",
         # Parses messagefoundry/store/{store.py,postgres.py,sqlserver.py} off disk without importing

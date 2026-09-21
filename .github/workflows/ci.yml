@@ -1605,6 +1605,7 @@ jobs:
       # `-m 'not tooling'` and the `tooling` job below runs it, path-gated. Membership is
       # tests/tooling_manifest.txt, NOT a filename pattern — see that file for why.
       tooling: ${{ steps.f.outputs.tooling }}
+      packaging: ${{ steps.f.outputs.packaging }}
       # `matrix`: the `test` job's include list, per-repo — full ubuntu+windows matrix HERE (this repo is
       # public, so hosted runners are free; the self-hosted Windows runners are retired), ubuntu-only on
       # a fork. Consumed as `matrix: ${{ fromJSON(needs.changes.outputs.matrix) }}` in `test`.
@@ -1745,6 +1746,7 @@ jobs:
             echo "code=true" >> "$GITHUB_OUTPUT"
             echo "ide=true" >> "$GITHUB_OUTPUT"
             echo "tooling=true" >> "$GITHUB_OUTPUT"
+            echo "packaging=true" >> "$GITHUB_OUTPUT"
             echo "tooling_matrix=$TOOLING_FULL" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -1766,6 +1768,12 @@ jobs:
             # construction. Push-to-main is where that gets caught. Set this false and the tier is
             # effectively unguarded against everything except its own edits.
             echo "tooling=true" >> "$GITHUB_OUTPUT"
+            # TRUE on push for the SAME reason as tooling above, and it is the more important
+            # half of this gate. The PR arm below fires only when packaging CONFIG changed, so a
+            # commit that merely ADDS a file to a packaged tree -- which is what shipped
+            # CLAUDE.md fifteen times -- does not trip it on its own pull request. Push-to-main
+            # is where a real build sees that.
+            echo "packaging=true" >> "$GITHUB_OUTPUT"
             echo "tooling_matrix=$TOOLING_FULL" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -1777,6 +1785,7 @@ jobs:
             echo "code=false" >> "$GITHUB_OUTPUT"
             echo "ide=false" >> "$GITHUB_OUTPUT"
             echo "tooling=false" >> "$GITHUB_OUTPUT"
+            echo "packaging=false" >> "$GITHUB_OUTPUT"
             # Emitted even though the job is off on this arm: fromJSON on an unset output fails the
             # whole job rather than falling back, so no arm may leave it blank.
             echo "tooling_matrix=$TOOLING_DOCS" >> "$GITHUB_OUTPUT"
@@ -1868,6 +1877,23 @@ jobs:
             echo "docker=true" >> "$GITHUB_OUTPUT"
           else
             echo "docker=false" >> "$GITHUB_OUTPUT"
+          fi
+          # The packaging BUILD smoke (BACKLOG #1840). Nothing outside release.yml builds a
+          # distribution, and release.yml fires only on a tag -- so every packaging guard in the
+          # suite MODELS hatchling from config and the git index rather than measuring an
+          # artifact. That is how `messagefoundry/CLAUDE.md` reached PyPI on fifteen releases
+          # with those guards green.
+          #
+          # Gated on the config that decides what a build SHIPS, plus the gate script itself.
+          # NOT on the packaged trees (`messagefoundry/**`, `harness/**`): that is most pull
+          # requests, and a build on each is not worth it when push-to-main already forces this
+          # job. The tracked-tree half of the same question is free and DOES run on every PR --
+          # tests/test_packaged_tree_denylist.py -- so a file ADDED to a packaged tree is caught
+          # there without a build.
+          if echo "$changed" | grep -qE '^(pyproject\.toml|packaging/|scripts/release/|\.github/workflows/(ci|release)\.yml)'; then
+            echo "packaging=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "packaging=false" >> "$GITHUB_OUTPUT"
           fi
           # The ide job (VS Code extension build+test) only depends on ide/** (its own npm project)
           # and this workflow; a pure-Python PR can't change its result, so don't run it there.
@@ -3317,6 +3343,106 @@ jobs:
         if: always()
         run: docker rm -f mefor || true
 
+  packaging-build:
+    # BUILD every distribution this repo publishes, then run the release gates over the REAL
+    # artifacts (BACKLOG #1840).
+    #
+    # WHY THIS JOB EXISTS. Until it landed, `release.yml` was the only workflow that ran a build, and
+    # it fires only on a tag. So every packaging guard in the suite MODELS hatchling -- it reads
+    # pyproject.toml and `git ls-files` and reasons about what a build WOULD ship. A model is not a
+    # measurement, and this one was wrong in production: `messagefoundry/CLAUDE.md` reached PyPI on
+    # releases 0.1.0 through 0.2.15 with those guards green the whole time, because the thing they
+    # modelled and the thing hatchling did had diverged and nothing compared them.
+    #
+    # It also covers the one residual the tracked-tree scan states it cannot see: `force-include`
+    # walks the FILESYSTEM and consults no .gitignore, so an untracked file inside a whole-mapped
+    # directory reaches a wheel. Only a build can observe that.
+    #
+    # PATH-GATED, AND TRUE ON PUSH-TO-MAIN. The PR arm fires on packaging config; push-to-main forces
+    # it regardless, which is what catches a commit that merely adds a file to a packaged tree. See
+    # the `packaging` output in `changes` for why the packaged trees themselves are not in the PR arm.
+    #
+    # RIDES `ci-gate` rather than taking a required context of its own -- the same choice `webconsole`
+    # and `tooling` made, and for the same reason: a new required context is a branch-protection
+    # change, and until that lands a PR can never satisfy it.
+    if: needs.changes.outputs.packaging == 'true'
+    needs: changes
+    runs-on: ubuntu-latest
+    # Generous against a 4-vCPU runner doing four builds plus a hash-pinned install; a hang backstop,
+    # not a tightness gate.
+    timeout-minutes: 20
+    permissions:
+      contents: read   # builds and inspects only; it publishes nothing and signs nothing
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      - name: Build every published distribution
+        run: |
+          # The SAME hash-pinned lock release.yml installs, so this job builds with the backend the
+          # release will use. A floating `pip install build` here would let this gate pass against a
+          # hatchling the release never runs -- which is precisely the model-versus-measurement error
+          # this job exists to end, rebuilt one layer up.
+          python -m pip install --require-hashes -r ci/locks/release-tools.lock
+          python -m build --outdir dist .
+          python -m build --wheel ./packaging/messagefoundry-harness --outdir harness-dist
+          python -m build --wheel ./packaging/messagefoundry-webconsole --outdir webconsole-dist
+          ls -l dist harness-dist webconsole-dist
+
+      - name: Member gate over the real artifacts
+        run: |
+          # The same script, the same arguments, the same three distribution sets release.yml gates
+          # -- so a refusal here is the refusal a tag would have produced, minutes after the commit
+          # instead of at publish time.
+          python scripts/release/forbidden_members.py 'dist/*.tar.gz' 'dist/*.whl'
+          python scripts/release/forbidden_members.py 'harness-dist/*.whl'
+          python scripts/release/forbidden_members.py 'webconsole-dist/*.whl'
+
+      - name: Positive control -- the gate must REFUSE a poisoned copy
+        run: |
+          # A GREEN GATE AND A BROKEN GATE LOOK IDENTICAL, and this job's whole value is the four
+          # clean results above. So poison a COPY of a real artifact and require a refusal: if the
+          # gate cannot fail here, its passes upstream mean nothing. Runs on a copy, so nothing this
+          # job built is modified.
+          cp harness-dist/*.whl poisoned.whl
+          python - <<'PY'
+          import zipfile
+          with zipfile.ZipFile("poisoned.whl", "a") as zf:
+              zf.writestr("harness/CLAUDE.md", "internal\n")
+          PY
+          # A NON-ZERO EXIT IS NOT PROOF THE GATE INSPECTED ANYTHING. `forbidden_members.py` exits 1
+          # for a refused member AND for a pattern that matched no file at all -- and for an archive
+          # it could not open, and for one that listed zero members. So if this fixture is ever
+          # renamed or moved out from under the line below, an exit-code test would print "control
+          # fired" having opened ZERO archives: it would report the gate armed whether or not the
+          # gate saw anything, which is a control that cannot fail. That is the empty-corpus defect
+          # this gate exists to prevent, rebuilt one layer up.
+          #
+          # So assert on the REASON instead. Only the inspection path prints an archive name beside
+          # the member it refused, so requiring that line distinguishes "the gate rejected a poisoned
+          # member" from "the gate found nothing to look at". The trailing `-- <why>` clause is
+          # deliberately NOT pinned: this step owns the two names below, the script owns its wording.
+          refusal="poisoned.whl ships harness/CLAUDE.md"
+          status=0
+          log="$(python scripts/release/forbidden_members.py poisoned.whl 2>&1)" || status=$?
+          printf '%s\n' "$log"
+          if [ "$status" -eq 0 ]; then
+            echo "::error::the member gate ACCEPTED an artifact carrying harness/CLAUDE.md -- the gate is broken, and every clean result in this job is meaningless"
+            exit 1
+          fi
+          if [[ "$log" != *"$refusal"* ]]; then
+            echo "::error::the member gate exited $status without reporting '$refusal', so it did NOT refuse the poisoned member -- a missing fixture, an unreadable archive and a zero-member listing all exit non-zero too. This control proved NOTHING about the clean results above"
+            exit 1
+          fi
+          echo "control fired: the gate refused the poisoned copy BY NAME, so its clean verdicts above are real"
+          rm -f poisoned.whl
+
   # Single STABLE required status check standing in for the conditional / matrix heavy legs (SQL
   # Server, Postgres, load, Windows-service smoke). Those legs CANNOT be required directly:
   #   * the nightly/path-gated legs (`postgres-store`, `load-test`, `load-test-sqlserver`,
@@ -3367,6 +3493,11 @@ jobs:
       # this roll-up is wrong -- it is `if: always()` and still reports, which is what lets the five
       # gated legs be path-gated at all. Only the inference "it skipped, so it did not need to run" is.
       - tooling
+      # `packaging-build` rides here on the same terms as the two above (BACKLOG #1840). It is
+      # path-gated, so it skips on most pull requests, and a skipped need is not a failure to the
+      # `contains(needs.*.result, ...)` check below -- which is the behaviour wanted, with the
+      # same merge_group caveat the `tooling` note states.
+      - packaging-build
     runs-on: ubuntu-latest
     steps:
       # TWO failing steps, not one, and the predicates PARTITION the old single condition -- their

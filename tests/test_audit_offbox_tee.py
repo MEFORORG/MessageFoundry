@@ -17,6 +17,7 @@ subcommand process that never calls ``configure_logging``.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -383,6 +384,11 @@ def _audit_records_in(stream: str) -> list[dict]:
     return records
 
 
+async def _provision_store(db: Path) -> None:
+    store = await MessageStore.open(db)
+    await store.close()
+
+
 def _run_backup(tmp_path: Path, *, allow_unencrypted: bool) -> subprocess.CompletedProcess[str]:
     """Run the real ``messagefoundry backup`` subcommand in a child process and capture both streams.
 
@@ -398,6 +404,9 @@ def _run_backup(tmp_path: Path, *, allow_unencrypted: bool) -> subprocess.Comple
     if allow_unencrypted:
         body += "\n[backup]\nallow_unencrypted = true\n"
     toml.write_text(body, encoding="utf-8")
+    # backup backs up a store and no longer creates the one it is pointed at (BACKLOG #1780), so the
+    # store exists before the child runs, as it would after serve's first run.
+    asyncio.run(_provision_store(tmp_path / "msg.db"))
     return subprocess.run(
         [
             sys.executable,

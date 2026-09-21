@@ -105,10 +105,15 @@ TRANSCRIPTS.md
 # list was redundant — and enumerating private filenames in a public file discloses the shape of
 # the private set for no gain. Do not re-add per-file entries; extend the blanket rule instead.
 
-# Operator-local load/throughput profiles — sized for one operator's own environment, not a
-# shipped artifact. Still usable by name (they sit in PROFILES_DIR).
-/harness/load/profiles/hospital-baseline.toml
-/harness/load/profiles/soak-12h.toml
+# Operator-local load/throughput profiles are NOT ignored here any more, and must never be again.
+# Two were, by name, at /harness/load/profiles/<name>.toml. That is a contradiction git cannot
+# report: hatchling's force-include walks the FILESYSTEM and reads no .gitignore, so a harness wheel
+# built on the machine holding those files shipped them, hosts and ports included (BACKLOG #1835).
+# They belong in migration-local/profiles/, which /migration-local/ above already covers, which no
+# force-include source names, and which docs/LOAD-TESTING.md and harness/load/profiles/README.md
+# already name as the home for site-specific numbers. harness/load/profile.py reads that directory,
+# so `--load <name>` still resolves. tests/test_packaging.py refuses a new anchored entry inside a
+# force-included tree.
 # Deep-research survey of alternative OSS DB backends for the shared-DB commit-wall — local working
 # note, not a committed artifact (the conclusion is carried in the throughput ADRs / AI memory).
 /docs/research/db-commit-wall-backend-survey.md

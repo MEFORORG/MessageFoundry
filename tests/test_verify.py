@@ -1023,7 +1023,7 @@ _RAW_ADT = (
 
 
 async def _seed_message(settings: StoreSettings, *, control_id: str, status: MessageStatus) -> str:
-    handle = await open_store(settings)
+    handle = await open_store(settings, create=True)  # the seed provisions; the checks must not
     try:
         return await handle.record_received(
             channel_id="verify-test", raw=_RAW_ADT, status=status, control_id=control_id
@@ -1126,6 +1126,18 @@ def test_a_missing_explicit_config_path_fails_rather_than_skipping(tmp_path: Pat
     results = run_verify(
         sections=["store"], smoke_mode="none", service_config=str(tmp_path / "nope.toml")
     )
+    load = [r for r in results if r.id == "config.load"]
+    assert load and load[0].status is Status.FAIL
+    assert exit_code(results) == 1
+
+
+def test_a_directory_given_as_the_config_path_fails_rather_than_crashing(tmp_path: Path) -> None:
+    """A directory reaches load_settings's open, so `verify` must report it, not crash on it.
+
+    The mechanism is stated once at messagefoundry.__main__._load_service_settings. This asserts
+    the config.load ROW and the exit code rather than the exception class, because the class
+    differs by platform and this leg runs on both."""
+    results = run_verify(sections=["store"], smoke_mode="none", service_config=str(tmp_path))
     load = [r for r in results if r.id == "config.load"]
     assert load and load[0].status is Status.FAIL
     assert exit_code(results) == 1

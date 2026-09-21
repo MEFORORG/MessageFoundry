@@ -318,3 +318,74 @@ def test_the_script_reads_the_roster_at_all() -> None:
     assert "docs/roles/seats.json" in source, (
         "seat.ps1 does not name the roster, so the verdict fields cannot be coming from it"
     )
+
+
+# ------------------------------------------------------------------ the role-card marker
+#
+# WHY THESE ARMS EXIST. `seat.ps1` writes the fleet episode record and `role-card-inject.ps1` reads
+# `.claude/seat.local.txt`. Nothing bridged them, so a session that declared its seat -- exactly what
+# the SessionStart prompt asks every session to do -- got a record and no card, silently, at the next
+# session start. Measured 2026-09-19: 165 of 171 worktrees on the development box carried no marker.
+
+MARKER_REL = Path(".claude") / "seat.local.txt"
+INJECTOR = ROOT / "scripts" / "hooks" / "role-card-inject.ps1"
+
+
+def marker(repo: Path) -> str | None:
+    p = repo / MARKER_REL
+    return p.read_text(encoding="utf-8").strip() if p.exists() else None
+
+
+def test_a_live_declaration_writes_the_role_card_marker(repo: Path) -> None:
+    assert marker(repo) is None, "the fixture must start with no marker or this proves nothing"
+    proc = declare(repo, "manager")
+    assert proc.returncode == 0, proc.stderr
+    assert marker(repo) == "manager"
+
+
+def test_an_alias_declaration_writes_the_CANONICAL_marker(repo: Path) -> None:
+    """`-Seat mgr` must leave `manager` behind, so the hook resolves it in one step next session."""
+    declare(repo, "mgr")
+    assert marker(repo) == "manager", (
+        "the marker carries the canonical seat, not the typed label -- the record keeps the verbatim "
+        "one, and these two fields answer different questions"
+    )
+
+
+@pytest.mark.parametrize("label", ["console", "zzqx9137nosuchseat"])
+def test_a_declaration_that_resolves_to_no_live_seat_writes_no_marker(
+    repo: Path, label: str
+) -> None:
+    """A retired or unmapped label already warns loudly. A marker would move that failure and hide it.
+
+    The hook would refuse the same label at the NEXT session start, which is a quiet failure in a
+    place nobody is watching -- so the loud CLI objection is the only report anyone gets.
+    """
+    proc = declare(repo, label)
+    assert proc.returncode == 0, "a roster objection must not fail the declaration"
+    assert proc.stderr.strip() != "", "the objection is the only report; it must still be made"
+    assert marker(repo) is None, f"{label!r} resolves to no live seat, so it must leave no marker"
+
+
+@pytest.mark.parametrize("label", ["console", "zzqx9137nosuchseat"])
+def test_a_bad_declaration_does_not_clobber_a_GOOD_marker(repo: Path, label: str) -> None:
+    """The dangerous half. Overwriting a working marker would take a card away from a live seat."""
+    declare(repo, "manager")
+    assert marker(repo) == "manager"
+    declare(repo, label)
+    assert marker(repo) == "manager", (
+        f"declaring {label!r} overwrote a live seat's marker; the next session would get no card"
+    )
+
+
+def test_both_scripts_name_the_same_marker_path() -> None:
+    """The bridge, pinned as text. A rename on either side reopens the gap with nothing reporting it.
+
+    This is the anti-vacuity arm for the whole family above: those tests drive `seat.ps1` alone, so
+    they would stay green if `role-card-inject.ps1` started reading somewhere else.
+    """
+    literal = ".claude/seat.local.txt"
+    writer = SEAT.read_text(encoding="utf-8")
+    reader = INJECTOR.read_text(encoding="utf-8")
+    assert literal in writer, f"{SEAT.name} no longer writes {literal}"
+    assert literal in reader, f"{INJECTOR.name} no longer reads {literal}"

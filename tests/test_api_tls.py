@@ -1299,6 +1299,10 @@ def _shim_cert_request(app: object, cn: str = "svc.internal") -> Request:
     role holds ``monitoring:read``, so the only wired route cannot produce a denial at all; and because
     the property under test belongs to the gate that any future service route would also use. The
     query string is deliberately non-empty: the audit row must carry the PATH and never the full URL.
+
+    ``client`` is a REAL peer address (RFC 5737 TEST-NET-1) and not an omitted key: starlette resolves
+    an absent one to None without raising, which would make the BACKLOG #1644 assertion below vacuous
+    rather than failing.
     """
     return Request(
         {
@@ -1310,6 +1314,7 @@ def _shim_cert_request(app: object, cn: str = "svc.internal") -> Request:
             "app": app,
             "scheme": "http",
             "server": ("t", 80),
+            "client": ("192.0.2.77", 51234),
             "state": {MF_CLIENT_PEERCERT_STATE_KEY: _peercert(cn)},
         }
     )
@@ -1343,6 +1348,10 @@ async def test_service_cert_authz_denial_is_audited(tmp_path: Path) -> None:
             "permission": "users:manage",
             "path": "/service/probe",
         }
+        # BACKLOG #1644 (ADR 0150): the row records WHERE FROM, and this gate needs its own threading
+        # to get it — the comment on the ``audit_permission_denied`` call in ``require_service_cert``
+        # says why. RED when ``client=`` is dropped from that call; nothing else covers it.
+        assert rows[0]["client"] == "192.0.2.77"
 
         # POSITIVE CONTROL, same store and same counter: the bearer plane's denial also lands, so the
         # zero this test was written against could not have been an inert audit path on this app.
@@ -1398,11 +1407,17 @@ async def test_service_cert_grant_writes_no_authorization_row(tmp_path: Path) ->
 
 
 def _handshake(
-    server_ctx: ssl.SSLContext, client_ctx: ssl.SSLContext, *, client_cert: tuple[Path, Path] | None
+    server_ctx: ssl.SSLContext,
+    client_ctx: ssl.SSLContext,
+    *,
+    client_cert: tuple[Path, Path] | None,
+    server_hostname: str = "localhost",
 ) -> str | None:
     """Drive a REAL TLS handshake over a loopback socket using ``server_ctx`` (the exact context the serve
     path builds via :func:`build_api_ssl_context`). Returns the negotiated cipher name on success; raises
-    ``ssl.SSLError`` when the handshake is refused. ``client_cert`` presents a client cert (mTLS)."""
+    ``ssl.SSLError`` when the handshake is refused. ``client_cert`` presents a client cert (mTLS).
+    ``server_hostname`` is the name the client verifies against -- it must be a SAN of the server's
+    certificate, so the minted-pair arms pass ``[api].host`` rather than the ``localhost`` default."""
     import socket
     import threading
 
@@ -1447,7 +1462,7 @@ def _handshake(
     client_err: BaseException | None = None
     try:
         with socket.create_connection((host, port), timeout=5) as raw:  # noqa: SIM117
-            with client_ctx.wrap_socket(raw, server_hostname="localhost") as cs:
+            with client_ctx.wrap_socket(raw, server_hostname=server_hostname) as cs:
                 cipher = cs.cipher()
                 client_cipher = cipher[0] if cipher else None
                 cs.recv(
@@ -1546,7 +1561,31 @@ def _strict_ca_and_leaf(tmp_path: Path) -> tuple[Path, Path, Path]:
 
 
 def _verifying_client_ctx(ca: Path) -> ssl.SSLContext:
-    return ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=str(ca))
+    ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=str(ca))
+    # THE FLOOR IS PINNED RATHER THAN INHERITED, AND THE PIN IS A RUNTIME NO-OP. Measured on
+    # CPython 3.14.6 / OpenSSL 3.5.7: `ssl.create_default_context().minimum_version` is ALREADY
+    # `TLSVersion.TLSv1_2` (771). Python 3.10 made `PROTOCOL_TLS`, `PROTOCOL_TLS_CLIENT` and
+    # `PROTOCOL_TLS_SERVER` use TLS 1.2 as their minimum version, `create_default_context` builds a
+    # `PROTOCOL_TLS_CLIENT` context, and this project requires >=3.14 -- so the line below assigns
+    # the value that was already there. What it buys is the guarantee being STATED IN THE SOURCE
+    # instead of inherited from an interpreter default.
+    #
+    # WHY THAT MATTERS HERE: CodeQL's `py/insecure-protocol` model hardcodes the PRE-3.10 answer.
+    # `SslDefaultContextCreation.getProtocol` in the query's own Ssl.qll returns TLSv1 and TLSv1_1
+    # among the versions `create_default_context` allows, and a static analyser cannot read the
+    # runtime default -- so the single `wrap_socket` call these client contexts reach inside
+    # `_handshake` was reported HIGH, naming all three of them as sources.
+    # `ContextSetVersion` in that same model makes
+    # `ctx.minimum_version = ssl.TLSVersion.TLSv1_2` a ProtocolRestriction over every version
+    # `lessThan` it, clearing exactly those two bits, and it is the remediation the rule's own help
+    # page prescribes. So this is ADR 0034's `Fix` disposition, not another dismissal.
+    #
+    # Nothing in this file wants a weak client. The tests that MEASURE a refused protocol build
+    # their own context (see messagefoundry/config/tls_probe.py for the one place that deliberately
+    # offers 1.0/1.1, and ADR 0034's 2026-07-29 amendment for why that one is a `won't fix`).
+    # The other two client contexts below carry the same pin and point back here.
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    return ctx
 
 
 #: Key-exchange groups OUTSIDE `APPROVED_KEX_GROUPS` that a client can pin via `set_ecdh_curve`.
@@ -1935,6 +1974,101 @@ def test_a_second_start_reuses_the_pair_and_never_re_mints(tmp_path: Path) -> No
     assert (second_cert, second_key) == (first_cert, first_key)
     assert Path(second_cert).read_bytes() == cert_bytes
     assert Path(second_key).read_bytes() == key_bytes
+
+
+def test_the_plan_answers_the_same_three_postures_without_touching_the_disk(
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #1695. `plan_api_tls_material` is what a READ-ONLY caller asks, and it must agree
+    with the minting path exactly -- it is the same branch order, which is why `ensure` consumes it.
+
+    A client (the VS Code extension, via `cert inventory --json`) needs the served certificate's path
+    to verify the handshake, and asking must not mint a key. So the pure function is graded on both
+    halves: the same answer, and no file created.
+    """
+    from messagefoundry.api.tls import plan_api_tls_material
+
+    operator = ApiSettings(tls_cert_file="/etc/mf/chain.pem", tls_key_file="/etc/mf/key.pem")
+    plan = plan_api_tls_material(operator, state_dir=tmp_path)
+    assert (plan.source, plan.cert_file, plan.key_file) == (
+        "operator",
+        "/etc/mf/chain.pem",
+        "/etc/mf/key.pem",
+    )
+    assert plan.scheme == "https"
+    assert plan.material() == ("/etc/mf/chain.pem", "/etc/mf/key.pem")
+
+    proxied = ApiSettings(tls_terminated_upstream=True, trusted_proxies=["10.0.0.7"])
+    upstream = plan_api_tls_material(proxied, state_dir=tmp_path)
+    assert upstream.source == "upstream"
+    assert upstream.material() is None
+    assert upstream.scheme == "http"  # the one posture a client must NOT dial over https
+
+    generated = plan_api_tls_material(ApiSettings(), state_dir=tmp_path)
+    assert generated.source == "generated" and generated.scheme == "https"
+    assert generated.cert_file is not None and Path(generated.cert_file).parent == tmp_path
+    # PURE: naming the pair must not create it. This is the whole reason the function exists -- a
+    # `cert inventory` that minted would write a private key on a read-only command.
+    assert not any(tmp_path.iterdir())
+
+    # And now the agreement. Minting returns exactly what the plan named, for the same settings.
+    assert ensure_api_tls_material(ApiSettings(), state_dir=tmp_path) == generated.material()
+    assert ensure_api_tls_material(operator, state_dir=tmp_path) == (
+        "/etc/mf/chain.pem",
+        "/etc/mf/key.pem",
+    )
+    assert ensure_api_tls_material(proxied, state_dir=tmp_path) is None
+
+
+def test_the_branch_order_is_callable_without_the_settings_machinery(tmp_path: Path) -> None:
+    """`api_tls_source` is the order itself, over two values rather than an `ApiSettings`.
+
+    It exists because the tray asks the same question of a raw, possibly-malformed TOML dict and
+    cannot afford this module's imports (ADR 0113). The shape is graded here so that convergence
+    stays available: an operator cert wins even when an upstream terminator is ALSO declared, which
+    is the one ordering a reader is most likely to get backwards.
+    """
+    from messagefoundry.api.tls import api_tls_source, plan_api_tls_material
+
+    assert api_tls_source(cert_file="/x.pem", tls_terminated_upstream=False) == "operator"
+    assert api_tls_source(cert_file="/x.pem", tls_terminated_upstream=True) == "operator"
+    assert api_tls_source(cert_file=None, tls_terminated_upstream=True) == "upstream"
+    assert api_tls_source(cert_file=None, tls_terminated_upstream=False) == "generated"
+    assert api_tls_source(cert_file="", tls_terminated_upstream=False) == "generated"
+
+    # And the planner really is built on it, rather than repeating the order beside it.
+    both = ApiSettings(
+        tls_cert_file="/x.pem", tls_terminated_upstream=True, trusted_proxies=["10.0.0.7"]
+    )
+    assert plan_api_tls_material(both, state_dir=tmp_path).source == "operator"
+
+
+def test_the_minted_certificate_verifies_against_itself_as_a_ca_file(tmp_path: Path) -> None:
+    """BACKLOG #1695, the property every first-party client's trust seam rests on.
+
+    A client cannot import the minted certificate into an OS trust store on the user's behalf, so it
+    hands the PEM to its TLS layer as the anchor for that one engine instead. That only works if a
+    SELF-SIGNED leaf with `CA:FALSE` is accepted when it IS the trust anchor. It is -- but nothing
+    pinned it, and the whole client half would fail silently at handshake time if the minting
+    primitive ever grew a constraint that broke it.
+    """
+    api = ApiSettings()
+    cert, key = ensure_api_tls_material(api, state_dir=tmp_path)
+    server = build_api_ssl_context(
+        api.model_copy(update={"tls_cert_file": cert, "tls_key_file": key})
+    )
+    client = ssl.create_default_context(cafile=cert)
+    client.minimum_version = ssl.TLSVersion.TLSv1_2  # pinned floor -- see _verifying_client_ctx
+    assert client.verify_mode is ssl.CERT_REQUIRED  # verification stays ON; only the anchor changed
+    assert _handshake(server, client, client_cert=None, server_hostname=api.host)
+
+    # NEGATIVE CONTROL: the stock trust store does NOT accept it, which is the defect being fixed
+    # (Node reports the same refusal as DEPTH_ZERO_SELF_SIGNED_CERT). Without this arm the assertion
+    # above could pass on a client that verifies nothing.
+    stock = ssl.create_default_context()
+    stock.minimum_version = ssl.TLSVersion.TLSv1_2  # pinned floor -- see _verifying_client_ctx
+    with pytest.raises(ssl.SSLError, match="self.signed|unable to get local issuer"):
+        _handshake(server, stock, client_cert=None, server_hostname=api.host)
 
 
 def test_a_failed_cert_write_leaves_no_orphaned_key(

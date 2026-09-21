@@ -89,6 +89,7 @@ from messagefoundry.transports.rest import (
     refuse_cleartext_credentials,
     refuse_cleartext_egress,
     refuse_unrevoked_verified_hop,
+    refuse_url_credentials,
     refuse_verify_off,
 )
 from messagefoundry.transports.signing import MessageSigner, signer_from_destination
@@ -284,6 +285,7 @@ class FhirDestination(DestinationConnector):
         scheme = urllib.parse.urlsplit(url).scheme.lower()
         if scheme not in ("http", "https"):
             raise ValueError(f"FHIR destination 'url' must be http or https, got scheme {scheme!r}")
+        refuse_url_credentials(url, "FHIR destination 'url'")
         self.base_url = url
         self.fhir_version: str = str(s.get("fhir_version", "R4B"))
         self.format: str = str(s.get("format", "json"))
@@ -650,6 +652,11 @@ class FhirDestination(DestinationConnector):
             raise DeliveryError(
                 f"FHIR {_redact_url(self.base_url)} unreachable: {exc.reason}"
             ) from exc
+        except (ValueError, http.client.InvalidURL) as exc:
+            # BACKLOG #1793: classified like _post's arm, so the probe reply carries no urllib text.
+            raise DeliveryError(
+                f"FHIR {_redact_url(self.base_url)} rejected an invalid request value"
+            ) from exc
         except (TimeoutError, OSError) as exc:
             raise DeliveryError(f"FHIR {_redact_url(self.base_url)} failed: {exc}") from exc
 
@@ -917,6 +924,7 @@ class FhirLookupExecutor:
                 raise ValueError(
                     f"FhirLookup {cname!r} 'url' must be http or https, got scheme {scheme!r}"
                 )
+            refuse_url_credentials(url, f"FhirLookup {cname!r} 'url'")
             self._base[cname] = url
             self._timeout[cname] = float(s.get("timeout_seconds", 30.0))
             self._encoding[cname] = str(s.get("encoding", "utf-8"))
@@ -1120,6 +1128,13 @@ class FhirLookupExecutor:
             raise FhirLookupError(
                 f"fhir_lookup on {connection!r}: FHIR {_redact_url(base)} unreachable: {exc.reason}"
             ) from exc
+        except (ValueError, http.client.InvalidURL) as exc:
+            # BACKLOG #1793: the destination's arm, for the Handler-side read. An escaped InvalidURL
+            # reached messages.error as "handler error: ..." carrying urllib's text.
+            raise FhirLookupError(
+                f"fhir_lookup on {connection!r}: FHIR {_redact_url(base)} rejected an invalid "
+                "request value"
+            ) from exc
         except (TimeoutError, OSError) as exc:
             raise FhirLookupError(
                 f"fhir_lookup on {connection!r}: FHIR {_redact_url(base)} failed: {exc}"
@@ -1187,6 +1202,11 @@ class FhirLookupExecutor:
         except urllib.error.URLError as exc:
             raise FhirLookupError(
                 f"FhirLookup {connection!r}: FHIR {_redact_url(base)} unreachable: {exc.reason}"
+            ) from exc
+        except (ValueError, http.client.InvalidURL) as exc:
+            raise FhirLookupError(
+                f"FhirLookup {connection!r}: FHIR {_redact_url(base)} rejected an invalid "
+                "request value"
             ) from exc
         except (TimeoutError, OSError) as exc:
             raise FhirLookupError(

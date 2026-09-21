@@ -171,7 +171,15 @@ The offline fallback ([__main__.py](../messagefoundry/__main__.py)): it loads
 `messagefoundry.toml` from the working directory (or `--service-config <path>`), resolves the
 effective policy, and prints the **same JSON** to stdout — except `assist_permitted` is **always
 `null`** (RBAC is not evaluable offline). `--json` prints only the JSON object (the IDE parses
-stdout); on error it prints `{"error": "..."}`. It prints **config only, never message data**.
+stdout); on error it prints `{"error": "..."}`.
+
+It prints **no message data and no configured value**. That is narrower than the "config only, never
+message data" this line used to say, and the difference is the point: no HL7 ever reaches this
+subcommand, so the only thing its output could disclose was config, which that sentence said nothing
+about. It did disclose config — `str(ValidationError)` carries `input_value=` for every failing
+field, so a `[store]` missing `server` put `MEFOR_STORE_PASSWORD` on the stdout the IDE reads. The
+error line is now rendered by `settings_error_detail` (field path and message, never the value);
+that function's docstring carries the argument, and `tests/test_cli_ai_policy.py` pins it.
 
 ---
 
