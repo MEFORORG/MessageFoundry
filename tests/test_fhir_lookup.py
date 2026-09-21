@@ -748,7 +748,7 @@ def test_check_fhir_lookup_allowed_denies_unlisted_host() -> None:  # AC-4
 
 def test_check_fhir_lookup_deny_by_default_refuses_empty_allowlist() -> None:  # AC-4
     egress = EgressSettings(deny_by_default=True)  # empty allowed_http
-    with pytest.raises(WiringError, match="deny_by_default"):
+    with pytest.raises(WiringError, match="block_unlisted_outbound"):
         check_fhir_lookup_allowed("epic", {"url": BASE}, egress)
 
 

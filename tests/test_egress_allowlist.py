@@ -103,7 +103,7 @@ def _db_dest(server: str) -> Destination:
 def test_deny_by_default_refuses_empty_allowlist() -> None:
     e = EgressSettings(deny_by_default=True)  # nothing listed → every destination refused
     for dest in (_mllp("hl7.partner.org", 2575), _file("/tmp/out"), _db_dest("sql.internal")):
-        with pytest.raises(WiringError, match="deny_by_default"):
+        with pytest.raises(WiringError, match="block_unlisted_outbound"):
             check_egress_allowed(dest, e)
 
 
@@ -114,7 +114,7 @@ def test_deny_by_default_honours_a_set_allowlist() -> None:
     with pytest.raises(WiringError, match="allowed_mllp"):
         check_egress_allowed(_mllp("evil.example", 2575), e)  # not listed → refused
     # The flag is global, so a different transport with no list of its own is still refused.
-    with pytest.raises(WiringError, match="deny_by_default"):
+    with pytest.raises(WiringError, match="block_unlisted_outbound"):
         check_egress_allowed(_file("/tmp/out"), e)
 
 
@@ -129,9 +129,9 @@ def test_deny_by_default_gates_dial_out_sources_and_lookups() -> None:
     db_source = Source(
         type=ConnectorType.DATABASE, settings={"server": "sql.internal", "port": 1433}
     )
-    with pytest.raises(WiringError, match="deny_by_default"):
+    with pytest.raises(WiringError, match="block_unlisted_outbound"):
         check_source_allowed(db_source, "IB_DB", e)
-    with pytest.raises(WiringError, match="deny_by_default"):
+    with pytest.raises(WiringError, match="block_unlisted_outbound"):
         check_lookup_allowed("LK", {"server": "sql.internal", "port": 1433}, e)
     # A listener source (MLLP binds + waits; never dials out) is unaffected even under deny_by_default.
     mllp_source = Source(type=ConnectorType.MLLP, settings={"host": "0.0.0.0", "port": 2575})
@@ -147,7 +147,7 @@ async def test_build_check_deny_by_default_refuses_unlisted(tmp_path: Path) -> N
             store,
             egress=EgressSettings(deny_by_default=True),
         )
-        with pytest.raises(WiringError, match="deny_by_default"):
+        with pytest.raises(WiringError, match="block_unlisted_outbound"):
             refused.build_check(refused.registry)
         # Listing the destination permits it even under deny_by_default.
         allowed = RegistryRunner(

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 
 import pytest
 
@@ -206,6 +207,49 @@ _LEAKY_RAW = (
 )
 
 
+def _console_without_temp_paths(text: str, tmp_path: Path) -> str:
+    """``text`` with this test's own temp-directory path removed.
+
+    The tee CLI echoes its ``--out`` argument, so the PHI needles below are searched against a
+    pytest ``tmp_path``. The class of defect is a needle matching the test's own scaffolding, and
+    that path carries at least three sources of one: pytest's run counter, the OS temp directory,
+    and the account name. A counter like ``pytest-22999`` spells ``_RAW``'s synthetic MRN ``999``;
+    a developer running as ``JDOE`` would spell the surname needle. Removing the path answers every
+    needle at once, where a more distinctive MRN would answer only the run counter.
+
+    Only the known-benign path text goes; every needle stays exactly as strict as it was. ``_RAW``
+    is the one body the caller's output can carry and it holds no path, so a real body echo cannot
+    hide in what is removed -- pinned by
+    :func:`test_console_scrub_keeps_a_real_body_leak_visible`, which also pins that ``<tmp>``
+    rather than ``""`` is load-bearing: removing the path outright can splice its two neighbours
+    into a fresh ``999``. The caller asserts the scrub actually fired, so a spelling this misses
+    (a ``!r`` echo doubles every backslash on Windows) reddens instead of silently restoring the
+    flake.
+
+    Local on purpose: shared, it would get applied by reflex, without the reasoning about what it
+    swallows that the arming test exists to force. ``tests/test_file_partial_write.py`` strips a path
+    before a PHI scan for the same reason; give both a ``tests/_*.py`` home when a third turns up.
+    """
+    return text.replace(str(tmp_path), "<tmp>")
+
+
+def test_console_scrub_keeps_a_real_body_leak_visible(tmp_path) -> None:
+    # Arms the stdout/stderr guard below. That guard asserts ABSENCE, which a scrub returning ""
+    # would satisfy just as well, so this is the only upper bound on what the scrub may remove.
+    out = tmp_path / "ds.jsonl"
+    leaked = f"wrote 1 de-identified message(s) to {out}\n{_RAW}\n"
+
+    console = _console_without_temp_paths(leaked, tmp_path)
+    assert "DOE" in console
+    assert "JOHN" in console
+    assert "999" in console
+    assert _RAW in console
+
+    # And the <tmp> sentinel is load-bearing, not decoration: deleting the path outright would
+    # splice the digits on either side of it into a needle that was never in the output.
+    assert "999" not in _console_without_temp_paths(f"seq 99{tmp_path}9 end", tmp_path)
+
+
 def test_tee_anonymize_captures_keeps_bodies_off_stdout_stderr(
     tmp_path, monkeypatch, capsys
 ) -> None:
@@ -221,10 +265,15 @@ def test_tee_anonymize_captures_keeps_bodies_off_stdout_stderr(
     combined = captured.out + captured.err
     assert "wrote 1 de-identified message" in combined  # count-only status was emitted
     # the dataset went to --out, never the console -> no raw body / PHI on stdout or stderr
-    assert "DOE" not in combined
-    assert "JOHN" not in combined
-    assert "999" not in combined
-    assert _RAW not in combined
+    console = _console_without_temp_paths(combined, tmp_path)
+    # Say what the search examined beside what it concluded. Without this the scrub could quietly
+    # become a no-op -- the CLI stops echoing --out, or spells it in a form the scrub misses -- and
+    # the needles below would go on passing over a narrowing that no longer buys anything.
+    assert "<tmp>" in console
+    assert "DOE" not in console
+    assert "JOHN" not in console
+    assert "999" not in console
+    assert _RAW not in console
 
 
 def test_tee_anonymize_captures_leak_token_fails_closed(tmp_path, monkeypatch, capsys) -> None:
@@ -242,6 +291,11 @@ def test_tee_anonymize_captures_leak_token_fails_closed(tmp_path, monkeypatch, c
     combined = captured.out + captured.err
     assert "forbidden token" in combined  # count-only fail-closed status
     assert "fail closed" in combined
+    # This branch is count-only and names no path, so the needles below run against the UNSCRUBBED
+    # text at full strength. Scrubbing here would quietly absorb a path echo somebody adds later;
+    # this makes them come and look instead. It checks the whole temp path only, so a message
+    # naming some PARENT of it would still reach the needles below rather than this line.
+    assert str(tmp_path) not in combined
     # the leaking value and PHI never surface
     assert _LEAK_IP not in combined
     assert "DOE" not in combined
