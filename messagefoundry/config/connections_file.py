@@ -677,13 +677,13 @@ def _element_fits(value: Any, element: _Accepted) -> bool:
     would preempt both.
 
     **WHERE NO REFUSAL EXISTS THE VALUE GOES THROUGH, and that is a HOLE, not a decision this skip
-    makes safe.** At least three, measured on this branch, all of which load clean, survive
-    ``resolve_env_settings`` unchanged, and reach the connector as a literal ``{'env': ...}`` table:
-    ``headers``, answered by an open nested-env() refusal at the factory seam; ``odbc_params``, whose
-    ``_reject_envref_odbc_params`` tests ``isinstance(v, EnvRef)`` and so cannot see the raw-dict
-    spelling a ``connections.toml`` produces; and any ``list[str]`` setting, answered by nothing at
-    all. None of them is #1809 -- this check judges TYPES -- and a second refusal written here would
-    collide with the one already open, so they need a row, not a patch."""
+    makes safe.** When #1809 measured it, at least three loaded clean, survived
+    ``resolve_env_settings`` unchanged, and reached the connector as a literal ``{'env': ...}`` table.
+    Two now have a refusal at the factory seam: ``headers`` in ``_reject_envref_headers`` (BACKLOG
+    #1649), and ``odbc_params`` in ``_reject_envref_odbc_params``, which tests the raw-dict spelling
+    as well as an ``EnvRef`` (BACKLOG #1806). The third, any ``list[str]`` setting, was answered by
+    nothing at all and is not re-measured here. None of them is #1809 -- this check judges TYPES --
+    and a refusal written here would preempt the factory's, so a hole needs a row, not a patch."""
     if isinstance(value, EnvRef) or _is_env_marker(value):
         return True
     return _value_matches(value, element.scalars)

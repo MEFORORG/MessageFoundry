@@ -2752,6 +2752,12 @@ def _reject_envref_odbc_params(odbc_params: Mapping[str, Any] | None) -> None:
     or the file: ``_build_spec`` re-raises a factory ``WiringError`` unwrapped, ahead of the arm that
     adds that context, so every factory refusal is un-located in the same way.
 
+    From ``connections.toml``, the loader's type check (BACKLOG #1809) refuses first wherever it can
+    judge the value, and its message does name the connection. It judges a string or array
+    ``odbc_params``, and a whole-table ref whose ``default`` is not a table. It cannot judge a ref with
+    no ``default``, or one whose ``default`` is a table, so those still reach the mapping check below.
+    So does every code-first call, which that check never sees.
+
     **The residual is a marker one container deep**, and it is deliberately still open here: a dict
     carrying ``env`` plus an unrecognised key, or a marker inside a list, fails ``set(v) <=
     _ENVREF_KEYS`` and reaches ``_build_odbc_dsn``, which ``str()``-splices it into the DSN with any
@@ -2775,13 +2781,7 @@ def _reject_envref_odbc_params(odbc_params: Mapping[str, Any] | None) -> None:
         )
     if not odbc_params:
         return
-    offenders = sorted(
-        k
-        for k, v in odbc_params.items()
-        # Mirrors parse_env_setting's own env-marker test, against the shared _ENVREF_KEYS. Collapse
-        # both arms to _is_env_marker(v) once PR 1257 (BACKLOG #1649) factors that helper out.
-        if isinstance(v, EnvRef) or (isinstance(v, dict) and "env" in v and set(v) <= _ENVREF_KEYS)
-    )
+    offenders = sorted(k for k, v in odbc_params.items() if _is_nested_envref(v))
     if offenders:
         raise WiringError(
             f"Database odbc_params may not use env() ({', '.join(offenders)}) — nested settings are "
