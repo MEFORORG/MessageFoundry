@@ -3979,7 +3979,7 @@ def _import(args: argparse.Namespace) -> int:
 
     try:
         result = import_corepoint(args.export, args.out)
-    except CorepointImportError as exc:
+    except (CorepointImportError, OSError, RecursionError) as exc:
         return _emit_error(str(exc), as_json=args.json)
 
     if args.json:
