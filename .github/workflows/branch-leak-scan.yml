@@ -22,9 +22,16 @@ name: Branch leak scan
 #     -f 'rules[][type]=file_path_restriction' ...
 #   -> 422  "Source public repos cannot have push rules"
 #
-# The other half of BACKLOG #1034's "durable answer is server-side" is re-enabling `enforce_admins`,
-# which governs PROTECTED BRANCHES and therefore does nothing about an arbitrary feature branch. So
-# there is no server-side content control available for this repository, and the only prevention is
+# BACKLOG #1034's "durable answer is server-side" also names `enforce_admins`, and for THIS job that
+# half is beside the point under either value: the setting governs PROTECTED BRANCHES, so it does
+# nothing about an arbitrary feature branch. Its value is deliberately not restated here -- it is a
+# server setting and it has moved more than once. This header used to name re-enabling it as the
+# OUTSTANDING half of #1034, and that framing went false without a single edit to the line, which is
+# the argument for a pointer rather than a fresh copy. Read it if it matters:
+#
+#   gh api repos/MEFORORG/MessageFoundry/branches/main/protection/enforce_admins
+#
+# So there is no server-side content control available for this repository, and the only prevention is
 # the client-side pre-push guard (scripts/hooks/push_guard.py) -- which `git push --no-verify` skips
 # and which a fresh clone does not have installed until scripts/coord/install-git-hooks.ps1 runs.
 # This job is the backstop behind that, and nothing else is.

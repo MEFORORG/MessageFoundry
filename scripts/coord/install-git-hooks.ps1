@@ -526,10 +526,14 @@ exec "$PY" "$HOOK_DIR/claim_check.py" "$1"
 # --- push guard ------------------------------------------------------------------------------------
 # Since the MEFORORG cutover this repo IS the published artifact -- a push to main is publication, with
 # no publish step left to catch anything. Server-side protection requires a PR and the checks listed
-# in .github/required-contexts.txt -- never a count written down here, which has gone stale before --
-# but enforce_admins is false, so the owner bypasses all of it and VS Code's Sync button does not
-# distinguish main from a feature branch. This restores the class of protection the old mirror clone's
-# Gate-Provenance pre-push hook provided before it was quarantined at cutover.
+# in .github/required-contexts.txt -- never a count written down here, which has gone stale before.
+# Whether the server ALSO refuses an admin's direct push depends on enforce_admins, which this script
+# cannot read and must not restate; this comment carried a stale value of it once already. Read it if
+# it matters:
+#   gh api repos/MEFORORG/MessageFoundry/branches/main/protection/enforce_admins
+# The hook earns its place under either value -- it fails fast and locally, and VS Code's Sync button
+# does not distinguish main from a feature branch. This restores the class of protection the old
+# mirror clone's Gate-Provenance pre-push hook provided before it was quarantined at cutover.
 Copy-Item (Join-Path $RepoRoot "scripts\hooks\push_guard.py") (Join-Path $hooksDir "push_guard.py") -Force
 
 $pushHook = @'
