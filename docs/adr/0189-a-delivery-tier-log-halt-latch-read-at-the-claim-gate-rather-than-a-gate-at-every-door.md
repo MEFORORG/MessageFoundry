@@ -81,8 +81,9 @@ are not):
 
 **`_delivery_halted` is DERIVED from `_log_write_stopped`, not a second flag.** "This process cannot
 log and has fail-closed" is one load-bearing fact, and `_log_write_stopped` already states it: both
-halt sites set it, and the only path that clears it is `_log_recovery_ok`, which re-tests the sinks
-by WRITING to them. A parallel boolean set and cleared at the same moments would be state that must
+halt sites set it, and two paths clear it: `_log_recovery_ok` at the recovery doors, and `start`
+when the same runner starts again (door 3). Both re-validate the sinks through the log guard when
+one is installed. A parallel boolean set and cleared at the same moments would be state that must
 agree with this one, with nothing checking that it does -- SDS-3.5, *state a load-bearing fact once
 and link to it*. What the property adds is the NAME and the delivery tier's ownership of the
 question, and one inherited property that is the whole point: `_log_write_stopped` is not cleared by
@@ -210,10 +211,11 @@ not.
 and in the flow graph, because the halt takes a lane down by pausing it and a pause is what an
 operator does. That told an operator the lane was waiting for them to press start, when what it was
 waiting for was a writable disk. It now reads `log_halted`, in the BAD colour rather than the muted
-grey of "stopped", and `outbound_running` is False for it -- so `/stats`' running/stopped split
-counts a halted lane as not running. A lane an unguarded path brought up used to read `running`,
-since it is not in `_outbound_paused`, while the claim gate refused every one of its rows; it now
-reads `log_halted` too. Three things are deliberately NOT collapsed into the new state:
+grey of "stopped", and `outbound_running` is False for it -- so the running/stopped split in
+`/status`' KPIs counts a halted lane as not running. A lane an unguarded path brought up used to
+read `running`, since it is not in `_outbound_paused`, while the claim gate refused every one of
+its rows; it now reads `log_halted` too. Three things are deliberately NOT collapsed into the
+new state:
 `not_deployed`, `failed` and `filtered` still outrank it on the display ladder, because those are
 per-connection facts an operator fixes on that row, while the halt is process-wide and already has
 its own page. `outbound_quiesced` -- the purge precondition -- still answers off the pause set, so a
