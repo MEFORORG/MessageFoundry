@@ -17,7 +17,8 @@ quietly stop being the same values the engine loaded:
 2. it must project the RESOLVED ``mask``, not the spelling -- ``prefix = 24`` and
    ``netmask = "255.255.255.0"`` are one wire value, and the ``.conf`` takes only that one;
 3. a config that will not load must be an ERROR the caller can see, not an empty or half-filled
-   read.
+   read -- and that error must not carry the values the failing config was given, because the
+   secrets are among them (``test_a_config_error_never_echoes_an_env_supplied_secret``).
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.__main__ import main
+from messagefoundry.config.settings import load_settings
 
 # Same shape as tests/test_settings.py's VIP fixtures: [cluster.vip] needs [cluster].enabled, which
 # needs a server-DB store.
@@ -172,9 +174,11 @@ def test_a_directory_at_service_config_is_an_error_line_not_a_traceback(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # An easy typo: the config DIRECTORY instead of the file inside it. Path.exists() is True and the
-    # open raises IsADirectoryError, which is an OSError and not a FileNotFoundError -- so without
+    # open raises -- IsADirectoryError on POSIX, PermissionError on Windows (measured 2026-09-20:
+    # "[Errno 13] Permission denied"). Both are OSError and neither is FileNotFoundError, so without
     # OSError in the catch the traceback goes to stderr, stdout is empty, and the installer reports
-    # "printed nothing" instead of the reason.
+    # "printed nothing" instead of the reason. This asserts the behaviour rather than the exception
+    # class, because the class differs by platform and this test runs on both legs.
     code, payload = _run(capsys, "--service-config", str(tmp_path), "--json")
     assert code == 2
     assert "error" in payload
@@ -189,6 +193,68 @@ def test_enabled_but_unusable_block_is_an_error_not_a_half_read(
     code, payload = _run(capsys, "--service-config", str(cfg), "--json")
     assert code == 2
     assert "prefix or netmask" in str(payload["error"])
+
+
+#: The value this test plants in the environment and then looks for. Not a credential, and shaped so
+#: it cannot be read as one: low entropy and dictionary words, so it does not trip the gitleaks hook
+#: and needs no entry in ``.gitleaks.toml``'s allowlist -- an allowlist entry is a scanner blind spot
+#: bought for nothing when the fixture can simply not look like a key.
+#:
+#: SHORT, which is load-bearing. Pydantic abbreviates a long ``input_value`` repr from the middle, so
+#: a 32-character value comes back as ``{'backend': 'postgres', '...-A-REAL-ONE-x'}`` and an ``in``
+#: test on the whole string reads False while most of the value is plainly on screen. A real
+#: 32-character password leaks its tail exactly that way. The control below is what stops a future
+#: repr change from turning this test green for that reason.
+_CANARY = "not-a-real-one"
+
+
+@pytest.mark.parametrize("flags", [("--json",), ()], ids=["machine", "human"])
+def test_a_config_error_never_echoes_an_env_supplied_secret(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    flags: tuple[str, ...],
+) -> None:
+    """A load failure reports the FIELD, never the value the field was given.
+
+    The failing config is a ``[store]`` with ``backend = "postgres"`` and none of the three keys that
+    backend requires. ``MEFOR_STORE_PASSWORD`` is set, as it is on any real Postgres node, so the
+    store password is in the input mapping that ``_require_server_db_fields`` rejects.
+
+    ``str(ValidationError)`` renders that mapping as ``input_value=``. This subcommand's error line
+    goes to stdout AND into ``install-net-helper.ps1``'s ``throw`` ("Could not read [cluster.vip]:
+    ..."), so the string reaches an operator transcript and whatever captured the install.
+
+    THE CONTROL IS THE RAW RENDERING, asserted first. A test that only looked for the absence of a
+    string would pass just as well against an empty error, a renamed variable, or a value pydantic
+    never had -- so it first proves the planted secret IS in ``str(exc)`` on this exact config, which
+    is what makes its absence below attributable to the fix.
+
+    Both output spellings are checked because the error path does not branch on ``--json``: the
+    payload formatter does, and the failure line is printed before it.
+    """
+    monkeypatch.setenv("MEFOR_STORE_PASSWORD", _CANARY)
+    cfg = _write(tmp_path / "messagefoundry.toml", '[store]\nbackend = "postgres"\n')
+
+    with pytest.raises(ValueError) as caught:  # ValidationError subclasses ValueError
+        load_settings(config_path=str(cfg))
+    assert _CANARY in str(caught.value), (
+        "CONTROL FAILED: str(ValidationError) does not carry the planted secret on this config, so "
+        "the absence asserted below would prove nothing -- re-aim this guard at a config whose "
+        "rejected input still holds [store].password"
+    )
+
+    code = main(["cluster-vip", "--service-config", str(cfg), *flags])
+    out = capsys.readouterr().out
+
+    assert code == 2
+    assert _CANARY not in out, (
+        "`cluster-vip` echoed an env-supplied secret in its config error. Render the failure with "
+        "settings_error_detail(); str(ValidationError) carries input_value= for every failing field."
+    )
+    error = str(json.loads(out)["error"])
+    # Useful, not just quiet: an error that named no field would also pass the assertion above.
+    assert "store" in error and "server, database, username" in error
 
 
 def test_the_no_controller_warning_goes_to_stderr_not_into_the_json(

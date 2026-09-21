@@ -159,13 +159,57 @@ def test_lookalike_members_are_allowed(member: str) -> None:
 
 
 def test_the_denylist_is_stored_casefolded() -> None:
-    """The matcher lowercases the member, so an uppercase entry could never match anything.
+    """The matcher casefolds the member, so a non-casefolded entry could never match anything.
 
     This is the silent-disarm shape: a contributor adds ``"AGENTS.md"``, every test that does not
     exercise that specific name stays green, and the entry is dead.
+
+    Asserted against ``casefold()`` and not ``lower()`` (BACKLOG #1838). The two differ, the test
+    was named for casefold while asserting lower, and the matcher used lower -- so the name was the
+    only thing telling the truth.
     """
     for name in (*FORBIDDEN_BASENAMES, *FORBIDDEN_PATH_COMPONENTS):
-        assert name == name.lower(), f"{name!r} is not lowercased and can never match"
+        assert name == name.casefold(), f"{name!r} is not casefolded and can never match"
+
+
+@pytest.mark.parametrize(
+    "member",
+    [
+        # BACKSLASH SEPARATOR. `tarfile.getnames()` and `zipfile.namelist()` return STORED names
+        # verbatim, so a writer that stored a backslash hands one back and a `/`-only split saw a
+        # single component. Measured: all three passed before the fix.
+        "pkg\\CLAUDE.md",
+        ".claude\\settings.json",
+        "C:\\repo\\CLAUDE.md",
+        "a/b\\CLAUDE.md",
+        # TRAILING DOT OR SPACE. Windows strips both on open, so each installs as the real file.
+        "messagefoundry/CLAUDE.md ",
+        "messagefoundry/CLAUDE.md.",
+        ".claude./settings.json",
+        ".claude /settings.json",
+        # CASEFOLD, NOT lower(). U+017F casefolds to "s"; lower() leaves it alone.
+        "messagefoundry/agent\u017f.md",
+    ],
+)
+def test_normalisation_evasions_are_refused(member: str) -> None:
+    """Each of these passed the first version of the rule (BACKLOG #1838)."""
+    assert forbidden(member) is not None, f"{member!r} evaded the denylist"
+
+
+@pytest.mark.parametrize(
+    "member",
+    [
+        # The fix strips trailing dots and spaces, and must not eat a LEADING or INTERIOR one.
+        "messagefoundry/.claudecfg/x.py",
+        "messagefoundry/my.claude.py",
+        "messagefoundry/claude.md.bak",
+        # A backslash that is part of a legitimate name, not a separator, still must not match.
+        "messagefoundry/not-claude.md",
+    ],
+)
+def test_normalisation_does_not_overreach(member: str) -> None:
+    """The control for the fix above. Stripping too much would red a real release."""
+    assert forbidden(member) is None, f"{member!r} was refused and should not be"
 
 
 # --------------------------------------------------------------------------------------------------
@@ -355,6 +399,45 @@ def test_the_gate_runs_before_anything_publishes() -> None:
         assert min(gate_at) < min(publish_at), (
             f"{jid} runs its member gate at step {min(gate_at)}, after its first publishing step "
             f"at {min(publish_at)} -- the leak would already be public"
+        )
+
+
+def test_no_step_hands_out_an_archive_the_member_gate_refused() -> None:
+    """ORDERING IS NOT ENOUGH: a later step with ``if: always()`` runs anyway (BACKLOG #1838).
+
+    The test above asks whether the gate runs FIRST. That is necessary and not sufficient, because
+    ``always()`` ignores an earlier failure entirely. Every publishing job ends with an
+    ``actions/upload-artifact`` step carrying ``always()`` so a broken build still leaves something
+    to inspect -- and as first shipped, two of the three would upload the very archive the gate had
+    just refused, as a downloadable workflow artifact on a public repository.
+
+    ``actions/upload-artifact`` is deliberately NOT in the publish set of the ordering test: that
+    set is about *release* surfaces, and widening it there would say the upload must come after the
+    gate, which is true but not the point. What matters here is the CONDITION, not the position.
+    """
+    offenders = []
+    for jid, job in _publishing_jobs().items():
+        for i, step in enumerate(_steps(job)):
+            cond = str(step.get("if") or "")
+            if "always()" not in cond:
+                continue
+            if "upload-artifact" not in str(step.get("uses") or ""):
+                continue
+            if "steps.member-gate.outcome" not in cond:
+                offenders.append(f"{jid} step[{i}] {step.get('name')!r}: if: {cond}")
+    assert not offenders, (
+        "these steps run on always() and would hand out an archive the member gate refused -- "
+        "each needs `&& steps.member-gate.outcome != 'failure'`:\n  " + "\n  ".join(offenders)
+    )
+
+
+def test_the_member_gate_step_keeps_the_id_that_guard_depends_on() -> None:
+    """The guard above is a string reference. Renaming or dropping the id disarms it silently."""
+    for jid, job in _publishing_jobs().items():
+        ids = [s.get("id") for s in _steps(job) if _GATE_INVOCATION in str(s.get("run") or "")]
+        assert "member-gate" in ids, (
+            f"{jid}'s member gate has no `id: member-gate`, so every "
+            f"`steps.member-gate.outcome` reference in that job silently evaluates to empty"
         )
 
 

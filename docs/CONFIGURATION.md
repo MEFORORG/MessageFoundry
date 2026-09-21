@@ -21,7 +21,7 @@
 >
 > **The refusal covers the FILE. It does not cover env or CLI — check those spellings yourself.** A
 > misspelled `MEFOR_*` variable or `serve` flag is still dropped silently — the env layer is where
-> secrets belong, and it already drops a var aimed at one of the five sections that have no env layer
+> secrets belong, and it already drops a var aimed at one of the four sections that have no env layer
 > ([Mechanism](#mechanism)). The loader also cannot tell such a typo from one of the documented
 > `MEFOR_*` variables its consuming module reads straight from the environment rather than declaring as
 > a field (`MEFOR_STORE_VAULT_ADDR`, `MEFOR_TLS_REVOCATION_ATTESTED` and siblings). **One exception:**
@@ -66,10 +66,12 @@ CLI flag  >  environment variable  >  messagefoundry.toml  >  built-in default
 - **Secrets** (e.g. a DB password) should come from **env** (or a secret reference), never plaintext
   in the file — env wins over the file so a deployment can inject them.
 - Env naming: `MEFOR_<SECTION>_<KEY>` (e.g. `MEFOR_STORE_PASSWORD`, `MEFOR_API_PORT`). The parser splits
-  the name at the **first** `_` after the prefix and matches that against a known-section list, so five
+  the name at the **first** `_` after the prefix and matches that against a known-section list, so four
   built sections have **no env layer** and a `MEFOR_*` var aimed at one is dropped without a warning:
-  `[sandbox]`, `[service]`, and the underscored `[cert_monitor]`, `[secret_rotation]`, `[update_check]`.
-  Set those in the file.
+  `[service]`, and the underscored `[cert_monitor]`, `[secret_rotation]`, `[update_check]`. The reasons
+  differ. `[service]` would work if the known-section list named it, but it just isn't listed. The other
+  three fail a different way: that same first-underscore split turns `MEFOR_CERT_MONITOR_ENABLED` into
+  section `cert`, not `cert_monitor`, so no list entry can rescue it. Set those four in the file.
 - Loaded once at startup into a typed `ServiceSettings` (pydantic) model; the engine + store read from
   it. `serve` keeps its existing flags as the CLI layer.
 
