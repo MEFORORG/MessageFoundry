@@ -30,6 +30,15 @@ THE THREE TRAPS, each of which has already cost this repo a wrong number:
    exactly the tail being measured. ``step_margin_baseline.toml`` records which rows are censored and
    this script prints the caveat instead of silently dividing by them.
 
+   **THE SHARPEST FORM OF THIS IS WHEN ``--cap-minutes`` IS ALSO THE STEP'S ``timeout-minutes``, and
+   it is a wiring question rather than a sampling accident.** One variable is then both the ruler and
+   the wall: a run slower than the cap is killed AT the cap, its step concludes ``failure``, this
+   script keys it ``CENSORED``, and it leaves the success-sample. The observed maximum over that
+   sample cannot exceed the cap BY CONSTRUCTION, so "size the cap at 1.30x the observed maximum"
+   re-derives the cap from a sample the cap truncated. The web console leg was wired that way and was
+   split for this reason -- ci.yml's "THE RULER AND THE WALL" note is the source of record. The
+   ENGINE leg is still wired that way, which is a known, unfixed instance rather than an oversight.
+
 WHAT THE INSTRUMENT ACTUALLY MEASURES, so it is not read as more (SDS-3.8). Elapsed is the interval
 between two ``--mark`` calls made in the steps ADJACENT to the one being measured. That is the step's
 own duration PLUS the two step transitions around it, i.e. an UPPER bound on the step. So the margin
@@ -451,7 +460,16 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--mark", help="record the clock under this label and exit; nothing else runs")
     ap.add_argument("--step", help="the step's `name:` exactly as ci.yml spells it")
     ap.add_argument("--leg", help="the matrix leg, e.g. windows-2025")
-    ap.add_argument("--cap-minutes", type=int, help="that step's timeout-minutes")
+    ap.add_argument(
+        "--cap-minutes",
+        type=int,
+        help=(
+            "the BUDGET this step's duration is measured against. Not necessarily its "
+            "timeout-minutes: on the web console leg the two are separate matrix knobs "
+            "(webconsole_margin_cap here, webconsole_step_timeout for the kill) so that a run "
+            "breaching this budget still completes and reports an honest duration"
+        ),
+    )
     ap.add_argument(
         "--outcome",
         help="steps.<id>.outcome for THAT STEP -- never the job's conclusion (see the module docstring)",
