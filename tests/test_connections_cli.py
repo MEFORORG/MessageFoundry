@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry import __main__ as cli
 from messagefoundry.__main__ import main
 from messagefoundry.config.wiring import load_config
 
@@ -402,3 +403,33 @@ def test_list_returns_entries(cfg: Path, capsys: pytest.CaptureFixture[str]) -> 
     entries = json.loads(capsys.readouterr().out)
     assert rc == 0
     assert any(e["name"] == "IB" and e["direction"] == "inbound" for e in entries)
+
+
+def test_cli_upsert_reports_connection_json_nested_past_the_decoder(
+    cfg: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`_connection`'s `except json.JSONDecodeError` arm structurally cannot reach a `RecursionError`,
+    so deeply nested `--data` escaped the subcommand uncaught (BACKLOG #1855).
+
+    The conversion is scoped to the `json.loads` call, NOT to this subcommand's wide `try`: that
+    `try` also wraps `upsert_connection`, `remove_connection` and the build-check callback, and a
+    `RecursionError` raised by any of those is not the operator's input being at fault.
+
+    Why that arm cannot reach it, and why the trigger below is manufactured rather than real nesting:
+    `_load_operator_json` in `messagefoundry/__main__.py`. The type facts are pinned once, by the
+    anchor test `tests/test_security_cli.py::test_cli_set_reports_security_json_nested_past_the_decoder`.
+
+    RED when: `_load_operator_json`'s `except RecursionError` arm, or `_connection`'s
+    `except _OperatorJsonTooDeep` arm, is dropped."""
+
+    def _raise_recursion(*_args: object, **_kwargs: object) -> object:
+        raise RecursionError("simulated deep nesting")
+
+    monkeypatch.setattr(cli.json, "loads", _raise_recursion)
+    rc = main(["connection", "upsert", "--config", str(cfg), "--data", "[]", "--json"])
+    out = capsys.readouterr().out
+    monkeypatch.undo()  # restore json.loads before parsing the captured payload with it
+
+    assert rc == 1
+    assert json.loads(out)["error"].startswith("connection JSON is nested too deeply to parse")
+    assert not (cfg / "connections.toml").exists()  # nothing was written

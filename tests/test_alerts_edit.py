@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry import __main__ as cli
 from messagefoundry.__main__ import main
 from messagefoundry.config import alerts_edit
 from messagefoundry.config.alerts_edit import _RULE_FIELDS
@@ -271,3 +272,34 @@ def test_add_allows_a_rule_that_names_no_transport(
     rc, _ = _add(svc, {"event_type": "connection_stopped", "severity": "critical"}, capsys)
     assert rc == 0
     assert len(load_settings(config_path=svc).alerts.rules) == 1
+
+
+def test_cli_add_reports_alert_rule_json_nested_past_the_decoder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`_alert`'s `except json.JSONDecodeError` arm structurally cannot reach a `RecursionError`, so
+    deeply nested `--data` escaped the subcommand uncaught (BACKLOG #1855).
+
+    The conversion is scoped to the `json.loads` call, NOT to this subcommand's wide `try`: that
+    `try` also wraps `add_rule`, `remove_rule` and two `load_settings` calls, and a `RecursionError`
+    raised by any of those is not the operator's input being at fault.
+
+    Why that arm cannot reach it, and why the trigger below is manufactured rather than real nesting:
+    `_load_operator_json` in `messagefoundry/__main__.py`. The type facts are pinned once, by the
+    anchor test `tests/test_security_cli.py::test_cli_set_reports_security_json_nested_past_the_decoder`.
+
+    RED when: `_load_operator_json`'s `except RecursionError` arm, or `_alert`'s
+    `except _OperatorJsonTooDeep` arm, is dropped."""
+    svc = _svc(tmp_path)
+
+    def _raise_recursion(*_args: object, **_kwargs: object) -> object:
+        raise RecursionError("simulated deep nesting")
+
+    monkeypatch.setattr(cli.json, "loads", _raise_recursion)
+    rc = main(["alert", "add", "--service-config", str(svc), "--data", "[]", "--json"])
+    out = capsys.readouterr().out
+    monkeypatch.undo()  # restore json.loads before parsing the captured payload with it
+
+    assert rc == 1
+    assert json.loads(out)["error"].startswith("alert rule JSON is nested too deeply to parse")
+    assert not svc.exists()  # nothing was written
