@@ -2958,6 +2958,26 @@ class EgressSettings(_Section):
         return v
 
 
+#: How an operator-facing refusal says ``EgressSettings.deny_by_default`` is on (BACKLOG #1361).
+#:
+#: BOTH ARMS ARE REACHABLE, AND SAYING ONLY "is set" ASSERTS SOMETHING FALSE ON THE COMMON PATH. The
+#: operator can write ``[security].block_unlisted_outbound`` -- but ``__main__`` also FLIPS the field on
+#: for any PHI instance that left it unset, announcing that as "defaulted ON". An instance that
+#: configured nothing is the usual way this refusal fires, so a message reading "is set" tells that
+#: operator they set something they did not.
+#:
+#: Defined once, beside the field, because the six refusal sites live in two other modules
+#: (``pipeline/reference_sync.py``, ``pipeline/wiring_runner.py``) and a second copy of this sentence
+#: is how five of them stay right while the sixth goes stale.
+#:
+#: Names the ``[security]`` spelling, not ``[egress].deny_by_default``: ADR 0118 relocated the key and
+#: the loader REFUSES the old one as file or env input, so naming it hands out a remediation that dies
+#: at load. tests/test_relocated_key_messages.py holds that line.
+BLOCK_UNLISTED_OUTBOUND_IN_FORCE = (
+    "[security].block_unlisted_outbound is in force (set, or defaulted ON for a PHI instance)"
+)
+
+
 class ShadowSettings(_Section):
     """``[shadow]`` — parallel-run / shadow-instance egress suppression (#15).
 

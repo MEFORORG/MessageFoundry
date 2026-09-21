@@ -38,7 +38,11 @@ from uuid import uuid4
 
 from messagefoundry.config.code_sets import CodeSetError, load_code_set
 from messagefoundry.config.models import hop_attestation_from_settings
-from messagefoundry.config.settings import EgressSettings, ReferenceSettings
+from messagefoundry.config.settings import (
+    BLOCK_UNLISTED_OUTBOUND_IN_FORCE,
+    EgressSettings,
+    ReferenceSettings,
+)
 from messagefoundry.config.wiring import ReferenceSpec, resolve_env_settings
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
@@ -125,7 +129,7 @@ async def _load_database_source(
         # otherwise ignored the flag).
         if egress.deny_by_default and not egress.allowed_db:
             raise ReferenceSyncError(
-                "DATABASE reference source: [security].block_unlisted_outbound is set and "
+                f"DATABASE reference source: {BLOCK_UNLISTED_OUTBOUND_IN_FORCE} and "
                 "[egress].allowed_db is empty — list the reference server to permit it"
             )
         if egress.allowed_db and not _egress_allows(

@@ -2333,6 +2333,14 @@ def _serve(args: argparse.Namespace) -> int:
     # therefore REQUIRES exposure_protected (in-process TLS or a declared upstream terminator) and is
     # refused even under --allow-insecure-bind (that dev override covers only the JSON API's cleartext
     # risk, never the browser surface). The loopback default never trips this.
+    # The local-only remediation names [security].listen_address, NOT local_access_only=true (BACKLOG
+    # #1361). Reaching this gate REQUIRES local_access_only=false with a non-loopback listen_address:
+    # the loader REFUSES local_access_only=true beside a non-loopback listen_address, so an operator
+    # who only set listen_address never gets here either. Adding local_access_only=true on top of the
+    # config that tripped this is therefore the one edit that CANNOT work -- it dies at load with that
+    # contradiction refusal. Moving listen_address to loopback does work, and is verified by
+    # tests/test_cli.py::test_serve_ui_offloopback_refusal_prescribes_a_config_that_loads, which drives
+    # the prescribed config back through the real loader rather than reading the message.
     if (
         settings.api.serve_ui
         and not settings.api.is_loopback
@@ -2343,7 +2351,8 @@ def _serve(args: argparse.Namespace) -> int:
             f"non-loopback host {settings.api.host!r} without TLS. The /ui surface requires "
             "in-process TLS ([api].tls_cert_file) or a declared TLS-terminating proxy "
             "([api].tls_terminated_upstream + trusted_proxies); --allow-insecure-bind does not cover "
-            "it. Set [security].local_access_only=true for local-only access, or configure TLS.",
+            "it. Set [security].listen_address to a loopback address (127.0.0.1) for local-only "
+            "access, or configure TLS.",
             file=sys.stderr,
         )
         return 2
