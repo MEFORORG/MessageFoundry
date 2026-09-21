@@ -107,9 +107,13 @@ def _assignment(section: str, key: str) -> str:
     return rf"(?<![\w.])(?:\[{re.escape(section)}\]\.)?{re.escape(key)}\s*=\s*{_VALUE}"
 
 
-#: Built once. `_citations` runs this inner loop per surviving line, so the corpus pass makes
-#: about 1.4 million of them; rebuilding the pattern string each time cost a measured 3.37s
-#: against 2.26s compiled at import.
+#: Built once, not per line. THE ONE PLACE THE SCAN COST IS MEASURED, so the prefilter in
+#: `_citations` cites this rather than restating it. One whole-corpus pass over docs/**/*.md
+#: (320 files, 91,215 lines), best of three on 2026-09-20, identical 52 hits at every step:
+#:
+#:     2.31s  rebuilding the pattern string per line, as this scan did before
+#:     1.84s  compiled once here
+#:     0.22s  and `_citations` also skipping the 94 percent of lines with no `=`
 _PATTERNS: tuple[tuple[str, str, re.Pattern[str]], ...] = tuple(
     (section, key, re.compile(_assignment(section, key))) for section, key in _REFUSED_KEYS
 )
@@ -119,10 +123,10 @@ def _citations(text: str) -> list[tuple[int, str, str]]:
     """Every line presenting a refused key as config, with the fragment that made it match."""
     hits: list[tuple[int, str, str]] = []
     for lineno, line in enumerate(text.splitlines(), 1):
-        # Every pattern embeds a literal `=`, so a line without one cannot match any of the 16.
-        # 94 percent of docs/**/*.md is such a line, and skipping them before the regexes run
-        # took a measured corpus pass from 3.0s to 0.33s. `test_every_pattern_needs_an_equals`
-        # is what keeps the shortcut honest if the pattern ever widens.
+        # Every pattern embeds a literal `=`, so a line without one cannot match any of the 16,
+        # and 94 percent of the corpus is such a line (see `_PATTERNS` for what that saves).
+        # `test_every_pattern_needs_an_equals` is what keeps the shortcut honest if the pattern
+        # ever widens to a citation shape with no `=`.
         if "=" not in line or _DISCLAIMS.search(line):
             continue
         for section, key, pattern in _PATTERNS:
