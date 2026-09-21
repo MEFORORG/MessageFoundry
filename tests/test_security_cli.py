@@ -212,22 +212,14 @@ def test_cli_set_reports_security_json_nested_past_the_decoder(
     exception type. That breaks `_emit_error`'s contract that under `--json` the error object IS the
     command's machine-readable output, and it never said which input was at fault.
 
-    THE TRIGGER IS MANUFACTURED, NOT REAL NESTING, AND MUST STAY THAT WAY (BACKLOG #1222). `json`'s C
-    accelerator consumes the C stack, which no Python-level knob reaches -- `sys.setrecursionlimit`
-    does not bound it. `tests/test_sandbox_codec.py::test_recursion_error_is_not_a_value_error`
-    measured a first raise at depth 16,913 on one box and NO raise at 100,000 on a CI runner, and the
-    real-nesting version of that test reddened `main` and two unrelated pull requests on a
-    byte-identical file. Raising the depth buys a green on today's runner image and re-fires on the
-    next roll. Do not "improve" this back to real nesting.
+    THE TRIGGER IS MANUFACTURED, NOT REAL NESTING, AND MUST STAY THAT WAY (BACKLOG #1222): the depth
+    where `json`'s C accelerator gives out measures the runner, not this code. Do not "improve" it
+    back to real nesting. The argument, the measurements and the type facts
+    (`RecursionError` is a `RuntimeError`, not a `ValueError`) are pinned once, in
+    `tests/test_sandbox_codec.py::test_recursion_error_is_not_a_value_error`.
 
     RED when: `_load_operator_json`'s `except RecursionError` arm is dropped, or `_security`'s
-    `except _OperatorJsonTooDeep` arm is dropped -- the decode escapes and stdout comes back empty."""
-    # (1) The type facts the two-arm split rests on. Environment-independent, so they pin the claim
-    # "the JSONDecodeError arm cannot reach this" rather than merely asserting it.
-    assert issubclass(RecursionError, RuntimeError)
-    assert not issubclass(RecursionError, ValueError)
-
-    # (2) Drive the arm itself.
+    `except _OperatorJsonError` arm is dropped -- the decode escapes and stdout comes back empty."""
     monkeypatch.setattr(cli.json, "loads", _raise_recursion)
     rc = main(
         ["security", "set", "--service-config", str(tmp_path / "mf.toml"), "--data", "[]", "--json"]

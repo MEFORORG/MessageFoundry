@@ -277,19 +277,21 @@ def test_add_allows_a_rule_that_names_no_transport(
 def test_cli_add_reports_alert_rule_json_nested_past_the_decoder(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """`_alert`'s `except json.JSONDecodeError` arm structurally cannot reach a `RecursionError`, so
-    deeply nested `--data` escaped the subcommand uncaught (BACKLOG #1855).
+    """A `RecursionError` is a `RuntimeError`, so the `except json.JSONDecodeError` arm this
+    subcommand used to carry structurally could not reach one, and deeply nested `--data` escaped
+    uncaught (BACKLOG #1855).
 
-    The conversion is scoped to the `json.loads` call, NOT to this subcommand's wide `try`: that
-    `try` also wraps `add_rule`, `remove_rule` and two `load_settings` calls, and a `RecursionError`
-    raised by any of those is not the operator's input being at fault.
+    The conversion is scoped by TYPE, to the `json.loads` call alone, NOT to this subcommand's wide
+    `try`: that `try` also wraps `add_rule`, `remove_rule` and two `load_settings` calls, and a
+    `RecursionError` raised by any of those is not an `_OperatorJsonError`, so the arm below still
+    does not blame the operator's input for it.
 
-    Why that arm cannot reach it, and why the trigger below is manufactured rather than real nesting:
-    `_load_operator_json` in `messagefoundry/__main__.py`. The type facts are pinned once, by the
-    anchor test `tests/test_security_cli.py::test_cli_set_reports_security_json_nested_past_the_decoder`.
+    Why, and why the trigger below is manufactured rather than real nesting: `_load_operator_json`
+    in `messagefoundry/__main__.py`. The type facts are pinned once, by the anchor test
+    `tests/test_security_cli.py::test_cli_set_reports_security_json_nested_past_the_decoder`.
 
     RED when: `_load_operator_json`'s `except RecursionError` arm, or `_alert`'s
-    `except _OperatorJsonTooDeep` arm, is dropped."""
+    `except _OperatorJsonError` arm, is dropped."""
     svc = _svc(tmp_path)
 
     def _raise_recursion(*_args: object, **_kwargs: object) -> object:

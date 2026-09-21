@@ -735,19 +735,22 @@ def test_cli_upsert_bad_json_emits_error(
 def test_cli_upsert_reports_code_set_json_nested_past_the_decoder(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The arm above cannot reach this one, so deeply nested `--data` escaped this subcommand
-    uncaught and took the whole JSON report with it (BACKLOG #1855).
+    """A malformed spec and a too-deep one now share one arm, but they did not always: a
+    `RecursionError` is a `RuntimeError`, so the bare `except json.JSONDecodeError` this subcommand
+    used to carry could not reach the case the test above covers, and deeply nested `--data` escaped
+    uncaught, taking the whole JSON report with it (BACKLOG #1855).
 
-    The conversion is scoped to the `json.loads` call, NOT to this subcommand's wide `try`: that
-    `try` also wraps `upsert_code_set` and the post-write loader, and a `RecursionError` from either
-    of those is not the operator's input being at fault.
+    The conversion is scoped by TYPE, to the `json.loads` call alone, NOT to this subcommand's wide
+    `try`: that `try` also wraps `upsert_code_set` and the post-write loader, and a `RecursionError`
+    from either is not an `_OperatorJsonError`, so the arm below still does not blame the operator's
+    input for it.
 
-    Why that arm cannot reach it, and why the trigger below is manufactured rather than real nesting:
-    `_load_operator_json` in `messagefoundry/__main__.py`. The type facts are pinned once, by the
-    anchor test `tests/test_security_cli.py::test_cli_set_reports_security_json_nested_past_the_decoder`.
+    Why, and why the trigger below is manufactured rather than real nesting: `_load_operator_json`
+    in `messagefoundry/__main__.py`. The type facts are pinned once, by the anchor test
+    `tests/test_security_cli.py::test_cli_set_reports_security_json_nested_past_the_decoder`.
 
     RED when: `_load_operator_json`'s `except RecursionError` arm, or `_codeset`'s
-    `except _OperatorJsonTooDeep` arm, is dropped."""
+    `except _OperatorJsonError` arm, is dropped."""
 
     def _raise_recursion(*_args: object, **_kwargs: object) -> object:
         raise RecursionError("simulated deep nesting")

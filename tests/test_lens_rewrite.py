@@ -410,15 +410,17 @@ def test_cli_rewrite_invalid_edit_json(capsysbinary: pytest.CaptureFixture[bytes
 def test_cli_rewrite_reports_an_edit_spec_nested_past_the_decoder(
     monkeypatch: pytest.MonkeyPatch, capsysbinary: pytest.CaptureFixture[bytes]
 ) -> None:
-    """The arm above cannot reach this one, so a deeply nested `--edit` spec escaped this subcommand
-    uncaught and took the whole JSON report with it (BACKLOG #1855).
+    """A malformed spec and a too-deep one now share one arm, but they did not always: a
+    `RecursionError` is a `RuntimeError`, so the bare `except json.JSONDecodeError` this subcommand
+    used to carry could not reach the case the test above covers, and a deeply nested `--edit` spec
+    escaped uncaught, taking the whole JSON report with it (BACKLOG #1855).
 
-    Why that arm cannot reach it, and why the trigger below is manufactured rather than real nesting:
-    `_load_operator_json` in `messagefoundry/__main__.py`. The type facts are pinned once, by the
-    anchor test `tests/test_security_cli.py::test_cli_set_reports_security_json_nested_past_the_decoder`.
+    Why, and why the trigger below is manufactured rather than real nesting: `_load_operator_json`
+    in `messagefoundry/__main__.py`. The type facts are pinned once, by the anchor test
+    `tests/test_security_cli.py::test_cli_set_reports_security_json_nested_past_the_decoder`.
 
     RED when: `_load_operator_json`'s `except RecursionError` arm, or this subcommand's
-    `except _OperatorJsonTooDeep` arm, is dropped."""
+    `except _OperatorJsonError` arm, is dropped."""
 
     def _raise_recursion(*_args: object, **_kwargs: object) -> object:
         raise RecursionError("simulated deep nesting")
