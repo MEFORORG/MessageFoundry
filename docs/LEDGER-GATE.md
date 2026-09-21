@@ -260,7 +260,7 @@ per number, so "missing" would have to be unforgeable).
 named `alloc.ps1` and nothing else. `alloc.ps1` issues a **new** number, so a seat that hit a
 *correct* refusal was steered into spending a second number and abandoning the first — and claims are
 never released, so that hole is permanent. **Measured on the maintainer clone, 2026-09-03: 19 titles
-hold more than one number**, including [#1297](#1297)/[#1298](#1298), backlog 1422/1423 and 1425/1426. The
+hold more than one number**, including #1297/#1298, backlog 1422/1423 and 1425/1426. The
 refusal text now names the recorded worktree and branch and lists the three recoveries below.
 
 *(Those last two pairs are written without the `#` sigil on purpose: the numbers are allocated, but
@@ -519,11 +519,20 @@ subject.
 
 ### Enforcement
 
+> **That script is NOT in this repository — it left with the ledger tooling (BACKLOG #1250, #1754),
+> along with `tests/test_dangling_citation_check.py`. `.github/workflows/ci.yml` records dropping
+> that test from its documentation-only guard list in the same move, and
+> `tests/test_doc_guards_lane.py` records it again. Run the checker from the maintainer-internal
+> clone.** The paragraph below describes what it does where it now lives. **No check in this
+> repository reports a dangling citation**, so here the rule above is the whole control, and
+> "fail-closed" is that script's own exit-code default rather than a gate standing on this side.
+
 `scripts/docs/dangling_citation_check.py` reports unresolved citations and keys its exit code on the
 **live shape** — above the floor, and not foreign — rather than on a raw hit count, so the inert cases
 are reported without failing anything. **It is fail-closed by default**, with `--advisory` as the
-explicit escape. Note its stated coverage bound: it sees this repository only, and **not** the private
-companion repository.
+explicit escape. Its stated coverage bound is one repository: written while it lived here, that meant
+it did not see the private companion; read from the other side, it means a run there does not cover
+this one.
 
 **Enforcement does not replace the rule.** A checker can only find what has already been written; the
 rule is what stops it being written.
