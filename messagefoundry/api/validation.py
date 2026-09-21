@@ -161,6 +161,11 @@ EPOCH_SECONDS_MAX = 4_102_444_800.0
 
 EpochSeconds = Annotated[float, Field(ge=0.0, le=EPOCH_SECONDS_MAX, allow_inf_nan=False)]
 
+#: 30 days, in minutes -- the longest alert-notification mute window (#143). Named here, beside the
+#: other shared bounds, because the /ui suspend form quotes it back to the operator when it refuses a
+#: window: a hand-copied number in that message drifts silently the day the bound moves (#1744).
+ALERT_SUSPEND_MINUTES_MAX = 43200
+
 
 # --- Free-text search terms and metadata filters --------------------------------------------------
 #

@@ -8,9 +8,14 @@ methods against recording fakes. This module drives **real messages** of known `
 store and asserts the store's always-on ``committed_txns`` / ``body_copies`` counters equal those formulas
 — so a future change that adds a commit or a body copy to the hot path trips a test, not just a review.
 
-``H`` = handlers the router selects; ``N`` = destinations delivered. The three shapes mirror the static
-gates: ``(1, 1)`` the simple feed, ``(8, 8)`` the bench topology, ``(20, 4)`` the reference estate's ADT
-hub.
+``H`` and ``N`` are defined ONCE, on ``QueueStore.committed_txns`` in ``messagefoundry/store/base.py`` —
+read them there rather than here (CLAUDE.md SDS-3.5). The one-line reminder: ``H`` = handlers the router
+selects, ``N`` = **outbound rows**, one per ``Send``, *not* distinct destinations. Every shape below
+happens to give each delivering handler its own outbound connection, so the two readings coincide here
+and this module cannot tell them apart; ``tests/test_runner_txn_cost_model.py`` is the gate that does.
+
+The three shapes mirror the static gates: ``(1, 1)`` the simple feed, ``(8, 8)`` the bench topology,
+``(20, 4)`` the reference estate's ADT hub.
 
 Two backends, two harnesses:
 

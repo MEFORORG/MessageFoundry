@@ -256,9 +256,12 @@ The key is a base64 32-byte secret. Two ways to supply it:
 config directory in-process, with the service account's privileges. The directory is therefore a
 trust boundary: anyone who can write a `.py` file there can run code as the service.
 
-- Restrict the config directory's ACL so only administrators / the service account can write it:
+- Restrict the config directory's ACL so only administrators / the service account can write it, and
+  set its **owner** — the guard checks both, and the ACL alone is not enough (see the owner bullet
+  below):
   ```powershell
   icacls "D:\hl7\config" /inheritance:r /grant "Administrators:(OI)(CI)F" "NT SERVICE\MessageFoundry:(OI)(CI)R"
+  icacls "D:\hl7\config" /setowner "*S-1-5-32-544" /T /C
   ```
   The supported one-step way to do this at install time is `install-service.ps1 -LockConfigDir`:
   it strips inherited ACEs and locks the dir to SYSTEM + Administrators (full) and the run-as
@@ -284,6 +287,30 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
     is likewise refused. If the DACL **cannot be read** (a Win32 API error), the guard **fails open
     with a loud WARNING** rather than bricking a previously-working service — a WARNING about an
     *unevaluable* guard means "fix/lock the config-dir ACL", not "ignore it".
+  - **The OWNER is checked too, and this arm REFUSES rather than warning.** An owner holds
+    `WRITE_DAC` implicitly, so it can rewrite the DACL and the executed `.py` whatever the ACEs
+    currently say — a clean DACL owned by a low-privilege account is not evidence of anything. The
+    owner passes when it is **the account the engine runs as**, a **well-known administrator SID**
+    (SYSTEM, `BUILTIN\Administrators`, or a domain SID ending in RID 500/512/518/519), or a
+    **resolved direct member of the local Administrators group**. Anything else is refused, **and so
+    is a membership lookup that cannot be completed** — unlike the DACL arms above, this one does
+    not fail open (ADR 0036 Decision 3 as amended).
+    - **The membership lookup is local-only and sees DIRECT members**, deliberately: it must not be
+      able to block on an unreachable domain controller. So an account whose administrator rights
+      come **through a nested domain group** (the common `Domain Admins` case) does **not** resolve
+      and is refused, even though it really is an administrator on the box.
+    - **The cure is to own the config dir as an administrator**, which `icacls` does in one line.
+      `-LockConfigDir` now does this for you at install time; run it by hand on a directory you
+      locked down before this behaviour shipped, or one created by an operator whose rights are
+      nested:
+      ```powershell
+      icacls "D:\hl7\config" /setowner "*S-1-5-32-544" /T /C
+      ```
+      `*S-1-5-32-544` is `BUILTIN\Administrators` by SID, so the command is correct on a non-English
+      Windows. `/T` covers the `*.py` files, which the guard vets individually; `/C` keeps the walk
+      going past a file it cannot set (an open editor, an antivirus scan) instead of stopping at the
+      first one and leaving the rest on the old owner — check its summary line for skipped files.
+      Setting the owner does **not** grant anyone access — pair it with the DACL recipes above.
   - On **POSIX** hosts the loader **refuses** to load from a group/world-writable or foreign-owned
     directory or module file.
   - **Dev/test escape (never set in production).** Because a default Windows checkout grants
@@ -422,6 +449,16 @@ it — the engine refuses to start otherwise, naming the collision.
    `connection_stopped` alert per halted connection naming the log as the cause, and `GET /status`'s
    `log_sinks` block, which is read from memory and still answers when the disk does not.
 
+**Every outbound reads `log_halted` on `/connections` while this is in force** (ADR 0189), not
+`stopped`. The difference is the one that decides what you do next: `stopped` means the lane is
+waiting for you to press start, and `log_halted` means it is waiting for a writable disk — pressing
+start is refused until the disk is fixed. The state is process-wide because the broken thing is, so
+every lane this engine owns shows it at once, and `outbound_running` reports false for all of them
+(so `/stats`' running/stopped split counts them as not running). A lane that failed to build, was
+parked by the DR run-profile, or is `deployed = false` keeps showing `failed` / `filtered` /
+`not_deployed` instead: those are facts about that one connection, and the halt already has its own
+alert.
+
 Recover by fixing the disk or permissions and then **restarting the affected connections** — inbounds
 *and* outbounds — from the web console, or by restarting the service; the retained queue then drains.
 **Fix the disk first — the restart is refused while the log is still unwritable.** The engine
@@ -505,15 +542,53 @@ host-wide — coordinate with whatever else the box runs.
 .\scripts\service\uninstall-service.ps1
 ```
 
-This stops and removes the service. The log files and message store under `DataDir`
-are left in place.
+This stops the service and removes its registration. **It does not return the host to its
+pre-install state.** The script reads the host before it removes the registration, then prints an
+inventory of what is still there and the command that clears each one. Read that inventory; the
+list below says what it covers.
+
+| Left behind | Why | Clear it with |
+|---|---|---|
+| The `DataDir` tree — logs, message store, and `bin\nssm.exe` if the installer downloaded it | Your data, and the NSSM binary the uninstall just used | Delete it yourself once you are sure you are not reinstalling. `DataDir` is a PHI sink — dispose of it the way [PHI.md](PHI.md) describes |
+| An access-control entry for the run-as account on `DataDir` **and** on the config directory | The installer grants both so the service can read config and write logs | `-RemoveAccountAces`, or `icacls "<dir>" /remove:g "*<SID>"` |
+| The `SeServiceLogonRight` ("Log on as a service") grant | NSSM's `ObjectName` does not grant it, so the installer does | `-RemoveLogonRight`, or secpol.msc under Local Policies, User Rights Assignment |
+| Inheritance turned off on `DataDir`, and (with `-LockConfigDir`) on the config directory plus its owner moved to Administrators | See below | `icacls "<dir>" /inheritance:e`, by hand |
+| Windows Error Reporting keys, when you installed with `-SuppressCrashDumps` — **two** surfaces, `ExcludedApplications` and `LocalDumps`, reported separately because Windows evaluates them independently | [Stated above](#suppress-windows-crash-dumps-of-the-engine-adr-0152-phase-0) — removing them switches PHI-carrying dumps back on | By hand, under that registry path |
+
+**Why the uninstaller does not put the permissions back.** Turning inheritance on again would hand
+the parent directory's principals read access to logs and a message store that can carry PHI — on
+the way out, when nobody is watching. And nothing recorded what the permissions and the owner were
+before the installer changed them, so a "restore" would be inventing a state rather than returning
+to one. The two switches exist for the residues that **are** reversible, and both are opt-in.
+
+```powershell
+.\scripts\service\uninstall-service.ps1 -RemoveLogonRight -RemoveAccountAces
+```
+
+**Pass them on the uninstall run itself.** Both act on facts that only exist while the service is
+registered — the run-as account, its SID, the config directory. Once the service is gone the script
+exits at its "not installed" guard, so a second run with the switches does nothing. The inventory
+says so, and names the manual command for each.
+
+`-RemoveLogonRight` is safe for the installer's default per-service virtual account, whose SID
+belongs to this service alone. It warns first for any other account: a gMSA or a dedicated user may
+log other services on, and they fail to start with error 1069 once the right is gone. The script
+also refuses to remove the right when the account is the only holder on the host, which would take
+it from every service at once.
+
+A read that fails leaves its residue out of the inventory, so the script names what it could not
+read rather than printing a shorter list. Check those by hand before you call the host clean.
 
 ## Troubleshooting
 
 - **Service won't start / exits immediately.** Read `service.err.log`. The most common
-  cause is a bad path baked into the service (relative paths resolve to the *system*
-  directory for a service account); re-run the install script, which resolves all paths
-  to absolute.
+  cause is a bad path baked into the service: a service resolves a relative path against
+  its own working directory, not against yours. Read what is actually registered —
+  `nssm get MessageFoundry AppParameters` and `nssm get MessageFoundry AppDirectory` — and
+  compare it against where the files really are. The installer makes `-Config`, `-DbPath`,
+  `-DataDir` and `-AppExe` absolute, anchored to the directory you ran it from, so
+  re-running it from a *different* directory changes what a relative argument meant. Pass
+  absolute paths if you want to be certain.
 - **Port already in use (e.g. 2575).** The sample config's inbound connection binds MLLP
   port `2575`. If a stray `messagefoundry serve` (or a second copy of the service) is already
   running, the listener fails to bind. Make sure only one instance runs:

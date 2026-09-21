@@ -8,10 +8,31 @@ rules:
   dangerous-triggers:
     ignore:
       # A CLA assistant REQUIRES pull_request_target to record signatures + comment on fork PRs. This
-      # workflow never checks out untrusted PR code, pins the third-party action by SHA, and gates on the
-      # immutable comment body / event name — so the usual pull_request_target risk (running attacker
-      # code with a write token) does not apply. The action is pinned at ca4a40a7d100 (v2.6.1); its
-      # archived-upstream status is adjudicated under archived-uses below.
+      # workflow never checks out untrusted PR code, runs the action from a copy VENDORED into this
+      # repository, and gates on the immutable comment body / event name — so the usual
+      # pull_request_target risk (running attacker code with a write token) does not apply.
+      #
+      # THE ACTION IS LOCAL, NOT A SHA-PINNED REMOTE (BACKLOG #1381 vendored it):
+      # `uses: ./.github/actions/cla-assistant-lite`, from ca4a40a7d100 (v2.6.1). The action's bytes
+      # are committed in this repository, so there is no remote reference for an upstream to change
+      # or withdraw. It is still third-party Apache-2.0 code.
+      #
+      # WHAT CARRIES THE `pull_request_target` CLAIM IS THE CHECKOUT, AND IT IS NAMED HERE RATHER
+      # THAN LEFT IMPLIED. A SHA pin was immune to which ref got checked out; vendored bytes are not,
+      # because a local `uses:` resolves against GITHUB_WORKSPACE and therefore against whatever the
+      # checkout put there. The step named "Check out the base, so the vendored local action
+      # resolves" takes the BASE -- the default under `pull_request_target` -- with
+      # `persist-credentials: false`, and its own `NO ref: HERE, DELIBERATELY` block states why.
+      # ADDING a `ref:` that names the pull request's head would run FORK-AUTHORED code under this
+      # job's `contents: write` token and invalidate this suppression. Nothing lints for that: the
+      # local-action checker (scripts/quality/workflow_local_action_check.py) says outright that it
+      # does not police `ref:`. If that step changes, re-justify this entry or delete it.
+      #
+      # Upstream is ARCHIVED. That residual is recorded in docs/adr/0034 (amendment, 2026-08-01) and
+      # no longer as an archived-uses entry in this file -- a local `uses:` gives that audit nothing
+      # to fire on, so an entry here would be a suppression that can never match. Its deadline is
+      # LIVE and is what forces fork-or-replace: the vendored action.yml declares `runs.using:
+      # node20`, and GitHub removes Node20 in fall 2026. Re-check before then.
       - cla.yml
       # A notice that a SCHEDULED run failed can only be written by something observing that run AFTER
       # it finishes — no other trigger sees another workflow's conclusion, so `workflow_run` is not a
@@ -24,8 +45,8 @@ rules:
       #   * NO checkout, and no third-party actions at all — `test_it_pulls_in_no_third_party_actions`
       #     fails if a `uses:` ever appears. Nothing from the triggering ref is fetched, let alone run.
       #     That is a STRONGER claim than cla.yml's above: cla.yml runs a third-party action with a
-      #     write token — SHA-pinned, so it cannot change under us, but still third-party code —
-      #     whereas this job runs no third-party code at all.
+      #     write token — vendored into this repository, so it cannot change under us, but still
+      #     third-party code — whereas this job runs no third-party code at all.
       #   * It only reacts to `workflow_run.event == 'schedule'`
       #     (`test_it_only_reacts_to_scheduled_runs`), so a PR — including a fork PR — has no path to
       #     the job at all.
@@ -118,37 +139,6 @@ rules:
       # RE-ANCHOR it; do not broaden it to the file.
       - dependabot-lock-resync.yml:76
 
-  archived-uses:
-    ignore:
-      # contributor-assistant/github-action is ARCHIVED upstream (GitHub API `archived: true`; the date
-      # is observed from its last push, 2026-03-23, since `archived_at` is null). v2.6.1 is both the last
-      # tag and the last release, and the pin ca4a40a7d1004f18d9960b404b97e5f30a505a08 equals that tag
-      # exactly — so there is no future patch to bump to. Recorded as an ACCEPTED RESIDUAL, not a false
-      # positive: the finding is true.
-      #
-      # What the SHA pin buys, and what it does not. It closes the TAMPER axis completely — a bundled JS
-      # action's pinned SHA fully determines the bytes that run, and a deleted or re-registered namespace
-      # makes this step FAIL rather than run a stranger's code. It does NOT close the axis this audit is
-      # about: a flaw in the code already at that SHA will never be patched.
-      #
-      # NOT REPLACED, deliberately. `cla` is a REQUIRED status context (.github/required-contexts.txt)
-      # and it is this JOB's own conclusion, so a broken step blocks every contribution.
-      # pull_request_target / issue_comment workflows run only from the DEFAULT branch, so a swap cannot
-      # be exercised on the PR that makes it — it lands on main untested, with approvals at 0 and
-      # auto-merge armed. On a step holding a write token that any GitHub user can trigger by comment,
-      # trading a frozen SHA-pinned bundle for a less-reviewed fork is not self-evidently a security win.
-      #
-      # WHAT WILL FORCE THE DECISION, and it is not this lint: action.yml at this SHA declares
-      # `runs.using: node20`, as does the archived repo's HEAD, so no upstream release can ever
-      # re-declare node24. GitHub removes Node20 in fall 2026. Re-check before then. Full record and the
-      # replacement candidate: docs/adr/0034 (amendment, 2026-08-01).
-      #
-      # Line-anchored on purpose: a file-level entry would silently swallow a SECOND archived action
-      # added here later. Accepted cost is drift — an inserted line re-fires the finding with no change
-      # in risk. Re-anchor; do not broaden. Delete this entry when the action is replaced, or if upstream
-      # un-archives (the audit re-checks that every run).
-      - cla.yml:44
-
   self-repository:
     ignore:
       # THE FINDING IS TRUE AND THE SYNTAX IT RECOMMENDS IS REAL. Recorded as an ACCEPTED RESIDUAL, not
@@ -189,7 +179,7 @@ rules:
       # migration is items 3 and 4 done together, deliberately, by someone who can accept a live
       # required-context outage. Adopt it then, and delete this entry.
       #
-      # Line-anchored on purpose, same as the two entries above: a file-level entry would swallow a
+      # Line-anchored on purpose, same as the bot-conditions entry above: a file-level entry would swallow a
       # future local `uses:` added to this file, and that one might carry none of the four reasons.
       # Re-anchor if the line moves; do not broaden it to the file.
       - cla.yml:178

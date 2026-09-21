@@ -42,8 +42,9 @@ before the real shape was known.
 **Every source element inside an action-list is accounted for (count-and-log ethos).** A verb that
 maps to a v1 vocabulary helper emits that call; an **unmapped** verb — and an element whose **tag** this
 layer does not model — is *never silently dropped*: it emits an in-place ``# TODO: Corepoint …
-hand-finish`` marker (plus, when a target field is recoverable, a best-effort field-preserving
-``msg.set`` stub), its subtree is parsed and inlined beneath it, and the import summary counts it.
+hand-finish`` marker naming the intended target field when one is recoverable, its subtree is parsed
+and inlined beneath it, and the import summary counts it. An unmapped verb emits **no live code at
+all** — see :func:`_decline` for why the former ``msg.set`` "passthrough stub" was not inert.
 Control flow is emitted as real nested Python (``if``/``for``/``while``/``try``) whose *condition* is
 left as an explicit, dead (`False`) hand-finish placeholder — a Corepoint condition expression is not
 Python and is never guessed. ``@Disabled`` is honoured at **every** level — a single statement, a
@@ -52,12 +53,16 @@ pseudo-source: never live code, and a disabled action-list is not routed to.
 
 **Security (untrusted input).** A Corepoint export is untrusted *data*, never instructions
 (CLAUDE.md §5/§8). Every value lifted from the export into generated Python source is rendered through
-:func:`json.dumps`, which emits a fully-escaped string/list/dict **literal** — a stray quote, newline,
-or backslash cannot break out of the literal into executable code, so a hostile export cannot inject
-code into the generated module. Text that rides into a *comment* is flattened by
-:func:`_comment_text` (newlines collapsed), so a crafted ``@Data``/``@Comment`` cannot escape the
-``#`` into a statement. XML is parsed through **defusedxml** with ``forbid_dtd``/``forbid_entities``/
-``forbid_external`` all on, so a billion-laughs or external-entity payload raises instead of expanding.
+:func:`_lit` (:func:`json.dumps`), which emits a fully-escaped string/list/dict **literal** — a stray
+quote, newline, or backslash cannot break out of the literal into executable code, so a hostile export
+cannot inject code into the generated module. A value JSON *can* render but Python cannot read back —
+``null``/``true``/``false``/a non-finite number, or a string carrying an unpaired surrogate — is
+refused as a :class:`CorepointImportError` rather than written into a module that fails at import or at
+encode. Text that rides into a *comment* is flattened by :func:`_comment_text` (whitespace collapsed,
+non-whitespace controls deleted), so a crafted ``@Data``/``@Comment``, action class name, or recovered
+target field cannot escape the ``#`` into a statement, and a NUL cannot make the module uncompilable.
+XML is parsed through **defusedxml** with ``forbid_dtd``/``forbid_entities``/``forbid_external`` all
+on, so a billion-laughs or external-entity payload raises instead of expanding.
 Paths ride across as data to :meth:`Message.set` at run time.
 
 Pure (parse + string codegen): no network, no message content, no dependency beyond the already-in-tree
@@ -71,6 +76,7 @@ import json
 import keyword
 import re
 from dataclasses import dataclass, field, replace
+from math import isfinite
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from xml.etree.ElementTree import (  # nosec B405 — exception type only; every parse goes through defusedxml
@@ -79,6 +85,8 @@ from xml.etree.ElementTree import (  # nosec B405 — exception type only; every
 
 from defusedxml.common import DefusedXmlException
 from defusedxml.ElementTree import fromstring as _xml_fromstring
+
+from messagefoundry.controlchars import strip_control_chars
 
 if TYPE_CHECKING:  # runtime never needs the class — only the annotations do
     from xml.etree.ElementTree import (  # nosec B405 — type-only import (see above)
@@ -109,11 +117,16 @@ __all__ = [
 
 
 class CorepointImportError(ValueError):
-    """The export could not be parsed into the ADR 0086 model (malformed XML/JSON or a missing field).
+    """The import could not be completed: the export is malformed, or the module it generates is not
+    valid Python.
 
     A subclass of :class:`ValueError`; the CLI turns it into a clean error + non-zero exit. The
     importer treats the export as untrusted data, so a structural problem — including a rejected DTD
-    or entity payload — is reported, never raised as an uncaught traceback."""
+    or entity payload — is reported, never raised as an uncaught traceback.
+
+    Most arms blame the EXPORT (malformed XML/JSON, a missing field). One does not: a
+    :class:`SyntaxError` caught by :func:`_verify_compilable` is a defect in this generator, so an
+    operator reading the message should not assume their export is at fault."""
 
 
 # --- intermediate action model ----------------------------------------------
@@ -135,13 +148,13 @@ class Action:
 
 @dataclass(frozen=True)
 class UnmappedAction:
-    """A source action with no v1 vocabulary mapping — emitted as a visible TODO + best-effort stub.
+    """A source action with no v1 vocabulary mapping — emitted as a visible TODO marker, never code.
 
-    ``stub_path`` is the recovered target field (``None`` when the export names none, so only the TODO
-    marker is emitted). ``detail`` is a short human note for the marker."""
+    ``detail`` is a short human note for the marker, and it is where the recovered target field rides
+    when the export names one: there is deliberately NO field to carry a stub target, because there is
+    no stub. See :func:`_decline` for why a "best-effort passthrough" line is not inert."""
 
     source_class: str
-    stub_path: str | None
     detail: str
 
 
@@ -215,7 +228,7 @@ class Destination:
 class Channel:
     """A parsed Corepoint channel: one inbound, a router over N handlers, and the outbounds they use."""
 
-    module_name: str  # file stem + inbound connection name, e.g. IB_ACME_ADT
+    module_name: str  # file stem + inbound connection name, e.g. IB_DEMO_ADT
     inbound_connector: str  # "MLLP" | "File"
     inbound_call: str  # e.g. "MLLP(port=2600)"
     router_name: str
@@ -374,10 +387,18 @@ def _map_action(raw: dict[str, Any]) -> Action | UnmappedAction:
     if cls in ("SegmentDelete", "ItemSegmentDelete"):
         return Action(cls, "delete_segment", (_lit(_req_str(raw, "segment", cls)),))
 
-    # Unrecognized: never dropped. Recover a plausible target field for a best-effort passthrough stub.
-    stub = raw.get("target") or raw.get("destination") or raw.get("source")
-    stub_path = stub if isinstance(stub, str) else None
-    return UnmappedAction(cls, stub_path, f"no v1 vocabulary mapping for Corepoint {cls}")
+    # Unrecognized: never dropped. The recovered target rides into the marker TEXT, not into a live
+    # ``msg.set`` line — see :func:`_decline` for why that stub was never the inert marker it claimed.
+    # Both ``cls`` and the target stay RAW here, and that is deliberate: unlike every other value this
+    # layer handles neither has been through a grammar, so both need escaping — but a comment needs a
+    # different escape from a literal, and the renderer is the one place that knows a value is about
+    # to become a comment. :func:`_generate_steps` applies :func:`_comment_text`; escaping here too
+    # would leave a reader unable to tell which of the two is the contract.
+    recovered = raw.get("target") or raw.get("destination") or raw.get("source")
+    detail = f"no v1 vocabulary mapping for Corepoint {cls}"
+    if isinstance(recovered, str) and recovered:
+        detail += f"; intended target {recovered}"
+    return UnmappedAction(cls, detail)
 
 
 # --- export parsing (defensive; untrusted data) ------------------------------
@@ -396,6 +417,13 @@ def parse_export(text: str) -> tuple[Channel, ...]:
         doc = json.loads(text)
     except json.JSONDecodeError as exc:
         raise CorepointImportError(f"export is not valid JSON: {exc}") from exc
+    except RecursionError as exc:
+        # `json.loads` raises `RecursionError` (a `RuntimeError`, not caught by the arm above) on
+        # deeply nested input; the CLI's `_import` happens to catch it too, but any other caller of
+        # this function -- the one the module's own "defensive throughout" docstring promises -- would
+        # see a raw traceback instead of the clean `CorepointImportError` every other malformed-export
+        # path here returns.
+        raise CorepointImportError(f"export is nested too deeply to parse: {exc}") from exc
     if not isinstance(doc, dict):
         raise CorepointImportError("export root must be a JSON object")
     channels_raw = doc.get("channels")
@@ -657,7 +685,7 @@ class Operand:
     # Whether a ``literal`` span carried its own quotes *inside* the span. The exporter is
     # inconsistent (most literals are wrapped, a large minority are bare), so the unwrap is
     # conditional and must happen exactly once — rendering a wrapped span verbatim would emit
-    # ``set_field(msg, "MSH-6", "\"ACME\"")``, a value carrying two stray quote characters.
+    # ``set_field(msg, "MSH-6", "\"DEMO\"")``, a value carrying two stray quote characters.
     quoted: bool = False
 
 
@@ -1003,7 +1031,7 @@ def _option(token: str) -> str | None:
 
 
 def _first_path(operands: list[str]) -> str | None:
-    """The first operand that resolves to an HL7 path — the best-effort stub target for a TODO."""
+    """The first operand that resolves to an HL7 path — the intended target named in a TODO marker."""
     for token in operands:
         path = _message_path(token)
         if path is not None:
@@ -1041,12 +1069,18 @@ def _map_statement(verb: str, operands: list[str], statement: str) -> Action | U
         if target is not None and suffix is not None:
             return Action(verb, "append_to_field", (_lit(target), _lit(suffix)))
 
-    detail = (
-        f"no v1 vocabulary mapping for Corepoint {verb}: {_comment_text(statement)}"
+    reason = (
+        f"no v1 vocabulary mapping for Corepoint {verb}"
         if verb
-        else f"statement does not begin with a verb: {_comment_text(statement)}"
+        else "statement does not begin with a verb"
     )
-    return UnmappedAction(verb or "<unparsed>", _first_path(operands), detail)
+    # The recovered target rides into the marker text, exactly as on the validated role-parsed path
+    # (:func:`_decline`) — never into a live ``msg.set`` line. It goes AHEAD of the quoted statement
+    # because the statement is the unbounded part: :func:`_generate_steps` elides the marker, and the
+    # target is the half a migrator cannot reconstruct from the export by eye.
+    target = _first_path(operands)
+    lead = f"{reason}; intended target {target}" if target is not None else reason
+    return UnmappedAction(verb or "<unparsed>", f"{lead}: {statement}")
 
 
 def _subject_field(operand: Operand, subject: frozenset[str]) -> str | None:
@@ -1181,22 +1215,23 @@ def _map_roles(
 
 
 def _decline(verb: str, operands: tuple[Operand, ...], subject: frozenset[str]) -> UnmappedAction:
-    """Turn a declined role-parsed statement into a TODO marker that says *why*, plus a safe stub.
+    """Turn a declined role-parsed statement into a TODO marker that says *why*, and emits no code.
 
-    The stub target is the first operand that is genuinely ``msg``'s own field, so the hand-finish keeps
-    the intended field visible without inventing one when nothing resolves."""
+    The recovered target is the first operand that is genuinely ``msg``'s own field, so the hand-finish
+    keeps the intended field visible without inventing one when nothing resolves."""
     # NO live stub. The "best-effort passthrough" ``msg.set(p, msg.field(p) or "")`` is not the inert
-    # marker its comment claims: ``Message.set`` RAISES ``KeyError`` on an absent segment, and on a
+    # marker its comment claimed: ``Message.set`` RAISES ``KeyError`` on an absent segment, and on a
     # present segment with an absent field it *materialises* the field and its empty components on the
     # wire. A line whose only job is to stay visible must not be able to change the message or
-    # dead-letter it, so the recovered target rides into the comment instead.
+    # dead-letter it, so the recovered target rides into the comment instead. Every other
+    # ``UnmappedAction`` site now does the same (#1681); this one did it first.
     target = next(
         (field for field in (_subject_field(o, subject) for o in operands) if field is not None),
         None,
     )
     reason = _decline_reason(operands, subject)
     detail = f"{reason}; intended target {target}" if target else reason
-    return UnmappedAction(verb, None, detail)
+    return UnmappedAction(verb, detail)
 
 
 def _role_send_args(operands: tuple[Operand, ...]) -> tuple[str, ...]:
@@ -1216,19 +1251,58 @@ def _split_branches(steps: list[Step]) -> tuple[tuple[Step, ...], tuple[Control,
     """Split a container body at its branch markers into ``(body, branches)``.
 
     The export writes ``Else``/``ElseIf``/``Catch``/``Matching`` as ordinary statements *inside* the
-    construct's own ``<List>``, so everything after such a marker belongs to that branch. Recursing
-    keeps successive branches siblings (``if`` → ``elif`` → ``else``), not nested."""
+    construct's own ``<List>``, so everything after such a marker belongs to that branch. Walk once
+    to keep successive branches siblings without consuming stack space for a wide list."""
+    body: tuple[Step, ...] = ()
+    branches: list[Control] = []
+    marker: Control | None = None
+    start = 0
     for i, step in enumerate(steps):
         if isinstance(step, Control) and step.kind in _BRANCH_PARENT and not step.body:
-            body, rest = _split_branches(steps[i + 1 :])
-            return tuple(steps[:i]), (replace(step, body=body), *rest)
-    return tuple(steps), ()
+            if marker is None:
+                body = tuple(steps[:i])
+            else:
+                branches.append(replace(marker, body=tuple(steps[start:i])))
+            marker = step
+            start = i + 1
+    if marker is None:
+        return tuple(steps), ()
+    branches.append(replace(marker, body=tuple(steps[start:])))
+    return body, tuple(branches)
 
 
 # How deep the ``<List>`` tree may nest. The walk is mutually recursive (list → statement → list), so
 # an untrusted export nesting thousands of elements would otherwise exhaust the interpreter stack and
 # surface as a RecursionError traceback instead of a clean, reported error (CLAUDE.md §6/§8). Real
 # packages nest a handful of levels; 100 is far past any plausible hand-authored action-list.
+#
+# This bounds DEPTH only, not the WIDTH of one branch list, and width has its own bound the fix for the
+# earlier recursion-on-width defect moved rather than removed: ``generate_module`` renders one ``elif
+# False:`` per sibling branch (see the ``If``/``ChooseFrom`` renderer below) into the generated module's
+# source text, and past roughly 5,950 to 5,960 siblings CPython's own parser raises ``MemoryError:
+# Parser stack overflowed``. Two independent instruments put the edge in that band: a bisect over the
+# real generator and a bisect over synthetic source, landing one apart, the difference explained by how
+# much nesting frames the branch list. Treat it as a band and not a constant -- it moves with nesting
+# depth, and it belongs to the CPython build rather than to this module, so never assert an exact width.
+#
+# The accept-and-drop this used to describe is FIXED: ``import_corepoint`` now compiles every generated
+# module before writing it (:func:`_verify_compilable`), so crossing the wall is a reported
+# ``CorepointImportError`` and a non-zero exit instead of a bad file written under a success report.
+# WHETHER TO BOUND BRANCH WIDTH WAS THE OPEN QUESTION, AND IT IS ANSWERED: DO NOT. The fear was that
+# a limit low enough to stay clear of the wall would refuse a legitimate long ``ElseIf`` chain. That
+# is a claim about how wide a REAL export gets, which nobody had measured -- the wall was quoted
+# precisely while the number that actually decides the question was assumed. Measured 2026-09-21
+# against a real production Corepoint export (4.3 MB, roughly 500x the test fixture), walked with
+# this module's own ``parse_package``: 206 branching constructs, WIDEST SIBLING CHAIN 5, median 2,
+# the ten widest all between 3 and 5. Against a wall near 5,950 that is about three orders of
+# magnitude of headroom, so a width bound would protect nothing and is not worth its risk.
+#
+# n=1: one export from one site, and it is the only real one that was available. The conclusion
+# survives a site two orders of magnitude wider, but do not read 5 as a surveyed maximum -- it is one
+# measurement, and a second export is what would upgrade it.
+#
+# The guard that DOES matter is the post-condition above, which is not a limit at all: it refuses
+# nothing legitimate and fires only on source this module could not itself parse.
 _MAX_NESTING = 100
 
 
@@ -1368,7 +1442,7 @@ def _parse_statement(
         else:
             # No statement at all — reported rather than skipped, because a silently-ignored element is
             # exactly the accept-and-drop this importer refuses (count-and-log).
-            mapped = UnmappedAction(tag, None, f"<{tag}> carries no statement to translate")
+            mapped = UnmappedAction(tag, f"<{tag}> carries no statement to translate")
         # An operator's ``@Comment`` — and the ``description``/``comment`` prose the role layer lifts
         # OUT of the statement — is preserved beside the step it annotates, never dropped.
         prose = note or _role_prose(roles)
@@ -1568,7 +1642,8 @@ def generate_module(channel: Channel) -> str:
 
     The output calls the ADR 0076 vocabulary + :class:`Send` and is designed to pass ``messagefoundry
     check`` and round-trip through ``lens parse`` (every mapped step classifies into a typed action
-    row; a TODO stub degrades to an in-place ``code`` row — never a whole-file refusal)."""
+    row; a TODO marker is a bare comment and so contributes no row at all — never a whole-file
+    refusal)."""
     used_vocab: set[str] = set()
     used_connectors: set[str] = {channel.inbound_connector}
     for d in channel.destinations:
@@ -1706,20 +1781,30 @@ def _generate_steps(steps: tuple[Step, ...], indent: int, *, in_loop: bool) -> l
                 parts.append(f"{kw_name}={kw_val}")
             out.append(f"{pad}{step.vocabulary}({', '.join(parts)})")
         elif isinstance(step, UnmappedAction):
-            out.append(f"{pad}# TODO: Corepoint {step.source_class} — hand-finish ({step.detail})")
-            if step.stub_path is not None:
-                # Best-effort passthrough: re-set the field to its own value so nothing is corrupted and
-                # the intended target stays visible for the hand-finish (count-and-log; never dropped).
-                out.append(
-                    f'{pad}msg.set({_lit(step.stub_path)}, msg.field({_lit(step.stub_path)}) or "")'
-                )
+            # A marker and nothing else. Both fields arrive RAW — on the JSON layer ``source_class``
+            # is an arbitrary export string and ``detail`` quotes one — so this render site is where
+            # they are escaped for the comment they are about to become (#1683).
+            out.append(
+                f"{pad}# TODO: Corepoint {_comment_text(step.source_class, 60)} — hand-finish "
+                f"({_comment_text(step.detail)})"
+            )
         else:
             out.extend(_generate_control(step, indent, in_loop=in_loop))
     return out
 
 
 def _generate_control(ctrl: Control, indent: int, *, in_loop: bool) -> list[str]:
-    """Render one control construct. Conditions are never guessed — they become dead placeholders."""
+    """Render one control construct, then whatever branches it could not continue.
+
+    The tail runs for EVERY kind, so a construct added later cannot silently drop an adopted branch by
+    forgetting to ask for it — see :func:`_stray_branches` (BACKLOG #1854)."""
+    out = _generate_construct(ctrl, indent, in_loop=in_loop)
+    out.extend(_stray_branches(ctrl, indent, in_loop=in_loop))
+    return out
+
+
+def _generate_construct(ctrl: Control, indent: int, *, in_loop: bool) -> list[str]:
+    """Render the construct itself. Conditions are never guessed — they become dead placeholders."""
     pad = "    " * indent
     label = _comment_text(ctrl.detail)
     suffix = f" — hand-finish: {label}" if label else ""
@@ -1764,16 +1849,16 @@ def _generate_control(ctrl: Control, indent: int, *, in_loop: bool) -> list[str]
     if ctrl.kind == "try":
         out = [f"{pad}try:"]
         out.extend(_block_body(ctrl.body, indent + 1, in_loop=in_loop))
-        handlers = [b for b in ctrl.branches if b.kind == "except"] or None
-        if handlers is None:
+        # The complement of this filter is what :func:`_stray_branches` marks, so both sides read the
+        # same predicate — a ``try`` that learns a new branch kind cannot leave one in neither set.
+        handlers = [b for b in ctrl.branches if _renders_as_branch(ctrl.kind, b.kind)]
+        if not handlers:
             out.append(f"{pad}except Exception:  # TODO: Corepoint Try with no Catch — hand-finish")
             out.append(f"{pad}    raise")
-            return out
         for branch in handlers:
-            note = _comment_text(branch.detail)
             out.append(
-                f"{pad}except Exception:  # TODO: Corepoint {branch.source_verb} — hand-finish"
-                + (f": {note}" if note else "")
+                f"{pad}except Exception:  # TODO: Corepoint {branch.source_verb}"
+                f"{_hint(_comment_text(branch.detail))}"
             )
             out.extend(_block_body(branch.body, indent + 1, in_loop=in_loop))
         return out
@@ -1791,6 +1876,65 @@ def _generate_control(ctrl: Control, indent: int, *, in_loop: bool) -> list[str]
     # bare ``else:`` would not even parse, so it degrades to a marker + its body inline — never lost.
     out = [f"{pad}# TODO: Corepoint {ctrl.source_verb} with no enclosing construct{suffix}"]
     out.extend(_generate_steps(ctrl.body, indent, in_loop=in_loop))
+    return out
+
+
+def _renders_as_branch(parent_kind: str, branch_kind: str) -> bool:
+    """Whether :func:`_generate_construct` emits this branch as real Python control flow.
+
+    THE single answer, asked by the render and by :func:`_count_steps` alike, because the summary is a
+    count-and-log record and a branch the render only marks must not be reported as shipped. An
+    ``if``/``case`` chain takes every branch as an arm — a stray marker there is a mislabelled arm,
+    not a loss — while a ``try`` speaks only ``except`` and a loop speaks no branch at all.
+
+    Spelled out rather than read off ``_BRANCH_PARENT``: that table says which construct may ADOPT a
+    marker, which is a parse question. This is a render question, and the two part company the moment
+    a construct adopts a kind it has no faithful form for — a ``finally`` added to the table would
+    otherwise be rendered as ``except Exception:``, which is worse than being marked."""
+    if parent_kind in ("if", "case"):
+        return True
+    return parent_kind == "try" and branch_kind == "except"
+
+
+def _stray_branches(ctrl: Control, indent: int, *, in_loop: bool) -> list[str]:
+    """Render the branches ``ctrl`` cannot continue: a TODO marker, then the body inline.
+
+    :func:`_split_branches` adopts ANY bodyless branch marker written inside a container's own
+    ``<List>`` without checking that the marker's construct matches that container, so an ``Else``
+    lands on a ``Try`` and a ``Catch`` on a ``ForEach``. Keeping only the branches a render understood
+    dropped the rest with their whole bodies, while the summary counted every dropped statement as
+    mapped — worse than a plain drop, because it asserted the statement shipped (BACKLOG #1854).
+
+    The marker's own scope is unknowable (the export's intent is not recoverable from a misplaced
+    marker), so this degrades exactly as the ``unknown`` arm above does: say what was found, say the
+    scope was lost, and inline the body at THIS indentation rather than invent a construct for it.
+
+    A ``@Disabled`` subtree never reaches here (:func:`_parse_statement` returns it before branches are
+    split, so it carries none), and the explicit guard keeps it that way: its whole contract is that
+    nothing under it is emitted as live code, which inlining a body would break."""
+    if ctrl.kind == "disabled":
+        return []
+    strays = [b for b in ctrl.branches if not _renders_as_branch(ctrl.kind, b.kind)]
+    if not strays:
+        return []
+    # The body is being lifted OUT of the loop it was written inside, so a ``LoopExit`` in it no
+    # longer names that loop. Emitting a live ``break`` here would bind it to whatever loop encloses
+    # the construct — a silent change of which loop exits — so the loop context is dropped and the
+    # ``LoopExit`` degrades to its own marker instead.
+    in_loop = in_loop and ctrl.kind not in ("for", "while")
+    pad = "    " * indent
+    out: list[str] = []
+    for branch in strays:
+        out.append(
+            f"{pad}# TODO: Corepoint {branch.source_verb} cannot continue a Corepoint "
+            f"{ctrl.source_verb}{_hint(_comment_text(branch.detail))}"
+        )
+        if branch.body:
+            out.append(
+                f"{pad}#   its body is inlined below at THIS indentation — the branch's own scope "
+                f"is lost, re-scope by hand"
+            )
+        out.extend(_generate_steps(branch.body, indent, in_loop=in_loop))
     return out
 
 
@@ -1863,9 +2007,13 @@ def _disabled_body(steps: tuple[Step, ...], pad: str, depth: int) -> list[str]:
     prefix = f"{pad}#{'  ' * depth}"
     for step in steps:
         if isinstance(step, Action):
-            out.append(f"{prefix}{step.source_class} -> {step.vocabulary}({', '.join(step.args)})")
+            # ``args`` are already rendered literals (escaped by _lit); ``source_class`` is not.
+            out.append(
+                f"{prefix}{_comment_text(step.source_class, 60)} -> "
+                f"{step.vocabulary}({', '.join(step.args)})"
+            )
         elif isinstance(step, UnmappedAction):
-            out.append(f"{prefix}{step.source_class} (no vocabulary mapping)")
+            out.append(f"{prefix}{_comment_text(step.source_class, 60)} (no vocabulary mapping)")
         else:
             out.append(f"{prefix}{step.source_verb}: {_comment_text(step.detail)}")
             out.extend(_disabled_body(step.body, pad, depth + 1))
@@ -1903,15 +2051,52 @@ def _has_inline_send(steps: tuple[Step, ...]) -> bool:
 # --- top-level entry point ---------------------------------------------------
 
 
+def _verify_compilable(source: str, target: Path) -> None:
+    """Refuse generated source CPython cannot compile, before it reaches disk as a config module.
+
+    :func:`generate_module` builds the module as a STRING, so without this nothing on the import path
+    ever asked CPython whether the result parses -- the accept-and-drop the width note near
+    ``_MAX_NESTING`` records. Catching only the obvious class would repeat that defect, so the tuple
+    is deliberately broad: at least these four are reachable, and each is measured, not assumed.
+
+    * ``SyntaxError`` -- a codegen bug, and what 3.14 raises for a NUL in the source (``ValueError``
+      on older builds).
+    * ``MemoryError`` -- the width wall. A bounded parser-arena limit rather than heap exhaustion,
+      so the interpreter is fully usable afterwards.
+    * ``RecursionError`` -- the compiler re-descending source this module emitted; ``_MAX_NESTING``
+      bounds only this module's own walk. A flat chain of about 20,000 operands reaches it.
+    * ``ValueError`` -- covers ``UnicodeEncodeError``, which a lone surrogate reaching the source
+      raises. That is why the tuple names a BASE class here rather than one more leaf: enumerating
+      leaves is how the original defect was written.
+
+    Not a merge candidate with the lens's ``_assert_reparses``, which does the same job for rewritten
+    Handlers: it raises a different error type, and its own ``except`` is narrower than this one."""
+    name = str(target)
+    try:
+        compile(source, name, "exec")
+    except (SyntaxError, ValueError, MemoryError, RecursionError) as exc:
+        # Report the compiler's own message: it names the limit or character that was rejected, which
+        # a bare "could not be generated" would hide from the operator deciding what to do next.
+        raise CorepointImportError(
+            f"generated module {name!r} could not be compiled and was not written: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+
 def import_corepoint(export_path: str | Path, out_dir: str | Path) -> ImportResult:
     """Parse the export at ``export_path`` and write one config module per channel into ``out_dir``.
 
     Returns the :class:`ImportResult` count-and-log summary. Raises :class:`CorepointImportError` on a
-    malformed export and :class:`OSError` on a filesystem failure (the CLI maps both to a clean error)."""
+    malformed export -- including one that is not valid UTF-8, and one whose generated module CPython
+    cannot parse -- and :class:`OSError` on a filesystem failure (the CLI maps both to a clean
+    error)."""
     epath = Path(export_path)
     try:
         text = epath.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
+        # `UnicodeDecodeError` subclasses `ValueError`, NOT `OSError` -- catching only the latter let a
+        # non-UTF-8 export escape as a raw traceback instead of the clean `CorepointImportError` this
+        # function's own docstring promises. Same shape as `__main__.py`'s audit-anchor file reader.
         raise CorepointImportError(f"cannot read export {epath}: {exc}") from exc
 
     channels = parse_any(text, source_name=epath.stem)
@@ -1922,7 +2107,7 @@ def import_corepoint(export_path: str | Path, out_dir: str | Path) -> ImportResu
     assigned: set[str] = set()
     for ch in channels:
         # Two channels can resolve to the same ``module_name`` — either from equal source names or
-        # because ``_sanitize`` folds distinct names ("ACME ADT" vs "ACME-ADT") onto one stem. Since the
+        # because ``_sanitize`` folds distinct names ("DEMO ADT" vs "DEMO-ADT") onto one stem. Since the
         # module_name is BOTH the filename stem AND the emitted ``inbound()`` connection name, a naive
         # write would silently overwrite the earlier file (losing a channel while the summary claims
         # success) and collide in the registry. De-duplicate deterministically (``IB_DUP`` → ``IB_DUP_2``,
@@ -1949,7 +2134,11 @@ def import_corepoint(export_path: str | Path, out_dir: str | Path) -> ImportResu
             unmapped_classes.extend(h_unmapped)
             disabled += h_disabled
         filename = f"{module_name}.py"
-        (out / filename).write_text(source, encoding="utf-8")
+        target = out / filename
+        # Raising here leaves an earlier channel's file in place, as an ``OSError`` from the write
+        # already would; the error names the module that failed and the command exits non-zero.
+        _verify_compilable(source, target)
+        target.write_text(source, encoding="utf-8")
         results.append(
             ChannelResult(
                 module_name,
@@ -1968,7 +2157,8 @@ def import_corepoint(export_path: str | Path, out_dir: str | Path) -> ImportResu
 # Control kinds that ARE faithfully represented in the emitted Python (real ``if``/``for``/``try``/…),
 # so they count as mapped. ``block`` is a section label (never an action, so never counted); ``exit``
 # has no faithful form and ``unknown`` is an unmodelled element tag — both count unmapped, emitted as a
-# TODO marker.
+# TODO marker. The four ``_BRANCH_PARENT`` kinds are faithful only while a construct ADOPTS them, so a
+# BRANCH asks :func:`_renders_as_branch` rather than this set, and an orphaned marker counts unmapped.
 _MAPPED_CONTROL_KINDS = frozenset(
     {
         "if",
@@ -1993,7 +2183,13 @@ def _count_steps(steps: tuple[Step, ...]) -> tuple[int, list[str], int]:
     Every source element lands in exactly one bucket: emitted as a vocabulary call or as real control
     flow (*mapped*), emitted as an in-place TODO marker — an unmapped verb, an ``exit``, or an element
     whose tag is not modelled at all (*unmapped*), or preserved as commented-out pseudo-source under a
-    ``@Disabled`` element or action-list (*disabled*). Nothing is ever silently dropped."""
+    ``@Disabled`` element or action-list (*disabled*). Nothing is ever silently dropped.
+
+    The names go through :func:`_comment_text` because the CLI prints them: the import summary is the
+    count-and-log record a migrator trusts, and a JSON export naming a class
+    ``"Foo\\n  IB_X.py (400 mapped)"`` would otherwise forge a line in it. Same escape, different sink
+    — a terminal rather than a generated module — and the same reason, which is that ``class`` is an
+    arbitrary export string that has been through no grammar."""
     mapped = 0
     unmapped: list[str] = []
     disabled = 0
@@ -2001,15 +2197,19 @@ def _count_steps(steps: tuple[Step, ...]) -> tuple[int, list[str], int]:
         if isinstance(step, Action):
             mapped += 1
         elif isinstance(step, UnmappedAction):
-            unmapped.append(step.source_class)
+            unmapped.append(_comment_text(step.source_class, 60))
         elif step.kind == "disabled":
             # Counted as one preserved element; its whole subtree rides along in the comment block.
             disabled += 1
         else:
-            if step.kind in _MAPPED_CONTROL_KINDS:
+            if step.kind in _MAPPED_CONTROL_KINDS and step.kind not in _BRANCH_PARENT:
                 mapped += 1
-            elif step.kind in ("exit", "unknown"):
-                # "unknown": an unmodelled element TAG. Counted here (and surfaced by name in
+            elif step.kind in ("exit", "unknown") or step.kind in _BRANCH_PARENT:
+                # "unknown": an unmodelled element TAG. A ``_BRANCH_PARENT`` kind here is a branch
+                # marker standing where a statement should be, with no construct to continue: its
+                # kind names real Python control flow, so it sits in ``_MAPPED_CONTROL_KINDS``, but
+                # only an ADOPTED marker is ever EMITTED as control flow and an orphan degrades to a
+                # TODO marker (BACKLOG #1854). Either way it is counted here (and surfaced by name in
                 # ``unmapped_classes``) so it is reported, never skipped — its body counts on below.
                 unmapped.append(step.source_verb)
             for nested in (step.body, *(b.body for b in step.branches)):
@@ -2018,8 +2218,12 @@ def _count_steps(steps: tuple[Step, ...]) -> tuple[int, list[str], int]:
                 unmapped.extend(n_unmapped)
                 disabled += n_disabled
             for branch in step.branches:
-                if branch.kind in _MAPPED_CONTROL_KINDS:
+                # A branch the render cannot emit as control flow becomes a TODO marker instead, so
+                # it lands in the unmapped bucket; its body statements are real and counted above.
+                if _renders_as_branch(step.kind, branch.kind):
                     mapped += 1
+                else:
+                    unmapped.append(branch.source_verb)
     return mapped, unmapped, disabled
 
 
@@ -2027,22 +2231,109 @@ def _count_steps(steps: tuple[Step, ...]) -> tuple[int, list[str], int]:
 
 
 def _lit(value: Any) -> str:
-    """Render ``value`` as a SAFE Python literal via :func:`json.dumps`.
+    """Render ``value`` as a SAFE Python literal via :func:`json.dumps`, or raise.
 
-    ``json.dumps`` emits a fully-escaped double-quoted string / list / dict literal that is also valid
-    Python source, so an untrusted export value (even one containing quotes, backslashes, or newlines)
-    rides across as inert data and cannot break out of the literal to inject code (CLAUDE.md §5/§8)."""
-    return json.dumps(value)
+    ``json.dumps`` emits a fully-escaped double-quoted string / list / dict literal, so an untrusted
+    export value (even one containing quotes, backslashes, or newlines) rides across as inert data and
+    cannot break out of the literal to inject code (CLAUDE.md §5/§8). Two properties of the output are
+    load-bearing, and they are why this stays :func:`json.dumps` rather than :func:`repr`:
+
+    * The output is **valid JSON**, which :func:`_collect_sends` relies on — it recovers a ``MsgSend``
+      destination by ``json.loads``-ing the rendered argument back. ``repr`` renders a single-quoted
+      Python string that ``json.loads`` rejects, so the shipped XML fixture would die on an uncaught
+      ``JSONDecodeError`` before any module was written.
+    * The output is **double-quoted**, which is ruff's canonical form, so a generated module needs no
+      reformatting pass to satisfy the project's own format gate.
+
+    The JSON and Python literal grammars are not the same grammar, though, and the overlap is what
+    :func:`_assert_renderable` polices. ``ensure_ascii=False`` is part of the same job: the default
+    ASCII escaping turns an astral code point into a ``\\uXXXX`` **surrogate pair** that Python re-reads
+    as two lone surrogates, so the raw character is the value-preserving rendering."""
+    _assert_renderable(value)
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _assert_renderable(value: Any, where: str = "") -> None:
+    """Refuse a value :func:`json.dumps` would render into something the module cannot carry.
+
+    Walks containers, because the unguarded values are not only the top-level ones: an
+    ``ItemCodeLookup`` passes its whole ``table`` through :func:`_lit`, so ``{"table": {"M": null}}``
+    renders ``{"M": null}`` and raises ``NameError`` the moment the generated module is imported.
+    Refusing every non-string scalar instead would be wrong in the other direction — the ``table``
+    dict and an ``ItemSplit`` ``destinations`` list are legitimate, working input.
+
+    ``where`` names the position inside the container, so a 200-entry lookup table reports which entry
+    is the bad one rather than only that one of them is."""
+    if isinstance(value, str):
+        _assert_encodable(value, where)
+        return
+    if value is None or isinstance(value, bool):  # bool before int — bool is an int subclass
+        # json.dumps writes null/true/false; Python reads all three as undefined NAMES.
+        raise CorepointImportError(
+            f"export value{where} is the JSON scalar {json.dumps(value)}, which is not a Python "
+            "literal — supply a quoted string instead"
+        )
+    if isinstance(value, float) and not isfinite(value):
+        # json.dumps writes NaN/Infinity/-Infinity by default; Python reads all three as names.
+        raise CorepointImportError(
+            f"export value{where} is a non-finite number, which is not a Python literal"
+        )
+    if isinstance(value, (int, float)):
+        return
+    if isinstance(value, list):
+        for i, item in enumerate(value):
+            _assert_renderable(item, f"{where}[{i}]")
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise CorepointImportError(
+                    f"export value{where} has a non-string key {key!r}; json.dumps would silently "
+                    "coerce it to a string, changing the value the module carries"
+                )
+            _assert_encodable(key, f"{where} key {key!r}")
+            _assert_renderable(item, f"{where}[{key!r}]")
+        return
+    raise CorepointImportError(
+        f"export value{where} is of type {type(value).__name__}, which has no literal form"
+    )
+
+
+def _assert_encodable(text: str, where: str) -> None:
+    """Refuse a string carrying an unpaired surrogate.
+
+    A lone surrogate survives ``json.dumps`` AND Python's own parser, then raises
+    ``UnicodeEncodeError`` when the module is written as UTF-8 — a failure at the very last step,
+    where the traceback blames the file write rather than the export that caused it. Performing the
+    encode is the check: it is the same operation :func:`import_corepoint` will perform later, so
+    there is no second definition of "encodable" to drift out of step with it."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise CorepointImportError(
+            f"export value{where} carries an unpaired surrogate code point, which cannot be "
+            f"encoded as UTF-8 in a generated module: {exc}"
+        ) from exc
 
 
 def _comment_text(text: str, limit: int = 200) -> str:
     """Flatten untrusted text for safe carriage inside a generated ``#`` comment.
 
-    Every run of whitespace — crucially including newlines — collapses to a single space, so a crafted
-    ``@Data``/``@Comment`` carrying a line break cannot escape the ``#`` and become a statement in the
-    generated module (CLAUDE.md §5/§8, the comment-side sibling of :func:`_lit`). Long text is elided
-    so one pathological statement cannot produce a multi-kilobyte comment line."""
-    flat = " ".join(text.split())
+    THE single boundary for text crossing into generated Python as a comment, and it is applied at the
+    RENDER site rather than where the value is built: a comment is not a literal, so it needs a
+    different escape from :func:`_lit`, and there are more places that build an ``UnmappedAction``
+    than there are places that render one. Three jobs, in order:
+
+    * Every run of whitespace — crucially including newlines — collapses to a single space, so a
+      crafted ``@Data``/``@Comment`` carrying a line break cannot escape the ``#`` and become a
+      statement in the generated module (CLAUDE.md §5/§8).
+    * The control characters that are *not* whitespace are then deleted. NUL is the member that
+      matters: Python refuses to compile a source string containing one, so a single NUL in an
+      export's action-class name turns the whole generated module into a file that cannot be
+      imported. The alphabet comes from :mod:`messagefoundry.controlchars` rather than being spelled
+      out again here — see that module on why the test lives in exactly one place.
+    * Long text is elided, so one pathological value cannot produce a multi-kilobyte comment line."""
+    flat = strip_control_chars(" ".join(text.split()))
     return flat if len(flat) <= limit else flat[: limit - 1] + "…"
 
 

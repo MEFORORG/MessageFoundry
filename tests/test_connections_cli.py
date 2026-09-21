@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry import __main__ as cli
 from messagefoundry.__main__ import main
 from messagefoundry.config.wiring import load_config
 
@@ -134,7 +135,9 @@ def test_remove(cfg: Path, capsys: pytest.CaptureFixture[str]) -> None:
     )
     capsys.readouterr()
     assert rc == 0
-    assert "IB" not in load_config(cfg).inbound
+    # allow_empty: removing the only connection leaves an empty graph, which load_config refuses by
+    # default (BACKLOG #1648). Emptiness is what this test just asserted happened.
+    assert "IB" not in load_config(cfg, allow_empty=True).inbound
 
 
 def test_remove_missing_fails(cfg: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -400,3 +403,69 @@ def test_list_returns_entries(cfg: Path, capsys: pytest.CaptureFixture[str]) -> 
     entries = json.loads(capsys.readouterr().out)
     assert rc == 0
     assert any(e["name"] == "IB" and e["direction"] == "inbound" for e in entries)
+
+
+def test_cli_upsert_reports_connection_json_nested_past_the_decoder(
+    cfg: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A `RecursionError` is a `RuntimeError`, so the `except json.JSONDecodeError` arm this
+    subcommand used to carry structurally could not reach one, and deeply nested `--data` escaped
+    uncaught (BACKLOG #1855).
+
+    The conversion is scoped by TYPE, to the `json.loads` call alone, NOT to this subcommand's wide
+    `try`: that `try` also wraps `upsert_connection`, `remove_connection` and the build-check
+    callback, and a `RecursionError` raised by any of those is not an `_OperatorJsonError`, so the
+    arm below still does not blame the operator's input for it. Pinned by
+    `test_cli_upsert_does_not_report_a_downstream_recursion_error_as_bad_input` below.
+
+    Why, and why the trigger below is manufactured rather than real nesting: `_load_operator_json`
+    in `messagefoundry/__main__.py`. The type facts are pinned once, by the anchor test
+    `tests/test_security_cli.py::test_cli_set_reports_security_json_nested_past_the_decoder`.
+
+    RED when: `_load_operator_json`'s `except RecursionError` arm, or `_connection`'s
+    `except _OperatorJsonError` arm, is dropped."""
+
+    def _raise_recursion(*_args: object, **_kwargs: object) -> object:
+        raise RecursionError("simulated deep nesting")
+
+    monkeypatch.setattr(cli.json, "loads", _raise_recursion)
+    rc = main(["connection", "upsert", "--config", str(cfg), "--data", "[]", "--json"])
+    out = capsys.readouterr().out
+    monkeypatch.undo()  # restore json.loads before parsing the captured payload with it
+
+    assert rc == 1
+    assert json.loads(out)["error"].startswith("connection JSON is nested too deeply to parse")
+    assert not (cfg / "connections.toml").exists()  # nothing was written
+
+
+def test_cli_upsert_does_not_report_a_downstream_recursion_error_as_bad_input(
+    cfg: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The converse of the test above, and the property that lets ONE arm serve a wide `try`: the
+    conversion is scoped by TYPE, so a `RecursionError` raised downstream of the decode is still not
+    reported as invalid operator JSON.
+
+    `_connection`'s single `except _OperatorJsonError` arm sits on a `try` that also wraps
+    `upsert_connection` and the build-check callback. It is safe there only because
+    `_load_operator_json` wraps `json.loads` ALONE -- nothing else in the block can produce an
+    `_OperatorJsonError`. So drive `upsert_connection` itself into a `RecursionError` on input that
+    decoded fine: it must escape uncaught rather than be blamed on the operator's `--data`.
+
+    RED when: the conversion moves out to the subcommand's wide `try` (an `except RecursionError`
+    there), or `_load_operator_json` grows to wrap more than the decode. Either turns this into an
+    exit 1 reporting "connection JSON is nested too deeply to parse" about a payload that parsed."""
+    from messagefoundry.config import connections_edit
+
+    def _raise_recursion(*_args: object, **_kwargs: object) -> object:
+        raise RecursionError("raised by upsert_connection, not by the decode")
+
+    monkeypatch.setattr(connections_edit, "upsert_connection", _raise_recursion)
+    obj = {
+        "direction": "inbound",
+        "name": "IB",
+        "transport": "mllp",
+        "router": "r",
+        "settings": {"port": 2600},
+    }
+    with pytest.raises(RecursionError, match="raised by upsert_connection"):
+        main(["connection", "upsert", "--config", str(cfg), "--data", json.dumps(obj), "--json"])

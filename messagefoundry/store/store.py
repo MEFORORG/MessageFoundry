@@ -35,6 +35,7 @@ independently, so overlapping id sets are reachable in normal operation. They no
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import hmac
 import json
@@ -59,7 +60,7 @@ from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Final, Protocol, runtime_checkable
+from typing import Any, Final, NoReturn, Protocol, runtime_checkable
 from uuid import uuid4
 
 import aiosqlite
@@ -70,9 +71,14 @@ from messagefoundry.config.models import RetryPolicy
 # may not import `messagefoundry.store` — can rebuild the SAME class the engine publishes. Re-exported
 # here so every existing `from messagefoundry.store.store import CapturedResponse` keeps working.
 from messagefoundry.config.response import CapturedResponse as CapturedResponse  # re-export
-from messagefoundry.config.settings import StoreBackend, StorePrivilegeStatus
+from messagefoundry.config.settings import (
+    AlertSeverity,
+    StoreBackend,
+    StorePrivilegeStatus,
+)
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
+from messagefoundry.service_status import _system_exe
 from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.content_search import SearchSpec, row_matches
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
@@ -118,29 +124,34 @@ _RELEASE_CHUNK = 500
 # fixed parameters; the chunks run inside the reset's single transaction, so atomicity is unchanged.
 _RESET_LANE_CHUNK = 500
 
-# How long a writer-transaction unwind waits for its shielded ROLLBACK before giving up on it. A
+# How long a transaction unwind waits for its shielded ROLLBACK before giving up on it. A
 # cancellation is usually a shutdown, so the unwind must never be able to hang shutdown on a worker
 # thread that is wedged on the abandoned statement. 5s matches the SQL Server store's
 # `_DIRTY_CLOSE_TIMEOUT` (ADR 0159) and the read pool's `busy_timeout`, so the store's three
 # "stop waiting on a stuck connection" bounds agree rather than each carrying its own number.
-_WRITER_ROLLBACK_TIMEOUT = 5.0
+_ROLLBACK_TIMEOUT = 5.0
 
 
-def _drain_detached_rollback(fut: asyncio.Future[None]) -> None:
+def _drain_detached_rollback(role: str, fut: asyncio.Future[None]) -> None:
     """Retrieve a detached rollback's outcome so asyncio does not log it as never-retrieved."""
     if fut.cancelled():
         return
     exc = fut.exception()
     if exc is not None:
-        log.warning("sqlite: detached writer rollback failed: %s", exc)
+        log.warning("sqlite: detached %s rollback failed: %s", role, exc)
 
 
-async def _unwind_writer_txn(db: aiosqlite.Connection) -> bool:
-    """Roll the open writer transaction back while the caller unwinds. Returns ``True`` if a further
-    cancellation was swallowed to finish the job.
+async def _unwind_txn(db: aiosqlite.Connection, *, role: str) -> bool:
+    """Roll the open transaction on ``db`` back while the caller unwinds. Returns ``True`` if a
+    further cancellation was swallowed to finish the job.
+
+    ``role`` is ``"writer"`` or ``"read"`` and only names the connection in the log lines. The
+    mechanism is deliberately identical for both — see *why both roles wait* below.
 
     Called from :func:`_writer_txn` with the writer lock STILL HELD, so no other writer can take the
-    connection mid-rollback.
+    connection mid-rollback, and from :meth:`MessageStore._read` on a borrowed pooled connection this
+    task still owns — it goes back to the queue only after this helper returns — so no other reader
+    can take it either.
 
     The rollback is **shielded** because a cancellation is the common reason we are here, and an
     unshielded ``await`` on the cancelled task's own stack is cancelled at once — leaving exactly the
@@ -148,23 +159,32 @@ async def _unwind_writer_txn(db: aiosqlite.Connection) -> bool:
     on a worker thread that may still be stuck on the abandoned statement.
 
     A FURTHER cancellation (shutdown cancels a task, then the gather cancels it again) is swallowed
-    and the wait resumes for what is left of the bound. This is where SQLite parts company with the
+    and the wait resumes for what is left of the bound.
+
+    **Why both roles wait rather than returning early.** This is where SQLite parts company with the
     pooled SQL Server path (ADR 0159's ``_release_dirty``, which swallows the second cancel and
-    returns immediately): there the connection is already quarantined out of the pool, so returning
-    early is safe. Here there is exactly ONE writer connection behind one lock, so returning early
-    would release the lock over a half-open transaction and the next writer would inherit it."""
+    returns immediately): there the connection is already quarantined OUT of the pool, so returning
+    early strands nothing. Neither SQLite connection can be quarantined. The writer is exactly ONE
+    connection behind one lock, so returning early would release the lock over a half-open
+    transaction and the next writer would inherit it. The read pool is a FIXED
+    :class:`asyncio.Queue` filled once at ``open()`` with **no reopen path**, so dropping a
+    connection rather than healing it would shrink the pool permanently, and dropping all
+    ``_READ_POOL_SIZE`` of them would park every later read forever — silently, and strictly worse
+    than the half-open transaction it was avoiding (BACKLOG #1635). Waiting out the bound is the only
+    remedy available to either role, so do not port the quarantine here."""
     loop = asyncio.get_running_loop()
     rollback = asyncio.ensure_future(db.rollback())
-    deadline = loop.time() + _WRITER_ROLLBACK_TIMEOUT
+    deadline = loop.time() + _ROLLBACK_TIMEOUT
     swallowed_cancel = False
     while True:
         remaining = deadline - loop.time()
         if remaining <= 0:
-            rollback.add_done_callback(_drain_detached_rollback)
+            rollback.add_done_callback(functools.partial(_drain_detached_rollback, role))
             log.warning(
-                "sqlite: writer rollback did not complete within %.1fs; it will finish detached and"
-                " the next writer may inherit an open transaction",
-                _WRITER_ROLLBACK_TIMEOUT,
+                "sqlite: %s rollback did not complete within %.1fs; it will finish detached and the"
+                " next user of this connection may inherit an open transaction",
+                role,
+                _ROLLBACK_TIMEOUT,
             )
             return swallowed_cancel
         try:
@@ -175,8 +195,23 @@ async def _unwind_writer_txn(db: aiosqlite.Connection) -> bool:
             swallowed_cancel = True  # re-cancelled mid-unwind; keep waiting out the bound
             continue
         except Exception:  # noqa: BLE001 — a rollback failure must not mask the original failure
-            log.warning("sqlite: writer rollback failed", exc_info=True)
+            log.warning("sqlite: %s rollback failed", role, exc_info=True)
         return swallowed_cancel
+
+
+async def _unwind_and_raise(db: aiosqlite.Connection, exc: BaseException, *, role: str) -> NoReturn:
+    """Unwind ``db``'s open transaction, then re-raise ``exc`` — or a cancellation if one landed
+    mid-unwind.
+
+    A cancellation swallowed by :func:`_unwind_txn` while an ORDINARY failure was rolling back must
+    not be dropped: re-raising only the original would leave the task running through a shutdown, so
+    the cancellation wins and carries the original failure as its cause.
+
+    One definition, shared by :func:`_writer_txn` and :meth:`MessageStore._read`, because both have
+    exactly this obligation and a second copy is how the two drift apart. It never returns."""
+    if await _unwind_txn(db, role=role) and not isinstance(exc, asyncio.CancelledError):
+        raise asyncio.CancelledError from exc
+    raise exc
 
 
 @asynccontextmanager
@@ -213,19 +248,23 @@ async def _writer_txn(db: aiosqlite.Connection, lock: asyncio.Lock) -> AsyncIter
             await db.execute("BEGIN")
             yield
         except BaseException as exc:
-            swallowed_cancel = await _unwind_writer_txn(db)
-            if swallowed_cancel and not isinstance(exc, asyncio.CancelledError):
-                # A cancellation landed while we were rolling an ORDINARY failure back. Re-raising
-                # only that failure would drop the cancellation and leave the task running through a
-                # shutdown, so the cancellation wins and carries the original failure as its cause.
-                raise asyncio.CancelledError from exc
-            raise
+            await _unwind_and_raise(db, exc, role="writer")
 
 
 class _GroupPoisoned(Exception):  # noqa: N818 — control-flow signal, not an error condition
-    """Raised inside the group-commit batch's writer transaction when a member failed, so the shared
-    transaction unwinds through :func:`_writer_txn` (under the lock) instead of being rolled back by
-    hand. Caught by :meth:`_GroupCommitter._flush`, which then rejects every member's future."""
+    """Raised by :meth:`_GroupCommitter._unwind_member` when a member's SAVEPOINT unwind itself
+    failed, so the shared transaction unwinds through :func:`_writer_txn` (under the lock) instead of
+    being rolled back by hand. One of the whole-batch failures listed on :class:`_GroupCommitter`; an
+    ordinary member failure is contained and never reaches here.
+
+    It carries the failing ``member`` and the ``cause`` that member raised, because that member never
+    returns an outcome: without them :meth:`_GroupCommitter._reject_all` would hand it this signal
+    instead of its own error."""
+
+    def __init__(self, message: str, *, member: _Member, cause: Exception) -> None:
+        super().__init__(message)
+        self.member = member
+        self.cause = cause
 
 
 class _AbortMember(Exception):  # noqa: N818 — control-flow signal, not an error condition
@@ -251,9 +290,9 @@ class _Member:
     """One mutation enrolled in the open group-commit batch.
 
     ``run`` executes the member's prepared statements on the shared write connection between the
-    committer's single ``BEGIN`` and ``COMMIT`` (it must NOT issue BEGIN/commit/rollback itself). Its
-    return value (or an :class:`_AbortMember`'s ``result``) is delivered via ``future`` once the batch
-    commits; on a group rollback every member's ``future`` is rejected so each caller re-runs."""
+    committer's single ``BEGIN`` and ``COMMIT`` (it must NOT issue BEGIN/commit/rollback itself), inside
+    its own ``SAVEPOINT``. Its return value (or an :class:`_AbortMember`'s ``result``) is delivered via
+    ``future`` once the batch commits. See :class:`_GroupCommitter` for what a failure does to it."""
 
     run: Callable[[], Awaitable[Any]]
     future: asyncio.Future[Any]
@@ -266,6 +305,18 @@ class _Member:
     on_commit: Callable[[Any], None] | None = None
 
 
+#: What one member's pass through :meth:`_GroupCommitter._run_member` produced: the member, the value
+#: its body returned (``None`` if it raised), and the exception it raised (``None`` if it did not).
+#: A member carrying an exception has already been rolled back to its own savepoint.
+_MemberOutcome = tuple[_Member, Any, Exception | None]
+
+#: The one savepoint name the committer uses. A member's savepoint is always released before the next
+#: member's is opened, so the stack is never deeper than one and the name is never ambiguous. Constant
+#: rather than per-member so the three statements stay three cached prepared statements, instead of
+#: churning ``max_batch`` x 3 distinct SQL strings through sqlite3's statement cache every batch.
+_MEMBER_SAVEPOINT: Final = "gc_member"
+
+
 class _GroupCommitter:
     """App-side group-commit committer for the SQLite write connection (ADR 0055).
 
@@ -273,12 +324,25 @@ class _GroupCommitter:
     lock, amortizing the per-commit fsync (a large win under ``synchronous=FULL``). A member is
     enrolled via :meth:`submit`; the committer coroutine drains the open batch under ``self._lock``,
     runs each member's statements inside one :func:`_writer_txn` (``BEGIN`` … ``COMMIT``), then
-    resolves every member's future. If ANY member raises (other than :class:`_AbortMember`), or the
-    commit itself fails, or the committer task is CANCELLED, the whole batch is rolled back and EVERY
-    member's future is rejected — each caller re-runs (a coordinated form of the crash-re-run the
-    INFLIGHT-guarded idempotent handoffs already tolerate). Resolving the futures on the cancellation
-    path matters as much as the rollback does: a member's caller parks on its future (the ACK gate
-    among them), so a batch abandoned without rejection would park every one of them forever.
+    resolves every member's future.
+
+    **A failing member is contained, not contagious (BACKLOG #1632).** Each member runs inside its own
+    ``SAVEPOINT``; if it raises (other than :class:`_AbortMember`) the committer issues ``ROLLBACK TO``
+    on that savepoint alone, so the member's statements are undone, its own future is rejected, and its
+    co-batched siblings still commit with the batch. Without that containment one poisoned message
+    converted every message that happened to share its coalescing window into a rejected future — each
+    innocent sibling then taking its lane's error backoff and logging a stack trace it did nothing to
+    earn, and re-running work that had already succeeded.
+
+    A failure outside a member's own body still fails the WHOLE batch, because then nothing is
+    committable. That includes at least the ``COMMIT`` itself failing, the committer task being
+    CANCELLED, a statement the committer issues itself (``BEGIN``, ``SAVEPOINT``, ``RELEASE``)
+    failing, and a member's savepoint unwind failing (:class:`_GroupPoisoned`). There EVERY member's
+    future is rejected and each caller re-runs
+    (a coordinated form of the crash-re-run the INFLIGHT-guarded idempotent handoffs already tolerate).
+    Resolving the futures on the cancellation path matters as much as the rollback does: a member's
+    caller parks on its future (the ACK gate among them), so a batch abandoned without rejection would
+    park every one of them forever.
 
     Enabled only when ``window_ms > 0``; otherwise the store never constructs one and each grouped
     method commits inline (byte-identical to the pre-feature path)."""
@@ -325,7 +389,7 @@ class _GroupCommitter:
         """Enrol a member's statements in the open batch and await its committed result.
 
         The returned awaitable resolves to the member body's value once the batch commits, or raises
-        whatever the body raised (group rollback re-raises the body's own exception in every member).
+        whatever the body raised — or, on a whole-batch rollback, that failure (see the class).
 
         ``on_commit`` (a read-through cache publish) runs in the COMMITTER's frame at commit, before the
         future resolves — so it cannot be skipped by this caller being cancelled while parked on the
@@ -372,30 +436,25 @@ class _GroupCommitter:
         if not batch:
             return
         self._pending = self._pending[len(batch) :]
-        results: list[Any] = []
+        results: list[_MemberOutcome] = []
         try:
             async with _writer_txn(self._db, self._lock):
                 for member in batch:
-                    try:
-                        results.append((member, await member.run(), None))
-                    except _AbortMember as abort:
-                        # Zero-mutation early exit (idempotent no-op) — stays in the batch.
-                        results.append((member, abort.result, None))
-                    except Exception as exc:  # noqa: BLE001 — captured to fail the whole group
-                        results.append((member, None, exc))
-                # If ANY member raised a real error, the shared transaction is poisoned: roll the whole
-                # batch back and reject EVERY member's future (each re-runs). We cannot selectively keep
-                # the good members — they share one transaction with the failed mutation.
-                if any(e is not None for _, _, e in results):
-                    raise _GroupPoisoned
+                    results.append(await self._run_member(member))
                 await self._db.commit()
                 # A1 live cost counter: one physical commit covers the whole batch (group-commit's whole
                 # point is fewer fsyncs), so count ONE committed transaction here, not one per member.
                 self._note_commit()
-        except _GroupPoisoned:
-            self._reject_all(batch, results)
+        except _GroupPoisoned as exc:
+            # A member's savepoint unwind failed, so there is no version of the batch that holds only
+            # the healthy members. That member never returned its outcome, so record it here: it then
+            # gets the error it raised, and only its siblings get the poison.
+            results.append((exc.member, None, exc.cause))
+            self._reject_all(batch, results, fallback=exc)
             return
         except Exception as exc:  # noqa: BLE001 — a commit failure fails the whole group
+            # The COMMIT, or a statement the committer issues itself (BEGIN, SAVEPOINT, RELEASE),
+            # failed: nothing in the batch is durable.
             self._reject_all(batch, results, fallback=exc)
             return
         except BaseException:
@@ -416,7 +475,13 @@ class _GroupCommitter:
         # resolves so a co-batched sibling that wakes on its own result already sees this delta, and so
         # a caller cancelled while parked on the future never causes a committed write to skip the cache.
         # A failing hook must not strand siblings, so it is isolated per member (logged, never raised).
-        for member, value, _ in results:
+        for member, value, err in results:
+            if err is not None:
+                # Rolled back to its own savepoint: nothing of this member's is durable, so it gets its
+                # own cause and NO cache publish (AC-4) while its siblings below keep their commit.
+                if not member.future.done():
+                    member.future.set_exception(err)
+                continue
             if member.on_commit is not None:
                 try:
                     member.on_commit(value)
@@ -425,23 +490,83 @@ class _GroupCommitter:
             if not member.future.done():
                 member.future.set_result(value)
 
+    async def _run_member(self, member: _Member) -> _MemberOutcome:
+        """Run ONE member inside :data:`_MEMBER_SAVEPOINT`, so its failure cannot reach its siblings.
+
+        The savepoint is the whole of the containment (BACKLOG #1632). A member that raises is undone
+        by ``ROLLBACK TO`` — its statements leave the shared transaction and the batch keeps every
+        healthy sibling's work, committable as one transaction and one fsync. Returning the failure as
+        a value rather than raising it is what lets the loop carry on to the next member.
+
+        Re-running the healthy members in fresh transactions was the other candidate and was rejected:
+        it degenerates to N transactions and N fsyncs on the failure path (which is group-commit
+        inverted), and it invokes ``member.run()`` a second time, relying on a double-invocation safety
+        nobody has established for these bodies.
+
+        ``SAVEPOINT``/``ROLLBACK TO``/``RELEASE`` are transaction control, and
+        ``tests/test_writer_txn_is_the_only_begin.py`` pins each of them by count in
+        ``_ALLOWED_NESTED``, so a new one here or anywhere else in the module reds that test. They are
+        confined to this method and :meth:`_unwind_member` on purpose, because both run only inside
+        :meth:`_flush`'s :func:`_writer_txn`; keep them here.
+
+        Cancellation is deliberately NOT caught: :class:`asyncio.CancelledError` derives from
+        ``BaseException``, so it passes through :func:`_writer_txn` — which unwinds the whole batch —
+        and :meth:`_flush` rejects everyone. A cancelled committer has nothing to commit for anybody."""
+        await self._db.execute(f"SAVEPOINT {_MEMBER_SAVEPOINT}")
+        try:
+            value = await member.run()
+        except _AbortMember as abort:
+            # Zero-mutation early exit (idempotent no-op): nothing to undo, so it is RELEASEd into the
+            # batch exactly as before. The savepoint would make rolling it back available should that
+            # zero-mutation property ever weaken — see :class:`_AbortMember`.
+            value = abort.result
+        except Exception as exc:  # noqa: BLE001 — contained to this member; siblings still commit
+            await self._unwind_member(member, exc)
+            return (member, None, exc)
+        await self._db.execute(f"RELEASE {_MEMBER_SAVEPOINT}")
+        return (member, value, None)
+
+    async def _unwind_member(self, member: _Member, cause: Exception) -> None:
+        """Undo one member's statements, leaving the rest of the open batch intact.
+
+        ``ROLLBACK TO`` leaves the savepoint on the stack, so the ``RELEASE`` after it is what pops it
+        — without it the stack deepens on every failure and the name stops being unambiguous."""
+        try:
+            await self._db.execute(f"ROLLBACK TO {_MEMBER_SAVEPOINT}")
+            await self._db.execute(f"RELEASE {_MEMBER_SAVEPOINT}")
+        except Exception as exc:
+            # SQLite can abandon the savepoint under the member (an error that rolls the whole
+            # transaction back, e.g. SQLITE_FULL/SQLITE_IOERR). Either way nothing here is safe to
+            # commit. If SQLite rolled everything back, the healthy siblings' writes are gone too, and
+            # resolving their futures would ACK rows that were never stored. If it did not, the
+            # transaction may still carry this member's partial write, and committing it would make a
+            # mixture durable. Both are worse than the over-rejection this change exists to remove, so
+            # poison the batch instead.
+            raise _GroupPoisoned(
+                f"group commit rolled back (a member's savepoint unwind failed: {exc})",
+                member=member,
+                cause=cause,
+            ) from cause
+
     @staticmethod
     def _reject_all(
         batch: list[_Member],
-        results: list[tuple[_Member, Any, Exception | None]],
+        results: list[_MemberOutcome],
         *,
-        fallback: Exception | None = None,
+        fallback: Exception,
     ) -> None:
-        """Reject every member's future on a group rollback so each caller re-runs.
+        """Reject every member's future on a WHOLE-batch rollback so each caller re-runs.
+
+        Reached only for a whole-batch failure (see :class:`_GroupCommitter`); an ordinary member
+        failure is contained by :meth:`_run_member` and rejects only its own future.
 
         A member that itself raised gets its OWN exception (so its caller sees the true cause); the
-        rest get a coordinated rollback error (or the commit failure) and re-run idempotently."""
+        rest get ``fallback`` and re-run idempotently."""
         own: dict[int, Exception | None] = {id(m): e for m, _, e in results}
-        group_err = fallback or RuntimeError("group commit rolled back (sibling member failed)")
         for member in batch:
             if member.future.done():
                 continue
-            err = own.get(id(member)) or group_err
+            err = own.get(id(member)) or fallback
             member.future.set_exception(err)
 
 
@@ -860,6 +985,80 @@ class AlertInstance:
 
 
 @dataclass(frozen=True)
+class AlertSummary:
+    """The whole-of-scope aggregate over **active** (open + acknowledged) alert instances (BACKLOG
+    #1564) — what the nav bell needs, and the one thing a page of rows cannot give it.
+
+    The bell used to count ``len(list_active_alert_instances(limit=200))`` and rank the severities of
+    that page. Both answers go wrong past 200 active instances, and they go wrong SILENTLY: 200
+    warnings plus one older critical reported ``count=200, severity=warning``, hiding the critical
+    entirely. Raising the limit only moves the threshold, so the aggregate is computed in the store
+    over every row in scope instead.
+
+    **Scoped exactly like the list it summarises.** :meth:`QueueStore.summarize_active_alert_instances`
+    takes the same ``allowed_channels`` allow-set, because a total computed outside the per-channel
+    RBAC filter would disclose the existence and severity of alerts the caller may not read — a worse
+    defect than the truncation it fixes.
+    """
+
+    #: Active instances in the caller's scope. Unbounded by any page limit.
+    total: int
+    #: The worst severity among them; ``None`` when there are none, or when none carries a severity
+    #: this build ranks (an unrecognised value is ignored rather than allowed to win).
+    worst_severity: str | None
+
+
+#: The "active" predicate, shared by every alert read so the list and its aggregate cannot disagree
+#: about what they are counting. Open OR acknowledged — an acked instance is still a live condition on
+#: the dashboard, which is why this is NOT ``count_open_alerts_by_connection``'s open-only predicate.
+_ACTIVE_ALERT_STATUS_SQL: Final[str] = "status IN ('open','acknowledged')"
+
+#: ADR 0014's severity vocabulary ranked worst-highest. The keys come from :class:`AlertSeverity` so
+#: the store cannot hold a stale copy of a vocabulary ``config`` owns; the ranks stay explicit so
+#: reordering that enum cannot silently re-rank the bell. A member added there with no rank here is a
+#: RED TEST (``test_severity_rank_covers_the_whole_vocabulary``) rather than a silent ``ELSE 0``.
+#: The RANK is what the aggregate maximises; the NAME must never be, because SQL ``MAX`` over
+#: ``'warning'``/``'critical'`` is ``'warning'`` — alphabetical order inverts the answer with no error.
+_ALERT_SEVERITY_RANK: Final[dict[str, int]] = {
+    AlertSeverity.INFO.value: 1,
+    AlertSeverity.WARNING.value: 2,
+    AlertSeverity.CRITICAL.value: 3,
+}
+
+#: That rank as a portable SQL expression (SQLite / Postgres / T-SQL all take a simple ``CASE``),
+#: DERIVED from the map above so the two cannot drift apart. Every interpolated part is a
+#: code-controlled literal out of that dict — no caller value reaches this string. ``ELSE 0`` ranks an
+#: unrecognised severity below every known one, so a stray value can never be reported as the worst.
+_ALERT_SEVERITY_RANK_SQL: Final[str] = (
+    "CASE severity"
+    + "".join(f" WHEN '{name}' THEN {rank}" for name, rank in _ALERT_SEVERITY_RANK.items())
+    + " ELSE 0 END"
+)
+
+_SEVERITY_BY_RANK: Final[dict[int, str]] = {r: n for n, r in _ALERT_SEVERITY_RANK.items()}
+
+
+def _alert_summary(row: Any) -> AlertSummary:
+    """Build an :class:`AlertSummary` from one backend's ``COUNT(*) AS n, MAX(rank) AS worst`` row.
+
+    Shared by all three backends so the rank-to-name mapping cannot drift between them. ``MAX`` over
+    zero rows is NULL and an unrecognised severity ranks 0; both land on ``worst_severity=None``.
+    """
+    if row is None:
+        # An un-grouped aggregate always returns exactly one row, so this is unreachable by design --
+        # but it must RAISE rather than fall back to an empty summary. AlertSummary(total=0) is not a
+        # safe default here: it paints a confident gray "no active alerts" bell over an estate that may
+        # be full of criticals, which is the silent-wrong class this whole item exists to remove. The
+        # nav route already degrades correctly on an exception (alerts=None HIDES the bell rather than
+        # asserting zero), so raising reaches a better answer than any value this could invent.
+        raise RuntimeError("active-alert aggregate returned no row")
+    return AlertSummary(
+        total=int(row["n"] or 0),
+        worst_severity=_SEVERITY_BY_RANK.get(int(row["worst"] or 0)),
+    )
+
+
+@dataclass(frozen=True)
 class InboundMetrics:
     """Per-channel inbound aggregates for the connections dashboard."""
 
@@ -950,7 +1149,11 @@ class DbStatus:
 
     path: str
     size_bytes: int  # db file + -wal + -shm
-    disk_free_bytes: int  # free space on the DB's drive
+    # Free space on the DB's drive, or None when this process CANNOT measure it -- a remote server
+    # backend whose disk is not ours to stat, or a failed ``disk_usage`` call. ``None`` and ``0`` are
+    # different facts and must stay so: 0 is a MEASURED empty drive and has to keep raising the
+    # operator-health alarm, while None carries no claim about the drive at all (BACKLOG #1563).
+    disk_free_bytes: int | None
     journal_mode: str
     messages: int
     events: int
@@ -1237,6 +1440,24 @@ def audit_row_hash(
     return hmac.new(key, data, hashlib.sha256).hexdigest()
 
 
+#: The phrase :func:`audit_prefix_verdict` puts in its failure message, exported so a CALLER can tell a
+#: TRUNCATED/REWRITTEN TAIL from a BROKEN CHAIN without walking the log twice (BACKLOG #328).
+#:
+#: ``verify_audit_chain`` folds both verdicts into one ``(ok, message)`` pair and reports the chain break
+#: FIRST, returning before the prefix comparator runs. So a caller holding only ``ok=False`` cannot say
+#: which fired -- and the two want different handling: a break names a row an operator can go and read,
+#: while a truncation names rows that are no longer there to read. ``Engine._verify_audit_chain_on_start``
+#: routes them to DIFFERENT alert subjects on the strength of this marker, so they throttle and route
+#: independently.
+#:
+#: IT IS A SHARED CONSTANT RATHER THAN A STRING THE CALLER RESTATES, and that is the whole point: a
+#: restated copy drifts silently the day this message is reworded, and the caller then quietly
+#: reclassifies every truncation as a chain break. Substring-matching a message is a weak seam either
+#: way; making the producer and the consumer read the SAME name is what stops the seam rotting
+#: unobserved. Pinned by ``test_prefix_break_marker_appears_in_a_real_prefix_failure``.
+AUDIT_PREFIX_BREAK_MARKER = "is not an extension of the recorded prefix"
+
+
 def audit_prefix_verdict(
     expected_prefix: tuple[int, str], prefix_head: str | None, count: int
 ) -> tuple[bool, str | None]:
@@ -1279,10 +1500,177 @@ def audit_prefix_verdict(
         have = "(never reached)" if prefix_head is None else f"{prefix_head[:12]!r}"
         return (
             False,
-            f"audit log is not an extension of the recorded prefix (have {count} row(s), head at "
+            f"audit log {AUDIT_PREFIX_BREAK_MARKER} (have {count} row(s), head at "
             f"row {exp_count} {have}, expected {exp_head[:12]!r}) — truncated or rewritten",
         )
     return True, None
+
+
+#: The operator-facing shape of an audit anchor, quoted into every parse refusal below. One sentence,
+#: one place. The ``audit-verify`` CLI's ``--expected-anchor`` help writes its own shorter wording and
+#: does NOT interpolate this -- said plainly because a comment claiming otherwise would let a maintainer
+#: edit this constant believing the help moved with it.
+AUDIT_ANCHOR_FORM = (
+    "expected COUNT:HEAD — the row count and the FULL head, copied verbatim from "
+    "'messagefoundry audit-anchor' (the 12-character head printed inside a FAIL message is a display "
+    "truncation, not an anchor); an empty log anchors as '0:'"
+)
+
+#: Every hex character, both cases. The store only ever emits lowercase (``hexdigest()``); uppercase is
+#: admitted and NORMALISED rather than rejected, because an operator who upper-cased the value in a
+#: ticket must get a verify, not a tamper alarm.
+_AUDIT_ANCHOR_HEX = frozenset("0123456789abcdefABCDEF")
+#: ``hashlib.sha256``/``hmac.new(..., sha256)`` ``hexdigest()`` width — the only hex head length the
+#: chain can produce, keyless or keyed (:func:`audit_row_hash`).
+AUDIT_ANCHOR_DIGEST_HEX_LEN = 64
+#: ADR 0138 ``vault_transit``: the row MAC is computed INSIDE Vault/OpenBao Transit
+#: (``crypto_transit.TransitCipher.audit_hmac``), which returns its own opaque ``vault:v<N>:<base64>``
+#: string — not hex, not 64 characters — and that string lands in ``row_hash`` verbatim. A future
+#: isolated-module MAC provider with a different prefix MUST be added here, or a legitimate anchor from
+#: that deployment is refused as malformed.
+AUDIT_ANCHOR_ISOLATED_MAC_PREFIX = "vault:v"
+
+
+#: How much of an anchor file is read before it is refused. An anchor is ONE short line -- the longest
+#: producible form is a count plus a `vault:v1:<base64>` MAC, comfortably under 200 bytes -- so anything
+#: past this is not an anchor file and the excess must never be read, let alone quoted back.
+#:
+#: THE BOUND IS A LOG-DISCLOSURE CONTROL, NOT A PERFORMANCE ONE. Every refusal below interpolates the
+#: offending text with ``{text!r}``, and both callers log that refusal. A path typo'd onto
+#: ``messagefoundry.toml``, a key file, or a captured HL7 message would otherwise put that file's whole
+#: contents into the service log at WARNING -- which is the PHI rule in CLAUDE.md section 9, breached by
+#: a control whose own purpose is to avoid manufacturing bad outcomes from its input handling.
+AUDIT_ANCHOR_MAX_BYTES = 4096
+
+
+class AuditAnchorError(ValueError):
+    """A ``COUNT:HEAD`` anchor that :func:`parse_audit_anchor` refuses, carrying TWO renderings.
+
+    ``str(exc)`` quotes the offending text back, which is what an operator running ``audit-verify``
+    needs: they typed the path, the refusal lands on their own terminal, and seeing the bad value is
+    how they fix it. ``reason`` says what was wrong and **never includes the text**.
+
+    THE SPLIT EXISTS BECAUSE THE TWO CONSUMERS HAVE DIFFERENT EXPOSURE, not because one is tidier. The
+    engine's startup check logs to a persistent service log that NSSM captures to disk, so quoting the
+    file there publishes whatever the path was typo'd onto -- a key file, ``messagefoundry.toml``, a
+    captured message -- at WARNING, which is the PHI rule in CLAUDE.md section 9. Redaction filters
+    downstream of the logger do catch some of it, and a control resting on that is resting on a false
+    premise: measured, a filter scrubbed a key's VALUE and let its name and 165 further characters
+    through. Not putting the content in the record is the control; the filter is defence in depth.
+
+    It subclasses ``ValueError`` so every existing ``except ValueError`` around the parser still fires.
+    """
+
+    def __init__(self, reason: str, text: str) -> None:
+        #: What was wrong, with NO part of the offending text in it. Safe for a service log.
+        self.reason = reason
+        self.text = text
+        super().__init__(f"malformed audit anchor {text!r}: {reason} — {AUDIT_ANCHOR_FORM}")
+
+
+def read_audit_anchor_file(path: str | Path) -> str:
+    """Read an anchor file into the text :func:`parse_audit_anchor` takes. Raises ``OSError`` or
+    ``UnicodeDecodeError``; each caller words its own operator-facing refusal around those.
+
+    ``utf-8-sig`` absorbs a leading BOM: PowerShell 5.1's ``Set-Content -Encoding utf8`` writes UTF-8
+    WITH one, and this product deploys as a Windows service, so that is a first-class way an operator
+    produces this file. ``UnicodeDecodeError`` is raised, not swallowed, because PowerShell 5.1's ``>``
+    writes UTF-16LE -- the likely mistake, not an exotic one -- and it subclasses ``ValueError`` rather
+    than ``OSError``, so a caller that catches only the latter lets it escape as an unhandled traceback.
+
+    ONE READER FOR BOTH CONSUMERS (the ``audit-verify`` CLI and the engine's startup check), for the
+    same reason :func:`parse_audit_anchor` is one parser: the encoding handling, the byte bound and the
+    first-line rule are each a place a later hardening would otherwise reach one caller and miss the
+    other. Only the first line is returned, bounded by :data:`AUDIT_ANCHOR_MAX_BYTES`."""
+    with Path(path).open("rb") as fh:
+        # Read one byte past the bound so an oversized file is DETECTED rather than silently truncated
+        # into a parse failure that blames the operator's anchor for the reader's cap.
+        data = fh.read(AUDIT_ANCHOR_MAX_BYTES + 1)
+    if len(data) > AUDIT_ANCHOR_MAX_BYTES:
+        raise OSError(
+            f"anchor file is larger than {AUDIT_ANCHOR_MAX_BYTES} bytes, so it is not an anchor "
+            f"(an anchor is one short COUNT:HEAD line)"
+        )
+    # The first line only: a file whose SECOND line is something else is a refusal either way, and
+    # taking one line keeps whatever follows out of the refusal message that quotes this back.
+    lines = data.decode("utf-8-sig").splitlines()
+    return lines[0] if lines else ""
+
+
+def parse_audit_anchor(text: str) -> tuple[int, str]:
+    """Parse a ``COUNT:HEAD`` audit anchor into the tuple ``verify_audit_chain`` expects.
+
+    Raises ``ValueError`` naming the form. It must RAISE rather than fall back to an unanchored
+    verify: a silently-ignored anchor turns the whole control into a gate that reports green while
+    checking nothing, which is precisely the failure the anchor exists to close.
+
+    It must ALSO refuse rather than hand a comparator a head the store can never emit. Both comparators
+    compare the head byte-exactly and report *any* difference as ``truncated or rewritten``, so an
+    accepted-but-impossible head becomes a FALSE tamper alarm — a red light on an intact chain,
+    indistinguishable from a real detection. A control whose whole value is that a FAIL means something
+    cannot be allowed to manufacture FAILs out of its own input handling — the inverse of the
+    green-while-checking-nothing hole above, and it costs just as much.
+
+    Two head shapes are legal, because exactly two are producible:
+
+    * a **hex digest** — :func:`audit_row_hash`'s keyless SHA-256 or in-heap HMAC-SHA256 ``hexdigest()``,
+      always exactly 64 lowercase hex characters. Case is normalised, and the length is *required*: a
+      12-character head pasted out of a FAIL message's display truncation is refused as malformed
+      input instead of being reported as tampering.
+    * an **isolated-module MAC** — ADR 0138 ``vault_transit`` mode, whose ``vault:v1:…`` string is
+      passed through UNCHANGED. ``partition`` splits on the FIRST colon, so its internal colons
+      survive the ``COUNT:HEAD`` split.
+
+    An EMPTY head is legal and load-bearing — :meth:`MessageStore.audit_anchor` returns ``(0, "")`` for
+    an empty log, so ``0:`` must round-trip or a fresh instance is the one state that cannot be anchored.
+    **It is legal ONLY at count 0**, and that pairing is the whole of its legality: an empty head is
+    producible only from an empty log, so ``5:`` is a head the store can never emit and falls under the
+    refusal above. Left accepted it parses to ``(5, "")``, which no intact chain can match — so a line
+    truncated while being copied, or an anchor file caught half-written, would be reported as
+    ``truncated or rewritten`` on a chain nobody touched.
+
+    IT LIVES HERE, BESIDE THE COMPARATORS AND THE PRODUCER, BECAUSE IT NOW HAS TWO CONSUMERS: the
+    ``audit-verify`` CLI and the engine's ``[integrity].audit_anchor_file`` startup check (BACKLOG #328).
+    A second copy beside the second consumer is the copy-versus-single-source defect BACKLOG #1253
+    catalogues, and it would be the worst possible place for one: a later hardening of the refusals
+    above would reach one caller and leave the other accepting what it had learned to reject.
+    """
+    raw = text.strip()
+    count_text, sep, head = raw.partition(":")
+    if not sep:
+        raise AuditAnchorError("no ':' separator", text)
+    try:
+        count = int(count_text)
+    except ValueError:
+        # The count is quoted in `str(exc)` via `text`, so the reason stays content-free: a row count
+        # is short and non-secret, but "content-free" has to be a rule, not a judgement per branch.
+        raise AuditAnchorError("the row count is not an integer", text) from None
+    if count < 0:
+        raise AuditAnchorError(f"the row count {count} is negative", text)
+    head = head.strip()
+    if not head:
+        if count != 0:
+            raise AuditAnchorError(
+                "an empty head is only producible from an EMPTY log, so it cannot carry a row count "
+                f"of {count}",
+                text,
+            )
+        return count, head
+    if all(c in _AUDIT_ANCHOR_HEX for c in head):
+        if len(head) != AUDIT_ANCHOR_DIGEST_HEX_LEN:
+            raise AuditAnchorError(
+                f"the head is {len(head)} hex characters, not a full "
+                f"{AUDIT_ANCHOR_DIGEST_HEX_LEN}-character digest",
+                text,
+            )
+        return count, head.lower()
+    if head.startswith(AUDIT_ANCHOR_ISOLATED_MAC_PREFIX):
+        return count, head  # opaque by construction; never normalise what we do not define
+    raise AuditAnchorError(
+        f"the head is neither a {AUDIT_ANCHOR_DIGEST_HEX_LEN}-character hex digest nor an "
+        f"isolated-module {AUDIT_ANCHOR_ISOLATED_MAC_PREFIX}… MAC (ADR 0138)",
+        text,
+    )
 
 
 def audit_mac_bytes(value: str | None) -> bytes:
@@ -1567,11 +1955,16 @@ def _secure_file(path: Path, *, extra_read_grants: Sequence[str] | None = None) 
                     path,
                 )
                 return
-            # icacls is a fixed system tool, invoked without a shell; an extra-grant principal (if any)
-            # is a single argv token, never a shell word, so it can't inject a flag (low-27/STORE-5).
+            # icacls is pinned to its absolute System32 path and invoked without a shell; an
+            # extra-grant principal (if any) is a single argv token, never a shell word, so it can't
+            # inject a flag (low-27/STORE-5). The pin is what makes "fixed system tool" true:
+            # CreateProcess resolves an unqualified name through a search path that reaches the
+            # caller's working directory, and because this call only logs on a non-zero exit, a
+            # planted icacls.exe that exits 0 would leave this PHI-adjacent file its inherited
+            # (possibly broad) ACL while reporting nothing (BACKLOG #1769).
             grants = [f"{user}:F", *(f"{p}:R" for p in extra_read_grants or ())]
             result = subprocess.run(  # nosec B603 B607
-                ["icacls", str(path), "/inheritance:r", "/grant:r", *grants],
+                [_system_exe("icacls.exe"), str(path), "/inheritance:r", "/grant:r", *grants],
                 check=False,
                 capture_output=True,
                 text=True,
@@ -1587,6 +1980,29 @@ def _secure_file(path: Path, *, extra_read_grants: Sequence[str] | None = None) 
             os.chmod(path, _OWNER_ONLY)
     except OSError as exc:
         log.warning("could not restrict permissions on %s: %s", path, exc)
+
+
+async def _secure_file_async(path: Path, *, extra_read_grants: Sequence[str] | None = None) -> None:
+    """:func:`_secure_file` dispatched off the event loop — for the two callers that run ON one.
+
+    On Windows the restriction is an ``icacls`` subprocess, measured at 21 to 28 ms per file. Called
+    straight from a coroutine, that span is dead time for every other task on the loop: a deploying
+    site would see one such stall per secured file of every in-flight ACK, claim and delivery on each
+    DR backup, because ``snapshot_to`` runs on the SERVING loop by design (see
+    ``pipeline/dr_backup.py``, which keeps the consistent snapshot there and moves only the tar+AEAD
+    off it). ``MessageStore.open`` secures three files, but it completes before the API serves and
+    before any listener binds, so its stall has nothing to stall.
+
+    The synchronous :func:`_secure_file` stays the callable for every caller that is NOT on a loop —
+    the CLI key/cert writers, the lifespan bootstrap admin, and the ``config/*_edit.py`` writers
+    (whose one async caller already wraps the whole write in ``to_thread``). It is deliberately left
+    unrenamed and unmoved: ``tests/test_phi_at_rest_inventory.py`` asserts that token lives in this
+    module and in no other ``store/`` backend, and ``tests/test_cli.py`` patches it by that name.
+
+    ``_secure_file`` is resolved through the module global when the call is made, so a test that
+    patches the name is honoured through this wrapper too.
+    """
+    await asyncio.to_thread(_secure_file, path, extra_read_grants=extra_read_grants)
 
 
 def _opt_float(value: Any) -> float | None:
@@ -2540,9 +2956,20 @@ class MessageStore:
             await db.execute("PRAGMA foreign_keys=ON")
             await db.execute("PRAGMA busy_timeout=5000")
             await db.executescript(_SCHEMA)
-            await cls._migrate(db)
-            await db.commit()
+            # BACKLOG #1586: the migrations run in ONE transaction, so an interrupted run leaves no
+            # trace. Outside one, each ALTER ... ADD COLUMN commits on its own, and a failure before
+            # its paired backfill leaves the column present -- the next open's column-missing guard
+            # then skips that backfill for good. The transaction opens exactly here and no earlier:
+            # before the PRAGMAs, foreign_keys=ON is a silent no-op and journal_mode=WAL raises;
+            # before executescript, its implicit COMMIT ends the transaction before _migrate runs.
+            # _writer_txn rolls back on BaseException; the lock is a fresh one because nothing else
+            # can reach this connection yet.
+            async with _writer_txn(db, asyncio.Lock()):
+                await cls._migrate(db)
+                await db.commit()
             # Tighten permissions now that the file (and its WAL siblings) exist — they hold PHI.
+            # Off the loop (BACKLOG #1634): three files, each an icacls subprocess on Windows. Open
+            # completes before anything is serving, so this one is consistency rather than a fix.
             if str(path) != ":memory:":
                 main = Path(path)
                 for f in (
@@ -2551,7 +2978,7 @@ class MessageStore:
                     main.with_name(main.name + "-shm"),
                 ):
                     if f.exists():
-                        _secure_file(f)
+                        await _secure_file_async(f)
             store = cls(
                 db,
                 path=path,
@@ -2628,15 +3055,29 @@ class MessageStore:
         """Yield a connection to run a read on without taking the write lock (lockfree-reads).
 
         Pooled path (file-backed WAL): borrow a read-only connection and wrap the block in one deferred
-        read transaction, so every statement in the block sees a single consistent WAL snapshot taken at
-        ``BEGIN`` and concurrent writes can't interleave. The transaction is always closed
+        read transaction, so every statement in the block sees a single consistent WAL snapshot and
+        concurrent writes can't interleave. ``BEGIN`` is DEFERRED, so the snapshot opens at the block's
+        FIRST statement rather than at the ``BEGIN`` itself — what the block gets is one snapshot, not a
+        snapshot of the instant it was entered. The transaction is always closed
         (``COMMIT``/``ROLLBACK``) before the connection returns to the pool, so the next borrower starts
         a *fresh* snapshot (a read always reflects the latest committed write) and never pins the WAL.
+
+        **"Always closed" means on BaseException too, and the ``BEGIN``'s own await is inside the guard
+        for a reason.** aiosqlite runs that ``BEGIN`` on a worker thread, so it lands whether or not the
+        awaiting task survives; a cancellation delivered there used to unwind past a handler that only
+        began *after* the ``BEGIN``, and the connection went back into the pool holding an open
+        transaction. Every later borrower's ``BEGIN`` would then raise "cannot start a transaction
+        within a transaction" from that same unguarded position, so the pool would never heal: one such
+        cancellation would permanently fail one read in ``_READ_POOL_SIZE`` on a deploying site
+        (BACKLOG #1635). The unwind goes through :func:`_unwind_txn` — shielded and bounded — because a
+        bare ``await conn.execute("ROLLBACK")`` is itself cancellable, and a second cancellation landing
+        on it would return the poisoned connection anyway.
 
         Fallback path (``:memory:``, no pool): reads share the single writer connection, serialized under
         ``self._lock`` — the pre-pool behaviour, required because ``:memory:`` can't be reached by a
         second connection. Callers must therefore never invoke a ``_read()`` method while already
-        holding ``self._lock`` (none do)."""
+        holding ``self._lock`` (none do). There is no ``BEGIN`` on this path at all, so a test that means
+        to exercise the snapshot or the unwind must use a FILE-backed store."""
         pool = self._read_pool
         if pool is None:
             async with self._lock:
@@ -2644,14 +3085,15 @@ class MessageStore:
             return
         conn = await pool.get()
         try:
-            await conn.execute("BEGIN")
             try:
+                await conn.execute("BEGIN")
                 yield conn
                 await conn.execute("COMMIT")
-            except BaseException:
-                await conn.execute("ROLLBACK")
-                raise
+            except BaseException as exc:
+                await _unwind_and_raise(conn, exc, role="read")
         finally:
+            # Synchronous on purpose: the unwind above has already finished, and `put_nowait` has no
+            # await for a further cancellation to land on, so the connection cannot be stranded.
             pool.put_nowait(conn)
 
     async def _run_grouped(
@@ -2669,9 +3111,11 @@ class MessageStore:
         explicit ``rollback(); return <sentinel>``.
 
         Group-commit ENABLED: enrol ``body`` in the committer, which runs it between the batch's single
-        ``BEGIN`` … ``COMMIT`` and resolves this caller's future post-commit (so an inbound ACK waiting on
-        the returned value never releases before the data is durable — Hazard B). A group rollback
-        rejects the future and the caller re-runs (licensed by the INFLIGHT-guarded idempotent handoffs).
+        ``BEGIN`` … ``COMMIT`` — inside its own ``SAVEPOINT``, so a failing body harms only itself, just
+        as it does inline — and resolves this caller's future post-commit (so an inbound ACK waiting on
+        the returned value never releases before the data is durable — Hazard B). A rejected future means
+        this caller re-runs (licensed by the INFLIGHT-guarded idempotent handoffs); see
+        :class:`_GroupCommitter` for which failures reject only this member and which reject the batch.
 
         ``on_commit`` is an optional read-through cache publish run AFTER a successful commit and only
         then (a rolled-back/aborted body never runs it, so an uncommitted delta never leaks — AC-4). In
@@ -3703,16 +4147,14 @@ class MessageStore:
         # seq/rowid but KEPT the names ix_queue_fifo_in/out with CREATE IF NOT EXISTS — so an upgraded DB
         # silently keeps its old created_at-trailing index and never adopts the seq-only claim's index.
         # Drop the old-named indexes and build the seq-trailing ones under a NEW name (so name-existence is
-        # a correct discriminator). This is NOT a transactional swap on SQLite — Python's sqlite3 auto-
-        # commits DDL — but it does not need to be: the FIFO index is CORRECTNESS-NEUTRAL (the claim orders
-        # by rowid and names no index, ADR 0059), so a crash in the DROP→CREATE gap leaves a lane
-        # transiently unindexed (claims stay correct, just slower) and the next open's idempotent re-run
-        # (DROP IF EXISTS / CREATE IF NOT EXISTS) converges to the seq-trailing pair. This runs at open,
-        # before serving, so the transient gap is never observed by a live claim. DROP-old before
-        # CREATE-new so the on-disk FIFO index count never doubles; a fresh DB no-ops the drops and a
-        # re-opened migrated DB no-ops everything. (The server backends run the same swap inside a real
-        # schema transaction, so they additionally get atomicity — see ADR 0060 / sqlserver.py /
-        # postgres.py.)
+        # a correct discriminator). The swap is atomic now that `open` runs this whole method in one
+        # transaction (BACKLOG #1586), as it already was on the server backends (ADR 0060 /
+        # sqlserver.py / postgres.py). It never depended on that: the FIFO index is CORRECTNESS-NEUTRAL
+        # (the claim orders by rowid and names no index, ADR 0059), so any partial index state still
+        # claims correctly, just slower, and the next open's idempotent re-run (DROP IF EXISTS / CREATE
+        # IF NOT EXISTS) converges to the seq-trailing pair. DROP-old before CREATE-new so the on-disk
+        # FIFO index count never doubles; a fresh DB no-ops the drops and a re-opened migrated DB
+        # no-ops everything.
         await db.execute("DROP INDEX IF EXISTS ix_queue_fifo_in")
         await db.execute("DROP INDEX IF EXISTS ix_queue_fifo_out")
         await db.execute(
@@ -7781,7 +8223,7 @@ class MessageStore:
         # scope as list_connection_events (None = unrestricted; a set restricts to instances whose
         # connection is in the allow-set). limit is clamped server-side.
         limit = max(1, min(limit, 1000))
-        where = ["status IN ('open','acknowledged')"]
+        where = [_ACTIVE_ALERT_STATUS_SQL]
         params: list[Any] = []
         if allowed_channels is not None:
             _append_channel_scope(where, params, "connection", allowed_channels)
@@ -7796,6 +8238,27 @@ class MessageStore:
                 params,
             )
             return [self._alert_instance_row(r) for r in await cur.fetchall()]
+
+    async def summarize_active_alert_instances(
+        self, *, allowed_channels: Sequence[str] | None = None
+    ) -> AlertSummary:
+        # BACKLOG #1564: the nav bell's count + worst severity over EVERY active instance in scope, not
+        # over a page of them. Same predicate and same RBAC scope as list_active_alert_instances above —
+        # deliberately NOT count_open_alerts_by_connection's, which is open-only and would silently drop
+        # the acknowledged instances the bell has always counted. Lockfree read; no row leaves the store.
+        where = [_ACTIVE_ALERT_STATUS_SQL]
+        params: list[Any] = []
+        if allowed_channels is not None:
+            _append_channel_scope(where, params, "connection", allowed_channels)
+        clause = " WHERE " + " AND ".join(where)
+        async with self._read() as db:
+            cur = await db.execute(
+                f"SELECT COUNT(*) AS n, MAX({_ALERT_SEVERITY_RANK_SQL}) AS worst"
+                f" FROM alert_instance{clause}",
+                params,
+            )
+            row = await cur.fetchone()
+        return _alert_summary(row)
 
     async def get_alert_instance(
         self, alert_id: int, *, allowed_channels: Sequence[str] | None = None
@@ -9364,11 +9827,13 @@ class MessageStore:
                 total += p.stat().st_size
         return total
 
-    def _disk_free_bytes(self) -> int:
+    def _disk_free_bytes(self) -> int | None:
+        """Free bytes on the DB's drive; ``None`` when the probe failed — see
+        :attr:`DbStatus.disk_free_bytes` for why that is not ``0`` (BACKLOG #1563)."""
         try:
             return shutil.disk_usage(Path(self.path).resolve().parent).free
         except OSError:
-            return 0
+            return None
 
     # --- retention / purge + maintenance (PHI.md §8, ASVS 14.2.x) -------------
 
@@ -9887,7 +10352,9 @@ class MessageStore:
         # Tighten the snapshot file's permissions: it is a full copy of the (PHI-bearing) store. The
         # encrypted .mfbak the BackupRunner wraps it in is the at-rest protection, but the transient
         # plaintext snapshot must not be world-readable either.
-        _secure_file(dest)
+        # Off the loop (BACKLOG #1634): this is the call that matters. A DR backup runs on the SERVING
+        # loop, so a synchronous icacls here stalls every in-flight ACK, claim and delivery with it.
+        await _secure_file_async(dest)
 
     async def stats(self) -> dict[str, int]:
         """Outbound-queue depth by status — feeds the monitoring/queue-depth view. Scoped to outbound

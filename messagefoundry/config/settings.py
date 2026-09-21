@@ -117,6 +117,7 @@ __all__ = [
     "DrActivationMode",
     "ServiceSettings",
     "load_settings",
+    "settings_error_detail",
 ]
 
 #: Known config sections (used to parse ``MEFOR_<SECTION>_<KEY>`` env vars).
@@ -152,6 +153,10 @@ _SECTIONS = (
 )
 _ENV_PREFIX = "MEFOR_"
 _DEFAULT_FILE = "messagefoundry.toml"
+
+#: How many failing fields :func:`settings_error_detail` names before it counts the rest. A bad
+#: section can fail every key in it, and an unbounded list is unreadable in a one-line CLI error.
+_ERROR_DETAIL_ROWS = 5
 
 _log = logging.getLogger(__name__)
 
@@ -798,6 +803,19 @@ class StoreSettings(_Section):
         return self
 
 
+#: The hosts that count as a loopback bind for the OPERATOR API, i.e. not exposed off-box. Both IPv4 and
+#: IPv6 loopback are listed so a dual-stack box never spuriously counts as exposed.
+#:
+#: Defined here rather than beside its ADR 0118 use because at least two security decisions in this
+#: module key on it and must not disagree: :attr:`ApiSettings.is_loopback`, which used to inline the
+#: same three hosts as a tuple, and ``_desugar_security``'s refusal of a non-loopback ``listen_address``
+#: under ``local_access_only = true``. This unifies THIS module only. Other packages carry same-named
+#: frozensets for their own transports, with different contents (``::ffff:127.0.0.1`` in
+#: ``pipeline.wiring_runner`` and ``transports.dicom``, ``[::1]`` in the harness poller); reconciling
+#: those is a separate question, recorded in ADR 0154.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
 class ApiSettings(_Section):
     host: str = "127.0.0.1"  # Phase 1 = localhost only
     port: int = 8765
@@ -926,9 +944,10 @@ class ApiSettings(_Section):
     @property
     def is_loopback(self) -> bool:
         """Whether the API binds a loopback host — i.e. is **not** exposed off-box, so the exposed-bind
-        TLS gate and the MFA-at-exposure advisory (``serve``) don't apply. Treats ``127.0.0.1``,
-        ``localhost`` and ``::1`` as loopback (a dual-stack box never spuriously counts as exposed)."""
-        return self.host in ("127.0.0.1", "localhost", "::1")
+        TLS gate and the MFA-at-exposure advisory (``serve``) don't apply. The host set is
+        :data:`_LOOPBACK_HOSTS`, shared with the ``[security]`` desugar so one definition serves every
+        off-box decision."""
+        return self.host in _LOOPBACK_HOSTS
 
     @property
     def proxy_intra_service_declared(self) -> bool:
@@ -958,8 +977,8 @@ class ApiSettings(_Section):
             or parts.fragment
         ):
             raise ValueError(
-                "[api].public_origin must be a bare origin like 'https://ops.example.com' "
-                "(scheme + host, no path/query/fragment)"
+                "[security].web_console_public_address must be a bare origin like "
+                "'https://ops.example.com' (scheme + host, no path/query/fragment)"
             )
         # Lowercase scheme + host (case-insensitive per RFC 3986 §3.2.2) so the same-origin comparison
         # is reliable regardless of how the admin cased it or how the browser sends the Origin.
@@ -1068,8 +1087,9 @@ class ApiSettings(_Section):
                 pass  # a DNS name — HSTS is notable, nothing to refuse
             else:
                 raise ValueError(
-                    f"[api].public_origin {self.public_origin!r} is an IP literal while a TLS posture "
-                    "is declared. RFC 6797 §8.1.1 forbids a browser from noting an IP-literal host as "
+                    f"[security].web_console_public_address {self.public_origin!r} is an IP literal "
+                    "while a TLS posture is declared. RFC 6797 §8.1.1 forbids a browser from noting "
+                    "an IP-literal host as "
                     "an HSTS host, so the Strict-Transport-Security header would be silently "
                     "discarded and the console would have no HTTPS-downgrade protection (ASVS 3.4.1). "
                     "Use a DNS hostname for the console — a dedicated subdomain, since "
@@ -1079,7 +1099,7 @@ class ApiSettings(_Section):
 
 
 class TlsSettings(_Section):
-    """``[tls]`` — the instance-wide client **trust-anchor** policy (#190, ADR 0093).
+    """``[tls]`` — the instance-wide client **trust-anchor and revocation** policy (#190, ADR 0093).
 
     A small, shared fallback for outbound connectors that verify a downstream *server* certificate
     (MLLP/DICOM/FTPS today). By default the OS trust store roots verify the peer; a hospital estate
@@ -1100,6 +1120,20 @@ class TlsSettings(_Section):
     #   "pinned"  — ONLY the internal CA, not the public bundle (a fully-private estate; strictest,
     #               the forward_tls_ca_file template).
     trust_anchor_mode: TrustAnchorMode = "system"
+    # PEM path to a CRL (or a CA+CRL bundle) for OUTBOUND hops (BACKLOG #299). NOT a secret — a path,
+    # the same status as internal_ca_file. Empty (default) = no outbound revocation checking, which is
+    # exactly the gap the #201 RevocationHopGuard refuses on an enforcing hop. Set it and every hop that
+    # resolves a trust anchor loads the CRL onto its OWN context and sets VERIFY_CRL_CHECK_LEAF.
+    #
+    # WARNING, and it is the operational half of this setting: VERIFY_CRL_CHECK_LEAF refuses a peer whose
+    # issuer has NO CRL in the store, not only a revoked one. So the file must cover every issuer the
+    # covered hops present, and it must be refreshed before its nextUpdate. Both failures are
+    # fail-CLOSED (the handshake is refused, nothing crosses unverified), and harden_crl_check refuses an
+    # already-expired or unloadable CRL at construction rather than at the first partner handshake.
+    # LOOPBACK HOPS ARE EXEMPT for that reason -- an on-box peer is usually issued by a different,
+    # local PKI the org CRL does not cover, and the revocation guard already ALLOWs a loopback hop, so
+    # applying a CRL there would break on-box traffic to close a gap the gate does not consider open.
+    crl_file: str | None = None
 
     @model_validator(mode="after")
     def _check_pinned_requires_internal_ca(self) -> TlsSettings:
@@ -1122,7 +1156,9 @@ class TlsSettings(_Section):
         outbound so a connector's client-verify context resolves the same anchor at build_check and
         live construction (the internal-outbound context builders call ``resolve_trust_anchor``)."""
         return TrustAnchorPolicy(
-            internal_ca_file=self.internal_ca_file, mode=self.trust_anchor_mode
+            internal_ca_file=self.internal_ca_file,
+            mode=self.trust_anchor_mode,
+            crl_file=self.crl_file,
         )
 
 
@@ -1142,14 +1178,30 @@ class InboundSettings(_Section):
     # delivery) is not yet implemented and is rejected at engine start.
     ack_after: AckAfter = AckAfter.INGEST
 
-    # Very-large-document streaming in-flight budget (#149, ADR 0105 Phase 1a) — the aggregate DoS guard
-    # that replaces the frame-cap-as-only-OOM-guard for streaming inbounds. It caps the TOTAL bytes of
-    # over-threshold message bodies concurrently mid-detach (buffered + being sealed into the attachment
-    # substrate) across ALL inbounds; a detach that would push the running total over it is refused with
-    # backpressure (the message is NAK'd/ERROR'd, never accepted-and-dropped) so a burst of huge uploads
-    # can't exhaust memory. 0 (the default) = unlimited (the per-connection max_message_bytes still bounds
-    # a SINGLE body); a positive value bounds concurrency. Only over-threshold streaming detaches count
-    # against it — below-threshold and non-streaming ingress is byte-identical and never touches it.
+    # Very-large-document streaming in-flight budget (#149, ADR 0105 Phase 1a) — the OPT-IN aggregate DoS
+    # guard for streaming inbounds. It caps the TOTAL bytes of over-threshold message bodies concurrently
+    # mid-detach (buffered + being sealed into the attachment substrate) across ALL inbounds; a detach
+    # that would push the running total over it is refused with backpressure (the message is
+    # NAK'd/ERROR'd, never accepted-and-dropped) so a burst of huge uploads can't exhaust memory. Only
+    # over-threshold streaming detaches count against it — below-threshold and non-streaming ingress is
+    # byte-identical and never touches it.
+    #
+    # THE TWO CEILINGS BOUND DIFFERENT THINGS, and this one does NOT replace the other. A SINGLE body on a
+    # streaming inbound is bounded by that inbound's per-connection max_message_bytes, which applies
+    # whether or not this is set. What THIS bounds is the AGGREGATE. 0 (the default) = unlimited IN THE
+    # AGGREGATE: no single body escapes max_message_bytes, but the NUMBER of such bodies in flight at once
+    # is uncapped until an operator sets a positive value. docs/CONNECTIONS.md ("Two ceilings bound it")
+    # is the operator-facing statement of the same split; docs/CONFIGURATION.md carries the catalog row.
+    #
+    # BACKLOG #1729: this block used to open by calling the setting "the aggregate DoS guard that replaces
+    # the frame-cap-as-only-OOM-guard", four lines above its own "0 (the default) = unlimited" — one
+    # comment contradicting itself, and the SDS-3.7 shape (a compensating control resting on a false
+    # premise) for anyone who read only the first sentence. The DEFAULT is deliberately unchanged: it is a
+    # coupled pin (tests/test_threat_model_doc_drift.py, "streaming-detach budget default 0 = unlimited",
+    # against a vault THREAT-MODEL.md row), and "a multiple of the largest max_message_bytes" is not
+    # expressible here at all — max_message_bytes is PER-CONNECTION and no registry exists at settings
+    # load. What closes the visibility half is a start-time WARNING, keyed on the registry where the
+    # streaming inbounds are actually in hand: pipeline/wiring_runner.warn_unbudgeted_streaming_inbound.
     stream_inflight_budget_bytes: int = 0
 
 
@@ -1626,6 +1678,14 @@ class LoggingSettings(_Section):
     forward_tls_verify: bool = True
     # Optional client cert (PEM cert+key chain) for mutual TLS to the collector. None = no client auth.
     forward_tls_client_cert: str | None = None
+    # Optional CRL (PEM, or a CA+CRL bundle) checked against the COLLECTOR's certificate (BACKLOG
+    # #299). The syslog forwarder builds its own context and resolves no trust anchor, so
+    # [tls].crl_file never reaches it -- this is its own knob rather than a silent inheritance, which
+    # would be the per-hop scoping error that item warns about. Applies only with
+    # forward_tls_verify=true: the opt-out arm is CERT_NONE, where there is no chain to check against.
+    # Same fail-closed refusals as every other CRL: absent, unloadable or past nextUpdate refuses at
+    # startup rather than at the first collector handshake.
+    forward_tls_crl_file: str | None = None
     # Per-hop insecure-forwarding attestation (#200, ADR 0092 shape — the [logging] sibling of a
     # connection's `tls_hop_attested`). The off-box forwarder ships a PHI-REDACTED copy of every log +
     # audit row, but the default `forward_protocol = "udp"` puts that evidence stream (usernames,
@@ -2239,6 +2299,12 @@ class AuthSettings(_Section):
     # REFUSES — always, independent of [security].enforcement (a substituted OIDC anchor permits JWKS
     # substitution + forged id_tokens). Dormant when None. Block-scoped (direct-read, not desugared).
     oidc_tls_ca_cert_pin: str | None = None
+    # BACKLOG #299: optional CRL (PEM, or a CA+CRL bundle) checked against the IdP's certificate. The
+    # IdP opener resolves no trust anchor, so [tls].crl_file cannot reach it -- this is its own knob
+    # rather than a silent inheritance. A revoked IdP cert matters more than on a data hop: this is the
+    # leg carrying the client secret, the authorization code and the identity assertion. Same
+    # fail-closed refusals as every other CRL (absent / unloadable / past nextUpdate refuses at start).
+    oidc_tls_crl_file: str | None = None
     oidc_redirect_path: str = "/ui/oidc/callback"  # full URI derived from [api].public_origin
     oidc_scopes: list[str] = Field(default_factory=lambda: ["openid", "profile"])
     oidc_signing_algorithms: list[str] = Field(default_factory=lambda: ["RS256"])
@@ -2904,6 +2970,26 @@ class EgressSettings(_Section):
         if isinstance(v, str):
             return [item.strip() for item in v.split(",") if item.strip()]
         return v
+
+
+#: How an operator-facing refusal says ``EgressSettings.deny_by_default`` is on (BACKLOG #1361).
+#:
+#: BOTH ARMS ARE REACHABLE, AND SAYING ONLY "is set" ASSERTS SOMETHING FALSE ON THE COMMON PATH. The
+#: operator can write ``[security].block_unlisted_outbound`` -- but ``__main__`` also FLIPS the field on
+#: for any PHI instance that left it unset, announcing that as "defaulted ON". An instance that
+#: configured nothing is the usual way this refusal fires, so a message reading "is set" tells that
+#: operator they set something they did not.
+#:
+#: Defined once, beside the field, because the six refusal sites live in two other modules
+#: (``pipeline/reference_sync.py``, ``pipeline/wiring_runner.py``) and a second copy of this sentence
+#: is how five of them stay right while the sixth goes stale.
+#:
+#: Names the ``[security]`` spelling, not ``[egress].deny_by_default``: ADR 0118 relocated the key and
+#: the loader REFUSES the old one as file or env input, so naming it hands out a remediation that dies
+#: at load. tests/test_relocated_key_messages.py holds that line.
+BLOCK_UNLISTED_OUTBOUND_IN_FORCE = (
+    "[security].block_unlisted_outbound is in force (set, or defaulted ON for a PHI instance)"
+)
 
 
 class ShadowSettings(_Section):
@@ -3967,6 +4053,29 @@ class IntegritySettings(_Section):
     # refuse-to-start on a tripped tamper alarm would be a self-inflicted DoS). Default false — opt in;
     # on a very large audit_log the full re-walk adds startup latency, so it is not on by default.
     audit_verify_on_start: bool = False
+    # Path to a file holding one COUNT:HEAD anchor as printed by `messagefoundry audit-anchor` (BACKLOG
+    # #328). Empty (the default) = the startup walk stays the bare walk it is today, byte-identical.
+    #
+    # WHAT IT BUYS: the walk alone cannot see a TRUNCATED TAIL — deleting the newest rows leaves a prefix
+    # that still chains cleanly — so audit_verify_on_start on its own is blind to exactly what an
+    # attacker hiding their tracks would do. An anchor is the external witness that catches it.
+    #
+    # THE ENGINE CONSUMES IT AS A PREFIX, NOT AS THE CLI'S EXACT SEAL, and that difference is why this
+    # key can exist at all. `audit-verify --expected-anchor` compares the CURRENT head, so it diverges
+    # the moment one more row is appended; a running engine writes audit rows, so a startup check built
+    # on the exact seal would alarm on essentially every restart. This feeds `expected_prefix`
+    # (`audit_prefix_verdict`) instead, which asks the weaker, survivable question: was the recorded
+    # state ever true, and has the chain only GROWN since? It still catches a truncated tail and a
+    # mid-chain rewrite. So a stale anchor stays VALID here — it just witnesses less.
+    #
+    # ALERT-ONLY, like its partner: a missing, unreadable or malformed anchor logs a WARNING and lets the
+    # bare walk run. It never crashes startup, and it never fires the tamper alert — a config fault must
+    # not manufacture a tamper alarm, or a real one stops meaning anything. `0:`, the anchor of an empty
+    # log, is refused the same way: it can witness nothing, so it is reported rather than compared.
+    #
+    # It does nothing on its own: without audit_verify_on_start the engine warns at startup that the
+    # anchor is never read.
+    audit_anchor_file: str = ""
 
 
 class ApprovalsSettings(_Section):
@@ -4784,7 +4893,8 @@ def _reject_unknown_file_keys(file_data: Mapping[str, Any]) -> None:
 
 
 # --- ADR 0118: the [security] section desugars into the internal fields it replaces ----------------
-_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+# The loopback host set this section keys on is _LOOPBACK_HOSTS, defined beside `ApiSettings` above so
+# `is_loopback` and the desugar refusal cannot disagree about what "off-box" means.
 
 #: Legacy ``(section, key)`` → the ``[security]`` key that replaces it (ADR 0118). Setting any of these
 #: in its old section (file OR ``MEFOR_<SECTION>_<KEY>`` env) is REJECTED at load — the posture switches
@@ -4969,6 +5079,57 @@ def _desugar_security(data: dict[str, dict[str, Any]]) -> None:
     # The master posture lever USED TO BE DESUGARED HERE, into [ai].data_class. Both keys are retired
     # (BACKLOG #1279) and `_reject_relocated_keys` refuses either spelling before this runs, so there
     # is nothing left to translate. The production tier still passes through `_SECURITY_PASSTHROUGH`.
+
+
+def _reconcile_effective_bind(settings: ServiceSettings) -> None:
+    """Fold the EFFECTIVE API bind back into the ``[security]`` view, in the loosening direction only
+    (BACKLOG #1852).
+
+    :func:`_desugar_security` writes ``[security]`` down into ``[api].host`` and runs BEFORE the CLI
+    merge so ``serve --host`` still wins. That ordering is deliberate and stays, but it leaves the two
+    views disagreeing: ``--host 0.0.0.0`` moves the socket off-box while ``[security]`` still reads
+    ``local_access_only = true``. Nothing reported that. :func:`security_loosenings` reads the raw
+    ``[security]`` model, so BOTH the ``local_access_only`` entry and the exposure-gated
+    ``allowed_client_networks`` entry stayed silent. The serve-time loosening warning,
+    ``GET /security/posture`` and the web console's "Local access only" row all said the engine was
+    loopback-only while it was listening on every interface. The exposed-bind TLS gate in ``__main__``
+    was never fooled (it reads :attr:`ApiSettings.is_loopback`); only the REPORTING was.
+
+    Reconciling here, on the validated object, reuses that same ``is_loopback`` predicate, so the gate
+    and the posture view share one definition of "off-box" and cannot drift apart again. It also fixes
+    every consumer at once without adding a parameter to the loosening registry. That parameter would
+    be wrong for ``messagefoundry security show`` anyway, where the declared reading IS the effective
+    one because there is no CLI bind to reconcile against. This is the same move ``serve`` already
+    makes for the egress and retention flips (ADR 0118), one layer earlier.
+
+    A FREE FUNCTION AND NOT A ``ServiceSettings`` AFTER-VALIDATOR, deliberately. The two cross-section
+    validators on that model REFUSE a contradiction; they do not rewrite a field, and a mutating one
+    beside them would read as the same kind of rule. More to the point, this fold is a LOADER concern:
+    what it reconciles against is the CLI-over-file precedence :func:`load_settings` owns, and a
+    ``ServiceSettings`` a caller builds by hand has no CLI layer for it to be about. A validator would
+    not even be the stronger guarantee it looks like, since ``model_copy(update=...)`` re-runs none.
+
+    ``is_loopback`` is a three-host string match, so a bind on ``127.0.0.2`` (loopback on every
+    supported platform) reconciles as EXPOSED. That over-reports, which is the safe direction, and it
+    is byte-identical to what the serve TLS gate already does with the same host. Do not "fix" it into
+    an :mod:`ipaddress` ``is_loopback`` call here: that would relax the TLS gate in the same move.
+
+    **ONE-WAY, and that is the load-bearing part.** Reconcile only where the effective bind ADDS a
+    loosening:
+
+    * effective bind is NON-loopback: force ``local_access_only`` false and point ``listen_address``
+      at the host actually bound (leaving it at ``127.0.0.1`` would make the model lie, since that
+      field is documented as the address used once ``local_access_only`` is false);
+    * effective bind IS loopback: change nothing. Never flip ``local_access_only`` back to true. An
+      operator may declare ``local_access_only = false`` and leave ``listen_address`` at its loopback
+      default; the declaration is still a deviation from the one shipped posture and the registry must
+      keep reporting it. Suppressing a loosening the operator declared is the wrong direction, whatever
+      the socket ended up bound to.
+    """
+    if settings.api.is_loopback:
+        return
+    settings.security.local_access_only = False
+    settings.security.listen_address = settings.api.host
 
 
 def security_loosenings(
@@ -5335,6 +5496,85 @@ def security_loosenings(
     return out
 
 
+def settings_error_detail(exc: Exception) -> str:
+    """Render a :func:`load_settings` failure WITHOUT echoing any configured value.
+
+    WHY ``str(exc)`` IS NOT SAFE HERE. ``str(ValidationError)`` carries ``input_value=`` for every
+    failing field, and for an ``after``-mode model validator that value is the whole section's input
+    mapping. The secrets in ``_FILE_SECRET_KEYS`` come from the environment
+    (``MEFOR_STORE_PASSWORD`` and siblings) and are in that mapping, so one missing ``[store].server``
+    renders the store password into whatever the caller does with the string -- stdout, a pasted
+    ticket, a PowerShell ``throw`` in a transcript. Field path plus message, never ``input`` and never
+    ``ctx``, is enough for an operator to find the key and carries no configured value at all.
+
+    A LONG VALUE IS NOT SAFER: pydantic abbreviates a long ``input_value`` repr from the middle, so a
+    32-character password loses its head and discloses its tail.
+
+    THIS IS THE RENDERER TO REACH FOR, AND AT LEAST FIFTEEN CALLERS STILL DO NOT REACH FOR IT.
+    "At least", and never an enumeration, for two reasons this paragraph has already been wrong about
+    once each.
+
+    FIRST, THE NUMBER IS A MEASUREMENT AND NOT AN INVARIANT. Nothing gates a new ``except`` arm, so
+    the next one lands without touching this paragraph; PR 1141 was open with one in it while this
+    was being written. Re-measure before you quote it.
+
+    SECOND, AND THIS IS THE ONE THAT BIT: THE INSTRUMENT DECIDES THE ANSWER, so read what it asked.
+    This paragraph used to say SEVEN arms, then SIX, then FIVE, each from an AST walk for a literal
+    ``str(<bound>)`` in the handler. That walk is BLIND TO AN F-STRING, and most of these sites use
+    one. Re-run over ``messagefoundry/__main__.py`` at ``19c98e023`` asking instead whether the bound
+    exception reaches ANY string rendering -- ``str()``, an f-string, ``%`` or ``.format`` -- of the
+    20 ``except`` arms naming ``ValidationError``, **16** render it, not five. The narrow instrument
+    was not measuring a smaller problem; it was measuring a smaller part of the same one. The earlier
+    counts are kept above as what they were: readings, from a tool that answered an adjacent question.
+
+    SO NO LIST HERE IS THE POPULATION. #1523 fixed ``_cluster_vip``; this change fixed ``_ai_policy``
+    (and this paragraph said those five were what remained, under the narrow walk, until the broad
+    one was run). ``ai-policy`` is also the only one RUN and confirmed to disclose a planted
+    ``MEFOR_STORE_PASSWORD``, first here and now pinned by ``tests/test_cli_ai_policy.py``; every
+    other site was read, not run, so what follows counts ARMS, not confirmed disclosures.
+
+    WHERE TO START, IF YOU ARE THE ONE DOING THE SWEEP, because the arms are not equally bad and a
+    count flattens them. ``_serve`` (``__main__.py`` around line 1495) and ``_supervise`` are the
+    two that matter most: both render a boot-time ``load_settings`` failure with
+    ``print(f"error: {exc}", file=sys.stderr)``, and the engine runs as a Windows service under NSSM,
+    which captures that stream to a file (docs/SERVICE.md). On first deployment a ``[store]`` that
+    fails validation would therefore write ``MEFOR_STORE_PASSWORD`` into a persisted service log, on
+    every start attempt, with no operator present to see it -- and support-bundle assembly collects
+    logs. ``ai-policy`` reached one IDE bridge read; that one reaches a file that keeps it. A third
+    group -- ``_security`` and ``_alert`` -- validates JSON the operator just typed at a named path,
+    where echoing the input back is arguably the point; do not sweep those without deciding that
+    question separately.
+
+    ``_emit_error`` IS NOT THE CHOKEPOINT, and the shape of the sweep depends on knowing that. It
+    takes an already-rendered ``str``, not an exception, so it cannot call this function without a
+    signature change; many of its 56 call sites pass hand-authored or deliberately value-carrying
+    text that must NOT be re-rendered (the JSON-echo group above is the clearest kind); and half the
+    arms above never touch it, printing straight to stderr through their own emitter. The shape that
+    DOES work is already written, in ``messagefoundry/verify/runner.py``'s ``_load_settings``: a
+    wrapper returning ``(settings, detail)`` so each caller keeps its own emitter, stream and exit
+    code. That one renders safely and is still missing ``OSError``, so it is a third site holding
+    half the fix. The sweep is NOT part of #1523 or of this change, and is stated rather than done,
+    so nobody reads this docstring as covering it.
+    """
+    from pydantic import ValidationError
+
+    if isinstance(exc, ValidationError):
+        errors = exc.errors(include_url=False)
+        rows = [
+            f"{'.'.join(str(part) for part in err['loc']) or '<root>'}: {err['msg']}"
+            for err in errors[:_ERROR_DETAIL_ROWS]
+        ]
+        extra = (
+            ""
+            if len(errors) <= _ERROR_DETAIL_ROWS
+            else f" (+{len(errors) - _ERROR_DETAIL_ROWS} more)"
+        )
+        return "; ".join(rows) + extra
+    # Our own model validators raise plain ValueError with hand-authored text naming the key, and
+    # FileNotFoundError/OSError carry a path. Neither reflects a configured value back.
+    return str(exc)
+
+
 def load_settings(
     *,
     config_path: str | Path | None = None,
@@ -5375,6 +5615,9 @@ def load_settings(
         _merge(data, cli)
 
     settings = ServiceSettings.model_validate(data)
+    # AFTER the CLI merge, so a `--host` that moved the socket off-box is reported as the posture
+    # loosening it is. One-way: it only ever ADDS a loosening. See the helper for why.
+    _reconcile_effective_bind(settings)
     if settings.cluster.vip.enabled:
         # Configuration only in this build (ADR 0056). Say so, or an operator who switched it on finds
         # out at the first failover that the address never moved.

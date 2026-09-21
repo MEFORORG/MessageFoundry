@@ -102,7 +102,7 @@ from typing import IO, Any, Final
 
 from messagefoundry.config.code_sets import CodeSet
 from messagefoundry.config.run_context import RunContext
-from messagefoundry.logging_setup import scrub_control_chars
+from messagefoundry.controlchars import scrub_control_chars
 from messagefoundry.pipeline import _sandbox_codec as codec
 from messagefoundry.pipeline._sandbox_codec import SandboxCodecError, SandboxError
 

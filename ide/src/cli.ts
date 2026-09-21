@@ -80,8 +80,18 @@ export function serviceConfig(): string {
   return config().get<string>("serviceConfig", "messagefoundry.toml");
 }
 
+/**
+ * The engine API URL. **https by default** since ADR 0172 made the engine always serve TLS, minting
+ * a self-signed pair when no operator chain is configured (BACKLOG #1695) — the previous `http://`
+ * default reached a TLS socket in cleartext and failed with `ECONNRESET`.
+ *
+ * THE FALLBACK HERE AND `messagefoundry.engineUrl`'s `default` IN package.json MUST AGREE. Nothing
+ * in VS Code reconciles them: the manifest default is what `get` returns to a user who never touched
+ * the setting, and this literal is what it returns if the key is ever absent from the manifest. They
+ * are pinned equal by `settings-scope.test.ts` because changing one and not the other is silent.
+ */
 export function engineUrl(): string {
-  return config().get<string>("engineUrl", "http://127.0.0.1:8765");
+  return config().get<string>("engineUrl", "https://127.0.0.1:8765");
 }
 
 /** One addressable engine instance within an environment (e.g. a horizontal shard / replica). */

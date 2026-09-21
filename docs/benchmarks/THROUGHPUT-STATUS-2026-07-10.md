@@ -447,6 +447,17 @@ attention.
 The durable-write cost per message (ADR 0051): `txn/msg = 3 + 2H + 2N`, where `H` = handlers the router
 **selects** and `N` = outbound destinations.
 
+> *Correction to the `N` term (added 2026-09-16, BACKLOG #1736):* **`N` counts outbound ROWS, one per
+> `Send`, not distinct destination connections.** A handler sending twice to the SAME outbound is
+> `N = 2`, costing 9 — not `N = 1` costing 7 — because each row is claimed in its own transaction and
+> resolved in its own. The correction is to the DEFINITION, and no figure here was re-derived under it:
+> the shapes this document measures — at least `(1,1)`, `(8,8)` and `(20,4)` — give one `Send` per
+> destination, which is the case where the two readings coincide. Re-check any figure you take from
+> here against that condition before reusing it. `H` and `N` are now defined once, on
+> `QueueStore.committed_txns` in [`messagefoundry/store/base.py`](../../messagefoundry/store/base.py);
+> the reading is settled by execution in
+> [`tests/test_runner_txn_cost_model.py`](../../tests/test_runner_txn_cost_model.py).
+
 **The `2H` term is charged before the handler runs** — therefore before it can decide to filter.
 
 | act | cost |

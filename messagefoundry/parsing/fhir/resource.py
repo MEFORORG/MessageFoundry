@@ -93,14 +93,18 @@ class FhirResource:
             raise FhirValidationError(
                 f"unknown FHIR resourceType {resource_type!r} for version {version}"
             ) from exc
+        # A pydantic ValidationError carries the offending input values (PHI) in its message and on
+        # its `errors()` entries. Sever the chain and surface only the PHI-safe summary — and raise
+        # OUTSIDE the handler, because `from None` clears `__cause__` but leaves `__context__`
+        # populated, so a chain-walking handler still reaches the PHI. See `encode_wire_body` in
+        # transports/base.py for the full mechanism.
+        summary: str | None = None
         try:
             model = model_class.model_validate(data)
         except ValidationError as exc:
-            # `from None`: a pydantic ValidationError carries the offending input values (PHI) in its
-            # message/__cause__ — sever the chain and surface only the PHI-safe summary.
-            raise FhirValidationError(
-                _safe_validation_summary(resource_type, version, exc)
-            ) from None
+            summary = _safe_validation_summary(resource_type, version, exc)
+        if summary is not None:
+            raise FhirValidationError(summary)
         return cls(model=model, version=version, resource_type=resource_type)
 
     @property

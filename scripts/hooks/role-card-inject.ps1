@@ -88,9 +88,17 @@ $RoleCopyRelPath = '.claude/ROLE.local.md'
 
 function Write-Note {
     param([string] $Text)
-    # Plain stdout. See "the one thing not proven" in docs/ROLE-CARDS.md: whether a hook wired in
-    # a project's own settings can emit hookSpecificOutput.additionalContext is UNTESTED here, and
-    # plain stdout is the shape this repository has actually exercised at SessionStart.
+    # Plain stdout, DELIBERATELY, and at SessionStart that is not the weaker channel: the hooks
+    # reference lists this event among the ones whose exit-0 stdout is added to context as plain
+    # text, and this repository measured that shape landing in context on 2026-09-15.
+    #
+    # THE OLD COMMENT HERE SAID THE ENVELOPE WAS UNTESTED AND CITED "the one thing not proven" in
+    # docs/ROLE-CARDS.md. Both halves were wrong. That phrase has never appeared in that file --
+    # measured 2026-09-18 against the working tree and against HEAD, 0 occurrences in each -- so
+    # the pointer never resolved. And hooks wired in this project's own .claude/settings.json DO
+    # emit hookSpecificOutput.additionalContext: context-budget.ps1 at UserPromptSubmit and
+    # usage-headroom-inject.ps1 at PreToolUse both do. See docs/ROLE-CARDS.md section 8 for what
+    # is actually still unmeasured, which is only whether the two shapes RENDER differently here.
     Write-Output $Text
 }
 

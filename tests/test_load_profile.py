@@ -9,6 +9,8 @@ parse and self-validate.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from harness.load.profile import (
@@ -19,6 +21,7 @@ from harness.load.profile import (
     get_profile,
     list_profiles,
     load_profile_text,
+    local_profiles_dir,
 )
 
 _MINIMAL = """
@@ -235,3 +238,72 @@ def test_get_profile_by_path(tmp_path: object) -> None:
     # A filesystem path resolves directly (this is how real-numbers profiles in migration-local run).
     path = PROFILES_DIR / "smoke.toml"
     assert get_profile(str(path)).name == "smoke"
+
+
+# --- BACKLOG #1835: operator-local profiles, resolved outside the packaged tree -------------------
+#
+# These used to be dropped straight into PROFILES_DIR and ignored by name in .gitignore. That shipped
+# them: the harness wheel force-includes PROFILES_DIR whole, and hatchling walks the filesystem for a
+# force-included source without reading .gitignore. They belong under migration-local/profiles/, the
+# tree profiles/README.md already reserves for site-specific numbers, and the lookup below is what
+# keeps `--load <name>` working so nobody has a reason to put one back.
+
+
+def _write_local_profile(root: Path, stem: str, name: str) -> Path:
+    local = root / "migration-local" / "profiles"
+    local.mkdir(parents=True, exist_ok=True)
+    path = local / f"{stem}.toml"
+    path.write_text(_MINIMAL.replace('name = "t"', f'name = "{name}"', 1), encoding="utf-8")
+    return path
+
+
+def test_local_profiles_dir_follows_the_working_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A module constant would freeze whichever directory was current at import time, and an installed
+    # harness is run from the operator's directory, not from a checkout.
+    monkeypatch.chdir(tmp_path)
+    assert local_profiles_dir() == tmp_path / "migration-local" / "profiles"
+
+
+def test_an_operator_local_profile_resolves_by_bare_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_local_profile(tmp_path, "hospital-baseline", "hospital-baseline")
+    monkeypatch.chdir(tmp_path)
+    assert get_profile("hospital-baseline").name == "hospital-baseline"
+
+
+def test_an_operator_local_profile_is_listed_and_labelled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_local_profile(tmp_path, "hospital-baseline", "hospital-baseline")
+    monkeypatch.chdir(tmp_path)
+    listed = list_profiles()
+    # Both sets, and the local one says which it is: a profile sized for one site is not a built-in.
+    assert "smoke" in listed
+    assert "(operator-local)" in listed["hospital-baseline"]
+    assert "(operator-local)" not in listed["smoke"]
+
+
+def test_a_local_profile_shadowing_a_builtin_raises_rather_than_picking_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Either precedence is a silent wrong answer half the time. `smoke` is a CI gate, so local-wins
+    # would reshape a named run for anyone standing in the wrong directory; built-in-wins would
+    # ignore the file the operator just wrote.
+    _write_local_profile(tmp_path, "smoke", "smoke")
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(LoadProfileError, match="ambiguous"):
+        get_profile("smoke")
+
+
+def test_no_local_directory_changes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The ordinary case, and the control for the three above: without migration-local/profiles/ the
+    # built-ins still resolve, so a pass there is not the lookup silently failing open.
+    monkeypatch.chdir(tmp_path)
+    assert not (tmp_path / "migration-local").exists()
+    assert get_profile("smoke").name == "smoke"
+    assert "(operator-local)" not in list_profiles()["smoke"]

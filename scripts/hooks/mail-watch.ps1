@@ -50,7 +50,21 @@
     shown-marker under box/<key>/shown/ is what distinguishes them, and reading it is not rendering:
     delivery still happens in exactly one place.
 
-    FAIL OPEN. Any error exits 0, which means "no rewake" and costs nothing.
+    NEWEST WATCHER WINS, AND THE CLAIM FILE IS NEVER DELETED. Each watcher publishes a token to
+    mefor-coord/mail/watch/<sessionKey>.owner and stands itself down once that file names someone else,
+    so a session holds one watcher rather than one per turn. See the block around that write for the
+    measurement and for why the guard's failure direction is inverted relative to the rest of this file.
+
+    Cleaning the file up on exit is the obvious next thought and it is WRONG. By the time a watcher
+    exits, the token in that file is usually the NEWER watcher's -- deleting it would release a claim
+    this process does not hold, and the winner would then see no file and keep running while the turn
+    after it starts a third. A check-then-delete cannot close that race either, it only narrows it.
+    Stale claims are self-healing and cost one small file per session: the next arming overwrites it,
+    and a token naming a dead process stands nobody down, because every watcher compares against its
+    OWN token and never asks whether the named process is alive.
+
+    FAIL OPEN. Any error exits 0, which means "no rewake" and costs nothing. The one deliberate
+    exception is the stand-down check, whose header says why.
 #>
 [CmdletBinding()]
 param(
@@ -84,11 +98,54 @@ try {
     # Validated before any path is built from it, exactly as the drain does; $null means UNMARKABLE.
     $sessionKey = ConvertTo-SessionKey -SessionId ([string]$hook.session_id)
 
+    # --- NEWEST WATCHER WINS -----------------------------------------------------------------------
+    # This hook arms on Stop -- every turn boundary -- and then polls for MaxWaitSeconds. With no guard
+    # a session that takes turns faster than 900s ACCUMULATES watchers, one per turn, each holding a
+    # process for its full deadline. Measured 2026-09-18: 15 alive across 7 sessions, two sessions
+    # holding 5 each, ~1.9 GB resident. Nothing was stuck -- the oldest was 902s against the 900s
+    # deadline, so every one of them exited on time. The population was bounded and the ceiling was
+    # simply 900s / turn_interval, which for a fast session is 15 on its own.
+    #
+    # They are not merely redundant, they are answering a question that has already been settled: this
+    # watcher exists to wake an IDLE session, and the arrival of a newer watcher is proof the session
+    # took another turn and is no longer idle. Every watcher but the newest is polling on behalf of a
+    # state that ended.
+    #
+    # So each watcher publishes a token and stands down when it stops being the published one. NOTHING
+    # KILLS ANYTHING -- an older watcher notices and exits itself, within one PollSeconds. A hook that
+    # terminated its siblings by PID would be a far worse thing to ship into a fleet than the stacking.
+    $ownerFile = $null
+    $myToken = "$PID $([guid]::NewGuid())"
+    if ($sessionKey) {
+        # Keyed by SESSION, never by box: two sessions can share a worktree, and a box-keyed claim
+        # would have them evict each other -- trading a bounded process count for lost wakes.
+        $watchDir = Join-Path $root 'watch'
+        [System.IO.Directory]::CreateDirectory($watchDir) | Out-Null
+        $ownerFile = Join-Path $watchDir "$sessionKey.owner"
+        [System.IO.File]::WriteAllText($ownerFile, $myToken)
+    }
+
     $deadline = [DateTime]::UtcNow.AddSeconds($MaxWaitSeconds)
     while ([DateTime]::UtcNow -lt $deadline) {
         # The OFF switch is checked every pass, not once at arm time: it exists to reach sessions that
         # are ALREADY running, and a watcher armed an hour ago is exactly such a session.
         if (Test-Path -LiteralPath (Join-Path $root 'OFF')) { exit 0 }
+
+        # Stand down if a newer watcher has claimed this session. Checked every pass for the same
+        # reason the OFF switch is: the event that makes this watcher pointless happens long after it
+        # was armed.
+        #
+        # THE FAILURE DIRECTION IS DELIBERATE AND IT IS NOT THIS FILE'S USUAL ONE. Everywhere else here
+        # an error exits 0, because a missed rewake costs nothing. Here exiting IS the action, so a
+        # guard that failed that way would drop wakes on any unreadable or half-written file -- turning
+        # a memory cost into a correctness one. So ONLY a well-formed token that is not mine stands this
+        # watcher down. Missing file, unreadable file, torn read, anything unparseable: keep watching,
+        # which degrades to exactly the behaviour that shipped before this guard existed.
+        if ($ownerFile) {
+            $owner = $null
+            try { $owner = [System.IO.File]::ReadAllText($ownerFile) } catch { }
+            if ($owner -and $owner -match '^\d+ [0-9a-fA-F-]{36}$' -and $owner -ne $myToken) { exit 0 }
+        }
 
         if (Test-Path -LiteralPath $inboxDir) {
             # "MAIL THIS SESSION HAS NOT BEEN SHOWN", NOT "THE INBOX IS NON-EMPTY". Those were the same

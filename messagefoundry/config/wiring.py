@@ -42,7 +42,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Final, Literal
+from typing import Any, Final, Literal, TypeIs
 
 from messagefoundry.config.code_sets import (
     CODESETS_DIR_NAME,
@@ -74,6 +74,7 @@ from messagefoundry.config.models import (
 )
 from messagefoundry.config.send_snapshot import snapshot_on_send_active
 from messagefoundry.parsing.message import Message, RawMessage, snapshot_payload
+from messagefoundry.secretscrub import scrub_credentials
 
 __all__ = [
     "ConnectionSpec",
@@ -119,6 +120,7 @@ __all__ = [
     "PortConflictError",
     "API_LISTENER_LABEL",
     "inbound_binding_conflicts",
+    "resolved_encoding_problems",
     "resolve_listener_binding",
     "bindings_overlap",
     "Diagnostic",
@@ -284,6 +286,139 @@ _NAMED_CASTS: dict[str, Callable[[Any], Any]] = {
 _ENVREF_KEYS = frozenset({"env", "default", "cast"})
 
 
+def _is_env_marker(value: Any) -> TypeIs[dict[str, Any]]:
+    """Is ``value`` a ``connections.toml`` env-ref inline table -- ``{env = "k", default = "..."}``?
+
+    Factored out of :func:`parse_env_setting` so the nested-reference refusals test the SAME predicate
+    the decoder does. The two used to be one expression in one place; once other callers needed it
+    (:func:`_is_nested_envref`, :func:`_redact_header_value`), a copy would have been free to drift,
+    and a drifted copy fails open -- it stops recognizing a marker the decoder still recognizes, and
+    the refusal goes quiet.
+
+    It returns ``TypeIs`` rather than ``bool`` so a caller holding an ``object`` can index the marker
+    it just recognized. The alternative was a second ``isinstance(value, dict)`` at each such call --
+    redundant to this predicate, and a standing invitation for a reader to treat it as a real second
+    condition and widen this one to match."""
+    return isinstance(value, dict) and "env" in value and set(value) <= _ENVREF_KEYS
+
+
+def _is_nested_envref(value: Any) -> bool:
+    """Either shape a nested ``env()`` reference arrives in, since both have to be refused.
+
+    Code-first authoring gives an :class:`EnvRef` instance. ``connections.toml`` gives a RAW
+    ``{"env": ..., "default": ...}`` dict, because :func:`parse_env_setting` decodes only top-level
+    values and does not descend into a nested table -- so an ``isinstance(..., EnvRef)`` test alone
+    would refuse the code-first surface while the TOML one still shipped the default to the partner."""
+    return isinstance(value, EnvRef) or _is_env_marker(value)
+
+
+def _envref_label(value: Any) -> str:
+    """Name a nested reference in an operator message WITHOUT echoing its ``default``.
+
+    ``str()`` on an :class:`EnvRef` renders the whole dataclass, ``default=`` and all, and on the raw
+    marker the whole dict. So a refusal that builds its text by stringifying the offender MOVES the
+    leak into the operator log, ``messagefoundry check`` output and the support bundle rather than
+    closing it -- the shape BACKLOG #1183 is about. Only the env KEY is ever named."""
+    key = value.key if isinstance(value, EnvRef) else value.get("env")
+    return f"env({key!r})"
+
+
+#: How far into one header's value :func:`_contains_envref` looks. A header value is ultimately a
+#: string, so anything structured under it is already unusual; the cap exists so a pathological or
+#: self-referential structure cannot spin the loader, not because a legitimate table is ever deep.
+_MAX_HEADER_SCAN_DEPTH = 6
+
+
+def _contains_envref(value: Any, depth: int = 0) -> bool:
+    """Does ``value`` hold an ``env()`` reference anywhere a ``str()`` of it would expose?
+
+    A TOP-LEVEL scan is not enough. ``str(v)`` renders a container whole, so a marker one level down
+    lands on the wire with its ``default`` inside it exactly as a bare one does. Measured before this
+    scan existed: ``X-Partner-Key = [ { env = "partner_key", default = "..." } ]`` in a
+    ``connections.toml`` headers table built clean and sent
+    ``[{'env': 'partner_key', 'default': '...'}]`` to the partner; a sub-table did the same.
+
+    Non-reference structure is left alone -- this looks for references, not for nesting, so an
+    ordinary list or table under a header value is still the author's business."""
+    if _is_nested_envref(value):
+        return True
+    if depth >= _MAX_HEADER_SCAN_DEPTH:
+        return False
+    if isinstance(value, Mapping):
+        return any(
+            _contains_envref(k, depth + 1) or _contains_envref(v, depth + 1)
+            for k, v in value.items()
+        )
+    # str/bytes are Sequences and must not be walked -- they contain no references and recursing a
+    # string yields its characters forever.
+    if isinstance(value, list | tuple | set | frozenset):
+        return any(_contains_envref(item, depth + 1) for item in value)
+    return False
+
+
+def _reject_envref_headers(factory: str, headers: Any) -> None:
+    """Refuse an ``env()`` reference inside a ``headers`` table (BACKLOG #1649).
+
+    Nested settings are NOT env-resolved: :func:`resolve_env_settings` walks only the TOP level, which
+    is the same ruling :func:`_hoist_body_secrets` and :func:`_reject_envref_odbc_params` are built on.
+    So an ``env()`` inside ``headers`` reaches the connector unresolved and every ``_build_headers``
+    does ``str(v)`` on it -- putting the reference's ``repr``, ``default=`` and all, on the wire to the
+    partner. Fail loud at authoring instead, pointing at the typed credential fields, which ARE
+    env-resolved and secret-redacted. Measured on ``Rest`` before this guard existed:
+    ``{'env': 'acme_key', 'default': 'FALLBACK-SECRET'}`` arrived as the header value, stringified.
+
+    BOTH AXES OF THE TABLE ARE SCANNED, because every ``_build_headers`` does ``str(k)`` as well as
+    ``str(v)`` -- names land on the wire exactly as values do. A value-shaped scan alone left
+    ``headers={env("hdr_name", default=...): "static"}`` building clean and sent the dataclass repr as
+    the header NAME. Only an :class:`EnvRef` can sit in the key position (the raw marker is a dict and
+    a dict is unhashable), but the predicate is asked rather than assumed, so the two axes cannot drift.
+
+    A REFERENCE STANDING FOR THE WHOLE TABLE IS NOT NESTED AND STAYS SUPPORTED.
+    ``Rest(headers=env("all_headers"))`` -- and the ``connections.toml`` spelling
+    ``headers = { env = "all_headers" }``, which :func:`parse_env_setting` decodes into an
+    :class:`EnvRef` because it IS a top-level settings value -- put the reference where
+    :func:`resolve_env_settings` does reach it, and it resolves to the real table before the connector
+    runs. Measured: ``resolve_env_settings({"headers": env("all_headers")}, ...)`` returns the table.
+    Only a reference INSIDE the table is unresolvable, so only that is refused.
+
+    A non-mapping ``headers`` is refused here too, not merely skipped. ``connections.toml`` is untyped
+    input, so ``headers = "not-a-table"`` reaches this function; iterating it raises ``AttributeError``,
+    which :func:`~messagefoundry.config.connections_file._build_spec` does not catch (it catches
+    :class:`WiringError` and ``TypeError``/``ValueError``), so the operator would get an internal
+    traceback where every other malformed setting in that loader gives a configuration error.
+    :func:`_hoist_body_secrets` raises :class:`WiringError` on the same input and this matches it.
+    Neither error names the connection or the file: ``_build_spec`` re-raises a ``WiringError``
+    verbatim rather than prefixing its ``where``, which is true of every factory-level refusal here
+    and is not fixed by this function.
+
+    This refuses rather than resolves, which is the row's other option. Recursive resolution would have
+    to reach into every nested settings shape and would undercut the top-level-only ruling the two
+    functions named above already depend on."""
+    if headers is None or isinstance(headers, EnvRef):
+        return
+    if not isinstance(headers, Mapping):
+        raise WiringError(
+            f"{factory} headers must be a table of header name to value, or a single env() reference "
+            f"standing for the whole table -- not {type(headers).__name__}."
+        )
+    offenders: list[str] = []
+    for name, value in headers.items():
+        if _is_nested_envref(name):
+            # The NAME is the reference. Label it by its env key -- str(name) here would print the
+            # repr that carries the default, which is the leak this refusal exists to stop.
+            offenders.append(f"{_envref_label(name)} used as a header name")
+        elif _contains_envref(value):
+            offenders.append(str(name))
+    if offenders:
+        raise WiringError(
+            f"{factory} headers may not use env() ({', '.join(sorted(offenders))}) - nested settings "
+            "are not env-resolved, so the reference reaches the partner as its repr with any default= "
+            "inside it. Put a credential in the top-level bearer_token / basic_user / basic_password "
+            "fields (env-resolved and secret-redacted); headers carries only static, non-secret "
+            "names and values."
+        )
+
+
 def parse_env_setting(value: Any) -> Any:
     """Decode one ``connections.toml`` settings value into a literal or an :class:`EnvRef` (ADR 0007).
 
@@ -292,7 +427,7 @@ def parse_env_setting(value: Any) -> Any:
     ``cast`` is a **named** cast (``"int"``/``"float"``/``"bool"``/``"str"``) since a file can't carry a
     Python callable. Any other value (a scalar, list, or a plain dict like a REST ``headers`` map) is
     returned verbatim. Raises :class:`WiringError` on a malformed env marker or an unknown cast name."""
-    if not (isinstance(value, dict) and "env" in value and set(value) <= _ENVREF_KEYS):
+    if not _is_env_marker(value):
         return value
     key = value["env"]
     if not isinstance(key, str) or not key:
@@ -555,7 +690,8 @@ def FhirLookup(
     *,
     url: str | EnvRef,  # the FHIR service BASE url, e.g. https://host/fhir (may be env())
     fhir_version: str = "R4B",  # "R4B" (default) | "R5" | "STU3" — explicit, no autodetect
-    headers: dict[str, str] | None = None,  # static extra headers (no secrets — not env()-resolved)
+    headers: dict[str, str]
+    | None = None,  # static extra headers (no secrets; a nested env() is refused)
     bearer_token: str
     | EnvRef
     | None = None,  # Authorization: Bearer … (static; or compose with_smart_backend)
@@ -607,6 +743,7 @@ def FhirLookup(
     ``GET /security/posture`` naming this connection. Same flag/reason coherence rules as an
     ``outbound()``: the flag without a reason, a blank reason, or a reason without the flag all fail
     loud at load."""
+    _reject_envref_headers("FhirLookup", headers)
     # ADR 0153: coherence-checked at the ONE authoring surface, exactly as build_outbound_connection
     # does for an outbound, so the declaration cannot reach the read executor unvalidated.
     try:
@@ -640,9 +777,12 @@ def resolve_env_settings(settings: Mapping[str, Any], values: Mapping[str, Any])
 
     Resolution order per ref: the environment value (cast if a ``cast`` was given), else its
     ``default``, else it's *missing*. Raises a single :class:`WiringError` listing **all** problems
-    at once — both missing keys and values that fail their ``cast`` (naming setting/key/value) — so
-    the failure is loud and actionable, not a raw ``ValueError`` traceback that names nothing and
-    aborts on the first bad value (fail loud, never blank; review M-22)."""
+    at once — both missing keys and values that fail their ``cast`` (naming the setting and the key,
+    NEVER the value — BACKLOG #1183) — so
+    the failure is loud and actionable, not a raw traceback that names nothing and aborts on the
+    first bad value (fail loud, never blank; review M-22). A cast is an arbitrary callable, so
+    **every** exception it raises is caught and redacted, not just ``ValueError``/``TypeError``
+    (BACKLOG #1656; see the handler)."""
     resolved: dict[str, Any] = {}
     missing: list[str] = []
     bad: list[str] = []
@@ -655,7 +795,17 @@ def resolve_env_settings(settings: Mapping[str, Any], values: Mapping[str, Any])
                 else:
                     try:
                         resolved[name] = value.cast(raw)
-                    except (ValueError, TypeError) as exc:
+                    except Exception as exc:
+                        # BACKLOG #1656 limb 2: `Exception`, not `(ValueError, TypeError)`. A cast is
+                        # an arbitrary callable, so it can raise anything -- a `KeyError` from a
+                        # lookup-table cast was the measured case -- and a non-(ValueError, TypeError)
+                        # escaped this handler RAW, carrying the secret value in its own exception
+                        # text. That re-opened, for every other exception type, exactly the leak
+                        # BACKLOG #1183 closed for the ValueError arm. The redaction below is the
+                        # whole point of catching it, so it has to cover every way a cast can fail.
+                        # NEVER `BaseException`: a KeyboardInterrupt or SystemExit is not a cast
+                        # failure and must keep propagating.
+                        #
                         # NEVER the raw value: a MEFOR_VALUE_* env() setting carries store passwords
                         # and connector keys, and this string is raised at startup into the operator
                         # log, the support bundle and GET /logs/tail (BACKLOG #1183). The value used to
@@ -664,6 +814,14 @@ def resolve_env_settings(settings: Mapping[str, Any], values: Mapping[str, Any])
                         # dropping only the f-string half would still have leaked it. Name the setting,
                         # the key and the expected TYPE, which is the whole diagnostic an operator
                         # needs to go fix the value they already hold.
+                        #
+                        # The WiringError below is raised OUTSIDE this block ON PURPOSE, so it
+                        # carries neither `__cause__` nor `__context__`. Chaining it (`raise ... from
+                        # exc`) would put the redacted-away text back within reach: a rendered
+                        # traceback prints the chained exception in full, and that traceback goes to
+                        # the same operator log, support bundle and GET /logs/tail this handler
+                        # exists to keep the value out of. Do not "improve" the diagnostic by
+                        # chaining -- it re-opens BACKLOG #1183 through the traceback.
                         want = getattr(value.cast, "__name__", None) or type(value.cast).__name__
                         bad.append(
                             f"setting {name!r} (env {value.key!r}): value is not a valid {want} "
@@ -1002,6 +1160,19 @@ def _mask_url_userinfo(value: object) -> object:
     return f"{scheme}//{user}:***@{hostpart}"
 
 
+def _redact_header_name(name: object) -> str:
+    """One header's NAME, rendered JSON-safe and secret-free (BACKLOG #1649).
+
+    A name is normally a string, and the factories refuse a reference in this slot -- but this is a
+    DISPLAY control over settings that reach it from elsewhere too, and an :class:`EnvRef` key was
+    handled by neither axis. It kept its ``default`` under ``str()``/``repr()`` AND left the key a
+    non-str object, so ``json.dumps`` refused the whole map: measured, ``GET /metadata`` and
+    ``graph --json`` raised rather than rendering. Name it by its env key, as the refusal does."""
+    if _is_nested_envref(name):
+        return _envref_label(name)
+    return str(name)
+
+
 def _redact_header_value(name: str, value: object) -> object:
     """One header's value, scrubbed. Handles the ``EnvRef`` case the headers branch used to miss.
 
@@ -1014,9 +1185,18 @@ def _redact_header_value(name: str, value: object) -> object:
     from ``env()`` is a credential by intent -- nobody env-refs a ``Content-Type`` -- so the name
     heuristic is the wrong gate here, and it is exactly the gate that failed: the measured instance
     used ``X-Vendor-Thing``, which matches no substring rule.
+
+    BOTH NESTED SHAPES ARE DROPPED, not just the ``EnvRef`` one (BACKLOG #1649). The factory now
+    refuses either shape, but this is a DISPLAY control over settings that reach it from more places
+    than one factory call -- a hand-built ``ConnectionSpec``, a stored graph, a settings map built
+    before that refusal existed -- so it must drop the default wherever the value came from. The raw
+    ``connections.toml`` marker was served verbatim here, fallback secret included, because
+    ``parse_env_setting`` never descends into a nested table and so the ``EnvRef`` arm never saw it.
     """
     if isinstance(value, EnvRef):
         return {"env": value.key}
+    if _is_env_marker(value):
+        return {"env": value["env"]}
     return "***" if _is_secret_header(name, value) else value
 
 
@@ -1040,7 +1220,13 @@ def redacted_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
             # BACKLOG #1207 -- a credential in URL userinfo, masked without destroying the view.
             out[name] = _mask_url_userinfo(value)
         elif name == "headers" and isinstance(value, dict):
-            out[name] = {k: _redact_header_value(k, v) for k, v in value.items()}
+            # Both axes: a header NAME is rendered through _redact_header_name before it is used as
+            # the output key AND before it is handed to the value rule, so a reference in the name
+            # slot neither survives nor reaches _is_secret_header as a repr carrying its default.
+            out[name] = {
+                (safe := _redact_header_name(k)): _redact_header_value(safe, v)
+                for k, v in value.items()
+            }
         elif name == "odbc_params" and isinstance(value, dict):
             # BACKLOG #1206. This bag is documented as carrying "only static driver keywords", and the
             # redactor honoured that by not descending -- so a credential inside it was served verbatim
@@ -1092,13 +1278,12 @@ def MLLP(
     max_connections: int | None = 256,  # cap concurrent clients (connection-flood guard)
     receive_timeout: float | None = 60.0,  # close a client idle this many seconds (slowloris)
     max_frame_bytes: int | None = 16 * 1024 * 1024,  # cap one frame's bytes (OOM guard); both dirs
-    # INBOUND message-RATE pacing (BACKLOG #1249). Unlike the caps above these default to OFF, and
-    # that is ruled rather than accidental: a rate on a clinical interface is only safe at a number
-    # taken from a real feed profile. The connector has read both keys since the pacer was built --
-    # until now no factory parameter and no connections.toml key could populate them, so the setting
-    # existed and could not be reached. Over budget the listener PAUSES READING so TCP back-pressures
-    # the sender: nothing is dropped, refused, NAK'd or reordered, which the count-and-log invariant
-    # requires (a discarding limiter was never an option here).
+    # INBOUND message-RATE pacing. Unlike the caps above these default to OFF, and that is ruled
+    # rather than accidental: a rate on a clinical interface is only safe at a number taken from a
+    # real feed profile. Both are parameters of this factory, and a connections.toml inbound entry
+    # desugars through it, so either surface sets them. Over budget the listener PAUSES READING so TCP
+    # back-pressures the sender: nothing is dropped, refused, NAK'd or reordered, which the
+    # count-and-log invariant requires (a discarding limiter was never an option here).
     max_messages_per_second: float | None = None,  # None/0 = no rate bound (the shipped default)
     message_burst: float
     | None = None,  # allowance over the sustained rate; None = one second's worth
@@ -1143,6 +1328,23 @@ def MLLP(
     inbound); outbound uses host/port/connect_timeout/timeout_seconds/max_frame_bytes. ``encoding``
     applies to framing in both directions. ``capture_response`` (outbound, ADR 0013) records the
     application ACK as a captured reply (a negative ACK still dead-letters/retries unchanged).
+
+    **Inbound message-rate pacing (BACKLOG #1249).** ``max_messages_per_second`` bounds how fast one
+    accepted inbound connection may feed messages in; ``None``/``0`` (the default) is no bound.
+    ``message_burst`` sizes the allowance above that sustained rate; ``None`` **and** ``0`` both mean
+    one second's worth of it -- **not** an unbounded burst, and **not** a burst of zero. The connector
+    reads it as ``message_burst or rate``, so any falsy value takes the rate. Both keys reach the
+    connector from here or from a ``connections.toml`` inbound entry, which desugars through this same
+    factory.
+
+    The history behind that last sentence -- the connector read both keys before either was a
+    parameter here, so text written in that window described the setting as reachable through no
+    surface at all, and some of it outlived the window -- is stated HERE, and cited from
+    ``tests/test_connection_schema.py`` and ``tests/test_security_doc_rate_limits.py``. Treat it as
+    the CANONICAL statement, not the only one: at least ``docs/SECURITY.md``'s ingest row and the two
+    pacing test modules say it independently. Why the ledger number sits in this paragraph and not in
+    the parameter comment above it -- that comment becomes an operator-facing GUI heading; see
+    :mod:`messagefoundry.config.connection_schema`.
 
     **Persistent outbound connection (ADR 0067).** Ships **opt-in** this release: ``persistent=False``
     is the default (connect-per-message — today's proven posture, dial a fresh connection per delivery).
@@ -2035,7 +2237,8 @@ def Rest(
     url: str | EnvRef,  # the endpoint; may be env() for DEV/PROD-specific hosts
     method: str = "POST",
     content_type: str = "application/json",
-    headers: dict[str, str] | None = None,  # static extra headers (no secrets — not env()-resolved)
+    headers: dict[str, str]
+    | None = None,  # static extra headers (no secrets; a nested env() is refused)
     bearer_token: str | EnvRef | None = None,  # Authorization: Bearer … (use env() for the secret)
     basic_user: str
     | EnvRef
@@ -2074,6 +2277,7 @@ def Rest(
     default web proxy, an ``http(s)://`` address is explicit, unset inherits ``[egress].proxy_url``.
     ``proxy_user``/``proxy_password`` (secret → ``env()``) authenticate to it (``proxy_auth_type``
     Basic/Digest); ``proxy_no_proxy`` lists intranet hosts to reach directly."""
+    _reject_envref_headers("Rest", headers)
     return ConnectionSpec(
         ConnectorType.REST,
         {
@@ -2115,7 +2319,8 @@ def FHIR(
     | None = None,  # None | "if-none-exist" | "conditional-update" | "if-match"
     conditional_query: str
     | None = None,  # search params for if-none-exist / conditional-update (e.g. "identifier=sys|val")
-    headers: dict[str, str] | None = None,  # static extra headers (no secrets — not env()-resolved)
+    headers: dict[str, str]
+    | None = None,  # static extra headers (no secrets; a nested env() is refused)
     bearer_token: str | EnvRef | None = None,  # Authorization: Bearer … (SMART/OAuth; use env())
     basic_user: str
     | EnvRef
@@ -2156,6 +2361,7 @@ def FHIR(
     and the egress host is gated by ``[egress].allowed_http``. Put secrets in ``env()``
     (``bearer_token``/``basic_*``), never in ``headers``. The FHIR server operation **must be idempotent**
     (delivery is at-least-once) — the conditional knobs are the native lever. ADR 0022."""
+    _reject_envref_headers("FHIR", headers)
     return ConnectionSpec(
         ConnectorType.FHIR,
         {
@@ -2443,7 +2649,8 @@ def DICOMweb(
     url: str | EnvRef,  # the DICOMweb STOW-RS BASE url, e.g. https://host/dicom-web (may be env())
     study_uid: str | EnvRef | None = None,  # POST to {base}/studies (server assigns) or, when set,
     # {base}/studies/{study_uid} (store into a known study)
-    headers: dict[str, str] | None = None,  # static extra headers (no secrets — not env()-resolved)
+    headers: dict[str, str]
+    | None = None,  # static extra headers (no secrets; a nested env() is refused)
     bearer_token: str
     | EnvRef
     | None = None,  # Authorization: Bearer … (OAuth; use env() for the secret)
@@ -2482,6 +2689,7 @@ def DICOMweb(
     modern HTTP imaging lane that **exceeds** both Mirth's and Corepoint's DICOM options. Put secrets in
     ``env()`` (``bearer_token``/``basic_*``), never in ``headers``. The DICOMweb server **must be
     idempotent** (delivery is at-least-once; a re-store of the same SOPInstanceUID is the native lever)."""
+    _reject_envref_headers("DICOMweb", headers)
     return ConnectionSpec(
         ConnectorType.DICOMWEB,
         {
@@ -2520,18 +2728,67 @@ def _is_db_proc_call(statement_lower: str) -> bool:
 
 
 def _reject_envref_odbc_params(odbc_params: Mapping[str, Any] | None) -> None:
-    """Refuse an ``env()`` ref inside ``odbc_params`` (#66). Nested settings are NOT env-resolved (only
-    top-level ones are — see :func:`resolve_env_settings`), so an ``EnvRef`` here would stringify to a
-    broken literal at connect. Fail loud at authoring, pointing to the top-level ``username``/``password``
-    fields (which ARE env-resolved + secret-redacted) for a per-environment/secret value."""
+    """Refuse an ``env()`` ref inside ``odbc_params`` (#66), in **both** spellings. Nested settings are
+    NOT env-resolved (only top-level ones are — see :func:`resolve_env_settings`), so an env ref here
+    would stringify to a broken literal at connect. Fail loud at authoring, pointing to the top-level
+    ``username``/``password`` fields (which ARE env-resolved + secret-redacted) for a
+    per-environment/secret value.
+
+    The two spellings reach this function as **different objects**, and testing only the first let the
+    second through (BACKLOG #1806). Code-first ``odbc_params={"PWD": env("acme_pw")}`` arrives as an
+    :class:`EnvRef`. A ``connections.toml`` ``[settings.odbc_params]`` inline table arrives as a **raw
+    dict** — :func:`parse_env_setting` decodes only *top-level* settings values and does not descend, so
+    ``PWD = { env = "acme_pw", default = "…" }`` is copied through verbatim. Both factories that take
+    ``odbc_params`` are reachable from a TOML table (see :mod:`messagefoundry.config.connections_file`),
+    so that raw dict used to pass unrefused and stringify into the DSN with its fallback attached.
+
+    At least one further position exists and is not nested: ``odbc_params = { env = "..." }`` names
+    the *whole table*, which IS a top-level settings value, so ``parse_env_setting`` decodes it to an
+    :class:`EnvRef`. That object has no ``items()``, and the resulting :class:`AttributeError` is
+    neither a ``TypeError`` nor a ``ValueError``, so ``connections_file._build_spec`` did not convert
+    it — the operator got a bare traceback. The mapping check below makes that a typed
+    :class:`WiringError` instead; ``_build_odbc_dsn`` already refuses a non-mapping at connect, so
+    this only moves an existing refusal earlier. It does **not** make the refusal name the connection
+    or the file: ``_build_spec`` re-raises a factory ``WiringError`` unwrapped, ahead of the arm that
+    adds that context, so every factory refusal is un-located in the same way.
+
+    From ``connections.toml``, the loader's type check (``connections_file._check_setting_types``,
+    BACKLOG #1809) runs before this function, and where it refuses, its message names the
+    connection. What it lets through reaches the mapping check below, as does every code-first call,
+    which that check never sees. Which whole-table shapes land where is pinned in
+    ``tests/test_odbc_params_envref_toml_shape.py``.
+
+    **The residual is a marker one container deep**, and it is deliberately still open here: a dict
+    carrying ``env`` plus an unrecognised key, or a marker inside a list, fails ``set(v) <=
+    _ENVREF_KEYS`` and reaches ``_build_odbc_dsn``, which ``str()``-splices it into the DSN with any
+    ``default`` attached. Closing it means refusing every non-scalar ``odbc_params`` value (no ODBC
+    keyword takes a container), which is a wider rule than mirroring the decoder and wants its own
+    row rather than being folded in here.
+
+    Offenders are reported as **keys only**; the refusal must never echo the value, which may be a
+    fallback secret. The non-mapping arm reports the type name for the same reason."""
+    if odbc_params is None:
+        return
+    # Ahead of the empty-table short-circuit on purpose: `odbc_params = ""` is falsy AND not a table,
+    # and `_build_odbc_dsn`'s `or {}` would otherwise read it as "no params" with no diagnostic.
+    if not isinstance(odbc_params, Mapping):
+        raise WiringError(
+            "Database odbc_params must be a table of ODBC keyword -> value pairs, not "
+            f"{type(odbc_params).__name__} — write it as a table (TOML "
+            "[settings.odbc_params], or a Python dict). An env() reference naming the whole table "
+            "is refused here too; put a credential/password in the top-level username/password "
+            "fields (env-resolved + redacted)."
+        )
     if not odbc_params:
         return
-    offenders = sorted(k for k, v in odbc_params.items() if isinstance(v, EnvRef))
+    offenders = sorted(k for k, v in odbc_params.items() if _is_nested_envref(v))
     if offenders:
         raise WiringError(
             f"Database odbc_params may not use env() ({', '.join(offenders)}) — nested settings are "
-            "not env-resolved. Put a credential/password in the top-level username/password fields "
-            "(env-resolved + redacted); odbc_params carries only static driver keywords."
+            "not env-resolved, in either spelling (a code-first env() ref, or a connections.toml "
+            'inline table like PWD = { env = "acme_pw" }). Put a credential/password in the top-level '
+            "username/password fields (env-resolved + redacted); odbc_params carries only static "
+            "driver keywords."
         )
 
 
@@ -2782,7 +3039,8 @@ def Soap(
     url: str | EnvRef,  # the SOAP endpoint (may be env())
     soap_action: str | EnvRef | None = None,  # SOAPAction (1.1 header / 1.2 content-type param)
     soap_version: Literal["1.1", "1.2"] = "1.1",  # "1.1" | "1.2"
-    headers: dict[str, str] | None = None,  # static extra headers (no secrets — not env()-resolved)
+    headers: dict[str, str]
+    | None = None,  # static extra headers (no secrets; a nested env() is refused)
     bearer_token: str | EnvRef | None = None,  # Authorization: Bearer … (use env() for the secret)
     basic_user: str | EnvRef | None = None,
     basic_password: str | EnvRef | None = None,
@@ -2847,6 +3105,7 @@ def Soap(
     use ``ws_security`` (above) and this is unnecessary. The
     operation **must be idempotent**: an at-least-once re-send mints a fresh ``<wsa:MessageID>`` (correct
     WS-\\* retry semantics), so the partner's dedup must treat a re-send as a retry, not a duplicate."""
+    _reject_envref_headers("Soap", headers)
     return ConnectionSpec(
         ConnectorType.SOAP,
         {
@@ -3715,12 +3974,126 @@ def _is_text_codec(value: str) -> bool:
     ``hex``, ``rot13``, ``zlib``), which ``codecs.lookup`` accepts and the transports do not. The
     mirror-image probe ``b"".decode(value)`` is no probe at all — CPython short-circuits an empty
     decode without consulting the codec, so it returns cleanly for *every* string including
-    ``"not-a-real-codec"``."""
+    ``"not-a-real-codec"``.
+
+    ``UnicodeError`` is caught beside ``LookupError`` because the two failures are NOT interchangeable
+    and only one of them is a lookup: ``"undefined"`` is a real registered codec whose whole purpose is
+    to refuse every conversion, so ``codecs.lookup`` finds it and ``"".encode`` raises ``UnicodeError``
+    (a ``ValueError``, not a ``LookupError``). Measured: catching only ``LookupError`` let that escape
+    this function uncaught, out of ``load_config`` and — once the resolved pass existed — out of
+    ``build_check_registry`` as a bare ``UnicodeError`` rather than the ``WiringError`` every caller
+    funnels into a red check line or a 422. Unusable for the same reason a missing codec is unusable,
+    so it gets the same verdict rather than a different exception."""
     try:
         "".encode(value)
-    except LookupError:
+    except (LookupError, UnicodeError):
         return False
     return True
+
+
+def _resolve_one_env_value(ref: EnvRef, values: Mapping[str, Any]) -> Any:
+    """``ref``'s value for this instance, or :data:`_UNSET` when it has none here.
+
+    :func:`resolve_env_settings`' resolution order — the environment value (cast if a ``cast`` was
+    given), else the ``default`` — narrowed to a single ref and made **non-raising**, so a caller that
+    only wants to *probe* a value can skip what it cannot resolve instead of pre-empting that
+    function's own loud, all-problems-at-once report."""
+    if ref.key in values:
+        raw = values[ref.key]
+        if ref.cast is None:
+            return raw
+        try:
+            return ref.cast(raw)
+        except (ValueError, TypeError):
+            return _UNSET
+    if ref.default is not _UNSET:
+        return ref.default
+    return _UNSET
+
+
+def resolved_encoding_problems(registry: Registry, *, env_values: Mapping[str, Any]) -> list[str]:
+    """Human-readable messages for ``env()``-supplied ``encoding`` values that resolve, in THIS
+    environment, to no usable text codec — the resolved half of :meth:`Registry.encoding_problems`
+    (BACKLOG #1767).
+
+    The relationship is exactly :func:`inbound_binding_conflicts` to :meth:`Registry.port_collisions`:
+    the registry-only pass probes what the graph alone can answer, and this one re-probes what only the
+    instance's environment values can. Run from ``build_check_registry``, so it fires at
+    ``messagefoundry check``, at every reload and promote, and at every ``connection upsert``.
+
+    **A ``deployed=False`` connection is SKIPPED (#233, ADR 0111), and the skip IS the design.** That
+    ADR's bright line is that a not-deployed connection's ``env()`` values are never resolved on any
+    path; reading one here to probe it would cross that line just as surely as building the connector
+    would. So an ``env()``-named encoding on a not-deployed connection stays unchecked until the
+    connection is deployed — the accepted cost of the owner ruling that chose this over amending
+    ADR 0111, counted by :meth:`Registry.encoding_census` rather than hidden.
+
+    An ``env()`` ref this cannot resolve — a missing key, or a value its ``cast`` rejects — is skipped
+    rather than reported: for a connection, a database lookup and a FHIR lookup,
+    :func:`resolve_env_settings` raises on it loudly moments later when the connector is built, and a
+    second message here would only make the first read as the failure. :func:`_resolve_port` skips an
+    unresolved port for the same reason.
+
+    **That justification does NOT extend to a reference set, and the difference is not this pass's to
+    fix.** ``_build_check_connectors`` env-resolves ``inbound``, ``outbound``, ``lookups`` and
+    ``fhir_lookups`` only; ``references`` is resolved by ``pipeline.reference_sync`` on a serving
+    engine, so a reference source whose ``encoding`` key has no value anywhere is skipped here and
+    reported by nothing until sync. A reference set whose key DOES have a value is probed here like any
+    other, so this is the missing-value gap and not an encoding gap — widening it belongs with the
+    reference table's build-check resolution, unfiled and named rather than numbered.
+
+    **A clean pass here does NOT mean an ``env()``-supplied INBOUND encoding decodes.** Measured
+    2026-09-18: both listener decode sites read ``ic.spec.settings["encoding"]`` RAW, and
+    ``_source_config``'s :func:`resolve_env_settings` writes its result into a copy that is never read
+    back — so the value reaching ``bytes.decode`` is the ``EnvRef`` object itself (``TypeError``), and
+    ``ingress_guards.ingress_encoding`` stringifies the same ref into ``"EnvRef(key=...)"`` and fails
+    the preview with that as the codec name. The outbound half is fine: ``_dest_config`` resolves, so
+    an outbound ``env()`` encoding works and this pass guards it properly. Recorded here because a
+    validation pass that reads as certifying a config the runtime cannot execute is the
+    false-premise shape the repo's SDS-3.7 forbids: this pass rejects a bad codec NAME, and says
+    nothing about whether the inbound path can use a good one. Resolving the listener's encoding is a
+    separate change to the ingress hot path — unfiled, and named rather than numbered."""
+    problems: list[str] = []
+    for kind, name, value, deployed in registry._declared_encodings():
+        if not isinstance(value, EnvRef):
+            continue  # a literal — Registry.encoding_problems owns it and has already probed it
+        if not deployed:
+            continue  # ADR 0111: never resolve a not-deployed connection's env() values
+        resolved = _resolve_one_env_value(value, env_values)
+        if resolved is _UNSET:
+            continue  # no value here — reported loud by resolve_env_settings at connector build
+        if resolved is None or resolved == "":
+            # `env("charset", default=None)` is a DECLARED opt-out, not a bad codec name: an explicit
+            # None means "not declared" and falls back to utf-8, which `ingress_guards.ingress_encoding`
+            # states as its own rule (`str(declared) if declared else "utf-8"`). Refusing it here would
+            # hard-fail `check`, every reload and every unrelated `connection upsert` on a config that
+            # runs correctly — a per-environment override that this environment declines to set. Empty
+            # string falls the same way, being the same falsy "unset" spelling out of a TOML value.
+            continue
+        if isinstance(resolved, str) and _is_text_codec(resolved):
+            continue
+        # NEVER render ``resolved``. It is a MEFOR_VALUE_* environment value and this string is raised
+        # as a WiringError into the operator log, the support bundle, GET /logs/tail and a 422 body —
+        # the exact carriage BACKLOG #1183 had to strip a value out of once already. The key is
+        # operator-authored, so `encoding=env('store_password')` is one copy-paste away and printed the
+        # password verbatim (measured). `_cast_bool` says why withholding AT THE SOURCE, rather than
+        # trusting the handler that renders it, is what makes that invariant hold.
+        # The TYPE is safe to name and is the other half of the diagnostic: `charset = 8859` in a value
+        # file types as an int, and "not a text codec" alone sends the operator hunting a misspelling
+        # that is not there. Spelled "type X" because an article would have to agree with a name this
+        # does not control — "a int" is how "a {name}" reads when it does not.
+        withheld = (
+            "value withheld"
+            if isinstance(resolved, str)
+            else f"type {type(resolved).__name__}, value withheld"
+        )
+        problems.append(
+            f"{kind} {name!r}: encoding from environment value {value.key!r} is not a Python text "
+            f"codec ({withheld}) — every message would fail at decode/encode; set it to a codec "
+            f"name such as 'utf-8', 'latin-1' or 'cp1252' in this environment's values "
+            f"(environments/<env>.toml or MEFOR_VALUE_*)"
+        )
+    return problems
 
 
 @dataclass
@@ -3828,28 +4201,68 @@ class Registry:
             raise WiringError(f"duplicate {kind} name: {name!r}")
         table[name] = value
 
-    def validate(self) -> None:
-        """Statically check references (inbound → router) and literal inbound port collisions."""
+    def validate(self, *, allow_empty: bool = False) -> None:
+        """Raise ``WiringError`` on the FIRST problem :meth:`graph_problems` reports.
+
+        ``allow_empty`` suppresses the empty-graph rule and nothing else. Only ``messagefoundry
+        check --allow-empty-config`` passes it (BACKLOG #1648); ``serve`` and the engine reload
+        never do, so an empty graph is refused on every path that would run it.
+        """
+        problem = next(self.graph_problems(allow_empty=allow_empty), None)
+        if problem is not None:
+            raise WiringError(problem)
+
+    @property
+    def declares_no_connections(self) -> bool:
+        """True when this graph would receive and send nothing (BACKLOG #1648).
+
+        The predicate on its own, because it has two readers that must not drift: the load-time rule
+        in :meth:`graph_problems`, and ``Engine.reload_detail``'s POST-shard-filter check, which is
+        a genuinely different moment (the filter can empty a graph the loader already passed) and
+        raises its own message naming the directory. Widening the rule must move both, so it lives
+        in one place even though the two messages deliberately differ.
+        """
+        return not self.inbound and not self.outbound
+
+    def graph_problems(self, *, allow_empty: bool = False) -> Iterator[str]:
+        """Every static problem in this graph, as human-readable messages, in report order.
+
+        The SINGLE rule list behind both validators (BACKLOG #1656). It **yields** rather than
+        raising because the two callers have deliberately different contracts: :meth:`validate`
+        stops at the first problem (the loader has nothing to hand the engine), while
+        :func:`validate_config` collects them all so an editor can show the full set at once.
+        A new rule belongs here, not in either caller — and so do the message strings, which
+        ``tests/test_wiring.py`` asserts by substring on both paths.
+        """
+        # An empty graph is a config the operator can start and watch do nothing: no listener binds,
+        # no destination drains, and every surface reports a healthy engine (BACKLOG #1648). The
+        # predicate is inbound AND outbound — deliberately the WIDER of the two shapes already in the
+        # tree, matching Engine.reload_detail — so an outbound-only config (a half-built graph, or one
+        # shard's slice viewed unfiltered) is still accepted here rather than newly refused.
+        if not allow_empty and self.declares_no_connections:
+            yield (
+                "config declares no connections — no inbound and no outbound connection is "
+                "declared, so this graph would receive and send nothing; declare one, or run "
+                "'messagefoundry init' to scaffold a starter config"
+            )
         for conn in self.inbound.values():
             if conn.router not in self.routers:
-                raise WiringError(
-                    f"inbound connection {conn.name!r} references unknown router {conn.router!r}"
-                )
+                yield f"inbound connection {conn.name!r} references unknown router {conn.router!r}"
         # An `accepts=` predicate keyed to no handler would silently never run (ADR 0084): the router
         # filter looks the predicate up BY handler name, so an orphan is dead code that reads as an
         # armed filter. Fail closed at load/`check` time. (add_handler cannot produce one; a registry
         # assembled by hand — a rebuild that drops a handler, a test — can.)
         for hname, pred in self.handler_accepts.items():
             if hname not in self.handlers:
-                raise WiringError(f"accepts= predicate declared for unknown handler {hname!r}")
-            _check_accepts_predicate(hname, pred)
-        problems = self.encoding_problems()
-        if problems:
-            raise WiringError(problems[0])
-        collisions = self.port_collisions()
-        if collisions:
-            port, first, second = collisions[0]
-            raise WiringError(f"inbound connections {first!r} and {second!r} both bind port {port}")
+                yield f"accepts= predicate declared for unknown handler {hname!r}"
+                continue
+            try:
+                _check_accepts_predicate(hname, pred)
+            except WiringError as exc:
+                yield str(exc)
+        yield from self.encoding_problems()
+        for port, first, second in self.port_collisions():  # low-13
+            yield f"inbound connections {first!r} and {second!r} both bind port {port}"
 
     def port_collisions(self) -> list[tuple[int, str, str]]:
         """Inbound listeners that bind a shared literal port on overlapping interfaces, as
@@ -3884,17 +4297,25 @@ class Registry:
         **Literal names only**, exactly like :meth:`port_collisions`. An :func:`env` reference is
         skipped **deliberately, not by oversight**: it carries no value here (``resolve_env_settings``
         needs the instance's environment values and :func:`validate_config` is handed only a
-        directory). Nothing checks it later either — the resolved counterpart is unbuilt, and would
-        belong in ``build_check_registry`` alongside :func:`inbound_binding_conflicts`, which is where
-        the same second pass already happens for ``env()`` ports. So the skip is *unchecked*, not
-        deferred, and :meth:`encoding_census` is what keeps it from being silent.
+        directory). It is now **deferred rather than unchecked** (BACKLOG #1767):
+        :func:`resolved_encoding_problems` probes it inside ``build_check_registry``, where the
+        environment values exist, beside the second pass :func:`inbound_binding_conflicts` already runs
+        for ``env()`` ports. :meth:`encoding_census` keeps deferred and unchecked apart, because they
+        are not the same promise.
 
-        A ``deployed=False`` connection IS checked: parking a feed does not make a typo'd codec name
-        correct, and the ``inbound -> router`` check above treats a parked connection the same way.
-        (``port_collisions`` excludes it for a reason that does not apply here — it never binds, so it
-        genuinely cannot collide.)"""
+        **A ``deployed=False`` connection is checked HERE and nowhere else — the split is deliberate
+        (BACKLOG #1767, owner ruling 2026-09-18), and the old blanket claim above it no longer holds.**
+        A literal is read straight off the graph, so a not-deployed connection's typo'd codec name is
+        still caught: declaring a feed not-deployed does not make a typo'd codec name correct, and the
+        ``inbound -> router`` check above treats a not-deployed connection the same way. **The resolved
+        pass cannot follow it there.** Resolving an ``env()`` value on a not-deployed connection is what
+        ADR 0111 forbids on every path, ``messagefoundry check`` included, so that stance now holds of
+        a LITERAL encoding name and NOT of an ``env()`` reference. A reader who takes the literal half
+        as covering both will read the resolved pass as a bug; it is the accepted cost of the ruling.
+        (``port_collisions`` excludes a not-deployed connection for a reason that does not apply
+        here — it never binds, so it genuinely cannot collide.)"""
         problems: list[str] = []
-        for kind, name, value in self._declared_encodings():
+        for kind, name, value, _deployed in self._declared_encodings():
             if isinstance(value, EnvRef):
                 # Spelled out rather than swallowed: probing an EnvRef raises TypeError, and a
                 # try/except wide enough to catch that could not tell it from a real failure.
@@ -3909,37 +4330,69 @@ class Registry:
                 )
         return problems
 
-    def encoding_census(self) -> tuple[int, int]:
-        """Declared ``encoding`` values, as ``(checked, unchecked)``.
+    def encoding_census(self) -> tuple[int, int, int]:
+        """Declared ``encoding`` values, as ``(checked, deferred, unchecked)``.
 
         A pass that examined **nothing** and one that examined everything and found it good both
-        return no problems, so this count is what tells them apart. ``unchecked`` is the ``env()``
-        refs :meth:`encoding_problems` skips; it is derived from the total, so no entry can fall into
-        a silent third bucket. Only a connector type with no ``encoding`` argument at all is in
-        neither number — every other factory writes its ``utf-8`` default into ``settings``, so
-        leaving the argument off still counts as checked."""
-        declared = list(self._declared_encodings())
-        checked = sum(1 for *_, value in declared if isinstance(value, str))
-        return checked, len(declared) - checked
+        return no problems, so these counts are what tell them apart. Three populations, held apart
+        because they carry three different promises (BACKLOG #1767) and collapsing the last two is
+        the exact false-green BACKLOG #1613 built this census against:
 
-    def _declared_encodings(self) -> Iterator[tuple[str, str, Any]]:
-        """``(kind, name, value)`` for every registry entry whose settings carry an ``encoding``.
+        * ``checked`` — a literal codec name, probed right here by :meth:`encoding_problems`.
+        * ``deferred`` — an :func:`env` ref on a DEPLOYED entry. Not probed here;
+          :func:`resolved_encoding_problems` probes it inside ``build_check_registry``, which has the
+          environment values. The word is *deferred* and not *checked* because that pass can be
+          absent: ``messagefoundry check`` SKIPs its ``build-check`` line on a bare config dir with no
+          ``messagefoundry.toml``, and that line says so itself. *Deferred* is therefore a promise
+          about WHERE the value is probed, never that a value exists to probe — a ref with no value at
+          all is counted here and reported by the missing-value path instead, whose one gap
+          :func:`resolved_encoding_problems` names.
+        * ``unchecked`` — nothing probes it on any path. The population this bucket exists for is an
+          :func:`env` ref on a ``deployed=False`` connection, whose values ADR 0111 forbids resolving.
+          A value that is neither a literal string nor an ``env()`` ref falls here too — unreachable
+          from the factories, which all declare ``encoding: str``, and nothing probes it either.
+
+        The three are derived from the total, so no entry can fall into a silent fourth bucket. Only a
+        connector type with no ``encoding`` argument at all is in none of them — every other factory
+        writes its ``utf-8`` default into ``settings``, so leaving the argument off still counts as
+        checked."""
+        declared = list(self._declared_encodings())
+        checked = sum(1 for _k, _n, value, _d in declared if isinstance(value, str))
+        deferred = sum(
+            1 for _k, _n, value, deployed in declared if isinstance(value, EnvRef) and deployed
+        )
+        return checked, deferred, len(declared) - checked - deferred
+
+    def _declared_encodings(self) -> Iterator[tuple[str, str, Any, bool]]:
+        """``(kind, name, value, deployed)`` for every registry entry whose settings carry an
+        ``encoding``.
 
         Every settings-bearing table, because an unusable codec name is a property of the setting and
         not of the direction it is read in. The table list is the same one
         ``messagefoundry.config.anchor._iter_settings_values`` walks for ``env()`` refs — keep the two
-        together, since a sixth settings-bearing table added to one and missed here reads as clean."""
-        tables: list[tuple[str, Iterable[tuple[str, Mapping[str, Any]]]]] = [
-            ("inbound connection", ((n, c.spec.settings) for n, c in self.inbound.items())),
-            ("outbound connection", ((n, c.spec.settings) for n, c in self.outbound.items())),
-            ("database lookup", ((n, s.settings) for n, s in self.lookups.items())),
-            ("fhir lookup", ((n, s.settings) for n, s in self.fhir_lookups.items())),
-            ("reference set", ((n, r.source.settings) for n, r in self.references.items())),
+        together, since a sixth settings-bearing table added to one and missed here reads as clean.
+
+        ``deployed`` is the #233 / ADR 0111 flag, carried so :func:`resolved_encoding_problems` can
+        honour it without re-deriving it per table. Only a connection has one; a lookup, a FHIR lookup
+        and a reference set are always ``True``, there being no declared-but-not-deployed state for
+        them."""
+        tables: list[tuple[str, Iterable[tuple[str, Mapping[str, Any], bool]]]] = [
+            (
+                "inbound connection",
+                ((n, c.spec.settings, c.deployed) for n, c in self.inbound.items()),
+            ),
+            (
+                "outbound connection",
+                ((n, c.spec.settings, c.deployed) for n, c in self.outbound.items()),
+            ),
+            ("database lookup", ((n, s.settings, True) for n, s in self.lookups.items())),
+            ("fhir lookup", ((n, s.settings, True) for n, s in self.fhir_lookups.items())),
+            ("reference set", ((n, r.source.settings, True) for n, r in self.references.items())),
         ]
         for kind, entries in tables:
-            for name, settings in entries:
+            for name, settings, deployed in entries:
                 if "encoding" in settings:
-                    yield kind, name, settings["encoding"]
+                    yield kind, name, settings["encoding"], deployed
 
 
 # --- declaration API (writes to the registry being loaded) -------------------
@@ -4752,6 +5205,31 @@ def build_outbound_connection(
             "(0 = show 'waiting for reply' immediately)"
         )
     send_pace = spec.settings.get("send_min_interval_seconds")
+    if isinstance(send_pace, EnvRef):
+        # BACKLOG #1653. `send_min_interval_seconds: float | None` carries no `EnvRef` member and
+        # `build_schema()` reports `"env": false` for it, so an env() ref here is not a supported
+        # spelling and never was -- it is a pacing number, not a per-environment or secret value.
+        # Refuse it rather than skip the sign check below: NOTHING downstream would resolve it.
+        # `_resolve_send_pace` (pipeline/wiring_runner.py) reads `oc.spec.settings` UNRESOLVED at both
+        # of its call sites and calls `float(raw)`, so accepting the ref at wiring only MOVES the
+        # TypeError into outbound start -- a dead lane AFTER the sender has been ACKed, which is
+        # strictly worse than a load-time error.
+        #
+        # Refused HERE because this is the one choke point both authoring surfaces pass through, so
+        # code-first and connections.toml now give the identical error. They used to diverge: a raw
+        # TypeError escaping `validate`/`load` on the TOML surface (`_build_spec` wraps only the
+        # factory call), versus an opaque `_exec_module` WiringError naming no field on the
+        # code-first one.
+        raise WiringError(
+            # Keep the remedy SURFACE-NEUTRAL. This message is the one string both authoring
+            # surfaces share, so naming a Python spelling (`send_min_interval_seconds=0.5`) would
+            # hand a connections.toml author the wrong syntax and half-undo the point of refusing at
+            # this shared choke point.
+            f"outbound connection {name!r}: send_min_interval_seconds may not use env() "
+            f"(env {send_pace.key!r}) — it is a plain pacing interval in seconds, not a "
+            "per-environment or secret value. Give it a plain number (0.5), or omit it "
+            "for no pacing."
+        )
     if send_pace is not None and send_pace < 0:
         # BACKLOG #82: per-connection egress send pacing (min seconds between sends on this lane). A
         # negative interval is meaningless (None/0 = no pacing). Fail loud at wiring (dry-run / check).
@@ -5138,13 +5616,18 @@ def _loading(directory: Path, registry: Registry) -> Iterator[None]:
                 sys.modules.pop(name, None)
 
 
-def load_config(directory: str | Path) -> Registry:
+def load_config(directory: str | Path, *, allow_empty: bool = False) -> Registry:
     """Load every ``*.py`` config module in ``directory`` (sorted; ``_*`` skipped) into a Registry.
 
     Config modules are **executed** in-process with the engine's full privilege, so the source
     location is part of the trust boundary: :func:`_assert_safe_config_source` refuses a
     group/world-writable directory before any code runs. Blocking: an async caller (engine reload)
-    should run this via ``asyncio.to_thread`` so heavy user-config imports don't stall listeners."""
+    should run this via ``asyncio.to_thread`` so heavy user-config imports don't stall listeners.
+
+    ``allow_empty`` is passed straight to :meth:`Registry.validate` and suppresses the empty-graph
+    refusal only. It exists for ``messagefoundry check --allow-empty-config`` (BACKLOG #1648) and
+    is deliberately NOT reachable from ``serve``: a running engine must never start on a graph that
+    would receive and send nothing."""
     directory = Path(directory)
     # Fail loudly on a missing/typo'd dir: Path.glob() on a nonexistent dir yields nothing, so the
     # engine would otherwise start with an empty graph — a silently dead interface (review M-24).
@@ -5174,7 +5657,7 @@ def load_config(directory: str | Path) -> Registry:
     conn_file = directory / CONNECTIONS_FILE_NAME
     if conn_file.is_file():
         load_connections_file(conn_file, registry)
-    registry.validate()
+    registry.validate(allow_empty=allow_empty)
     return registry
 
 
@@ -5216,17 +5699,47 @@ _WIN_REJECTED_SIDS = frozenset(
     }
 )
 
-# SIDs trusted to hold write on executed config (the owner is also always trusted, plus the current
-# process user, both passed in at evaluation time): SYSTEM and the local Administrators group. The two
-# placeholder/alias SIDs CREATOR OWNER (S-1-3-0) and OWNER RIGHTS (S-1-3-4) resolve to whoever OWNS the
-# object (not a foreign principal), so an ACE granting them write is equivalent to an owner grant and
-# is trusted — they appear on inherited ACLs (e.g. the user-profile temp dir) and must not be refused.
-_WIN_TRUSTED_SIDS = frozenset(
+# BUILTIN\Administrators, the group a foreign owner must resolve into to be trusted.
+_WIN_ADMINISTRATORS_SID = "S-1-5-32-544"
+
+# Literal SIDs whose holder administers this machine whatever domain it is joined to.
+_WIN_ADMIN_SIDS = frozenset(
     {
         "S-1-5-18",  # NT AUTHORITY\SYSTEM
-        "S-1-5-32-544",  # BUILTIN\Administrators
-        "S-1-3-0",  # CREATOR OWNER (placeholder: rights granted to the object's owner)
+        _WIN_ADMINISTRATORS_SID,
+    }
+)
+
+# SIDs trusted to hold write on executed config (the current process user and the directory owner are
+# added at evaluation time): the admin SIDs above, plus two owner-relative placeholders.
+#
+# CREATOR OWNER (S-1-3-0) and OWNER RIGHTS (S-1-3-4) are trusted because neither names a principal
+# this ACL can be read against, so refusing them would refuse on no evidence: S-1-3-4 carries the
+# CURRENT owner's effective rights, and S-1-3-0 is an inherit-only placeholder Windows replaces with
+# the CREATOR's SID when the ACE is inherited by a child. They appear on ordinary inherited ACLs (e.g.
+# the user-profile temp dir) and must not be refused.
+#
+# Do NOT read that as "they alias the owner, so the owner arm covers them". It does not hold for
+# S-1-3-0 (a creator is not necessarily the current owner — ownership can be transferred afterwards),
+# and the owner arm is skipped entirely when the process token cannot be read (``self_sid is None`` in
+# :func:`_evaluate_config_dacl`). The justification is the paragraph above, not the owner arm.
+_WIN_TRUSTED_SIDS = _WIN_ADMIN_SIDS | frozenset(
+    {
+        "S-1-3-0",  # CREATOR OWNER (inherit-only placeholder: resolved to the child's creator)
         "S-1-3-4",  # OWNER RIGHTS (the current owner's effective rights)
+    }
+)
+
+# Relative identifiers (a SID's last sub-authority) of the well-known administrator principals inside a
+# machine/domain SID (``S-1-5-21-<authority>-<RID>``): the built-in Administrator account and the
+# Domain / Schema / Enterprise Admins groups. Unlike SYSTEM these vary per domain, so they cannot be
+# listed as literal SIDs.
+_WIN_ADMIN_RIDS = frozenset(
+    {
+        500,  # the built-in Administrator account
+        512,  # Domain Admins
+        518,  # Schema Admins
+        519,  # Enterprise Admins
     }
 )
 
@@ -5234,18 +5747,72 @@ _WIN_TRUSTED_SIDS = frozenset(
 _WIN_ACCESS_ALLOWED_ACE_TYPE = 0x00
 
 
+def _is_well_known_admin_sid(sid: str) -> bool:
+    """Whether ``sid`` names an administrator by its well-known form alone, with no lookup.
+
+    Deciding these syntactically keeps the Administrators-membership lookup off the path for every
+    ordinary SYSTEM- or admin-owned install, which is what makes a fail-closed membership arm
+    affordable in :func:`_evaluate_config_dacl`.
+
+    **Known limitation, deliberately accepted (ADR 0036 Amendment A).** The RID arm matches an admin
+    RID under *any* machine/domain authority, not only this machine's or a domain it trusts, so a
+    directory carrying a foreign ``S-1-5-21-<other machine>-500`` owner (an NTFS volume from another
+    host: removable media, a mounted VHD, a restored backup) is trusted here. Narrowing it needs the
+    local machine SID *and* the trusted-domain list, and the naive narrowing — requiring the owner's
+    authority to match ``self_sid``'s — breaks the ordinary case, because the engine's default run-as
+    identity is a virtual account (``S-1-5-80-*``) with no machine authority to compare. The RID arm
+    exists so a legitimate domain admin owner resolves at all; the local-only membership lookup cannot
+    see a nested domain group."""
+    if sid in _WIN_ADMIN_SIDS:
+        return True
+    parts = sid.split("-")
+    # A machine/domain SID is S-1-5-21-<three sub-authorities>-<RID>: exactly 8 dash-separated parts.
+    # Anything shorter (e.g. "S-1-5-21-1-500") is malformed, and matching it would widen the arm to
+    # strings no Windows API produces. isascii() rejects the Unicode digits int() would otherwise
+    # accept ("٥٠٠" parses as 500); isdigit() rejects a sign or surrounding space.
+    if len(parts) != 8 or parts[:4] != ["S", "1", "5", "21"]:
+        return False
+    rid_text = parts[-1]
+    if not (rid_text.isascii() and rid_text.isdigit()):
+        return False
+    return int(rid_text) in _WIN_ADMIN_RIDS
+
+
 def _evaluate_config_dacl(
     owner_sid: str,
     aces: Sequence[tuple[int, int, str]],
     self_sid: str | None,
+    owner_in_admins: Callable[[str], bool | None],
 ) -> str | None:
-    """Pure DACL policy: return a refusal reason, or ``None`` if the source is trusted.
+    """Pure DACL + owner policy: return a refusal reason, or ``None`` if the source is trusted.
 
     ``aces`` is ``(ace_type, access_mask, trustee_sid)`` tuples as strings (``ConvertSidToStringSidW``
     form). A source is refused when any **ALLOWED** ACE grants a **write-class** right to a principal
     that is neither the file owner, nor the current process user, nor a trusted admin/SYSTEM SID —
     and unconditionally when a broad/low-privilege SID (Everyone/Authenticated Users/Users/…) holds
-    such a right. Kept free of ctypes so the policy is unit-testable on every platform."""
+    such a right.
+
+    The **owner** is then vetted in its own right (CONFIG-2), mirroring the POSIX arm's refusal of a
+    foreign uid: an owner holds WRITE_DAC implicitly, so a low-privilege owner can rewrite the code
+    this loader executes as the service account no matter what the DACL currently says. The owner
+    passes as the current process user, as a well-known admin SID (:func:`_is_well_known_admin_sid`),
+    or as a resolved member of Administrators. ``owner_in_admins`` returning ``None`` means the
+    membership could **not** be determined, and that is a **refusal**, not a warning-and-proceed —
+    ASVS v5.0.0 V16.5.3 (fail gracefully and securely, no fail-open when validation logic errors).
+    The refusal carries the documented ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` escape because it is
+    raised through :func:`_refuse_unsafe_config_source`.
+
+    Order matters, and it is not cosmetic: the ACEs are evaluated first so an observed insecure ACE is
+    reported as itself instead of being masked by the owner verdict. A ``self_sid`` of ``None`` (the
+    process token could not be read) **skips** the owner comparison entirely, exactly as the POSIX arm
+    skips it without ``self_uid`` — an unreadable token must not turn this guard into a service that
+    cannot start. That is the one unresolvable input here that does not refuse, and it differs from an
+    unresolvable membership: this one leaves nothing to compare against, that one leaves a question
+    answerable and unanswered. It is the **fourth** non-refusing arm of this guard, alongside the three
+    WARNING arms in :func:`_assert_safe_config_source_windows`; that caller logs it, because a control
+    that disables itself silently leaves no trace an operator could act on.
+
+    Kept free of ctypes so the policy is unit-testable on every platform."""
     trusted = set(_WIN_TRUSTED_SIDS)
     trusted.add(owner_sid)
     if self_sid is not None:
@@ -5259,6 +5826,19 @@ def _evaluate_config_dacl(
             return f"a broad/low-privilege principal ({trustee_sid}) has write access"
         if trustee_sid not in trusted:
             return f"a non-owner, non-admin principal ({trustee_sid}) has write access"
+    if self_sid is None or owner_sid == self_sid or _is_well_known_admin_sid(owner_sid):
+        return None
+    owner_is_admin = owner_in_admins(owner_sid)
+    if owner_is_admin is None:
+        return (
+            f"the owner ({owner_sid}) is not the account the engine runs as, and its Administrators "
+            f"membership could not be resolved"
+        )
+    if not owner_is_admin:
+        return (
+            f"the owner ({owner_sid}) is neither the account the engine runs as nor an administrator, "
+            f"so it can rewrite the code this loader executes"
+        )
     return None
 
 
@@ -5267,11 +5847,22 @@ def _assert_safe_config_source_windows(directory: Path) -> None:
 
     Parses the owner + DACL of the directory and each ``*.py`` (incl. ``_*.py`` helpers, the same
     candidate set as POSIX) via ctypes/advapi32 and refuses to load when :func:`_evaluate_config_dacl`
-    rejects it. **Fail-open with a loud WARNING on a Win32 API error**: a ``GetNamedSecurityInfoW``
-    failure must not brick a previously-working service — it logs and proceeds (no worse than the old
-    no-op). A NULL/absent DACL, however, means "everyone allowed" and is treated as a REFUSAL. All
-    ctypes work lives behind the ``sys.platform == 'win32'`` guard in the caller so mypy/lint pass on
-    the Linux CI leg (mirrors :mod:`messagefoundry.secrets_dpapi`)."""
+    rejects it. A NULL/absent DACL means "everyone allowed" and is a REFUSAL. All ctypes work lives
+    behind the ``sys.platform == 'win32'`` guard in the caller so mypy/lint pass on the Linux CI leg
+    (mirrors :mod:`messagefoundry.secrets_dpapi`).
+
+    **Two error postures live here, and they differ deliberately** (ADR 0036 Decision 3 as amended).
+    **Four** arms **fail open with a loud WARNING**: a ``GetNamedSecurityInfoW`` failure, an
+    unresolvable owner SID, a DACL that cannot be enumerated, and a process token that cannot be read
+    (which costs the owner comparison alone — the ACE pass still runs, and is warned about once per
+    load rather than once per file). They log and proceed, so they never reach
+    :func:`_refuse_unsafe_config_source` and carry no escape hatch — the original argument was that a
+    transient Win32 failure must not brick a service that started fine before the check existed. The
+    **owner-membership** arm does not follow them: an Administrators lookup that cannot be performed is
+    a refusal, raised through :func:`_refuse_unsafe_config_source` so the documented
+    ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` override still clears it. That inconsistency is known and
+    named rather than papered over; widening the fail-closed posture to the other four is a separate,
+    unfiled change."""
     if sys.platform != "win32":  # pragma: no cover - guard for type-checker / non-Windows
         return
     import ctypes
@@ -5297,6 +5888,21 @@ def _assert_safe_config_source_windows(directory: Path) -> None:
     advapi32.GetAce.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p)]
     advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
     advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
+    advapi32.ConvertStringSidToSidW.restype = wintypes.BOOL
+    advapi32.ConvertStringSidToSidW.argtypes = [
+        wintypes.LPCWSTR,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi32.LookupAccountSidW.restype = wintypes.BOOL
+    advapi32.LookupAccountSidW.argtypes = [
+        wintypes.LPCWSTR,  # lpSystemName (NULL = this machine)
+        ctypes.c_void_p,  # Sid
+        wintypes.LPWSTR,  # Name
+        ctypes.POINTER(wintypes.DWORD),  # cchName
+        wintypes.LPWSTR,  # ReferencedDomainName
+        ctypes.POINTER(wintypes.DWORD),  # cchReferencedDomainName
+        ctypes.POINTER(ctypes.c_int),  # peUse (SID_NAME_USE)
+    ]
     advapi32.OpenProcessToken.restype = wintypes.BOOL
     advapi32.OpenProcessToken.argtypes = [
         wintypes.HANDLE,
@@ -5384,7 +5990,184 @@ def _assert_safe_config_source_windows(directory: Path) -> None:
         finally:
             kernel32.CloseHandle(token)
 
+    # LOCALGROUP_MEMBERS_INFO_0 — level 0 of NetLocalGroupGetMembers returns member SIDs only. Levels
+    # 1..3 return NAMES, and translating a domain member's SID to a name is what reaches out to a domain
+    # controller; level 0 keeps the lookup on the local SAM/LSA. That matters because the owner arm is
+    # fail-closed: a lookup that could block on an unreachable DC would turn a network partition into a
+    # refused start. The cost of staying local is that only DIRECT members are seen — an account that is
+    # an administrator only through a nested domain group does not resolve, and is refused.
+    class _LOCALGROUP_MEMBERS_INFO_0(ctypes.Structure):
+        _fields_ = (("lgrmi0_sid", ctypes.c_void_p),)
+
+    _MAX_PREFERRED_LENGTH = 0xFFFFFFFF
+    _ERROR_MORE_DATA = 234
+    # With MAX_PREFERRED_LENGTH the API allocates as much as it needs, so a real local Administrators
+    # group is one page. The budget bounds a provider that keeps saying "more data" without ever
+    # draining; it is a termination guard, not a size limit anyone should tune.
+    _MAX_MEMBER_PAGES = 64
+
+    def _administrators_group_name() -> str | None:
+        # NetLocalGroupGetMembers takes a NAME, so resolve BUILTIN\Administrators to its localized one
+        # ("Administratoren", "Administradores", ...). S-1-5-32-544 is a BUILTIN SID that LSA resolves
+        # locally, so this lookup does not depend on a domain controller either.
+        sid_ptr = ctypes.c_void_p()
+        if not advapi32.ConvertStringSidToSidW(_WIN_ADMINISTRATORS_SID, ctypes.byref(sid_ptr)):
+            return None
+        try:
+            name_len = wintypes.DWORD(0)
+            domain_len = wintypes.DWORD(0)
+            use = ctypes.c_int(0)
+            advapi32.LookupAccountSidW(  # sizing probe: fails by design, fills the two lengths
+                None,
+                sid_ptr,
+                None,
+                ctypes.byref(name_len),
+                None,
+                ctypes.byref(domain_len),
+                ctypes.byref(use),
+            )
+            if name_len.value == 0:
+                return None
+            name = ctypes.create_unicode_buffer(name_len.value)
+            domain = ctypes.create_unicode_buffer(max(domain_len.value, 1))
+            if not advapi32.LookupAccountSidW(
+                None,
+                sid_ptr,
+                name,
+                ctypes.byref(name_len),
+                domain,
+                ctypes.byref(domain_len),
+                ctypes.byref(use),
+            ):
+                return None
+            return name.value
+        finally:
+            if sid_ptr:
+                kernel32.LocalFree(sid_ptr)
+
+    def _unresolved(why: str) -> tuple[frozenset[str], bool]:
+        """Log why the membership lookup gave up, then report an EMPTY, INCOMPLETE result.
+
+        Every abandon path funnels through here because the arm it feeds is fail-closed: it stops the
+        service, and without this line the operator sees one string — "its Administrators membership
+        could not be resolved" — for a missing netapi32, an access-denied enumeration, an unreadable
+        member SID and a short read alike, with no way to tell which."""
+        _logger.warning(
+            "config-source trust guard could not resolve local Administrators membership (%s); an "
+            "owner that is neither the run-as account nor a well-known admin SID will be REFUSED "
+            "(see docs/SERVICE.md for the required config-dir ownership)",
+            why,
+        )
+        return frozenset(), False
+
+    def _local_administrators_members() -> tuple[frozenset[str], bool]:
+        """Direct member SIDs of the local Administrators group, and whether the read was COMPLETE.
+
+        The completeness flag is why this returns a pair rather than an optional set. Membership is
+        **monotone**: a SID found in a partial enumeration really is a member, so a partial read can
+        still answer *yes* soundly. Only a *no* needs the full set — and answering *no* from a short
+        read is what would refuse a legitimate admin owner while reporting, confidently and wrongly,
+        that it "is neither the account the engine runs as nor an administrator"."""
+        try:
+            netapi32 = ctypes.WinDLL("netapi32", use_last_error=True)
+        except OSError:
+            # No netapi32 on this SKU: unresolvable, and the caller refuses a non-well-known owner.
+            return _unresolved("netapi32 is not available on this Windows SKU")
+        netapi32.NetLocalGroupGetMembers.restype = wintypes.DWORD
+        netapi32.NetLocalGroupGetMembers.argtypes = [
+            wintypes.LPCWSTR,  # servername (NULL = this machine)
+            wintypes.LPCWSTR,  # localgroupname
+            wintypes.DWORD,  # level
+            ctypes.POINTER(ctypes.c_void_p),  # bufptr
+            wintypes.DWORD,  # prefmaxlen
+            ctypes.POINTER(wintypes.DWORD),  # entriesread
+            ctypes.POINTER(wintypes.DWORD),  # totalentries
+            ctypes.POINTER(ctypes.c_void_p),  # resumehandle
+        ]
+        netapi32.NetApiBufferFree.restype = wintypes.DWORD
+        netapi32.NetApiBufferFree.argtypes = [ctypes.c_void_p]
+
+        group = _administrators_group_name()
+        if group is None:
+            return _unresolved(
+                "BUILTIN\\Administrators could not be resolved to its local group name"
+            )
+        members: set[str] = set()
+        resume = ctypes.c_void_p(0)
+        for _page in range(_MAX_MEMBER_PAGES):
+            buf = ctypes.c_void_p()
+            read = wintypes.DWORD(0)
+            total = wintypes.DWORD(0)
+            rc = netapi32.NetLocalGroupGetMembers(
+                None,
+                group,
+                0,
+                ctypes.byref(buf),
+                _MAX_PREFERRED_LENGTH,
+                ctypes.byref(read),
+                ctypes.byref(total),
+                ctypes.byref(resume),
+            )
+            if rc not in (0, _ERROR_MORE_DATA):
+                # rc is a NET_API_STATUS: 5 is ERROR_ACCESS_DENIED (a SAM-access hardening baseline,
+                # or a domain controller where the group object's own ACL decides), 2220 is
+                # NERR_GroupNotFound. Naming the number is the difference between an operator who can
+                # look it up and one who only knows the service will not start.
+                return _unresolved(f"NetLocalGroupGetMembers returned status {rc}")
+            try:
+                entries = ctypes.cast(buf, ctypes.POINTER(_LOCALGROUP_MEMBERS_INFO_0))
+                for i in range(read.value):
+                    member_ptr = entries[i].lgrmi0_sid
+                    member = _sid_to_str(member_ptr) if member_ptr else None
+                    if member is None:
+                        # Keep what was read: membership is monotone, so the SIDs already collected
+                        # are still sound evidence for a YES. Only the NO becomes unavailable.
+                        return frozenset(members), False
+                    members.add(member)
+            finally:
+                if buf:
+                    netapi32.NetApiBufferFree(buf)
+            if rc == _ERROR_MORE_DATA:
+                # A "there is more" page that yielded nothing cannot have advanced the resume handle,
+                # so looping again asks the identical question — an unbounded spin inside load_config
+                # (startup, and every POST /config/reload) rather than an answer.
+                if read.value == 0:
+                    return _unresolved("NetLocalGroupGetMembers made no progress across a page")
+                continue
+            # rc == 0 terminates the enumeration. totalentries counts what was available from THIS
+            # resume position, so a final page that read fewer than it was promised is a short read.
+            # It is not an error and nothing is logged: the members collected still answer YES, and
+            # only a NO is withheld.
+            return frozenset(members), read.value >= total.value
+        return _unresolved(
+            f"the Administrators enumeration did not finish in {_MAX_MEMBER_PAGES} pages"
+        )
+
+    # One enumeration per load, not per candidate file: the directory and its *.py share an owner in
+    # every realistic layout, and the group does not change mid-load. A list is the memo cell because
+    # the result is a tuple whose "not yet computed" state must stay distinct from any valid value.
+    admins_cache: list[tuple[frozenset[str], bool]] = []
+
+    def _owner_in_admins(sid: str) -> bool | None:
+        if not admins_cache:
+            admins_cache.append(_local_administrators_members())
+        members, complete = admins_cache[0]
+        if sid in members:
+            return True  # monotone: a SID present in a partial read is still genuinely a member
+        return False if complete else None
+
     self_sid = _self_sid()
+    if self_sid is None:
+        # The fourth fail-open arm, and the only one that is not a per-file event: with no process
+        # SID there is nothing to compare an owner against, so _evaluate_config_dacl skips the owner
+        # arm for every candidate below (the ACE pass still runs). Warn once per load — an operator
+        # cannot act on a control that quietly stops checking half of what it checks.
+        _logger.warning(
+            "config-source trust guard could not read this process's own user SID; the OWNER of %s "
+            "will NOT be vetted for this load (the DACL is still checked) — verify the config dir is "
+            "owned by an administrator or the service account (see docs/SERVICE.md)",
+            directory,
+        )
     candidates = [directory, *directory.glob("*.py")]
     for path in candidates:
         owner_sid_ptr = ctypes.c_void_p()
@@ -5458,7 +6241,7 @@ def _assert_safe_config_source_windows(directory: Path) -> None:
                     path,
                 )
                 continue
-            reason = _evaluate_config_dacl(owner_sid, aces, self_sid)
+            reason = _evaluate_config_dacl(owner_sid, aces, self_sid, _owner_in_admins)
             if reason is not None:
                 _refuse_unsafe_config_source(
                     f"refusing to load config from writable-by-others path {path}: {reason}; "
@@ -5498,11 +6281,13 @@ def _assert_safe_config_source(directory: Path) -> None:
     Because :func:`_exec_module` runs arbitrary Python as the engine's service account, a
     lower-privileged user who can write into the config dir (or a module file) could execute
     code as that account on the next reload. On POSIX we hard-fail on a group/world-writable
-    directory or module. On Windows the equivalent NTFS-DACL check now runs in-process
+    directory or module, **and on one owned by another unprivileged uid**. On Windows the equivalent
+    NTFS-DACL check now runs in-process
     (:func:`_assert_safe_config_source_windows`, SEC-003): the directory and each ``*.py``
-    owner/DACL is parsed via ctypes and a source whose DACL grants a broad/low-privilege
-    principal a write-class right is refused — no longer a silent no-op delegated entirely to
-    install-time ACLs (docs/SERVICE.md, DEPLOY-1)."""
+    owner/DACL is parsed via ctypes and a source is refused when its DACL grants a broad/low-privilege
+    principal a write-class right, **or when its owner is neither the engine's own account nor an
+    administrator** (the Windows counterpart of that foreign-uid arm, CONFIG-2) — no longer a silent
+    no-op delegated entirely to install-time ACLs (docs/SERVICE.md, DEPLOY-1)."""
     if not directory.is_dir():
         return
     if sys.platform == "win32":
@@ -5558,12 +6343,16 @@ def _exec_module(path: Path) -> None:
         raise WiringError(f"error loading config module {path.name}: {exc}") from exc
 
 
-def validate_config(directory: str | Path) -> list[Diagnostic]:
+def validate_config(directory: str | Path, *, allow_empty: bool = False) -> list[Diagnostic]:
     """Load ``directory`` best-effort and return **all** problems (not just the first).
 
     Unlike :func:`load_config`, a bad module is recorded and loading continues, and every
     unresolved ``inbound → router`` reference is reported — so an editor can show the full set
     at once. Returns ``[]`` when the config is valid.
+
+    ``allow_empty`` suppresses the empty-graph rule, for ``messagefoundry check
+    --allow-empty-config`` (BACKLOG #1648). The rules themselves live in
+    :meth:`Registry.graph_problems`, shared with :meth:`Registry.validate`.
     """
     directory = Path(directory)
     if not directory.is_dir():  # fail loudly, not silently empty (review M-24)
@@ -5575,6 +6364,10 @@ def validate_config(directory: str | Path) -> list[Diagnostic]:
         return [Diagnostic(message=str(exc), file=str(directory))]
     registry = Registry()
     diagnostics: list[Diagnostic] = []
+    # Tracked separately from `diagnostics` on purpose — see the empty-graph note at the end of this
+    # function. Only a source that could have DECLARED a connection counts: a module or
+    # connections.toml. A bad code-set table is a diagnostic that explains nothing about emptiness.
+    declaring_source_failed = False
     # Load reference tables first (so a module-top-level code_set(...) resolves during import). A
     # bad/duplicate table is recorded as a diagnostic, not raised, so the editor sees every problem.
     codesets_dir = directory / CODESETS_DIR_NAME
@@ -5588,6 +6381,7 @@ def validate_config(directory: str | Path) -> list[Diagnostic]:
                 _exec_module(path)
             except WiringError as exc:
                 diagnostics.append(Diagnostic(message=str(exc), file=str(path)))
+                declaring_source_failed = True
     # Merge connections.toml best-effort too (ADR 0007), so the editor sees TOML problems alongside the
     # *.py ones and the router/port checks below cover TOML-authored connections. Lazy import (cycle).
     from messagefoundry.config.connections_file import (
@@ -5600,33 +6394,64 @@ def validate_config(directory: str | Path) -> list[Diagnostic]:
         try:
             load_connections_file(conn_file, registry)
         except WiringError as exc:
-            diagnostics.append(Diagnostic(message=str(exc), file=str(conn_file)))
-    for conn in registry.inbound.values():
-        if conn.router not in registry.routers:
+            # Scrubbed like the arm below, and for the SAME reason: a WiringError out of the TOML
+            # loader is a project-authored TEMPLATE wrapped around somebody else's exception text.
+            # MEASURED: `[outbound.retry] max_attempts = "<value>"` reaches `_policy`
+            # (connections_file.py), which raises `WiringError(f"{where}: invalid {key} — {exc}")`
+            # around a pydantic ValidationError, and pydantic prints `input_value='<value>'`
+            # verbatim. So "this arm is ours, therefore it withholds the value" is FALSE -- only the
+            # template is ours. Both arms get the same treatment because both carry the same kind of
+            # text.
+            diagnostics.append(Diagnostic(message=scrub_credentials(str(exc)), file=str(conn_file)))
+            declaring_source_failed = True
+        except Exception as exc:
+            # BACKLOG #1653: the *.py arm above cannot leak an unexpected exception (`_exec_module`
+            # wraps whatever a module raises), but this one could -- the TOML loader converts only
+            # what it anticipates, so anything else escaped `validate_config` as a raw traceback and
+            # took the OTHER diagnostics with it. That breaks this function's contract (return ALL
+            # problems, raise none) and leaves the IDE with nothing to render. A loader gap is still
+            # a bug to fix at its source; reporting it as a diagnostic is what keeps the contract
+            # while it exists. `Exception`, never `BaseException`: a KeyboardInterrupt or SystemExit
+            # is not a config problem and must keep propagating.
+            #
+            # `exc` IS interpolated here, and it is scrubbed on the way out -- same as the arm
+            # above. An exception the loader never anticipated was worded by somebody else and can
+            # stringify whatever it was handed, including an inline credential from
+            # connections.toml. A `Diagnostic.message` is printed verbatim by `messagefoundry
+            # validate` and carried into `messagefoundry check` output, so it reaches CI logs.
+            #
+            # STATE WHAT THE SCRUB DOES AND DOES NOT DO, so nobody reads either arm as safe.
+            # MEASURED over three shapes: it replaces a LABELLED credential value (`password=<v>`)
+            # and it does NOT see pydantic's `input_value='<v>'` spelling, nor a bare unlabelled
+            # value (`KeyError: 'hunter2'`). It is a backstop that lowers the exposure, NOT a
+            # boundary, and nothing downstream may be built on it holding. The real fix for any
+            # instance is still to convert the failure at its source in the loader, which is why the
+            # exception TYPE is named: that name is the actionable half.
             diagnostics.append(
                 Diagnostic(
-                    message=f"inbound connection {conn.name!r} references unknown router "
-                    f"{conn.router!r}"
+                    message=scrub_credentials(
+                        f"{CONNECTIONS_FILE_NAME}: unexpected {type(exc).__name__} while "
+                        f"loading connections — {exc}"
+                    ),
+                    file=str(conn_file),
                 )
             )
-    # Mirror Registry.validate's `accepts=` checks as editor diagnostics (ADR 0084) — an orphan /
-    # non-callable / fail-open-state-reading predicate should surface in the IDE, not first at `serve`.
-    for hname, pred in registry.handler_accepts.items():
-        if hname not in registry.handlers:
-            diagnostics.append(
-                Diagnostic(message=f"accepts= predicate declared for unknown handler {hname!r}")
-            )
-            continue
-        try:
-            _check_accepts_predicate(hname, pred)
-        except WiringError as exc:
-            diagnostics.append(Diagnostic(message=str(exc)))
-    # Mirror Registry.encoding_problems as editor diagnostics (BACKLOG #1613).
-    diagnostics.extend(Diagnostic(message=m) for m in registry.encoding_problems())
-    for port, first, second in registry.port_collisions():  # low-13
-        diagnostics.append(
-            Diagnostic(
-                message=f"inbound connections {first!r} and {second!r} both bind port {port}"
-            )
-        )
+            # Set on BOTH connections.toml arms, not just the WiringError one: the file is a
+            # DECLARING source either way, so an empty graph after it failed to load is a
+            # derived symptom and must not be reported beside its own cause.
+            declaring_source_failed = True
+    # The graph rules are NOT re-implemented here (BACKLOG #1656): Registry.graph_problems is the
+    # one place the inbound->router, `accepts=` (ADR 0084), encoding (BACKLOG #1613), port-collision
+    # (low-13) and empty-graph (BACKLOG #1648) rules — and their exact message strings — live. This
+    # caller reports them all; Registry.validate raises the first.
+    #
+    # `declaring_source_failed` also absorbs the empty-graph rule: with a module or connections.toml
+    # broken, an empty graph is a DERIVED symptom, and printing it beside its own cause sends the
+    # reader after the wrong problem. It is deliberately NOT `bool(diagnostics)` — a diagnostic that
+    # cannot explain emptiness (a bad codesets/ table) must not hide a genuinely empty graph, and
+    # keying on the list would also couple this suppressor to `Diagnostic.severity`, which is a plain
+    # str field: a future warning-severity diagnostic would suppress the rule here while
+    # `checks._check_validate` filters it out, leaving its own `load_config` to raise unhandled.
+    problems = registry.graph_problems(allow_empty=allow_empty or declaring_source_failed)
+    diagnostics.extend(Diagnostic(message=m) for m in problems)
     return diagnostics

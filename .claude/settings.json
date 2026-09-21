@@ -77,23 +77,8 @@
               "-NonInteractive",
               "-File",
               "${CLAUDE_PROJECT_DIR}/scripts/hooks/role-card-inject.ps1",
-              "-Worktree",
+              "-WorktreeRoot",
               "${CLAUDE_PROJECT_DIR}"
-            ],
-            "statusMessage": "Injecting this worktree's role card"
-          }
-        ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "pwsh",
-            "args": [
-              "-NoProfile",
-              "-NonInteractive",
-              "-File",
-              "${CLAUDE_PROJECT_DIR}/scripts/hooks/role-card-inject.ps1"
             ],
             "timeout": 20,
             "statusMessage": "Injecting this worktree's role card"
@@ -133,13 +118,7 @@
             ],
             "timeout": 15,
             "statusMessage": "Checking for GitHub API polling"
-          }
-        ]
-      }
-    ],
-    "UserPromptSubmit": [
-      {
-        "hooks": [
+          },
           {
             "type": "command",
             "command": "pwsh",
@@ -147,10 +126,10 @@
               "-NoProfile",
               "-NonInteractive",
               "-File",
-              "${CLAUDE_PROJECT_DIR}/scripts/hooks/context-budget.ps1"
+              "${CLAUDE_PROJECT_DIR}/scripts/hooks/block-unbounded-fs-scan.ps1"
             ],
             "timeout": 15,
-            "statusMessage": "Reading this session context budget"
+            "statusMessage": "Checking for an unbounded filesystem scan"
           }
         ]
       }
