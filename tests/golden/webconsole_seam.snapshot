@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-00530873daf5e80d
+2e64489e5d4494f1
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
