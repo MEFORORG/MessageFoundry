@@ -4018,6 +4018,29 @@ class IntegritySettings(_Section):
     # refuse-to-start on a tripped tamper alarm would be a self-inflicted DoS). Default false — opt in;
     # on a very large audit_log the full re-walk adds startup latency, so it is not on by default.
     audit_verify_on_start: bool = False
+    # Path to a file holding one COUNT:HEAD anchor as printed by `messagefoundry audit-anchor` (BACKLOG
+    # #328). Empty (the default) = the startup walk stays the bare walk it is today, byte-identical.
+    #
+    # WHAT IT BUYS: the walk alone cannot see a TRUNCATED TAIL — deleting the newest rows leaves a prefix
+    # that still chains cleanly — so audit_verify_on_start on its own is blind to exactly what an
+    # attacker hiding their tracks would do. An anchor is the external witness that catches it.
+    #
+    # THE ENGINE CONSUMES IT AS A PREFIX, NOT AS THE CLI'S EXACT SEAL, and that difference is why this
+    # key can exist at all. `audit-verify --expected-anchor` compares the CURRENT head, so it diverges
+    # the moment one more row is appended; a running engine writes audit rows, so a startup check built
+    # on the exact seal would alarm on essentially every restart. This feeds `expected_prefix`
+    # (`audit_prefix_verdict`) instead, which asks the weaker, survivable question: was the recorded
+    # state ever true, and has the chain only GROWN since? It still catches a truncated tail and a
+    # mid-chain rewrite. So a stale anchor stays VALID here — it just witnesses less.
+    #
+    # ALERT-ONLY, like its partner: a missing, unreadable or malformed anchor logs a WARNING and lets the
+    # bare walk run. It never crashes startup, and it never fires the tamper alert — a config fault must
+    # not manufacture a tamper alarm, or a real one stops meaning anything. `0:`, the anchor of an empty
+    # log, is refused the same way: it can witness nothing, so it is reported rather than compared.
+    #
+    # It does nothing on its own: without audit_verify_on_start the engine warns at startup that the
+    # anchor is never read.
+    audit_anchor_file: str = ""
 
 
 class ApprovalsSettings(_Section):
