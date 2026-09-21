@@ -27,11 +27,11 @@ import logging
 import sqlite3  # stdlib; the exception the store-opening subcommands translate (#1670) + the ro probe (#1669)
 import sys
 import tomllib  # stdlib; classifies a malformed SERVICE-config TOML (_env_dir_name + `security show`)
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import (
     Path,
 )  # stdlib, imported at interpreter startup — no cost to the fast subcommands
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from messagefoundry import __version__
 from messagefoundry.logging_setup import (
@@ -42,6 +42,11 @@ from messagefoundry.logging_setup import (
     configure_stderr_logging,
     query_sntp_offset,
 )
+
+if TYPE_CHECKING:
+    # Type-only, so the settings module still loads lazily per command: a quick `validate` /
+    # `hl7schema` call must not pay for it (see the module docstring on deferred heavy imports).
+    from messagefoundry.config.settings import ServiceSettings
 
 
 class _VersionAction(argparse.Action):
@@ -1419,9 +1424,56 @@ def _measure_webconsole_provenance() -> str | None:
     )
 
 
+def _load_service_settings(
+    config_path: str | None,
+    *,
+    cli: Mapping[str, Mapping[str, object]] | None = None,
+) -> tuple[ServiceSettings | None, str | None]:
+    """Load the service settings for a BOOT-PATH command, returning ``(settings, detail)``.
+
+    Exactly one side is non-``None``. This owns the catch and the rendering only -- each caller
+    keeps its own stream and exit code, because the part they got wrong was the same and the part
+    they do differently is not.
+
+    THE FAILURE IS RENDERED, NEVER STRINGIFIED. ``str(ValidationError)`` carries ``input_value=``
+    for every failing field, and for an ``after``-mode section validator that value is the whole
+    section's input mapping. The secrets in ``_FILE_SECRET_KEYS`` come from the environment, so a
+    ``[store]`` missing ``server`` on a node with ``MEFOR_STORE_PASSWORD`` set renders the store
+    password into the line. :func:`~messagefoundry.config.settings.settings_error_detail` gives the
+    field path and the message and no configured value at all.
+
+    WHY THIS PAIR OF COMMANDS IS WORTH A SHARED HELPER. ``serve`` and ``supervise`` are what the
+    Windows service runs under NSSM, which captures stderr to a FILE (``docs/SERVICE.md``). A
+    ``[store]`` that fails to validate would therefore write that value into a persisted service
+    log on every start attempt, with no operator present to see it happen, and support-bundle
+    assembly collects those logs afterwards. Nothing runs this engine yet, so that is what a first
+    deployment WOULD hit rather than something anyone is living with -- which is the reason there
+    is still time to render it properly. The other ``ValidationError`` arms in this module answer
+    an operator standing at a terminal; they are a separate question, deliberately untouched here.
+
+    ``OSError`` IS IN THE CATCH AND HAS TO BE. A ``--service-config`` naming a DIRECTORY passes
+    ``load_settings``'s ``Path.exists()`` guard and then raises at the open -- ``PermissionError``
+    on Windows (measured 2026-09-20: ``[Errno 13] Permission denied``), ``IsADirectoryError`` on
+    POSIX. Neither is a ``FileNotFoundError``, so narrowing this to the POSIX spelling would put a
+    raw traceback back on exactly the platform the NSSM service runs on. It is an easy typo for the
+    file inside the directory.
+
+    NOT reused from :mod:`messagefoundry.verify.runner`, whose ``_load_settings`` has this shape
+    already: ``verify/`` is a subcommand package, and the boot path depending on it to load its own
+    settings is the wrong direction.
+    """
+    from pydantic import ValidationError
+
+    from messagefoundry.config.settings import load_settings, settings_error_detail
+
+    try:
+        return load_settings(config_path=config_path, cli=cli), None
+    except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
+        return None, settings_error_detail(exc)
+
+
 def _serve(args: argparse.Namespace) -> int:
     import uvicorn
-    from pydantic import ValidationError
 
     from messagefoundry.api import create_managed_app
     from messagefoundry.auth.trust_anchors import collect_anchor_specs
@@ -1436,7 +1488,6 @@ def _serve(args: argparse.Namespace) -> int:
         SyslogProtocol,
         forward_hop_disposition,
         hop_posture_from_ai,
-        load_settings,
         security_loosenings,
     )
     from messagefoundry.config.tls_policy import (
@@ -1494,10 +1545,10 @@ def _serve(args: argparse.Namespace) -> int:
         # Anchor for environments/<env>.toml resolution (overrides [environments].base_dir).
         cli.setdefault("environments", {})["base_dir"] = args.project_root
 
-    try:
-        settings = load_settings(config_path=service_config, cli=cli)
-    except (FileNotFoundError, ValueError, ValidationError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+    settings, detail = _load_service_settings(service_config, cli=cli)
+    if settings is None:
+        # Rendered, not stringified: under NSSM this stream is a file (see _load_service_settings).
+        print(f"error: {detail}", file=sys.stderr)
         return 2
 
     # The bundle root from BOTH sources (ADR 0050 §1 "the same merged value"): --project-root is already
@@ -3513,17 +3564,14 @@ def _supervise(args: argparse.Namespace) -> int:
     # Resolve the store backend up front so the no-split-store guard (ADR 0063) can refuse a >1-shard
     # config on SQLite BEFORE any subprocess is spawned. --service-config is anchored the same way each
     # child resolves it; --db only sets the SQLite path, never the backend.
-    from pydantic import ValidationError
-
-    from messagefoundry.config.settings import load_settings
-
+    #
     # anchor_under_root(None, ...) returns None (config/anchor.py), so this is safe when unset; each child
     # re-anchors the raw --service-config to the same path under the forwarded --project-root.
     service_config = anchor_under_root(args.service_config, root, cwd=cwd)
-    try:
-        settings = load_settings(config_path=service_config)
-    except (FileNotFoundError, ValueError, ValidationError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+    settings, detail = _load_service_settings(service_config)
+    if settings is None:
+        # Same rendering as `serve`, for the same reason: this is the stream NSSM captures to a file.
+        print(f"error: {detail}", file=sys.stderr)
         return 2
 
     return asyncio.run(
