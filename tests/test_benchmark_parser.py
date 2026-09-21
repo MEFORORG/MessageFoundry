@@ -207,7 +207,7 @@ def test_single_thread_throughput_floor() -> None:
 @pytest.mark.skipif(
     not _is_freethreaded(),
     reason=(
-        "AC-6 ≥6× multi-core scaling is measurable only on a free-threaded (cp314t) build; on a "
+        "AC-6 >=6x multi-core scaling is measurable only on a free-threaded (cp314t) build; on a "
         "GIL build the threads serialize. Gate stays operator-owned on the bench box (ADR 0054/0053)."
     ),
 )
@@ -229,7 +229,7 @@ def test_freethread_scaling_measure(capsys: pytest.CaptureFixture[str]) -> None:
         print(
             f"\n[PARSE-15 AC-6 measure] workers={workers} "
             f"single={single_rate:,.0f} msg/s multi={multi_rate:,.0f} msg/s "
-            f"scaling={ratio:.2f}x (gate ≥6x is operator-owned on the cp314t bench box)"
+            f"scaling={ratio:.2f}x (gate >=6x is operator-owned on the cp314t bench box)"
         )
-    # Present, not gated: a real free-threaded build scales past 1x; the ≥6x bar is recorded, not here.
+    # Present, not gated: a real free-threaded build scales past 1x; the >=6x bar is recorded, not here.
     assert ratio > 1.0
