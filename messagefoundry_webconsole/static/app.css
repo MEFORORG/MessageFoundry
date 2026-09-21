@@ -174,6 +174,9 @@ body.mf-col-resizing, body.mf-col-resizing * { cursor: col-resize !important; us
 /* #233 (ADR 0111): present in the config but deployed=false — an intentional, benign state, so it reads
    in the informational accent (never the muted grey of "stopped", which means it SHOULD be running). */
 .status-not_deployed { color: var(--accent); }
+/* #122 (ADR 0189): the engine cannot write its application log, so no lane delivers. Reads BAD, not the
+   muted grey of "stopped": the disk is broken and nothing the operator does on this row fixes it. */
+.status-log_halted { color: var(--bad); }
 
 pre.raw {
   background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
@@ -301,6 +304,7 @@ ul.tree .tval { color: var(--ink); white-space: pre-wrap; word-break: break-word
 .gnode-failed, .gnode-error { stroke: var(--bad); }
 .gnode-filtered, .gnode-stopping { stroke: var(--warn); }
 .gnode-not_deployed { stroke: var(--accent); }
+.gnode-log_halted { stroke: var(--bad); }  /* #122 (ADR 0189) — see .status-log_halted */
 .gedge { stroke: var(--line); stroke-width: 1.5px; }
 .gedge-declared, .gedge-literal { stroke: var(--muted); }
 .gedge-heuristic { stroke: var(--muted); stroke-dasharray: 4 3; opacity: 0.7; }

@@ -1192,7 +1192,7 @@ gate are identical to the SQL Server preset.
 | Setting | Default | Meaning |
 |---------|---------|---------|
 | `odbc_driver` | — (required for `generic`) | the **exact OS-registered ODBC driver name**, e.g. `PostgreSQL Unicode`, `MySQL ODBC 8.0 Unicode Driver`, `Oracle in instantclient_21_13` |
-| `odbc_params` | — | a mapping of **driver-specific ODBC keywords** → values, e.g. `{"PORT": 5432, "SSLmode": "verify-full"}`. Values are **literals** (not `env()`-resolved — put per-env/secret values in the top-level fields) and are brace-quoted (injection-safe); keys must be valid ODBC keywords and may not re-set `DRIVER`/`SERVER`/`DATABASE`. |
+| `odbc_params` | — | a mapping of **driver-specific ODBC keywords** → values, e.g. `{"PORT": 5432, "SSLmode": "verify-full"}`. Values are **literals** (not `env()`-resolved — put per-env/secret values in the top-level fields) and are brace-quoted (injection-safe); keys must be valid ODBC keywords and may not re-set `DRIVER`/`SERVER`/`DATABASE`. An `env()` reference here is **refused at load** — as a code-first `env(...)` value, as a `connections.toml` inline table (`PWD = { env = "acme_pw" }`), and as one naming the whole table (`odbc_params = { env = "..." }`). |
 | `odbc_user_key` | `UID` | ODBC keyword the top-level `username` is emitted under (some drivers want `USER`) |
 | `odbc_password_key` | `PWD` | ODBC keyword the top-level `password` is emitted under (some drivers want `PASSWORD`) |
 
@@ -2340,6 +2340,13 @@ passes, and the engine starts **healthy** rather than DEGRADED. `stopped` means 
 `not_deployed` means *"off by design."* **Start / restart and resend are refused (`409`)** on a not-deployed
 connection — deploying it is a **config change** (flip the flag, supply the values, reload), not a runtime
 action.
+
+One more outbound state sits outside that ladder: **`log_halted`** ([ADR 0189](adr/0189-a-delivery-tier-log-halt-latch-read-at-the-claim-gate-rather-than-a-gate-at-every-door.md)).
+The engine cannot write its application log and has fail-closed (#122, [ADR 0162](adr/0162-fail-closed-application-log-write-guard-detect-roll-and-stop.md)),
+so no lane in the process delivers and every outbound reports it at once. It is deliberately not
+`stopped`: nothing on that row is the fix, and start is refused until the disk is. Queued rows are
+retained PENDING throughout. `failed`, `filtered` and `not_deployed` still win over it on the display,
+because each of those is a fact about that one connection. See [SERVICE.md](SERVICE.md) for recovery.
 
 ```python
 from messagefoundry import MLLP, env, inbound, outbound

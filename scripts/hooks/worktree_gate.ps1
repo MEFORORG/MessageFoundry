@@ -814,11 +814,30 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
     if ($Line -cmatch '(?:^|\s)--work-tree[=\s]+"?([^"\s]+)"?') { $explicit += $Matches[1]; $explicit += $CwdRaw }
     if ($Line -cmatch '(?:^|\s)GIT_WORK_TREE="?([^"\s]+)"?')    { $explicit += $Matches[1]; $explicit += $CwdRaw }
 
-    # THE SWITCH IS OPT-IN AND DEFAULT-OFF, so rules 3 and 3d keep the exact list they had: explicit
-    # tokens after the base, in the same order, with GIT_DIR appended at the end where -- being behind
-    # the base -- it cannot change any verdict they reach. Only rule 3c opts in. Same blast-radius
-    # control as -AllTargets, and for the same reason: two earlier attempts at this rule were rejected
-    # for changing behaviour a caller did not ask for.
+    # THE SWITCH IS OPT-IN AND DEFAULT-OFF, so rules 3 and 3d keep the exact list they had: the `-C`
+    # candidates, then the base, then the explicit WORKING-TREE tokens. Only rule 3c opts in. Same
+    # blast-radius control as -AllTargets, and for the same reason: two earlier attempts at this rule
+    # were rejected for changing behaviour a caller did not ask for.
+    #
+    # *** THIS PARAGRAPH PREVIOUSLY ENDED "with GIT_DIR appended at the end where -- being behind the
+    # base -- it cannot change any verdict they reach". BOTH HALVES WERE FALSE. *** It is not appended
+    # for those callers at all, and while it was, it DID change a verdict: rule 3 iterates the WHOLE
+    # candidate list rather than stopping at the first answer, so `GIT_DIR=<governed> git clean -fd`
+    # flipped from ALLOW to DENY -- a false deny naming a tree the command does not touch. The `else`
+    # branch below carries the correction; this sentence lagged behind it.
+    #
+    # SAY "RULE 3", NOT "RULES 3 AND 3d", AND THE DIFFERENCE IS MEASURABLE. Rule 3d consumes $where[0]
+    # ALONE and its own comment says so, and the append put $promoted LAST behind a base that always
+    # emits for that caller -- so the promoted token could never reach slot 0 and no 3d verdict ever
+    # moved. Naming both rules where only one flips teaches the next reader that 3d is order-blind
+    # when it is strictly first-candidate, which is the wrong-mechanism-inside-the-reassurance shape
+    # this paragraph is here to retire. The OPT-IN still covers both, because the list they are handed
+    # must stay byte-identical either way; only the flipped verdict is rule 3's alone.
+    #
+    # WHERE IT SAT IS THE WHOLE LESSON, and this file already states it once about a different claim:
+    # a wrong reassurance directly above the branch it describes is the worst place for one, because a
+    # reviewer reads the reassurance instead of the ordering. Left quoted rather than deleted, so the
+    # next reader can tell a corrected claim from one nobody ever made.
     if ($ExplicitFirst) {
         # PROMOTED FIRST, AHEAD OF `-C` (BACKLOG #1379 class one). `--git-dir` DECIDES which repository
         # is written, regardless of where it sits relative to `-C` -- measured against real git twice,
@@ -3041,13 +3060,52 @@ $cleanupBullet
             # trains people to route around it. This is the same defect #308 fixed for the nested-worktree
             # subpath, arriving through a different spelling.
             #
-            # Narrowing is safe because the fallback has exactly one job. Every OTHER way of aiming a git
-            # verb at the primary is resolved STRUCTURALLY before this point and sets $root without it:
-            # the cwd, an explicit `-C`, and `--work-tree` / `--git-dir` (added to the candidate set
-            # above, which is why a RELATIVE `--work-tree=../../..` still denies -- it never reaches this
-            # text scan). The fallback exists solely for `cd <primary>; git checkout`, where the verb runs
-            # somewhere the hook cannot observe because the directory changes mid-command. So require the
-            # directory change, and the true positive is untouched while the false one disappears.
+            # Narrowing is safe because the fallback has exactly one job, and because AT LEAST these
+            # ways of aiming a git verb at the primary's TREE are resolved STRUCTURALLY before this
+            # point and set $root without it: the cwd, an explicit `-C`, and `--work-tree` /
+            # `GIT_WORK_TREE` (added to the candidate set above, which is why a RELATIVE
+            # `--work-tree=../../..` still denies -- it never reaches this text scan). The fallback
+            # exists solely for `cd <primary>; git checkout`, where the verb runs somewhere the hook
+            # cannot observe because the directory changes mid-command. So require the directory
+            # change, and the true positive is untouched while the false one disappears.
+            #
+            # READ THAT AS "AT LEAST THESE", NOT AS AN ENUMERATION. The sentence it replaces said
+            # "every OTHER way", which makes a spelling nobody has enumerated read as already covered
+            # (CLAUDE.md section 11, SDS-3.6) -- the same hedge rule 3d's own residual list carries.
+            #
+            # `--git-dir` AND `GIT_DIR` ARE NOT IN THAT SET AND MUST NOT BE. This line used to name
+            # `--git-dir` among them, which was false in both directions: the resolver stopped emitting
+            # it to this rule when the promotion was corrected, and putting it back is what produced a
+            # false deny on an ordinary command. Those two tokens select the REPOSITORY; only the
+            # working-tree pair decides which TREE a verb rewrites, which is the only thing this rule
+            # asks. Measured by CONSEQUENCE with a paired control per verb, rather than by verdict, in
+            # test_the_tokens_rule_3_excludes_really_cannot_move_a_governed_tree -- stated there once
+            # rather than copied here, because two copies of a measurement drift apart independently.
+            #
+            # WHAT THE ALLOW DOES NOT SAY, because "allowed here" must not be read as "harmless". It is
+            # scoped to the WORKING TREE and nothing wider. Two things it does not bound, both measured
+            # on the shipped gate with a control, both pinned by the test named above rather than
+            # certified here:
+            #
+            #   THE INDEX. The same allowed command rewrites the named repository's index -- a file
+            #   staged in the primary goes back to untracked after `git --git-dir=<primary>/.git reset
+            #   --hard` runs from an ungoverned cwd.
+            #
+            #   THE HEAD, AND THIS ONE IS A LIVE FAIL-OPEN. `git --git-dir=<primary>/.git checkout
+            #   <branch>` from an ungoverned cwd is ALLOWED, and it really moves the primary's HEAD
+            #   while leaving its files where they are -- so a co-tenant session standing in the
+            #   primary sees modifications it never made, which is verbatim the harm rule 3's own deny
+            #   text describes. Control: the same verb spelled without the token DENIES, so the gate
+            #   and the rig both work and the allow belongs to this spelling. ATTRIBUTED: the
+            #   pre-correction resolver, which appended $promoted for this rule, DENIED it; withholding
+            #   the token to fix the false deny above is what opened this. Closing it needs a verb
+            #   split this rule does not have today -- `clean` and `reset --hard` must keep allowing,
+            #   `checkout` must not -- so it is named here rather than half-fixed.
+            #
+            # DO NOT READ "rule 3b governs a HEAD" AS COVER FOR THE SECOND ONE. An earlier draft of this
+            # paragraph said exactly that and it is false for this token class; 3b judges a linked
+            # worktree's HEAD, not a repository named by `--git-dir` from outside. A reassurance that
+            # sends the reader away from a live gap is the defect this whole block exists to retire.
             #
             # Still deliberately conservative: `cd <primary>; cd <elsewhere>; git checkout` denies. Once a
             # command has stepped into the primary this hook stops reasoning about where it stepped next.

@@ -10,8 +10,10 @@ import json
 import os
 import subprocess
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from functools import cache
 from pathlib import Path
+from types import MappingProxyType
 from typing import NamedTuple
 
 import pytest
@@ -48,12 +50,23 @@ _MIN_FILES_WALKED: dict[str, int] = {
     "config": 15,
 }
 
+# No floor may be lowered far enough to disarm the thing it is for. A red floor invites the obvious
+# "fix" of editing the number down, and a floor of 0 or 1 passes a walk that reached nothing.
+# Deliberately an absolute bound rather than a fraction of the live census: a fraction reds whenever
+# a package legitimately grows, which is the brittleness the floors sit under the census to avoid.
+_MIN_FLOOR = 5
+
 
 class _Scan(NamedTuple):
-    """What one boundary walk found: the violations, and how many files it actually opened."""
+    """What one boundary walk found: the violations, and how many files it actually opened.
 
-    violations: list[str]
-    walked: dict[str, int]
+    Both fields are read-only. `_engine_scan` hands the SAME object to every caller, so a list
+    appended to or a count reassigned would rewrite what every later caller reads — including the
+    floor guard's own input. A NamedTuple reads as a frozen value; these fields make it one.
+    """
+
+    violations: tuple[str, ...]
+    walked: Mapping[str, int]
 
 
 def _package_of(path: Path, root: Path) -> str:
@@ -130,73 +143,231 @@ def test_the_forbidden_matcher_can_actually_fail() -> None:
 
 
 def _scan(root: Path, packages: Sequence[str]) -> _Scan:
-    """Walk `packages` under `root` for forbidden imports, counting the files reached.
+    """Walk `packages` under `root` for forbidden imports, counting the files opened.
 
     Extracted from the boundary test so the guards below can drive the SAME walk over a planted
     tree (BACKLOG #1747). A guard that re-implements the walk proves nothing about the walk that
-    actually grades the engine. The per-package file count rides along for the same reason the
-    violations do: an empty walk is otherwise indistinguishable from a clean one.
+    actually grades the engine.
+
+    THE FACT THIS FILE IS BUILT AROUND, stated here and not restated: a walk that opened no file
+    reports exactly what a clean walk reports. `Path.rglob` over a directory that is not there
+    raises nothing and yields nothing, so a renamed package, a typo in `_ENGINE_PACKAGES`, or a
+    root resolved one level off each buy a green verdict over nothing at all. Both answers to that
+    live in the walk rather than in a caller, because a caller is skippable: a missing directory
+    raises here, and `walked` rides back beside `violations` so a caller over the real tree can
+    hold it to a floor.
+
+    Only STATIC `import` statements are seen — `_imported_modules` reads the AST. An
+    `importlib.import_module("fastapi")`, a `__import__(...)`, or a re-export through a permitted
+    module all pass untouched. Green here means the static-import boundary holds, NOT that no
+    forbidden module can be reached.
     """
     violations: list[str] = []
     walked: dict[str, int] = {}
     for package in packages:
+        directory = root / package
+        if not directory.is_dir():
+            raise AssertionError(f"walk target is not a directory: {directory}")
         forbidden = _FORBIDDEN + _PACKAGE_FORBIDDEN.get(package, ())
         seen = 0
-        for py in sorted((root / package).rglob("*.py")):
-            seen += 1
-            for module in _imported_modules(py, root):
+        for py in sorted(directory.rglob("*.py")):
+            modules = _imported_modules(py, root)
+            seen += 1  # after the parse, so `walked` counts files opened, not files globbed
+            for module in modules:
                 if _is_forbidden(module, forbidden):
                     violations.append(f"{py.relative_to(root)} imports {module}")
         walked[package] = seen
-    return _Scan(violations, walked)
+    return _Scan(tuple(violations), MappingProxyType(walked))
+
+
+def _guarded_scan(root: Path, packages: Sequence[str], floors: Mapping[str, int]) -> _Scan:
+    """`_scan` over `root`, refusing every shape in which its clean verdict would mean nothing.
+
+    Takes its targets as ARGUMENTS so each refusal below can be driven over a planted tree and
+    shown to fire. A guard branch reachable only when the real engine tree is already broken is
+    exactly the unproven matcher this file exists to rule out.
+
+    The four refusals, in the order a failure is easiest to read:
+
+    1. `packages` and `floors` must name the same set. Without it, emptying or shortening the
+       package list walks fewer packages and still returns clean — the top-level way back into the
+       defect — and adding a package with no floor dies on a bare `KeyError` at step 4 instead.
+       KNOWN LIMIT, measured: this catches an UNCOORDINATED edit only. Dropping a package from the
+       list AND its floor together leaves the two consistent and walks one package fewer in
+       silence. Nothing here can close that, because the package list IS the policy — there is no
+       second source naming the engine packages to check it against. That edit is a deliberate
+       narrowing of CLAUDE.md §4's rule, and review is what catches it.
+    2. No floor below `_MIN_FLOOR`. Editing the numbers down is the obvious response to a red.
+    3. Every package resolves to an importable one. `__init__.py` rather than `is_dir`: a directory
+       left behind by a rename, or a package emptied down to loose scripts, satisfies `is_dir` and
+       is no longer the package being graded.
+    4. Every package's walk meets its floor.
+    """
+    disagree = set(packages) ^ set(floors)
+    if disagree:
+        raise AssertionError(f"package list and floor table disagree on: {sorted(disagree)}")
+
+    weak = {p: n for p, n in floors.items() if n < _MIN_FLOOR}
+    if weak:
+        raise AssertionError(
+            f"floors low enough to disarm the guard: {weak} (minimum {_MIN_FLOOR})"
+        )
+
+    missing = [p for p in packages if not (root / p / "__init__.py").is_file()]
+    if missing:
+        raise AssertionError(f"packages missing or not importable under {root}: {missing}")
+
+    scan = _scan(root, packages)
+    short = {p: n for p, n in scan.walked.items() if n < floors[p]}
+    if short:
+        raise AssertionError(f"walk fell under its floor: {short} (floors {dict(floors)})")
+    return scan
+
+
+@cache
+def _engine_scan() -> _Scan:
+    """The one guarded boundary walk over the real engine tree.
+
+    The guard sits in the walk rather than in a sibling test because a sibling is skippable.
+    Measured on this file at 909a38549, with all five names in `_ENGINE_PACKAGES` misspelled: the
+    boundary test passed. Measured again at baf53b3ae, with the reach check in a sibling:
+    `pytest -k never_import` passed, 10 deselected. A `-x` short-circuit, a deselect, or deleting
+    the sibling all did the same. Guarding inside the walk makes every caller inherit it.
+
+    Cached because the tree does not move mid-session and the walk parses about 150 files; both
+    engine-facing tests below read this one result.
+    """
+    return _guarded_scan(_ENGINE_ROOT, _ENGINE_PACKAGES, _MIN_FILES_WALKED)
 
 
 def test_engine_packages_never_import_api_console_or_gui() -> None:
     # low-30: automated enforcement of the one-way dependency rule (the governing invariant for
     # parallel agent work) — a `from fastapi import ...` slipping into transports/ would be caught.
-    violations = _scan(_ENGINE_ROOT, _ENGINE_PACKAGES).violations
+    violations = _engine_scan().violations
     assert not violations, violations
 
 
 def test_the_boundary_walk_reaches_every_engine_package() -> None:
-    # BACKLOG #1747: `Path.rglob` over a directory that is not there raises nothing and yields
-    # nothing, so the walk above would return a clean verdict having opened no file at all. A
-    # renamed package, a typo in `_ENGINE_PACKAGES`, or a root resolved one level off would each
-    # leave the guard green while it graded nothing — measured on this file at 909a38549, with all
-    # five names misspelled, it still passed. Two assertions close that, because either alone has
-    # a hole: `is_dir` catches a name resolving nowhere, and the floor catches a directory that
-    # exists but has gone all but empty under the walk.
-    missing = [p for p in _ENGINE_PACKAGES if not (_ENGINE_ROOT / p).is_dir()]
-    assert not missing, f"engine packages not found under {_ENGINE_ROOT}: {missing}"
-
-    walked = _scan(_ENGINE_ROOT, _ENGINE_PACKAGES).walked
-    assert sorted(walked) == sorted(_MIN_FILES_WALKED), (walked, _MIN_FILES_WALKED)
+    # BACKLOG #1747: gives the reach guard a test of its own to fail by name. `_guarded_scan` has
+    # already refused every shape that would make the walk meaningless, so this reports what the
+    # walk actually reached; the refusals themselves are proven over planted trees below.
+    walked = _engine_scan().walked
+    assert set(walked) == set(_MIN_FILES_WALKED), sorted(set(walked) ^ set(_MIN_FILES_WALKED))
     short = {p: n for p, n in walked.items() if n < _MIN_FILES_WALKED[p]}
-    assert not short, f"boundary walk fell under its floor: {short} (floors {_MIN_FILES_WALKED})"
+    assert not short, f"{short} against floors {_MIN_FILES_WALKED}"
 
 
-@pytest.mark.parametrize(
-    ("package", "line", "flagged"),
-    [
-        # Every entry in `_FORBIDDEN`, planted one at a time, in an engine package.
-        ("pipeline", "from fastapi import FastAPI\n", True),
-        ("pipeline", "import PySide6.QtWidgets\n", True),
-        ("pipeline", "from messagefoundry.api import models\n", True),
-        ("pipeline", "import messagefoundry_webconsole.mount\n", True),
-        # The `_PACKAGE_FORBIDDEN` inward rules, which bind transports/ only.
-        ("transports", "from messagefoundry.store import base\n", True),
-        ("transports", "from messagefoundry.pipeline import engine\n", True),
-        # ...and the negative arm: that same import is legitimate outside transports/, so a guard
-        # flagging it here would be reporting the rule as broader than it is.
-        ("store", "from messagefoundry.pipeline import engine\n", False),
-    ],
-)
-def test_the_walk_sees_a_planted_forbidden_import(
-    tmp_path: Path, package: str, line: str, flagged: bool
+def _plant_package(root: Path, package: str, files: int) -> None:
+    """An importable package under `root` holding `files` parseable modules, `__init__.py` included."""
+    (root / package).mkdir(parents=True)
+    (root / package / "__init__.py").write_text("", encoding="utf-8")
+    for i in range(files - 1):
+        (root / package / f"m{i}.py").write_text("import json\n", encoding="utf-8")
+
+
+def test_the_engine_guard_passes_a_tree_that_meets_every_check(tmp_path: Path) -> None:
+    # The positive control for the four refusals below. Without it they show only that SOMETHING
+    # raises, not that the checks discriminate between a good tree and a bad one.
+    root = tmp_path / "messagefoundry"
+    _plant_package(root, "pipeline", 6)
+    scan = _guarded_scan(root, ["pipeline"], {"pipeline": 5})
+    assert scan.violations == (), scan.violations
+    assert scan.walked == {"pipeline": 6}, scan.walked
+
+
+def test_the_engine_guard_refuses_a_package_list_that_disagrees_with_the_floors(
+    tmp_path: Path,
 ) -> None:
-    # BACKLOG #1747: prove the walk can SEE the thing it is written to catch. Without this, the
-    # boundary test's green says only that nothing was reported — which is also what a walk with a
-    # broken matcher, an unreadable tree, or an empty glob reports.
+    # The guard reads its targets from the package list, so an emptied or shortened list would
+    # otherwise walk fewer packages and still return clean — the defect, one level up.
+    root = tmp_path / "messagefoundry"
+    _plant_package(root, "pipeline", 6)
+    with pytest.raises(AssertionError, match="disagree"):
+        _guarded_scan(root, [], {"pipeline": 5})
+    # And the other direction: a package added with no floor, which would otherwise be a KeyError.
+    with pytest.raises(AssertionError, match="disagree"):
+        _guarded_scan(root, ["pipeline", "auth"], {"pipeline": 5})
+
+
+def test_the_engine_guard_refuses_a_floor_low_enough_to_disarm_it(tmp_path: Path) -> None:
+    root = tmp_path / "messagefoundry"
+    _plant_package(root, "pipeline", 6)
+    with pytest.raises(AssertionError, match="disarm"):
+        _guarded_scan(root, ["pipeline"], {"pipeline": 1})
+
+
+def test_the_engine_guard_refuses_a_directory_that_is_not_an_importable_package(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "messagefoundry"
+    _plant_package(root, "pipeline", 6)
+    (root / "pipeline" / "__init__.py").unlink()
+    with pytest.raises(AssertionError, match="not importable"):
+        _guarded_scan(root, ["pipeline"], {"pipeline": 5})
+
+
+def test_the_engine_guard_refuses_a_walk_that_fell_under_its_floor(tmp_path: Path) -> None:
+    root = tmp_path / "messagefoundry"
+    _plant_package(root, "pipeline", 6)
+    with pytest.raises(AssertionError, match="under its floor"):
+        _guarded_scan(root, ["pipeline"], {"pipeline": 9})
+
+
+# (package, the rule the row proves, the planted import line, whether the walk must flag it).
+# `rule` is empty on the negative rows, which prove no rule — they prove the matcher does not
+# over-reach. `test_every_forbidden_rule_has_a_planted_case` holds the positive rows to the
+# constants, so a rule added without a planted case reds instead of shipping as an unproven matcher.
+_PLANTED: list[tuple[str, str, str, bool]] = [
+    # Every entry in `_FORBIDDEN`, planted one at a time, in an engine package.
+    ("pipeline", "fastapi", "from fastapi import FastAPI\n", True),
+    ("pipeline", "pyside6", "import PySide6.QtWidgets\n", True),
+    ("pipeline", "messagefoundry.api", "from messagefoundry.api import models\n", True),
+    ("pipeline", "messagefoundry_webconsole", "import messagefoundry_webconsole.mount\n", True),
+    # The `_PACKAGE_FORBIDDEN` inward rules, which bind transports/ only.
+    ("transports", "messagefoundry.store", "from messagefoundry.store import base\n", True),
+    (
+        "transports",
+        "messagefoundry.pipeline",
+        "from messagefoundry.pipeline import engine\n",
+        True,
+    ),
+    # Negative arm 1, rule scoping: the transports-only rules must not bind elsewhere, or the guard
+    # reports the rule as broader than it is. `pipeline` importing `store` is the engine's own
+    # direction of travel — pipeline/engine.py does it today.
+    ("pipeline", "", "from messagefoundry.store import base\n", False),
+    # Negative arm 2, the prefix boundary — the matcher's one subtle line, `startswith(f + ".")`.
+    # Dropping that `.` passes every row above while reporting these two as violations:
+    # `messagefoundry.apiclient` is a real package (CLAUDE.md §3) and is not the api package, and
+    # `fastapi_utils` is not fastapi.
+    ("pipeline", "", "from messagefoundry.apiclient import client\n", False),
+    ("pipeline", "", "import fastapi_utils\n", False),
+]
+
+
+def test_every_forbidden_rule_has_a_planted_case() -> None:
+    # BACKLOG #1747, and CLAUDE.md §11 / SDS-3.6: the rows above are an enumeration, and an
+    # enumeration nobody checks rots. Measured at baf53b3ae — appending a rule to `_FORBIDDEN` with
+    # no planted row left the whole file green, so the new rule shipped unproven.
+    planted = {rule for _, rule, _, flagged in _PLANTED if flagged}
+    rules = set(_FORBIDDEN) | {r for rs in _PACKAGE_FORBIDDEN.values() for r in rs}
+    assert planted == rules, f"planted {sorted(planted)} against rules {sorted(rules)}"
+
+
+def test_the_forbidden_rules_are_written_lowercase() -> None:
+    # `_scan` lowercases the MODULE it read and not the RULE, so a rule spelled `PySide6` or
+    # `FastAPI` can never match: present in the table, reading as enforced, catching nothing.
+    # `_FORBIDDEN` honours that by convention only — this states the convention.
+    rules = [*_FORBIDDEN, *(r for rs in _PACKAGE_FORBIDDEN.values() for r in rs)]
+    mixed = [r for r in rules if r != r.lower()]
+    assert not mixed, f"the matcher never lowercases a rule, so these match nothing: {mixed}"
+
+
+@pytest.mark.parametrize(("package", "rule", "line", "flagged"), _PLANTED)
+def test_the_walk_sees_a_planted_forbidden_import(
+    tmp_path: Path, package: str, rule: str, line: str, flagged: bool
+) -> None:
+    # BACKLOG #1747: prove the walk can SEE the thing it is written to catch, and that it sees only
+    # that. See `_scan`'s docstring for why its green would otherwise report nothing.
     root = tmp_path / "messagefoundry"
     (root / package).mkdir(parents=True)
     (root / package / "clean.py").write_text("import json\n", encoding="utf-8")
@@ -205,11 +376,44 @@ def test_the_walk_sees_a_planted_forbidden_import(
     scan = _scan(root, [package])
     assert scan.walked == {package: 2}, scan.walked
     if not flagged:
-        assert scan.violations == [], scan.violations
+        assert scan.violations == (), scan.violations
         return
     assert len(scan.violations) == 1, scan.violations
     # `clean.py` must not be the file reported: a matcher that flags everything sees nothing.
     assert "planted.py imports " in scan.violations[0], scan.violations
+    # ...and the module reported must be the one THIS row claims to prove. Without this, a row can
+    # plant one rule's import under another rule's name: the coverage test above compares rule
+    # strings and would still pass, leaving the named rule wholly unexercised while reading proven.
+    flagged_module = scan.violations[0].split(" imports ", 1)[1].lower()
+    assert flagged_module == rule or flagged_module.startswith(rule + "."), (
+        f"row claims to prove {rule!r}, but the walk flagged {flagged_module!r}"
+    )
+
+
+def test_the_walk_recurses_into_subpackages(tmp_path: Path) -> None:
+    # BACKLOG #1747: every planted tree above is flat, and so is most of the engine — measured at
+    # 909a38549, only `parsing` nests (14 top-level against 43 recursive). So regressing `rglob` to
+    # `glob` leaves the rows above green and reds one floor with six files of margin. Planting a
+    # level down is what makes losing recursion loud.
+    root = tmp_path / "messagefoundry"
+    (root / "pipeline" / "sub").mkdir(parents=True)
+    (root / "pipeline" / "clean.py").write_text("import json\n", encoding="utf-8")
+    (root / "pipeline" / "sub" / "deep.py").write_text(
+        "from fastapi import FastAPI\n", encoding="utf-8"
+    )
+
+    scan = _scan(root, ["pipeline"])
+    assert scan.walked == {"pipeline": 2}, scan.walked
+    assert len(scan.violations) == 1, scan.violations
+    assert "deep.py imports fastapi" in scan.violations[0], scan.violations
+
+
+def test_the_walk_refuses_a_package_that_is_not_there(tmp_path: Path) -> None:
+    # The missing-directory refusal in `_scan` itself, which every caller inherits — see that
+    # function's docstring for the fact it exists to answer.
+    (tmp_path / "messagefoundry").mkdir()
+    with pytest.raises(AssertionError, match="not a directory"):
+        _scan(tmp_path / "messagefoundry", ["pipeline"])
 
 
 def test_relative_imports_are_resolved_not_skipped(tmp_path: Path) -> None:

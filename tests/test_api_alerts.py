@@ -243,16 +243,23 @@ async def test_alerts_active_per_channel_scope(engine: Engine) -> None:
     service = await _service(engine)
     uid = await _add(service, "op", Role.OPERATOR)
     await service.set_channel_scope(uid, ["IB_A"], actor="admin")
+    # Severities differ so the AGGREGATE discriminates too: a scoped caller must see its own warning,
+    # never the out-of-scope critical (BACKLOG #1564). Identical severities would let an unscoped
+    # aggregate pass, which is the hole a row-set-only assertion leaves open.
     await engine.store.upsert_alert_instance(
-        event_type="connection_stopped", connection="IB_A", severity="critical", now=100.0
+        event_type="connection_stopped", connection="IB_A", severity="warning", now=100.0
     )
     await engine.store.upsert_alert_instance(
         event_type="connection_stopped", connection="IB_B", severity="critical", now=110.0
     )
     async with _client(engine, service) as c:
         h = await _login(c, "op")
-        alerts = (await c.get("/alerts/active", headers=h)).json()["alerts"]
-        assert {x["connection"] for x in alerts} == {"IB_A"}  # IB_B is out of scope
+        body = (await c.get("/alerts/active", headers=h)).json()
+        assert {x["connection"] for x in body["alerts"]} == {"IB_A"}  # IB_B is out of scope
+        # The count and the severity are a SECOND store read. Scoped identically, or the bell leaks
+        # the existence and severity of alerts this operator may not read.
+        assert body["total"] == 1
+        assert body["worst_severity"] == "warning"
 
 
 async def test_alerts_ack_resolve_out_of_scope_refused_no_mutation(engine: Engine) -> None:
