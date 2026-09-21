@@ -999,7 +999,7 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
   live ledger; the connector-parity row is [`docs/CONNECTIONS.md`](docs/CONNECTIONS.md)).
 - Don't build **per-key message ordering** — canonically **sequence-keyed lanes** over a **sequence
   key**; older text writes it `partition_key` or "order-group sharding", both retired by the
-  2026-06-30 naming lock — **declined-by-design (owner ruling 2026-09-21)**: the demand gate closed
+  2026-06-30 naming lock — **declined-by-design (owner ruling 2026-09-20)**: the demand gate closed
   **unfired**. Its trigger was specifically **one ordered interface exceeding about 60 msg/s**, and
   the owner has ruled that trigger is not expected to fire. The
   [ADR 0052](docs/adr/0052-enterprise-scale-target.md) scale target does not imply it — 45M/day
