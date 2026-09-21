@@ -666,11 +666,18 @@ def test_the_web_console_suite_shares_neither_budget_nor_job_with_the_engine_sui
 def test_every_leg_sizes_each_gated_step_inside_its_own_job_cap() -> None:
     """The machine-checkable half of the nesting invariant, per leg.
 
-    WHAT THIS DOES NOT CHECK, said so it is not read as more: the real invariant is
-    setup(max) + step_timeout + webconsole_step_timeout < job_timeout, and setup(max) is a measured
-    quantity that lives in a comment -- unreadable from here. So this checks the two caps against the
-    job cap and nothing else; the setup term is arithmetic in the note above the web console step. The
-    weaker check still catches the edit that matters, which is a cap raised without re-summing.
+    WHAT THIS DOES NOT CHECK, said so it is not read as more: the real invariant carries a setup term,
+    `setup(max) + <this job's step cap> < <this job's job cap>`, and setup(max) is a measured quantity
+    that lives in a ci.yml comment. So this checks each step cap against its own job cap and nothing
+    else. The weaker check still catches the edit that matters, which is a cap raised without
+    re-summing.
+
+    THE WEB CONSOLE HALF IS NO LONGER UNCHECKED, and that is the one correction to the paragraph above.
+    `test_the_webconsole_nesting_arithmetic_in_ci_yml_is_read_and_checks_out` parses the setup table in
+    that job's own note and re-adds it, so for `webconsole` the setup term IS verified. The `test`
+    job's setup term is still unread, and this docstring's earlier claim that the sum spans BOTH gated
+    steps predates the job split -- each step now sits in its own job with its own cap, so there is no
+    single sum over the pair to check.
     """
     legs = _matrix_legs()
     print(f"[step-margin] matrix legs scanned: {[leg['os'] for leg in legs]}")
@@ -853,8 +860,16 @@ def test_the_webconsole_nesting_arithmetic_in_ci_yml_is_read_and_checks_out() ->
     Falsified by raising a kill in the matrix without re-summing the comment: RED, naming the leg and
     both values. Falsified by editing a stated total to a wrong sum: RED. Restored.
     """
-    rows = {m.group("leg"): m for m in _NESTING_ROW.finditer(_CI.read_text(encoding="utf-8"))}
-    print(f"[step-margin] nesting rows parsed from ci.yml: {sorted(rows)}")
+    found = list(_NESTING_ROW.finditer(_CI.read_text(encoding="utf-8")))
+    rows = {m.group("leg"): m for m in found}
+    print(f"[step-margin] nesting rows parsed from ci.yml: {len(found)} raw -> {sorted(rows)}")
+    # Keying by leg would let a SECOND table for the same leg -- a stale one left behind by a
+    # half-finished edit -- silently overwrite the first, and the name assertion below would still
+    # pass. Count the raw matches, so a duplicate is a failure rather than a quiet last-one-wins.
+    assert len(found) == len(rows), (
+        f"ci.yml holds {len(found)} nesting rows for {len(rows)} distinct legs, so at least one leg "
+        f"has two tables and the later one silently wins: {[m.group('leg') for m in found]}"
+    )
     assert set(rows) == _EXPECTED_LEGS, (
         f"the nesting table above the web console step names {sorted(rows)}, expected "
         f"{sorted(_EXPECTED_LEGS)} -- this extraction has rotted, or a leg lost its row"
