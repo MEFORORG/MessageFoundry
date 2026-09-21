@@ -7,7 +7,9 @@
 > Its finding stands: the commit tier is **~9% utilised** (~2,416 c/s demand at the full 45M/day target against a
 > **~27–29k commits/s** ceiling). **Do not propose a commit-reduction lever without measuring `txn/s` first.**
 
-**Status:** Proposed (2026-07-03)
+**Status:** **Accepted** -- **RATIFIED 2026-07-12** by [ADR 0099](0099-phase-4-group-commit-amortize-the-per-event-transaction-cost.md),
+which withdrew [ADR 0055](0055-group-commit-durable-write.md) and adopted this ADR's conclusion (see the banner above).
+Originally drafted 2026-07-03.
 **Deciders:** throughput working group
 **Related:** ADR 0066 (pooled stage claimers), ADR 0055 (group-commit / durable-write), ADR 0001 (staged pipeline), ADR 0037 / ADR 0063 (sharding on a unified store), ADR 0053 (free-threading); `docs/archive/throughput/throughput-roadmap.md`, `docs/archive/throughput/throughput-build-plan.md`
 

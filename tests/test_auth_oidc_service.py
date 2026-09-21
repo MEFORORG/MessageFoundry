@@ -226,14 +226,22 @@ async def test_service_threads_enforcement_dial_and_pin_to_the_oidc_anchor(
     calls: list[dict[str, Any]] = []
 
     def spy(
-        ca_cert_file: str | None, *, pin: str | None = None, enforcing: bool = True
+        ca_cert_file: str | None,
+        *,
+        pin: str | None = None,
+        enforcing: bool = True,
+        crl_file: str | None = None,
     ) -> urllib.request.OpenerDirector:
-        calls.append({"ca": ca_cert_file, "pin": pin, "enforcing": enforcing})
+        calls.append(
+            {"ca": ca_cert_file, "pin": pin, "enforcing": enforcing, "crl": crl_file},
+        )
         return urllib.request.build_opener()
 
     monkeypatch.setattr("messagefoundry.auth.service.build_idp_opener", spy)
     settings = _settings(
-        oidc_tls_ca_cert_file="C:/anchors/idp-ca.pem", oidc_tls_ca_cert_pin="ab" * 32
+        oidc_tls_ca_cert_file="C:/anchors/idp-ca.pem",
+        oidc_tls_ca_cert_pin="ab" * 32,
+        oidc_tls_crl_file="C:/anchors/idp-crl.pem",
     )
     for enforcing in (False, True):
         store = await MessageStore.open(":memory:")
@@ -244,6 +252,9 @@ async def test_service_threads_enforcement_dial_and_pin_to_the_oidc_anchor(
     # The dial is forwarded verbatim (warn then enforce), as is the pin and the CA path.
     assert [c["enforcing"] for c in calls] == [False, True]
     assert all(c["ca"] == "C:/anchors/idp-ca.pem" and c["pin"] == "ab" * 32 for c in calls)
+    # BACKLOG #299: the CRL path is threaded on the same seam. Asserted here rather than only at
+    # build_idp_opener, because a setting that never reaches the builder is a knob that does nothing.
+    assert all(c["crl"] == "C:/anchors/idp-crl.pem" for c in calls)
 
 
 # --- AC-2: roles come from LDAP, never from a token claim -------------------------------------------

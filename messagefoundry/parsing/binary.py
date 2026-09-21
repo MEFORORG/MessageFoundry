@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import re
 import time
 from collections.abc import Awaitable, Callable, Iterator
 from typing import TYPE_CHECKING
@@ -131,6 +132,19 @@ def _b64decode(text: str) -> bytes:
         return base64.b64decode(compact, validate=True)
     except (binascii.Error, ValueError) as exc:
         raise BinaryCarriageError(f"invalid base64: {exc}") from exc
+
+
+def _b64decoded_size(text: str) -> int:
+    """Size normal base64 without allocating its decoded document.
+
+    Keep the decoder as the authority for noncanonical forms, including surplus
+    padding accepted by some Python versions. Whitespace matches _b64decode.
+    """
+    compact = "".join(text.split())
+    if len(compact) % 4 == 0 and re.fullmatch(r"[A-Za-z0-9+/]*={0,2}", compact):
+        padding = 2 if compact.endswith("==") else int(compact.endswith("="))
+        return len(compact) // 4 * 3 - padding
+    return len(_b64decode(text))
 
 
 def encode(data: bytes) -> str:
@@ -391,7 +405,7 @@ def _strip_whole_body_mfb64(
     """Strip a whole-body ``mfb64:v1:`` carriage value (ADR 0028) to a tombstone."""
     b64 = raw[len(MARKER) :]
     try:
-        size = len(_b64decode(b64))
+        size = _b64decoded_size(b64)
     except BinaryCarriageError:
         # A corrupt carriage value: leave it for the operator to see rather than guess its size.
         return raw, 0, 0
@@ -421,7 +435,7 @@ def strip_documents_in_hl7(
         if not data_b64 or is_document_tombstone(data_b64):
             continue  # empty or already-stripped — idempotent
         try:
-            size = len(_b64decode(data_b64))
+            size = _b64decoded_size(data_b64)
         except BinaryCarriageError:
             continue  # corrupt base64 — leave it for the operator to see
         if size < min_bytes:

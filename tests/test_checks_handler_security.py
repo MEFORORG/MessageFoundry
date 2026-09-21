@@ -462,6 +462,153 @@ CASES: list[tuple[str, str, bool, str]] = [
             return Send("OB", msg)
         """,
     ),
+    # --- unsafe-db-lookup: a statement COMPOSED BEFORE the call (BACKLOG #1658) ------------------
+    #
+    # The rule used to read the call's own statement expression and nothing else, so every shape that
+    # built the statement a line earlier went unseen — which is the ordinary way to write a long one,
+    # and what a `dedent` or a `join` produces. Each positive arm below was measured MISSED before
+    # this change; the negatives pin that resolving a name did not turn a literal into a finding.
+    (
+        "db_pos_assign_then_pass_fstring",
+        "unsafe-db-lookup",
+        True,
+        """
+        @handler("h")
+        def h(msg):
+            stmt = f"select npi from provider where mrn = '{msg['PID-3.1']}'"
+            return db_lookup("MPI", stmt)
+        """,
+    ),
+    (
+        "db_pos_assign_then_pass_percent",
+        "unsafe-db-lookup",
+        True,
+        """
+        @handler("h")
+        def h(msg):
+            stmt = "select npi from provider where mrn = '%s'" % msg["PID-3.1"]
+            return db_lookup("MPI", stmt)
+        """,
+    ),
+    (
+        "db_pos_augassign_build",
+        "unsafe-db-lookup",
+        True,
+        """
+        @handler("h")
+        def h(msg):
+            stmt = "select npi from provider "
+            stmt += "where mrn = '" + msg["PID-3.1"] + "'"
+            return db_lookup("MPI", stmt)
+        """,
+    ),
+    (
+        "db_pos_dedent_wrap",
+        "unsafe-db-lookup",
+        True,
+        """
+        from textwrap import dedent
+
+        @handler("h")
+        def h(msg):
+            stmt = dedent(f"select npi from provider where mrn = '{msg['PID-3.1']}'")
+            return db_lookup("MPI", stmt)
+        """,
+    ),
+    (
+        "db_pos_join_of_parts",
+        "unsafe-db-lookup",
+        True,
+        """
+        @handler("h")
+        def h(msg):
+            parts = ["select npi from provider", f"where mrn = '{msg['PID-3.1']}'"]
+            return db_lookup("MPI", " ".join(parts))
+        """,
+    ),
+    (
+        "db_pos_conditional_expression",
+        "unsafe-db-lookup",
+        True,
+        """
+        @handler("h")
+        def h(msg):
+            stmt = f"select npi from p where mrn='{msg['PID-3.1']}'" if msg else "select 1"
+            return db_lookup("MPI", stmt)
+        """,
+    ),
+    (
+        "db_pos_module_level_composition",
+        "unsafe-db-lookup",
+        True,
+        # A module-level constant is visible inside the handler, so the concat still reads as composed.
+        """
+        PREFIX = "select npi from provider where mrn = "
+
+        @handler("h")
+        def h(msg):
+            return db_lookup("MPI", PREFIX + msg["PID-3.1"])
+        """,
+    ),
+    (
+        "db_neg_assign_then_pass_literal",
+        "unsafe-db-lookup",
+        False,
+        """
+        @handler("h")
+        def h(msg):
+            stmt = "select npi from provider where mrn = :mrn"
+            return db_lookup("MPI", stmt, {"mrn": msg["PID-3.1"]})
+        """,
+    ),
+    (
+        "db_neg_module_constant_by_name",
+        "unsafe-db-lookup",
+        False,
+        """
+        STMT = "select npi from provider where mrn = :mrn"
+
+        @handler("h")
+        def h(msg):
+            return db_lookup("MPI", STMT, {"mrn": msg["PID-3.1"]})
+        """,
+    ),
+    (
+        "db_neg_dedent_of_a_literal",
+        "unsafe-db-lookup",
+        False,
+        """
+        from textwrap import dedent
+
+        @handler("h")
+        def h(msg):
+            stmt = dedent("select npi from provider where mrn = :mrn")
+            return db_lookup("MPI", stmt, {"mrn": msg["PID-3.1"]})
+        """,
+    ),
+    (
+        "db_neg_join_of_literal_parts",
+        "unsafe-db-lookup",
+        False,
+        """
+        @handler("h")
+        def h(msg):
+            parts = ["select npi", "from provider", "where mrn = :mrn"]
+            return db_lookup("MPI", " ".join(parts), {"mrn": msg["PID-3.1"]})
+        """,
+    ),
+    (
+        "db_neg_self_referential_name_terminates",
+        "unsafe-db-lookup",
+        False,
+        # A name bound through itself must terminate the resolution walk, not recurse forever.
+        """
+        @handler("h")
+        def h(msg):
+            stmt = stmt
+            return db_lookup("MPI", stmt)
+        """,
+    ),
     # impure-transform is gated on a real imported module — a local shadowing `secrets` is clean.
     (
         "impure_neg_secrets_local_shadow",
@@ -905,8 +1052,17 @@ def test_block_mode_through_run_checks(tmp_path: Path) -> None:
         '    return Send("OB", msg)\n',
         encoding="utf-8",
     )
-    assert run_checks(tmp_path, run_lint=False).ok is True  # advisory never blocks the gate
-    assert run_checks(tmp_path, run_lint=False, strict_handler_security=True).ok is False
+    # allow_empty_config: the fixture is a handler with no connections, and the gate refuses an empty
+    # graph (BACKLOG #1648). This test is about the handler-security lint, so drop that one rule
+    # rather than wire a connection the lint never reads — otherwise `.ok is False` below would pass
+    # for the wrong reason.
+    assert run_checks(tmp_path, run_lint=False, allow_empty_config=True).ok is True  # advisory
+    assert (
+        run_checks(
+            tmp_path, run_lint=False, strict_handler_security=True, allow_empty_config=True
+        ).ok
+        is False
+    )
 
 
 def test_cli_strict_handler_security_exit_code(tmp_path: Path) -> None:
@@ -921,7 +1077,17 @@ def test_cli_strict_handler_security_exit_code(tmp_path: Path) -> None:
         '    return Send("OB", msg)\n',
         encoding="utf-8",
     )
-    base = [sys.executable, "-m", "messagefoundry", "check", "--config", str(tmp_path), "--no-lint"]
+    # --allow-empty-config: handler-only fixture, no connections (see the sibling run_checks test).
+    base = [
+        sys.executable,
+        "-m",
+        "messagefoundry",
+        "check",
+        "--config",
+        str(tmp_path),
+        "--no-lint",
+        "--allow-empty-config",
+    ]
     advisory = subprocess.run(base, capture_output=True, text=True)
     strict = subprocess.run([*base, "--strict-handler-security"], capture_output=True, text=True)
     assert advisory.returncode == 0, advisory.stdout + advisory.stderr
@@ -949,13 +1115,19 @@ def test_allow_threads_through_run_checks(tmp_path: Path) -> None:
     from messagefoundry.checks import run_checks
 
     (tmp_path / "feed.py").write_text(_PANDAS_BODY_IMPORT, encoding="utf-8")
-    assert run_checks(tmp_path, run_lint=False, strict_handler_security=True).ok is False
+    assert (
+        run_checks(
+            tmp_path, run_lint=False, strict_handler_security=True, allow_empty_config=True
+        ).ok
+        is False
+    )
     assert (
         run_checks(
             tmp_path,
             run_lint=False,
             strict_handler_security=True,
             handler_security_allow=frozenset({"pandas"}),
+            allow_empty_config=True,
         ).ok
         is True
     )
@@ -998,6 +1170,7 @@ def test_cli_handler_security_allow_exit_code(tmp_path: Path) -> None:
         str(tmp_path),
         "--no-lint",
         "--strict-handler-security",
+        "--allow-empty-config",  # handler-only fixture, no connections (BACKLOG #1648)
     ]
     blocked = subprocess.run(base, capture_output=True, text=True)
     allowed = subprocess.run(

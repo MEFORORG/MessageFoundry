@@ -512,6 +512,29 @@ _UNSCANNABLE_RE_PATTERNS = {
     "messagefoundry/logging_setup.py": (
         r"""'(?i)\\b(' + '|'.join(_CREDENTIAL_QUERY_KEYS) + ')=[^&\\s\\"\']+'""",
     ),
+    # BACKLOG #1572 -- the separator-aware redaction pass. Unresolvable BY CONSTRUCTION and that is the
+    # point: the character class is the delimiter set the MESSAGE declares in MSH-1/MSH-2, read at
+    # runtime, so there is no literal to write. Writing one out would mean hardcoding ``|^~&`` back into
+    # the redactor, which is the exact defect #1572 fixed.
+    #
+    # Nothing partner-chosen reaches the pattern unescaped. The sniff admits only non-word, non-space
+    # characters, and each is passed through ``re.escape`` before it is spliced, which escapes every
+    # character-class metacharacter (``-`` ``^`` ``]`` ``\``), so a header cannot inject a range, a
+    # negation, or a class terminator.
+    #
+    # The shapes are non-catastrophic by inspection. The segment pattern is a fixed ``{2}`` repetition,
+    # a one-character class, and one unbounded repetition of a negated class that is quantified nowhere
+    # and sits inside no quantified group. The field run's repetitions are all POSSESSIVE over
+    # ``[^\s<delims>]``, the exact complement of the ``[<delims>]`` class that follows each of them, so
+    # no two adjacent elements can match at one position and there is nothing to re-walk; the outer
+    # ``(?:...)+`` therefore has one parse of any prefix rather than many. The leading lookbehind is
+    # that same complement, so a delimiter-free run costs one match attempt rather than one per
+    # character -- the linear-scan property BACKLOG #1437 bought, carried onto this path rather than
+    # given back. ``tests/test_redaction.py`` pins the scan budget for both.
+    "messagefoundry/redaction.py": (
+        "f'\\\\b([A-Z][A-Z0-9]{{2}})([{chars}])[^\\\\r\\\\n]*'",
+        "f'(?<![^\\\\s{chars}])[^\\\\s{chars}]*+[{chars}][^\\\\s{chars}]*+(?:[{chars}][^\\\\s{chars}]*+)+'",
+    ),
     # BACKLOG #1478 -- the credential-label vocabulary. Unresolvable BY CONSTRUCTION and that is the
     # point: each label alternation is spliced from the SAME word tuple its admission gate is built
     # from, which is what makes gating provably non-narrowing. Writing the alternations out as
@@ -553,6 +576,17 @@ _UNSCANNABLE_RE_PATTERNS = {
     # no nested quantifier, no overlapping alternation.
     "messagefoundry/anon/surrogates.py": ("f'(?:{alt})\\\\d{{4}}'",),
     "tee/anon/surrogates.py": ("f'(?:{alt})\\\\d{{4}}'",),
+    # BACKLOG #1678 -- the orphan sweep's temp-file shape. Unresolvable BY CONSTRUCTION, and that is
+    # the point: the matcher is spliced from the SAME constants the atomic write MINTS the name from
+    # (_BLOB_SUFFIX, _META_SUFFIX, _TMP_TOKEN_BYTES), which is what stops a DELETING pattern from
+    # drifting wider than the writer's own spelling. Writing the escaped suffixes and the hex width
+    # out as literals would restore static scannability and lose exactly that coupling. The shape is
+    # bounded and non-catastrophic by inspection: every repetition is a FIXED count ({32}, and {8}
+    # from _TMP_TOKEN_BYTES * 2), the single alternation is two literal suffixes with no quantifier
+    # over it, and the whole pattern is anchored ^...\Z -- no nested quantifier, nothing to backtrack.
+    "messagefoundry/uploads.py": (
+        r"f'^\\.[0-9a-f]{{32}}(?:{re.escape(_BLOB_SUFFIX)}|{re.escape(_META_SUFFIX)})\\.[0-9a-f]{{{_TMP_TOKEN_BYTES * 2}}}\\.tmp\\Z'",
+    ),
     # a wrapper's parameter. NOTE: register_ui_action's own re.compile(pattern) stays here BY
     # CONSTRUCTION — its argument is the function's parameter — but every one of its 25 call sites is
     # now resolved through _PATTERN_WRAPPERS, so no console route pattern is unscanned. consistency.py

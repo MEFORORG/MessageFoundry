@@ -2,7 +2,11 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """A1 — pin the durable-write cost model: ``txn/msg = 3 + 2H + 2N``.
 
-`H` = handlers the router SELECTS. `N` = outbound destinations. ADR 0051 states this model and the whole
+`H` and `N` are defined ONCE, on ``QueueStore.committed_txns`` in ``messagefoundry/store/base.py`` — read
+them there rather than here (CLAUDE.md SDS-3.5). The one-line reminder: `H` = handlers the router
+SELECTS, `N` = **outbound rows**, one per `Send`, *not* distinct destinations.
+
+ADR 0051 states this model and the whole
 capacity argument rests on it — the incumbent's own spec names *"the speed of the disk of the database
 server's data drive"* as the leading performance driver, so **committed transactions per message, not
 messages per second, is the currency the disk actually serves.** Until now the model was asserted, never

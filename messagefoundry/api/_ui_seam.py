@@ -144,12 +144,19 @@ from typing import Any
 #: golden snapshot once auto-merged clean carrying both changes under a single seam. The digest is
 #: the identifier; this line is the reason.
 #:
+#: ADR 0092 / BACKLOG #1738: ``_auth.require_ui`` now imports ``api.security.enforce_phi_read_hop`` and
+#: calls it on its ``phi=True`` arm, so the /ui PHI browse routes take the posture-keyed serve-hop
+#: refusal the JSON plane has always taken. A FUNCTION the console imports at module scope, so a skew
+#: is an ImportError at mount time rather than a degraded render -- the same class as the
+#: ``factor_binding_is_blocked`` entry above, and it forces a bump for the same reason. Unnumbered:
+#: the ``vN`` labels are retired as identifiers (#1220 above); the digest is the identifier.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "8dd30734cd1e27f3"
+ENGINE_UI_SEAM: str = "00530873daf5e80d"
 
 
 @dataclass(frozen=True, slots=True)

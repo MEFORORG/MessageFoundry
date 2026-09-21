@@ -10,9 +10,9 @@
   Proves the real listener accepts + acks. (Full disposition is then confirmed in the console — a
   MANUAL row — so the tool stays dependency-light and not brittle to API specifics.)
 * store     — open the *existing* configured store backend and confirm it connects. For SQLite it
-  refuses to create the database file first (BACKLOG #1708): ``open_store``'s schema-ensure creates
-  whatever path it is handed, so the check used to PASS against a store it had just made and leave
-  the database behind — meaning it could not fail for the reason its title names.
+  refuses to create the database file first (BACKLOG #1708): ``open_store``'s schema-ensure created
+  whatever path it was handed until BACKLOG #1780, so the check used to PASS against a store it had
+  just made and leave the database behind — meaning it could not fail for the reason its title names.
 
 Synthetic HL7 only — never real PHI. The smoke message is inlined below rather than generated, so
 the verifier never imports ``messagefoundry.generators`` (BACKLOG #1192 / ASVS 15.2.3).
@@ -106,18 +106,36 @@ def _classify_self_smoke(disposition: MessageStatus, summary: str) -> CheckResul
     rid, title = "smoke.self", "Self smoke (dry-run routing)"
     if disposition is Disposition.RECEIVED:
         return CheckResult(rid, title, Status.PASS, summary)  # the preview's delivering outcome
+    if disposition is Disposition.NOT_DEPLOYED:
+        # Its own arm and its own remedy, which is the whole point of the member (BACKLOG #1690
+        # split it out of FILTERED so this gate could stop reading a decline as an author's filter).
+        # The Router and the Handler both did their job here, so the two remedies below are both
+        # wrong for it: re-pointing ``--inbound`` finds a different feed for a feed that was fine,
+        # and looking at the filter finds a filter that did not fire.
+        return CheckResult(
+            rid,
+            title,
+            Status.FAIL,
+            f"{summary} — a handler ran and produced a Send, but every destination it addressed is "
+            "present-but-not-deployed, so nothing would be delivered; deploy the outbound "
+            "connection(s) the Handler sends to, or send to one that is already deployed",
+        )
     if disposition is Disposition.UNROUTED:
         reason = "the Router selected no handler, so nothing would be delivered"
     elif disposition is Disposition.FILTERED:
-        reason = (
-            "handlers ran but produced no delivery (a filter returned nothing, or every destination "
-            "is present-but-not-deployed)"
-        )
+        # No longer "or every destination is present-but-not-deployed": that outcome is
+        # ``NOT_DEPLOYED`` above, and naming it here too is what made the two indistinguishable.
+        reason = "handlers ran but produced no delivery — a filter returned nothing"
     else:
         # Fail closed, and deliberately WITHOUT the remedy below. This arm exists for a member added
-        # after this function — ``disposition_for`` cannot reach it today — and re-pointing
-        # ``--inbound`` is not something that flag could act on for such a member. A confident wrong
-        # remedy, at the one moment an operator is reading this row, is worse than none.
+        # after this function: ``disposition_for`` returns exactly RECEIVED, UNROUTED, FILTERED and
+        # NOT_DEPLOYED, and all four are handled above. Re-pointing ``--inbound`` is not something
+        # that flag could act on for an unforeseen member, and a confident wrong remedy, at the one
+        # moment an operator is reading this row, is worse than none.
+        #
+        # This comment used to claim ``disposition_for`` could not reach any member here. That
+        # stopped being true when #1690 added NOT_DEPLOYED, and the arm silently became the handler
+        # for a live outcome it was never written for -- correct verdict, no usable next step.
         return CheckResult(
             rid,
             title,
@@ -331,10 +349,14 @@ def smoke_live(
 def missing_sqlite_store(store: StoreSettings) -> Path | None:
     """The configured SQLite path when it is absent, else ``None`` (nothing for this gate to stop).
 
-    Every ``open_store`` call in the verifier goes through this first (BACKLOG #1708). ``open_store``
-    ensures the schema and SQLite's own connect creates an absent file, so an ungated call makes the
-    store it is about to report on. Read-only intent is not enough — ``newest_message_id`` and
-    ``check_smoke_disposition`` only ever read, and both created a database to do it.
+    Every ``open_store`` call in the verifier goes through this first (BACKLOG #1708). Before
+    BACKLOG #1780 an ungated call made the store it was about to report on: SQLite's connect creates
+    an absent file and ``open_store`` ensured the schema into it. Read-only intent was not enough —
+    ``newest_message_id`` and ``check_smoke_disposition`` only ever read, and both created a database
+    to do it. ``open_store`` now refuses an absent SQLite file by default (``StoreNotFoundError``).
+    This gate still runs first, so the verifier reports its own FAIL without importing the store
+    stack. The two differ at the edges: this one uses ``is_file()``, the seam counts only
+    ``FileNotFoundError`` as absent.
 
     ``:memory:`` creates nothing on disk and so is outside what this gate exists to stop.
 
@@ -358,9 +380,9 @@ def missing_sqlite_store(store: StoreSettings) -> Path | None:
 def check_store_connectivity(store: StoreSettings) -> CheckResult:
     """Open the *existing* configured store backend, confirm it connects, then close.
 
-    For SQLite the file must already be there. ``open_store`` ensures the schema, and SQLite's own
-    connect creates an absent file, so without this gate the check created the database it then
-    reported PASS against (BACKLOG #1708) — a mistyped ``[store].path`` passed, and an operator
+    For SQLite the file must already be there. Before BACKLOG #1780 ``open_store`` ensured the schema
+    into whatever SQLite's connect created, so without this gate the check created the database it
+    then reported PASS against (BACKLOG #1708) — a mistyped ``[store].path`` passed, and an operator
     running ``verify`` elevated on a fresh box left an administrator-owned store at the configured
     path before the service started under another identity.
 

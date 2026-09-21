@@ -49,7 +49,7 @@ import re
 from collections.abc import Callable, Mapping
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, NamedTuple
 
 from messagefoundry.config.db_lookup import DbLookupError
 from messagefoundry.config.models import (
@@ -64,6 +64,7 @@ from messagefoundry.config.settings import (
     insecure_tls_allowed,
 )
 from messagefoundry.config.tls_policy import InsecureHopRefused, current_hop_posture
+from messagefoundry.redaction import safe_exc
 from messagefoundry.transports.base import (
     DEFAULT_MAX_ITEMS_PER_POLL,
     DeliveryError,
@@ -162,8 +163,10 @@ def _build_dsn(s: dict[str, Any], *, read_only: bool = False, attested: bool = F
     ``read_only`` (only the db_lookup pool sets it; destination/source omit it, keeping their DSN
     byte-identical) appends ``ApplicationIntent=ReadOnly`` so the connection advertises read-only intent
     — defense-in-depth for the ADR 0010 read-only carve-out, layered with the statement guard in
-    :func:`_require_read_only` (note: ApplicationIntent is only honored by a SQL Server Always-On read
-    replica, a no-op otherwise — the statement guard is the load-bearing control)."""
+    :func:`_require_read_only`. **Neither layer is read-only authority.** ApplicationIntent is honored
+    only by a SQL Server Always-On read replica and is a no-op otherwise, and a statement guard is a
+    shape test on text. The control that actually refuses a write is the privilege of the account this
+    DSN dials, which only the operator can set (``docs/CONNECTIONS.md``, BACKLOG #1574)."""
     encrypt = bool(s.get("encrypt", True))
     trust = bool(s.get("trust_server_certificate", False))
     if (trust or not encrypt) and not _weakened_tls_permitted(attested=attested):
@@ -556,50 +559,146 @@ def _build_connection(
     raise ValueError(f"DATABASE dialect must be 'sqlserver' or 'generic', got {dialect!r}")
 
 
-# A leading SQL line comment (`-- ...` to end of line) or block comment (`/* ... */`). Stripped (with
-# leading whitespace) before the read-only check so a commented preamble can't mask a write statement.
-_SQL_LEADING_COMMENT_RE = re.compile(r"^\s*(?:--[^\n]*\n|/\*.*?\*/)", re.DOTALL)
+# One bare SQL word token. The T-SQL sigils (`@var`, `@@ROWCOUNT`, `#temp`) are part of the token, so
+# `#delete` reads as one identifier rather than as the `DELETE` keyword.
+_SQL_WORD_RE = re.compile(r"[@#]{0,2}[A-Za-z_][A-Za-z0-9_$#@]*")
+
+# Write/authority keywords refused anywhere outside a string literal, a quoted identifier or a comment.
+# `INTO` is here because `SELECT ... INTO copy` writes a table while still opening with `SELECT`; the
+# CTE-terminal forms (`WITH c AS (...) DELETE ...`) fall to the same scan. DDL is included for the
+# reason a chained `DROP` is refused: a lookup has no business carrying it.
+_SQL_WRITE_KEYWORDS = frozenset(
+    {
+        "ALTER",
+        "CREATE",
+        "DELETE",
+        "DENY",
+        "DROP",
+        "EXEC",
+        "EXECUTE",
+        "GRANT",
+        "INSERT",
+        "INTO",
+        "MERGE",
+        "REVOKE",
+        "TRUNCATE",
+        "UPDATE",
+    }
+)
+
+# Keywords that are also ordinary scalar FUNCTIONS in at least one supported dialect, so a `(` directly
+# after one means a call rather than a statement: MySQL has `INSERT(str,pos,len,new)` and
+# `TRUNCATE(n,d)`. `EXEC`/`EXECUTE` are deliberately NOT here — T-SQL `EXEC('...')` is dynamic SQL,
+# the exact shape this gate exists to refuse.
+_SQL_FUNCTION_FORM_KEYWORDS = frozenset({"INSERT", "TRUNCATE"})
+
+_READ_ONLY_MESSAGE = (
+    "db_lookup statement must be a read-only SELECT/WITH query "
+    "(no writes, no EXEC, no multiple statements)"
+)
+
+
+def _scan_sql_tokens(statement: str) -> list[tuple[str, str]]:
+    """Tokenize ``statement`` into ``(kind, text)`` pairs, dropping comments and the contents of string
+    literals and quoted identifiers.
+
+    ``kind`` is ``"word"`` (text upper-cased) or ``"other"`` (one character, ``;`` included).
+    Single-quoted strings and double-quoted / ``[...]``-bracketed / backtick-quoted identifiers are
+    consumed whole, doubled-delimiter escapes included, so a keyword *inside* one is data and never a
+    token. T-SQL block comments nest, so the scan tracks depth.
+
+    An unterminated literal or comment raises :class:`DbLookupError`: the rest of such a statement
+    cannot be read, and guessing at it is how a shape-based gate gets bypassed."""
+    tokens: list[tuple[str, str]] = []
+    i, n = 0, len(statement)
+    while i < n:
+        ch = statement[i]
+        if ch.isspace():
+            i += 1
+            continue
+        if statement.startswith("--", i):
+            nl = statement.find("\n", i)
+            i = n if nl == -1 else nl + 1
+            continue
+        if statement.startswith("/*", i):
+            depth, i = 1, i + 2
+            while i < n and depth:
+                if statement.startswith("/*", i):
+                    depth, i = depth + 1, i + 2
+                elif statement.startswith("*/", i):
+                    depth, i = depth - 1, i + 2
+                else:
+                    i += 1
+            if depth:
+                raise DbLookupError(f"{_READ_ONLY_MESSAGE}; unterminated block comment")
+            continue
+        if ch in "'\"[`":
+            closer = "]" if ch == "[" else ch
+            i += 1
+            while True:
+                if i >= n:
+                    raise DbLookupError(f"{_READ_ONLY_MESSAGE}; unterminated quoted text")
+                if statement[i] == closer:
+                    if i + 1 < n and statement[i + 1] == closer:  # doubled = an escaped delimiter
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+            continue
+        m = _SQL_WORD_RE.match(statement, i)
+        if m:
+            tokens.append(("word", m.group(0).upper()))
+            i = m.end()
+            continue
+        tokens.append(("other", ch))
+        i += 1
+    return tokens
 
 
 def _require_read_only(statement: str) -> None:
     """Enforce the ADR 0010 db_lookup read-only carve-out at the statement layer (defense-in-depth with
     ``ApplicationIntent=ReadOnly`` + a recommended ``db_datareader``-only login).
 
-    After stripping any leading SQL comments/whitespace the statement must begin (case-insensitive) with
-    ``SELECT`` or ``WITH`` and must not chain a second statement (a ``;`` followed by more SQL). This is
-    a conservative lightweight gate, not a full SQL parser: it blocks ``INSERT``/``UPDATE``/``DELETE``/
-    ``MERGE``/``EXEC`` and multi-statement smuggling so a crash-replay of the transform can't silently
-    double-apply a write the at-least-once reliability model assumes is impossible. Raises
-    :class:`DbLookupError` (PHI-free — never echoes the statement text) on violation."""
-    stripped = statement
-    while True:
-        m = _SQL_LEADING_COMMENT_RE.match(stripped)
-        if not m:
-            break
-        stripped = stripped[m.end() :]
-    stripped = stripped.lstrip()
-    head = stripped[:6].upper()
-    if not (head.startswith("SELECT") or head.startswith("WITH")):
-        raise DbLookupError(
-            "db_lookup statement must be a read-only SELECT/WITH query "
-            "(no writes, no EXEC, no multiple statements)"
-        )
-    # Reject a chained second statement: any ';' followed by non-whitespace/non-comment text. A single
-    # trailing ';' (optionally followed by whitespace/comments) is fine.
-    for idx, ch in enumerate(stripped):
-        if ch != ";":
+    The statement is tokenized (:func:`_scan_sql_tokens`), so comments, string literals and quoted
+    identifiers are skipped, and then three rules apply:
+
+    1. it must *begin* (after comments and whitespace) with the word ``SELECT`` or ``WITH``;
+    2. no write or authority keyword (at least ``INSERT``/``UPDATE``/``DELETE``/``MERGE``/``INTO``/
+       ``EXEC``, plus DDL — :data:`_SQL_WRITE_KEYWORDS`) may appear outside a literal or a comment;
+    3. nothing may follow a ``;`` (no chained second statement); a trailing one is fine.
+
+    Rule 2 is what makes this a read-only test rather than a leading-token test. Opening with ``SELECT``
+    or ``WITH`` never implied the rest was a read: ``SELECT * INTO copy FROM patients`` writes a table,
+    ``WITH c AS (...) DELETE FROM patients`` writes through a CTE, and T-SQL needs no ``;`` between
+    statements, so ``SELECT 1 UPDATE patients SET mrn='X'`` is two statements that rule 3 cannot see.
+    All three passed the former leading-token gate (BACKLOG #1574, #1658).
+
+    This is still a lightweight gate and not a SQL parser, and a statement test is not read-only
+    *authority*: a keyword scan cannot follow a write executed on a linked server through a
+    pass-through literal, so the account itself should be read-only (``docs/CONNECTIONS.md``). Raises
+    :class:`DbLookupError` on violation. The message stays PHI-free — it never echoes statement text,
+    and any keyword it names comes from the fixed vocabulary above, never from operator data."""
+    tokens = _scan_sql_tokens(statement)
+    if not tokens or tokens[0] not in (("word", "SELECT"), ("word", "WITH")):
+        raise DbLookupError(_READ_ONLY_MESSAGE)
+    last = len(tokens) - 1
+    for index, (kind, text) in enumerate(tokens):
+        if kind != "word":
+            # A ';' is tolerated only as the final token (a statement terminator); anything after one
+            # is a second statement, whatever that statement starts with.
+            if text == ";" and index != last:
+                raise DbLookupError(_READ_ONLY_MESSAGE)
             continue
-        rest = stripped[idx + 1 :]
-        while True:
-            m = _SQL_LEADING_COMMENT_RE.match(rest)
-            if not m:
-                break
-            rest = rest[m.end() :]
-        if rest.strip():
-            raise DbLookupError(
-                "db_lookup statement must be a read-only SELECT/WITH query "
-                "(no writes, no EXEC, no multiple statements)"
-            )
+        if text not in _SQL_WRITE_KEYWORDS:
+            continue
+        if (
+            text in _SQL_FUNCTION_FORM_KEYWORDS
+            and index != last
+            and tokens[index + 1] == ("other", "(")
+        ):
+            continue  # a scalar function call that shares the keyword's name, not a statement
+        raise DbLookupError(f"{_READ_ONLY_MESSAGE}; found a '{text}' keyword")
     return None
 
 
@@ -643,13 +742,46 @@ def _is_transient(sqlstate: str) -> bool:
     return sqlstate[:2] in _TRANSIENT_PREFIXES or sqlstate in _TRANSIENT_STATES
 
 
+# The native error code an ODBC driver appends to its own message text, ANCHORED on the trailing
+# ``(SQLFunctionName)`` the driver always writes after it — ``... (2627) (SQLExecDirectW)``. Both the
+# SQL Server driver and psqlODBC use this shape, which is why :func:`_driver_code` can share one
+# pattern with :func:`messagefoundry.store.sqlserver._is_lock_timeout`'s substring convention.
+#
+# THE ANCHOR AND THE DIGIT BOUND ARE THE WHOLE POINT, not tidiness (BACKLOG #1661). A bare
+# ``\((\d+)\)`` lifts ``(900123456)`` straight out of ``The duplicate key value is (900123456).`` —
+# it would re-introduce, through the extractor, exactly the leak this function stopped interpolating.
+# So: at most six digits, an ODBC function name required immediately after, and the LAST match wins
+# (the driver's suffix is always last, so a crafted value earlier in the text cannot outrank it).
+# *Residual:* a partner-supplied value ending in a literal ``) (SQLx`` could still present 1-6 of its
+# own digits here. It is self-chosen, bounded to six characters, and no real driver text ends that
+# way; the alternative — dropping the code — costs the operator the only field that separates a PK
+# violation (2627) from a unique-index violation (2601) under one generic SQLSTATE.
+_DRIVER_CODE_RE = re.compile(r"\((\d{1,6})\)\s*\(SQL[A-Za-z]+\)")
+
+
+def _driver_code(message: str) -> str | None:
+    """The driver's native error number from ``message``, or ``None`` when it carries none."""
+    found = _DRIVER_CODE_RE.findall(message)
+    return str(found[-1]) if found else None
+
+
 def _classify_db_error(sqlstate: str, message: str) -> DeliveryError:
     """Map a DB error's SQLSTATE to a transient :class:`DeliveryError` (retry) or a permanent
-    :class:`NegativeAckError` (dead-letter)."""
+    :class:`NegativeAckError` (dead-letter), with **PHI-free** text.
+
+    ``message`` is read for its SQLSTATE and native error number and is **never interpolated**
+    (BACKLOG #1661). Driver text embeds the offending value on exactly the failures this connector
+    meets most — SQL Server 2627/2601 (``The duplicate key value is (...)``) and PostgreSQL 23505
+    (``Key (mrn)=(...) already exists``) — and the returned error is persisted to ``queue.last_error``
+    and ``message_events.detail`` and rendered into the ``connection_error`` alert, so interpolating
+    it would carry a partner's identifier into all three on a first deployment. The same rule the
+    ``db_lookup`` arm already follows: name the SQLSTATE, never the statement, params or rows."""
+    code = _driver_code(message)
+    detail = f"[{sqlstate}]" + (f" driver error {code}" if code else "")
     if _is_transient(sqlstate):
-        return DeliveryError(f"database transient error [{sqlstate}]: {message}")
+        return DeliveryError(f"database transient error {detail}")
     return NegativeAckError(
-        f"database rejected the statement [{sqlstate}]: {message}",
+        f"database rejected the statement {detail}",
         code=sqlstate or "db",
         permanent=True,
     )
@@ -663,6 +795,24 @@ def _sqlstate(exc: BaseException) -> str | None:
     if args and isinstance(args[0], str) and len(args[0]) == 5 and args[0].isalnum():
         return args[0]
     return None
+
+
+def _safe_db_error(exc: BaseException) -> str:
+    """A PHI-free rendering of a failure for a LOG line, the log-side twin of
+    :func:`_classify_db_error` (BACKLOG #1661).
+
+    A driver error renders as its type, SQLSTATE and native error number — the message is read, never
+    quoted. ``safe_exc`` is NOT enough on its own here and the difference is measured: fed the SQL
+    Server 2627 text, it keeps ``Cannot insert duplicate key ... The duplicate key value is (4242``
+    because ``redact`` sees no HL7 delimiters and no name run, and the 200-character bound cuts the
+    identifier in the middle rather than removing it. Anything without a SQLSTATE is not a driver
+    error, carries no embedded column value by construction, and keeps the ``safe_exc`` rendering —
+    which is the more useful text for a bug or an unreachable host."""
+    state = _sqlstate(exc)
+    if state is None:
+        return safe_exc(exc)
+    code = _driver_code(str(exc))
+    return f"{type(exc).__name__} [{state}]" + (f" driver error {code}" if code else "")
 
 
 def _import_aioodbc() -> Any:
@@ -746,7 +896,7 @@ async def _probe_db(
         raise (
             _classify_db_error(state, str(exc))
             if state
-            else DeliveryError(f"DATABASE connect failed: {exc}")
+            else DeliveryError(f"DATABASE connect failed: {safe_exc(exc)}")
         ) from exc
     cur: Any = None
     try:
@@ -757,7 +907,7 @@ async def _probe_db(
         raise (
             _classify_db_error(state, str(exc))
             if state
-            else DeliveryError(f"DATABASE probe failed: {exc}")
+            else DeliveryError(f"DATABASE probe failed: {safe_exc(exc)}")
         ) from exc
     finally:
         await _close_cursor(cur)
@@ -1000,6 +1150,34 @@ class DatabaseDestination(DestinationConnector):
             self._pool = None
 
 
+#: How many undecodable rows ONE poll will step past before it stops fetching and defers the rest
+#: (BACKLOG #1662). A flat number rather than a multiple of ``poll_max_rows``, so it holds for a
+#: ceiling of 1 as well as the shipped 500: one poll pulls at most ``poll_max_rows + 64`` rows out of
+#: the driver, and logs at most 64 skip lines, which is already fewer than the 500 the shipped code
+#: could log for one misconfigured column.
+#:
+#: **A stop rule re-creates the starvation it was written against whenever the poison run is longer
+#: than the bound**, so the bound alone is not the answer and is not asked to be: the dominant case,
+#: a ``body_column`` that names no selected column, is caught once per poll before any row is read,
+#: and never reaches this budget at all. What is left here is genuinely per-row (an undecodable BLOB,
+#: an unserializable column type), where a run of more than 64 in front of the good rows means a
+#: table one poll cannot repair — and the operator gets 64 ``row_undecodable`` events saying so.
+_MAX_SKIPPED_ROWS_PER_POLL = 64
+
+
+class _PolledBatch(NamedTuple):
+    """What one poll took from ``poll_statement``.
+
+    ``rows`` are ``(record, body)`` pairs that decoded; ``skipped`` carries one PHI-free reason per
+    row that could not become a body; ``skip_budget_spent`` says this poll stopped fetching early
+    because it hit :data:`_MAX_SKIPPED_ROWS_PER_POLL`. Reasons are carried out rather than reported
+    in place so the pool connection is released before anything is logged or emitted."""
+
+    rows: list[tuple[dict[str, Any], str]]
+    skipped: list[str]
+    skip_budget_spent: bool
+
+
 class DatabaseSource(SourceConnector):
     """Poll a SQL table on an interval, hand each row to the pipeline handler, then mark it processed.
 
@@ -1149,20 +1327,45 @@ class DatabaseSource(SourceConnector):
             logger.debug("DATABASE source skipping polling (not leader; another node ingests it)")
         return False
 
+    async def _emit_event(self, kind: str, *, reason: str | None = None) -> None:
+        """Fire one connection event (ADR 0021) to the runner-injected sink, **fail-soft**: an event
+        problem must never wedge the poll loop (pure observer). No-op when the sink is unset — capture
+        off, or a direct caller / test — so that path stays byte-identical.
+
+        No ``peer_host``: a poll source dials OUT to an operator-configured server, so there is no
+        peer address to report and the column stays ``NULL``, unlike the listen sources."""
+        sink = self.on_connection_event
+        if sink is None:
+            return
+        try:
+            await sink(kind, None, reason)
+        except Exception as exc:  # noqa: BLE001 - observer only; a capture bug can't stop ingest
+            logger.warning("DATABASE connection-event emit failed: %s", safe_exc(exc))
+
     async def _poll_once(self) -> None:
         assert self._handler is not None
-        columns, rows = await self._select()
-        for row in rows:
+        batch = await self._select()
+        for reason in batch.skipped:
+            # A row that cannot become a body is skipped, and the shipped code said so ONLY to the
+            # logger — no handler call, no mark, no store row, no event — so an operator watching the
+            # console saw a silent connection (BACKLOG #1662). The event is the visibility half.
+            #
+            # It is still NOT marked, and that stays deliberate: mark_statement is an operator-authored
+            # UPDATE, so marking a row that never became a message would record data DONE that was
+            # never ingested. There is no store disposition to record either — a row the source could
+            # not read was never a received message, the same reading the file sources apply to an
+            # oversize or unscannable drop.
+            logger.error("DATABASE source: %s; skipping row", reason)
+            await self._emit_event("row_undecodable", reason=reason)
+        if batch.skip_budget_spent:
+            logger.error(
+                "DATABASE source skipped %d undecodable rows in one poll and stopped fetching; the "
+                "rest of the result set is deferred to the next poll (nothing dropped or marked)",
+                len(batch.skipped),
+            )
+        for record, body in batch.rows:
             if self._stop.is_set():
                 break  # shutting down — leave the rest unmarked for the next start (at-least-once)
-            record = dict(zip(columns, row))  # noqa: B905
-            try:
-                body = self._body(record)
-            except (ValueError, TypeError) as exc:
-                # A row we can't turn into a body (missing body_column, unserializable value) is a
-                # config/data error for that row — log and skip it rather than wedging the batch.
-                logger.error("DATABASE source: %s; skipping row", exc)
-                continue
             try:
                 await self._handler(body.encode(self._encoding))
             except Exception as exc:
@@ -1171,7 +1374,8 @@ class DatabaseSource(SourceConnector):
                 # failed). Leave the row UNMARKED so the next poll re-emits it (at-least-once) — marking
                 # it now would drop a received-but-unrecorded message (mirrors the File source's M-15).
                 logger.warning(
-                    "DATABASE source handler failed (row left unmarked, will retry): %s", exc
+                    "DATABASE source handler failed (row left unmarked, will retry): %s",
+                    safe_exc(exc),
                 )
                 continue
             try:
@@ -1179,54 +1383,115 @@ class DatabaseSource(SourceConnector):
             except Exception as exc:
                 # The handler already ingested the message; a mark failure means the row re-emits next
                 # poll (a duplicate — at-least-once). Log and move on rather than abort the batch tail.
+                # _safe_db_error, not safe_exc: a mark is an UPDATE bound from the row's own columns,
+                # so the driver's rejection text quotes the bound value straight back, and safe_exc
+                # is measured to keep a partial copy of it (BACKLOG #1661).
                 logger.warning(
-                    "DATABASE source mark failed (row will re-emit, a duplicate): %s", exc
+                    "DATABASE source mark failed (row will re-emit, a duplicate): %s",
+                    _safe_db_error(exc),
                 )
 
-    async def _select(self) -> tuple[list[str], list[Any]]:
-        """Run ``poll_statement`` and return ``(column_names, rows)``, at most ``poll_max_rows`` of them.
-        The connection is released before the rows are handed to the (possibly slow) handler, so a batch
-        never holds a pool connection hostage to downstream store I/O.
+    async def _select(self) -> _PolledBatch:
+        """Run ``poll_statement``, decode each row into a body, and return the decodable ones (at most
+        ``poll_max_rows``) plus a PHI-free reason per row that could not be decoded. The connection is
+        released before the rows are handed to the (possibly slow) handler, so a batch never holds a
+        pool connection hostage to downstream store I/O.
 
-        **The ceiling is charged at the FETCH, not after it.** ``fetchmany`` leaves the rest of the
-        result set in the driver and the cursor is closed on the way out, so a poll of a table holding a
-        million rows pulls exactly the ceiling into memory rather than all of them — the ``fetchall``
-        this replaced materialised the whole set before anything could bound it.
-        The rows not taken are untouched in the table, so the next poll re-runs ``poll_statement`` and
-        takes the next batch; nothing is dropped, errored or marked. Progress depends on the
-        ``mark_statement`` removing a handled row from ``poll_statement``'s own predicate, which is the
-        shape this connector already documents and requires — without a mark the same rows re-emit every
-        poll, ceiling or no ceiling.
+        **Decoding happens HERE, under the open cursor, and that is what lets the ceiling count rows
+        that produced something** (BACKLOG #1662). ``_body`` is pure, synchronous and cheap — a dict
+        lookup or a ``json.dumps`` — so running it at the fetch costs nothing extra and means a row the
+        source cannot read is replaced rather than spending a ceiling slot on nothing. The shipped code
+        charged the ceiling at the fetch and skipped the row afterwards, so one undecodable row sorting
+        first starved a ``poll_max_rows=1`` feed forever: three polls handled nothing and the good row
+        behind it was never reached.
 
-        A falsy ``poll_max_rows`` disables the ceiling and restores the unbounded ``fetchall``."""
+        **The ceiling is still charged at the FETCH, not after it**, and the memory contract it exists
+        for is intact: each fetch asks only for what is still missing, so one poll pulls at most
+        ``poll_max_rows`` plus :data:`_MAX_SKIPPED_ROWS_PER_POLL` rows out of the driver, never the
+        whole result set. This is **not** the file sources' rule and must not be described as parity
+        with them: they charge on COMPLETION and can afford to, because a directory listing is already
+        in hand, while here the point of the ceiling is that the rest of the result set never leaves
+        the driver. What is shared is the reason behind it, which the file source states as *a budget
+        can only be charged by something that makes progress*.
+
+        **Undecodable rows are bounded two ways, and the bound is why this is not a log flood.** The
+        dominant ``_body`` failure is static — ``body_column`` naming a column ``poll_statement`` does
+        not select fails EVERY row — so that one is checked ONCE per poll against the cursor's own
+        description and returns immediately with a single reason, where the shipped code logged once
+        per row up to the ceiling. Everything else (an undecodable BLOB, an unserializable column type)
+        is per-row: it is skipped and replaced, up to :data:`_MAX_SKIPPED_ROWS_PER_POLL`, after which
+        this poll stops fetching and leaves the rest for the next one.
+
+        Rows not taken are untouched in the table, so the next poll re-runs ``poll_statement`` and takes
+        the next batch; nothing is dropped, errored or marked. Progress depends on the ``mark_statement``
+        removing a handled row from ``poll_statement``'s own predicate, which is the shape this connector
+        already documents and requires — without a mark the same rows re-emit every poll, ceiling or no
+        ceiling.
+
+        A falsy ``poll_max_rows`` disables the ceiling and restores the unbounded ``fetchall``; the skip
+        budget still applies there, bounding this poll's log and event volume the same way."""
         pool = await self._get_pool()
         conn = await _acquire(pool, self._acquire_timeout)
         cur: Any = None
+        rows: list[tuple[dict[str, Any], str]] = []
+        skipped: list[str] = []
+        budget_spent = False
+        ceiling = self._poll_max_rows
         try:
             cur = await conn.cursor()
             await cur.execute(self._poll_sql)
             columns = [d[0] for d in cur.description]
-            if self._poll_max_rows is None:
-                rows = list(await cur.fetchall())
-            else:
-                # Exactly the ceiling, NOT ceiling+1. The +1 probe is the usual idiom for "is there
-                # more?", and it is wrong here: this connector's rows can carry a message BODY
-                # (`body_column`), so the probe row would marshal a whole payload out of the driver
-                # and discard it on every poll — hundreds of KB every `poll_seconds` to decide one
-                # word in a log line. A full batch is the signal instead: it means the ceiling bound
-                # this poll, and cannot distinguish "exactly N remained" from "more remain", which is
-                # why the message says at least rather than naming a remainder.
-                rows = list(await cur.fetchmany(self._poll_max_rows))
-                if len(rows) == self._poll_max_rows:
-                    logger.info(
-                        "DATABASE source filled poll_max_rows (%s) this poll; any remaining rows are "
-                        "left for the next poll (deferred, not dropped)",
-                        self._poll_max_rows,
-                    )
+            if self._body_column is not None and self._body_column not in columns:
+                # Static: this fails every row in every poll, so say it once and fetch nothing. The
+                # reason names the operator's own configured column, never a row value.
+                return _PolledBatch(
+                    [],
+                    [
+                        f"body_column {self._body_column!r} is not in the poll_statement result "
+                        f"columns"
+                    ],
+                    False,
+                )
+            want = 0
+            while True:
+                if ceiling is None:
+                    batch = list(await cur.fetchall())
+                else:
+                    # Exactly what is still missing, NOT ceiling+1. The +1 probe is the usual idiom
+                    # for "is there more?", and it is wrong here: this connector's rows can carry a
+                    # message BODY (`body_column`), so the probe row would marshal a whole payload out
+                    # of the driver and discard it on every poll — hundreds of KB every `poll_seconds`
+                    # to decide one word in a log line. A full batch is the signal instead: it means
+                    # the ceiling bound this poll, and cannot distinguish "exactly N remained" from
+                    # "more remain", which is why the message says at least rather than naming a
+                    # remainder.
+                    want = ceiling - len(rows)
+                    batch = list(await cur.fetchmany(want))
+                for raw in batch:
+                    record = dict(zip(columns, raw))  # noqa: B905
+                    try:
+                        body = self._body(record)
+                    except (ValueError, TypeError) as exc:
+                        skipped.append(safe_exc(exc))
+                        if len(skipped) >= _MAX_SKIPPED_ROWS_PER_POLL:
+                            budget_spent = True
+                            break
+                        continue
+                    rows.append((record, body))
+                if ceiling is None or budget_spent or len(batch) < want or len(rows) >= ceiling:
+                    # A short batch means the driver is out of rows, so there is nothing to top up
+                    # with — the ONLY reason to fetch again is a skip, and then only for the shortfall.
+                    break
+            if ceiling is not None and len(rows) == ceiling:
+                logger.info(
+                    "DATABASE source filled poll_max_rows (%s) this poll; any remaining rows are "
+                    "left for the next poll (deferred, not dropped)",
+                    ceiling,
+                )
         finally:
             await _close_cursor(cur)
             await pool.release(conn)
-        return columns, rows
+        return _PolledBatch(rows, skipped, budget_spent)
 
     def _body(self, record: dict[str, Any]) -> str:
         """The body for one row: a single column verbatim (``body_column``) or the whole row as JSON."""
@@ -1297,12 +1562,26 @@ class DatabaseLookupExecutor:
     ``DatabaseLookup`` specs (``env()``-resolved + ``[egress].allowed_db``-checked by the runner). Lazily
     opens one read-only ``aioodbc`` pool per named connection; :meth:`query` runs on the engine loop,
     while ``db_lookup`` bridges to it from the handler's worker thread via ``run_coroutine_threadsafe``.
-    Reuses the DATABASE connector's DSN build / named-parameter translation / SQLSTATE extraction. Pools
-    are autocommit — a lookup is read-only, so each query is its own implicit transaction; nothing here
-    writes. **Read-only is enforced** (ADR 0010), not merely documented: every statement is gated by
-    :func:`_require_read_only` (must begin SELECT/WITH, no chained writes/EXEC) and the pool DSN carries
-    ``ApplicationIntent=ReadOnly`` (``_build_dsn(read_only=True)``). Production / supported (SQL Server
-    via the ``[sqlserver]`` extra), like the DATABASE connector."""
+    Reuses the DATABASE connector's DSN build / named-parameter translation / SQLSTATE extraction.
+
+    **Read-only here is a statement test, not read-only authority, and the difference is load-bearing.**
+    Two layers sit in front of a lookup: :func:`_require_read_only` refuses a statement that does not
+    open with SELECT/WITH or that carries a write/EXEC keyword or a chained statement, and the pool DSN
+    carries ``ApplicationIntent=ReadOnly`` (``_build_dsn(read_only=True)``). Neither is authority.
+    ApplicationIntent is honored only by a SQL Server Always-On read replica and is a no-op elsewhere
+    (:func:`_build_dsn`), and pools here are opened **autocommit**, so a write that got past the
+    statement test would commit rather than be rolled back. What actually bounds this connection is the
+    privilege of the account it dials, which only the operator can set — see ``docs/CONNECTIONS.md``
+    (BACKLOG #1574). ADR 0010 states the same shape as a read-only *convention*: "the executor neither
+    commits nor exposes a write path."
+
+    Pools are autocommit because each lookup is a single self-contained read; T-SQL has no
+    ``SET TRANSACTION READ ONLY``, so there is no read-only transaction to open in its place.
+
+    Production / supported (SQL Server via the ``[sqlserver]`` extra), like the DATABASE connector.
+    ``db_lookup`` is SQL-Server-only: ``__init__`` calls :func:`_build_dsn` directly rather than the
+    :func:`_build_connection` dialect dispatcher, so the ``generic`` ODBC dialect the DATABASE connector
+    accepts is not reachable from here (ADR 0010, "SQL Server backend only")."""
 
     def __init__(self, connections: Mapping[str, Mapping[str, Any]]) -> None:
         # connections: name -> already-env-resolved settings (the runner substitutes env() first).
@@ -1351,8 +1630,10 @@ class DatabaseLookupExecutor:
         """Run ``statement`` against ``connection`` and return rows as ``{column: value}`` dicts.
 
         Always parameterized (``:name`` → positional ``?``, bound from ``params`` — a value can never
-        inject SQL) and **read-only enforced** (the statement must be a SELECT/WITH query — see
-        :func:`_require_read_only`). Raises :class:`DbLookupError` (PHI-free) on an unknown connection, a
+        inject SQL) and statement-gated: the text must pass :func:`_require_read_only` (a SELECT/WITH
+        query carrying no write keyword and no second statement) before anything executes. That gate is
+        a statement test, not read-only authority — see this class's docstring for what actually bounds
+        the connection. Raises :class:`DbLookupError` (PHI-free) on an unknown connection, a
         non-read-only statement, a missing parameter, or a DB/driver error — the transform worker turns
         it into that message's ``ERROR`` /
         dead-letter disposition. Runs on the engine loop (the handler thread bridges in via
