@@ -940,7 +940,9 @@ class RegistryRunner:
         # Event set, so 'stopped' means truly quiesced, not merely "won't claim new".
         self._outbound_quiesced: dict[str, asyncio.Event] = {}
         # per_lane-mode resume Events: the delivery worker awaits its lane's Event at the loop-top pause
-        # gate; start_outbound sets it. Unused in pooled mode (the dispatcher's resume_lane re-arms).
+        # gate; start_outbound sets it. Unused for a lane the pooled OUTBOUND dispatcher drains (its
+        # resume_lane re-arms instead) — but a pooled ordering=unordered lane keeps its own worker
+        # and therefore its own gate (ADR 0066 D4), so this is NOT empty under pooled.
         self._outbound_resume: dict[str, asyncio.Event] = {}
         # Which of _outbound_paused this ENGINE parked (auto_start=False #115 / deployed=False #233) as
         # opposed to an OPERATOR pausing it. Both reuse _outbound_paused (so every consumer — status,
@@ -1305,6 +1307,8 @@ class RegistryRunner:
         """Wake every pooled lane that runs its own delivery worker — the OUTBOUND half of a broadcast
         (``notify_work`` / a reload nudge) that the dispatchers cannot carry, because no dispatcher
         speaks for these lanes. A no-op in per_lane mode and on a graph with no UNORDERED outbound."""
+        if not self._worker_owned:
+            return  # per_lane mode, or a pooled graph with no outbound decided yet
         lanes = [name for name, owned in self._worker_owned.items() if owned]
         if not lanes:
             return
@@ -5184,7 +5188,7 @@ class RegistryRunner:
                 # claim that RAISES is not timed (the worker's outer except logs it and backs off); a
                 # timeout-capped duration would distort the claim-latency figure this measures.
                 _claim_t0 = time.perf_counter_ns() if self._delivery_phase_timing else 0
-                if self._ordering.get(name, self._ordering_default) is OrderingMode.FIFO:
+                if self._lane_ordering(name) is OrderingMode.FIFO:
                     # FIFO: claim only the due head; the head blocks the lane while it backs off. Under
                     # active-passive HA the graph runs on the leader ONLY, so one node drains this lane;
                     # the Postgres claim also reclaims a prior leader's stranded head for failover FIFO.

@@ -320,7 +320,6 @@ async def test_pooled_default_rotates_past_a_backing_off_head_on_an_unordered_la
         await _wait_until(lambda: len(sink) >= 5)
         assert "p0" in attempts  # the head WAS tried, so its absence below is a pass-over
         assert sorted(payload for _, payload in sink) == [f"p{i}" for i in range(1, 6)]
-        assert all(payload != "p0" for _, payload in sink)
     finally:
         await runner.stop()
 
