@@ -128,9 +128,11 @@ from messagefoundry.store.store import (
     ClaimedHeads,
     ClaimProcStatus,
     ConnectionEvent,
+    ConnectionEventWrite,
     ConnectionMetrics,
     DbStatus,
     DestinationMetrics,
+    FederatedUnbind,
     InboundMetrics,
     LatencyHistogram,
     MessageSearchResult,
@@ -4166,10 +4168,46 @@ class PostgresStore:
         reason: str | None = None,
         now: float | None = None,
     ) -> None:
-        # Pure observer: a single short INSERT in its own statement — no queue row, no finalizer, never
-        # inside a handoff txn. reason rides the safe_text PHI chokepoint (#120) + the cipher. Bound to
-        # (connection, ts, kind) — the id is BIGSERIAL, unknown here (ASVS 11.3.3).
-        now = time.time() if now is None else now
+        # Pure observer: no queue row, no finalizer, never inside a handoff txn. A burst of one, so
+        # the scrub and seal live in ONE place for both writers.
+        await self.record_connection_events(
+            [
+                ConnectionEventWrite(
+                    connection=connection,
+                    transport=transport,
+                    direction=direction,
+                    kind=kind,
+                    peer_host=peer_host,
+                    message_id=message_id,
+                    reason=reason,
+                    now=now,
+                )
+            ]
+        )
+
+    async def record_connection_events(self, events: Sequence[ConnectionEventWrite]) -> None:
+        # A burst in ONE transaction (BACKLOG #1731): one commit per drained burst, not per event.
+        # record=False keeps this diagnostic side path out of the worker acquire-wait histogram, the
+        # same exemption the low-frequency convenience helpers take.
+        rows = [self._connection_event_params(ev) for ev in events]
+        if not rows:
+            return
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+            await conn.executemany(
+                "INSERT INTO connection_event"
+                " (ts, connection, transport, direction, kind, peer_host, message_id, reason)"
+                " VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+                rows,
+            )
+
+    def _connection_event_params(self, ev: ConnectionEventWrite) -> tuple[Any, ...]:
+        """The INSERT parameters for one connection event. ``reason`` rides the safe_text PHI
+        chokepoint (#120), then the cipher."""
+        now = ev.get("now")
+        if now is None:
+            now = time.time()
+        connection, kind, reason = ev["connection"], ev["kind"], ev["reason"]
+        # Bound to (connection, ts, kind) — the id is BIGSERIAL, unknown here (ASVS 11.3.3).
         reason_enc = (
             self._enc(
                 safe_text(reason)[:200],
@@ -4178,17 +4216,14 @@ class PostgresStore:
             if reason
             else None
         )
-        await self._pool.execute(
-            "INSERT INTO connection_event"
-            " (ts, connection, transport, direction, kind, peer_host, message_id, reason)"
-            " VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+        return (
             now,
             connection,
-            transport,
-            direction,
+            ev["transport"],
+            ev["direction"],
             kind,
-            peer_host,
-            message_id,
+            ev["peer_host"],
+            ev["message_id"],
             reason_enc,
         )
 
@@ -7036,6 +7071,49 @@ class PostgresStore:
             user_id,
         )
 
+    async def clear_user_federated_subject(
+        self, user_id: str, *, now: float | None = None
+    ) -> FederatedUnbind | None:
+        """Unbind the federated pair and revoke the account's live sessions in one transaction
+        (BACKLOG #1474). This leg is CI-only, so a divergence from the SQLite and SQL Server bodies
+        surfaces first in CI.
+
+        ``FOR UPDATE`` on the prior-pair read, unlike the SQLite body, which is serialized by its one
+        writer lock instead. Under READ COMMITTED a plain SELECT would let a concurrent unbind commit
+        between the read and the UPDATE, so the row lock is what makes the reported pair the one this
+        transaction clears."""
+        now = time.time() if now is None else now
+        async with self._timed_acquire() as conn, conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT username, oidc_issuer, oidc_subject FROM users WHERE id=$1 FOR UPDATE",
+                user_id,
+            )
+            if row is None:
+                return None
+            issuer, subject = row["oidc_issuer"], row["oidc_subject"]
+            if issuer is None and subject is None:
+                # Already unbound: write NOTHING, so a no-op cannot sign the account out. AND, not
+                # OR: a half row has something to clear (see FederatedUnbind).
+                return FederatedUnbind(
+                    username=row["username"], issuer=None, subject=None, sessions_revoked=0
+                )
+            await conn.execute(
+                "UPDATE users SET oidc_issuer=NULL, oidc_subject=NULL, updated_at=$1 WHERE id=$2",
+                now,
+                user_id,
+            )
+            result = await conn.execute(
+                "UPDATE sessions SET revoked_at=$1 WHERE user_id=$2 AND revoked_at IS NULL",
+                now,
+                user_id,
+            )
+            return FederatedUnbind(
+                username=row["username"],
+                issuer=issuer,
+                subject=subject,
+                sessions_revoked=_rowcount(result),
+            )
+
     async def roles_for_ad_groups(self, groups: Iterable[str]) -> set[str]:
         normalized = sorted({g.strip().lower() for g in groups if g.strip()})
         if not normalized:
@@ -7099,20 +7177,37 @@ class PostgresStore:
         client: str | None = None,
         seed_reauth: bool = True,
         now: float | None = None,
-    ) -> None:
+        require_federated_subject: tuple[str, str] | None = None,
+    ) -> bool:
         now = time.time() if now is None else now
-        await self._execute(
-            # reauth_at ($6) seeds the step-up window from login (ASVS 7.5.3); seed_reauth=False leaves
-            # it NULL for an MFA-PENDING session (WP-14) so a stolen pre-MFA token can't enroll/step-up.
+        # reauth_at ($6) seeds the step-up window from login (ASVS 7.5.3); seed_reauth=False leaves
+        # it NULL for an MFA-PENDING session (WP-14) so a stolen pre-MFA token can't enroll/step-up.
+        insert = (
             "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
-            " revoked_at, client, reauth_at) VALUES ($1,$2,$3,$4,$3,NULL,$5,$6)",
-            token_hash,
-            user_id,
-            now,
-            expires_at,
-            client,
-            now if seed_reauth else None,
+            " revoked_at, client, reauth_at) VALUES ($1,$2,$3,$4,$3,NULL,$5,$6)"
         )
+        params = (token_hash, user_id, now, expires_at, client, now if seed_reauth else None)
+        if require_federated_subject is None:
+            await self._execute(insert, *params)
+            return True
+        # BACKLOG #1474. FOR UPDATE, not a plain read: the row lock is the whole guard here. Either
+        # a concurrent unbind committed first and this read sees the cleared pair (so the insert is
+        # refused), or this transaction holds the row and the unbind waits behind it — and its
+        # session sweep, which runs after its own users UPDATE, then sees this session and revokes
+        # it. A plain SELECT under READ COMMITTED admits the interleaving that loses the session.
+        #
+        # record=False: a login is not a per-lane worker, and the acquire-wait histogram exists to
+        # show how long those workers queue for a connection as the pool saturates. This is the
+        # exemption the low-frequency helpers take.
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT oidc_issuer, oidc_subject FROM users WHERE id=$1 FOR UPDATE", user_id
+            )
+            bound = None if row is None else (row["oidc_issuer"], row["oidc_subject"])
+            if bound != require_federated_subject:
+                return False
+            await conn.execute(insert, *params)
+        return True
 
     async def get_session(self, token_hash: str) -> SessionRecord | None:
         d = await self._fetchone("SELECT * FROM sessions WHERE token_hash=$1", token_hash)

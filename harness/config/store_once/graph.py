@@ -23,7 +23,7 @@ then inject a few ADT messages on the inbound port and inspect the store (``shar
 
 from __future__ import annotations
 
-from harness.config.load._shape import load_shape
+from harness.config.load._shape import NO_PER_HOST_CAP, load_shape
 from messagefoundry import MLLP, Send, handler, inbound, outbound, router
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.parsing.message import Message, RawMessage
@@ -54,7 +54,13 @@ def _register_dests(fanout: int) -> list[str]:
 
 _DESTS = _register_dests(_SHAPE.fanout)
 
-inbound("IB_StoreOnce", MLLP(port=_SHAPE.adt_port), router="store_once_router")
+# The per-host cap is off on this hub (BACKLOG #1725) — see NO_PER_HOST_CAP in _shape for the reason,
+# which reaches this graph through the write-amplification profile it exists for.
+inbound(
+    "IB_StoreOnce",
+    MLLP(port=_SHAPE.adt_port, max_connections_per_host=NO_PER_HOST_CAP),
+    router="store_once_router",
+)
 
 
 @router("store_once_router")
