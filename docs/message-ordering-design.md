@@ -12,23 +12,27 @@ Layer 4a (the configurable *stop-connection* override
 framework (routing the `AlertSink` events to notifications) remains [`BACKLOG-CLOSED.md`](BACKLOG.md) item 5;
 the next foundational step is **Phase 2** — per-stage durable queues (ADR-first, top of `BACKLOG.md`).
 Companion to the engine survey in
-[`hl7-message-ordering-reference.md`](hl7-message-ordering-reference.md); per-key ordering is the
-long-term follow-on tracked in [`BACKLOG.md`](BACKLOG.md) item 3.
+[`hl7-message-ordering-reference.md`](hl7-message-ordering-reference.md). Per-key (sequence-keyed)
+ordering was once the long-term follow-on. It is now **declined** — see
+[Declined: sequence-keyed ordering](#declined-sequence-keyed-ordering) below, which is this
+project's single record of that decision.
 
 ## Goal
 
 Guarantee **in-order (FIFO) delivery per outbound connection** so HL7 dependencies hold
 (ADT before the ORM that references the encounter; ORM before its ORU; no stale update overwriting a
 newer one). Parallelism stays *across* connections (one worker per outbound, already the model);
-ordering is enforced *within* each connection. Per-key parallelism is explicitly out of scope here
-(backlog).
+ordering is enforced *within* each connection. Per-key parallelism is **declined**, not deferred —
+see [Declined: sequence-keyed ordering](#declined-sequence-keyed-ordering).
 
 ## Locked decisions
 
 - **FIFO per outbound connection** is the default. Ordering is by **enqueue time on the outbound
   connection** — the order outbox rows were created for *that* destination. Fan-out (one inbound → N
   outbounds) and fan-in (multiple routers → one outbound) both resolve the same way: each outbound
-  orders only its own rows, by enqueue time on it. Parallelism is opt-in later (per-key, backlog).
+  orders only its own rows, by enqueue time on it. Parallelism *within* one connection is opt-in
+  **today** through `ordering=UNORDERED`, which trades order for throughput on that lane;
+  sequence-keyed lanes are a separate idea and are declined (below).
 - **Nothing is silently lost** (conservative posture). Default failure policy, by failure *kind*:
   - **Internal/code error** at a **router, transformer, or connection** (a bug / unexpected
     exception) → **default: error the message and continue** — record the `ERROR` disposition
@@ -211,7 +215,37 @@ a transient error still blocks-and-retries.
 - **Note — backoff is lane latency:** if an operator opts into finite retries, the head's backoff
   delays everything behind it, so the retry schedule becomes a per-connection latency knob.
 
-## Out of scope (→ backlog)
+## Declined: sequence-keyed ordering
 
-- **Per-key (partition-key) ordering** — [`BACKLOG.md`](BACKLOG.md) item 3, with the A40
-  patient-merge cross-key hazard.
+**Per-key (sequence-keyed) ordering is declined by owner ruling, 2026-09-20.** It is not scheduled,
+not deferred, and not awaiting a design. Build around it rather than waiting for it. This section is
+the single record of the decision; the other engine documents point here instead of restating it.
+
+**What was proposed.** Preserve order only *within* a **sequence group** — the messages sharing a
+**sequence key** such as an MRN, an encounter, or a sending facility — and run different groups in
+parallel on their own **sequence-keyed lanes**. `partition_key` and "order-group sharding" are
+retired names for the same idea.
+
+**What the engine guarantees instead.** **FIFO per outbound connection**, by enqueue time on that
+connection. That is the guarantee this document specifies and the engine has built. One strictly
+ordered feed is therefore bound to **one core**. A feed that outgrows a core is answered by
+**fanning out at source**, splitting it upstream into several inbound connections that each carry
+their own ordered outbound. The scaling axis stays per *connection* (engine shards,
+[ADR 0037](adr/0037-multi-process-sharding-l3.md)), which reaches the same throughput without
+introducing a new correctness boundary.
+
+**The standing technical reason.** Sequence-keyed parallelism is sound only while no message's
+correct processing depends on another group's order. Real HL7 traffic breaks that assumption. The
+canonical counter-example is an **A40 patient merge**, which legitimately spans two MRNs and so
+belongs to two sequence groups at once. Every such cross-key message needs a serialization fallback
+or explicit two-group handling, and getting it wrong corrupts data silently rather than failing
+loudly. The survey and hazard analysis in
+[`hl7-message-ordering-reference.md`](hl7-message-ordering-reference.md) are **not retracted**: what
+changed is the status of the feature, not the accuracy of the research.
+
+**What this does not rule out.** `OrderingMode.UNORDERED`
+([`config/models.py`](../messagefoundry/config/models.py)) is shipped and stays. An operator may set
+`ordering=UNORDERED` on an outbound connection to trade order for parallelism within that lane, and
+the [ADR 0154](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md)
+`reply_from` lane requires it. What is declined is **sequence-keyed lanes as the scaling answer for
+an ordered feed**, never the existence of an unordered mode.

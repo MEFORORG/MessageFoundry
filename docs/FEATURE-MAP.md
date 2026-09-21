@@ -13,6 +13,7 @@ maintainer-internal document; this is the **capability** view.
 | 🔨 | **v0.1** — planned for the `0.1.0` release |
 | ⏭️ | **0.2+** — deferred (see the plan's *Out of scope*) |
 | 🧭 | **Later** — on the long-term vision, not yet scheduled |
+| Declined | **Declined-by-design** — ruled out; not scheduled, not deferred. Build around it |
 
 **Core model (shipped):** a code-first message graph wired *by name* — an inbound **Connection**
 names a **Router** (`@router`), which forwards to one or more **Handlers** (`@handler`, filter →
@@ -95,7 +96,7 @@ is sourced, and the Mirth/NextGen Connect parity reference lives in
 | FIFO-per-outbound ordering | ✅ | Ordering Phase 1 |
 | Failure classification/policy (`NegativeAckError`, AR/CR fail-fast vs AE/CE retry) | ✅ | Per-connection overridable |
 | Retry/backoff, dead-letter, **bulk replay** | ✅ | `/dead-letters` + CLI |
-| Per-key / partition-key ordering lanes | ⏭️ | Single-feed scale path |
+| Sequence-keyed ordering lanes (per-key / partition-key) | Declined | Declined-by-design (2026-09-20) — FIFO per outbound connection stays the guarantee; an ordered feed that outgrows one core fans out at source. [message-ordering-design.md](message-ordering-design.md#declined-sequence-keyed-ordering) |
 | `ack_after=delivered` (deferred ACK) | ⏭️ | Fail-closed at wiring today |
 
 ## 5. Message Store & Backends

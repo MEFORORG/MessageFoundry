@@ -2,6 +2,14 @@
 
 **Context document for MessageFoundry development (Claude Code reference).**
 
+> **Status — the survey stands; the recommendation does not.** The engine comparison, the concept
+> definitions and the A40 cross-key hazard below are accurate research and are **not retracted**.
+> The design recommendation they led to — making per-key ordering a first-class MessageFoundry
+> setting — was **declined by owner ruling on 2026-09-20**. Read the "Design Implications" and
+> "Open Design Questions" sections as a record of what was considered, not as work to do. The
+> decision and what the engine guarantees instead are recorded once, in
+> [`message-ordering-design.md`](message-ordering-design.md#declined-sequence-keyed-ordering).
+
 ## BLUF
 
 HL7 integration has two related but distinct reliability concerns: **in-order delivery** and **isolating bad messages**. These sit at very different maturity levels across existing engines:
@@ -9,7 +17,7 @@ HL7 integration has two related but distinct reliability concerns: **in-order de
 - **Dead-letter / quarantine is table stakes.** Every serious engine has it, just under different names (error queue, failed queue, suspended messages, error database).
 - **Per-key ordering is the harder, rarer one.** For years it was something you *built by hand* rather than configured; it has only recently begun appearing as a first-class, native feature.
 
-The design opportunity for MessageFoundry is to make **per-key ordering a first-class Router/Connection setting with an explicit partition key**, rather than a workaround — putting it where the leading edge is now heading rather than where incumbents historically sat.
+This survey originally read that gap as a design opportunity for MessageFoundry: make per-key ordering a first-class Router/Connection setting with an explicit partition key. **That recommendation was declined on 2026-09-20.** MessageFoundry guarantees **FIFO per outbound connection** and scales an ordered feed by fanning out at source, not by narrowing the ordering guarantee — see [`message-ordering-design.md`](message-ordering-design.md#declined-sequence-keyed-ordering).
 
 ---
 
@@ -54,7 +62,7 @@ Mapping onto the existing concepts (Connections, Routers, Handlers, durable mess
 
 1. **Make ordering a configurable property, defaulting to FIFO.** Per-Connection or per-Router, the safe default is in-order processing. Treat parallelism as an opt-in.
 
-2. **Add an explicit `partition_key` to Router config.** Same key → same ordered worker/lane; different keys → processed in parallel. The key is a configurable expression over the message (e.g. PID-3 MRN, PV1 visit number, or MSH sending facility). This is the first-class version of Mirth's thread-assignment variable and InterSystems' SessionId pattern.
+2. **An explicit `partition_key` on Router config — considered, and declined.** The shape was: same key → same ordered worker/lane, different keys → processed in parallel, the key being a configurable expression over the message (e.g. PID-3 MRN, PV1 visit number, or MSH sending facility) — the first-class version of Mirth's thread-assignment variable and InterSystems' SessionId pattern. **No such setting exists and none is planned.** There is no `partition_key` or `sequence_key` anywhere in the engine's configuration surface; do not write one into a Router. See [`message-ordering-design.md`](message-ordering-design.md#declined-sequence-keyed-ordering).
 
 3. **Let the durable store be the source of truth for order.** A SQLite/aiosqlite (WAL) store with a **monotonic sequence column** and single-writer semantics naturally preserves receipt order across restarts and retries. Processing order should be *derived from the store*, not from in-memory arrival timing. Per-key parallel workers read their lane from the store; the durable sequence remains authoritative.
 
@@ -65,6 +73,12 @@ Mapping onto the existing concepts (Connections, Routers, Handlers, durable mess
 ---
 
 ## Open Design Questions
+
+*Kept as a record of the design pass. **None of these is open.** Every question that presupposes a
+partition key is **moot** — settled by the decline rather than by an answer — and the ordering
+guarantee is FIFO per outbound connection. The rest, at least failure-policy granularity and
+queue observability, were answered by Phase 1. See
+[`message-ordering-design.md`](message-ordering-design.md).*
 
 - **Partition key scope:** per-Router or per-Connection? What field(s) form the default key (MRN vs encounter vs sending facility), and is it a fixed field or a user-supplied expression?
 - **Failure policy granularity:** is retry/rotate/quarantine configured per Router, per Handler, or globally? What are the default retry count and interval?
