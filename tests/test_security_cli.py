@@ -7,10 +7,13 @@ next engine restart."""
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
+from messagefoundry import __main__ as cli
 from messagefoundry.__main__ import main
 
 
@@ -184,3 +187,94 @@ def test_show_declares_a_partial_report_when_the_file_will_not_load(
     assert data["loosenings_partial"] is True
     # ...and it still prints a usable [security] view rather than failing the subcommand.
     assert data["values"]["require_mfa"] is True
+
+
+# --- operator JSON that nests past the decoder (BACKLOG #1855) --------------------------------
+#
+# `json.loads` guards its own decode depth and raises `RecursionError`, which is a `RuntimeError` --
+# NOT a `JSONDecodeError` and not a `ValueError` -- so the `except json.JSONDecodeError` arm beside
+# every operator-JSON decode in `__main__.py` structurally cannot reach it. The reasoning, and why
+# the catch is scoped to the `json.loads` call rather than to the wide `try` around it, is stated
+# once on `_load_operator_json`; this module carries the anchor test for the behaviour.
+
+
+def _raise_recursion(*_args: object, **_kwargs: object) -> object:
+    raise RecursionError("simulated deep nesting")
+
+
+def test_cli_set_reports_security_json_nested_past_the_decoder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Deeply nested `--data` escaped `security set` uncaught before this arm existed.
+
+    Measured on a real subprocess at engine 40ee1a9cd: exit 1 with **stdout EMPTY**, the whole report
+    redacted by the last-resort excepthook (BACKLOG #1674) to one CRITICAL line naming only the
+    exception type. That breaks `_emit_error`'s contract that under `--json` the error object IS the
+    command's machine-readable output, and it never said which input was at fault.
+
+    THE TRIGGER IS MANUFACTURED, NOT REAL NESTING, AND MUST STAY THAT WAY (BACKLOG #1222): the depth
+    where `json`'s C accelerator gives out measures the runner, not this code. Do not "improve" it
+    back to real nesting. The argument, the measurements and the type facts
+    (`RecursionError` is a `RuntimeError`, not a `ValueError`) are pinned once, in
+    `tests/test_sandbox_codec.py::test_recursion_error_is_not_a_value_error`.
+
+    RED when: `_load_operator_json`'s `except RecursionError` arm is dropped, or `_security`'s
+    `except _OperatorJsonError` arm is dropped -- the decode escapes and stdout comes back empty."""
+    monkeypatch.setattr(cli.json, "loads", _raise_recursion)
+    rc = main(
+        ["security", "set", "--service-config", str(tmp_path / "mf.toml"), "--data", "[]", "--json"]
+    )
+    out = capsys.readouterr().out
+    monkeypatch.undo()  # restore json.loads before parsing the captured payload with it
+
+    assert rc == 1
+    error = json.loads(out)["error"]
+    assert "is nested too deeply to parse" in error
+    # Named per site, so the report says WHICH input was at fault -- the half the CRITICAL line lost.
+    assert error.startswith("security update JSON")
+    assert not (tmp_path / "mf.toml").exists()  # refused before any write
+
+
+def test_cli_set_reports_a_malformed_edit_as_json_on_stdout_in_a_real_subprocess(
+    tmp_path: Path,
+) -> None:
+    """`_emit_error`'s `--json` contract, end-to-end in a real process: the error object is the
+    command's machine-readable output, on STDOUT, with exit 1 -- so a consumer piping to `jq` reads
+    the reason there instead of getting a parse failure on an empty stream.
+
+    In-process `main()` cannot demonstrate this. `sys.excepthook` never fires under pytest, so the
+    empty stdout an escaping exception produces is invisible there; only a real subprocess installs
+    the last-resort hook the escape was redacted by.
+
+    Driven with ORDINARY malformed JSON, not deep nesting: a subprocess cannot be monkeypatched, and
+    real nesting measures the runner rather than the code (BACKLOG #1222 -- see the manufactured
+    trigger above). The contract under test does not need a `RecursionError` to demonstrate.
+
+    RED when: `security set` stops routing a decode failure through `_emit_error` -- the payload then
+    leaves stdout empty and the reason lands on stderr, if anywhere."""
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "messagefoundry",
+            "security",
+            "set",
+            "--service-config",
+            str(tmp_path / "mf.toml"),
+            "--data",
+            "{not json",
+            "--json",
+        ],
+        cwd=tmp_path,  # away from the repo, so no stray ./messagefoundry.toml is picked up
+        capture_output=True,
+        text=True,
+        # Well under the pytest-timeout watchdog, so a hang is reported HERE, by a readable
+        # `TimeoutExpired` naming the CLI, rather than by the watchdog's thread dump. `addopts` sets
+        # `--timeout=60` and CI overrides it per leg (60s ubuntu, 120s Windows), so 60 here would tie
+        # the ubuntu watchdog and lose that race -- the watchdog's timer starts at test setup.
+        timeout=20,
+    )
+    assert proc.returncode == 1, f"rc={proc.returncode}\n{proc.stderr}"
+    assert proc.stdout.strip(), f"stdout was empty; stderr={proc.stderr}"
+    assert json.loads(proc.stdout)["error"].startswith("invalid security update JSON:")
+    assert "Traceback" not in proc.stderr, "a raw traceback reached the operator"

@@ -1318,7 +1318,13 @@ def _editable_source_roots(direct_url_json: str | None) -> list[Path]:
         return []
     try:
         data = json.loads(direct_url_json)
-    except (json.JSONDecodeError, TypeError):
+    except (json.JSONDecodeError, TypeError, RecursionError):
+        # `RecursionError` is a `RuntimeError`, so neither name beside it reaches it, and deeply
+        # nested metadata would escape a helper whose docstring promises that anything which is not a
+        # local editable directory yields no candidate. Degraded rather than reported (the arm's
+        # existing contract): this reads the INSTALLER's `direct_url.json`, not operator input, so
+        # there is no operator to hand a message to. Sibling of the operator-input sites converted
+        # via `_load_operator_json` (BACKLOG #1855).
         return []
     if not isinstance(data, dict):
         return []
@@ -3979,9 +3985,9 @@ def _lens_rewrite(args: argparse.Namespace) -> int:
             as_json=True,
         )
     try:
-        edit = json.loads(edit_text)
-    except json.JSONDecodeError as exc:
-        return _emit_error(f"invalid --edit JSON: {exc}", as_json=True)
+        edit = _load_operator_json(edit_text, "--edit JSON")
+    except _OperatorJsonError as exc:
+        return _emit_error(str(exc), as_json=True)
     if not isinstance(edit, dict):
         return _emit_error("the edit spec must be a JSON object", as_json=True)
 
@@ -5665,14 +5671,14 @@ def _connection(args: argparse.Namespace) -> int:
     try:
         if args.action == "upsert":
             raw = args.data if args.data is not None else sys.stdin.read()
-            obj = json.loads(raw)
+            obj = _load_operator_json(raw, "connection JSON")
             result = connections_edit.upsert_connection(args.config, obj, validate=validate)
         else:  # remove
             if not args.name:
                 return _emit_error("--name is required for `connection remove`", as_json=args.json)
             result = connections_edit.remove_connection(args.config, args.name, validate=validate)
-    except json.JSONDecodeError as exc:
-        return _emit_error(f"invalid connection JSON: {exc}", as_json=args.json)
+    except _OperatorJsonError as exc:
+        return _emit_error(str(exc), as_json=args.json)
     except (WiringError, OSError) as exc:
         return _emit_error(str(exc), as_json=args.json)
     _print_json(result, compact=args.json)
@@ -5707,7 +5713,7 @@ def _codeset(args: argparse.Namespace) -> int:
             return 0
         if args.action == "upsert":
             raw = args.data if args.data is not None else sys.stdin.read()
-            detail = json.loads(raw)
+            detail = _load_operator_json(raw, "code set JSON")
             if not isinstance(detail, dict):
                 return _emit_error("code set: input must be a JSON object", as_json=args.json)
             fmt = detail.get("format")
@@ -5740,8 +5746,8 @@ def _codeset(args: argparse.Namespace) -> int:
             if not args.name:
                 return _emit_error("--name is required for `codeset remove`", as_json=args.json)
             result = codeset_edit.remove_code_set(args.config, args.name, validate=validate)
-    except json.JSONDecodeError as exc:
-        return _emit_error(f"invalid code set JSON: {exc}", as_json=args.json)
+    except _OperatorJsonError as exc:
+        return _emit_error(str(exc), as_json=args.json)
     except (WiringError, CodeSetError, OSError) as exc:
         # codeset_edit raises WiringError for its own (pre-write) validation, but the post-write
         # reload callback calls load_code_set() directly, which raises the loader's own CodeSetError
@@ -5962,7 +5968,7 @@ def _alert(args: argparse.Namespace) -> int:
     try:
         if args.action == "add":
             raw = args.data if args.data is not None else sys.stdin.read()
-            obj = json.loads(raw)
+            obj = _load_operator_json(raw, "alert rule JSON")
             try:
                 new_rule = AlertRule.model_validate(obj)
             except ValidationError as exc:
@@ -6001,8 +6007,8 @@ def _alert(args: argparse.Namespace) -> int:
             if args.index is None:
                 return _emit_error("--index is required for `alert remove`", as_json=args.json)
             result = alerts_edit.remove_rule(path, args.index, validate=validate)
-    except json.JSONDecodeError as exc:
-        return _emit_error(f"invalid alert rule JSON: {exc}", as_json=args.json)
+    except _OperatorJsonError as exc:
+        return _emit_error(str(exc), as_json=args.json)
     except (alerts_edit.AlertRuleError, FileNotFoundError, ValueError, OSError) as exc:
         return _emit_error(str(exc), as_json=args.json)
     _print_json(result, compact=args.json)
@@ -6119,7 +6125,7 @@ def _security(args: argparse.Namespace) -> int:
 
     try:
         data = args.data if args.data is not None else sys.stdin.read()
-        updates = json.loads(data)
+        updates = _load_operator_json(data, "security update JSON")
         if not isinstance(updates, dict):
             return _emit_error(
                 "security updates must be a JSON object {key: value}", as_json=args.json
@@ -6138,8 +6144,8 @@ def _security(args: argparse.Namespace) -> int:
         result = security_edit.set_security(path, updates, validate=validate)
         result["loosenings"] = _loosenings(SecuritySettings.model_validate(merged))
         result.update(_loosenings_scope)
-    except json.JSONDecodeError as exc:
-        return _emit_error(f"invalid security update JSON: {exc}", as_json=args.json)
+    except _OperatorJsonError as exc:
+        return _emit_error(str(exc), as_json=args.json)
     except (security_edit.SecurityEditError, FileNotFoundError, ValueError, OSError) as exc:
         return _emit_error(str(exc), as_json=args.json)
     _print_json(result, compact=args.json)
@@ -6182,6 +6188,51 @@ def _emit_store_open_error(exc: sqlite3.DatabaseError, path: str, *, as_json: bo
     else:
         print(f"error: {message}", file=sys.stderr)
     return 2
+
+
+class _OperatorJsonError(Exception):
+    """Operator-supplied JSON that ``json`` would not decode -- malformed, or nested too deep.
+
+    A private CLI signal raised ONLY by :func:`_load_operator_json`, never by engine code. The TYPE
+    is the scope: a subcommand can catch it on a ``try`` that also wraps its edit/validate calls
+    without that catch ever attributing a downstream fault to the operator's input."""
+
+
+def _load_operator_json(raw: str, what: str) -> Any:
+    """Decode operator-supplied JSON (an argument or stdin), reporting either failure as
+    :class:`_OperatorJsonError` with ``what`` naming which input was at fault.
+
+    ``json`` guards its own decode depth and raises ``RecursionError`` -- a ``RuntimeError``, and
+    neither a ``JSONDecodeError`` nor a ``ValueError`` -- so before this helper existed, deeply
+    nested input escaped every subcommand that reads operator JSON. The cost is not a traceback:
+    ``main`` installs the last-resort excepthook (BACKLOG #1674), so the escape was redacted to one
+    CRITICAL line and exit 1 with **stdout empty**. That breaks :func:`_emit_error`'s contract that
+    under ``--json`` the error object IS the command's machine-readable output -- measured on a real
+    subprocess, a consumer piping to ``jq`` got a parse failure, and the CRITICAL line named only
+    the exception type, never which input was at fault.
+
+    BOTH conversions happen HERE, around ``json.loads`` alone, and that is what scopes them. Four of
+    the five callers wrap the decode AND their edit/validate calls in ONE ``try``; raising a
+    dedicated type from a function that wraps only the decode means a ``RecursionError`` (or a
+    ``JSONDecodeError``) from ``upsert_connection`` or ``load_settings`` is NOT an
+    ``_OperatorJsonError`` and still falls through -- so no caller's arm can blame an input nothing
+    has established is at fault. The stack has already unwound to this shallow frame before either
+    clause runs, so raising cannot re-trip the limit.
+
+    Each caller keeps its OWN arm rather than one dispatch-level catch because the callers differ in
+    where the report goes: four pass ``as_json=args.json``, while ``lens rewrite`` has no ``--json``
+    flag and always emits JSON. A single catch could not pick the right output stream.
+
+    DO NOT DRIVE A TEST OF THE RECURSION ARM WITH REAL DEEPLY-NESTED INPUT -- manufacture the
+    exception. The depth where ``json``'s C accelerator gives out is a property of the runner, not
+    of this code; ``tests/test_sandbox_codec.py::test_recursion_error_is_not_a_value_error`` is the
+    canonical write-up of why, with the measurements (BACKLOG #1222)."""
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise _OperatorJsonError(f"invalid {what}: {exc}") from exc
+    except RecursionError as exc:
+        raise _OperatorJsonError(f"{what} is nested too deeply to parse: {exc}") from exc
 
 
 def _emit_error(message: str, *, as_json: bool) -> int:

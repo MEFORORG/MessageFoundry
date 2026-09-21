@@ -289,3 +289,27 @@ def test_the_opt_out_is_named_and_uses_the_projects_environment_convention() -> 
         "the opt-out must be defined, consulted, and named in BOTH operator messages -- the refusal "
         "that tells them it exists and the warning that tells them it is in force"
     )
+
+
+def test_editable_source_roots_degrades_on_a_recursion_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The helper promises that anything which is not a local editable directory yields no candidate,
+    and `RecursionError` is the one decode failure the arm's other two names cannot reach.
+
+    DEGRADED, NOT REPORTED, and that is the difference from the operator-input sites converted via
+    `_load_operator_json` (BACKLOG #1855): this reads the INSTALLER's PEP 610 `direct_url.json`, not
+    an operator's argument or stdin, so there is no operator to hand a message to. The arm's existing
+    contract is "no candidate", and this keeps that total.
+
+    Why the sibling names cannot reach it, and why the trigger below is manufactured rather than real
+    nesting: `_load_operator_json` in `messagefoundry/__main__.py`. The type facts are pinned once, by
+    `tests/test_security_cli.py::test_cli_set_reports_security_json_nested_past_the_decoder`.
+
+    RED when: `RecursionError` is dropped from that arm's except-tuple -- the call then raises."""
+
+    def _raise_recursion(*_args: object, **_kwargs: object) -> object:
+        raise RecursionError("simulated deep nesting")
+
+    monkeypatch.setattr(json, "loads", _raise_recursion)
+    assert _editable_source_roots('{"url": "file:///tmp/x", "dir_info": {"editable": true}}') == []
