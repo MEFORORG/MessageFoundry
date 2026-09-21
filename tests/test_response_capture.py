@@ -574,7 +574,7 @@ async def test_runner_start_isolates_capture_on_unsupporting_backend(
     try:
         await runner.start()  # does NOT raise — the capturing lane is isolated, not fatal
         assert runner.running
-        reason = runner.connection_failed("OB_Q")
+        reason = runner.outbound_failed("OB_Q")
         assert reason and "capture" in reason
         assert "OB_Q" not in runner._destinations  # no live connector → routed rows retry, not drop
     finally:

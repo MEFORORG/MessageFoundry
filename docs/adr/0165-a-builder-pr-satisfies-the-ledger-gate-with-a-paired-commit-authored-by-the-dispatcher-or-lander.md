@@ -3,9 +3,37 @@
 
 # ADR 0165 — A builder PR satisfies the ledger gate with a paired commit authored by the Dispatcher or Lander
 
-- **Status:** Accepted (2026-08-13) — **already in force; no code change was required.** See §"The decision needed no build"
+- **Status:** Accepted (2026-08-13), **SUPERSEDED BY MIGRATION 2026-09-13 — do not follow the Decision below.** Originally: already in force; no code change was required. See §"The decision needed no build"
 - **Date:** 2026-08-13
 - **Related:** [backlog-hygiene.yml](../../.github/workflows/backlog-hygiene.yml) (the gate) · [BACKLOG #1240, #1241](../BACKLOG.md) (the PR that surfaced it) · [ADR 0158](0158-silent-controls-green-signals-that-mean-nothing-and-shape-over-detection.md) (a control that cannot observe its own failure) · [CLAUDE.md](../../CLAUDE.md) §5 (git discipline), §11 (state a load-bearing fact once)
+
+---
+
+## SUPERSEDED 2026-09-13: the ledger left this repository, so there is no gate to satisfy
+
+**The Decision below is kept as the record of what was decided on 2026-08-13. Do not follow it.**
+Its subject no longer exists here. The item ledger migrated to the maintainer-internal repository
+on 2026-09-13 (BACKLOG #1250), and with it the parsing this decision was written against.
+
+Measured with `git ls-files` on `origin/main`:
+
+| File this ADR rests on | State now |
+|---|---|
+| `scripts/docs/backlog_status_check.py` | deleted |
+| `docs/archive/backlog/BACKLOG-CLOSED.md` | deleted |
+| `docs/BACKLOG.md` | tracked, but a stub |
+| `.github/workflows/backlog-hygiene.yml` | tracked, and a deliberate no-op |
+
+**So no builder PR needs a paired ledger commit, and no seat authors one.** `backlog-hygiene.yml`
+is kept only because its `name:` is a required status-check context in branch protection: deleting
+or renaming it makes that context never report, which WEDGES every pull request rather than failing
+one. Retiring it is a branch-protection change, not an in-repo edit. `CLAUDE.md` is the source of
+record for that, and the workflow's own header restates it.
+
+**The Dispatcher named in the title and the Decision retired on 2026-09-01**, and the seven seats
+retired with it are listed in `CLAUDE.md` §5. The title is left unchanged because an ADR filename
+is cited from elsewhere; renaming it would break those citations to fix a line no one should now
+be acting on.
 
 ---
 

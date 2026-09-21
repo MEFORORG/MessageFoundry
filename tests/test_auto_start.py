@@ -95,10 +95,10 @@ async def test_auto_start_false_is_not_bound_at_boot(store: MessageStore, tmp_pa
         assert runner.inbound_running("in_on")  # default: started
         assert not runner.inbound_running("in_off")  # auto_start=False: not listening
         # Not a DR filter and not a fault — a clean deliberate "stopped".
-        assert runner.connection_filtered("in_off") is None
-        assert runner.connection_failed("in_off") is None
-        assert "in_off" not in runner.filtered_connections()
-        assert runner.degraded_connections() == {}
+        assert runner.inbound_filtered("in_off") is None
+        assert runner.inbound_failed("in_off") is None
+        assert "in_off" not in runner.filtered_inbound()
+        assert not runner.degraded_inbound() and not runner.degraded_outbound()
     finally:
         await runner.stop()
 
@@ -134,7 +134,7 @@ async def test_default_auto_start_is_byte_identical(store: MessageStore, tmp_pat
     await runner.start()
     try:
         assert runner.inbound_running("in_default")
-        assert runner.filtered_connections() == {}
+        assert not runner.filtered_inbound() and not runner.filtered_outbound()
     finally:
         await runner.stop()
 
@@ -175,9 +175,9 @@ async def test_start_disabled_outbound_reports_stopped(store: MessageStore, tmp_
         assert not runner.outbound_running("out_off")
         assert runner.outbound_quiesced("out_off")  # never started => nothing in flight
         # Deliberately down, so neither an ADR-0031 fault nor a DR park — the engine is NOT degraded.
-        assert runner.connection_failed("out_off") is None
-        assert runner.connection_filtered("out_off") is None
-        assert runner.degraded_connections() == {}
+        assert runner.outbound_failed("out_off") is None
+        assert runner.outbound_filtered("out_off") is None
+        assert not runner.degraded_inbound() and not runner.degraded_outbound()
     finally:
         await runner.stop()
 

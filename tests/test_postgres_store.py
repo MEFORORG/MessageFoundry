@@ -19,7 +19,10 @@ import asyncio
 import base64
 import json
 import os
+import subprocess
+import sys
 from collections.abc import AsyncIterator
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -92,19 +95,74 @@ async def store() -> AsyncIterator[object]:
 
     settings = load_settings(environ=os.environ).store
     s = await PostgresStore.open(settings)
-    # Clean slate (the container DB persists across tests in a run).
-    async with s._pool.acquire() as conn:
-        await conn.execute("TRUNCATE " + ", ".join(_TABLES) + " RESTART IDENTITY CASCADE")
-    # open() seeded the read-through caches from the DB BEFORE this truncate, so re-load them from the
-    # now-empty tables — otherwise a prior test's state/reference rows linger in this handle's in-memory
-    # caches (e.g. _state_versions) and leak across tests (Track B Step 6b).
-    await s._load_state_cache()
-    await s._load_reference_cache()
-    # audit_chain_meta was truncated above; sync the in-memory keying watermark so this keyless fixture
-    # handle never carries a stale watermark that would fail-close a later keyless record_audit (#190).
-    s._audit_keyed_from = None
-    yield s
-    await s.close()
+    # BACKLOG #1629: everything between open() and the yield runs inside this try, so a setup
+    # failure still closes the pool. Without it one failing setup step would leak a pool per test
+    # and the rest of the run would error on the connection cap, burying the real cause.
+    try:
+        # Clean slate (the container DB persists across tests in a run).
+        async with s._pool.acquire() as conn:
+            await conn.execute("TRUNCATE " + ", ".join(_TABLES) + " RESTART IDENTITY CASCADE")
+        # open() seeded the read-through caches from the DB BEFORE this truncate, so re-load them from the
+        # now-empty tables — otherwise a prior test's state/reference rows linger in this handle's in-memory
+        # caches (e.g. _state_versions) and leak across tests (Track B Step 6b).
+        await s._load_state_cache()
+        await s._load_reference_cache()
+        # audit_chain_meta was truncated above; sync the in-memory keying watermark so this keyless fixture
+        # handle never carries a stale watermark that would fail-close a later keyless record_audit (#190).
+        s._audit_keyed_from = None
+        yield s
+    finally:
+        await s.close()
+
+
+async def test_store_fixture_closes_the_pool_when_setup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #1629: a setup failure between open() and the yield still closes the pool.
+
+    The window under test is the FIXTURE's own setup, not ``open()``'s. ``PostgresStore.open``
+    carries its own M-6 guard (``except Exception: await pool.close(); raise``), so a failure
+    injected into any step ``open()`` performs is caught and the pool closed *there*, ``open()``
+    never returns, and the fixture's ``try``/``finally`` is never entered -- the closed-pool
+    assertion below would then hold with the fix reverted, which is no test at all.
+
+    So the failure is armed only once ``open()`` has RETURNED, and on the returned instance
+    rather than on the class. ``open()`` therefore runs its own ``_load_state_cache`` for real,
+    and the raise can only land in the fixture's own call to it -- after the TRUNCATE, before
+    the ``yield``. Without the ``try``/``finally`` the generator walks away from a live pool, so
+    one bad setup step would leak a handle per test and every later test would error on the
+    connection cap instead of on the real fault. Test infrastructure: no deployment axis.
+
+    ``store.__wrapped__`` is the undecorated generator pytest keeps on the fixture object.
+    """
+    from messagefoundry.config.settings import StoreSettings
+    from messagefoundry.store.postgres import PostgresStore
+
+    opened: list[PostgresStore] = []
+
+    async def _boom() -> None:
+        raise RuntimeError("fixture setup failed after open")
+
+    real_open = PostgresStore.open
+
+    async def _open_then_arm(settings: StoreSettings) -> PostgresStore:
+        s = await real_open(settings)
+        # open() returned, so its M-6 guard is behind us and the pool is live. Patching the
+        # INSTANCE (not the class) is what pins the raise to a fixture-owned step: nothing
+        # inside open() can reach this attribute, because open() is already done.
+        assert not s._pool.is_closing(), "open() handed back a closed pool -- anchor broken"
+        setattr(s, "_load_state_cache", _boom)  # noqa: B010 - shadows the bound method on purpose
+        opened.append(s)
+        return s
+
+    monkeypatch.setattr(PostgresStore, "open", _open_then_arm)
+
+    gen = store.__wrapped__()
+    with pytest.raises(RuntimeError, match="fixture setup failed after open"):
+        await anext(gen)
+
+    assert opened, "open() never returned, so no fixture-owned step ran and this asserts nothing"
+    assert opened[0]._pool.is_closing(), "the fixture left its pool open on the failure path"
 
 
 # --- parity tests (mirror tests/test_sqlserver_store.py) -----------------------
@@ -657,6 +715,14 @@ async def test_stats_and_metrics(store) -> None:
     assert metrics.destinations[("IB", "OB1")].queue_depth == 1
     db = await store.db_status()
     assert db.messages == 1 and db.journal_mode == "postgres"
+    # BACKLOG #1563: the remote server's disk is not ours to stat, so this is the "unmeasurable"
+    # None and never 0 — 0 is the console's critical-disk alarm, which pinned the engine-health
+    # heart red on every healthy Postgres deployment. The whole server-side fix is this one
+    # literal, and nothing else asserted it at all. This module is gated on MEFOR_TEST_POSTGRES,
+    # so the pin holds on the Postgres leg only — that is the sole place the real backend runs, and
+    # a default run still cannot tell the literal from a 0. Naming the limit rather than implying
+    # this guards every run.
+    assert db.disk_free_bytes is None
     ok, _ = await store.integrity_check()
     assert ok is True
 
@@ -680,6 +746,24 @@ async def test_dead_letter_missing_destinations(store) -> None:
     assert killed == 1
     assert (await store.outbox_for(mid))[0]["status"] == OutboxStatus.DEAD.value
     assert (await store.get_message(mid))["status"] == MessageStatus.ERROR.value
+
+
+async def test_dead_letter_missing_inbounds(store) -> None:
+    # BACKLOG #1612. The channel-keyed sweep, at parity with its two siblings: an ingress row whose
+    # inbound left the registry is dead-lettered (nothing else would ever claim it), while an
+    # outbound row is spared even when ITS origin channel is the removed one — outbound lanes key on
+    # destination_name and drain regardless of where the message came from.
+    orphan = await store.enqueue_ingress(channel_id="GONE_IN", raw=RAW, now=100.0)
+    outbound = await store.enqueue_message(
+        channel_id="GONE_IN", raw=RAW, deliveries=[("OB1", "p")], now=100.0
+    )
+    assert await store.dead_letter_missing_inbounds({"IB"}, now=200.0) == 1
+    assert (await store.get_message(orphan))["status"] == MessageStatus.ERROR.value
+    assert (await store.outbox_for(outbound))[0]["status"] == OutboxStatus.PENDING.value
+    # Replayable: the operator restores the inbound and the row comes back pending at its own stage.
+    assert await store.replay(orphan, now=300.0) == 1
+    item = await store.claim_next_fifo("GONE_IN", stage=Stage.INGRESS.value, now=300.0)
+    assert item is not None and item.payload == RAW
 
 
 async def test_audit_chain_verifies(store) -> None:
@@ -4349,3 +4433,153 @@ async def test_session_rotation_contract(store) -> None:
     from tests._session_rotation_contract import assert_session_rotation_contract
 
     await assert_session_rotation_contract(store)
+
+
+# --- the per-message finalize lock + the audit chain, under real concurrency ------------------------
+
+
+async def test_concurrent_mark_done_finalizes_processed_every_round(store) -> None:
+    """Both destinations of ONE message complete at the same moment, every round -> PROCESSED.
+
+    Pins the per-message finalize advisory lock (H-7/H-8) as the SINGLE authority on disposition.
+    ``tests/_finalize_race_contract`` carries the property, the mechanism, and the paired-arm
+    measurement behind the round count -- read it there rather than here.
+
+    THIS is the backend that measurement was taken on, so a red here is the shared contract's first
+    and best signal.
+    """
+    from tests._finalize_race_contract import assert_concurrent_finalize_reaches_processed
+
+    await assert_concurrent_finalize_reaches_processed(store)
+
+
+# The appender each subprocess runs: open the SAME store this test's fixture opened, append N chained
+# audit rows, close. Carried as source rather than a helper module so the child's whole contract is
+# readable beside the assertions that depend on it, and because `[sys.executable, "-c", <source>]` is
+# already the house form for a child probe. Synthetic actor/detail only, never PHI.
+_AUDIT_APPENDER_SRC = """\
+import asyncio
+import os
+import sys
+import time
+from pathlib import Path
+
+from messagefoundry.config.settings import load_settings
+from messagefoundry.store.postgres import PostgresStore
+
+
+def rendezvous(latch_dir, tag, peers, timeout=60.0):
+    # MEASURED, and the test is worthless without it. Each child's whole append window is ~0.03s,
+    # while interpreter start plus the messagefoundry import desynchronizes the two by up to 0.5s --
+    # so unlatched, the two write windows simply do not meet. With the chain lock patched out to
+    # check that this test can fail at all, an unlatched pair forked the chain in only 1 run of 5;
+    # the other 4 passed having never raced. This latch is taken AFTER the store is open, so every
+    # fixed cost is paid before it, and both children leave it within a poll interval of each other.
+    d = Path(latch_dir)
+    (d / (tag + ".ready")).write_text("1", encoding="utf-8")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if len(list(d.glob("*.ready"))) >= peers:
+            return
+        time.sleep(0.002)
+    raise SystemExit("rendezvous timed out waiting for %d peers in %s" % (peers, d))
+
+
+async def main() -> None:
+    tag, rows, latch_dir, peers = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
+    store = await PostgresStore.open(load_settings(environ=os.environ).store)
+    try:
+        rendezvous(latch_dir, tag, peers)
+        for i in range(rows):
+            await store.record_audit("message_view", actor=tag, detail=f"{tag}-{i}")
+    finally:
+        await store.close()
+
+
+asyncio.run(main())
+"""
+
+_AUDIT_ROWS_PER_PROCESS = 25
+
+#: Bound on ONE appender's wait, sized to stay under the suite's own ``--timeout=60`` watchdog (the
+#: gated ``postgres-store`` job adds no ``--timeout=`` of its own, so the pyproject value is what
+#: binds). The ordering is the whole point: at the watchdog the ``thread`` method dumps stacks and
+#: hard-exits the interpreter, which orphans both children AND takes the rest of this file's tests
+#: down with it. A bound above the watchdog would be dead code.
+_APPENDER_TIMEOUT_SECONDS = 30.0
+
+
+def _await_appender(proc: subprocess.Popen[str]) -> tuple[bool, str]:
+    """Wait for one appender under a finite bound. Returns ``(exited_clean, detail)``."""
+    try:
+        out, _ = proc.communicate(timeout=_APPENDER_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out, _ = proc.communicate()
+        return False, f"did not exit within {_APPENDER_TIMEOUT_SECONDS}s, killed; output:\n{out}"
+    return proc.returncode == 0, f"exited {proc.returncode}; output:\n{out}"
+
+
+_AUDIT_APPENDER_TAGS = ("proc-a", "proc-b")
+
+
+async def test_audit_chain_survives_two_process_append(store, tmp_path: Path) -> None:
+    """Two OS PROCESSES append to one audit chain at once and the chain still verifies.
+
+    ``record_audit`` hash-links every row to the chain tail, so two appenders that read the same tail
+    fork it: two rows claiming one predecessor, and ``verify_audit_chain`` goes false. What stops that
+    is ``pg_advisory_xact_lock`` on the chain (H-7), taken in the DATABASE -- and only a second OS
+    process can show the database is what does the work. A single-interpreter test cannot tell the
+    advisory lock apart from any Python-level lock, so it would stay green over a store whose
+    serialization lives entirely in one process. Two processes over one store is also the shipped
+    engine-shard topology (ADR 0037), where that in-process lock would not exist at all.
+
+    This SUBSUMES a Postgres copy of ``test_sqlserver_store.py``'s single-process
+    ``test_audit_chain_no_fork_under_concurrent_record_audit``: anything a one-interpreter gather
+    would prove here, two processes prove strictly harder. Do not add that as missing parity.
+
+    Measured on a local PostgreSQL 16.14 over the LATCHED form below, 5 paired runs each way, with a
+    positive control confirming the mutation landed in both children every run: lock intact,
+    ``verify_audit_chain`` clean over 50 rows 5 times out of 5; chain lock patched out inside both
+    children, broken 5 times out of 5. Disjoint reds, so the arms discriminate rather than merely
+    differ. The row COUNT was 50 in BOTH arms, so the count assertion below does not catch the fork
+    -- it is there only to refuse the vacuous pass where a child wrote nothing and an empty chain
+    verified clean.
+
+    The children RENDEZVOUS on ``tmp_path`` before their first append, and that latch is what makes
+    this test able to fail at all -- see the comment in ``_AUDIT_APPENDER_SRC`` for the measurement
+    that put it there. Spawn order alone does not make two processes race.
+    """
+    # cwd is sys.path[0] for `python -c`, so this is what makes the children import THIS tree rather
+    # than any other installed copy. One mechanism, not two: PYTHONPATH would land BEHIND sys.path[0]
+    # and could never be the entry that wins. MEFOR_STORE_* reaches them via the inherited environ.
+    repo_root = Path(__file__).resolve().parents[1]
+    peers = len(_AUDIT_APPENDER_TAGS)
+    procs = [
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                _AUDIT_APPENDER_SRC,
+                tag,
+                str(_AUDIT_ROWS_PER_PROCESS),
+                str(tmp_path),
+                str(peers),
+            ],
+            cwd=repo_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        for tag in _AUDIT_APPENDER_TAGS
+    ]
+    # Both are already spawned; communicate() blocks, and this suite runs on ONE shared session loop,
+    # so hand the two bounded waits to threads. That keeps the loop free and the children concurrent.
+    results = await asyncio.gather(*(asyncio.to_thread(_await_appender, p) for p in procs))
+    for ok, detail in results:
+        assert ok, f"audit appender {detail}"
+
+    ok, detail = await store.verify_audit_chain()
+    assert ok is True, detail
+    count, _head = await store.audit_anchor()
+    assert count == 2 * _AUDIT_ROWS_PER_PROCESS

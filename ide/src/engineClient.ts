@@ -6,6 +6,8 @@
 import * as http from "node:http";
 import * as https from "node:https";
 
+import { engineHostKey, trustRemedy } from "./engineTrustModel";
+
 /** A non-2xx engine response. `status` lets callers branch (e.g. 401 → (re)authenticate). */
 export class HttpError extends Error {
   constructor(
@@ -56,8 +58,48 @@ export class NetworkError extends Error {
 export const TLS_MIN_VERSION = "TLSv1.2";
 
 /**
- * TLS options for `url`, empty for plain http (the 127.0.0.1 default flow, where there is no
+ * Extra trust anchors, keyed by `host:port` (see {@link engineHostKey}) — BACKLOG #1695.
+ *
+ * Module-level because a trust anchor is a property of a SERVER, not of one request: every caller
+ * in this extension reaching a given engine needs the same one, and threading a `ca` argument
+ * through `postJson`/`getJson` and their eight call sites would let one of them be forgotten.
+ * Populated by `engineTrust.ts` from what the engine itself reports; empty until then, which is
+ * exactly the previous behaviour (Node's default CA set alone).
+ */
+const trustAnchors = new Map<string, string>();
+
+/** Register (or, with `undefined`, drop) the PEM to verify `url`'s engine with. */
+export function setEngineTrustAnchor(url: string, pem: string | undefined): void {
+  const key = engineHostKey(url);
+  if (key === undefined) {
+    return;
+  }
+  if (pem === undefined) {
+    trustAnchors.delete(key);
+  } else {
+    trustAnchors.set(key, pem);
+  }
+}
+
+/** Drop every registered anchor, and report whether there WAS one. `engineTrust.ts` calls this before
+ *  each refresh, so a target the user edits away from does not leave its certificate registered for
+ *  the life of the window. The return value is what tells that caller the trust state changed even
+ *  when the refresh ends up registering nothing — dropping an anchor is a change worth re-probing. */
+export function clearEngineTrustAnchors(): boolean {
+  const had = trustAnchors.size > 0;
+  trustAnchors.clear();
+  return had;
+}
+
+/**
+ * TLS options for `url`, empty for plain http (the loopback cleartext flow, where there is no
  * handshake to constrain and `assertTargetAllowed` separately refuses cleartext off-box).
+ *
+ * `ca`, when this engine has a registered anchor, is what lets the client verify the self-signed
+ * certificate the engine mints on first run. It REPLACES Node's default bundle for that request,
+ * which is safe here precisely because the anchor is the certificate that engine presents — and it
+ * is why `rejectUnauthorized` is never touched. Verification stays on in every posture; the only
+ * thing that changes is which anchors it may succeed against.
  *
  * NO explicit cipher list, deliberately, and this is a decision rather than an omission. Node's
  * default suite already excludes the weak families, is maintained upstream, and is negotiated against
@@ -66,13 +108,27 @@ export const TLS_MIN_VERSION = "TLSv1.2";
  * and can refuse a handshake a correctly configured proxy would have completed. That is real operator
  * cost paid for a narrower gain than the version floor above, so only the floor is pinned here.
  */
-function tlsOptions(url: URL): https.RequestOptions {
-  return url.protocol === "https:" ? { minVersion: TLS_MIN_VERSION } : {};
+export function tlsOptions(url: URL): https.RequestOptions {
+  if (url.protocol !== "https:") {
+    return {};
+  }
+  // engineHostKey on BOTH sides of the Map. Spelling the normalization inline here and calling the
+  // helper in setEngineTrustAnchor would let a later change to one make every lookup silently miss.
+  const key = engineHostKey(url.href);
+  const ca = key === undefined ? undefined : trustAnchors.get(key);
+  return ca === undefined ? { minVersion: TLS_MIN_VERSION } : { minVersion: TLS_MIN_VERSION, ca };
 }
 
 /** Fold a Node request error into a {@link NetworkError}, preserving its errno. Shared by GET/POST so
  *  the two paths cannot drift (they had duplicate, subtly different branches before). */
 function networkError(err: NodeJS.ErrnoException, baseUrl: string): NetworkError {
+  // A certificate we cannot verify is NOT "not reachable": something answered, and telling the user
+  // to start an engine that is already running is the failure BACKLOG #1695 records. Tested first
+  // because it must never fall into the bucket below.
+  const remedy = trustRemedy(err.code, baseUrl);
+  if (remedy !== undefined) {
+    return new NetworkError(remedy, err.code);
+  }
   if (err.code === "ECONNREFUSED" || err.code === "ECONNRESET" || err.code === "ENOTFOUND") {
     return new NetworkError(
       `engine not reachable at ${baseUrl} — start it (Console or \`messagefoundry serve\`).`,

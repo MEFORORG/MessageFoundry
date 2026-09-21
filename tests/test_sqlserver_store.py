@@ -69,53 +69,109 @@ async def store() -> AsyncIterator[object]:
 
     settings = load_settings(environ=os.environ).store
     s = await SqlServerStore.open(settings)
-    # Clean slate (the container DB persists across tests in a run).
-    async with s._pool.acquire() as conn:
-        cur = await conn.cursor()
-        for table in (
-            "message_events",
-            "audit_log",
-            "audit_chain_meta",  # #190 audit-chain keying watermark — a keying test (CLI-23) sets it;
-            #                      leaving it would fail-close a later keyless record_audit (poison)
-            "cipher_meta",  # ASVS 11.3.4 per-key GCM invocation counters (no FK)
-            "connection_event",  # #46 lifecycle log (no FK) — ciphered `reason` rows else leak across
-            #                      runs and break the key-rotation reencrypt scan (persistent contamination)
-            "state",
-            "reference",  # ADR 0006 snapshot rows (no FK) — leaked ciphered/plaintext rows break the
-            #               exact reencrypt counts (the == 6 in
-            #               test_reencrypt_to_active_rotates_all_columns_including_state)
-            "reference_version",  # ADR 0006 active-version pointers (no FK)
-            "message_attachment",  # #149 attachment linkage (no FK; cleared for a clean slate)
-            "attachment_chunk",  # #149 attachment chunks (no FK)
-            "attachment",  # #149 attachment headers (no FK)
-            "queue",  # FK to messages(id) — must be cleared before messages
-            "response",  # FK to messages(id) — must be cleared before messages
-            "delivered_keys",  # H2 idempotency ledger (no FK, but ids reference messages)
-            "resend_log",  # ADR 0090 idempotency ledger (no FK) — STOREF-8/9 reuse keys across tests
-            "alert_instance",  # #56 operator alert-state (no FK) — ALERT-19 lists ALL active rows
-            "search_presets",  # ADR 0136 saved searches (no FK) — the ciphered `criteria` rides the
-            #                    key-rotation reencrypt scan, and this suite asserts EXACT rotate
-            #                    counts (the == 6 / == 2 above), so a preset left behind by one test
-            #                    silently miscounts an unrelated one
-            "messages",
-            "sessions",
-            "webauthn_credentials",  # ADR 0068: FK to users(id) — must clear before users
-            "user_roles",
-            "ad_group_role_map",
-            "users",
-            "roles",
-        ):
-            await cur.execute(f"DELETE FROM {table}")
-        await conn.commit()
-    # audit_chain_meta was cleared above; sync the in-memory keying watermark so this keyless fixture
-    # handle never carries a stale watermark that would fail-close a later keyless record_audit (#190).
-    s._audit_keyed_from = None
-    # open() seeded the reference read-through cache BEFORE the clean-slate DELETE above, so re-load it
-    # from the now-empty tables — otherwise a prior test's reference rows linger in this handle's
-    # in-memory cache/versions and leak across tests (mirrors the Postgres fixture; Track B Step 6).
-    await s._load_reference_cache()
-    yield s
-    await s.close()
+    # BACKLOG #1629: everything between open() and the yield runs inside this try, so a setup
+    # failure still closes the pool. Without it one failing setup step would leak a pool per test
+    # and the rest of the run would error on the connection cap, burying the real cause.
+    try:
+        # Clean slate (the container DB persists across tests in a run).
+        async with s._pool.acquire() as conn:
+            cur = await conn.cursor()
+            for table in (
+                "message_events",
+                "audit_log",
+                "audit_chain_meta",  # #190 audit-chain keying watermark — a keying test (CLI-23) sets it;
+                #                      leaving it would fail-close a later keyless record_audit (poison)
+                "cipher_meta",  # ASVS 11.3.4 per-key GCM invocation counters (no FK)
+                "connection_event",  # #46 lifecycle log (no FK) — ciphered `reason` rows else leak across
+                #                      runs and break the key-rotation reencrypt scan (persistent contamination)
+                "state",
+                "reference",  # ADR 0006 snapshot rows (no FK) — leaked ciphered/plaintext rows break the
+                #               exact reencrypt counts (the == 6 in
+                #               test_reencrypt_to_active_rotates_all_columns_including_state)
+                "reference_version",  # ADR 0006 active-version pointers (no FK)
+                "message_attachment",  # #149 attachment linkage (no FK; cleared for a clean slate)
+                "attachment_chunk",  # #149 attachment chunks (no FK)
+                "attachment",  # #149 attachment headers (no FK)
+                "queue",  # FK to messages(id) — must be cleared before messages
+                "response",  # FK to messages(id) — must be cleared before messages
+                "delivered_keys",  # H2 idempotency ledger (no FK, but ids reference messages)
+                "resend_log",  # ADR 0090 idempotency ledger (no FK) — STOREF-8/9 reuse keys across tests
+                "alert_instance",  # #56 operator alert-state (no FK) — ALERT-19 lists ALL active rows
+                "search_presets",  # ADR 0136 saved searches (no FK) — the ciphered `criteria` rides the
+                #                    key-rotation reencrypt scan, and this suite asserts EXACT rotate
+                #                    counts (the == 6 / == 2 above), so a preset left behind by one test
+                #                    silently miscounts an unrelated one
+                "messages",
+                "sessions",
+                "webauthn_credentials",  # ADR 0068: FK to users(id) — must clear before users
+                "user_roles",
+                "ad_group_role_map",
+                "users",
+                "roles",
+            ):
+                await cur.execute(f"DELETE FROM {table}")
+            await conn.commit()
+        # audit_chain_meta was cleared above; sync the in-memory keying watermark so this keyless fixture
+        # handle never carries a stale watermark that would fail-close a later keyless record_audit (#190).
+        s._audit_keyed_from = None
+        # open() seeded the reference read-through cache BEFORE the clean-slate DELETE above, so re-load it
+        # from the now-empty tables — otherwise a prior test's reference rows linger in this handle's
+        # in-memory cache/versions and leak across tests (mirrors the Postgres fixture; Track B Step 6).
+        await s._load_reference_cache()
+        yield s
+    finally:
+        await s.close()
+
+
+async def test_store_fixture_closes_the_pool_when_setup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #1629: a setup failure between open() and the yield still closes the pool.
+
+    The window under test is the FIXTURE's own setup, not ``open()``'s. ``SqlServerStore.open``
+    carries its own M-6 guard (``except Exception:`` -> ``pool.close()``/``wait_closed()`` plus the
+    executor shutdown), so a failure injected into any step ``open()`` performs is caught and the
+    pool closed *there*, ``open()`` never returns, and the fixture's ``try``/``finally`` is never
+    entered -- the closed-pool assertion below would then hold with the fix reverted, which is no
+    test at all.
+
+    So the failure is armed only once ``open()`` has RETURNED, and on the returned instance rather
+    than on the class. ``open()`` therefore runs its own ``_load_reference_cache`` for real, and the
+    raise can only land in the fixture's own call to it -- after the clean-slate DELETE batch,
+    before the ``yield``. Without the ``try``/``finally`` the generator walks away from a live pool,
+    so one bad setup step would leak a handle per test and every later test would error on the
+    connection cap instead of on the real fault. Test infrastructure: no deployment axis.
+
+    ``store.__wrapped__`` is the undecorated generator pytest keeps on the fixture object.
+    """
+    from messagefoundry.config.settings import StoreSettings
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    opened: list[SqlServerStore] = []
+
+    async def _boom() -> None:
+        raise RuntimeError("fixture setup failed after open")
+
+    real_open = SqlServerStore.open
+
+    async def _open_then_arm(settings: StoreSettings) -> SqlServerStore:
+        s = await real_open(settings)
+        # open() returned, so its M-6 guard is behind us and the pool is live. Patching the
+        # INSTANCE (not the class) is what pins the raise to a fixture-owned step: nothing
+        # inside open() can reach this attribute, because open() is already done.
+        assert not s._pool.closed, "open() handed back a closed pool -- anchor broken"
+        setattr(s, "_load_reference_cache", _boom)  # noqa: B010 - shadows the method on purpose
+        opened.append(s)
+        return s
+
+    monkeypatch.setattr(SqlServerStore, "open", _open_then_arm)
+
+    gen = store.__wrapped__()
+    with pytest.raises(RuntimeError, match="fixture setup failed after open"):
+        await anext(gen)
+
+    assert opened, "open() never returned, so no fixture-owned step ran and this asserts nothing"
+    assert opened[0]._pool.closed, "the fixture left its pool open on the failure path"
 
 
 async def test_enqueue_creates_message_and_outbox(store) -> None:
@@ -347,6 +403,21 @@ async def test_stats_and_metrics(store) -> None:
     assert metrics.destinations[("IB", "OB1")].queue_depth == 1
     db = await store.db_status()
     assert db.messages == 1
+    # BACKLOG #1563: the remote server's disk is not ours to stat, so this is the "unmeasurable"
+    # None and never 0 — 0 is the console's critical-disk alarm, which pinned the engine-health
+    # heart red on every healthy SQL Server deployment. The whole server-side fix is this one
+    # literal, and nothing else asserted it at all. This module is gated like its Postgres twin, so
+    # the pin holds on the SQL Server leg only — that is the sole place the real backend runs, and
+    # a default run still cannot tell the literal from a 0. Naming the limit rather than implying
+    # this guards every run.
+    assert db.disk_free_bytes is None
+    # Non-empty is the engine-side fact a reader of the null above depends on: this backend names
+    # itself through `journal_mode` (the recovery model), and the "" fallback here means the
+    # sys.databases read came back empty, so the row says nothing about which store answered.
+    # Deliberately asserts only that, not WHICH model — the set of recovery models a console might
+    # recognise is that console's policy, and restating it in the engine suite would let the two
+    # drift apart while both stayed green.
+    assert db.journal_mode
     ok, _ = await store.integrity_check()
     assert ok is True
 
@@ -1010,6 +1081,24 @@ async def test_dead_letter_missing_handlers_errors_the_message(store) -> None:
     )
     assert await store.dead_letter_missing_handlers({"OtherHandler"}, now=200.0) == 1
     assert (await store.get_message(mid))["status"] == MessageStatus.ERROR.value
+
+
+async def test_dead_letter_missing_inbounds_errors_the_message(store) -> None:
+    # BACKLOG #1612. The channel-keyed sweep, at parity with its two siblings: an ingress row whose
+    # inbound left the registry is dead-lettered (nothing else would ever claim it), while an
+    # outbound row is spared even when ITS origin channel is the removed one — outbound lanes key on
+    # destination_name and drain regardless of where the message came from.
+    orphan = await store.enqueue_ingress(channel_id="GONE_IN", raw=RAW, now=100.0)
+    outbound = await store.enqueue_message(
+        channel_id="GONE_IN", raw=RAW, deliveries=[("OB", "p")], now=100.0
+    )
+    assert await store.dead_letter_missing_inbounds({"IB"}, now=200.0) == 1
+    assert (await store.get_message(orphan))["status"] == MessageStatus.ERROR.value
+    assert (await store.outbox_for(outbound))[0]["status"] == OutboxStatus.PENDING.value
+    # Replayable: the operator restores the inbound and the row comes back pending at its own stage.
+    assert await store.replay(orphan, now=300.0) == 1
+    item = await store.claim_next_fifo("GONE_IN", stage=Stage.INGRESS.value, now=300.0)
+    assert item is not None and item.payload == RAW
 
 
 async def test_transform_state_persists_and_reloads_on_reopen(store) -> None:
@@ -4417,3 +4506,23 @@ async def test_session_rotation_contract(store) -> None:
     from tests._session_rotation_contract import assert_session_rotation_contract
 
     await assert_session_rotation_contract(store)
+
+
+# --- the per-message finalize lock, under real concurrency -----------------------------------------
+
+
+async def test_concurrent_mark_done_finalizes_processed_every_round(store) -> None:
+    """Both destinations of ONE message complete at the same moment, every round -> PROCESSED.
+
+    Pins the per-message ``sp_getapplock`` finalize lock as the SINGLE authority on disposition.
+    ``tests/_finalize_race_contract`` carries the property, the mechanism and the measurement behind
+    the round count; the shared module is what keeps this leg and the Postgres one asking the same
+    question rather than two hand-synced copies drifting apart.
+
+    THIS BACKEND'S NUMBER IS UNMEASURED. The 30 rounds were measured against Postgres, whose lock is
+    a different mechanism under a different snapshot rule. What this leg establishes on a real SQL
+    Server, nobody has yet read -- the gated ``sqlserver-store`` CI job carries its first result.
+    """
+    from tests._finalize_race_contract import assert_concurrent_finalize_reaches_processed
+
+    await assert_concurrent_finalize_reaches_processed(store)

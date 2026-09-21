@@ -546,8 +546,17 @@ the engine-side controller will need no path to the binary and will import nothi
 **No release job publishes the helper yet.** The `net-helper` workflow uploads only a short-lived build
 artifact, and that is not a release.
 
-**No install script exists yet either.** BACKLOG #1523 files one for the README's "Install it" steps, and
-records why it is not an MSI.
+**The install script exists; the release job still does not.** BACKLOG #1523 built
+[`scripts/service/install-net-helper.ps1`](../../scripts/service/install-net-helper.ps1) and its
+uninstaller for the README's "Install it" steps, and records why it is not an MSI. It ships in the repo
+beside `install-service.ps1`, so it reaches an operator the same way that one does -- from a checkout,
+not from the wheel.
+
+It writes `address`, `interface` and `mask` into `mefor-net-helper.conf` from the engine's own
+`[cluster.vip]`, read through `messagefoundry cluster-vip --json`. That subcommand exists for this one
+caller: the helper refuses every request naming values other than its `.conf`'s, so the installer's three
+values and the engine's three values have to be the same three values, and a TOML parser in PowerShell
+would have been a second definition of the block rather than a second reader of it.
 
 ## Observability
 

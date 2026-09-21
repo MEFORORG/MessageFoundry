@@ -105,10 +105,15 @@ TRANSCRIPTS.md
 # list was redundant — and enumerating private filenames in a public file discloses the shape of
 # the private set for no gain. Do not re-add per-file entries; extend the blanket rule instead.
 
-# Operator-local load/throughput profiles — sized for one operator's own environment, not a
-# shipped artifact. Still usable by name (they sit in PROFILES_DIR).
-/harness/load/profiles/hospital-baseline.toml
-/harness/load/profiles/soak-12h.toml
+# Operator-local load/throughput profiles are NOT ignored here any more, and must never be again.
+# Two were, by name, at /harness/load/profiles/<name>.toml. That is a contradiction git cannot
+# report: hatchling's force-include walks the FILESYSTEM and reads no .gitignore, so a harness wheel
+# built on the machine holding those files shipped them, hosts and ports included (BACKLOG #1835).
+# They belong in migration-local/profiles/, which /migration-local/ above already covers, which no
+# force-include source names, and which docs/LOAD-TESTING.md and harness/load/profiles/README.md
+# already name as the home for site-specific numbers. harness/load/profile.py reads that directory,
+# so `--load <name>` still resolves. tests/test_packaging.py refuses a new anchored entry inside a
+# force-included tree.
 # Deep-research survey of alternative OSS DB backends for the shared-DB commit-wall — local working
 # note, not a committed artifact (the conclusion is carried in the throughput ADRs / AI memory).
 /docs/research/db-commit-wall-backend-survey.md
@@ -197,7 +202,7 @@ scripts/security/scan-tokens.local.txt
 # needs, or something a SECURITY REVIEWER assessing it needs. Material whose subject is how this
 # project is DEVELOPED -- session orchestration, wave schedules, per-session briefs -- fails both.
 #
-# Custody moved to the vault (wshallwshall/MessageFoundry-vault) BEFORE these left the tracked tree, so
+# Custody moved to the vault (MEFORORG/MessageFoundry-vault) BEFORE these left the tracked tree, so
 # this rule is not the only copy. That ordering is the point: gitignoring alone would have left 103
 # files as single unversioned copies that `git clean -xdf` erases.
 #
@@ -232,7 +237,7 @@ scripts/security/scan-tokens.local.txt
 # inventory and the Secure_* standards are all reviewer material and remain tracked.
 #
 # Custody moved to the vault BEFORE these left the tracked tree, same ordering and same reason as
-# Phase 1: 96b8feec on wshallwshall/MessageFoundry-vault, branch lander/adr0160-custody. This block
+# Phase 1: 96b8feec on MEFORORG/MessageFoundry-vault, branch lander/adr0160-custody. This block
 # untracks 46 files. Of those 46, 15 already existed in the vault and 7 of the 15 were DIVERGENT
 # stale forks predating the 2026-07-27 cutover, so the vault copies were overwritten with the
 # maintained public ones. A bare untrack would have left the vault holding the older text and
@@ -322,3 +327,15 @@ scripts/security/scan-tokens.local.txt
 # the state that serves both, so the rule is here rather than in a reviewer's memory.
 # Rooted with a leading slash: only the repo root, never a `docs/` or `tests/` file of that name.
 /PR_BODY.md
+
+# `mefor-coord/` AT A WORK-TREE ROOT IS DELIBERATELY NOT IGNORED. DO NOT ADD IT HERE.
+# The allocator writes claims under <git-common-dir>/mefor-coord/, which is inside .git -- already
+# outside the work tree, already invisible to `git status`, already impossible to commit. So a
+# `mefor-coord/` directory at a work-tree root is never a legitimate artifact. It means something
+# built that path from an empty or relative base and it landed in the process cwd.
+# Measured 2026-09-18: a test helper read `git rev-parse --git-common-dir` through a wrapper that
+# swallowed git's exit code, got "", and wrote five claim records to a worktree root.
+# Ignoring it would buy protection from `git add -A` at the price of deleting the only signal that
+# the leak happened at all -- and the signal is what surfaced this defect. The protection is bought
+# instead by a guard that fails the test which leaks: tests/conftest.py,
+# _no_allocation_records_in_the_checkout. A leak that shows up beats one that hides.

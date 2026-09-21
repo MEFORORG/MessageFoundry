@@ -35,6 +35,7 @@ from pathlib import Path
 import hl7
 import hl7.parser
 import pytest
+from _ast_sites import named_func
 
 import messagefoundry.parsing._backend as _backend
 import messagefoundry.parsing._builtin_hl7 as _builtin_hl7
@@ -180,11 +181,7 @@ def test_unescape_declares_no_counted_escape_of_its_own() -> None:
     # Adding one is now only possible via _RICH_TEXT_MAP (which _REPEAT_WIDTHS is derived from) — and
     # this fails if anyone puts a dotted key back inside the function.
     source = Path(_builtin_hl7.__file__).read_text(encoding="utf-8")
-    func = next(
-        node
-        for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.FunctionDef) and node.name == "unescape"
-    )
+    func = named_func(ast.parse(source), "unescape")
     inline_dotted = [
         key.value
         for node in ast.walk(func)

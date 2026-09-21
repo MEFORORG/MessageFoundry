@@ -11,8 +11,10 @@ delivery body through a minimal ``RegistryRunner`` + a recording connector, on *
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
-from collections.abc import AsyncIterator
+import time
+from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -22,8 +24,9 @@ from _pace_probe import install_pace_probe
 from messagefoundry.config.models import BatchConfig, RetryPolicy
 from messagefoundry.config.wiring import Registry
 from messagefoundry.parsing.split import split_batch
+from messagefoundry.pipeline import stage_dispatcher, wiring_runner
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
-from messagefoundry.store import MessageStore, Stage
+from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus, Stage
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 
 DEST = "OB_ADT"
@@ -139,22 +142,73 @@ async def _enqueue(store: Any, n: int, *, now0: float = 100.0) -> list[str]:
     return mids
 
 
+# --- BACKLOG #1582: what each message BECAME, asserted per id ------------------------------------
+#
+# `pending_depth(DEST) == 0` is an ABSENCE, and a batch completion that does nothing at all satisfies
+# it: the rows do not become pending, they stay INFLIGHT. Measured on SQLite with
+# `store.mark_batch_done` replaced by a no-op, on the AC1 fixture: depth read **0** and `count_dead()`
+# read **0** — identical to the real run — while all three queue rows sat INFLIGHT and all three
+# messages sat ROUTED. Both completion assertions the test had, depth and dead-letter count, passed
+# against a completion that resolved nothing. The envelope still goes out under that mutation, so the
+# `len(rec.sent) == 1` control does not catch it either.
+#
+# SDS-3.8, the question and what the instrument returns: the question is "what terminal state did each
+# message reach", so the instrument reads each id's own message status and its own per-destination
+# queue status. A no-op now fails on the state it left behind rather than passing on the state it did
+# not create. Because the fixture's enqueued ids are the store's whole population, per-id DONE also
+# answers "zero in flight" — stated per id, so a stranded row names itself.
+#
+# Backend-agnostic: `get_message` and `outbox_for` carry the same status vocabulary on SQLite, SQL
+# Server and Postgres, so the gated legs assert exactly what the SQLite leg does.
+
+_State = tuple[str, tuple[str, ...]]
+
+DELIVERED: _State = (MessageStatus.PROCESSED.value, (OutboxStatus.DONE.value,))
+QUEUED: _State = (MessageStatus.ROUTED.value, (OutboxStatus.PENDING.value,))
+# A dead destination finalizes the MESSAGE as ERROR, not PROCESSED — the finalizer tests DEAD before
+# it tests "every outbound row resolved", so dead-lettering is an error disposition rather than a
+# completed one. Measured, not assumed: this expectation was written as PROCESSED first and the two
+# dead-letter tests failed on it. That agrees with docs/ARCHITECTURE.md and with the finalizer; what
+# it contradicts is `MessageStatus.PROCESSED`'s own inline comment in store/store.py, "all
+# destinations terminal (done or dead)", which is stale. Left alone here — a comment fix is a
+# separate change, and this constant pins the behaviour either way.
+DEAD_LETTERED: _State = (MessageStatus.ERROR.value, (OutboxStatus.DEAD.value,))
+
+
+async def _states(store: Any, mids: Sequence[str]) -> list[_State]:
+    """Each id's (message status, per-destination queue statuses), in the order given.
+
+    Returned rather than asserted so a failure prints every id's ACTUAL state side by side with the
+    expected one — which is what tells you whether a batch half-resolved or never resolved at all.
+    """
+    out: list[_State] = []
+    for mid in mids:
+        msg = await store.get_message(mid)
+        assert msg is not None, f"message {mid} vanished from the store"
+        rows = await store.outbox_for(mid)
+        out.append((str(msg["status"]), tuple(str(r["status"]) for r in rows)))
+    return out
+
+
 # --- AC1: N rows → one BHS…BTS envelope on a single send ------------------------------------------
 
 
 async def test_n_rows_one_envelope(store: Any) -> None:
-    await _enqueue(store, 3)
+    mids = await _enqueue(store, 3)  # retained: the assertion below is per message id (#1582)
     runner = _runner(store)
     rec = _Recorder()
     _wire_batch(runner, rec, BatchConfig(max_count=5, max_wait_ms=1))  # 1ms → head ages out at once
     head = await store.claim_next_fifo(DEST)
     outcome, _ = await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
-    assert len(rec.sent) == 1  # ONE send for all three rows
+    assert len(rec.sent) == 1  # ONE send for all three rows — the no-op-connector negative control
     env = rec.sent[0]
     assert env.startswith("BHS") and "BTS|3" in env
     members = split_batch(env)
     assert [m.split("|")[9] for m in members] == ["MSG1", "MSG2", "MSG3"]  # in FIFO order
-    # every message finalized PROCESSED, nothing left pending
+    # Every message finalized PROCESSED and every queue row DONE — the state a completion must CREATE,
+    # so a completion that resolves nothing fails here (#1582). The depth/dead reads stay as the
+    # store-wide cross-check they always were, no longer as the proof of completion.
+    assert await _states(store, mids) == [DELIVERED] * 3
     depth, _ = await store.pending_depth(DEST)
     assert depth == 0 and await store.count_dead() == 0
 
@@ -165,7 +219,7 @@ async def test_n_rows_one_envelope(store: Any) -> None:
 async def test_crash_midbatch_no_loss_no_reorder(store: Any) -> None:
     # Part A — a TRUE crash: claim the whole batch INFLIGHT, then die before completing. Nothing is
     # completed; reset_stale_inflight (restart recovery) returns all three to PENDING in seq order.
-    await _enqueue(store, 3)
+    mids = await _enqueue(store, 3)
     for _ in range(3):
         assert await store.claim_next_fifo(DEST) is not None  # all three now INFLIGHT
     depth, _ = await store.pending_depth(DEST)
@@ -173,6 +227,8 @@ async def test_crash_midbatch_no_loss_no_reorder(store: Any) -> None:
     await store.reset_stale_inflight()  # as if after a restart (recovered rows become due now)
     depth, _ = await store.pending_depth(DEST)
     assert depth == 3 and await store.count_dead() == 0  # all three recovered, none lost
+    # Recovery has to RE-QUEUE them, not merely stop counting them as in flight (#1582).
+    assert await _states(store, mids) == [QUEUED] * 3
 
     # Part B — atomic failure: a transient transport failure re-pends ALL three together (never a split
     # batch); a re-delivery then frames them in the identical prefix order. Zero backoff so the re-pended
@@ -190,6 +246,7 @@ async def test_crash_midbatch_no_loss_no_reorder(store: Any) -> None:
     assert retry_until is not None  # rescheduled, not dead-lettered
     depth, _ = await store.pending_depth(DEST)
     assert depth == 3 and await store.count_dead() == 0  # all three back, none lost
+    assert await _states(store, mids) == [QUEUED] * 3  # re-pended, not abandoned INFLIGHT
 
     ok = _Recorder()
     runner._destinations[DEST] = ok
@@ -201,6 +258,7 @@ async def test_crash_midbatch_no_loss_no_reorder(store: Any) -> None:
         "MSG2",
         "MSG3",
     ]  # order held
+    assert await _states(store, mids) == [DELIVERED] * 3  # the re-delivery actually completed them
     assert (await store.pending_depth(DEST))[0] == 0
 
 
@@ -234,7 +292,7 @@ async def test_rerun_identical_envelope(store: Any, tmp_path: Path) -> None:
 
 
 async def test_permanent_reject_deadletters_all(store: Any) -> None:
-    await _enqueue(store, 3)
+    mids = await _enqueue(store, 3)
     runner = _runner(store)
     reject = _Recorder(fail=NegativeAckError("partner rejected batch", code="AR", permanent=True))
     _wire_batch(runner, reject, BatchConfig(max_count=5, max_wait_ms=1))
@@ -242,6 +300,8 @@ async def test_permanent_reject_deadletters_all(store: Any) -> None:
     _outcome, retry_until = await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
     assert retry_until is None
     assert await store.count_dead() == 3  # all three dead-lettered atomically
+    # WHICH three: a count alone cannot say the dead rows are these messages' rows (#1582).
+    assert await _states(store, mids) == [DEAD_LETTERED] * 3
     depth, _ = await store.pending_depth(DEST)
     assert depth == 0
 
@@ -250,7 +310,7 @@ async def test_permanent_reject_deadletters_all(store: Any) -> None:
 
 
 async def test_graceful_stop_flushes_partial(store: Any) -> None:
-    await _enqueue(store, 2)  # only 2 rows, but max_count=5 and a long wait
+    mids = await _enqueue(store, 2)  # only 2 rows, but max_count=5 and a long wait
     runner = _runner(store)
     rec = _Recorder()
     _wire_batch(runner, rec, BatchConfig(max_count=5, max_wait_ms=60000))  # 60s wait
@@ -260,6 +320,9 @@ async def test_graceful_stop_flushes_partial(store: Any) -> None:
     outcome, _ = await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
     assert len(rec.sent) == 1
     assert "BTS|2" in rec.sent[0]  # the partial of two was flushed, not stranded
+    # "Not stranded" is the whole claim, so assert the state that proves it (#1582): a stop that sent
+    # the envelope and then skipped completion would leave these two INFLIGHT at a zero depth.
+    assert await _states(store, mids) == [DELIVERED] * 2
     depth, _ = await store.pending_depth(DEST)
     assert depth == 0
 
@@ -270,7 +333,7 @@ async def test_graceful_stop_flushes_partial(store: Any) -> None:
 async def test_batch_within_pooled_claim(store: Any) -> None:
     # In pooled mode the dispatcher claims one head per lane; _dispatch_delivery routes a batching lane
     # to the same batch body, which coalesces its own tail — so batching works with NO per_lane forcing.
-    await _enqueue(store, 3)
+    mids = await _enqueue(store, 3)
     runner = _runner(store, claim_mode="pooled")
     assert runner._claim_mode == "pooled"  # the DEFAULT mode, not forced to per_lane
     rec = _Recorder()
@@ -279,6 +342,8 @@ async def test_batch_within_pooled_claim(store: Any) -> None:
     result = await runner._dispatch_delivery(DEST, head)  # the pooled dispatch adapter
     assert result.kind.name == "RESOLVED"
     assert len(rec.sent) == 1 and "BTS|3" in rec.sent[0]
+    # RESOLVED is what the adapter REPORTED; this is what the store actually holds (#1582).
+    assert await _states(store, mids) == [DELIVERED] * 3
     depth, _ = await store.pending_depth(DEST)
     assert depth == 0
 
@@ -303,8 +368,10 @@ async def test_unparseable_head_dead_letters_not_strands(store: Any) -> None:
     # An MLLP outbound is payload-agnostic (ADR 0004): a non-HL7 body can reach the batch framer. It must
     # dead-letter (framing inside the try) — NOT leave every claimed row INFLIGHT forever.
     bad = "MSH|^~|X\r"  # MSH-2 has < 4 encoding chars → _encoding_chars raises at frame time
-    await store.enqueue_message(channel_id="c1", raw=bad, deliveries=[(DEST, bad)], now=101.0)
-    await store.enqueue_message(channel_id="c1", raw=bad, deliveries=[(DEST, bad)], now=102.0)
+    mids = [
+        await store.enqueue_message(channel_id="c1", raw=bad, deliveries=[(DEST, bad)], now=now)
+        for now in (101.0, 102.0)
+    ]
     runner = _runner(store)
     rec = _Recorder()
     _wire_batch(runner, rec, BatchConfig(max_count=5, max_wait_ms=1))
@@ -314,6 +381,8 @@ async def test_unparseable_head_dead_letters_not_strands(store: Any) -> None:
     assert (
         await store.count_dead() == 2
     )  # both dead-lettered (CONTINUE policy), none stranded INFLIGHT
+    # "None stranded INFLIGHT" named per id, which a zero depth cannot say on its own (#1582).
+    assert await _states(store, mids) == [DEAD_LETTERED] * 2
     depth, _ = await store.pending_depth(DEST)
     assert depth == 0
 
@@ -337,7 +406,7 @@ async def test_head_carried_verbatim(store: Any) -> None:
 
 
 async def test_max_count_caps_the_batch(store: Any) -> None:
-    await _enqueue(store, 5)
+    mids = await _enqueue(store, 5)
     runner = _runner(store)
     rec = _Recorder()
     _wire_batch(runner, rec, BatchConfig(max_count=2, max_wait_ms=1))
@@ -345,6 +414,9 @@ async def test_max_count_caps_the_batch(store: Any) -> None:
     head = await store.claim_next_fifo(DEST)
     await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
     assert "BTS|2" in rec.sent[0]
+    # WHICH two were capped in: the FIFO head pair, and the other three untouched. A depth of 3 alone
+    # is equally consistent with completing nothing and leaving the head pair INFLIGHT (#1582).
+    assert await _states(store, mids) == [DELIVERED] * 2 + [QUEUED] * 3
     depth, _ = await store.pending_depth(DEST)
     assert depth == 3
 
@@ -365,7 +437,7 @@ async def test_batch_seam_is_paced(store: Any, monkeypatch: pytest.MonkeyPatch) 
     # Mutations this refuses: delete `await self._pace_outbound(lane)` from _dispatch_delivery and
     # `calls` comes back empty; delete the `await asyncio.sleep(...)` from _pace_outbound and `slept`
     # comes back empty; move the gate inside the batch body's per-row loop and `calls` reads six.
-    await _enqueue(store, 6)
+    mids = await _enqueue(store, 6)
     runner = _runner(store, claim_mode="pooled")
     rec = _Recorder()
     _wire_batch(runner, rec, BatchConfig(max_count=3, max_wait_ms=1))
@@ -390,6 +462,8 @@ async def test_batch_seam_is_paced(store: Any, monkeypatch: pytest.MonkeyPatch) 
     # Exact, because both the credit for work already done and the wait itself are on a clock the test
     # owns; the 1e-9 absorbs binary float representation only, never a timing difference.
     assert probe.slept == [pytest.approx(interval - work, abs=1e-9)]
+    # Both batches DELIVERED, per id — pacing must delay a send, never cost a completion (#1582).
+    assert await _states(store, mids) == [DELIVERED] * 6
     depth, _ = await store.pending_depth(DEST)
     assert (
         depth == 0
@@ -399,7 +473,7 @@ async def test_batch_seam_is_paced(store: Any, monkeypatch: pytest.MonkeyPatch) 
 async def test_batch_seam_unpaced_is_byte_identical(store: Any) -> None:
     # send_min_interval_seconds unset (0.0) → NO delay, delivery byte-identical: two back-to-back batch
     # deliveries complete with no pacing wait (the default path is untouched).
-    await _enqueue(store, 6)
+    mids = await _enqueue(store, 6)
     runner = _runner(store, claim_mode="pooled")
     rec = _Recorder()
     _wire_batch(runner, rec, BatchConfig(max_count=3, max_wait_ms=1))
@@ -409,5 +483,179 @@ async def test_batch_seam_unpaced_is_byte_identical(store: Any) -> None:
         await runner._dispatch_delivery(DEST, head)
     assert len(rec.sent) == 2 and all("BTS|3" in e for e in rec.sent)
     assert DEST not in runner._send_pace_at  # no pacing → the clock dict was never touched
+    assert await _states(store, mids) == [DELIVERED] * 6  # the unpaced path completes too (#1582)
     depth, _ = await store.pending_depth(DEST)
     assert depth == 0
+
+
+# --- BACKLOG #1579: a fault past the head hands back EVERY coalesced member -----------------------
+
+
+class _FaultOnce:
+    """Wrap a bound store method so call number ``at`` raises, and every other call is the real one.
+
+    One-shot on purpose: a permanently-faulting store lets the worker loop re-fault while the test
+    polls, which measures the retry cadence instead of the re-pend this is about.
+
+    ``fired`` is set the instant the injected call raises, and it is what :func:`_await_fault` gates
+    on. Set BEFORE the raise so a waiter cannot observe the recovered state without having observed
+    the fault that caused it.
+    """
+
+    def __init__(self, real: Any, *, at: int = 1) -> None:
+        self.real = real
+        self.at = at
+        self.calls = 0
+        self.fired = asyncio.Event()
+
+    async def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        self.calls += 1
+        if self.calls == self.at:
+            self.fired.set()
+            raise RuntimeError("injected store fault")
+        return await self.real(*args, **kwargs)
+
+
+@pytest.fixture
+def slow_fault_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Widen both post-fault backoffs so the recovered state is STABLE while the test reads it.
+
+    Both recovery arms date the rows they hand back by a backoff and then sleep it off, so at stock
+    1.0s the "every member is PENDING again" state is a ONE-SECOND window: miss it and the (one-shot)
+    fault is spent, the retry succeeds, and depth falls to 0 with nothing left to see. Widening the
+    constant does not change WHAT is asserted -- the rows are re-pended not-due either way, and
+    ``pending_depth`` counts not-due rows -- it only stops the assertion racing the retry on a loaded
+    runner. Both workers are cancelled by the test, so nothing actually sleeps this long.
+    """
+    # per_lane worker + the #1579 guard itself:
+    monkeypatch.setattr(wiring_runner, "_WORKER_ERROR_BACKOFF_SECONDS", 30.0)
+    # pooled T17 fix A (the dispatcher's own head re-pend):
+    monkeypatch.setattr(stage_dispatcher, "_LANE_ERROR_BACKOFF_SECONDS", 30.0)
+
+
+async def _await_fault(fault: _FaultOnce, *, timeout: float = 10.0) -> None:
+    """Block until the injected fault has actually fired. THE START GATE for every assertion below.
+
+    Without it these tests cannot fail, and that is exactly how they passed on one machine and failed
+    on every CI runner. ``_enqueue`` leaves N rows PENDING, so the success condition ``depth == N`` is
+    ALSO the state before the worker has claimed anything: a poll that starts at t=0 races the worker's
+    first claim against its own first round trip to the store, and whichever wins is pure scheduling.
+    Once the fault has fired every member is INFLIGHT, so a later depth of N can only have come from
+    the re-pend under test.
+    """
+    try:
+        async with asyncio.timeout(timeout):
+            await fault.fired.wait()
+    except TimeoutError:
+        pytest.fail(f"the injected store fault never fired within {timeout}s")
+
+
+async def _until_pending(store: Any, want: int, *, timeout: float = 5.0) -> int:
+    """Poll DEST's PENDING depth until it reaches ``want``; return the depth actually observed.
+
+    PENDING depth is the instrument for "no member was abandoned INFLIGHT" (SDS-3.8 — name the
+    question and what the tool returns): the test enqueues a known N and every row holds exactly one
+    status, so ``depth == N`` says none of them is still claimed. It counts NOT-DUE rows too, which is
+    required here because the re-pend deliberately dates the recovered rows into the future. Backend-
+    agnostic, so the SQL Server and Postgres legs assert the same thing as SQLite.
+
+    Only meaningful AFTER :func:`_await_fault` — before the fault the enqueued rows satisfy it for
+    free. Never call it as the first thing a worker-driven test awaits.
+    """
+    deadline = time.monotonic() + timeout
+    depth = -1
+    while time.monotonic() < deadline:
+        depth, _ = await store.pending_depth(DEST)
+        if depth == want:
+            return depth
+        await asyncio.sleep(0.01)
+    return depth
+
+
+async def _drain_worker(runner: RegistryRunner, task: asyncio.Task[None]) -> None:
+    """Stop a per_lane delivery worker task deterministically.
+
+    Cancel rather than wait out the loop: with per-lane wake ON the idle backstop is long, so a
+    stop-and-await could block for it. Cancelling is safe at every call site below, which only
+    cancels after the rows under test are already back PENDING.
+    """
+    runner._stop.set()
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+async def test_completion_fault_repends_every_member_per_lane(
+    store: Any, slow_fault_backoff: None
+) -> None:
+    # The batch body claims MSG2/MSG3 itself and the per_lane worker's #1611 arm knows only the head
+    # IT claimed, so a completion fault used to leave those two INFLIGHT with no recovery owner until
+    # the next service start. Through the real worker: all three must come back PENDING, no restart.
+    await _enqueue(store, 3)
+    runner = _runner(store)
+    rec = _Recorder()
+    _wire_batch(runner, rec, BatchConfig(max_count=5, max_wait_ms=1))
+    fault = _FaultOnce(store.mark_batch_done)
+    store.mark_batch_done = fault
+
+    worker = asyncio.create_task(runner._delivery_worker(DEST))
+    try:
+        await _await_fault(fault)  # see the helper: without this the test cannot fail
+        depth = await _until_pending(store, 3)
+    finally:
+        await _drain_worker(runner, worker)
+    assert depth == 3  # the head (#1611) AND both coalesced members (#1579)
+    assert await store.count_dead() == 0  # a store fault is not the message's fault
+    # The envelope did go out. At-least-once permits the re-send the recovery costs (ADR 0082);
+    # exactly-once is explicitly NOT promised here.
+    assert len(rec.sent) == 1 and "BTS|3" in rec.sent[0]
+
+
+async def test_coalescing_fault_repends_the_claimed_extras_per_lane(
+    store: Any, slow_fault_backoff: None
+) -> None:
+    # The other injection point: fault DURING coalescing, after an extra is already claimed. Call 1 is
+    # the worker's own head claim, call 2 pulls MSG2 into the window, call 3 raises — so MSG2 is the
+    # stranded member and MSG3 never left PENDING. All three still have to be PENDING afterwards.
+    await _enqueue(store, 3)
+    runner = _runner(store)
+    rec = _Recorder()
+    _wire_batch(runner, rec, BatchConfig(max_count=5, max_wait_ms=1))
+    fault = _FaultOnce(store.claim_next_fifo, at=3)
+    store.claim_next_fifo = fault
+
+    worker = asyncio.create_task(runner._delivery_worker(DEST))
+    try:
+        await _await_fault(fault)  # MSG1 + MSG2 are INFLIGHT here, so depth is 1, never 3
+        depth = await _until_pending(store, 3)
+    finally:
+        await _drain_worker(runner, worker)
+    assert depth == 3
+    assert await store.count_dead() == 0
+    assert rec.sent == []  # the fault landed before framing, so nothing was sent
+
+
+async def test_completion_fault_repends_every_member_pooled(
+    store: Any, slow_fault_backoff: None
+) -> None:
+    # The pooled arm, through the REAL StageDispatcher (not the _dispatch_delivery adapter alone): its
+    # T17 machinery re-pends the head it claimed and releases its own tail, and it cannot name the
+    # members the batch body coalesced — that asymmetry is the defect. Same requirement: all PENDING.
+    await _enqueue(store, 3)
+    runner = _runner(store, claim_mode="pooled")
+    rec = _Recorder()
+    _wire_batch(runner, rec, BatchConfig(max_count=5, max_wait_ms=1))
+    fault = _FaultOnce(store.mark_batch_done)
+    store.mark_batch_done = fault
+
+    dispatcher = runner._make_dispatcher(Stage.OUTBOUND)
+    await dispatcher.start()
+    try:
+        await _await_fault(fault)
+        depth = await _until_pending(store, 3)
+    finally:
+        runner._stop.set()
+        await dispatcher.stop()
+    assert depth == 3
+    assert await store.count_dead() == 0
+    assert len(rec.sent) == 1 and "BTS|3" in rec.sent[0]

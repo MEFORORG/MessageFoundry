@@ -27,6 +27,7 @@ import re
 from pathlib import Path
 
 import pytest
+from _ast_sites import callee_name, named_func
 
 from messagefoundry.config.settings import (
     AlertsSettings,
@@ -352,15 +353,7 @@ def test_message_event_constant_matches_the_literal_emit_sites() -> None:
         for node in ast.walk(ast.parse(source)):
             if not isinstance(node, ast.Call):
                 continue
-            func = node.func
-            attr = (
-                func.attr
-                if isinstance(func, ast.Attribute)
-                else func.id
-                if isinstance(func, ast.Name)
-                else None
-            )
-            if attr not in {"_event", "_event_stmt"}:
+            if callee_name(node) not in {"_event", "_event_stmt"}:
                 continue
             for arg in node.args[:2]:
                 if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
@@ -428,13 +421,7 @@ def test_connection_event_vocabulary_is_derived_from_the_emit_sites() -> None:
         for node in _ast.walk(tree):
             if not isinstance(node, _ast.Call):
                 continue
-            name = (
-                node.func.attr
-                if isinstance(node.func, _ast.Attribute)
-                else node.func.id
-                if isinstance(node.func, _ast.Name)
-                else None
-            )
+            name = callee_name(node)
             if name not in targets:
                 continue
             if (
@@ -498,12 +485,7 @@ def test_auto_resolve_inverses_are_described_accurately() -> None:
     tree = _ast.parse(
         (_ROOT / "messagefoundry" / "pipeline" / "alert_sinks.py").read_text(encoding="utf-8")
     )
-    record_state = next(
-        node
-        for node in _ast.walk(tree)
-        if isinstance(node, _ast.FunctionDef | _ast.AsyncFunctionDef)
-        and node.name == "_record_state"
-    )
+    record_state = named_func(tree, "_record_state")
     calls = {
         n.func.attr
         for n in _ast.walk(record_state)
@@ -815,8 +797,9 @@ def test_every_socket_listener_that_emits_nothing_is_named_in_row_7() -> None:
     so a socket listener that emits **no** event must be named as an exception. Nothing derived that:
     the row said the DICOM C-STORE SCP was the only silent listener while the ``ISA``/``IEA``-framed
     X12 inbound was equally silent, so an operator reading it concluded an X12 feed's connects and
-    refusals were captured. They are not — ``transports/x12.py`` contains zero ``_emit_event`` calls,
-    and its ``max_connections`` refusal writes no log either.
+    refusals were captured. They were not. BACKLOG #1665 closed that by wiring X12 to the same seven
+    kinds its raw-TCP twin emits, so the row's exception list is once again just the DICOM SCP — and
+    this guard is what catches the next listener that arrives silent.
 
     Scoped to modules that actually call ``asyncio.start_server``: a poll/file source legitimately
     never emits (``SourceConnector.on_connection_event`` defaults to ``None`` precisely so those stay

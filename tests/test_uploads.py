@@ -15,6 +15,7 @@ import pytest
 from messagefoundry.config.settings import StoreSettings
 from messagefoundry.store.crypto import CipherError, generate_key, make_cipher
 from messagefoundry.uploads import (
+    PruneResult,
     UploadContentError,
     UploadedFileMeta,
     UploadNotFoundError,
@@ -369,7 +370,7 @@ async def test_prune_deletes_aged_pairs_and_is_idempotent(tmp_path: Path) -> Non
         data=b"fresh diagnostic\n", filename="new.txt", uploader="op", uploader_id="u-op"
     )
     # A prune "now" (nothing aged yet) removes nothing.
-    assert await store.prune_expired() == []
+    assert await store.prune_expired() == PruneResult()
     # Backdate `old` by rewriting its meta uploaded_at 31 days into the past (re-encrypted under the same
     # store cipher + file_id AAD), then prune at real-now so only the aged pair is swept.
     root = tmp_path / "uploads"
@@ -378,11 +379,12 @@ async def test_prune_deletes_aged_pairs_and_is_idempotent(tmp_path: Path) -> Non
         store._encrypt_meta(aged_meta),
         encoding="utf-8",  # noqa: SLF001 — test drives the cipher seam
     )
-    pruned = await store.prune_expired()
-    assert [m.file_id for m in pruned] == [meta.file_id]
+    result = await store.prune_expired()
+    assert [m.file_id for m in result.pruned] == [meta.file_id]
     assert not (root / f"{meta.file_id}.blob").exists()
     assert not (root / f"{meta.file_id}.meta").exists()
-    assert await store.prune_expired() == []  # idempotent — the aged pair is already gone
+    # Idempotent — the aged pair is already gone, and the orphan sweep found nothing to remove.
+    assert await store.prune_expired() == PruneResult()
     assert [m.file_id for m in await store.list_files()] == [fresh.file_id]  # fresh file untouched
 
 
@@ -400,8 +402,8 @@ async def test_retention_runner_prunes_and_audits(tmp_path: Path) -> None:
 
     # Inject a clock 31 days ahead so the just-saved file is past the window.
     runner = UploadRetentionRunner(store, audit=_audit, clock=lambda: time.time() + 31 * 86_400)
-    pruned = await runner.run_once()
-    assert [m.file_id for m in pruned] == [meta.file_id]
+    result = await runner.run_once()
+    assert [m.file_id for m in result.pruned] == [meta.file_id]
     assert [m.file_id for m in audited] == [meta.file_id]
     assert await store.list_files() == []
 

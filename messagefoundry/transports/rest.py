@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import http.client
 import logging
 import re
 import ssl
@@ -71,7 +72,7 @@ from messagefoundry.transports.base import (
     encode_wire_body,
     register_destination,
 )
-from messagefoundry.transports.bounded_read import read_bounded, read_bounded_text
+from messagefoundry.transports.bounded_read import drain_bounded, read_bounded_text
 from messagefoundry.transports.signing import MessageSigner, signer_from_destination
 
 __all__ = [
@@ -93,6 +94,7 @@ __all__ = [
     "refuse_cleartext_credentials",
     "refuse_cleartext_egress",
     "refuse_unrevoked_verified_hop",
+    "refuse_url_credentials",
     "refuse_verify_off",
 ]
 
@@ -113,7 +115,30 @@ DYNAMIC_HEADER_PREFIX = "http.header."
 
 # RFC 7230 header-name token: a message-derived name that isn't a valid token is DROPPED (never emitted),
 # so a crafted metadata key can't smuggle a ':' / space / control char into the request as a header line.
-_HEADER_NAME_TOKEN = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+#
+# ANCHORED WITH ``\Z``, NOT ``$``, and the difference is the whole guard. Python's ``$`` also matches
+# just before a trailing newline, so ``$`` accepted ``X-Foo\n`` -- a name carrying the one character
+# this screen exists to keep out of the header block. ``\Z`` matches only at the true end of the
+# string. Measured on the pre-fix literal: ``match("X-Foo\n")`` was truthy; with ``\Z`` it is None.
+_HEADER_NAME_TOKEN = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+\Z")
+
+
+def _latin1_refusal_position(value: str) -> int | None:
+    """Index of the first character ``http.client.putheader``'s latin-1 encode would reject, or
+    ``None`` when the whole value encodes.
+
+    **Returns an index instead of raising, and that is the point.** The caller must refuse OUTSIDE an
+    ``except`` block: raising inside one makes Python set ``__context__`` to the ``UnicodeEncodeError``,
+    and that exception carries ``.object`` — the **entire offending value**. ``raise ... from None``
+    clears ``__cause__`` and sets ``__suppress_context__`` (so a traceback will not PRINT the chain),
+    but ``__context__`` itself stays populated and readable by anything that walks it. Measured: the
+    shipped body-path guard :func:`~messagefoundry.transports.base.encode_wire_body` uses ``from None``
+    inside its ``except`` and its ``__context__.object`` is still the whole payload."""
+    try:
+        value.encode("latin-1")
+    except UnicodeEncodeError as exc:
+        return exc.start
+    return None
 
 
 def _strip_header_control_chars(value: str) -> str:
@@ -182,7 +207,30 @@ def outbound_headers_from_metadata(metadata: Mapping[str, str] | None) -> dict[s
     a message-derived value can neither weaken nor replace the connection's credential. **Pure:** the
     result is a deterministic function of ``metadata`` (itself pure from the transform), so an
     at-least-once re-run yields byte-identical headers. ``None``/empty → ``{}`` (the default,
-    byte-identical) — no per-message headers."""
+    byte-identical) — no per-message headers.
+
+    **A value that is not encodable as latin-1 is REFUSED, permanently and content-free** (BACKLOG
+    #1663). ``http.client.putheader`` latin-1-encodes a ``str`` header value, so a Handler that stamps
+    a non-Latin-1 codepoint — ``_strip_header_control_chars`` removes C0 controls and DEL, not these —
+    produced a ``UnicodeEncodeError`` deep inside ``urllib``. That is a ``ValueError`` and **not** an
+    ``OSError``, so it escaped the connector's arms as an unhandled internal error.
+
+    Refused here rather than merely classified downstream, and the choice mirrors
+    :func:`~messagefoundry.transports.base.encode_wire_body`, which already ruled this question for the
+    message BODY: the same bytes will never encode on a retry (hence ``permanent``), and the refusal
+    names the **codec and the position — an index, never the content**. It goes one step further than
+    ``encode_wire_body`` and raises from OUTSIDE the encode's ``except`` block (see
+    :func:`_latin1_refusal_position`), so neither ``__cause__`` nor ``__context__`` retains the
+    ``UnicodeEncodeError`` whose ``.object`` is the whole offending value.
+
+    **It does not name the header either**, which is where this parts company with ``encode_wire_body``
+    and follows :func:`enforce_send_time_length_limits`'s message-derived arm instead. At send time the
+    NAME is as message-derived as the value — it is a metadata key suffix, and ``_HEADER_NAME_TOKEN``
+    bounds its charset, not its content, so ``X-Patient-MRN-12345`` is a well-formed token. This string
+    travels through ``safe_exc`` into ``last_error`` and ``message_events.detail``, and on a
+    ``DeliveryError`` arm off-box to the webhook AlertSink. RFC 8187 percent-encoding was considered and
+    rejected: its ext-value form is opt-in per field definition, so applying it to an arbitrary
+    Handler-named header would silently send a partner a wire format it never agreed to parse."""
     if not metadata:
         return {}
     out: dict[str, str] = {}
@@ -196,7 +244,20 @@ def outbound_headers_from_metadata(metadata: Mapping[str, str] | None) -> dict[s
             continue  # auth is connection-configured only — a message never sets/overrides it
         if not isinstance(value, str):
             continue  # SetMeta enforces str, but stay defensive against a hand-built bag
-        out[name] = _strip_header_control_chars(value)
+        safe = _strip_header_control_chars(value)
+        # Checked on the STRIPPED value because that is what would ship, so the reported position
+        # indexes the characters urllib would actually have rejected. Stripping cannot change WHETHER
+        # a value encodes (every C0 control and DEL is latin-1-encodable), only the index.
+        position = _latin1_refusal_position(safe)
+        if position is not None:
+            # Raised OUTSIDE the encode's except block on purpose — see _latin1_refusal_position.
+            raise NegativeAckError(
+                "per-message request-header value is not encodable as 'latin-1' "
+                f"(first offending character at position {position})",
+                code="encoding",
+                permanent=True,
+            )
+        out[name] = safe
     return out
 
 
@@ -339,10 +400,60 @@ def _expiry_relaxed_opener(
 
 def _redact_url(url: str) -> str:
     """``scheme://host[:port]/path`` only — drops query/userinfo so a token or PHI in the query
-    string never reaches a log line."""
+    string never reaches a log line.
+
+    A port that is not a number is DROPPED, never echoed, and never raised (BACKLOG #1793). A password
+    holding an unencoded ``/`` makes ``urlsplit`` read its head as the port, and ``SplitResult.port``
+    raises a ``ValueError`` that quotes it. Every classified ``except`` arm calls this, so a raise here
+    would escape that arm unclassified, carrying the password head with it."""
     p = urllib.parse.urlsplit(url)
-    port = f":{p.port}" if p.port else ""
+    try:
+        port = f":{p.port}" if p.port else ""
+    except ValueError:
+        port = ""
     return f"{p.scheme}://{p.hostname or ''}{port}{p.path}"
+
+
+def refuse_url_credentials(
+    url: str,
+    setting: str,
+    *,
+    use: str = "basic_user/basic_password or bearer_token",
+    error: type[ValueError] = ValueError,
+) -> None:
+    """Refuse an endpoint URL that carries a credential, at CONSTRUCTION time (BACKLOG #1793).
+
+    WHY IT IS REFUSED RATHER THAN SUPPORTED. urllib never turns URL userinfo into an ``Authorization``
+    header. It hands ``user:pw@host`` to ``http.client`` as the HOST, which reads ``pw@host`` as the
+    port and raises ``InvalidURL("nonnumeric port: 'pw@host'")``. With an explicit port the lookup fails
+    on a host that still holds the password, and through a plain-http forward proxy the password goes
+    out in the request line and the ``Host`` header. So the shape never authenticated anything, and its
+    error text carried the password into ``queue.last_error`` and the test-connection reply.
+
+    TWO CHECKS, because ``urlsplit`` misses one shape. An ``@`` in the authority is userinfo; it is
+    tested after unquoting because urllib unquotes the host, so ``%40`` leaks exactly like ``@``. A port
+    that is not a number is what a password holding an unencoded ``/``, ``?`` or ``#`` looks like: the
+    authority stops there, no ``@`` is seen, and the password's head becomes the port. An EMPTY port
+    (``host:/``) passes, because ``urlsplit`` reads it as no port and ``http.client`` as the default.
+
+    ``proxy_url`` is deliberately NOT screened here: a forward-proxy URL legitimately carries its own
+    credentials, and #1207 masks them for display.
+
+    PHI- and secret-safe: names the setting, never the URL or any part of it. ``error`` keeps each
+    seam's own ``ValueError`` subclass, so a caller catching ``HttpAuthError`` still catches this."""
+    p = urllib.parse.urlsplit(url)
+    if "@" in urllib.parse.unquote(p.netloc):
+        raise error(
+            f"{setting} must not carry credentials in the URL (the user:password@ part); "
+            f"set them in {use} instead"
+        )
+    try:
+        p.port  # noqa: B018 - evaluated only for the ValueError a non-numeric port raises
+    except ValueError:
+        raise error(
+            f"{setting} has a port that is not a number from 0 to 65535. A password written "
+            f"into the URL can cause this; set credentials in {use} instead"
+        ) from None
 
 
 # --- posture-keyed insecure-hop enforcement (#200, ADR 0092) -----------------------------------
@@ -884,7 +995,9 @@ def enforce_signature_header_limits(signer: object | None, *, connector: str) ->
 # byte-identical.
 
 #: Sentinel ``proxy_url`` value meaning "Use the OS/environment default web proxy" (getproxies()), #112.
-_PROXY_DEFAULT = "default"
+#: PUBLIC because the ``[egress].allowed_proxy`` gate in ``pipeline/wiring_runner.py`` has to exempt it
+#: (it names no address at config time), and a second copy of the literal would be free to drift.
+PROXY_DEFAULT = "default"
 
 
 def _normalize_no_proxy(value: Any) -> tuple[str, ...]:
@@ -1090,7 +1203,7 @@ def proxy_config_from_settings(
         return None
     bypass = _normalize_no_proxy(s.get("proxy_no_proxy"))
     proxy_url = str(raw).strip()
-    if proxy_url.lower() == _PROXY_DEFAULT:
+    if proxy_url.lower() == PROXY_DEFAULT:
         # "Use Default Web Proxy" — explicit creds are meaningless here (the system proxy carries its own),
         # so reject the ambiguous combo rather than silently drop a configured credential.
         if s.get("proxy_user") or s.get("proxy_password") or s.get("proxy_auth_type"):
@@ -1263,6 +1376,7 @@ class RestDestination(DestinationConnector):
         scheme = urllib.parse.urlsplit(url).scheme.lower()
         if scheme not in ("http", "https"):
             raise ValueError(f"REST destination 'url' must be http or https, got scheme {scheme!r}")
+        refuse_url_credentials(url, "REST destination 'url'")
         self.url = url
         self.method: str = str(s.get("method", "POST")).upper()
         self.timeout: float = float(s.get("timeout_seconds", 30.0))
@@ -1357,8 +1471,16 @@ class RestDestination(DestinationConnector):
         # a forward proxy carried as opener handlers, or the ECH sidecar the request is re-addressed to.
         # #1176: before this, the ECH case passed `proxy=None` and nothing else, so the token hop went
         # DIRECT and leaked the authorization server's SNI while the payload hop was routed.
+        # #1794 (#1660's third configuration): the client trust anchor travels the same way, so the
+        # credential-bearing hop verifies against the instance `[tls]` policy the delivery hop below has
+        # honoured since #1180. Pass the POLICY, never the `anchor` this method resolves for the delivery
+        # opener further down: the provider resolves its own against the TOKEN url, for the reason
+        # `oauth2_cc_provider_from_settings` records.
         self._token_provider = bearer_provider_from_settings(
-            s, proxy=self._proxy, ech_sidecar=self._ech_sidecar
+            s,
+            proxy=self._proxy,
+            ech_sidecar=self._ech_sidecar,
+            trust_anchor_policy=config.trust_anchor_policy,
         )
         if self._token_provider is not None:
             # The SMART bearer is injected per-request in _post, so the static-header cleartext check
@@ -1543,7 +1665,7 @@ class RestDestination(DestinationConnector):
             with self._opener.open(req, timeout=self.timeout) as resp:
                 # ASVS 15.2.2: the probe body is discarded, but an unbounded drain would let a
                 # reachability check be turned into a memory exhaustion.
-                read_bounded(resp, connector=f"REST {_redact_url(self.url)} probe")
+                drain_bounded(resp, connector=f"REST {_redact_url(self.url)} probe")
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):
                 raise DeliveryError(
@@ -1552,6 +1674,11 @@ class RestDestination(DestinationConnector):
             return  # any other status (the host answered) → reachable
         except urllib.error.URLError as exc:  # DNS / connection refused / TLS / timeout
             raise DeliveryError(f"REST {_redact_url(self.url)} unreachable: {exc.reason}") from exc
+        except (ValueError, http.client.InvalidURL) as exc:
+            # BACKLOG #1793: classified like _post's arm, so the probe reply carries no urllib text.
+            raise DeliveryError(
+                f"REST {_redact_url(self.url)} rejected an invalid request value"
+            ) from exc
         except (TimeoutError, OSError) as exc:
             raise DeliveryError(f"REST {_redact_url(self.url)} failed: {exc}") from exc
 
@@ -1655,6 +1782,29 @@ class RestDestination(DestinationConnector):
             ) from exc
         except urllib.error.URLError as exc:  # DNS / connection refused / TLS / timeout
             raise DeliveryError(f"REST {_redact_url(self.url)} unreachable: {exc.reason}") from exc
+        except (ValueError, http.client.InvalidURL) as exc:
+            # Backstop for an illegal request value urllib rejects -- the arm fhir.py and dicomweb.py
+            # already carry and this connector did not (BACKLOG #1663). A retry re-sends the same
+            # bytes, so it is permanent, never an internal error escaping send(). PHI-safe: the
+            # redacted url only, never the value -- a message-derived header value is PHI-adjacent
+            # and ``UnicodeEncodeError`` stringifies the offending characters.
+            #
+            # The limb that MOTIVATED it was a message-derived header value: ``putheader``
+            # latin-1-encodes a str value, so a Handler stamping a CJK one raised
+            # ``UnicodeEncodeError`` -- a ``ValueError``, NOT an ``OSError`` -- which matched none of
+            # the arms above and left send() as an unhandled internal error. That route is now closed
+            # upstream: ``outbound_headers_from_metadata`` refuses such a value content-free before a
+            # request is built. This arm stays as the BACKSTOP for anything urllib rejects that the
+            # helper cannot see -- a value that is not message-derived, or a future caller path.
+            #
+            # InvalidURL is named EXPLICITLY because it is not a ValueError: its MRO is
+            # InvalidURL -> HTTPException -> Exception, so it is neither a ValueError nor an OSError
+            # and would escape this arm too. Same reasoning as fhir.py's.
+            raise NegativeAckError(
+                f"REST {_redact_url(self.url)} rejected an invalid request value",
+                code="bad-request-value",
+                permanent=True,
+            ) from exc
         except (TimeoutError, OSError) as exc:
             raise DeliveryError(f"REST {_redact_url(self.url)} failed: {exc}") from exc
 

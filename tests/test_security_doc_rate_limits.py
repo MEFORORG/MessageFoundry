@@ -27,11 +27,15 @@ from __future__ import annotations
 import ast
 import inspect
 import re
+import tokenize
+from io import StringIO
 from pathlib import Path
 
 import pytest
+from _ast_sites import call_sites, callee_name, calls_to, named_func
 
 from messagefoundry.auth.service import AuthService
+from messagefoundry.config import wiring
 from messagefoundry.config.settings import AuthSettings, ServiceSettings
 from messagefoundry.store.base import Store
 
@@ -226,24 +230,6 @@ def _decorated_path(node: ast.AST) -> str | None:
     return None
 
 
-def _calls_to(tree: ast.AST, names: set[str]) -> set[str]:
-    """Every function name in ``names`` that is called anywhere in ``tree``."""
-    found: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            func = node.func
-            name = (
-                func.attr
-                if isinstance(func, ast.Attribute)
-                else func.id
-                if isinstance(func, ast.Name)
-                else None
-            )
-            if name in names:
-                found.add(name)
-    return found
-
-
 def _route_limiter_calls(path: Path, limiters: set[str]) -> dict[str, set[str]]:
     """``{"<METHOD> <path>": {limiter, …}}`` for every decorated route function in ``path``."""
     tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -254,7 +240,7 @@ def _route_limiter_calls(path: Path, limiters: set[str]) -> dict[str, set[str]]:
         route = _decorated_path(node)
         if route is None:
             continue
-        used = _calls_to(node, limiters)
+        used = calls_to(node, limiters)
         if used:
             method = next(
                 deco.func.attr.upper()
@@ -538,27 +524,27 @@ def test_scope_guard_detects_a_planted_rescoping() -> None:
 def test_ingest_plane_rate_limit_row_matches_the_code() -> None:
     """The ingest row must describe the pacer's REACHABILITY as the code actually has it.
 
-    This guard has moved twice. Until 2026-08-11 it asserted the doc said "no message-rate or volume
-    limit exists"; the MLLP pacing build (ASVS 2.4.1 / 15.2.2) falsified that, so it moved to
-    requiring both that a control exists and that it "ships OFF". BACKLOG #1249 falsified that
-    wording in turn: the pacer is built, but neither key is a parameter of the ``MLLP()`` factory and
-    ``connections.toml`` desugars through that SAME factory, so no documented surface can set either.
-    "Off" is the more dangerous half-truth, because a reader takes it to mean "then set it to on".
+    This guard has moved twice, and the history is why it reads the signature instead of pinning a
+    verdict. Until 2026-08-11 it asserted the doc said "no message-rate or volume limit exists"; the
+    MLLP pacing build (ASVS 2.4.1 / 15.2.2) falsified that, so it moved to requiring both that a
+    control exists and that it "ships OFF". BACKLOG #1249 falsified that wording in turn, for the
+    reason stated once in ``MLLP()``'s own docstring under "Inbound message-rate pacing" -- read it
+    there rather than from a copy here. "Off" was the more dangerous half-truth, because a reader
+    takes it to mean "then set it to on".
+
+    THAT WINDOW HAS CLOSED, so the branch below that demands the row say "NOT REACHABLE" is the one
+    that no longer fires. The prose in this module is held to that same reading by
+    ``test_this_module_does_not_outlive_the_reachability_it_reports``.
 
     WHAT THIS ASSERTS IS CONSISTENCY, NOT A PREFERENCE, AND THE DISTINCTION IS THE WHOLE POINT.
-    **#1249 is OPEN.** The owner has not chosen between exposing the two keys and rewording the row,
-    and a guard that pinned "NOT REACHABLE" as the correct state would settle that product question
-    BY BUILD -- the same shape as settling one by omission. So reachability is READ FROM THE
-    SIGNATURE and the doc is required to agree with whatever it says. Expose the keys and this test
-    demands the row stop saying unreachable; leave them out and it demands the row say so. Either
-    ruling stays cheap, and neither is pre-empted by a green run here.
+    A guard that pinned EITHER state as the correct one would settle a product question BY BUILD --
+    the same shape as settling one by omission. So reachability is READ FROM THE SIGNATURE and the
+    doc is required to agree with whatever it says. Both branches are kept for that reason, not
+    because the unreachable one is expected back: withdraw the keys and this test demands the row say
+    so; leave them exposed and it demands the row stop saying unreachable. Either way stays cheap,
+    and neither is pre-empted by a green run here.
     """
-    import inspect
-
-    from messagefoundry.config import wiring
-
-    pacing_keys = {"max_messages_per_second", "message_burst"}
-    accepted = pacing_keys & set(inspect.signature(wiring.MLLP).parameters)
+    accepted = _PACING_KEYS & set(inspect.signature(wiring.MLLP).parameters)
 
     block = _section(_H_LIMITS)
     assert "Ingest plane" in block
@@ -582,7 +568,7 @@ def test_ingest_plane_rate_limit_row_matches_the_code() -> None:
     # BACKLOG #1114 ported it to the raw-TCP, X12 and HTTP intakes, and the row named the raw-TCP one
     # as never covered. Pinning either state as correct would settle by build what the code decides.
     for factory, label in (("Tcp", "raw-TCP"), ("X12", "X12"), ("Http", "HTTP")):
-        reaches = pacing_keys <= set(inspect.signature(getattr(wiring, factory)).parameters)
+        reaches = _PACING_KEYS.issubset(inspect.signature(getattr(wiring, factory)).parameters)
         if reaches:
             assert label in block, (
                 f"{factory}() now accepts the pacing keys, so the ingest row must name the "
@@ -601,6 +587,152 @@ def test_ingest_plane_rate_limit_row_matches_the_code() -> None:
         assert cap in block, f"the ingest row must name the {cap} resource cap it DOES have"
 
 
+#: The MLLP pacing keys, and the one place this module decides whether they are reachable. It was
+#: derived twice by copy, which let the two copies disagree about what "reachable" means.
+_PACING_KEYS = frozenset({"max_messages_per_second", "message_burst"})
+
+
+def _pacing_is_reachable() -> bool:
+    """Whether ``MLLP()`` exposes either pacing key, read live from the signature.
+
+    EITHER, not both, and the asymmetry with the ``Tcp``/``X12``/``Http`` loop below -- which uses
+    ``<=`` and so requires both -- is deliberate rather than an oversight: the MLLP row's claim is
+    about the pacer being settable at all, while the other three are named as covered or not."""
+    return bool(_PACING_KEYS & set(inspect.signature(wiring.MLLP).parameters))
+
+
+def _module_prose(path: Path) -> list[tuple[str, str]]:
+    """``(owner, text)`` for every docstring AND every comment in ``path``.
+
+    Comments are included because the claim this screens for lived in a COMMENT when it was found --
+    an own-line block in `wiring.py` -- and `ast` cannot see one. A docstring-only screen would have
+    let the identical sentence come back three characters away from where it was removed. Comments
+    are attributed by line rather than by owner, which is enough to find them."""
+    source = path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    found: list[tuple[str, str]] = [("<module>", ast.get_docstring(tree) or "")]
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            found.append((node.name, ast.get_docstring(node) or ""))
+    for token in tokenize.generate_tokens(StringIO(source).readline):
+        if token.type is tokenize.COMMENT:
+            found.append((f"comment:line {token.start[0]}", token.string.lstrip("#").strip()))
+    return [(owner, text) for owner, text in found if text]
+
+
+#: Present-tense claims that the MLLP pacing keys cannot be set. Each was true of the code before the
+#: keys became ``MLLP()`` parameters and each was still sitting in a docstring here afterwards, which
+#: is what this pattern exists to stop recurring. Deliberately PRESENT tense: the surviving history
+#: prose records the same facts in the past tense and must keep being allowed to.
+#:
+#: The ledger-status alternative is anchored to a row number and is the one piece held
+#: case-SENSITIVE. Written as a bare ``is OPEN`` under ``re.IGNORECASE`` it matched the ordinary
+#: English "is open" -- "while the MLLP connection is open", "the CRL question is open" -- and would
+#: have reddened this guard from an unrelated docstring in a module of this size.
+_PACING_UNREACHABLE_PROSE = re.compile(
+    r"neither key is a parameter"
+    r"|no documented surface can set"
+    r"|(?-i:#\s*\d+ is OPEN)"
+    r"|owner has not chosen"
+    r"|keys? (?:is|are) not (?:a )?parameters?"
+    r"|keys? (?:is|are) (?:still )?unreachable",
+    re.IGNORECASE,
+)
+
+#: The mirror: present-tense claims that they CAN be set. Checked only while the signature says they
+#: cannot, so neither state is pinned as the correct one. Exercised by the control below even though
+#: that branch is not the live one -- an untested screen that runs only in the case the two-branch
+#: design exists for is worse than none, because it reports clean.
+_PACING_REACHABLE_PROSE = re.compile(
+    r"keys? (?:is|are) (?:now )?(?:keyword-only )?parameters? of"
+    r"|keys? (?:is|are) (?:now )?(?:reachable|settable)"
+    r"|keys? reach the connector"
+    r"|keys? can be set",
+    re.IGNORECASE,
+)
+
+
+def _pacing_prose_complaints(prose: list[tuple[str, str]], reachable: bool) -> list[str]:
+    """Prose here whose present-tense reachability claim contradicts the live signature."""
+    pattern = _PACING_UNREACHABLE_PROSE if reachable else _PACING_REACHABLE_PROSE
+    return [owner for owner, text in prose if pattern.search(text)]
+
+
+def test_this_module_does_not_outlive_the_reachability_it_reports() -> None:
+    """The prose in this module is held to the same signature reading as its assertions.
+
+    The assertions in ``test_ingest_plane_rate_limit_row_matches_the_code`` read reachability from
+    ``inspect.signature(wiring.MLLP)`` and were therefore correct throughout. Its DOCSTRING was not,
+    and nothing failed, because prose is not executed. A reader reaches for a test's docstring to
+    learn what it means before reading what it does. What the stale half said, and when it stopped
+    being true is stated in ``MLLP()``'s docstring, under "Inbound message-rate pacing".
+
+    This is a phrase screen, and a phrase screen finds the shape it was cut from. It pins the claims
+    that actually drifted rather than pretending to grade meaning; a fresh way of saying the same
+    wrong thing would pass it. The structurally-grounded half of this fix is in
+    ``tests/test_connection_schema.py``, which derives the same contradiction from the schema itself
+    instead of from wording."""
+    reachable = _pacing_is_reachable()
+    complaints = _pacing_prose_complaints(_module_prose(Path(__file__)), reachable)
+    verdict = "settable" if reachable else "unreachable"
+    assert not complaints, (
+        f"MLLP() reports the pacing keys as {verdict}, but this prose states the opposite in the "
+        f"present tense: {sorted(complaints)}. Correct it -- the assertions already read the "
+        "signature, so only the explanation is wrong."
+    )
+
+
+def test_the_prose_screen_catches_the_claim_that_actually_drifted() -> None:
+    """Proves the screen above can fail, by replanting the sentence it was cut from.
+
+    BOTH screens are exercised, not just the live one. The ``reachable=False`` branch runs only if
+    the keys are ever withdrawn from ``MLLP()`` -- which is the single case the two-branch design
+    exists for -- so an unexercised screen there would report clean at exactly the moment it was
+    needed.
+
+    The check over THIS module reads the live signature rather than hardcoding a direction. Pinned
+    to ``reachable=True`` it inverted on withdrawal: a maintainer who correctly rewrote the prose to
+    say the keys are no longer parameters would satisfy the guard above and fail this control, and
+    the only ways out would be reverting correct prose or editing the control."""
+    retired = (
+        "the pacer is built, but neither key is a parameter of the MLLP() factory and "
+        "connections.toml desugars through that SAME factory, so no documented surface can set "
+        "either. #1249 is OPEN."
+    )
+    planted = [("test_ingest_plane_rate_limit_row_matches_the_code", retired)]
+    assert _pacing_prose_complaints(planted, reachable=True), (
+        "the screen does not match the exact sentence this guard was written against -- it is not a "
+        "guard"
+    )
+    assert not _pacing_prose_complaints(_module_prose(Path(__file__)), _pacing_is_reachable()), (
+        "the live screen already matches this module as it stands, so a green run above proves "
+        "nothing"
+    )
+    # The MIRROR screen, which no live run reaches. Four ways of claiming the keys are settable;
+    # all four must be seen, because the failure mode of a phrase screen is a near-miss wording.
+    for claim in (
+        "both keys are keyword-only parameters of MLLP() today",
+        "both keys are now settable",
+        "the keys reach the connector from here",
+        "the pacing keys can be set on the factory",
+    ):
+        assert _pacing_prose_complaints([("mirror", claim)], reachable=False), (
+            f"the reachable-prose screen misses {claim!r}; it runs only when the keys are withdrawn, "
+            "so nothing else would ever catch that"
+        )
+    # And the past tense stays legal under BOTH screens: recording why the guard moved is not a
+    # present-tense claim in either direction.
+    history = (
+        "at that point the two keys were parameters of no factory, so no documented surface could "
+        "set either"
+    )
+    for direction in (True, False):
+        assert not _pacing_prose_complaints([("history", history)], direction), (
+            "a screen reads past-tense history as a present-tense claim, so it would forbid "
+            "recording why the guard moved"
+        )
+
+
 def test_four_get_phi_pacing_scope_matches_the_call_sites() -> None:
     """The bulk-PHI GETs that charge the PHI-read budget explicitly are exactly four, and the doc says
     so — including the count word, so it cannot silently drift.
@@ -615,12 +747,12 @@ def test_four_get_phi_pacing_scope_matches_the_call_sites() -> None:
     # rather than a check that a particular function still holds the call: shrinking the pinned set to
     # the one route that still charges inline would have stopped guarding the other three entirely.
     chargers = {"enforce_phi_read_pacing"} | {
-        f.name for f in funcs if _calls_to(f, {"enforce_phi_read_pacing"})
+        f.name for f in funcs if calls_to(f, {"enforce_phi_read_pacing"})
     }
     charged: set[str] = set()
     for node in funcs:
         route = _decorated_path(node)
-        if route and _calls_to(node, chargers):
+        if route and calls_to(node, chargers):
             charged.add(route)
     assert charged >= _FOUR_GET_SCOPE, (
         "the explicit PHI-read pacing call sites changed: "
@@ -647,7 +779,7 @@ def _phi_read_dependency_routes() -> set[str]:
             continue
         defaults = [*node.args.defaults, *(d for d in node.args.kw_defaults if d is not None)]
         for default in defaults:
-            if _calls_to(default, {"require_phi_read"}):
+            if calls_to(default, {"require_phi_read"}):
                 routes.add(route)
                 break
     return routes
@@ -658,18 +790,7 @@ def _ui_phi_view_count() -> int:
     count = 0
     for module in sorted(_CONSOLE_ROUTES.rglob("*.py")):
         tree = ast.parse(module.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            name = (
-                node.func.attr
-                if isinstance(node.func, ast.Attribute)
-                else node.func.id
-                if isinstance(node.func, ast.Name)
-                else None
-            )
-            if name != "require_ui":
-                continue
+        for node in call_sites(tree, "require_ui"):
             for kw in node.keywords:
                 if (
                     kw.arg == "phi"
@@ -693,7 +814,7 @@ def _ui_delegating_phi_get_count() -> int:
         for node in ast.walk(tree)
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
         and _decorated_path(node) is not None
-        and _calls_to(node, {"enforce_phi_read_pacing"})
+        and calls_to(node, {"enforce_phi_read_pacing"})
     }
     assert charging, "no route handler in api/app.py charges enforce_phi_read_pacing any more"
     count = 0
@@ -709,7 +830,7 @@ def _ui_delegating_phi_get_count() -> int:
                 for deco in node.decorator_list
                 if isinstance(deco, ast.Call) and isinstance(deco.func, ast.Attribute)
             )
-            if method == "get" and _calls_to(node, charging):
+            if method == "get" and calls_to(node, charging):
                 count += 1
     return count
 
@@ -772,7 +893,7 @@ def _pacing_charging_factories() -> set[str]:
         for node in ast.walk(tree)
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
         and node.name.startswith("require")
-        and _calls_to(node, {"_enforce_admin_write_pacing"})
+        and calls_to(node, {"_enforce_admin_write_pacing"})
     }
 
 
@@ -781,7 +902,7 @@ def test_both_pacing_gate_families_are_named() -> None:
     tree = ast.parse(_SECURITY.read_text(encoding="utf-8"))
     callers: set[str] = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and _calls_to(
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and calls_to(
             node, {"_enforce_admin_write_pacing"}
         ):
             callers.add(node.name)
@@ -958,13 +1079,7 @@ def _limiter_accessors() -> dict[str, str]:
         if not isinstance(node, ast.Assign | ast.AnnAssign):
             continue
         for sub in ast.walk(node.value) if node.value is not None else ():
-            if isinstance(sub, ast.Call) and (
-                (isinstance(sub.func, ast.Name) and sub.func.id == "SlidingWindowRateLimiter")
-                or (
-                    isinstance(sub.func, ast.Attribute)
-                    and sub.func.attr == "SlidingWindowRateLimiter"
-                )
-            ):
+            if isinstance(sub, ast.Call) and callee_name(sub) == "SlidingWindowRateLimiter":
                 target = node.targets[0] if isinstance(node, ast.Assign) else node.target
                 attr = getattr(target, "attr", None)
                 if attr:
@@ -1162,12 +1277,7 @@ def test_lockout_auto_expires_but_re_locking_is_unbounded() -> None:
     )
 
     tree = ast.parse(_SERVICE.read_text(encoding="utf-8"))
-    register = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef)
-        and node.name == "_register_failure"
-    )
+    register = named_func(tree, "_register_failure")
     user_reads = {
         node.attr
         for node in ast.walk(register)
@@ -1194,7 +1304,7 @@ def test_lockout_auto_expires_but_re_locking_is_unbounded() -> None:
         for node in ast.walk(tree)
         if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef)
         and node.name != "_register_failure"
-        and _calls_to(node, {"_register_failure"})
+        and calls_to(node, {"_register_failure"})
     }
     assert feeders == {"_login_local", "verify_mfa"}, (
         f"the per-account lockout is now fed from {sorted(feeders)}; the 6.1.1 note scopes it to "
@@ -1288,12 +1398,8 @@ def test_reauth_surface_has_no_lockout_and_the_doc_says_so() -> None:
     source = ast.parse(
         (_ROOT / "messagefoundry" / "auth" / "service.py").read_text(encoding="utf-8")
     )
-    reauth = next(
-        node
-        for node in ast.walk(source)
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "reauth"
-    )
-    assert not _calls_to(reauth, {"_register_failure"}), (
+    reauth = named_func(source, "reauth")
+    assert not calls_to(reauth, {"_register_failure"}), (
         "reauth now feeds the per-account lockout — the doc's honest caveat is stale, update it."
     )
     block = _section(_H_BRUTE)
@@ -1331,7 +1437,7 @@ def test_console_entry_route_breach_shape_is_documented_per_route() -> None:
             for branch in ast.walk(node):
                 # `if not auth.allow_login_attempt(...):` — inspect what that branch does.
                 if not (
-                    isinstance(branch, ast.If) and _calls_to(branch.test, {"allow_login_attempt"})
+                    isinstance(branch, ast.If) and calls_to(branch.test, {"allow_login_attempt"})
                 ):
                     continue
                 body = ast.dump(ast.Module(body=branch.body, type_ignores=[]))
@@ -1385,7 +1491,7 @@ def _retry_after_routes() -> set[str]:
                 if isinstance(deco, ast.Call) and isinstance(deco.func, ast.Attribute)
             )
             for branch in ast.walk(node):
-                if not (isinstance(branch, ast.If) and _calls_to(branch.test, limiters)):
+                if not (isinstance(branch, ast.If) and calls_to(branch.test, limiters)):
                     continue
                 body = ast.dump(ast.Module(body=branch.body, type_ignores=[]))
                 if "Retry-After" in body:
@@ -1475,12 +1581,7 @@ def test_lockout_is_fed_by_two_legs_but_enforced_on_the_assertion_leg_too() -> N
     what it does not do is FEED the lockout.
     """
     tree = ast.parse(_SERVICE.read_text(encoding="utf-8"))
-    assertion = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef)
-        and node.name == "finish_webauthn_assertion"
-    )
+    assertion = named_func(tree, "finish_webauthn_assertion")
     reads_lock = any(
         isinstance(n, ast.Attribute) and n.attr == "locked_until" for n in ast.walk(assertion)
     )
@@ -1488,7 +1589,7 @@ def test_lockout_is_fed_by_two_legs_but_enforced_on_the_assertion_leg_too() -> N
         "finish_webauthn_assertion no longer refuses a locked account; docs/SECURITY.md says the "
         "lock is ENFORCED across every local factor."
     )
-    assert not _calls_to(assertion, {"_register_failure"}), (
+    assert not calls_to(assertion, {"_register_failure"}), (
         "WebAuthn assertion failures now feed the lockout; the doc's deliberate-divergence note is "
         "stale — update it in the same change."
     )
@@ -1563,7 +1664,7 @@ def _charging_console_gates() -> set[str]:
         for node in ast.walk(tree)
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
         and node.name.startswith("require")
-        and _calls_to(node, {"allow_admin_write"})
+        and calls_to(node, {"allow_admin_write"})
     }
     assert factories, "no console gate charges allow_admin_write any more; this guard is now blind"
     derived = {
@@ -1571,7 +1672,7 @@ def _charging_console_gates() -> set[str]:
         for node in ast.walk(tree)
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
         and node.name.startswith("require")
-        and _calls_to(node, factories)
+        and calls_to(node, factories)
     }
     return factories | derived
 

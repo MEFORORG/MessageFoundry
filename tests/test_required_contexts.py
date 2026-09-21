@@ -73,6 +73,12 @@ _CLAIM_FILES = (
     Path(".github/workflows/freethread-smoke.yml"),
     Path("tests/test_push_guard.py"),
     Path("scripts/hooks/push_guard.py"),
+    # Added under BACKLOG #1705, after both were found carrying a stale answer to "does this check
+    # block a merge". security.yml's header enumerated the set; .semgrep/messagefoundry.yml's header
+    # cited a LINE NUMBER in the canonical file plus a posture bucket the `semgrep` job had left.
+    # Neither was in this tuple, so the numeric scan below had never read either one.
+    Path(".github/workflows/security.yml"),
+    Path(".semgrep/messagefoundry.yml"),
 )
 
 # Contexts that must NEVER appear in the canonical file. Each is a job that cannot report on an
@@ -107,13 +113,15 @@ def test_the_canonical_file_parses_and_names_the_live_set() -> None:
     )
     # Pinned so that ADDING or REMOVING a required check is a deliberate, reviewed edit here rather
     # than a silent one. Verified against `gh api repos/MEFORORG/MessageFoundry/branches/main/protection
-    # --jq '.required_status_checks.contexts[]'` at 2026-09-15: 15 contexts, SET-EQUAL to the file with
-    # nothing extra on either side, checked by diffing the sorted API read against the sorted parse of
-    # the file. The two added since the previous reading are `security.yml`'s composite roll-ups,
-    # `repo-scan (bandit, semgrep, crypto-inventory, forbidden-content)` and
-    # `dependency-and-secret-scan (pip-audit, npm-audit, gitleaks)` -- step 2 of the consolidation
-    # staged in docs/CI.md. Earlier readings: 13 at 2026-09-04 19:05 CDT, and 14 at 2026-08-31 20:57
-    # CDT before the owner retired `a reviewer has read this`. Set-equal is the reading worth recording
+    # --jq '.required_status_checks.contexts[]'` at 2026-09-17 00:23Z: 8 contexts, SET-EQUAL to the file
+    # with nothing extra on either side, checked by diffing the sorted API read against the sorted parse
+    # of the file. The SEVEN dropped since the previous reading are `security.yml`'s original scan jobs
+    # -- bandit, pip-audit, npm-audit, gitleaks, semgrep, crypto-inventory and forbidden-content --
+    # which the owner removed from protection at about 2026-09-16 18:45Z: consolidation step 4, taken
+    # before step 3. The two composite roll-ups that replaced them stay required, and the seven JOBS are
+    # still in the workflow, still hard-failing, still reporting on every pull request. Earlier readings:
+    # 15 at 2026-09-15, 13 at 2026-09-04 19:05 CDT, and 14 at 2026-08-31 20:57 CDT before the owner
+    # retired `a reviewer has read this`. Set-equal is the reading worth recording
     # -- a count alone cannot tell a matching set from two errors that cancel.
     #
     # THE PIN GOES STALE IN THE DIRECTION THAT LOOKS FINE. It read 13 while the server held more, and
@@ -139,7 +147,22 @@ def test_the_canonical_file_parses_and_names_the_live_set() -> None:
     # sessions counted checks against this file and read a pull request as fully green with two
     # required contexts unreported. The caution above was written before that happened and is left
     # exactly as it was, because it predicted it.
-    assert len(contexts) == 15, (
+    #
+    # 2026-09-16 IS THE THIRD LIVE PROOF, AND THE FIRST IN THE OVER-CLAIMING DIRECTION. The owner
+    # removed the seven original security.yml scan contexts at about 18:45Z. This assertion stayed
+    # green at 15 over a server holding 8 for about six hours, because -- again -- it reads the file.
+    # The direction is the novelty: every prior drift left the file naming FEWER contexts than the
+    # server, which reads as reassuring. This one left it naming MORE, which fails safe for a reader
+    # but is still false, and it broke an assumption nothing here had needed to state before: that a
+    # context which REPORTS is a context that BLOCKS. The seven still report on every pull request and
+    # block nothing, so a session reading a red `bandit (Python SAST)` and consulting this file would
+    # have concluded its merge was gated when `repo-scan` was the gate.
+    #
+    # WHAT ACTUALLY CAUGHT IT WAS A HUMAN READING THE API, not this pin and not the cron. The cron had
+    # not yet run -- the change landed at 18:45Z and the schedule fires at 07:00Z -- so the detector's
+    # first opportunity to report was still hours away. That is worth recording next to the pin: the
+    # drift script closes the "nobody ever checks" hole, not the "nobody checks promptly" one.
+    assert len(contexts) == 8, (
         f"the canonical required set changed to {len(contexts)} contexts. If branch protection really "
         "changed, update this count AND every claim this suite checks; if it did not, revert the file."
     )

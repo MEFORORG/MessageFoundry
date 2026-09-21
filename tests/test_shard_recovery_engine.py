@@ -44,6 +44,8 @@ from messagefoundry.store.store import OwnedLanes
 
 _CFG_HEADER = "from messagefoundry import inbound, outbound, router, handler, Send, File\n"
 
+_RAW = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100||DOE^JANE\r"
+
 _CFG_LOGIC = textwrap.dedent(
     """
     @router('r')
@@ -194,6 +196,62 @@ async def test_start_passes_owned_none_when_unsharded(
     try:
         await eng.start()
         assert spy.owned_calls == [None]
+    finally:
+        await eng.stop()
+
+
+# --- 2b. Startup orphan sweep for a removed inbound (BACKLOG #1612) -------------
+
+
+async def _orphan_status(store: Store, mid: str) -> str:
+    return str((await store.get_message(mid))["status"])
+
+
+async def test_start_dead_letters_ingress_rows_of_a_removed_inbound(tmp_path: Path) -> None:
+    """An inbound removed before a restart leaves ingress rows no worker will ever claim.
+
+    ``_start_graph``'s two older sweeps key on ``destination_name`` and ``handler_name``, so neither
+    can see a channel-keyed row. Without the third sweep the message sits ``RECEIVED`` with a pending
+    ingress row for the life of the store — no disposition, no dead-letter, and invisible to the
+    buildup and stall alerts, which only ask ``pending_depth`` about registry lanes.
+    """
+    cfg = _write_cfg(tmp_path / "cfg", tmp_path, [None])
+    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.02)
+    # Residue from a config in which IB_GONE existed; the graph being started no longer names it.
+    gone = await eng.store.enqueue_ingress(channel_id="IB_GONE", raw=_RAW)
+    live = await eng.store.enqueue_ingress(channel_id="IB_PLAIN", raw=_RAW)
+    eng.add_registry(load_config(cfg))
+    try:
+        await eng.start()
+        assert (
+            await _orphan_status(eng.store, gone) == "error"
+        )  # dead-lettered, visible, replayable
+        assert await _orphan_status(eng.store, live) != "error"  # the configured lane is untouched
+    finally:
+        await eng.stop()
+
+
+async def test_start_never_dead_letters_a_sibling_shards_lane(tmp_path: Path) -> None:
+    """The sweep keys on the WHOLE config's inbound names, never one shard's slice.
+
+    Engine shards share ONE unified store (ADR 0063) and each shard's ``registry.inbound`` holds only
+    its own inbounds, so a sweep keyed off that map would read every sibling shard's live lane as
+    removed and dead-letter its rows on the first restart. Shard a must leave IB_B alone and still
+    kill a channel no shard configures.
+    """
+    cfg = _write_cfg(tmp_path / "cfg", tmp_path, ["a", "b"])
+    full = load_config(cfg)
+    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.02, registry_filter=_only("a"))
+    sibling = await eng.store.enqueue_ingress(channel_id="IB_B", raw=_RAW)
+    gone = await eng.store.enqueue_ingress(channel_id="IB_GONE", raw=_RAW)
+    eng.add_registry(filter_registry_for_shard(full, "a"))
+    try:
+        await eng.start()
+        assert "IB_B" not in eng._registry_runner.registry.inbound  # not shard a's to run...
+        assert (
+            await _orphan_status(eng.store, sibling) == "received"
+        )  # ...and not shard a's to kill
+        assert await _orphan_status(eng.store, gone) == "error"  # configured by no shard at all
     finally:
         await eng.stop()
 

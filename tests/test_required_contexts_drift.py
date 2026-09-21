@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import copy
+import functools
 import json
 import subprocess
 import sys
@@ -115,3 +116,130 @@ def test_the_canonical_file_is_the_one_being_read() -> None:
     """Guards the seam itself: if the script stops reading the register, every arm above goes quiet."""
     assert _CANONICAL.exists()
     assert "required-contexts.txt" in _SCRIPT.read_text(encoding="utf-8")
+
+
+# Memoised: one call parses EVERY workflow file, none of which change during a run, and three tests
+# below call it. Uncached that sweep ran three times for 0.578s where one run costs 0.190s. Same
+# pattern and same reason as tests/test_failure_signal.py's four memoised readers.
+@functools.cache
+def _invoking_workflows_cached() -> dict[str, list[str]]:
+    """Workflow file -> job keys whose steps invoke this script. Parsed, never grepped whole-file.
+
+    A whole-file substring search would be satisfied by the script's name inside a COMMENT, which is
+    exactly how the wiring would appear to have survived its own deletion -- two workflows in this
+    repository already mention this script in prose only.
+    """
+    from tests._workflow_contexts import WORKFLOWS, jobs_of
+
+    found: dict[str, list[str]] = {}
+    for path in sorted(WORKFLOWS.glob("*.yml")):
+        for key, job in jobs_of(path.name).items():
+            steps = job.get("steps") or []
+            if any(_SCRIPT.name in str((s or {}).get("run", "")) for s in steps):
+                found.setdefault(path.name, []).append(str(key))
+    return found
+
+
+def _invoking_workflows() -> dict[str, list[str]]:
+    """A private copy of the memoised scan above.
+
+    Handing every caller the SAME mutable dict would let one caller's edit reach every later one, and
+    a "treat this as read-only" comment is not a control. The copy costs nothing beside the 26-file
+    parse it skips -- the same trade, and the same shape, as ``_workflow_contexts.reportable_contexts``.
+    """
+    return {name: list(keys) for name, keys in _invoking_workflows_cached().items()}
+
+
+def test_a_workflow_actually_runs_this_checker() -> None:
+    """A detector nothing invokes is a file. This is the arm that keeps the wiring from being deleted.
+
+    THE DEFECT THIS EXISTS FOR, and it is a reading error rather than a code one. The script's own
+    docstring records that it "reported to nobody" on the 2026-09-14 drift, meaning its scheduled red
+    reached no pull request or session. That sentence has since been read as "no workflow runs it" --
+    a conclusion that leads straight to writing a second detector beside the working one. Nothing in
+    the tree contradicted the misreading, because nothing asserted the wiring at all: deleting the job
+    that runs this script would have reddened no test.
+    """
+    invoking = _invoking_workflows()
+    print(f"[drift] {_SCRIPT.name} is invoked by {invoking or 'NOTHING'}")
+    assert invoking, (
+        f"no workflow job runs {_SCRIPT.name}. It reads the live branch-protection set, which no "
+        "in-repo test can see, so without a workflow invoking it a protection change is undetectable "
+        "from this repository. Restore the step (it was required-workflow-state.yml's `accurate` job) "
+        "rather than deleting this test."
+    )
+
+
+def test_the_scheduled_red_of_this_checker_reaches_a_person() -> None:
+    """BACKLOG #1450, THE HALF THE TWO ARMS ABOVE DO NOT COVER. Wired and advisory is the posture; a
+    consumer for the red is what makes the posture a control rather than a file.
+
+    The arms around it pin that SOMETHING runs this script and that what runs it is not a required
+    context. Both were satisfied throughout the 2026-09-14 drift this module's script docstring
+    records, when the checker caught real drift on the first cron and reached nobody. Detection was
+    never the missing half.
+
+    KEYED OFF THE INVOKING WORKFLOW, NOT OFF A LITERAL NAME, because ``workflow_run`` matches on a
+    workflow's ``name:``. Renaming that workflow would detach the notice from it silently -- no error,
+    no run, permanent silence -- which is the failure mode this whole chain exists to end. Resolving
+    the name from the file that actually invokes the script makes a rename red here instead.
+
+    The cron this route depends on is asserted for every watched name by
+    ``tests/test_nightly_notice.py::test_every_watched_workflow_exists_and_can_actually_fire``, and
+    the same module's ``test_it_also_watches_the_required_workflow_state_workflow`` covers the move
+    this row does not: the script relocating out of a file whose OTHER job still needs watching.
+    """
+    from tests._workflow_contexts import load_workflow, triggers_of
+
+    watched = triggers_of("nightly-notice.yml")["workflow_run"]["workflows"]
+
+    invoking = _invoking_workflows()
+    assert invoking, (
+        f"no workflow runs {_SCRIPT.name}, so there is no red for a consumer to carry. "
+        "test_a_workflow_actually_runs_this_checker is the arm that explains this."
+    )
+
+    unwatched = []
+    for filename in invoking:
+        name = load_workflow(filename).get("name")
+        assert name, f"{filename} runs {_SCRIPT.name} but declares no `name:` to watch it by"
+        if name not in watched:
+            unwatched.append(f"{filename} (named {name!r})")
+
+    assert not unwatched, (
+        "the drift checker's scheduled red reaches nobody: nightly-notice.yml does not watch "
+        + ", ".join(unwatched)
+        + f".\nIt watches {watched}.\nThis checker is advisory by design (see the arm below), so a "
+        "red run carries no pull request and no label -- the notice is the whole route to a person. "
+        "Add the workflow's `name:` to that watch list rather than promoting the job or writing a "
+        "second detector."
+    )
+
+
+def test_the_job_that_runs_this_checker_is_not_a_required_context() -> None:
+    """THE ASYMMETRY, and the more important half. Wired is necessary; wired-as-ADVISORY is the claim.
+
+    This checker calls the GitHub API. A required context whose job depends on a network read would
+    put every merge in the repository behind that call: a rate limit, an outage, or a revoked token
+    stops being a red run and starts being a wedged queue. The register's own header names the
+    required-but-absent trap for the same reason.
+
+    So the two arms are deliberately opposite -- one fails if nothing runs the script, the other fails
+    if what runs it has been promoted. Neither alone says what the posture is, and a single arm would
+    be satisfiable by the state this repository must not reach.
+    """
+    from tests._workflow_contexts import context_of, jobs_of, required_contexts
+
+    required = set(required_contexts())
+    promoted = [
+        f"{wf}:{key} reports {context_of(key, jobs_of(wf)[key])!r}"
+        for wf, keys in _invoking_workflows().items()
+        for key in keys
+        if context_of(key, jobs_of(wf)[key]) in required
+    ]
+    assert not promoted, (
+        "the job running the drift checker has become a REQUIRED status context:\n  "
+        + "\n  ".join(promoted)
+        + "\nIt reads branch protection over the network, so every merge would then depend on that "
+        "call succeeding. Keep it advisory: a red run is a report, not a gate."
+    )

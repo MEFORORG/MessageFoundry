@@ -59,7 +59,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.parsing.message import emit_raw_separators
 from messagefoundry.parsing.peek import HL7PeekError, Peek, normalize
-from messagefoundry.redaction import safe_exc
+from messagefoundry.redaction import clamp_untrusted, safe_exc
 from messagefoundry.timezone import hl7_now
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -116,6 +116,12 @@ DEFAULT_RECEIVE_TIMEOUT = 60.0  # seconds — close inbound sockets idle this lo
 #: mechanism exists and an operator opts in with their own number. The cell stays `partial` on the
 #: shipped default and the record says why; that is the honest outcome, not a disappointing one.
 DEFAULT_MAX_MESSAGES_PER_SECOND: float | None = None
+
+#: Seconds between operator-facing pacing reports on ONE pacer (BACKLOG #290). Pacing is silent by
+#: construction — it never drops, NAKs or errors — so without a report an operator cannot tell a
+#: paced interface from a slow one. A pacer in deficit is consulted on every read, so the report is
+#: throttled to this window; see :meth:`_MessagePacer._note_paced`.
+_PACING_REPORT_SECONDS = 60.0
 # On stop()/reload, established clients are closed and their handlers given this long to finish an
 # in-flight commit before the connection tasks are cancelled — bounds shutdown so a peer holding a
 # connection open can't hang it (review H-2).
@@ -135,6 +141,30 @@ _CLIENT_SHUTDOWN_GRACE = 5.0
 # may take to leave, versus how long teardown waits for in-flight handlers — and a test that bounds
 # one must not silently shrink the other.
 _ACK_DRAIN_GRACE = _CLIENT_SHUTDOWN_GRACE
+
+#: Characters of a negative acknowledgment's MSA-3 that reach the :class:`NegativeAckError` message
+#: (BACKLOG #1576). MSA-3 is *Text Message* — a human-readable reason for the rejection — and the
+#: consumers of it are a log line, a dead-letter row's ``last_error`` and an alert, each of which
+#: redacts and then truncates to :data:`~messagefoundry.redaction._DEFAULT_LIMIT` (200) anyway. Five
+#: times that is room for a peer to name the offending segment and then some.
+#:
+#: **The bound belongs here rather than only downstream because the length is the PEER's to choose.**
+#: ``receive_max_bytes`` caps the ACK frame, not this field inside it, so MSA-3 arrives sized to the
+#: frame cap — 16 MiB by default — and redaction is a linear event-loop scan that would be charged all
+#: of it. Bounding at the read keeps the peer's string out of the exception text, the store write and
+#: the log, not merely out of the scan.
+_MAX_NAK_DETAIL_CHARS = 1024
+
+
+def _bounded_ack_field(value: str | None) -> str:
+    """A peer-chosen ACK field, bounded for the exception message it is about to be written into
+    (BACKLOG #1576).
+
+    One helper for both fields that reach a raise, so the two cannot drift: adding the bound to MSA-3
+    and leaving MSA-2 beside it is the shape this fix arrived in, and the shape a review caught.
+    ``clamp_untrusted`` and not a slice -- cutting at an arbitrary offset strands a fragment under the
+    redactor's thresholds and walks the identifier into the log downstream."""
+    return clamp_untrusted(value or "", window=_MAX_NAK_DETAIL_CHARS)
 
 
 # --- posture-keyed cleartext-hop refusal (#200, ADR 0092) --------------------------------------
@@ -792,6 +822,11 @@ class MLLPDestination(DestinationConnector):
                 cell="MLLP outbound",
                 description="verified MLLP-over-TLS egress (no revocation check)",
                 attested=config.tls_revocation_attested,
+                # BACKLOG #299: the context this hop will actually hand to wrap_socket. A CRL that
+                # reached it (via [tls].crl_file through the resolved anchor) sets
+                # VERIFY_CRL_CHECK_LEAF, and the guard reads that flag rather than the setting -- so a
+                # sibling hop the same CRL never reached keeps its refusal.
+                context=self._ssl,
             )
             if self._ssl is not None and self._ssl.verify_mode is not ssl.CERT_NONE
             else None
@@ -1325,8 +1360,13 @@ class MLLPDestination(DestinationConnector):
                 # unreadable OWN MSH-10 skips correlation (nothing to correlate), per the design decision.
                 ack_control_id = ack.field("MSA-2")
                 if ack_control_id != sent_control_id:
+                    # BACKLOG #1576, same defect as MSA-3 below: MSA-2 is peer-chosen and frame-cap
+                    # sized too, and it is interpolated into this raise. Clamped HERE and not at the
+                    # read above, because the comparison must see the field the peer actually sent --
+                    # bounding first would silently correlate a long control id against its own prefix.
                     raise DeliveryError(
-                        f"ACK control-id mismatch: MSA-2={ack_control_id!r} "
+                        f"ACK control-id mismatch: "
+                        f"MSA-2={_bounded_ack_field(ack_control_id)!r} "
                         f"!= sent MSH-10={sent_control_id!r}"
                     )
             if self.capture_response:
@@ -1336,7 +1376,19 @@ class MLLPDestination(DestinationConnector):
                     detail=f"MSA-1={msa1}",
                 )
             return None
-        detail = ack.field("MSA-3") or ""
+        # BACKLOG #1576: the peer sizes MSA-3, and it reached the frame cap unbounded. Every consumer
+        # downstream redacts this text, and redaction is a linear scan on the event loop, so an
+        # unbounded field here is an unbounded stall there — measured, 0.29 s to 0.78 s per negative
+        # acknowledgment at a 16 MiB cap depending on shape. Bound it at READ time, where it is still a
+        # field and not yet an exception message half the engine will re-render: the 16 MiB string is
+        # never copied into the raise, the dead-letter row, or the alert.
+        #
+        # _MAX_NAK_DETAIL_CHARS, not the redaction module's own window, because this is not a
+        # traceback: MSA-3 is a human-readable reason and a peer that answers with a megabyte is
+        # echoing our payload back at us, not explaining anything. Clamped rather than sliced --
+        # slicing at an arbitrary offset strands a fragment under the redactor's thresholds and walks
+        # the identifier straight into the log, which is the whole defect #1576 was filed on.
+        detail = _bounded_ack_field(ack.field("MSA-3"))
         # A negative ACK is a *partner rejection*, not a transport failure: the message reached the
         # peer, which said no. It is NOT captured — it routes through the existing NegativeAckError
         # failure policy (dead-letter on a permanent reject / retry on a transient error), unchanged by
@@ -1395,9 +1447,19 @@ class _MessagePacer:
     and drives it with :meth:`deficit` / :meth:`charge`. There is no flag and no branch in here.
     """
 
-    __slots__ = ("_capacity", "_last", "_pending_wait", "_rate", "_tokens")
+    __slots__ = (
+        "_capacity",
+        "_last",
+        "_name",
+        "_paced_count",
+        "_paced_seconds",
+        "_pending_wait",
+        "_rate",
+        "_report_at",
+        "_tokens",
+    )
 
-    def __init__(self, rate: float, burst: float, *, now: float) -> None:
+    def __init__(self, rate: float, burst: float, *, now: float, name: str = "") -> None:
         self._rate = rate
         self._capacity = max(burst, 1.0)
         self._tokens = self._capacity
@@ -1405,6 +1467,16 @@ class _MessagePacer:
         #: Debt owed before the next read, in seconds. PRIVATE, and settled only through pace() —
         #: a consult-then-clear a caller performs by hand is an invariant restated once per loop.
         self._pending_wait = 0.0
+        #: The declaring inbound's name, carried only so a pacing report can NAME the connection an
+        #: operator has to go and look at (the :attr:`Source.name` precedent). "" when unwired.
+        self._name = name
+        #: Applied-delay tally since the last report, reset by each report.
+        self._paced_count = 0
+        self._paced_seconds = 0.0
+        #: Next monotonic stamp a report may be emitted at. Starts at ``now`` so the FIRST time
+        #: pacing engages is reported immediately — that transition is the event an operator most
+        #: needs, and holding it back for a window would hide it behind the throttle.
+        self._report_at = now
 
     def charge(self, messages: int, *, now: float) -> float:
         """Charge ``messages`` and return the seconds to wait before reading again (0.0 if none).
@@ -1428,6 +1500,7 @@ class _MessagePacer:
         """
         if (wait := self._pending_wait) > 0.0:
             self._pending_wait = 0.0
+            self._note_paced(wait)
             await asyncio.sleep(wait)
 
     def settle(self, messages: int) -> None:
@@ -1446,16 +1519,61 @@ class _MessagePacer:
         connections has to recompute it at read time instead. Delegates to :meth:`charge` rather
         than re-deriving the arithmetic, so the two can never disagree.
         """
-        return self.charge(0, now=now)
+        owed = self.charge(0, now=now)
+        if owed > 0.0:
+            self._note_paced(owed, now=now)
+        return owed
+
+    def _note_paced(self, seconds: float, *, now: float | None = None) -> None:
+        """Tally one APPLIED read delay and report it to the operator, throttled.
+
+        Called from the two places a wait is actually acted on — :meth:`pace` for the stream pair and
+        :meth:`deficit` for the listener pair — never from :meth:`charge`, which both of those route
+        through and which ``deficit`` consults on every read. Counting in ``charge`` would tally the
+        same outstanding debt once per consult and report a number that is not a count of anything.
+
+        **Why pacing needs a voice at all.** The control is otherwise entirely invisible: it never
+        drops, NAKs, refuses or errors, so a paced interface looks to the operator exactly like a
+        slow one, and nothing is written anywhere. The 2026-08-11 ruling ships
+        :data:`DEFAULT_MAX_MESSAGES_PER_SECOND` OFF *because* a safe number can only come from a
+        site's own feed profile — and a site cannot tune a number it has no way to watch engage.
+        Reporting is the half that makes the opt-in posture usable; it changes no default and paces
+        nothing differently.
+
+        Throttled to one line per :data:`_PACING_REPORT_SECONDS` because a pacer that is in deficit
+        is consulted on every read, and an unthrottled line would restate one fact thousands of
+        times. WARNING rather than INFO: a clinical interface being held back is an operator-facing
+        condition, not routine chatter.
+
+        **Metadata only.** The connection name, a count, a duration and the configured rate — never a
+        frame, a peer address, or a byte of the body being paced (PHI.md; CLAUDE.md section 9).
+        """
+        self._paced_count += 1
+        self._paced_seconds += seconds
+        stamp = time.monotonic() if now is None else now
+        if stamp < self._report_at:
+            return
+        logger.warning(
+            "inbound message pacing engaged on %s: %d read delay(s) totalling %.3fs "
+            "(max_messages_per_second=%g). The sender is being held back, not refused — no message "
+            "is dropped. Raise the rate if this feed is legitimate.",
+            self._name or "<unnamed inbound>",
+            self._paced_count,
+            self._paced_seconds,
+            self._rate,
+        )
+        self._paced_count = 0
+        self._paced_seconds = 0.0
+        self._report_at = stamp + _PACING_REPORT_SECONDS
 
     @classmethod
-    def for_rate(cls, rate: float | None, burst: float) -> _MessagePacer | None:
+    def for_rate(cls, rate: float | None, burst: float, *, name: str = "") -> _MessagePacer | None:
         """Build a pacer, or ``None`` when no rate is configured — the shipped default.
 
         The single place the off-default is honoured, so the four intakes that pace cannot drift
         apart on what "unset" means. See :data:`DEFAULT_MAX_MESSAGES_PER_SECOND` for why off.
         """
-        return cls(rate, burst, now=time.monotonic()) if rate else None
+        return cls(rate, burst, now=time.monotonic(), name=name) if rate else None
 
 
 def _pacing_settings(settings: Mapping[str, Any]) -> tuple[float | None, float]:
@@ -1494,6 +1612,8 @@ class MLLPSource(SourceConnector):
         # Message-rate pacing. Absent -> OFF, unlike the caps above; see _pacing_settings and
         # DEFAULT_MAX_MESSAGES_PER_SECOND for why that deviation is deliberate and ruled.
         self.max_messages_per_second, self.message_burst = _pacing_settings(s)
+        # Carried only so a pacing report can name this connection (BACKLOG #290).
+        self._pacing_name = config.name or ""
         # Per-connection peer-IP allowlist (Tier 4 operability): when set, a connecting peer whose IP
         # is not listed is refused at accept time. Absent/empty = no restriction.
         sa = s.get("source_ip_allowlist")
@@ -1629,7 +1749,9 @@ class MLLPSource(SourceConnector):
             await self._emit_event("established", peer_host=peer_host)
             try:
                 decoder = MLLPDecoder(max_frame_bytes=self.max_frame_bytes)
-                pacer = _MessagePacer.for_rate(self.max_messages_per_second, self.message_burst)
+                pacer = _MessagePacer.for_rate(
+                    self.max_messages_per_second, self.message_burst, name=self._pacing_name
+                )
                 while True:
                     # ASVS 2.4.1 / 15.2.2 — the wait is BEFORE the read, never around the handler.
                     if pacer is not None:

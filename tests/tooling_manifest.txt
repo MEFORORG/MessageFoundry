@@ -40,6 +40,7 @@ tests/test_ci_docs_only_detector.py
 tests/test_ci_engine_step_excludes_webconsole.py
 tests/test_ci_faulthandler_belts.py
 tests/test_ci_leg_data_class.py
+tests/test_ci_red_clearer.py
 tests/test_ci_red_reader.py
 tests/test_ci_retry_native_crash.py
 tests/test_ci_step_margin.py
@@ -47,10 +48,20 @@ tests/test_ci_tooling_gate.py
 tests/test_ci_venv_pinning.py
 tests/test_claim_check.py
 tests/test_claim_shared_registry.py
-tests/test_context_budget_hook.py
 tests/test_coord_alloc_floor.py
+tests/test_coord_alloc_reentrancy.py
 tests/test_coord_fleet_fetch_clock.py
+# The three below share one SUBJECT: scripts/hooks/durability_push.sh, copied off disk and run as a
+# real post-commit hook. They are listed rather than left off because the diff that can break them is
+# a diff to that file, which trips this job's scripts/** path gate -- so the tooling job faces the
+# change that would break them. None of them reads anything under messagefoundry/** or
+# packaging/messagefoundry-webconsole/**, so the reason that keeps a scanner in
+# _STAYS_WITHOUT_IMPORTING does not apply: there is no engine diff that can break them and then
+# arrive at a leg where they are deselected. The header's "when ambiguous, leave it off" is not in
+# play, because nothing here is ambiguous about which tier owns the subject.
 tests/test_durability_hook_provenance.py
+tests/test_durability_hook_remote_guard.py
+tests/test_durability_hook_rewrite_coverage.py
 tests/test_gate_ci_mirror_parity.py
 tests/test_hook_prose_folding.py
 tests/test_hook_prose_folding_push_ledger.py
@@ -67,6 +78,7 @@ tests/test_coord_handoff_pointer.py
 tests/test_coord_handoff_report.py
 tests/test_coord_lane_statement.py
 tests/test_coord_lock.py
+tests/test_coord_occupancy_unplaceable.py
 tests/test_coord_overlap_attribution.py
 tests/test_coord_overlap_cache.py
 tests/test_coord_overlap_signals.py
@@ -111,10 +123,13 @@ tests/test_net_helper_signing_scope.py
 tests/test_new_dependency_check.py
 tests/test_nightly_notice.py
 tests/test_operator_docs_no_warning_sign.py
+tests/test_precompact_reprime_hook.py
 tests/test_private_paths_stay_ignored.py
 tests/test_push_guard.py
 tests/test_quality_advisory_invariants.py
 tests/test_quality_record_scope_claims.py
+tests/test_reap_orphans.py
+tests/test_release_member_gate.py
 tests/test_required_contexts.py
 tests/test_required_contexts_drift.py
 tests/test_required_workflow_state.py
@@ -130,16 +145,21 @@ tests/test_serverdb_ci_coverage.py
 tests/test_session_context_presence.py
 tests/test_session_mail_held.py
 tests/test_session_mail.py
+tests/test_session_mail_watch_standdown.py
 tests/test_session_registry.py
 tests/test_setup_leak_gate_reports_source.py
 tests/test_shipped_line_endings_pinned.py
+tests/test_spawn_lock.py
 tests/test_stale_repo_slug_check.py
 tests/test_stalled_prs.py
 tests/test_steer_inject.py
 tests/test_testpaths_webconsole_coverage.py
+tests/test_unbounded_fs_scan_guard.py
 tests/test_workflow_concurrency_keys.py
 tests/test_workflow_local_action_check.py
+tests/test_workflow_pipefail_screen.py
 tests/test_workflow_shell_syntax.py
+tests/test_worktree_ensure_venv.py
 tests/test_worktree_gate_command_parsing.py
 tests/test_worktree_gate_control_plane.py
 tests/test_worktree_gate_default_reposfile.py

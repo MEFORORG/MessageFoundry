@@ -9,8 +9,10 @@
 * ``live``  — MLLP-send a synthetic HL7 to the running engine's inbound and confirm an **AA ACK**.
   Proves the real listener accepts + acks. (Full disposition is then confirmed in the console — a
   MANUAL row — so the tool stays dependency-light and not brittle to API specifics.)
-* store     — open the configured store backend and confirm it connects (no writes beyond the
-  idempotent schema-ensure ``open_store`` already does).
+* store     — open the *existing* configured store backend and confirm it connects. For SQLite it
+  refuses to create the database file first (BACKLOG #1708): ``open_store``'s schema-ensure created
+  whatever path it was handed until BACKLOG #1780, so the check used to PASS against a store it had
+  just made and leave the database behind — meaning it could not fail for the reason its title names.
 
 Synthetic HL7 only — never real PHI. The smoke message is inlined below rather than generated, so
 the verifier never imports ``messagefoundry.generators`` (BACKLOG #1192 / ASVS 15.2.3).
@@ -20,9 +22,10 @@ from __future__ import annotations
 
 import socket
 import ssl
+from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
-from messagefoundry.config.settings import StoreSettings
+from messagefoundry.config.settings import StoreBackend, StoreSettings
 from messagefoundry.config.tls_policy import (
     harden_cipher_suites,
     harden_kex_groups,
@@ -103,18 +106,36 @@ def _classify_self_smoke(disposition: MessageStatus, summary: str) -> CheckResul
     rid, title = "smoke.self", "Self smoke (dry-run routing)"
     if disposition is Disposition.RECEIVED:
         return CheckResult(rid, title, Status.PASS, summary)  # the preview's delivering outcome
+    if disposition is Disposition.NOT_DEPLOYED:
+        # Its own arm and its own remedy, which is the whole point of the member (BACKLOG #1690
+        # split it out of FILTERED so this gate could stop reading a decline as an author's filter).
+        # The Router and the Handler both did their job here, so the two remedies below are both
+        # wrong for it: re-pointing ``--inbound`` finds a different feed for a feed that was fine,
+        # and looking at the filter finds a filter that did not fire.
+        return CheckResult(
+            rid,
+            title,
+            Status.FAIL,
+            f"{summary} — a handler ran and produced a Send, but every destination it addressed is "
+            "present-but-not-deployed, so nothing would be delivered; deploy the outbound "
+            "connection(s) the Handler sends to, or send to one that is already deployed",
+        )
     if disposition is Disposition.UNROUTED:
         reason = "the Router selected no handler, so nothing would be delivered"
     elif disposition is Disposition.FILTERED:
-        reason = (
-            "handlers ran but produced no delivery (a filter returned nothing, or every destination "
-            "is present-but-not-deployed)"
-        )
+        # No longer "or every destination is present-but-not-deployed": that outcome is
+        # ``NOT_DEPLOYED`` above, and naming it here too is what made the two indistinguishable.
+        reason = "handlers ran but produced no delivery — a filter returned nothing"
     else:
         # Fail closed, and deliberately WITHOUT the remedy below. This arm exists for a member added
-        # after this function — ``disposition_for`` cannot reach it today — and re-pointing
-        # ``--inbound`` is not something that flag could act on for such a member. A confident wrong
-        # remedy, at the one moment an operator is reading this row, is worse than none.
+        # after this function: ``disposition_for`` returns exactly RECEIVED, UNROUTED, FILTERED and
+        # NOT_DEPLOYED, and all four are handled above. Re-pointing ``--inbound`` is not something
+        # that flag could act on for an unforeseen member, and a confident wrong remedy, at the one
+        # moment an operator is reading this row, is worse than none.
+        #
+        # This comment used to claim ``disposition_for`` could not reach any member here. That
+        # stopped being true when #1690 added NOT_DEPLOYED, and the arm silently became the handler
+        # for a live outcome it was never written for -- correct verdict, no usable next step.
         return CheckResult(
             rid,
             title,
@@ -325,10 +346,65 @@ def smoke_live(
     return CheckResult("smoke.live", "Live smoke (MLLP + ACK)", Status.FAIL, detail)
 
 
+def missing_sqlite_store(store: StoreSettings) -> Path | None:
+    """The configured SQLite path when it is absent, else ``None`` (nothing for this gate to stop).
+
+    Every ``open_store`` call in the verifier goes through this first (BACKLOG #1708). Before
+    BACKLOG #1780 an ungated call made the store it was about to report on: SQLite's connect creates
+    an absent file and ``open_store`` ensured the schema into it. Read-only intent was not enough —
+    ``newest_message_id`` and ``check_smoke_disposition`` only ever read, and both created a database
+    to do it. ``open_store`` now refuses an absent SQLite file by default (``StoreNotFoundError``).
+    This gate still runs first, so the verifier reports its own FAIL without importing the store
+    stack. The two differ at the edges: this one uses ``is_file()``, the seam counts only
+    ``FileNotFoundError`` as absent.
+
+    ``:memory:`` creates nothing on disk and so is outside what this gate exists to stop.
+
+    **Scoped to SQLite, and that is a real limit rather than a proof the others are safe.** What the
+    server backends do not do is ``CREATE DATABASE``, so a wrong database *name* fails at connect.
+    They do build the whole schema into a database that *does* exist: ``open_store`` runs the same
+    ensure-and-migrate on all three. So a Postgres store pointed at ``postgres``, or at a sibling
+    application's database, is still populated by a PASSing check — the same defect one level up
+    from the file. Closing that needs a per-backend schema-presence probe, which is not this gate;
+    ``docs/testing/VERIFY.md`` carries the operator-facing warning meanwhile.
+    """
+    if store.backend is not StoreBackend.SQLITE or store.path == ":memory:":
+        return None
+    path = Path(store.path)
+    try:
+        return None if path.is_file() else path
+    except OSError:  # e.g. a permission error stat-ing an ancestor — let the open report it
+        return None
+
+
 def check_store_connectivity(store: StoreSettings) -> CheckResult:
-    """Open the configured store backend and confirm it connects, then close. No test-data writes."""
+    """Open the *existing* configured store backend, confirm it connects, then close.
+
+    For SQLite the file must already be there. Before BACKLOG #1780 ``open_store`` ensured the schema
+    into whatever SQLite's connect created, so without this gate the check created the database it
+    then reported PASS against (BACKLOG #1708) — a mistyped ``[store].path`` passed, and an operator
+    running ``verify`` elevated on a fresh box left an administrator-owned store at the configured
+    path before the service started under another identity.
+
+    The gate covers SQLite only, and :func:`missing_sqlite_store` says what that leaves open on the
+    server backends.
+    """
     import asyncio
 
+    rid, title = "store.connect", "Store connectivity"
+    absent = missing_sqlite_store(store)
+    if absent is not None:
+        return CheckResult(
+            rid,
+            title,
+            Status.FAIL,
+            f"no SQLite store at {absent} — run `messagefoundry serve` once to create it, "
+            "or check [store].path (verify does not create it for you)",
+            evidence=str(absent),
+        )
+
+    # Below the gate on purpose: store.base pulls store.store and aiosqlite, the edge this module's
+    # TYPE_CHECKING block exists to defer. The FAIL above needs one stat, not the store stack.
     from messagefoundry.store.base import open_store
 
     async def _open_close() -> None:
@@ -339,14 +415,14 @@ def check_store_connectivity(store: StoreSettings) -> CheckResult:
         asyncio.run(_open_close())
     except Exception as exc:  # any driver/connection/auth failure
         return CheckResult(
-            "store.connect",
-            "Store connectivity",
+            rid,
+            title,
             Status.FAIL,
             f"{store.backend.value} store failed to open: {exc}",
         )
     return CheckResult(
-        "store.connect",
-        "Store connectivity",
+        rid,
+        title,
         Status.PASS,
         f"{store.backend.value} store opened and closed cleanly as the calling user "
         "(NOT proof the NSSM service account can connect — confirm the service-identity grants)",
@@ -356,10 +432,18 @@ def check_store_connectivity(store: StoreSettings) -> CheckResult:
 def newest_message_id(store: StoreSettings, control_id: str) -> str | None:
     """Id of the most-recent stored message with ``control_id`` (the pre-send baseline for the
     disposition check), or ``None``. Lets a re-used synthetic control id not match a prior run's
-    message — the disposition poll waits for one NEWER than this baseline. Read-only."""
+    message — the disposition poll waits for one NEWER than this baseline. Read-only.
+
+    An absent SQLite store holds no prior message, so it yields ``None`` without opening — and so
+    without creating — one (BACKLOG #1708; see :func:`missing_sqlite_store`)."""
     import asyncio
 
-    from messagefoundry.store.base import open_store
+    if missing_sqlite_store(store) is not None:
+        return None
+
+    from messagefoundry.store.base import (
+        open_store,
+    )  # below the gate — see check_store_connectivity
 
     async def _newest() -> str | None:
         handle = await open_store(store)
@@ -417,10 +501,24 @@ def check_smoke_disposition(
     catching a **post-ACK dead-letter** (a bad transform, a delivery failure, or the service-identity
     db-grant trap), which a headless/CI acceptance run would otherwise miss. Correlates by MSH-10
     control id, waiting for a message NEWER than ``baseline_id`` (so a re-used synthetic id can't match
-    a prior run). Read-only; opens the store as the calling user.
+    a prior run). Read-only; opens the store as the calling user, and refuses to create an absent
+    SQLite one to do it (BACKLOG #1708).
     """
     import asyncio
 
+    rid, title = "smoke.disposition", "Live smoke disposition"
+    absent = missing_sqlite_store(store)
+    if absent is not None:
+        return CheckResult(
+            rid,
+            title,
+            Status.FAIL,
+            f"no SQLite store at {absent} — is the engine running and pointed at this same store? "
+            "(check [store].path; verify does not create it for you)",
+            evidence=str(absent),
+        )
+
+    # Below the gate — see check_store_connectivity.
     from messagefoundry.store.base import open_store
     from messagefoundry.store.store import MessageStatus
 
@@ -452,10 +550,5 @@ def check_smoke_disposition(
     try:
         status = asyncio.run(_poll())
     except Exception as exc:  # any driver/connection failure — surface, never crash the verify run
-        return CheckResult(
-            "smoke.disposition",
-            "Live smoke disposition",
-            Status.ERROR,
-            f"could not read the store disposition: {exc}",
-        )
+        return CheckResult(rid, title, Status.ERROR, f"could not read the store disposition: {exc}")
     return _classify_disposition(status, control_id=control_id, timeout=timeout)
