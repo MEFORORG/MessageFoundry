@@ -213,6 +213,22 @@ _SAME_ORIGIN = {"Sec-Fetch-Site": "same-origin"}
             "/ui/reauth?next=/ui/account/mfa/disable",
             id="step_up_action",
         ),
+        # BACKLOG #1700. The fourth factory shape: a step-up POST with NO reauth_next, so the
+        # continuation is the action's own path. The single-connection queue purge is the case that
+        # sent someone looking -- nothing drove either leg of ITS gate, and the two guards that did
+        # cover it (the /ui route map's gate-NAME check against docs/SECURITY.md and
+        # test_ui_gate_divergences_are_exactly_the_reviewed_set, both in
+        # tests/test_security_doc_drift.py) are STATIC. Measured before this row existed: swapping
+        # the route to require_ui_reauth_only -- MFA gate OFF, password window kept -- and updating
+        # the one doc row ran GREEN across the whole console suite, all 42 doc-drift tests and the 6
+        # golden-surface tests. OB_X need not exist: this gate refuses above the handler.
+        pytest.param(
+            "POST",
+            "/ui/connections/OB_X/purge/all",
+            Role.OPERATOR,
+            "/ui/reauth?next=/ui/connections/OB_X/purge/all",
+            id="step_up-post-no-reauth_next",
+        ),
     ],
 )
 async def test_a_step_up_route_refusal_writes_an_mfa_denial_row(
@@ -224,7 +240,8 @@ async def test_a_step_up_route_refusal_writes_an_mfa_denial_row(
     Location is what ``allow_mfa_pending`` was added to protect: a fix that restored the row by
     sending the browser to ``/ui/mfa``, or by answering a bare 403, would pass a row-only test while
     losing the continuation the operator clicked. One case per factory shape: a step-up GET, a step-up
-    POST whose continuation ``reauth_next`` remaps, and the action-bound factory.
+    POST whose continuation ``reauth_next`` remaps, the action-bound factory, and a step-up POST with
+    no ``reauth_next`` (the continuation is its own path).
     """
     service = await _service(engine, require_mfa=True)
     await _add(service, "op", role)

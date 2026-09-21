@@ -9,8 +9,12 @@ never touches the store.
 
 > **Synthetic only.** Every profile and the load config graph are generic and synthetic — no real
 > partner, site code, host, IP, or message volume. A real-numbers profile (if you build one) lives
-> only in the git-ignored `migration-local/` tree and is run with `--load <path>`. Generated traffic
-> is synthetic HL7 (the `messagefoundry` generators). Reports carry **metrics and metadata only** —
+> only in the git-ignored `migration-local/` tree: put it at `migration-local/profiles/<name>.toml`
+> and `--load <name>` resolves it, or run any path with `--load <path>`. **Never** put one under
+> `harness/load/profiles/`, even gitignored by name: the harness wheel force-includes that directory
+> whole, hatchling walks the filesystem without reading `.gitignore`, and the file ships to everyone
+> who installs the harness from a build on your machine (BACKLOG #1835). Generated traffic is
+> synthetic HL7 (the `messagefoundry` generators). Reports carry **metrics and metadata only** —
 > never message bodies or control-id lists.
 
 ## How it works

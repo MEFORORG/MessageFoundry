@@ -10,6 +10,7 @@ multi-backend suite)."""
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import shutil
@@ -279,16 +280,42 @@ async def test_a_plaintext_backup_charges_nothing(tmp_path, key_b64) -> None:
     await store.close()
 
 
-# --- AC-6: keep-N prune excludes a verify-failed archive ---------------------
+# --- AC-6: keep-N prune, and a verify-failed archive that never takes a slot --
+
+#: The canonical keep-N candidate shape for instance "dev" — the anchored stamp + extension the
+#: prune globs for. Spelled out here so a test asserting "the kept set" reads the same pattern the
+#: runner prunes by, rather than a loose `*.mfbak` that would also match a diagnostic name.
+_CANONICAL_GLOB = "mefor-backup-dev-????????T??????Z.mfbak"
 
 
-async def test_keep_n_prune_excludes_failed(tmp_path, key_b64) -> None:
+def _inject_verify_failure(monkeypatch) -> None:
+    """Make restore-verify FAIL. Undo with ``monkeypatch.undo()``.
+
+    Patches the module global the runner resolves at call time, so the archive is really built,
+    really encrypted and really written, and then fails ITS OWN VERIFY. That is the one failure
+    shape that reaches the publish decision — a snapshot or write error aborts long before it, which
+    is why the pre-existing failure tests (``test_failed_backup_alerts_and_preserves_prior``) cannot
+    stand in for this one."""
+    from messagefoundry.pipeline import dr_backup as dr
+
+    monkeypatch.setattr(
+        dr,
+        "_verify_archive_blocking",
+        lambda **_kw: dr.VerifyResult("FAIL", reason="integrity_check failed: injected"),
+    )
+
+
+async def test_keep_n_prunes_the_oldest_once_the_kept_set_is_full(tmp_path, key_b64) -> None:
+    # The plain keep-N arm: three GOOD backups at retention_keep=2 → the third prunes the oldest.
+    # This is what `test_keep_n_prune_excludes_failed` actually asserted before BACKLOG #1587 — it
+    # ran three good backups and never injected a failure, so it proved the prune counts, never the
+    # "excludes failed" its name claimed. Kept under a name that matches what it proves; the claim
+    # the old name made is now carried by the test below.
     dest = tmp_path / "backups"
     store = await _store_with_rows(tmp_path / "msg.db", key_b64)
     settings = _settings(dest, key_b64, retention_keep=2)
     ss = _store_settings(tmp_path / "msg.db", key_b64)
     runner = BackupRunner(store, settings, store_settings=ss, config_dir=None, instance="dev")
-    # Three good backups at distinct seconds → after the third, keep-N=2 prunes the oldest.
     for i, t in enumerate((1000.0, 1001.0, 1002.0)):
         result = await runner.run_once(now=t)
         assert result is not None
@@ -297,6 +324,300 @@ async def test_keep_n_prune_excludes_failed(tmp_path, key_b64) -> None:
     remaining = sorted(dest.glob("*.mfbak"))
     assert len(remaining) == 2
     await store.close()
+
+
+# --- BACKLOG #1724: keep-N spans both archive extensions ---------------------
+
+
+async def test_keep_n_prunes_plaintext_archives_left_by_a_pre_key_box(tmp_path, key_b64) -> None:
+    """Configuring a store key must not strand every `.mfbak.plain` outside keep-N.
+
+    Pruning globbed only the extension the CURRENT pass wrote, and the two anchored patterns are
+    disjoint. So a box that had been writing plaintext under `[backup].allow_unencrypted`, then had
+    a key configured, kept every plaintext archive it had ever written -- forever, with nothing
+    reporting it. The retention window silently stopped applying to a whole generation.
+    """
+    dest = tmp_path / "backups"
+    dest.mkdir()
+    # Three archives an earlier, key-less configuration would have left behind. Written directly so
+    # the test states its own precondition rather than depending on the no-key path.
+    stale = [dest / f"mefor-backup-dev-2026010{i}T000000Z.mfbak.plain" for i in (1, 2, 3)]
+    for p in stale:
+        p.write_bytes(b"old plaintext archive")
+
+    store = await _store_with_rows(tmp_path / "msg.db", key_b64)
+    runner = BackupRunner(
+        store,
+        _settings(dest, key_b64, retention_keep=2),
+        store_settings=_store_settings(tmp_path / "msg.db", key_b64),
+        config_dir=None,
+        instance="dev",
+    )
+    result = await runner.run_once(now=1000.0)
+    await store.close()
+
+    assert result is not None
+    remaining = {p.name for p in dest.iterdir() if p.is_file()}
+    # retention_keep counts archives TOTAL, which test_keep_n_prunes_the_oldest_once_the_kept_set_is_full
+    # pins. keep=2 over these four leaves the new archive plus the single newest plaintext.
+    assert stale[0].name not in remaining, "the oldest plaintext archive survived keep-N"
+    assert stale[1].name not in remaining, "the second plaintext archive survived keep-N"
+    assert stale[2].name in remaining, "keep-N pruned past its own retention count"
+    assert Path(result.archive_path).name in remaining, "keep-N pruned the archive it just wrote"
+    assert result.pruned == 2
+
+
+async def test_keep_n_does_not_reserve_a_slot_for_an_archive_that_is_not_there(
+    tmp_path, key_b64
+) -> None:
+    """The reserved retention slot must be COUNTED, not assumed. At keep=1 the bug empties the dir.
+
+    `just_written` is excluded from the candidate set and is meant to occupy one of the N retained
+    slots, so the slice leaves room for it. If it is not actually at the destination, reserving the
+    slot anyway retains `keep - 1` archives -- and at `retention_keep = 1`, zero. The pass still
+    returns a success BackupResult and writes a `dr_backup` audit row naming an archive that is gone.
+
+    Ordinary causes: antivirus quarantining a freshly published multi-GB opaque file on a share, a
+    cleanup script, or a second engine sharing the instance and destination (the default
+    NullCoordinator does not prevent that). Made deterministic here by unlinking after the publish.
+    """
+    dest = tmp_path / "backups"
+    dest.mkdir()
+    prior = dest / "mefor-backup-dev-20260101T000000Z.mfbak"
+    prior.write_bytes(b"the only surviving backup")
+
+    store = await _store_with_rows(tmp_path / "msg.db", key_b64)
+    runner = BackupRunner(
+        store,
+        _settings(dest, key_b64, retention_keep=1),
+        store_settings=_store_settings(tmp_path / "msg.db", key_b64),
+        config_dir=None,
+        instance="dev",
+    )
+    real_prune = runner._prune_keep_n
+
+    def prune_with_the_published_archive_gone(dest_dir, inst, *, just_written):
+        Path(just_written).unlink(missing_ok=True)
+        return real_prune(dest_dir, inst, just_written=just_written)
+
+    runner._prune_keep_n = prune_with_the_published_archive_gone  # type: ignore[method-assign]
+    result = await runner.run_once(now=1000.0)
+    await store.close()
+
+    assert result is not None
+    assert prior.exists(), (
+        "keep-N reserved a slot for an archive that was not at the destination and deleted the only "
+        "one that was; at retention_keep=1 that empties the backup destination"
+    )
+    assert result.pruned == 0
+
+
+async def test_keep_n_orders_case_insensitively_where_its_glob_does(tmp_path, key_b64) -> None:
+    """The sort must fold case wherever `Path.glob` does, or it reads the newest as the oldest.
+
+    On Windows -- the platform this ships on -- `Path.glob` is case-INSENSITIVE, so an
+    all-uppercase archive name enters the candidate set. A case-SENSITIVE sort then compares `M`
+    (0x4D) against `m` (0x6D) at the FIRST character of the prefix, decides the ordering there, and
+    never reaches the timestamp. The newest archive sorts last and gets pruned.
+
+    MEANINGFUL ONLY ON WINDOWS, and it says so rather than pretending otherwise: on a
+    case-sensitive filesystem the uppercase name never matches the glob, so it is not a candidate,
+    and this test passes for a different and uninteresting reason. Stated because a test that
+    passes everywhere for two different reasons is one somebody will later trust on the wrong one.
+    """
+    dest = tmp_path / "backups"
+    dest.mkdir()
+    # Newest by timestamp, but first by a case-sensitive sort, so it is the one at risk.
+    newest_upper = dest / "MEFOR-BACKUP-DEV-20260109T000000Z.MFBAK"
+    older = [dest / f"mefor-backup-dev-2026010{i}T000000Z.mfbak" for i in (1, 2)]
+    for p in (newest_upper, *older):
+        p.write_bytes(b"archive")
+
+    # Decide BEFORE the run whether this platform makes the uppercase name a candidate. Deciding
+    # AFTERWARDS from the surviving files is what made the first version of this test
+    # unfalsifiable: when the defect fires that file is GONE, so a post-hoc "was it a candidate?"
+    # test reads False and skips the very assertion it guards.
+    glob_is_case_insensitive = any(
+        q.name == newest_upper.name for q in dest.glob("mefor-backup-dev-????????T??????Z.mfbak")
+    )
+
+    store = await _store_with_rows(tmp_path / "msg.db", key_b64)
+    runner = BackupRunner(
+        store,
+        _settings(dest, key_b64, retention_keep=3),
+        store_settings=_store_settings(tmp_path / "msg.db", key_b64),
+        config_dir=None,
+        instance="dev",
+    )
+    result = await runner.run_once(now=1000.0)
+    await store.close()
+    assert result is not None
+
+    if glob_is_case_insensitive:
+        assert newest_upper.exists(), (
+            "the newest archive by timestamp was pruned because the sort compared case before it "
+            "reached the stamp; the sort key must fold case wherever the glob does"
+        )
+
+
+async def test_widening_to_both_extensions_does_not_readmit_part_or_failed(
+    tmp_path, key_b64
+) -> None:
+    """The #1724 widening must not reopen BACKLOG #1587.
+
+    #1587 keeps a bad archive out of the candidate set by SUFFIXING it -- `.part` while staging,
+    `.failed` after a failed verify -- which works because both land AFTER the extension, so a
+    pattern ending in the extension cannot match them. Adding a second extension is exactly the kind
+    of change that could undo that, and nothing else here would notice: the suffixed files would
+    simply start consuming retention slots.
+    """
+    dest = tmp_path / "backups"
+    dest.mkdir()
+    decoys = [
+        dest / "mefor-backup-dev-20260101T000000Z.mfbak.part",
+        dest / "mefor-backup-dev-20260102T000000Z.mfbak.failed",
+        dest / "mefor-backup-dev-20260103T000000Z.mfbak.plain.part",
+        dest / "mefor-backup-dev-20260104T000000Z.mfbak.plain.failed",
+    ]
+    for p in decoys:
+        p.write_bytes(b"must never be a keep-N candidate")
+
+    store = await _store_with_rows(tmp_path / "msg.db", key_b64)
+    runner = BackupRunner(
+        store,
+        _settings(dest, key_b64, retention_keep=1),
+        store_settings=_store_settings(tmp_path / "msg.db", key_b64),
+        config_dir=None,
+        instance="dev",
+    )
+    result = await runner.run_once(now=1000.0)
+    await store.close()
+
+    assert result is not None
+    for p in decoys:
+        assert p.exists(), f"{p.name} was pruned, so the widening readmitted a #1587 suffix"
+    # ...and they did not silently consume the retention slot either.
+    assert result.pruned == 0
+    assert Path(result.archive_path).exists()
+
+
+async def test_a_verify_failed_archive_never_takes_a_retention_slot(
+    tmp_path, key_b64, monkeypatch
+) -> None:
+    """AC-6's real claim (BACKLOG #1587): a backup that fails its restore-verify must never be
+    published under the canonical archive name, because the canonical name IS the keep-N candidate
+    set.
+
+    Published there, an unrestorable archive spends a retention slot. At ``retention_keep=2`` the
+    next good backup then evicts the older GOOD copy rather than the bad one, so two good backups
+    plus one failure leave **one** good copy — the silent loss of a recovery point, on the exact
+    path a DR backup exists to protect.
+
+    Skipping the prune on the failing run (the pre-#1587 behavior) does not fix this: it only defers
+    the eviction to the next run, which is when it happens."""
+    dest = tmp_path / "backups"
+    store = await _store_with_rows(tmp_path / "msg.db", key_b64)
+    ss = _store_settings(tmp_path / "msg.db", key_b64)
+    runner = BackupRunner(
+        store,
+        _settings(dest, key_b64, retention_keep=2),
+        store_settings=ss,
+        config_dir=None,
+        instance="dev",
+    )
+
+    first = await runner.run_once(now=1000.0)
+    assert first is not None and first.verify is not None and first.verify.status == "PASS"
+
+    _inject_verify_failure(monkeypatch)
+    with pytest.raises(BackupError) as exc:
+        await runner.run_once(now=1001.0)
+    assert exc.value.kind == "verify"
+    monkeypatch.undo()  # the only patch in this test — the third run verifies for real
+
+    third = await runner.run_once(now=1002.0)
+    assert third is not None and third.verify is not None and third.verify.status == "PASS"
+
+    # The whole point: BOTH good archives survive at retention_keep=2.
+    assert Path(first.archive_path).exists(), (
+        "the older GOOD archive was pruned — the verify-failed archive took its retention slot"
+    )
+    assert Path(third.archive_path).exists()
+    assert third.pruned == 0, "the failed archive was counted as a keep-N candidate"
+
+    # The keep-N candidate set is exactly the two good archives — the failed one is not in it...
+    canonical = sorted(p.name for p in dest.glob(_CANONICAL_GLOB))
+    assert canonical == sorted([Path(first.archive_path).name, Path(third.archive_path).name])
+    # ...and it is still on disk for diagnosis, under a name the prune glob cannot match. KEPT, not
+    # deleted: the operator has to be able to look at the archive that would not verify.
+    failed = sorted(dest.glob("*.failed"))
+    assert len(failed) == 1, "the verify-failed archive must be KEPT for diagnosis, not deleted"
+    await store.close()
+
+
+async def test_a_verify_failed_run_still_charges_the_frames_it_spent(
+    tmp_path, key_b64, monkeypatch
+) -> None:
+    """ASVS 11.3.4: a run that fails its verify has still ENCRYPTED an archive, so the AES-GCM
+    invocations it spent are real and must still be charged to the key's persisted bound.
+
+    Pinned because the #1587 fix moves the publish decision to after the verify, and the tempting
+    next step is to move the invocation charge with it. That would under-count the bound by every
+    failed run — an error in the unsafe direction, on a counter whose whole job is to bound nonce
+    reuse. The charge belongs where the invocations are SPENT, not where the run succeeds."""
+    import base64 as _b64
+
+    db = tmp_path / "msg.db"
+    store = await _store_with_rows(db, key_b64)
+    key_id = key_fingerprint(_b64.b64decode(key_b64))
+    runner = BackupRunner(
+        store,
+        _settings(tmp_path / "backups", key_b64),
+        store_settings=_store_settings(db, key_b64),
+        config_dir=None,
+        instance="dev",
+    )
+    before = await store.cipher_invocations(key_id)
+    _inject_verify_failure(monkeypatch)
+    with pytest.raises(BackupError) as exc:
+        await runner.run_once(now=1000.0)
+    assert exc.value.kind == "verify"
+    assert await store.cipher_invocations(key_id) > before, (
+        "a verify-failed run encrypted an archive but charged none of its AES-GCM frames to the "
+        "key's persisted invocation bound"
+    )
+    await store.close()
+
+
+# --- BACKLOG #1570 rider: the manifest read is size-bounded ------------------
+
+
+def test_an_oversized_manifest_is_refused_before_it_is_parsed(tmp_path, monkeypatch) -> None:
+    """The manifest is the one archive member parsed INTO memory, so an archive declaring a huge
+    ``manifest.json`` could balloon the verifying process before ``json.loads`` ever runs.
+
+    Post-authentication on the encrypted path — ``decrypt_stream`` has already checked every AES-GCM
+    frame tag, so producing such an archive means holding the store DEK. This bounds the damaged,
+    locally-tampered and ``allow_unencrypted`` plaintext cases; it is not a pre-auth control."""
+    from messagefoundry.pipeline import dr_backup as dr
+
+    tar_path = tmp_path / "archive.tar"
+    payload = json.dumps({"format": "mfbak", "pad": "A" * 20_000}).encode("utf-8")
+    with tarfile.open(tar_path, "w") as tar:
+        info = tarfile.TarInfo(dr._MANIFEST_MEMBER)
+        info.size = len(payload)
+        tar.addfile(info, io.BytesIO(payload))
+
+    # Under a cap the manifest fits, it reads back normally — the positive control, without which a
+    # refusal below would prove only that something went wrong.
+    monkeypatch.setattr(dr, "_MAX_MANIFEST_BYTES", len(payload))
+    assert dr._read_manifest_from_tar(tar_path)["format"] == "mfbak"
+
+    # One byte under, and it is refused as a TarError — which _verify_archive_blocking already
+    # catches and turns into a verify FAIL rather than letting it escape.
+    monkeypatch.setattr(dr, "_MAX_MANIFEST_BYTES", len(payload) - 1)
+    with pytest.raises(tarfile.TarError):
+        dr._read_manifest_from_tar(tar_path)
 
 
 # --- AC-7: server-DB store is config-only ------------------------------------

@@ -15,7 +15,9 @@ stamps ``_last``, and ``charge`` refills from ``now``; ``settle``, ``deficit`` a
 ``for_rate`` all reach the clock THROUGH those two. Overriding both in a recording subclass puts the
 whole bucket on a clock this file owns, advanced only by the waits the pacer itself decides. The
 runner then drops out of the arithmetic completely and the schedule becomes exact, which is what lets
-a test assert what the pacer DECIDED rather than how long the box took.
+a test assert what the pacer DECIDED rather than how long the box took. The pacing report (BACKLOG
+#290) reads the real clock too, but only to throttle when a log line is written; it never sizes a
+wait, so the schedule cannot see it and this probe leaves it alone.
 
 This is the ``tests/_pace_probe.py`` rule (BACKLOG #82) applied to the ingress side, and the same
 rule ``tests/test_dicom_association_intake_bound.py`` applies to the DICOM association intake
@@ -144,11 +146,13 @@ def install_ingress_pace_probe(
                 probe.decided.append(wait)
                 probe.now += wait
 
-        def __init__(self, rate: float, burst: float, *, now: float) -> None:
+        def __init__(self, rate: float, burst: float, *, now: float, name: str = "") -> None:
             # The caller's `now` is the runner's monotonic clock. Dropping it here is what puts
             # `_last` and every later refill on one clock, since a bucket stamped from one clock and
-            # refilled from another reads a nonsense first interval.
-            super().__init__(rate, burst, now=probe.now)
+            # refilled from another reads a nonsense first interval. `name` is forwarded untouched:
+            # `for_rate` passes it to `cls(...)`, so this signature has to track the base's or the
+            # swap raises inside the accept handler and the intake records nothing (BACKLOG #290).
+            super().__init__(rate, burst, now=probe.now, name=name)
             probe.built += 1
 
         def charge(self, messages: int, *, now: float) -> float:

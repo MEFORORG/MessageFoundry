@@ -92,7 +92,7 @@ class EngineAttribution:
     foreign_rows: int  # inbound rows whose name does NOT carry this engine's tag (a steal ⇒ > 0)
     reads: int  # Σ inbound read across this engine's own rows
     #: The engine's OWN reason for each lane it reports as not-listening, verbatim from `/connections`
-    #: (`error`, which the API sets from `connection_failed()` per ADR 0031). Empty on a clean run.
+    #: (`error`, which the API sets from `inbound_failed()`/`outbound_failed()` per ADR 0031).
     #:
     #: CARRIED BECAUSE `reads == 0` CANNOT DIAGNOSE ITSELF WITHOUT IT, and the engine already knows.
     #: `inbound_rows` and `foreign_rows` are CONFIG-derived, not traffic-derived -- the API appends a
