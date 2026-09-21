@@ -339,10 +339,15 @@ _CONTEXTUAL_TOKENS = frozenset(
         "require_called_aet",
         # inbound mTLS: a pre-auth, consumer-keyed DENY at the TLS handshake
         "tls_ca_file",
-        # the dials that decide whether a "DENY at startup" / hop refusal EXISTS at all
+        # the dials that decide whether a "DENY at startup" / hop refusal EXISTS at all.
+        # ``data_class`` was one of these until BACKLOG #1279 deleted the axis. Do not re-add the
+        # token to turn this list green: the only way to satisfy it would be to put a lever the code
+        # does not have back into a decision table. NOTHING IN THIS MODULE would catch the axis
+        # returning -- ``data_class`` matches no _CONTEXTUAL_NAME_MARKERS entry, so it was only ever
+        # in this hand-reviewed set by hand. The guard that does bite is the load-time refusal in
+        # ``_REMOVED_KEYS[("ai", "data_class")]`` (messagefoundry/config/settings.py).
         "enforcement",
         "allow_single_factor_admin_when_exposed",
-        "data_class",
         # the federated pending-flow per-IP cap: an IP-keyed refusal of a sign-in leg
         "oidc_flow_cache_max",
         "oidc_flow_ttl_seconds",
