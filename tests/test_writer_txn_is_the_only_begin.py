@@ -79,20 +79,41 @@ _ALLOWED: dict[str, tuple[int, str]] = {
 
 #: The same pin for the NESTED-transaction verbs, keyed `(qualified function name, verb)`.
 #:
-#: EMPTY IS THE MEASUREMENT, not an unfinished table. Scanned 2026-09-16 against `store.py` at
-#: `ec32c96a8`: two BEGIN sites, and zero SAVEPOINT / ROLLBACK TO / RELEASE sites anywhere. So
-#: unlike BEGIN -- where a flat ban is unsatisfiable because something has to issue it -- a flat ban
-#: on these three IS satisfiable today, and an empty carve-out is the honest expression of it.
+#: It started EMPTY, and that was a measurement, not an unfinished table. Scanned 2026-09-16 against
+#: `store.py` at `ec32c96a8`: two BEGIN sites, and zero SAVEPOINT / ROLLBACK TO / RELEASE sites
+#: anywhere, so a flat ban on these three was satisfiable then.
 #:
 #: It is a table rather than a bare ban so that the FIRST legitimate savepoint registers itself here
 #: with a count and a reason, the way the BEGIN sites did, instead of arriving as a reason to delete
-#: the check. A pending example: PR 1233 (BACKLOG #1632) contains a failing group-commit member in
-#: its own savepoint and would add four entries -- `_GroupCommitter._run_member` SAVEPOINT 1 and
-#: RELEASE 1, `_GroupCommitter._unwind_member` ROLLBACK TO 1 and RELEASE 1. Those four were measured
-#: against `pull/1233/head` and confirmed independently by that PR's own session; the PR's prose
-#: says `_flush`, which drives the members but holds none of the statements. Whichever of the two
-#: lands second writes them; that is this guard working, not this guard being wrong.
-_ALLOWED_NESTED: dict[tuple[str, str], tuple[int, str]] = {}
+#: the check. The first is the group committer's per-member containment (BACKLOG #1632): four
+#: statements, all on `self._db`, and all reached only from `_GroupCommitter._flush`'s
+#: `async with _writer_txn(...)` block -- `_run_member` is called from nowhere else, and
+#: `_unwind_member` only from `_run_member`. `_flush` drives the members but holds none of the
+#: statements itself. What makes them safe is the enclosing `_writer_txn`: it holds the lock and an
+#: open BEGIN for their whole life, and a cancellation between SAVEPOINT and RELEASE unwinds through
+#: it with a full ROLLBACK, which discards every savepoint with the transaction.
+_ALLOWED_NESTED: dict[tuple[str, str], tuple[int, str]] = {
+    ("_GroupCommitter._run_member", "SAVEPOINT"): (
+        1,
+        "opens the member's savepoint inside `_flush`'s `_writer_txn`, whose BaseException unwind"
+        " rolls the whole transaction back, savepoint included",
+    ),
+    ("_GroupCommitter._run_member", "RELEASE"): (
+        1,
+        "pops a member's savepoint after its body ran; always under `_writer_txn`'s open BEGIN, so"
+        " it never commits the transaction, only folds the member into the batch",
+    ),
+    ("_GroupCommitter._unwind_member", "ROLLBACK TO"): (
+        1,
+        "undoes one failed member inside `_writer_txn`; if this unwind itself fails, `_GroupPoisoned`"
+        " sends the whole batch back through `_writer_txn`'s rollback",
+    ),
+    ("_GroupCommitter._unwind_member", "RELEASE"): (
+        1,
+        "pops the savepoint that ROLLBACK TO leaves on the stack, under the same open BEGIN, so the"
+        " stack never deepens past one",
+    ),
+}
 
 #: Order is not significant: `_verb_of` returns the LONGEST match, so a verb added here cannot be
 #: shadowed by one that happens to be its prefix. A set rather than a tuple to say that outright,
@@ -323,8 +344,8 @@ def _audit(
     reverse-engineering a message; rewording a failure string then cannot red a control.
 
     `expected` is a parameter rather than a read of `_expectations()` so the controls can drive this
-    with synthetic tables. `_ALLOWED_NESTED` is empty today, so a module-global read would leave the
-    counting arm exercised by exactly one data case, the two BEGIN carve-outs.
+    with synthetic tables, which reach cases the live tables do not hold: a stray nested verb, and a
+    nested count that moved.
     """
     stray = [site for site in sites if (site.owner, site.verb) not in expected]
     miscounted = [
@@ -453,8 +474,8 @@ def test_the_scanner_finds_a_hand_rolled_begin_and_ignores_prose() -> None:
     assert scan.sites == []
     assert (scan.calls, scan.unreadable) == (1, 1)
 
-    # The counting arm, on a populated table -- `_ALLOWED_NESTED` is empty today, so this is the
-    # only place `_audit` sees a nested key at all.
+    # The counting arm, on a synthetic table -- the only place `_audit` sees a nested key go stray or
+    # a nested count move, because the live table holds neither case.
     exact: dict[tuple[str, str], tuple[int, str]] = {
         ("S.nested", "SAVEPOINT"): (1, "control"),
         ("S.nested", "ROLLBACK TO"): (1, "control"),
@@ -474,11 +495,12 @@ def test_the_scanner_finds_a_hand_rolled_begin_and_ignores_prose() -> None:
     _, miscounted = _audit(nested, {**exact, ("S.nested", "SAVEPOINT"): (2, "control")})
     assert [(m.key, m.got, m.expected) for m in miscounted] == [(("S.nested", "SAVEPOINT"), 1, 2)]
 
-    # The join itself, which nothing else covers: `_ALLOWED_NESTED` is empty, so a typo in the
-    # implied "BEGIN" key would turn both live carve-outs stray and only the main test would notice.
+    # The join itself, which nothing else covers: a typo in the implied "BEGIN" key would turn both
+    # live BEGIN carve-outs stray and only the main test would notice.
     assert _expectations() == {
         ("_writer_txn", "BEGIN"): _ALLOWED["_writer_txn"],
         ("MessageStore._read", "BEGIN"): _ALLOWED["MessageStore._read"],
+        **_ALLOWED_NESTED,
     }
 
     # The negative arm. Every statement here is SYNTHETIC on purpose and must stay that way: PR 1227
