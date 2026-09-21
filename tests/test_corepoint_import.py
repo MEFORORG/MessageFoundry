@@ -52,6 +52,40 @@ def _package_source() -> str:
     return generate_module(parse_package(_acme_package(), source_name="acme_adt_package")[0])
 
 
+def _one_action_export(
+    action: dict[str, object], *, inbound_name: str | None = None, port: int = 2610
+) -> str:
+    """A minimal one-channel JSON export carrying exactly ``action`` — the untrusted value under test.
+
+    One builder for the whole file. A test that needs a hostile *inbound name* rather than a hostile
+    action passes ``inbound_name``; everything else varies only in ``action``."""
+    inbound: dict[str, object] = {"connector": "mllp", "port": port}
+    if inbound_name is not None:
+        inbound["name"] = inbound_name
+    return json.dumps(
+        {
+            "channels": [
+                {
+                    "name": "X",
+                    "inbound": inbound,
+                    "destinations": [{"name": "OB_X", "connector": "mllp", "host": "h", "port": 7}],
+                    "handlers": [{"name": "h", "actions": [action]}],
+                }
+            ]
+        }
+    )
+
+
+def _assert_no_live_stub(source: str) -> None:
+    """The unmapped-action rule, asserted in ONE place: a TODO marker emits no live code (#1681).
+
+    ``msg.field(`` is the stronger half. It pins the withdrawn stub's READ, which no marker or hint
+    text has any reason to mention, so it still fails on a passthrough rewritten to write through
+    something other than ``Message.set`` — which is exactly the shape a partial revert would take."""
+    assert "msg.field(" not in source
+    assert "msg.set(" not in source
+
+
 # --- mapping fidelity (AC-1) -------------------------------------------------
 
 
@@ -134,20 +168,26 @@ def test_multiple_destinations_emit_list_of_sends() -> None:
     assert "from messagefoundry import File, MLLP, Send" in src
 
 
-# --- count-and-log: unmapped is stubbed, never dropped (AC-2) ----------------
+# --- count-and-log: unmapped is marked, never dropped and never live (AC-2) --
 
 
-def test_unmapped_action_is_stubbed_not_dropped() -> None:
-    """An unmapped class becomes an in-place TODO + best-effort stub and is counted (AC-2)."""
+def test_unmapped_action_is_marked_not_dropped() -> None:
+    """An unmapped class becomes an in-place TODO marker, emits NO live code, and is counted (AC-2).
+
+    The JSON layer used to emit ``msg.set(p, msg.field(p) or "")`` here. That line was never the inert
+    passthrough its comment claimed — ``Message.set`` raises ``KeyError`` on an absent segment and
+    materialises the field and its empty components on a present one — so the recovered target now
+    rides into the marker text, exactly as the validated role-parsed path already did."""
     channels = parse_export(_acme_export())
     steps = channels[0].handlers[0].steps
     unmapped = [s for s in steps if isinstance(s, UnmappedAction)]
     assert [u.source_class for u in unmapped] == ["ItemCustomScript"]
-    assert unmapped[0].stub_path == "OBX-5"
+    assert "intended target OBX-5" in unmapped[0].detail
 
     src = generate_module(channels[0])
     assert "# TODO: Corepoint ItemCustomScript — hand-finish" in src
-    assert 'msg.set("OBX-5", msg.field("OBX-5") or "")' in src
+    assert "intended target OBX-5" in src
+    _assert_no_live_stub(src)
 
 
 def test_import_summary_counts_mapped_and_unmapped(tmp_path: Path) -> None:
@@ -163,26 +203,15 @@ def test_import_summary_counts_mapped_and_unmapped(tmp_path: Path) -> None:
 
 
 def test_unmapped_without_target_emits_marker_only() -> None:
-    export = json.dumps(
-        {
-            "channels": [
-                {
-                    "name": "X",
-                    "inbound": {"connector": "mllp", "port": 2612},
-                    "destinations": [{"name": "OB_X", "connector": "mllp", "host": "h", "port": 7}],
-                    "handlers": [{"name": "h", "actions": [{"class": "ItemMysteryOp"}]}],
-                }
-            ]
-        }
-    )
-    channels = parse_export(export)
+    channels = parse_export(_one_action_export({"class": "ItemMysteryOp"}, port=2612))
     step = channels[0].handlers[0].steps[0]
     assert isinstance(step, UnmappedAction)
-    assert step.stub_path is None
+    # Nothing to recover, so the marker names no target — and there is no stub field to hold one.
+    assert "intended target" not in step.detail
     src = generate_module(channels[0])
     assert "# TODO: Corepoint ItemMysteryOp — hand-finish" in src
-    # No stub line when no target field is recoverable, but the marker records it (never dropped).
-    assert "msg.set(" not in src
+    # The marker records it (never dropped) and emits no live code either way.
+    _assert_no_live_stub(src)
 
 
 def test_colliding_module_names_are_deduped_not_overwritten(tmp_path: Path) -> None:
@@ -271,24 +300,8 @@ def test_generated_module_imports_and_wires(tmp_path: Path) -> None:
 def test_hostile_values_are_escaped_not_injected() -> None:
     """A value carrying quotes/newlines/backslashes rides across as an inert literal (no code injection)."""
     hostile = 'x") ; import os ; os.system("echo pwned'
-    export = json.dumps(
-        {
-            "channels": [
-                {
-                    "name": "X",
-                    "inbound": {"connector": "mllp", "port": 2613},
-                    "destinations": [{"name": "OB_X", "connector": "mllp", "host": "h", "port": 7}],
-                    "handlers": [
-                        {
-                            "name": "h",
-                            "actions": [
-                                {"class": "ItemReplace", "target": "MSH-6", "value": hostile}
-                            ],
-                        }
-                    ],
-                }
-            ]
-        }
+    export = _one_action_export(
+        {"class": "ItemReplace", "target": "MSH-6", "value": hostile}, port=2613
     )
     src = generate_module(parse_export(export)[0])
     # The dangerous payload appears only inside a single escaped string literal — the injected
@@ -297,29 +310,129 @@ def test_hostile_values_are_escaped_not_injected() -> None:
     assert "\nimport os" not in src
     assert "os.system(" not in src.replace(json.dumps(hostile), "")
     # And the generated source still parses as a single, well-formed module (no literal breakout).
-    import ast
+    ast.parse(src)
 
+
+def test_an_unmapped_actions_recovered_target_cannot_escape_its_comment() -> None:
+    """The recovered target rides into a ``#`` comment, so it needs the comment-side escape.
+
+    #1681 moved this value out of a ``_lit``-rendered ``msg.set`` line and into the marker text. A
+    ``_lit`` literal contains a newline by escaping it; a comment does not — the line simply ends and
+    whatever follows is a statement. So the move is only safe because the renderer flattens both the
+    action class and the marker text through ``_comment_text``. Without that, this export injects a
+    top-level ``import os`` into a module that still compiles."""
+    payload = 'MSH-6\nimport os\nos.system("echo pwned")'
+    export = _one_action_export({"class": "ItemMystery", "target": payload})
+    src = generate_module(parse_export(export)[0])
+    # The payload stays VISIBLE (count-and-log) — so "it is gone" is not the property to assert. The
+    # property is that every line carrying it is a comment, and that nothing it named is a statement.
+    tainted = [ln for ln in src.splitlines() if "import os" in ln or "os.system(" in ln]
+    assert tainted, "the payload vanished — an unmapped action must stay visible to the migrator"
+    assert all(ln.lstrip().startswith("#") for ln in tainted)
+    imported = {
+        alias.name
+        for node in ast.walk(ast.parse(src))
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    assert "os" not in imported
+    assert "# TODO: Corepoint ItemMystery — hand-finish" in src
+    # The value is not dropped either — it is still visible to the migrator, flattened onto one line.
+    assert 'intended target MSH-6 import os os.system("echo pwned")' in src
+    ast.parse(src)
+
+
+def test_a_nul_in_an_action_class_cannot_make_the_module_uncompilable() -> None:
+    """Python refuses to compile a source string containing NUL, so the comment path must strip it."""
+    src = generate_module(parse_export(_one_action_export({"class": "Item\x00Script"}))[0])
+    assert "\x00" not in src
+    assert "# TODO: Corepoint ItemScript — hand-finish" in src
+    compile(src, "generated.py", "exec")  # the shape that used to raise ValueError
+
+
+@pytest.mark.parametrize(
+    ("action", "needle", "position"),
+    [
+        # The table's OWN values are rendered by _lit too, and ``null`` is a NameError at import. The
+        # message must say WHICH entry, or a 200-code lookup table sends the migrator hunting.
+        ({"class": "ItemCodeLookup", "target": "PID-8", "table": {"M": None}}, "null", "['M']"),
+        # So is an explicit JSON ``null`` default — a top-level value, so there is no position to name.
+        (
+            {"class": "ItemCodeLookup", "target": "PID-8", "table": {"M": "male"}, "default": None},
+            "null",
+            "",
+        ),
+        # ``true``/``false`` are names to Python as well.
+        ({"class": "ItemCodeLookup", "target": "PID-8", "table": {"M": True}}, "true", "['M']"),
+    ],
+)
+def test_a_json_scalar_python_cannot_read_is_refused_not_rendered(
+    action: dict[str, object], needle: str, position: str
+) -> None:
+    """``{"table": {"M": null}}`` rendered ``{"M": null}`` — a ``NameError`` the moment it imports.
+
+    Refused at render time instead, because a module that cannot be imported is a worse outcome than a
+    named error on the export. The refusal is deliberately NOT "no non-string scalars": the ``table``
+    dict and an ``ItemSplit`` ``destinations`` list are legitimate input, and
+    ``test_a_nested_container_of_strings_still_renders`` pins that they keep working."""
+    with pytest.raises(CorepointImportError) as excinfo:
+        parse_export(_one_action_export(action))
+    message = str(excinfo.value)
+    assert needle in message
+    # The position is what distinguishes a bad table entry from a bad top-level value; without it the
+    # three cases below would all report the same thing and the parametrization would test nothing.
+    assert f"export value{position} is" in message
+
+
+def test_a_nested_container_of_strings_still_renders() -> None:
+    """The container values _lit is legitimately handed are not collateral damage of the refusal."""
+    src = generate_module(
+        parse_export(
+            _one_action_export(
+                {
+                    "class": "ItemSplit",
+                    "source": "PID-5",
+                    "separator": "^",
+                    "destinations": ["PID-5.1", "PID-5.2"],
+                }
+            )
+        )[0]
+    )
+    assert 'split_field(msg, "PID-5", "^", ["PID-5.1", "PID-5.2"])' in src
+    ast.parse(src)
+
+
+def test_an_unpaired_surrogate_is_refused_before_it_reaches_the_file(tmp_path: Path) -> None:
+    """A lone surrogate survives json.dumps AND ast.parse, then dies at UTF-8 encode.
+
+    That is the last step, where the traceback blames the file write rather than the export, so the
+    value is refused at render time instead. An astral character is the neighbouring case and must
+    still work: ``ensure_ascii=False`` keeps it one raw code point instead of splitting it into the
+    surrogate pair the default ASCII escaping would emit."""
+    lone = json.loads(
+        '"\\ud83d"'
+    )  # a high surrogate with no low half, exactly as an export carries it
+    with pytest.raises(CorepointImportError, match="unpaired surrogate"):
+        parse_export(_one_action_export({"class": "ItemReplace", "target": "MSH-6", "value": lone}))
+
+    astral = "\U0001f6f0"  # the same code point, properly paired
+    src = generate_module(
+        parse_export(
+            _one_action_export({"class": "ItemReplace", "target": "MSH-6", "value": astral})
+        )[0]
+    )
+    assert astral in src
+    assert "\ud83d" not in src  # never split into surrogates
+    (tmp_path / "generated.py").write_text(src, encoding="utf-8")  # the step that used to raise
     ast.parse(src)
 
 
 def _named_inbound_export(inbound_name: str) -> str:
     """A minimal one-channel export whose ``inbound.name`` is caller-chosen (the untrusted value)."""
-    return json.dumps(
-        {
-            "channels": [
-                {
-                    "name": "X",
-                    "inbound": {"connector": "mllp", "name": inbound_name, "port": 2615},
-                    "destinations": [{"name": "OB_X", "connector": "mllp", "host": "h", "port": 7}],
-                    "handlers": [
-                        {
-                            "name": "h",
-                            "actions": [{"class": "ItemReplace", "target": "MSH-6", "value": "V"}],
-                        }
-                    ],
-                }
-            ]
-        }
+    return _one_action_export(
+        {"class": "ItemReplace", "target": "MSH-6", "value": "V"},
+        inbound_name=inbound_name,
+        port=2615,
     )
 
 
@@ -505,10 +618,13 @@ def test_block_becomes_a_comment_never_an_action() -> None:
 
 
 def test_unmapped_verb_emits_a_todo_marker_and_is_counted(tmp_path: Path) -> None:
-    """An unmapped verb is never silently dropped — TODO marker, best-effort stub, counted (AC-2)."""
+    """An unmapped verb is never silently dropped — TODO marker naming the target, counted (AC-2).
+
+    The marker is all it emits: no ``msg.set`` passthrough, on this layer or any other (#1681)."""
     src = _package_source()
     assert "# TODO: Corepoint ItemCustomScript — hand-finish" in src
-    assert 'msg.set("OBX-5", msg.field("OBX-5") or "")' in src
+    assert "intended target OBX-5" in src
+    assert "msg.field(" not in src
     # Message-lifecycle / logging verbs have no honest vocabulary equivalent either.
     assert "# TODO: Corepoint MsgParse — hand-finish" in src
     assert "# TODO: Corepoint EnvLogText — hand-finish" in src
@@ -528,9 +644,11 @@ def test_a_path_that_does_not_resolve_is_never_guessed() -> None:
     )
     assert src.count("# TODO: Corepoint ItemCopy — hand-finish") == 2
     assert "copy_field(" not in src
-    # The recoverable half of each statement still rides across as the stub target.
-    assert 'msg.set("PID-3.1"' in src
-    assert 'msg.set("NK1-2.1"' in src
+    # The recoverable half of each statement rides across in the marker TEXT — never as a live write.
+    assert "intended target PID-3.1" in src
+    assert "intended target NK1-2.1" in src
+    assert "msg.field(" not in src
+    assert "msg.set(" not in src
 
 
 def test_disabled_element_is_preserved_as_comment_not_live_code(tmp_path: Path) -> None:

@@ -803,6 +803,19 @@ class StoreSettings(_Section):
         return self
 
 
+#: The hosts that count as a loopback bind for the OPERATOR API, i.e. not exposed off-box. Both IPv4 and
+#: IPv6 loopback are listed so a dual-stack box never spuriously counts as exposed.
+#:
+#: Defined here rather than beside its ADR 0118 use because at least two security decisions in this
+#: module key on it and must not disagree: :attr:`ApiSettings.is_loopback`, which used to inline the
+#: same three hosts as a tuple, and ``_desugar_security``'s refusal of a non-loopback ``listen_address``
+#: under ``local_access_only = true``. This unifies THIS module only. Other packages carry same-named
+#: frozensets for their own transports, with different contents (``::ffff:127.0.0.1`` in
+#: ``pipeline.wiring_runner`` and ``transports.dicom``, ``[::1]`` in the harness poller); reconciling
+#: those is a separate question, recorded in ADR 0154.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
 class ApiSettings(_Section):
     host: str = "127.0.0.1"  # Phase 1 = localhost only
     port: int = 8765
@@ -931,9 +944,10 @@ class ApiSettings(_Section):
     @property
     def is_loopback(self) -> bool:
         """Whether the API binds a loopback host — i.e. is **not** exposed off-box, so the exposed-bind
-        TLS gate and the MFA-at-exposure advisory (``serve``) don't apply. Treats ``127.0.0.1``,
-        ``localhost`` and ``::1`` as loopback (a dual-stack box never spuriously counts as exposed)."""
-        return self.host in ("127.0.0.1", "localhost", "::1")
+        TLS gate and the MFA-at-exposure advisory (``serve``) don't apply. The host set is
+        :data:`_LOOPBACK_HOSTS`, shared with the ``[security]`` desugar so one definition serves every
+        off-box decision."""
+        return self.host in _LOOPBACK_HOSTS
 
     @property
     def proxy_intra_service_declared(self) -> bool:
@@ -4018,6 +4032,29 @@ class IntegritySettings(_Section):
     # refuse-to-start on a tripped tamper alarm would be a self-inflicted DoS). Default false — opt in;
     # on a very large audit_log the full re-walk adds startup latency, so it is not on by default.
     audit_verify_on_start: bool = False
+    # Path to a file holding one COUNT:HEAD anchor as printed by `messagefoundry audit-anchor` (BACKLOG
+    # #328). Empty (the default) = the startup walk stays the bare walk it is today, byte-identical.
+    #
+    # WHAT IT BUYS: the walk alone cannot see a TRUNCATED TAIL — deleting the newest rows leaves a prefix
+    # that still chains cleanly — so audit_verify_on_start on its own is blind to exactly what an
+    # attacker hiding their tracks would do. An anchor is the external witness that catches it.
+    #
+    # THE ENGINE CONSUMES IT AS A PREFIX, NOT AS THE CLI'S EXACT SEAL, and that difference is why this
+    # key can exist at all. `audit-verify --expected-anchor` compares the CURRENT head, so it diverges
+    # the moment one more row is appended; a running engine writes audit rows, so a startup check built
+    # on the exact seal would alarm on essentially every restart. This feeds `expected_prefix`
+    # (`audit_prefix_verdict`) instead, which asks the weaker, survivable question: was the recorded
+    # state ever true, and has the chain only GROWN since? It still catches a truncated tail and a
+    # mid-chain rewrite. So a stale anchor stays VALID here — it just witnesses less.
+    #
+    # ALERT-ONLY, like its partner: a missing, unreadable or malformed anchor logs a WARNING and lets the
+    # bare walk run. It never crashes startup, and it never fires the tamper alert — a config fault must
+    # not manufacture a tamper alarm, or a real one stops meaning anything. `0:`, the anchor of an empty
+    # log, is refused the same way: it can witness nothing, so it is reported rather than compared.
+    #
+    # It does nothing on its own: without audit_verify_on_start the engine warns at startup that the
+    # anchor is never read.
+    audit_anchor_file: str = ""
 
 
 class ApprovalsSettings(_Section):
@@ -4835,7 +4872,8 @@ def _reject_unknown_file_keys(file_data: Mapping[str, Any]) -> None:
 
 
 # --- ADR 0118: the [security] section desugars into the internal fields it replaces ----------------
-_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+# The loopback host set this section keys on is _LOOPBACK_HOSTS, defined beside `ApiSettings` above so
+# `is_loopback` and the desugar refusal cannot disagree about what "off-box" means.
 
 #: Legacy ``(section, key)`` → the ``[security]`` key that replaces it (ADR 0118). Setting any of these
 #: in its old section (file OR ``MEFOR_<SECTION>_<KEY>`` env) is REJECTED at load — the posture switches
@@ -5020,6 +5058,57 @@ def _desugar_security(data: dict[str, dict[str, Any]]) -> None:
     # The master posture lever USED TO BE DESUGARED HERE, into [ai].data_class. Both keys are retired
     # (BACKLOG #1279) and `_reject_relocated_keys` refuses either spelling before this runs, so there
     # is nothing left to translate. The production tier still passes through `_SECURITY_PASSTHROUGH`.
+
+
+def _reconcile_effective_bind(settings: ServiceSettings) -> None:
+    """Fold the EFFECTIVE API bind back into the ``[security]`` view, in the loosening direction only
+    (BACKLOG #1852).
+
+    :func:`_desugar_security` writes ``[security]`` down into ``[api].host`` and runs BEFORE the CLI
+    merge so ``serve --host`` still wins. That ordering is deliberate and stays, but it leaves the two
+    views disagreeing: ``--host 0.0.0.0`` moves the socket off-box while ``[security]`` still reads
+    ``local_access_only = true``. Nothing reported that. :func:`security_loosenings` reads the raw
+    ``[security]`` model, so BOTH the ``local_access_only`` entry and the exposure-gated
+    ``allowed_client_networks`` entry stayed silent. The serve-time loosening warning,
+    ``GET /security/posture`` and the web console's "Local access only" row all said the engine was
+    loopback-only while it was listening on every interface. The exposed-bind TLS gate in ``__main__``
+    was never fooled (it reads :attr:`ApiSettings.is_loopback`); only the REPORTING was.
+
+    Reconciling here, on the validated object, reuses that same ``is_loopback`` predicate, so the gate
+    and the posture view share one definition of "off-box" and cannot drift apart again. It also fixes
+    every consumer at once without adding a parameter to the loosening registry. That parameter would
+    be wrong for ``messagefoundry security show`` anyway, where the declared reading IS the effective
+    one because there is no CLI bind to reconcile against. This is the same move ``serve`` already
+    makes for the egress and retention flips (ADR 0118), one layer earlier.
+
+    A FREE FUNCTION AND NOT A ``ServiceSettings`` AFTER-VALIDATOR, deliberately. The two cross-section
+    validators on that model REFUSE a contradiction; they do not rewrite a field, and a mutating one
+    beside them would read as the same kind of rule. More to the point, this fold is a LOADER concern:
+    what it reconciles against is the CLI-over-file precedence :func:`load_settings` owns, and a
+    ``ServiceSettings`` a caller builds by hand has no CLI layer for it to be about. A validator would
+    not even be the stronger guarantee it looks like, since ``model_copy(update=...)`` re-runs none.
+
+    ``is_loopback`` is a three-host string match, so a bind on ``127.0.0.2`` (loopback on every
+    supported platform) reconciles as EXPOSED. That over-reports, which is the safe direction, and it
+    is byte-identical to what the serve TLS gate already does with the same host. Do not "fix" it into
+    an :mod:`ipaddress` ``is_loopback`` call here: that would relax the TLS gate in the same move.
+
+    **ONE-WAY, and that is the load-bearing part.** Reconcile only where the effective bind ADDS a
+    loosening:
+
+    * effective bind is NON-loopback: force ``local_access_only`` false and point ``listen_address``
+      at the host actually bound (leaving it at ``127.0.0.1`` would make the model lie, since that
+      field is documented as the address used once ``local_access_only`` is false);
+    * effective bind IS loopback: change nothing. Never flip ``local_access_only`` back to true. An
+      operator may declare ``local_access_only = false`` and leave ``listen_address`` at its loopback
+      default; the declaration is still a deviation from the one shipped posture and the registry must
+      keep reporting it. Suppressing a loosening the operator declared is the wrong direction, whatever
+      the socket ended up bound to.
+    """
+    if settings.api.is_loopback:
+        return
+    settings.security.local_access_only = False
+    settings.security.listen_address = settings.api.host
 
 
 def security_loosenings(
@@ -5505,6 +5594,9 @@ def load_settings(
         _merge(data, cli)
 
     settings = ServiceSettings.model_validate(data)
+    # AFTER the CLI merge, so a `--host` that moved the socket off-box is reported as the posture
+    # loosening it is. One-way: it only ever ADDS a loosening. See the helper for why.
+    _reconcile_effective_bind(settings)
     if settings.cluster.vip.enabled:
         # Configuration only in this build (ADR 0056). Say so, or an operator who switched it on finds
         # out at the first failover that the address never moved.
