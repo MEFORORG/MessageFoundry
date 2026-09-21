@@ -412,6 +412,13 @@ def parse_export(text: str) -> tuple[Channel, ...]:
         doc = json.loads(text)
     except json.JSONDecodeError as exc:
         raise CorepointImportError(f"export is not valid JSON: {exc}") from exc
+    except RecursionError as exc:
+        # `json.loads` raises `RecursionError` (a `RuntimeError`, not caught by the arm above) on
+        # deeply nested input; the CLI's `_import` happens to catch it too, but any other caller of
+        # this function -- the one the module's own "defensive throughout" docstring promises -- would
+        # see a raw traceback instead of the clean `CorepointImportError` every other malformed-export
+        # path here returns.
+        raise CorepointImportError(f"export is nested too deeply to parse: {exc}") from exc
     if not isinstance(doc, dict):
         raise CorepointImportError("export root must be a JSON object")
     channels_raw = doc.get("channels")
@@ -1263,6 +1270,15 @@ def _split_branches(steps: list[Step]) -> tuple[tuple[Step, ...], tuple[Control,
 # an untrusted export nesting thousands of elements would otherwise exhaust the interpreter stack and
 # surface as a RecursionError traceback instead of a clean, reported error (CLAUDE.md §6/§8). Real
 # packages nest a handful of levels; 100 is far past any plausible hand-authored action-list.
+#
+# This bounds DEPTH only, not the WIDTH of one branch list, and width has its own unbounded hazard the
+# fix for the earlier recursion-on-width defect moved rather than removed: ``generate_module`` renders
+# one ``elif False:`` per sibling branch (see the ``If``/``ChooseFrom`` renderer below) into the
+# generated module's source text. Measured: 5,000 siblings parse; 20,000 make CPython's own parser
+# raise ``MemoryError: Parser stack overflowed`` while ``import_corepoint`` still reports success and
+# returns 0 — an accept-and-drop with a success exit code. Not fixed here: bounding branch width in the
+# importer would refuse a legitimate long ``ElseIf`` chain, so it needs a width-limit decision, not a
+# default.
 _MAX_NESTING = 100
 
 
@@ -1946,11 +1962,15 @@ def import_corepoint(export_path: str | Path, out_dir: str | Path) -> ImportResu
     """Parse the export at ``export_path`` and write one config module per channel into ``out_dir``.
 
     Returns the :class:`ImportResult` count-and-log summary. Raises :class:`CorepointImportError` on a
-    malformed export and :class:`OSError` on a filesystem failure (the CLI maps both to a clean error)."""
+    malformed export -- including one that is not valid UTF-8 -- and :class:`OSError` on a filesystem
+    failure (the CLI maps both to a clean error)."""
     epath = Path(export_path)
     try:
         text = epath.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
+        # `UnicodeDecodeError` subclasses `ValueError`, NOT `OSError` -- catching only the latter let a
+        # non-UTF-8 export escape as a raw traceback instead of the clean `CorepointImportError` this
+        # function's own docstring promises. Same shape as `__main__.py`'s audit-anchor file reader.
         raise CorepointImportError(f"cannot read export {epath}: {exc}") from exc
 
     channels = parse_any(text, source_name=epath.stem)
