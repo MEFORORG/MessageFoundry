@@ -4615,6 +4615,19 @@ async def test_webauthn_rp_fail_closed_legible(engine: Engine) -> None:
     # AC-7: public_origin unset + request-derivation disallowed (the declared-proxy topology) —
     # ceremonies fail closed with the shared notice on every surface, never a redirect loop.
     pytest.importorskip("webauthn")
+    # BACKLOG #1361: PINNED AGAINST THE RELOCATION MAP, NOT A REMEMBERED LITERAL. `[api].public_origin`
+    # is the INTERNAL field this code reads; ADR 0118 relocated the OPERATOR-FACING key and
+    # `_reject_relocated_keys` REFUSES the old spelling as file or env input, so a notice naming it
+    # hands the operator a remediation that dies at load. Asserting some literal here would pass just
+    # as well after the next relocation moved the key again -- the notice and the loader would drift
+    # apart silently, which is the defect the pin exists to stop. Same shape, and the same reasoning,
+    # as tests/test_api_tls.py::test_the_refusal_names_a_key_the_loader_actually_accepts.
+    from messagefoundry.config.settings import _RELOCATED_TO_SECURITY
+
+    # The SECTION is part of the remediation: "[api].web_console_public_address" is the right key in a
+    # section the loader still refuses, and a bare-key assertion would pass on it. So pin the spelling an
+    # operator can actually paste into messagefoundry.toml.
+    expected_key = f"[security].{_RELOCATED_TO_SECURITY[('api', 'public_origin')]}"
     service = await _service(engine)
     await _add(service, "boss", Role.ADMINISTRATOR)
     transport = httpx.ASGITransport(
@@ -4623,10 +4636,14 @@ async def test_webauthn_rp_fail_closed_legible(engine: Engine) -> None:
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         await _cookie_login(c, "boss")
         r = await c.get("/ui/account")
-        assert "public_origin is not set" in r.text
+        assert expected_key in r.text
+        # The OLD spelling must be ABSENT, so a revert reds HERE -- on the rendered page a user
+        # actually reads -- and not only in the #1361 static census.
+        assert "[api].public_origin" not in r.text
         await _mint_action(c, "/ui/account/webauthn/enroll")  # 7.5.1: enroll is action-bound
         r = await c.post("/ui/account/webauthn/enroll", headers=_SFS)
-        assert r.status_code == 409 and "public_origin is not set" in r.text
+        assert r.status_code == 409 and expected_key in r.text
+        assert "[api].public_origin" not in r.text
         r = await c.post("/ui/reauth/webauthn", json={"response": {}}, headers=_SFS)
         assert r.status_code == 409 and r.json()["error"] == "rp_unavailable"
 
