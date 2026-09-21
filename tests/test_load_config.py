@@ -16,10 +16,12 @@ from pathlib import Path
 import pytest
 
 from harness.load.profile import PROFILES_DIR, LoadProfileError, load_profile
+from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.wiring import load_config
 from messagefoundry.generators import _core, all_types  # noqa: F401  (registers message types)
 from messagefoundry.parsing import Peek, normalize
 from messagefoundry.pipeline.dryrun import dry_run
+from messagefoundry.transports.mllp import DEFAULT_MAX_CONNECTIONS_PER_HOST
 
 _CONFIG = "harness/config/load"
 
@@ -50,6 +52,35 @@ def test_graph_loads_and_validates() -> None:
     reg = load_config(_CONFIG)
     reg.validate()
     assert set(reg.inbound) == {"IB_Load_ADT", "IB_Load_Results", "IB_Load_Other"}
+
+
+@pytest.mark.parametrize(
+    ("config", "profile"),
+    [
+        (_CONFIG, "closed-loop.toml"),
+        # Both of these reuse `load_shape`, the SAME ADT port and the same profiles, so they inherit
+        # the one-address shape that needs the override. Covering only `harness/config/load` left
+        # them shipping the 32-per-host default on a port driven by a 64-to-160 connection pool.
+        ("harness/config/passthrough", "closed-loop.toml"),
+        ("harness/config/store_once", "writeamp.toml"),
+    ],
+)
+def test_every_hub_turns_the_per_host_cap_off(config: str, profile: str) -> None:
+    # The pool opens from ONE address and outgrows the shipped per-host cap (BACKLOG #1725), so a hub
+    # that kept it would refuse most of its own load. Every hub of every LISTED graph is checked, so
+    # a hub added to one of them fails here instead of in a run. The list is hand-maintained and
+    # covers the three graphs that import `load_shape` today; a fourth built on that shape needs a
+    # row here, which nothing enforces.
+    pool = load_profile(PROFILES_DIR / profile).pool_size
+    # Positive control: the shipped cap WOULD bite without the override, on THIS graph's own profile.
+    assert pool > DEFAULT_MAX_CONNECTIONS_PER_HOST
+    reg = load_config(config)
+    # PT_Relay is a PassThrough — no socket, so no peer to cap. Filtering it out means the loop below
+    # cannot pass on a graph whose only inbound has no such setting at all.
+    hubs = [ib for ib in reg.inbound.values() if ib.spec.type is ConnectorType.MLLP]
+    assert hubs, f"{config} registered no MLLP inbound, so this assertion checked nothing"
+    for ib in hubs:
+        assert ib.spec.settings["max_connections_per_host"] is None, ib.name
 
 
 def test_inbounds_carry_no_shard_by_default() -> None:
