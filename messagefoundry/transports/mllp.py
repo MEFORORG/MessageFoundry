@@ -1657,6 +1657,39 @@ def _pacing_settings(settings: Mapping[str, Any]) -> tuple[float | None, float]:
     return rate, float(settings.get("message_burst") or rate or 0.0)
 
 
+def _cap_setting[NumT: (int, float)](value: Any, convert: Callable[[Any], NumT]) -> NumT | None:
+    """Read one inbound cap: a number, or ``None`` for the documented ``None``/``0`` disable.
+
+    **Decide "off" on the NUMBER, not on Python truthiness.** The older idiom ``int(v) if v else
+    None`` tests the RAW settings value, and a raw ``"0"`` is a non-empty string — truthy — so it
+    survives that test and becomes a live cap of zero. That spelling is reachable rather than
+    contrived: a
+    ``connections.toml`` ``env()`` reference without a ``cast`` hands the connector the environment's
+    TEXT (``docs/CONNECTIONS.md``), so an operator disabling a cap through the environment writes
+    ``"0"`` and gets the opposite of what they asked for — a listener that refuses every connection,
+    rejects every frame, or closes every socket the instant it opens, depending on which cap it was.
+
+    ``None`` and ``""`` short-circuit before either conversion, and both are needed: a key may be
+    absent, and ``resolve_env_settings`` tests membership rather than truthiness, so an env var that
+    is SET but empty arrives as ``""`` — which ``int()``/``float()`` would raise on.
+
+    **The zero test reads a ``float`` view, and the cap is built with the caller's own ``convert``.**
+    Testing the CONVERTED value instead would read anything that truncates to zero as "off": with
+    ``convert=int``, a ``max_connections_per_host`` of ``-0.5`` would silently disable a security cap
+    that the guard below is supposed to refuse at build. A float view answers "did the operator write
+    zero", which is the actual question, and leaves every sub-1 value to the caller's own guard.
+
+    A negative value is therefore returned as-is, for the callers that refuse one at build with a
+    message naming their own key. It is a different mistake with a different answer, and folding it
+    into "off" here would swallow the typo this connector exists to reject.
+    """
+    if value is None or value == "":
+        return None
+    if float(value) == 0:  # at least 0, 0.0, -0.0, False, "0", "0.0" and " 0 " reach this as off
+        return None
+    return convert(value)
+
+
 class MLLPSource(SourceConnector):
     """Listen for inbound MLLP connections, hand each message to the pipeline handler,
     and frame whatever the handler returns back to the sender as the ACK.
@@ -1682,34 +1715,45 @@ class MLLPSource(SourceConnector):
         self.host: str = s.get("host") or "127.0.0.1"
         self.port: int = int(s["port"])
         self.encoding: str = s.get("encoding", "utf-8")
-        # Caps below: key absent → secure default; present-but-falsy (None/0) → disabled.
-        mc = s.get("max_connections", DEFAULT_MAX_CONNECTIONS)
-        self.max_connections: int | None = int(mc) if mc else None
-        mch = s.get("max_connections_per_host", DEFAULT_MAX_CONNECTIONS_PER_HOST)
-        self.max_connections_per_host: int | None = int(mch) if mch else None
+        # Every cap on THIS listener: key absent → secure default; None/0 → disabled, in whichever
+        # spelling arrives. `_cap_setting` is what makes that last clause true — see it for why
+        # deciding "off" before the conversion read a string `"0"` as a live cap of zero. All five go
+        # through it, so there is one rule here rather than a per-key convention to look up. The
+        # raw-TCP, X12 and HTTP listeners still read their own caps the older way, so this is a
+        # property of this connector and not yet of the transport layer.
+        self.max_connections: int | None = _cap_setting(
+            s.get("max_connections", DEFAULT_MAX_CONNECTIONS), int
+        )
+        self.max_connections_per_host: int | None = _cap_setting(
+            s.get("max_connections_per_host", DEFAULT_MAX_CONNECTIONS_PER_HOST), int
+        )
         if self.max_connections_per_host is not None and self.max_connections_per_host < 1:
-            # A negative value is TRUTHY, so it survives the `if mch` above and becomes a cap that
-            # refuses every peer — including one holding zero connections, since `0 >= -1`. Nothing
-            # is admitted, so `_release` never runs and `_host_capacity_warned` grows one
-            # attacker-chosen key per address with nothing to clear it: the unbounded table this
-            # control is not allowed to contain. Refuse at build, where dry-run and `check` surface
-            # it, rather than at the first connection. `0` is the documented way to turn it off.
+            # Only a NEGATIVE value reaches here: `_cap_setting` passes one through on purpose, and
+            # it would be a cap that refuses every peer, including one holding zero connections,
+            # since `0 >= -1`. Nothing is admitted, so `_release` never runs and
+            # `_host_capacity_warned` grows one attacker-chosen key per address with nothing to clear
+            # it: the unbounded table this control is not allowed to contain. Refuse at build, where
+            # dry-run and `check` surface it, rather than at the first connection.
             raise ValueError(
                 "MLLP max_connections_per_host must be at least 1 (use None or 0 to disable the "
                 f"per-host cap), got {self.max_connections_per_host}"
             )
-        rt = s.get("receive_timeout", DEFAULT_RECEIVE_TIMEOUT)
-        self.receive_timeout: float | None = float(rt) if rt else None
-        mf = s.get("max_frame_bytes", DEFAULT_MAX_FRAME_BYTES)
-        self.max_frame_bytes: int | None = int(mf) if mf else None
-        mfs = s.get("max_frame_seconds", DEFAULT_MAX_FRAME_SECONDS)
-        self.max_frame_seconds: float | None = float(mfs) if mfs else None
+        self.receive_timeout: float | None = _cap_setting(
+            s.get("receive_timeout", DEFAULT_RECEIVE_TIMEOUT), float
+        )
+        self.max_frame_bytes: int | None = _cap_setting(
+            s.get("max_frame_bytes", DEFAULT_MAX_FRAME_BYTES), int
+        )
+        self.max_frame_seconds: float | None = _cap_setting(
+            s.get("max_frame_seconds", DEFAULT_MAX_FRAME_SECONDS), float
+        )
         if self.max_frame_seconds is not None and not self.max_frame_seconds >= 0:
-            # Negative is truthy here too, and it would expire every frame the instant one opened —
-            # a listener that drops every sender, configured from a value the author meant as "off".
+            # Negative reaches here too, and would expire every frame the instant one opened — a
+            # listener that drops every sender, configured from a value the author meant as "off".
             # Written `not >= 0` rather than `< 0` so NaN is refused as well: TOML can spell `nan`,
-            # it is truthy, and every comparison with it is false, so `min()` against the idle bound
-            # would silently drop the deadline and a bare `wait_for(..., nan)` would fire at once.
+            # `_cap_setting` cannot recognise it (`nan != 0`), and every comparison with it is false
+            # — so `min()` against the idle bound would silently drop the deadline and a bare
+            # `wait_for(..., nan)` would fire at once.
             raise ValueError(
                 "MLLP max_frame_seconds must be a number of seconds, zero or more (use None or 0 to "
                 f"disable the frame deadline), got {self.max_frame_seconds}"
@@ -1940,10 +1984,16 @@ class MLLPSource(SourceConnector):
         """How long the next read may block: the idle bound, the open frame's remaining life, or the
         smaller of the two. ``None`` only when neither bound is configured (an unbounded read).
 
-        Both inputs are positive here — ``receive_timeout`` is ``None`` rather than falsy when it is
-        off, and the caller has already broken out of the loop on a spent ``frame_left`` — so there is
-        no clamp. An earlier draft carried ``max(0.0, ...)``; it could not fire on any reachable
-        input, and dead defensive code in a bound is a claim nobody can check.
+        There is no clamp on the result. ``frame_left`` cannot be negative here — the caller has
+        already broken out of the loop on a spent one — and ``receive_timeout`` is ``None`` rather
+        than falsy when it is off, so neither ordinary input can produce one. An earlier draft
+        carried ``max(0.0, ...)`` and it was dead on those inputs, which is a claim nobody can check.
+
+        **One input CAN still be negative, and it is not defended here.** Unlike
+        ``max_frame_seconds``, ``receive_timeout`` has no build-time guard refusing a negative, so a
+        configured ``-1`` reaches this function and closes every peer at once as ``idle_timeout``.
+        That predates the frame deadline and is unchanged by it; the fix is a guard beside the other
+        two in ``__init__``, not a clamp here, because a clamp would turn a typo into a silent bound.
         """
         if frame_left is None:
             return self.receive_timeout

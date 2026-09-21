@@ -484,7 +484,10 @@ async def test_a_pipelined_sender_gets_a_fresh_deadline_for_each_frame() -> None
     asserted: all frames acknowledged, and no `frame_deadline` anywhere.
     """
     cap = _Capture()
-    source = _mllp(receive_timeout=5.0, max_frame_seconds=0.3)
+    # The deadline is 1.0 s against a 0.03 s write gap, so a frame has to lose about 0.97 s to a
+    # scheduler stall before this test reds for a reason that is not the defect. An earlier 0.3 s
+    # deadline left only 0.27 s of that margin, which a loaded CI runner can eat.
+    source = _mllp(receive_timeout=5.0, max_frame_seconds=1.0)
     source.on_connection_event = cap
 
     async def _slow_ack(raw: bytes) -> str:
@@ -492,7 +495,12 @@ async def test_a_pipelined_sender_gets_a_fresh_deadline_for_each_frame() -> None
         return build_ack(raw, code="AA")
 
     await source.start(_slow_ack)
-    count = 40  # 40 chunks at 0.03 s is 1.2 s in-frame, four times max_frame_seconds
+    # 60 chunks at 0.03 s is 1.8 s continuously in-frame against a 1.0 s deadline. `asyncio.sleep`
+    # is a lower bound, so a loaded runner only lengthens that — the cumulative margin never shrinks,
+    # which is why raising the per-frame margin above did not have to be paid for here. Under the
+    # defect a clock running across frames closes this connection around chunk 33 of 60, which the
+    # count assertion below reports.
+    count = 60
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
         # Every chunk ENDS by opening the next frame, so the decoder is in-frame at the end of every
@@ -522,11 +530,17 @@ async def test_a_pipelined_sender_gets_a_fresh_deadline_for_each_frame() -> None
             # happened; a raw ConnectionResetError out of the write loop names only the symptom.
             pass
         deadline = asyncio.get_event_loop().time() + 5.0
-        while acks.count(b"MSA|AA") < count and asyncio.get_event_loop().time() < deadline:
-            block = await asyncio.wait_for(reader.read(65536), 5.0)
-            if not block:
-                break  # the listener dropped us, which is the regression this test is for
-            acks += block
+        # Same reason as the write loop's `except OSError` above, for the read side: the reader
+        # shares the transport, so a drop the write loop swallowed is re-raised HERE on Windows as
+        # ConnectionAborted/Reset. Uncaught it replaces the count assertion with a bare WinError,
+        # which is the symptom and not the finding. `TimeoutError` is deliberately not suppressed —
+        # a hung listener must still fail loudly rather than read as a short ACK count.
+        with contextlib.suppress(ConnectionResetError, ConnectionAbortedError):
+            while acks.count(b"MSA|AA") < count and asyncio.get_event_loop().time() < deadline:
+                block = await asyncio.wait_for(reader.read(65536), 5.0)
+                if not block:
+                    break  # the listener dropped us, which is the regression this test is for
+                acks += block
         assert acks.count(b"MSA|AA") == count, (
             f"only {acks.count(b'MSA|AA')} of {count} pipelined frames were acknowledged; the "
             "connection was dropped mid-feed, so the frame clock is running across frames rather "
@@ -663,3 +677,172 @@ def test_a_negative_cap_is_refused_at_build_not_discovered_at_the_first_connecti
     # 0 stays the documented "off" spelling for both, and is NOT caught by the refusal above.
     assert _mllp(max_connections_per_host=0).max_connections_per_host is None
     assert _mllp(max_frame_seconds=0).max_frame_seconds is None
+
+
+# --- the string "0", which is how an env() reference without a cast spells a disable -------------
+#
+# Why that spelling reaches a connector, and why deciding "off" before the conversion got it wrong,
+# is on `_cap_setting` in transports/mllp.py. One arm per setting rather than one combined test,
+# because the caps fail in several different ways and a combined test would stop at the first.
+
+
+async def _write_then_read_ack(
+    writer: asyncio.StreamWriter, reader: asyncio.StreamReader, payload: bytes
+) -> bytes:
+    """Write `payload` and return whatever comes back, or `b""` if the listener dropped us.
+
+    Every defect these arms pin ends with the listener closing the connection, and on Windows that
+    surfaces as `ConnectionResetError` out of the write OR the read rather than a clean empty read.
+    Raised, it fails the test naming only the symptom; swallowed here, the caller's own assertion
+    fires and can say which cap and which connection_event were responsible.
+    """
+    with contextlib.suppress(ConnectionResetError, BrokenPipeError):
+        writer.write(payload)
+        await writer.drain()
+        return await asyncio.wait_for(reader.read(200), 2.0)
+    return b""
+
+
+async def test_a_string_zero_receive_timeout_is_off_not_a_zero_second_read_budget() -> None:
+    """A live zero-second read budget closes every connection the instant it is accepted.
+
+    Asserted behaviourally as well as on the attribute, because an attribute test passes against a
+    connector that reads the value correctly and then arms the wait on something else.
+    """
+    source = _mllp(receive_timeout="0", max_frame_seconds=None)
+    assert source.receive_timeout is None
+    await source.start(_ack_handler)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
+        # Say nothing at all for far longer than a zero-second budget tolerates. Under the
+        # regression the listener has already closed by now and this frame goes nowhere. Kept
+        # generous on purpose: shortening it would race the close on a loaded runner, and a race
+        # here fails OPEN — the test would pass against the defect.
+        await asyncio.sleep(0.25)
+        ack = await _write_then_read_ack(writer, reader, frame(ADT))
+        assert b"MSA|AA" in ack, (
+            "a listener with receive_timeout='0' did not acknowledge a frame sent after a quiet "
+            f"quarter-second: {ack!r}. Nothing came back, so the idle bound fired and the string "
+            "was converted to a live zero-second budget instead of being read as off"
+        )
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        # Bound teardown so a listener-stop regression (the #55 Windows Proactor wedge) fails LOUD as a
+        # fast timeout instead of silently hanging the shared session loop — mirrors test_connection_resilience.
+        await asyncio.wait_for(source.stop(), timeout=5.0)
+
+
+async def test_a_string_zero_max_frame_seconds_is_off_not_a_zero_second_deadline() -> None:
+    """Same spelling, a different failure: a live `0.0` expires every frame that spans two reads.
+
+    A frame delivered in one read is never re-examined, so this needs a SPLIT frame to show the
+    defect — which is also the realistic case, since a partner on a congested link routinely sends
+    one message in several segments. Under a live zero the second read finds the budget already
+    spent and the connection closes with a `frame_deadline` reason instead of being acknowledged.
+    """
+    cap = _Capture()
+    source = _mllp(receive_timeout=5.0, max_frame_seconds="0")
+    source.on_connection_event = cap
+    assert source.max_frame_seconds is None
+    await source.start(_ack_handler)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
+        blob = frame(ADT)
+        writer.write(blob[: len(blob) // 2])  # opens the frame, does not close it
+        await writer.drain()
+        # Long enough that the two halves land in separate reads whatever the runner is doing. The
+        # requirement is two reads, not a long gap, but a gap too short to guarantee them would fail
+        # OPEN — one read never re-examines the deadline, so the test would pass against the defect.
+        await asyncio.sleep(0.25)
+        ack = await _write_then_read_ack(writer, reader, blob[len(blob) // 2 :])
+        assert b"MSA|AA" in ack, (
+            "a listener with max_frame_seconds='0' did not acknowledge a frame split across two "
+            f"reads: {ack!r}. The string was converted to a live zero-second deadline rather than "
+            "being read as off"
+        )
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        # Bound teardown so a listener-stop regression (the #55 Windows Proactor wedge) fails LOUD as a
+        # fast timeout instead of silently hanging the shared session loop — mirrors test_connection_resilience.
+        await asyncio.wait_for(source.stop(), timeout=5.0)
+    assert not [e for e in cap.events if e[2] == "frame_deadline"], (
+        f"a frame_deadline fired on a listener whose deadline is off: {cap.events}"
+    )
+
+
+def test_a_string_zero_max_connections_per_host_is_off_not_a_refused_build() -> None:
+    """A third failure mode: not a wrong bound but a build that refuses the documented spelling.
+
+    `int("0")` is `0`, and the negative-cap guard reads `0 < 1` as a typo — so the listener failed
+    to build with a message telling the operator to write `0`, which is what they had written. The
+    guard now sees only genuinely negative values, in either spelling.
+    """
+    assert _mllp(max_connections_per_host="0").max_connections_per_host is None
+    with pytest.raises(ValueError, match="max_connections_per_host must be at least 1"):
+        _mllp(max_connections_per_host="-1")
+    # A string that is not a disable still configures the cap it names, on every one of the five, so
+    # none of this can be passing by turning all text into None.
+    assert _mllp(max_connections_per_host="8").max_connections_per_host == 8
+    assert _mllp(max_connections="99").max_connections == 99
+    assert _mllp(receive_timeout="30").receive_timeout == 30.0
+    assert _mllp(max_frame_bytes="4096").max_frame_bytes == 4096
+    assert _mllp(max_frame_seconds="45").max_frame_seconds == 45.0
+
+
+def test_a_sub_one_cap_is_still_refused_and_is_not_swallowed_as_off() -> None:
+    """ "Off" means the operator WROTE zero, not that the value truncates to zero.
+
+    The narrow way to read a string zero as off is to convert first and test the result. On an `int`
+    cap that also reads `-0.5` as off, because `int(-0.5)` is `0` — turning a refusal into a silently
+    disabled security cap, and in the fail-open direction. `_cap_setting` tests a float view instead,
+    so a sub-1 value still reaches the guard that was written for it.
+
+    Only reachable from a hand-written Python kwarg: `connections.toml` refuses a float or a string
+    on an integer key, and an uncast `env()` ref hands over text that `int()` rejects. Pinned anyway,
+    because the whole subject of this group is a spelling nobody expected to be reachable either.
+    """
+    for bad in (-0.5, 0.5, -1):
+        with pytest.raises(ValueError, match="max_connections_per_host must be at least 1"):
+            _mllp(max_connections_per_host=bad)
+    # The float cap has no truncation to hide behind, so its guard sees the value as written.
+    with pytest.raises(ValueError, match="max_frame_seconds must be a number of seconds"):
+        _mllp(max_frame_seconds=-0.5)
+    # Negative zero is a way of writing zero, not a negative, and must not reach either guard.
+    assert _mllp(max_connections_per_host=-0.0).max_connections_per_host is None
+    assert _mllp(max_frame_seconds="-0.0").max_frame_seconds is None
+
+
+@pytest.mark.parametrize("setting", ["max_connections", "max_frame_bytes"])
+async def test_a_string_zero_on_the_two_older_caps_is_off_too(setting: str) -> None:
+    """The two caps that predate the frame deadline read the STRING `"0"` the same way, and worse.
+
+    A plain `0` has always meant off on both, and `test_emits_at_capacity` above relies on that. It
+    is the string that used to survive the truthiness test and land as a LIVE zero, where
+    `max_connections` refuses every connection (`self._active >= 0` on the first one) and
+    `max_frame_bytes` makes `FrameDecoder` raise on any frame of one byte or more. Neither is a
+    subtle mis-bound — each turns the listener off while the operator reads their own config as
+    having disabled a cap, which is why they are covered here rather than left for a follow-up.
+
+    One plain frame, acknowledged, separates both from their defective forms.
+    """
+    cap = _Capture()
+    source = _mllp(**{setting: "0"})
+    source.on_connection_event = cap
+    assert getattr(source, setting) is None
+    await source.start(_ack_handler)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
+        ack = await _write_then_read_ack(writer, reader, frame(ADT))
+        assert b"MSA|AA" in ack, (
+            f"a listener with {setting}='0' did not acknowledge one ordinary frame: {ack!r}. "
+            f"The string was converted to a live zero rather than being read as off; "
+            f"the events say which gate refused it: {cap.events}"
+        )
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        # Bound teardown so a listener-stop regression (the #55 Windows Proactor wedge) fails LOUD as a
+        # fast timeout instead of silently hanging the shared session loop — mirrors test_connection_resilience.
+        await asyncio.wait_for(source.stop(), timeout=5.0)

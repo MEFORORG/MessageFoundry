@@ -2467,8 +2467,16 @@ Facts that are easy to get wrong, stated plainly first:
   `max_frame_seconds` (default 60 s), which bounds one frame from its **start byte to its end byte**
   and closes the connection with a `frame_deadline` reason when it is exceeded (BACKLOG #1725). The
   two run **together** and neither replaces the other — a peer that opens a socket and sends nothing
-  never opens a frame, so only the idle bound reaches it. **The raw-TCP, X12, HTTP and DICOM intakes
-  carry no frame-life bound**; this paragraph is about the MLLP listener alone.
+  never opens a frame, so only the idle bound reaches it. **`max_frame_seconds` is MLLP-only, but
+  "no frame-life bound" is not what the other intakes have in common.** The **raw-TCP and X12**
+  listeners apply `receive_timeout` per read exactly as described above and carry no second TIME
+  bound (X12's `max_interchange_bytes` is a size cap, not a clock), so a trickling peer holds one of
+  those sockets for as long as it keeps sending. The **HTTP** listener spends that same
+  `receive_timeout` **differently**: one budget covers the **whole** request — request line, headers,
+  authentication and body — and a synchronous `408` answers a request that outruns it, so an HTTP
+  request is bounded end to end without a second key. The **DICOM** SCP is a different shape
+  again, with `timeout_seconds` on its pynetdicom timers rather than `receive_timeout`; see its own
+  paragraph below.
 - **`max_connections` counts sockets, not hosts, so the MLLP listener carries a per-peer term as
   well.** `max_connections_per_host` (default 32, an eighth of the socket cap) bounds the connections
   one peer address may hold at once, refused the same pre-ingress way as the socket cap and carrying
