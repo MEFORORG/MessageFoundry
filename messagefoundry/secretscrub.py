@@ -65,6 +65,11 @@ The last is the adversarial ceiling, stated rather than hidden: log text is atta
 dotted-or-hyphenated run that names every family defeats every admission gate. It is not a NEW class of
 hazard -- :func:`messagefoundry.redaction.redact` costs **33 ms** on the same 6 KB line, before this
 module runs at all, and ``support/redact.py`` has the identical property on ``GET /logs/tail`` today.
+THE CEILING IS A ``_LABEL_PREFIX`` NUMBER AND IT IS THE WHOLE CEILING, which is a claim only since
+BACKLOG #1547: :data:`_DSN_PASSWORD`'s scheme class was reachable from every word boundary in the same
+"." and "-" run, so the same run carrying a ``://`` cost 302 ms at 16 KB rather than 21 ms. That one is
+anchored now -- 0.18 ms on the same input -- and the reasoning and numbers live on the pattern rather
+than here.
 It was NOT bought down further: the obvious lever, a bounded lookahead requiring a separator near the
 label, would silently stop scrubbing a credential whose label is longer than the bound. Trading a
 silent security narrowing for time on a synthetic input, against a cost this module does not dominate,
@@ -74,6 +79,24 @@ WHAT KEEPS THE REAL NUMBERS SMALL is the admission gating described below -- a c
 test, not a compiled alternation, and one per pass rather than one shared. Between them they took the
 plain line from 4.4 us to 0.9 us and the credential line from 7.8 us to 3.7 us; the 6 KB run naming no
 credential word went from 0.39 ms to 15 us.
+
+WHAT BACKLOG #1685's QUOTED-VALUE ALTERNATES COST, measured 2026-09-14. **A DIFFERENT INSTRUMENT FROM
+THE TABLE ABOVE, and the numbers are not comparable to it:** that table is what the whole MODULE adds
+to the four-filter chain per record, while these are one ``_CREDENTIAL_KV.sub`` call against a
+reconstruction of the pre-#1685 pattern, minimum over 25 interleaved rounds of 20 passes. Every shape
+that occurs in real log text got FASTER or stayed level -- plain line 2.18 against 2.27 us, credential
+line 1.35 against 1.39, a quoted value with a space 1.37 against 2.34, a well-formed braced password
+4.10 against 4.61, a 400-character braced password 6.77 against 40.00 (the old pattern made many small
+matches where this makes one), and the 6 KB adversarial run naming every family level within noise at
+359 against 357 us.
+
+ONE SHAPE GOT SLOWER AND IT IS STATED RATHER THAN HIDDEN: a 6 KB line whose credential value opens "{"
+and never closes costs **83 us against 25 us**. The walk is linear and runs twice -- once for
+:data:`_ODBC_BRACED`, which fails at end of line, then once for :data:`_ODBC_BRACED_OVERRUN`, which
+succeeds. It is 3x a number that was already 250x below this module's own adversarial ceiling, and the
+sibling shape with many such labels went the other way, 64 us against 141. Not bought down further: a
+``{0,N}`` bound measured 32 us on that line and costs correctness elsewhere, for the reason
+:data:`_ODBC_BRACED` records.
 """
 
 from __future__ import annotations
@@ -200,12 +223,83 @@ _MEFOR_SECRET = re.compile(
     r"\b(" + re.escape(_ENV_PREFIX) + r"[A-Z0-9_]+)\b['\"]?\s*[:=]\s*['\"]?[^\s'\"]+['\"]?"
 )
 
+# A QUOTED value span, for the two quoting forms a credential value actually arrives in (BACKLOG
+# #1685). Both exist for one reason: a value is quoted PRECISELY so it may carry the characters that
+# would otherwise end it -- ";", "=" and spaces -- and those are exactly what the plain value class
+# below stops at. So the shipped pattern replaced the HEAD of a quoted password and printed the tail.
+#
+# Measured at 1aa2d6a1b, both shapes, on both credential surfaces:
+#
+#   PWD={wt-A;B}                     ->  PWD=<redacted>;B}
+#   ad_bind_password='wt-A wt-B'     ->  ad_bind_password=<redacted> wt-B'
+#
+# THE SECOND IS THE MORE REACHABLE ONE. Brace-quoting is a connection-string form, so it rides in on
+# the SQL Server store; a password with a SPACE in it reaches every backend, and ``ad_bind_password``
+# and ``tls_key_password`` are real settings here.
+#
+# THE DOUBLED BRACE IS THE PART A NAIVE FIX GETS WRONG. ODBC ends a braced value at the first "}" that
+# is NOT doubled; an interior literal "}" is written "}}". So ``\{[^}]*\}`` -- the obvious pattern --
+# stops at the first "}" and leaks the tail of any password containing one. The repetition walks
+# non-"}" characters and doubled "}}" pairs, and the trailing ``(?!\})`` refuses a closer that is
+# really the first half of an escape.
+#
+# POSSESSIVE, AND NOT BOUNDED, WHICH IS THE OPPOSITE OF WHAT :data:`_LABEL_PREFIX` NEEDED. That bound
+# exists because "." and "-" leave ``\b`` firing, so an N-segment run offers N start positions and the
+# group re-walks from each -- genuinely quadratic. None of that applies here. The two brace branches
+# cannot both match at one position (``[^}]`` excludes the one character ``\}\}`` needs), and the
+# quoted classes exclude their own closer, so every repetition below is DETERMINISTIC: there is one
+# parse of any prefix and nothing to re-walk. ``*+`` then says so to the engine, which also costs
+# nothing in reach -- a shorter brace parse could only end at a "}" that is followed by another "}",
+# and ``(?!\})`` rejects exactly that. A ``{0,N}`` bound would buy no safety and would silently stop
+# matching a password longer than N, which is the one direction this module must not fail in.
+_ODBC_BRACED = r"\{(?:[^}]|\}\})*+\}(?!\})"
+_QUOTED_VALUE = "'[^'\r\n]*+'|\"[^\"\r\n]*+\""
+
+# The fallback for a "{" this module cannot close: take the rest of the physical line and nothing more.
+#
+# IT IS REQUIRED INDEPENDENTLY OF ANY BOUND, which is why it is not merely a safety net for one. A
+# driver error string is cut off wherever the driver cut it, so a truncated connection string reaches
+# this pass with an opening "{" and no closer anywhere. Dropping back to the plain value class there
+# would print the password; running to end of line over-redacts, and over-redaction is the direction
+# this module is allowed to fail in.
+#
+# STOPPING AT THE LINE IS THE LOAD-BEARING HALF, and a record CAN be multi-line here: ``exc_text``
+# carries a whole rendered traceback, so a run that crossed "\n" would redact every later frame of it
+# and hand the operator a traceback with no stack. ``[^\r\n]`` rather than "." adds only the CR --
+# "." stops at "\n" on its own, but still matches "\r", so on CRLF text a bare ".*" would pull the
+# carriage return into the redacted span and leave the line ending broken.
+_ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
+
 # A credential in a "<label>=<value>" pair: an ODBC "PWD=", a "password=" in a connection error, a
 # provider "secret=". The value class stops at the separators these actually appear inside (";" in an
 # ODBC string, "," and "&" in a query), so a redaction cannot swallow the rest of the line.
+#
+# THE QUOTED ALTERNATES COME FIRST because they and the plain class overlap and the first alternate
+# wins; the plain class keeps its own leading ``['\"]?`` so a value whose quote does not CLOSE on this
+# line still loses its head exactly as it did before.
+#
+# TWO RESIDUALS, WRITTEN DOWN RATHER THAN IMPLIED.
+#
+# * An UNCLOSED quote falls back to the plain class, so ``password='wt-A wt-B`` (no closing quote)
+#   still prints " wt-B". The brace form gets an overrun and this does not, deliberately: a "{" after
+#   a credential label is unambiguous, while an apostrophe is ordinary prose, and a quote overrun
+#   would eat the rest of any line whose value merely CONTAINS one.
+# * The other three label=value patterns keep their own plain classes, so a quoted or braced value
+#   under THEIR labels leaks the same way. ``_MEFOR_SECRET`` is the most exposed of the three -- it
+#   runs first and its class stops at whitespace, and a ``MEFOR_*`` variable holding a connection
+#   string is exactly the echo shape its own comment cites. ``_BEARER`` is the one with a REASON to
+#   stay narrow rather than merely a lack of evidence: ``session=`` and ``token=`` legitimately carry
+#   a "{"-opening dict or JSON repr in this engine's log text, and the overrun would eat those lines.
 _CREDENTIAL_KV = re.compile(
     r"(?i)\b(" + _LABEL_PREFIX + r"(?:" + _alternation(_CREDENTIAL_WORDS) + r"))\b"
-    r"['\"]?\s*[:=]\s*['\"]?[^\s'\";,&]+"
+    r"['\"]?\s*[:=]\s*"
+    r"(?:"
+    + _ODBC_BRACED
+    + r"|"
+    + _QUOTED_VALUE
+    + r"|"
+    + _ODBC_BRACED_OVERRUN
+    + r"|['\"]?[^\s'\";,&]+)"
 )
 
 # Key MATERIAL in a "<label>=<value>" pair, where the label ends in a credential word neither pattern
@@ -226,7 +320,41 @@ _KEY_MATERIAL = re.compile(
 
 # An inline password in a URL-shaped DSN: "postgres://user:<pw>@host/db". The scheme and the user
 # survive so an operator can still tell which connection failed.
-_DSN_PASSWORD = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^\s:/@]+):[^\s/@]+@")
+#
+# THE HEAD ANCHOR IS WHAT KEEPS THIS SCAN LINEAR, AND A REPETITION BOUND IS NOT. Both halves are
+# measured, and the second one shipped briefly as a defect, so the whole reasoning is kept here rather
+# than reduced to its conclusion (BACKLOG #1547).
+#
+# THE QUADRATIC IS A START-POSITION PROBLEM. "." and "-" are both in the scheme class and neither
+# suppresses ``\b``, so under a ``\b`` head an N-segment dotted or hyphenated run offers O(N) start
+# positions and each one re-walks O(N) characters looking for a "://" it never reaches. Log text is
+# attacker-influenceable and this pass runs on EVERY record, so one long delimiter-free run would hang
+# a worker on first deployment. Measured on this interpreter, min of 5 passes over one hyphen-and-dot
+# run: ``\b([a-z][a-z0-9+.\-]*`` cost 4.8 ms at 2 KB and 302 ms at 16 KB -- 63x the time for 8x the
+# length, which is the quadratic.
+#
+# BOUNDING THE WALK FIXED THE CLOCK AND BROKE THE SCRUB. A ``{0,63}`` on the repetition caps what each
+# start position re-walks and is genuinely linear (0.34 ms and 2.7 ms, 7.8x for 8x) -- but ``\b``
+# anchors at the head of the whole unbroken run the scheme sits in, NOT at the scheme, so a DSN glued
+# to any 64-character run of ``[A-Za-z0-9+.\-]`` stopped matching at all and the password was published
+# in full. That is a credential surviving redaction, not a narrowed label: measured at the 65th
+# character, and reached by a base64url token, a long dotted name or a hyphenated id sitting in front
+# of the DSN. ``tests/test_log_write_guard.py``'s straddling-diagnostic fixture is exactly that shape
+# and leaked its password on both copies of this pattern while the bound stood.
+#
+# SO THE ANCHOR CARRIES IT INSTEAD, AND NOTHING IS CAPPED. ``(?<![a-z0-9+.\-])`` forbids a match from
+# STARTING inside such a run, which leaves the run one start position rather than O(N); walks from
+# distinct start positions then cannot overlap, because every character the repetition consumes is one
+# the lookbehind excludes. Linear with no ceiling on the scheme -- 0.022 ms at 2 KB and 0.18 ms at
+# 16 KB, 8.0x for 8x the length, and 15x FASTER at 16 KB than the bound it replaces. It also matches
+# strictly MORE than the pre-#1547 pattern: no scheme length is lost, and "_" is not in the class, so
+# ``_postgres://user:pw@host`` redacts here where ``\b`` refused to.
+#
+# Pinned three ways in ``tests/test_log_redaction_secret_domain.py``, which guards BOTH copies of this
+# vocabulary: the anchor structurally, the growth with a stopwatch against the pre-#1547 pattern as its
+# control, and the shapes that must still redact BY VALUE -- including the glued run above, so the
+# bound cannot come back without a red.
+_DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z][a-z0-9+.\-]*://[^\s:/@]+):[^\s/@]+@")
 
 
 def _keep_label(m: re.Match[str], placeholder: str) -> str:
@@ -323,7 +451,7 @@ def scrub_credentials(text: str, *, placeholder: str = CREDENTIAL_PLACEHOLDER) -
     The label survives on purpose: an operator reading a scrubbed line must still be able to tell WHICH
     credential the failing code was handling. Nothing else about the line is touched -- this is a
     credential pass, not a PHI pass (:mod:`messagefoundry.redaction` owns that) and not a control-char
-    pass (:func:`logging_setup.scrub_control_chars` owns that).
+    pass (:func:`messagefoundry.controlchars.scrub_control_chars` owns that).
 
     Idempotent, because a record dispatched to stdout *and* the off-box forwarder is filtered once per
     handler: the placeholder carries no credential word, no ``MEFOR_`` prefix and no ``://``, so a

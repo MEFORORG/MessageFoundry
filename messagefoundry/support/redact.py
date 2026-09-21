@@ -107,11 +107,16 @@ _LABEL_PREFIX = r"(?:[A-Za-z0-9]+[._-]){0,6}"
 # ``_AUTH_SCHEME`` is worth ZERO and should stay unscoped: its only case-bearing part IS the span that
 # would be scoped, and the two spellings compile to the same program. ``_DSN_PASSWORD`` would pay --
 # it scans two classes under its fold -- but its ``[a-z]`` classes depend on the global fold, so
-# scoping it means rewriting them, and it has a larger and separate problem: ``[a-z0-9+.\-]*`` is
-# unbounded over "." and "-", which is the quadratic shape ``_LABEL_PREFIX``'s ``{0,6}`` bound exists
-# to stop. Measured on a hyphen run, 4.00x the time for 2x the length at every step from 512 B to
-# 8 KB: 0.30, 1.18, 4.72, 18.75, 74.96 ms. That is a fix with its own reasoning and its own test, not
-# a line to fold into this one.
+# scoping it means rewriting them, and that is still a separate change from the one it needed first.
+#
+# THE LARGER PROBLEM THAT SENTENCE NAMED IS FIXED, AND THE NUMBERS ARE KEPT RATHER THAN DELETED.
+# ``\b([a-z][a-z0-9+.\-]*`` could be entered from every word boundary in a "." or "-" run -- the
+# quadratic shape ``_LABEL_PREFIX``'s ``{0,6}`` bound exists to stop. Measured on a hyphen run, 4.00x
+# the time for 2x the length at every step from 512 B to 8 KB: 0.30, 1.18, 4.72, 18.75, 74.96 ms. It
+# carries a delimiter lookbehind in place of that ``\b`` now (BACKLOG #1547), which removes the start
+# positions rather than capping the walk; why that is the lever, and why a ``{0,63}`` bound on the walk
+# was the wrong one, are stated on the pattern itself, below. The fold scoping stays declined, so this
+# paragraph's conclusion is unchanged.
 #
 # EVERY ALTERNATION OF LITERAL WORDS NEEDS ITS OWN ``(?i:...)``, AND THIS PATTERN HAS TWO. Scope only
 # the first and the optional ``(?:bearer|basic|digest)\s+`` scheme group goes case-SENSITIVE: it stops
@@ -160,9 +165,41 @@ _MEFOR_SECRET = re.compile(r"\b(MEFOR_[A-Z0-9_]+)\b['\"]?\s*[:=]\s*['\"]?[^\s'\"
 # credential-bearing spelling "api_key" is carried by ``_BEARER`` instead.
 #
 # The case fold is scoped to the alternation; the reason and the numbers are on ``_BEARER``.
+#
+# THE QUOTED ALTERNATES CARRY THE TWO FORMS A CREDENTIAL VALUE ARRIVES QUOTED IN (BACKLOG #1685) --
+# an ODBC "PWD={p@ss;w0rd}" and an ordinary "password='a b'". A value is quoted precisely so it may
+# hold ";", "=" and spaces, which are the characters the plain class stops at, so without them this
+# pattern redacted the HEAD of a quoted password and wrote the tail into the support archive and
+# ``GET /logs/tail``. Measured at 1aa2d6a1b: ``PWD={wt-A;B}`` -> ``PWD=[REDACTED];B}`` and
+# ``ad_bind_password='wt-A wt-B'`` -> ``ad_bind_password=[REDACTED] wt-B'``.
+#
+# ODBC ends a braced value at the first "}" that is NOT doubled, which is why the repetition admits
+# "}}" and the closer carries ``(?!\})``: the obvious ``\{[^}]*\}`` stops at the first "}" and leaks
+# the tail of any password containing one. ``messagefoundry/secretscrub.py`` carries the same three
+# fragments with the full reasoning -- why every repetition here is deterministic and therefore
+# possessive rather than bounded, why the BRACE form gets an overrun and the quote form does not, and
+# which residuals are left open.
+#
+# THE FRAGMENTS ARE RESTATED RATHER THAN IMPORTED, which follows this module's shape rather than
+# setting it: ``_LABEL_PREFIX``, ``_BEARER``, ``_MEFOR_SECRET``, ``_CREDENTIAL_KV``, ``_KEY_MATERIAL``
+# and ``_DSN_PASSWORD`` are ALREADY stated in both files, and nothing here imports ``secretscrub``
+# today. Folding the two pattern sets into one is a real question and a separate change --
+# ``secretscrub``'s own docstring works through which markers belong to the vocabulary and which to a
+# surface -- so this fix does not settle it in passing by making one file depend on the other.
+_ODBC_BRACED = r"\{(?:[^}]|\}\})*+\}(?!\})"
+_QUOTED_VALUE = "'[^'\r\n]*+'|\"[^\"\r\n]*+\""
+_ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
+
 _CREDENTIAL_KV = re.compile(
     r"\b(" + _LABEL_PREFIX + r"(?i:pass(?:word|wd|phrase)?|pwd|secret|credential))\b"
-    r"['\"]?\s*[:=]\s*['\"]?[^\s'\";,&]+"
+    r"['\"]?\s*[:=]\s*"
+    r"(?:"
+    + _ODBC_BRACED
+    + r"|"
+    + _QUOTED_VALUE
+    + r"|"
+    + _ODBC_BRACED_OVERRUN
+    + r"|['\"]?[^\s'\";,&]+)"
 )
 
 # Key MATERIAL in a "<label>=<value>" pair, where the label ends in a credential word neither pattern
@@ -239,7 +276,18 @@ _KEY_MATERIAL = re.compile(
 
 # An inline password in a URL-shaped DSN: "postgres://user:<pw>@host/db". The scheme and the user
 # survive so an operator can still tell which connection failed.
-_DSN_PASSWORD = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^\s:/@]+):[^\s/@]+@")
+#
+# THE HEAD LOOKBEHIND IS LOAD-BEARING, and unlike ``_LABEL_PREFIX``'s bound it is NOT restated here:
+# both copies of this vocabulary carried the same ``\b`` head and the same quadratic, so the reasoning,
+# the measurements, and why a repetition bound was the wrong lever and had to be taken back out, are
+# stated ONCE, on ``messagefoundry/secretscrub.py``'s ``_DSN_PASSWORD`` (BACKLOG #1547). Two things are
+# local to this surface and worth saying. This pattern is NOT admission-gated the way the write-time
+# copy is, so it scans every line ``GET /logs/tail`` and the support bundle carry, marker or no marker
+# -- measured on a 16 KB hyphen-and-dot run, ``redact_log_line`` cost 429 ms with a ``://`` and 516 ms
+# without one, which is why a no-marker input is a CONTROL for the gated copy and not for this one. And
+# the shared PHI pass beside it is linear on that same input (0.12 ms at 2 KB, 0.99 ms at 16 KB), so
+# the quadratic was this module's own rather than inherited.
+_DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z][a-z0-9+.\-]*://[^\s:/@]+):[^\s/@]+@")
 
 # A long base64-ish run (>= 24 chars) that isn't otherwise matched — likely a key/token/encoded body.
 _LONG_B64 = re.compile(r"\b[A-Za-z0-9+/]{24,}={0,2}\b")

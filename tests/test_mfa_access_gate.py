@@ -29,6 +29,7 @@ from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry.store.store import WebAuthnCredential
 
 PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 
@@ -46,8 +47,26 @@ async def _service(engine: Engine, settings: AuthSettings | None = None) -> Auth
     return service
 
 
-def _client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
-    transport = httpx.ASGITransport(app=create_app(engine, auth=service))
+#: httpx's own ASGITransport default, named rather than left implicit. ``_client`` in
+#: tests/test_api_auth.py carries the reasoning; this is the same constant for the same reason.
+_DEFAULT_PEER = ("127.0.0.1", 123)
+
+
+def _client(
+    engine: Engine, service: AuthService, *, peer: tuple[str, int] | None = None
+) -> httpx.AsyncClient:
+    """``peer`` pins the ASGI scope's client address; omitted, ``_DEFAULT_PEER`` stands.
+
+    Either way ``request.client`` is a real address and never None, so an assertion on the audited
+    ``client`` cannot degenerate to ``None == None`` and pass against unfixed code. Pass ``peer``
+    wherever the address is the subject.
+
+    The full rationale -- including when modelling an absent peer IS the right thing to do, and why
+    the loopback default is not neutral for the network allowlist -- is on ``_client`` in
+    tests/test_api_auth.py, stated once there rather than restated here (BACKLOG #1644)."""
+    transport = httpx.ASGITransport(
+        app=create_app(engine, auth=service), client=_DEFAULT_PEER if peer is None else peer
+    )
     return httpx.AsyncClient(transport=transport, base_url="http://t")
 
 
@@ -125,7 +144,9 @@ async def test_the_refusal_is_audited_so_probing_is_not_silent(engine: Engine) -
     """
     service = await _service(engine)
     await _add(service, "vw", Role.VIEWER)
-    async with _client(engine, service) as c:
+    # RFC 5737 TEST-NET-1, so it cannot resolve to a real host. See ``_client`` for why the address
+    # has to be set here at all.
+    async with _client(engine, service, peer=("192.0.2.77", 51234)) as c:
         tok = await _login(c, "vw")
         assert (await c.get("/messages", headers=_auth(tok))).status_code == 403
     denied = [a for a in await engine.store.list_audit() if a["action"] == "auth.mfa_denied"]
@@ -134,6 +155,11 @@ async def test_the_refusal_is_audited_so_probing_is_not_silent(engine: Engine) -
     assert "/messages" in (denied[-1]["detail"] or "")
     # The row must never carry the bearer token or a code — only the path.
     assert "Bearer" not in (denied[-1]["detail"] or "")
+    # BACKLOG #1644 (ADR 0150): and it records WHERE FROM. This row is the ONLY evidence a stolen
+    # password-only token was used at all — the paragraph above says the trail would otherwise be
+    # empty — so the address is the half an incident responder acts on. RED when ``client=`` is
+    # dropped from require()'s ``audit_mfa_denied`` call.
+    assert denied[-1]["client"] == "192.0.2.77"
 
 
 async def test_exempt_routes_stay_reachable_while_pending(engine: Engine) -> None:
@@ -301,6 +327,82 @@ async def test_bootstrap_enrollment_from_a_pending_session_still_works(engine: E
         assert elevated.status_code == 200
         h = _auth(str(elevated.json()["token"]))  # re-keyed by the re-auth
         assert (await c.post("/me/mfa/enroll", headers=h)).status_code == 200
+
+
+@pytest.mark.parametrize("action_step_up", (True, False), ids=("enforced", "opted-out"))
+async def test_the_existing_factor_is_required_whatever_the_step_up_knob_says(
+    engine: Engine, action_step_up: bool
+) -> None:
+    """RED when: the ``factor_binding_is_blocked`` refusal leaves ``_action_step_up_ok``.
+
+    The ``opted-out`` arm is the one that matters. The guard in ``AuthService.reauth`` is keyed on
+    the re-auth's ``purpose``, so a purpose-LESS re-auth walks past it while still refreshing the
+    session window — and under ``[auth].require_action_step_up = false`` that window is the whole
+    gate. A password holder would therefore be able to enrol a NEW factor on an account that already
+    holds one, then be promoted by the confirm ceremony, which is an account takeover reachable by
+    flipping a config knob. A control a knob can switch off is not a control, so the refusal sits
+    above the fork and the ``enforced`` arm pins that the same refusal covers both branches.
+
+    THE VICTIM HOLDS A PASSKEY, NOT A TOTP SECRET, AND THAT IS DELIBERATE. Against a TOTP holder
+    ``begin_mfa_enrollment`` refuses on its own ("MFA is already enabled") with a 400, so the route
+    answers 400 whether the gate opened or not and a 403 assertion would grade a gate that is wide
+    open. A passkey holder has ``totp_enabled`` False, so the TOTP lane is a real second-factor
+    bind: measured against the unfixed code, the opted-out arm enrolls and returns **200**.
+    """
+    service = await _service(
+        engine,
+        AuthSettings(login_rate_limit_enabled=False, require_action_step_up=action_step_up),
+    )
+    await _add(service, "vic", Role.VIEWER)
+
+    # The victim really holds a factor, so the enrollment deadlock carve-out does not cover them.
+    victim = await service.store.get_user_by_username("vic")
+    assert victim is not None
+    await engine.store.add_webauthn_credential(
+        WebAuthnCredential(
+            credential_id_hash="vic-passkey-hash",
+            credential_id="vic-passkey-id-b64url",
+            user_id=victim.id,
+            rp_id="t",
+            public_key="cose-public-key-b64url",
+            sign_count=0,
+            transports=None,
+            device_type="multi_device",
+            backed_up=True,
+            label="yubikey",
+            aaguid="aaguid-0000",
+            created_at=1000.0,
+            last_used_at=None,
+        )
+    )
+    assert await service.store.has_webauthn_credentials(victim.id) is True
+
+    async with _client(engine, service) as c:
+        tok = await _login(c, "vic")  # the attacker knows the password and nothing else
+        h = _auth(tok)
+        # A purpose-LESS re-auth. Nothing refuses it: it is a genuine password proof, and the
+        # factor-binding guard on the mint never runs because there is no purpose to bind.
+        r = await c.post("/me/reauth", json={"password": PW}, headers=h)
+        assert r.status_code == 200
+        tok = str(r.json()["token"])  # the re-auth re-keys the session (ASVS 7.2.4)
+        h = _auth(tok)
+        # The positive control. Without it a refusal for some OTHER reason (a stale window) would
+        # read as this guard working, and the opted-out arm would pass while the hole stood open.
+        assert await service.has_recent_step_up(tok) is True
+
+        enroll = await c.post("/me/mfa/enroll", headers=h)
+        assert enroll.status_code == 403, (
+            "an MFA-pending session on an ALREADY-ENROLLED account bound a new factor with the "
+            "password alone — the existing passkey is what should have been required"
+        )
+        # The confirm lane is refused on its own, not merely starved of a staged secret.
+        confirm = await c.post("/me/mfa/confirm", json={"code": "000000"}, headers=h)
+        assert confirm.status_code == 403
+        # Nothing was staged, so the takeover has no second step to take.
+        assert await service.store.get_totp_secret(victim.id) is None
+        # No promotion happened: the session is still behind the 6.3.3 gate.
+        assert await service.mfa_satisfied(tok) is False
+        assert (await c.get("/messages", headers=h)).status_code == 403
 
 
 # --- 6.3.4: per-mechanism directory strength --------------------------------

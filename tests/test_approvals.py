@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import Any
@@ -22,7 +23,7 @@ from messagefoundry.api.approvals import ApprovalGate
 from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
-from messagefoundry.config.models import ConnectorType
+from messagefoundry.config.models import ConnectorType, RetryPolicy
 from messagefoundry.config.settings import ApprovalsSettings, AuthSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
@@ -62,7 +63,9 @@ def _client(
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t")
 
 
-async def _add(service: AuthService, username: str, *roles: Role) -> None:
+async def _add(service: AuthService, username: str, *roles: Role) -> str:
+    """Provision a usable local operator; returns the immutable ``users.id`` (BACKLOG #1540 keys the
+    self-approval refusal on it, so the rename tests below need it)."""
     uid = await service.create_local_user(
         username=username,
         password=PW,
@@ -80,6 +83,7 @@ async def _add(service: AuthService, username: str, *roles: Role) -> None:
     await service.store.set_password(
         uid, password_hash=user.password_hash, must_change_password=False
     )
+    return uid
 
 
 async def _token(c: httpx.AsyncClient, username: str) -> dict[str, str]:
@@ -183,6 +187,7 @@ async def test_expired_or_unknown_requests_are_refused(engine: Engine) -> None:
         operation="dead_letter_replay",
         params="{}",
         requester="op",
+        requester_user_id="op-id",
         requested_at=1.0,
         expires_at=2.0,
     )
@@ -273,6 +278,103 @@ def test_settings_validator_rejects_unknown_operation() -> None:
         ApprovalsSettings(operations=["not_a_real_op"])
 
 
+# --- BACKLOG #1646: the released replay writes its own dead_letter_replay row ------------------
+#
+# approval.approved attributes both identities and the count, but the executor wrote NO
+# `dead_letter_replay` row -- so an auditor filtering on the ACTION NAME saw only the ungated
+# replays, where _record_reload_audit was given exactly that parity for config_reload. The queries
+# below filter on the action name deliberately: that IS the auditor's query this row is about.
+
+
+async def _dead_letter(engine: Engine) -> None:
+    """Seed one message and fail its only delivery, so a replay has something to re-queue.
+
+    LOAD-BEARING. `_request_replay` on its own posts against an engine holding no dead letters, so
+    `requeued` is 0, the guarded audit write never runs, and an assertion on top of it would pass
+    whether or not the executor writes the row."""
+    await engine.store.enqueue_message(
+        channel_id="ch1", raw=ADT, deliveries=[("archive", ADT)], source_type="file"
+    )
+    item = (await engine.store.claim_ready())[0]
+    await engine.store.mark_failed(item.id, "boom", RetryPolicy(max_attempts=1))
+
+
+async def _release_a_replay(engine: Engine) -> httpx.Response:
+    """Provision a requester and a DISTINCT approver, hold a replay, and return the release."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await _add(service, "approver", Role.ADMINISTRATOR)
+    async with _client(engine, service, ON) as c:
+        approval_id = (await _request_replay(c, await _token(c, "op"))).json()["approval_id"]
+        admin = await _token(c, "approver")
+        return await c.post(f"/approvals/{approval_id}/approve", headers=admin)
+
+
+async def test_released_replay_is_audited_under_its_own_action_name(engine: Engine) -> None:
+    await _dead_letter(engine)
+    ok = await _release_a_replay(engine)
+    assert ok.status_code == 200
+    # POSITIVE CONTROL: something was actually re-queued, so the guarded write really did run.
+    assert ok.json()["result"] == {"requeued": 1}
+
+    rows = await engine.store.list_audit(action="dead_letter_replay")
+    assert len(rows) == 1
+    row = rows[0]
+    # The REQUESTER owns the action -- matching the inline row. The approver's half of the ceremony
+    # is on approval.approved, which is where the second identity belongs.
+    assert str(row["actor"]) == "op"
+    assert json.loads(str(row["detail"])) == {"destination_name": None, "requeued": 1}
+    # ADR 0150: `client` is the address of the ACTOR NAMED IN THE ROW. That actor is the requester,
+    # while the request in flight belongs to the approver, so no address is in scope here.
+    assert row["client"] is None
+
+
+async def test_released_replay_that_requeues_nothing_writes_no_row(engine: Engine) -> None:
+    """The write is GUARDED on requeued, matching the inline route: this action name means PHI was
+    actually re-transmitted (review M-4). The zero-effect release is not thereby lost --
+    approval.approved carries the executor's own {"requeued": 0} result."""
+    ok = await _release_a_replay(engine)  # no dead letters seeded
+    assert ok.status_code == 200 and ok.json()["result"] == {"requeued": 0}
+
+    assert await engine.store.list_audit(action="dead_letter_replay") == []
+    approved = (await engine.store.list_audit(action="approval.approved"))[0]
+    assert json.loads(str(approved["detail"]))["result"] == {"requeued": 0}
+
+
+async def test_a_pending_replay_with_no_captured_requester_still_releases(engine: Engine) -> None:
+    """A request persisted BEFORE the guard began capturing `requester` carries no such key. Reading
+    it with ``p["requester"]`` would raise KeyError inside the executor, and ApprovalGate.approve
+    would compensate that into a 'failed' row (ASVS 2.3.3) -- recording an operation that ran, and
+    re-queued PHI, as one that did not. The row is written with a NULL actor instead: no literal is
+    safe (a username could be "unknown"), and the requester is still named on approval.approved."""
+    await _dead_letter(engine)
+    service = await _service(engine)
+    await _add(service, "approver", Role.ADMINISTRATOR)
+    await engine.store.create_pending_approval(
+        approval_id="cafebabecafebabecafebabecafebabe",
+        operation="dead_letter_replay",
+        params="{}",  # the pre-#1646 shape: scope keys absent, and no requester
+        requester="op",
+        requester_user_id="op-id",
+        requested_at=time.time(),
+        expires_at=None,
+    )
+    async with _client(engine, service, ON) as c:
+        ok = await c.post(
+            "/approvals/cafebabecafebabecafebabecafebabe/approve",
+            headers=await _token(c, "approver"),
+        )
+        assert ok.status_code == 200  # NOT a 500 from a KeyError the gate compensated
+        assert ok.json()["result"] == {"requeued": 1}
+
+    rows = await engine.store.list_audit(action="dead_letter_replay")
+    assert len(rows) == 1 and rows[0]["actor"] is None
+    approved = (await engine.store.list_audit(action="approval.approved"))[0]
+    assert json.loads(str(approved["detail"]))["requester"] == "op"
+    # The row the gate writes on a compensated failure must be absent: the operation did run.
+    assert await engine.store.list_audit(action="approval.failed") == []
+
+
 # --- ASVS 2.3.3: the released-but-unexecuted compensating transition ---------------------------
 #
 # approve() moves the row to 'approved' BEFORE running the executor, and that ordering is
@@ -296,12 +398,14 @@ async def _gate_with_failing_op(engine: Engine) -> tuple[ApprovalGate, RuntimeEr
 async def test_raising_executor_rolls_the_row_out_of_approved(engine: Engine) -> None:
     """The row must NOT be left at 'approved' for an operation that did not run."""
     gate, boom = await _gate_with_failing_op(engine)
-    approval_id = await gate.guard("dead_letter_replay", {}, requester="maker")
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id="maker-id"
+    )
     assert approval_id is not None
 
     # The original executor error still reaches the caller -- compensation must not swallow it.
     with pytest.raises(RuntimeError) as caught:
-        await gate.approve(approval_id, approver="checker")
+        await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
     assert caught.value is boom
 
     row = await engine.store.get_pending_approval(approval_id)
@@ -313,10 +417,12 @@ async def test_raising_executor_audits_the_failure_against_both_identities(
     engine: Engine,
 ) -> None:
     gate, _ = await _gate_with_failing_op(engine)
-    approval_id = await gate.guard("dead_letter_replay", {}, requester="maker")
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id="maker-id"
+    )
     assert approval_id is not None
     with pytest.raises(RuntimeError):
-        await gate.approve(approval_id, approver="checker")
+        await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
 
     rows = await engine.store.list_audit(limit=50)
     audited = {(str(r["action"]), str(r["actor"])) for r in rows}
@@ -340,7 +446,9 @@ async def test_compensation_cannot_clobber_an_already_rejected_row(engine: Engin
     """The compensating transition is guarded on 'approved', so it can only ever move a row this
     gate itself released -- never one another caller rejected or expired."""
     gate, _ = await _gate_with_failing_op(engine)
-    approval_id = await gate.guard("dead_letter_replay", {}, requester="maker")
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id="maker-id"
+    )
     assert approval_id is not None
     await gate.reject(approval_id, approver="checker")
 
@@ -355,3 +463,98 @@ async def test_compensation_cannot_clobber_an_already_rejected_row(engine: Engin
     row = await engine.store.get_pending_approval(approval_id)
     assert row is not None
     assert str(row["status"]) == "rejected"
+
+
+async def test_pending_approval_store_contract(engine: Engine) -> None:
+    """The SQLite leg of the shared ``requester_user_id`` store contract (BACKLOG #1540).
+
+    The same body runs against live PostgreSQL and SQL Server, so the one round-trip the three SQL
+    bodies owe is asserted once rather than worded three times."""
+    from tests._pending_approval_store_contract import _assert_pending_approval_contract
+
+    await _assert_pending_approval_contract(engine.store)
+
+
+# --- BACKLOG #1540: the self-approval refusal keys on users.id, not on the username --------
+# BACKLOG #1532 made `users.username` directory-writable, so the stored `requester` and the live
+# `approver` are two snapshots of a mutable value taken up to `[approvals].expiry_hours` apart.
+# Comparing them fails in BOTH directions, so both directions are pinned here. The session token is
+# deliberately NOT re-issued after the rename: `identity_for_token` rebuilds the Identity from the
+# live users row, which is exactly how the reconciler's new name reaches the approve endpoint.
+
+
+async def test_renamed_requester_still_cannot_approve_their_own_request(engine: Engine) -> None:
+    """The FALSE ACCEPT. Pre-fix, a requester renamed inside the approval window compared unequal to
+    their own stored name, passed the refusal, and released their own gated action."""
+    service = await _service(engine)
+    jdoe_id = await _add(service, "jdoe", Role.ADMINISTRATOR)
+    async with _client(engine, service, ON) as c:
+        jdoe = await _token(c, "jdoe")
+        approval_id = (await _request_replay(c, jdoe)).json()["approval_id"]
+        # The directory renames the requester mid-window; the engine copies the new name down.
+        await engine.store.set_user_username(jdoe_id, "jdoe2")
+        # POSITIVE CONTROL, and it is what makes the 403 below evidence of anything. The stored
+        # `requester` and the approver's LIVE username must actually DIFFER at this point -- if they
+        # did not, a username comparison would refuse too and the assertion could pass under the very
+        # bug this test exists to catch. `identity_for_token` rebuilds the Identity from the users
+        # row, so the renamed row IS what the approve endpoint sees on the unchanged session token.
+        row = await engine.store.get_pending_approval(approval_id)
+        assert row is not None and str(row["requester"]) == "jdoe"
+        renamed = await engine.store.get_user(jdoe_id)
+        assert renamed is not None and renamed.username == "jdoe2"
+
+        r = await c.post(f"/approvals/{approval_id}/approve", headers=jdoe)
+        assert r.status_code == 403  # pre-fix: 200, and the operation ran
+        assert "your own request" in r.json()["detail"]
+        # Still pending: a refused self-approval must not consume the request.
+        row = await engine.store.get_pending_approval(approval_id)
+        assert row is not None and str(row["status"]) == "pending"
+
+
+async def test_a_new_user_holding_the_freed_username_can_approve(engine: Engine) -> None:
+    """The FALSE REFUSAL, the reverse of the test above. Once a rename frees the name, a DIFFERENT
+    person can be given it; pre-fix their approval was refused as a self-approval it is not."""
+    service = await _service(engine)
+    jdoe_id = await _add(service, "jdoe", Role.ADMINISTRATOR)
+    async with _client(engine, service, ON) as c:
+        approval_id = (await _request_replay(c, await _token(c, "jdoe"))).json()["approval_id"]
+        await engine.store.set_user_username(jdoe_id, "jdoe2")
+        await _add(service, "jdoe", Role.ADMINISTRATOR)  # a second person inherits the freed name
+        ok = await c.post(f"/approvals/{approval_id}/approve", headers=await _token(c, "jdoe"))
+        assert ok.status_code == 200  # pre-fix: 403
+        outcome = ok.json()
+        assert outcome["result"] == {"requeued": 0}  # the captured operation actually executed
+        # Both labels read "jdoe" because `requester` is the pre-rename DISPLAY snapshot and the
+        # approver now holds that same name. They are two different people, and the ids the refusal
+        # compared say so -- which is the whole point of keying on the id.
+        assert outcome["requested_by"] == "jdoe" and outcome["approved_by"] == "jdoe"
+
+
+async def test_a_request_with_no_requester_id_is_refused_fail_closed(engine: Engine) -> None:
+    """A row carrying NULL `requester_user_id` -- the shape the ALTER-in migration leaves behind --
+    cannot be checked for self-approval, so it is refused rather than falling back to the name.
+
+    The refusal is a DISTINCT 409, not the 403: a stale row is not an accusation of self-approval,
+    and the message has to tell the operator the remedy (re-request), which 403 does not."""
+    service = await _service(engine)
+    await _add(service, "approver", Role.ADMINISTRATOR)
+    await _add(service, "jdoe", Role.ADMINISTRATOR)
+    async with _client(engine, service, ON) as c:
+        approval_id = (await _request_replay(c, await _token(c, "jdoe"))).json()["approval_id"]
+        # Strip the id to model a row written before the column existed.
+        await engine.store._db.execute(
+            "UPDATE pending_approvals SET requester_user_id = NULL WHERE id = ?", (approval_id,)
+        )
+        await engine.store._db.commit()
+        stale = await c.post(
+            f"/approvals/{approval_id}/approve", headers=await _token(c, "approver")
+        )
+        assert stale.status_code == 409
+        detail = stale.json()["detail"]
+        assert "reject it and request the operation again" in detail
+        assert "your own request" not in detail  # must not read as a self-approval accusation
+        # Fail-closed means the row is untouched, not silently consumed.
+        row = await engine.store.get_pending_approval(approval_id)
+        assert row is not None and str(row["status"]) == "pending"
+        # And the id is what the refusal turned on -- the requester's NAME is still present.
+        assert str(row["requester"]) == "jdoe"

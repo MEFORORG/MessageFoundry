@@ -76,6 +76,7 @@ from messagefoundry.config.tls_policy import (
     resolve_trust_anchor,
 )
 from messagefoundry.controlchars import has_control_char
+from messagefoundry.redaction import safe_exc, safe_name
 from messagefoundry.transports.base import (
     DEFAULT_MAX_ITEMS_PER_POLL,
     DeliveryError,
@@ -200,6 +201,54 @@ class _RemoteOversize(Exception):
         self.limit = limit
 
 
+class _RemoteChanged(Exception):
+    """The file's size moved while it was being retrieved (BACKLOG #116): a partner is still writing
+    it in place, so the bytes read may be a cut-off message.
+
+    **Deliberately NOT a** :class:`_RemoteError`, like :class:`_RemoteOversize`, so the source can say
+    in its log what happened. The disposition is the transient one: the file is left where it is and
+    the next poll reads it again. ``None`` is a size the server could not report."""
+
+    def __init__(self, *, before: int | None, read: int, after: int | None) -> None:
+        super().__init__(
+            f"remote file changed during the retrieve ({before} bytes before, {read} read, "
+            f"{after} after)"
+        )
+        self.before = before
+        self.read = read
+        self.after = after
+
+
+def _differs(reported: int | None, actual: int) -> bool:
+    """True when the server reported a size and it is not ``actual``. A size the server could not
+    report is no evidence either way, so on its own it never holds a file back (#116)."""
+    return reported is not None and reported != actual
+
+
+def _raise_if_changed(before: int | None, read: int, after: int | None) -> None:
+    """Raise :class:`_RemoteChanged` unless each size the server reported matches the bytes read."""
+    if _differs(before, read) or _differs(after, read):
+        raise _RemoteChanged(before=before, read=read, after=after)
+
+
+def _sftp_size(attrs: Any) -> int | None:
+    """``st_size`` from paramiko ``SFTPAttributes``, which leaves it ``None`` when the server omits it."""
+    size = attrs.st_size
+    return None if size is None else int(size)
+
+
+def _ftp_size(ftp: ftplib.FTP, path: str) -> int | None:
+    """The file's size from ``SIZE`` (RFC 3659), or ``None`` when the server will not say.
+
+    A #116 caller sends ``TYPE I`` first on its session: several common servers refuse ``SIZE`` in
+    ASCII mode, and the binary size is the one ``retrbinary`` reads. A transient reply still raises,
+    for ``_op`` to map."""
+    try:
+        return ftp.size(path)
+    except (ftplib.error_perm, ftplib.error_proto):
+        return None
+
+
 class _BoundedSink:
     """Accumulates retrieved chunks and refuses at the first byte past ``limit``.
 
@@ -244,7 +293,10 @@ class _RemoteClient(abc.ABC):
         ``max_bytes`` bounds what is pulled into memory. An implementation reads incrementally and
         raises :class:`_RemoteOversize` as soon as the bytes it has actually read pass the budget,
         so it never buffers a whole hostile body first. ``None`` = unbounded (the operator set
-        ``max_file_bytes=0``)."""
+        ``max_file_bytes=0``).
+
+        It also reads the file's size on the same connection before and after the transfer, and
+        raises :class:`_RemoteChanged` when either differs from the bytes read (BACKLOG #116)."""
 
     @abc.abstractmethod
     def store(self, path: str, data: bytes) -> None:
@@ -257,6 +309,15 @@ class _RemoteClient(abc.ABC):
     @abc.abstractmethod
     def remove(self, path: str) -> None:
         """Delete the file at ``path``."""
+
+    @abc.abstractmethod
+    def dispose_unless_changed(self, path: str, expected_size: int, dest: str | None) -> int | None:
+        """Rename ``path`` to ``dest``, or delete it when ``dest`` is ``None``, unless its size is no
+        longer ``expected_size`` (BACKLOG #116).
+
+        Returns ``None`` once the file is disposed of. Returns the size it has now when that differs,
+        and leaves the file in place. A size the server cannot report does not block the disposal. The
+        check and the rename or delete share one connection, so the gap between them stays small."""
 
     @abc.abstractmethod
     def ensure_dir(self, remote_dir: str) -> bool:
@@ -395,10 +456,8 @@ class _FtpClient(_RemoteClient):
             base = posixpath.basename(name)
             if base in (".", ".."):
                 continue
-            try:
-                size = ftp.size(posixpath.join(remote_dir, base)) or 0
-            except (ftplib.error_perm, ftplib.error_proto):
-                size = 0  # a directory or an un-sizable entry; treat as 0 (oversize check skips it)
+            # A directory or an un-sizable entry lists as 0 (the oversize check skips it).
+            size = _ftp_size(ftp, posixpath.join(remote_dir, base)) or 0
             out.append((base, int(size)))
         return out
 
@@ -409,8 +468,12 @@ class _FtpClient(_RemoteClient):
             # instead of buffering the rest of a hostile body. _op's finally still closes the
             # connection (its quit() is bounded by the socket timeout set at connect).
             sink = _BoundedSink(max_bytes)
+            ftp.voidcmd("TYPE I")  # before SIZE: see _ftp_size
+            before = _ftp_size(ftp, path)
             ftp.retrbinary(f"RETR {path}", sink.write, blocksize=RETRIEVE_CHUNK_BYTES)
-            return sink.value()
+            body = sink.value()
+            _raise_if_changed(before, len(body), _ftp_size(ftp, path))
+            return body
 
         return self._op(run)
 
@@ -422,6 +485,20 @@ class _FtpClient(_RemoteClient):
 
     def remove(self, path: str) -> None:
         self._op(lambda ftp: ftp.delete(path))
+
+    def dispose_unless_changed(self, path: str, expected_size: int, dest: str | None) -> int | None:
+        def run(ftp: ftplib.FTP) -> int | None:
+            ftp.voidcmd("TYPE I")  # before SIZE: see _ftp_size
+            current = _ftp_size(ftp, path)
+            if _differs(current, expected_size):
+                return current
+            if dest is None:
+                ftp.delete(path)
+            else:
+                ftp.rename(path, dest)
+            return None
+
+        return self._op(run)
 
     def ensure_dir(self, remote_dir: str) -> bool:
         def run(ftp: ftplib.FTP) -> bool:
@@ -680,12 +757,16 @@ class _SftpClient(_RemoteClient):
         def run(sftp: Any) -> bytes:
             sink = _BoundedSink(max_bytes)
             with sftp.open(path, "rb") as fh:
+                before = _sftp_size(fh.stat())
                 while True:
                     chunk: bytes = fh.read(RETRIEVE_CHUNK_BYTES)
                     if not chunk:
                         break
                     sink.write(chunk)  # raises _RemoteOversize past the budget, closing the handle
-            return sink.value()
+                after = _sftp_size(fh.stat())
+            body = sink.value()
+            _raise_if_changed(before, len(body), after)
+            return body
 
         return self._op(run)
 
@@ -701,6 +782,19 @@ class _SftpClient(_RemoteClient):
 
     def remove(self, path: str) -> None:
         self._op(lambda sftp: sftp.remove(path))
+
+    def dispose_unless_changed(self, path: str, expected_size: int, dest: str | None) -> int | None:
+        def run(sftp: Any) -> int | None:
+            current = _sftp_size(sftp.stat(path))
+            if _differs(current, expected_size):
+                return current
+            if dest is None:
+                sftp.remove(path)
+            else:
+                sftp.posix_rename(path, dest)
+            return None
+
+        return self._op(run)
 
     def ensure_dir(self, remote_dir: str) -> bool:
         def run(sftp: Any) -> bool:
@@ -1196,8 +1290,15 @@ class RemoteFileSource(SourceConnector):
                 # consumer set grew at every measurement pass and never shrank.
                 # NOT quarantined: moving it would join the hostile name onto a directory, which is
                 # the very operation being refused. Left in place and logged, so an operator sees it
-                # every poll rather than once. PHI-safe: names are not logged at INFO+ elsewhere in
-                # this source, so this stays WARNING-with-no-name — the count is the signal.
+                # every poll rather than once. No name is logged: this arm has refused the name as an
+                # unsafe path component, so it is the one place that must not hand it to `safe_name`
+                # either — the host:dir and the fact of a refusal are the signal.
+                #
+                # This comment used to justify that by asserting "names are not logged at INFO+
+                # elsewhere in this source". Nine WARNING sites below falsified it (BACKLOG #1748),
+                # which made a real control rest on a false premise (CLAUDE.md §11, SDS-3.7). Those
+                # sites now route through `safe_name`, so the claim would be true today — it is gone
+                # anyway, because this arm's reason never depended on what the others do.
                 logger.warning(
                     "REMOTEFILE %s: a listing entry was refused as an unsafe path component "
                     "(not a single safe name); left in place, not retrieved",
@@ -1221,8 +1322,10 @@ class RemoteFileSource(SourceConnector):
                 # hostile or malfunctioning share passes it by under-reporting; the same budget is
                 # therefore charged again below against the bytes actually read.
                 logger.warning(
-                    "REMOTEFILE file %s exceeds max_file_bytes (%s); routing to error dir",
-                    name,
+                    "REMOTEFILE file %s (listed at %s bytes) exceeds max_file_bytes (%s); routing "
+                    "to error dir",
+                    safe_name(name),
+                    size,
                     self._max_file_bytes,
                 )
                 await self._move(path, self._error_dir, name)
@@ -1240,17 +1343,32 @@ class RemoteFileSource(SourceConnector):
                 logger.warning(
                     "REMOTEFILE file %s delivered more than max_file_bytes (%s) despite a smaller "
                     "listed size; routing to error dir",
-                    name,
+                    safe_name(name),
                     self._max_file_bytes,
                 )
                 await self._move(path, self._error_dir, name)
                 disposed += 1
                 continue
+            except _RemoteChanged as exc:
+                # BACKLOG #116: a partner is still writing this file in place, so what was read may be
+                # a cut-off message. Leave it for the next poll; not charged, since it did not move.
+                logger.warning(
+                    "REMOTEFILE %s: %s changed while it was retrieved (%s bytes before, %d read, %s "
+                    "after); not emitted, left in place for the next poll",
+                    _redact(self._host, self._remote_dir),
+                    safe_name(name),
+                    exc.before,
+                    exc.read,
+                    exc.after,
+                )
+                continue
             except _RemoteError as exc:
                 # Transient (locked / vanished mid-poll): leave it in place to retry next poll rather
                 # than quarantine a healthy file. Logged, never silently swallowed.
                 logger.warning(
-                    "REMOTEFILE could not retrieve %s (will retry next poll): %s", name, exc
+                    "REMOTEFILE could not retrieve %s (will retry next poll): %s",
+                    safe_name(name),
+                    safe_exc(exc, file_name=name),
                 )
                 continue
             # Content-vs-type magic-byte check (ASVS 5.2.2), mirroring the local File source's
@@ -1267,7 +1385,7 @@ class RemoteFileSource(SourceConnector):
                 logger.warning(
                     "REMOTEFILE file %s does not match its declared content type %r "
                     "(no matching magic bytes); routing to error dir",
-                    name,
+                    safe_name(name),
                     (self.content_type or ContentType.HL7V2).value,
                 )
                 await self._move(path, self._error_dir, name)
@@ -1282,8 +1400,8 @@ class RemoteFileSource(SourceConnector):
                 # became a "received message", so there's no store disposition.
                 logger.warning(
                     "REMOTEFILE file %s rejected by the pre-ingest scan hook (%s); routing to error dir",
-                    name,
-                    exc,
+                    safe_name(name),
+                    safe_exc(exc, file_name=name),
                 )
                 await self._move(path, self._error_dir, name)
                 disposed += 1
@@ -1297,8 +1415,8 @@ class RemoteFileSource(SourceConnector):
                 # pass-through, and scoped to THIS file so a hiccup can't abort the poll's remaining files.
                 logger.warning(
                     "REMOTEFILE file %s: pre-ingest scan hook errored (%s); leaving in place, will retry",
-                    name,
-                    exc,
+                    safe_name(name),
+                    safe_exc(exc, file_name=name),
                 )
                 continue
             try:
@@ -1309,10 +1427,12 @@ class RemoteFileSource(SourceConnector):
                 # file in place so the next poll retries (at-least-once) — moving it would drop a
                 # received-but-unrecorded message (mirrors the File source's M-15).
                 logger.warning(
-                    "REMOTEFILE handler failed for %s (will retry next poll): %s", name, exc
+                    "REMOTEFILE handler failed for %s (will retry next poll): %s",
+                    safe_name(name),
+                    safe_exc(exc, file_name=name),
                 )
                 continue
-            await self._after_processing(path, name)
+            await self._after_processing(path, name, len(raw))
             disposed += 1
             if file_key is not None:
                 # Record AFTER emit success (the FILE — not each split message — is the dedup unit).
@@ -1397,19 +1517,40 @@ class RemoteFileSource(SourceConnector):
         if self.processed_ledger is not None:
             await self.processed_ledger.mark_processed(file_key)
 
-    async def _after_processing(self, path: str, name: str) -> None:
-        if self._after_read == "delete":
-            try:
-                await asyncio.to_thread(self._client.remove, path)
-            except _RemoteError as exc:
-                # A processed file we can't delete will be re-read (a duplicate); surface it.
-                logger.warning("REMOTEFILE could not delete processed file %s: %s", name, exc)
-        elif self._after_read == "leave":
+    async def _after_processing(self, path: str, name: str, read_size: int) -> None:
+        if self._after_read == "leave":
             # #142 process-in-place: never move/delete — the durable dedup ledger (recorded by
             # _poll_once AFTER this returns) is what stops it being re-ingested next poll.
+            # No #116 size check here: it would cost a connection per file, and the dedup key folds
+            # the listed size, so a file that grew after this read gets a new key and is re-read.
             return
-        else:
-            await self._move(path, self._processed_dir, name)
+        dest = None if self._after_read == "delete" else posixpath.join(self._processed_dir, name)
+        try:
+            # #116: the size check and the rename or delete share one connection, so a file that
+            # changed after it was read is left in place rather than archived with its unread tail.
+            now = await asyncio.to_thread(
+                self._client.dispose_unless_changed, path, read_size, dest
+            )
+        except _RemoteError as exc:
+            # A processed file we can't move or delete will be re-read (a duplicate); surface it.
+            logger.warning(
+                "REMOTEFILE could not %s %s%s: %s",
+                "delete processed file" if dest is None else "move",
+                safe_name(name),
+                "" if dest is None else f" to {self._processed_dir}",
+                safe_exc(exc, file_name=name),
+            )
+            return
+        if now is not None:
+            logger.warning(
+                "REMOTEFILE %s: %s changed after it was read (%d bytes read, %d now); the message "
+                "emitted from it may be incomplete, so the file is left in place for the next poll to "
+                "read whole",
+                _redact(self._host, self._remote_dir),
+                safe_name(name),
+                read_size,
+                now,
+            )
 
     async def _move(self, path: str, dest_dir: str, name: str) -> None:
         dst = posixpath.join(dest_dir, name)
@@ -1417,7 +1558,12 @@ class RemoteFileSource(SourceConnector):
             await asyncio.to_thread(self._client.rename, path, dst)
         except _RemoteError as exc:
             # A stuck file (locked / dest unwritable) stays and is re-read; log it.
-            logger.warning("REMOTEFILE could not move %s to %s: %s", name, dest_dir, exc)
+            logger.warning(
+                "REMOTEFILE could not move %s to %s: %s",
+                safe_name(name),
+                dest_dir,
+                safe_exc(exc, file_name=name),
+            )
 
 
 register_destination(ConnectorType.REMOTEFILE, RemoteFileDestination)

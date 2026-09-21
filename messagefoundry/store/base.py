@@ -103,6 +103,7 @@ __all__ = [
     "SearchTarget",
     "Store",
     "StoreLifecycle",
+    "StoreNotFoundError",
     "StreamingAttachmentsUnsupported",
     "backend_supports_reference_sets",
     "make_spec",
@@ -224,8 +225,22 @@ class QueueStore(StoreLifecycle, Protocol):
 
     #: A1 live cost counters (always-on, additive; surfaced via ``/stats``). ``committed_txns`` = durable
     #: **write**-path transactions committed on this handle — the *committed transactions per message*
-    #: currency ADR 0051 sizes capacity on (``3 + 2H + 2N`` per ingress message, H = handlers routed,
-    #: N = destinations). Read-snapshot-release commits (e.g. the RCSI hygiene commit a SQL Server read
+    #: currency ADR 0051 sizes capacity on (``3 + 2H + 2N`` per ingress message).
+    #:
+    #: **This is the CANONICAL definition of H and N. Every other site links here rather than restating
+    #: it** (CLAUDE.md SDS-3.5 — state a load-bearing fact once). ``H`` = the routed rows the Router
+    #: materializes: one per handler it SELECTS, after any ``accepts=`` decline (ADR 0084). ``N`` = the
+    #: **outbound ROWS** the handlers' transforms emit — one per ``Send`` — **not** the number of
+    #: distinct outbound connections addressed. Two ``Send``s aimed at the SAME outbound cost the same
+    #: 2 transactions each as two aimed at different ones, because every outbound row is claimed in its
+    #: own transaction and resolved in its own, and a shared destination shares neither. So one handler
+    #: emitting two ``Send``s to one outbound is ``N = 2`` (9 txn/msg), never ``N = 1`` (7). That
+    #: reading is settled by execution through the real ``RegistryRunner`` in
+    #: ``tests/test_runner_txn_cost_model.py`` (BACKLOG #1736), which also records why the DEFAULT
+    #: pooled claimer reads slightly above the model on a multi-message run: its claim commit is per
+    #: ``claim_fifo_heads`` SWEEP, not per row.
+    #:
+    #: Read-snapshot-release commits (e.g. the RCSI hygiene commit a SQL Server read
     #: needs, or SQLite's read-pool ``COMMIT``) are excluded, so the counter stays the write currency the
     #: cost model validates rather than a superset that also counts every live lookup.
     #: ``body_copies`` = raw/payload body strings durably written (the ``2 + H + N`` per-message
@@ -837,6 +852,17 @@ class QueueStore(StoreLifecycle, Protocol):
         """Dead-letter non-terminal **routed** rows whose ``handler_name`` left the registry (a removed
         handler no transform worker can run). The routed-stage parallel of
         :meth:`dead_letter_missing_destinations`; call once at startup. Returns the rows killed."""
+        ...
+
+    async def dead_letter_missing_inbounds(
+        self, valid_names: set[str], now: float | None = None
+    ) -> int:
+        """Dead-letter non-terminal **channel-keyed** rows (ingress, routed, response) whose
+        ``channel_id`` left the registry — a removed inbound for which no router, transform or
+        re-ingress worker is spawned and whose lane no dispatcher claims. The third startup sweep
+        beside :meth:`dead_letter_missing_destinations` and :meth:`dead_letter_missing_handlers`;
+        call once at startup. ``valid_names`` is the WHOLE deployment's inbound names (an engine
+        shard's own ``registry.inbound`` is only its slice). Returns the rows killed."""
         ...
 
     # --- process-in-place dedup ledger (ADR 0129, BACKLOG #142) --------------
@@ -1520,9 +1546,25 @@ class AuditStore(Protocol):
         operation: str,
         params: str,
         requester: str,
+        requester_user_id: str,
         requested_at: float,
         expires_at: float | None,
-    ) -> None: ...
+    ) -> None:
+        """Persist a high-value action awaiting a distinct second approver (dual-control, 2.3.5).
+
+        ``requester_user_id`` is the **authorization key** and ``requester`` is the display label
+        (BACKLOG #1540). :meth:`~messagefoundry.api.approvals.ApprovalGate.approve` is the source of
+        record for why the name cannot serve as the key; this is the store-side contract that follows
+        from it, and every backend's schema comment points here rather than restating it:
+
+        * ``requester_user_id`` is **required on every call**. No caller legitimately lacks it, and a
+          row written without one can never be approved.
+        * The column is declared **nullable** on all three backends, so the ``ALTER`` lands on a
+          pre-existing table. It is **not** backfilled: after a rename the stored name may belong to
+          somebody else, so resolving it to an id would key the refusal on the wrong person -- the
+          exact error the column exists to remove.
+        * A NULL is therefore refused **fail closed** at approve time, never fallen back from."""
+        ...
 
     async def get_pending_approval(self, approval_id: str) -> Row | None: ...
 
@@ -1764,6 +1806,12 @@ class AuthStore(Protocol):
 
     async def record_login_success(self, user_id: str, *, now: float | None = None) -> None: ...
 
+    # The RAW lockout-state write: it sets exactly the values it is handed. Its remaining caller is
+    # the offline administrator unlock (ADR 0171), which clears the lock by passing zero and None.
+    # **It is not the failed-attempt path -- that is `increment_login_failure` below, and the split is
+    # the point.** A caller that computes the next count itself has already lost the increment: the
+    # read it computed from is one await away from the write, and another attempt reads the same
+    # value in between.
     async def record_login_failure(
         self,
         user_id: str,
@@ -1772,6 +1820,20 @@ class AuthStore(Protocol):
         locked_until: float | None,
         now: float | None = None,
     ) -> None: ...
+
+    # The failed-attempt path: read, lapsed-window reset, increment, lockout decision and write, in
+    # ONE atomic store call per backend (SQLite under its store lock, PostgreSQL under SELECT ... FOR
+    # UPDATE, SQL Server under UPDLOCK). Returns ``(failed_attempts, just_locked)``; ``just_locked``
+    # is decided INSIDE that atomic section and must not be recomputed outside it, where it is only
+    # the stale read again. See ``store.next_lockout_state`` for the policy.
+    async def increment_login_failure(
+        self,
+        user_id: str,
+        *,
+        threshold: int,
+        lockout_seconds: float,
+        now: float | None = None,
+    ) -> tuple[int, bool]: ...
 
     # --- roles / AD-group maps -----------------------------------------------
     async def upsert_role(
@@ -1859,9 +1921,11 @@ class AuthStore(Protocol):
         **The inverse of the #1015 guard, and the direction that guard cannot look.** That check
         resolves a user by USERNAME and asks whether *this account* carries a different subject --
         so it constrains WHICH subject may bind to a given account, and is structurally incapable of
-        seeing a SECOND ACCOUNT already holding the same subject. Nothing else could see it either:
-        measured, there is no UNIQUE constraint naming the federated columns on any of the three
-        backends (0/0/0, against 13/8/10 total UNIQUE declarations as the positive control).
+        seeing a SECOND ACCOUNT already holding the same subject. The database enforces the same rule
+        underneath -- every backend declares a filtered UNIQUE ``ux_users_federated_subject`` -- and
+        this lookup is what lets the caller answer cleanly instead of surfacing that refusal as an
+        integrity error. :meth:`AuthService._complete_ad_login`'s subject-exclusivity guard carries
+        why that pairing is worded the way it is, and what it replaced.
 
         Deliberately a lookup rather than a scan: it sits on the federated login path, and
         ``list_users()`` would make every sign-in O(number of accounts).
@@ -2024,13 +2088,53 @@ def build_store_cipher(settings: StoreSettings) -> Cipher:
     return make_cipher(resolve_active_key(settings), retired, write_v2=settings.aad_bind)
 
 
+class StoreNotFoundError(RuntimeError):
+    """:func:`open_store` was pointed at an absent SQLite store without ``create=True`` (BACKLOG
+    #1780). ``path`` is the absent file, as configured."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        super().__init__(
+            f"no SQLite store at {path}: refusing to create one "
+            "(check [store].path or --db; `messagefoundry serve` creates the store on its first run)"
+        )
+
+
+def _absent_sqlite_store(settings: StoreSettings) -> Path | None:
+    """The configured SQLite path when nothing is there, else ``None``.
+
+    ``:memory:`` puts nothing on disk, so it has no file to be absent. Only ``FileNotFoundError``
+    counts as absent. Any other stat failure, such as a permission error on an ancestor, is left for
+    the open to report, because SQLite could not have created a file there either. The verifier keeps
+    a stricter twin, ``verify/smoke.py::missing_sqlite_store`` (``is_file``), so that it can refuse
+    without importing the store stack."""
+    if settings.backend is not StoreBackend.SQLITE or settings.path == ":memory:":
+        return None
+    path = Path(settings.path)
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return path
+    except OSError:
+        pass
+    return None
+
+
 async def open_store(
     settings: StoreSettings,
     *,
+    create: bool = False,
     message_events: str = "all",
     posture: HopPosture | None = None,
 ) -> Store:
     """Open the store for the configured backend — the single backend-selection seam.
+
+    ``create`` (BACKLOG #1780) must be passed ``True`` by a caller that provisions a store: ``serve``'s
+    first run and the ``provision-admin`` bootstrap. Otherwise an absent SQLite file raises
+    :class:`StoreNotFoundError` before anything connects, because SQLite's connect would create it and
+    the schema ensure would fill it. It governs creation only: an existing file is still migrated, and
+    the server backends ignore it (they never ``CREATE DATABASE``, but do build the schema into any
+    database that exists).
 
     ``sqlite`` is the default; ``postgres`` is a production server-DB backend with single-node parity
     (lazy-imported, needs the ``postgres`` extra); ``sqlserver`` is a production server-DB backend,
@@ -2046,6 +2150,9 @@ async def open_store(
     clamps the ``MEFOR_ALLOW_INSECURE_TLS`` escape on a production-PHI hop (decision 2). ``None`` (SQLite —
     no TLS — or a backup/restore utility / test) leaves it unclamped, byte-identical to pre-#200.
     """
+    # Before the cipher, so a refusal never waits on a key provider (a Vault round trip).
+    if not create and (absent := _absent_sqlite_store(settings)) is not None:
+        raise StoreNotFoundError(absent)
     # The at-rest cipher via the single build_store_cipher seam: ADR 0019 key sourcing + the ADR 0138
     # cipher_provider dispatch. Default `aesgcm` is the in-process AES-256-GCM keyring (active + retired
     # decrypt-only, write_v2=aad_bind — which now defaults ON, so new writes are cell-bound mfenc:v2;

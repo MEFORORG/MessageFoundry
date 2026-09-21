@@ -172,12 +172,53 @@ def test_every_console_spelling_warns_not_just_the_canonical_one(repo: Path) -> 
     assert record(repo)["seatRosterVerdict"] == "retired"
 
 
-def test_a_korus_only_seat_says_it_is_a_roster_difference(repo: Path) -> None:
-    proc = declare(repo, "reviewer")
+def test_the_shipped_roster_has_no_elsewhere_occupant() -> None:
+    """The bucket emptied on 2026-09-16, so the verdict below needs an INJECTED occupant.
+
+    Asserting the emptiness here is what keeps the next test honest. If the roster ever gains a
+    real occupant this goes red, and whoever added it has to decide whether an injected probe still
+    stands in for the real thing.
+    """
+    assert roster()["elsewhere"] == {}, (
+        "the shipped roster gained an elsewhere occupant, so the probe below no longer represents it"
+    )
+
+
+def test_an_elsewhere_seat_says_it_is_a_roster_difference(repo: Path) -> None:
+    """The bucket is empty, so this exercises seat.ps1's branch against an occupant it injects.
+
+    Without the injection this branch has NO test: every assertion over an empty map passes while
+    examining nothing. The probe also checks that the roster's own REASON reaches stderr, which the
+    occupant-based version of this test never did -- a warning without the reason leaves the reader
+    with a refusal and no roster fact.
+    """
+    seats_path = repo / "docs" / "roles" / "seats.json"
+    data = json.loads(seats_path.read_text(encoding="utf-8"))
+    assert data["elsewhere"] == {}, "the fixture roster already carries an occupant"
+    reason = "A probe occupant, injected by this test and present in no shipped roster."
+    data["elsewhere"] = {"probeseat": reason}
+    seats_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    proc = declare(repo, "probeseat")
     assert proc.returncode == 0, proc.stderr
     assert "NOT A SEAT IN THIS REPOSITORY" in proc.stderr, proc.stderr
     assert "not a typo and not a retirement" in proc.stderr
+    assert reason in proc.stderr, (
+        "the warning dropped the roster's reason, so it reads as a refusal"
+    )
     assert record(repo)["seatRosterVerdict"] == "elsewhere"
+
+
+def test_the_probe_label_lands_in_unknown_without_the_injection(repo: Path) -> None:
+    """The CONTROL. The same label must reach a DIFFERENT verdict when the bucket is untouched.
+
+    Without this arm the test above proves only that seat.ps1 warns about something, not that the
+    injection is what moved it from `unknown` to `elsewhere`.
+    """
+    proc = declare(repo, "probeseat")
+    assert proc.returncode == 0, proc.stderr
+    assert "MATCHES NO SEAT" in proc.stderr, proc.stderr
+    assert record(repo)["seatRosterVerdict"] == "unknown"
 
 
 def test_an_unmapped_label_warns_rather_than_rendering_as_a_real_seat(repo: Path) -> None:
@@ -189,6 +230,50 @@ def test_an_unmapped_label_warns_rather_than_rendering_as_a_real_seat(repo: Path
     rec = record(repo)
     assert rec["seatRosterVerdict"] == "unknown"
     assert rec["seatCanonical"] is None
+
+
+@pytest.mark.parametrize("emptied", ["aliases", "retired", "elsewhere"])
+def test_an_empty_roster_map_does_not_silence_the_objection(repo: Path, emptied: str) -> None:
+    """MEASURED 2026-09-16, and it cost the whole warning.
+
+    Under `Set-StrictMode -Version Latest`, `$map.PSObject.Properties.Name` THROWS on a map with no
+    members. The resolver wraps its entire read in one catch, and that catch cannot tell an
+    unreadable roster from a readable one holding an empty map -- so emptying `elsewhere` demoted
+    EVERY verdict to `roster-unreadable`, and `MATCHES NO SEAT` stopped being printed at all. Exit
+    code stayed 0 and stderr went empty, so nothing anywhere reported it.
+
+    THE SHAPE, NOT THE INSTANCE. All three maps are read the same way, so all three are
+    parameterized here: fixing only the map that happened to empty leaves the defect armed in the
+    other two, waiting for the next roster edit.
+    """
+    seats_path = repo / "docs" / "roles" / "seats.json"
+    data = json.loads(seats_path.read_text(encoding="utf-8"))
+    data[emptied] = {}
+    seats_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    proc = declare(repo, "wombat")
+    assert proc.returncode == 0, proc.stderr
+    assert "MATCHES NO SEAT" in proc.stderr, (
+        f"emptying '{emptied}' silenced the objection entirely; stderr was {proc.stderr!r}"
+    )
+    assert record(repo)["seatRosterVerdict"] == "unknown", (
+        f"emptying '{emptied}' demoted the verdict instead of resolving the label"
+    )
+
+
+def test_the_empty_map_probe_can_tell_a_silenced_run_from_a_healthy_one(repo: Path) -> None:
+    """The POSITIVE CONTROL for the test above, which asserts a string is PRESENT.
+
+    A roster the script genuinely cannot read produces exactly the failure signature that test
+    guards against -- rc 0, empty stderr, verdict `roster-unreadable`. Reproducing it here proves
+    the assertions above can actually distinguish the two states, rather than passing because
+    `MATCHES NO SEAT` happens to appear whatever the roster holds.
+    """
+    (repo / "docs" / "roles" / "seats.json").write_text("{ not json", encoding="utf-8")
+    proc = declare(repo, "wombat")
+    assert proc.returncode == 0, "an unreadable roster must never cost a session its declaration"
+    assert proc.stderr.strip() == "", proc.stderr
+    assert record(repo)["seatRosterVerdict"] == "roster-unreadable"
 
 
 def test_the_objection_goes_to_stderr_and_never_pollutes_stdout(repo: Path) -> None:
@@ -233,3 +318,74 @@ def test_the_script_reads_the_roster_at_all() -> None:
     assert "docs/roles/seats.json" in source, (
         "seat.ps1 does not name the roster, so the verdict fields cannot be coming from it"
     )
+
+
+# ------------------------------------------------------------------ the role-card marker
+#
+# WHY THESE ARMS EXIST. `seat.ps1` writes the fleet episode record and `role-card-inject.ps1` reads
+# `.claude/seat.local.txt`. Nothing bridged them, so a session that declared its seat -- exactly what
+# the SessionStart prompt asks every session to do -- got a record and no card, silently, at the next
+# session start. Measured 2026-09-19: 165 of 171 worktrees on the development box carried no marker.
+
+MARKER_REL = Path(".claude") / "seat.local.txt"
+INJECTOR = ROOT / "scripts" / "hooks" / "role-card-inject.ps1"
+
+
+def marker(repo: Path) -> str | None:
+    p = repo / MARKER_REL
+    return p.read_text(encoding="utf-8").strip() if p.exists() else None
+
+
+def test_a_live_declaration_writes_the_role_card_marker(repo: Path) -> None:
+    assert marker(repo) is None, "the fixture must start with no marker or this proves nothing"
+    proc = declare(repo, "manager")
+    assert proc.returncode == 0, proc.stderr
+    assert marker(repo) == "manager"
+
+
+def test_an_alias_declaration_writes_the_CANONICAL_marker(repo: Path) -> None:
+    """`-Seat mgr` must leave `manager` behind, so the hook resolves it in one step next session."""
+    declare(repo, "mgr")
+    assert marker(repo) == "manager", (
+        "the marker carries the canonical seat, not the typed label -- the record keeps the verbatim "
+        "one, and these two fields answer different questions"
+    )
+
+
+@pytest.mark.parametrize("label", ["console", "zzqx9137nosuchseat"])
+def test_a_declaration_that_resolves_to_no_live_seat_writes_no_marker(
+    repo: Path, label: str
+) -> None:
+    """A retired or unmapped label already warns loudly. A marker would move that failure and hide it.
+
+    The hook would refuse the same label at the NEXT session start, which is a quiet failure in a
+    place nobody is watching -- so the loud CLI objection is the only report anyone gets.
+    """
+    proc = declare(repo, label)
+    assert proc.returncode == 0, "a roster objection must not fail the declaration"
+    assert proc.stderr.strip() != "", "the objection is the only report; it must still be made"
+    assert marker(repo) is None, f"{label!r} resolves to no live seat, so it must leave no marker"
+
+
+@pytest.mark.parametrize("label", ["console", "zzqx9137nosuchseat"])
+def test_a_bad_declaration_does_not_clobber_a_GOOD_marker(repo: Path, label: str) -> None:
+    """The dangerous half. Overwriting a working marker would take a card away from a live seat."""
+    declare(repo, "manager")
+    assert marker(repo) == "manager"
+    declare(repo, label)
+    assert marker(repo) == "manager", (
+        f"declaring {label!r} overwrote a live seat's marker; the next session would get no card"
+    )
+
+
+def test_both_scripts_name_the_same_marker_path() -> None:
+    """The bridge, pinned as text. A rename on either side reopens the gap with nothing reporting it.
+
+    This is the anti-vacuity arm for the whole family above: those tests drive `seat.ps1` alone, so
+    they would stay green if `role-card-inject.ps1` started reading somewhere else.
+    """
+    literal = ".claude/seat.local.txt"
+    writer = SEAT.read_text(encoding="utf-8")
+    reader = INJECTOR.read_text(encoding="utf-8")
+    assert literal in writer, f"{SEAT.name} no longer writes {literal}"
+    assert literal in reader, f"{INJECTOR.name} no longer reads {literal}"

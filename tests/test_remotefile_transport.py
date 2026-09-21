@@ -16,9 +16,17 @@ import logging
 import posixpath
 import ssl
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from _phi_log_capture import (
+    IDENTIFIER_SHAPE,
+    IDENTIFIER_SHAPED_NAMES,
+    SAFE_NAME_LABEL,
+    filtered_sink,
+    strip_safe_labels,
+)
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -119,6 +127,18 @@ class _FakeClient(_RemoteClient):
     def remove(self, path: str) -> None:
         self.ops.append(("remove", path))
         self.files.pop(path, None)
+
+    def dispose_unless_changed(self, path: str, expected_size: int, dest: str | None) -> int | None:
+        # #116: a real client stats then renames/removes on one connection. The stored body's length
+        # is what a stat reports; the listing's `sizes` override models a lying LISTING, not a stat.
+        # Delegates to rename/remove so their recorded ops and injected failures stay as they were.
+        if path in self.files and len(self.files[path]) != expected_size:
+            return len(self.files[path])
+        if dest is None:
+            self.remove(path)
+        else:
+            self.rename(path, dest)
+        return None
 
     def ensure_dir(self, remote_dir: str) -> bool:
         # #114: the contract now reports whether THIS call created the directory, so the caller can log
@@ -405,6 +425,10 @@ class _StubSftpFile:
         self.read_total += len(chunk)
         return chunk
 
+    def stat(self) -> SimpleNamespace:
+        # #116: the retrieve reads the handle's size on each side of the transfer.
+        return SimpleNamespace(st_size=len(self.body))
+
     def __enter__(self) -> _StubSftpFile:
         return self
 
@@ -428,6 +452,13 @@ class _StubFtp:
         self.body = body
         self.written = 0
         self.blocksize: int | None = None
+
+    def voidcmd(self, cmd: str) -> str:
+        return "200 OK"
+
+    def size(self, path: str) -> int:
+        # #116: the retrieve reads SIZE on each side of the transfer.
+        return len(self.body)
 
     def retrbinary(self, cmd: str, callback: Any, blocksize: int = 8192) -> None:
         self.blocksize = blocksize
@@ -1663,3 +1694,99 @@ def test_the_pinned_key_names_match_the_installed_paramiko() -> None:
         f"installed paramiko {paramiko.__version__} filters on {sorted(called_with)}; the connector's "
         "keys are no longer the ones it reads, so the control is inert again."
     )
+
+
+# --- BACKLOG #1748: the REMOTEFILE source never logs a partner-chosen name ----
+
+_REMOTE_LOGGER = "messagefoundry.transports.remotefile"
+
+
+@pytest.mark.parametrize("name", IDENTIFIER_SHAPED_NAMES)
+async def test_remote_source_oversize_reject_never_logs_the_partner_chosen_name(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """The remote half of #1748, through the real ``_install_phi_filters`` sink rather than ``caplog``.
+
+    ``caplog`` reads a record BEFORE any handler filter runs, so it cannot answer what would reach the
+    NSSM-captured log. The share names the file, so this is the arm a partner's naming convention hits
+    first."""
+    client = _FakeClient(files={f"/in/{name}": b"M" * 100})
+    src = _src(monkeypatch, client, max_file_bytes=10)
+    src._handler = _RecordingHandler()
+    with filtered_sink(_REMOTE_LOGGER) as sink:
+        await src._poll_once()
+    assert f"/in/.error/{name}" in client.files  # the arm really ran (not a vacuous pass)
+    assert "exceeds max_file_bytes" in sink.text
+    assert name not in sink.text
+    assert IDENTIFIER_SHAPE.search(strip_safe_labels(sink.text)) is None
+    assert SAFE_NAME_LABEL.search(sink.text)
+
+
+async def test_remote_source_control_the_shipped_filters_alone_would_not_have_caught_it() -> None:
+    """The negative control. Without it every assertion above is equally consistent with "the filter
+    chain was already scrubbing the name", and the call-site edits would have bought nothing."""
+    with filtered_sink(_REMOTE_LOGGER) as sink:
+        logging.getLogger(_REMOTE_LOGGER).warning(
+            "REMOTEFILE file %s exceeds max_file_bytes (%s); routing to error dir",
+            "MRN123456789_ADT.hl7",
+            10,
+        )
+    assert "MRN123456789_ADT.hl7" in sink.text
+    assert IDENTIFIER_SHAPE.search(sink.text)
+
+
+async def test_remote_source_retrieve_failure_logs_neither_the_name_nor_a_raw_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The transient-retrieve arm carries both helpers. A remote client's error text routinely quotes
+    the path it was asked for, which is why ``safe_exc`` is given the name to swap out."""
+    name = "DOE_JANE_19800505_ADT.hl7"
+    client = _FakeClient(
+        files={f"/in/{name}": b"MSH|^~\\&|A"},
+        retrieve_exc=_RemoteError(f"550 no such file: /in/{name}", permanent=False),
+    )
+    src = _src(monkeypatch, client)
+    src._handler = _RecordingHandler()
+    with filtered_sink(_REMOTE_LOGGER) as sink:
+        await src._poll_once()
+    assert "could not retrieve" in sink.text  # the arm ran
+    assert name not in sink.text
+    assert "_RemoteError" in sink.text  # safe_exc keeps the type
+    assert "550" in sink.text  # and the server's code, which is the diagnostic
+    assert IDENTIFIER_SHAPE.search(strip_safe_labels(sink.text)) is None
+
+
+async def test_remote_source_move_failure_logs_neither_the_name_nor_a_raw_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "PID-100001-DOE-JANE.hl7"
+    client = _FakeClient(
+        files={f"/in/{name}": b"MSH|^~\\&|A"},
+        rename_exc=_RemoteError(f"permission denied: /in/.processed/{name}", permanent=True),
+    )
+    src = _src(monkeypatch, client)
+    src._handler = _RecordingHandler()
+    with filtered_sink(_REMOTE_LOGGER) as sink:
+        await src._poll_once()
+    assert "could not move" in sink.text  # the arm ran
+    assert name not in sink.text
+    assert IDENTIFIER_SHAPE.search(strip_safe_labels(sink.text)) is None
+
+
+async def test_remote_source_unsafe_name_refusal_still_logs_no_name_at_all(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The one arm that deliberately logs NO label, not even a derived one: it has just refused the
+    name as an unsafe path component, so it must not hand that name to any helper either.
+
+    Its comment used to justify this by asserting that names are not logged elsewhere in the source.
+    Nine WARNING sites falsified that (#1748); the justification is now the refusal itself."""
+    client = _HostileListingClient(["../../drops/MRN123456789_ADT.hl7"])
+    src = _src(monkeypatch, client)
+    src._handler = _RecordingHandler()
+    with filtered_sink(_REMOTE_LOGGER) as sink:
+        await src._poll_once()
+    assert "refused as an unsafe path component" in sink.text  # the arm ran
+    assert "MRN123456789" not in sink.text
+    assert SAFE_NAME_LABEL.search(sink.text) is None  # no label either — the name is not touched
+    assert IDENTIFIER_SHAPE.search(sink.text) is None

@@ -56,9 +56,11 @@ settings/config that won't load).
 
 ``ruff`` and ``mypy`` are **advisory**: run only when installed (``shutil.which``) and never block —
 a non-developer author shouldn't be stopped by a lint nit. So is ``raise-fstring`` — an AST scan of the
-config-dir Router/Handler modules that flags ``raise <Exc>(f"...{var}...")``, the exact pattern that can
-carry free-text PHI past the exception-path redaction (``redaction.py``); it only ever **prints** a
-heuristic reminder of the "never put PHI in an exception message" convention, never blocks the gate.
+config-dir Router/Handler modules that flags a ``raise`` whose message interpolates a variable — at
+least the f-string, ``+`` concatenation, ``%`` formatting and ``.format(...)`` spellings — the
+pattern that can carry free-text PHI past the exception-path redaction (``redaction.py``); it only
+ever **prints** a heuristic reminder of the "never put PHI in an exception message" convention,
+never blocks the gate. ``_check_raise_fstring`` catalogues what it over- and under-flags.
 So is ``accepts-candidate`` — an AST scan that flags a ``@handler`` opening with a guard-filter
 (``if <cond>: return []``), a filter that belongs in an ``accepts=`` router-stage predicate (ADR 0084)
 where it costs 0 transactions instead of 2; also advisory (prints, never blocks).
@@ -90,6 +92,7 @@ import re
 import shutil
 import subprocess
 import sys
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -147,6 +150,7 @@ def run_checks(
     service_config: str | Path | None = None,
     suppress_service_toml_search: bool = False,
     project_root: str | Path | None = None,
+    allow_empty_config: bool = False,
 ) -> CheckReport:
     """Run the gate against ``config_dir``; ``messages_dir`` enables the dry-run check when it has
     fixtures. Set ``run_lint=False`` to skip the advisory ruff/mypy pass. ``strict_handler_security``
@@ -168,9 +172,24 @@ def run_checks(
     ``load_settings``' CLI > env > file precedence overrides a file-set ``base_dir`` exactly as
     ``__main__.py``'s ``serve`` does. Left ``None`` the resolution is unchanged and still falls back to
     the process directory, so the documented ``check --config config`` invocation is untouched.
+
+    ``allow_empty_config`` (``--allow-empty-config``, BACKLOG #1648) drops the empty-graph rule from
+    the blocking validate leg.
+
+    A leg whose SUBJECT survives an empty graph drops the rule unconditionally instead, at its own
+    ``load_config`` — ``build-check``, ``reference-backend``, ``dead-config`` and ``send-target``.
+    Each of their skip arms delegates the reporting to ``validate``, and ``--allow-empty-config`` is
+    exactly when ``validate`` stops reporting it, so a leg that skipped there would be covered by
+    nothing — and its "config did not load" line would be false about a config that loaded. Use that
+    test when deciding for a new leg: ask whether it reads something a connection-less config still
+    has (Routers, Handlers, reference sets), not whether the flag was passed.
+
+    The remaining legs still load with the rule in force and do skip on an empty dir: they report on
+    connections, and there are none. The skip line they print says "config did not load", which is
+    inexact for this one cause; threading the keyword further was left out of scope.
     """
     results = [
-        _check_validate(config_dir),
+        _check_validate(config_dir, allow_empty=allow_empty_config),
         _check_dryrun(
             config_dir,
             messages_dir,
@@ -269,7 +288,12 @@ def _check_dead_config(config_dir: str | Path) -> CheckResult:
     from messagefoundry.config.wiring import WiringError, load_config
 
     try:
-        registry = load_config(config_dir)
+        # allow_empty: this leg's subject is the ROUTER/HANDLER reference graph, which exists whether
+        # or not a connection is declared (BACKLOG #1648). Without it the docstring's delegation
+        # above -- "a config dir that fails to load is left to validate" -- breaks under
+        # `--allow-empty-config`, because validate is then the one leg that does not report it, and
+        # the skip line would read "config did not load" about a config that loaded.
+        registry = load_config(config_dir, allow_empty=True)
     except (WiringError, OSError, ImportError, SyntaxError, ValueError):
         # A broken config is reported (blocking) by validate; the advisory never crashes the gate.
         return CheckResult(
@@ -303,7 +327,12 @@ def _check_send_target(config_dir: str | Path) -> CheckResult:
     from messagefoundry.config.wiring import WiringError, load_config
 
     try:
-        registry = load_config(config_dir)
+        # allow_empty: same reason as dead-config above (BACKLOG #1648). This leg judges literal
+        # Send()/Router targets against what is registered, and a connection-less config is exactly
+        # where EVERY such target dangles — the case most worth printing, not least. Letting the
+        # empty-graph refusal through would make `--allow-empty-config` silently disable the one leg
+        # that catches a dangling literal target.
+        registry = load_config(config_dir, allow_empty=True)
     except (WiringError, OSError, ImportError, SyntaxError, ValueError):
         return CheckResult(
             "send-target", ok=True, required=False, skipped=True, detail="config did not load"
@@ -330,12 +359,37 @@ def _check_send_target(config_dir: str | Path) -> CheckResult:
 
 
 def _check_raise_fstring(config_dir: str | Path) -> CheckResult:
-    """Advisory: flag ``raise <Exc>(f"...{var}...")`` in the config-dir Router/Handler modules — an
-    f-string ``raise`` that interpolates a variable, the one pattern that can carry **free-text PHI**
+    """Advisory: flag an interpolated ``raise`` message in the config-dir Router/Handler modules — a
+    ``raise`` whose message is built from a variable, the pattern that can carry **free-text PHI**
     past the exception-path redaction (``redaction.py``) into the stored ``last_error``/``detail`` and
-    the log. It is a heuristic reminder of the "never put PHI in an exception message" convention, not a
-    hard rule: a benign interpolation (``raise ValueError(f"port {p} in use")``) trips it too, so the
-    check is **advisory** (prints, never blocks).
+    the log. :func:`_is_dynamic_string` is the shared predicate and defines the shapes it reaches: at
+    least the f-string, ``+``, ``%`` and ``.format(...)`` spellings, which carry the same payload.
+
+    It is a heuristic reminder of the "never put PHI in an exception message" convention, not a hard
+    rule, so it is **advisory** (prints, never blocks) — which is what pays for both error directions,
+    measured against the predicate:
+
+    * Over-flags, at least. A benign interpolation (``raise ValueError(f"port {p} in use")``).
+      Arithmetic, since the first constructor argument need not be a string at all
+      (``raise ValueError(retry + 1)``). And *literal-only* messages that do not fold to a constant —
+      measured: ``"a %s" % ("b",)``, ``"a %s" % ["b"]``, ``"%(k)s" % {"k": "b"}`` (the folding helper
+      has no case for a tuple, list or dict operand), ``"a {}".format("b")`` (the ``.format`` branch
+      counts arguments without inspecting them) and ``"a" + f"b"`` (no case for a constant-only
+      f-string operand, which is why the same ``f"b"`` alone does not flag).
+    * Under-flags, at least. A message assigned to a local first (``m = f"bad {x}"``;
+      ``raise ValueError(m)``), because this caller passes the predicate no scope ``env``, so a bare
+      ``Name`` is not followed here — pinned by ``test_raise_fstring_ignores_bare_name_message``. The
+      lookup lint builds that ``env`` (:func:`_lookup_scope_envs`), so widening *that* one means
+      passing it, not changing the predicate. Measured and **not** deliberate, only unbuilt: a message
+      in any argument but the first positional (``raise FeedError("E01", f"p {x}")``,
+      ``raise FeedError(detail=f"p {x}")``), a ``*args`` splat (``raise ValueError(*parts)``), and a
+      field read rather than an interpolation (``raise ValueError(str(msg["PID-5"]))`` — the predicate
+      reads through the ``str`` call and does not count the subscript it finds).
+      :func:`_unsafe_lookup_hit` already reads keywords, a second positional and a splat; this caller
+      does not.
+    * No longer an under-flag: an interpolation wrapped in a call
+      (``raise ValueError(f"p {x}".upper())``). The predicate reads a call's arguments and receiver,
+      so the wrapped f-string flags — pinned by ``test_raise_fstring_flags_call_wrapped_interpolation``.
 
     Scans every ``*.py`` under ``config_dir`` (helpers included — a ``_*`` helper can ``raise`` too).
     A malformed module never crashes the gate (``SyntaxError``/``OSError`` → skip that file; ``validate``
@@ -358,20 +412,19 @@ def _check_raise_fstring(config_dir: str | Path) -> CheckResult:
                 continue
             args = node.exc.args
             first = args[0] if args else None
-            # An f-string with at least one ``{var}`` (FormattedValue); a constant-only f-string or a
-            # plain string literal is fine and not flagged.
-            if isinstance(first, ast.JoinedStr) and any(
-                isinstance(part, ast.FormattedValue) for part in first.values
-            ):
+            # Shared with the ADR 0144 lookup lint rather than re-implemented, so the two cannot
+            # drift on what counts as interpolation. Both directions of its error are advisory and
+            # catalogued in this function's docstring.
+            if first is not None and _is_dynamic_string(first):
                 hits.append(f"{path.name}:{node.lineno}")
     if not hits:
         return CheckResult(
-            "raise-fstring", ok=True, required=False, skipped=True, detail="no f-string raises"
+            "raise-fstring", ok=True, required=False, skipped=True, detail="no interpolated raises"
         )
     shown = ", ".join(hits[:5])
     more = f" (+{len(hits) - 5} more)" if len(hits) > 5 else ""
     detail = (
-        f"{len(hits)} f-string raise(s) interpolate a variable (heuristic PHI reminder — keep "
+        f"{len(hits)} raise(s) build the message by interpolation (heuristic PHI reminder — keep "
         f"identifiers out of exception messages): {shown}{more}"
     )
     return CheckResult("raise-fstring", ok=True, required=False, detail=detail)
@@ -712,22 +765,126 @@ def _folds_to_constant(node: ast.expr) -> bool:
     return False
 
 
-def _is_dynamic_string(node: ast.expr) -> bool:
-    """True when ``node`` is a string built by interpolating a *non-constant* value (f-string with a
-    ``{expr}`` / ``+`` or ``%`` with a variable operand / ``.format(...)`` with args) — the injection
+# Scopes whose body is NOT part of the enclosing scope — each is walked on its own iteration.
+_NESTED_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+
+def _scope_nodes(body: Sequence[ast.stmt]) -> list[ast.AST]:
+    """Every node in a scope's own executable body, not descending into a nested def/class body (each
+    of those is its own scope) and not into a nested signature (decorators, defaults, annotations)."""
+    nodes: list[ast.AST] = []
+    stack: list[ast.AST] = [stmt for stmt in body if not isinstance(stmt, _NESTED_SCOPES)]
+    while stack:
+        node = stack.pop()
+        nodes.append(node)
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, _NESTED_SCOPES):
+                continue
+            stack.append(child)
+    return nodes
+
+
+def _assigned_names(target: ast.expr) -> list[str]:
+    """The plain names a single assignment target binds (a tuple/list unpack yields each element)."""
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return [name for elt in target.elts for name in _assigned_names(elt)]
+    if isinstance(target, ast.Starred):
+        return _assigned_names(target.value)
+    return []  # an attribute/subscript target is not a local name this lint can resolve
+
+
+def _scope_assignments(body: Sequence[ast.stmt]) -> dict[str, list[tuple[ast.expr, bool]]]:
+    """Map each name this scope assigns to ``(value, augmented)`` pairs — every binding it takes, not
+    only the last one.
+
+    Reading *every* binding rather than the last is deliberate. A statement composed in one branch of
+    an ``if`` and a literal in the other has no "last assignment" in source order that means anything,
+    and this lint is a filter, not a boundary (ADR 0144) — so it over-reports rather than let the
+    branch that interpolates go unseen. ``augmented`` marks an ``x += ...`` binding, whose right side
+    is judged by the stricter rule in :func:`_is_dynamic_string`."""
+    env: dict[str, list[tuple[ast.expr, bool]]] = {}
+    for node in _scope_nodes(body):
+        targets: list[ast.expr]
+        if isinstance(node, ast.Assign):
+            targets, value, augmented = list(node.targets), node.value, False
+        elif isinstance(node, ast.AugAssign):
+            targets, value, augmented = [node.target], node.value, True
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets, value, augmented = [node.target], node.value, False
+        else:
+            continue
+        for target in targets:
+            for name in _assigned_names(target):
+                env.setdefault(name, []).append((value, augmented))
+    return env
+
+
+def _is_dynamic_string(
+    node: ast.expr,
+    env: Mapping[str, list[tuple[ast.expr, bool]]] | None = None,
+    _resolving: frozenset[str] = frozenset(),
+) -> bool:
+    """True when ``node`` is a string built by interpolating a *non-constant* value — the injection
     shape for a ``db_lookup``/``fhir_lookup`` query. A pure-literal concat folds to a constant and is
     not flagged. (A trusted-identifier concat like ``"select from " + TABLE`` still flags — SQL cannot
-    parameterize an identifier, so the concatenation nudge is intentional; ADR 0144 known FP.)"""
+    parameterize an identifier, so the concatenation nudge is intentional; ADR 0144 known FP.)
+
+    Reading the call site's own expression is not enough, because the ordinary way to write a longer
+    statement is to build it first and pass the variable (BACKLOG #1658). So with an ``env`` of the
+    enclosing scope's assignments this also follows:
+
+    * a ``Name``, through every value bound to it in ``env`` (cycles cut by ``_resolving``);
+    * an ``x += ...`` binding, dynamic on any right side that is not a pure literal — that is the
+      shape of a statement assembled in pieces;
+    * a wrapping call's arguments and, for a method call, its receiver — so ``dedent(stmt)``,
+      ``stmt.strip()`` and ``" ".join(parts)`` are read through rather than treated as opaque;
+    * both branches of a conditional expression, and the elements of a list/tuple/set or a
+      comprehension (what a ``.join`` is usually handed).
+
+    Following a wrapper by its arguments rather than by name keeps the rule from depending on a list
+    of blessed wrapper names, which would always be missing one.
+
+    **Two callers, and tuning this moves both.** :func:`_unsafe_lookup_hit` passes a query string;
+    :func:`_check_raise_fstring` passes the first argument of any ``raise`` constructor, which need not
+    be a string. The SQL rationale above does not transfer to that caller — see its docstring for the
+    error directions it accepts."""
     if isinstance(node, ast.JoinedStr):
         return any(isinstance(part, ast.FormattedValue) for part in node.values)
     if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mod)):
         return not _folds_to_constant(node)
-    return (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "format"
-        and bool(node.args or node.keywords)
-    )
+    if isinstance(node, ast.IfExp):
+        return _is_dynamic_string(node.body, env, _resolving) or _is_dynamic_string(
+            node.orelse, env, _resolving
+        )
+    if isinstance(node, ast.Starred):
+        return _is_dynamic_string(node.value, env, _resolving)
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return any(_is_dynamic_string(elt, env, _resolving) for elt in node.elts)
+    if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+        return _is_dynamic_string(node.elt, env, _resolving)
+    if isinstance(node, ast.Name):
+        if env is None or node.id in _resolving:
+            return False
+        deeper = _resolving | {node.id}
+        return any(
+            (augmented and not _folds_to_constant(value)) or _is_dynamic_string(value, env, deeper)
+            for value, augmented in env.get(node.id, ())
+        )
+    if isinstance(node, ast.Call):
+        func = node.func
+        if (
+            isinstance(func, ast.Attribute)
+            and func.attr == "format"
+            and (node.args or node.keywords)
+        ):
+            return True
+        parts: list[ast.expr] = list(node.args) + [kw.value for kw in node.keywords]
+        if isinstance(func, ast.Attribute):
+            parts.append(func.value)  # the receiver, e.g. the string `stmt` in `stmt.strip()`
+        return any(_is_dynamic_string(part, env, _resolving) for part in parts)
+    return False
 
 
 def _is_logger_receiver(recv: ast.expr) -> bool:
@@ -763,8 +920,37 @@ def _phi_to_log_hit(call: ast.Call, msg_sym: str) -> bool:
     return any(_references_phi(arg, msg_sym) for arg in checked)
 
 
-def _unsafe_lookup_hit(call: ast.Call) -> bool:
-    """A ``db_lookup``/``fhir_lookup`` whose statement/query argument is interpolated, not a literal."""
+def _lookup_scope_envs(tree: ast.Module) -> dict[int, dict[str, list[tuple[ast.expr, bool]]]]:
+    """``id(Call)`` to the assignment env that call should be read against: the assignments of the
+    scope holding it, over the module's own (so a module-level statement constant is visible inside a
+    function, and a same-named local shadows it).
+
+    Only calls in a scope's executable body get an entry. A call in a signature — a decorator or a
+    default argument — has no scope of its own here and is read as it always was, from its own
+    expression alone."""
+    envs: dict[int, dict[str, list[tuple[ast.expr, bool]]]] = {}
+    module_env = _scope_assignments(tree.body)
+    bodies: list[Sequence[ast.stmt]] = [tree.body]
+    bodies += [
+        node.body
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    for body in bodies:
+        env = {**module_env, **_scope_assignments(body)}
+        for node in _scope_nodes(body):
+            if isinstance(node, ast.Call):
+                envs[id(node)] = env
+    return envs
+
+
+def _unsafe_lookup_hit(
+    call: ast.Call, env: Mapping[str, list[tuple[ast.expr, bool]]] | None = None
+) -> bool:
+    """A ``db_lookup``/``fhir_lookup`` whose statement/query argument is interpolated, not a literal.
+
+    ``env`` is the enclosing scope's assignments (:func:`_lookup_scope_envs`); with it the rule also
+    sees a statement composed *before* the call, which is the ordinary way to write a long one."""
     func = call.func
     is_lookup = (isinstance(func, ast.Name) and func.id in _LOOKUP_NAMES) or (
         isinstance(func, ast.Attribute) and func.attr in _LOOKUP_NAMES
@@ -779,7 +965,7 @@ def _unsafe_lookup_hit(call: ast.Call) -> bool:
     for kw in call.keywords:
         if kw.arg in _LOOKUP_QUERY_KW:
             query = kw.value
-    return query is not None and _is_dynamic_string(query)
+    return query is not None and _is_dynamic_string(query, env)
 
 
 def _open_mode(call: ast.Call, index: int = 1) -> str | None:
@@ -1030,10 +1216,13 @@ def _check_handler_security(
             else []
         )
         # Whole-file rules — unsafe-db-lookup + ambient-authority (helpers + module level included).
+        # unsafe-db-lookup reads each call against its own scope's assignments, so a statement
+        # composed a line earlier and passed by name is seen (BACKLOG #1658).
+        lookup_envs = _lookup_scope_envs(tree)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
-            if _unsafe_lookup_hit(node):
+            if _unsafe_lookup_hit(node, lookup_envs.get(id(node))):
                 file_hits.append((node.lineno, "unsafe-db-lookup"))
             if _ambient_authority_hit(node):
                 file_hits.append((node.lineno, "ambient-authority"))
@@ -1078,32 +1267,48 @@ def _check_handler_security(
     return CheckResult("handler-security", ok=not strict, required=strict, detail=detail)
 
 
-def _check_validate(config_dir: str | Path) -> CheckResult:
+def _check_validate(config_dir: str | Path, *, allow_empty: bool = False) -> CheckResult:
+    """The blocking validate leg. ``allow_empty`` (``--allow-empty-config``, BACKLOG #1648) drops the
+    empty-graph rule so a config dir that legitimately declares no connections — a scaffold, a
+    helper-only bundle — can still pass the gate. It is scoped to ``check``: ``serve`` refuses an
+    empty graph by design and has no opt-out."""
     from messagefoundry.config.wiring import load_config, validate_config
 
-    errors = [d for d in validate_config(config_dir) if d.severity == "error"]
+    errors = [
+        d for d in validate_config(config_dir, allow_empty=allow_empty) if d.severity == "error"
+    ]
     if errors:
         detail = f"{len(errors)} problem(s): " + "; ".join(
             f"{d.file or '-'}: {d.message}" for d in errors[:5]
         )
         return CheckResult("validate", ok=False, required=True, detail=detail)
-    # Say how many declared `encoding` values this pass actually probed (BACKLOG #1613): a pass that
-    # examined NOTHING and one that examined everything and found it good both report no problems.
-    # An env() ref carries no value at config time and NOTHING checks it later either, so the word is
-    # "unchecked" — see Registry.encoding_problems for where the resolved pass would belong.
+    # Say how many declared `encoding` values were probed, and BY WHICH PASS (BACKLOG #1613, #1767):
+    # a pass that examined NOTHING and one that examined everything and found it good both report no
+    # problems. Three populations, never collapsed into two — a literal probed here; an env() ref
+    # DEFERRED to the `build-check` line, which resolves it against this environment; and one left
+    # UNCHECKED on every path because its connection is not deployed, whose env() values ADR 0111
+    # forbids resolving anywhere. A census that folded the last two would read as a clean pass over
+    # values nothing had looked at, which is the false-green this line exists to prevent.
     # load_config here rather than a second return value out of validate_config, matching the sibling
     # checks above; the config is known to load, since every error diagnostic returned already.
-    checked, unchecked = load_config(config_dir).encoding_census()
-    census = f"encodings checked: {checked}, unchecked env() refs: {unchecked}"
+    checked, deferred, unchecked = load_config(
+        config_dir, allow_empty=allow_empty
+    ).encoding_census()
+    census = (
+        f"encodings checked: {checked}, env() refs deferred to build-check: {deferred}, "
+        f"unchecked: {unchecked}"
+    )
     return CheckResult("validate", ok=True, required=True, detail=f"no problems ({census})")
 
 
 # Executable acceptance criteria for dry-run fixtures (Secure Development Standards §5): a fixture may
 # declare its expected dry-run disposition in a sibling ``<fixture>.expect`` file. ``dry_run`` reports
 # ``RECEIVED`` (would route + deliver), ``UNROUTED`` (no handler matched), ``FILTERED`` (a handler ran
-# but delivered nothing), or ``ERROR`` (parse/validate/router-handler failure). ``PROCESSED``/``ROUTED``
-# are live-only post-delivery states, so they alias to ``RECEIVED`` for authoring ergonomics.
-_DRYRUN_DISPOSITIONS = frozenset({"RECEIVED", "UNROUTED", "FILTERED", "ERROR"})
+# but delivered nothing), ``NOT_DEPLOYED`` (a handler ran and every Send it produced addressed a
+# present-but-not-deployed destination — #233, BACKLOG #1690), or ``ERROR`` (parse/validate/
+# router-handler failure). ``PROCESSED``/``ROUTED`` are live-only post-delivery states, so they alias
+# to ``RECEIVED`` for authoring ergonomics.
+_DRYRUN_DISPOSITIONS = frozenset({"RECEIVED", "UNROUTED", "FILTERED", "NOT_DEPLOYED", "ERROR"})
 _DISPOSITION_ALIASES = {
     "PROCESSED": "RECEIVED",
     "ROUTED": "RECEIVED",
@@ -1115,7 +1320,7 @@ _DISPOSITION_ALIASES = {
 def _expected_disposition(fixture_path: str | Path) -> str | None:
     """Read an optional ``<fixture>.expect`` sidecar declaring the expected dry-run disposition.
 
-    Returns the normalized disposition name (``RECEIVED``/``UNROUTED``/``FILTERED``/``ERROR``), or
+    Returns the normalized disposition name (one of :data:`_DRYRUN_DISPOSITIONS`), or
     ``None`` when no sidecar exists — then the fixture keeps the default "must not ERROR" semantics.
     Raises ``ValueError`` for an unreadable or unrecognized declaration (a fixture-authoring mistake).
     """
@@ -1177,6 +1382,7 @@ def _check_dryrun(
 ) -> CheckResult:
     from messagefoundry.config.wiring import WiringError, load_config
     from messagefoundry.pipeline.dryrun import dry_run, read_message_sets
+    from messagefoundry.redaction import safe_error
     from messagefoundry.store import MessageStatus
 
     if messages_dir is None:
@@ -1216,11 +1422,24 @@ def _check_dryrun(
     # not-deployed feed must still resolve to that feed, or it would silently become "unmapped" and be
     # cross-producted against every OTHER feed — worse than the problem. It is the cross-product target
     # list that drops the not-deployed feeds: an unmapped fixture must not be run against a feed nobody
-    # deployed (its Sends are declined, so it would report FILTERED and fail a .expect). An explicitly
+    # deployed (its Sends are declined, so it would report NOT_DEPLOYED — truthfully since BACKLOG
+    # #1690, and still not what a fixture written for the OTHER feeds declared). An explicitly
     # PINNED fixture still runs against its not-deployed feed — carrying the record is the point of the
     # state, and dry-run resolves no env(), so previewing its router/handler logic stays free.
+    #
+    # A **binary** feed (BINARY, DICOM) leaves the cross-product for the same reason and on the same
+    # terms (BACKLOG #1689). `read_message_sets` reads `*.hl7` files, and a binary inbound base64-
+    # carries its bytes rather than decoding them (ADR 0028), so running an unmapped HL7 fixture
+    # against one asks "would this HL7 file route as a DICOM object" — a question whose answer is
+    # always no and which tells an author nothing about either feed. It became visible only when the
+    # preview started carrying bytes the way the listener does: the text-decoded body used to miss the
+    # feed's own `is_binary` guard and report a placid UNROUTED, where the engine would have carried
+    # it, failed the codec, and dead-lettered it. A PINNED fixture still runs against its binary feed,
+    # exactly as one pinned to a not-deployed feed does.
     inbound_names = list(reg.inbound)
-    deployed_inbounds = [n for n, ic in reg.inbound.items() if ic.deployed]
+    crossproduct_inbounds = [
+        n for n, ic in reg.inbound.items() if ic.deployed and not ic.content_type.is_binary
+    ]
     message_sets = read_message_sets(mpath, inbound_names)
     # #230 P4 (ADR 0104): preview under the engine's copy-on-Send posture (best-effort; fallback = the
     # Settings-model default, ON) so the gate exercises the fixtures exactly as the engine would run them.
@@ -1239,21 +1458,28 @@ def _check_dryrun(
         except ValueError as exc:
             errors.append(f"{label}: {exc}")
             continue
-        targets = [target] if target is not None else deployed_inbounds
+        targets = [target] if target is not None else crossproduct_inbounds
         if target is not None:
             pinned += 1
         for ic_name in targets:
             total += 1
             result = dry_run(reg, raw, inbound=ic_name, snapshot_on_send=snapshot_on_send)
+            # A Router/Handler's own `raise` can quote field values, so its text goes through
+            # `safe_error` before it enters the detail string (BACKLOG #1668). **No `show_phi=` keyword,
+            # and this surface must never grow one:** `check` is the commit/CI gate, its stdout lands in
+            # a commit hook and a CI log by design, so an opt-in here would put PHI in that log on
+            # request. The conditions still branch on `result.error` rather than on the redacted value —
+            # redaction must never decide whether the gate fails, only what the failure says — and each
+            # call sits inside its failing arm, so a clean run pays nothing for it.
             if expected is not None:
                 asserted += 1
                 actual = result.disposition.name
                 if actual != expected:
-                    errors.append(
-                        f"{label} @ {ic_name}: expected {expected}, got {result.error or actual}"
-                    )
+                    got = safe_error(result.error) or actual
+                    errors.append(f"{label} @ {ic_name}: expected {expected}, got {got}")
             elif result.error or result.disposition is MessageStatus.ERROR:
-                errors.append(f"{label} @ {ic_name}: {result.error or result.disposition.value}")
+                shown = safe_error(result.error) or result.disposition.value
+                errors.append(f"{label} @ {ic_name}: {shown}")
     if errors:
         detail = f"{len(errors)}/{total} run(s) failed: " + "; ".join(errors[:5])
         return CheckResult("dryrun", ok=False, required=True, detail=detail)
@@ -1263,16 +1489,17 @@ def _check_dryrun(
         # check claiming a pass over a verification it never performed. Every sibling marks "I
         # established nothing" with `skipped=True`, which `CheckResult.blocking` excludes; this was
         # the one path reaching a non-skipped success on zero work. Keep it a postcondition on
-        # `total`: an equivalent precondition on `deployed_inbounds` would have to be kept in
+        # `total`: an equivalent precondition on `crossproduct_inbounds` would have to be kept in
         # lockstep with the loop's branching, and it would miss any other path to zero.
         #
         # `read_message_sets` only ever pins a fixture to a name drawn from `reg.inbound`, so a
         # pinned fixture always contributes a run — reaching here means every fixture is unmapped
-        # AND nothing is deployed. The counts below are read, not inferred, so the detail stays
-        # true even if some later path arrives here for a different reason.
+        # AND no inbound is eligible for the cross-product. The counts below are read, not inferred,
+        # so the detail stays true even if some later path arrives here for a different reason.
         detail = (
             f"{len(message_sets)} fixture(s) read but 0 dry-run(s) executed — only "
-            f"{len(deployed_inbounds)} of {len(inbound_names)} inbound(s) are deployed and no "
+            f"{len(crossproduct_inbounds)} of {len(inbound_names)} inbound(s) take an unmapped "
+            f"fixture (the rest are not deployed, or carry a binary content type) and no "
             f"fixture is feed-pinned, so every target list was empty"
         )
         return CheckResult("dryrun", ok=False, required=True, detail=detail)
@@ -1444,7 +1671,11 @@ def _check_build(
             detail=f"settings did not load: {exc}",
         )
     try:
-        registry = load_config(config_dir)
+        # allow_empty: same reason as reference-backend (BACKLOG #1648) -- REQUIRED leg, and its skip
+        # arm delegates to the one leg `--allow-empty-config` silences. With zero connections there
+        # is nothing to build-check and it passes trivially, which is the honest answer; a skip line
+        # reading "config did not load" about a config that loaded is not.
+        registry = load_config(config_dir, allow_empty=True)
     except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
         # A broken graph is reported (blocking) by validate; don't double-fail here.
         return CheckResult(
@@ -2156,7 +2387,11 @@ def _check_reference_backend(
             detail=f"settings did not load: {exc}",
         )
     try:
-        registry = load_config(config_dir)
+        # allow_empty: this leg is REQUIRED and its subject is `registry.references`, which exists
+        # with zero connections declared (BACKLOG #1648). Its skip arm delegates to validate -- the
+        # one leg `--allow-empty-config` silences -- so without this the flag would silently disable
+        # a required check and print "config did not load" about a config that loaded.
+        registry = load_config(config_dir, allow_empty=True)
     except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
         return CheckResult(
             "reference-backend",

@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.__main__ import main
+from messagefoundry.config.settings import load_settings
 
 SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
 ADT_A01 = (
@@ -183,6 +184,187 @@ def test_dryrun_redacts_bodies_by_default(
     assert "DOE" not in json.dumps(r)
     # routing metadata stays — that's what dryrun is for
     assert r["message_type"] == "ADT^A01" and r["control_id"] == "MSG1"
+
+
+# --- BACKLOG #1668: a raised exception's text is PHI on the dryrun and check surfaces -------------
+#
+# `test_dryrun_redacts_bodies_by_default` above is blind to this: it runs samples/config, whose handler
+# never raises, so `error` is null there and the assertion over it asserts nothing. These fixtures ship
+# their own handler that DOES raise, quoting PID-5 and PID-3 the way an author debugging a feed does.
+#
+# PHI: every value here is synthetic (CLAUDE.md §9). The raise is built by concatenation, which the
+# advisory `raise-fstring` check now DOES flag (it reads the `+` spelling as well as the f-string).
+# That costs these fixtures nothing: the check only ever prints, and its detail carries a filename
+# and line number, never the message text. The assertions below are about `redact` on the dryrun and
+# check surfaces, which is a separate path from the lint.
+PHI_RAISER_CONFIG = """\
+# SPDX-License-Identifier: AGPL-3.0-or-later
+from messagefoundry import File, handler, inbound, router
+
+inbound("IB_TEST", File(directory="in"), router="r")
+
+
+@router("r")
+def route(msg):
+    return ["h"]
+
+
+@handler("h")
+def h(msg):
+    raise ValueError("unmapped patient " + str(msg["PID-5"]) + " mrn " + str(msg["PID-3"]))
+"""
+
+# Whole fields, not components: PID-3 and PID-5 each carry >=2 HL7 delimiters, which is what `redact`
+# keys on. A bare component (`PID-3.1` -> "900123456") is the module's own documented residual, so a
+# fixture built from one would assert a guarantee redaction.py does not make. That is also why this is
+# spelled out rather than derived from ADT_A01 above: ADT_A01's `DOE^JANE` carries ONE delimiter, and a
+# `.replace()` off it would silently stop testing redaction the day somebody edits that constant.
+PHI_RAISER_MESSAGE = (
+    "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|MSG1|P|2.5.1\r"
+    "EVN|A01|20260101\r"
+    "PID|1||900123456^^^H^MR||DOE^JANE^Q||19800505|F\r"
+)
+#: Tokens that must not reach stdout on any default path. The prose the author wrote must survive.
+PHI_TOKENS = ("DOE", "JANE", "900123456", "19800505")
+
+
+def _phi_raiser(tmp_path: Path) -> tuple[str, str, str]:
+    """A config dir whose handler raises quoting PHI, plus the two paths the two CLIs want.
+
+    ``check`` takes the fixtures ROOT and walks it; ``dryrun``'s ``read_messages`` does not recurse, so
+    it takes the message FILE. The fixture sits under ``<messages>/IB_TEST/`` so ``check`` runs it
+    against that feed by name rather than by cross-product, which does not depend on the feed's
+    deployed state."""
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "IB_TEST.py").write_text(PHI_RAISER_CONFIG, encoding="utf-8")
+    fixtures = tmp_path / "messages" / "IB_TEST"
+    fixtures.mkdir(parents=True)
+    message = fixtures / "a.hl7"
+    message.write_bytes(PHI_RAISER_MESSAGE.encode("utf-8"))
+    return str(cfg), str(tmp_path / "messages"), str(message)
+
+
+@pytest.mark.parametrize("trace", [[], ["--trace"]])
+def test_dryrun_redacts_a_raised_exception_by_default(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], trace: list[str]
+) -> None:
+    """Plain and traced ``dryrun`` both withhold the PID values a handler's ``raise`` quoted."""
+    cfg, _messages, message = _phi_raiser(tmp_path)
+    rc = main(["dryrun", "--config", cfg, "--messages", message, "--json", *trace])
+    assert rc == 0
+    out = capsys.readouterr().out
+    results = json.loads(out)
+    assert isinstance(results, list) and len(results) == 1
+    error = results[0]["error"]
+    # The instrument has to have observed a raise at all, or every absence below is vacuous -- which
+    # is exactly how the pre-existing default-redaction test passed while this leak was open.
+    assert error, "the fixture handler did not raise; the assertions below would prove nothing"
+    for token in PHI_TOKENS:
+        assert token not in out, f"{token!r} reached dryrun stdout"
+    assert "[redacted]" in error
+    # `safe_text`, not a whole-string drop: the stage prefix and the author's own prose survive, which
+    # is the detail an author reaches for dryrun to read.
+    assert "router/handler error:" in error and "unmapped patient" in error
+
+
+@pytest.mark.parametrize("trace", [[], ["--trace"]])
+def test_dryrun_show_phi_still_yields_the_raised_text(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], trace: list[str]
+) -> None:
+    """``--show-phi`` still returns the raw text -- the affordance redacting at the SOURCE would destroy.
+
+    Synthetic data only (CLAUDE.md §9); this is the opt-in arm of the gate, not a licence for real PHI.
+    """
+    cfg, _messages, message = _phi_raiser(tmp_path)
+    rc = main(["dryrun", "--config", cfg, "--messages", message, "--json", "--show-phi", *trace])
+    assert rc == 0
+    error = json.loads(capsys.readouterr().out)[0]["error"]
+    assert "DOE^JANE^Q" in error and "900123456^^^H^MR" in error
+
+
+# --- BACKLOG #1692: dryrun prints a Handler's declared metadata writes ----------------------------
+#
+# A SetMeta key and value are both message-derived in the general case, so this fixture builds each
+# from a PID field the way an author tagging a message does. Synthetic data only (CLAUDE.md §9).
+META_WRITER_CONFIG = """\
+# SPDX-License-Identifier: AGPL-3.0-or-later
+from messagefoundry import File, SetMeta, handler, inbound, router
+
+inbound("IB_TEST", File(directory="in"), router="r")
+
+
+@router("r")
+def route(msg):
+    return ["h"]
+
+
+@handler("h")
+def h(msg):
+    return [SetMeta("patient " + str(msg["PID-5"]), "mrn " + str(msg["PID-3"]))]
+"""
+
+
+def _meta_writer(tmp_path: Path) -> tuple[str, str]:
+    """A config dir whose handler declares one ``SetMeta``, plus the message file ``dryrun`` wants."""
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "IB_TEST.py").write_text(META_WRITER_CONFIG, encoding="utf-8")
+    fixtures = tmp_path / "messages" / "IB_TEST"
+    fixtures.mkdir(parents=True)
+    message = fixtures / "a.hl7"
+    message.write_bytes(PHI_RAISER_MESSAGE.encode("utf-8"))
+    return str(cfg), str(message)
+
+
+def test_dryrun_prints_meta_ops_redacted_by_default(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The CLI emits a ``meta_ops`` key, and redacts both members without ``--show-phi``.
+
+    Before BACKLOG #1692 the output dict had no ``meta_ops`` key at all, and the field behind it was
+    never populated, so a Handler's ``SetMeta`` was invisible on this surface.
+    """
+    cfg, message = _meta_writer(tmp_path)
+    assert main(["dryrun", "--config", cfg, "--messages", message, "--json"]) == 0
+    out = capsys.readouterr().out
+    ops = json.loads(out)[0]["meta_ops"]
+    # The instrument has to have observed a SetMeta at all, or the absences below prove nothing.
+    assert len(ops) == 1, f"the fixture handler declared no SetMeta: {ops!r}"
+    assert "redacted" in ops[0]["key"] and "redacted" in ops[0]["value"]
+    for token in PHI_TOKENS:
+        assert token not in out, f"{token!r} reached dryrun stdout"
+
+
+def test_dryrun_show_phi_yields_the_declared_meta_op(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The opt-in arm: ``--show-phi`` returns the key and value the Handler actually declared."""
+    cfg, message = _meta_writer(tmp_path)
+    assert main(["dryrun", "--config", cfg, "--messages", message, "--json", "--show-phi"]) == 0
+    ops = json.loads(capsys.readouterr().out)[0]["meta_ops"]
+    assert ops == [{"key": "patient DOE^JANE^Q", "value": "mrn 900123456^^^H^MR"}]
+
+
+def test_check_redacts_a_raised_exception_and_offers_no_opt_in(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``check`` redacts unconditionally, and must never grow a ``--show-phi``.
+
+    It is the commit/CI gate: its stdout is written to a CI log by design, so an opt-in here would put
+    PHI in that log on request. The second half pins that -- an escape hatch added later fails here."""
+    cfg, messages, _message = _phi_raiser(tmp_path)
+    rc = main(["check", "--config", cfg, "--messages", messages, "--no-lint"])
+    assert rc == 1  # the raising fixture fails the required dryrun check
+    out = capsys.readouterr().out
+    dryrun_line = next(ln for ln in out.splitlines() if " dryrun" in ln)
+    assert dryrun_line.startswith("FAIL"), f"dryrun check did not run: {dryrun_line!r}"
+    for token in PHI_TOKENS:
+        assert token not in out, f"{token!r} reached check stdout"
+    assert "[redacted]" in dryrun_line and "unmapped patient" in dryrun_line
+
+    with pytest.raises(SystemExit):  # argparse: check has no --show-phi, and must not acquire one
+        main(["check", "--config", cfg, "--messages", messages, "--show-phi"])
 
 
 def test_dryrun_splits_batched_file(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -2426,3 +2608,273 @@ def test_admin_unlock_writes_an_audit_row(
             await s.close()
 
     assert "auth.admin_unlocked" in asyncio.run(rows())
+
+
+def test_audit_verify_exits_2_on_a_file_that_is_not_a_database(tmp_path: Path) -> None:
+    """BACKLOG #1670: the measured symptom, and the assertion is that the PROCESS ENDS.
+
+    ``MessageStore.open`` connects before its first ``PRAGMA``, so a path that is not a database
+    raised with the aiosqlite connection still live. That worker thread is not a daemon, so the
+    interpreter blocked in ``threading._shutdown`` joining it -- two hung ``audit-verify`` processes
+    were measured at 319 seconds and killed by hand. A scheduled compliance job pointed at the wrong
+    file would neither pass nor fail; it would pile up one stuck process per tick.
+
+    A CHILD interpreter with a hard timeout is the only honest shape. Asserting that ``close`` was
+    called does not prove the process exits, and an in-process check would hang pytest's own exit.
+
+    Exit 2, not 1: ``audit-verify`` spends 1 on a BROKEN CHAIN, so a job keying on exit codes would
+    read "not a database" as "tamper detected".
+    """
+    import subprocess
+    import sys
+
+    bad = tmp_path / "not-a-db.txt"
+    bad.write_text("not a db\n", encoding="utf-8")
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "messagefoundry", "audit-verify", "--db", str(bad)],
+        cwd=tmp_path,  # away from the repo, so no stray ./messagefoundry.toml is picked up
+        capture_output=True,
+        text=True,
+        timeout=30,  # well under the 60s pytest-timeout watchdog, so THIS reports the failure
+    )
+    assert proc.returncode == 2, f"rc={proc.returncode}\n{proc.stderr}"
+    assert "cannot open the store" in proc.stderr
+    assert "Traceback" not in proc.stderr, "a raw traceback reached the operator"
+
+
+# --- the last-resort excepthooks are a process property, not a `serve` one (BACKLOG #1674) ----------
+#
+# THE ROW'S OWN REPRODUCTION NO LONGER REPRODUCES, AND THAT IS NOT EVIDENCE THE ROW IS CLOSED.
+# It named `audit-verify --db <directory>` printing a `sqlite3.OperationalError` traceback; BACKLOG
+# #1670 translated that to a clean line and exit 2, and the test directly above pins it. What #1670
+# fixed is one subcommand's handling of one exception class. What #1674 is about is the guarantee
+# `last_resort` states for EVERY unhandled error in the process, which stayed installed inside
+# `_serve` alone. So these probe the PROPERTY -- is the hook in place for a non-serve subcommand --
+# rather than re-running a repro that a neighbouring fix has since cleaned up.
+
+
+def test_a_non_serve_subcommand_installs_both_last_resort_hooks(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Both hooks, because `install_thread_excepthook` had the identical serve-only gap: a non-main
+    thread's escaping exception goes to `threading.excepthook` and nowhere else, so installing the
+    sync hook alone leaves the engine's narrow-except drain threads unredacted.
+
+    The originals go back in a `finally`, because these are process-wide: pytest restores
+    `threading.excepthook` itself per test, but not `sys.excepthook` (its `unraisableexception`
+    plugin guards `sys.unraisablehook`, which is a different surface).
+    """
+    import sys
+    import threading
+
+    from messagefoundry import last_resort
+
+    sys_hook, thread_hook = sys.excepthook, threading.excepthook
+    try:
+        sys.excepthook, threading.excepthook = sys.__excepthook__, threading.__excepthook__
+
+        assert main(["hl7schema", "--json"]) == 0
+        capsys.readouterr()  # the schema payload is not what this test is about
+
+        assert sys.excepthook is last_resort._excepthook, (
+            "a non-serve subcommand ran with the stock sys.excepthook: an uncaught exception would "
+            "print a raw traceback that can quote a PHI-bearing value (ASVS 16.5.4)"
+        )
+        assert threading.excepthook is last_resort._thread_excepthook, (
+            "the thread hook was not installed, so an exception escaping a non-main thread's run() "
+            "still reaches the stdlib default"
+        )
+    finally:
+        sys.excepthook, threading.excepthook = sys_hook, thread_hook
+
+
+def test_an_uncaught_exception_in_a_non_serve_subcommand_prints_no_traceback(
+    tmp_path: Path,
+) -> None:
+    """End to end, in a CHILD interpreter, because `sys.excepthook` only fires at the interpreter's
+    top level -- inside pytest the exception never gets there, so an in-process check would assert
+    nothing. A dispatch entry is replaced with a raiser: that is the only honest way to produce an
+    *unhandled* exception now that every shipped subcommand's known escapes are handled.
+
+    The exit code is asserted UNCHANGED at 1. Installing an excepthook does not alter it -- the
+    interpreter still exits 1 once the hook returns -- which is exactly why this shape was taken over
+    the row's alternative of wrapping the dispatch and exiting 2.
+    """
+    import subprocess
+    import sys
+
+    driver = tmp_path / "raise_in_a_subcommand.py"
+    driver.write_text(
+        "import messagefoundry.__main__ as m\n"
+        "def _boom(args):\n"
+        "    raise RuntimeError('synthetic failure carrying DOE^JANE')\n"
+        "m._DISPATCH['hl7schema'] = _boom\n"
+        "raise SystemExit(m.main(['hl7schema', '--json']))\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [sys.executable, str(driver)],
+        cwd=tmp_path,  # away from the repo, so no stray ./messagefoundry.toml is picked up
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 1, f"rc={proc.returncode}\n{proc.stderr}"
+    assert "Traceback" not in proc.stderr, "a raw traceback reached the operator"
+    assert "last-resort: uncaught exception" in proc.stderr, (
+        "the error vanished instead of being logged -- the guarantee is redact-and-report, not drop"
+    )
+
+
+# --- `--version` says which tree answered (BACKLOG #1677) -------------------------------------------
+
+
+def test_version_reports_the_package_directory_that_answered(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Why a shadowing copy of the package can answer at all is stated once, on `_VersionAction`.
+
+    ASSERTS ON THE PRESENCE OF THE PATH TOKEN, NEVER ON A LINE INDEX, and that is not fussiness. The
+    obvious implementation -- a newline inside `action="version"`'s text -- yields no second line at
+    all, for the reason `_VersionAction`'s docstring gives, so a test keyed to `lines[1]` would pass
+    on the author's terminal and be a coin flip everywhere else.
+    """
+    import messagefoundry.__main__ as main_module
+    from messagefoundry import __version__
+
+    with pytest.raises(SystemExit) as exc:
+        main(["--version"])
+    assert exc.value.code == 0
+
+    out = capsys.readouterr().out
+    package_dir = Path(main_module.__file__).resolve().parent
+    # two independent claims: the version is still reported, AND the tree that answered is named.
+    # (`"messagefoundry" in out` would NOT be a second claim -- the path already contains it.)
+    assert f"messagefoundry {__version__}" in out, out
+    assert str(package_dir) in out, f"--version does not say which tree answered:\n{out}"
+    # the reported directory is the real one, not a plausible string
+    assert (package_dir / "__main__.py").is_file()
+
+
+# --- BACKLOG #1673: which stream a failure goes to ---------------------------------------------
+
+
+def _unloadable_config(tmp_path: Path) -> Path:
+    """A config dir `graph` cannot load, so its failure goes through `_emit_error`.
+
+    `validate` is the wrong vehicle here: it REPORTS diagnostics as its output rather than failing
+    through `_emit_error`, so it proves nothing about which stream an error takes."""
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    (cfg / "broken.py").write_text("this is not python (", encoding="utf-8")
+    return cfg
+
+
+def test_text_mode_error_goes_to_stderr(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """A text-mode failure must not land in the file a shell redirect is capturing.
+
+    `messagefoundry graph --config <broken> > report.txt` wrote the reason into report.txt and left
+    the terminal blank; `2>/dev/null` could not silence diagnostics without silencing results."""
+    assert main(["graph", "--config", str(_unloadable_config(tmp_path))]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == "", f"the failure reached stdout: {captured.out!r}"
+    assert captured.err.startswith("error: "), captured.err
+
+
+def test_json_mode_error_stays_on_stdout(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The other half, and it is deliberate: under --json the error object is the output.
+
+    A consumer pipes stdout to `jq` and reads the non-zero exit code to tell a failure from a
+    success payload, so moving this to stderr would break the machine-readable contract."""
+    assert main(["graph", "--config", str(_unloadable_config(tmp_path)), "--json"]) == 1
+    captured = capsys.readouterr()
+    assert captured.err == "", f"the JSON payload reached stderr: {captured.err!r}"
+    payload = json.loads(captured.out)
+    assert isinstance(payload, dict), payload
+    assert "error" in payload
+
+
+# --- the boot path must not echo a configured value into an unattended service log --------------
+
+
+#: The value the boot-path tests below plant in the environment and then look for. Why it is short
+#: and why it must not look like a key are stated once, on ``_CANARY`` in
+#: ``tests/test_cli_cluster_vip.py``; the short form is that pydantic abbreviates a long
+#: ``input_value`` repr FROM THE MIDDLE, so an ``in`` test over a 32-character value reads False
+#: while its tail is plainly on screen. A separate constant rather than a cross-module test import:
+#: sharing it would let one suite's edit weaken another suite's guard with nothing reporting it.
+_BOOT_CANARY = "not-a-real-one"
+
+
+@pytest.mark.parametrize("command", ["serve", "supervise"])
+def test_the_boot_path_never_echoes_an_env_supplied_secret(
+    command: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A settings load that fails at boot reports the FIELD, never the value the field was given.
+
+    The failing config is a ``[store]`` with ``backend = "postgres"`` and none of the three keys
+    that backend requires. ``MEFOR_STORE_PASSWORD`` is set, as it would be on any real Postgres
+    node, so the store password is inside the mapping ``_require_server_db_fields`` rejects, and
+    ``str(ValidationError)`` renders that whole mapping as ``input_value=``.
+
+    WHY THIS PAIR AND NOT THE OTHER ``ValidationError`` ARMS IN THIS MODULE. ``serve`` and
+    ``supervise`` are the two commands the Windows service runs under NSSM, which captures stderr
+    to a file (``docs/SERVICE.md``). A ``[store]`` that fails to validate on a deploying site would
+    therefore write the store password into a PERSISTED service log on every start attempt, with no
+    operator present to see it happen, and support-bundle assembly then collects that log. No
+    instance runs this today, so that is what a first deployment WOULD hit, not something anyone is
+    living with.
+
+    THE CONTROL IS THE RAW RENDERING, ASSERTED FIRST. A test that only looked for the absence of a
+    string would pass just as well against an empty error, a renamed variable, or a value pydantic
+    never had -- so it first proves the planted secret IS in ``str(exc)`` on this exact config,
+    which is what makes its absence below attributable to the rendering rather than to luck.
+    """
+    monkeypatch.setenv("MEFOR_STORE_PASSWORD", _BOOT_CANARY)
+    cfg = tmp_path / "messagefoundry.toml"
+    cfg.write_text('[store]\nbackend = "postgres"\n', encoding="utf-8")
+
+    with pytest.raises(ValueError) as caught:  # ValidationError subclasses ValueError
+        load_settings(config_path=str(cfg))
+    assert _BOOT_CANARY in str(caught.value), (
+        "CONTROL FAILED: str(ValidationError) does not carry the planted secret on this config, so "
+        "the absence asserted below would prove nothing -- re-aim this guard at a config whose "
+        "rejected input still holds [store].password"
+    )
+
+    assert main([command, "--service-config", str(cfg)]) == 2
+    captured = capsys.readouterr()
+    err = captured.err
+
+    # BOTH streams, because NSSM captures both to files: asserting only on the one the error
+    # currently takes would go quiet the day a caller moved it to the other.
+    assert _BOOT_CANARY not in err + captured.out, (
+        f"`{command}` echoed an env-supplied secret into its config error, which NSSM would capture "
+        "to a service log file. Render the failure with settings_error_detail(); "
+        "str(ValidationError) carries input_value= for every failing field."
+    )
+    # Useful, not just quiet: an error that named no field would also satisfy the assertion above.
+    assert "store" in err and "server, database, username" in err
+
+
+@pytest.mark.parametrize("command", ["serve", "supervise"])
+def test_the_boot_path_reports_a_directory_service_config_without_a_traceback(
+    command: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--service-config`` naming a DIRECTORY is an operator error, not a crash.
+
+    Why a directory reaches the open at all, and why ``OSError`` has to be in the catch, are stated
+    once at ``_load_service_settings``. What this pins is that the two SERVICE commands exit 2 with
+    a reported line rather than a traceback, on the stream NSSM captures.
+
+    It asserts the BEHAVIOUR rather than the exception class, because the class differs by platform
+    and this test runs on both legs.
+    """
+    assert main([command, "--service-config", str(tmp_path)]) == 2
+    assert capsys.readouterr().err.startswith("error: ")

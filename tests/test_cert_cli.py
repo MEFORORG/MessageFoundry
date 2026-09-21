@@ -11,7 +11,9 @@ passphrase, and that a bad/missing password never leaks into the error output.
 from __future__ import annotations
 
 import datetime
+import errno
 import json
+import os
 import time
 from pathlib import Path
 
@@ -315,10 +317,133 @@ def test_inventory_service_config_adds_api_cert(
         ]
     )
     assert rc == 0
-    certs = json.loads(capsys.readouterr().out)["certs"]
-    api = next(c for c in certs if c["label"] == "api")
+    payload = json.loads(capsys.readouterr().out)
+    api = next(c for c in payload["certs"] if c["label"] == "api")
     assert "api.local" in api["subject"]
     assert api["sans"] == ["api.local"]
+    # BACKLOG #1695: an operator chain is reported as the served cert, over https.
+    assert payload["api_tls"] == {
+        "scheme": "https",
+        "source": "operator",
+        "cert": str(cert_path),
+        "cert_present": True,
+    }
+
+
+# --- cert inventory: what the API bind serves with (BACKLOG #1695) ----------
+#
+# A CLIENT (the VS Code extension) cannot verify the engine's handshake without the path of the
+# certificate it presents, and since ADR 0172 that is no longer the same question as
+# `[api].tls_cert_file`: an engine with no operator chain MINTS a self-signed pair beside its store.
+# Reporting it here keeps the generated filename and the `[store].path` rule in the engine, where a
+# client cannot copy them and drift.
+
+
+def _svc(tmp_path: Path, state: Path, api_lines: str = "") -> Path:
+    """A service TOML whose store (and therefore the generated pair) lives under `state`."""
+    svc = tmp_path / "messagefoundry.toml"
+    body = f"[store]\npath = {json.dumps(str(state / 'messagefoundry.db'))}\n"
+    if api_lines:
+        body += f"\n[api]\n{api_lines}"
+    svc.write_text(body, encoding="utf-8")
+    return svc
+
+
+def test_inventory_service_config_alone_is_a_source(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # It used to be read ONLY alongside --config, so a client asking the one question it has -- which
+    # certificate does this engine present -- was refused with "no certificate source".
+    state = tmp_path / "state"
+    state.mkdir()
+    rc = main(["cert", "inventory", "--service-config", str(_svc(tmp_path, state)), "--json"])
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["api_tls"]["source"] == "generated"
+
+
+def test_inventory_reports_the_generated_pair_before_it_is_minted(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The path is reported even though nothing is on disk yet (the engine mints on its first run),
+    # and that must NOT count as a missing-file error -- the engine has simply never started.
+    state = tmp_path / "state"
+    state.mkdir()
+    rc = main(["cert", "inventory", "--service-config", str(_svc(tmp_path, state)), "--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["certs"] == []
+    assert payload["api_tls"]["scheme"] == "https"
+    assert payload["api_tls"]["cert_present"] is False
+    assert Path(payload["api_tls"]["cert"]).parent == state.resolve()
+
+
+def test_inventory_reports_the_minted_pair_the_engine_actually_wrote(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Mint through the engine's OWN wiring rather than a stand-in, so the reported path is the one
+    # `serve` would present and a client pinning it is pinning the real anchor.
+    from messagefoundry.api.tls import ensure_api_tls_material
+    from messagefoundry.config.settings import ApiSettings
+
+    state = tmp_path / "state"
+    state.mkdir()
+    minted = ensure_api_tls_material(ApiSettings(), state_dir=state)
+    assert minted is not None
+
+    rc = main(["cert", "inventory", "--service-config", str(_svc(tmp_path, state)), "--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["api_tls"]["cert"] == minted[0]
+    assert payload["api_tls"]["cert_present"] is True
+    # It is also inventoried as a row now, so its expiry is visible like any other served cert.
+    api = next(c for c in payload["certs"] if c["label"] == "api")
+    assert api["path"] == minted[0]
+    assert api["expired"] is False
+
+
+def test_inventory_reports_http_for_a_declared_upstream_terminator(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The one topology where the engine deliberately mints nothing and speaks plaintext to its proxy.
+    # A client that assumes https because "the engine always serves TLS" breaks exactly this.
+    state = tmp_path / "state"
+    state.mkdir()
+    svc = _svc(tmp_path, state, 'tls_terminated_upstream = true\ntrusted_proxies = ["127.0.0.1"]\n')
+    rc = main(["cert", "inventory", "--service-config", str(svc), "--json"])
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["api_tls"] == {
+        "scheme": "http",
+        "source": "upstream",
+        "cert": None,
+        "cert_present": False,
+    }
+
+
+def test_inventory_still_errors_on_an_operator_cert_that_is_not_there(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The existence gate that keeps an unminted GENERATED pair quiet must not also silence a
+    # configured path that does not resolve -- that one is a real fault and keeps its error row.
+    state = tmp_path / "state"
+    state.mkdir()
+    missing = tmp_path / "nope.pem"
+    svc = _svc(tmp_path, state, f"tls_cert_file = {json.dumps(str(missing))}\n")
+    rc = main(["cert", "inventory", "--service-config", str(svc), "--json"])
+    assert rc == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["certs"][0]["error"] == "file not found"
+    assert payload["api_tls"]["source"] == "operator"
+
+
+def test_inventory_omits_api_tls_without_a_service_config(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Absent means "unknown", never a guessed default: there is no settings file to answer from.
+    _k, cert = _make_cert("plain")
+    cert_path = tmp_path / "plain.pem"
+    cert_path.write_bytes(_pem(cert))
+    assert main(["cert", "inventory", "--cert", str(cert_path), "--json"]) == 0
+    assert "api_tls" not in json.loads(capsys.readouterr().out)
 
 
 # --- cert self-signed -------------------------------------------------------
@@ -361,9 +486,13 @@ def test_self_signed_ip_literal_lands_as_ip_address_san(
 
     Hostname verification for an IP-literal URL is satisfied ONLY by an ``iPAddress`` entry -- a DNS
     entry carrying the same characters does not match it. Every shipped first-party client defaults
-    to ``http://127.0.0.1:8765`` (``ide/src/cli.ts``, ``tray/config.py``, ``apiclient/client.py``) and
-    ``[api].host`` binds ``127.0.0.1``, so minting for the engine's own default produced a
-    certificate that could not verify against any of them. BACKLOG #1179.
+    to the IP LITERAL ``127.0.0.1:8765`` (``ide/src/cli.ts``, ``tray/config.py``,
+    ``apiclient/client.py``) and ``[api].host`` binds ``127.0.0.1``, so minting for the engine's own
+    default produced a certificate that could not verify against any of them. BACKLOG #1179.
+
+    The SCHEME those clients default to is a separate, moving question and deliberately not named
+    here: ``ide/src/cli.ts`` now defaults to ``https://`` (BACKLOG #1695), and the rest follow one at
+    a time. It is the HOST that decides this test, and it has not moved.
     """
     out = tmp_path / "o"
     rc = main(
@@ -494,3 +623,76 @@ def test_inventory_does_not_crash_or_leak_on_non_valueerror_parse_failure(
     assert rc == 1
     assert "could not read or parse certificate" in combined
     assert "SECRET-LOOKING-TEXT" not in combined  # exception text never echoed
+
+
+# --- the key write is all-or-nothing --------------------------------------------------------
+
+
+class _HandleThatDiesMidWrite:
+    """Wraps the real file object so the fd is still closed by the `with`, but `write` lands some
+    bytes and then raises. Writing through the real handle first is the point: it makes the failure
+    leave genuine truncated debris rather than an empty file, which is what the guard must remove.
+
+    The fixtures below deliberately carry NO `BEGIN PRIVATE KEY` header. `_write_private_key` writes
+    opaque bytes and never parses them, so a real PEM header would add nothing and would trip the
+    gitleaks private-key rule in the commit gate."""
+
+    def __init__(self, fh: object) -> None:
+        self._fh = fh
+
+    def __enter__(self) -> _HandleThatDiesMidWrite:
+        self._fh.__enter__()  # type: ignore[attr-defined]
+        return self
+
+    def __exit__(self, *exc: object) -> object:
+        return self._fh.__exit__(*exc)  # type: ignore[attr-defined]
+
+    def write(self, _data: bytes) -> int:
+        self._fh.write(b"KEY-MATERIAL-STAND-IN\nTRUNC")  # type: ignore[attr-defined]
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+
+def test_a_key_write_that_dies_midway_leaves_no_truncated_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_write_private_key` must leave nothing behind when the write fails.
+
+    The O_EXCL create succeeds, then the write raises on a full volume. Without the cleanup guard a
+    TRUNCATED private key would be left at `path` on first deployment, and because the same O_EXCL
+    then refuses to overwrite it, nothing could ever re-mint over it: the caller would get a bare
+    FileExistsError naming no cause, on every retry, until someone deleted the file by hand.
+
+    Mutation: drop the `try/finally`. Red: the truncated key is still there."""
+    from messagefoundry.__main__ import _write_private_key
+
+    real_fdopen = os.fdopen
+
+    def _dying_fdopen(fd: int, *a: object, **k: object) -> _HandleThatDiesMidWrite:
+        return _HandleThatDiesMidWrite(real_fdopen(fd, *a, **k))  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "fdopen", _dying_fdopen)
+    key_path = tmp_path / "key.pem"
+
+    with pytest.raises(OSError, match="No space left on device"):
+        _write_private_key(key_path, b"KEY-MATERIAL-STAND-IN\nREAL\n")
+
+    assert not key_path.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_pre_existing_key_is_refused_and_never_deleted(tmp_path: Path) -> None:
+    """The invariant the cleanup guard must not have widened. "Never clobber a key" means the O_EXCL
+    refusal fires on an existing file AND leaves it intact. The create therefore has to stay OUTSIDE
+    the guard: inside it, the FileExistsError would unlink the very key the refusal protects, turning
+    a safe refusal into the silent key loss it was written to prevent.
+
+    Mutation: move `os.open` inside the `try`. Red: the operator's key is gone."""
+    from messagefoundry.__main__ import _write_private_key
+
+    key_path = tmp_path / "key.pem"
+    key_path.write_bytes(b"KEY-MATERIAL-STAND-IN\nTHE-OPERATORS-REAL-KEY\n")
+
+    with pytest.raises(FileExistsError):
+        _write_private_key(key_path, b"KEY-MATERIAL-STAND-IN\nREPLACEMENT\n")
+
+    assert key_path.read_bytes() == b"KEY-MATERIAL-STAND-IN\nTHE-OPERATORS-REAL-KEY\n"

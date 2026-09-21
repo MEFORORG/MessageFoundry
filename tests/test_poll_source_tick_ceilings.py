@@ -28,6 +28,7 @@ import pytest
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.config.wiring import DatabasePoll, File, Ftp, Sftp
 from messagefoundry.transports import build_source, remotefile
+from messagefoundry.transports import database as db_mod
 from messagefoundry.transports.base import DEFAULT_MAX_ITEMS_PER_POLL
 from messagefoundry.transports.database import DatabaseSource
 from messagefoundry.transports.file import FileSource
@@ -290,6 +291,14 @@ class _FakeRemoteClient(_RemoteClient):
     def remove(self, path: str) -> None:
         self.files.pop(path, None)
 
+    def dispose_unless_changed(self, path: str, expected_size: int, dest: str | None) -> int | None:
+        # #116: nothing here writes behind the poll, so there is never a size change to report.
+        if dest is None:
+            self.remove(path)
+        else:
+            self.rename(path, dest)
+        return None
+
     def ensure_dir(self, remote_dir: str) -> bool:
         return False
 
@@ -427,12 +436,21 @@ async def test_remote_refused_listing_name_does_not_charge_the_ceiling(
 # === DATABASE =================================================================
 
 
+#: A payload column value that ``_body`` cannot turn into a body: raw bytes that are not valid UTF-8,
+#: so ``bytes(value).decode(encoding)`` raises ``UnicodeDecodeError`` (a ``ValueError``). This is the
+#: genuinely PER-ROW decode failure — the static one (a ``body_column`` naming no selected column) is
+#: caught once per poll and never reaches a row at all.
+_POISON = b"\xff\xfe\xfd"
+
+
 class _FakeTable:
     """A poll table. ``mark`` deletes a row, which is the shape ``mark_statement`` is documented to
     have, and it is what makes a deferral drain: an unmarked row is still selected by the next poll."""
 
-    def __init__(self, count: int) -> None:
-        self.rows: list[tuple[int, str]] = [(n, _ADT.format(n=n)) for n in range(count)]
+    def __init__(self, count: int, *, rows: list[tuple[int, Any]] | None = None) -> None:
+        self.rows: list[tuple[int, Any]] = (
+            rows if rows is not None else [(n, _ADT.format(n=n)) for n in range(count)]
+        )
 
     def mark(self, row_id: int) -> None:
         self.rows = [row for row in self.rows if row[0] != row_id]
@@ -443,7 +461,7 @@ class _FakeCursor:
 
     def __init__(self, table: _FakeTable, fetches: list[tuple[str, int | None]]) -> None:
         self._table = table
-        self._buffer: list[tuple[int, str]] = []
+        self._buffer: list[tuple[int, Any]] = []
         self._position = 0
         self._fetches = fetches
 
@@ -454,13 +472,13 @@ class _FakeCursor:
         else:  # a per-row mark
             self._table.mark(params[0])
 
-    async def fetchall(self) -> list[tuple[int, str]]:
+    async def fetchall(self) -> list[tuple[int, Any]]:
         self._fetches.append(("fetchall", None))
         rows = self._buffer[self._position :]
         self._position = len(self._buffer)
         return rows
 
-    async def fetchmany(self, size: int) -> list[tuple[int, str]]:
+    async def fetchmany(self, size: int) -> list[tuple[int, Any]]:
         self._fetches.append(("fetchmany", size))
         rows = self._buffer[self._position : self._position + size]
         self._position += len(rows)
@@ -602,6 +620,147 @@ async def test_db_ceiling_is_on_by_default_and_the_opt_out_restores_fetchall() -
     await src._poll_once()
     assert len(handler.bodies) == 7
     assert fetches == [("fetchall", None)]
+
+
+# --- BACKLOG #1662: an undecodable row must not spend a ceiling slot ----------
+
+
+class _CapturingSink:
+    """The runner's connection-event sink, recorded. The runner injects one onto EVERY source, this
+    one included — the DATABASE source simply never called it before #1662."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str | None, str | None]] = []
+
+    async def __call__(self, kind: str, peer_host: str | None, reason: str | None) -> None:
+        self.events.append((kind, peer_host, reason))
+
+
+async def test_db_a_poison_row_does_not_starve_the_ceiling(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The measured starvation, at the ceiling that reproduces it in one poll.
+
+    With ``poll_max_rows=1`` and an undecodable row sorting first, the shipped code charged the
+    ceiling at the fetch and skipped the row afterwards: every poll handled nothing, marked nothing
+    and logged one ERROR, for ever, while the good row behind it was never reached.
+
+    Red mutation: charge the ceiling at the fetch again (take ``fetchmany(poll_max_rows)`` once and
+    decode in ``_poll_once``) — no body arrives, the good row is still in the table, and the
+    single-fetch assertion reds with it.
+    """
+    table = _FakeTable(0, rows=[(0, _POISON), (1, _ADT.format(n=1))])
+    src = _db_source(poll_max_rows=1)
+    fetches = _attach(src, table)
+    handler = _RecordingHandler()
+    src._handler = handler
+    with caplog.at_level(logging.ERROR, logger=_DB_LOGGER):
+        await src._poll_once()
+    assert [b.decode() for b in handler.bodies] == [_ADT.format(n=1)]  # the row behind IS reached
+    assert table.rows == [(0, _POISON)]  # ... and marked; the poison row stays, unmarked
+    assert "skipping row" in caplog.text  # the skip is still reported, not swallowed
+    # The top-up asks only for the SHORTFALL, so one poll pulls at most the ceiling plus the rows it
+    # skipped — never the rest of the result set.
+    assert fetches == [("fetchmany", 1), ("fetchmany", 1)]
+
+
+async def test_db_a_poison_row_emits_a_connection_event(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The visibility half of #1662: an operator must be able to SEE rows being skipped.
+
+    The shipped code wrote no store row, no disposition and no event — only a logger line — so a feed
+    quietly ingesting nothing looked identical to an idle one on the console.
+
+    Red mutation: delete the ``_emit_event`` call in ``_poll_once``. Reds here while the starvation
+    test above stays green, so the two halves are pinned independently.
+    """
+    table = _FakeTable(0, rows=[(0, _POISON), (1, _ADT.format(n=1))])
+    src = _db_source(poll_max_rows=4)
+    _attach(src, table)
+    sink = _CapturingSink()
+    src.on_connection_event = sink
+    src._handler = _RecordingHandler()
+    with caplog.at_level(logging.ERROR, logger=_DB_LOGGER):
+        await src._poll_once()
+    assert [kind for kind, _peer, _reason in sink.events] == ["row_undecodable"]
+    reason = sink.events[0][2] or ""
+    assert "UnicodeDecodeError" in reason  # the type is kept; safe_exc renders it
+    assert sink.events[0][1] is None  # a poll source dials out — there is no peer to name
+
+
+async def test_db_a_missing_body_column_is_reported_once_per_poll_not_once_per_row(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The dominant ``_body`` failure is STATIC — ``body_column`` naming a column ``poll_statement``
+    does not select fails every row — so replacing skipped rows without catching it first would trade
+    a starved ceiling for a log flood.
+
+    Checked once against the cursor's own description, before any row is read: one line, one event,
+    and nothing fetched at all. The shipped code logged once per row, up to the ceiling.
+
+    Red mutation: drop the static pre-check and let ``_body`` raise per row. The counts red (four
+    lines and four events), and the empty ``fetches`` assertion reds with them.
+    """
+    table = _FakeTable(4)
+    src = _db_source(body_column="nope", poll_max_rows=500)
+    fetches = _attach(src, table)
+    sink = _CapturingSink()
+    src.on_connection_event = sink
+    handler = _RecordingHandler()
+    src._handler = handler
+    with caplog.at_level(logging.ERROR, logger=_DB_LOGGER):
+        await src._poll_once()
+    assert handler.bodies == []
+    assert caplog.text.count("skipping row") == 1
+    assert len(sink.events) == 1
+    assert "'nope'" in (sink.events[0][2] or "")  # the operator's own column name, no row value
+    assert fetches == []  # nothing pulled out of the driver for a poll that cannot decode anything
+    assert len(table.rows) == 4  # nothing marked
+
+
+async def test_db_the_skip_budget_stops_one_poll_and_defers_the_rest(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Replacement is bounded: one poll steps past at most ``_MAX_SKIPPED_ROWS_PER_POLL`` rows.
+
+    Without this bound a table whose rows all fail per-row decoding would be walked end to end on
+    every tick, one log line per row.
+
+    Red mutation: remove the budget check — every poison row is skipped and logged, so both the
+    budget line and the skip count red.
+    """
+    poison = [(n, _POISON) for n in range(db_mod._MAX_SKIPPED_ROWS_PER_POLL + 5)]
+    table = _FakeTable(0, rows=poison)
+    src = _db_source(poll_max_rows=500)
+    _attach(src, table)
+    handler = _RecordingHandler()
+    src._handler = handler
+    with caplog.at_level(logging.ERROR, logger=_DB_LOGGER):
+        await src._poll_once()
+    assert handler.bodies == []
+    assert caplog.text.count("skipping row") == db_mod._MAX_SKIPPED_ROWS_PER_POLL
+    assert "stopped fetching" in caplog.text
+    assert len(table.rows) == len(poison)  # deferred, not dropped and not marked
+
+
+async def test_db_a_poison_row_is_never_marked() -> None:
+    """A row that never became a message is NOT marked, and that is deliberate.
+
+    ``mark_statement`` is an operator-authored ``UPDATE``, so marking here would record data DONE that
+    was never ingested — see the reasoning in ``database.py``'s handler-failure arm. There is no store
+    disposition to record either: a row the source could not read was never a received message, the
+    same reading ``file.py`` applies to an oversize or unscannable drop.
+
+    Red mutation: mark the row on the skip arm — the table empties and this reds.
+    """
+    table = _FakeTable(0, rows=[(0, _POISON)])
+    src = _db_source(poll_max_rows=4)
+    _attach(src, table)
+    src._handler = _RecordingHandler()
+    await src._poll_once()
+    await src._poll_once()
+    assert table.rows == [(0, _POISON)]  # still there after two polls, unmarked
 
 
 # === all three poll sources ===================================================

@@ -25,6 +25,7 @@ import httpx
 import pytest
 from _totp_clock import fresh_totp
 from pydantic import ValidationError
+from starlette.datastructures import Address
 
 from messagefoundry.api import create_app
 from messagefoundry.api.app import _emit_bootstrap_admin, _session_reaper
@@ -665,6 +666,18 @@ class _FakeURL:
     path = "/ws/stats"
 
 
+#: The peer address both doubles below report, and the value the ADR 0150 ``client`` assertions in this
+#: file compare against. A real :class:`starlette.datastructures.Address` rather than a hand-rolled
+#: stand-in: ``client_ip`` reads ``.host`` off whatever ``HTTPConnection.client`` yields, so borrowing
+#: starlette's own type is what stops these doubles drifting from the shape the server really passes.
+#: RFC 5737 TEST-NET-1, so nothing here can resolve to a real host.
+#:
+#: It must be a REAL address and never None. A double reporting None would let every ``client``
+#: assertion in this file degenerate to ``None == None`` — passing against the unfixed code, which is
+#: the failure mode BACKLOG #1644's tests exist to avoid rather than reproduce.
+_PEER = Address("192.0.2.77", 51234)
+
+
 class _FakeWS:
     def __init__(self, auth: object, token: str | None) -> None:
         self.app = _FakeApp(auth)
@@ -673,6 +686,9 @@ class _FakeWS:
         # removed (WP-1, ASVS Session Management): a token in a URL leaks into proxy/access logs.
         self.headers: dict[str, str] = {"Authorization": f"Bearer {token}"} if token else {}
         self.url = _FakeURL()
+        # BACKLOG #1644: authorize_ws now stamps the peer address onto its three audit rows, so a
+        # double without this attribute raises AttributeError rather than failing an assertion.
+        self.client = _PEER
 
 
 async def test_must_change_password_blocks_websocket(engine: Engine) -> None:
@@ -707,6 +723,10 @@ async def test_ws_permission_denied_is_audited(engine: Engine) -> None:
     assert denied is None
     rows = [a for a in await engine.store.list_audit() if a["action"] == "auth.permission_denied"]
     assert rows and rows[-1]["actor"] == "vw" and "/ws/stats" in (rows[-1]["detail"] or "")
+    # BACKLOG #1644 (ADR 0150) — WHERE FROM, not only who and what. RED when the ``client=`` argument
+    # is dropped from ``authorize_ws``'s denial call: the row reverts to NULL, which under the
+    # docs/PHI.md section 6 contract asserts no client was in scope. One was.
+    assert rows[-1]["client"] == _PEER.host
 
 
 async def test_ws_permission_granted_is_audited_for_sensitive_only(engine: Engine) -> None:
@@ -737,6 +757,7 @@ async def test_ws_permission_granted_is_audited_for_sensitive_only(engine: Engin
     assert len(rows) == 1
     assert rows[-1]["actor"] == "adm" and "config:deploy" in (rows[-1]["detail"] or "")
     assert "/ws/stats" in (rows[-1]["detail"] or "")
+    assert rows[-1]["client"] == _PEER.host  # BACKLOG #1644 — the GRANT side carries it too
 
 
 # --- RBAC-4: HTTP require() grant/deny audit precision ------------------------
@@ -755,14 +776,16 @@ class _FakeReqURL:
 
 class _FakeRequest:
     """Minimal ASGI-shaped Request for driving ``api.security.require()`` directly — the HTTP sibling of
-    :class:`_FakeWS`. ``require()`` reads only ``.app.state.auth``, ``.headers``, ``.url.path`` and
-    ``.method`` (``allow_no_auth`` is absent → fail-closed, matching a served app)."""
+    :class:`_FakeWS`. ``require()`` reads only ``.app.state.auth``, ``.headers``, ``.url.path``,
+    ``.method`` and — since BACKLOG #1644 — ``.client`` (``allow_no_auth`` is absent → fail-closed,
+    matching a served app)."""
 
     def __init__(self, auth: object, token: str | None, *, method: str, path: str) -> None:
         self.app = _FakeApp(auth)
         self.method = method
         self.headers: dict[str, str] = {"Authorization": f"Bearer {token}"} if token else {}
         self.url = _FakeReqURL(path)
+        self.client = _PEER  # BACKLOG #1644 — see the note on :class:`_FakeWS`
 
 
 async def _assert_http_grant_deny_precision(store: object) -> None:
@@ -834,9 +857,18 @@ async def _assert_http_grant_deny_precision(store: object) -> None:
     assert len(denied) == 1
     assert denied[0]["actor"] == "vw"
     assert "/connections/IB_X/purge" in str(denied[0]["detail"] or "")
+    # BACKLOG #1644 (ADR 0150): the refusal records WHERE FROM. Asserted inside this shared helper
+    # rather than beside it so the SQL Server and Postgres legs prove the ``client`` COLUMN is written
+    # on a server backend too, not only on SQLite — the same reason the rest of the helper is shaped
+    # this way. RED when ``client=`` is dropped from require()'s denial call.
+    assert denied[0]["client"] == _PEER.host
     # The refused caller left NO grant row — deny-by-default really denied (belt-and-braces).
     purge_grants = await _rows("auth.permission_granted", "messages:purge")
     assert [g for g in purge_grants if g["actor"] == "vw"] == []
+    # The GRANT side carries the address too, so one threading can't land without the other. Reuses
+    # the rows just fetched rather than re-querying — this helper runs against SQL Server and
+    # Postgres as well, where a needless round-trip is not free.
+    assert purge_grants[0]["client"] == _PEER.host
 
 
 async def test_http_grant_deny_audit_precision(engine: Engine) -> None:

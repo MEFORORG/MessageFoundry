@@ -11,6 +11,7 @@ framing behavior is unchanged after refactoring it onto the shared codec."""
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 
 import pytest
@@ -91,6 +92,113 @@ def test_decoder_rejects_oversize_open_frame() -> None:
     dec = STX_ETX_CODEC.decoder(max_frame_bytes=4)
     with pytest.raises(FrameError):
         list(dec.feed(b"\x02" + b"toolong"))
+
+
+def test_decoder_in_frame_tracks_the_open_frame() -> None:
+    # in_frame is the ADR 0067 reuse-desync guard, so assert it directly rather than leaning on the
+    # persistent-connection tests that only observe it through a desync verdict.
+    dec = STX_ETX_CODEC.decoder()
+    assert not dec.in_frame
+    assert list(dec.feed(b"\x02MSH|par")) == []
+    assert dec.in_frame  # start byte seen, end byte not yet: a partial payload is buffered
+    assert list(dec.feed(b"tial\x03")) == [b"MSH|partial"]
+    assert not dec.in_frame
+    assert list(dec.feed(b"trailing noise")) == []
+    assert not dec.in_frame
+
+
+def test_decoder_resets_state_after_an_oversize_frame() -> None:
+    dec = STX_ETX_CODEC.decoder(max_frame_bytes=4)
+    with pytest.raises(FrameError):
+        list(dec.feed(b"\x02" + b"toolong"))
+    assert not dec.in_frame  # state reset on the raise, so the decoder is reusable
+    assert list(dec.feed(STX_ETX_CODEC.frame("ok"))) == [b"ok"]
+
+
+def test_decoder_is_split_invariant_at_every_read_boundary() -> None:
+    # A frame must decode identically however the reads fall -- including a delimiter landing as the
+    # last byte of one read, and a start byte inside a payload, which is content and not a new frame.
+    payload = "first|" + chr(0x02) + "|a start byte inside a frame is payload"
+    stream = (
+        b"lead-in noise" + STX_ETX_CODEC.frame(payload) + b"\r\n" + STX_ETX_CODEC.frame("second")
+    )
+    expected = [payload.encode(), b"second"]
+    assert list(STX_ETX_CODEC.decoder().feed(stream)) == expected
+    for cut in range(len(stream) + 1):
+        dec = STX_ETX_CODEC.decoder()
+        out: list[bytes] = []
+        out.extend(dec.feed(stream[:cut]))
+        out.extend(dec.feed(stream[cut:]))
+        assert out == expected, f"a read boundary at byte {cut} decoded differently"
+        assert not dec.in_frame
+
+
+def test_decoder_cap_admits_exactly_max_frame_bytes() -> None:
+    # The cap bounds the payload: exactly max_frame_bytes is accepted and one byte more raises.
+    # Pinned because checking a whole slice's length sits one byte away from the per-byte check.
+    whole = STX_ETX_CODEC.decoder(max_frame_bytes=4).feed(STX_ETX_CODEC.frame("ABCD"))
+    assert list(whole) == [b"ABCD"]
+    with pytest.raises(FrameError):
+        list(STX_ETX_CODEC.decoder(max_frame_bytes=4).feed(STX_ETX_CODEC.frame("ABCDE")))
+
+
+def test_decoder_cap_ignores_an_end_delimiter_beyond_it() -> None:
+    # The end delimiter is present in this read but sits past the cap. Locating it first must not
+    # rescue an over-cap frame: the cap is charged against the payload before the frame closes.
+    dec = STX_ETX_CODEC.decoder(max_frame_bytes=2)
+    with pytest.raises(FrameError):
+        list(dec.feed(b"\x02" + b"far beyond the cap" + b"\x03"))
+
+
+def test_decoder_yields_earlier_frames_before_an_over_cap_frame_in_the_same_read() -> None:
+    # Both inbound listeners iterate feed() lazily and await the handler plus the ACK between
+    # frames, so a frame that completed earlier in the read must already be handed over when a
+    # later frame in that same read blows the cap.
+    dec = STX_ETX_CODEC.decoder(max_frame_bytes=4)
+    seen: list[bytes] = []
+    with pytest.raises(FrameError):
+        for message in dec.feed(STX_ETX_CODEC.frame("AAA") + b"\x02" + b"far too long"):
+            seen.append(message)
+    assert seen == [b"AAA"]
+
+
+def test_decoder_decodes_16_mib_without_a_per_byte_walk() -> None:
+    """16 MiB in 4 KiB reads must cost a fraction of a per-byte walk over the same bytes.
+
+    The budget is calibrated on the machine running the test rather than hard-coded, so a slow or
+    loaded runner scales both halves together instead of flaking (BACKLOG #1728).
+    """
+    mib = 1024 * 1024
+    framed = MLLP_CODEC.frame(b"A" * (16 * mib))
+
+    # Baseline: the shape feed() used to have -- one Python loop step per inbound byte.
+    sample = bytes(mib)
+    buf = bytearray()
+    started = time.perf_counter()
+    for byte in sample:
+        if byte == MLLP_CODEC.end:
+            buf.clear()
+        else:
+            buf.append(byte)
+    per_byte_one_mib = time.perf_counter() - started
+
+    dec = MLLP_CODEC.decoder(max_frame_bytes=32 * mib)
+    decoded = 0
+    started = time.perf_counter()
+    for offset in range(0, len(framed), 4096):
+        for message in dec.feed(framed[offset : offset + 4096]):
+            decoded += len(message)
+    elapsed = time.perf_counter() - started
+
+    assert decoded == 16 * mib
+    assert not dec.in_frame
+    # A per-byte decoder costs 16 baseline units to walk these 16 MiB. Half that is a loose ceiling
+    # -- roughly 8x headroom on the measured slice-based cost, and still red on a per-byte relapse.
+    budget = 8 * per_byte_one_mib
+    assert elapsed < budget, (
+        f"16 MiB in 4 KiB reads took {elapsed:.3f}s against a {budget:.3f}s budget "
+        f"({per_byte_one_mib * 1000:.0f}ms per MiB per-byte baseline)"
+    )
 
 
 def test_codec_validates_bytes_and_distinct_delimiters() -> None:
@@ -179,16 +287,25 @@ async def test_destination_no_reply_returns_when_not_expecting_one() -> None:
 
 
 async def test_destination_expect_reply_reads_framed_reply() -> None:
+    received: list[bytes] = []
+
     async def handler(raw: bytes) -> str:
+        received.append(raw)
         return "ACK-OPAQUE"  # the source frames + sends this back on the same connection
 
     source = _source()
     await source.start(handler)
     try:
-        # With expect_reply the destination reads one framed reply and treats it as confirmation.
-        await _dest(source.sockport, expect_reply=True).send(X12)
+        # With expect_reply the destination reads one framed reply and treats it as confirmation:
+        # the frame is CONSUMED, not returned. capture_response (ADR 0013) is the knob that hands
+        # one back as a DeliveryResponse.
+        assert await _dest(source.sockport, expect_reply=True).send(X12) is None
     finally:
         await source.stop()
+    # Settled by the time send() returns, because the source awaits the handler before writing the
+    # reply: the payload reached the peer verbatim. That the destination BLOCKS for the reply is the
+    # sibling test below, which raises DeliveryError when none is sent.
+    assert received == [X12.encode("utf-8")]
 
 
 async def test_destination_expect_reply_times_out_when_none_sent() -> None:

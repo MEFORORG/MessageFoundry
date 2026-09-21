@@ -183,10 +183,13 @@ def test_recheck_at_the_default_with_ad_enabled_is_not_a_loosening() -> None:
 # nothing.
 
 
-def _load(tmp_path: Path, toml: str) -> ServiceSettings:
+def _load(
+    tmp_path: Path, toml: str, cli: dict[str, dict[str, object]] | None = None
+) -> ServiceSettings:
     path = tmp_path / "messagefoundry.toml"
     path.write_text(toml, encoding="utf-8")
-    return load_settings(config_path=path)
+    # environ={} so an ambient MEFOR_* on the developer's box cannot move the posture under the test.
+    return load_settings(config_path=path, cli=cli, environ={})
 
 
 def test_shipped_default_does_not_break_a_non_ad_deployment(tmp_path: Path) -> None:
@@ -214,6 +217,68 @@ def test_explicit_zero_without_ad_loads(tmp_path: Path) -> None:
     reconcile, and the operator has asserted no belief the refusal needs to falsify."""
     settings = _load(tmp_path, "[auth]\nad_session_recheck_seconds = 0\n")
     assert settings.auth.ad_session_recheck_seconds == 0
+
+
+# --- the CLI bind override, reconciled back into [security] (BACKLOG #1852) --------------------
+#
+# These pin `_reconcile_effective_bind` in BOTH directions; that helper's docstring carries the defect
+# and the reasoning. A fix that simply reported everything would pass the positive arm and be worthless,
+# which is what the negative arms below are for.
+
+
+def _cli_host(host: str) -> dict[str, dict[str, object]]:
+    """The exact `cli` shape `serve` builds for `--host` (``__main__``: ``cli["api"]["host"]``)."""
+    return {"api": {"host": host}}
+
+
+def test_off_box_host_override_is_reported_as_a_loosening(tmp_path: Path) -> None:
+    """THE defect. With no `[security]` block at all, `--host 0.0.0.0` must name BOTH entries: the bind
+    itself, and the empty source-network allow-list that is only a weakness once exposed."""
+    settings = _load(tmp_path, "", cli=_cli_host("0.0.0.0"))
+    assert settings.api.host == "0.0.0.0"
+    assert settings.security.local_access_only is False
+    # `listen_address` is documented as the address used once `local_access_only` is false, so leaving
+    # it on loopback while the socket is on 0.0.0.0 would have the posture view state a falsehood: an
+    # operator reading it would believe the bind is narrower than it is.
+    assert settings.security.listen_address == "0.0.0.0"
+    names = _names(sec=settings.security)
+    assert "local_access_only" in names
+    assert "allowed_client_networks" in names
+
+
+def test_loopback_bind_reports_neither_entry(tmp_path: Path) -> None:
+    """The NEGATIVE arm, without which the test above passes on a registry that reports everything
+    always. Both an absent `--host` and an explicit loopback one stay quiet."""
+    assert _names(sec=_load(tmp_path, "").security) == []
+    assert _names(sec=_load(tmp_path, "", cli=_cli_host("127.0.0.1")).security) == []
+
+
+def test_declared_off_box_posture_survives_a_loopback_bind(tmp_path: Path) -> None:
+    """The reconciliation is ONE-WAY. An operator may declare `local_access_only = false` and leave
+    `listen_address` at its loopback default; the effective bind is then loopback, and reconciling in
+    that direction would SUPPRESS a deviation they declared. The registry must keep reporting it."""
+    settings = _load(tmp_path, "[security]\nlocal_access_only = false\n")
+    assert settings.api.is_loopback is True
+    assert settings.security.local_access_only is False
+    assert settings.security.listen_address == "127.0.0.1"
+    names = _names(sec=settings.security)
+    assert "local_access_only" in names
+    assert "allowed_client_networks" in names
+
+
+def test_off_box_override_still_honours_a_declared_client_allowlist(tmp_path: Path) -> None:
+    """The allow-list entry is exposure-GATED, not unconditional: an operator who exposed the bind AND
+    listed the networks that may reach it has the guard-rail, so only the bind itself is reported.
+    Without this arm the exposure gate could be replaced by an unconditional append and nothing would
+    notice."""
+    settings = _load(
+        tmp_path,
+        '[security]\nallowed_client_networks = ["10.20.0.0/16"]\n',
+        cli=_cli_host("0.0.0.0"),
+    )
+    names = _names(sec=settings.security)
+    assert "local_access_only" in names
+    assert "allowed_client_networks" not in names
 
 
 # --- registry completeness --------------------------------------------------------------------
@@ -284,6 +349,10 @@ _CONNECTION_DEVIATIONS_EXEMPT = {
     # gates tls/tls_verify below. A reader that merely reported "no CRL configured" would be strictly
     # weaker than the refusal that already exists.
     "tls_crl_file": "material/path; its absence is gated by #1005's posture-keyed revocation refusal",
+    # ADR 0188. A TIGHTENING, which is why it is exempt rather than reported: setting it applies the
+    # strict AEAD allow-list to that one hop, and leaving it unset is the shipped posture every other
+    # connection already has. A reader that reported it would be reporting operators who hardened.
+    "tls_ciphers": "opt-in AEAD allow-list on one hop -- a tightening, not a deviation to report",
     # Not TLS at all — the regex matches the word 'verify' in an HL7 ACK correlation check.
     "verify_ack_control_id": "HL7 ACK control-id correlation, unrelated to transport TLS",
     # Verify-off and TLS-off are GATED rather than reported: the ADR 0092 posture-keyed cell refuses

@@ -40,6 +40,7 @@ from messagefoundry.parsing.compression import CompressionError, gzip_compress, 
 from messagefoundry.parsing.peek import HL7PeekError, Peek
 from messagefoundry.parsing.sniff import _content_matches_declared, _looks_like_hl7
 from messagefoundry.parsing.split import split_batch
+from messagefoundry.redaction import safe_exc, safe_name
 from messagefoundry.transports import wincred
 from messagefoundry.transports.base import (
     DEFAULT_MAX_ITEMS_PER_POLL,
@@ -71,6 +72,9 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
+
+#: ``(size, mtime_ns)``: what the partial-write guard compares (BACKLOG #116).
+_FileSig = tuple[int, int]
 
 # Cap a single inbound file read so a multi-GB drop can't OOM the engine (DoS guard). A
 # falsy value (None/0) in settings disables the cap; see docs/CONNECTIONS.md.
@@ -379,7 +383,9 @@ class FileSource(SourceConnector):
         # Opt-in at-start directory validation (#114, ADR 0031 amendment). Default off = the historical
         # run-time deferral (a missing dir is logged-and-retried each poll, never fails start).
         self.validate_directory: bool = bool(s.get("validate_directory", False))
-        self.sort: str = s.get("sort", "name")  # "name" | "mtime"
+        self.sort: str = s.get("sort", "name")
+        if self.sort not in ("name", "mtime"):
+            raise ValueError(f"file source sort must be 'name' or 'mtime', got {self.sort!r}")
         self.recursive: bool = bool(s.get("recursive", False))
         # Encoding used to re-encode split batch messages back to bytes for the handler. A single
         # (non-batch) message is handed off verbatim, so its bytes never round-trip through this.
@@ -549,41 +555,57 @@ class FileSource(SourceConnector):
                 break  # shutting down — leave the rest for the next start (at-least-once)
             if self._at_ceiling(disposed, len(candidates) - position):
                 break
+            # One stat serves the leave-mode key, the size cap and the before-read side of the #116
+            # partial-write check, so the key recorded below describes the bytes actually read.
+            try:
+                before = await self._run_fs(_file_sig, path)
+            except OSError as exc:
+                self._log_unreadable(path, exc)
+                continue
             # #142 leave-in-place dedup: skip a file this connection already ingested. In-memory set
             # first (no I/O), then the durable ledger (survives restart / a fresh process). Keyed on a
             # HASHED file id (name+mtime+size) — never a cleartext filename, never logged at INFO+.
             file_key: str | None = None
             if self.after_read == "leave":
-                try:
-                    file_key = await self._run_fs(self._file_key, path)
-                except OSError:
-                    continue  # vanished/locked mid-scan — retry next poll (never a drop)
+                file_key = self._file_key(path, before)
                 if await self._leave_already_ingested(file_key):
                     continue
-            if await self._run_fs(self._oversize, path):
+            if self.max_file_bytes is not None and before[0] > self.max_file_bytes:
                 # Transport-level reject *before* any message is read — parallels MLLP dropping an
                 # over-cap frame. It never became a "received message", so (like MLLP) there's no
                 # store disposition to record; preserve the file in .error for the operator and log it.
                 logger.warning(
                     "file %s exceeds max_file_bytes (%s); routing to error dir",
-                    path.name,
+                    safe_name(path.name),
                     self.max_file_bytes,
                 )
                 await self._run_fs(self._move, path, self.error_dir)
                 disposed += 1
                 continue
             try:
-                raw = await self._run_fs(path.read_bytes)
+                raw, read_sig = await self._run_fs(self._read_settled, path)
             except OSError as exc:
-                # Transient (file locked / vanished mid-scan): leave it in place to retry next scan
-                # rather than quarantining a healthy file. Logged, never silently swallowed.
-                logger.warning("could not read %s (will retry next scan): %s", path.name, exc)
+                self._log_unreadable(path, exc)
+                continue
+            if before != read_sig or len(raw) != read_sig[0]:
+                # BACKLOG #116: a partner is still writing this file in place. Emitting what was read
+                # would pass a cut-off message as a complete one, so leave it for the next scan. Not
+                # charged against the per-tick budget: nothing was handed off and nothing moved.
+                logger.warning(
+                    "file source %s: %s changed while it was read (%d bytes before, %d read, %d "
+                    "after); not emitted, left in place for the next scan",
+                    self.directory,
+                    safe_name(path.name),
+                    before[0],
+                    len(raw),
+                    read_sig[0],
+                )
                 continue
             if self.decompress == "gzip":
                 # Decompress BEFORE the sniff, the AV/ICAP scan, and the batch split (ADR 0123): each
                 # must see the REAL bytes, not the gzip container. The ceiling bounds the decompressed
-                # output (and therefore post-split expansion) — the compressed-`st_size` `_oversize`
-                # cap above cannot. A corrupt / oversized archive is quarantined like an oversize /
+                # output (and therefore post-split expansion) — the compressed-`st_size`
+                # `max_file_bytes` cap above cannot. A corrupt / oversized archive is quarantined like an oversize /
                 # non-HL7 reject: it never became a received message, so there is no store disposition;
                 # move the ORIGINAL compressed file to .error and log the CODEC message only (never the
                 # decompressed body — it is PHI).
@@ -593,7 +615,9 @@ class FileSource(SourceConnector):
                     )
                 except CompressionError as exc:
                     logger.warning(
-                        "file %s failed to gunzip (%s); routing to error dir", path.name, exc
+                        "file %s failed to gunzip (%s); routing to error dir",
+                        safe_name(path.name),
+                        safe_exc(exc, file_name=path.name),
                     )
                     await self._run_fs(self._move, path, self.error_dir)
                     disposed += 1
@@ -612,7 +636,7 @@ class FileSource(SourceConnector):
                 logger.warning(
                     "file %s does not match its declared content type %r (no matching magic bytes); "
                     "routing to error dir",
-                    path.name,
+                    safe_name(path.name),
                     (self.content_type or ContentType.HL7V2).value,
                 )
                 await self._run_fs(self._move, path, self.error_dir)
@@ -629,8 +653,8 @@ class FileSource(SourceConnector):
                 # never became a "received message", so there's no store disposition; quarantine + log.
                 logger.warning(
                     "file %s rejected by the pre-ingest scan hook (%s); routing to error dir",
-                    path.name,
-                    exc,
+                    safe_name(path.name),
+                    safe_exc(exc, file_name=path.name),
                 )
                 await self._run_fs(self._move, path, self.error_dir)
                 disposed += 1
@@ -644,8 +668,8 @@ class FileSource(SourceConnector):
                 # THIS file so a scanner hiccup can't abort the whole tick's remaining candidates.
                 logger.warning(
                     "file %s: pre-ingest scan hook errored (%s); leaving in place, will retry next scan",
-                    path.name,
-                    exc,
+                    safe_name(path.name),
+                    safe_exc(exc, file_name=path.name),
                 )
                 continue
             try:
@@ -663,9 +687,13 @@ class FileSource(SourceConnector):
                 # re-emits every message 1..N. That is at-least-once: messages 1..K-1 may be re-emitted
                 # (duplicates, acceptable — handlers are idempotent), but the file is NEVER moved with
                 # only some of its messages emitted (no accept-and-drop of the tail).
-                logger.warning("handler failed for %s (will retry next scan): %s", path.name, exc)
+                logger.warning(
+                    "handler failed for %s (will retry next scan): %s",
+                    safe_name(path.name),
+                    safe_exc(exc, file_name=path.name),
+                )
                 continue
-            await self._run_fs(self._after_processing, path)
+            await self._run_fs(self._after_processing, path, read_sig)
             disposed += 1
             if self.after_read == "leave" and file_key is not None:
                 # Record AFTER emit success (the FILE — not each split message — is the dedup unit), so a
@@ -710,7 +738,7 @@ class FileSource(SourceConnector):
         )
         return True
 
-    def _file_key(self, path: Path) -> str:
+    def _file_key(self, path: Path, sig: _FileSig | None = None) -> str:
         """A stable, HASHED identity for a source file, for the leave-in-place dedup ledger (#142).
 
         The identity folds the file's path **relative to the watch root** (not just the basename) +
@@ -720,11 +748,12 @@ class FileSource(SourceConnector):
         which would be an accept-and-drop of a received file, count-and-log invariant). SHA-256 so the
         relative path — which, like a filename, can embed an MRN — is never stored or logged in the clear
         (the ledger holds this derived id only; never log the relative path). Folding mtime+size in means
-        an UPDATED file (new mtime/size → new key) is re-ingested, while an unchanged file is skipped. May
-        raise ``OSError`` if the file vanished mid-scan (the caller treats that as transient)."""
-        st = path.stat()
+        an UPDATED file (new mtime/size → new key) is re-ingested, while an unchanged file is skipped.
+        ``sig`` is a stat the caller already holds; without one this stats the file, and may raise
+        ``OSError`` if it vanished mid-scan (the caller treats that as transient)."""
+        size, mtime_ns = _file_sig(path) if sig is None else sig
         rel = path.relative_to(self.directory).as_posix()
-        ident = f"{rel}\x00{st.st_mtime_ns}\x00{st.st_size}"
+        ident = f"{rel}\x00{mtime_ns}\x00{size}"
         return hashlib.sha256(ident.encode("utf-8", "surrogatepass")).hexdigest()
 
     def _seen_touch(self, file_key: str) -> bool:
@@ -819,15 +848,6 @@ class FileSource(SourceConnector):
             # back-pressures the rest (and a failure stops the file from being moved — see above).
             await self._handler(message.encode(self.encoding))
 
-    def _oversize(self, path: Path) -> bool:
-        """True if ``path`` is larger than the configured cap (checked before reading it)."""
-        if self.max_file_bytes is None:
-            return False
-        try:
-            return path.stat().st_size > self.max_file_bytes
-        except OSError:
-            return False  # vanished/locked — let the read path handle it
-
     def _candidates(self) -> list[Path]:
         """Files ready to process, honoring recursion, min-age, and sort order.
 
@@ -895,17 +915,67 @@ class FileSource(SourceConnector):
             return True
         logger.warning(
             "file source: skipping %s — it resolves outside the watch root (symlink escape?)",
-            path.name,
+            safe_name(path.name),
         )
         return False
 
-    def _after_processing(self, path: Path) -> None:
+    @staticmethod
+    def _read_settled(path: Path) -> tuple[bytes, _FileSig]:
+        """Read ``path`` whole, then stat it, in one hop off the event loop (BACKLOG #116).
+
+        The caller compares that stat and the bytes read with the stat it took before the read, so a
+        file a partner is still writing in place is caught before it is emitted. The read stays
+        ``path.read_bytes()`` on purpose: tests stand in for a locked file by patching that call."""
+        raw = path.read_bytes()
+        return raw, _file_sig(path)
+
+    @staticmethod
+    def _log_unreadable(path: Path, exc: OSError) -> None:
+        """Transient (file locked / vanished mid-scan): the caller leaves it in place to retry next
+        scan rather than quarantining a healthy file. Logged, never silently swallowed."""
+        logger.warning(
+            "could not read %s (will retry next scan): %s",
+            safe_name(path.name),
+            safe_exc(exc, file_name=path.name),
+        )
+
+    def _changed_since_read(self, path: Path, read_sig: _FileSig) -> bool:
+        """True, with a WARNING, when ``path`` no longer matches the stat taken as it was read (#116).
+
+        The message is already handed off by then and cannot be recalled. What this stops is the move
+        or delete that would carry the unread tail away as processed. The file stays put and the next
+        scan reads it whole; under ``leave`` its dedup key has changed with it, so the same holds. A file
+        that is gone, or cannot be stat'd, is not reported as changed: the move or delete reports it."""
+        try:
+            now = _file_sig(path)
+        except OSError:
+            return False
+        if now == read_sig:
+            return False
+        logger.warning(
+            "file source %s: %s changed after it was read (%d bytes read, %d now); the message emitted "
+            "from it may be incomplete, so the file is left in place for the next scan to read whole",
+            self.directory,
+            safe_name(path.name),
+            read_sig[0],
+            now[0],
+        )
+        return True
+
+    def _after_processing(self, path: Path, read_sig: _FileSig | None = None) -> None:
+        # ``read_sig`` None is a direct caller with no read to compare against: dispose as before.
+        if read_sig is not None and self._changed_since_read(path, read_sig):
+            return
         if self.after_read == "delete":
             try:
                 path.unlink()
             except OSError as exc:
                 # A processed file we can't delete will be re-read (duplicate); surface it (FILE-4).
-                logger.warning("could not delete processed file %s: %s", path.name, exc)
+                logger.warning(
+                    "could not delete processed file %s: %s",
+                    safe_name(path.name),
+                    safe_exc(exc, file_name=path.name),
+                )
         elif self.after_read == "leave":
             # #142 process-in-place: never move or delete the source file — the durable dedup ledger
             # (recorded by _scan_once AFTER this returns) is what stops it being re-ingested next poll.
@@ -934,16 +1004,21 @@ class FileSource(SourceConnector):
             _claim_unique(path, dest_dir / path.name)
         except OSError as exc:
             # A stuck file (locked / dest unwritable) stays and is re-read; log it (FILE-4).
-            logger.warning("could not move %s to %s: %s", path.name, dest_dir.name, exc)
+            logger.warning(
+                "could not move %s to %s: %s",
+                safe_name(path.name),
+                dest_dir.name,
+                safe_exc(exc, file_name=path.name),
+            )
             return
         try:
             path.unlink()
         except OSError as exc:
             logger.warning(
                 "archived %s to %s but could not remove the original (it will be re-read): %s",
-                path.name,
+                safe_name(path.name),
                 dest_dir.name,
-                exc,
+                safe_exc(exc, file_name=path.name),
             )
 
 
@@ -1035,12 +1110,51 @@ def _claim_unique(tmp: Path, target: Path) -> Path:
             n += 1
             candidate = target.with_name(f"{stem}-{n}{suffix}")
             continue
-        # Streamed, not read_bytes(): the archive move claims through here too (#1046), and an
-        # inbound file is only as small as the operator's max_file_bytes (unset by default), so
-        # buffering the whole thing to claim a name would put an arbitrarily large inbound payload
-        # in memory on exactly the filesystems that already can't hard-link.
-        with open(tmp, "rb") as source, os.fdopen(fd, "wb") as handle:
-            shutil.copyfileobj(source, handle)
+        # The exclusive create above sits OUTSIDE the cleanup guard on purpose: a lost create race
+        # raises FileExistsError there and bumps the name, so the file then at `candidate` belongs to
+        # the winner — unlinking it would clobber exactly what O_EXCL exists to protect.
+        placed = False
+        try:
+            # Streamed, not read_bytes(): the archive move claims through here too (#1046), and an
+            # inbound file is only as small as the operator's max_file_bytes (unset by default), so
+            # buffering the whole thing to claim a name would put an arbitrarily large inbound payload
+            # in memory on exactly the filesystems that already can't hard-link.
+            # `fd` is wrapped FIRST so a handle that closes it always exists: were `open(tmp)` opened
+            # first and to raise, the fd would still be open and the unlink below would die on Windows
+            # with a sharing violation, replacing the real error with a bogus one.
+            with os.fdopen(fd, "wb") as handle, open(tmp, "rb") as source:
+                shutil.copyfileobj(source, handle)
+            placed = True
+        finally:
+            # A copy that dies mid-stream (a full volume, a dropped share) would otherwise leave a
+            # TRUNCATED, PHI-bearing file at `candidate` beside a reported failure — and it would
+            # consume that name permanently, since the bumping loop above skips a name that exists,
+            # so every later delivery would route around the debris instead of replacing it.
+            # `finally`, not `except`, so nothing is caught or relabelled and no failure mode is
+            # missed — `return` and `break` included, which an `except` arm never sees. It runs
+            # after the `with` has closed the handle, which Windows requires.
+            #
+            # Deliberately NOT the `except BaseException` that this package's persistent-connection
+            # connectors use (mllp.py, tcp.py, x12.py). Those are connection-discard arms inside
+            # `async def`, and they are broad because an await point can deliver CancelledError and
+            # the arm must stay distinguishable from the `except DeliveryError` above it. Neither
+            # applies here: `_claim_unique` is sync, so no CancelledError can arrive mid-execution,
+            # and there is only one cleanup path to begin with. Matching that shape would widen a
+            # catch past section 6 of CLAUDE.md for nothing. Settled twice; please leave it.
+            if not placed:
+                try:
+                    candidate.unlink(missing_ok=True)
+                except OSError as unlink_exc:
+                    # Cleanup must never DISPLACE the failure that caused it. Our own handle is
+                    # closed by now, but a drop directory is one other processes watch by design, so
+                    # a scanner or a reader holding the partial open is ordinary here, not exotic —
+                    # and an escaping unlink error would hide the full volume or dropped share behind
+                    # a cleanup message. Log it and let the real exception propagate.
+                    logger.warning(
+                        "could not remove the partial file %s after a failed claim: %s",
+                        candidate,
+                        unlink_exc,
+                    )
         return candidate
 
 
@@ -1049,6 +1163,13 @@ def _mtime(p: Path) -> float:
         return p.stat().st_mtime
     except OSError:
         return 0.0
+
+
+def _file_sig(path: Path) -> _FileSig:
+    """The file's size and modification time. The size alone would miss a rewrite that keeps the
+    length; the modification time still moves. May raise ``OSError`` if the file is gone."""
+    st = path.stat()
+    return st.st_size, st.st_mtime_ns
 
 
 register_destination(ConnectorType.FILE, FileDestination)

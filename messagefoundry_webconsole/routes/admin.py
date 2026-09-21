@@ -17,6 +17,7 @@ from messagefoundry.api.auth_models import (
     ChannelScope,
     CustomRoleInfo,
     CustomRoleRequest,
+    PasswordResetResponse,
     RolesUpdateRequest,
     UserCreateRequest,
     UserUpdateRequest,
@@ -27,6 +28,7 @@ from messagefoundry.auth.permissions import CUSTOM_ROLE_FORBIDDEN_PERMISSIONS
 from messagefoundry.auth.service import (
     STEP_UP_ACTION_ADMIN_RESET_MFA,
     STEP_UP_ACTION_ADMIN_RESET_PASSWORD,
+    STEP_UP_ACTION_ADMIN_USER_UPDATE,
     AuthService,
 )
 
@@ -42,7 +44,24 @@ from .._service import _service
 from ._common import _form_pairs
 
 register_ui_action(r"^/ui/users/new$", Permission.USERS_MANAGE, auto_retry=False, unlock=True)
-register_ui_action(r"^/ui/users/[^/?#]+$", Permission.USERS_MANAGE, auto_retry=False, unlock=True)
+# BACKLOG #1737: the user-detail page is the unlock continuation for the body-carrying
+# POST /ui/users/{id}/update, whose JSON twin (PATCH /users/{id}) is bound to admin_user_update. The
+# POST path itself can never be the continuation -- a body-carrying action is deliberately in neither
+# allow-list -- so the grant has to be minted HERE, against the page the operator is 303'd back to.
+#
+# That page also hosts the /roles and /channel-scope forms, which stay window-gated, so a re-auth
+# aimed at either of those mints an admin_user_update grant nothing consumes. Accepted: the grant is
+# single-use, bound to that one action id, keyed on that one session's token hash, and expires on the
+# same clock as the step-up window it replaces -- so the whole of its effect is that an operator who
+# just re-proved their password may submit ONE profile update inside the window they re-proved for.
+# The alternative, a narrower continuation, means a new confirm page for a form that already has one.
+register_ui_action(
+    r"^/ui/users/[^/?#]+$",
+    Permission.USERS_MANAGE,
+    auto_retry=False,
+    unlock=True,
+    action=STEP_UP_ACTION_ADMIN_USER_UPDATE,
+)
 # BACKLOG #1148 (ASVS 7.5.1): the two RESET lanes are split out and TAGGED. Combined and untagged,
 # /ui/reauth minted nothing for them, so the browser path -- the only operator surface that ships --
 # kept riding the login-seeded window even after the JSON routes were bound. revoke-sessions and
@@ -170,8 +189,14 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         user_id: str,
         request: Request,
         service: AuthService = Depends(_service),
+        # BACKLOG #1737 (ASVS 7.5.1): action-bound, matching the JSON twin PATCH /users/{id}. This
+        # lane sets display name, email and the DISABLED flag -- the attributes a security notice is
+        # delivered to, and the switch that locks an account out -- so a login-seeded window must not
+        # reach it through the console while the JSON plane refuses the same request. Enforced HERE:
+        # the JSON dependency does not run on this path (the handler FUNCTION is called via the seam).
         identity: Identity = Depends(
-            require_ui_step_up(
+            require_ui_step_up_action(
+                STEP_UP_ACTION_ADMIN_USER_UPDATE,
                 Permission.USERS_MANAGE,
                 reauth_next=lambda r: r.url.path.removesuffix("/update"),
             )
@@ -302,7 +327,14 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     ) -> Response:
         assert_same_origin(request)
         try:
-            result = await admin.reset_user_password(user_id, service=service, identity=identity)
+            # Annotated, and PasswordResetResponse imported for it, so the seam discovery SEEDS this
+            # DTO: handler RETURN types are not otherwise reached (only import statements are), and
+            # this route reads a field off one. Without the annotation a console built against a
+            # newer engine would read `expires_at` off an older one and raise AttributeError at
+            # reset time — the exact skew SUPPORTED_ENGINE_SEAMS exists to refuse loudly at startup.
+            result: PasswordResetResponse = await admin.reset_user_password(
+                user_id, service=service, identity=identity
+            )
         except HTTPException as exc:
             if exc.status_code == status.HTTP_404_NOT_FOUND:
                 raise
@@ -312,7 +344,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         user = await service.store.get_user(user_id)
         username = user.username if user is not None else user_id
         # The one-time credential is rendered ONCE for out-of-band delivery — never logged/stored.
-        return HTMLResponse(pages.temp_password_page(username, result.temp_password))
+        # BACKLOG #1141 (ASVS 6.4.5): its deadline rides along on the same page, read off the same
+        # response, so the administrator who conveys the credential can convey when it dies.
+        return HTMLResponse(
+            pages.temp_password_page(username, result.temp_password, result.expires_at)
+        )
 
     @app.post("/ui/users/{user_id}/reset-mfa")
     async def ui_user_reset_mfa(

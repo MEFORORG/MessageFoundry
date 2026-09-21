@@ -8,6 +8,8 @@ The body moved to :mod:`messagefoundry.service` (ADR 0088); this exercises it th
 
 from __future__ import annotations
 
+import ntpath
+import os
 import re
 import sys
 from pathlib import Path
@@ -15,6 +17,7 @@ from pathlib import Path
 import pytest
 
 import messagefoundry.service as service_control
+from messagefoundry import service_status
 from messagefoundry.__main__ import main
 from messagefoundry.service import (
     _install_params,
@@ -43,10 +46,48 @@ class _ShellExecRecorder:
         return 42
 
 
+# The absolute program paths every dispatch must name (BACKLOG #1680). An unqualified name would be
+# resolved through a search path reaching the caller's working directory — see
+# `messagefoundry.service_status._system_exe`, which is where that is explained once.
+_SYSDIR = service_control._system_dir()
+_CMD = os.path.join(_SYSDIR, "cmd.exe")
+_NET = os.path.join(_SYSDIR, "net.exe")
+
+
+class _ScRun:
+    """A stand-in for ``subprocess.run`` on the ``sc query`` path, recording args and kwargs."""
+
+    def __init__(self) -> None:
+        self.args: list[list[str]] = []
+        self.kwargs: dict[str, object] = {}
+
+    returncode = 0
+    stdout = "STATE : 4  RUNNING"
+
+    def __call__(self, args: list[str], **kwargs: object) -> _ScRun:
+        self.args.append(args)
+        self.kwargs.update(kwargs)
+        return self
+
+
+def _fake_sc_query(monkeypatch: pytest.MonkeyPatch) -> _ScRun:
+    """Fake win32 + ``subprocess.run`` so the ``sc query`` guards hold on any host OS."""
+    run = _ScRun()
+    monkeypatch.setattr(service_control.sys, "platform", "win32")
+    monkeypatch.setattr(service_control.subprocess, "run", run)
+    return run
+
+
 def test_parse_service_state() -> None:
     assert parse_service_state("        STATE              : 4  RUNNING") == "running"
     assert parse_service_state("        STATE              : 1  STOPPED") == "stopped"
     assert parse_service_state("nonsense") == "unknown"
+
+
+def test_parse_service_state_is_the_sibling_modules_parser() -> None:
+    """One implementation, not two: this module re-exports the neutral leaf's parser. See
+    :data:`messagefoundry.service_status._STATE_LINE` for why a second copy is the hazard."""
+    assert parse_service_state is service_status.parse_service_state
 
 
 def test_service_state_for_missing_service() -> None:
@@ -54,27 +95,27 @@ def test_service_state_for_missing_service() -> None:
     assert service_state("MessageFoundryNoSuchService_zzz") in {"not installed", "unavailable"}
 
 
-def test_service_state_query_suppresses_console_window(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    """Regression: ``sc query`` must run with CREATE_NO_WINDOW so the windowless GUI process doesn't
-    flash a console window on every Status-page poll. Fake win32 + capture the kwargs so the guard
-    holds on any host OS (``_NO_WINDOW`` is 0 off Windows, so we assert the flag is *passed*)."""
-
-    class _Result:
-        returncode = 0
-        stdout = "STATE : 4  RUNNING"
-
-    captured: dict[str, object] = {}
-
-    def _fake_run(*args: object, **kwargs: object) -> _Result:
-        captured.update(kwargs)
-        return _Result()
-
-    monkeypatch.setattr(service_control.sys, "platform", "win32")
-    monkeypatch.setattr(service_control.subprocess, "run", _fake_run)
+def test_service_state_query_suppresses_console_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: ``sc query`` must run with CREATE_NO_WINDOW so a windowless host process doesn't
+    flash a console window. ``_NO_WINDOW`` is 0 off Windows, so assert the flag is *passed*."""
+    run = _fake_sc_query(monkeypatch)
 
     assert service_state("MessageFoundry") == "running"
-    assert "creationflags" in captured  # the flag must be passed (no console-window flash)
-    assert captured["creationflags"] == service_control._NO_WINDOW
+    assert "creationflags" in run.kwargs  # the flag must be passed (no console-window flash)
+    assert run.kwargs["creationflags"] == service_control._NO_WINDOW
+
+
+def test_service_state_query_pins_sc_to_the_system_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``sc`` is unprivileged, but it is the same unqualified-resolution defect, so it is pinned too.
+
+    This is the ``messagefoundry service status`` CLI path, not the web console's — that one goes
+    through ``service_status.query_service_state``, which shares the pin (BACKLOG #1680)."""
+    run = _fake_sc_query(monkeypatch)
+
+    assert service_state("MyEngine") == "running"
+    assert run.args == [[os.path.join(_SYSDIR, "sc.exe"), "query", "MyEngine"]]
 
 
 def test_install_script_path_is_found() -> None:
@@ -136,56 +177,77 @@ def test_installer_keeps_restart_and_throttle_guardrails() -> None:
 # real elevation (ShellExecuteW is monkeypatched) or a real installed service.
 
 
-@_win32_only
-def test_control_service_start_shellexecute_args(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``control_service('start', name)`` runs an elevated hidden ``cmd /c net start "<name>"``."""
+def _recorded_dispatch(monkeypatch: pytest.MonkeyPatch) -> _ShellExecRecorder:
+    """Fake win32 + ShellExecuteW so an elevated dispatch is recorded instead of performed."""
     rec = _ShellExecRecorder()
     monkeypatch.setattr(service_control.sys, "platform", "win32")
     monkeypatch.setattr(service_control.ctypes.windll.shell32, "ShellExecuteW", rec.ShellExecuteW)
+    return rec
+
+
+def test_system_dir_is_an_absolute_system32_path() -> None:
+    """The anchor every pin below is built from: absolute, and the system directory itself.
+
+    The exact-argument tests that follow name paths derived from ``_system_dir()``, so this is what
+    keeps them from being self-satisfying — it fixes the property independently (BACKLOG #1680)."""
+    assert ntpath.isabs(_SYSDIR), _SYSDIR
+    assert ntpath.basename(_SYSDIR).lower() == "system32", _SYSDIR
+
+
+@_win32_only
+def test_control_service_start_shellexecute_args(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``control_service('start', name)`` runs an elevated hidden ``cmd /s /c net start "<name>"``."""
+    rec = _recorded_dispatch(monkeypatch)
 
     assert control_service("start", "MyEngine") is True
     # (hwnd, verb, file, params, dir, nShow): elevated ("runas"), via cmd.exe, hidden (SW_HIDE=0).
-    assert rec.calls == [(None, "runas", "cmd.exe", '/c net start "MyEngine"', None, 0)]
+    # Both programs are absolute system-directory paths, and lpDirectory is the system directory
+    # rather than null — a null one would start the elevated child in the CALLER's working
+    # directory, the very directory a planted program would sit in (BACKLOG #1680).
+    assert rec.calls == [(None, "runas", _CMD, f'/s /c ""{_NET}" start "MyEngine""', _SYSDIR, 0)]
 
 
 @_win32_only
 def test_control_service_stop_shellexecute_args(monkeypatch: pytest.MonkeyPatch) -> None:
-    rec = _ShellExecRecorder()
-    monkeypatch.setattr(service_control.sys, "platform", "win32")
-    monkeypatch.setattr(service_control.ctypes.windll.shell32, "ShellExecuteW", rec.ShellExecuteW)
+    rec = _recorded_dispatch(monkeypatch)
 
     assert control_service("stop", "MyEngine") is True
-    assert rec.calls == [(None, "runas", "cmd.exe", '/c net stop "MyEngine"', None, 0)]
+    assert rec.calls == [(None, "runas", _CMD, f'/s /c ""{_NET}" stop "MyEngine""', _SYSDIR, 0)]
 
 
 @_win32_only
 def test_control_service_restart_chains_stop_then_start(monkeypatch: pytest.MonkeyPatch) -> None:
     """restart chains two elevated ``net`` calls with ``&`` — that's why it must go through cmd.exe."""
-    rec = _ShellExecRecorder()
-    monkeypatch.setattr(service_control.sys, "platform", "win32")
-    monkeypatch.setattr(service_control.ctypes.windll.shell32, "ShellExecuteW", rec.ShellExecuteW)
+    rec = _recorded_dispatch(monkeypatch)
 
     assert control_service("restart", "MyEngine") is True
     assert rec.calls == [
-        (None, "runas", "cmd.exe", '/c net stop "MyEngine" & net start "MyEngine"', None, 0)
+        (
+            None,
+            "runas",
+            _CMD,
+            f'/s /c ""{_NET}" stop "MyEngine" & "{_NET}" start "MyEngine""',
+            _SYSDIR,
+            0,
+        )
     ]
 
 
 @_win32_only
 def test_install_service_shellexecute_args(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``install_service`` launches a *visible* (SW_SHOWNORMAL=1) elevated PowerShell installer."""
-    rec = _ShellExecRecorder()
-    monkeypatch.setattr(service_control.sys, "platform", "win32")
-    monkeypatch.setattr(service_control.ctypes.windll.shell32, "ShellExecuteW", rec.ShellExecuteW)
+    """``install_service`` launches a *visible* (SW_SHOWNORMAL=1) elevated PowerShell installer.
+
+    The image is Windows PowerShell 5.1 under the system directory, not a bare ``powershell.exe``."""
+    rec = _recorded_dispatch(monkeypatch)
 
     assert install_service(r"C:\repo\install-service.ps1", "dev") is True
     assert rec.calls == [
         (
             None,
             "runas",
-            "powershell.exe",
+            os.path.join(_SYSDIR, "WindowsPowerShell", "v1.0", "powershell.exe"),
             '-NoExit -ExecutionPolicy Bypass -File "C:\\repo\\install-service.ps1" -Environment "dev"',
-            None,
+            _SYSDIR,
             1,
         )
     ]

@@ -7,6 +7,29 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **`[integrity].audit_anchor_file` — the startup audit check can now hold an anchor, so it can see a
+  truncated tail.** A previous release shipped `audit-anchor` / `audit-verify --expected-anchor` and
+  recorded, accurately at the time, that `[integrity].audit_verify_on_start` "is unchanged — it is a
+  bare walk and stays blind to a truncated tail". **That sentence no longer describes the engine.**
+  Point the new key at the `COUNT:HEAD` file `messagefoundry audit-anchor` writes and every startup
+  compares against it; leave it empty (the default) and the walk is byte-identical to before.
+  **It consumes the anchor as a PREFIX, not as the CLI's exact seal, and that is the whole reason a
+  startup setting can hold one.** The exact seal compares the *current* head, so it diverges on the
+  next appended row — and a running engine writes audit rows, so a startup check built on it would
+  alarm on essentially every restart. The prefix comparison asks instead whether the recorded state was
+  ever true and the chain has only **grown** since, which survives restarts while still catching a
+  truncated tail and a mid-chain rewrite. A stale anchor therefore stays valid; it just witnesses less.
+  **Alert-only in both directions.** A missing, unreadable or malformed anchor logs a WARNING naming
+  the file, the reason and the coverage lost, then lets the bare walk run — it never blocks startup,
+  and it never fires the tamper alert, because a config fault that raised a tamper alarm would train
+  operators to ignore the real one. `0:`, the anchor of an empty log, is reported rather than compared:
+  it can witness nothing, and passing it on would have alarmed on every start of an intact chain.
+  A truncated tail and a broken chain fire **different** alert subjects (`audit-chain-truncated` /
+  `audit-chain`) so they route and throttle separately — but they are not independent: a chain break is
+  reported *before* the anchor comparison runs, so a break should be read as *at least* a break.
+  **Scope.** It fires at startup and only at startup, so it detects a cut made since the last boot and
+  says nothing about the window between two boots. For continuous coverage the off-box log forward /
+  tee remains the control. ([BACKLOG #328](docs/BACKLOG.md))
 - **A startup preflight that reads the store principal's *effective* privileges, so the least-privilege
   grant the runbooks prescribe stops being a claim the engine cannot check.**
   [`DEPLOY-SERVER-DB.md`](docs/DEPLOY-SERVER-DB.md) told operators exactly which grant the engine's
@@ -62,6 +85,22 @@ All notable changes to MessageFoundry are documented here. The format follows
   and BACKLOG #1279.
 
 ### Changed
+- **Setting `[integrity].fail_closed_on_drift` on an editable install now says so at startup, and two
+  claims about startup attestation are corrected.** An install that declares itself editable is exempt
+  from attestation by design, so a dev checkout is never bricked. That exemption silently cancels the
+  fail-closed opt-in, and the code path returned with no log, no audit row and no alert -- so a first
+  deployment that opted into hard enforcement on an editable install would have started with its
+  tripwire disarmed and nothing in the boot log to read. It now logs a WARNING naming the reason. **This
+  reports a misconfiguration; it closes no hole** -- an actor who can write the virtual environment can
+  plant the editable marker or rewrite the check in the same single write. AC-12's exemption is
+  unchanged: still no refusal, no audit row, no alert, and silence under the default alert-only posture.
+  Two ADR 0041 D3 claims were false in the shipped code and are narrowed rather than left standing: the
+  non-editable hash-locked wheel is a **recommended** production default, not an enforced one (nothing
+  in the engine refuses an editable install), and attestation runs **at startup only** -- there is no
+  on-demand surface, no `attest` CLI subcommand and no API route. ADR 0041 D3 also now records the
+  resolution of the baseline's trust domain: the wheel's own `RECORD` stays the baseline, no runtime
+  out-of-domain anchor is adopted, and the control detects an *inconsistent* in-place edit and not a
+  *consistent* one. (BACKLOG #1679)
 - **An Active Directory login is now identified by the directory's immutable id, not by
   `sAMAccountName`.** A directory frees a deleted account's name and may reissue it to a different
   person. The engine resolved an AD principal by that name, so a recycle without a matching
@@ -125,6 +164,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   on every ordinary boot. For continuous coverage of a live engine the off-box log forward / tee remains
   the control, and `[integrity].audit_verify_on_start` is unchanged — it is a bare walk and stays blind
   to a truncated tail. ([BACKLOG #328](docs/BACKLOG.md))
+- **The advisory `raise-fstring` lint in `messagefoundry check` now reads three more spellings of the
+  same risk.** It matched only an f-string, so `raise ValueError("bad " + x)`, the `%` form and
+  `.format(...)` carried an interpolated message past it — the identical free-text PHI payload, in the
+  spellings an author is most likely to reach for after an f-string. It now shares the predicate the
+  ADR 0144 lookup lint already used, so the two cannot drift on what counts as interpolation. A
+  deploying site's existing config dir may therefore report hits it did not report before: the check
+  is advisory and still only ever prints, so it cannot block the gate, and its detail names a file and
+  line, never the message text. The check keeps the name `raise-fstring`. It stays a nudge rather
+  than a boundary: it reads only the first positional argument of the `raise`, so a message assigned
+  to a local first, passed as a keyword or a later positional, or wrapped in a call is still
+  unflagged. ([BACKLOG #1676](docs/BACKLOG.md))
 
 ### Changed
 - **An API request body with an unknown or misspelled key is now refused with HTTP 422 instead of
@@ -317,6 +367,39 @@ All notable changes to MessageFoundry are documented here. The format follows
   and every such read was already audited. ([BACKLOG #324](docs/BACKLOG.md))
 
 ### Fixed
+- **`audit-verify` accepted a zero-byte database, wrote a schema into it, and reported a clean chain
+  of nothing.** The existing guard on `audit-verify`, `audit-anchor` and `rekey-audit` only asked
+  whether the `--db` path *existed*. A zero-byte file exists and is a valid, empty SQLite database —
+  what a `touch` in an install script, a failed copy or a log-rotation mistake leaves behind — so it
+  walked past the guard, `open_store` migrated 372,736 bytes of schema **into the file that was
+  meant to be the evidence**, and the command printed `OK: verified 0 audit row(s)` and exited 0. A
+  scheduled compliance job reads the exit code, so a first deployment with one would have reported
+  OK forever while the real audit log went unchecked. All three subcommands now probe the path over
+  a **read-only** SQLite handle before the store opens — it can neither create the file nor migrate
+  it — and exit **2** when there is no `audit_log` table, naming which of absent, zero-byte or
+  not-a-database it found.
+  **`audit-verify` also splits "verified nothing" out of its success code:** a clean walk over an
+  empty log is now exit **3**, and `--allow-empty` (new) turns that back into 0, as does an expected
+  anchor of `0:`, which asserts emptiness and is checked. Exit 1 stays a BROKEN CHAIN, so a job can
+  no longer read an empty log as detected tamper. `audit-anchor` keeps exit 0 on a real store whose
+  log is legitimately empty — sealing a fresh instance as `0:` is a supported workflow — and refuses
+  only the non-audit-database paths. ([BACKLOG #1669](docs/BACKLOG.md))
+- **`verify --smoke self` reported PASS on a synthetic message the config would have dropped.**
+  `smoke_self` failed only on `DryRunResult.error`, which `dry_run` sets for a parse failure, a
+  strict-validation failure or a Router/Handler raise. `UNROUTED` (the Router selected no handler) and
+  `FILTERED` (Handlers ran and sent nothing, including a sole destination that is
+  present-but-not-deployed) carry `error=None`, so the disposition was written into the row's summary
+  and never gated on. A deploying site whose Router matched nothing, or whose only outbound was not
+  yet deployed, would read a green acceptance report off a message the engine would have dropped. The
+  row now PASSES only on a delivering outcome and otherwise FAILs, naming the disposition and the
+  handler/delivery counts. That is the verdict `_classify_disposition` already reaches for the **live**
+  smoke on the **same** synthetic message, so the two halves of `verify` no longer answer one question
+  two ways; an unrecognised disposition fails closed instead of falling through to PASS. **Visible
+  change:** a config whose Router declines the fixed synthetic `ADT^A01` from `MAINHOSP` now reds this
+  row, and the failure text says to point `--inbound` at a connection that takes one. The happy-path
+  test asserted `"deliveries=" in detail`, which `deliveries=0` also satisfies, so neither the defect
+  nor the `FAIL` branch had a covering test; both do now.
+  ([BACKLOG #1707](docs/BACKLOG.md))
 - **The shipped VS Code snippet generated a FHIR lookup the engine now refuses.** The
   `meforfhirlookup` snippet built its search by concatenating a message field into a flat `?`-query —
   the form removed along with `[egress].fhir_require_structured_params` — so the snippet emitted a
@@ -372,6 +455,21 @@ All notable changes to MessageFoundry are documented here. The format follows
   dead ACK path that nonetheless delivered everything still passes when `connections >= sent`; an
   intake floor cannot catch a fault whose signature is a high read with no ACKs. Bounding that arm
   needs its own change.
+- **`messagefoundry adr-analyze` exited 0 over an ADR directory that does not exist.** `Path.glob`
+  yields nothing and raises nothing for a missing directory, so a missing, non-directory, or
+  ADR-less `--adr-dir` produced zero reports and `AnalysisResult.ok = True` — the exact shape of a
+  clean run. Withdrawing the ADRs would have silently turned a failing advisory check into a
+  passing one. `AnalysisResult` now carries an `error` field, set to a line naming the directory
+  when it is missing, is not a directory, or holds no file matching the ADR glob; discovery also
+  drops a directory that happens to be named like an ADR, which the glob alone would have matched.
+  **Visible change:** `adr-analyze` now exits **2**, with or without `--strict`, when there is no
+  corpus to analyze — the same "could not start" code the CLI's other subcommands already spend on
+  a store that fails to open, and distinct from `--strict`'s own coverage-gap exit of 1. `--json`
+  output gains a permanent `error` key (`null` on a normal run), and `ok` is now
+  `error is None and not coverage_gaps`. The error line says what was looked for, not why nothing
+  matched: both `Path.exists` and `Path.glob` swallow `OSError`, so a directory the process cannot
+  read is indistinguishable here from one that is absent, and a message guessing between them would
+  send an operator after the wrong cause.
 
 ## [0.3.2] — 2026-07-28 — Early Access
 

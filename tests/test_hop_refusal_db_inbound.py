@@ -4,7 +4,8 @@
 
 Covers three cells that consume the shared authority in ``config/tls_policy.py``:
 
-* **DB egress/lookup** (``transports/database.py``): the customer-DB weakened-TLS (verify-off) refusal,
+* **DB egress/lookup** (``transports/database.py``, plus the reference-sync twin in
+  ``pipeline/reference_sync.py``): the customer-DB weakened-TLS (verify-off) refusal,
   routed through the ONE escape/predicate — a STRICT verify-off cell (refused for staging AND prod PHI),
   with the global escape CLAMPED so it can never relax a production hop, plus the per-connection
   ``tls_hop_attested`` opt-in and the zero-I/O send-time byte-crossing re-assertion.
@@ -41,6 +42,7 @@ from messagefoundry.pipeline.wiring_runner import (
 )
 from messagefoundry.transports.database import (
     DatabaseDestination,
+    DatabaseLookupExecutor,
     DatabaseSource,
     _assert_send_hop,
     _build_dsn,
@@ -173,6 +175,92 @@ def test_assert_send_hop_noop_when_not_weakened() -> None:
 
 def test_assert_send_hop_permitted_when_attested() -> None:
     _assert_send_hop(weakened=True, attested=True)  # attested secure by other means
+
+
+# --- DB: the live-lookup executor and the reference-sync twin honour the attestation (#1666) -----
+#
+# Both cells build their DSN through `_build_dsn` and both dropped the per-connection attestation, so
+# a weakened-TLS hop the operator HAD attested was refused on the live-read and reference-sync paths
+# while the destination and the poll source crossed it. The setting stays UNAUTHORABLE either way --
+# neither `DatabaseLookup()` nor `DatabaseRef()` takes it and neither has a TOML surface, so only a
+# direct embedding reaches the mapping. Giving a factory the parameter is a separate, owner-gated
+# question, not this.
+
+_ATTESTED_DB = {
+    **_WEAK_DB,
+    "tls_hop_attested": True,
+    "tls_hop_attested_reason": "proxy-terminated TLS on a dedicated segment",
+}
+
+
+class _StopBeforeDial(RuntimeError):
+    """Raised by the faked pool factory once the DSN exists — the dial itself is out of scope here."""
+
+
+def test_lookup_executor_prod_phi_attested_constructs(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    with active_hop_posture(PROD_PHI):
+        executor = DatabaseLookupExecutor({"clarity": dict(_ATTESTED_DB)})
+    dsn = executor._dsn["clarity"]
+    assert "Encrypt=no" in dsn
+    assert "ApplicationIntent=ReadOnly" in dsn  # the ADR 0010 read-only intent is unchanged
+
+
+def test_lookup_executor_prod_phi_unattested_still_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No-loosen control: with no attestation the clamp still refuses, escape variable set or not.
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    with active_hop_posture(PROD_PHI), pytest.raises(ValueError, match="weakened"):
+        DatabaseLookupExecutor({"clarity": dict(_WEAK_DB)})
+
+
+def test_lookup_executor_reason_without_flag_fails_loud() -> None:
+    settings = {**_ATTESTED_DB, "tls_hop_attested": False}
+    with pytest.raises(ValueError, match="tls_hop_attested_reason is set without"):
+        DatabaseLookupExecutor({"clarity": settings})
+
+
+def test_lookup_executor_flag_without_reason_fails_loud() -> None:
+    settings = {k: v for k, v in _ATTESTED_DB.items() if k != "tls_hop_attested_reason"}
+    with pytest.raises(ValueError, match="requires tls_hop_attested_reason"):
+        DatabaseLookupExecutor({"clarity": settings})
+
+
+def _fail_at_dial(monkeypatch: pytest.MonkeyPatch, seen: list[str]) -> None:
+    """Capture the DSN the reference source builds and stop before any socket is opened."""
+
+    async def _fake_make_pool(dsn: str, pool_max: int, *, autocommit: bool) -> object:
+        seen.append(dsn)
+        raise _StopBeforeDial
+
+    monkeypatch.setattr("messagefoundry.transports.database._make_pool", _fake_make_pool)
+
+
+def test_reference_source_prod_phi_attested_builds_dsn(monkeypatch: pytest.MonkeyPatch) -> None:
+    from messagefoundry.pipeline.reference_sync import _load_database_source
+
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    seen: list[str] = []
+    _fail_at_dial(monkeypatch, seen)
+    settings = {**_ATTESTED_DB, "statement": "SELECT code, label FROM t", "key_column": "code"}
+    with active_hop_posture(PROD_PHI), pytest.raises(_StopBeforeDial):
+        asyncio.run(_load_database_source(settings, None))
+    assert "Encrypt=no" in seen[0]
+
+
+def test_reference_source_prod_phi_unattested_still_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from messagefoundry.pipeline.reference_sync import _load_database_source
+
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    seen: list[str] = []
+    _fail_at_dial(monkeypatch, seen)
+    settings = {**_WEAK_DB, "statement": "SELECT code FROM t", "key_column": "code"}
+    with active_hop_posture(PROD_PHI), pytest.raises(ValueError, match="weakened"):
+        asyncio.run(_load_database_source(settings, None))
+    assert seen == []  # refused BEFORE the pool was ever built
 
 
 # --- DB: the generic-ODBC dialect's cleartext hop, gated (BACKLOG #1178) -------------------------

@@ -208,10 +208,53 @@ async def test_dead_ingress_row_finalizes_message_error(store: MessageStore) -> 
     assert (await store.get_message(mid))["status"] == MessageStatus.ERROR.value
 
 
+async def test_replay_of_a_message_with_no_queue_rows_changes_nothing(store: MessageStore) -> None:
+    """``replay``'s ``if cur.rowcount:`` guard, on the input class the erased-body suite cannot reach.
+
+    ``tests/test_replay_purged_body.py`` pins the same guard for a message whose rows EXIST and whose
+    bodies retention erased. A FILTERED (or UNROUTED) message reaches it by a different route: it has
+    no queue rows at all, so ``stuck`` is 0, replay falls through to the RE-SEND branch, and the
+    UPDATE matches nothing. Drop the guard and the status write and the audit event would still run,
+    flipping a deliberately-filtered message to ROUTED and logging a ``replayed`` event for rows that
+    were never there — a false disposition an operator reading the timeline would act on
+    (BACKLOG #1633).
+
+    The delivered CONTROL is not padding: "0 rows requeued, nothing moved" is also what a replay
+    broken outright looks like, so the second half proves the call still works in this store.
+    """
+    mid = await store.enqueue_ingress(channel_id="IB", raw=RAW)
+    item = await _claim_ingress(store, "IB")
+    assert item is not None
+    await store.handoff(
+        ingress_id=item.id,
+        message_id=mid,
+        channel_id="IB",
+        deliveries=[],
+        disposition=MessageStatus.FILTERED,
+    )
+    assert await store.outbox_for(mid) == []  # the input class, asserted rather than assumed
+
+    assert await store.replay(mid) == 0
+    assert (await store.get_message(mid))["status"] == MessageStatus.FILTERED.value
+    assert "replayed" not in [e["event"] for e in await store.events_for(mid)]
+
+    # Control: a message that DOES have a row still replays, so the zero above is about this input.
+    other = await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB_A", "p")])
+    assert await store.replay(other) == 1
+    assert "replayed" in [e["event"] for e in await store.events_for(other)]
+
+
 # --- per-stage recovery ------------------------------------------------------
 
 
-async def test_reset_stale_inflight_recovers_all_stages(store: MessageStore) -> None:
+async def test_reset_stale_inflight_recovers_ingress_and_outbound(store: MessageStore) -> None:
+    # Named for the two stages it actually seeds. It used to be called "..._recovers_all_stages",
+    # which claimed cover it does not have: there are FOUR stages and this seeds ingress and outbound
+    # only, so a regression at the routed or response stage would not have reddened it (BACKLOG
+    # #1633). All four ARE covered, by
+    # tests/test_ownership_scoped_reset.py::test_global_default_recovers_all_stages_and_lanes, whose
+    # _seed_all_lanes seeds every Stage value across two lanes each. This stays as the compact
+    # stage=None smoke check beside its scoped sibling below.
     # An inflight ingress row AND an inflight outbound row both revert to pending in one all-stages call.
     mid1 = await store.enqueue_ingress(channel_id="IB", raw=RAW)
     await _claim_ingress(store, "IB")  # leaves an inflight ingress row
@@ -767,6 +810,142 @@ async def test_dead_letter_missing_handlers_kills_orphan_routed_rows(store: Mess
     assert await store.dead_letter_missing_handlers({"present"}) == 0
 
 
+# --- the inbound-keyed orphan sweep (BACKLOG #1612) --------------------------
+
+
+async def test_dead_letter_missing_inbounds_kills_orphan_ingress_and_routed_rows(
+    store: MessageStore,
+) -> None:
+    """An inbound removed before a restart strands every ingress and routed row it left behind.
+
+    Both stages key their lane on ``channel_id``, and the pooled lane provider is the live registry's
+    inbound set, so no worker ever claims the orphan lane. The two sweeps that already existed key on
+    ``destination_name`` and ``handler_name``, so neither can see these rows: before this one, they
+    sat pending forever with no disposition, no dead-letter, and no alert able to reach them.
+    """
+    # Two removed inbounds, one stranded at each channel-keyed stage (a shared lane would have
+    # `_route` claim the other message's row — it takes the lane's FIFO head, not its own).
+    ingress_only = await store.enqueue_ingress(channel_id="mllp_in", raw=RAW)
+    routed = await _route(store, "http_in", ["h"], MessageStatus.ROUTED)
+    # The existing sweeps are blind to the inbound column. This is the gap, asserted.
+    assert await store.dead_letter_missing_destinations({"OB_A"}) == 0
+    assert await store.dead_letter_missing_handlers({"h"}) == 0
+    assert (await store.get_message(ingress_only))["status"] == MessageStatus.RECEIVED.value
+
+    assert await store.dead_letter_missing_inbounds({"other_in"}, now=5.0) == 2
+    for mid in (ingress_only, routed):
+        assert (await store.get_message(mid))["status"] == MessageStatus.ERROR.value
+        dead = [e for e in await store.events_for(mid) if e["event"] == "dead"]
+        assert len(dead) == 1 and dead[0]["detail"] == "inbound removed from registry"
+    # Nothing pending left on either orphan lane.
+    assert await store.pending_depth("mllp_in", stage=Stage.INGRESS.value) == (0, None)
+    assert await store.pending_depth("http_in", stage=Stage.ROUTED.value) == (0, None)
+
+
+async def test_dead_letter_missing_inbounds_spares_live_lanes_and_outbound_rows(
+    store: MessageStore,
+) -> None:
+    """Scoped two ways: to the ``channel_id``-keyed stages, and to channels absent from the registry.
+
+    An outbound row carries the origin's ``channel_id`` too, but its lane keys on ``destination_name``
+    and its delivery worker exists regardless of where the message came from — so a removed inbound
+    must never dead-letter work that is still draining normally.
+    """
+    live = await store.enqueue_ingress(channel_id="IB", raw=RAW)
+    # An outbound row whose ORIGIN inbound is gone: still delivering, must be left alone.
+    outbound = await store.enqueue_message(
+        channel_id="gone_in", raw=RAW, deliveries=[("OB_A", "p")]
+    )
+    assert await store.dead_letter_missing_inbounds({"IB"}) == 0
+    assert (await store.get_message(live))["status"] == MessageStatus.RECEIVED.value
+    assert (await store.get_message(outbound))["status"] == MessageStatus.ROUTED.value
+    assert (await store.pending_depth("OB_A", stage=Stage.OUTBOUND.value))[0] == 1
+    assert await _claim_ingress(store, "IB") is not None  # the live lane still claims
+
+
+async def test_dead_letter_missing_inbounds_covers_the_response_stage(
+    store: MessageStore,
+) -> None:
+    """The response stage keys on ``channel_id`` too, so a removed LOOPBACK strands the same way.
+
+    A response row is a "this reply owes a re-ingress" token whose ``channel_id`` is the loopback
+    inbound and whose ``message_id`` is the ORIGIN, so the finalizer holds that message in flight
+    until the token drains. The re-ingress worker has the same missing-inbound retry-forever exit as
+    the router and transform workers, and the response lane provider is the registry's loopback
+    inbounds — so an orphan token pins its origin message out of a disposition forever.
+    """
+    mid = await store.enqueue_ingress(channel_id="in_c", raw=RAW)
+    rid = f"resp-{mid[:6]}"
+    await store._db.execute(
+        "INSERT INTO queue (id, message_id, stage, channel_id, destination_name, handler_name,"
+        " payload, status, attempts, next_attempt_at, created_at, updated_at)"
+        " VALUES (?,?,?,?,NULL,NULL,?,?,0,?,?,?)",
+        (
+            rid,
+            mid,
+            Stage.RESPONSE.value,
+            "loop_in",
+            store._cipher.encrypt(RAW),
+            OutboxStatus.PENDING.value,
+            0.0,
+            0.0,
+            0.0,
+        ),
+    )
+    await store._db.commit()
+    # Only the loopback is gone; the message's own ingress lane is still configured.
+    assert await store.dead_letter_missing_inbounds({"in_c"}) == 1
+    assert await store.pending_depth("loop_in", stage=Stage.RESPONSE.value) == (0, None)
+    assert (await store.pending_depth("in_c", stage=Stage.INGRESS.value))[0] == 1  # spared
+
+
+async def test_dead_letter_missing_inbounds_ingress_orphan_replays(store: MessageStore) -> None:
+    """A dead-letter that cannot be replayed is data loss with a nicer name, so prove the round trip.
+
+    Restoring the inbound and replaying re-pends the orphan at the ingress stage with its raw intact;
+    the lane claims it again and the message runs the rest of the pipeline to ``PROCESSED``.
+    """
+    mid = await store.enqueue_ingress(channel_id="in_a", raw=RAW)
+    assert await store.dead_letter_missing_inbounds(set()) == 1
+    assert await _claim_ingress(store, "in_a") is None  # a dead row is not claimable
+
+    assert await store.replay(mid) == 1  # the inbound is back; the operator replays
+    item = await _claim_ingress(store, "in_a")
+    assert item is not None and item.message_id == mid and item.payload == RAW
+    await store.route_handoff(
+        ingress_id=item.id,
+        message_id=mid,
+        channel_id="in_a",
+        handlers=[("h", RAW)],
+        disposition=MessageStatus.ROUTED,
+    )
+    await _transform(store, "in_a", [("OB_A", "p")])
+    out = await store.claim_next_fifo("OB_A")
+    assert out is not None
+    await store.mark_done(out.id)
+    assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
+
+
+async def test_dead_letter_missing_inbounds_routed_orphan_replays(store: MessageStore) -> None:
+    """The routed orphan replays at its OWN stage — re-pended as ``routed``, still naming its handler,
+    so the replay resumes the message rather than re-running routing over it."""
+    mid = await _route(store, "in_b", ["h"], MessageStatus.ROUTED)
+    assert await store.dead_letter_missing_inbounds(set()) == 1
+    assert await _claim_routed(store, "in_b") is None
+
+    assert await store.replay(mid) == 1
+    item = await _claim_routed(store, "in_b")
+    assert item is not None and item.stage == Stage.ROUTED.value
+    assert item.handler_name == "h" and item.payload == RAW
+    await store.transform_handoff(
+        routed_id=item.id, message_id=mid, channel_id="in_b", deliveries=[("OB_A", "p")]
+    )
+    out = await store.claim_next_fifo("OB_A")
+    assert out is not None
+    await store.mark_done(out.id)
+    assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
+
+
 async def test_replay_dead_routed_row_does_not_repend_delivered_sibling(
     store: MessageStore,
 ) -> None:
@@ -932,7 +1111,7 @@ async def test_ack_after_delivered_global_default_rejected_at_start(tmp_path: Pa
         try:
             assert runner.running
             assert not runner.inbound_running("IB")
-            reason = runner.connection_failed("IB")
+            reason = runner.inbound_failed("IB")
             assert reason and "not yet implemented" in reason
             # the guard is still the sole defense and still fires loud for a direct caller:
             with pytest.raises(WiringError, match="not yet implemented"):

@@ -428,6 +428,13 @@ Full references: **[SECURITY.md](SECURITY.md)**, **[PHI.md](PHI.md)**, and **[DE
       surface in `last_error`/`detail`).
 - [ ] Run **`messagefoundry audit-verify`** periodically (the audit log is tamper-*evident*, not
       tamper-*proof*), and set `[retention]` windows — they are **off by default (kept forever)**.
+- [ ] **Have that scheduled job branch on the exit code, not just on nonzero.** `1` is a broken
+      chain, `2` is "the `--db` path is not an audit database" (absent, zero-byte, or no `audit_log`
+      table — a `touch` in an install script or a failed copy leaves exactly that, and the verifier
+      refuses it rather than creating one), and `3` is a clean walk over an **empty** log. Treating
+      `2` or `3` as a tamper alarm pages someone for a misconfiguration; treating either as a pass
+      leaves the real log unchecked. Add `--allow-empty` only where an empty log is expected.
+      Exit codes and their reasoning: [`SECURITY.md`](SECURITY.md) "Tamper-evidence".
 - [ ] **Seal the audit DB across any gap in custody, with an anchor.** A bare `audit-verify` is clean
       after the *newest* rows are deleted — the surviving prefix still chains — so on its own it is
       blind to the attack it is run for. **`messagefoundry audit-anchor`** prints `COUNT:HEAD` (no PHI,
@@ -893,7 +900,10 @@ Ending a pilot is a **PHI-disposal** event. `uninstall-service.ps1` removes the 
 **deliberately leaves the store and logs on disk**. To tear down cleanly:
 
 1. **Graceful drain + stop**, confirm no in-flight work remains.
-2. **Uninstall the service** (`scripts\service\uninstall-service.ps1`).
+2. **Uninstall the service** (`scripts\service\uninstall-service.ps1`). Read the inventory it
+   prints: removing the registration leaves the data directory, permissions naming the run-as
+   account, a user right and more, each with the command that clears it
+   ([SERVICE.md](SERVICE.md#uninstall)).
 3. **Securely dispose of all PHI-bearing artifacts:** the store (`.db` + `-wal` + `-shm`), any
    PostgreSQL database/backups, **File-connector spill directories**, the `logs` directory, every
    **backup copy**, and the **encryption key / DPAPI key file**.

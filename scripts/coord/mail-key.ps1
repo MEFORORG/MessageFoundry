@@ -93,7 +93,46 @@ function Test-MailStem {
     #
     # This validates the STEM, not the whole filename -- the extension and the claim-token half are
     # checked by Split-MailFileName in mail-claim.ps1, which is the one place the two shapes meet.
+    #
+    # COMPOSED FROM Get-MailStemPattern BELOW RATHER THAN CARRYING ITS OWN COPY OF THE SHAPE. The
+    # anchors are this function's whole contribution: the shape itself has one definition, so the
+    # validator and the search pattern cannot drift apart at all rather than being held together by a
+    # test. That is this file's own rule, applied to the shape it owns.
     [CmdletBinding()]
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Stem)
-    return ($Stem -cmatch '\A[0-9]{8}T[0-9]{9}-[0-9a-z]{6}\z')
+    return ($Stem -cmatch ('\A' + (Get-MailStemPattern) + '\z'))
+}
+
+function Get-MailStemPattern {
+    # THE STEM SHAPE, ONCE. Unanchored, because it has two jobs: Test-MailStem above anchors it to
+    # decide whether a whole string is a stem, and the drain's receipt sweep matches it unanchored to
+    # FIND a stem quoted inside a document.
+    #
+    # IT SITS HERE RATHER THAN IN THE DRAIN for the reason this whole file exists: a second copy of a
+    # shared shape drifts, and the copy that drifts is the one nobody is testing.
+    #
+    # -cmatch above is case-SENSITIVE and .NET's Regex default is too, so a caller that builds its own
+    # [regex] from this pattern gets the same verdict as the validator. Do not pass IgnoreCase.
+    return '[0-9]{8}T[0-9]{9}-[0-9a-z]{6}'
+}
+
+function Split-ReceiptFileName {
+    # THE RECEIPT NAME SHAPE, <stem>.json. Returns $null for anything this channel did not mint, and a
+    # $null return is the caller's signal to LEAVE THE FILE ALONE -- the same contract as
+    # Split-MailFileName and Split-ShownMarkerName in mail-claim.ps1.
+    #
+    # IT IS HERE AND NOT THERE BECAUSE A RECEIPT NAME HAS NO CLAIM TOKEN IN IT. Those two exist in
+    # mail-claim.ps1 because they JOIN the stem shape to the token shape, and this file's header
+    # forbids a second definition of that join. A receipt is a bare stem, so there is no join to
+    # define and the shape belongs beside the stem validator that decides it.
+    #
+    # A CALLER MUST NOT REACH FOR Split-MailFileName HERE. That one requires the --<token> half a
+    # receipt name does not carry, so it rejects every receipt in the directory -- and a sweep guarded
+    # by it deletes nothing while reporting, truthfully, that it ran. Silent in both directions.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Name)
+    if (-not $Name.EndsWith('.json', [StringComparison]::Ordinal)) { return $null }
+    $stem = $Name.Substring(0, $Name.Length - 5)
+    if (-not (Test-MailStem -Stem $stem)) { return $null }
+    return [pscustomobject]@{ Stem = $stem }
 }

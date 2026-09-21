@@ -20,7 +20,7 @@ from urllib.parse import quote, urlsplit
 from fastapi import HTTPException, Request, Response, WebSocket, status
 from fastapi.responses import RedirectResponse
 
-from messagefoundry.api.security import get_auth
+from messagefoundry.api.security import enforce_phi_read_hop, get_auth
 from messagefoundry.auth import Identity, Permission
 from messagefoundry.auth.service import AuthService
 
@@ -257,11 +257,13 @@ def require_ui(
     switch: it turns the gate OFF, and the row with it, so it belongs only on a route a pending session
     must reach (enrollment, the confinement page, the account pages).
 
-    ``phi=True`` also applies the same per-actor anti-automation throttle as ``require_phi_read`` (the
-    /ui PHI views call the JSON handlers directly, which skips their own ``Depends`` gate, so this
-    dependency must re-apply the equivalent permission + throttle — otherwise a cookie session could
-    read PHI it lacks the permission/quota for). Unauthenticated/expired → 303 to the login page;
-    forbidden → 403; throttled → 429.
+    ``phi=True`` also applies the ADR 0092 serve-hop refusal (``enforce_phi_read_hop``) and the same
+    per-actor anti-automation throttle as ``require_phi_read`` (the /ui PHI views call the JSON
+    handlers directly, which skips their own ``Depends`` gate, so this dependency must re-apply the
+    equivalent permission + hop refusal + throttle — otherwise a cookie session could read PHI it
+    lacks the permission/quota for, over a hop the JSON plane refuses to emit it on).
+    Unauthenticated/expired → 303 to the login page; forbidden → 403; refused hop → 403; throttled →
+    429.
 
     A ``must_change_password`` account is 303'd to the browser change-password page (L4b) from every
     /ui route — ``allow_must_change=True`` is set ONLY by that page's own GET/POST (so the rotation
@@ -315,12 +317,24 @@ def require_ui(
             if not identity.has(permission):
                 await auth.audit_permission_denied(identity, permission, request.url.path)
                 raise HTTPException(status.HTTP_403_FORBIDDEN, "forbidden")
-        if phi and not auth.allow_phi_read(identity.user_id):
-            raise HTTPException(
-                status.HTTP_429_TOO_MANY_REQUESTS,
-                "too many requests; please slow down",
-                headers={"Retry-After": "10"},
-            )
+        if phi:
+            # BACKLOG #1738, the same shape as the #287 block below. The console reaches the PHI
+            # handlers IN-PROCESS, so their own `Depends(require_phi_read(...))` -- where
+            # `enforce_phi_read_hop` is folded in -- never runs for a /ui request, and this arm
+            # re-applied the permission and the throttle but not the ADR 0092 serve-hop refusal.
+            #
+            # TWO ORDERING DECISIONS, both load-bearing, both stated in full in docs/SECURITY.md
+            # under the /ui console plane. Below the identity work, unlike the JSON plane: refusing
+            # first would answer an unauthenticated GET with a 403 naming this instance's serve-hop
+            # posture, where a browser has to get its login redirect instead. Above the budget: a
+            # read that will not be served must not spend the actor's PHI-read quota.
+            enforce_phi_read_hop(request)
+            if not auth.allow_phi_read(identity.user_id):
+                raise HTTPException(
+                    status.HTTP_429_TOO_MANY_REQUESTS,
+                    "too many requests; please slow down",
+                    headers={"Retry-After": "10"},
+                )
         # BACKLOG #287: the console reaches the handlers IN-PROCESS -- it holds no HTTP client -- so
         # a /ui write never passes through the engine's `_enforce_admin_write_pacing`. Without this
         # the product's only pacing floor was absent on the one surface a human actually uses. Same
@@ -614,9 +628,11 @@ def require_ui_step_up(
     gets no trust: ``/ui/reauth`` still validates it against the write-action registry (fail-closed).
 
     ``phi=True`` forwards to :func:`require_ui`'s ``phi`` arm, so a step-up route that PUTS PHI ON THE
-    WIRE also charges the per-actor anti-automation budget (``allow_phi_read``; 429 + ``Retry-After``
-    when exhausted) — the same throttle the plain ``require_ui(..., phi=True)`` browse routes and the
-    JSON ``require_phi_read`` routes charge. It defaults **False** because most routes riding this
+    WIRE also takes the ADR 0092 serve-hop refusal (``enforce_phi_read_hop``) and charges the per-actor
+    anti-automation budget (``allow_phi_read``; 429 + ``Retry-After`` when exhausted) — the same two
+    controls the plain ``require_ui(..., phi=True)`` browse routes and the JSON ``require_phi_read``
+    routes take. Forwarding is why the edit pair below is covered without a call site of its own
+    (BACKLOG #1738). It defaults **False** because most routes riding this
     factory are admin writes (user/role management, replay, purge, config reload) that emit no message
     body: charging a PHI budget there would throttle administration on a quota that measures PHI reads.
     The charge runs in the DEPENDENCY, i.e. on EVERY request the route serves, BEFORE the body. So set
@@ -719,7 +735,13 @@ async def _ui_action_step_up_ok(auth: AuthService, token: str | None, action: st
     ``api.security._action_step_up_ok``: when action-binding is enforced (default) a fresh single-use
     grant BOUND to ``action`` (consumed here); when the org opted out
     (``[auth].require_action_step_up = false``) the legacy session-window recency. Uses only PUBLIC
-    ``AuthService`` members, so no cross-package private import is needed."""
+    ``AuthService`` members, so no cross-package private import is needed.
+
+    The factor-binding refusal below sits ABOVE that fork, so no knob reaches it (ASVS 6.3.3; the
+    bypass it closes is the ADR 0077 amendment of 2026-09-14). Closing it only on the JSON twin
+    would have left the surface a human actually uses open."""
+    if await auth.factor_binding_is_blocked(token, action):
+        return False
     if auth.action_step_up_required:
         return await auth.has_action_step_up(token, action)
     return await auth.has_recent_step_up(token)
@@ -996,7 +1018,8 @@ def clear_oidc_flow_cookie(response: Response, request: Request) -> None:
 #: Legible fail-closed copy, shared by every affected surface (account page, enroll flow, reauth
 #: page) so the operator sees ONE consistent message + recovery path — never a redirect loop.
 WEBAUTHN_RP_MISSING_NOTICE = (
-    "Passkeys are unavailable: [api].public_origin is not set — contact your administrator."
+    "Passkeys are unavailable: [security].web_console_public_address is not set — "
+    "contact your administrator."
 )
 WEBAUTHN_EXTRA_MISSING_NOTICE = (
     "Passkeys are unavailable on this install (the [webauthn] extra is not installed) — "

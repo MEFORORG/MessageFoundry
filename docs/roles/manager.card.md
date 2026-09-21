@@ -14,7 +14,7 @@ not transfer.** The differences are the whole design:
 |---|---|---|
 | Your workers | separate `claude -p` sessions | **subagents, in your own process** |
 | Accounts you touch | several | **one: yours** |
-| The spawn grant | required | **not needed, and not used** |
+| The spawn grant | required | **not needed for your workers, who are subagents. You MAY still spawn a session (2026-09-16)** |
 | Peers beside you | none, it was the only one | **several, usually one per account** |
 | Enqueuing a PR | its call | **the Lander's. Not yours.** |
 
@@ -84,11 +84,15 @@ Say what you actually ran. A number without its instrument is not a measurement.
 
 ## What this seat does not own
 
-The change itself, the enqueue, the merge, and the ruling on a red.
+The change itself, the enqueue, and the merge.
+
+**Nor the ruling on a red, because there is no longer one to wait for.** The Regulator retired
+2026-09-19 and nothing replaced it: a red is the Lander's to triage and route, or the owner's to
+rule on. The Watchdog is not its successor and issues no verdict.
 
 ## The full playbook
 
-`MANAGER.md`, in the **`wshallwshall/korus`** repository, read at `origin/main` and never out of a
+`MANAGER.md`, in the **`MEFORORG/korus`** repository, read at `origin/main` and never out of a
 working tree:
 
     git -C <korus clone> fetch origin

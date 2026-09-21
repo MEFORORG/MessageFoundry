@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import logging
 import ssl
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from messagefoundry.auth.trust_anchors import api_client_anchor_spec, enforce_anchor
 from messagefoundry.config.settings import ApiSettings
@@ -23,7 +25,15 @@ from messagefoundry.config.tls_policy import (
     harden_verify_flags,
 )
 
-__all__ = ["build_api_ssl_context", "ensure_api_tls_material"]
+__all__ = [
+    "ApiTlsPlan",
+    "ApiTlsSource",
+    "api_tls_source",
+    "build_api_ssl_context",
+    "ensure_api_tls_material",
+    "generated_state_dir",
+    "plan_api_tls_material",
+]
 
 log = logging.getLogger(__name__)
 
@@ -84,6 +94,131 @@ _GENERATED_CERT_NAME = "api-generated-cert.pem"
 _GENERATED_KEY_NAME = "api-generated-key.pem"
 
 
+def _generated_pair(state_dir: Path) -> tuple[Path, Path]:
+    """The ``(cert, key)`` paths of the first-run generated pair. The only place they are spelled."""
+    return state_dir / _GENERATED_CERT_NAME, state_dir / _GENERATED_KEY_NAME
+
+
+def generated_state_dir(store_path: str) -> Path:
+    """Where the engine keeps its own writable state: the directory holding the store database.
+
+    Named here rather than spelled at each call site, because it is the rule a CLIENT must not have
+    to know -- and it was already written twice (the serve path and the ``cert inventory`` reporter)
+    before it had a name.
+    """
+    return Path(store_path).resolve().parent
+
+
+#: Where the material the API bind serves with comes from. ``upstream`` is the one source that is not
+#: material at all -- a declared reverse proxy terminates TLS in front and the engine serves plaintext.
+ApiTlsSource = Literal["operator", "generated", "upstream"]
+
+
+def api_tls_source(*, cert_file: str | None, tls_terminated_upstream: bool) -> ApiTlsSource:
+    """The ORDER: an operator chain wins, a declared upstream terminator mints nothing, else generated.
+
+    Takes the two settings rather than an :class:`ApiSettings`, so a caller that cannot afford this
+    module's imports -- the tray reads an untrusted, possibly-malformed service TOML and must degrade
+    rather than raise (ADR 0113 layering) -- can share the ordering without sharing the machinery.
+    """
+    if cert_file:
+        return "operator"
+    return "upstream" if tls_terminated_upstream else "generated"
+
+
+@dataclass(frozen=True)
+class ApiTlsPlan:
+    """What the API bind **will** serve with, decided without reading or writing a single file.
+
+    This is the branch order of :func:`ensure_api_tls_material` lifted out so a caller that must not
+    mint can still answer the two questions a CLIENT has: *which scheme does this engine speak*, and
+    *which certificate will it present*. Both were previously derivable only by re-implementing the
+    predicate, and each re-implementation got it wrong in its own way -- keying the scheme on
+    ``[api].tls_cert_file`` alone reads the SHIPPED DEFAULT as cleartext (BACKLOG #1126), and a
+    client with no idea where the generated pair lands cannot trust it at all (BACKLOG #1695).
+
+    **THE ORDERING IS NOT DECLARED ONCE IN THIS REPOSITORY, and saying so would be the
+    false-premise documentation that let the first copy drift.** ``tray/config.py``'s
+    ``engine_serves_https`` spells it a second time, over a raw TOML dict, and that copy stays: the
+    tray is stdlib-only by ADR 0113, and importing this module would pull pydantic and the settings
+    package into a tray icon's startup for one boolean. :func:`api_tls_source` exists so the order
+    is at least *callable* without the machinery -- it takes the two settings, not an
+    :class:`ApiSettings` -- and converging the tray onto it is unfiled follow-up work.
+    """
+
+    source: ApiTlsSource
+    #: The certificate the bind will present, **whether or not it exists yet** -- for ``generated``
+    #: this is the path the engine mints to on its first run. ``None`` only for ``upstream``.
+    cert_file: str | None
+    key_file: str | None
+
+    @property
+    def scheme(self) -> Literal["http", "https"]:
+        """The scheme the engine's OWN bind serves.
+
+        ``http`` only for a DECLARED upstream terminator, which is not a weaker posture: the proxy
+        holds the protected hop and the engine speaks plaintext behind it. A client that hardcodes
+        https breaks exactly that topology, which is why this is reported rather than assumed.
+        """
+        return "http" if self.source == "upstream" else "https"
+
+    def material(self) -> tuple[str, str | None] | None:
+        """The pair in :func:`ensure_api_tls_material`'s shape, or ``None`` for an upstream proxy."""
+        return None if self.cert_file is None else (self.cert_file, self.key_file)
+
+
+def plan_api_tls_material(api: ApiSettings, *, state_dir: Path) -> ApiTlsPlan:
+    """Decide the API bind's TLS posture **without touching the disk** -- see :class:`ApiTlsPlan`.
+
+    Pure: it neither mints, reads, nor stats anything, so it is safe on a read-only path (the
+    ``cert inventory`` reporter) and safe to call before the engine has ever run.
+    :func:`ensure_api_tls_material` consumes it, so the engine's own material is decided once.
+    """
+    source = api_tls_source(
+        cert_file=api.tls_cert_file, tls_terminated_upstream=api.tls_terminated_upstream
+    )
+    if source == "operator":
+        # Pass tls_key_file through UNCHANGED, None included -- see ensure_api_tls_material.
+        return ApiTlsPlan(source, api.tls_cert_file, api.tls_key_file)
+    if source == "upstream":
+        return ApiTlsPlan(source, None, None)
+    cert_path, key_path = _generated_pair(state_dir)
+    return ApiTlsPlan(source, str(cert_path), str(key_path))
+
+
+def _discard_half_minted_pair(cert_path: Path, key_path: Path) -> None:
+    """Remove a lone half of a previously generated pair, so the mint that follows can re-run.
+
+    Called only once the reuse branch has established that BOTH files are not present, so at most
+    one of these exists. A half-pair is unusable -- reuse needs both -- and the key half is also a
+    TRAP: the mint falls through, :func:`_write_private_key`'s ``O_EXCL`` refuses the surviving key,
+    and the engine fails to start. On EVERY start, permanently, naming no file to delete. ADR 0172
+    makes the generated pair the default first-run path, so that is a fresh deployment that never
+    comes up rather than an edge case.
+
+    **This is the durable half of the fix, and the ``try/finally`` around the mint is not.** That
+    guard unwinds an EXCEPTION. It does not run on a SIGKILL, a power loss, or an OOM kill, and each
+    of those leaves exactly the same half-pair. Recovery therefore cannot hang off the failure; it
+    has to sit on the path that runs next, which is this one. Attaching it here also makes the
+    recovery indifferent to how the half-pair arose, which is the property that matters, since the
+    causes are not enumerable.
+
+    **Deleting a private key is safe here and only here.** An operator-supplied ``tls_cert_file``
+    returned far above, so operator material never reaches this function; these are the engine's own
+    fixed generated names under its own state dir, and a lone one is engine-written debris by
+    construction. It is still logged at warning, because a deleted key must never be silent.
+    """
+    for orphan in (cert_path, key_path):
+        if not orphan.exists():
+            continue
+        log.warning(
+            "discarding a half-minted TLS pair: %s exists without its counterpart, so it is "
+            "unusable and would refuse every later start. Re-minting both.",
+            orphan,
+        )
+        orphan.unlink()
+
+
 def ensure_api_tls_material(api: ApiSettings, *, state_dir: Path) -> tuple[str, str | None] | None:
     """Return the ``(cert_path, key_path)`` the API should serve with, minting on first run.
 
@@ -100,11 +235,17 @@ def ensure_api_tls_material(api: ApiSettings, *, state_dir: Path) -> tuple[str, 
     fallback BENEATH it, never a replacement -- so a site that configures its own chain sees no
     behaviour change and this function is not even consulted.
 
-    **Returns ``None`` when a reverse proxy terminates TLS upstream** -- see the guard below.
+    **Returns ``None`` when a reverse proxy terminates TLS upstream.** Which of the three postures
+    applies is :func:`plan_api_tls_material`'s decision, not this function's -- this one adds only
+    the minting, so a read-only caller can ask the same question without writing a key.
 
     **Mint-once, then reuse.** The pair is written with :func:`_write_private_key`'s ``O_EXCL`` +
     ``0o600`` + Windows-DACL sequence, which REFUSES to overwrite. So a second start finds the
     files and loads them; it does not re-mint, and it cannot clobber a key.
+
+    **A HALF-PAIR IS THE EXCEPTION, and it re-mints rather than refusing** -- see
+    :func:`_discard_half_minted_pair`. Reuse needs BOTH files, so one alone is unusable AND a trap:
+    the O_EXCL refusal above would fire on the survivor at every later start, permanently.
 
     **The generated certificate is a PLACEHOLDER TO BE REPLACED, not an endorsed production
     terminator.** It is self-signed, so it carries no chain of trust: strictly better than
@@ -116,22 +257,21 @@ def ensure_api_tls_material(api: ApiSettings, *, state_dir: Path) -> tuple[str, 
     would serve an expired certificate every client rejects. The rotation shape is an open decision
     on #1276; until it lands, ``CertExpiryRunner`` alarms on this path like any other served cert.
     """
-    if api.tls_cert_file:  # operator-supplied material always wins
-        # Pass tls_key_file through UNCHANGED, None included -- see the key_path note above.
-        return api.tls_cert_file, api.tls_key_file
+    # The branch order lives in plan_api_tls_material, so the read-only reporter and the minting
+    # path cannot disagree about which certificate the bind presents. Two of the three branches
+    # need no disk at all: an operator's material is passed through UNCHANGED (tls_key_file's None
+    # included -- see the key_path note above), and a DECLARED UPSTREAM TERMINATOR IS NOT AN
+    # UNPROTECTED HOP, so minting there would break the proxy's own plaintext hop rather than
+    # harden anything. "Always serves TLS" means the engine never leaves a hop unprotected, NOT
+    # that it terminates TLS in every topology.
+    plan = plan_api_tls_material(api, state_dir=state_dir)
+    if plan.source != "generated":
+        return plan.material()
 
-    # A DECLARED UPSTREAM TERMINATOR IS NOT AN UNPROTECTED HOP, AND MINTING HERE WOULD BREAK IT.
-    # `tls_terminated_upstream` (+ trusted_proxies) says a reverse proxy terminates TLS in FRONT of
-    # the engine and speaks plaintext to it. Serving HTTPS underneath that proxy does not harden the
-    # deployment -- it breaks the proxy's own hop. "Always serves TLS" means the engine never leaves
-    # a hop unprotected, NOT that it terminates TLS in every topology.
-    if api.tls_terminated_upstream:
-        return None
-
-    cert_path = state_dir / _GENERATED_CERT_NAME
-    key_path = state_dir / _GENERATED_KEY_NAME
+    cert_path, key_path = _generated_pair(state_dir)
     if cert_path.exists() and key_path.exists():
         return str(cert_path), str(key_path)
+    _discard_half_minted_pair(cert_path, key_path)
 
     from messagefoundry import pki
     from messagefoundry.__main__ import _write_private_key
@@ -141,7 +281,18 @@ def ensure_api_tls_material(api: ApiSettings, *, state_dir: Path) -> tuple[str, 
     # lifetime for the same primitive.
     cert_pem, key_pem = pki.make_self_signed(api.host, [], 365)
     _write_private_key(key_path, key_pem)
-    cert_path.write_bytes(cert_pem)
+    paired = False
+    try:
+        cert_path.write_bytes(cert_pem)
+        paired = True
+    finally:
+        # THE MINT IS ALL-OR-NOTHING. An orphaned key.pem is not merely untidy: the reuse branch
+        # above needs BOTH files, so a next start finds cert_path missing, falls through, re-mints,
+        # and dies on _write_private_key's O_EXCL refusal. That repeats on every start until an
+        # operator deletes a file nothing told them about, so a half-written pair would brick the
+        # engine rather than degrade it. `finally`, not `except`, so no failure mode is missed.
+        if not paired:
+            key_path.unlink(missing_ok=True)
     log.warning(
         "no [api].tls_cert_file configured — minted a SELF-SIGNED certificate for %s at %s. It has "
         "no chain of trust and is a PLACEHOLDER: browsers will show a trust interstitial until it "

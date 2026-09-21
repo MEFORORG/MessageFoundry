@@ -547,10 +547,10 @@ function Resolve-SeatAgainstRoster {
         if ($seats.live -contains $lower) {
             $out.Canonical = $lower; $out.Verdict = 'live'; return $out
         }
-        if ($seats.aliases.PSObject.Properties.Name -contains $lower) {
+        if ((Get-RosterMapKeys $seats.aliases) -contains $lower) {
             $out.Canonical = $seats.aliases.$lower; $out.Verdict = 'alias'; return $out
         }
-        if ($seats.retired.PSObject.Properties.Name -contains $lower) {
+        if ((Get-RosterMapKeys $seats.retired) -contains $lower) {
             $out.Verdict = 'retired'
             $out.Message = @"
 [seat] DECLARED A RETIRED SEAT: '$Label'. The record was written anyway -- no record is worse than
@@ -566,8 +566,8 @@ Live seats: $liveList.
 "@
             return $out
         }
-        if (($seats.PSObject.Properties.Name -contains 'elsewhere') -and
-            ($seats.elsewhere.PSObject.Properties.Name -contains $lower)) {
+        if (((Get-RosterMapKeys $seats) -contains 'elsewhere') -and
+            ((Get-RosterMapKeys $seats.elsewhere) -contains $lower)) {
             $out.Verdict = 'elsewhere'
             $out.Message = @"
 [seat] '$Label' IS NOT A SEAT IN THIS REPOSITORY. The record was written anyway.
@@ -594,6 +594,32 @@ If '$Label' is a spelling of one of those, add it to the aliases map in docs/rol
         $out.Verdict = 'roster-unreadable'
         return $out
     }
+}
+
+function Get-RosterMapKeys {
+    <#
+      .SYNOPSIS
+        Key names of a seats.json map. An EMPTY ARRAY for a map that is empty, null, or absent.
+
+      .DESCRIPTION
+        WHY THIS EXISTS, MEASURED 2026-09-16. Under `Set-StrictMode -Version Latest`,
+        `$map.PSObject.Properties.Name` THROWS on a map with no members -- "The property 'Name'
+        cannot be found on this object" -- because projecting `.Name` over an empty property
+        collection has nothing to project from. A non-empty map of the same shape works, so the
+        expression reads as correct until the day a map empties.
+
+        WHAT THAT COST. The roster resolver wraps its whole read in one catch, and that catch
+        cannot tell "this JSON is unreadable" from "this JSON is readable and one map is empty".
+        So emptying a single map demoted EVERY verdict to `roster-unreadable` and the warning
+        this script exists to print vanished -- silently, with a zero exit and an empty stderr.
+        A declaration of a nonsense seat looked exactly like a declaration of a good one.
+
+        The rule that follows: never project a member over a ConvertFrom-Json map directly. Ask
+        this function, which answers the same question for an empty map as for a full one.
+    #>
+    param($Map)
+    if ($null -eq $Map) { return @() }
+    return @($Map.PSObject.Properties | ForEach-Object { $_.Name })
 }
 
 function Write-RecordAtomic {
@@ -798,6 +824,47 @@ try {
     }
 
     Write-RecordAtomic -Path $recPath -Object $rec
+    # ------------------------------------------------------------ the role-card marker
+    # A DECLARATION ALSO WRITES `.claude/seat.local.txt`, BECAUSE NOTHING ELSE DOES AND THE CARD
+    # HOOK READS NOTHING ELSE. This script writes the fleet episode record; `role-card-inject.ps1`
+    # resolves a seat from the marker file and from `$env:KORUS_SEAT`, and never from the record.
+    # Two stores, no bridge: a session that did exactly what the SessionStart prompt told it to do
+    # got a record and no card, and the failure was silent at the next session start.
+    #
+    # Measured 2026-09-19: 165 of 171 worktrees on this box carried no marker at all, and the only
+    # sessions that had one had typed it by hand on the /seat skill's instruction.
+    #
+    # THE CANONICAL LABEL IS WRITTEN, NOT THE TYPED ONE, so `-Seat mgr` leaves a marker that reads
+    # `manager` and resolves in one step next session.
+    #
+    # NOTHING IS WRITTEN WHEN THE LABEL RESOLVES TO NO LIVE SEAT. A retired or unknown label already
+    # gets a loud stderr notice below; leaving a marker the card hook will refuse would move that
+    # failure to the next session start and make it quiet again.
+    #
+    # THE MARKER CANNOT RIDE INTO A COMMIT: `.gitignore` carries `/.claude/*` with one negation, for
+    # `settings.json`. Verified with `git check-ignore -v`. Do not add a second negation.
+    if ($Declare -and $Seat -and $seatRoster.Canonical) {
+        try {
+            $markerPath = Join-Path $wt '.claude/seat.local.txt'
+            $markerDir = Split-Path -Parent $markerPath
+            if (-not (Test-Path -LiteralPath $markerDir)) {
+                New-Item -ItemType Directory -Path $markerDir -Force | Out-Null
+            }
+            Set-Content -LiteralPath $markerPath -Value $seatRoster.Canonical `
+                -Encoding utf8NoBOM -NoNewline -EA Stop
+        }
+        catch {
+            # Rule 2: nothing here may throw out of this script. A declaration that recorded but
+            # could not leave a marker is still a declaration, and saying so beats losing it.
+            Write-WriterError -Stage 'marker' -Message $_.Exception.Message
+            try {
+                [System.Console]::Error.WriteLine(
+                    "seat.ps1: recorded the declaration, but could not write .claude/seat.local.txt " +
+                    "($($_.Exception.Message)). No role card will be injected here until it exists.")
+            }
+            catch { }
+        }
+    }
 
     # Said AFTER the write, so the declaration is safely recorded before anything is said about it.
     # Not gated on -Record/-Prompt: a retired seat arriving through a hook is the same defect as one

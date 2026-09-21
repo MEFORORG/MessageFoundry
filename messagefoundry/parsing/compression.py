@@ -215,7 +215,8 @@ def zip_decompress(
     ``max_entries`` caps the member count (a many-entry archive is a bomb axis too). ``max_output_bytes``
     caps the **total** decompressed size across all members, enforced with per-member bounded reads so a
     lying central-directory size cannot force full expansion. A corrupt archive, too many members, or an
-    over-ceiling total raises :class:`CompressionError`.
+    over-ceiling total raises :class:`CompressionError`. Duplicate file member names also refuse the whole
+    archive, since the returned mapping cannot preserve repeated names.
 
     Each member is also **admitted or refused** (ASVS 5.2.2 / 5.3.2, BACKLOG #1128) — its name must be a
     safe relative path and its bytes must correspond to the type its own extension names. Both checks are
@@ -237,6 +238,9 @@ def zip_decompress(
                 raise CompressionError(
                     f"zip archive has {len(names)} members, over the {max_entries}-member cap"
                 )
+            file_names = [info.filename for info in zf.infolist() if not info.is_dir()]
+            if len(set(file_names)) != len(file_names):
+                raise CompressionError("zip archive contains duplicate member names")
             for position, info in enumerate(zf.infolist(), start=1):
                 if info.is_dir():
                     continue

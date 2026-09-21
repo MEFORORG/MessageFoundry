@@ -5,10 +5,17 @@ crash recovery, replay, and message finalization. Time is injected for determini
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import os
+import sqlite3
 import stat
 import sys
+import threading
+import time
+from collections.abc import Iterator
 
+import aiosqlite
 import pytest
 
 from messagefoundry.config.models import RetryPolicy
@@ -92,7 +99,10 @@ def test_secure_file_grants_extra_read_principals(monkeypatch: pytest.MonkeyPatc
         Path("key.dpapi"), extra_read_grants=["*S-1-5-18", "NT SERVICE\\MessageFoundry"]
     )
     argv = captured[0]
-    assert argv[0] == "icacls" and "/inheritance:r" in argv and "/grant:r" in argv
+    # argv[0] is the pinned absolute path; test_secure_file_pins_icacls_to_the_system_directory
+    # owns that assertion, so check only that it is still icacls here.
+    assert os.path.basename(argv[0]).lower() == "icacls.exe"
+    assert "/inheritance:r" in argv and "/grant:r" in argv
     assert "minter:F" in argv  # owner keeps full control
     assert "*S-1-5-18:R" in argv  # SYSTEM read
     assert "NT SERVICE\\MessageFoundry:R" in argv  # service account read
@@ -107,7 +117,96 @@ def test_secure_file_default_is_owner_only(monkeypatch: pytest.MonkeyPatch) -> N
 
     captured = _capture_icacls(monkeypatch)
     store_mod._secure_file(Path("store.db"))
-    assert captured[0] == ["icacls", "store.db", "/inheritance:r", "/grant:r", "minter:F"]
+    argv = captured[0]
+    assert os.path.basename(argv[0]).lower() == "icacls.exe"  # the pin has its own test
+    assert argv[1:] == ["store.db", "/inheritance:r", "/grant:r", "minter:F"]
+
+
+@_windows_only
+def test_secure_file_pins_icacls_to_the_system_directory(monkeypatch: pytest.MonkeyPatch) -> None:
+    # This call WRITES the ACL restricting the store DB and the DPAPI key file, so it must name
+    # icacls by absolute path: CreateProcess resolves an unqualified name through a search path that
+    # reaches the caller's working directory. _secure_file logs only on a non-zero exit, so a planted
+    # icacls.exe that exits 0 would leave the file its inherited (possibly broad) ACL and report
+    # nothing — the hardening becomes a silent no-op (BACKLOG #1769).
+    from pathlib import Path
+
+    import messagefoundry.store.store as store_mod
+    from messagefoundry import service_status
+
+    captured = _capture_icacls(monkeypatch)
+    store_mod._secure_file(Path("store.db"))
+    # Guard the guard: with no call recorded, every assertion below passes over nothing.
+    assert captured, "icacls was never invoked; the pin assertions would pass vacuously"
+    program = captured[0][0]
+    assert os.path.isabs(program), f"icacls must be pinned to an absolute path, got {program!r}"
+    assert os.path.basename(program).lower() == "icacls.exe"
+    # It must be the OS-reported system directory, not merely some absolute path. Compared against
+    # _system_dir rather than a literal "System32" because GetSystemDirectoryW answers "SysWOW64" to
+    # a 32-bit process, and that is the correct system directory there; _system_dir's own behaviour
+    # is tested beside it in tests/test_service_control.py.
+    assert os.path.dirname(program) == service_status._system_dir()
+
+
+# --- BACKLOG #1634: the restriction must not run ON the event loop ------------------------------
+#
+# WHAT THESE ASSERT, AND WHY THE INSTRUMENT IS THREAD IDENTITY (SDS-3.8). The question is "was the
+# call dispatched off the loop", and a thread id answers exactly that sentence: `asyncio.to_thread`
+# runs the target on an executor thread, a direct call runs it on the loop's own thread, and the two
+# are never the same id. A wall-clock or loop-responsiveness assertion would answer an ADJACENT
+# question -- `snapshot_to` awaits several times either way, so a concurrent counter advances even
+# with the blocking call in place, and a 21ms stall is below the noise of a timing assertion under
+# fleet contention. These tests are platform-independent on purpose: they patch `_secure_file`
+# itself, so no real `icacls` (Windows) or `chmod` (POSIX) runs and every CI leg exercises them.
+
+
+def _record_secure_file_threads(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Replace ``_secure_file`` with a recorder of the thread it ran on (no real icacls/chmod)."""
+    import messagefoundry.store.store as store_mod
+
+    idents: list[int] = []
+
+    def _record(path: object, *, extra_read_grants: object = None) -> None:
+        idents.append(threading.get_ident())
+
+    monkeypatch.setattr(store_mod, "_secure_file", _record)
+    return idents
+
+
+async def test_snapshot_to_secures_the_copy_off_the_event_loop(
+    store: MessageStore, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # This is the call that matters. A DR backup runs `snapshot_to` on the SERVING loop by design
+    # (pipeline/dr_backup.py keeps the consistent snapshot there), so restricting the copy inline
+    # would stall every in-flight ACK, claim and delivery for the length of one icacls subprocess --
+    # 21 to 28ms on Windows -- once per backup on a deploying site.
+    idents = _record_secure_file_threads(monkeypatch)
+    await store.snapshot_to(tmp_path / "snap.db")
+    assert idents, "snapshot_to no longer restricts the snapshot file at all"
+    loop_thread = threading.get_ident()
+    assert loop_thread not in idents, (
+        "snapshot_to restricted the snapshot file ON the event loop thread; it must go through "
+        "_secure_file_async (BACKLOG #1634)"
+    )
+
+
+async def test_open_secures_the_db_files_off_the_event_loop(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `open` completes before the API serves and before any listener binds, so its stall has nothing
+    # to stall -- this pins the consistency, not a live defect. It secures the db plus its -wal/-shm
+    # siblings, so it is also the site where a blocking call costs three subprocesses, not one.
+    idents = _record_secure_file_threads(monkeypatch)
+    s = await MessageStore.open(tmp_path / "offloop.db")
+    try:
+        assert idents, "open no longer restricts the store file at all"
+        loop_thread = threading.get_ident()
+        assert loop_thread not in idents, (
+            "open restricted a store file ON the event loop thread; it must go through "
+            "_secure_file_async (BACKLOG #1634)"
+        )
+    finally:
+        await s.close()
 
 
 async def test_enqueue_creates_message_and_outbox_rows(store: MessageStore) -> None:
@@ -590,6 +689,25 @@ async def test_db_status_reports_counts_journal_size(store: MessageStore) -> Non
     assert st.journal_mode.lower() == "wal"
     assert st.size_bytes > 0
     assert st.path == store.path
+    # A real local drive is measurable, so this is a number — never the "unmeasurable" None.
+    assert st.disk_free_bytes is not None and st.disk_free_bytes > 0
+
+
+async def test_disk_free_bytes_is_none_when_unmeasurable_never_zero(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #1563: a failed ``disk_usage`` reports ``None``, not ``0``.
+
+    ``0`` is the console's critical-disk alarm, so returning it for "I could not measure this" turned
+    an unreadable mount point into a disk emergency. The two are different facts and the type now
+    says so; a drive that genuinely measures 0 free still returns 0 and still alarms."""
+
+    def boom(_path: object) -> object:
+        raise OSError("mount point unreadable")
+
+    monkeypatch.setattr("messagefoundry.store.store.shutil.disk_usage", boom)
+    assert store._disk_free_bytes() is None
+    assert (await store.db_status()).disk_free_bytes is None
 
 
 async def test_integrity_check_ok(store: MessageStore) -> None:
@@ -821,3 +939,258 @@ async def test_replay_resend_is_not_deduped(store: MessageStore) -> None:
     await store.mark_done(again.id, now=201.0)
     # A fresh ledger row is written for the re-delivery (seq recomputes to 1 after the delete).
     assert len(await _ledger_rows(store)) == 1
+
+
+def test_a_failed_open_closes_the_connection_and_lets_the_process_exit(tmp_path) -> None:
+    """BACKLOG #1670: ``MessageStore.open`` connects BEFORE its first ``PRAGMA``, so a path that is
+    not a database raises with the connection still live and nothing closes it.
+
+    aiosqlite drives every statement on a background thread created WITHOUT ``daemon=True``, so a
+    connection nobody closed parks a non-daemon thread forever. Interpreter exit then blocks in
+    ``threading._shutdown`` joining it and the process never returns -- measured at 319 seconds
+    before a kill by hand.
+
+    This runs in a CHILD interpreter on purpose. A leaked worker would otherwise hang the pytest
+    process itself at exit, turning a clear failure into a stalled run with no report. It is also
+    the only shape that actually proves the claim: asserting ``close`` was called does not prove
+    the process exits.
+    """
+    import subprocess
+    import textwrap
+
+    bad = tmp_path / "not-a-db.txt"
+    bad.write_text("not a db\n", encoding="utf-8")
+
+    script = textwrap.dedent(
+        """
+        import asyncio
+        import sqlite3
+        import sys
+        import threading
+        import time
+
+        from messagefoundry.store import MessageStore
+
+        async def main() -> None:
+            try:
+                await MessageStore.open(sys.argv[1])
+            except sqlite3.DatabaseError:
+                return
+            raise SystemExit("open succeeded on a file that is not a database")
+
+        asyncio.run(main())
+
+        # Only a non-daemon thread can block interpreter exit, so that is what is reported.
+        def _live() -> list[str]:
+            return [
+                t.name
+                for t in threading.enumerate()
+                if t is not threading.main_thread() and not t.daemon
+            ]
+
+        # POLLED TO A DEADLINE, NOT SAMPLED ONCE. Closing the connection SIGNALS the aiosqlite
+        # worker and returns; the thread exits a moment later. A single enumerate() here races
+        # that shutdown and names a thread already on its way out, which is a failure on a build
+        # where the fix works -- it reported a leak on 2 of 3 CI runs, across two platforms, and
+        # evicted two unrelated pull requests from the merge queue.
+        #
+        # A GENUINELY leaked worker never drains, so it is still reported after the deadline and
+        # this keeps its teeth. Measured both ways before landing: 0/20 on a correct build, and
+        # 3/3 still detected against a store opened and deliberately never closed.
+        deadline = time.monotonic() + 5.0
+        while True:
+            left = _live()
+            if not left or time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+        print(",".join(left))
+        """
+    )
+    # A hard timeout is the assertion: on the leaking build the child never exits and this raises
+    # subprocess.TimeoutExpired. 30s sits well under the 60s pytest-timeout watchdog so THIS reports
+    # the failure rather than a thread-stack dump; a healthy child finishes in about two seconds.
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(bad)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "", f"a failed open left live thread(s): {proc.stdout.strip()}"
+
+
+# --- a close returns before the worker thread it stops has gone --------------------------------
+
+#: How long :func:`_park_workers_inside_the_close_window` holds a worker inside the window under
+#: test. It only has to outlast the few microseconds the main thread needs to resume and sample.
+#: Measured with the wait reverted to a no-op, ``MessageStore.close`` returns 5ms after it is called
+#: with five connections to shut down, so 100ms is a 20x margin that costs this file six tenths of a
+#: second.
+#:
+#: Deliberately generous, because the two ways of being wrong here are not symmetrical. Too long
+#: only wastes wall time. Too short lets the worker reach its ``break`` before the sample, which
+#: passes WITHOUT the fix -- a green that means nothing, on the one test whose whole job is to
+#: notice that the fix is gone. Buy the margin.
+_WORKER_PARK_SECONDS = 0.1
+
+
+def _watch_aiosqlite_connects(
+    monkeypatch: pytest.MonkeyPatch, watched: set[threading.Thread]
+) -> list[aiosqlite.Connection]:
+    """Record every aiosqlite connection opened from here on, and watch its worker thread.
+
+    Fills ``watched`` IN PLACE, so the set can be handed to
+    :func:`_park_workers_inside_the_close_window` before the connection under test exists. That is
+    the only option for the two paths whose connection is a local the store never exposes: the
+    backup target ``snapshot_to`` opens, and the one a failed ``open`` has to clean up.
+    """
+    real_connect = aiosqlite.connect
+    opened: list[aiosqlite.Connection] = []
+
+    def spy_connect(*args, **kwargs):  # type: ignore[no-untyped-def]
+        # `connect` builds the Connection (and its Thread) synchronously and returns it awaitable,
+        # so the worker is watchable before a single statement has run on it.
+        conn = real_connect(*args, **kwargs)
+        opened.append(conn)
+        watched.add(conn._thread)
+        return conn
+
+    monkeypatch.setattr(aiosqlite, "connect", spy_connect)
+    return opened
+
+
+@contextlib.contextmanager
+def _park_workers_inside_the_close_window(
+    watched: set[threading.Thread],
+) -> Iterator[list[str]]:
+    """Hold each watched aiosqlite worker inside the window ``_await_connection_worker_exit`` closes.
+
+    The window is real and it is tiny. ``_connection_worker_thread`` hands a close result back with
+    ``future.get_loop().call_soon_threadsafe(...)`` and only THEN runs the two statements ending in
+    its ``break``, so the awaiting coroutine can resume -- and its caller run all the way to
+    ``is_alive()`` -- while the worker is still inside that call. It joins in 4us to 4ms, which is
+    why sampling it unaided is a coin toss rather than a test: PR 1174 had to make the BACKLOG #1670
+    regression test poll to a deadline for precisely this reason.
+
+    So this does not sample the race, it removes it. Wrapping ``call_soon_threadsafe`` puts a sleep
+    at the one statement the race turns on, AFTER the handback is scheduled and BEFORE the worker can
+    reach its ``break``. The main thread is then certain to get there first, and what the assertion
+    reads is no longer who won but whether the caller WAITED: with the wait reverted to a no-op
+    ``close`` returns with the worker still parked, and with it in place ``close`` does not return
+    until the worker is gone.
+
+    Parks only on the close handback, identified by aiosqlite's private ``_STOP_RUNNING_SENTINEL``.
+    That import is deliberately inside the function: if a future release renames it, the three tests
+    below error instead of quietly parking nothing and passing over a window they never opened.
+    Yields the names of the workers it parked so a caller can assert the instrument fired at all.
+    """
+    from aiosqlite.core import _STOP_RUNNING_SENTINEL
+
+    loop = asyncio.get_running_loop()
+    original = loop.call_soon_threadsafe
+    parked: list[str] = []
+
+    def call_soon_threadsafe(callback, *args, **kwargs):  # type: ignore[no-untyped-def]
+        handle = original(callback, *args, **kwargs)
+        worker = threading.current_thread()
+        # The length guard is load-bearing, not defensive: this shadows the method on the LOOP, so
+        # it also sees asyncio's own internal wakeups, which pass no second argument.
+        if worker in watched and len(args) >= 2 and args[1] is _STOP_RUNNING_SENTINEL:
+            parked.append(worker.name)
+            time.sleep(_WORKER_PARK_SECONDS)
+        return handle
+
+    loop.call_soon_threadsafe = call_soon_threadsafe  # type: ignore[method-assign]
+    try:
+        yield parked
+    finally:
+        # `del` rather than reassigning `original`: the loop is session-scoped and shared with every
+        # other test, so drop the instance attribute and let the class method show through again
+        # instead of leaving a permanent shadow behind on it.
+        del loop.call_soon_threadsafe  # type: ignore[method-assign]
+
+
+async def test_close_waits_for_every_aiosqlite_worker_thread(tmp_path) -> None:
+    """``MessageStore.close`` must not return while a connection it owns still has a live worker.
+
+    ``await Connection.close()`` does not promise that. The threads are created WITHOUT
+    ``daemon=True``, so each one still listed is a thread interpreter exit has to join -- the same
+    property that made BACKLOG #1670 hang a process for 319 seconds, here reached by a different
+    route. This covers the SUCCESSFUL close of a whole store, read pool included, where #1670's test
+    covers a failed open.
+
+    Runs in-process, where #1670's test needs a child interpreter. Its leak is unbounded, so
+    sampling it inside pytest would hang the run itself; this residue always drains within
+    milliseconds, so a failure here is a plain assertion rather than a stalled leg.
+    """
+    store = await MessageStore.open(tmp_path / "close-waits.db")
+    conns = [*store._read_conns, store._db]
+    workers = {c._thread for c in conns}
+    # Aim check: a silent pool change that left nothing to watch would make the assertions vacuous.
+    assert len(workers) == len(conns) >= 2, f"expected one worker per connection, got {workers}"
+
+    with _park_workers_inside_the_close_window(workers) as parked:
+        await store.close()
+        still_running = sorted(t.name for t in workers if t.is_alive())
+
+    # Positive control BEFORE the claim: if the instrument never parked anybody then `close` was
+    # never observed inside the window and a green result below would mean nothing.
+    assert len(parked) == len(conns), (
+        f"instrument did not fire on every close: parked {parked} for {len(conns)} connections"
+    )
+    assert still_running == [], (
+        f"close() returned with live aiosqlite worker(s): {', '.join(still_running)}"
+    )
+
+
+async def test_snapshot_to_waits_for_the_backup_target_worker_thread(tmp_path, monkeypatch) -> None:
+    """The per-snapshot backup connection must be fully gone before ``snapshot_to`` returns.
+
+    A snapshot runs against a LIVE engine on a schedule, so this is the path where the residue would
+    accrete rather than pass: every run opens a fresh target connection, and a worker still listed
+    when the call returns is one the next run adds to. Only ``method="online_backup"`` opens that
+    second connection -- the default ``vacuum_into`` writes through the store's own writer -- so the
+    method is load-bearing here, not incidental.
+    """
+    store = await MessageStore.open(tmp_path / "snapshot-waits.db")
+    try:
+        watched: set[threading.Thread] = set()
+        targets = _watch_aiosqlite_connects(monkeypatch, watched)
+
+        with _park_workers_inside_the_close_window(watched) as parked:
+            await store.snapshot_to(tmp_path / "snapshot.db", method="online_backup")
+            still_running = sorted(t.name for t in watched if t.is_alive())
+
+        assert len(targets) == 1, f"expected exactly one backup target connection, got {targets}"
+        assert parked, "instrument never parked the backup target worker; the window was not opened"
+        assert still_running == [], (
+            f"snapshot_to() returned with live aiosqlite worker(s): {', '.join(still_running)}"
+        )
+    finally:
+        await store.close()
+
+
+async def test_a_failed_open_waits_for_its_connection_worker_thread(tmp_path, monkeypatch) -> None:
+    """The fourth call site: the cleanup that runs when ``MessageStore.open`` raises.
+
+    BACKLOG #1670's test above covers the same path but cannot see this window -- it polls to a
+    deadline, so a worker on its way out drains before the deadline and it reports success either
+    way. That is correct for what it exists to catch, an UNBOUNDED leak that never drains. This is
+    the bounded one, and without it the only call site with no discriminating test would be the one
+    whose absence hung a process for 319 seconds.
+    """
+    bad = tmp_path / "not-a-db.txt"
+    bad.write_text("not a db\n", encoding="utf-8")
+
+    watched: set[threading.Thread] = set()
+    _watch_aiosqlite_connects(monkeypatch, watched)
+
+    with _park_workers_inside_the_close_window(watched) as parked:
+        with pytest.raises(sqlite3.DatabaseError):
+            await MessageStore.open(bad)
+        still_running = sorted(t.name for t in watched if t.is_alive())
+
+    assert parked, "instrument never parked the failed-open worker; the window was not opened"
+    assert still_running == [], (
+        f"a failed open returned with live aiosqlite worker(s): {', '.join(still_running)}"
+    )

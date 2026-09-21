@@ -208,9 +208,10 @@ into a `failed` (degraded) status; the DR run-profile *deliberately does not sta
 Both must be surfaced distinctly so an operator can tell a deliberately-parked feed from a broken one.
 The connection-status field (`api/models.py`, `ConnectionRow.status`) already carries
 **`running` | `stopped` | `failed` | `draining`** — this ADR adds a **fifth value, `filtered`** (skipped by the DR
-run-profile), distinct from ADR 0031's `failed`. It is surfaced via a sibling `filtered_connections()` accessor
-on the `RegistryRunner` (the exact shape of the existing `connection_failed()` / `degraded_connections()` at
-`wiring_runner.py` ~516/522), wired into the same status-derivation branch in `api/app.py` that already maps
+run-profile), distinct from ADR 0031's `failed`. It is surfaced via sibling accessors on the
+`RegistryRunner` in the exact shape of the ADR 0031 pair — `inbound_filtered()` / `outbound_filtered()` and
+`filtered_inbound()` / `filtered_outbound()`, keyed by `(Direction, name)` for the reason ADR 0031 §5 gives —
+wired into the same status-derivation branch in `api/app.py` that already maps
 `running`/`stopped`/`failed`/`draining` — **not** a new API model — and reported on `GET /connections`,
 `GET /connections/{name}/metadata`, and the console connections table.
 

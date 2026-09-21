@@ -138,11 +138,13 @@ from messagefoundry.store.store import (
     UserRecord,
     WebAuthnCredential,
     _append_channel_scope,
+    _opt_float,
     _qmark_cutoff_case,
     audit_mac_bytes,
     audit_prefix_verdict,
     audit_row_hash,
     delivery_key,
+    next_lockout_state,
     not_deployed_detail,
     owned_lane_scope,
     password_claim_set,
@@ -196,6 +198,35 @@ def _is_lock_timeout(exc: BaseException) -> bool:
     return f"({_LOCK_TIMEOUT_NATIVE_ERROR})" in str(exc)
 
 
+# SQL Server native error 1205 = deadlock victim: the server rolled this transaction back to break a
+# deadlock cycle. Like a lock timeout it leaves NO committed effect, so a re-issue is safe.
+_DEADLOCK_NATIVE_ERROR = 1205
+
+
+def _is_transient_write_conflict(exc: BaseException) -> bool:
+    """True iff ``exc`` is a transient SQL Server write conflict that is SAFE TO RETRY after a rollback:
+    a client-side query timeout (SQLSTATE ``HYT00`` — the statement gave up WAITING for a lock, having
+    committed nothing) or a deadlock-victim rollback (native error 1205). Both leave the transaction
+    with no persisted effect, so re-issuing an increment cannot double-apply it. Matched on the stable
+    driver substrings (rather than importing pyodbc, the lazy extra), like :func:`_is_lock_timeout`.
+
+    NOT the same predicate as ``transports.database._is_transient``, and deliberately not shared with
+    it: that one keys on a parsed SQLSTATE instead of this module's driver-substring convention, and it
+    is broader by design -- it admits the ``08`` connection-exception class, which is precisely where
+    you CANNOT prove the transaction committed nothing. Retrying an increment on an ``08`` would risk
+    the double-count this method exists to prevent."""
+    s = str(exc)
+    return "HYT00" in s or f"({_DEADLOCK_NATIVE_ERROR})" in s
+
+
+# add_cipher_invocations bounds: a HOLDLOCK-serialized burst of concurrent increments on ONE key can
+# make a waiter give up (HYT00) or be a deadlock victim (1205) on a slow/contended server — the very
+# engine-shard fleet the method promises to survive. Both roll back with no committed effect, so a
+# bounded retry-with-backoff is safe and no-double-count. Backoff is per-1-based-attempt.
+_CIPHER_MERGE_ATTEMPTS = 5
+_CIPHER_MERGE_BACKOFF = 0.05
+
+
 # The lane column is NVARCHAR(256); a longer requested lane name can never match a real lane. On
 # the ADR 0114 proc path the lane list rides one JSON parameter through a server-side CAST — a
 # TRUNCATING cast could make an oversized name's prefix match a REAL lane, a shard-safety contract
@@ -205,6 +236,12 @@ def _is_lock_timeout(exc: BaseException) -> bool:
 # units, and CAST silently right-truncates at 256 units (possibly mid-surrogate), which is exactly
 # the prefix-match hazard the skip exists to kill.
 _CLAIM_PROC_LANE_MAX = 256
+
+#: A queue row whose body is still THERE, and therefore still replayable (BACKLOG #1560). The SQL
+#: Server twin of ``store._REPLAYABLE_BODY``; the reasoning lives there and is not restated. Spliced
+#: into :meth:`SqlServerStore.replay` and :meth:`SqlServerStore.replay_dead` so neither re-queues a
+#: delivery whose content retention has erased.
+_REPLAYABLE_BODY = "payload <> '' OR body_ref IS NOT NULL"
 
 
 def _utf16_units(text: str) -> int:
@@ -1115,6 +1152,11 @@ class _ClaimHolder:
 # guards below are check-then-create and do NOT serialize concurrent creators on a virgin DB — see
 # _ensure_schema.
 _SCHEMA_LOCK = "mefor:schema_init"
+# Audit-chain append lock (BACKLOG #1605) — the T-SQL analog of the Postgres store's
+# ``pg_advisory_xact_lock`` on the audit chain. One fixed resource for the whole chain: the
+# read-tail-then-INSERT in record_audit is only atomic if EVERY appender, in EVERY engine-shard
+# process, queues on the same name.
+_AUDIT_APPEND_LOCK = "mefor:audit_append"
 _SCHEMA: list[str] = [
     # Single-row marker recording which shipped DDL batch was last applied (the sha256 of this very
     # list — see _schema_hash). Lets a re-open of a current database SKIP the whole guarded batch +
@@ -1372,11 +1414,21 @@ _SCHEMA: list[str] = [
         uploader_id NVARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL PRIMARY KEY,
         inflight_files BIGINT NOT NULL DEFAULT 0, inflight_bytes BIGINT NOT NULL DEFAULT 0,
         since FLOAT NOT NULL)""",
+    # BACKLOG #1540: `requester` is a DISPLAY label; `requester_user_id` is the authorization key the
+    # self-approval refusal compares (the Store protocol's create_pending_approval says why).
+    # NVARCHAR(64) matches users.id and this table's own id column.
     """IF OBJECT_ID('pending_approvals','U') IS NULL CREATE TABLE pending_approvals (
         id NVARCHAR(64) NOT NULL PRIMARY KEY, operation NVARCHAR(128) NOT NULL,
         params NVARCHAR(MAX) NOT NULL, requester NVARCHAR(256) NOT NULL,
+        requester_user_id NVARCHAR(64) NULL,
         requested_at FLOAT NOT NULL, status NVARCHAR(20) NOT NULL DEFAULT 'pending',
         approver NVARCHAR(256) NULL, decided_at FLOAT NULL, expires_at FLOAT NULL)""",
+    # COL_LENGTH-gated ADD for a pre-existing pending_approvals table; a no-op on a fresh DB (the
+    # CREATE above has it). This MUST live in _SCHEMA: `_schema_hash()` stores a content marker of
+    # this batch, so an on-open migration placed anywhere else is skipped whenever the marker already
+    # matches and the column never appears, with no error.
+    """IF COL_LENGTH('pending_approvals','requester_user_id') IS NULL
+        ALTER TABLE pending_approvals ADD requester_user_id NVARCHAR(64) NULL""",
     """IF INDEXPROPERTY(OBJECT_ID('pending_approvals'),'ix_pending_approvals_status','IndexID') IS NULL
         CREATE INDEX ix_pending_approvals_status ON pending_approvals(status, requested_at)""",
     # BACKLOG #1268: `username` carries the same binary collation as every other identifier column in
@@ -3151,9 +3203,14 @@ class SqlServerStore:
                 # virgin DB) — the T-SQL analog of the Postgres store's schema advisory lock. Without it
                 # the `IF OBJECT_ID(...) IS NULL CREATE` guards below are check-then-create: two nodes
                 # both see NULL and both CREATE, and the loser dies on a 2714 "There is already an object
-                # named ...". The applock is transaction-scoped (the autocommit=False pool means this
-                # first statement opens the txn), so it auto-releases on the commit/rollback below; the
-                # second node then runs the now-no-op guarded CREATEs cleanly.
+                # named ...". The applock is transaction-scoped, so it auto-releases on the commit/
+                # rollback below; the second node then runs the now-no-op guarded CREATEs cleanly. It
+                # is NOT this transaction's first statement and must not become one: the ADR 0064 fast-
+                # path probe above already ran one or two table-reading SELECTs on this connection with
+                # no commit between, so the autocommit=False pool has an open transaction for
+                # `@LockOwner='Transaction'` to attach to. (An earlier comment here read "this first
+                # statement opens the txn" — it predated the probe and was stale, not a contradiction
+                # of the applock rule record_audit now follows.)
                 await self._applock(cur, _SCHEMA_LOCK)
                 # Double-check under the lock: the peer we queued behind may have just applied this
                 # exact batch and committed its marker — then this open has nothing to do.
@@ -5953,6 +6010,64 @@ class SqlServerStore:
         )
         return len(orphans)
 
+    async def dead_letter_missing_inbounds(
+        self, valid_names: set[str], now: float | None = None
+    ) -> int:
+        """Dead-letter non-terminal channel-keyed queue rows (ingress/routed/response) whose
+        channel_id is no longer in the registry (a removed/renamed inbound) — no router, transform or
+        re-ingress worker is spawned for it and no dispatcher claims its lane, so they'd strand
+        forever. Outbound rows key on destination_name and drain regardless of origin, so they are
+        excluded. Call ONCE at startup, AFTER reset_stale_inflight. ``valid_names`` is the WHOLE
+        deployment's inbound names, never one engine shard's slice. Per-message finalize applocks are
+        pre-acquired in sorted id order to avoid multi-message deadlock; a killed row -> DEAD -> the
+        finalizer resolves the message to ERROR."""
+        now = time.time() if now is None else now
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute(
+                    "SELECT id, message_id, channel_id FROM queue"
+                    " WHERE stage IN (?, ?, ?) AND status IN (?, ?)",
+                    (
+                        Stage.INGRESS.value,
+                        Stage.ROUTED.value,
+                        Stage.RESPONSE.value,
+                        OutboxStatus.PENDING.value,
+                        OutboxStatus.INFLIGHT.value,
+                    ),
+                )
+                rows = await cur.fetchall()  # positional: (id, message_id, channel_id)
+                orphans = [r for r in rows if r[2] not in valid_names]
+                if not orphans:
+                    await self._commit(conn)
+                    return 0
+                error = "inbound removed from registry"
+                await self._lock_finalize_batch(cur, {r[1] for r in orphans})
+                for row in orphans:
+                    await cur.execute(
+                        "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?,"
+                        " owner=NULL, lease_expires_at=NULL WHERE id=?",
+                        (
+                            OutboxStatus.DEAD.value,
+                            now,
+                            self._enc(error, aad=cell_aad("queue", "last_error", row[0])),  # H4
+                            now,
+                            row[0],
+                        ),
+                    )
+                    await self._event(cur, row[1], "dead", None, error, now)
+                    await self._maybe_finalize(cur, row[1], now)
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        log.warning(
+            "dead-lettered %d orphaned ingress/routed/response row(s) at startup for missing"
+            " inbound(s): %s",
+            len(orphans),
+            ", ".join(sorted({r[2] for r in orphans})),
+        )
+        return len(orphans)
+
     # --- retention / purge + maintenance (PHI.md §8) -------------------------
     # The RetentionRunner drives these once the staged pipeline is enabled. Bodies are blanked to ''
     # (not deleted) so cipher re-encrypt scans skip them and the FK to messages stays intact. SQL
@@ -8323,7 +8438,12 @@ class SqlServerStore:
         """Re-queue a message's stuck/dead deliveries — or, if none are stuck, re-send the delivered
         ones. Two-mode (M-2): if any row is dead/pending, replay ONLY those (never re-fire a DONE
         sibling); else replay the done rows. messages.status -> RECEIVED if a pending ingress/routed
-        row remains (needs re-routing), else ROUTED."""
+        row remains (needs re-routing), else ROUTED.
+
+        A row whose body retention has ERASED is never re-queued (:data:`_REPLAYABLE_BODY`, BACKLOG
+        #1560), and the ``delivered_keys`` DELETE carries the same predicate so it never drops the
+        idempotency entry of a row the UPDATE skipped. Mirrors :meth:`MessageStore.replay`, whose
+        docstring carries the reasoning — including why the ``stuck`` count deliberately does not."""
         now = time.time() if now is None else now
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
@@ -8344,13 +8464,15 @@ class SqlServerStore:
                     # a crash-re-run duplicate. Scoped to this message only.
                     await cur.execute(
                         "DELETE FROM delivered_keys WHERE outbox_id IN"
-                        " (SELECT id FROM queue WHERE message_id=? AND status=?)",
+                        f" (SELECT id FROM queue WHERE message_id=? AND status=?"
+                        f" AND ({_REPLAYABLE_BODY}))",
                         (message_id, OutboxStatus.DONE.value),
                     )
                 placeholders = ",".join("?" * len(replay_from))
                 await cur.execute(
                     f"UPDATE queue SET status=?, attempts=0, next_attempt_at=?, last_error=NULL,"
-                    f" updated_at=? WHERE message_id=? AND status IN ({placeholders})",
+                    f" updated_at=? WHERE message_id=? AND status IN ({placeholders})"
+                    f" AND ({_REPLAYABLE_BODY})",
                     (OutboxStatus.PENDING.value, now, now, message_id, *replay_from),
                 )
                 count = cur.rowcount
@@ -8766,8 +8888,16 @@ class SqlServerStore:
         destination_name: str | None = None,
         now: float | None = None,
     ) -> int:
+        """Re-queue dead-lettered outbound deliveries (optionally scoped), reverting each affected
+        message from ``error`` to ``routed``. Mirrors :meth:`MessageStore.replay_dead`.
+
+        Rows whose body retention has ERASED are excluded (:data:`_REPLAYABLE_BODY`, BACKLOG #1560).
+        The predicate lives in the shared ``clause`` so it reaches BOTH the ``SELECT DISTINCT`` that
+        computes the affected message set and the UPDATE: guarding only the write would revert a purged
+        message from ``ERROR`` to ``ROUTED`` with nothing re-queued. It binds no parameter, so it does
+        not disturb the positional ``?`` order ``params`` depends on."""
         now = time.time() if now is None else now
-        where = ["stage=?", "status=?"]
+        where = ["stage=?", "status=?", f"({_REPLAYABLE_BODY})"]
         params: list[Any] = [Stage.OUTBOUND.value, OutboxStatus.DEAD.value]
         if channel_id is not None:
             where.append("channel_id=?")
@@ -9148,17 +9278,38 @@ class SqlServerStore:
         client: str | None = None,
         now: float | None = None,
     ) -> None:
-        """``client`` is the caller's network address (ADR 0150), NULL for engine-internal writes; see
+        """Append a row to the audit hash chain. Takes the audit-append applock first, so concurrent
+        writers — including writers in OTHER engine-shard processes — serialize on the read-tail +
+        insert and cannot fork the chain (H-7, BACKLOG #1605).
+
+        ``client`` is the caller's network address (ADR 0150), NULL for engine-internal writes; see
         :meth:`~messagefoundry.store.base.AuditStore.record_audit`."""
         now = time.time() if now is None else now
-        # Serialize the read-prev-then-insert append in-process so two concurrent audited actions can't
-        # read the same prev hash and FORK the hash chain (H-7). The store is the single audit writer
-        # per engine process (active-passive = one active node), so an in-process lock is sufficient and
-        # reliable — unlike a txn-scoped sp_getapplock taken as the connection's first statement, which
-        # does not release on commit and strands under concurrent contention.
+        # Serialize the read-prev-then-insert append so two concurrent audited actions can't read the
+        # same prev hash and FORK the hash chain (H-7). TWO locks, and only the second one is
+        # sufficient: `_audit_lock` is an asyncio.Lock, so it holds within ONE process, and engine
+        # sharding (`serve --shard`, ADR 0037 + ADR 0063 — the built default scaling axis) runs one
+        # process per shard over ONE unified store. N shards are N independent asyncio.Locks over one
+        # chain, so the appends have to queue at the DATABASE (BACKLOG #1605). The in-process lock is
+        # kept as the cheap near gate that keeps this process's own concurrent audits off the
+        # server-side lock queue; `_AUDIT_APPEND_LOCK` is what actually holds across shards, exactly as
+        # the Postgres twin's `pg_advisory_xact_lock` already does.
         async with self._audit_lock:  # noqa: SIM117
             async with self._acquire() as conn, self._cursor(conn) as cur:
                 try:
+                    # OPENS THE TRANSACTION, and that is its whole job — `_applock` takes
+                    # `@LockOwner='Transaction'`, which requires one already open. The autocommit=False
+                    # pool begins a transaction on the first statement that touches a table, so this is
+                    # a real one-row read of audit_log's PK index rather than a bare `SELECT 1`: under
+                    # the driver's implicit-transactions mode a SELECT with no FROM begins nothing, and
+                    # the applock would then be scoped to a transaction that does not exist. Nor
+                    # `BEGIN TRANSACTION`, which nests @@TRANCOUNT to 2 while the single `_commit`
+                    # below decrements it once, leaving the lock held on a pooled connection. The value
+                    # read here is deliberately discarded — it is read OUTSIDE the lock and only the
+                    # re-read below is authoritative.
+                    await cur.execute("SELECT TOP (1) id FROM audit_log ORDER BY id DESC")
+                    await cur.fetchall()  # drain, so the next execute on this cursor is clean
+                    await self._applock(cur, _AUDIT_APPEND_LOCK)
                     await cur.execute("SELECT TOP (1) row_hash FROM audit_log ORDER BY id DESC")
                     last = await cur.fetchone()
                     prev = last[0] if last and last[0] else ""
@@ -9219,29 +9370,58 @@ class SqlServerStore:
         """Atomically add ``count`` invocations to ``key_id``'s persisted total; return the new total (a
         NEGATIVE ``count`` refunds an unspent reserve at settlement). See the SQLite twin. MERGE with
         HOLDLOCK is the SQL Server upsert that is safe under the concurrent opens of an engine-shard
-        fleet (a bare IF EXISTS/INSERT races)."""
+        fleet (a bare IF EXISTS/INSERT races).
+
+        That serialized fleet can make a waiter time out (HYT00) or lose a deadlock (1205) on a slow or
+        contended server; both roll the statement back with NO committed effect, so we retry (bounded,
+        with backoff). ``merged`` is the no-double-count guard: it is set the instant the MERGE returns
+        its OUTPUT — after that a failure could be a completed-but-unacknowledged COMMIT, so we NEVER
+        retry then (a re-issue would double-count the security-critical GCM invocation bound)."""
         now = time.time()
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute(
-                    "MERGE cipher_meta WITH (HOLDLOCK) AS t"
-                    " USING (SELECT ? AS key_id, ? AS invocations, ? AS updated_at) AS s"
-                    " ON t.key_id = s.key_id"
-                    " WHEN MATCHED THEN UPDATE SET"
-                    " t.invocations = t.invocations + s.invocations, t.updated_at = s.updated_at"
-                    " WHEN NOT MATCHED THEN"
-                    " INSERT (key_id, invocations, updated_at)"
-                    " VALUES (s.key_id, s.invocations, s.updated_at)"
-                    " OUTPUT INSERTED.invocations;",
-                    (key_id, int(count), now),
-                )
-                row = await cur.fetchone()
-                total = int(row[0]) if row is not None else int(count)
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
-        return total
+        for attempt in range(_CIPHER_MERGE_ATTEMPTS):
+            merged = False
+            retry = False
+            async with self._acquire() as conn, self._cursor(conn) as cur:
+                try:
+                    await cur.execute(
+                        "MERGE cipher_meta WITH (HOLDLOCK) AS t"
+                        " USING (SELECT ? AS key_id, ? AS invocations, ? AS updated_at) AS s"
+                        " ON t.key_id = s.key_id"
+                        " WHEN MATCHED THEN UPDATE SET"
+                        " t.invocations = t.invocations + s.invocations, t.updated_at = s.updated_at"
+                        " WHEN NOT MATCHED THEN"
+                        " INSERT (key_id, invocations, updated_at)"
+                        " VALUES (s.key_id, s.invocations, s.updated_at)"
+                        " OUTPUT INSERTED.invocations;",
+                        (key_id, int(count), now),
+                    )
+                    row = await cur.fetchone()
+                    merged = True  # MERGE ran + OUTPUT the total; past here a failure is a COMMIT
+                    total = int(row[0]) if row is not None else int(count)
+                    await self._commit(conn)
+                    return total
+                except Exception as exc:
+                    await conn.rollback()
+                    if (
+                        not merged
+                        and _is_transient_write_conflict(exc)
+                        and attempt < _CIPHER_MERGE_ATTEMPTS - 1
+                    ):
+                        retry = True
+                    else:
+                        raise
+            # The backoff sleeps with the pooled connection ALREADY RELEASED (the rollback above ran
+            # inside the block, so there is nothing left to hold). Two engine-specific reasons, neither
+            # of which applies to the vault's plain `pool.acquire()` twin this was ported from: this
+            # store's `_acquire` bounds every OTHER caller's pool wait at `[store].acquire_timeout` and
+            # then raises, so sleeping on a borrowed connection spends a resource its peers time out
+            # on -- under exactly the contention this retry exists for; and a cancellation landing in
+            # the sleep would reach `_acquire`'s `except BaseException` and quarantine the connection
+            # via `_release_dirty`, destroying it to protect a transaction that was already rolled
+            # back. Holding nothing across the sleep dissolves both.
+            if retry:
+                await asyncio.sleep(_CIPHER_MERGE_BACKOFF * (attempt + 1))
+        raise RuntimeError("unreachable: the add_cipher_invocations retry loop returns or raises")
 
     async def reserve_upload_quota(
         self,
@@ -9502,27 +9682,37 @@ class SqlServerStore:
         operation: str,
         params: str,
         requester: str,
+        requester_user_id: str,
         requested_at: float,
         expires_at: float | None,
     ) -> None:
         """Persist a high-value action awaiting a distinct second approver (dual-control, 2.3.5)."""
         await self._execute(
             "INSERT INTO pending_approvals "
-            "(id, operation, params, requester, requested_at, status, expires_at) "
-            "VALUES (?,?,?,?,?,'pending',?)",
-            (approval_id, operation, params, requester, requested_at, expires_at),
+            "(id, operation, params, requester, requester_user_id, requested_at, status, expires_at)"
+            " VALUES (?,?,?,?,?,?,'pending',?)",
+            (
+                approval_id,
+                operation,
+                params,
+                requester,
+                requester_user_id,
+                requested_at,
+                expires_at,
+            ),
         )
 
     async def get_pending_approval(self, approval_id: str) -> dict[str, Any] | None:
         return await self._fetchone(
-            "SELECT id, operation, params, requester, requested_at, status, approver, decided_at,"
-            " expires_at FROM pending_approvals WHERE id = ?",
+            "SELECT id, operation, params, requester, requester_user_id, requested_at, status,"
+            " approver, decided_at, expires_at FROM pending_approvals WHERE id = ?",
             (approval_id,),
         )
 
     async def list_pending_approvals(self, *, now: float, limit: int = 100) -> list[dict[str, Any]]:
         """Open (still-``pending``, unexpired) approval requests, newest-first."""
         return await self._fetchall(
+            # No requester_user_id here — see the SQLite twin.
             "SELECT TOP (?) id, operation, params, requester, requested_at, status, approver,"
             " decided_at, expires_at FROM pending_approvals"
             " WHERE status = 'pending' AND (expires_at IS NULL OR expires_at > ?)"
@@ -9957,6 +10147,52 @@ class SqlServerStore:
             (failed_attempts, locked_until, now, user_id),
         )
 
+    async def increment_login_failure(
+        self,
+        user_id: str,
+        *,
+        threshold: int,
+        lockout_seconds: float,
+        now: float | None = None,
+    ) -> tuple[int, bool]:
+        """Count one failed credential attempt and apply the lockout policy in ONE atomic step;
+        return ``(failed_attempts, just_locked)``.
+
+        The ``UPDLOCK`` SELECT + UPDATE run in one transaction, so concurrent attempts serialize on
+        the row rather than each reading the same pre-increment count.
+        :func:`next_lockout_state` carries the policy and the reason this has to be one call rather
+        than three. Returns ``(0, False)`` for an unknown user."""
+        now = time.time() if now is None else now
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute(
+                    "SELECT failed_attempts, locked_until FROM users WITH (UPDLOCK, ROWLOCK)"
+                    " WHERE id=?",
+                    (user_id,),
+                )
+                # fetchall reads the counters AND drains the SELECT so the same-cursor UPDATE below is
+                # clean; `_cursor` closes the cursor before the pooled connection is reused (EF-6).
+                rows = await cur.fetchall()
+                if not rows:
+                    await self._commit(conn)
+                    return 0, False
+                state = next_lockout_state(
+                    failed_attempts=int(rows[0][0]),
+                    locked_until=_opt_float(rows[0][1]),
+                    now=now,
+                    threshold=threshold,
+                    lockout_seconds=lockout_seconds,
+                )
+                await cur.execute(
+                    "UPDATE users SET failed_attempts=?, locked_until=?, updated_at=? WHERE id=?",
+                    (state.attempts, state.locked_until, now, user_id),
+                )
+                await self._commit(conn)
+                return state.attempts, state.just_locked
+            except Exception:
+                await conn.rollback()
+                raise
+
     async def upsert_role(
         self,
         *,
@@ -10315,7 +10551,7 @@ class SqlServerStore:
         return DbStatus(
             path=self.path,
             size_bytes=int(size["b"]) if size and size["b"] is not None else 0,
-            disk_free_bytes=0,  # not readily available for a remote SQL Server
+            disk_free_bytes=None,  # a remote server's disk is not ours to stat; unmeasurable, not 0
             journal_mode=str(recovery["m"]) if recovery and recovery["m"] else "",
             messages=await self._count("messages"),
             events=await self._count("message_events"),

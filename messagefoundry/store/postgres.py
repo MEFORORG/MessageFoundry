@@ -150,10 +150,12 @@ from messagefoundry.store.store import (
     UserRecord,
     WebAuthnCredential,
     _finite_cutoff,  # backlog #106: keep-forever cutoff clamp
+    _opt_float,
     audit_mac_bytes,
     audit_prefix_verdict,
     audit_row_hash,
     delivery_key,
+    next_lockout_state,
     not_deployed_detail,
     owned_lane_scope,
     password_claim_set,
@@ -227,6 +229,12 @@ _EPOCH_GUARD_RESOLVE = (
     " AND COALESCE((SELECT ll.leader_epoch FROM leader_lease ll WHERE ll.lease_key=${k}), ${h})"
     " <= ${h}"
 )
+
+#: A queue row whose body is still THERE, and therefore still replayable (BACKLOG #1560). The Postgres
+#: twin of ``store._REPLAYABLE_BODY``; the reasoning lives there and is not restated. Spliced into
+#: :meth:`PostgresStore.replay` and :meth:`PostgresStore.replay_dead` so neither re-queues a delivery
+#: whose content retention has erased.
+_REPLAYABLE_BODY = "payload <> '' OR body_ref IS NOT NULL"
 
 
 class _FencedWrite(Exception):
@@ -528,13 +536,21 @@ _SCHEMA: list[str] = [
         id           TEXT PRIMARY KEY,
         operation    TEXT NOT NULL,
         params       TEXT NOT NULL,
+        -- `requester` is a DISPLAY label; `requester_user_id` is the authorization key. See the
+        -- Store protocol's create_pending_approval (BACKLOG #1540).
         requester    TEXT NOT NULL,
+        requester_user_id TEXT,
         requested_at DOUBLE PRECISION NOT NULL,
         status       TEXT NOT NULL DEFAULT 'pending',
         approver     TEXT,
         decided_at   DOUBLE PRECISION,
         expires_at   DOUBLE PRECISION
     )""",
+    # BACKLOG #1540: the immutable requester id for a pre-existing pending_approvals table; a no-op on
+    # a fresh DB (the CREATE above has it). Lives in _SCHEMA (hash-gated, ADR 0064) so it runs once
+    # per schema version rather than taking ACCESS EXCLUSIVE on every open, and so adding it moves
+    # _schema_hash() automatically — no _MIGRATION_REV bump is needed or wanted.
+    "ALTER TABLE pending_approvals ADD COLUMN IF NOT EXISTS requester_user_id TEXT",
     "CREATE INDEX IF NOT EXISTS ix_pending_approvals_status"
     " ON pending_approvals(status, requested_at)",
     """CREATE TABLE IF NOT EXISTS users (
@@ -5234,10 +5250,58 @@ class PostgresStore:
         )
         return len(orphans)
 
+    async def dead_letter_missing_inbounds(
+        self, valid_names: set[str], now: float | None = None
+    ) -> int:
+        """Dead-letter every non-terminal **channel-keyed** row (ingress/routed/response) whose
+        ``channel_id`` left the registry — no router, transform or re-ingress worker exists for an
+        unknown inbound and no dispatcher claims its lane. Outbound rows are excluded: they key on
+        ``destination_name`` and drain regardless of origin. ``valid_names`` is the WHOLE
+        deployment's inbound names, never one engine shard's slice. Returns the rows killed."""
+        now = time.time() if now is None else now
+        async with self._timed_acquire() as conn, conn.transaction():
+            rows = await conn.fetch(
+                "SELECT id, message_id, channel_id FROM queue"
+                " WHERE stage = ANY($1::text[]) AND status = ANY($2::text[])",
+                [Stage.INGRESS.value, Stage.ROUTED.value, Stage.RESPONSE.value],
+                [OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value],
+            )
+            orphans = [r for r in rows if r["channel_id"] not in valid_names]
+            if not orphans:
+                return 0
+            error = "inbound removed from registry"
+            # Pre-lock all affected messages' finalize locks in canonical order before the loop
+            # finalizes any, so concurrent multi-message sweeps/cancels can't deadlock.
+            await self._lock_finalize_batch(conn, (r["message_id"] for r in orphans))
+            for row in orphans:
+                await conn.execute(
+                    "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
+                    " owner=NULL, lease_expires_at=NULL WHERE id=$5",
+                    OutboxStatus.DEAD.value,
+                    now,
+                    self._enc(error, aad=cell_aad("queue", "last_error", row["id"])),
+                    now,
+                    row["id"],
+                )
+                await self._event(conn, row["message_id"], "dead", None, error, now)
+                await self._maybe_finalize_message(conn, row["message_id"], now)
+        log.warning(
+            "dead-lettered %d orphaned ingress/routed/response row(s) at startup for missing"
+            " inbound(s): %s",
+            len(orphans),
+            ", ".join(sorted({r["channel_id"] for r in orphans})),
+        )
+        return len(orphans)
+
     async def replay(self, message_id: str, now: float | None = None) -> int:
         """Re-queue a message for re-processing/re-delivery (attempts reset). Two modes: **recover**
         any ``dead``/``pending`` row (never a ``done`` sibling — the M-2 hazard), else **re-send** the
-        ``done`` rows. ``cancelled`` rows are never touched. Returns rows requeued."""
+        ``done`` rows. ``cancelled`` rows are never touched. Returns rows requeued.
+
+        A row whose body retention has ERASED is never re-queued (:data:`_REPLAYABLE_BODY`, BACKLOG
+        #1560), and the ``delivered_keys`` DELETE carries the same predicate so it never drops the
+        idempotency entry of a row the UPDATE skipped. Mirrors :meth:`MessageStore.replay`, whose
+        docstring carries the reasoning — including why the ``stuck`` count deliberately does not."""
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
             stuck_row = await conn.fetchrow(
@@ -5257,13 +5321,15 @@ class PostgresStore:
                 # completed as a crash-re-run duplicate. Scoped to this message only.
                 await conn.execute(
                     "DELETE FROM delivered_keys WHERE outbox_id IN"
-                    " (SELECT id FROM queue WHERE message_id=$1 AND status=$2)",
+                    f" (SELECT id FROM queue WHERE message_id=$1 AND status=$2"
+                    f" AND ({_REPLAYABLE_BODY}))",
                     message_id,
                     OutboxStatus.DONE.value,
                 )
             result = await conn.execute(
                 "UPDATE queue SET status=$1, attempts=0, next_attempt_at=$2, last_error=NULL,"
-                " updated_at=$2 WHERE message_id=$3 AND status = ANY($4::text[])",
+                f" updated_at=$2 WHERE message_id=$3 AND status = ANY($4::text[])"
+                f" AND ({_REPLAYABLE_BODY})",
                 OutboxStatus.PENDING.value,
                 now,
                 message_id,
@@ -5625,13 +5691,19 @@ class PostgresStore:
     ) -> int:
         """Re-queue dead-lettered **outbound** deliveries only (optionally scoped): set them back to
         ``pending`` with attempts reset, revert each affected message from ``error`` to ``routed``.
-        Scoped to ``stage='outbound'`` to match the dead-letter view. Returns rows requeued."""
+        Scoped to ``stage='outbound'`` to match the dead-letter view. Returns rows requeued.
+
+        Rows whose body retention has ERASED are excluded (:data:`_REPLAYABLE_BODY`, BACKLOG #1560).
+        Unlike the SQLite and SQL Server backends this spells its two statements out separately, so the
+        predicate is written TWICE on purpose: the affected message set comes from the ``SELECT
+        DISTINCT``, and guarding only the UPDATE would revert a purged message from ``ERROR`` to
+        ``ROUTED`` with nothing re-queued. ``tests/test_replay_erased_body_scope.py`` pins both."""
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
             ids = await conn.fetch(
                 "SELECT DISTINCT message_id FROM queue WHERE stage=$1 AND status=$2"
                 " AND ($3::text IS NULL OR channel_id=$3)"
-                " AND ($4::text IS NULL OR destination_name=$4)",
+                f" AND ($4::text IS NULL OR destination_name=$4) AND ({_REPLAYABLE_BODY})",
                 Stage.OUTBOUND.value,
                 OutboxStatus.DEAD.value,
                 channel_id,
@@ -5644,7 +5716,7 @@ class PostgresStore:
                 "UPDATE queue SET status=$1, attempts=0, next_attempt_at=$2, last_error=NULL,"
                 " updated_at=$2 WHERE stage=$3 AND status=$4"
                 " AND ($5::text IS NULL OR channel_id=$5)"
-                " AND ($6::text IS NULL OR destination_name=$6)",
+                f" AND ($6::text IS NULL OR destination_name=$6) AND ({_REPLAYABLE_BODY})",
                 OutboxStatus.PENDING.value,
                 now,
                 Stage.OUTBOUND.value,
@@ -6153,26 +6225,28 @@ class PostgresStore:
         operation: str,
         params: str,
         requester: str,
+        requester_user_id: str,
         requested_at: float,
         expires_at: float | None,
     ) -> None:
         """Persist a high-value action awaiting a distinct second approver (dual-control, 2.3.5)."""
         await self._execute(
             "INSERT INTO pending_approvals "
-            "(id, operation, params, requester, requested_at, status, expires_at) "
-            "VALUES ($1,$2,$3,$4,$5,'pending',$6)",
+            "(id, operation, params, requester, requester_user_id, requested_at, status, expires_at)"
+            " VALUES ($1,$2,$3,$4,$5,$6,'pending',$7)",
             approval_id,
             operation,
             params,
             requester,
+            requester_user_id,
             requested_at,
             expires_at,
         )
 
     async def get_pending_approval(self, approval_id: str) -> Row | None:
         row: Row | None = await self._fetchone(
-            "SELECT id, operation, params, requester, requested_at, status, approver, decided_at,"
-            " expires_at FROM pending_approvals WHERE id = $1",
+            "SELECT id, operation, params, requester, requester_user_id, requested_at, status,"
+            " approver, decided_at, expires_at FROM pending_approvals WHERE id = $1",
             approval_id,
         )
         return row
@@ -6180,6 +6254,7 @@ class PostgresStore:
     async def list_pending_approvals(self, *, now: float, limit: int = 100) -> Sequence[Row]:
         """Open (still-``pending``, unexpired) approval requests, newest-first."""
         return await self._fetchall(
+            # No requester_user_id here — see the SQLite twin.
             "SELECT id, operation, params, requester, requested_at, status, approver, decided_at,"
             " expires_at FROM pending_approvals"
             " WHERE status = 'pending' AND (expires_at IS NULL OR expires_at > $1)"
@@ -6807,6 +6882,45 @@ class PostgresStore:
             user_id,
         )
 
+    async def increment_login_failure(
+        self,
+        user_id: str,
+        *,
+        threshold: int,
+        lockout_seconds: float,
+        now: float | None = None,
+    ) -> tuple[int, bool]:
+        """Count one failed credential attempt and apply the lockout policy in ONE atomic step;
+        return ``(failed_attempts, just_locked)``.
+
+        The ``SELECT ... FOR UPDATE`` + ``UPDATE`` run in one transaction, so concurrent attempts --
+        even cross-node, which is the case only this backend has -- serialize on the row rather than
+        each reading the same pre-increment count. :func:`next_lockout_state` carries the policy and
+        the reason this has to be one call rather than three. Returns ``(0, False)`` for an unknown
+        user."""
+        now = time.time() if now is None else now
+        async with self._timed_acquire() as conn, conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT failed_attempts, locked_until FROM users WHERE id=$1 FOR UPDATE", user_id
+            )
+            if row is None:
+                return 0, False
+            state = next_lockout_state(
+                failed_attempts=int(row["failed_attempts"]),
+                locked_until=_opt_float(row["locked_until"]),
+                now=now,
+                threshold=threshold,
+                lockout_seconds=lockout_seconds,
+            )
+            await conn.execute(
+                "UPDATE users SET failed_attempts=$1, locked_until=$2, updated_at=$3 WHERE id=$4",
+                state.attempts,
+                state.locked_until,
+                now,
+                user_id,
+            )
+            return state.attempts, state.just_locked
+
     async def upsert_role(
         self,
         *,
@@ -7410,7 +7524,7 @@ class PostgresStore:
         return DbStatus(
             path=self.path,
             size_bytes=int(size["b"]) if size and size["b"] is not None else 0,
-            disk_free_bytes=0,  # not readily available for a remote Postgres server
+            disk_free_bytes=None,  # a remote server's disk is not ours to stat; unmeasurable, not 0
             journal_mode="postgres",
             messages=await self._count("messages"),
             events=await self._count("message_events"),

@@ -109,8 +109,19 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         "test_escape_sequence_check.py",
         "test_external_link_interstitial.py",
         "test_licence_header_gate.py",
+        # Scans the TRACKED messagefoundry/ and harness/ trees for files the release member gate
+        # would refuse, so an engine commit adding one is exactly the diff it has to catch
+        # (BACKLOG #1840). Listed as tooling it would be deselected on the engine legs AND unreached
+        # by the tooling path gate, which is the silent-coverage-loss case this list exists for.
+        # It loads scripts/release/forbidden_members.py by path; that is the RULE it reads, not its
+        # subject.
+        "test_packaged_tree_denylist.py",
         "test_packaging.py",
         "test_release_pipeline.py",
+        # Parses messagefoundry/store/{store.py,postgres.py,sqlserver.py} off disk without importing
+        # them. What it guards is the erased-body predicate going missing from a replay statement,
+        # which arrives as an ENGINE diff and does not trip the tooling path gate (BACKLOG #1560).
+        "test_replay_erased_body_scope.py",
         # NOT engine source either, so this entry widens the list's stated rule and the claim is
         # spelled out for review, as test_conftest_name_collision_guard.py above does. Its subject is
         # the DEPENDENCY CLOSURE: it holds docs/RISKY-COMPONENTS.md closed over
@@ -135,6 +146,17 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # .github/**, the ledger) is not tripped by one, so gating this behind scripts/** would
         # leave exactly the change that reintroduces the defect facing nothing.
         "test_username_access_key_screen.py",
+        # AST-scans messagefoundry/store/store.py and reds on any `execute("BEGIN")` -- or on the
+        # nested-transaction verbs `SAVEPOINT`, `ROLLBACK TO` and `RELEASE` -- outside
+        # `_writer_txn` (ADR 0159). Same shape as sqlserver_encrypt_pass_tables below -- a guard whose
+        # subject is a store module it reads rather than imports -- and it stays here for this file's
+        # standard gating reason, checked against the gate rather than assumed: what it catches is an
+        # eighteenth writer hand-rolling its own transaction, which arrives as a diff to
+        # messagefoundry/store/store.py, and the `tooling=true` predicate in ci.yml does not name
+        # `messagefoundry/` at all. Listed as tooling it would be deselected by `-m 'not tooling'` on
+        # the engine legs AND unreached by the tooling gate, so it would run on ZERO legs for the one
+        # change it exists to stop.
+        "test_writer_txn_is_the_only_begin.py",
         # The four below were WRONGLY LISTED as tooling in the first cut of the manifest and were
         # caught by adversarial review, not by any guard here. Each reads real engine source without
         # importing it, so the marker took them off every engine leg while the tooling job's path gate

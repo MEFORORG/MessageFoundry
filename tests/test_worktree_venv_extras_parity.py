@@ -34,6 +34,9 @@ CI's, while the neighbouring ``-Sqlserver`` switch shows the author did think ab
 unexplained divergence from CI is an oversight until something says otherwise, and nothing did. If a
 future reader wants the lane list DELIBERATELY narrower, that is a decision -- and it needs to be
 written down and this test updated, which is the point.
+
+THE DECLARATION MOVED, 2026-09-16: the install line is now ``scripts/worktree/ensure-venv.ps1``'s and
+``new.ps1`` calls that script. See that script's header for why. What this test asserts is unchanged.
 """
 
 from __future__ import annotations
@@ -44,7 +47,7 @@ from pathlib import Path
 import pytest
 
 _ROOT = Path(__file__).resolve().parents[1]
-_NEW_PS1 = _ROOT / "scripts" / "worktree" / "new.ps1"
+_VENV_PS1 = _ROOT / "scripts" / "worktree" / "ensure-venv.ps1"
 _CI = _ROOT / ".github" / "workflows" / "ci.yml"
 
 #: The lane's own extra. CI has no SQL Server service on the ordinary test leg, so `-Sqlserver` adding
@@ -53,13 +56,13 @@ _LANE_ONLY = frozenset({"sqlserver"})
 
 
 def _lane_extras() -> set[str]:
-    """The default (non -Sqlserver) extras `new.ps1` installs."""
-    text = _NEW_PS1.read_text(encoding="utf-8")
+    """The default (non -Sqlserver) extras `ensure-venv.ps1` installs."""
+    text = _VENV_PS1.read_text(encoding="utf-8")
     m = re.search(
         r"^\$extras = if \(\$Sqlserver\) \{ \"([^\"]+)\" \} else \{ \"([^\"]+)\" \}", text, re.M
     )
     assert m is not None, (
-        "could not find the $extras assignment in new.ps1 -- has it been rewritten?"
+        "could not find the $extras assignment in ensure-venv.ps1 -- has it been rewritten?"
     )
     return {e.strip() for e in m.group(2).split(",") if e.strip()}
 
@@ -92,7 +95,7 @@ def test_the_lane_venv_installs_every_extra_the_ci_test_leg_installs() -> None:
     ci = _ci_test_leg_extras()
     missing = ci - lane - _LANE_ONLY
     assert not missing, (
-        f"scripts/worktree/new.ps1 installs .[{','.join(sorted(lane))}] but ci.yml's test leg installs "
+        f"scripts/worktree/ensure-venv.ps1 installs .[{','.join(sorted(lane))}] but ci.yml's test leg installs "
         f".[{','.join(sorted(ci))}] -- missing {sorted(missing)}. A lane without these COLLECTS FEWER "
         f"TESTS and reads green over a tree it never ran (BACKLOG #1335)."
     )
@@ -102,9 +105,9 @@ def test_the_lane_venv_installs_the_web_console_package() -> None:
     """SEPARATE FROM THE EXTRAS, and separately invisible. `pyproject.toml`'s `testpaths` collects
     `packaging/messagefoundry-webconsole/tests`, so without this editable install that whole suite is
     absent rather than failing."""
-    text = _NEW_PS1.read_text(encoding="utf-8")
+    text = _VENV_PS1.read_text(encoding="utf-8")
     assert "-e packaging/messagefoundry-webconsole" in text, (
-        "new.ps1 does not install the web console package, but pyproject's testpaths collects its "
+        "ensure-venv.ps1 does not install the web console package, but pyproject's testpaths collects its "
         "suite -- a lane would silently not run it (BACKLOG #1335)"
     )
 
@@ -125,7 +128,8 @@ def test_each_extra_this_item_added_is_declared_in_pyproject(extra: str) -> None
     it next, and only after the venv is half-built."""
     pyproject = (_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert re.search(rf"^{re.escape(extra)}\s*=\s*\[", pyproject, re.M), (
-        f"new.ps1 installs the {extra!r} extra but pyproject.toml declares no such optional dependency"
+        f"ensure-venv.ps1 installs the {extra!r} extra but pyproject.toml declares no such optional "
+        f"dependency"
     )
 
 
@@ -133,7 +137,7 @@ def test_the_sqlserver_switch_still_adds_its_extra() -> None:
     """The lane-only option must survive the widening. `-Sqlserver` is not a divergence from CI -- the
     ordinary test leg has no SQL Server service -- so it is excluded from the parity comparison, and
     that exclusion must not quietly become a deletion."""
-    text = _NEW_PS1.read_text(encoding="utf-8")
+    text = _VENV_PS1.read_text(encoding="utf-8")
     m = re.search(r"^\$extras = if \(\$Sqlserver\) \{ \"([^\"]+)\" \}", text, re.M)
     assert m is not None
     assert "sqlserver" in {e.strip() for e in m.group(1).split(",")}, (

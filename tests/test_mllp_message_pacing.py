@@ -19,10 +19,14 @@ The load-bearing test here is therefore NOT that pacing happens. It is
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 
 import pytest
+from _ingress_pace_probe import install_ingress_pace_probe, stream_debt_seconds
 
 from messagefoundry.config.models import ConnectorType, Source
+from messagefoundry.transports import mllp
 from messagefoundry.transports.mllp import (
     DEFAULT_MAX_MESSAGES_PER_SECOND,
     MLLPSource,
@@ -94,6 +98,13 @@ def test_an_explicit_burst_is_honoured() -> None:
 
 # --- end to end, on a real socket ---------------------------------------------------------------
 
+#: The paced scenario, named once so the timing arms can derive their bounds from it instead of
+#: restating a number the bucket arithmetic already fixes -- and so nobody can move the burst on the
+#: connector while those arms keep checking a scenario it is no longer running.
+_PACED: dict[str, float] = {"max_messages_per_second": 20.0, "message_burst": 2.0}
+_RATE, _BURST = _PACED["max_messages_per_second"], _PACED["message_burst"]
+_MESSAGES = 12
+
 
 async def _run_against(src: MLLPSource, count: int) -> list[str]:
     """Send ``count`` framed messages down ONE connection and return what the handler received."""
@@ -129,7 +140,7 @@ async def test_pacing_never_drops_a_message() -> None:
     what the count-and-log invariant forbids, and a limiter that discarded would pass a
     'rate is bounded' test while breaking the thing that actually matters.
     """
-    seen = await _run_against(_source(max_messages_per_second=20, message_burst=2), 12)
+    seen = await _run_against(_source(**_PACED), _MESSAGES)
     assert len(seen) == 12
     # And in order: pacing must not reorder either, since FIFO is the project's ordering model.
     ids = [(m.decode() if isinstance(m, bytes) else m).split("|")[9] for m in seen]
@@ -141,19 +152,28 @@ async def test_pacing_off_delivers_everything_unchanged() -> None:
     assert len(seen) == 12
 
 
-async def test_pacing_actually_delays_the_reads() -> None:
-    """Watched fail: with the pacer removed this elapsed time collapses to near zero.
+async def test_pacing_actually_delays_the_reads(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Watched fail: with the pre-read wait removed, both arms below go to zero.
 
-    Deliberately a LOWER bound only. Asserting an upper bound would pin scheduler timing and make
-    this the flaky test that gets deleted; the claim under test is that a wait occurs at all.
+    **Neither arm is a constant, and that is the fix for BACKLOG #1538.** This asserted
+    ``elapsed >= 0.3``, which is pacing plus the runner's own work with nothing to separate them --
+    a box slow enough to spend 0.3s framing twelve messages passed it with the pacer deleted.
+    Raising the number does not help: the pacer's debt SHRINKS as the runner slows, because the
+    bucket refills on the same wall clock the work is spent on. ``tests/_ingress_pace_probe.py``
+    puts the bucket on a clock this test owns, so the DECISION arm reads exact bucket arithmetic
+    that no runner can influence, and the WALL-CLOCK arm is bounded by what this run decided rather
+    than by a guess -- it is what still catches a pacer that decides a wait and never takes it.
     """
+    probe = install_ingress_pace_probe(monkeypatch, mllp)
     loop = asyncio.get_running_loop()
     start = loop.time()
-    seen = await _run_against(_source(max_messages_per_second=20, message_burst=2), 12)
+    seen = await _run_against(_source(**_PACED), _MESSAGES)
     elapsed = loop.time() - start
-    assert len(seen) == 12
-    # 12 messages, burst 2, 20/s -> at least (12-2)/20 = 0.5s of debt must be paid somewhere.
-    assert elapsed >= 0.3
+    assert len(seen) == _MESSAGES
+    assert probe.built == 1, "the probe never replaced the pacer this intake builds"
+    # 12 messages, burst 2, 20/s -> exactly (12-2)/20 = 0.5s of debt, paid before the next read.
+    assert sum(probe.decided) == pytest.approx(stream_debt_seconds(_MESSAGES, _BURST, _RATE))
+    assert elapsed >= sum(probe.taken)
 
 
 # --- REACHABILITY: the factory surface that could not populate the pacer (BACKLOG #1249) ----------
@@ -221,3 +241,88 @@ def test_the_shipped_default_constant_is_still_off() -> None:
     """`DEFAULT_MAX_MESSAGES_PER_SECOND` is what the connector falls back to when the key is absent.
     If it ever becomes non-None, exposing the keys would have silently turned pacing on for everyone."""
     assert DEFAULT_MAX_MESSAGES_PER_SECOND is None
+
+
+# --- BACKLOG #290: pacing has to be observable, or its opt-in posture cannot be tuned -------------
+#
+# The 2026-08-11 ruling ships DEFAULT_MAX_MESSAGES_PER_SECOND OFF because a safe number can only come
+# from a site's own feed profile. That posture only works if an operator who sets a number can watch
+# it engage -- and pacing is silent by construction (it never drops, NAKs, refuses or errors), so a
+# paced interface is indistinguishable from a slow one. These pin the report, not the pacing.
+
+
+def test_pacing_reports_itself_on_a_stream_intake(caplog: pytest.LogCaptureFixture) -> None:
+    """The pace()/settle() pair -- MLLP, raw TCP and X12 -- reports the delay it applies.
+
+    Fails without the change: `_note_paced` does not exist, so `pace()` sleeps in silence and nothing
+    reaches the log at any level.
+    """
+    pacer = _MessagePacer(1000.0, 1.0, now=time.monotonic(), name="IB_ACME_ADT")
+    pacer.settle(5)  # 5 messages against a burst of 1 -> 4 tokens of debt, 4ms at 1000/s
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.mllp"):
+        asyncio.run(pacer.pace())
+    assert "IB_ACME_ADT" in caplog.text
+    assert "pacing engaged" in caplog.text
+    # The operator has to be told this is a hold, not a loss -- the whole point of the control.
+    assert "not refused" in caplog.text
+
+
+def test_pacing_reports_itself_on_a_listener_scoped_intake(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The deficit()/charge() pair -- the HTTP intake's one listener-wide bucket -- reports too.
+
+    Driven on a fully synthetic clock, so it pins the report rather than any wall-clock timing.
+    """
+    pacer = _MessagePacer(1.0, 1.0, now=0.0, name="IB_ACME_HTTP")
+    pacer.charge(5, now=0.0)  # 5 messages against a burst of 1 -> 4s of debt at 1/s
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.mllp"):
+        owed = pacer.deficit(now=0.0)
+    assert owed > 0.0
+    assert "IB_ACME_HTTP" in caplog.text
+
+
+def test_a_pacer_that_is_not_engaging_says_nothing(caplog: pytest.LogCaptureFixture) -> None:
+    """NEGATIVE CONTROL for the two tests above. Without this, a report emitted unconditionally --
+    on every read of every paced connection, whether or not the bucket is in deficit -- would pass
+    both of them while flooding the log of a connection that is under its rate and fine."""
+    pacer = _MessagePacer(1000.0, 1000.0, now=0.0, name="IB_QUIET")
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.mllp"):
+        assert pacer.deficit(now=0.0) == 0.0  # well inside the burst -> nothing owed
+        asyncio.run(pacer.pace())  # no debt held -> no sleep, no report
+    assert caplog.text == ""
+
+
+def test_the_report_is_throttled_to_one_line_per_window(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A pacer in deficit is consulted on EVERY read, so an unthrottled line would restate one fact
+    thousands of times and bury the log. Two applied delays inside one window produce one line."""
+    pacer = _MessagePacer(1.0, 1.0, now=0.0, name="IB_BUSY")
+    pacer.charge(5, now=0.0)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.mllp"):
+        first = pacer.deficit(now=0.0)  # stamp == _report_at -> reports
+        second = pacer.deficit(now=1.0)  # inside the window -> tallied, silent
+    assert first > 0.0 and second > 0.0
+    assert len([r for r in caplog.records if "pacing engaged" in r.getMessage()]) == 1
+
+
+def test_the_report_names_the_connection_the_source_was_wired_with() -> None:
+    """The name is not decoration: a pacing report an operator cannot trace to a connection tells
+    them a feed somewhere is being held back and nothing about which one. Pins the wiring from
+    `Source.name` through the source to the pacer, which is the half a pacer-only test cannot see."""
+    src = _source(max_messages_per_second=5.0)
+    assert src._pacing_name == "IB_TEST"
+    pacer = _MessagePacer.for_rate(
+        src.max_messages_per_second, src.message_burst, name=src._pacing_name
+    )
+    assert pacer is not None
+    assert pacer._name == "IB_TEST"
+
+
+def test_for_rate_still_returns_none_when_pacing_is_off() -> None:
+    """POSITIVE CONTROL on the test above. If `for_rate` had stopped honouring the off-default while
+    gaining its `name` argument, every pacing test in this file would still pass and pacing would
+    have been silently turned on for every inbound."""
+    assert _MessagePacer.for_rate(None, 1.0, name="IB_TEST") is None
+    assert _MessagePacer.for_rate(0, 1.0, name="IB_TEST") is None
