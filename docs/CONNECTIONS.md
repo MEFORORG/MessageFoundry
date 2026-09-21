@@ -1192,7 +1192,7 @@ gate are identical to the SQL Server preset.
 | Setting | Default | Meaning |
 |---------|---------|---------|
 | `odbc_driver` | — (required for `generic`) | the **exact OS-registered ODBC driver name**, e.g. `PostgreSQL Unicode`, `MySQL ODBC 8.0 Unicode Driver`, `Oracle in instantclient_21_13` |
-| `odbc_params` | — | a mapping of **driver-specific ODBC keywords** → values, e.g. `{"PORT": 5432, "SSLmode": "verify-full"}`. Values are **literals** (not `env()`-resolved — put per-env/secret values in the top-level fields) and are brace-quoted (injection-safe); keys must be valid ODBC keywords and may not re-set `DRIVER`/`SERVER`/`DATABASE`. |
+| `odbc_params` | — | a mapping of **driver-specific ODBC keywords** → values, e.g. `{"PORT": 5432, "SSLmode": "verify-full"}`. Values are **literals** (not `env()`-resolved — put per-env/secret values in the top-level fields) and are brace-quoted (injection-safe); keys must be valid ODBC keywords and may not re-set `DRIVER`/`SERVER`/`DATABASE`. An `env()` reference here is **refused at load** — as a code-first `env(...)` value, as a `connections.toml` inline table (`PWD = { env = "acme_pw" }`), and as one naming the whole table (`odbc_params = { env = "..." }`). |
 | `odbc_user_key` | `UID` | ODBC keyword the top-level `username` is emitted under (some drivers want `USER`) |
 | `odbc_password_key` | `PWD` | ODBC keyword the top-level `password` is emitted under (some drivers want `PASSWORD`) |
 

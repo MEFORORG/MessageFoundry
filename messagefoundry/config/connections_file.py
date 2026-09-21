@@ -299,11 +299,14 @@ def _build_spec(transport: str, table: dict[str, Any], where: str) -> Connection
         # ValueError out of that walk would otherwise escape as a raw traceback naming nothing.
         #
         # IT ABSORBS TypeError AND ValueError, AND SAYS SO RATHER THAN IMPLYING MORE. A factory guard
-        # that raises anything else still escapes, and one does today: `odbc_params = { env = "x" }`
-        # reaches _reject_envref_odbc_params as an EnvRef, which calls .items() on it and raises
-        # AttributeError past this handler (measured). Widening the catch is a change to the factory
-        # boundary this branch does not own; the hole is recorded rather than papered over, because a
-        # comment claiming coverage it does not have is worse than no comment (SDS-3.7).
+        # that raises anything else still escapes. One did when this was written:
+        # `odbc_params = { env = "x" }` reached _reject_envref_odbc_params as an EnvRef, which called
+        # .items() on it and raised AttributeError past this handler (measured). That guard now
+        # refuses a non-table with a WiringError (BACKLOG #1806), so that case is closed; the catch is
+        # unchanged, and any other exception out of a factory still escapes. Widening the catch is a
+        # change to the factory boundary this branch does not own; the hole is recorded rather than
+        # papered over, because a comment claiming coverage it does not have is worse than no comment
+        # (SDS-3.7).
         _check_setting_types(factory, settings, transport, where)
         return factory(**settings)
     except WiringError:
@@ -677,13 +680,13 @@ def _element_fits(value: Any, element: _Accepted) -> bool:
     would preempt both.
 
     **WHERE NO REFUSAL EXISTS THE VALUE GOES THROUGH, and that is a HOLE, not a decision this skip
-    makes safe.** At least three, measured on this branch, all of which load clean, survive
-    ``resolve_env_settings`` unchanged, and reach the connector as a literal ``{'env': ...}`` table:
-    ``headers``, answered by an open nested-env() refusal at the factory seam; ``odbc_params``, whose
-    ``_reject_envref_odbc_params`` tests ``isinstance(v, EnvRef)`` and so cannot see the raw-dict
-    spelling a ``connections.toml`` produces; and any ``list[str]`` setting, answered by nothing at
-    all. None of them is #1809 -- this check judges TYPES -- and a second refusal written here would
-    collide with the one already open, so they need a row, not a patch."""
+    makes safe.** When #1809 measured it, at least three loaded clean, survived
+    ``resolve_env_settings`` unchanged, and reached the connector as a literal ``{'env': ...}`` table.
+    Two now have a refusal at the factory seam: ``headers`` in ``_reject_envref_headers`` (BACKLOG
+    #1649), and ``odbc_params`` in ``_reject_envref_odbc_params``, which tests the raw-dict spelling
+    as well as an ``EnvRef`` (BACKLOG #1806). The third, any ``list[str]`` setting, was answered by
+    nothing at all and is not re-measured here. None of them is #1809 -- this check judges TYPES --
+    so a hole that remains needs its own row, not a patch here."""
     if isinstance(value, EnvRef) or _is_env_marker(value):
         return True
     return _value_matches(value, element.scalars)
