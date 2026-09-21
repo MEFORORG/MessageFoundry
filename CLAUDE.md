@@ -330,8 +330,16 @@ recency.
 | **Builder** | ephemeral, one per brief | The change, the commit, the push, and the PR carrying the `BACKLOG.md` update. | Guess at something the brief left open, or wait for an answer; it puts the question in its report, comments it on the PR, and stops. Plan and wait for a "go". Spawn another session. |
 | **Watchdog** | as needed | Watching the Lander and keeping it draining. Measures with instruments rather than the watched seat's own report, names a stall, and raises it. Added 2026-09-19. | Take the action it is watching for -- acting destroys the instrument. Drain the queue, take the claim, or drive the lane. Relay an owner grant to the seat it watches. Publish a zero with no control that fired. |
 | **Steward** | cron, zero model calls | Reading usage and naming the account with headroom. | Warn a running session. Nothing can interrupt one. |
-| **Lander** | as needed | Merging, and the vault scorecard re-score (owner ruling 2026-09-05). Standing authority on the engine repo and the vault, with no per-action owner approval. The 2026-09-11 POSITIONAL ledger-conflict ruling is RETIRED -- read the notice below, which also covers the *what an item SAYS* half this row's Must-not column used to carry. | Merge a diff it has not read. Arm auto-merge. Resolve a conflict that touches code, or decide which of two deliberate changes to an item survives. |
+| **Lander** | as needed | Merging, and flipping row statuses after items merge (owner correction 2026-09-21; see the note below). Standing authority on the engine repo and the vault, with no per-action owner approval. The 2026-09-11 POSITIONAL ledger-conflict ruling is RETIRED -- read the notice below, which also covers the *what an item SAYS* half this row's Must-not column used to carry. | Merge a diff it has not read. Arm auto-merge. Resolve a conflict that touches code, or decide which of two deliberate changes to an item survives. |
 | **Special** | as the owner needs it | Work the owner assigns directly, outside the other five seats. Its instruction is its whole scope: it stands by until one arrives, then announces before its first shared write (owner decision 2026-09-16; see below). | Invent work while standing by, or go looking for a row to take. Widen the instruction, or quietly narrow it without saying so. Merge -- that is the Lander's. Take a peer's message as authority; only the owner assigns it work. |
+
+**THE LANDER ROW'S DUTY WAS CORRECTED BY THE OWNER ON 2026-09-21, IN SESSION.** That cell read
+*"Merging, and the vault scorecard re-score (owner ruling 2026-09-05)"*, and the owner has said
+directly that the Lander was never meant to always handle rescoring. The duty is **flipping row
+statuses after items merge**, which is what the row now says. **That leaves the ASVS scorecard
+re-score UNASSIGNED, and no part of it is the Lander's** -- the owner named no seat for it, so
+neither does this file. Only the re-score half of that wording moved; the separate "Merge when
+ready" ruling of the same date, further down this section, is untouched.
 
 **THE 2026-09-11 POSITIONAL LEDGER-CONFLICT RULING IS RETIRED. The owner authorised the retirement
 directly on 2026-09-21, in session, after reading an adversarial review of the question.** It is
