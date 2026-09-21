@@ -706,3 +706,190 @@ def test_the_baseline_covers_every_gated_step_on_every_leg() -> None:
         f"[step-margin] checked {len(_GATED_STEPS)} step(s) x {len(legs)} leg(s) against {len(rows)} row(s)"
     )
     assert not missing, f"no recorded maximum for: {missing}"
+
+
+# --- the ruler and the wall -------------------------------------------------------------------------
+#
+# The web console step's `timeout-minutes` and the margin gate's `--cap-minutes` used to be ONE matrix
+# variable, which made the gate structurally unable to size itself: a run slower than the cap was killed
+# AT the cap, concluded `failure`, and left the success-sample, so the observed maximum could not exceed
+# the cap by construction. ci.yml's "THE RULER AND THE WALL" note is the source of record.
+#
+# Splitting it buys that, and costs TWO NUMBERS THAT MUST MOVE TOGETHER -- the drift class this
+# repository has been bitten by more than once. The three checks below are the price: they read both
+# numbers out of the matrix literals in ci.yml, so a raised kill or a raised cap that leaves the other
+# behind fails here instead of rotting.
+
+
+#: The legs this matrix is expected to define. A SECOND copy of these names, deliberately, and it is
+#: not the drift the paragraph above is about: the numbers stay single-sourced and only the NAMES are
+#: restated. Asserting the count alone would be satisfied by any three-entry block -- a different
+#: matrix that happened to have three legs would pass and tell you nothing. A parse that finds three
+#: legs it cannot name has not found this matrix.
+_EXPECTED_LEGS: frozenset[str] = frozenset({"ubuntu-latest", "windows-2022", "windows-2025"})
+
+#: Per gated job: the matrix knob the margin gate's `--cap-minutes` must come from, and whether that
+#: knob is ALSO the step's `timeout-minutes`.
+#:
+#: The engine leg is still fused and that is DECLARED here rather than left out of the scan, so the
+#: state is asserted rather than merely unchecked. Splitting it the way the web console leg is split is
+#: a separate change; making that change means flipping its flag here, which is the point.
+_MARGIN_CAP_SOURCE: dict[str, tuple[str, bool]] = {
+    # job: (matrix knob feeding --cap-minutes, is that knob also the kill?)
+    "test": ("step_timeout", True),
+    "webconsole": ("webconsole_margin_cap", False),
+}
+
+#: `#   <leg>  <setup> + <noise> + kill <kill> = <total>   under <job cap>, slack <slack>`
+_NESTING_ROW = re.compile(
+    r"^\s*#\s+(?P<leg>\S+)\s+(?P<setup>\d+:\d{2})\s*\+\s*(?P<noise>\d+:\d{2})\s*\+\s*"
+    r"kill\s+(?P<kill>\d+:\d{2})\s*=\s*(?P<total>\d+:\d{2})\s+under\s+(?P<cap>\d+:\d{2})",
+    re.MULTILINE,
+)
+
+
+def _cap_knob(job_name: str) -> str:
+    """The matrix knob whose value reaches ``--cap-minutes`` in ``job_name``'s margin check.
+
+    Resolved through the env indirection rather than pattern-matched on a knob name, so it reports
+    what the workflow actually feeds the gate. `${{ }}` cannot appear in a `run:` body here (zizmor),
+    so the value always arrives as an env var and the hop is always there to follow.
+    """
+    check = next(s for s in _job(job_name)["steps"] if "--since" in str(s.get("run", "")))
+    run = str(check.get("run", ""))
+    var = re.search(r'--cap-minutes\s+"?\$\{?(\w+)\}?"?', run)
+    assert var, f"{job_name}'s margin check does not pass --cap-minutes at all: {run!r}"
+    env = {str(k): str(v) for k, v in (check.get("env") or {}).items()}
+    name = var.group(1)
+    assert name in env, (
+        f"{job_name} feeds --cap-minutes from ${name}, which its `env:` does not set"
+    )
+    knob = re.fullmatch(r"\$\{\{\s*matrix\.(\w+)\s*\}\}", env[name])
+    assert knob, f"{job_name}'s --cap-minutes is {env[name]!r}, not a matrix knob"
+    return knob.group(1)
+
+
+def test_the_margin_gate_divides_by_the_knob_it_is_declared_to_divide_by() -> None:
+    """THE DECOUPLING, asserted at the wiring rather than described in a comment.
+
+    Re-pointing `WEBCONSOLE_CAP` back at `webconsole_step_timeout` restores the censoring silently:
+    every run still passes, the gate still prints a ratio, and the sample it is sized from is
+    truncated again at exactly the number being sized. Nothing else in this file would notice.
+
+    Falsified by setting `WEBCONSOLE_CAP: ${{ matrix.webconsole_step_timeout }}`: RED, naming both
+    knobs. Falsified in the other direction by flipping the `test` job's declared flag to False: RED.
+    Restored.
+    """
+    for job_name, (expected_knob, fused) in _MARGIN_CAP_SOURCE.items():
+        gated, kill_knob, _ = _GATED[job_name]
+        actual = _cap_knob(job_name)
+        print(
+            f"[step-margin] {job_name}: --cap-minutes <- matrix.{actual}; kill <- matrix.{kill_knob}"
+        )
+        assert actual == expected_knob, (
+            f"{job_name}'s margin check divides by matrix.{actual}, not matrix.{expected_knob}"
+        )
+        if fused:
+            assert actual == kill_knob, (
+                f"{job_name} is declared FUSED but its cap ({actual}) and kill ({kill_knob}) differ "
+                f"-- if it was split deliberately, flip its flag in _MARGIN_CAP_SOURCE"
+            )
+        else:
+            assert actual != kill_knob, (
+                f"{job_name}'s margin cap and its `timeout-minutes` are the same knob "
+                f"({actual}) again, so the gate's sample is right-censored at the very number it "
+                f"exists to size -- see ci.yml's 'THE RULER AND THE WALL' note"
+            )
+    assert set(_MARGIN_CAP_SOURCE) == set(_GATED), (
+        f"a gated job is missing a declared cap source: {sorted(set(_GATED) - set(_MARGIN_CAP_SOURCE))}"
+    )
+
+
+def test_every_leg_gives_the_kill_real_headroom_over_the_margin_cap() -> None:
+    """The kill must sit far enough above the margin cap that a breaching run still COMPLETES.
+
+    The required headroom is the gate's own floor, read from the gate rather than restated: a run may
+    be observed as far above the cap, in ratio, as the floor reserves below it. A bare `kill > cap`
+    would be satisfied by one minute and would leave the sample censored a hair above the cap.
+
+    Falsified by lowering windows-2025's kill from 12 to 11 (1.222x): RED, naming the leg and both
+    numbers. Restored.
+    """
+    legs = _matrix_legs()
+    names = {leg["os"] for leg in legs}
+    print(f"[step-margin] headroom scanned on legs: {sorted(names)}")
+    assert names == _EXPECTED_LEGS, (
+        f"expected legs {sorted(_EXPECTED_LEGS)}, parsed {sorted(names)}"
+    )
+    assert len(legs) == len(_EXPECTED_LEGS), f"duplicate leg entries: {[leg['os'] for leg in legs]}"
+    checked = 0
+    for leg in legs:
+        for knob in ("webconsole_margin_cap", "webconsole_step_timeout"):
+            assert knob in leg, f"{leg['os']} does not define {knob}"
+        cap, kill = leg["webconsole_margin_cap"], leg["webconsole_step_timeout"]
+        required = DEFAULT_MIN_MARGIN * cap
+        print(
+            f"[step-margin] {leg['os']}: margin cap {cap}m, kill {kill}m -> {kill / cap:.3f}x "
+            f"(need >= {DEFAULT_MIN_MARGIN:.2f}x, i.e. {required:.1f}m)"
+        )
+        assert kill >= required, (
+            f"{leg['os']}: the kill (webconsole_step_timeout {kill}m) gives only {kill / cap:.3f}x "
+            f"over the margin cap (webconsole_margin_cap {cap}m); the gate's own floor is "
+            f"{DEFAULT_MIN_MARGIN:.2f}x, so a run this gate reds would still be truncated"
+        )
+        checked += 1
+    assert checked == len(_EXPECTED_LEGS), f"checked {checked} legs, expected {len(_EXPECTED_LEGS)}"
+
+
+def test_the_webconsole_nesting_arithmetic_in_ci_yml_is_read_and_checks_out() -> None:
+    """setup(max) + kill < webconsole_job_timeout, per leg, with the setup term actually read.
+
+    The older guard here says outright that it CANNOT check the setup term because it lives in a
+    comment, and leaves the real invariant unverified. So the comment is now written in a fixed shape
+    and parsed: the kill it states is reconciled against the matrix, and the sum is re-added here. That
+    turns the comment from a claim nothing reads into the third copy that CANNOT drift -- the same move
+    `step_margin_baseline.toml` exists to make for the recorded maxima.
+
+    Falsified by raising a kill in the matrix without re-summing the comment: RED, naming the leg and
+    both values. Falsified by editing a stated total to a wrong sum: RED. Restored.
+    """
+    rows = {m.group("leg"): m for m in _NESTING_ROW.finditer(_CI.read_text(encoding="utf-8"))}
+    print(f"[step-margin] nesting rows parsed from ci.yml: {sorted(rows)}")
+    assert set(rows) == _EXPECTED_LEGS, (
+        f"the nesting table above the web console step names {sorted(rows)}, expected "
+        f"{sorted(_EXPECTED_LEGS)} -- this extraction has rotted, or a leg lost its row"
+    )
+    legs = {leg["os"]: leg for leg in _matrix_legs()}
+    assert set(legs) == _EXPECTED_LEGS, f"matrix legs {sorted(legs)} != {sorted(_EXPECTED_LEGS)}"
+    checked = 0
+    for name in sorted(_EXPECTED_LEGS):
+        row, leg = rows[name], legs[name]
+        setup = parse_clock(row.group("setup"))
+        noise = parse_clock(row.group("noise"))
+        kill = parse_clock(row.group("kill"))
+        total = parse_clock(row.group("total"))
+        job_cap = parse_clock(row.group("cap"))
+        assert kill == leg["webconsole_step_timeout"] * 60, (
+            f"{name}: the nesting note says the kill is {row.group('kill')} but the matrix sets "
+            f"webconsole_step_timeout to {leg['webconsole_step_timeout']}m -- re-sum the note"
+        )
+        assert job_cap == leg["webconsole_job_timeout"] * 60, (
+            f"{name}: the nesting note says the job cap is {row.group('cap')} but the matrix sets "
+            f"webconsole_job_timeout to {leg['webconsole_job_timeout']}m"
+        )
+        assert setup + noise + kill == total, (
+            f"{name}: {row.group('setup')} + {row.group('noise')} + {row.group('kill')} is "
+            f"{format_clock(setup + noise + kill)}, not the stated {row.group('total')}"
+        )
+        print(
+            f"[step-margin] {name}: setup {row.group('setup')} + noise {row.group('noise')} + kill "
+            f"{row.group('kill')} = {row.group('total')} under {row.group('cap')} "
+            f"(slack {format_clock(job_cap - total)})"
+        )
+        assert total < job_cap, (
+            f"{name}: setup(max) + kill is {row.group('total')}, which does NOT fit under "
+            f"webconsole_job_timeout {row.group('cap')} -- the JOB cap would fire before the step "
+            f"cap and the failure would stop naming the step"
+        )
+        checked += 1
+    assert checked == len(_EXPECTED_LEGS), f"checked {checked} legs, expected {len(_EXPECTED_LEGS)}"

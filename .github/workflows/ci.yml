@@ -1086,7 +1086,10 @@ jobs:
       # concurrently with the engine one anyway -- its wall-clock is already off the critical path.
       # Adding workers would spend the contention risk the -n 8 trial measured to buy nothing.
       #
-      # WINDOWS-2025's CAP IS 9, NOT 6, AND THE CAUSE IS RUNNER VARIANCE RATHER THAN SUITE GROWTH.
+      # WINDOWS-2025's MARGIN CAP IS 9, NOT 6, AND THE CAUSE IS RUNNER VARIANCE RATHER THAN SUITE
+      # GROWTH. Every "cap" in this note means `webconsole_margin_cap`, which is what these four runs
+      # were measured against; it was spelled `webconsole_step_timeout` when the note was written,
+      # because that one variable was then both the ruler and the wall. The numbers are untouched.
       # Re-derived 2026-09-13, after the margin gate EVICTED PR 1097 from the merge queue. Four
       # windows-2025 runs of the SAME 497-test suite, inside one hour:
       #
@@ -1108,8 +1111,49 @@ jobs:
       # against a 5:00 cap (1.85x, 1.77x), windows-2022 3:34 and 3:28 against 6:00 (1.68x, 1.73x).
       # Both are clear. Raise one only when its own numbers say so.
       #
-      # THE NESTING INVARIANT STILL HOLDS: setup(max) 4:05 + 9 = 13, under webconsole_job_timeout 20.
-      # tests/test_ci_step_margin.py checks the arithmetic half of it and passes.
+      # THE NESTING INVARIANT STILL HOLDS. Re-summed against the KILL rather than the margin cap when
+      # the two were split -- see the note below. Worst-case setup is the leg's recorded setup maximum
+      # plus the 4:30 provisioning noise this file records separately, so per leg:
+      #
+      #   ubuntu-latest   5:22 + 4:30 + kill  9:00 = 18:52   under 20:00, slack 1:08
+      #   windows-2022    4:05 + 4:30 + kill 10:00 = 18:35   under 20:00, slack 1:25
+      #   windows-2025    2:32 + 4:30 + kill 12:00 = 19:02   under 20:00, slack 0:58
+      #
+      # windows-2025 is the tightest and is the leg to watch: if setup there ever runs a minute past
+      # its recorded worst case, the JOB cap fires before the step cap and the failure stops naming the
+      # step. The lever for that is `webconsole_job_timeout`, which is a deadlock backstop rather than
+      # a tightness gate, not a smaller kill -- a smaller kill re-narrows the observation window this
+      # change was made to open. tests/test_ci_step_margin.py checks the arithmetic half of it.
+      #
+      # THE RULER AND THE WALL: THE MARGIN CAP AND THE KILL ARE NOW TWO NUMBERS, DELIBERATELY.
+      # `webconsole_step_timeout` is the step's `timeout-minutes` -- the WALL, which kills a run.
+      # `webconsole_margin_cap` is what the margin gate divides by -- the RULER. Until this change one
+      # variable was both, which made the gate structurally unable to size itself: a run slower than
+      # the cap was killed AT the cap and its step concluded `failure`, so the gate keyed it
+      # `CENSORED` and dropped it from the success-sample. The observed maximum over that sample
+      # therefore could not exceed the cap BY CONSTRUCTION rather than by luck, and "size the cap at
+      # 1.30x the observed maximum" would have re-derived the cap from a sample the cap had truncated.
+      # That is the same right-censoring `scripts/ci/step_margin_baseline.toml` already records for the
+      # engine leg, where seven windows-2025 runs were killed at a 36:00 cap and reported 36:01-36:08.
+      #
+      # THIS PRESERVES THE GATE'S PURPOSE RATHER THAN WORKING AROUND IT. The design intent recorded
+      # beside `webconsole_job_timeout` below is that the margin check is the drift detector and warns
+      # BEFORE the kill. Splitting the two makes that true with room: the gate still reds at
+      # margin_cap / 1.30, which now sits well under the wall instead of on it.
+      #
+      # THE MARGIN CAPS ARE UNCHANGED AND ARE NOT SIZED BY THIS CHANGE: 5 / 6 / 9, exactly the values
+      # that were in force as `webconsole_step_timeout`. Sizing them honestly needs a sample collected
+      # under a kill that does not truncate it, which does not exist yet and cannot exist until this
+      # arrangement has been live for a while. Shipping a decoupling and a re-size together would bury
+      # the one change that can be reasoned about, so the re-size is deliberately a later, separate
+      # change with its own measurement.
+      #
+      # THE KILLS ARE 9 / 10 / 12, and each is at least 1.30x its leg's margin cap -- the same ratio
+      # the gate's own floor reserves below the cap, so the band a run may be observed in ABOVE the cap
+      # is at least as wide, in ratio, as the band the floor reserves below it. 1.80x / 1.67x / 1.33x
+      # as set. tests/test_ci_step_margin.py asserts that headroom per leg, reading BOTH numbers out of
+      # the matrix literals rather than restating them, because two numbers that must move together are
+      # exactly the drift this file has been bitten by before.
       #
       # THE GATE'S OWN OUTPUT SAYS "Raising the cap is NOT the fix and this check must not be read as
       # asking for one", and that sentence was read before this change rather than after. It is still in
@@ -1122,9 +1166,11 @@ jobs:
       # second. The detector is not disarmed either: at 9:00 it warns again above 6:55, which is outside
       # the entire observed range.
       #
-      # AND THE HAZARD IS NOT ONLY THE WARNING. At 5:25 against 6:00 a green suite came within 35 seconds
-      # of being KILLED at its cap with zero failing assertions -- the outcome the gate's last clause says
-      # it exists to pre-empt. Leaving the cap at 6 keeps that.
+      # AND THE HAZARD IS NOT ONLY THE WARNING. At 5:25 a green suite came within 35 seconds of being
+      # KILLED, because the 6:00 that was then the margin cap was also the `timeout-minutes` -- the
+      # outcome the gate's last clause says it exists to pre-empt. Leaving that number at 6 kept it.
+      # The split below is what finally separates the two hazards: a green suite is now killed at
+      # `webconsole_step_timeout`, minutes above the margin cap, rather than at the margin cap itself.
       #
       # THE UNDERLYING ITEM IS REAL AND IS NOT CLOSED BY THIS. Two things feed the runtime and only one is
       # the runner: this suite went from about 356 tests to 497, roughly 40 percent, since the cap was set.
@@ -1156,7 +1202,11 @@ jobs:
         if: always()
         env:
           WEBCONSOLE_OUTCOME: ${{ steps.webconsole.outcome }}
-          WEBCONSOLE_CAP: ${{ matrix.webconsole_step_timeout }}
+          # THE MARGIN CAP, WHICH IS NO LONGER THE KILL. This read `matrix.webconsole_step_timeout`
+          # until the decoupling above; feeding the gate the same number that kills the step made the
+          # gate's own sample right-censored at exactly the number it exists to size. See the
+          # "THE RULER AND THE WALL" note above the suite step.
+          WEBCONSOLE_CAP: ${{ matrix.webconsole_margin_cap }}
           LEG: ${{ matrix.os }}
         run: |
           rc=0
@@ -1651,10 +1701,24 @@ jobs:
           # $GITHUB_REPOSITORY is a built-in runner env var, read here as plain shell (NOT a workflow-
           # expression interpolation into the run body), so it is zizmor-safe and cannot be misparsed as
           # an Actions expression the way a literal double-brace token in a run: block would be.
-          # `webconsole_step_timeout` is the web console suite's OWN cap (BACKLOG #344 proposal 5). It
-          # used to take `step_timeout` -- a 2-to-4-minute suite holding a 25-to-55-minute budget --
-          # which is why the nesting invariant could not hold for it on any leg. Derived in the note
-          # above the `Web console tests (pytest)` step, which is also where to re-derive it.
+          # `webconsole_step_timeout` is the web console suite's OWN `timeout-minutes` -- THE KILL, and
+          # only the kill (BACKLOG #344 proposal 5). It used to take `step_timeout` -- a 2-to-4-minute
+          # suite holding a 25-to-55-minute budget -- which is why the nesting invariant could not hold
+          # for it on any leg. Derived in the note above the `Web console tests (pytest)` step, which
+          # is also where to re-derive it.
+          #
+          # `webconsole_margin_cap` is what the MARGIN GATE divides by, and it is a SECOND number on
+          # purpose. One variable used to be both the kill and the gate's cap, which made the gate
+          # structurally unable to size itself: a run slower than the cap was killed AT the cap, its
+          # step concluded `failure`, the gate keyed it CENSORED, and it left the success-sample. So
+          # the observed maximum could never exceed the cap by construction. Full reasoning in the
+          # "THE RULER AND THE WALL" note above the suite step.
+          #
+          # THE TWO MUST MOVE TOGETHER AND A TEST SAYS SO. Two copies of a coupled number is the drift
+          # this repository has been bitten by repeatedly, so the coupling is asserted mechanically
+          # rather than documented: tests/test_ci_step_margin.py reads BOTH out of these literals and
+          # requires kill >= 1.30x margin cap on every named leg, plus the nesting invariant, plus the
+          # leg names and their count. Raise one of the pair and that test names the other.
           # `pytest_workers` is the xdist worker count for the engine suite. It is a MATRIX knob rather
           # than a literal in the run body for the same reason every other per-leg number here is one:
           # the trial dispatches that size it are then a one-line edit, and a leg can differ from its
@@ -1711,9 +1775,9 @@ jobs:
           # the widest leg. 20 clears that with room. It is a DEADLOCK BACKSTOP, not a tightness gate:
           # the drift detector is the margin check against `webconsole_step_timeout`, so sizing this
           # close to the observed run would buy no detection and cost false reds on green suites.
-          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":43,"step_timeout":31,"webconsole_step_timeout":5,"webconsole_job_timeout":20,"pytest_timeout":60,"fault_timeout":90,"pytest_workers":4}'
-          W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":66,"step_timeout":55,"webconsole_step_timeout":6,"webconsole_job_timeout":20,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
-          W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":66,"step_timeout":55,"webconsole_step_timeout":9,"webconsole_job_timeout":20,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
+          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":43,"step_timeout":31,"webconsole_margin_cap":5,"webconsole_step_timeout":9,"webconsole_job_timeout":20,"pytest_timeout":60,"fault_timeout":90,"pytest_workers":4}'
+          W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":66,"step_timeout":55,"webconsole_margin_cap":6,"webconsole_step_timeout":10,"webconsole_job_timeout":20,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
+          W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":66,"step_timeout":55,"webconsole_margin_cap":9,"webconsole_step_timeout":12,"webconsole_job_timeout":20,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
           if [ "${GITHUB_REPOSITORY:-}" = "MEFORORG/MessageFoundry" ]; then
             echo "matrix={\"include\":[$U,$W22,$W25]}" >> "$GITHUB_OUTPUT"
           else

@@ -15,9 +15,25 @@
 # that bound and then -- correctly -- dropped for not concluding success, so it is missing from exactly
 # the tail being measured. The script prints the caveat rather than quietly dividing by it.
 #
-# THIS FILE IS NOT THE CAP. The cap is `matrix.step_timeout` / `matrix.webconsole_step_timeout` in
-# ci.yml, sized there with its own arithmetic. This is the observed distribution the cap was sized
-# against, kept separately so a run exceeding the record is visible without anyone re-reading a comment.
+# THIS FILE IS NOT THE CAP. The cap the margin gate divides by is `matrix.step_timeout` (engine) /
+# `matrix.webconsole_margin_cap` (web console) in ci.yml, sized there with its own arithmetic. This is
+# the observed distribution the cap was sized against, kept separately so a run exceeding the record is
+# visible without anyone re-reading a comment.
+#
+# THE TWO LEGS NAME DIFFERENT KINDS OF NUMBER, AND THAT ASYMMETRY IS THE POINT OF THIS PARAGRAPH.
+# On the web console leg the gate's cap and the step's `timeout-minutes` were SPLIT: the kill is
+# `matrix.webconsole_step_timeout` and the gate divides by `matrix.webconsole_margin_cap`, which sits
+# below it. On the ENGINE leg they are still ONE variable -- `matrix.step_timeout` is both the kill at
+# ci.yml's `Tests (pytest)` step and the `--cap-minutes` the gate is handed. So every engine row below
+# is CENSORABLE at its own cap by construction -- no engine pool can ever contain a run above it.
+#
+# CENSORABLE IS NOT CENSORED, and the rows below already keep the two apart on evidence rather than on
+# the structure. The windows-2025 engine row is censored and says how it knows: seven runs killed AT
+# the 36:00 cap, reporting 36:01 to 36:08. The ubuntu and windows-2022 rows say `censored = false` and
+# earn it -- the largest step FAILURE on either leg is minutes below its cap, so nothing was truncated
+# even though something could have been. Do not flatten that into "every engine row is a lower bound".
+# Splitting the engine pair the way the web console pair is now split is a separate change nobody has
+# made.
 
 [[baseline]]
 step = "Tests (pytest)"
