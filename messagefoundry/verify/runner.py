@@ -70,7 +70,10 @@ def _load_settings(service_config: str | None) -> tuple[ServiceSettings | None, 
 
     try:
         return load_settings(config_path=service_config), None
-    except (FileNotFoundError, ValueError, ValidationError) as exc:
+    except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
+        # OSError covers a --service-config that names a DIRECTORY; the mechanism is stated once,
+        # at messagefoundry.__main__._load_service_settings. It costs more here than there: the
+        # report IS this command's output, so a traceback leaves an operator with no report at all.
         return None, settings_error_detail(exc)
 
 

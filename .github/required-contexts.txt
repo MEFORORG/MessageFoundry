@@ -114,13 +114,20 @@
 # it, no `if:` gated on a non-PR event) BEFORE it lands here or in branch protection.
 
 # --- ci.yml ---------------------------------------------------------------------------------------
-# `CI gate` (ci.yml, job `ci-gate`) is a ROLL-UP, not a test. It is `if: always()` over EIGHT legs
-# and fails if any of them failed or was cancelled:
+# `CI gate` (ci.yml, job `ci-gate`) is a ROLL-UP, not a test. It is `if: always()` over the legs
+# below and fails if any of them failed or was cancelled:
 #
 #   PATH-GATED or nightly -- these cannot be required directly (see below):
 #     sqlserver-store, postgres-store, load-test, load-test-sqlserver, windows-service-smoke, changes
+#     packaging-build   (BACKLOG #1840 -- builds every distribution and runs the release member gate
+#                        over the real artifacts; path-gated on packaging config, forced on push-to-main)
 #   NOT path-gated -- these RUN ON EVERY PULL REQUEST and are the two most likely to report:
 #     webconsole, tooling
+#
+# NO COUNT IS WRITTEN HERE ON PURPOSE. This block said "EIGHT legs" until `packaging-build` made it
+# nine, and a number in prose is a second claim about the `needs:` list that nothing reconciles --
+# the exact drift #1300 filed, one level up from the names it fixed. The names below ARE reconciled,
+# by tests/test_required_contexts.py, and that test deliberately asserts no count for the same reason.
 #
 # THE SECOND GROUP WAS ABSENT FROM THIS FILE UNTIL BACKLOG #1300, AND THAT IS THE FAILURE THIS FILE
 # EXISTS TO PREVENT. This file's whole purpose is to be the checked-in answer to "does this check

@@ -25,10 +25,12 @@ permanent holes in a shared registry.
 
 from __future__ import annotations
 
+import ctypes
 import os
 import re
 import shutil
 import subprocess
+import warnings
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -335,6 +337,15 @@ def test_the_adr_sweep_is_invariant_under_the_console_code_page(
     first version of this case passed under cp932 with the defect fully present -- it was measured
     doing exactly that. So 0100's body is varied until its blob id ENDS in a lead byte (0x81-0xFE),
     which puts the hazard next to 0999's entry by construction rather than by luck.
+
+    **CHCP GETS A CONSOLE OF ITS OWN, AND THE CASE CHECKS BOTH HALVES OF THAT.** ``chcp`` sets the
+    page of the whole CONSOLE, not of one process. Run in pytest's own console, it switched every
+    xdist worker sharing that console to cp932 and never switched it back. A pwsh launched by another
+    test then wrote an ellipsis as ``0x81 0x63``, and cp1252 cannot decode 0x81. ``subprocess``'s
+    stderr reader died, so ``test_worktree_selfheal_wiring.py`` got ``stderr=None`` and a TypeError.
+    So the case checks that the shared console did not take this case's page. It also has a pwsh
+    started in the private console, just before the sweep's, report its page: without that, a launch
+    that never reached the DBCS page would pass everywhere.
     """
     repo = _checkout(tmp_path / f"cp{codepage}", {"0100-primer.md": "# Primer\n"})
 
@@ -347,19 +358,57 @@ def test_the_adr_sweep_is_invariant_under_the_console_code_page(
     assert int(oid[-2:], 16) >= 0x81, f"fixture blob id {oid} does not end in a DBCS lead byte"
 
     script = repo / "scripts" / "coord" / "alloc.ps1"
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    shared = (kernel32.GetConsoleOutputCP(), kernel32.GetConsoleCP())
+    if shared == (0, 0):
+        warnings.warn(
+            pytest.PytestWarning(
+                f"code page {codepage}: this process has no console, so the check that chcp left "
+                "the shared console alone has nothing to measure; the sweep itself is still checked"
+            ),
+            stacklevel=1,  # B028 wants it explicit; 1 points at this test, which is the subject.
+        )
     # shell=True, NOT ["cmd", "/c", ...]. The list form makes Python quote the whole command as one
     # argument and cmd.exe then hands pwsh the quotes as part of the filename -- measured, it fails
     # identically under EVERY code page, which would have read as "the sweep is broken everywhere"
     # rather than as a quoting bug in the test.
     proc = subprocess.run(
-        f'chcp {codepage} >nul && pwsh -NoProfile -NonInteractive -File "{script}" '
-        "-ShowFloor -Kind adr",
+        f"chcp {codepage} >nul"
+        " && pwsh -NoProfile -NonInteractive -Command \"'page=' + [Console]::OutputEncoding.CodePage\""
+        f' && pwsh -NoProfile -NonInteractive -File "{script}" -ShowFloor -Kind adr',
         shell=True,
         cwd=str(repo),
         capture_output=True,
-        text=True,
+        # The private console writes in THIS page, so decode with it. The locale default (cp1252)
+        # would kill the reader thread on the first DBCS byte, the very crash this case once caused.
+        encoding=f"cp{codepage}",
+        errors="replace",
+        # A new console with no window, so chcp reaches only cmd and the pwsh processes it starts.
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    after = (kernel32.GetConsoleOutputCP(), kernel32.GetConsoleCP())
+    # Blame chcp only for a move TO its own page. A sibling worker can move this console too (at
+    # least three repo scripts set it to 65001), and plain equality would red here for that. This
+    # sees a leak only if it is still there once pwsh exits.
+    leaked = any(now == codepage != before for before, now in zip(shared, after, strict=True))
+    restore = ""
+    if leaked:
+        # Put the page back before failing, so a regression reds THIS case rather than crashing
+        # whichever test launches pwsh next.
+        if kernel32.SetConsoleOutputCP(shared[0]) and kernel32.SetConsoleCP(shared[1]):
+            restore = "It was put back."
+        else:
+            restore = f"Putting it back FAILED, error {ctypes.get_last_error()}."
+    assert not leaked, (
+        f"chcp {codepage} changed the console this pytest process shares with its xdist siblings, "
+        f"from (output, input) {shared} to {after}. Any pwsh they launch writes in that page. "
+        + restore
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert re.search(rf"^page={codepage}$", proc.stdout, re.MULTILINE), (
+        f"pwsh did not start under code page {codepage}, so this case is not measuring a "
+        f"{codepage} console:\n{proc.stdout}\n{proc.stderr}"
+    )
     match = re.search(r"^floor\s*:\s*(\d+)$", proc.stdout, re.MULTILINE)
     assert match, f"no floor line under code page {codepage}:\n{proc.stdout}\n{proc.stderr}"
     assert int(match.group(1)) == 999, (
