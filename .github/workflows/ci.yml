@@ -3416,11 +3416,31 @@ jobs:
           with zipfile.ZipFile("poisoned.whl", "a") as zf:
               zf.writestr("harness/CLAUDE.md", "internal\n")
           PY
-          if python scripts/release/forbidden_members.py poisoned.whl; then
+          # A NON-ZERO EXIT IS NOT PROOF THE GATE INSPECTED ANYTHING. `forbidden_members.py` exits 1
+          # for a refused member AND for a pattern that matched no file at all -- and for an archive
+          # it could not open, and for one that listed zero members. So if this fixture is ever
+          # renamed or moved out from under the line below, an exit-code test would print "control
+          # fired" having opened ZERO archives: it would report the gate armed whether or not the
+          # gate saw anything, which is a control that cannot fail. That is the empty-corpus defect
+          # this gate exists to prevent, rebuilt one layer up.
+          #
+          # So assert on the REASON instead. Only the inspection path prints an archive name beside
+          # the member it refused, so requiring that line distinguishes "the gate rejected a poisoned
+          # member" from "the gate found nothing to look at". The trailing `-- <why>` clause is
+          # deliberately NOT pinned: this step owns the two names below, the script owns its wording.
+          refusal="poisoned.whl ships harness/CLAUDE.md"
+          status=0
+          log="$(python scripts/release/forbidden_members.py poisoned.whl 2>&1)" || status=$?
+          printf '%s\n' "$log"
+          if [ "$status" -eq 0 ]; then
             echo "::error::the member gate ACCEPTED an artifact carrying harness/CLAUDE.md -- the gate is broken, and every clean result in this job is meaningless"
             exit 1
           fi
-          echo "control fired: the gate refused the poisoned copy, so its clean verdicts above are real"
+          if [[ "$log" != *"$refusal"* ]]; then
+            echo "::error::the member gate exited $status without reporting '$refusal', so it did NOT refuse the poisoned member -- a missing fixture, an unreadable archive and a zero-member listing all exit non-zero too. This control proved NOTHING about the clean results above"
+            exit 1
+          fi
+          echo "control fired: the gate refused the poisoned copy BY NAME, so its clean verdicts above are real"
           rm -f poisoned.whl
 
   # Single STABLE required status check standing in for the conditional / matrix heavy legs (SQL
