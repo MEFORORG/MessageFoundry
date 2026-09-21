@@ -260,7 +260,7 @@ per number, so "missing" would have to be unforgeable).
 named `alloc.ps1` and nothing else. `alloc.ps1` issues a **new** number, so a seat that hit a
 *correct* refusal was steered into spending a second number and abandoning the first — and claims are
 never released, so that hole is permanent. **Measured on the maintainer clone, 2026-09-03: 19 titles
-hold more than one number**, including [#1297](#1297)/[#1298](#1298), backlog 1422/1423 and 1425/1426. The
+hold more than one number**, including #1297/#1298, backlog 1422/1423 and 1425/1426. The
 refusal text now names the recorded worktree and branch and lists the three recoveries below.
 
 *(Those last two pairs are written without the `#` sigil on purpose: the numbers are allocated, but
@@ -517,13 +517,21 @@ merely quiet.
 vendor forum thread, another project's tracker. They match a naive scan and are not this rule's
 subject.
 
-### Enforcement
+### Enforcement, which moved with the ledger
+
+> **`scripts/docs/dangling_citation_check.py` is NOT in this repository — it left with the ledger
+> tooling (BACKLOG #1250, #1754), along with its test. `tests/test_doc_guards_lane.py` records the
+> drop from the documentation-only guard list in `.github/workflows/ci.yml`. Run it from the
+> maintainer-internal clone.** The paragraph below describes what it does where it now lives.
+> **Nothing here resolves a backlog `#N` citation, because the ledger it would resolve against is not
+> in this repository** ([`BACKLOG.md`](BACKLOG.md)). So the rule above is the whole control on this
+> side, and "fail-closed" is that script's own exit-code default, not a gate standing here.
 
 `scripts/docs/dangling_citation_check.py` reports unresolved citations and keys its exit code on the
 **live shape** — above the floor, and not foreign — rather than on a raw hit count, so the inert cases
 are reported without failing anything. **It is fail-closed by default**, with `--advisory` as the
-explicit escape. Note its stated coverage bound: it sees this repository only, and **not** the private
-companion repository.
+explicit escape. Its stated coverage bound is one repository: a run covers the clone it runs in and no
+other, so the maintainer-internal clone and this repository are never checked by the same run.
 
 **Enforcement does not replace the rule.** A checker can only find what has already been written; the
 rule is what stops it being written.
