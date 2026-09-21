@@ -1266,6 +1266,24 @@ def audit_row_hash(
     return hmac.new(key, data, hashlib.sha256).hexdigest()
 
 
+#: The phrase :func:`audit_prefix_verdict` puts in its failure message, exported so a CALLER can tell a
+#: TRUNCATED/REWRITTEN TAIL from a BROKEN CHAIN without walking the log twice (BACKLOG #328).
+#:
+#: ``verify_audit_chain`` folds both verdicts into one ``(ok, message)`` pair and reports the chain break
+#: FIRST, returning before the prefix comparator runs. So a caller holding only ``ok=False`` cannot say
+#: which fired -- and the two want different handling: a break names a row an operator can go and read,
+#: while a truncation names rows that are no longer there to read. ``Engine._verify_audit_chain_on_start``
+#: routes them to DIFFERENT alert subjects on the strength of this marker, so they throttle and route
+#: independently.
+#:
+#: IT IS A SHARED CONSTANT RATHER THAN A STRING THE CALLER RESTATES, and that is the whole point: a
+#: restated copy drifts silently the day this message is reworded, and the caller then quietly
+#: reclassifies every truncation as a chain break. Substring-matching a message is a weak seam either
+#: way; making the producer and the consumer read the SAME name is what stops the seam rotting
+#: unobserved. Pinned by ``test_prefix_break_marker_appears_in_a_real_prefix_failure``.
+AUDIT_PREFIX_BREAK_MARKER = "is not an extension of the recorded prefix"
+
+
 def audit_prefix_verdict(
     expected_prefix: tuple[int, str], prefix_head: str | None, count: int
 ) -> tuple[bool, str | None]:
@@ -1308,10 +1326,100 @@ def audit_prefix_verdict(
         have = "(never reached)" if prefix_head is None else f"{prefix_head[:12]!r}"
         return (
             False,
-            f"audit log is not an extension of the recorded prefix (have {count} row(s), head at "
+            f"audit log {AUDIT_PREFIX_BREAK_MARKER} (have {count} row(s), head at "
             f"row {exp_count} {have}, expected {exp_head[:12]!r}) — truncated or rewritten",
         )
     return True, None
+
+
+#: The operator-facing shape of an audit anchor, quoted into every parse refusal below and into the
+#: ``audit-verify`` CLI help. One sentence, one place.
+AUDIT_ANCHOR_FORM = (
+    "expected COUNT:HEAD — the row count and the FULL head, copied verbatim from "
+    "'messagefoundry audit-anchor' (the 12-character head printed inside a FAIL message is a display "
+    "truncation, not an anchor); an empty log anchors as '0:'"
+)
+
+#: Every hex character, both cases. The store only ever emits lowercase (``hexdigest()``); uppercase is
+#: admitted and NORMALISED rather than rejected, because an operator who upper-cased the value in a
+#: ticket must get a verify, not a tamper alarm.
+_AUDIT_ANCHOR_HEX = frozenset("0123456789abcdefABCDEF")
+#: ``hashlib.sha256``/``hmac.new(..., sha256)`` ``hexdigest()`` width — the only hex head length the
+#: chain can produce, keyless or keyed (:func:`audit_row_hash`).
+AUDIT_ANCHOR_DIGEST_HEX_LEN = 64
+#: ADR 0138 ``vault_transit``: the row MAC is computed INSIDE Vault/OpenBao Transit
+#: (``crypto_transit.TransitCipher.audit_hmac``), which returns its own opaque ``vault:v<N>:<base64>``
+#: string — not hex, not 64 characters — and that string lands in ``row_hash`` verbatim. A future
+#: isolated-module MAC provider with a different prefix MUST be added here, or a legitimate anchor from
+#: that deployment is refused as malformed.
+AUDIT_ANCHOR_ISOLATED_MAC_PREFIX = "vault:v"
+
+
+def parse_audit_anchor(text: str) -> tuple[int, str]:
+    """Parse a ``COUNT:HEAD`` audit anchor into the tuple ``verify_audit_chain`` expects.
+
+    Raises ``ValueError`` naming the form. It must RAISE rather than fall back to an unanchored
+    verify: a silently-ignored anchor turns the whole control into a gate that reports green while
+    checking nothing, which is precisely the failure the anchor exists to close.
+
+    It must ALSO refuse rather than hand a comparator a head the store can never emit. Both comparators
+    compare the head byte-exactly and report *any* difference as ``truncated or rewritten``, so an
+    accepted-but-impossible head becomes a FALSE tamper alarm — a red light on an intact chain,
+    indistinguishable from a real detection. A control whose whole value is that a FAIL means something
+    cannot be allowed to manufacture FAILs out of its own input handling — the inverse of the
+    green-while-checking-nothing hole above, and it costs just as much.
+
+    Two head shapes are legal, because exactly two are producible:
+
+    * a **hex digest** — :func:`audit_row_hash`'s keyless SHA-256 or in-heap HMAC-SHA256 ``hexdigest()``,
+      always exactly 64 lowercase hex characters. Case is normalised, and the length is *required*: a
+      12-character head pasted out of a FAIL message's display truncation is refused as malformed
+      input instead of being reported as tampering.
+    * an **isolated-module MAC** — ADR 0138 ``vault_transit`` mode, whose ``vault:v1:…`` string is
+      passed through UNCHANGED. ``partition`` splits on the FIRST colon, so its internal colons
+      survive the ``COUNT:HEAD`` split.
+
+    An EMPTY head is legal and load-bearing — :meth:`MessageStore.audit_anchor` returns ``(0, "")`` for
+    an empty log, so ``0:`` must round-trip or a fresh instance is the one state that cannot be anchored.
+
+    IT LIVES HERE, BESIDE THE COMPARATORS AND THE PRODUCER, BECAUSE IT NOW HAS TWO CONSUMERS: the
+    ``audit-verify`` CLI and the engine's ``[integrity].audit_anchor_file`` startup check (BACKLOG #328).
+    A second copy beside the second consumer is the copy-versus-single-source defect BACKLOG #1253
+    catalogues, and it would be the worst possible place for one: a later hardening of the refusals
+    above would reach one caller and leave the other accepting what it had learned to reject.
+    """
+    raw = text.strip()
+    count_text, sep, head = raw.partition(":")
+    if not sep:
+        raise ValueError(f"malformed audit anchor {text!r}: no ':' separator — {AUDIT_ANCHOR_FORM}")
+    try:
+        count = int(count_text)
+    except ValueError:
+        raise ValueError(
+            f"malformed audit anchor {text!r}: row count {count_text!r} is not an integer — "
+            f"{AUDIT_ANCHOR_FORM}"
+        ) from None
+    if count < 0:
+        raise ValueError(
+            f"malformed audit anchor {text!r}: row count {count} is negative — {AUDIT_ANCHOR_FORM}"
+        )
+    head = head.strip()
+    if not head:
+        return count, head
+    if all(c in _AUDIT_ANCHOR_HEX for c in head):
+        if len(head) != AUDIT_ANCHOR_DIGEST_HEX_LEN:
+            raise ValueError(
+                f"malformed audit anchor {text!r}: head {head!r} is {len(head)} hex characters, not "
+                f"a full {AUDIT_ANCHOR_DIGEST_HEX_LEN}-character digest — {AUDIT_ANCHOR_FORM}"
+            )
+        return count, head.lower()
+    if head.startswith(AUDIT_ANCHOR_ISOLATED_MAC_PREFIX):
+        return count, head  # opaque by construction; never normalise what we do not define
+    raise ValueError(
+        f"malformed audit anchor {text!r}: head {head!r} is neither a "
+        f"{AUDIT_ANCHOR_DIGEST_HEX_LEN}-character hex digest nor an isolated-module "
+        f"{AUDIT_ANCHOR_ISOLATED_MAC_PREFIX}… MAC (ADR 0138) — {AUDIT_ANCHOR_FORM}"
+    )
 
 
 def audit_mac_bytes(value: str | None) -> bytes:

@@ -4463,88 +4463,6 @@ def _protect_key(args: argparse.Namespace) -> int:
     return 0
 
 
-_ANCHOR_FORM = (
-    "expected COUNT:HEAD — the row count and the FULL head, copied verbatim from "
-    "'messagefoundry audit-anchor' (the 12-character head printed inside a FAIL message is a display "
-    "truncation, not an anchor); an empty log anchors as '0:'"
-)
-
-#: Every hex character, both cases. The store only ever emits lowercase (``hexdigest()``); uppercase is
-#: admitted and NORMALISED rather than rejected, because an operator who upper-cased the value in a
-#: ticket must get a verify, not a tamper alarm.
-_ANCHOR_HEX = frozenset("0123456789abcdefABCDEF")
-#: ``hashlib.sha256``/``hmac.new(..., sha256)`` ``hexdigest()`` width — the only hex head length the
-#: chain can produce, keyless or keyed (``store/store.py``, ``audit_row_hash``).
-_ANCHOR_DIGEST_HEX_LEN = 64
-#: ADR 0138 ``vault_transit``: the row MAC is computed INSIDE Vault/OpenBao Transit
-#: (``crypto_transit.TransitCipher.audit_hmac``), which returns its own opaque ``vault:v<N>:<base64>``
-#: string — not hex, not 64 characters — and that string lands in ``row_hash`` verbatim. A future
-#: isolated-module MAC provider with a different prefix MUST be added here, or a legitimate anchor from
-#: that deployment is refused as malformed.
-_ANCHOR_ISOLATED_MAC_PREFIX = "vault:v"
-
-
-def _parse_anchor(text: str) -> tuple[int, str]:
-    """Parse a ``COUNT:HEAD`` audit anchor into the tuple ``verify_audit_chain`` expects.
-
-    Raises ``ValueError`` naming the form. It must RAISE rather than fall back to an unanchored
-    verify: a silently-ignored anchor turns the whole control into a gate that reports green while
-    checking nothing, which is precisely the failure this subcommand exists to close.
-
-    It must ALSO refuse rather than hand the comparator a head the store can never emit.
-    ``verify_audit_chain`` compares the head byte-exactly and reports *any* difference as
-    ``truncated or rewritten``, so an accepted-but-impossible head becomes a FALSE tamper alarm — a
-    red light on an intact chain, indistinguishable from a real detection. A control whose whole value
-    is that a FAIL means something cannot be allowed to manufacture FAILs out of its own input
-    handling — the inverse of the green-while-checking-nothing hole above, and it costs just as much.
-
-    Two head shapes are legal, because exactly two are producible:
-
-    * a **hex digest** — ``audit_row_hash``'s keyless SHA-256 or in-heap HMAC-SHA256 ``hexdigest()``,
-      always exactly 64 lowercase hex characters. Case is normalised, and the length is *required*: a
-      12-character head pasted out of a FAIL message's display truncation is refused as malformed
-      input (rc 2) instead of being reported as tampering (rc 1).
-    * an **isolated-module MAC** — ADR 0138 ``vault_transit`` mode, whose ``vault:v1:…`` string is
-      passed through UNCHANGED. ``partition`` splits on the FIRST colon, so its internal colons
-      survive the ``COUNT:HEAD`` split.
-
-    An EMPTY head is legal and load-bearing — ``audit_anchor()`` returns ``(0, "")`` for an empty log,
-    so ``0:`` must round-trip or a fresh instance is the one state that cannot be anchored.
-    """
-    raw = text.strip()
-    count_text, sep, head = raw.partition(":")
-    if not sep:
-        raise ValueError(f"malformed audit anchor {text!r}: no ':' separator — {_ANCHOR_FORM}")
-    try:
-        count = int(count_text)
-    except ValueError:
-        raise ValueError(
-            f"malformed audit anchor {text!r}: row count {count_text!r} is not an integer — "
-            f"{_ANCHOR_FORM}"
-        ) from None
-    if count < 0:
-        raise ValueError(
-            f"malformed audit anchor {text!r}: row count {count} is negative — {_ANCHOR_FORM}"
-        )
-    head = head.strip()
-    if not head:
-        return count, head
-    if all(c in _ANCHOR_HEX for c in head):
-        if len(head) != _ANCHOR_DIGEST_HEX_LEN:
-            raise ValueError(
-                f"malformed audit anchor {text!r}: head {head!r} is {len(head)} hex characters, not "
-                f"a full {_ANCHOR_DIGEST_HEX_LEN}-character digest — {_ANCHOR_FORM}"
-            )
-        return count, head.lower()
-    if head.startswith(_ANCHOR_ISOLATED_MAC_PREFIX):
-        return count, head  # opaque by construction; never normalise what we do not define
-    raise ValueError(
-        f"malformed audit anchor {text!r}: head {head!r} is neither a "
-        f"{_ANCHOR_DIGEST_HEX_LEN}-character hex digest nor an isolated-module "
-        f"{_ANCHOR_ISOLATED_MAC_PREFIX}… MAC (ADR 0138) — {_ANCHOR_FORM}"
-    )
-
-
 def _resolve_expected_anchor(args: argparse.Namespace) -> tuple[int, str] | None | int:
     """The anchor for ``audit-verify``, or the exit code 2 if the flags are unusable.
 
@@ -4577,8 +4495,14 @@ def _resolve_expected_anchor(args: argparse.Namespace) -> tuple[int, str] | None
         raw = args.expected_anchor
     if raw is None:
         return None
+    # The parser lives in the store package beside the comparators and `audit_anchor()` itself, because
+    # the engine's `[integrity].audit_anchor_file` startup check parses the SAME artifact (BACKLOG #328).
+    # A copy here would be the one place a later hardening of its refusals could reach the CLI and miss
+    # the engine.
+    from messagefoundry.store.store import parse_audit_anchor
+
     try:
-        return _parse_anchor(raw)
+        return parse_audit_anchor(raw)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
