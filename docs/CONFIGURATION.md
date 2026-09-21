@@ -21,7 +21,7 @@
 >
 > **The refusal covers the FILE. It does not cover env or CLI — check those spellings yourself.** A
 > misspelled `MEFOR_*` variable or `serve` flag is still dropped silently — the env layer is where
-> secrets belong, and it already drops a var aimed at one of the five sections that have no env layer
+> secrets belong, and it already drops a var aimed at one of the four sections that have no env layer
 > ([Mechanism](#mechanism)). The loader also cannot tell such a typo from one of the documented
 > `MEFOR_*` variables its consuming module reads straight from the environment rather than declaring as
 > a field (`MEFOR_STORE_VAULT_ADDR`, `MEFOR_TLS_REVOCATION_ATTESTED` and siblings). **One exception:**
@@ -66,10 +66,12 @@ CLI flag  >  environment variable  >  messagefoundry.toml  >  built-in default
 - **Secrets** (e.g. a DB password) should come from **env** (or a secret reference), never plaintext
   in the file — env wins over the file so a deployment can inject them.
 - Env naming: `MEFOR_<SECTION>_<KEY>` (e.g. `MEFOR_STORE_PASSWORD`, `MEFOR_API_PORT`). The parser splits
-  the name at the **first** `_` after the prefix and matches that against a known-section list, so five
+  the name at the **first** `_` after the prefix and matches that against a known-section list, so four
   built sections have **no env layer** and a `MEFOR_*` var aimed at one is dropped without a warning:
-  `[sandbox]`, `[service]`, and the underscored `[cert_monitor]`, `[secret_rotation]`, `[update_check]`.
-  Set those in the file.
+  `[service]`, and the underscored `[cert_monitor]`, `[secret_rotation]`, `[update_check]`. The reasons
+  differ. `[service]` would work if the known-section list named it, but it just isn't listed. The other
+  three fail a different way: that same first-underscore split turns `MEFOR_CERT_MONITOR_ENABLED` into
+  section `cert`, not `cert_monitor`, so no list entry can rescue it. Set those four in the file.
 - Loaded once at startup into a typed `ServiceSettings` (pydantic) model; the engine + store read from
   it. `serve` keeps its existing flags as the CLI layer.
 
@@ -327,7 +329,7 @@ byte-identical SSL context.
 |---|---|---|---|
 | `bind_host` | str | `127.0.0.1` | the **default** network interface every inbound MLLP/TCP listener binds to. Authors never set a `host` on an inbound connection (a wiring error if they do) — it's a per-environment operator decision here. Binding `0.0.0.0` exposes unauthenticated MLLP to the network, so it's deliberate (DEV typically loopback, PROD a specific NIC behind a firewall). A non-loopback bind **requires `tls=true`** on each MLLP connection: the §0 exposed-gate (`check_mllp_tls_exposure`) raises a `WiringError` for a plaintext off-loopback listener at wiring time, before the engine starts. `serve --allow-insecure-bind` downgrades that to a warning **only on a non-enforcing instance** — it is clamped inert whenever the hop is enforcing, which is the shipped default on all three built-in env names, so on a stock instance the flag buys nothing. Declaring the instance synthetic was the other way past the clamp and it is gone ([ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)); the `[security].enforcement` dial is the only one left. A single connection may override the interface with a per-connection `bind_address` (and restrict peers with a per-connection `source_ip_allowlist`) — MLLP/TCP only; see [CONNECTIONS.md](CONNECTIONS.md). |
 | `ack_after` | enum | `ingest` | the **default** ACK timing every inbound inherits (staged pipeline, [ADR 0001](adr/0001-staged-pipeline-architecture.md)). `ingest` = ACK-on-receipt, once the raw message is durably committed to the ingress stage and **before** routing/transform/delivery. `delivered` (defer the ACK until delivery succeeds) is **not built** — wiring it raises a `WiringError`, so it fails loud rather than silently ACKing early. A connection's own `ack_after=` overrides this. |
-| `stream_inflight_budget_bytes` | int (bytes) | `0` | aggregate cap on the **total** bytes of over-threshold message bodies concurrently mid-detach across **all** inbounds (#149, [ADR 0105](adr/0105-streaming-very-large-hl7-attachments-detach-the-opaque-document-from-the-transformable-skeleton.md)). A detach that would push the running total over it is refused with backpressure (the message is NAK'd/`ERROR`'d, never accepted-and-dropped), so a burst of very large documents can't exhaust memory. `0` (default) = unlimited — a *single* body is still bounded by the per-connection `max_message_bytes`. Only over-threshold streaming detaches count against it. |
+| `stream_inflight_budget_bytes` | int (bytes) | `0` | aggregate cap on the **total** bytes of over-threshold message bodies concurrently mid-detach across **all** inbounds (#149, [ADR 0105](adr/0105-streaming-very-large-hl7-attachments-detach-the-opaque-document-from-the-transformable-skeleton.md)). A detach that would push the running total over it is refused with backpressure (the message is NAK'd/`ERROR`'d, never accepted-and-dropped), so a burst of very large documents can't exhaust memory. `0` (default) = unlimited — a *single* body is still bounded by the per-connection `max_message_bytes`. Only over-threshold streaming detaches count against it. **Unlimited is opt-out, and it now says so at start** ([BACKLOG #1729](BACKLOG.md)): binding an inbound that sets `stream_threshold_bytes` while this is `0` logs a **WARNING** naming that connection, its threshold and its effective single-body cap. It does **not** refuse. A refusal here would fire on every streaming graph that is valid today with no new opt-in gating it, which is the scoping rule stated on `[security].require_memory_encryption_declaration` below; the warning is the rung below it, and it fires on start, on reload, and on a runtime connection start. A stock graph sets no `stream_threshold_bytes`, never reaches the detach path, and is silent. |
 
 ### `[environments]` — per-environment graph values (DEV/PROD)
 The **same** code-first graph runs in every environment; only the values it references via
@@ -1468,7 +1470,7 @@ DBA-delegated (#52): config-only, or skipped, per `config_only_on_server_db`.
 | `enabled` | bool | `false` | opt-in master switch; a deployment with no `[backup]` is unaffected |
 | `destination` | path | `""` | local or UNC destination dir (e.g. `D:/mefor-backups`). **Required (non-empty) when enabled.** A cloud URL (`s3://`, `https://`, …) is **rejected** — there is no cloud target |
 | `schedule_at` | str | `"02:00"` | daily local `"HH:MM"` the scheduled backup runs at (the same clock grammar as `[retention].vacuum_at`). `""` = **on-demand only** (the `messagefoundry backup` CLI), no scheduled pass |
-| `retention_keep` | int | `7` | keep-N: after a successful, **verified** new archive, prune the oldest archives beyond the newest N at the destination. `0` = keep all. A verify-**failed** archive is never counted as a good backup when pruning, so a failing run can't evict the last good one |
+| `retention_keep` | int | `7` | keep-N: after a successful, **verified** new archive, prune the oldest archives beyond the newest N at the destination. `0` = keep all. Only archives that passed every configured check are counted: a backup is written as `<name>.part` and renamed onto its canonical name after the verify, so a verify-**failed** archive keeps a `.failed` name and can evict a good one in neither this prune nor any later one. The flip side: `.failed` and `.part` files at the destination sit **outside** keep-N and nothing expires them — clear them yourself (ADR 0049) |
 | `snapshot_method` | str | `vacuum_into` | `vacuum_into` (default; takes a writer lock, sized for the off-peak schedule) or `online_backup` (low-contention, page-batched) |
 | `include_config` | bool | `true` | bundle the loaded `--config` dir into the archive, so the cold seed is self-sufficient (store **plus** the config that interprets it) without assuming the DR box can reach the org's git repo |
 | `verify_after_backup` | bool | `true` | run the lightweight restore-verify after every backup (open + `integrity_check` + row-count). On by default — a backup nobody has opened is a backup that silently doesn't restore |

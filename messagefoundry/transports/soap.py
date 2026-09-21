@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import http.client
 import io
 import logging
 import re
@@ -79,8 +80,8 @@ from messagefoundry.transports.base import (
     register_destination,
 )
 from messagefoundry.transports.bounded_read import (
-    ResponseTooLargeError,
-    read_bounded,
+    EgressReplyError,
+    drain_bounded,
     read_bounded_text,
 )
 
@@ -105,6 +106,7 @@ from messagefoundry.transports.rest import (
     refuse_cleartext_credentials,
     refuse_cleartext_egress,
     refuse_unrevoked_verified_hop,
+    refuse_url_credentials,
     refuse_verify_off,
 )
 from messagefoundry.transports.signing import MessageSigner, signer_from_destination
@@ -304,6 +306,7 @@ class SoapDestination(DestinationConnector):
         scheme = urllib.parse.urlsplit(url).scheme.lower()
         if scheme not in ("http", "https"):
             raise ValueError(f"SOAP destination 'url' must be http or https, got scheme {scheme!r}")
+        refuse_url_credentials(url, "SOAP destination 'url'")
         self.url = url
         self.timeout: float = float(s.get("timeout_seconds", 30.0))
         self.encoding: str = s.get("encoding", "utf-8")
@@ -537,14 +540,20 @@ class SoapDestination(DestinationConnector):
             # character; catching it here (fail-fast, before any message flows) keeps that character out
             # of the persisted last_error a send-time failure would produce. (`encoding` defaults to
             # utf-8, which encodes any str, so this only bites a deliberately-lossy codec like 'ascii'.)
+            # The raise sits OUTSIDE the handler on purpose: `raise ... from None` would leave the
+            # UnicodeEncodeError on `__context__`, and its `.object` is the SECRET itself. See
+            # `encode_wire_body` in transports/base.py for why the flag alone does not detach it.
+            offending_position: int | None = None
             try:
                 secret.encode(self.encoding)
             except UnicodeEncodeError as exc:
+                offending_position = exc.start
+            if offending_position is not None:
                 raise ValueError(
                     f"SOAP body secret for placeholder {token!r} is not encodable as "
-                    f"{self.encoding!r} (offending code point at position {exc.start}) — set an "
-                    "encodable value or widen the connection's encoding"
-                ) from None
+                    f"{self.encoding!r} (offending code point at position {offending_position}) — "
+                    "set an encodable value or widen the connection's encoding"
+                )
             pairs.append((str(token), secret))
         # A body-carried credential over a cleartext http hop is a plaintext-credential egress, exactly
         # like the WS-Security UsernameToken — refuse it under the same posture gate (loopback / attested
@@ -785,7 +794,7 @@ class SoapDestination(DestinationConnector):
                 # ASVS 15.2.2: the HEAD probe body is discarded, but an unbounded drain would let a
                 # reachability check be turned into a memory exhaustion. Unlike the length gate this
                 # method deliberately omits, this bound CAN fire: the peer chooses the body.
-                read_bounded(resp, connector=f"SOAP {_redact_url(self.url)} probe")
+                drain_bounded(resp, connector=f"SOAP {_redact_url(self.url)} probe")
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):
                 raise DeliveryError(
@@ -794,6 +803,11 @@ class SoapDestination(DestinationConnector):
             return  # any other status (the host answered) → reachable
         except urllib.error.URLError as exc:
             raise DeliveryError(f"SOAP {_redact_url(self.url)} unreachable: {exc.reason}") from exc
+        except (ValueError, http.client.InvalidURL) as exc:
+            # BACKLOG #1793: the probe is the test-connection reply; see the same arm in _post.
+            raise DeliveryError(
+                f"SOAP {_redact_url(self.url)} rejected an invalid request value"
+            ) from exc
         except (TimeoutError, OSError) as exc:
             raise DeliveryError(f"SOAP {_redact_url(self.url)} failed: {exc}") from exc
 
@@ -866,9 +880,10 @@ class SoapDestination(DestinationConnector):
                     connector=f"SOAP {_redact_url(self.url)} fault body",
                     encoding=self.encoding,
                 )
-            except ResponseTooLargeError:
+            except EgressReplyError:
+                # The FAMILY, not just the byte bound -- see the twin arm in fhir.py.
                 logger.warning(
-                    "SOAP %s returned an HTTP %s fault body over the response bound; "
+                    "SOAP %s returned an HTTP %s fault body the engine could not read whole; "
                     "classifying on the status alone",
                     _redact_url(self.url),
                     exc.code,
@@ -883,6 +898,14 @@ class SoapDestination(DestinationConnector):
             ) from exc
         except urllib.error.URLError as exc:
             raise DeliveryError(f"SOAP {_redact_url(self.url)} unreachable: {exc.reason}") from exc
+        except (ValueError, http.client.InvalidURL) as exc:
+            # BACKLOG #1793: the same arm as rest.py's _post, and the same reasoning. Without it an
+            # InvalidURL escaped as an internal error, and its text could hold a password.
+            raise NegativeAckError(
+                f"SOAP {_redact_url(self.url)} rejected an invalid request value",
+                code="bad-request-value",
+                permanent=True,
+            ) from exc
         except (TimeoutError, OSError) as exc:
             raise DeliveryError(f"SOAP {_redact_url(self.url)} failed: {exc}") from exc
 

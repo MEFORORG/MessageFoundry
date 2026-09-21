@@ -629,7 +629,8 @@ def _passkey_card(
             el(
                 "p",
                 "Keep TOTP enrolled if you use the desktop console — passkeys work in the "
-                "browser only. Changing [api].public_origin invalidates enrolled passkeys.",
+                "browser only. Changing [security].web_console_public_address invalidates "
+                "enrolled passkeys.",
                 class_="muted",
             )
         )

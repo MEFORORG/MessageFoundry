@@ -13,24 +13,59 @@ This is a conservative *redaction* of HL7-shaped content — **not** de-identifi
 separate, centralized framework; see PHI.md §9). It errs toward over-redaction. Beyond HL7-shaped
 spans it also applies a **conservative free-text heuristic** (date/DOB runs + multi-token name runs;
 see :func:`redact`), so a delimiter-free leak like ``raise ValueError("patient DOE JANE dob 1980-05-05
-not found")`` is narrowed too. The residual is now an adversarially-crafted *single-token* or non-name-
-shaped identifier, for which the "never put PHI in an exception message" convention remains the control.
+not found")`` is narrowed too. The delimiters are **read from MSH** rather than assumed, so a feed
+declaring ``*`` and ``$`` is covered too (:func:`_sniff_delimiters`, BACKLOG #1572).
 
-A **file name is exactly that residual**, which is why :func:`safe_name` exists beside the heuristic
-rather than inside it: a partner names a drop ``MRN123456789_ADT.hl7`` or ``DOE_JANE_19800505_ADT.hl7``
-and every pattern below misses it, because :data:`_NAME_RUN` needs whitespace between the tokens and
-:data:`_DATE_RUN` needs a word boundary that ``_`` does not give. A name is derived at the call site
-instead of pattern-matched after the fact (BACKLOG #1748).
+Two residuals, and this module claims no completeness beyond them: an adversarially-crafted
+*single-token* or non-name-shaped identifier, and a **headerless** custom-delimiter fragment (no MSH,
+so nothing declares its delimiters). For both, the "never put PHI in an exception message" convention
+remains the control.
 
-Pure stdlib (``re`` + ``hashlib``), so it can be used from any engine package.
+A **file name is exactly the first of those residuals**, which is why :func:`safe_name` exists beside
+the heuristic rather than inside it: a partner names a drop ``MRN123456789_ADT.hl7`` or
+``DOE_JANE_19800505_ADT.hl7`` and every pattern below misses it, because :data:`_NAME_RUN` needs
+whitespace between the tokens and :data:`_DATE_RUN` needs a word boundary that ``_`` does not give. A
+name is derived at the call site instead of pattern-matched after the fact (BACKLOG #1748).
+
+**THE INPUT IS BOUNDED BEFORE IT IS SCANNED, AND THE CUT IS THE WHOLE DIFFICULTY (BACKLOG #1576).** A
+remote peer chooses the length: an MLLP negative acknowledgment's MSA-3 runs to the frame cap, and a
+Router that quotes the received body raises a message the body's size. The scan is linear (BACKLOG
+#1437) and linear is not free — measured on a 16 MiB input, 0.29 s of segment-shaped text and 0.78 s
+of delimiter-free prose, every millisecond of it on the asyncio event loop. :func:`clamp_untrusted`
+cuts an over-long string to :data:`_REDACT_WINDOW` first.
+
+**Redacting ``text[:limit]`` is the obvious form of that and it leaks.** A cut lands mid-run, strands
+the surviving fragment below the two-delimiter threshold :data:`_HL7_FIELD_RUN` needs or the two-token
+threshold :data:`_NAME_RUN` needs, and the patient name the pattern existed to catch walks through
+into the log. So the cut is made at whitespace, and the spans a whitespace cut can still break are
+dropped whole — never emitted in part. At least two patterns need that, each with a walk of its own:
+:data:`_NAME_RUN` under :func:`_drop_trailing_name_tokens`, and :data:`_INVALID_URL_USERINFO` under
+:func:`_drop_truncated_userinfo`. Over-redaction at the boundary is the deliberate price.
+:data:`_CUT_CHARS` carries the per-pattern argument: which patterns a whitespace cut covers, which it
+does not, and the test to apply to the next one added. **"At least" rather than a count**, because a
+count here went stale the first time this module grew a pattern and nothing reported it, and because
+the register is a register of SPANS -- a dependency on the whole text rather than on a span is a
+different shape it cannot hold (:func:`_sniff_delimiters`, below).
+
+Pure stdlib (``re``, ``hashlib``, ``string``), so it can be used from any engine package.
 """
 
 from __future__ import annotations
 
 import hashlib
 import re
+from functools import lru_cache
+from string import ascii_lowercase, ascii_uppercase, whitespace
 
-__all__ = ["redact", "safe_error", "safe_exc", "safe_name", "safe_text"]
+__all__ = [
+    "clamp_untrusted",
+    "redact",
+    "redact_untrusted",
+    "safe_error",
+    "safe_exc",
+    "safe_name",
+    "safe_text",
+]
 
 _REDACTED = "[redacted]"
 #: Max characters of a (redacted) exception message to keep — a raw HL7 body is long, so bound what
@@ -62,10 +97,16 @@ _HL7_SEGMENT = re.compile(r"\b([A-Z][A-Z0-9]{2})\|[^\r\n]*")
 #: ``.`` and ``:`` are word boundaries but are also inside ``[^\s|^~&]``, so ``\b`` would drop them
 #: from the front of a redacted span.
 #:
-#: This matters because the input is not bounded. :func:`safe_text` truncates *after* :func:`redact`
-#: has run, and the logging handler filter in :mod:`messagefoundry.logging_setup` redacts whole
-#: rendered tracebacks with no bound at all — on whatever thread emitted the record, which for the
-#: engine is the asyncio event loop.
+#: This matters because the scan runs on whatever thread emitted the record, which for the engine is
+#: the asyncio event loop.
+#:
+#: **The input is no longer unbounded, and that does not retire the guard (BACKLOG #1576).** It used to
+#: be: :func:`safe_text` truncated *after* this pattern had run, and the logging handler filter in
+#: :mod:`messagefoundry.logging_setup` redacted whole rendered tracebacks with no bound at all.
+#: :func:`clamp_untrusted` now cuts both to :data:`_REDACT_WINDOW` first. But that window is three
+#: orders of magnitude above what a diagnostic needs, deliberately, so a quadratic scan across it
+#: would still stall the loop. **Linear is what makes a window that generous affordable**, and the
+#: bound is what keeps a linear scan from being charged 16 MiB of a peer's choosing.
 _HL7_FIELD_RUN = re.compile(r"(?<![^\s|^~&])[^\s|^~&]*+[|^~&][^\s|^~&]*+(?:[|^~&][^\s|^~&]*+)+")
 
 #: A **date / birthdate run** in free text: an ISO ``YYYY-MM-DD`` / US ``MM-DD-YYYY`` (``-`` or ``/``
@@ -84,6 +125,84 @@ _DATE_RUN = re.compile(
 #: never re-match (its lowercase-led ``[redacted]`` is a single token wrapped in brackets, not a ≥2-token
 #: run), so :func:`redact` stays a fixed point.
 _NAME_RUN = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}\b|\b[A-Z]{2,}(?:\s+[A-Z]{2,}){1,3}\b")
+
+#: The delimiters every pattern above hardcodes — field ``|``, component ``^``, repetition ``~``,
+#: subcomponent ``&``. **HL7 does not fix these; MSH declares them per message** (see the "read
+#: encoding characters from MSH" rule), so a feed using ``*`` and ``$`` walked its identifiers straight
+#: through this module. BACKLOG #1572. The escape character (``\`` by default) is deliberately absent:
+#: it is not a field boundary, and it is ordinary in a Windows path.
+_DEFAULT_DELIMITERS = frozenset("|^~&")
+
+#: Characters that may never be adopted as a sniffed delimiter. A run holding two of them would match
+#: :data:`_REDACTED` itself, which would break the fixed-point property :func:`safe_text` relies on when
+#: it re-applies :func:`redact` at the store-layer chokepoint. Derived from the placeholder so the two
+#: cannot drift apart. Letters and digits are already excluded by :data:`_MSH_DELIMITERS`.
+_UNSAFE_DELIMITERS = frozenset(_REDACTED)
+
+#: MSH-1 and MSH-2 at the offsets HL7 declares them: the **field separator** is the single character
+#: immediately after ``MSH``, and the **encoding characters** are the field that follows it. So one
+#: bounded regex recovers a message's real delimiter set with no parser and no import — and
+#: ``messagefoundry.parsing`` is deliberately not imported here, even though its
+#: ``_extract_separators`` does the same O(1) read: this module is pure stdlib by design, and 21
+#: engine modules depend on that (measured 2026-09-15).
+#:
+#: ``[^\w\s]`` holds the sniff to punctuation. HL7 wants non-alphanumeric delimiters, and the
+#: restriction also bounds the blast radius of a hostile header: a message declaring ``e`` as its field
+#: separator would otherwise turn every word in a rendered traceback into a redactable run.
+#:
+#: **``{4,5}`` is a detector's threshold, not a parser's, and it is deliberately stricter than
+#: ``parsing._builtin_hl7._extract_separators``.** That function reads a line already known to be an
+#: MSH; this one has to tell an MSH apart from prose that merely mentions one. Measured while building
+#: this: a looser bound read a delimiter set out of this module's OWN docstrings wherever a segment id
+#: sat inside markdown emphasis or backticks, adopting an asterisk or a backtick as the field separator
+#: and over-redacting the source lines a traceback quotes. Four encoding characters is what every
+#: conformant message carries (five since 2.7, with the truncation character); a message with a SHORT
+#: MSH-2 and a custom field separator is not sniffed, which is a further stated residual.
+#:
+#: It is still a heuristic. A punctuation-dense string of exactly the right shape can fool it, and the
+#: cost of being fooled is over-redaction of that text, never a leak.
+#:
+#: ``BHS``/``FHS`` carry the same declaration at the same offsets and open a batch file, so they are
+#: read too.
+_MSH_DELIMITERS = re.compile(r"(?:MSH|BHS|FHS)(?P<fs>[^\w\s])(?P<enc>[^\w\s]{4,5})(?P=fs)")
+
+#: Offsets inside MSH-2: component, repetition, escape, subcomponent, truncation. Index 2 — the escape
+#: character — is skipped for the reason given on :data:`_DEFAULT_DELIMITERS`, and index 4 because the
+#: truncation character is not a field boundary either.
+_ENCODING_OFFSETS = (0, 1, 3)
+
+
+def _sniff_delimiters(text: str) -> frozenset[str]:
+    """The HL7 delimiters ``text`` actually declares, unioned over every MSH header it carries.
+
+    Returns an empty set for text with no MSH header, which is the accepted residual: a headerless
+    custom-delimiter fragment declares nothing, so there is nothing to recover and it passes through
+    (``mrn MRN123$$$H$MR here`` still survives). This claims no completeness — the "never put PHI in an
+    exception message" convention remains the control there, as it does for a single-token identifier."""
+    found: set[str] = set()
+    for match in _MSH_DELIMITERS.finditer(text):
+        encoding = match.group("enc")
+        found.add(match.group("fs"))
+        found.update(encoding[i] for i in _ENCODING_OFFSETS if i < len(encoding))
+    return frozenset(found - _UNSAFE_DELIMITERS)
+
+
+@lru_cache(maxsize=16)
+def _delimiter_patterns(delimiters: frozenset[str]) -> tuple[re.Pattern[str], re.Pattern[str]]:
+    """Segment and field-run patterns over ``delimiters`` — the separator-aware analogues of
+    :data:`_HL7_SEGMENT` and :data:`_HL7_FIELD_RUN`, compiled once per delimiter set.
+
+    The field run carries the same lookbehind guard and possessive quantifiers as the hardcoded
+    one, so the linear-scan property BACKLOG #1437 bought is not given back on this path: the
+    lookbehind is the exact complement of the class that follows it, so a delimiter-free run gets one
+    match attempt rather than one per character."""
+    chars = "".join(re.escape(delimiter) for delimiter in sorted(delimiters))
+    segment = re.compile(rf"\b([A-Z][A-Z0-9]{{2}})([{chars}])[^\r\n]*")
+    field_run = re.compile(
+        rf"(?<![^\s{chars}])[^\s{chars}]*+[{chars}][^\s{chars}]*+(?:[{chars}][^\s{chars}]*+)+"
+    )
+    return segment, field_run
+
 
 #: Hex characters of the :func:`safe_name` digest kept. Long enough that two names in one directory do
 #: not collide in practice, short enough to read in a log line.
@@ -183,22 +302,417 @@ def _safe_suffixes(base: str) -> str:
     return "".join(reversed(kept))
 
 
+#: The literal ``http.client`` opens that message with, and the longest tail the pattern walks past it.
+#: **Named because the CLAMP needs both numbers**: it has to know how far back of a cut a span could
+#: have started (:data:`_USERINFO_SPAN`) and what to search for there
+#: (:func:`_first_truncated_userinfo`).
+#:
+#: **The pattern below SPELLS BOTH OUT again rather than interpolating them, and that is a gate's
+#: requirement rather than a style choice.** ``tests/test_security_static.py`` statically resolves
+#: every ``re.compile`` argument in this tree and pins the ones it cannot read as recorded blind
+#: spots. An f-string here makes the scanner blind to the one pattern in this module that matches a
+#: CREDENTIAL, which is the last one to hide from it. So the duplication is deliberate, and
+#: ``tests/test_redaction.py`` pins the two spellings against each other so they cannot drift --
+#: the same trade :data:`_SAFE_SUFFIXES` takes, for the same reason.
+_USERINFO_OPENER = "nonnumeric port: '"
+_USERINFO_TAIL_MAX = 256
+
+#: The password ``http.client`` quotes as a "port" when an endpoint URL carries userinfo: its
+#: ``InvalidURL("nonnumeric port: 'PW@host'")`` (BACKLOG #1793; the mechanism is on
+#: ``transports/rest.py`` ``refuse_url_credentials``). It is a CREDENTIAL, not PHI. It lives here
+#: because :func:`redact` is the one pass that the stored error, the log chain and the support bundle
+#: all run.
+#:
+#: The span runs to the LAST ``@`` because a decoded ``%40`` puts an ``@`` inside the password, and it
+#: admits quotes and spaces because ``http.client`` formats with ``'%s'``, not ``repr``. The host after
+#: the ``@`` is kept so the diagnostic still says where. The bound is load-bearing on
+#: attacker-influenceable log text; the literal prefix limits it to one bounded walk per occurrence.
+#: A password tail longer than the bound is NOT matched -- the construction-time refusal in
+#: ``transports/rest.py`` ``refuse_url_credentials`` is the primary control, and this is its backstop.
+_INVALID_URL_USERINFO = re.compile(r"(nonnumeric port: ')[^\r\n]{1,256}@")
+
+#: The widest match :data:`_INVALID_URL_USERINFO` can make: the opener, the longest tail it admits,
+#: and the ``@`` that closes it. An opener further back of a cut than this has its whole span inside
+#: the kept head, so the cut cannot have broken it -- which is what bounds the backward search in
+#: :func:`_first_truncated_userinfo` to a fixed region instead of the whole window.
+_USERINFO_SPAN = len(_USERINFO_OPENER) + _USERINFO_TAIL_MAX + 1
+
+
+# --- bounding the input (BACKLOG #1576) --------------------------------------
+
+#: How much of an over-long string :func:`clamp_untrusted` lets the scan see. Three orders of magnitude
+#: above :data:`_DEFAULT_LIMIT`, so no diagnostic anybody writes on purpose is ever cut, and small
+#: enough that the worst-shaped input costs the event loop single-digit milliseconds: measured on this
+#: module's own patterns, 64 KiB is 1.6 ms of segment-shaped text and about 3 ms of delimiter-free
+#: prose, against 0.29 s and 0.78 s for the same shapes at a 16 MiB MLLP frame cap.
+#:
+#: The number bounds the SCAN, not the answer: :func:`safe_text` still cuts its result to
+#: :data:`_DEFAULT_LIMIT`, and a caller that keeps the whole redacted text (the logging handler filter)
+#: keeps a window's worth of it.
+_REDACT_WINDOW = 64 * 1024
+
+#: The characters :func:`_clamp` may cut at. Whitespace is the boundary because a pattern survives a
+#: cut when it either cannot contain whitespace at all or still matches with its tail gone:
+#: :data:`_HL7_FIELD_RUN` and :data:`_DATE_RUN` are built from classes that exclude ``\s`` outright,
+#: and :data:`_HL7_SEGMENT` goes on matching from its own header whatever is cut off its tail.
+#: :data:`_NAME_RUN` has neither property, and the token walk in :func:`_clamp` is there for it.
+#:
+#: **A pattern with a REQUIRED tail past a space has neither property, and this module has one.**
+#: :data:`_INVALID_URL_USERINFO` (BACKLOG #1793) landed after this cut was designed. It is head-anchored
+#: like :data:`_HL7_SEGMENT`, but its trailing ``@`` is required rather than optional, so a cut inside
+#: its span does not shorten the match — it kills it, and the password head before the cut is written
+#: out. Reproduced on this module: in a 64 KiB-plus string whose last whitespace before the window falls
+#: between two space-separated halves of the quoted password, the first half survives, where an
+#: unclamped :func:`redact` would have scrubbed it and a clamped one does not.
+#:
+#: **That paragraph ended "the walk below does not cover it" and recorded a live leak. It is covered
+#: now: :func:`_drop_truncated_userinfo` runs after the name walk and drops a span the cut broke.**
+#: The retracted half is kept because the SHAPE recurs — the walk really does not cover it, since
+#: :func:`_ends_with_name_token` asks a name-shaped question, and the fix is a second walk rather than
+#: a wider one. For an ENDPOINT URL the construction-time refusal in ``transports/rest.py``
+#: ``refuse_url_credentials`` is the primary control and is untouched; that refusal deliberately does
+#: not screen a ``proxy_url``, which legitimately carries its own credentials, so do not read it as
+#: covering every arm.
+#:
+#: **The test a new pattern has to pass, which is a property and not a count:** if a cut at a space
+#: falls inside your span, does what is left still MATCH you? Answer it, and pin the answer beside the
+#: other properties of this cut in ``tests/test_redaction.py`` under *bounding the input*. A count of
+#: how many patterns are covered went stale here the first time the module grew one, and nothing
+#: reported it.
+#:
+#: **Answer "no" and you need a walk of your own, not a wider :func:`_ends_with_name_token`.** The two
+#: walks ask different questions: the name one asks whether the head's last TOKEN could have paired
+#: rightward, and the userinfo one asks whether an opener inside the head has lost the ``@`` that
+#: completes it. A pattern whose span is head-anchored and bounded can copy
+#: :func:`_drop_truncated_userinfo` by naming its own opener and its own widest span; one that is
+#: neither needs a different argument about how far back to look.
+#:
+#: **A THIRD SHAPE IS OUT OF THIS REGISTER'S REACH ENTIRELY, and adding a walk for it would not
+#: work.** :func:`_sniff_delimiters` reads the WHOLE text, so a clamp that drops the ``MSH`` declaring
+#: a feed's real delimiters leaves the separator-aware pass nothing to read, and a run inside the head
+#: that :func:`redact` scrubs unclamped survives. The dependency is not on a span, so no amount of
+#: looking back from the cut finds it. It is a known open gap, recorded here and on the corpus arm in
+#: ``tests/test_redaction.py`` that also cannot reach it -- not a pattern this register covers.
+#:
+#: ``string.whitespace`` searched with :meth:`str.rfind`, rather than ``\s`` through the regex engine:
+#: a right-to-left search is what this needs and ``re`` only scans left to right. The stdlib name is
+#: also the claim — ASCII whitespace, a strict subset of ``\s``, which is the direction that stays
+#: safe: a narrower cut set only means the cut falls further back and drops more, so a Unicode space it
+#: misses costs over-redaction and never coverage.
+_CUT_CHARS = whitespace
+
+#: :data:`_CUT_CHARS` as a set, for the single-character membership tests the walk in
+#: :func:`_drop_trailing_name_tokens` makes. Derived from the same name, so the two can never disagree
+#: about what a boundary is.
+_CUT_CHAR_SET = frozenset(_CUT_CHARS)
+
+
+def _clamp_marker(dropped: int) -> str:
+    """The note put in place of what :func:`_clamp` dropped.
+
+    Written so :func:`redact` passes it through untouched, which keeps the fixed-point property
+    :func:`safe_text` relies on: no ``|^~&`` pair, no capitalized token that could pair into a
+    :data:`_NAME_RUN`, and the count carries ``_`` separators so an eight-digit one can never be read
+    as a bare ``YYYYMMDD`` by :data:`_DATE_RUN`.
+
+    **No leading separator, because the right one differs by caller and one of them is not a space.**
+    :func:`clamp_untrusted` hands its result to :func:`redact`, and :data:`_HL7_SEGMENT` matches
+    ``[^\\r\\n]*`` — to end of LINE, not to end of token — so a clamped head that opens a segment-like
+    line swallows a space-joined note into its own ``[redacted]``. Measured while building this, on a
+    record of unbroken ``PID|…`` text: an 8 MiB message rendered as ``PID|[redacted]`` with no sign it
+    had been cut. A newline is outside that class and ends the match. :func:`safe_text` appends AFTER
+    redaction, where nothing can reach the note, and uses a space so a stored ``last_error`` stays one
+    line."""
+    return f"[redaction bound: dropped {dropped:_d} more chars unscanned]"
+
+
+#: Room reserved for :func:`_clamp_marker` and its joiner inside the window, so a clamped string is
+#: never longer than the window that produced it and re-clamping it is a no-op. **Idempotence is
+#: load-bearing, not tidiness:** ``_install_phi_filters`` attaches one filter chain per handler, so a
+#: record going to both stdout and the off-box forwarder is scrubbed twice and the two sinks must not
+#: disagree.
+#:
+#: **Derived, not hand-tuned.** The widest note this can produce carries the largest count a string
+#: length can be, so build that one and measure it. A literal here would state a rule the code did not
+#: perform, and re-wording the note could overrun it silently.
+_CLAMP_MARKER_BUDGET = len(_clamp_marker(2**63 - 1)) + 1  # + the newline joiner
+
+
+def _ends_with_name_token(token: str) -> bool:
+    """Whether ``token`` ends with something :data:`_NAME_RUN` could join to a *following* token across
+    the whitespace after it — ``[A-Z][a-z]+`` or ``[A-Z]{2,}`` sitting at the token's end.
+
+    The token's END is the question because the whitespace that follows it is where the cut fell. It
+    asks about a trailing shape rather than the whole token so a run that starts mid-token is still
+    seen: ``(DOE JANE`` is a name run to :data:`_NAME_RUN` (``\\b`` sits after the bracket), and a
+    whole-token test would have kept ``(DOE`` behind at the cut.
+
+    **Not the one-line regex that says the same thing.** Anchored
+    ``(?:[A-Z][a-z]+|[A-Z]{2,})\\Z`` is retried at every offset in the token, which is quadratic in the
+    token length — the exact cost this whole change exists to bound, reintroduced inside the fix for
+    it. :meth:`str.rstrip` is the right-to-left scan this wants and it reads each character once."""
+    stem = token.rstrip(ascii_lowercase)
+    if len(stem) < len(token):  # a trailing [a-z]+ run, so the shape can only be [A-Z][a-z]+
+        return bool(stem) and stem[-1] in ascii_uppercase
+    return len(token) >= 2 and token[-1] in ascii_uppercase and token[-2] in ascii_uppercase
+
+
+def _token_start(text: str, end: int) -> int:
+    """Index where the token ending at ``end`` begins — the first position after the :data:`_CUT_CHARS`
+    character before it, or ``0``.
+
+    **One spelling, because both walks in this module need it and what counts as a boundary may
+    move.** :data:`_CUT_CHARS` contemplates admitting a Unicode space; two copies of this loop sixty
+    lines apart would be two places to change and one place to forget.
+
+    An index walk rather than :meth:`str.rsplit` or a slice: the callers are walking backwards through
+    a region they are about to drop, and a slice copies from index 0 on every step, which is the
+    quadratic cost :func:`_drop_trailing_name_tokens` exists to avoid."""
+    while end and text[end - 1] not in _CUT_CHAR_SET:
+        end -= 1
+    return end
+
+
+def _last_cut(text: str, end: int) -> int:
+    """Index of the last :data:`_CUT_CHARS` character in ``text[:end]``, or ``-1`` if there is none."""
+    return max(text.rfind(char, 0, end) for char in _CUT_CHARS)
+
+
+def _drop_trailing_name_tokens(text: str, cut: int) -> int:
+    """``cut`` moved back past **every** whole token :data:`_NAME_RUN` could have joined across it.
+
+    The walk runs while :func:`_ends_with_name_token` holds and stops at the first token that fails
+    it. **A fixed number of steps is wrong, and three was the number this shipped with.** Dropping a
+    token strands *its* own left partner — the one that was only over :data:`_NAME_RUN`'s two-token
+    threshold because of the token just dropped — so any fixed budget leaves the run one token short
+    at the boundary. Reproduced at the shipped window on ``SMITH DOE JANE ROE`` cut after ``ROE``: the
+    three-step walk dropped ``ROE``, ``JANE`` and ``DOE``, and ``SMITH`` then stood alone under the
+    threshold and survived a scrub the **unbounded** redactor performed. That is the leak class
+    BACKLOG #1576 exists to close, reopened inside the fix for it.
+
+    **What makes stopping here safe is a property, not a count:** the last token of the kept head is
+    not name-shaped at its end, so no :data:`_NAME_RUN` match can span the cut at all. Every match the
+    unbounded scan would have made therefore lies wholly inside the head, where it still matches, or
+    wholly inside what was dropped. Pairings to that token's *left* are untouched — the cut cannot
+    reach them.
+
+    **And the work is still bounded by the window, which is the whole point of BACKLOG #1576.** The
+    walk visits each character of what it drops a constant number of times and never revisits one:
+    each iteration consumes ``text[start:cut]`` and the next begins at ``start``, so the regions are
+    disjoint and ``cut`` strictly decreases. The total is one backward pass over the dropped suffix
+    plus the single token it stops on — linear in the window, the same class as the scan it protects,
+    and it cannot exceed it because the window bounds the input.
+
+    **So the loop body must not scan from the string's start, and the obvious spelling does — both
+    halves of it.** The shipped three-step version paired ``text[:cut].rstrip(...)`` with
+    :func:`_last_cut`. That slice copies ``cut`` characters, and ``_last_cut`` is six
+    :meth:`str.rfind` calls that run to index 0 whenever the text holds no tab or newline — ordinary
+    for a peer's one-line field. Three of each is a constant; one per token is quadratic in the
+    window, which is exactly the cost class this change exists to bound. Index walking keeps both
+    inside the region being dropped. Measured best-of-3 on a 64 KiB window of nothing but ``AA``
+    tokens — 21,820 of them, the most a window can hold — the two walks agree on the answer and cost
+    **6.2 ms here against 630 ms spelled with ``_last_cut``**.
+
+    **That overturns one earlier decision, on its own measurement.** Stepping over a whitespace run a
+    character at a time was rejected for :meth:`str.rstrip`, and on a 64 KiB run of spaces stepping
+    does cost 1.6 ms against 0.2 ms. It is taken anyway: ``rstrip`` needs the ``text[:cut]`` slice,
+    which is the quadratic half above, and 1.4 ms inside a bounded window buys away a cost that grows
+    with the peer's input.
+
+    **The price is over-redaction, and the ceiling on it moved.** A fixed budget dropped at most three
+    tokens; this drops a contiguous name-shaped run of any length, so a window that is nothing but
+    such tokens is dropped whole and the answer is the note alone. That is the same trade
+    :data:`_CUT_CHARS` already takes at the boundary, and it loses no diagnostic: a run long enough to
+    trigger it is a run the unbounded redactor would have scrubbed to :data:`_REDACTED` anyway. The
+    walk stops at the first token that fails the test, so ordinary prose behind the cut is untouched."""
+    while cut:
+        end = cut
+        while end and text[end - 1] in _CUT_CHAR_SET:
+            end -= 1  # step over a whitespace RUN: _NAME_RUN joins its tokens with `\s+`
+        if not end:
+            return cut  # nothing but whitespace behind the cut, so no token to judge
+        start = _token_start(text, end)
+        if not _ends_with_name_token(text[start:end]):
+            return cut
+        cut = start
+    return cut
+
+
+def _first_truncated_userinfo(text: str, cut: int) -> int:
+    """Index of the leftmost :data:`_INVALID_URL_USERINFO` opener in ``text[:cut]`` whose match runs
+    past ``cut``, or ``-1`` when the cut broke none.
+
+    **Leftmost, because one match can cover several openers.** The tail is ``[^\\r\\n]``, which spans
+    whitespace and spans a second opener, so the span that starts first is the one whose loss takes the
+    most text with it; cutting back before it removes the later ones as well.
+
+    **Only a fixed region is searched, and that is what keeps this affordable.** A span is at most
+    :data:`_USERINFO_SPAN` characters, so an opener further back than that ends inside the head, where
+    the head's bytes are the text's bytes and the match still stands. Everything the cut can have
+    broken therefore sits in one bounded region behind it, whatever the peer's input is.
+
+    The question asked of each candidate is the shipping pattern's own, against the WHOLE text: a
+    candidate that does not match there is one :func:`redact` would not have scrubbed unclamped either,
+    so dropping it would buy nothing."""
+    pos = max(cut - _USERINFO_SPAN, 0)
+    while (start := text.find(_USERINFO_OPENER, pos, cut)) >= 0:
+        match = _INVALID_URL_USERINFO.match(text, start)
+        if match is not None and match.end() > cut:
+            return start
+        pos = start + 1
+    return -1
+
+
+def _drop_truncated_userinfo(text: str, cut: int) -> int:
+    """``cut`` moved back past every :data:`_INVALID_URL_USERINFO` span the cut would have broken.
+
+    **This is the second of the two walks :data:`_CUT_CHARS` describes, and it exists because a
+    whitespace cut is not enough for a pattern whose tail is required.** A password quoted with a space
+    in it puts a cut candidate inside the credential: the head keeps ``nonnumeric port: '`` and the
+    first half of the password, the ``@`` that completes the match is past the cut, and the pattern
+    that exists to scrub exactly that string no longer fires. Unclamped, :func:`redact` scrubs it. That
+    is the leak class BACKLOG #1576 exists to close, in the one pattern that arrived after the cut was
+    designed.
+
+    **A broken span is dropped whole rather than repaired**, and the cut goes back to the whitespace
+    boundary before the opener's own token, so the head still ends where :func:`_clamp` promises. The
+    name walk is re-run from there, because moving a cut back is exactly what can strand a
+    :data:`_NAME_RUN` partner, and re-running it is cheaper than reasoning that it cannot.
+
+    **The loop is necessary, not defensive.** A greedy tail reaches the last ``@`` in range, so an
+    EARLIER opener can own a span that swallows the one just dropped and still runs past the cut:
+    ``nonnumeric port: 'A nonnumeric port: 'B`` with the ``@`` past the window is one match unclamped,
+    covering both halves. Dropping only the rightmost opener would leave ``A`` standing.
+
+    **And it is bounded by the window, but NOT by the disjointness argument the walk above it uses,
+    and that distinction is the part to keep.** Two costs here, and only one of them is disjoint.
+    ``cut`` strictly decreases, so the backward scans for a token boundary do run over regions strictly
+    below the previous pass's and visit no character twice -- one pass over the dropped suffix in
+    total. The SEARCH does not: a pass that steps back past a single opener leaves the next pass's
+    :data:`_USERINFO_SPAN`-wide region overlapping this one by nearly all of it, so the search cost is
+    passes times the span rather than one pass over the window.
+
+    **That is still bounded, because both factors are.** The span is a constant, and a pass consumes
+    at least one opener, so the passes cannot exceed the openers a window holds. Measured over a sweep
+    of the gap between opener and terminator, in steps of 5 from 0 to 125, on 64 KiB of nothing but
+    credential spans: the worst is a 75-character gap at **348 passes and 1.6 ms**, against the 50 ms
+    the #1437 arms budget. A gap of 120 or more takes ONE pass -- past that the span cannot reach an
+    ``@`` beyond the cut at all -- so the cost is not monotone in the gap and a single sample of it
+    measures nothing. Pinned in ``tests/test_redaction.py`` under *bounding the input*."""
+    while cut:
+        start = _first_truncated_userinfo(text, cut)
+        if start < 0:
+            return cut
+        # Back to the start of the token the opener sits in, then one more: that index is the
+        # whitespace before it, which is the `_last_cut` convention -- the head ends just before it.
+        # A zero means no boundary at all behind the opener, so the answer is nothing.
+        cut = _drop_trailing_name_tokens(text, max(_token_start(text, start) - 1, 0))
+    return cut
+
+
+def _clamp(text: str, window: int) -> tuple[str, int]:
+    """``(head, dropped)`` — ``text`` cut to at most ``window`` characters at a whitespace boundary,
+    and how many characters that cost. See :data:`_CUT_CHARS` for which patterns that boundary covers
+    and which it does not.
+
+    ``dropped == 0`` means the text fit and ``head is text``, so every caller is byte-identical to its
+    pre-#1576 self on everything short enough to read.
+
+    **The cut ALWAYS lands on whitespace or on zero, and never at an arbitrary offset.** Cut anywhere
+    else and a run carrying two delimiters can lose one of them and fall under
+    :data:`_HL7_FIELD_RUN`'s threshold — which is the leak this whole change exists to avoid, rebuilt
+    inside the fix for it. A window holding no whitespace at all therefore yields nothing rather than a
+    fragment. :data:`_CUT_CHARS` carries the per-pattern argument for what a whitespace cut covers.
+
+    **Then the walk, which is there for :data:`_NAME_RUN`** — a pattern a whitespace cut can split
+    while leaving a match-killing remainder behind. A bare cut through ``DOE JANE`` leaves ``DOE``
+    standing under its two-token threshold, so the neighbouring name-shaped tokens are dropped whole.
+    :func:`_drop_trailing_name_tokens` carries how far that walk goes and why it is still bounded; the
+    cost is over-redaction of a few tokens at a boundary 64 KiB into a string nobody is reading that
+    far down.
+
+    **Then the second walk, which is there for :data:`_INVALID_URL_USERINFO`** — a pattern a whitespace
+    cut can split while leaving a match-KILLING remainder behind, because its trailing ``@`` is
+    required rather than optional. A password quoted with a space in it is the case, and the head would
+    otherwise keep its first half. :func:`_drop_truncated_userinfo` drops the broken span whole."""
+    if len(text) <= window:
+        return text, 0
+    # -1 when the window held no whitespace at all, which must yield nothing rather than text[:-1].
+    cut = max(_last_cut(text, window), 0)
+    # The window split a token unless it happened to land on whitespace. Either way that token is
+    # already gone; the walk continues from there through the rest of the run it belonged to.
+    cut = _drop_trailing_name_tokens(text, cut)
+    # After the name walk, not before it: that walk only ever moves the cut back, and moving it back
+    # is what breaks a span. This one re-runs the name walk itself wherever it moves the cut again.
+    cut = _drop_truncated_userinfo(text, cut)
+    return text[:cut], len(text) - cut
+
+
+def clamp_untrusted(text: str, *, window: int = _REDACT_WINDOW) -> str:
+    """``text`` bounded to ``window`` characters for a scan, with a note naming what was dropped.
+
+    **Call this on anything a remote peer sizes before handing it to :func:`redact`** — a rendered
+    traceback, a reply field, a Router's own ``raise``. :func:`redact` is linear but not free, and it
+    runs synchronously on whatever thread emitted the record, which for the engine is the asyncio event
+    loop. A negative acknowledgment at a 16 MiB frame cap would otherwise charge the loop the better
+    part of a second (module docstring), for a diagnostic whose useful part is its first line.
+
+    Idempotent: the result is never longer than ``window`` (:data:`_CLAMP_MARKER_BUDGET` is reserved
+    for the note), so clamping it again returns it unchanged. That matters because a record dispatched
+    to two handlers is filtered twice and the two sinks must agree. Deliberately NOT done by
+    recognising the note in the text — a peer can write that literal into its payload, and a bypass a
+    peer controls is not a bound."""
+    if len(text) <= window:
+        return text
+    # The budget comes off the CUT, never off this guard. A result is head + note, so it fits `window`
+    # and the guard hands it back untouched on the next pass. Cutting straight to `window` instead
+    # would leave every result in the `window - budget` to `window` band -- above its own cut, below
+    # its own guard -- and re-cut it on every pass, which is what the first version of this shipped.
+    head, dropped = _clamp(text, max(window - _CLAMP_MARKER_BUDGET, 0))
+    return f"{head}\n{_clamp_marker(dropped)}"  # newline, not space: see _clamp_marker
+
+
+def redact_untrusted(text: str, *, window: int = _REDACT_WINDOW) -> str:
+    """:func:`redact` over :func:`clamp_untrusted` — bound the input, then scrub it.
+
+    **The pairing has a name so a call site cannot hold half of it.** The two halves are separately
+    useful (the MLLP outbound clamps a reply field it does not scrub), but every caller that scans
+    peer-sized text wants both, and ``redact(text)`` alone is a silent reopening of BACKLOG #1576 that
+    reads like ordinary code. One name is what makes the bound reviewable at the call site."""
+    return redact(clamp_untrusted(text, window=window))
+
+
 def redact(text: str) -> str:
     """Scrub HL7 segment/field content (potential PHI) from free text, keeping segment IDs, then apply a
     conservative free-text heuristic for delimiter-free identifiers. Conservative (errs toward over-
     redaction); the goal is that a raw HL7 body — or a free-text name/DOB — embedded in an exception
     message can't reach a log or the stored ``last_error``/``detail``. NOT de-identification (PHI.md §9).
 
-    Order matters: HL7-shaped content (:data:`_HL7_SEGMENT`, then :data:`_HL7_FIELD_RUN`) is handled
-    first, so the free-text passes (:data:`_DATE_RUN`, then :data:`_NAME_RUN`) only see delimiter-free
+    Order matters: HL7-shaped content (:data:`_HL7_SEGMENT`, then :data:`_HL7_FIELD_RUN`, then the
+    separator-aware pass for a message that declares delimiters outside the defaults) is handled first,
+    so the free-text passes (:data:`_DATE_RUN`, then :data:`_NAME_RUN`) only see delimiter-free
     text. The free-text heuristic narrows the prior residual to adversarial *single-token* identifiers
     (a lone name with no second token, no date) — for which the "never put PHI in an exception message"
     convention remains the control. Idempotent: the literal ``[redacted]`` substituted in never re-
     matches any pattern, so ``redact(redact(x)) == redact(x)``."""
     if not text:
         return text
+    text = _INVALID_URL_USERINFO.sub(lambda m: f"{m.group(1)}{_REDACTED}@", text)
     scrubbed = _HL7_SEGMENT.sub(lambda m: f"{m.group(1)}|{_REDACTED}", text)
     scrubbed = _HL7_FIELD_RUN.sub(_REDACTED, scrubbed)
+    # BACKLOG #1572. The passes above assume `| ^ ~ &`; MSH DECLARES the real set per message, so a
+    # feed using `*` and `$` kept its identifiers. Sniff, and run a separator-aware pass only when the
+    # declared set reaches outside the defaults — widening the hardcoded class instead would have been
+    # the obvious move and is the wrong one: it scrubs timestamps, `C:/` paths, URLs and `host:port` out
+    # of ordinary operational text, which is most of what the support bundle and the forwarded log
+    # stream carry. Sniffing `text` and not `scrubbed` is load-bearing: on a custom FIELD separator with
+    # default encoding characters, `_HL7_FIELD_RUN` has already eaten the MSH line (and the delimiter
+    # declaration with it) by this point.
+    declared = _sniff_delimiters(text)
+    if not declared <= _DEFAULT_DELIMITERS:
+        segment, field_run = _delimiter_patterns(declared | _DEFAULT_DELIMITERS)
+        scrubbed = segment.sub(lambda m: f"{m.group(1)}{m.group(2)}{_REDACTED}", scrubbed)
+        scrubbed = field_run.sub(_REDACTED, scrubbed)
     scrubbed = _DATE_RUN.sub(_REDACTED, scrubbed)
     return _NAME_RUN.sub(_REDACTED, scrubbed)
 
@@ -209,10 +723,25 @@ def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
     errors, a ``last_error`` built at the store layer, a connector's reply-parse note). HL7-shaped content
     is scrubbed (:func:`redact`) and the result truncated. Idempotent on already-:func:`safe_text`'d
     input (``redact`` is a fixed point once delimiter runs are gone), so it is safe to re-apply as a
-    store-layer chokepoint over values a caller may already have scrubbed."""
-    message = redact(text).strip()
+    store-layer chokepoint over values a caller may already have scrubbed.
+
+    **``limit`` bounds the ANSWER; :data:`_REDACT_WINDOW` bounds the WORK (BACKLOG #1576).** That was
+    one number's job before and it could only do half of it: the truncation runs *after*
+    :func:`redact`, so a remote peer sizing the input bought an unbounded scan on the event loop for a
+    200-character result. :func:`_clamp` cuts the input first. It is emphatically **not**
+    ``redact(text[:limit])`` — the module docstring says why that form leaks the name it was meant to
+    catch.
+
+    The two counts stay separate and each is exactly true: ``(+N chars)`` is redacted text this call
+    held back, and the bound note is raw characters no pattern ever looked at. One total would add a
+    redacted length to an unredacted one and report a number that is neither. Nothing is dropped in the
+    ordinary case, so the ordinary result is byte-identical to its pre-#1576 self."""
+    head, dropped = _clamp(text, _REDACT_WINDOW)
+    message = redact(head).strip()
     if len(message) > limit:
         message = f"{message[:limit]}…(+{len(message) - limit} chars)"
+    if dropped:
+        message = f"{message} {_clamp_marker(dropped)}"
     return message
 
 

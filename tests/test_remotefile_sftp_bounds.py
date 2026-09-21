@@ -14,6 +14,7 @@ about the socket the connector makes, not about the transfer semantics that file
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -41,6 +42,10 @@ class _StubFile:
         chunk = self.body[self.read_total : self.read_total + size]
         self.read_total += len(chunk)
         return chunk
+
+    def stat(self) -> SimpleNamespace:
+        # BACKLOG #116: the retrieve reads the handle's size on each side of the transfer.
+        return SimpleNamespace(st_size=len(self.body))
 
     def __enter__(self) -> _StubFile:
         return self

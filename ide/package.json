@@ -720,9 +720,9 @@
         },
         "messagefoundry.engineUrl": {
           "type": "string",
-          "default": "http://127.0.0.1:8765",
+          "default": "https://127.0.0.1:8765",
           "scope": "machine",
-          "description": "Engine API URL used by Stage \u00e2\u2020\u2019 Promote when no named environments are configured (see messagefoundry.environments). Machine-scoped: a checked-in workspace .vscode/settings.json cannot retarget promote to an attacker host that would then receive your credentials and session token."
+          "description": "Engine API URL used by Stage \u00e2\u2020\u2019 Promote when no named environments are configured (see messagefoundry.environments). https by default: the engine always serves TLS, minting a self-signed certificate on first run, and the extension trusts that certificate by reading messagefoundry.serviceConfig. Use http:// only where a reverse proxy terminates TLS in front of the engine ([api].tls_terminated_upstream). Machine-scoped: a checked-in workspace .vscode/settings.json cannot retarget promote to an attacker host that would then receive your credentials and session token."
         },
         "messagefoundry.environments": {
           "type": "array",
@@ -830,7 +830,7 @@
     "esbuild": "^0.28.2",
     "glob": "^13.0.6",
     "jsdom": "^30.0.1",
-    "mocha": "^12.0.0",
+    "mocha": "^12.0.1",
     "typescript": "^5.4.5"
   },
   "overrides": {

@@ -99,7 +99,10 @@ def test_secure_file_grants_extra_read_principals(monkeypatch: pytest.MonkeyPatc
         Path("key.dpapi"), extra_read_grants=["*S-1-5-18", "NT SERVICE\\MessageFoundry"]
     )
     argv = captured[0]
-    assert argv[0] == "icacls" and "/inheritance:r" in argv and "/grant:r" in argv
+    # argv[0] is the pinned absolute path; test_secure_file_pins_icacls_to_the_system_directory
+    # owns that assertion, so check only that it is still icacls here.
+    assert os.path.basename(argv[0]).lower() == "icacls.exe"
+    assert "/inheritance:r" in argv and "/grant:r" in argv
     assert "minter:F" in argv  # owner keeps full control
     assert "*S-1-5-18:R" in argv  # SYSTEM read
     assert "NT SERVICE\\MessageFoundry:R" in argv  # service account read
@@ -114,7 +117,96 @@ def test_secure_file_default_is_owner_only(monkeypatch: pytest.MonkeyPatch) -> N
 
     captured = _capture_icacls(monkeypatch)
     store_mod._secure_file(Path("store.db"))
-    assert captured[0] == ["icacls", "store.db", "/inheritance:r", "/grant:r", "minter:F"]
+    argv = captured[0]
+    assert os.path.basename(argv[0]).lower() == "icacls.exe"  # the pin has its own test
+    assert argv[1:] == ["store.db", "/inheritance:r", "/grant:r", "minter:F"]
+
+
+@_windows_only
+def test_secure_file_pins_icacls_to_the_system_directory(monkeypatch: pytest.MonkeyPatch) -> None:
+    # This call WRITES the ACL restricting the store DB and the DPAPI key file, so it must name
+    # icacls by absolute path: CreateProcess resolves an unqualified name through a search path that
+    # reaches the caller's working directory. _secure_file logs only on a non-zero exit, so a planted
+    # icacls.exe that exits 0 would leave the file its inherited (possibly broad) ACL and report
+    # nothing — the hardening becomes a silent no-op (BACKLOG #1769).
+    from pathlib import Path
+
+    import messagefoundry.store.store as store_mod
+    from messagefoundry import service_status
+
+    captured = _capture_icacls(monkeypatch)
+    store_mod._secure_file(Path("store.db"))
+    # Guard the guard: with no call recorded, every assertion below passes over nothing.
+    assert captured, "icacls was never invoked; the pin assertions would pass vacuously"
+    program = captured[0][0]
+    assert os.path.isabs(program), f"icacls must be pinned to an absolute path, got {program!r}"
+    assert os.path.basename(program).lower() == "icacls.exe"
+    # It must be the OS-reported system directory, not merely some absolute path. Compared against
+    # _system_dir rather than a literal "System32" because GetSystemDirectoryW answers "SysWOW64" to
+    # a 32-bit process, and that is the correct system directory there; _system_dir's own behaviour
+    # is tested beside it in tests/test_service_control.py.
+    assert os.path.dirname(program) == service_status._system_dir()
+
+
+# --- BACKLOG #1634: the restriction must not run ON the event loop ------------------------------
+#
+# WHAT THESE ASSERT, AND WHY THE INSTRUMENT IS THREAD IDENTITY (SDS-3.8). The question is "was the
+# call dispatched off the loop", and a thread id answers exactly that sentence: `asyncio.to_thread`
+# runs the target on an executor thread, a direct call runs it on the loop's own thread, and the two
+# are never the same id. A wall-clock or loop-responsiveness assertion would answer an ADJACENT
+# question -- `snapshot_to` awaits several times either way, so a concurrent counter advances even
+# with the blocking call in place, and a 21ms stall is below the noise of a timing assertion under
+# fleet contention. These tests are platform-independent on purpose: they patch `_secure_file`
+# itself, so no real `icacls` (Windows) or `chmod` (POSIX) runs and every CI leg exercises them.
+
+
+def _record_secure_file_threads(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Replace ``_secure_file`` with a recorder of the thread it ran on (no real icacls/chmod)."""
+    import messagefoundry.store.store as store_mod
+
+    idents: list[int] = []
+
+    def _record(path: object, *, extra_read_grants: object = None) -> None:
+        idents.append(threading.get_ident())
+
+    monkeypatch.setattr(store_mod, "_secure_file", _record)
+    return idents
+
+
+async def test_snapshot_to_secures_the_copy_off_the_event_loop(
+    store: MessageStore, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # This is the call that matters. A DR backup runs `snapshot_to` on the SERVING loop by design
+    # (pipeline/dr_backup.py keeps the consistent snapshot there), so restricting the copy inline
+    # would stall every in-flight ACK, claim and delivery for the length of one icacls subprocess --
+    # 21 to 28ms on Windows -- once per backup on a deploying site.
+    idents = _record_secure_file_threads(monkeypatch)
+    await store.snapshot_to(tmp_path / "snap.db")
+    assert idents, "snapshot_to no longer restricts the snapshot file at all"
+    loop_thread = threading.get_ident()
+    assert loop_thread not in idents, (
+        "snapshot_to restricted the snapshot file ON the event loop thread; it must go through "
+        "_secure_file_async (BACKLOG #1634)"
+    )
+
+
+async def test_open_secures_the_db_files_off_the_event_loop(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `open` completes before the API serves and before any listener binds, so its stall has nothing
+    # to stall -- this pins the consistency, not a live defect. It secures the db plus its -wal/-shm
+    # siblings, so it is also the site where a blocking call costs three subprocesses, not one.
+    idents = _record_secure_file_threads(monkeypatch)
+    s = await MessageStore.open(tmp_path / "offloop.db")
+    try:
+        assert idents, "open no longer restricts the store file at all"
+        loop_thread = threading.get_ident()
+        assert loop_thread not in idents, (
+            "open restricted a store file ON the event loop thread; it must go through "
+            "_secure_file_async (BACKLOG #1634)"
+        )
+    finally:
+        await s.close()
 
 
 async def test_enqueue_creates_message_and_outbox_rows(store: MessageStore) -> None:
@@ -597,6 +689,25 @@ async def test_db_status_reports_counts_journal_size(store: MessageStore) -> Non
     assert st.journal_mode.lower() == "wal"
     assert st.size_bytes > 0
     assert st.path == store.path
+    # A real local drive is measurable, so this is a number — never the "unmeasurable" None.
+    assert st.disk_free_bytes is not None and st.disk_free_bytes > 0
+
+
+async def test_disk_free_bytes_is_none_when_unmeasurable_never_zero(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #1563: a failed ``disk_usage`` reports ``None``, not ``0``.
+
+    ``0`` is the console's critical-disk alarm, so returning it for "I could not measure this" turned
+    an unreadable mount point into a disk emergency. The two are different facts and the type now
+    says so; a drive that genuinely measures 0 free still returns 0 and still alarms."""
+
+    def boom(_path: object) -> object:
+        raise OSError("mount point unreadable")
+
+    monkeypatch.setattr("messagefoundry.store.store.shutil.disk_usage", boom)
+    assert store._disk_free_bytes() is None
+    assert (await store.db_status()).disk_free_bytes is None
 
 
 async def test_integrity_check_ok(store: MessageStore) -> None:
