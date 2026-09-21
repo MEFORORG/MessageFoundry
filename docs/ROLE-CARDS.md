@@ -192,8 +192,8 @@ issued.
 
 **Cards live in the engine repo, not in korus and not in the vault.** The hook runs inside an engine
 worktree, and both other clones may be absent beside it. Cards hold no ASVS content and no security
-specifics, so nothing vaulted moves. The only vault reference in any card is the Lander's scorecard
-duty, which names the record and no cell.
+specifics, so nothing vaulted moves. The only vault reference in any card is the Lander's standing
+authority over it, which names the repository and no cell.
 
 ### 2.3 The hook: `scripts/hooks/role-card-inject.ps1`
 
