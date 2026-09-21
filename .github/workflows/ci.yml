@@ -1111,19 +1111,30 @@ jobs:
       # against a 5:00 cap (1.85x, 1.77x), windows-2022 3:34 and 3:28 against 6:00 (1.68x, 1.73x).
       # Both are clear. Raise one only when its own numbers say so.
       #
-      # THE NESTING INVARIANT STILL HOLDS. Re-summed against the KILL rather than the margin cap when
-      # the two were split -- see the note below. Worst-case setup is the leg's recorded setup maximum
-      # plus the 4:30 provisioning noise this file records separately, so per leg:
+      # THE NESTING INVARIANT STILL HOLDS, AND THIS TABLE IS THE ONLY COPY OF THE SUM. Re-summed
+      # against the KILL rather than the margin cap when the two were split.
+      #
+      # THE SECOND TERM IS A DELIBERATE SAFETY PAD, NOT A SEPARATE MEASUREMENT, and saying so is the
+      # correction to how this table first read. The 4:30 is the largest `Set up job` this file
+      # records -- and the line that records it (ubuntu run 31109989006) says that 4:30 was observed
+      # INSIDE a 5:22 setup, so adding it to a recorded setup maximum counts it twice. That is kept,
+      # for two reasons: it is the additive model the `job_timeout` derivation above already uses, so
+      # diverging here would leave two models in one file; and on ubuntu the pad is doing real work,
+      # because the `Install Qt offscreen system libraries` step carries its own `timeout-minutes: 8`
+      # and so admits a setup longer than the 5:22 alone would cover. Read the second column as
+      # headroom the sum deliberately buys, not as time anyone has measured twice.
       #
       #   ubuntu-latest   5:22 + 4:30 + kill  9:00 = 18:52   under 20:00, slack 1:08
       #   windows-2022    4:05 + 4:30 + kill 10:00 = 18:35   under 20:00, slack 1:25
       #   windows-2025    2:32 + 4:30 + kill 12:00 = 19:02   under 20:00, slack 0:58
       #
-      # windows-2025 is the tightest and is the leg to watch: if setup there ever runs a minute past
-      # its recorded worst case, the JOB cap fires before the step cap and the failure stops naming the
-      # step. The lever for that is `webconsole_job_timeout`, which is a deadlock backstop rather than
-      # a tightness gate, not a smaller kill -- a smaller kill re-narrows the observation window this
-      # change was made to open. tests/test_ci_step_margin.py checks the arithmetic half of it.
+      # windows-2025 is the tightest and is the leg to watch: its setup has to reach 8:00 before the
+      # JOB cap fires ahead of the step cap and the failure stops naming the step. That is 0:58 past
+      # the 7:02 this table budgets and 5:28 past the 2:32 actually recorded for the leg, so the pad
+      # is most of what protects it. The lever if it ever bites is `webconsole_job_timeout`, which is
+      # a deadlock backstop rather than a tightness gate -- not a smaller kill, which would re-narrow
+      # the observation window this change was made to open.
+      # tests/test_ci_step_margin.py parses this table and re-adds every row.
       #
       # THE RULER AND THE WALL: THE MARGIN CAP AND THE KILL ARE NOW TWO NUMBERS, DELIBERATELY.
       # `webconsole_step_timeout` is the step's `timeout-minutes` -- the WALL, which kills a run.
@@ -1150,10 +1161,12 @@ jobs:
       #
       # THE KILLS ARE 9 / 10 / 12, and each is at least 1.30x its leg's margin cap -- the same ratio
       # the gate's own floor reserves below the cap, so the band a run may be observed in ABOVE the cap
-      # is at least as wide, in ratio, as the band the floor reserves below it. 1.80x / 1.67x / 1.33x
-      # as set. tests/test_ci_step_margin.py asserts that headroom per leg, reading BOTH numbers out of
-      # the matrix literals rather than restating them, because two numbers that must move together are
-      # exactly the drift this file has been bitten by before.
+      # is at least as wide, in ratio, as the band the floor reserves below it.
+      # tests/test_ci_step_margin.py asserts that headroom per leg, reading BOTH numbers out of the
+      # matrix literals rather than restating them, and PRINTS each leg's achieved ratio on every run
+      # -- so the ratios are deliberately not written here, where they would rot the next time either
+      # number moves. Two numbers that must move together are exactly the drift this file has been
+      # bitten by before, which is why the coupling is a check rather than a sentence.
       #
       # THE GATE'S OWN OUTPUT SAYS "Raising the cap is NOT the fix and this check must not be read as
       # asking for one", and that sentence was read before this change rather than after. It is still in
@@ -1770,11 +1783,19 @@ jobs:
           # `webconsole_job_timeout` caps the SEPARATE web console job. It exists because that suite
           # moved out of `test` into its own parallel job, so it now needs a job cap of its own -- and
           # the nesting invariant has to hold there too: setup(max) + webconsole_step_timeout must fit
-          # under it. Recorded setup maxima are 5:22 ubuntu / 4:05 W22 / 2:32 W25, and ci.yml records
-          # provisioning noise alone at 4:30, so the worst case is about 5:22 + 4:30 + 5:00 = 14:52 on
-          # the widest leg. 20 clears that with room. It is a DEADLOCK BACKSTOP, not a tightness gate:
-          # the drift detector is the margin check against `webconsole_step_timeout`, so sizing this
-          # close to the observed run would buy no detection and cost false reds on green suites.
+          # under it. THE SUM LIVES IN ONE PLACE AND IT IS NOT HERE -- the per-leg table above the
+          # `Web console tests (pytest)` step, which tests/test_ci_step_margin.py parses and re-adds.
+          # Its widest leg is 18:52 against 20:00. This paragraph used to carry its own copy of that
+          # arithmetic and the copy went stale the moment `webconsole_step_timeout` moved: it still
+          # read `5:22 + 4:30 + 5:00 = 14:52` after the kill became 9, so ci.yml asserted two
+          # different worst cases for the same leg 650 lines apart. A second copy is what a checked
+          # copy exists to replace, so this one is a pointer now.
+          #
+          # 20 clears it with room. It is a DEADLOCK BACKSTOP, not a tightness gate: the drift detector
+          # is the margin check against `webconsole_margin_cap`, so sizing this close to the observed
+          # run would buy no detection and cost false reds on green suites. That knob is the gate's
+          # ruler and `webconsole_step_timeout` is only the wall -- this sentence named the wall until
+          # they were split.
           U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":43,"step_timeout":31,"webconsole_margin_cap":5,"webconsole_step_timeout":9,"webconsole_job_timeout":20,"pytest_timeout":60,"fault_timeout":90,"pytest_workers":4}'
           W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":66,"step_timeout":55,"webconsole_margin_cap":6,"webconsole_step_timeout":10,"webconsole_job_timeout":20,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
           W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":66,"step_timeout":55,"webconsole_margin_cap":9,"webconsole_step_timeout":12,"webconsole_job_timeout":20,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'

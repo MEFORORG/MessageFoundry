@@ -829,7 +829,6 @@ def test_every_leg_gives_the_kill_real_headroom_over_the_margin_cap() -> None:
         f"expected legs {sorted(_EXPECTED_LEGS)}, parsed {sorted(names)}"
     )
     assert len(legs) == len(_EXPECTED_LEGS), f"duplicate leg entries: {[leg['os'] for leg in legs]}"
-    checked = 0
     for leg in legs:
         for knob in ("webconsole_margin_cap", "webconsole_step_timeout"):
             assert knob in leg, f"{leg['os']} does not define {knob}"
@@ -844,8 +843,12 @@ def test_every_leg_gives_the_kill_real_headroom_over_the_margin_cap() -> None:
             f"over the margin cap (webconsole_margin_cap {cap}m); the gate's own floor is "
             f"{DEFAULT_MIN_MARGIN:.2f}x, so a run this gate reds would still be truncated"
         )
-        checked += 1
-    assert checked == len(_EXPECTED_LEGS), f"checked {checked} legs, expected {len(_EXPECTED_LEGS)}"
+    # NO TRAILING `checked == 3` COUNTER. The loop walks `legs`, so such a counter agrees with the
+    # two assertions above it by construction -- a guard that cannot fail, which this repository
+    # treats as worse than no guard because it licenses the behaviour it appears to check. The COUNT
+    # is pinned, and pinned by assertions that CAN disagree: `names == _EXPECTED_LEGS` fails on a
+    # renamed or missing leg, and `len(legs) == len(_EXPECTED_LEGS)` fails on a duplicate entry that
+    # the name set would otherwise absorb.
 
 
 def test_the_webconsole_nesting_arithmetic_in_ci_yml_is_read_and_checks_out() -> None:
@@ -876,7 +879,6 @@ def test_the_webconsole_nesting_arithmetic_in_ci_yml_is_read_and_checks_out() ->
     )
     legs = {leg["os"]: leg for leg in _matrix_legs()}
     assert set(legs) == _EXPECTED_LEGS, f"matrix legs {sorted(legs)} != {sorted(_EXPECTED_LEGS)}"
-    checked = 0
     for name in sorted(_EXPECTED_LEGS):
         row, leg = rows[name], legs[name]
         setup = parse_clock(row.group("setup"))
@@ -906,5 +908,6 @@ def test_the_webconsole_nesting_arithmetic_in_ci_yml_is_read_and_checks_out() ->
             f"webconsole_job_timeout {row.group('cap')} -- the JOB cap would fire before the step "
             f"cap and the failure would stop naming the step"
         )
-        checked += 1
-    assert checked == len(_EXPECTED_LEGS), f"checked {checked} legs, expected {len(_EXPECTED_LEGS)}"
+    # Same reasoning as the headroom check: the loop walks `_EXPECTED_LEGS`, so a counter over it is
+    # vacuous. The count is pinned by `len(found) == len(rows)` and `set(rows) == _EXPECTED_LEGS`,
+    # both of which fire -- the first was falsified by duplicating a row, the second by renaming one.
