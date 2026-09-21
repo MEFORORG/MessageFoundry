@@ -19,6 +19,7 @@ from messagefoundry.corepoint_import import (
     Action,
     Control,
     CorepointImportError,
+    Step,
     UnmappedAction,
     _corepoint_path,
     _corepoint_segment,
@@ -1219,3 +1220,147 @@ def test_hostile_xml_values_cannot_inject_code() -> None:
     assert "\nos.system(" not in src
     assert 'set_field(msg, "MSH-6", "A\\nimport os")' in src  # escaped, inert literal
     ast.parse(src)  # still one well-formed module — no literal or comment breakout
+
+
+# --- branch WIDTH, and the structural errors the CLI promises (BACKLOG #1682, #1684) ------------
+#
+# _MAX_NESTING bounds the export's DEPTH. Nothing bounded its branch WIDTH, and the old
+# _split_branches recursed once per branch marker over a fresh tail slice, so a wide chain in an
+# untrusted export exhausted the stack. These pin the width case end to end and the two error shapes
+# the CLI handler's own docstring says never reach the operator as a traceback.
+
+# Measured at engine 0447f96e5 on 3.14: 900 sibling markers parsed, 1,500 raised RecursionError.
+_WIDE = 1500
+
+
+def test_a_wide_branch_chain_parses_as_flat_siblings() -> None:
+    """A branch chain's WIDTH must not cost stack: the split is one pass, not a recursion per marker.
+
+    RED when: ``_split_branches`` recurses on ``steps[i + 1:]`` again — both arms then raise
+    ``RecursionError`` out of ``parse_package`` at this width (BACKLOG #1682)."""
+    for wrapper, marker, branch_kind in (("If", "Else", "else"), ("Try", "Catch", "except")):
+        body = f"<{wrapper}>" + f'<Line Data="{marker}"/>' * _WIDE + f"</{wrapper}>"
+        steps = parse_package(_package(body))[0].handlers[0].steps
+        assert len(steps) == 1
+        chain = steps[0]
+        assert isinstance(chain, Control)
+        # Flat SIBLINGS, not a chain nested one level per marker — the shape the recursion produced,
+        # and the reason the render walk stays shallow however wide the export gets.
+        assert len(chain.branches) == _WIDE
+        assert {b.kind for b in chain.branches} == {branch_kind}
+        assert all(b.body == () for b in chain.branches)
+
+
+def test_each_branch_keeps_exactly_its_own_statements() -> None:
+    """The one-pass split must slice each branch's body at the NEXT marker, not inherit the tail.
+
+    RED when: a rewrite gets the slice bounds wrong — an off-by-one moves a statement into the
+    neighbouring branch, which the wide-chain arm above (every body empty) cannot see."""
+    body = (
+        '<If Data="If (%ADT/PID-8 = &quot;M&quot;)"><List>'
+        '<Line Data="ItemClear %ADT/PID-19"/>'
+        '<Line Data="ElseIf (%ADT/PID-8 = &quot;F&quot;)"/>'
+        '<Line Data="ItemClear %ADT/PID-22"/>'
+        '<Line Data="Else"/>'
+        '<Line Data="ItemClear %ADT/PID-23"/>'
+        "</List></If>"
+    )
+    chain = parse_package(_package(body))[0].handlers[0].steps[0]
+    assert isinstance(chain, Control) and chain.kind == "if"
+    assert [b.kind for b in chain.branches] == ["elif", "else"]
+
+    def targets(steps: tuple[Step, ...]) -> list[str]:
+        return [s.args[0] for s in steps if isinstance(s, Action)]
+
+    assert targets(chain.body) == ['"PID-19"']
+    assert targets(chain.branches[0].body) == ['"PID-22"']
+    assert targets(chain.branches[1].body) == ['"PID-23"']
+
+
+def test_the_cli_imports_a_wide_branch_chain_end_to_end(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The RENDER walk is the other half: a green split alone would not prove the crash stops.
+
+    ``_generate_conditional`` iterates ``branches`` flatly and only ``_block_body`` descends, so
+    render depth tracks the export's NESTING (bounded by ``_MAX_NESTING``) and never its width — but
+    that is a measurement, so it is pinned here through the real CLI entry point, not asserted.
+
+    RED when: either the split or the render recurses per branch marker (BACKLOG #1682)."""
+    from messagefoundry.__main__ import main
+
+    export = tmp_path / "wide.xml"
+    body = "<If>" + '<Line Data="Else"/>' * _WIDE + "</If>"
+    export.write_text(_package(body), encoding="utf-8")
+    out = tmp_path / "config"
+    code = main(["import", "corepoint", str(export), "--out", str(out), "--json"])
+    assert code == 0
+    summary = json.loads(capsys.readouterr().out)
+    # The construct plus one branch each — every marker accounted for, none collapsed (count-and-log).
+    assert summary["total_mapped"] == _WIDE + 1
+    ast.parse((out / "IB_ACME_X.py").read_text(encoding="utf-8"))
+
+
+def test_cli_reports_an_unwritable_out_directory_without_a_traceback(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``import_corepoint``'s docstring promised the CLI maps a filesystem failure; it did not.
+
+    ``--out`` naming an existing FILE raises ``FileExistsError`` out of ``mkdir`` — an ``OSError``,
+    which is not a ``CorepointImportError``, so it printed the raw traceback the handler's own
+    docstring says never happens.
+
+    RED when: the ``except OSError`` arm is dropped — the call then raises out of ``main`` instead of
+    returning 1 (BACKLOG #1684)."""
+    from messagefoundry.__main__ import main
+
+    export = tmp_path / "ok.xml"
+    export.write_text(_package('<Line Data="ItemClear %ADT/PID-19"/>'), encoding="utf-8")
+    occupied = tmp_path / "already-a-file"
+    occupied.write_text("not a directory", encoding="utf-8")
+
+    code = main(["import", "corepoint", str(export), "--out", str(occupied), "--json"])
+    assert code == 1
+    assert "cannot write the imported modules into" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_cli_reports_a_too_deeply_structured_export_without_a_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``RecursionError`` is a ``RuntimeError``, so neither the ``ValueError`` nor the ``OSError`` arm
+    can reach it — it needs an arm of its own or it escapes as a traceback (BACKLOG #1682 limb 2).
+
+    THE BINDING ARM RAISES ONE RATHER THAN RECURSING, on the discipline
+    ``tests/test_sandbox_codec.py`` already uses: 3.14's ``json`` scanner checks the real C stack, so
+    ``sys.setrecursionlimit`` does not bound it (measured: limit 80 still parsed 2,000 levels) and the
+    depth where it gives out varies with the machine. The live arm below therefore only requires a
+    clean exit, which holds whichever way that machine falls.
+
+    RED when: the ``except RecursionError`` arm is dropped."""
+    import messagefoundry.corepoint_import as corepoint_import
+    from messagefoundry.__main__ import main
+
+    assert issubclass(RecursionError, RuntimeError)
+    assert not issubclass(RecursionError, ValueError)  # so `except CorepointImportError` misses it
+    assert not issubclass(RecursionError, OSError)  # and so does the arm beside it
+
+    export = tmp_path / "ok.xml"
+    export.write_text(_package('<Line Data="ItemClear %ADT/PID-19"/>'), encoding="utf-8")
+
+    def _blow(*_args: object, **_kwargs: object) -> None:
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(corepoint_import, "import_corepoint", _blow)
+    code = main(["import", "corepoint", str(export), "--out", str(tmp_path / "out"), "--json"])
+    assert code == 1
+    assert "too deeply" in json.loads(capsys.readouterr().out)["error"]
+    monkeypatch.undo()
+
+    # The live trigger that survives the #1682 fix: the superseded JSON layer decodes through
+    # json.loads, whose depth guard raises RecursionError rather than a JSONDecodeError, so
+    # parse_export cannot fold it into CorepointImportError. Measured at 0447f96e5: 20,000 levels
+    # escaped ``main`` as "Stack overflow (used 2912 kB) while decoding a JSON array".
+    deep = tmp_path / "deep.json"
+    deep.write_text("[" * 100_000 + "]" * 100_000, encoding="utf-8")
+    assert main(["import", "corepoint", str(deep), "--out", str(tmp_path / "out2"), "--json"]) == 1
+    assert json.loads(capsys.readouterr().out)["error"]

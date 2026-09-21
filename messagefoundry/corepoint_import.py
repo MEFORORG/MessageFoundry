@@ -1239,13 +1239,28 @@ def _split_branches(steps: list[Step]) -> tuple[tuple[Step, ...], tuple[Control,
     """Split a container body at its branch markers into ``(body, branches)``.
 
     The export writes ``Else``/``ElseIf``/``Catch``/``Matching`` as ordinary statements *inside* the
-    construct's own ``<List>``, so everything after such a marker belongs to that branch. Recursing
-    keeps successive branches siblings (``if`` → ``elif`` → ``else``), not nested."""
-    for i, step in enumerate(steps):
-        if isinstance(step, Control) and step.kind in _BRANCH_PARENT and not step.body:
-            body, rest = _split_branches(steps[i + 1 :])
-            return tuple(steps[:i]), (replace(step, body=body), *rest)
-    return tuple(steps), ()
+    construct's own ``<List>``, so everything after such a marker belongs to that branch. Successive
+    branches come back as flat SIBLINGS (``if`` → ``elif`` → ``else``), never nested.
+
+    ONE PASS over the markers, not a recursion on ``steps[i + 1:]``. The recursive shape spent a stack
+    frame and a fresh tail slice per marker, so an export's branch WIDTH drove both — and width is a
+    dimension ``_MAX_NESTING`` does not bound, because that bounds DEPTH. Measured on 3.14 at engine
+    ``0447f96e5``: 1,500 bare ``<Line Data="Else"/>`` siblings under one ``<If>`` (and the same for
+    ``Catch`` under ``<Try>``) raised ``RecursionError`` out of an untrusted export, while 900 parsed.
+    A single pass is linear in both stack and work (BACKLOG #1682)."""
+    markers = [
+        (i, step)
+        for i, step in enumerate(steps)
+        if isinstance(step, Control) and step.kind in _BRANCH_PARENT and not step.body
+    ]
+    if not markers:
+        return tuple(steps), ()
+    branches: list[Control] = []
+    for pos, (start, marker) in enumerate(markers):
+        # A branch runs from just after its own marker to the next marker, or to the end.
+        end = markers[pos + 1][0] if pos + 1 < len(markers) else len(steps)
+        branches.append(replace(marker, body=tuple(steps[start + 1 : end])))
+    return tuple(steps[: markers[0][0]]), tuple(branches)
 
 
 # How deep the ``<List>`` tree may nest. The walk is mutually recursive (list → statement → list), so
@@ -1935,7 +1950,11 @@ def import_corepoint(export_path: str | Path, out_dir: str | Path) -> ImportResu
     """Parse the export at ``export_path`` and write one config module per channel into ``out_dir``.
 
     Returns the :class:`ImportResult` count-and-log summary. Raises :class:`CorepointImportError` on a
-    malformed export and :class:`OSError` on a filesystem failure (the CLI maps both to a clean error)."""
+    malformed export and :class:`OSError` on a filesystem failure writing ``out_dir``. A
+    ``RecursionError`` can also come back out: the superseded JSON layer decodes through
+    :func:`json.loads`, whose own depth guard raises one that is NOT a ``JSONDecodeError``, so
+    :func:`parse_export` cannot convert it. The CLI (``messagefoundry import corepoint``) maps all
+    three to a clean, reported error rather than a traceback — see ``__main__._import``."""
     epath = Path(export_path)
     try:
         text = epath.read_text(encoding="utf-8")

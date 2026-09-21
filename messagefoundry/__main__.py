@@ -3983,14 +3983,36 @@ def _import(args: argparse.Namespace) -> int:
     """``import corepoint`` — translate a Corepoint action-list export into code-first config (ADR 0086).
 
     Writes one ``@router``/``@handler`` module per channel into ``--out`` and reports the count-and-log
-    summary (mapped vs. unmapped actions). The export is untrusted data — a malformed export is a clean
-    error + exit 1, never a traceback."""
+    summary (mapped vs. unmapped actions). The export is untrusted data, so a failure is reported as a
+    clean error + exit 1 rather than a traceback — at least a malformed export, a ``--out`` the engine
+    cannot write, and an export structured deeply enough to hit the interpreter's recursion limit."""
     from messagefoundry.corepoint_import import CorepointImportError, import_corepoint
 
     try:
         result = import_corepoint(args.export, args.out)
     except CorepointImportError as exc:
         return _emit_error(str(exc), as_json=args.json)
+    except OSError as exc:
+        # ``import_corepoint`` already folds a failure READING the export into CorepointImportError, so
+        # an OSError arriving here came from writing: ``--out`` naming an existing FILE raises
+        # FileExistsError out of ``mkdir``, and a read-only or full target raises out of ``write_text``.
+        # Its own docstring promised the CLI maps this; without the arm the operator got the traceback
+        # this handler's docstring says never happens (BACKLOG #1684).
+        return _emit_error(
+            f"cannot write the imported modules into {args.out}: {exc}", as_json=args.json
+        )
+    except RecursionError as exc:
+        # A structural refusal, not a crash — and RecursionError derives from RuntimeError, so neither
+        # arm above can reach it. Live trigger measured at engine 0447f96e5: the superseded JSON layer
+        # decodes through json.loads, whose depth guard raises RecursionError rather than a
+        # JSONDecodeError, so a 20,000-deep array in an export file escaped as a raw traceback. The XML
+        # layer's own depth is bounded by corepoint_import._MAX_NESTING and its branch WIDTH no longer
+        # recurses (BACKLOG #1682), so this arm is the last resort that keeps the promise if a future
+        # walk over untrusted export structure recurses without a bound of its own.
+        return _emit_error(
+            f"export is structured too deeply to import: {type(exc).__name__}: {exc}",
+            as_json=args.json,
+        )
 
     if args.json:
         _print_json(result.to_json(), compact=True)
