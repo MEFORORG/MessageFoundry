@@ -1845,9 +1845,15 @@ def _renders_as_branch(parent_kind: str, branch_kind: str) -> bool:
     THE single answer, asked by the render and by :func:`_count_steps` alike, because the summary is a
     count-and-log record and a branch the render only marks must not be reported as shipped. An
     ``if``/``case`` chain takes every branch as an arm — a stray marker there is a mislabelled arm,
-    not a loss — while every other construct speaks only the branch ``_BRANCH_PARENT`` gives it, and a
-    loop speaks none at all."""
-    return parent_kind in ("if", "case") or _BRANCH_PARENT.get(branch_kind) == parent_kind
+    not a loss — while a ``try`` speaks only ``except`` and a loop speaks no branch at all.
+
+    Spelled out rather than read off ``_BRANCH_PARENT``: that table says which construct may ADOPT a
+    marker, which is a parse question. This is a render question, and the two part company the moment
+    a construct adopts a kind it has no faithful form for — a ``finally`` added to the table would
+    otherwise be rendered as ``except Exception:``, which is worse than being marked."""
+    if parent_kind in ("if", "case"):
+        return True
+    return parent_kind == "try" and branch_kind == "except"
 
 
 def _stray_branches(ctrl: Control, indent: int, *, in_loop: bool) -> list[str]:
@@ -1861,10 +1867,21 @@ def _stray_branches(ctrl: Control, indent: int, *, in_loop: bool) -> list[str]:
 
     The marker's own scope is unknowable (the export's intent is not recoverable from a misplaced
     marker), so this degrades exactly as the ``unknown`` arm above does: say what was found, say the
-    scope was lost, and inline the body at THIS indentation rather than invent a construct for it."""
+    scope was lost, and inline the body at THIS indentation rather than invent a construct for it.
+
+    A ``@Disabled`` subtree never reaches here (:func:`_parse_statement` returns it before branches are
+    split, so it carries none), and the explicit guard keeps it that way: its whole contract is that
+    nothing under it is emitted as live code, which inlining a body would break."""
+    if ctrl.kind == "disabled":
+        return []
     strays = [b for b in ctrl.branches if not _renders_as_branch(ctrl.kind, b.kind)]
     if not strays:
         return []
+    # The body is being lifted OUT of the loop it was written inside, so a ``LoopExit`` in it no
+    # longer names that loop. Emitting a live ``break`` here would bind it to whatever loop encloses
+    # the construct — a silent change of which loop exits — so the loop context is dropped and the
+    # ``LoopExit`` degrades to its own marker instead.
+    in_loop = in_loop and ctrl.kind not in ("for", "while")
     pad = "    " * indent
     out: list[str] = []
     for branch in strays:

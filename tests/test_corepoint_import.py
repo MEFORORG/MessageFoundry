@@ -777,7 +777,8 @@ def test_a_stray_branch_under_try_keeps_its_body(tmp_path: Path) -> None:
     """An ``Else`` a ``Try`` cannot continue keeps its body and is flagged, never dropped (#1854)."""
     src = _handler_source(_STRAY_ELSE_UNDER_TRY)
     # The Catch still renders as a real ``except``; what the Try cannot continue degrades to a marker.
-    assert "    except Exception:  # TODO: Corepoint Catch" in src
+    # The tail is the house ``_hint`` wording, pinned whole so the two markers cannot drift apart.
+    assert "    except Exception:  # TODO: Corepoint Catch — hand-finish\n" in src
     assert "# TODO: Corepoint Else cannot continue a Corepoint Try" in src
     # The dropped half. Its scope is unknowable, so the body rides inline under the marker.
     assert 'set_field(msg, "PID-21", "")' in src
@@ -813,7 +814,12 @@ def test_a_stray_branch_under_a_loop_keeps_its_body() -> None:
 
     # ``while`` reads its branches through the same render path.
     loop = body.replace("Foreach", "Loop")
-    assert 'set_field(msg, "PID-21", "")' in _handler_source(loop)
+    loop_src = _handler_source(loop)
+    assert "    while False:  # TODO: Corepoint Loop" in loop_src
+    assert "# TODO: Corepoint Catch cannot continue a Corepoint Loop" in loop_src
+    assert '    set_field(msg, "PID-21", "")' in loop_src
+    ast.parse(loop_src)
+    assert _count_steps(_handler_steps(loop)) == (3, ["Catch"], 0)
 
 
 def test_a_stray_branch_body_is_live_code_outside_the_loop_it_was_adopted_by() -> None:
@@ -831,10 +837,27 @@ def test_a_stray_branch_body_is_live_code_outside_the_loop_it_was_adopted_by() -
         "</Foreach>"
     )
     assert "# TODO: Corepoint LoopExit outside a loop" in src
-    assert "\n    break" not in src
+    assert "break" not in src
     assert "    sends = []" in src
     assert '    sends.append(Send("OB_ACME_ADT", msg))' in src
     ast.parse(src)
+
+    # And nested, where an enclosing loop WOULD make a ``break`` parse. It must still not be emitted:
+    # it would bind the outer loop, silently changing which loop the export meant to exit.
+    nested = _handler_source(
+        '<Foreach Data="ForEach %ADT/PID-3(*)"><List>'
+        "<Foreach>"
+        '<Line Data="Catch"/>'
+        '<Line Data="LoopExit"/>'
+        '<Line Data="ItemClear %ADT/PID-5"/>'
+        "</Foreach>"
+        "</List></Foreach>"
+    )
+    assert "# TODO: Corepoint LoopExit outside a loop" in nested
+    assert "break" not in nested
+    # The statement after the LoopExit is still emitted, and is not left unreachable behind a break.
+    assert 'set_field(msg, "PID-5", "")' in nested
+    ast.parse(nested)
 
 
 def test_a_branch_marker_with_no_construct_is_counted_unmapped() -> None:
