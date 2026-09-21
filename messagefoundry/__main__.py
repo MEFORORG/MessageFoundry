@@ -5331,17 +5331,38 @@ def _ai_policy(args: argparse.Namespace) -> int:
 
     Offline mirror of ``GET /ai/policy`` for the IDE's fallback path: it reads the same [ai] config
     and runs the same clamp, but ``assist_permitted`` is always ``null`` because RBAC can't be
-    evaluated without the engine. Prints config only — never message data (PHI-safe)."""
+    evaluated without the engine.
+
+    WHAT IT GUARANTEES, stated as what it is rather than as what it is not. This docstring said
+    "Prints config only -- never message data (PHI-safe)" and nothing else. That sentence is TRUE --
+    no HL7 reaches this function -- and it is what let a disclosure through review, because the value
+    that leaked was CONFIG, which the sentence says nothing about. So: NO MESSAGE DATA AND NO
+    CONFIGURED VALUE. On the success path that is the [ai] fields named in ``payload`` below; on the
+    failure path it is a field path and a message from
+    :func:`~messagefoundry.config.settings.settings_error_detail`, whose docstring carries the
+    argument for why ``str(exc)`` is not safe here. Measured at ``19c98e023``: this subcommand, on a
+    ``[store]`` missing ``server`` with ``MEFOR_STORE_PASSWORD`` set as it is on any server-DB node,
+    printed that password to the stdout the IDE's ``runJson`` bridge reads.
+    ``tests/test_cli_ai_policy.py`` pins the absence with a planted secret and a control.
+
+    ``OSError`` is in the catch for the reason ``_cluster_vip`` states at length: a
+    ``--service-config`` naming a DIRECTORY passes ``Path.exists()`` and then raises at the open, as
+    ``IsADirectoryError`` on POSIX and ``PermissionError`` on Windows. Without it the exception
+    escaped, stdout stayed empty, and the bridge's ``parseJsonResult`` threw "produced no output"
+    instead of the reason.
+
+    THE COPY WENT THIS WAY ROUND: ``_cluster_vip`` was written to mirror this function and inherited
+    both defects with the shape. BACKLOG #1523 fixed the copy; this is the original."""
     from pydantic import ValidationError
 
     from messagefoundry.config.ai_policy import resolve_effective_policy
-    from messagefoundry.config.settings import load_settings
+    from messagefoundry.config.settings import load_settings, settings_error_detail
 
     try:
         settings = load_settings(config_path=args.service_config)
-    except (FileNotFoundError, ValueError, ValidationError) as exc:
+    except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
         # Surface via stdout so the IDE's runJson bridge sees it (mirrors the wire-error shape).
-        print(json.dumps({"error": str(exc)}))
+        print(json.dumps({"error": settings_error_detail(exc)}))
         return 2
 
     ai = settings.ai
