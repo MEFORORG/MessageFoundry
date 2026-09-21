@@ -1697,38 +1697,50 @@ def test_serve_ui_offloopback_refusal_prescribes_a_config_that_loads(
     reaches this gate at all, that was the one edit guaranteed to die at load.
 
     A test that read the message could not have caught it -- the old text named a real, correctly-spelled
-    [security] field. Only running the prescribed config finds it, so arm 2 below is a NEGATIVE CONTROL
-    that fails on the pre-repair message and passes on this one.
+    [security] field. Only running the prescribed config finds it.
+
+    WHICH ARM CATCHES A REVERT, stated exactly, because the obvious reading is wrong. Revert the message
+    and ONLY arm 1 reds, on its `[security].listen_address in refusal` assertion. Arm 2 builds its own
+    config and drives the LOADER, so it proves the old prescription dies at load without ever reading the
+    message -- it stays green through a full revert and is evidence about the loader, not a second guard
+    on the text. Arm 3 is the same shape for the new prescription. Do not count three guards here.
     """
-    offbox = (
-        _UI_OFFLOOPBACK_STANDDOWNS + "security.serve_web_console = true\n"
-        "security.block_unlisted_outbound = true\n"
-        "security.local_access_only = false\n"
-        'security.listen_address = "0.0.0.0"\n'
-    )
+
+    def cfg(local_only: str, addr: str) -> str:
+        """The two axes under test are the ARGUMENTS, so each arm reads as one edit to one config."""
+        return (
+            _UI_OFFLOOPBACK_STANDDOWNS + "security.serve_web_console = true\n"
+            "security.block_unlisted_outbound = true\n"
+            f"security.local_access_only = {local_only}\n"
+            f'security.listen_address = "{addr}"\n'
+        )
 
     # 1. The gate fires, and its remediation names listen_address rather than local_access_only.
-    assert _l5b_serve(tmp_path, monkeypatch, offbox) == 2
+    assert _l5b_serve(tmp_path, monkeypatch, cfg("false", "0.0.0.0")) == 2
+    err = capsys.readouterr().err
+    # A default rather than a bare next(): with no match that raises StopIteration, which pytest
+    # reports as a bare error and throws away the two assertion messages written to explain it.
     refusal = next(
-        line for line in capsys.readouterr().err.splitlines() if _UI_OFFLOOPBACK_REFUSAL in line
+        (line for line in err.splitlines() if _UI_OFFLOOPBACK_REFUSAL in line),
+        "",
     )
+    assert refusal, f"the /ui exposure refusal did not fire; stderr was: {err!r}"
     assert "[security].listen_address" in refusal, refusal
     assert "local_access_only" not in refusal, (
         "the refusal prescribes [security].local_access_only, which the loader REFUSES beside the "
-        f"non-loopback listen_address that is the only way to reach this gate: {refusal!r}"
+        f"non-loopback listen_address that is the only way to reach this gate by FILE: {refusal!r}"
     )
 
-    # 2. NEGATIVE CONTROL. The remediation the message used to give, applied to the config that
-    #    tripped it, dies at load -- and never reaches the /ui gate to be cleared.
-    dead = offbox.replace("local_access_only = false", "local_access_only = true")
-    assert _l5b_serve(tmp_path, monkeypatch, dead) == 2
+    # 2. The remediation the message used to give, applied to the config that tripped it, dies at
+    #    load -- and never reaches the /ui gate to be cleared. Evidence about the LOADER, not a
+    #    second reading of the message; see the docstring on which arm catches a revert.
+    assert _l5b_serve(tmp_path, monkeypatch, cfg("true", "0.0.0.0")) == 2
     dead_err = capsys.readouterr().err
     assert "is not a loopback address" in dead_err, dead_err
     assert _UI_OFFLOOPBACK_REFUSAL not in dead_err
 
     # 3. The remediation the message DOES give loads, binds loopback, and clears the gate.
-    fixed = offbox.replace('listen_address = "0.0.0.0"', 'listen_address = "127.0.0.1"')
-    rc = _l5b_serve(tmp_path, monkeypatch, fixed)
+    rc = _l5b_serve(tmp_path, monkeypatch, cfg("false", "127.0.0.1"))
     fixed_err = capsys.readouterr().err
     assert rc == 0, fixed_err
     assert _UI_OFFLOOPBACK_REFUSAL not in fixed_err

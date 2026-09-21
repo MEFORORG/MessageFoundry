@@ -8096,8 +8096,16 @@ def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
     if dest.type in _HTTP_FAMILY_DEST_TYPES:
         _check_forward_proxy_egress(f"outbound {dest.name!r}", dest.settings, egress.allowed_proxy)
     if egress.deny_by_default and not _allowlist_for(dest.type, egress):
+        # Names the switch the way the raise below does, not the internal field. NSSM captures stderr
+        # to files, so this log line is a forensic surface an operator reads -- and "under
+        # deny_by_default", sitting beside "[egress] allowlist" in one sentence, reads as a settable
+        # [egress] key. It is not: ADR 0118 relocated it, and writing it there is refused at next
+        # start with "unrecognized config key(s)" (BACKLOG #1361). The spelling guard in
+        # tests/test_relocated_key_messages.py cannot see this line -- it reads print, add_argument
+        # and *Error constructors only -- so the fix is here rather than left for a red.
         log.warning(
-            "egress denied: outbound %r %s has no [egress] allowlist under deny_by_default",
+            "egress denied: outbound %r %s has no [egress] allowlist while "
+            "[security].block_unlisted_outbound is in force",
             dest.name,
             dest.type.value,
         )

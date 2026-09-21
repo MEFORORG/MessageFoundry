@@ -3,10 +3,15 @@
 """No shipped document may present a config key the loader REFUSES as a key to write.
 
 BACKLOG #1383. `_RELOCATED_TO_SECURITY` maps the legacy `[section] key` spellings to their
-`[security]` replacements, and `_reject_relocated_keys` RAISES on any of them. It is called at
-settings.py:4588, BEFORE `_desugar_security` at :4592, so a legacy spelling never reaches the
-desugarer -- refusing is the whole behaviour, not a fallback. A document that quotes one as
-config is telling a reader to write something that fails at load.
+`[security]` replacements, and `_reject_relocated_keys` RAISES on any of them. `load_settings`
+calls it BEFORE `_desugar_security`, so a legacy spelling never reaches the desugarer --
+refusing is the whole behaviour, not a fallback. A document that quotes one as config is
+telling a reader to write something that fails at load.
+
+(That ordering used to be written here as "settings.py:4588, BEFORE ... at :4592". Both anchors
+had drifted about 900 lines by 2026-09-20 -- the calls are adjacent statements in one function,
+so naming the function locates them and the numerals only went stale. CLAUDE.md section 5:
+line numbers are navigation aids and never evidence.)
 
 THE TABLE IS THE SINGLE SOURCE OF TRUTH AND THIS TEST IMPORTS IT. A hand-copied key list would
 be a second definition that silently drifts the day someone relocates another key -- the
