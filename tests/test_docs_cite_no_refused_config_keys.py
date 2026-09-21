@@ -15,6 +15,12 @@ same rule `ledger_check.py` states for `PUBLIC_BACKLOG_FLOOR`.
 WHAT COUNTS AS A CITATION, AND WHY IT IS NARROWER THAN "THE KEY APPEARS":
   * Only an ASSIGNMENT shape (`key = value`) counts. Prose that merely NAMES a key is
     descriptive and harmless.
+  * THREE SPELLINGS of that assignment count: bare `key = value`, the space form
+    `[section] key = value`, and the dotted form `[section].key = value`. The dotted one is
+    what documents in this repo actually write, and it matched NOTHING until 2026-09-20.
+  * Python ATTRIBUTE ACCESS still does not count. `settings.api.public_origin = "..."` reaches
+    the key through an identifier and a dot, not through a `[section].` prefix, and excluding
+    it is what the dotted form was blocked by for as long as it was. See `_assignment`.
   * TOML booleans are LOWERCASE. `serve_ui=True` is a Python keyword argument to `create_app`,
     not config, and capitalised `True`/`False` is what separates the two. That one character is
     what stops this test flagging the API surface.
@@ -53,6 +59,32 @@ _DISCLAIMS = re.compile(
 _VALUE = r'("[^"]*"|true|false|\d+)(?![\w])'
 
 
+def _assignment(section: str, key: str) -> str:
+    r"""The citation pattern for one refused ``[section] key``, in every spelling docs use.
+
+    THE `(?<![\w.])` GUARD IS WHAT KEEPS PYTHON ATTRIBUTE ACCESS OUT, and it is why the dotted
+    TOML spelling was excluded by ACCIDENT for as long as it was. `settings.api.public_origin =`
+    and `self.public_origin =` reach the key through an identifier and a dot, so rejecting a
+    preceding dot rejects them -- and it rejected `[api].public_origin = "..."` with exactly the
+    same character. The guard stays; the optional `[section].` prefix in front of it is what
+    lets the TOML spelling through, because that prefix ends in `].` rather than in an
+    identifier. Measured 2026-09-20 over docs/**/*.md: 45 citations before, 52 after.
+
+    THE PREFIX IS ANCHORED TO THE KEY'S OWN SECTION, and a generic `[\w+]\.` is measurably
+    wrong. `enabled` is refused under `[auth]` and is ordinary LIVE config under at least
+    `[cluster]`, `[backup]`, `[approvals]`, `[update_check]` and `[integrity]`. Measured the
+    same day, an unanchored prefix added 14 hits and every one of them was a correct line of
+    supported config -- a gate that reports those sends a builder to break working examples,
+    which is the failure `test_the_scanner_does_not_flag_a_line_documenting_the_refusal` exists
+    to name. `test_the_dotted_form_is_anchored_to_the_keys_own_section` holds this line.
+
+    The BRACKETLESS dotted path (`api.host = "..."`) is deliberately NOT matched: it is
+    indistinguishable from attribute access, and it occurs zero times in docs/**/*.md, so
+    admitting the ambiguity would buy nothing.
+    """
+    return rf"(?<![\w.])(?:\[{re.escape(section)}\]\.)?{re.escape(key)}\s*=\s*{_VALUE}"
+
+
 def _citations(text: str) -> list[tuple[int, str, str]]:
     """Every line presenting a refused key as config, with the fragment that made it match."""
     hits: list[tuple[int, str, str]] = []
@@ -60,7 +92,7 @@ def _citations(text: str) -> list[tuple[int, str, str]]:
         if _DISCLAIMS.search(line):
             continue
         for section, key in _REFUSED_KEYS:
-            match = re.search(rf"(?<![\w.]){re.escape(key)}\s*=\s*{_VALUE}", line)
+            match = re.search(_assignment(section, key), line)
             if match:
                 hits.append((lineno, f"[{section}].{key}", match.group(0)))
     return hits
@@ -81,11 +113,53 @@ def test_the_relocated_table_is_populated() -> None:
 
 
 def test_the_scanner_catches_a_deliberately_bad_line() -> None:
-    """POSITIVE CONTROL. A scanner that finds nothing anywhere is indistinguishable from a
-    clean corpus, so make it fire on purpose before trusting a zero."""
+    """POSITIVE CONTROL for the SPACE form. A scanner that finds nothing anywhere is
+    indistinguishable from a clean corpus, so make it fire on purpose before trusting a zero."""
     section, key = next(iter(_RELOCATED_TO_SECURITY))
     planted = f"Set `[{section}] {key} = true` in your config.\n"
     assert _citations(planted), f"the scanner did not catch a planted citation of {key}"
+
+
+def test_the_scanner_catches_a_dotted_toml_section_citation() -> None:
+    """POSITIVE CONTROL for the DOTTED form, which is the spelling documents here actually use.
+
+    IT IS A SEPARATE TEST BECAUSE THE SPACE-FORM CONTROL ABOVE SHARED THE SCANNER'S BLIND SPOT.
+    It plants `[section] key`, the one spelling that always worked, so it stayed green through
+    the whole window in which `[section].key = value` matched nothing at all. A control that
+    can only exercise the working path reports a clean scan and a broken scan identically.
+    """
+    section, key = next(iter(_RELOCATED_TO_SECURITY))
+    planted = f"Set `[{section}].{key} = true` in your config.\n"
+    assert _citations(planted), f"the scanner did not catch a dotted citation of [{section}].{key}"
+
+
+def test_the_dotted_form_is_anchored_to_the_keys_own_section() -> None:
+    """NEGATIVE CONTROL, PAIRED with a positive arm so it cannot pass by matching nothing.
+
+    `enabled` is refused under `[auth]` and is ordinary live config under `[cluster]`. A prefix
+    that accepted any section would read the second as a citation of the first: measured
+    2026-09-20, that mistake added 14 hits across docs/**/*.md and every one was a correct line
+    of supported config. The FIRES arm proves the scanner is live on this key, so a regression
+    that broke dotted matching outright could not turn the MISSES arm green.
+    """
+    assert ("auth", "enabled") in _REFUSED_KEYS, _REFUSED_KEYS
+    assert _citations("Set `[auth].enabled = true` in your config.\n")
+    assert not _citations("Set `[cluster].enabled = true` in your config.\n")
+
+
+def test_the_scanner_does_not_flag_python_attribute_access() -> None:
+    """NEGATIVE CONTROL: admitting the dotted form must not admit attribute access with it.
+
+    Every probe here carries a LOWERCASE TOML value, so the capitalisation rule below cannot
+    rescue it -- the lookbehind in `_assignment` is the only thing rejecting these, and this
+    test fails the moment it is dropped.
+    """
+    for line in (
+        '`settings.api.public_origin = "https://ops.example.com"` reads the loaded model.\n',
+        '`self.public_origin = "https://ops.example.com"` assigns the field.\n',
+        "`cfg.store.allow_unencrypted_phi = true` is a dotted path, not a `[store].` prefix.\n",
+    ):
+        assert not _citations(line), line
 
 
 def test_the_scanner_does_not_flag_a_line_documenting_the_refusal() -> None:
@@ -104,8 +178,10 @@ def test_the_scanner_does_not_flag_a_python_keyword_argument() -> None:
 
 # THE MEASURED BASELINE, AND WHY THIS IS A RATCHET RATHER THAN A CLEAN GATE.
 #
-# 27 documents carry 59 of these citations -- the sum of the table below, which is the only
-# authority for that number; an earlier draft of this line said 58 and was one behind its own dict. BACKLOG #1383's agreed scope is docs/SECURITY.md ONLY
+# 28 documents carry 66 of these citations -- the row count and the sum of the table below,
+# which is the only authority for both numbers. Two drafts of this line have already drifted from
+# the dict they describe: one said 58 against a sum of 59, and the document count read 27 against
+# 26 rows. BACKLOG #1383's agreed scope is docs/SECURITY.md ONLY
 # -- the ASVS tracker recommended that scope, the Liaison endorsed it unaltered, and widening it
 # here would be a scope decision nobody made. SECURITY.md is now 0 and is absent from this table.
 #
@@ -124,8 +200,24 @@ def test_the_scanner_does_not_flag_a_python_keyword_argument() -> None:
 # whose only remedy is to delete a decision record is the wrong instrument, so they are baselined.
 # What the widening DOES catch is the case it was added for: a NEW doc telling a reader to write
 # one, which fails immediately, at zero, like any other new citation.
+#
+# ADMITTING THE DOTTED `[section].key` SPELLING (post-merge review of PR #1364) took the on-disk
+# count from 45 to 52 and added two rows, for the same reason #1279 did: the ratchet went UP
+# because the INSTRUMENT got better, not because a document got worse. All seven new citations
+# are ADR prose recording what a since-removed or since-relocated key did, so they are baselined
+# rather than rewritten -- there is no live spelling to rewrite `[ai].data_class` to, and
+# rewriting a decision record is the wrong remedy for a scan finding.
+#
+# THE TWO WITHHELD ROWS BELOW COULD NOT BE RE-MEASURED, AND NO CHECKOUT CAN DETECT THAT. Their
+# documents are not in any clone (see _WITHHELD_FROM_PUBLIC_CHECKOUTS), so 12 and 2 are now LOWER
+# BOUNDS carried over from the narrower scan rather than measurements of this one -- widening can
+# only ever raise a count. Whoever holds those two documents must re-measure them with the dotted
+# form admitted and correct these rows; until then the ratchet is inert on them, exactly as it
+# already was, and no instrument here will say so.
 _BASELINE: dict[str, int] = {
-    "docs/adr/0014-alerting-rules-engine.md": 1,
+    # Dotted-spelling rows below (PR #1364 review): was 1, the added one is `[ai].data_class`.
+    "docs/adr/0014-alerting-rules-engine.md": 2,
+    "docs/adr/0019-pluggable-keyprovider-hsm-kms-vault.md": 2,
     "docs/adr/0022-fhir-resource-codec-rest-client.md": 1,
     "docs/adr/0027-per-connection-retention.md": 1,
     "docs/adr/0049-turnkey-dr-backup-restore-verify.md": 1,
@@ -133,7 +225,11 @@ _BASELINE: dict[str, int] = {
     "docs/adr/0096-cluster-leader-preference-and-non-promotable-standby.md": 1,
     # #1279: was 2. The three added are the retired posture lever, quoted in this ADR's own
     # amendment banner and in the two config blocks that show what the section looked like.
-    "docs/adr/0118-secure-by-default-security-configuration-section.md": 5,
+    # PR #1364 review: was 5, the added one is the `# was [ai].data_class = "phi"` migration note.
+    "docs/adr/0118-secure-by-default-security-configuration-section.md": 6,
+    # PR #1364 review: three `[store].allow_unencrypted_phi=true`, all of them this ADR stating
+    # what the audited opt-out did, including its acceptance criterion.
+    "docs/adr/0109-at-rest-encryption-fail-closed-on-an-undeclared-phi-posture.md": 3,
     # #1279 rows below: each records what the removed key did, in a decision record.
     "docs/adr/0115-asvs-l3-drive-to-pass-secure-by-default-flips-and-residual-closure.md": 1,
     "docs/adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md": 2,
