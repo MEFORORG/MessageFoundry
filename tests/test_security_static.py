@@ -576,6 +576,17 @@ _UNSCANNABLE_RE_PATTERNS = {
     # no nested quantifier, no overlapping alternation.
     "messagefoundry/anon/surrogates.py": ("f'(?:{alt})\\\\d{{4}}'",),
     "tee/anon/surrogates.py": ("f'(?:{alt})\\\\d{{4}}'",),
+    # BACKLOG #1678 -- the orphan sweep's temp-file shape. Unresolvable BY CONSTRUCTION, and that is
+    # the point: the matcher is spliced from the SAME constants the atomic write MINTS the name from
+    # (_BLOB_SUFFIX, _META_SUFFIX, _TMP_TOKEN_BYTES), which is what stops a DELETING pattern from
+    # drifting wider than the writer's own spelling. Writing the escaped suffixes and the hex width
+    # out as literals would restore static scannability and lose exactly that coupling. The shape is
+    # bounded and non-catastrophic by inspection: every repetition is a FIXED count ({32}, and {8}
+    # from _TMP_TOKEN_BYTES * 2), the single alternation is two literal suffixes with no quantifier
+    # over it, and the whole pattern is anchored ^...\Z -- no nested quantifier, nothing to backtrack.
+    "messagefoundry/uploads.py": (
+        r"f'^\\.[0-9a-f]{{32}}(?:{re.escape(_BLOB_SUFFIX)}|{re.escape(_META_SUFFIX)})\\.[0-9a-f]{{{_TMP_TOKEN_BYTES * 2}}}\\.tmp\\Z'",
+    ),
     # a wrapper's parameter. NOTE: register_ui_action's own re.compile(pattern) stays here BY
     # CONSTRUCTION — its argument is the function's parameter — but every one of its 25 call sites is
     # now resolved through _PATTERN_WRAPPERS, so no console route pattern is unscanned. consistency.py
@@ -1116,6 +1127,10 @@ _CRYPTO_SITES_OUTSIDE_THE_PACKAGE = {
     # block of its .NOTICE so the notice cannot describe a file that no longer exists. A change
     # detector over a published third-party wordlist -- no key, no secret, nothing PHI-derived.
     "scripts/security/build_password_corpus.py": frozenset({"hashlib"}),
+    # BACKLOG #1578: the vendored CLA action's provenance builder. It hashes third-party code to
+    # detect change and holds no key -- see crypto_inventory_check.py's INVENTORY entry for the same
+    # file, which this duplicates and which names the digests.
+    "scripts/security/build_cla_action_provenance.py": frozenset({"hashlib"}),
     # BACKLOG #1426: `secrets.token_hex` names a symbol that CANNOT be on the ref, for the negative
     # arm of the subject-exists screen's own control. ABSENCE is the property bought here, not
     # unpredictability -- a random 128-bit tail is the cheapest way to be sure the name was never

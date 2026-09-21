@@ -188,8 +188,13 @@ Manage and remove it:
 nssm start  MessageFoundry
 nssm status MessageFoundry
 nssm stop   MessageFoundry
-.\scripts\service\uninstall-service.ps1            # elevated; leaves logs + store in place
+.\scripts\service\uninstall-service.ps1            # elevated; prints what it leaves behind
 ```
+
+Removing the service does not undo everything the install did. The uninstaller prints an inventory
+of what is still on the host — the data directory, permissions naming the run-as account, a user
+right, and more — with the command that clears each one. [SERVICE.md](SERVICE.md#uninstall) has the
+full list and the two switches that take back the reversible ones.
 
 The complete procedure — least-privilege accounts, locking down the config/log directories, DPAPI key protection, update-vs-reinstall, and troubleshooting — is in [SERVICE.md](SERVICE.md).
 

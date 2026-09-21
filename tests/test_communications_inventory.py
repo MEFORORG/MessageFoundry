@@ -33,9 +33,11 @@ a planted-omission self-test). Five mechanisms:
 4. **Negative + shape assertions.** Retired false phrases must stay gone; Table A and Table B must
    carry an **identical row set in identical order** (the "documented in one table, missing from the
    other" failure that keeps re-opening 13.1.2/13.1.3); and every default the tables state is
-   **imported from the code** — all 30 of them, from ``model_fields[...].default`` or a module
-   constant — and asserted to appear on the same line as its anchor token, so changing a constant
-   reds the doc rather than letting it rot.
+   **imported from the code**, from ``model_fields[...].default`` or a module constant, and asserted
+   to appear on the same line as its anchor token, so changing a constant reds the doc rather than
+   letting it rot. The pinned set is :func:`_import_code_defaults` itself — it used to be quoted
+   here as a count, which went stale the first time a row was added and told a later reader auditing
+   coverage that pins were missing or spurious (SDS-3.6).
 5. **Planted-omission self-test.** The checkers are pure functions exercised against synthetic
    slices, so the guard itself cannot silently stop asserting.
 
@@ -217,9 +219,11 @@ S51_ROW_MARKERS: dict[str, str] = dict.fromkeys(
 CONNECTOR_ROW_TOKENS: dict[str, tuple[str, ...]] = {
     "mllp": ("MLLP",),
     "tcp": ("Raw TCP",),
-    # X12 is a SEPARATE row from raw TCP in both tables: their behaviour at the limit differs
-    # materially (transports/x12.py emits no connection_event at all), and merging them concealed
-    # that. Keyed on the X12-only label so a silent re-merge fails.
+    # X12 is a SEPARATE row from raw TCP in both tables. It was split because their behaviour at the
+    # limit differed materially -- X12 emitted no connection_event at all, and merging them concealed
+    # that. BACKLOG #1665 closed that gap, so the two now agree on telemetry; the rows stay split
+    # because they still differ on framing (ISA/IEA vs a configurable frame) and on the reply
+    # contract. Keyed on the X12-only label so a silent re-merge fails.
     "x12": ("X12 listener",),
     "http": ("HTTP web-service listener",),
     "file": ("File endpoint",),
@@ -275,8 +279,10 @@ RETIRED_PHRASES: tuple[str, ...] = (
     # "Timeout setting + default"; `requests` has NO default timeout, so the phrasing implied a
     # fallback that does not exist.
     "so `hvac`/`requests` defaults apply",
-    # X12 and DICOM emit NO connection event at all, so a blanket per-listener at_capacity claim is
-    # false; the merged Raw-TCP/X12 row concealed it.
+    # The merged Raw-TCP/X12 listener row concealed a real difference and must not come back. The
+    # difference it hid was telemetry (X12 emitted nothing), which BACKLOG #1665 closed; the rows
+    # stay split because they still differ on framing and on the reply contract, and because
+    # re-merging them is how the next asymmetry would be concealed the same way.
     "Raw TCP / X12 listener",
     # #1051: the retry DEFAULT is finite (100) since the cap landed. Both forms the section used to
     # disclose it in — "is `None` = retry forever" and "is unset = retry forever" — end in this.
@@ -309,8 +315,12 @@ REQUIRED_TRUTHS: tuple[str, ...] = (
     # 13.1.3: the two off-loop pools with a knob, and the one class of off-loop work with NO bound.
     "pooled_fusing_workers",
     "no timeout at all",
-    # 13.1.2: the telemetry asymmetry that the merged listener row concealed.
-    "No ADR 0021 connection_event is emitted",
+    # 13.1.2: the telemetry asymmetry that the merged listener row concealed. The pin used to be
+    # "No ADR 0021 connection_event is emitted", naming X12 and DICOM together. BACKLOG #1665 wired
+    # X12 to the same seven kinds as its raw-TCP twin, which made that sentence false — so the pin
+    # moved to the half that survives rather than being dropped, because the asymmetry is still real
+    # and an operator still needs to know which listener is silent.
+    "contains zero `_emit_event` call sites",
     # 13.1.3: the Handler-side bound that actually releases the transform worker for the two lookups.
     "_LOOKUP_RESULT_TIMEOUT_SECONDS",
     # 13.1.3: the hvac-inherited Vault timeout, named with its value and its provenance.
@@ -361,7 +371,16 @@ def _import_code_defaults() -> list[tuple[str, float | int, str]]:
 
     return [
         ("max_connections", mllp.DEFAULT_MAX_CONNECTIONS, "transports.mllp"),
+        # BACKLOG #1725. Both are MLLP-listener-only, so the tables must not be read as stating a
+        # bound the raw-TCP/X12/HTTP/DICOM intakes also carry; the prose rows say so in words, and
+        # these two pins only hold the stated NUMBER to the constant.
+        (
+            "max_connections_per_host",
+            mllp.DEFAULT_MAX_CONNECTIONS_PER_HOST,
+            "transports.mllp",
+        ),
         ("receive_timeout", mllp.DEFAULT_RECEIVE_TIMEOUT, "transports.mllp"),
+        ("max_frame_seconds", mllp.DEFAULT_MAX_FRAME_SECONDS, "transports.mllp"),
         ("acquire_timeout", database._DEFAULT_DB_ACQUIRE_TIMEOUT, "transports.database"),
         (
             "pooled_max_processing_lanes",

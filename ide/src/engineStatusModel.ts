@@ -28,6 +28,8 @@
 //      30-minute idle timeout unreachable forever (CWE-613). The cheap poll may only ever prove the
 //      NEGATIVE. "Usable" is earned by a user-initiated probe, and it decays.
 
+import { trustRemedy } from "./engineTrustModel";
+
 /** A configured named environment (a subset of cli.ts's EnvironmentTarget — kept local so this module
  *  stays vscode-free and does not import cli.ts, which pulls in vscode). */
 export interface StatusEnvironment {
@@ -250,6 +252,13 @@ export function resolveEngineStatusTarget(
  *  listening", "the engine is hung" and "you spoke http to an https port" have different fixes. */
 export function describeNetworkCode(code: string | undefined, url: string): string {
   const where = hostLabel(url);
+  // A certificate we cannot verify means something ANSWERED, so it must never render as "nothing is
+  // listening" (BACKLOG #1695). Above the switch, and reusing trustRemedy, so the wording and the
+  // closed code list stay together in engineTrustModel instead of drifting into a second copy.
+  const trust = trustRemedy(code, url);
+  if (trust !== undefined) {
+    return trust;
+  }
   switch (code) {
     case "ECONNREFUSED":
       return `nothing is listening on ${where} — the engine isn't running`;
@@ -264,6 +273,10 @@ export function describeNetworkCode(code: string | undefined, url: string): stri
     case "EPROTO":
     case "ERR_SSL_WRONG_VERSION_NUMBER":
       return `TLS handshake failed against ${where} — is the engine http:// rather than https://?`;
+    case "CERT_HAS_EXPIRED":
+      return `${where} presented an expired certificate — replace it (the engine's own minted pair lasts 365 days)`;
+    case "ERR_TLS_CERT_ALTNAME_INVALID":
+      return `${where}'s certificate does not cover that host name — 127.0.0.1 and localhost are different SANs`;
     default:
       return code
         ? `the connection to ${where} failed (${code})`

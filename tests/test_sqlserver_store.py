@@ -403,6 +403,21 @@ async def test_stats_and_metrics(store) -> None:
     assert metrics.destinations[("IB", "OB1")].queue_depth == 1
     db = await store.db_status()
     assert db.messages == 1
+    # BACKLOG #1563: the remote server's disk is not ours to stat, so this is the "unmeasurable"
+    # None and never 0 — 0 is the console's critical-disk alarm, which pinned the engine-health
+    # heart red on every healthy SQL Server deployment. The whole server-side fix is this one
+    # literal, and nothing else asserted it at all. This module is gated like its Postgres twin, so
+    # the pin holds on the SQL Server leg only — that is the sole place the real backend runs, and
+    # a default run still cannot tell the literal from a 0. Naming the limit rather than implying
+    # this guards every run.
+    assert db.disk_free_bytes is None
+    # Non-empty is the engine-side fact a reader of the null above depends on: this backend names
+    # itself through `journal_mode` (the recovery model), and the "" fallback here means the
+    # sys.databases read came back empty, so the row says nothing about which store answered.
+    # Deliberately asserts only that, not WHICH model — the set of recovery models a console might
+    # recognise is that console's policy, and restating it in the engine suite would let the two
+    # drift apart while both stayed green.
+    assert db.journal_mode
     ok, _ = await store.integrity_check()
     assert ok is True
 
@@ -564,6 +579,31 @@ async def test_directory_identity_store_contract(store) -> None:
     from tests._directory_identity_store_contract import _assert_directory_identity_contract
 
     await _assert_directory_identity_contract(store)
+
+
+async def test_federated_unbind_store_contract(store) -> None:
+    """BACKLOG #1474 ``clear_user_federated_subject`` on the real SQL Server backend.
+
+    The shared body is the one the SQLite and Postgres suites run. What this leg executes that no
+    other does: the two UPDATEs on one cursor under ``autocommit=False`` with a single commit, and
+    the FILTERED ``ux_users_federated_subject`` admitting several NULL pairs. This backend treats
+    NULLs as equal in a unique index, so the filter is what lets two unbound rows coexist here.
+    """
+    from tests._federated_unbind_store_contract import _assert_federated_unbind_contract
+
+    await _assert_federated_unbind_contract(store)
+
+
+async def test_session_binding_guard_store_contract(store) -> None:
+    """BACKLOG #1474 ``create_session(require_federated_subject=...)`` on real SQL Server.
+
+    The shared body is the one the SQLite and Postgres suites run. What this leg executes that no
+    other does: the ``WITH (UPDLOCK, ROWLOCK)`` read on one cursor under ``autocommit=False``,
+    whose refusal path rolls back to release the lock rather than committing an empty transaction.
+    """
+    from tests._federated_unbind_store_contract import _assert_session_binding_guard_contract
+
+    await _assert_session_binding_guard_contract(store)
 
 
 async def test_directory_binding_column_is_unconstrained_and_username_is_not(store) -> None:
@@ -3825,6 +3865,8 @@ async def test_summary_access_census_survives_and_coalesces_ss(store) -> None:
 
 
 async def test_alert_instance_lifecycle_ss(store) -> None:
+    from messagefoundry.store.store import AlertSummary
+
     # first fire opens one `open` instance (count 1, first_seen==last_seen).
     await store.upsert_alert_instance(
         event_type="connection_error", connection="OB_X", severity="critical", now=100.0
@@ -3854,6 +3896,18 @@ async def test_alert_instance_lifecycle_ss(store) -> None:
     assert got.acked_by == "scott" and got.acked_at == 200.0
     assert await store.ack_alert_instance(999999, actor="scott") is False
     assert await store.count_open_alerts_by_connection() == {"OB_Y": 1}
+    # BACKLOG #1564: run the scoped aggregate on a REAL server. The generated severity CASE, the
+    # `AS n`/`AS worst` aliases, the dialect scope bind and the row unpack never execute under the
+    # SQLite suite, so a dialect error in this leg is discoverable nowhere else.
+    assert await store.summarize_active_alert_instances() == AlertSummary(
+        total=2, worst_severity="critical"
+    )
+    assert await store.summarize_active_alert_instances(allowed_channels=["OB_Y"]) == AlertSummary(
+        total=1, worst_severity="critical"
+    )
+    assert await store.summarize_active_alert_instances(allowed_channels=[]) == AlertSummary(
+        total=0, worst_severity=None
+    )
     # an acknowledged re-fire folds in (count++) but does NOT pop back to open.
     await store.upsert_alert_instance(
         event_type="connection_error", connection="OB_X", severity="critical", now=210.0
@@ -4491,3 +4545,83 @@ async def test_session_rotation_contract(store) -> None:
     from tests._session_rotation_contract import assert_session_rotation_contract
 
     await assert_session_rotation_contract(store)
+
+
+# --- the per-message finalize lock, under real concurrency -----------------------------------------
+
+
+async def test_concurrent_mark_done_finalizes_processed_every_round(store) -> None:
+    """Both destinations of ONE message complete at the same moment, every round -> PROCESSED.
+
+    Pins the per-message ``sp_getapplock`` finalize lock as the SINGLE authority on disposition.
+    ``tests/_finalize_race_contract`` carries the property, the mechanism and the measurement behind
+    the round count; the shared module is what keeps this leg and the Postgres one asking the same
+    question rather than two hand-synced copies drifting apart.
+
+    THIS BACKEND'S NUMBER IS UNMEASURED. The 30 rounds were measured against Postgres, whose lock is
+    a different mechanism under a different snapshot rule. What this leg establishes on a real SQL
+    Server, nobody has yet read -- the gated ``sqlserver-store`` CI job carries its first result.
+    """
+    from tests._finalize_race_contract import assert_concurrent_finalize_reaches_processed
+
+    await assert_concurrent_finalize_reaches_processed(store)
+
+
+async def test_record_connection_events_writes_a_burst_all_or_nothing(store) -> None:
+    """BACKLOG #1731: the drainer's burst writer. Every row lands with the singular's scrub, seal and
+    AAD binding, and a burst that fails part-way writes none of its rows."""
+    from messagefoundry.store.store import ConnectionEventWrite
+
+    def ev(kind: str, now: float, **over: object) -> ConnectionEventWrite:
+        e = ConnectionEventWrite(
+            connection="IB_BURST",
+            transport="mllp",
+            direction="inbound",
+            kind=kind,
+            peer_host="10.0.0.1",
+            message_id=None,
+            reason=None,
+            now=now,
+        )
+        e.update(over)  # type: ignore[typeddict-item]
+        return e
+
+    await store.record_connection_events(
+        [
+            ev("established", 100.0),
+            ev("closed", 101.0, reason="clean eof"),
+            ev(
+                "connection_lost",
+                102.0,
+                connection="OB_BURST",
+                direction="outbound",
+                peer_host=None,
+                message_id="m-1",
+                reason="connect refused",
+            ),
+        ]
+    )
+    events = await store.list_connection_events()
+    assert [(e.kind, e.reason) for e in events] == [
+        ("connection_lost", "connect refused"),
+        ("closed", "clean eof"),
+        ("established", None),
+    ]
+    assert events[0].message_id == "m-1" and events[0].direction == "outbound"
+    assert events[2].peer_host == "10.0.0.1"
+
+    # THE FAILING ROW IS REJECTED BY THE SERVER, not by the driver: a NULL into ``connection``,
+    # which is NVARCHAR(256) NOT NULL. pyodbc binds NULL happily, so row 2 fails at the server with
+    # row 1 already executed on the same cursor -- which is exactly the state the rollback has to
+    # undo. A value the driver refuses would prove less: the failure would land at bind time and say
+    # nothing about what the server had accepted.
+    with pytest.raises(Exception):  # noqa: B017 -- pyodbc's IntegrityError, via its base
+        await store.record_connection_events(
+            [ev("established", 200.0), ev("closed", 201.0, connection=None)]
+        )
+    # Asserted on the CONTENT, not the count: what a missing rollback would leave behind is the
+    # ts=200.0 row, and naming it is what tells "rolled back" from "never arrived".
+    assert sorted(e.ts for e in await store.list_connection_events()) == [100.0, 101.0, 102.0]
+
+    await store.record_connection_events([])  # an empty burst is a no-op
+    assert len(await store.list_connection_events()) == 3

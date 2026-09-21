@@ -59,7 +59,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.parsing.message import emit_raw_separators
 from messagefoundry.parsing.peek import HL7PeekError, Peek, normalize
-from messagefoundry.redaction import safe_exc
+from messagefoundry.redaction import clamp_untrusted, safe_exc
 from messagefoundry.timezone import hl7_now
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -80,7 +80,9 @@ __all__ = [
     "EB",
     "CR",
     "DEFAULT_MAX_FRAME_BYTES",
+    "DEFAULT_MAX_FRAME_SECONDS",
     "DEFAULT_MAX_CONNECTIONS",
+    "DEFAULT_MAX_CONNECTIONS_PER_HOST",
     "DEFAULT_RECEIVE_TIMEOUT",
     "frame",
     "MLLPDecoder",
@@ -108,6 +110,71 @@ DEFAULT_MAX_FRAME_BYTES = 16 * 1024 * 1024  # 16 MiB — fits embedded base64 do
 DEFAULT_MAX_CONNECTIONS = 256  # bound concurrent inbound clients (connection-flood guard)
 DEFAULT_RECEIVE_TIMEOUT = 60.0  # seconds — close inbound sockets idle this long (slowloris guard)
 
+#: Seconds one frame may take from its START byte to its END byte (BACKLOG #1725).
+#:
+#: :data:`DEFAULT_RECEIVE_TIMEOUT` bounds SILENCE between reads and resets on every byte received, so
+#: a peer trickling one byte at a time INSIDE A FRAME is never idle: it would hold its slot — and up
+#: to ``max_frame_bytes`` of decoder buffer — for as long as it liked, without ever completing a
+#: message. This bounds the frame itself, so the two answer different questions and **both apply**.
+#: They are deliberately kept apart: dropping the per-read timeout would lose the idle-socket bound,
+#: which is a separate property and still wanted (a peer that opens a socket and says nothing at all
+#: never opens a frame, so no frame deadline would ever fire on it).
+#:
+#: **The clock runs from a START byte, and a peer that never sends one is outside it.** Inter-frame
+#: noise is discarded by the decoder without opening a frame, so a peer trickling bytes that are not
+#: an MLLP frame is neither idle nor in-frame and holds its slot. It buffers nothing, so the memory
+#: half of the threat is absent, and ``max_connections_per_host`` bounds how many slots one address
+#: can hold that way — but it is not bounded by THIS key, and reading it as "no peer can hold a slot
+#: without sending a message" would be wrong. Closing that needs a bound on a different unit
+#: (connected time without a completed message), which is a separate decision from this one.
+#:
+#: 60 s matches the idle bound, so the shipped posture reads as "a frame gets about as long to arrive
+#: as a quiet socket gets to stay open". ``None``/``0`` disables it, like every cap here.
+#:
+#: **It does not derive from** :data:`DEFAULT_MAX_FRAME_BYTES`, **and the pair is only satisfiable
+#: above a certain link speed.** Delivering the 16 MiB the byte cap permits inside 60 s needs roughly
+#: 2.2 Mbps sustained on that one socket. A connection carrying large embedded documents — a base64
+#: PDF spliced into OBX-5.5, ADR 0105 — over a slower WAN link will hit the deadline mid-document on
+#: every message. **Raise this key whenever you raise** ``max_frame_bytes``: the two are one bound on
+#: a frame expressed in two units, and setting only the byte half is how a feed that was working
+#: starts being dropped. Nothing warns about the combination at start today; wiring that check is
+#: left unbuilt rather than guessed at, since the honest threshold is a link speed the engine cannot
+#: see.
+DEFAULT_MAX_FRAME_SECONDS = 60.0
+
+#: Concurrent inbound clients allowed from ONE peer address (BACKLOG #1725).
+#:
+#: :data:`DEFAULT_MAX_CONNECTIONS` counts sockets, not hosts, so one peer can take every slot a
+#: listener has; ``source_ip_allowlist`` ships off, so on a default listener there is no other
+#: peer-scoped term at all. 32 is an eighth of the global cap, and that ratio is the point of the
+#: number — a per-host cap set near the global one bounds nothing, while at an eighth it takes at
+#: least eight distinct source addresses to fill a default listener. It is still far above what a
+#: real partner needs: MLLP is request/response over one socket per sending channel, so a partner
+#: holding thirty-two simultaneous connections into one listener port is already unusual.
+#:
+#: **What it does NOT bound, stated because the cap is easy to over-read.** It keys on the source
+#: address, so an attacker holding eight addresses — an IPv6 /64 hands out far more — gets a fresh
+#: budget per address and is bounded by :data:`DEFAULT_MAX_CONNECTIONS` alone. This raises the floor
+#: on the single-address case the row measured; it does not make a listener safe against a
+#: distributed peer, and nothing here should be read as claiming it does.
+#:
+#: This is a CONNECTION cap, not a rate cap, which is why it does not simply contradict
+#: :class:`_MessagePacer`'s "never scoped per PEER". That rule is about a per-IP MESSAGE budget,
+#: where NAT makes two feeds behind one egress address throttle each other. A slot cap refuses
+#: pre-ingress at accept, exactly like the ``max_connections`` refusal, so nothing was received to
+#: drop and the peer reconnects as soon as one of its own connections ends.
+#:
+#: **The NAT objection does still land on one topology, and it ships ON, so say so plainly.** Behind
+#: a source-NAT load balancer or proxy that does not preserve the client address, EVERY partner
+#: arrives as one peer and this becomes the effective listener capacity — 32 rather than 256, while
+#: the operator is reading ``max_connections`` in their config. That is a real way to lose a go-live.
+#: Two things make it survivable rather than a trap: the refusal names itself (a
+#: ``max_connections_per_host`` reason on the ``at_capacity`` event, and one warning per episode), so
+#: the diagnosis is the log line rather than an investigation; and ``None``/``0`` turns it off, which
+#: is the documented setting for exactly that topology. A proxied listener has a single upstream
+#: address it trusts, so it is the deployment with the least to gain from a per-host term anyway.
+DEFAULT_MAX_CONNECTIONS_PER_HOST = 32
+
 #: Message-rate pacing ships OFF, and that is a DELIBERATE DEVIATION from this module's
 #: "key absent -> secure default" convention, ruled 2026-08-11 (ASVS 2.4.1 / 15.2.2). A rate limit
 #: on a clinical interface is only safe at a number derived from a real feed profile, and this
@@ -116,6 +183,12 @@ DEFAULT_RECEIVE_TIMEOUT = 60.0  # seconds — close inbound sockets idle this lo
 #: mechanism exists and an operator opts in with their own number. The cell stays `partial` on the
 #: shipped default and the record says why; that is the honest outcome, not a disappointing one.
 DEFAULT_MAX_MESSAGES_PER_SECOND: float | None = None
+
+#: Seconds between operator-facing pacing reports on ONE pacer (BACKLOG #290). Pacing is silent by
+#: construction — it never drops, NAKs or errors — so without a report an operator cannot tell a
+#: paced interface from a slow one. A pacer in deficit is consulted on every read, so the report is
+#: throttled to this window; see :meth:`_MessagePacer._note_paced`.
+_PACING_REPORT_SECONDS = 60.0
 # On stop()/reload, established clients are closed and their handlers given this long to finish an
 # in-flight commit before the connection tasks are cancelled — bounds shutdown so a peer holding a
 # connection open can't hang it (review H-2).
@@ -135,6 +208,30 @@ _CLIENT_SHUTDOWN_GRACE = 5.0
 # may take to leave, versus how long teardown waits for in-flight handlers — and a test that bounds
 # one must not silently shrink the other.
 _ACK_DRAIN_GRACE = _CLIENT_SHUTDOWN_GRACE
+
+#: Characters of a negative acknowledgment's MSA-3 that reach the :class:`NegativeAckError` message
+#: (BACKLOG #1576). MSA-3 is *Text Message* — a human-readable reason for the rejection — and the
+#: consumers of it are a log line, a dead-letter row's ``last_error`` and an alert, each of which
+#: redacts and then truncates to :data:`~messagefoundry.redaction._DEFAULT_LIMIT` (200) anyway. Five
+#: times that is room for a peer to name the offending segment and then some.
+#:
+#: **The bound belongs here rather than only downstream because the length is the PEER's to choose.**
+#: ``receive_max_bytes`` caps the ACK frame, not this field inside it, so MSA-3 arrives sized to the
+#: frame cap — 16 MiB by default — and redaction is a linear event-loop scan that would be charged all
+#: of it. Bounding at the read keeps the peer's string out of the exception text, the store write and
+#: the log, not merely out of the scan.
+_MAX_NAK_DETAIL_CHARS = 1024
+
+
+def _bounded_ack_field(value: str | None) -> str:
+    """A peer-chosen ACK field, bounded for the exception message it is about to be written into
+    (BACKLOG #1576).
+
+    One helper for both fields that reach a raise, so the two cannot drift: adding the bound to MSA-3
+    and leaving MSA-2 beside it is the shape this fix arrived in, and the shape a review caught.
+    ``clamp_untrusted`` and not a slice -- cutting at an arbitrary offset strands a fragment under the
+    redactor's thresholds and walks the identifier into the log downstream."""
+    return clamp_untrusted(value or "", window=_MAX_NAK_DETAIL_CHARS)
 
 
 # --- posture-keyed cleartext-hop refusal (#200, ADR 0092) --------------------------------------
@@ -1330,8 +1427,13 @@ class MLLPDestination(DestinationConnector):
                 # unreadable OWN MSH-10 skips correlation (nothing to correlate), per the design decision.
                 ack_control_id = ack.field("MSA-2")
                 if ack_control_id != sent_control_id:
+                    # BACKLOG #1576, same defect as MSA-3 below: MSA-2 is peer-chosen and frame-cap
+                    # sized too, and it is interpolated into this raise. Clamped HERE and not at the
+                    # read above, because the comparison must see the field the peer actually sent --
+                    # bounding first would silently correlate a long control id against its own prefix.
                     raise DeliveryError(
-                        f"ACK control-id mismatch: MSA-2={ack_control_id!r} "
+                        f"ACK control-id mismatch: "
+                        f"MSA-2={_bounded_ack_field(ack_control_id)!r} "
                         f"!= sent MSH-10={sent_control_id!r}"
                     )
             if self.capture_response:
@@ -1341,7 +1443,19 @@ class MLLPDestination(DestinationConnector):
                     detail=f"MSA-1={msa1}",
                 )
             return None
-        detail = ack.field("MSA-3") or ""
+        # BACKLOG #1576: the peer sizes MSA-3, and it reached the frame cap unbounded. Every consumer
+        # downstream redacts this text, and redaction is a linear scan on the event loop, so an
+        # unbounded field here is an unbounded stall there — measured, 0.29 s to 0.78 s per negative
+        # acknowledgment at a 16 MiB cap depending on shape. Bound it at READ time, where it is still a
+        # field and not yet an exception message half the engine will re-render: the 16 MiB string is
+        # never copied into the raise, the dead-letter row, or the alert.
+        #
+        # _MAX_NAK_DETAIL_CHARS, not the redaction module's own window, because this is not a
+        # traceback: MSA-3 is a human-readable reason and a peer that answers with a megabyte is
+        # echoing our payload back at us, not explaining anything. Clamped rather than sliced --
+        # slicing at an arbitrary offset strands a fragment under the redactor's thresholds and walks
+        # the identifier straight into the log, which is the whole defect #1576 was filed on.
+        detail = _bounded_ack_field(ack.field("MSA-3"))
         # A negative ACK is a *partner rejection*, not a transport failure: the message reached the
         # peer, which said no. It is NOT captured — it routes through the existing NegativeAckError
         # failure policy (dead-letter on a permanent reject / retry on a transient error), unchanged by
@@ -1400,9 +1514,19 @@ class _MessagePacer:
     and drives it with :meth:`deficit` / :meth:`charge`. There is no flag and no branch in here.
     """
 
-    __slots__ = ("_capacity", "_last", "_pending_wait", "_rate", "_tokens")
+    __slots__ = (
+        "_capacity",
+        "_last",
+        "_name",
+        "_paced_count",
+        "_paced_seconds",
+        "_pending_wait",
+        "_rate",
+        "_report_at",
+        "_tokens",
+    )
 
-    def __init__(self, rate: float, burst: float, *, now: float) -> None:
+    def __init__(self, rate: float, burst: float, *, now: float, name: str = "") -> None:
         self._rate = rate
         self._capacity = max(burst, 1.0)
         self._tokens = self._capacity
@@ -1410,6 +1534,16 @@ class _MessagePacer:
         #: Debt owed before the next read, in seconds. PRIVATE, and settled only through pace() —
         #: a consult-then-clear a caller performs by hand is an invariant restated once per loop.
         self._pending_wait = 0.0
+        #: The declaring inbound's name, carried only so a pacing report can NAME the connection an
+        #: operator has to go and look at (the :attr:`Source.name` precedent). "" when unwired.
+        self._name = name
+        #: Applied-delay tally since the last report, reset by each report.
+        self._paced_count = 0
+        self._paced_seconds = 0.0
+        #: Next monotonic stamp a report may be emitted at. Starts at ``now`` so the FIRST time
+        #: pacing engages is reported immediately — that transition is the event an operator most
+        #: needs, and holding it back for a window would hide it behind the throttle.
+        self._report_at = now
 
     def charge(self, messages: int, *, now: float) -> float:
         """Charge ``messages`` and return the seconds to wait before reading again (0.0 if none).
@@ -1433,6 +1567,7 @@ class _MessagePacer:
         """
         if (wait := self._pending_wait) > 0.0:
             self._pending_wait = 0.0
+            self._note_paced(wait)
             await asyncio.sleep(wait)
 
     def settle(self, messages: int) -> None:
@@ -1451,16 +1586,61 @@ class _MessagePacer:
         connections has to recompute it at read time instead. Delegates to :meth:`charge` rather
         than re-deriving the arithmetic, so the two can never disagree.
         """
-        return self.charge(0, now=now)
+        owed = self.charge(0, now=now)
+        if owed > 0.0:
+            self._note_paced(owed, now=now)
+        return owed
+
+    def _note_paced(self, seconds: float, *, now: float | None = None) -> None:
+        """Tally one APPLIED read delay and report it to the operator, throttled.
+
+        Called from the two places a wait is actually acted on — :meth:`pace` for the stream pair and
+        :meth:`deficit` for the listener pair — never from :meth:`charge`, which both of those route
+        through and which ``deficit`` consults on every read. Counting in ``charge`` would tally the
+        same outstanding debt once per consult and report a number that is not a count of anything.
+
+        **Why pacing needs a voice at all.** The control is otherwise entirely invisible: it never
+        drops, NAKs, refuses or errors, so a paced interface looks to the operator exactly like a
+        slow one, and nothing is written anywhere. The 2026-08-11 ruling ships
+        :data:`DEFAULT_MAX_MESSAGES_PER_SECOND` OFF *because* a safe number can only come from a
+        site's own feed profile — and a site cannot tune a number it has no way to watch engage.
+        Reporting is the half that makes the opt-in posture usable; it changes no default and paces
+        nothing differently.
+
+        Throttled to one line per :data:`_PACING_REPORT_SECONDS` because a pacer that is in deficit
+        is consulted on every read, and an unthrottled line would restate one fact thousands of
+        times. WARNING rather than INFO: a clinical interface being held back is an operator-facing
+        condition, not routine chatter.
+
+        **Metadata only.** The connection name, a count, a duration and the configured rate — never a
+        frame, a peer address, or a byte of the body being paced (PHI.md; CLAUDE.md section 9).
+        """
+        self._paced_count += 1
+        self._paced_seconds += seconds
+        stamp = time.monotonic() if now is None else now
+        if stamp < self._report_at:
+            return
+        logger.warning(
+            "inbound message pacing engaged on %s: %d read delay(s) totalling %.3fs "
+            "(max_messages_per_second=%g). The sender is being held back, not refused — no message "
+            "is dropped. Raise the rate if this feed is legitimate.",
+            self._name or "<unnamed inbound>",
+            self._paced_count,
+            self._paced_seconds,
+            self._rate,
+        )
+        self._paced_count = 0
+        self._paced_seconds = 0.0
+        self._report_at = stamp + _PACING_REPORT_SECONDS
 
     @classmethod
-    def for_rate(cls, rate: float | None, burst: float) -> _MessagePacer | None:
+    def for_rate(cls, rate: float | None, burst: float, *, name: str = "") -> _MessagePacer | None:
         """Build a pacer, or ``None`` when no rate is configured — the shipped default.
 
         The single place the off-default is honoured, so the four intakes that pace cannot drift
         apart on what "unset" means. See :data:`DEFAULT_MAX_MESSAGES_PER_SECOND` for why off.
         """
-        return cls(rate, burst, now=time.monotonic()) if rate else None
+        return cls(rate, burst, now=time.monotonic(), name=name) if rate else None
 
 
 def _pacing_settings(settings: Mapping[str, Any]) -> tuple[float | None, float]:
@@ -1477,9 +1657,55 @@ def _pacing_settings(settings: Mapping[str, Any]) -> tuple[float | None, float]:
     return rate, float(settings.get("message_burst") or rate or 0.0)
 
 
+def _cap_setting[NumT: (int, float)](value: Any, convert: Callable[[Any], NumT]) -> NumT | None:
+    """Read one inbound cap: a number, or ``None`` for the documented ``None``/``0`` disable.
+
+    **Decide "off" on the NUMBER, not on Python truthiness.** The older idiom ``int(v) if v else
+    None`` tests the RAW settings value, and a raw ``"0"`` is a non-empty string — truthy — so it
+    survives that test and becomes a live cap of zero. That spelling is reachable rather than
+    contrived: a
+    ``connections.toml`` ``env()`` reference without a ``cast`` hands the connector the environment's
+    TEXT (``docs/CONNECTIONS.md``), so an operator disabling a cap through the environment writes
+    ``"0"`` and gets the opposite of what they asked for — a listener that refuses every connection,
+    rejects every frame, or closes every socket the instant it opens, depending on which cap it was.
+
+    ``None`` and ``""`` short-circuit before either conversion, and both are needed: a key may be
+    absent, and ``resolve_env_settings`` tests membership rather than truthiness, so an env var that
+    is SET but empty arrives as ``""`` — which ``int()``/``float()`` would raise on.
+
+    **The zero test reads a ``float`` view, and the cap is built with the caller's own ``convert``.**
+    Testing the CONVERTED value instead would read anything that truncates to zero as "off": with
+    ``convert=int``, a ``max_connections_per_host`` of ``-0.5`` would silently disable a security cap
+    that the guard below is supposed to refuse at build. A float view answers "did the operator write
+    zero", which is the actual question, and leaves every sub-1 value to the caller's own guard.
+
+    A negative value is therefore returned as-is, for the callers that refuse one at build with a
+    message naming their own key. It is a different mistake with a different answer, and folding it
+    into "off" here would swallow the typo this connector exists to reject.
+    """
+    if value is None or value == "":
+        return None
+    if float(value) == 0:  # at least 0, 0.0, -0.0, False, "0", "0.0" and " 0 " reach this as off
+        return None
+    return convert(value)
+
+
 class MLLPSource(SourceConnector):
     """Listen for inbound MLLP connections, hand each message to the pipeline handler,
-    and frame whatever the handler returns back to the sender as the ACK."""
+    and frame whatever the handler returns back to the sender as the ACK.
+
+    **The inbound resource caps are separate on purpose: each bounds a unit the others do not, so a
+    peer can sit inside all of them but one.** ``max_connections`` counts sockets on this listener
+    and ``max_connections_per_host`` counts sockets from one peer address; ``receive_timeout`` bounds
+    SILENCE between reads and ``max_frame_seconds`` bounds one frame's life; ``max_frame_bytes``
+    bounds that frame's size. Each takes ``None``/``0`` to disable it.
+
+    The two caps BACKLOG #1725 added are documented once, on :data:`DEFAULT_MAX_CONNECTIONS_PER_HOST`
+    and :data:`DEFAULT_MAX_FRAME_SECONDS` above — what each bounds, why the default is the number it
+    is, and what it does NOT cover. Read those rather than a summary here; this docstring deliberately
+    does not restate them, and does not count the caps either, because a closed count is a claim that
+    goes stale the next time a cap is added.
+    """
 
     def __init__(self, config: Source) -> None:
         s = config.settings
@@ -1489,16 +1715,54 @@ class MLLPSource(SourceConnector):
         self.host: str = s.get("host") or "127.0.0.1"
         self.port: int = int(s["port"])
         self.encoding: str = s.get("encoding", "utf-8")
-        # Caps below: key absent → secure default; present-but-falsy (None/0) → disabled.
-        mc = s.get("max_connections", DEFAULT_MAX_CONNECTIONS)
-        self.max_connections: int | None = int(mc) if mc else None
-        rt = s.get("receive_timeout", DEFAULT_RECEIVE_TIMEOUT)
-        self.receive_timeout: float | None = float(rt) if rt else None
-        mf = s.get("max_frame_bytes", DEFAULT_MAX_FRAME_BYTES)
-        self.max_frame_bytes: int | None = int(mf) if mf else None
+        # Every cap on THIS listener: key absent → secure default; None/0 → disabled, in whichever
+        # spelling arrives. `_cap_setting` is what makes that last clause true — see it for why
+        # deciding "off" before the conversion read a string `"0"` as a live cap of zero. All five go
+        # through it, so there is one rule here rather than a per-key convention to look up. The
+        # raw-TCP, X12 and HTTP listeners still read their own caps the older way, so this is a
+        # property of this connector and not yet of the transport layer.
+        self.max_connections: int | None = _cap_setting(
+            s.get("max_connections", DEFAULT_MAX_CONNECTIONS), int
+        )
+        self.max_connections_per_host: int | None = _cap_setting(
+            s.get("max_connections_per_host", DEFAULT_MAX_CONNECTIONS_PER_HOST), int
+        )
+        if self.max_connections_per_host is not None and self.max_connections_per_host < 1:
+            # Only a NEGATIVE value reaches here: `_cap_setting` passes one through on purpose, and
+            # it would be a cap that refuses every peer, including one holding zero connections,
+            # since `0 >= -1`. Nothing is admitted, so `_release` never runs and
+            # `_host_capacity_warned` grows one attacker-chosen key per address with nothing to clear
+            # it: the unbounded table this control is not allowed to contain. Refuse at build, where
+            # dry-run and `check` surface it, rather than at the first connection.
+            raise ValueError(
+                "MLLP max_connections_per_host must be at least 1 (use None or 0 to disable the "
+                f"per-host cap), got {self.max_connections_per_host}"
+            )
+        self.receive_timeout: float | None = _cap_setting(
+            s.get("receive_timeout", DEFAULT_RECEIVE_TIMEOUT), float
+        )
+        self.max_frame_bytes: int | None = _cap_setting(
+            s.get("max_frame_bytes", DEFAULT_MAX_FRAME_BYTES), int
+        )
+        self.max_frame_seconds: float | None = _cap_setting(
+            s.get("max_frame_seconds", DEFAULT_MAX_FRAME_SECONDS), float
+        )
+        if self.max_frame_seconds is not None and not self.max_frame_seconds >= 0:
+            # Negative reaches here too, and would expire every frame the instant one opened — a
+            # listener that drops every sender, configured from a value the author meant as "off".
+            # Written `not >= 0` rather than `< 0` so NaN is refused as well: TOML can spell `nan`,
+            # `_cap_setting` cannot recognise it (`nan != 0`), and every comparison with it is false
+            # — so `min()` against the idle bound would silently drop the deadline and a bare
+            # `wait_for(..., nan)` would fire at once.
+            raise ValueError(
+                "MLLP max_frame_seconds must be a number of seconds, zero or more (use None or 0 to "
+                f"disable the frame deadline), got {self.max_frame_seconds}"
+            )
         # Message-rate pacing. Absent -> OFF, unlike the caps above; see _pacing_settings and
         # DEFAULT_MAX_MESSAGES_PER_SECOND for why that deviation is deliberate and ruled.
         self.max_messages_per_second, self.message_burst = _pacing_settings(s)
+        # Carried only so a pacing report can name this connection (BACKLOG #290).
+        self._pacing_name = config.name or ""
         # Per-connection peer-IP allowlist (Tier 4 operability): when set, a connecting peer whose IP
         # is not listed is refused at accept time. Absent/empty = no restriction.
         sa = s.get("source_ip_allowlist")
@@ -1509,6 +1773,21 @@ class MLLPSource(SourceConnector):
         self._server: asyncio.Server | None = None
         self._handler: InboundHandler | None = None
         self._active = 0
+        #: Live connections per peer address, for `max_connections_per_host`. Keyed by IP string; a
+        #: peer whose address the socket cannot report (`_peer_host` -> None) is never counted and
+        #: never refused by that cap.
+        #:
+        #: A host is DROPPED at zero rather than left sitting at 0. This table is keyed by an
+        #: attacker-chosen value, so a peer cycling source addresses would otherwise grow it without
+        #: bound — the table would become a memory leak inside a control whose whole subject is
+        #: bounded resources. Dropping at zero holds it to the live connections, which
+        #: `max_connections` already bounds. **That is a bound on the TABLE, not a claim about the
+        #: cap:** a peer with many source addresses gets a fresh per-host budget for each one and is
+        #: bounded by `max_connections` alone. See DEFAULT_MAX_CONNECTIONS_PER_HOST.
+        self._per_host: dict[str, int] = {}
+        #: Hosts already warned about their per-host cap this episode, cleared with the count above.
+        #: See `_log_host_capacity_once` for why the refusal is not logged per attempt.
+        self._host_capacity_warned: set[str] = set()
         # Live client writers + their handler tasks, so stop()/reload can actively close established
         # connections (a peer may hold one open for weeks) and bound the wait — server.wait_closed()
         # alone hangs on a still-connected sender on py3.12.1+ and is a no-op quiesce on 3.11 (H-2).
@@ -1554,6 +1833,16 @@ class MLLPSource(SourceConnector):
                 await asyncio.gather(*still_running, return_exceptions=True)
         self._clients.clear()
         self._client_tasks.clear()
+        # Clear the per-host tables with them. A client task cancelled past its grace above, or one
+        # the runner ABANDONS when a stop() overruns (wiring_runner's demotion path leaves the drain
+        # running and reuses this same instance at the next promotion), never runs its `finally` —
+        # so a stale count would survive into the restarted listener, and `_release`'s own docstring
+        # names what that costs: "a per-host count left behind by a missed release locks that peer
+        # out permanently". A straggler that does run later decrements a missing key, which
+        # `_release` already treats as a no-op. `_active` keeps its existing behaviour: it is read
+        # by the global cap that predates this row, and resetting it here would be a separate change.
+        self._per_host.clear()
+        self._host_capacity_warned.clear()
         # Now that no client handlers are in flight, this should complete promptly — but on the Windows
         # ProactorEventLoop a still-pending overlapped accept/read can make wait_closed() never return,
         # which (on the suite's single shared session loop) wedges every subsequent test with no output
@@ -1602,6 +1891,116 @@ class MLLPSource(SourceConnector):
             )
             raise
 
+    def _at_host_capacity(self, peer_host: str | None) -> bool:
+        """Whether this peer address already holds every connection ``max_connections_per_host``
+        allows it (BACKLOG #1725). Always ``False`` when the cap is off or the socket could not
+        report an address — a cap that cannot name its subject must not refuse anybody."""
+        if self.max_connections_per_host is None or peer_host is None:
+            return False
+        return self._per_host.get(peer_host, 0) >= self.max_connections_per_host
+
+    def _log_host_capacity_once(self, writer: asyncio.StreamWriter, peer_host: str) -> None:
+        """Warn the FIRST time a host hits its cap, then stay quiet until it has no connections left.
+
+        Clearing at zero rather than the moment the host drops back under the cap is deliberate: a
+        peer oscillating on the boundary — close one, open two — would otherwise earn a line per
+        cycle, which is connection churn and unbounded. Requiring a full disconnect makes one line
+        per episode a real bound rather than a slower leak.
+
+        A peer that loops ``connect()`` against a budget it has already filled is refused as fast as
+        it can open sockets, so a line per refusal would let an unauthenticated peer fill the log
+        volume — the service's stdout is captured to files under NSSM. That turns the defense into an
+        amplifier for the very flood it exists to stop. The global ``max_connections`` refusal logs
+        nothing at all for the same reason; one line per episode is the middle ground, and the
+        `at_capacity` event still records every individual refusal for anyone counting them.
+
+        The warned set is keyed and cleared exactly like :attr:`_per_host`, so it inherits that
+        table's bound and adds no second population to leak.
+        """
+        if peer_host in self._host_capacity_warned:
+            return
+        self._host_capacity_warned.add(peer_host)
+        logger.warning(
+            "MLLP connections from %s refused: %s holds max_connections_per_host (%d). Further "
+            "refusals for this host are not logged until it has no connections left.",
+            writer.get_extra_info("peername"),
+            peer_host,
+            self.max_connections_per_host,
+        )
+
+    def _admit(self, peer_host: str | None) -> None:
+        """Take one connection slot, globally and (when the peer has an address) for that host."""
+        self._active += 1
+        if peer_host is not None:
+            self._per_host[peer_host] = self._per_host.get(peer_host, 0) + 1
+
+    def _release(self, peer_host: str | None) -> None:
+        """Give both slots back. Paired with :meth:`_admit` in one place so the two counters cannot
+        drift — a per-host count left behind by a missed release locks that peer out permanently."""
+        self._active -= 1
+        if peer_host is None:
+            return
+        remaining = self._per_host.get(peer_host, 0) - 1
+        if remaining > 0:
+            self._per_host[peer_host] = remaining
+        else:
+            self._per_host.pop(peer_host, None)
+            # Dropped together with the count, so the next episode for this host warns again and
+            # neither table outlives the connections it describes.
+            self._host_capacity_warned.discard(peer_host)
+
+    def _log_frame_deadline(self, writer: asyncio.StreamWriter) -> None:
+        """Say which bound dropped the connection (BACKLOG #1725). The `closed` event's reason says
+        `frame_deadline`, but only when connection-event capture is on; this line lands either way,
+        and an operator reading `idle_timeout` for a peer that was never idle would look in the wrong
+        place. Socket metadata only — no frame bytes, which is the whole point of the partial frame
+        this drops.
+
+        Unthrottled, unlike :meth:`_log_host_capacity_once`, and the difference is the rate rather
+        than a difference of opinion. A refused connection is free to the peer, so that path could be
+        driven as fast as it could call ``connect()``. Reaching this one costs a connection held for
+        ``max_frame_seconds``, so the caps already bound it: at the defaults, 32 lines per minute per
+        address. That is the same shape as the existing `frame_oversize` warning beside it, which is
+        also one line per dropped connection."""
+        logger.warning(
+            "MLLP frame from %s did not complete within max_frame_seconds (%.1fs); "
+            "dropping the connection",
+            writer.get_extra_info("peername"),
+            self.max_frame_seconds,
+        )
+
+    def _frame_seconds_left(self, frame_opened_at: float | None) -> float | None:
+        """Seconds left on the open frame's deadline, or ``None`` when no deadline is running.
+
+        ``None`` means "this bound has nothing to say" — either ``max_frame_seconds`` is off or no
+        frame is open. The result may be NEGATIVE, and the sign is the answer: at or below zero the
+        frame has outlived its budget, which is what both callers test.
+        """
+        if frame_opened_at is None or self.max_frame_seconds is None:
+            return None
+        return self.max_frame_seconds - (time.monotonic() - frame_opened_at)
+
+    def _read_budget(self, frame_left: float | None) -> float | None:
+        """How long the next read may block: the idle bound, the open frame's remaining life, or the
+        smaller of the two. ``None`` only when neither bound is configured (an unbounded read).
+
+        There is no clamp on the result. ``frame_left`` cannot be negative here — the caller has
+        already broken out of the loop on a spent one — and ``receive_timeout`` is ``None`` rather
+        than falsy when it is off, so neither ordinary input can produce one. An earlier draft
+        carried ``max(0.0, ...)`` and it was dead on those inputs, which is a claim nobody can check.
+
+        **One input CAN still be negative, and it is not defended here.** Unlike
+        ``max_frame_seconds``, ``receive_timeout`` has no build-time guard refusing a negative, so a
+        configured ``-1`` reaches this function and closes every peer at once as ``idle_timeout``.
+        That predates the frame deadline and is unchanged by it; the fix is a guard beside the other
+        two in ``__init__``, not a clamp here, because a clamp would turn a typo into a silent bound.
+        """
+        if frame_left is None:
+            return self.receive_timeout
+        if self.receive_timeout is None:
+            return frame_left
+        return min(self.receive_timeout, frame_left)
+
     async def _on_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         assert self._handler is not None
         # Register before anything else so stop() can always find + close this connection — no race
@@ -1629,22 +2028,75 @@ class MLLPSource(SourceConnector):
             if self.max_connections is not None and self._active >= self.max_connections:
                 await self._emit_event("at_capacity", peer_host=peer_host)
                 return  # at capacity — refuse the new client (closed in the outer finally)
-            self._active += 1
+            if peer_host is not None and self._at_host_capacity(peer_host):
+                # Same refusal, a different budget: this peer address already holds its share
+                # (BACKLOG #1725). Deliberately the SAME `at_capacity` kind rather than a new one —
+                # the connection event vocabulary is asserted against the emit sites and mirrored in
+                # the web console filter, and what an operator needs here is WHICH cap refused them,
+                # which the reason carries. The counter is not incremented, as above.
+                self._log_host_capacity_once(writer, peer_host)
+                await self._emit_event(
+                    "at_capacity", peer_host=peer_host, reason="max_connections_per_host"
+                )
+                return  # at per-host capacity — refuse (closed in the outer finally)
+            self._admit(peer_host)
             established = True
-            await self._emit_event("established", peer_host=peer_host)
+            # The `established` emit sits INSIDE the try whose finally releases the slot. It is
+            # fail-soft against `Exception` but not against `CancelledError`, and stop() cancels
+            # straggling client tasks — so a cancellation delivered here used to escape past
+            # `_release`. That leaked an `_active` count before; with a per-host table it would leak
+            # an entry nothing ever decrements, locking that address out until restart.
             try:
+                await self._emit_event("established", peer_host=peer_host)
                 decoder = MLLPDecoder(max_frame_bytes=self.max_frame_bytes)
-                pacer = _MessagePacer.for_rate(self.max_messages_per_second, self.message_burst)
+                pacer = _MessagePacer.for_rate(
+                    self.max_messages_per_second, self.message_burst, name=self._pacing_name
+                )
+                # Monotonic stamp of the read that carried the CURRENT frame's first byte, or None
+                # when no frame is open (BACKLOG #1725). A wall clock would let a DST jump either
+                # expire a healthy frame or reprieve a stalled one.
+                frame_opened_at: float | None = None
                 while True:
                     # ASVS 2.4.1 / 15.2.2 — the wait is BEFORE the read, never around the handler.
                     if pacer is not None:
+                        paced_from = time.monotonic()
                         await pacer.pace()
-                    if self.receive_timeout:
+                        if frame_opened_at is not None:
+                            # Deliberate back-pressure is the ENGINE declining to read, not the peer
+                            # being slow, so it must not spend the peer's frame budget. Push the
+                            # frame's start stamp forward by exactly what we withheld.
+                            # `_MessagePacer` promises it "never drops, never NAKs and never
+                            # refuses"; without this line a paced connection with a partial frame
+                            # buffered could be closed BY the pacing, which is that promise broken
+                            # and a partial frame discarded outside the count-and-log boundary.
+                            frame_opened_at += time.monotonic() - paced_from
+                    frame_left = self._frame_seconds_left(frame_opened_at)
+                    if frame_left is not None and frame_left <= 0.0:
+                        # The budget went while we were NOT waiting on the socket — bytes arrived at
+                        # or past the deadline, so the read below returned instead of timing out.
+                        # The trickle case is caught by the TimeoutError arm, not here: the read is
+                        # armed with the frame's remaining life whenever that is the smaller bound.
+                        self._log_frame_deadline(writer)
+                        close_reason = "frame_deadline"
+                        break
+                    read_budget = self._read_budget(frame_left)
+                    # WHICH bound armed the wait, decided here rather than re-measured in the
+                    # handler below. Re-measuring loses at the boundary: when the two budgets are
+                    # close, or wait_for fires a hair early, the frame's remaining life reads as a
+                    # small POSITIVE number and a peer that was never idle is closed as
+                    # `idle_timeout` — the exact misdiagnosis this reason exists to prevent.
+                    armed_by_frame = frame_left is not None and frame_left == read_budget
+                    if read_budget is not None:
                         try:
-                            chunk = await asyncio.wait_for(reader.read(4096), self.receive_timeout)
+                            chunk = await asyncio.wait_for(reader.read(4096), read_budget)
                         except TimeoutError:
-                            close_reason = "idle_timeout"
-                            break  # idle past receive_timeout — close the connection
+                            # One wait_for serves both bounds, so name whichever armed it.
+                            if armed_by_frame:
+                                self._log_frame_deadline(writer)
+                                close_reason = "frame_deadline"
+                            else:
+                                close_reason = "idle_timeout"
+                            break  # past one of the two read bounds — close the connection
                     else:
                         chunk = await reader.read(4096)
                     if not chunk:
@@ -1684,11 +2136,28 @@ class MLLPSource(SourceConnector):
                             "framing_error", peer_host=peer_host, reason=safe_exc(exc)
                         )
                         break
+                    # Run the frame clock off the DECODER, after it has consumed this read — it is
+                    # the only thing that knows whether a start byte arrived without its end byte.
+                    # Reached on the success path alone (every arm above breaks), so a connection
+                    # already being dropped never re-stamps.
+                    #
+                    # `decoded` is what makes this PER FRAME rather than per connection, and getting
+                    # it wrong is not a small error. A pipelined sender's reads almost never end on a
+                    # frame boundary, so `in_frame` stays True read after read across DIFFERENT
+                    # frames; stamping only when `frame_opened_at is None` would therefore measure
+                    # every later frame from the FIRST one's start byte and reset a perfectly healthy
+                    # feed once per `max_frame_seconds`, forever. Any frame that was being timed is
+                    # finished once this read completed one, so an open frame after that is a new one
+                    # and its clock starts here.
+                    if not decoder.in_frame:
+                        frame_opened_at = None  # the frame closed, or none was ever open
+                    elif decoded or frame_opened_at is None:
+                        frame_opened_at = time.monotonic()  # this read carried a frame's first byte
             except OSError as exc:
                 failed = True  # peer reset; nothing to do but drop the connection
                 await self._emit_event("peer_reset", peer_host=peer_host, reason=safe_exc(exc))
             finally:
-                self._active -= 1
+                self._release(peer_host)
         finally:
             self._clients.discard(writer)
             if task is not None:

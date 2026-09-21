@@ -39,8 +39,8 @@ non-loopback bind requires **TLS**: in-process (`[api].tls_cert_file`, WP-13a) o
 trusted upstream proxy (`tls_terminated_upstream` + `trusted_proxies`, WP-15), or — as a dev override —
 an explicit `serve --allow-insecure-bind` (without any of these, bearer tokens + PHI would cross the
 network in cleartext, so it's refused). So there is no way to be accidentally served with silent,
-unauthenticated full access — or to silently void the loopback assumption with a stray `[api].host`
-edit (SYS-1).
+unauthenticated full access — or to silently void the loopback assumption by changing
+`[security].local_access_only` / `listen_address` (SYS-1).
 
 ### First-run bootstrap admin
 
@@ -693,8 +693,8 @@ inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bu
 | `GET` | `/ui/uploaded-logs/file/{file_id}/delete-confirm` | `files:delete` | `require_ui` |
 | `POST` | `/ui/uploaded-logs/file/{file_id}/resend` | `files:browse` | `require_ui_step_up` |
 | `GET` | `/ui/uploaded-logs/file/{file_id}/resend-confirm` | `files:browse` | `require_ui` |
-| `GET` | `/ui/uploaded-logs/upload` | `files:upload` | `require_ui` |
-| `POST` | `/ui/uploaded-logs/upload` | `files:upload` | `require_ui` |
+| `POST` | `/ui/uploaded-logs/upload` | `files:upload` | `require_ui_step_up` |
+| `GET` | `/ui/uploaded-logs/upload-form` | `files:upload` | `require_ui_step_up` |
 | `GET` | `/ui/users` | `users:read` | `require_ui` |
 | `POST` | `/ui/users` | `users:manage` | `require_ui_step_up` |
 | `GET` | `/ui/users/new` | `users:manage` | `require_ui_step_up` |
@@ -749,31 +749,63 @@ else would need its own authorization rule stated here.
    browser cannot act on.
 2. **No `/ui` route charges the per-actor admin-write pacing floor** (see the interim note under
    [Anti-automation](#admin-password-reset-wp-l3-12-asvs-646)).
-3. **One console route loses a step-up its JSON counterpart has**: `POST /ui/uploaded-logs/upload`
-   is plain `require_ui`, while `POST /uploads` is `require_step_up` — a multipart body cannot
-   survive the re-auth redirect. So a PHI-at-rest write is gated on `files:upload` alone on this
-   plane. **The resend half of this divergence is CLOSED (BACKLOG #1227):**
-   `POST /ui/uploaded-logs/file/{file_id}/resend` is now `require_ui_step_up`, reached through a
-   body-less confirm step that carries its two parameters in the query, so it survives the re-auth
-   redirect the way `delete` does. The premise that used to stand in for the gate — that the POST
-   arrives from an already-stepped-up browse page — was never enforced by anything.
-   That step introduces one *new*, narrower divergence, disclosed here rather than left to be
-   discovered: `GET /ui/uploaded-logs/file/{file_id}/resend-confirm` is plain `require_ui` while the
+3. **The uploaded-logs resend-confirm GET is weaker than its JSON equivalent, and cannot be
+   otherwise** (it is not the only weaker uploaded-logs GET — `GET /ui/uploaded-logs` is one too,
+   under item 5, and the set of record is `_UI_WEAKER_THAN_JSON_EQUIVALENT`, not this prose).
+   `GET /ui/uploaded-logs/file/{file_id}/resend-confirm` is plain `require_ui` while the
    permission-equivalent JSON browse route carries a step-up. It **cannot** carry one, because it is
    the re-auth continuation itself — gating it would bounce the operator back to `/ui/reauth`
    indefinitely. It is accepted because the page renders **no message body**: a filename, an ordinal
    and a connection name, all three of which the operator supplied on the previous screen.
-4. **The ADR 0092 PHI-read hop refusal does not apply on the `/ui` browse routes.**
-   `enforce_phi_read_hop` appears nowhere in `messagefoundry_webconsole/`; the console's own gates —
-   `require_ui(..., phi=True)` and `require_ui_step_up(..., phi=True)` — apply only the per-actor
-   throttle. So `GET /ui/messages`, `/ui/messages/{message_id}`,
-   `/ui/messages/{message_id}/parse-tree`,
+
+   **The "cannot" above is inherited from BACKLOG #1227 and is now in doubt, so do not build on it.**
+   `GET /ui/uploaded-logs/upload-form` is also a registered re-auth continuation, is step-up-gated,
+   and does *not* bounce indefinitely: re-auth refreshes the window before redirecting back, so the
+   gated page renders. That is the same sequence resend-confirm would see. Whether resend-confirm
+   has a discriminator this text has not stated, or whether its divergence is simply closable, is an
+   open question against #1227 — it is recorded here rather than papered over, because a
+   compensating control resting on an unexamined premise is the defect this section exists to avoid.
+
+   **Both uploaded-logs WRITE divergences are closed**, and are recorded here because the reasoning
+   that kept one of them open is worth not re-deriving. `POST /ui/uploaded-logs/file/{file_id}/resend`
+   became `require_ui_step_up` in BACKLOG #1227, reached through a body-less confirm step carrying its
+   two parameters in the query. `POST /ui/uploaded-logs/upload` became `require_ui_step_up` in BACKLOG
+   #1739, matching `POST /uploads`, so a PHI-at-rest write is no longer gated on `files:upload` alone
+   on this plane; its re-auth continuation is the unlock form at `GET /ui/uploaded-logs/upload-form`,
+   and the multipart body is **lost** across that redirect so the operator re-picks the file — the
+   same behaviour `POST /ui/users` has with a typed password. **That body loss was the stated reason
+   the route carried no step-up, and it was never a reason:** it is the designed behaviour of the
+   unlock primitive, and the claim beside it — that browsing PHI is the gated surface — did not cover
+   an upload, which *writes* PHI at rest. The form sits on its own path because an unlock action may
+   not name a path that also serves `POST`; a GET-redirect into a state-changing POST is an open-POST
+   gadget.
+4. **The ADR 0092 PHI-read hop refusal applies on the `/ui` browse routes, and it refuses LATER than
+   its JSON twin (BACKLOG #1738).** `require_ui` calls `enforce_phi_read_hop` on its `phi=True` arm,
+   so every console gate that sets `phi=True` takes it: `require_ui(..., phi=True)` directly, and
+   `require_ui_step_up(..., phi=True)` by forwarding. That is `GET /ui/messages`,
+   `/ui/messages/{message_id}`, `/ui/messages/{message_id}/parse-tree`,
    `/ui/messages/{message_id}/attachments/{attachment_id}`, `/ui/dead-letters` and the edit pair
-   (`GET /ui/messages/{message_id}/edit`, `POST /ui/messages/{message_id}/edit-resend`) charge
-   the PHI-read budget but not the posture-keyed refusal that the JSON `require_phi_read` adds — at
-   least those; the set is whichever console gates pass `phi=True`, not a fixed list. Where a console
-   route reaches a JSON handler that calls `enforce_phi_read_hop(request)` inline (search, export,
-   uploads-browse, layered), that refusal DOES carry over.
+   (`GET /ui/messages/{message_id}/edit`, `POST /ui/messages/{message_id}/edit-resend`) — at least
+   those; the set is whichever console gates pass `phi=True`, not a fixed list. Before this, those
+   routes charged the per-actor budget and nothing else, so a production-PHI instance on an unproven
+   serve hop would have refused a JSON PHI read and served the same body through `/ui` on first
+   deployment.
+   **The ORDER differs from the JSON plane on purpose.** `require_phi_read` refuses **before** any
+   identity work; `require_ui` refuses **after** it, below the session check and the permission loop.
+   A browser with no session has to get its 303 to the login page, and refusing first would answer an
+   unauthenticated `GET /ui/messages` with a 403 naming the instance's serve-hop posture. The JSON
+   plane has no such disclosure to trade away — it answers 401 either way — so it takes the cheaper
+   check first. Inside the `phi` arm the refusal runs **before** the budget, so a read this instance
+   will not serve never spends the actor's quota.
+   Where a console route reaches a JSON handler that calls `enforce_phi_read_hop(request)` inline
+   (search, export, uploads-browse, layered), that refusal carries over as it always did.
+   **It is charged in the GATE, so it refuses `GET /ui/messages?defer=1` too** — the pre-filled
+   form-only landing, which returns above `core.list_messages` and emits no body. That is fail-closed
+   and deliberate: an instance that will not serve a body has nothing to offer that form. The
+   content-search routes' own bare-form renders are NOT refused, because they pass no gate-level
+   `phi=` (BACKLOG #1025) and short-circuit above the handler that would refuse. Neither render puts
+   PHI on the wire, so the asymmetry costs no confidentiality; it is recorded here because a reader
+   comparing the two surfaces will otherwise find it and read it as drift.
 5. **Three further console routes are weaker than a permission-equivalent JSON route**, each for a
    stated reason: `GET /ui/uploaded-logs` is plain `require_ui` — it mirrors `GET /uploads` (also
    plain `require`), a metadata-only listing, not the step-up'd `GET /uploads/{file_id}/messages`;
@@ -952,11 +984,12 @@ normal for synced passkeys). Assertion failures are audited but deliberately do 
 account lockout (signatures aren't guessable secrets). Abuse is bounded instead by the **per-actor
 credential-ceremony limiter** — the sole route that finishes an assertion, `POST /ui/reauth/webauthn`,
 charges `allow_reauth_attempt`, not the sign-in window — plus cookie-holder-only reachability. The RP
-identity (`rp_id`/origin) rides **`[api].public_origin`** when
-set; on a plain loopback deployment it derives from the request URL, and behind a **declared reverse
-proxy it fails closed** until `public_origin` is configured (anchoring the RP to a proxy-forwardable
-Host header would defeat the origin binding that makes WebAuthn phishing-resistant). Credentials are
-pinned to their mint-time `rp_id` — **changing `public_origin`'s host renders enrolled passkeys visibly
+identity (`rp_id`/origin) uses **`[security].web_console_public_address`**, stored internally as
+`settings.api.public_origin`, when set; on a plain loopback deployment it derives from the request URL,
+and behind a **declared reverse proxy it fails closed** until `web_console_public_address` is
+configured (anchoring the RP to a proxy-forwardable Host header would defeat the origin binding that
+makes WebAuthn phishing-resistant). Credentials are pinned to their mint-time `rp_id` — **changing
+`web_console_public_address`'s host renders enrolled passkeys visibly
 "unusable (origin changed)"** (re-enroll after an origin migration). Directory users may enrol a
 passkey, exactly as with TOTP (BACKLOG #1144).
 
@@ -981,11 +1014,12 @@ the full ladder (unchanged).
 
 Exposing `/ui` off-box is a supported, **gated** posture. Beyond the existing TLS-or-refuse exposure
 gate (refused even under `--allow-insecure-bind`), `serve` runs the **L5b exposure ladder** for an
-explicitly-enabled console: with a **declared reverse proxy** (`tls_terminated_upstream`), `serve_ui`
-**refuses to start without `[api].public_origin`** (behind a proxy the Host header is client-forwardable — the exact origin
-anchors the same-origin CSRF check and the WebAuthn rp_id); an `http://` `public_origin` is refused
-under any declared TLS posture; a set `public_origin` on an *undeclared* posture warns loudly (the
-cookie would ship without `Secure`); and an exposed console emits the ASVS 8.4.2 pointer to
+explicitly-enabled console: with a **declared reverse proxy** (`tls_terminated_upstream`), `serve`
+**refuses to start without `[security].web_console_public_address`** (behind a proxy the Host header
+is client-forwardable — the exact origin anchors the same-origin CSRF check and the WebAuthn rp_id);
+an `http://` `web_console_public_address` is refused under any declared TLS posture; a set
+`web_console_public_address` on an *undeclared* posture warns loudly (the cookie would ship without
+`Secure`); and an exposed console emits the ASVS 8.4.2 pointer to
 `OFF-LOOPBACK-DEPLOYMENT.md` (managed-admin-host runbook +
 reverse-proxy-mTLS reference configs) plus an advisory when `[auth].admin_new_ip_step_up` is off on
 a PHI instance (the default deliberately stays off — it remains advisory + step-up-forcing only,
@@ -1005,8 +1039,9 @@ factor binds a directory account like any other (BACKLOG #1144).
 documented org opt-out is `[security].require_mfa = false` — the `[auth]` spelling of this key is
 **rejected at load** and `serve` exits 2 naming the replacement). The exposure gate now guards the **explicit
 opt-out**: when the API is bound **off-loopback** with `require_mfa` *turned off*, `serve` makes the
-posture explicit at startup — it **refuses to start** on a **production PHI** instance and **warns** on a
-non-production PHI instance (a synthetic instance stays quiet), mirroring the keyless-store and
+posture explicit at startup — it **refuses to start** under `[security].enforcement = enforce`, the
+default in every environment, and **warns** otherwise or where
+`[security].allow_single_factor_admin_when_exposed` is set, mirroring the keyless-store and
 open-egress startup gates. So an exposed PHI deployment can't silently run the Administrator interface
 single-factor. **`require_mfa` now binds an AD-only deployment's *directory* users too** (BACKLOG
 #1144): directory identities used to be exempt under either `require_mfa_scope` value, their factor
@@ -1266,6 +1301,12 @@ routes), **CHALLENGE** (force a fresh step-up), **THROTTLE** (429), **LOG** (rec
 change). Where one attribute produced two different outcomes, the row is **split** so the mapping stays
 one-to-one — that is why the bind/exposure posture occupies two rows and the AD reconciliation three.
 
+**Knob cells are floors.** Table A's **Knob** column names the settings that shape each decision.
+Read every cell as *at least these*: the code is the authority, and a knob missing from a cell is a
+gap in this document rather than proof the knob does not exist. The floor runs one way. Every
+setting a cell does name must really be read by that decision, so a stale entry is a defect and not
+slack.
+
 #### Table A — control plane (operator API + web console)
 
 | Attribute | Source of the value | Predicate / threshold | Action | Default | Knob |
@@ -1291,12 +1332,12 @@ one-to-one — that is why the bind/exposure posture occupies two rows and the A
 | Live directory mass-revoke breaker | the size of one pass's revocation set vs the probed population | the set exceeds **both** `ad_session_revoke_max` (**5**) **and** `ad_session_revoke_max_fraction` (**0.34**) — a second **binary** predicate layered on the row above, never a score (see "Directory session reconciliation") | **LOG** — the pass aborts revoking **nothing**, logs at ERROR and writes an `auth.ad_reconcile_aborted` audit row + loud alert | 5 / 0.34 | `[auth].ad_session_revoke_max`, `ad_session_revoke_max_fraction` |
 | PHI-read volume, per actor | `identity.user_id` | > 120 reads (`phi_read_rate_limit_per_actor`) per 60 s (`phi_read_rate_limit_window_seconds`); the global dimension `phi_read_rate_limit_global` defaults to `0` = **off** | **THROTTLE** 429 + `Retry-After: 10`, WARNING-logged, charged at **admission** before any store work | on, 120 / 60 s | `[auth].phi_read_rate_limit_enabled` |
 | Admin-write rate, per actor | `identity.user_id` × request method | **non-GET only**; > 12 writes (`admin_write_rate_limit_per_actor`) per 1.0 s (`admin_write_rate_limit_window_seconds`); no global dimension (`glob=0`) | **THROTTLE** 429 + `Retry-After: 1`, WARNING-logged. Charged on the JSON API and on `/ui`, which re-applies it | on, 12 writes / 1.0 s | `[auth].admin_write_rate_limit_enabled` |
-| Serve-hop security posture | declared data class (`[ai].data_class`, or derived from `[ai].environment`) × `[security].enforcement` × (`api.is_loopback` **or** `exposure_protected`), via `phi_read_hop_disposition` | disposition is REFUSE — a **PHI** instance under `enforcement = enforce` whose serve hop is neither loopback, nor in-process TLS, nor a declared TLS-terminating proxy. Setting `[security].enforcement = warn` turns the refusal into WARN-and-serve; a non-PHI declared data class removes it entirely | **DENY** 403 (PHI-free message) on every **JSON-API** PHI-read route (`require_phi_read`, plus the step-up bulk routes), **before** any identity work. **Not applied on the `/ui` browse routes** — `enforce_phi_read_hop` has no console call site, so those get the per-actor budget only (pinned by `test_the_ui_phi_browse_gap_is_disclosed`) | ALLOW on loopback | `[security].enforcement`, `[ai].data_class`/`environment`, `[api].tls_cert_file`, `tls_terminated_upstream` + `trusted_proxies` |
-| Bind / exposure posture — refusing arms | `[api].host` loopback-ness, `tls_terminated_upstream`, `trusted_proxies`, `public_origin`; derived `instance_exposed` (loopback-ness **or** a declared terminator) and `admin_exposed`, plus `ui_exposed` for the `/ui` arms only; `[security].enforcement`; declared data class | auth off on an exposed instance — a non-loopback bind **or** a declared terminator (`instance_exposed`); `/ui` exposed without the required origin/TLS declarations; `admin_exposed` + PHI + `enforcing` + `require_mfa` explicitly opted out | **DENY at startup** — `serve` prints an error and exits **2**. The refuse/warn dial is `[security].enforcement` (default `enforce`), **not** `production`: the auth-off and `/ui`-exposure arms refuse **unconditionally**, and the `require_mfa` arm refuses when the declared data class is PHI **and** enforcement is `enforce` — which includes the non-production `dev` and `staging` environments, both of which derive PHI — and warns otherwise. `[security].allow_single_factor_admin_when_exposed = true` downgrades that one arm to permitted-but-audited. **`admin_exposed` is `instance_exposed`, and reads no console flag** (BACKLOG #326): the ADR 0143 degrade arms rewrite `serve_ui` in place earlier in the same startup, so deriving an exposure decision from it made this arm and the dual-control arm below miss a declared-proxy instance whose console had been degraded or disabled — while the ASVS 11.7.1 arm called that same boot exposed. The same attributes force the session cookie's `Secure` flag + HSTS, and permit WebAuthn `rp_id` derivation from the request URL **only** on a loopback bind with no proxy declared | loopback, nothing declared | `[api].*`, `[security].enforcement`, `[security].allow_single_factor_admin_when_exposed`, `[ai].data_class`/`environment` |
-| Bind / exposure posture — dual-control arm | `admin_exposed` (= `instance_exposed`: an off-loopback bind **or** a declared TLS terminator — never the console flag, BACKLOG #326) × `[approvals].enabled` × declared data class | `admin_exposed` **and** PHI **and** `[approvals].enabled` off — high-value actions complete on one caller's authority | **LOG** — a startup **WARNING only, on every instance including production**; `serve` does **not** refuse. The refuse arm is an explicit unresolved owner fork recorded in `__main__.py`, not a shipped control | approvals off | `[approvals].enabled` |
+| Serve-hop security posture | `[security].enforcement` × (`api.is_loopback` **or** `exposure_protected`), via `phi_read_hop_disposition` | disposition is REFUSE — an instance under `enforcement = enforce` whose serve hop is neither loopback, nor in-process TLS, nor a declared TLS-terminating proxy. Setting `[security].enforcement = warn` turns the refusal into WARN-and-serve. **No data-class value switches it off**: BACKLOG #1279 deleted that axis | **DENY** 403 (PHI-free message) on every **JSON-API** PHI-read route (`require_phi_read`, plus the step-up bulk routes), **before** any identity work — and on the `/ui` PHI routes through `require_ui`'s `phi=True` arm, **after** identity work, so an unauthenticated visit still gets its login redirect instead of a 403 disclosing the posture (BACKLOG #1738). Two tests, and they pin different things: `test_ui_plane_states_the_phi_read_hop_gap` pins the DISCLOSURE both ways, by comparing this document against the console's call sites — it issues no request and cannot see ordering; the ORDER is pinned by the console suite's `test_the_refusal_lands_after_identity_so_a_visitor_still_gets_the_login_page` | ALLOW on loopback | `[security].enforcement`, `[api].tls_cert_file`, `tls_terminated_upstream` + `trusted_proxies` |
+| Bind / exposure posture — refusing arms | `settings.api.host` loopback-ness, `tls_terminated_upstream`, `trusted_proxies`, `settings.api.public_origin`; derived `instance_exposed` (loopback-ness **or** a declared terminator) and `admin_exposed`, plus `ui_exposed` for the `/ui` arms only; `[security].enforcement` | auth off on an exposed instance — a non-loopback bind **or** a declared terminator (`instance_exposed`); `/ui` exposed without the required origin/TLS declarations; a non-loopback bind with neither in-process TLS nor a declared terminator, where `enforce` clamps both `--allow-insecure-bind` and `[security].require_encryption_for_remote = false` shut; `admin_exposed` + `enforcing` + `require_mfa` explicitly opted out | **DENY at startup** — `serve` prints an error and exits **2**. The refuse/warn dial is `[security].enforcement` (default `enforce`), **not** `production`: the auth-off and `/ui`-exposure arms refuse **unconditionally**, and the `require_mfa` arm refuses on enforcement `enforce` alone — no data-class term narrows it, so `dev` and `staging` are gated exactly as `prod` is — and warns otherwise. `[security].allow_single_factor_admin_when_exposed = true` downgrades that one arm to permitted-but-audited. **`admin_exposed` is `instance_exposed`, and reads no console flag** (BACKLOG #326): the ADR 0143 degrade arms rewrite `settings.api.serve_ui` in place earlier in the same startup, so deriving an exposure decision from it made this arm and the dual-control arm below miss a declared-proxy instance whose console had been degraded or disabled — while the ASVS 11.7.1 arm called that same boot exposed. The same attributes force the session cookie's `Secure` flag + HSTS, and permit WebAuthn `rp_id` derivation from the request URL **only** on a loopback bind with no proxy declared | loopback, nothing declared | `[security].local_access_only`, `listen_address`, `serve_web_console`, `web_console_public_address`, `require_sign_in`, `require_mfa`, `require_encryption_for_remote`, `[api].tls_cert_file`, `tls_terminated_upstream`, `trusted_proxies`, `[security].enforcement`, `[security].allow_single_factor_admin_when_exposed` |
+| Bind / exposure posture — dual-control arm | `admin_exposed` (= `instance_exposed`: an off-loopback bind **or** a declared TLS terminator — never the console flag, BACKLOG #326) × `[approvals].enabled` | `admin_exposed` **and** `[approvals].enabled` off — high-value actions complete on one caller's authority | **LOG** — a startup **WARNING only, on every instance including production**; `serve` does **not** refuse. The refuse arm is an explicit unresolved owner fork recorded in `__main__.py`, not a shipped control | approvals off | `[approvals].enabled` |
 | Pending federated-login flows, per client IP | the `client_ip` recorded on each staged flow | ≥ **16** pending flows from this address (`DEFAULT_PER_IP_CAP`, no knob), or ≥ `oidc_flow_cache_max` (**512**) engine-wide; 300 s TTL; **reject-when-full, never evict** (evict-oldest would turn a start-leg flood into a login DoS) | **DENY** the start leg — `FlowCacheFullError` → **303** to `/ui/login?e=rate_limited`, WARNING-logged, deliberately **never** audited so a flood cannot amplify into `audit_log` growth | 16 / 512 / 300 s | `[auth].oidc_flow_cache_max`, `oidc_flow_ttl_seconds` |
 | `Sec-Fetch-Mode` on the federated sign-in legs | the browser fetch-metadata header on `GET /ui/sso`, `POST /ui/oidc/start`, `GET /ui/oidc/callback` | header **present** and not `navigate` (absent = allowed, for non-browser clients). Distinct from the `Sec-Fetch-Site` row below: a different header, a different surface, and `assert_same_origin` deliberately does **not** run on the callback leg, whose `Sec-Fetch-Site` is legitimately cross-site | **DENY** — 303 → `/ui/login?e=sso_failed`\|`oidc_failed`, plus an **audited** `auth.login_failed` row carrying the closed-set slug `non_navigation_fetch`. Evaluated **after** the login limiter, so the audit write is itself rate-bounded | on | (no knob) |
-| Instance environment posture × claimed AI data scope | `[ai].derived_posture()` (from `[ai].environment` / `data_class` / `production`; an unresolved posture defaults to the **strictest** ceiling) re-resolved server-side through `resolve_effective_policy` on every `POST /ai/chat` | the effective mode is not `managed_endpoint`, or the request's `data_scope` exceeds the server-enforced ceiling (the engine-broker MVP enforces `code_only` regardless of what the caller claims) | **DENY** — **409** on the mode mismatch, **403** on scope excess; each audited `ai.assist` with PHI-safe metadata only | `mode = byo`, `data_scope = code_only` | `[ai].mode`, `[ai].data_scope`, `[ai].environment`/`data_class`/`production` |
+| Instance environment posture × claimed AI data scope | `[ai].derived_posture()` (from `[ai].environment` and `[security].production_instance`; an unresolved posture defaults to the **strictest** ceiling) re-resolved server-side through `resolve_effective_policy` on every `POST /ai/chat` | the effective mode is not `managed_endpoint`, or the request's `data_scope` exceeds the server-enforced ceiling (the engine-broker MVP enforces `code_only` regardless of what the caller claims) | **DENY** — **409** on the mode mismatch, **403** on scope excess; each audited `ai.assist` with PHI-safe metadata only | `mode = byo`, `data_scope = code_only` | `[ai].mode`, `[ai].data_scope`, `[ai].environment`, `[security].production_instance` |
 | Gated operation × requester-vs-approver identity × hold age | the pending-approval record: the operation name, the requesting identity, and the hold's creation time | `[approvals].enabled` **and** the operation is in `[approvals].operations` and has no approved unexpired release; the approver is the requester; the hold is older than `expiry_hours` | **DENY** the immediate execution — **202** hold + `approval.requested` audit; **403** on self-approval; **409** once expired or already decided | off; `['connection_purge','dead_letter_replay']`; 72 h | `[approvals].enabled`, `operations`, `expiry_hours` |
 | mTLS client-certificate subject | the qualified subject-RDN / SAN names of a **verified** peer certificate | exact match against a deny-by-default map (empty map = feature off) | **ALLOW** — resolve to that principal's Identity (RBAC then authorizes); a disabled account grants none | `{}` = off | `[api].tls_client_cert_identities` (requires `tls_client_ca_file`) |
 | Operator-listener peer client certificate | the TLS peer certificate presented at the API / `/ui` handshake | `[api].tls_client_ca_file` set (requires `tls_cert_file`) → `ssl.CERT_REQUIRED` plus strict RFC 5280 verify flags (`api/tls.py:47-50`); no client certificate, or one not issued by that CA | **DENY** — the TLS handshake fails, so the request never reaches the ASGI stack at all: no middleware runs, no route matches, no identity is resolved, and no 403 body is produced | unset = off (server-only TLS, no peer-certificate decision on the control plane) | `[api].tls_client_ca_file` |
@@ -1305,7 +1346,7 @@ one-to-one — that is why the bind/exposure posture occupies two rows and the A
 | UPN suffix of the federated username claim | the suffix after the FIRST `@` of the username claim | `oidc_username_strip_domain` on (default) **and** the suffix is not in `oidc_allowed_username_domains` (or `[auth].ad_domain`). With stripping **off** the claim is used verbatim and no suffix check runs | **DENY** the sign-in — `ClaimsError("username_domain_not_allowed")` | on | `[auth].oidc_allowed_username_domains`, `oidc_username_strip_domain` |
 | Bootstrap-admin claim state × age × admin population | `users.password_claimed_at` and `users.created_at` for the built-in bootstrap account × whether a second enabled Administrator exists | still unclaimed (`password_claimed_at` unset — only the holder's own self-service rotation stamps it, and nothing clears it) **and** (`now ≥ created_at + bootstrap_expiry_hours × 3600` **or** another enabled admin exists); `0` = no time expiry | **DENY** — the account is disabled, **all** its sessions revoked, `auth.bootstrap_admin_retired` audited. A *claimed* bootstrap account is never touched, and an admin password reset does not un-claim it (ADR 0164) | 72 h | `[auth].bootstrap_expiry_hours` |
 | Browser `Origin` at the WebSocket handshake | the `Origin` header on the upgrade | absent (a native client) → allowed; present → must be an exact member of the list, whose default `[]` rejects **every** browser Origin | **DENY** before `accept()`, so the route never runs | `[]` | `[api].ws_allowed_origins` |
-| Cross-site request signal on a `/ui` state change | `Sec-Fetch-Site` (preferred) else `Origin` vs our own origin (`[api].public_origin` is authoritative when set; `Host` is the fallback) | `Sec-Fetch-Site` ∈ {cross-site, same-site}, or a non-matching `Origin` | **DENY** 403 — defence-in-depth over the `SameSite=Strict` cookie, deliberately token-free | on | `[api].public_origin` |
+| Cross-site request signal on a `/ui` state change | `Sec-Fetch-Site` (preferred) else `Origin` vs our own origin (`settings.api.public_origin` is authoritative when set; `Host` is the fallback) | `Sec-Fetch-Site` ∈ {cross-site, same-site}, or a non-matching `Origin` | **DENY** 403 — defence-in-depth over the `SameSite=Strict` cookie, deliberately token-free | on | `[security].web_console_public_address` |
 | Fetch metadata on **every** `/ui` request, including the `/ui/static` mount | `Sec-Fetch-Site` / `-Mode` / `-Dest` / `-User`, read as ASGI middleware (`_security.UiFetchMetadataMiddleware`) rather than as a route dependency — a Starlette `Mount` runs no dependencies, so the asset tier is the one surface the row above cannot reach | `Sec-Fetch-Site` ∈ {cross-site, same-site}, **unless** the request is a safe top-level navigation: `Sec-Fetch-Mode: navigate` **and** method GET/HEAD **and** `Sec-Fetch-Dest: document` (an **allowlist** — `iframe`/`frame`/`object`/`embed` and an omitted destination are all framing or evasion) **and**, for `same-site` only, `Sec-Fetch-User: ?1`. Only the `same-site` half demands user activation, because `SameSite` keys on the site and a site ignores the port: on the loopback default `http://127.0.0.1:9999` is same-site, so its scripted `window.open` arrives **with the session cookie**, which a cross-site page cannot manage. Cross-site is deliberately **not** asked for `?1` — the IdP's redirect back to the OIDC callback is a server-driven 302 with no user activation once the IdP session is established. An **absent** `Sec-Fetch-Site` is ALLOWED and every rule here is reached only after it has arrived, so a non-browser client (the shipped Windows tray's own liveness `GET /ui` sends no headers at all) is wholly unaffected; failing closed there is a browser-support decision rather than a hardening pass, and is tracked with its measured cost on **BACKLOG #1122** | **DENY** 403, **never 404** (`tray/probe.py` reads 404 as console-DISABLED and every other status as ENABLED) | on | (no knob) |
 
 #### Table B — data plane (ingest listeners)
@@ -1325,7 +1366,7 @@ listen source. The refusal action differs materially per listener, so each has i
 |---|---|---|---|
 | **MLLP** | peer socket address (`writer.get_extra_info('peername')`) | not in `source_ip_allowlist` | **DENY** — connection refused + WARNING log + a `peer_not_allowlisted` connection event; the refusal does **not** consume a `max_connections` slot |
 | **TCP** | peer socket address | not in `source_ip_allowlist` | **DENY** — as MLLP (refuse, log, `peer_not_allowlisted` event) |
-| **X12** | peer socket address | not in `source_ip_allowlist` | **DENY** — connection refused + WARNING log; **no connection event emitted** |
+| **X12** | peer socket address | not in `source_ip_allowlist` | **DENY** — as MLLP (refuse, log, `peer_not_allowlisted` event); BACKLOG #1665 |
 | **HTTP** | peer socket address | not in `source_ip_allowlist` | **DENY** — a real `403 {"error":"forbidden"}` is written to the peer, then close; WARNING log + `peer_not_allowlisted` event |
 | **DICOM C-STORE SCP** | `event.assoc.requestor.address` | not in `source_ip_allowlist` | **DENY** — DIMSE status **`0x0124` (Not Authorized)** returned **before any durable commit**; WARNING log naming the peer IP and calling AE; **no connection event** |
 | **MLLP / HTTP / DICOM** — peer client certificate | the TLS peer certificate presented at handshake | `tls = true` **and** `tls_ca_file` set → `ssl.CERT_REQUIRED` plus strict RFC 5280 verify flags; no client certificate, or one not issued by that CA | **DENY** — the TLS handshake fails and the connection **never reaches the accept path**, so there is **no** connection event and no allow-list evaluation. `tls_ca_file` unset → server-only TLS and no peer-certificate decision. TCP and X12 have no inbound TLS at this release |
@@ -1336,16 +1377,18 @@ listen source. The refusal action differs materially per listener, so each has i
 > **Telemetry honesty.** The `peer_not_allowlisted` connection event is durable when the connection's
 > `capture_connection_errors` is `true`, **or is unset (`None`, the default) and the
 > `[diagnostics].connection_events` master switch is on — which it is by default**. So on a default
-> deployment MLLP, TCP and HTTP allow-list refusals **do** write a `connection_event` store row (never
-> an audit row); X12 and DICOM emit no connection event at any setting and are log-only. The emit is
+> deployment MLLP, TCP, X12 and HTTP allow-list refusals **do** write a `connection_event` store row
+> (never an audit row); DICOM emits no connection event at any setting and is log-only. The emit is
 > fail-soft: a capture failure can never raise into the accept path.
 
 > **Adjacent, and deliberately not a row above.** `[egress].allowed_db` / `allowed_http` / `allowed_tcp`
 > gate where the **engine may connect out** (an inbound DATABASE source's server, a Handler's read-only
 > `db_lookup` / `fhir_lookup`, an outbound destination's host), keyed on the **target** host — not on any
-> consumer characteristic. `[egress].deny_by_default` makes an empty list a refusal rather than
+> consumer characteristic. `[security].block_unlisted_outbound` makes an empty list a refusal rather than
 > "unrestricted". They are authorization decisions, but not *consumer* authorization, so they are named
-> here rather than tabulated.
+> here rather than tabulated. **An unset switch is not the permissive case**: the `[security]` and
+> `[egress]` sections of [CONFIGURATION.md](CONFIGURATION.md) are the authority on what an
+> unconfigured instance does.
 
 #### How factors are graded (ASVS 8.1.4)
 
@@ -1372,10 +1415,6 @@ The honest limits of that model, one sentence each:
   [Administrative-interface defense-in-depth](#administrative-interface-defense-in-depth-wp-l3-13-asvs-842)).
 - The per-actor admin-write floor is charged on the **JSON API only** at this release; the `/ui` write
   path charges none.
-- The posture-keyed **PHI-read hop refusal** is likewise charged on the **JSON API only**:
-  `enforce_phi_read_hop` has no `messagefoundry_webconsole/` call site, so the `/ui` browse routes
-  (`GET /ui/messages`, `/ui/messages/{id}`, `/ui/messages/{id}/parse-tree`, …) are **not** gated by it
-  and can emit PHI over a serve hop the JSON API would refuse. This is the larger of the two gaps.
 
 **Attributes not consumed at this release** — stated so the inventory cannot be read as claiming more
 than it does: time-of-day / hour-of-day, geolocation, device security posture or attestation,
@@ -1694,9 +1733,9 @@ until restart (`auth/service.py:429-435`). `oidc` is `oidc_available` — `oidc_
 `[auth].oidc_enabled` **and** a directory to resolve roles against, `:448-452`) **and** the last IdP
 interaction not having failed; that second term is deliberately **advisory and non-sticky**, set by a
 failed login and cleared by the next success, and *no login path gates on it* (`:455-465`). Neither
-flag consults `serve_ui`, so the route can still advertise `oidc: true` on a console-less engine that
-registers no OIDC route. The mTLS plane is deliberately absent from it, because it is not a sign-in
-offer.
+flag consults `settings.api.serve_ui`, so the route can still advertise `oidc: true` on a console-less
+engine that registers no OIDC route. The mTLS plane is deliberately absent from it, because it is not a
+sign-in offer.
 `[security].allowed_client_networks` is a pre-auth network
 gate that applies to **every** pathway equally, so it is a note here rather than a column.
 
@@ -1910,7 +1949,7 @@ additionally front the API with a proxy/WAF limiter and TLS.
 | Egress response body | *(module constants in `transports/bounded_read.py`: `DEFAULT_MAX_RESPONSE_BYTES`, `MAX_TOKEN_RESPONSE_BYTES` — no knobs)* | 16 MiB; 256 KiB on a token endpoint | per response | no | no | no | **stateless** — a per-response test carrying no budget, applied at every outbound HTTP read: REST, SOAP, FHIR write, the `fhir_lookup` live read, DICOMweb STOW-RS, the OAuth2 and SMART token endpoints, the AI broker and the alert webhook, plus each of their reachability probes | the read stops at the bound plus one byte and raises `ResponseTooLargeError`, a `DeliveryError`, so the message retries and then dead-letters like any other reply the engine could not read; a `fhir_lookup` refusal is a `FhirLookupError` the Handler sees directly, and the two HTTP-error-body reads instead WARNING-log and classify on the status alone. 16 MiB is not a new number — it is `parsing/peek.DEFAULT_MAX_MESSAGE_BYTES`, the engine's existing one-message ceiling, so no honest clinical reply is refused. **Egress only:** this bounds a reply to a request the engine made, never a received message, so it cannot drop one (BACKLOG #1191) |
 | OIDC pending flows | `[auth].oidc_flow_cache_max` (global), `DEFAULT_PER_IP_CAP` (per-IP, no knob), `oidc_flow_ttl_seconds` | 512 / 16 / 300 s | 300 s TTL | no | **yes** (512) | **yes** (16) | **in-process** — `GET /ui/oidc/start` — reject-when-full, never evict | 303 → `/ui/login?e=rate_limited`, WARNING-logged, **never** audited |
 | WebAuthn pending ceremonies | `GLOBAL_PENDING_CAP`, `PER_USER_PENDING_CAP`, `CHALLENGE_TTL_SECONDS` (module constants, no knobs) | 4096 / 16 / 120 s | 120 s TTL | **yes** (16) | **yes** (4096) | no | **in-process** — every passkey registration + assertion ceremony | per-user: evicts that user's **own** oldest pending ceremony (silent); global: `ChallengeCacheFullError` naming the cause + the `admin_reset_mfa` recovery path |
-| **Ingest plane** | `max_messages_per_second`, `message_burst` (MLLP, raw-TCP, X12 and HTTP inbounds) | **off** (unset = no rate bound) | per message | no | no | no | **in-process** — one bucket per MLLP / raw-TCP / X12 **connection** and one per HTTP **listener**, so it neither coordinates across engine shards nor aggregates per peer | **Ships OFF, and the off default is ruled rather than accidental** — a rate on a clinical interface is only safe at a number taken from a real feed profile. **So a default install has NO message-RATE bound on the ingest plane**, and that is a deliberate posture, not a gap in the control. Both keys are parameters of the `MLLP()`, `Tcp()`, `X12()` and `Http()` factories, so **the code-first surface expresses them on all four**. `connections.toml` desugars through those same factories, so **the TOML surface expresses them on three of the four**: `X12` is absent from that loader's `_TRANSPORTS` map entirely, so **no** X12 setting is expressible in `connections.toml` and the pacing keys are not a special case of that. Closing it means adding the transport, which is a separate decision from this control; the gap is pinned with its own positive control at `tests/test_ingress_message_pacing.py::test_x12_has_no_toml_surface_at_all_which_is_a_separate_gap` (BACKLOG #1249 for MLLP, BACKLOG #1114 for the other three — until #1249 landed the pacer was built and no documented configuration could turn it on, and until #1114 landed the other three intakes had no rate control in **any** configuration, which is a different and worse thing than being off). *What it does when set:* the listener **pauses reading before its next read** so TCP back-pressures the sender; no message is dropped, refused, NAK'd, 429'd or reordered — the count-and-log invariant forbids accept-and-drop, so a discarding limiter was never available. **The HTTP bucket is listener-wide, not per-connection**, because that connector answers one request per connection; a `GET`/`HEAD` probe waits behind an outstanding debt but charges nothing. **Two SIBLING intake bounds on different units, added by BACKLOG #1114 — read them as separate controls, not as this row's keys reaching further.** (1) `max_associations_per_second` / `association_burst` bound the **DICOM C-STORE SCP**, and the unit is an **association**, not a message: `pynetdicom` owns the read loop, so by the time a C-STORE reaches the engine the object has already been read and decoded, and a pace after decode would delay a message the count-and-log invariant has already obliged us to account for. The SCP waits before reading the association request and never refuses one; an established association is still **unbounded in the objects it may push** (`max_object_bytes` and `timeout_seconds` bound those instead). It **ships OFF**, for the reason in bold above, so it does not soften the sentence about a default install. (2) `max_files_per_poll` bounds one **poll tick** on the `File`, `Sftp` and `Ftp` sources, and it **ships ON** (1000) — the opposite default, deliberately, because those sources have no sender to back-pressure and the excess is **deferred to the next tick, never refused**: the files stay where they are and a later tick takes them, so a guessed number costs latency, never a message. **Still not covered even when set:** the **Database poll** source (its `fetchall` has no row ceiling), any **per-message** bound on the DICOM SCP, and any **per-peer** bound (MLLP, TCP and X12 peers are unauthenticated, so the only key would be source IP, which NAT collapses). **Resource bounds that DO ship on** — `max_connections` (256), `receive_timeout` (60.0 s), `max_frame_bytes` (16 MiB), per-connection `max_message_bytes`, `max_files_per_poll` (1000, on the poll sources), `source_ip_allowlist` |
+| **Ingest plane** | `max_messages_per_second`, `message_burst` (MLLP, raw-TCP, X12 and HTTP inbounds) | **off** (unset = no rate bound) | per message | no | no | no | **in-process** — one bucket per MLLP / raw-TCP / X12 **connection** and one per HTTP **listener**, so it neither coordinates across engine shards nor aggregates per peer | **Ships OFF, and the off default is ruled rather than accidental** — a rate on a clinical interface is only safe at a number taken from a real feed profile. **So a default install has NO message-RATE bound on the ingest plane**, and that is a deliberate posture, not a gap in the control. Both keys are parameters of the `MLLP()`, `Tcp()`, `X12()` and `Http()` factories, so **the code-first surface expresses them on all four**. `connections.toml` desugars through those same factories, so **the TOML surface expresses them on three of the four**: `X12` is absent from that loader's `_TRANSPORTS` map entirely, so **no** X12 setting is expressible in `connections.toml` and the pacing keys are not a special case of that. Closing it means adding the transport, which is a separate decision from this control; the gap is pinned with its own positive control at `tests/test_ingress_message_pacing.py::test_x12_has_no_toml_surface_at_all_which_is_a_separate_gap` (BACKLOG #1249 for MLLP, BACKLOG #1114 for the other three — until #1249 landed the pacer was built and no documented configuration could turn it on, and until #1114 landed the other three intakes had no rate control in **any** configuration, which is a different and worse thing than being off). *What it does when set:* the listener **pauses reading before its next read** so TCP back-pressures the sender; no message is dropped, refused, NAK'd, 429'd or reordered — the count-and-log invariant forbids accept-and-drop, so a discarding limiter was never available. **The HTTP bucket is listener-wide, not per-connection**, because that connector answers one request per connection; a `GET`/`HEAD` probe waits behind an outstanding debt but charges nothing. **Two SIBLING intake bounds on different units, added by BACKLOG #1114 — read them as separate controls, not as this row's keys reaching further.** (1) `max_associations_per_second` / `association_burst` bound the **DICOM C-STORE SCP**, and the unit is an **association**, not a message: `pynetdicom` owns the read loop, so by the time a C-STORE reaches the engine the object has already been read and decoded, and a pace after decode would delay a message the count-and-log invariant has already obliged us to account for. The SCP waits before reading the association request and never refuses one; an established association is still **unbounded in the objects it may push** (`max_object_bytes` and `timeout_seconds` bound those instead). It **ships OFF**, for the reason in bold above, so it does not soften the sentence about a default install. (2) `max_files_per_poll` bounds one **poll tick** on the `File`, `Sftp` and `Ftp` sources, and it **ships ON** (1000) — the opposite default, deliberately, because those sources have no sender to back-pressure and the excess is **deferred to the next tick, never refused**: the files stay where they are and a later tick takes them, so a guessed number costs latency, never a message. **Still not covered even when set:** the **Database poll** source (its `fetchall` has no row ceiling), any **per-message** bound on the DICOM SCP, and any **per-peer MESSAGE-RATE** bound (MLLP, TCP and X12 peers are unauthenticated, so the only key would be source IP, which NAT collapses). **A per-peer CONNECTION bound does now ship on the MLLP listener** — `max_connections_per_host` (32), BACKLOG #1725 — and it is a different unit: it caps concurrent sockets from one address, refusing pre-ingress, and never bounds how fast an admitted peer may send. It keys on source IP, so the NAT objection still applies to it and is recorded at its constant; behind a source-NAT proxy set it to `None`/`0`. The raw-TCP, X12, HTTP and DICOM intakes carry no per-host term. **Resource bounds that DO ship on** — at least `max_connections` (256), the MLLP listener's `max_connections_per_host` (32) and `max_frame_seconds` (60.0 s, one frame start-byte to end-byte; `receive_timeout` resets on every byte received and so bounds only silence), `receive_timeout` (60.0 s), `max_frame_bytes` (16 MiB), per-connection `max_message_bytes`, `max_files_per_poll` (1000, on the poll sources), `source_ip_allowlist` |
 
 **What these limits defend, and what they do not.** The full inventory of resource-demanding
 functionality — including the surfaces that remain **unbounded** at this release — is

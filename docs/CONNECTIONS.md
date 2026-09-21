@@ -146,6 +146,15 @@ transport = "mllp"
   without quotes. An `env()` reference is also accepted, but give it a `cast` for a non-string setting:
   an environment value arrives as text and an **uncast** ref hands the connector that text. An inline
   `default =` is held to the setting's type here, because a default is **not** converted by `cast`.
+  A setting whose type is a **table** or an **array** — `headers`, `odbc_params`,
+  `capture_response_headers`, `proxy_no_proxy` — is held to its shape, so `headers = 5` is refused;
+  where the entries have a readable type it is held to those too, one level in, so
+  `headers = { X-Key = 5 }` is refused naming the entry key, and a bad array item is named by index.
+  Write an array as `["a", "b"]`; a bare string is not an array, even where one string is all you
+  want. The entry check is **not** a guarantee that every value in a table was examined — an `env()`
+  reference written inside one is left to the connector's own rules. No refusal ever repeats the
+  value — a `[settings]` value can be a credential, and the message reaches the operator log and the
+  support bundle.
   The remaining connectors (`X12`/`FHIR`/`DICOM`/`DICOMweb`/`Email`/`Direct`/
   `Loopback`/`PassThrough`) are **code-first only** today — declare them in a `.py` module. A name
   declared in **both** a `.py` module and `connections.toml` is a hard error (no silent shadowing).
@@ -295,9 +304,11 @@ duplicate name (across **any** of these files) and an inbound that binds a route
 | `host` | out | — (required) | the downstream peer to dial. **Inbound takes no host** — passing one is a wiring error; the listen interface is the service-level `[inbound].bind_host` (see below). |
 | `port` | both | — (required) | bind/connect port |
 | `encoding` | both | `utf-8` | charset used for MLLP framing |
-| `max_connections` | in | `256` | cap on concurrent client connections (connection-flood guard). `None`/`0` = unlimited. |
-| `receive_timeout` | in | `60.0` | close a client idle this many seconds (slowloris guard). `None`/`0` = no timeout. |
+| `max_connections` | in | `256` | cap on concurrent client connections (connection-flood guard). Counts **sockets, not hosts** — see `max_connections_per_host` below for the peer-scoped term. `None`/`0` = unlimited. |
+| `max_connections_per_host` | in | `32` | cap on concurrent connections from **one peer address** (BACKLOG #1725). The connection is accepted, then refused and closed with an `at_capacity` connection event whose reason reads `max_connections_per_host`; nothing was received, so nothing is dropped, and the peer reconnects as soon as one of its own connections ends. An eighth of `max_connections`, so it takes at least eight distinct source addresses to fill a default listener — it raises the floor on a single-address peer and does **not** bound a distributed one. **Set it to `None`/`0` behind a source-NAT load balancer or proxy that does not preserve the client address**: every partner then arrives as one peer and this, not `max_connections`, becomes your effective listener capacity. |
+| `receive_timeout` | in | `60.0` | close a client **idle** this many seconds (slowloris guard). Applied **per read**, so it resets on every byte received: it bounds silence, not a frame — see `max_frame_seconds`. `None`/`0` = no timeout. |
 | `max_frame_bytes` | both | `16 MiB` | reject a single MLLP frame larger than this before buffering it whole (OOM guard); applies to inbound frames and outbound ACKs. `None`/`0` = unlimited. |
+| `max_frame_seconds` | in | `60.0` | close a client whose frame takes longer than this from its **start byte to its end byte** (BACKLOG #1725). This is the bound on a peer that trickles one byte at a time: it is never idle, so `receive_timeout` never fires on it, and without this it would hold a slot and up to `max_frame_bytes` of reassembly buffer indefinitely. Runs **beside** `receive_timeout`, not instead of it — a peer that opens a socket and says nothing never opens a frame, so only the idle bound covers that. The clock restarts for **each** frame, so a pipelined sender is unaffected. **Raise this whenever you raise `max_frame_bytes`** — 16 MiB inside 60 s needs about 2.2 Mbps sustained on that one socket, so a large-document feed over a slower link will otherwise trip it on every message. The connection closes with a `closed` event whose reason reads `frame_deadline`. `None`/`0` = no deadline. |
 | `max_messages_per_second` | in | **off** | sustained message-rate ceiling per **connection** (ASVS 2.4.1 / 15.2.2). Over budget the listener **pauses reading**, so TCP back-pressures the sender — **no message is ever dropped, refused or NAK'd**, and none is reordered. Unset = no bound, which is a deliberate exception to this table's usual secure-default rule: a guessed rate on a clinical interface throttles real traffic, so the number has to come from your own feed profile. |
 | `message_burst` | in | = the rate | tokens the bucket holds, i.e. how large a burst passes unpaced before the sustained rate applies. Only meaningful with `max_messages_per_second` set. Floor of 1 so a connection can always make progress. |
 | `connect_timeout` | out | `10.0` | TCP connect timeout (s) |
@@ -836,7 +847,16 @@ its own policy block below):
   as an `ERROR`-status message by the parser (raw preserved in the store). A **transient** read failure
   (file locked / mid-write) or an **infrastructure** failure (store unavailable) **leaves the file in
   place to retry** next scan — never an accept-and-drop. Use `min_age_seconds` to skip files still being
-  written.
+  written. As a backstop, the source compares a file's size and modification time on each side of the
+  read (BACKLOG #116). A file that changes **during** the read is not emitted that scan. One that
+  changes **after** it is not moved or deleted, so the next scan reads it whole, and a WARNING says the
+  message already handed off may be cut short. That message is **not a duplicate**: the pipeline treats
+  it like any other message, and a file that keeps growing can yield one on more than one scan before
+  the whole one follows. The WARNING is the only thing that ties them together. SFTP/FTP sources
+  compare sizes the same way when the server reports one. A remote `leave` source skips the
+  after-the-read check (the during-the-read one still runs), so it logs no WARNING, and nothing ties a
+  cut-short message to the whole one. It still re-reads a grown file, because its dedup key folds in
+  the listed size. A local `leave` source does warn.
 - **Traversal-safe output naming.** The destination resolves `{HL7-path}` placeholders to a **single safe
   filename** (path separators / unsafe chars stripped, leading dots removed, `.`/`..`/reserved device
   names fall back), so an attacker-controlled field can't write outside the target dir or shadow
@@ -902,7 +922,7 @@ upload chokepoint enforces a fixed policy independent of the directory-source po
   path returns **HTTP 415** — both metadata-only-audited, so a PHI body is never persisted or logged.
   (There is **no** antivirus/content-malware scan on the upload path — the `ScanRejected` pre-ingest
   scan-hook seam applies only to the `File(...)`/remote directory sources above, not to HTTP uploads.)
-- **Consent affordance (ASVS 14.2.8).** The `/ui/uploaded-logs/upload` form states, above its submit
+- **Consent affordance (ASVS 14.2.8).** The `/ui/uploaded-logs/upload-form` page states, above its submit
   button, that the original filename and the uploader's username are stored and shown to the uploader
   and to authorized operators holding `files:access_any`, and recorded in the audit log — **submitting
   the form is the consent**; the POST `/uploads` OpenAPI docstring states the same for programmatic
@@ -1069,6 +1089,14 @@ than blocking the FIFO lane on a request the endpoint will never accept.
 scheme is constrained to `http`/`https`, and the outbound host is gated by the fail-closed
 `[egress].allowed_http` allowlist (WP-11c). Standard library only (`urllib`) — no new dependency.
 
+**No credentials inside an endpoint URL (BACKLOG #1793).** A URL of the form `https://user:password@host/`
+is refused when the connector is built. The error names the setting and never the password. This covers
+at least `url` on REST, SOAP, FHIR, DICOMweb and `FhirLookup`, plus `oauth2_token_url`, `smart_token_url`
+and `[ai].endpoint`. The shape never worked: `urllib` does not send URL userinfo as auth, and its error
+text carried the password into `last_error`. Put credentials in `basic_user`/`basic_password` or
+`bearer_token` (or the `oauth2_*`/`smart_*` settings), each via `env()`. `proxy_url` is not refused,
+because a forward proxy URL may carry its own credentials.
+
 **Idempotency — operator responsibility.** Delivery is **at-least-once**, so a retry **re-sends** the
 request. The receiving endpoint **must be idempotent** (an idempotency key, a natural upsert, or a
 message-id de-dup) or a retried `POST` will double-apply.
@@ -1166,7 +1194,7 @@ gate are identical to the SQL Server preset.
 | Setting | Default | Meaning |
 |---------|---------|---------|
 | `odbc_driver` | — (required for `generic`) | the **exact OS-registered ODBC driver name**, e.g. `PostgreSQL Unicode`, `MySQL ODBC 8.0 Unicode Driver`, `Oracle in instantclient_21_13` |
-| `odbc_params` | — | a mapping of **driver-specific ODBC keywords** → values, e.g. `{"PORT": 5432, "SSLmode": "verify-full"}`. Values are **literals** (not `env()`-resolved — put per-env/secret values in the top-level fields) and are brace-quoted (injection-safe); keys must be valid ODBC keywords and may not re-set `DRIVER`/`SERVER`/`DATABASE`. |
+| `odbc_params` | — | a mapping of **driver-specific ODBC keywords** → values, e.g. `{"PORT": 5432, "SSLmode": "verify-full"}`. Values are **literals** (not `env()`-resolved — put per-env/secret values in the top-level fields) and are brace-quoted (injection-safe); keys must be valid ODBC keywords and may not re-set `DRIVER`/`SERVER`/`DATABASE`. An `env()` reference here is **refused at load** — as a code-first `env(...)` value, as a `connections.toml` inline table (`PWD = { env = "acme_pw" }`), and as one naming the whole table (`odbc_params = { env = "..." }`). |
 | `odbc_user_key` | `UID` | ODBC keyword the top-level `username` is emitted under (some drivers want `USER`) |
 | `odbc_password_key` | `PWD` | ODBC keyword the top-level `password` is emitted under (some drivers want `PASSWORD`) |
 
@@ -1204,6 +1232,30 @@ The DSN is built as `DRIVER={odbc_driver};SERVER=<server>;[DATABASE={database};]
 > **out of scope** (dep-heavy) — the generic path is ODBC-only. The `test_connection` reachability probe
 > runs `SELECT 1` (works on PostgreSQL / MySQL / SQL Server; Oracle needs `SELECT 1 FROM DUAL`, so its
 > probe reports an error even though delivery works). Read-only `db_lookup` (ADR 0010) stays SQL-Server-only.
+
+#### Give `db_lookup` a read-only login
+
+**Point every `DatabaseLookup(...)` at an account that cannot write — a `db_datareader`-class login on
+the partner database.** That account is the only thing that makes a lookup read-only. The engine's two
+in-process layers are defence in depth and neither is authority:
+
+| Layer | What it does | What it cannot do |
+|---|---|---|
+| Statement gate (`_require_read_only`) | refuses a statement that does not open with `SELECT`/`WITH`, or that carries a write/`EXEC`/DDL keyword outside a literal or comment, or that chains a second statement | it reads text. A write executed on a linked server through a pass-through literal is opaque to it |
+| `ApplicationIntent=ReadOnly` on the DSN | advertises read-only intent | honored only by a SQL Server Always-On **read replica**; a no-op against any other server |
+
+Lookup pools are opened **autocommit**, so a write that got past the statement gate would commit rather
+than roll back. T-SQL has no `SET TRANSACTION READ ONLY`, so the engine cannot open a read-only
+transaction instead: on SQL Server the read-only mechanisms — a read-only database or filegroup, a
+snapshot, or `ApplicationIntent` against an availability-group replica — are all operator provisioning.
+
+Grant the lookup account `SELECT` on the objects the feed reads and nothing else. It needs no
+membership in `db_datawriter`, `db_ddladmin` or `db_owner`, and no `EXECUTE` unless a feed genuinely
+reads through a stored procedure — which this gate refuses anyway.
+
+> This is a **separate principal** from the engine's own store login. `[store]` settings govern the
+> database MessageFoundry writes its own messages to; a `DatabaseLookup` dials a partner database under
+> a credential the operator configures per connection.
 
 #### Static database credentials
 
@@ -2291,6 +2343,13 @@ passes, and the engine starts **healthy** rather than DEGRADED. `stopped` means 
 connection — deploying it is a **config change** (flip the flag, supply the values, reload), not a runtime
 action.
 
+One more outbound state sits outside that ladder: **`log_halted`** ([ADR 0189](adr/0189-a-delivery-tier-log-halt-latch-read-at-the-claim-gate-rather-than-a-gate-at-every-door.md)).
+The engine cannot write its application log and has fail-closed (#122, [ADR 0162](adr/0162-fail-closed-application-log-write-guard-detect-roll-and-stop.md)),
+so no lane in the process delivers and every outbound reports it at once. It is deliberately not
+`stopped`: nothing on that row is the fix, and start is refused until the disk is. Queued rows are
+retained PENDING throughout. `failed`, `filtered` and `not_deployed` still win over it on the display,
+because each of those is a fact about that one connection. See [SERVICE.md](SERVICE.md) for recovery.
+
 ```python
 from messagefoundry import MLLP, env, inbound, outbound
 
@@ -2385,7 +2444,7 @@ contract a reviewer needs. The two tables below cover **every** hop in the commu
 set**, and `tests/test_communications_inventory.py` fails the build if they diverge or if a stated
 default drifts from the constant in the code.
 
-Four facts that are easy to get wrong, stated plainly first:
+Facts that are easy to get wrong, stated plainly first:
 
 - **The MLLP, raw-TCP, X12 and HTTP listeners have no accept-rate throttle.** The bound is
   `max_connections` (default 256)
@@ -2394,16 +2453,41 @@ Four facts that are easy to get wrong, stated plainly first:
   active-client counter is never incremented for the refused peer. The peer therefore observes a
   successful connect followed by an immediate close — not a refused connect and not a backlog wait.
   A peer failing `source_ip_allowlist` is refused the same way. **The telemetry is not uniform:** the
-  **MLLP, raw-TCP and HTTP** listeners emit an ADR 0021 `at_capacity` (and `peer_not_allowlisted`)
-  connection_event; the **X12 and DICOM** listeners refuse identically but emit **no connection event
-  at all** — `transports/x12.py` and `transports/dicom.py` contain zero `_emit_event` call sites. Nor
-  is the fallback uniform: X12's `source_ip_allowlist` refusal is a logged warning
-  (`transports/x12.py:310-312`), but its **`max_connections` refusal is entirely silent** — `:314-315`
-  returns with no event and no log, so a partner failing at capacity leaves **no engine-side evidence
-  of any kind**. Treat that gap as the thing to watch when sizing an X12 feed, not the counter.
+  **MLLP, raw-TCP, X12 and HTTP** listeners emit an ADR 0021 `at_capacity` (and
+  `peer_not_allowlisted`) connection_event; the **DICOM** listener refuses identically but emits **no
+  connection event at all** — `transports/dicom.py` contains zero `_emit_event` call sites. X12 sat
+  in that silent set until BACKLOG #1665 and no longer does: it now records the same seven kinds as
+  its raw-TCP twin, so an X12 refusal at either gate is no longer evidence-free.
   The slow-loris guard is the **separate**
   `receive_timeout` (default 60 s), not `max_connections`; the HTTP listener additionally answers a
   synchronous `408` when a request read exceeds it.
+- **`receive_timeout` bounds SILENCE, not a message, and on the MLLP listener a second bound covers
+  the difference.** It is applied **per read**, so it resets on every byte received: a peer trickling
+  one byte at a time is never idle by it. The MLLP listener therefore also runs
+  `max_frame_seconds` (default 60 s), which bounds one frame from its **start byte to its end byte**
+  and closes the connection with a `frame_deadline` reason when it is exceeded (BACKLOG #1725). The
+  two run **together** and neither replaces the other — a peer that opens a socket and sends nothing
+  never opens a frame, so only the idle bound reaches it. **`max_frame_seconds` is MLLP-only, but
+  "no frame-life bound" is not what the other intakes have in common.** The **raw-TCP and X12**
+  listeners apply `receive_timeout` per read exactly as described above and carry no second TIME
+  bound (X12's `max_interchange_bytes` is a size cap, not a clock), so a trickling peer holds one of
+  those sockets for as long as it keeps sending. The **HTTP** listener spends that same
+  `receive_timeout` **differently**: one budget covers the **whole** request — request line, headers,
+  authentication and body — and a synchronous `408` answers a request that outruns it, so an HTTP
+  request is bounded end to end without a second key. The **DICOM** SCP is a different shape
+  again, with `timeout_seconds` on its pynetdicom timers rather than `receive_timeout`; see its own
+  paragraph below.
+- **`max_connections` counts sockets, not hosts, so the MLLP listener carries a per-peer term as
+  well.** `max_connections_per_host` (default 32, an eighth of the socket cap) bounds the connections
+  one peer address may hold at once, refused the same pre-ingress way as the socket cap and carrying
+  a `max_connections_per_host` reason on its `at_capacity` event (BACKLOG #1725). Without it one
+  unauthenticated peer could take every slot a listener has, since `source_ip_allowlist` ships off.
+  **It keys on the source address, so it raises the floor on a single-address peer and does not
+  bound a distributed one** — eight addresses restore the full 256. **Two deployment notes:** behind
+  a source-NAT proxy every partner shares one address and this becomes the effective capacity, so
+  set it to `None`/`0` there; and the refusal is logged once per host per episode rather than per
+  attempt, so a peer hammering a filled budget cannot fill the log volume.
+  **Again MLLP only** — the raw-TCP, X12, HTTP and DICOM intakes have no per-host term.
 - **The DICOM C-STORE SCP is a different shape** and none of the paragraph above describes it. It has
   no `max_connections` and no engine-side active-client counter: its bound is `max_associations`
   (**default 10**, `transports/dicom.py:165`), enforced inside pynetdicom, which **rejects the
@@ -2632,10 +2716,10 @@ reading this page already applies to a file the scan never opened.
 
 | Service/hop | Concurrency bound (setting + default) | Behaviour when the limit is reached | Fallback / recovery |
 |---|---|---|---|
-| MLLP listener (inbound) | `max_connections` default 256 concurrent clients | connection accepted, then immediately refused and closed with an `at_capacity` connection_event; the counter is not incremented | the peer reconnects; a slot frees as soon as any client finishes or trips `receive_timeout` |
+| MLLP listener (inbound) | `max_connections` default 256 concurrent clients, plus `max_connections_per_host` default 32 from any one peer address | connection accepted, then immediately refused and closed with an `at_capacity` connection_event; the counter is not incremented. The per-host refusal carries a `max_connections_per_host` reason, which is the only thing distinguishing the two budgets | the peer reconnects; a slot frees as soon as any client finishes or trips `receive_timeout` or `max_frame_seconds`, except that a per-host refusal clears only when one of that same peer's own connections ends |
 | MLLP destination | 1 in-flight delivery per outbound connection (`per_lane`), else the `pooled_max_processing_lanes` budget | a lane waits for a slot; the socket itself is per-delivery unless `persistent=true` | transient failure re-queues into the `RetryPolicy` path; a stale persistent connection is not reused past `idle_timeout_seconds` |
 | Raw TCP listener (inbound) | `max_connections` default 256 concurrent clients | accepted then immediately refused and closed with an `at_capacity` connection_event | as MLLP |
-| X12 listener (inbound) | `max_connections` default 256 concurrent clients | connection accepted, then immediately refused and closed at the application layer; the active-client counter is not incremented. **No ADR 0021 connection_event is emitted** — `transports/x12.py` emits none at all; an allow-list refusal is a logged warning only, and the at-capacity path emits **no log line either** | as MLLP |
+| X12 listener (inbound) | `max_connections` default 256 concurrent clients | connection accepted, then immediately refused and closed at the application layer; the active-client counter is not incremented. An ADR 0021 `at_capacity` connection_event is emitted, as on the raw-TCP listener (BACKLOG #1665); an allow-list refusal emits `peer_not_allowlisted` and a WARNING log | as MLLP |
 | Raw TCP / X12 destination | as MLLP destination — one delivery per outbound lane | a lane waits for a processing slot; a fresh connection is dialled per delivery | transient failure re-queues into the retry path |
 | HTTP web-service listener (inbound) | `max_connections` default 256; `max_header_bytes` 64 KiB and `max_body_bytes` 16 MiB bound one request | at capacity the connection is accepted then refused and closed (`at_capacity`); an over-declared `Content-Length` is refused before buffering; a slow read gets a synchronous `408` | the partner retries; slots free on completion or `receive_timeout` |
 | File endpoint — local filesystem | one poll worker per inbound connection; one delivery lane per outbound | no connection limit exists — the bounds are the poll interval `poll_seconds` (default 1.0), `max_file_bytes` (16 MiB) and `poll_max_files` (500 files per scan, [deferring the rest to the next scan](#per-tick-poll-ceilings)) | an oversize or unreadable file is skipped/errored and left for the operator; the next poll continues |
@@ -2683,10 +2767,10 @@ reading this page already applies to a file the scan never opened.
 
 | Service/hop | Timeout setting + default | Release procedure | Failure handling | Retry posture |
 |---|---|---|---|---|
-| MLLP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris); the ACK **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. Not operator-configurable — an ACK is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against | the client handler's outer `finally` closes the writer, with a 5 s shutdown grace | a decode/parse/validate failure NAKs synchronously and records `ERROR` before any ingress row; an ACK over its write bound drops the connection as a `peer_reset` | n/a — the sender retries |
+| MLLP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris) and `max_frame_seconds` 60 s bounds one frame start-byte to end-byte, which is what reaches a peer that trickles bytes and is therefore never idle; the ACK **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. That write bound is not operator-configurable — an ACK is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against | the client handler's outer `finally` closes the writer, with a 5 s shutdown grace | a decode/parse/validate failure NAKs synchronously and records `ERROR` before any ingress row; a frame over its deadline closes with a `frame_deadline` reason, having received nothing to drop; an ACK over its write bound drops the connection as a `peer_reset` | n/a — the sender retries |
 | MLLP destination | `connect_timeout` 10 s, `timeout_seconds` 30 s (drain + ACK read) | the socket is closed per delivery, or reused and aged out via `idle_timeout_seconds` / `max_connection_age_seconds` when `persistent` | transient errors re-queue; a `NegativeAckError` (AR) dead-letters immediately | `RetryPolicy` — **default `retry_max_attempts` is 100, finite**; lower it, or set `None` to retry forever |
 | Raw TCP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris); the reply **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. Not operator-configurable — a reply is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path; a reply over its write bound drops the connection as a `peer_reset` | n/a |
-| X12 listener (inbound) | `receive_timeout` 60 s; `max_interchange_bytes` bounds one ISA/IEA frame; the reply **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. Not operator-configurable, for the same reason as the raw-TCP row | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path; an allow-list refusal is **log-only** (no connection_event) and a **capacity refusal is silent — no event and no log**; a reply over its write bound likewise drops the connection on a **logged warning only** — this listener emits no connection_event of any kind | n/a |
+| X12 listener (inbound) | `receive_timeout` 60 s; `max_interchange_bytes` bounds one ISA/IEA frame; the reply **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. Not operator-configurable, for the same reason as the raw-TCP row | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path; an allow-list refusal emits `peer_not_allowlisted` plus a WARNING log, and a capacity refusal emits `at_capacity`; a reply over its write bound drops the connection on a logged warning **and** the `peer_reset` its release path already carries. This listener emits the same seven kinds as the raw-TCP row above (BACKLOG #1665) | n/a |
 | Raw TCP / X12 destination | `connect_timeout` 10 s, `timeout_seconds` 30 s | a fresh connection per delivery, closed in `finally` | transient vs permanent classification as MLLP | `RetryPolicy` |
 | HTTP web-service listener (inbound) | `receive_timeout` 60 s bounds the **whole** request read; over budget returns `408` | handler `finally` closes the connection with a shutdown grace | an over-size body is refused before buffering | n/a |
 | File endpoint — local filesystem | **none** — filesystem I/O is unbounded by design | file handles are context-managed; the source file is moved/deleted/left per `after_read` | an unreadable/oversize file is skipped or moved to `error_subdir` | `RetryPolicy` on the outbound write |
@@ -2718,7 +2802,7 @@ reading this page already applies to a file the scan never opened.
 | SMART token endpoint (`smart_token_url`) | `smart_timeout_seconds` 30 s | the response is context-managed; the token is cached in memory | a mint failure fails the delivery | **single-shot** — re-minted only on the next attempt or a `401` |
 | OAuth2 token endpoint (`oauth2_token_url`) | `oauth2_timeout_seconds` 30 s | as SMART | as SMART | **single-shot** |
 | AI broker (`[ai].endpoint`) | 60 s — a **hard-coded module constant, not operator-configurable** (`[ai]` has no timeout field) | the response is context-managed; the call runs off the event loop via `to_thread` | a mis-configuration, an un-allowlisted host, or an HTTP error raises to the API route | **single-shot** — one POST per assist, no retry |
-| DR backup destination (`[backup].destination`, ADR 0049) | **no engine-owned timeout** — filesystem / SMB-redirector I/O, the same posture as the File connector | handles are context-managed; the archive is fsync'd then verified before the run counts | a failed or verify-failed run is logged + audited, never counted as a good backup when pruning | **single-shot per scheduled pass** — retried only by the next daily pass |
+| DR backup destination (`[backup].destination`, ADR 0049) | **no engine-owned timeout** — filesystem / SMB-redirector I/O, the same posture as the File connector | handles are context-managed; the archive is fsync'd, then verified, and only then renamed onto its canonical name | a failed or verify-failed run is logged + audited and keeps a `.failed` name, so it is never a keep-N candidate — in that prune or any later one (ADR 0049) | **single-shot per scheduled pass** — retried only by the next daily pass |
 | Vault Transit — store DEK unwrap (`MEFOR_STORE_VAULT_ADDR`, `[store].key_provider = vault`, ADR 0019) | **30 s, inherited — not MEFOR-owned.** The client is built as `hvac.Client(url=…, token=…)` with **no timeout argument**, so the bound is `hvac.adapters.Adapter.__init__`'s own `timeout=30` default (`requests` itself has **no** default timeout — without hvac's, this hop would block forever). `hvac>=2.3.0` is the pinned floor; **no MEFOR setting exists** | the `hvac` client is short-lived per unwrap | **fail-closed** — the store refuses to open | **single-shot** — one request per unwrap |
 | Vault Transit — bulk at-rest cipher (`MEFOR_STORE_TRANSIT_KEY`, `[store].cipher_provider = vault_transit`, ADR 0138) | **30 s, inherited — not MEFOR-owned**: the same no-timeout `hvac` client build, so the same `hvac.adapters.Adapter` `timeout=30` default applies to **every cell round trip** | a **single long-lived** `hvac.Client` held for the store's lifetime (`TransitCipher.__init__`), not per operation | a per-operation failure raises `CipherError` at runtime — it does **not** refuse to open the store | **single-shot** per cell; the stage's own re-claim is what retries |
 | Vault KV v2 (`MEFOR_SECRETS_VAULT_ADDR`) | **30 s, inherited — not MEFOR-owned**: the same `hvac.Client(url=…, token=…)` construction with no timeout argument, so the same `hvac.adapters.Adapter` `timeout=30` default applies | as Transit | **fail-closed** — the connector refuses to build | **single-shot** — one request per read |

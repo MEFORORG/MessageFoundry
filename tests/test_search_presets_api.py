@@ -112,12 +112,55 @@ async def test_preset_crud_and_owner_scoping(engine: Engine) -> None:
         assert (await c.delete(f"/search/presets/{pid}", headers=h)).status_code == 200
         assert (await c.get("/search/presets", headers=h)).json()["presets"] == []
 
-    # create + delete were audited (needle shape only — never the value)
+    # CONTAINMENT ONLY: whatever preset.* rows exist carry the needle SHAPE, never the value.
+    # BACKLOG #1643: this comment used to read "create + delete were audited", which this assertion
+    # is not evidence for -- it passes with both audit writes deleted, because an empty join
+    # contains neither needle. The presence claim lives in
+    # test_preset_routes_write_an_audit_row_naming_the_acting_user below, which is the test that
+    # reddens when a preset.* record_audit call is removed.
     audits = await engine.store.list_audit()
     detail = " ".join(
         str(a["detail"] or "") for a in audits if str(a["action"]).startswith("preset.")
     )
+    assert detail, "nothing decoded -- the containment checks below would be vacuous"
     assert "MRN999" not in detail and "OTHER" not in detail
+
+
+async def test_preset_routes_write_an_audit_row_naming_the_acting_user(engine: Engine) -> None:
+    """BACKLOG #1643: list / create / delete each leave an audit row naming the ACTING user.
+
+    RED when any one of the three ``record_audit`` calls in ``api/app.py`` is deleted, or when one
+    stops passing ``actor=identity.username``. That was previously unobservable: no file under
+    ``tests/`` or ``packaging/messagefoundry-webconsole/tests/`` named ``preset.create``,
+    ``preset.delete`` or ``preset.list`` at all, so deleting the ``preset.create`` write left the
+    whole preset suite green.
+
+    The actor is asserted per action rather than over the joined set, so a route that audits under
+    the wrong identity -- a fixed string, or another request's user -- fails here too.
+    """
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    service = await _user(engine, Role.OPERATOR, "auditee")
+    transport = httpx.ASGITransport(app=create_app(engine, auth=service))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, "auditee")
+        created = await c.post(
+            "/search/presets",
+            json={"name": "audited", "criteria": {"content": "MRN999"}},
+            headers=h,
+        )
+        assert created.status_code == 200, created.text
+        pid = created.json()["id"]
+        assert (await c.get("/search/presets", headers=h)).status_code == 200
+        assert (await c.delete(f"/search/presets/{pid}", headers=h)).status_code == 200
+
+    for action in ("preset.create", "preset.list", "preset.delete"):
+        rows = await engine.store.list_audit(action=action)
+        assert rows, f"{action} left no audit row"
+        assert [r["actor"] for r in rows] == ["auditee"], (
+            f"{action} must be audited under the acting user"
+        )
 
 
 async def test_layered_compose_and_conflicts(engine: Engine) -> None:

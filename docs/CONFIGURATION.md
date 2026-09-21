@@ -21,7 +21,7 @@
 >
 > **The refusal covers the FILE. It does not cover env or CLI — check those spellings yourself.** A
 > misspelled `MEFOR_*` variable or `serve` flag is still dropped silently — the env layer is where
-> secrets belong, and it already drops a var aimed at one of the five sections that have no env layer
+> secrets belong, and it already drops a var aimed at one of the four sections that have no env layer
 > ([Mechanism](#mechanism)). The loader also cannot tell such a typo from one of the documented
 > `MEFOR_*` variables its consuming module reads straight from the environment rather than declaring as
 > a field (`MEFOR_STORE_VAULT_ADDR`, `MEFOR_TLS_REVOCATION_ATTESTED` and siblings). **One exception:**
@@ -66,10 +66,12 @@ CLI flag  >  environment variable  >  messagefoundry.toml  >  built-in default
 - **Secrets** (e.g. a DB password) should come from **env** (or a secret reference), never plaintext
   in the file — env wins over the file so a deployment can inject them.
 - Env naming: `MEFOR_<SECTION>_<KEY>` (e.g. `MEFOR_STORE_PASSWORD`, `MEFOR_API_PORT`). The parser splits
-  the name at the **first** `_` after the prefix and matches that against a known-section list, so five
+  the name at the **first** `_` after the prefix and matches that against a known-section list, so four
   built sections have **no env layer** and a `MEFOR_*` var aimed at one is dropped without a warning:
-  `[sandbox]`, `[service]`, and the underscored `[cert_monitor]`, `[secret_rotation]`, `[update_check]`.
-  Set those in the file.
+  `[service]`, and the underscored `[cert_monitor]`, `[secret_rotation]`, `[update_check]`. The reasons
+  differ. `[service]` would work if the known-section list named it, but it just isn't listed. The other
+  three fail a different way: that same first-underscore split turns `MEFOR_CERT_MONITOR_ENABLED` into
+  section `cert`, not `cert_monitor`, so no list entry can rescue it. Set those four in the file.
 - Loaded once at startup into a typed `ServiceSettings` (pydantic) model; the engine + store read from
   it. `serve` keeps its existing flags as the CLI layer.
 
@@ -800,7 +802,7 @@ Because the local diff is cheap and PHI-safe it is **on by default** (zero phone
 |---|---|---|---|
 | `retry_max_attempts` | int | `100` | attempts before a delivery dead-letters. **Finite by default** (BACKLOG #1051): 100 attempts under the backoff below is a 28,215 s / 7 h 50 m 15 s window, long enough to ride out a partner outage without letting a lane wedge indefinitely. Safe as a default because attempts are counted **per row** (an outage burns the cap on roughly the lane heads, not the backlog) and an exhausted row **dead-letters into the replayable DLQ**. Raise or lower it freely, but note the two edges: retry-forever has a TOML/env spelling — in **this file, `messagefoundry.toml`**, `retry_max_attempts = "forever"` under `[delivery]` (case-insensitive; also `MEFOR_DELIVERY_RETRY_MAX_ATTEMPTS=forever`) is coerced to `None` at load (BACKLOG #1217) — while `""`/`none`/`null` remain load errors; **a per-outbound override is a different file and a different key** — `connections.toml`, `[outbound.retry]`, `max_attempts = "forever"`, since `connections.toml` has no `[delivery]` table and no flat `retry_max_attempts` key (under FIFO that head then blocks its lane until it succeeds or is purged); and **`0` or a negative value is now REFUSED at load** (`ge=1`, BACKLOG #1051). It used to be accepted and dead-letter on the FIRST failure — the check is `attempts >= max_attempts` against a post-increment count, so `0` gave up immediately while *reading* like "no limit". That is why the floor is on this key rather than a documentation note. **The floor is on this operator-facing setting ONLY:** the code-first `retry=RetryPolicy(max_attempts=0)` stays legal and is the deliberate idiom for a permanent, no-retry failure. A permanent `AR` reject fails fast regardless. |
 | `retry_backoff_seconds`, `retry_backoff_multiplier`, `retry_max_backoff_seconds` | num | 5 / 2 / 300 | exponential backoff between attempts (per-outbound `retry=` overrides) |
-| `ordering` | enum | `fifo` | default queue ordering per outbound: `fifo` (strict in-order, head-of-line on failure) or `unordered` (batch + rotate-past-failures). Per-outbound `ordering=` overrides. |
+| `ordering` | enum | `fifo` | default queue ordering per outbound: `fifo` (strict in-order, head-of-line on failure) or `unordered` (batch + rotate-past-failures). `unordered` isolates a stuck message and never adds concurrency — a lane sends one message at a time either way. It works in both claim modes. Switching a lane that is already running from `fifo` to `unordered` takes effect at the next engine start, not on reload. Per-outbound `ordering=` overrides. |
 | `internal_error` | enum | `continue` | what a delivery worker does on an **internal/code error** (a non-`DeliveryError` exception from `send` — our bug, not the partner's): `continue` (dead-letter the row + advance) or `stop` (halt the connection's worker, preserve the message for replay, raise a `connection_stopped` alert). Per-outbound `internal_error=` overrides. Partner NAKs / transport failures are unaffected. |
 | `buildup_max_depth` | int | _unset_ | raise a `queue_buildup` alert when an outbound lane's pending depth reaches this. Unset = depth dimension off (a healthy ceiling is throughput-specific, so there's no safe default). Per-outbound `buildup=BuildupThreshold(...)` overrides. |
 | `buildup_max_oldest_seconds` | num | 300 | raise `queue_buildup` when the lane's **oldest** pending message has waited this long (a stuck head retrying its way toward the cap is the classic cause). On by default — a head stuck >5 min is a problem in any environment. Set to unset/`0`-disable via a per-outbound override. |
@@ -814,7 +816,7 @@ Because the local diff is cheap and PHI-safe it is **on by default** (zero phone
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `max_correlation_depth` | int (≥1) | 8 | **Re-ingress loop cap** (ADR 0013 Increment 2). When a captured reply is re-ingressed (`reingress_to=`/`Loopback()`), the re-ingressed message carries a `correlation_depth`; a message at this depth still routes, but the next hop (depth+1) **dead-letters** its re-ingress work-row and marks the origin `ERROR`. Coarse by design — it bounds *total work*, not topology, so a chain that legitimately bounces A→B→A a few times needs headroom. 8 is safe for typical request→response→route feeds; raise it for deep correlation chains, lower it to fence a misbehaving loop. (A value of 0 would dead-letter every re-ingress, so the floor is 1.) |
-| `per_lane_wake` | bool | `false` | **Per-lane wake events** (B12, [ADR 0061](adr/0061-per-lane-wake-events.md)). **Reliability-core, default-OFF.** When `false`, a committed message wakes every worker of its stage via an engine-wide event (the historical behavior). When `true`, it wakes **only its own (stage, lane) worker**, eliminating the thundering-herd empty-claim storm that dominates at high **connection** counts (~1,500 inbounds). Correctness is unchanged (the FIFO claim + the 0.25 s lost-wakeup poll backstop are untouched; a missed wake self-heals within the poll). **Read once at engine start — a `/config/reload` does NOT toggle it (restart to change).** Env override (for the connection-scale harness A/B): `MEFOR_PIPELINE_PER_LANE_WAKE=true`. Applies only in `per_lane` claim mode (see `claim_mode`); the default `pooled` mode routes wakes through its dispatchers instead, so this knob is inert there. |
+| `per_lane_wake` | bool | `false` | **Per-lane wake events** (B12, [ADR 0061](adr/0061-per-lane-wake-events.md)). **Reliability-core, default-OFF.** When `false`, a committed message wakes every worker of its stage via an engine-wide event (the historical behavior). When `true`, it wakes **only its own (stage, lane) worker**, eliminating the thundering-herd empty-claim storm that dominates at high **connection** counts (~1,500 inbounds). Correctness is unchanged (the FIFO claim + the 0.25 s lost-wakeup poll backstop are untouched; a missed wake self-heals within the poll). **Read once at engine start — a `/config/reload` does NOT toggle it (restart to change).** Env override (for the connection-scale harness A/B): `MEFOR_PIPELINE_PER_LANE_WAKE=true`. The default `pooled` mode routes wakes through its dispatchers, so this knob is inert there for every lane a dispatcher drains — which is all of them except an outbound declaring `ordering = "unordered"`, whose own delivery worker still reads it ([ADR 0066](adr/0066-pooled-stage-claimers.md) D4). |
 | `claim_mode` | enum | `pooled` | **Pipeline claim mode** ([ADR 0066](adr/0066-pooled-stage-claimers.md)). **Reliability-core.** `pooled` (the **default since #744**) runs one `StageDispatcher` per stage — a handful of shared claimer tasks batch-claim head-prefixes across lanes, collapsing the per-connection claim storm and holding zero-loss at high fan-out where `per_lane` drops messages. `per_lane` is the **byte-identical opt-out** (`[pipeline].claim_mode = "per_lane"`): the pre-ADR-0066 topology of one router+transform worker per inbound and one delivery worker per outbound, enforced by a test sentinel. **Read once at engine start — a `/config/reload` does NOT toggle it (restart to change).** Env override (harness A/B): `MEFOR_PIPELINE_CLAIM_MODE`. **Two caveats** (see [CONNECTIONS.md](CONNECTIONS.md) "Pipeline claim mode"): exactly-once degrades under load (no inbound de-dup — receivers must be idempotent; not pooled-specific) and active-passive failover-under-load is covered (the gated `test_load_failover_{postgres,sqlserver}` two-node kill-the-leader runs hold no-acknowledged-loss / per-lane FIFO / bounded dup-rate under pooled; only recovery *time* is host-dependent, and the T17 infra-fault spin is bounded by ADR 0070). Invariants (at-least-once / per-lane FIFO / poison-guard) are unchanged in both modes. |
 | `pooled_claimers_per_stage` | int (≥1) | 1 | Pooled-only: K claimer tasks per stage (`>1` hash-partitions lanes across claimers so no two claim the same lane). |
 | `pooled_sweep_interval` | float (>0) | 0.25 | Pooled-only: the clock-driven discovery-sweep interval (the bounded at-least-once backstop; 0.25 s = `poll_interval` parity). |
@@ -1468,7 +1470,7 @@ DBA-delegated (#52): config-only, or skipped, per `config_only_on_server_db`.
 | `enabled` | bool | `false` | opt-in master switch; a deployment with no `[backup]` is unaffected |
 | `destination` | path | `""` | local or UNC destination dir (e.g. `D:/mefor-backups`). **Required (non-empty) when enabled.** A cloud URL (`s3://`, `https://`, …) is **rejected** — there is no cloud target |
 | `schedule_at` | str | `"02:00"` | daily local `"HH:MM"` the scheduled backup runs at (the same clock grammar as `[retention].vacuum_at`). `""` = **on-demand only** (the `messagefoundry backup` CLI), no scheduled pass |
-| `retention_keep` | int | `7` | keep-N: after a successful, **verified** new archive, prune the oldest archives beyond the newest N at the destination. `0` = keep all. A verify-**failed** archive is never counted as a good backup when pruning, so a failing run can't evict the last good one |
+| `retention_keep` | int | `7` | keep-N: after a successful, **verified** new archive, prune the oldest archives beyond the newest N at the destination. `0` = keep all. Only archives that passed every configured check are counted: a backup is written as `<name>.part` and renamed onto its canonical name after the verify, so a verify-**failed** archive keeps a `.failed` name and can evict a good one in neither this prune nor any later one. The flip side: `.failed` and `.part` files at the destination sit **outside** keep-N and nothing expires them — clear them yourself (ADR 0049) |
 | `snapshot_method` | str | `vacuum_into` | `vacuum_into` (default; takes a writer lock, sized for the off-peak schedule) or `online_backup` (low-contention, page-batched) |
 | `include_config` | bool | `true` | bundle the loaded `--config` dir into the archive, so the cold seed is self-sufficient (store **plus** the config that interprets it) without assuming the DR box can reach the org's git repo |
 | `verify_after_backup` | bool | `true` | run the lightweight restore-verify after every backup (open + `integrity_check` + row-count). On by default — a backup nobody has opened is a backup that silently doesn't restore |
@@ -1529,7 +1531,8 @@ an **editable** install (`pip install -e .` — no RECORD baseline) is a **no-op
 |---|---|---|---|
 | `enabled` | bool | `true` | run startup attestation at all. On by default (alert-only is harmless); a **no-op** off an editable install. Set `false` only to suppress the check entirely (e.g. an unusual packaging where RECORD is known-stale) — you then lose the in-place-tamper tripwire. |
 | `fail_closed_on_drift` | bool | `false` | when `true`, drift makes `serve` **refuse to start** (after recording the audit row + alerting), and so does an attestation that verified **nothing** — no `RECORD` baseline, a `RECORD` stripped of its package rows, or the package loaded from outside the install root (a pass that compared zero files cannot say the bytes are clean). Default `false` = **alert-only**: a legitimate reviewed in-place security hotfix (the documented vendored-parser patch contingency) would itself trip a RECORD mismatch, so fail-closed-by-default would brick a legitimate patch. Alert-only still logs a WARNING, records the row and alerts for both shapes. An install that **declares** itself editable (`pip install -e .`) is exempt either way, so dev is never bricked — and because that exemption silently cancels the opt-in, setting this on an editable install logs a WARNING naming the reason at startup (BACKLOG #1679). Opt in for hard enforcement on a locked-down instance. **Read the boundary before you record this as tamper-proof:** the baseline ships inside the same install the adversary would be writing, so it detects an *inconsistent* in-place edit and not a *consistent* one. Why no runtime anchor fixes that, where the out-of-domain anchoring actually lives, and what the resolution assumes about the install root are in [ADR 0041](adr/0041-load-path-attestation-and-change-attribution.md) D3, *"The baseline's trust domain"*. |
-| `audit_verify_on_start` | bool | `false` | when `true`, the engine **re-walks the `audit_log` hash chain once at startup** (#190). **Alert-only by construction:** a broken chain logs a WARNING and fires the `AlertSink` but **never** crashes startup — a refuse-to-start on a tripped tamper alarm would be a self-inflicted DoS. Default `false` (opt in): on a very large `audit_log` the full re-walk adds startup latency, so it is not on by default. **It is a bare walk: it passes no anchor, so it is blind to a truncated tail** (below). Nothing here consumes an anchor — that is `messagefoundry audit-verify --expected-anchor`, run by an operator against a quiesced chain. **Read the two limits below before citing this as tamper detection.** |
+| `audit_verify_on_start` | bool | `false` | when `true`, the engine **re-walks the `audit_log` hash chain once at startup** (#190). **Alert-only by construction:** a broken chain logs a WARNING and fires the `AlertSink` but **never** crashes startup — a refuse-to-start on a tripped tamper alarm would be a self-inflicted DoS. Default `false` (opt in): on a very large `audit_log` the full re-walk adds startup latency, so it is not on by default. **On its own it is a bare walk, and a bare walk is blind to a truncated tail** (below) — set `audit_anchor_file` beside it to close that. **Read the two limits below before citing this as tamper detection.** |
+| `audit_anchor_file` | str | `""` | path to a file holding one `COUNT:HEAD` anchor as written by `messagefoundry audit-anchor`. Empty (the default) leaves the startup walk exactly as it was. When set **and** `audit_verify_on_start` is `true`, the startup walk also compares the live chain against that anchor, which is **what lets it see a truncated tail** (BACKLOG #328). **The engine consumes it as a PREFIX, not as the CLI's exact seal** — `--expected-anchor` compares the *current* head and so diverges on the very next appended row, which a running engine produces constantly; this asks instead whether the recorded state was ever true and the chain has only **grown** since. It still catches a truncated tail and a mid-chain rewrite, and a **stale anchor stays valid** — it simply witnesses less, so re-anchor when you want the witness moved forward. **Alert-only, like its partner:** a missing, unreadable or malformed anchor logs a WARNING, names the file and the reason, and lets the bare walk run — it never crashes startup and **never fires the tamper alert**, because a config fault that raised a tamper alarm would train operators to ignore the real one. The refusal never quotes the file's contents into the log (a mis-pointed path is usually a path typo'd onto something else); the CLI still quotes it, because that lands on the operator's own terminal. `0:`, the anchor of an **empty** log, is reported rather than compared — it can witness nothing. Setting this **without** `audit_verify_on_start` is warned at startup: the anchor is never read. A truncated tail and a broken chain fire **different** alert subjects (`audit-chain-truncated` / `audit-chain`), so they route and throttle separately |
 
 **The chain is *tamper-evident* only when the store is keyed.** With no store encryption key the cipher
 is `IdentityCipher`, whose `audit_mac_key()` returns `None` — "no DEK → no derived key → the audit chain
@@ -1546,36 +1549,51 @@ deployment does get the keyed chain. The unkeyed chain is what an **acknowledged
 runs — and since [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md) that acknowledgment is the only route to it. Check `[store].encryption_key` /
 `encryption_key_file` before you record "tamper-evident audit log" in a risk register.
 
-**And the walk does not catch a truncated tail.** `verify_audit_chain` detects modified or deleted
+**And a bare walk does not catch a truncated tail.** `verify_audit_chain` detects modified or deleted
 **older** rows, but deleting the **newest** rows leaves a prefix that still chains cleanly, so a bare
 walk returns CLEAN after a tail-truncation. An attacker hiding what they just did truncates the newest
-rows. `audit_verify_on_start` is a bare walk and is therefore blind to exactly that.
+rows. `audit_verify_on_start` **on its own** is a bare walk and is therefore blind to exactly that.
 
-**What closes it is an anchor, and it is an operator command, not a startup setting**
-([BACKLOG #328](BACKLOG.md)). `messagefoundry audit-anchor` prints `COUNT:HEAD`; passing it back as
-`messagefoundry audit-verify --expected-anchor COUNT:HEAD` (or `--expected-anchor-file PATH`) compares
-the live chain against it and reports `truncated or rewritten` when they differ. The anchor is a row
-count plus a digest — no PHI, no secret — so it is safe to hold in a ticket or an object store, which
-is what makes it an *external* witness.
+**What closes it is an anchor, and there are now two ways to hold one**
+([BACKLOG #328](BACKLOG.md)). `messagefoundry audit-anchor` prints `COUNT:HEAD`. Either pass it back by
+hand as `messagefoundry audit-verify --expected-anchor COUNT:HEAD` (or `--expected-anchor-file PATH`),
+or point `[integrity].audit_anchor_file` at the file and let **every startup** compare against it. The
+anchor is a row count plus a digest — no PHI, no secret — so it is safe to hold in a ticket or an
+object store, which is what makes it an *external* witness.
 
-**The anchor is an EXACT point-in-time seal.** It compares the count **and** the head hash, so an
-anchor taken before any subsequent audit row reports `truncated or rewritten` on a chain that merely
-**grew**. The head half is not redundant with the count: an attacker who cuts the newest rows and
-forges the same number of replacements restores the count *and* leaves a chain that walks cleanly, so
-the head hash is the only thing that differs. The sharp edge and that detection are the same check.
+**The two consume it differently, and the difference is the whole reason the startup one can exist.**
 
-**So it seals a chain AT REST between two offline checks — that is the whole workflow, and it is the
-only one with detection power.** Anchoring and immediately re-verifying compares a value to itself and
-proves nothing; re-checking a held anchor against a **running** engine alarms on every ordinary boot,
-because a running engine writes audit rows. What sits between those two useless readings is a real
-control: **stop or quiesce the engine, take the anchor, hold it somewhere the engine's operator cannot
-rewrite, and re-verify while the chain is still quiesced** — across a maintenance window, a database
-move, a backup/restore, or a hand-off between custodians. Anything that happened to the DB in that gap
-is what the anchor detects. Do not build a periodic job against a live engine on it.
+**The CLI's `--expected-anchor` is an EXACT point-in-time seal.** It compares the count **and** the
+head hash, so an anchor taken before any subsequent audit row reports `truncated or rewritten` on a
+chain that merely **grew**. The head half is not redundant with the count: an attacker who cuts the
+newest rows and forges the same number of replacements restores the count *and* leaves a chain that
+walks cleanly, so the head hash is the only thing that differs. The sharp edge and that detection are
+the same check.
+
+**So the CLI check seals a chain AT REST between two offline readings — that is its whole workflow.**
+Anchoring and immediately re-verifying compares a value to itself and proves nothing; re-checking an
+*exact* anchor against a **running** engine alarms on every ordinary boot, because a running engine
+writes audit rows. What sits between those two useless readings is a real control: **stop or quiesce
+the engine, take the anchor, hold it somewhere the engine's operator cannot rewrite, and re-verify
+while the chain is still quiesced** — across a maintenance window, a database move, a backup/restore,
+or a hand-off between custodians. Anything that happened to the DB in that gap is what it detects. Do
+not build a periodic job against a live engine on the **exact** comparison.
+
+**`[integrity].audit_anchor_file` is the same artifact under a WEAKER comparison, and that is what
+makes it survivable on a running engine.** It asks whether the recorded state was ever true and the
+chain has only **grown** since — the head captured *at the recorded row position* against the recorded
+one — so appended rows are irrelevant to it and it does not alarm on an ordinary restart. It still
+catches the two shapes that matter: **fewer rows than recorded** (a truncated tail) and **a different
+head at that position** (a mid-chain rewrite). What it gives up is the exact seal's sharpness about
+*when*: it cannot tell you the chain is unchanged, only that it has not been cut or rewritten below
+the anchor. Use both — the startup check for continuous coverage of every boot, the quiesced CLI check
+for the custodial hand-offs above.
 
 The full reasoning is the [`[retention]`](#retention) `audit_days` row, which is the source of record
-for it. **For continuous coverage of a running engine, an off-box log forward / tee remains the answer**
-— the anchor does not replace it and cannot, because the anchor is a seal on a stationary object.
+for it. **An off-box log forward / tee remains the answer for continuous coverage, and neither anchor
+check replaces it.** `audit_anchor_file` fires **at startup and only at startup**, so it detects a cut
+made since the last boot — it says nothing about the window between two boots, and a host that never
+restarts never checks. The tee is the only control that sees the trail as it is written.
 
 ### `[engine]`
 **Not implemented.** There is **no `EngineSettings` model**, so an `[engine]` block in

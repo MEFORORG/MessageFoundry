@@ -34,7 +34,7 @@
 #
 # AND THE SAFE REMOTE IS NOT THE DEFAULT ONE. This checkout carries two remotes that differ in KIND:
 #     origin   MEFORORG/MessageFoundry             PUBLIC
-#     private  wshallwshall/MessageFoundry-vault   PRIVATE
+#     private  MEFORORG/MessageFoundry-vault   PRIVATE
 # `git push` with no remote named resolves to `origin`, so the dangerous target is the one a hand
 # reaches by default and the safe one must be typed. That is a sharper trap than assuming a remote is
 # private and being wrong: here the wrong answer is what happens when nobody decides anything. It is
@@ -74,9 +74,13 @@
 #
 # WHAT IT DOES NOT COVER, stated because a control trusted past its reach is worse than none:
 #   * Uncommitted work. Nothing here helps; a lost working tree is lost.
-#   * Rebases. The tag force-moves to follow the branch, so commits only reachable from a discarded
-#     tip are orphaned remotely. The local reflog still holds them. This narrows the window; it does
-#     not close it.
+#   * A rewrite that is never followed by a commit. The preserve-before-move block below fires on
+#     the next commit to the rewritten branch, because that is when the moving tag would discard the
+#     old tip. Until then nothing is at risk -- the remote tag still holds the old tip -- but nothing
+#     is captured either, so a clone lost in that window loses the discarded commits.
+#   * A branch whose name is a prefix of another branch's. `refs/tags/rescue/auto/<repo>/a` and
+#     `.../a/b` cannot both exist: git refuses the second, one ref being a directory the other needs
+#     to be a file. That predates this hook's bookkeeping ref, which inherits the same shape.
 #   * Concentration. Every tag lands on ONE nominated remote. That is one account away from total
 #     loss, and tags are mutable and unprotected.
 #   * The refs already pushed. Provenance cannot be retrofitted -- the information was never
@@ -88,20 +92,92 @@
 REMOTE=$(git config --get mefor.durabilityRemote 2>/dev/null)
 [ -n "$REMOTE" ] || exit 0
 
-URL=$(git remote get-url "$REMOTE" 2>/dev/null)
-[ -n "$URL" ] || exit 0
+# EVERY URL THE PUSH COULD USE, NOT THE ONE A READER ASSUMES. `git remote get-url` returns
+# remote.<name>.url -- the FETCH url -- while the `git push` at the foot of this script resolves
+# remote.<name>.pushurl when one is set. Reading only the fetch url left the entire refusal
+# bypassable by one config line: `git remote set-url --push <name> <public>` on an otherwise private
+# remote force-pushed a rescue tag to the public repository on every commit, and this guard printed
+# nothing. Measured 2026-09-19 with two local bare repos: with the public spelling as the fetch url
+# the hook refused; moved to the pushurl, the same spelling reached the push with no refusal.
+#
+# So collect both sets and refuse if ANY of them names the public repository. `--push --all` falls
+# back to the fetch url when no pushurl is configured, so the two overlap in the ordinary case and
+# a duplicate costs one extra comparison.
+URLS=$(
+  git remote get-url --all "$REMOTE" 2>/dev/null
+  git remote get-url --push --all "$REMOTE" 2>/dev/null
+)
+[ -n "$URLS" ] || exit 0
 
 # Hard refusal for the canonical PUBLIC remote. This is a named-target check, not a general
 # visibility test -- there is no offline visibility test. It exists because the most likely
 # misconfiguration by far is nominating the remote that is already there.
-case "$URL" in
-  *MEFORORG/MessageFoundry*)
-    echo "durability_push: REFUSING -- mefor.durabilityRemote names the canonical PUBLIC repo." >&2
-    echo "  A push there is publication, which is the gate this hook exists to avoid tripping." >&2
-    echo "  Nominate a private remote instead, then re-commit." >&2
-    exit 0
-    ;;
-esac
+#
+# THE TRAILING MATCH IS LOAD-BEARING, AND A PREFIX GLOB HERE FAILED IN EXACTLY THE WRONG DIRECTION.
+# This read `*MEFORORG/MessageFoundry*` until 2026-09-19, when the private vault was transferred
+# into the same organization and became `MEFORORG/MessageFoundry-vault`. That path matches the
+# prefix glob, so the hook began refusing the PRIVATE remote as though it were the public one --
+# and because the refusal is `exit 0`, every commit still succeeded with durability silently OFF.
+# The two repositories are now one suffix apart under one owner, so nothing before the end of the
+# path distinguishes them.
+#
+# ANCHORING ALONE LEFT THE OTHER DIRECTION OPEN, AND THAT ONE IS WORSE. The first fix matched three
+# literal spellings, so `https://github.com/mefororg/messagefoundry.git` -- the same public
+# repository, differing only in case -- was ACCEPTED and pushed. Measured 2026-09-19 against the
+# then-current script. Over-refusing turns durability off quietly; under-refusing opens the
+# unreviewed publication path this guard is the only thing standing in front of, and GitHub resolves
+# owner and name case-insensitively, so that URL reaches the same repository.
+#
+# So normalise, then compare whole. One repository has several legitimate spellings -- https, ssh,
+# `git://`, scp-style `host:owner/name`, with or without `.git`, with or without a trailing slash --
+# and `.wiki` is stripped because a public repository's wiki is public too.
+#
+# NOT COVERED, DELIBERATELY: the host is not examined, so any host serving this owner and name is
+# refused exactly as before; and a GitHub rename redirect is invisible offline, per the header.
+# Everything this does not name is still trusted to the nomination.
+#
+# This matcher is the vault clone's, ported rather than reinvented (vault PR 1604). The two clones
+# carry separate copies of this script and nothing re-syncs them, which is why the anchor fix and
+# the case fix were each live on one side only.
+#
+# THE SUFFIXES ARE STRIPPED IN A LOOP, NOT ONCE EACH IN A FIXED ORDER. A single pass over
+# `/`, `.git`, `.wiki` leaves any other composition intact, and each survivor is an ACCEPT -- the
+# publishing direction. Measured 2026-09-19 against the one-pass version: `MessageFoundry//`,
+# `MessageFoundry.git//` and `MessageFoundry///` all escaped the refusal. The loop terminates
+# because every iteration removes at least one character.
+#
+# `[:upper:]`/`[:lower:]` rather than `A-Z`/`a-z`: POSIX defines tr's range endpoints in COLLATION
+# order, so under a locale whose collation interleaves cases the ranges do not map what they appear
+# to and an uppercase URL survives unchanged -- again an accept. A git hook inherits whatever
+# LC_ALL/LC_CTYPE the committing shell carries, and nothing here controls that.
+is_public_repo() {
+  _n=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  while :; do
+    case "$_n" in
+      */) _n=${_n%/}; continue ;;
+      *.git) _n=${_n%.git}; continue ;;
+      *.wiki) _n=${_n%.wiki}; continue ;;
+    esac
+    break
+  done
+  case "$_n" in
+    */mefororg/messagefoundry | *:mefororg/messagefoundry | mefororg/messagefoundry) return 0 ;;
+  esac
+  return 1
+}
+
+# A `while read` rather than `for`, so a URL containing whitespace is one candidate and not two.
+printf '%s
+' "$URLS" | while IFS= read -r _u; do
+  [ -n "$_u" ] || continue
+  is_public_repo "$_u" && exit 1
+  :
+done || {
+  echo "durability_push: REFUSING -- mefor.durabilityRemote names the canonical PUBLIC repo." >&2
+  echo "  A push there is publication, which is the gate this hook exists to avoid tripping." >&2
+  echo "  Nominate a private remote instead, then re-commit." >&2
+  exit 0
+}
 
 # NAMESPACE BY REPOSITORY. Two repositories push rescue tags to ONE remote -- the engine's `private`
 # and the vault's `origin` are the same GitHub repo -- so a tag keyed by branch name ALONE collides on
@@ -188,8 +264,104 @@ else
   echo "  honest verdict for a ref that records nothing about what it captured." >&2
 fi
 
-# Backgrounded and detached so the commit returns immediately. --force because the tag tracks a
-# moving tip. Output is discarded: see "NEVER FAILS A COMMIT" above.
-( git push --quiet --force "$REMOTE" "$SRC:$TAG" >/dev/null 2>&1 & ) >/dev/null 2>&1
+# --- preserve before the tag moves off a discarded tip ----------------------------------------
+# THE TAG NAMES A BRANCH, NOT A COMMIT, SO EVERY COMMIT FORCE-MOVES IT. On an ordinary commit the
+# old value is an ancestor of the new one and the move costs nothing. After a rebase, an amend or a
+# reset it is NOT an ancestor, and the move used to make the discarded commits reachable from no ref
+# on the remote at all -- silently, which is the whole reason this is worth code. The tag still
+# existed, the push still succeeded, and the only thing that changed was what the tag covered.
+#
+# MEASURED 2026-09-20, in a throwaway repository with this hook installed rather than argued from
+# this source. Two commits on a branch, a rebase onto a moved main, then one more commit. Before the
+# rebase the tag peeled to the pre-rebase tip; after it, both pre-rebase commits were reachable from
+# NO ref in the bare remote. The same query asked of the new tip named the tag, so the scan that
+# returned "no coverage" was not simply a broken scan.
+#
+# SO THE VALUE ABOUT TO BE DISCARDED IS PUSHED SOMEWHERE IMMUTABLE FIRST.
+# `refs/tags/rescue/orphan/<repo>/<branch>/<sha>` is keyed by the sha it holds, so it never needs to
+# move -- and it is pushed WITHOUT --force, so a second attempt at the same name is refused by git
+# rather than by hope and the first capture stands. It sits under `refs/tags/rescue/`, which is
+# already what the fetch refspec collects and what `scripts/coord/rescue.ps1 -Check` audits, so
+# nothing downstream needs teaching about it.
+#
+# WHAT THE OLD VALUE IS, AND WHY IT IS A LOCAL REF INSTEAD OF A REMOTE READ. `$LAST` holds the
+# commit this hook last pushed for `$TAG`. Asking the remote instead would cost a network round trip
+# on every commit and would still hand back only a sha -- and a sha is not enough, because the
+# discarded commit has to still BE here to be pushed. A ref does both jobs at once: it answers
+# offline, and it keeps the object reachable so the reflog's expiry cannot take the rescue with it.
+#
+# IT IS DELIBERATELY NOT UNDER refs/tags/. `git push --follow-tags` and `git push --tags` sweep
+# refs/tags to whatever remote a hand reaches for, and the default one here is PUBLIC. That is the
+# same hazard the provenance object above avoids by being pushed by id and never given a local tag,
+# and a bookkeeping ref that reopened it would be a worse defect than the one this block closes.
+#
+# ONE SPAWN ON AN ORDINARY COMMIT, AND THE EXIT CODE IS READ RATHER THAN THE OUTPUT. `git merge-base
+# --is-ancestor` exits 0 for an ancestor, 1 for a rewrite, and 128 when a name does not resolve.
+# Measured on git 2.55.0.windows.5 across all three, including the two states that reach it here
+# with nothing to compare: the first commit on a branch, where `$LAST` does not exist yet, and the
+# degraded path above, where `$COMMIT` is empty. Both give 128, and only the 1 arm does further
+# work -- so a rewrite pays three more spawns and every other commit pays one.
+LAST="refs/mefor/durability/${TAG#refs/tags/rescue/auto/}"
+KEEP=
+
+git merge-base --is-ancestor "$LAST" "$COMMIT" >/dev/null 2>&1
+ANCESTRY=$?
+
+if [ "$ANCESTRY" -eq 1 ]; then
+  PREV=$(git rev-parse --verify --quiet "$LAST^{commit}" 2>/dev/null)
+  if [ -n "$PREV" ]; then
+    # TWELVE CHARACTERS RATHER THAN `git rev-parse --short`. printf is a shell builtin, so it costs
+    # no git spawn -- but the deciding reason is that git's abbreviation LENGTH grows with the
+    # object count, so the same commit spells a different ref name on two different days. A name
+    # relied on for immutability must not do that.
+    ORPHAN="refs/tags/rescue/orphan/${TAG#refs/tags/rescue/auto/}/$(printf '%.12s' "$PREV")"
+    ORPHANSRC="$PREV"
+
+    if [ -n "$IDENT" ] && [ -n "$LABEL" ] && [ -n "$CAPTURED" ]; then
+      # NO was-tip LINE, FOR THE REASON THE DETACHED CASE OMITS ONE. `was-tip` answers "was this the
+      # branch tip at the moment it was captured", and this ref is captured precisely because it is
+      # no longer the tip -- so False is literally true and reads as SHORT-AT-CAPTURE, "a partial
+      # snapshot", which is the opposite of what a reader should conclude about the only remaining
+      # copy of discarded work. True would be a straight falsehood. Omitting it gives
+      # SELF-DESCRIBING, and `orphaned-by` then says the thing that actually drives a recovery
+      # decision: which commit displaced this one.
+      OMSG="mefor-rescue-v1
+commit: $PREV
+branch: $LABEL
+captured: $CAPTURED
+orphaned-by: $COMMIT
+writer: durability_push.sh"
+      OTAGOBJ=$(printf 'object %s\ntype commit\ntag %s\ntagger %s\n\n%s\n' \
+        "$PREV" "${ORPHAN#refs/tags/}" "$IDENT" "$OMSG" \
+        | git hash-object -t tag -w --stdin 2>/dev/null)
+      # Same degradation rule as above: provenance is allowed to fail, durability is not. A bare
+      # commit still reaches the remote and still holds the work.
+      [ -n "$OTAGOBJ" ] && ORPHANSRC="$OTAGOBJ"
+    fi
+
+    KEEP="$ORPHANSRC:$ORPHAN"
+  fi
+fi
+
+# Backgrounded and detached so the commit returns immediately. --force on the moving tag because it
+# tracks a moving tip. Output is discarded: see "NEVER FAILS A COMMIT" above.
+#
+# PRESERVE, THEN DISCARD, AND THAT IS THE ONLY ORDER SAFE TO BE INTERRUPTED IN. Killed between the
+# two pushes, the orphan is already on the remote and the moving tag is merely stale -- which the
+# next commit repairs. The reverse order loses exactly the commits this block exists for. The orphan
+# push's own result is deliberately not checked: a refusal there means the name is already taken by
+# the capture this one would duplicate, and stopping on it would take the moving tag down too.
+#
+# $LAST IS UPDATED ONLY AFTER THE MOVING PUSH SUCCEEDS, so it keeps meaning "what the remote has"
+# rather than "what was attempted". A commit made offline leaves it alone, and the first push that
+# does land still preserves the right tip.
+_durability_push() {
+  [ -n "$KEEP" ] && git push --quiet "$REMOTE" "$KEEP"
+  git push --quiet --force "$REMOTE" "$SRC:$TAG" || return 1
+  [ -n "$COMMIT" ] || return 0
+  git update-ref "$LAST" "$COMMIT"
+}
+
+( _durability_push >/dev/null 2>&1 & ) >/dev/null 2>&1
 
 exit 0

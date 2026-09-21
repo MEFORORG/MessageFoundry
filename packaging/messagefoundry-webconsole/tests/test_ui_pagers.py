@@ -245,9 +245,10 @@ async def test_a_blank_filter_box_is_not_a_filter(engine: Engine) -> None:
         everything = await c.get(f"/ui/messages?channel_id=&{blank}")
         assert "1-3 of 3 message(s)" in everything.text
 
-        # Dead letters take the same treatment, and an unmatched NON-blank filter still narrows --
-        # without this the assertions above would also pass on a route that ignored its filters.
-        assert "0 of 0 dead delivery(s)" in (await c.get("/ui/dead-letters?channel_id=")).text
+        # An unmatched NON-blank filter still narrows -- without this the assertions above would
+        # also pass on a route that ignored its filters. No dead-letter arm: a blank channel_id is
+        # a 422 there by annotation rather than a filter, because that page draws no form to hand
+        # the value back to (BACKLOG #1740, pinned in golden/ui_input_rules.txt).
         assert "0 of 0 message(s)" in (await c.get("/ui/messages?channel_id=nosuch")).text
 
 

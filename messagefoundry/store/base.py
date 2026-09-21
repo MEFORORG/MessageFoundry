@@ -48,12 +48,15 @@ from messagefoundry.store.pool_metrics import PoolStatus
 from messagefoundry.store.store import (
     UPLOAD_RESERVATION_STALE_AFTER,
     AlertInstance,
+    AlertSummary,
     CapturedResponse,
     ClaimedHeads,
     ClaimProcStatus,
     ConnectionEvent,
+    ConnectionEventWrite,
     ConnectionMetrics,
     DbStatus,
+    FederatedUnbind,
     LatencyHistogram,
     MessageSearchResult,
     MessageStatus,
@@ -103,6 +106,7 @@ __all__ = [
     "SearchTarget",
     "Store",
     "StoreLifecycle",
+    "StoreNotFoundError",
     "StreamingAttachmentsUnsupported",
     "backend_supports_reference_sets",
     "make_spec",
@@ -224,8 +228,22 @@ class QueueStore(StoreLifecycle, Protocol):
 
     #: A1 live cost counters (always-on, additive; surfaced via ``/stats``). ``committed_txns`` = durable
     #: **write**-path transactions committed on this handle — the *committed transactions per message*
-    #: currency ADR 0051 sizes capacity on (``3 + 2H + 2N`` per ingress message, H = handlers routed,
-    #: N = destinations). Read-snapshot-release commits (e.g. the RCSI hygiene commit a SQL Server read
+    #: currency ADR 0051 sizes capacity on (``3 + 2H + 2N`` per ingress message).
+    #:
+    #: **This is the CANONICAL definition of H and N. Every other site links here rather than restating
+    #: it** (CLAUDE.md SDS-3.5 — state a load-bearing fact once). ``H`` = the routed rows the Router
+    #: materializes: one per handler it SELECTS, after any ``accepts=`` decline (ADR 0084). ``N`` = the
+    #: **outbound ROWS** the handlers' transforms emit — one per ``Send`` — **not** the number of
+    #: distinct outbound connections addressed. Two ``Send``s aimed at the SAME outbound cost the same
+    #: 2 transactions each as two aimed at different ones, because every outbound row is claimed in its
+    #: own transaction and resolved in its own, and a shared destination shares neither. So one handler
+    #: emitting two ``Send``s to one outbound is ``N = 2`` (9 txn/msg), never ``N = 1`` (7). That
+    #: reading is settled by execution through the real ``RegistryRunner`` in
+    #: ``tests/test_runner_txn_cost_model.py`` (BACKLOG #1736), which also records why the DEFAULT
+    #: pooled claimer reads slightly above the model on a multi-message run: its claim commit is per
+    #: ``claim_fifo_heads`` SWEEP, not per row.
+    #:
+    #: Read-snapshot-release commits (e.g. the RCSI hygiene commit a SQL Server read
     #: needs, or SQLite's read-pool ``COMMIT``) are excluded, so the counter stays the write currency the
     #: cost model validates rather than a superset that also counts every live lookup.
     #: ``body_copies`` = raw/payload body strings durably written (the ``2 + H + N`` per-message
@@ -1101,6 +1119,18 @@ class QueueStore(StoreLifecycle, Protocol):
         fail-soft, so a store error here can never wedge a listener or delivery lane."""
         ...
 
+    async def record_connection_events(self, events: Sequence[ConnectionEventWrite]) -> None:
+        """Append a burst of connection events in **one** transaction (BACKLOG #1731), each row
+        scrubbed, sealed and AAD-bound exactly as :meth:`record_connection_event` does it. The runner's
+        drainer calls this with whatever was already queued, so the cost is one commit per burst
+        rather than one per event. All-or-nothing: a failure writes none of the burst. An empty
+        sequence writes nothing.
+
+        All-or-nothing is a TRANSACTION guarantee and nothing more: a caller that would rather keep
+        the writable rows of a refused burst has to re-submit them itself, one at a time. What such
+        a caller then does with the rows that still fail is its own policy, not this method's."""
+        ...
+
     async def list_connection_events(
         self,
         *,
@@ -1158,6 +1188,19 @@ class QueueStore(StoreLifecycle, Protocol):
         the ``GET /alerts/active`` route. Runs on the lockfree read path; ``limit`` clamped server-side.
         ``allowed_channels`` applies the same per-channel RBAC scope as :meth:`list_connection_events`
         (``None`` = all; a set restricts to instances whose ``connection`` is in the allow-set)."""
+        ...
+
+    async def summarize_active_alert_instances(
+        self, *, allowed_channels: Sequence[str] | None = None
+    ) -> AlertSummary:
+        """The count + worst severity of **open + acknowledged** instances across the WHOLE of the
+        caller's scope (BACKLOG #1564) — the nav alert bell's read, which a page of rows cannot answer.
+
+        Same active predicate and same ``allowed_channels`` scope as
+        :meth:`list_active_alert_instances`, so the aggregate can never report an alert the caller may
+        not read. It takes no ``limit`` by design; see :class:`AlertSummary` for why a bounded one was
+        the defect, and for why severity is maximised by RANK in SQL and never by name. Lockfree read.
+        """
         ...
 
     async def ack_alert_instance(
@@ -1900,15 +1943,51 @@ class AuthStore(Protocol):
         carries a different subject is refused, not handed the account."""
         ...
 
+    async def clear_user_federated_subject(
+        self, user_id: str, *, now: float | None = None
+    ) -> FederatedUnbind | None:
+        """Unbind a user's federated ``(issuer, sub)`` identity and revoke every live session the
+        account holds, in ONE transaction (BACKLOG #1474). Returns what that transaction saw and
+        did — its ``issuer``/``subject`` being the binding this call cleared, both ``None`` when
+        there was none — or ``None`` in place of the whole record for a user that does not exist.
+
+        The complement of :meth:`set_user_federated_subject`, which takes ``str`` for both halves and
+        so cannot spell "no binding". Both columns go NULL together, which puts the row back in the
+        state every AD account is in before its first federated login. ``auth_provider`` is left
+        alone on purpose: a federated account IS an AD row carrying an extra pair, so the unbound row
+        is still a directory account and the directory session sweep is still right for it.
+
+        **The two writes are not separable, and that is the contract.** A session issued under the old
+        binding is exactly what the unbind exists to stop. If the unbind committed and the revocation
+        did not, those sessions would outlive the identity that earned them, with the account
+        reporting itself unbound. So a failure in either statement rolls both back.
+
+        **THE PRIOR PAIR IS READ IN HERE, AND THAT IS NOT A CONVENIENCE.** The caller audits what it
+        cleared, and a pair read by a separate ``get_user`` is a pair a concurrent unbind-and-rebind
+        can have replaced before this transaction runs — the audit row would then name a binding this
+        call never touched, which is worse than no record at all. Reading it inside the same
+        transaction makes the reported pair the one the UPDATE actually cleared.
+
+        **An already-unbound account writes NOTHING and revokes nothing**, reporting a NULL pair and
+        0 sessions. The check is in here rather than above so it is atomic with the write: an unbind
+        of nothing must not sign anybody out, and a caller checking first would be checking a state
+        that can change underneath it. "Already unbound" means BOTH halves NULL — a row holding one
+        of them has something to clear, and is cleared (see :class:`FederatedUnbind` for why the
+        schema allows that state at all).
+        """
+        ...
+
     async def get_user_by_federated_subject(self, issuer: str, subject: str) -> UserRecord | None:
         """The account bound to this verified ``(issuer, sub)``, or ``None`` (BACKLOG #1256).
 
         **The inverse of the #1015 guard, and the direction that guard cannot look.** That check
         resolves a user by USERNAME and asks whether *this account* carries a different subject --
         so it constrains WHICH subject may bind to a given account, and is structurally incapable of
-        seeing a SECOND ACCOUNT already holding the same subject. Nothing else could see it either:
-        measured, there is no UNIQUE constraint naming the federated columns on any of the three
-        backends (0/0/0, against 13/8/10 total UNIQUE declarations as the positive control).
+        seeing a SECOND ACCOUNT already holding the same subject. The database enforces the same rule
+        underneath -- every backend declares a filtered UNIQUE ``ux_users_federated_subject`` -- and
+        this lookup is what lets the caller answer cleanly instead of surfacing that refusal as an
+        integrity error. :meth:`AuthService._complete_ad_login`'s subject-exclusivity guard carries
+        why that pairing is worded the way it is, and what it replaced.
 
         Deliberately a lookup rather than a scan: it sits on the federated login path, and
         ``list_users()`` would make every sign-in O(number of accounts).
@@ -1937,7 +2016,25 @@ class AuthStore(Protocol):
         client: str | None = None,
         seed_reauth: bool = True,
         now: float | None = None,
-    ) -> None: ...
+        require_federated_subject: tuple[str, str] | None = None,
+    ) -> bool:
+        """Insert a session row. Returns ``True`` when one was written.
+
+        ``require_federated_subject`` makes the insert CONDITIONAL on the account still carrying
+        that verified ``(issuer, sub)``, checked in the same transaction (BACKLOG #1474): the row is
+        written only if the binding is still there, and the call returns ``False`` otherwise. A user
+        id that resolves to no row is a mismatch like any other, so it too returns ``False`` rather
+        than inserting a session against an account that is not there.
+
+        **It closes a race a caller cannot close for itself.** A federated login and an admin unbind
+        can overlap, and the unbind revokes the sessions that EXIST when it runs. Without this guard
+        the login's own ``INSERT`` can land just after that sweep, so the revocation misses it and
+        the withdrawn identity keeps a live session. Checking the binding before calling would only
+        narrow the window, because the check and the insert would still be two transactions.
+
+        Every other caller passes nothing and is byte-identical: no extra read, no extra statement.
+        """
+        ...
 
     async def get_session(self, token_hash: str) -> SessionRecord | None: ...
 
@@ -2071,13 +2168,53 @@ def build_store_cipher(settings: StoreSettings) -> Cipher:
     return make_cipher(resolve_active_key(settings), retired, write_v2=settings.aad_bind)
 
 
+class StoreNotFoundError(RuntimeError):
+    """:func:`open_store` was pointed at an absent SQLite store without ``create=True`` (BACKLOG
+    #1780). ``path`` is the absent file, as configured."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        super().__init__(
+            f"no SQLite store at {path}: refusing to create one "
+            "(check [store].path or --db; `messagefoundry serve` creates the store on its first run)"
+        )
+
+
+def _absent_sqlite_store(settings: StoreSettings) -> Path | None:
+    """The configured SQLite path when nothing is there, else ``None``.
+
+    ``:memory:`` puts nothing on disk, so it has no file to be absent. Only ``FileNotFoundError``
+    counts as absent. Any other stat failure, such as a permission error on an ancestor, is left for
+    the open to report, because SQLite could not have created a file there either. The verifier keeps
+    a stricter twin, ``verify/smoke.py::missing_sqlite_store`` (``is_file``), so that it can refuse
+    without importing the store stack."""
+    if settings.backend is not StoreBackend.SQLITE or settings.path == ":memory:":
+        return None
+    path = Path(settings.path)
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return path
+    except OSError:
+        pass
+    return None
+
+
 async def open_store(
     settings: StoreSettings,
     *,
+    create: bool = False,
     message_events: str = "all",
     posture: HopPosture | None = None,
 ) -> Store:
     """Open the store for the configured backend — the single backend-selection seam.
+
+    ``create`` (BACKLOG #1780) must be passed ``True`` by a caller that provisions a store: ``serve``'s
+    first run and the ``provision-admin`` bootstrap. Otherwise an absent SQLite file raises
+    :class:`StoreNotFoundError` before anything connects, because SQLite's connect would create it and
+    the schema ensure would fill it. It governs creation only: an existing file is still migrated, and
+    the server backends ignore it (they never ``CREATE DATABASE``, but do build the schema into any
+    database that exists).
 
     ``sqlite`` is the default; ``postgres`` is a production server-DB backend with single-node parity
     (lazy-imported, needs the ``postgres`` extra); ``sqlserver`` is a production server-DB backend,
@@ -2093,6 +2230,9 @@ async def open_store(
     clamps the ``MEFOR_ALLOW_INSECURE_TLS`` escape on a production-PHI hop (decision 2). ``None`` (SQLite —
     no TLS — or a backup/restore utility / test) leaves it unclamped, byte-identical to pre-#200.
     """
+    # Before the cipher, so a refusal never waits on a key provider (a Vault round trip).
+    if not create and (absent := _absent_sqlite_store(settings)) is not None:
+        raise StoreNotFoundError(absent)
     # The at-rest cipher via the single build_store_cipher seam: ADR 0019 key sourcing + the ADR 0138
     # cipher_provider dispatch. Default `aesgcm` is the in-process AES-256-GCM keyring (active + retired
     # decrypt-only, write_v2=aad_bind — which now defaults ON, so new writes are cell-bound mfenc:v2;

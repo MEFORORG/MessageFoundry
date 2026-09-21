@@ -321,7 +321,7 @@ jobs:
       # narrow set stays narrow; the docker-smoke job builds from docker/locks/* and installs nothing).
       - name: Set up uv
         if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -1056,7 +1056,7 @@ jobs:
 
       - name: Set up uv
         if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -1086,7 +1086,10 @@ jobs:
       # concurrently with the engine one anyway -- its wall-clock is already off the critical path.
       # Adding workers would spend the contention risk the -n 8 trial measured to buy nothing.
       #
-      # WINDOWS-2025's CAP IS 9, NOT 6, AND THE CAUSE IS RUNNER VARIANCE RATHER THAN SUITE GROWTH.
+      # WINDOWS-2025's MARGIN CAP IS 9, NOT 6, AND THE CAUSE IS RUNNER VARIANCE RATHER THAN SUITE
+      # GROWTH. Every "cap" in this note means `webconsole_margin_cap`, which is what these four runs
+      # were measured against; it was spelled `webconsole_step_timeout` when the note was written,
+      # because that one variable was then both the ruler and the wall. The numbers are untouched.
       # Re-derived 2026-09-13, after the margin gate EVICTED PR 1097 from the merge queue. Four
       # windows-2025 runs of the SAME 497-test suite, inside one hour:
       #
@@ -1108,8 +1111,62 @@ jobs:
       # against a 5:00 cap (1.85x, 1.77x), windows-2022 3:34 and 3:28 against 6:00 (1.68x, 1.73x).
       # Both are clear. Raise one only when its own numbers say so.
       #
-      # THE NESTING INVARIANT STILL HOLDS: setup(max) 4:05 + 9 = 13, under webconsole_job_timeout 20.
-      # tests/test_ci_step_margin.py checks the arithmetic half of it and passes.
+      # THE NESTING INVARIANT STILL HOLDS, AND THIS TABLE IS THE ONLY COPY OF THE SUM. Re-summed
+      # against the KILL rather than the margin cap when the two were split.
+      #
+      # THE SECOND TERM IS A DELIBERATE SAFETY PAD, NOT A SEPARATE MEASUREMENT, and saying so is the
+      # correction to how this table first read. The 4:30 is the largest `Set up job` this file
+      # records -- and the line that records it (ubuntu run 31109989006) says that 4:30 was observed
+      # INSIDE a 5:22 setup, so adding it to a recorded setup maximum counts it twice. That is kept,
+      # for two reasons: it is the additive model the `job_timeout` derivation above already uses, so
+      # diverging here would leave two models in one file; and on ubuntu the pad is doing real work,
+      # because the `Install Qt offscreen system libraries` step carries its own `timeout-minutes: 8`
+      # and so admits a setup longer than the 5:22 alone would cover. Read the second column as
+      # headroom the sum deliberately buys, not as time anyone has measured twice.
+      #
+      #   ubuntu-latest   5:22 + 4:30 + kill  9:00 = 18:52   under 20:00, slack 1:08
+      #   windows-2022    4:05 + 4:30 + kill 10:00 = 18:35   under 20:00, slack 1:25
+      #   windows-2025    2:32 + 4:30 + kill 12:00 = 19:02   under 20:00, slack 0:58
+      #
+      # windows-2025 is the tightest and is the leg to watch: its setup has to reach 8:00 before the
+      # JOB cap fires ahead of the step cap and the failure stops naming the step. That is 0:58 past
+      # the 7:02 this table budgets and 5:28 past the 2:32 actually recorded for the leg, so the pad
+      # is most of what protects it. The lever if it ever bites is `webconsole_job_timeout`, which is
+      # a deadlock backstop rather than a tightness gate -- not a smaller kill, which would re-narrow
+      # the observation window this change was made to open.
+      # tests/test_ci_step_margin.py parses this table and re-adds every row.
+      #
+      # THE RULER AND THE WALL: THE MARGIN CAP AND THE KILL ARE NOW TWO NUMBERS, DELIBERATELY.
+      # `webconsole_step_timeout` is the step's `timeout-minutes` -- the WALL, which kills a run.
+      # `webconsole_margin_cap` is what the margin gate divides by -- the RULER. Until this change one
+      # variable was both, which made the gate structurally unable to size itself: a run slower than
+      # the cap was killed AT the cap and its step concluded `failure`, so the gate keyed it
+      # `CENSORED` and dropped it from the success-sample. The observed maximum over that sample
+      # therefore could not exceed the cap BY CONSTRUCTION rather than by luck, and "size the cap at
+      # 1.30x the observed maximum" would have re-derived the cap from a sample the cap had truncated.
+      # That is the same right-censoring `scripts/ci/step_margin_baseline.toml` already records for the
+      # engine leg, where seven windows-2025 runs were killed at a 36:00 cap and reported 36:01-36:08.
+      #
+      # THIS PRESERVES THE GATE'S PURPOSE RATHER THAN WORKING AROUND IT. The design intent recorded
+      # beside `webconsole_job_timeout` below is that the margin check is the drift detector and warns
+      # BEFORE the kill. Splitting the two makes that true with room: the gate still reds at
+      # margin_cap / 1.30, which now sits well under the wall instead of on it.
+      #
+      # THE MARGIN CAPS ARE UNCHANGED AND ARE NOT SIZED BY THIS CHANGE: 5 / 6 / 9, exactly the values
+      # that were in force as `webconsole_step_timeout`. Sizing them honestly needs a sample collected
+      # under a kill that does not truncate it, which does not exist yet and cannot exist until this
+      # arrangement has been live for a while. Shipping a decoupling and a re-size together would bury
+      # the one change that can be reasoned about, so the re-size is deliberately a later, separate
+      # change with its own measurement.
+      #
+      # THE KILLS ARE 9 / 10 / 12, and each is at least 1.30x its leg's margin cap -- the same ratio
+      # the gate's own floor reserves below the cap, so the band a run may be observed in ABOVE the cap
+      # is at least as wide, in ratio, as the band the floor reserves below it.
+      # tests/test_ci_step_margin.py asserts that headroom per leg, reading BOTH numbers out of the
+      # matrix literals rather than restating them, and PRINTS each leg's achieved ratio on every run
+      # -- so the ratios are deliberately not written here, where they would rot the next time either
+      # number moves. Two numbers that must move together are exactly the drift this file has been
+      # bitten by before, which is why the coupling is a check rather than a sentence.
       #
       # THE GATE'S OWN OUTPUT SAYS "Raising the cap is NOT the fix and this check must not be read as
       # asking for one", and that sentence was read before this change rather than after. It is still in
@@ -1122,9 +1179,11 @@ jobs:
       # second. The detector is not disarmed either: at 9:00 it warns again above 6:55, which is outside
       # the entire observed range.
       #
-      # AND THE HAZARD IS NOT ONLY THE WARNING. At 5:25 against 6:00 a green suite came within 35 seconds
-      # of being KILLED at its cap with zero failing assertions -- the outcome the gate's last clause says
-      # it exists to pre-empt. Leaving the cap at 6 keeps that.
+      # AND THE HAZARD IS NOT ONLY THE WARNING. At 5:25 a green suite came within 35 seconds of being
+      # KILLED, because the 6:00 that was then the margin cap was also the `timeout-minutes` -- the
+      # outcome the gate's last clause says it exists to pre-empt. Leaving that number at 6 kept it.
+      # The split below is what finally separates the two hazards: a green suite is now killed at
+      # `webconsole_step_timeout`, minutes above the margin cap, rather than at the margin cap itself.
       #
       # THE UNDERLYING ITEM IS REAL AND IS NOT CLOSED BY THIS. Two things feed the runtime and only one is
       # the runner: this suite went from about 356 tests to 497, roughly 40 percent, since the cap was set.
@@ -1156,7 +1215,11 @@ jobs:
         if: always()
         env:
           WEBCONSOLE_OUTCOME: ${{ steps.webconsole.outcome }}
-          WEBCONSOLE_CAP: ${{ matrix.webconsole_step_timeout }}
+          # THE MARGIN CAP, WHICH IS NO LONGER THE KILL. This read `matrix.webconsole_step_timeout`
+          # until the decoupling above; feeding the gate the same number that kills the step made the
+          # gate's own sample right-censored at exactly the number it exists to size. See the
+          # "THE RULER AND THE WALL" note above the suite step.
+          WEBCONSOLE_CAP: ${{ matrix.webconsole_margin_cap }}
           LEG: ${{ matrix.os }}
         run: |
           rc=0
@@ -1277,10 +1340,53 @@ jobs:
     # worker buys queueing rather than throughput. This experiment is what tests it. THE CAPS ARE SIZED
     # AGAINST THE BOUND, NOT AGAINST THE READING, so they hold even if the reading is wrong.
     #
-    # NO FIGURE HERE IS AN -n 3 OBSERVATION. There are none; the first lands on this change's own run.
+    # THE -n 3 OBSERVATIONS ARE NOW IN, and the paragraph they replace said there were none because
+    # the first had not yet landed. THREE windows-2025 job logs read on 2026-09-19, all at
+    # TOOLING_WORKERS=3 (the value is echoed in each job's own step log, so this is not inferred from
+    # the file). Two of `main`'s four reds that day, plus one green; the other two reds were reported
+    # rather than re-read here:
+    #
+    #   1409.14s  23.5 min  red    run 35475462069  job 105984649514  coord_usage 60s starvation
+    #   1433.55s  23.9 min  red    run 35465858823  job 105958065037  coord_usage 60s starvation
+    #   1457.82s  24.3 min  GREEN  run 35472705438  job 105976506178
+    #
+    # THE TWO REDS ARE #1304 BUT NOT THE SIGNATURE SPELLED OUT ABOVE, and the two must not be fused.
+    # That paragraph's signature is `PWSH LAUNCH TIMED OUT after 45s` out of the worktree-gate files,
+    # which take the spawn lock. These two are `subprocess.TimeoutExpired ... timed out after 60
+    # seconds` out of tests/test_coord_usage.py, which did NOT take it until the change carrying this
+    # comment. Same defect -- a launch that never returns -- at a different ceiling, in a different
+    # file, with a different coverage status. Only the coord_usage failure was observed in these runs.
+    #
+    # All three rows are the pytest clock, read from the job log's own summary line, so they are
+    # comparable with the pytest-clock rows above and NOT with the step-clock ones.
+    #
     # READ THE STEP'S DURATION, NOT ONLY ITS CONCLUSION -- a green -n 3 run that costs 7 extra minutes
     # on every harness PR is a different verdict from a green one that costs nothing, and the pass/fail
-    # alone cannot tell them apart.
+    # alone cannot tell them apart. COMPARE GREEN WITH GREEN, because a red row partly measures the
+    # failure: the one -n 3 green is 24.3 minutes against the worst -n 4 green at 21.3, so -n 3 costs
+    # ABOUT 3 MINUTES. That is the only cost figure here; it is stated once and not restated below.
+    # It sits well under the 28.4-minute pessimistic bound the caps were sized against and under the
+    # 29-minute re-derive trigger, so the caps hold and neither moves.
+    #
+    # THAT 3 MINUTES INHERITS AN UNVERIFIED ROW, which is the caveat to carry. The 21.3-minute -n 4
+    # green is one of the two "reported, not re-read" rows the paragraph above warns about. Against
+    # the only RE-READ -n 4 green (1128.00s, 18.8 min) the cost would be 5.5 minutes instead. One
+    # green sample per arm is an order of magnitude, not a mean, and the wider figure is the one to
+    # assume if only one can be.
+    #
+    # THE VERDICT IS THAT -n 3 DID NOT CLEAR #1304, which is what the experiment existed to test. The
+    # hypothesis stated on TOOLING_WORKERS below -- that a 4-vCPU runner oversubscribed by 4 workers is
+    # the condition under which a single pwsh launch starves -- does not survive it: the leg starved a
+    # launch at 3 workers in both reds read. READ THE LIMIT OF THAT: the starving file was unwrapped at
+    # the time, so these reds show the oversubscription fix is not SUFFICIENT on its own; they do not
+    # show worker count is irrelevant. The cause that does hold is the one tests/_spawn_lock.py
+    # measured -- a single launch in flight beside a 16-process pwsh storm -- and the fix is to keep
+    # the two apart rather than to resize the tier. See BACKLOG #1304.
+    #
+    # WHETHER TO KEEP -n 3 IS NOT DECIDED HERE, deliberately: it costs what the green-to-green figure
+    # above says and buys nothing measured against the failure it was aimed at, but reverting it is
+    # BACKLOG #1109's call on #1109's evidence, not a side effect of the #1304 fix. Left running so
+    # the reverting change reads a tier whose #1304 noise has been removed.
     #
     # RE-DERIVE IF a GREEN Windows run of this tier is ever observed above 29 minutes at whatever worker
     # count it is actually running, or if TOOLING_WORKERS changes. 29, not the old 25, and the reason is
@@ -1338,7 +1444,7 @@ jobs:
           exit 1
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -1562,6 +1668,7 @@ jobs:
       # `-m 'not tooling'` and the `tooling` job below runs it, path-gated. Membership is
       # tests/tooling_manifest.txt, NOT a filename pattern — see that file for why.
       tooling: ${{ steps.f.outputs.tooling }}
+      packaging: ${{ steps.f.outputs.packaging }}
       # `matrix`: the `test` job's include list, per-repo — full ubuntu+windows matrix HERE (this repo is
       # public, so hosted runners are free; the self-hosted Windows runners are retired), ubuntu-only on
       # a fork. Consumed as `matrix: ${{ fromJSON(needs.changes.outputs.matrix) }}` in `test`.
@@ -1607,10 +1714,24 @@ jobs:
           # $GITHUB_REPOSITORY is a built-in runner env var, read here as plain shell (NOT a workflow-
           # expression interpolation into the run body), so it is zizmor-safe and cannot be misparsed as
           # an Actions expression the way a literal double-brace token in a run: block would be.
-          # `webconsole_step_timeout` is the web console suite's OWN cap (BACKLOG #344 proposal 5). It
-          # used to take `step_timeout` -- a 2-to-4-minute suite holding a 25-to-55-minute budget --
-          # which is why the nesting invariant could not hold for it on any leg. Derived in the note
-          # above the `Web console tests (pytest)` step, which is also where to re-derive it.
+          # `webconsole_step_timeout` is the web console suite's OWN `timeout-minutes` -- THE KILL, and
+          # only the kill (BACKLOG #344 proposal 5). It used to take `step_timeout` -- a 2-to-4-minute
+          # suite holding a 25-to-55-minute budget -- which is why the nesting invariant could not hold
+          # for it on any leg. Derived in the note above the `Web console tests (pytest)` step, which
+          # is also where to re-derive it.
+          #
+          # `webconsole_margin_cap` is what the MARGIN GATE divides by, and it is a SECOND number on
+          # purpose. One variable used to be both the kill and the gate's cap, which made the gate
+          # structurally unable to size itself: a run slower than the cap was killed AT the cap, its
+          # step concluded `failure`, the gate keyed it CENSORED, and it left the success-sample. So
+          # the observed maximum could never exceed the cap by construction. Full reasoning in the
+          # "THE RULER AND THE WALL" note above the suite step.
+          #
+          # THE TWO MUST MOVE TOGETHER AND A TEST SAYS SO. Two copies of a coupled number is the drift
+          # this repository has been bitten by repeatedly, so the coupling is asserted mechanically
+          # rather than documented: tests/test_ci_step_margin.py reads BOTH out of these literals and
+          # requires kill >= 1.30x margin cap on every named leg, plus the nesting invariant, plus the
+          # leg names and their count. Raise one of the pair and that test names the other.
           # `pytest_workers` is the xdist worker count for the engine suite. It is a MATRIX knob rather
           # than a literal in the run body for the same reason every other per-leg number here is one:
           # the trial dispatches that size it are then a one-line edit, and a leg can differ from its
@@ -1662,14 +1783,22 @@ jobs:
           # `webconsole_job_timeout` caps the SEPARATE web console job. It exists because that suite
           # moved out of `test` into its own parallel job, so it now needs a job cap of its own -- and
           # the nesting invariant has to hold there too: setup(max) + webconsole_step_timeout must fit
-          # under it. Recorded setup maxima are 5:22 ubuntu / 4:05 W22 / 2:32 W25, and ci.yml records
-          # provisioning noise alone at 4:30, so the worst case is about 5:22 + 4:30 + 5:00 = 14:52 on
-          # the widest leg. 20 clears that with room. It is a DEADLOCK BACKSTOP, not a tightness gate:
-          # the drift detector is the margin check against `webconsole_step_timeout`, so sizing this
-          # close to the observed run would buy no detection and cost false reds on green suites.
-          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":43,"step_timeout":31,"webconsole_step_timeout":5,"webconsole_job_timeout":20,"pytest_timeout":60,"fault_timeout":90,"pytest_workers":4}'
-          W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":66,"step_timeout":55,"webconsole_step_timeout":6,"webconsole_job_timeout":20,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
-          W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":66,"step_timeout":55,"webconsole_step_timeout":9,"webconsole_job_timeout":20,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
+          # under it. THE SUM LIVES IN ONE PLACE AND IT IS NOT HERE -- the per-leg table above the
+          # `Web console tests (pytest)` step, which tests/test_ci_step_margin.py parses and re-adds.
+          # Its widest leg is 18:52 against 20:00. This paragraph used to carry its own copy of that
+          # arithmetic and the copy went stale the moment `webconsole_step_timeout` moved: it still
+          # read `5:22 + 4:30 + 5:00 = 14:52` after the kill became 9, so ci.yml asserted two
+          # different worst cases for the same leg 650 lines apart. A second copy is what a checked
+          # copy exists to replace, so this one is a pointer now.
+          #
+          # 20 clears it with room. It is a DEADLOCK BACKSTOP, not a tightness gate: the drift detector
+          # is the margin check against `webconsole_margin_cap`, so sizing this close to the observed
+          # run would buy no detection and cost false reds on green suites. That knob is the gate's
+          # ruler and `webconsole_step_timeout` is only the wall -- this sentence named the wall until
+          # they were split.
+          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":43,"step_timeout":31,"webconsole_margin_cap":5,"webconsole_step_timeout":9,"webconsole_job_timeout":20,"pytest_timeout":60,"fault_timeout":90,"pytest_workers":4}'
+          W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":66,"step_timeout":55,"webconsole_margin_cap":6,"webconsole_step_timeout":10,"webconsole_job_timeout":20,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
+          W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":66,"step_timeout":55,"webconsole_margin_cap":9,"webconsole_step_timeout":12,"webconsole_job_timeout":20,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
           if [ "${GITHUB_REPOSITORY:-}" = "MEFORORG/MessageFoundry" ]; then
             echo "matrix={\"include\":[$U,$W22,$W25]}" >> "$GITHUB_OUTPUT"
           else
@@ -1702,6 +1831,7 @@ jobs:
             echo "code=true" >> "$GITHUB_OUTPUT"
             echo "ide=true" >> "$GITHUB_OUTPUT"
             echo "tooling=true" >> "$GITHUB_OUTPUT"
+            echo "packaging=true" >> "$GITHUB_OUTPUT"
             echo "tooling_matrix=$TOOLING_FULL" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -1723,6 +1853,12 @@ jobs:
             # construction. Push-to-main is where that gets caught. Set this false and the tier is
             # effectively unguarded against everything except its own edits.
             echo "tooling=true" >> "$GITHUB_OUTPUT"
+            # TRUE on push for the SAME reason as tooling above, and it is the more important
+            # half of this gate. The PR arm below fires only when packaging CONFIG changed, so a
+            # commit that merely ADDS a file to a packaged tree -- which is what shipped
+            # CLAUDE.md fifteen times -- does not trip it on its own pull request. Push-to-main
+            # is where a real build sees that.
+            echo "packaging=true" >> "$GITHUB_OUTPUT"
             echo "tooling_matrix=$TOOLING_FULL" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -1734,12 +1870,54 @@ jobs:
             echo "code=false" >> "$GITHUB_OUTPUT"
             echo "ide=false" >> "$GITHUB_OUTPUT"
             echo "tooling=false" >> "$GITHUB_OUTPUT"
+            echo "packaging=false" >> "$GITHUB_OUTPUT"
             # Emitted even though the job is off on this arm: fromJSON on an unset output fails the
             # whole job rather than falling back, so no arm may leave it blank.
             echo "tooling_matrix=$TOOLING_DOCS" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # Remaining case: pull_request. Compute the path-based filters from the PR diff.
+          # Remaining cases: ANY event not returned above. Compute the path-based filters from the diff.
+          # Today that is pull_request and merge_group; it is written as a residual rather than a list
+          # because the list is what went wrong -- see the next paragraph, and SDS-3.6.
+          #
+          # THE SECOND EVENT IS A DEFECT, AND IT IS STATED HERE BECAUSE THIS IS WHERE IT LIVES -- the
+          # gates that mislead a reader are elsewhere, but they only mislead because of this line
+          # (BACKLOG #1830, which is FILED IN THE INTERNAL LEDGER AND NOT YET MERGED THERE -- so the
+          # citation may not resolve yet). This comment used to read "Remaining case: pull_request",
+          # naming the one event the code below is written for. merge_group falls through to here too,
+          # and `BASE_SHA` is `github.event.pull_request.base.sha`, which is EMPTY on merge_group.
+          # `git diff --name-only "...HEAD"` with an empty left side resolves to HEAD...HEAD: exit 0,
+          # ZERO output. Verified by RUNNING it rather than reasoning about it -- 2026-08-26, recorded
+          # in 080fb235b as a residual, and re-measured 2026-09-19.
+          #
+          # SO EVERY PATH FILTER THIS JOB COMPUTES IS FALSE ON A QUEUE ENTRY -- that follows from the
+          # empty base, not from a sample. `code` is true there only because an empty diff takes the
+          # `-z "$changed"` arm far below. The corroborating observation is narrower and is stated as
+          # such: on three merge_group runs sampled 2026-09-19, `ide`, `tooling` and `docker-smoke`
+          # each skipped.
+          #
+          # WHAT IT MEANS FOR A GATE ELSEWHERE IN THIS FILE, which is the part worth carrying away. An
+          # `if:` of the shape `... || github.event_name == 'merge_group' || needs.changes.outputs.X ==
+          # 'true'` is NOT diff-sensitive in the queue: the merge_group arm is the only one that can be
+          # true there, so the job is unconditionally forced and the X arm decides nothing.
+          # `sqlserver-store` and `postgres-store` both have exactly that shape today.
+          #
+          # NOT FIXED HERE, AND #1830 CARRIES WHY IT IS NOT A ONE-LINE CHANGE. Reading the base from
+          # `github.event.merge_group.base_sha` makes EVERY filter real at once, and that is not a
+          # latency win. Measured 2026-09-19 over the last 80 merges to main, and BOTH figures are
+          # stated with their scope because neither is the whole of its quantity:
+          #   * `tooling` would fire on at least 56 percent of single-PR entries and at least 94
+          #     percent of 5-deep ones. LOWER BOUNDS -- measured against the PATH arm of the `tooling`
+          #     filter only; its second arm (`grep -qxFf tests/tooling_manifest.txt`) can only widen
+          #     them. For what that tier costs, see its own note above the `tooling` output; it is
+          #     measured there and is deliberately not repeated here (SDS-3.5).
+          #   * against that, the two server-DB jobs would be SKIPPED on 52/33/22/13/7 percent of
+          #     entries at stack depths 1/2/3/4/5. The mean is about a quarter, but the deep end is
+          #     where ubuntu contention actually bites and there the saving is 7 to 13 percent, so
+          #     the mean is the wrong number to compare against the cost above.
+          # It must also FAIL LOUDLY on a base that is empty or unreachable, because a silent empty
+          # diff degrades a path gate into skipping everything while still reading as path-gated,
+          # which is the defect this comment exists to stop hiding.
           changed=$(git diff --name-only "$BASE_SHA...HEAD")
           # NB: the tests/test_(...) alternation MUST list every file the sqlserver-store /
           # postgres-store pytest steps below run (the ADR 0057/0058/0060/0066 throughput levers AND
@@ -1784,6 +1962,23 @@ jobs:
             echo "docker=true" >> "$GITHUB_OUTPUT"
           else
             echo "docker=false" >> "$GITHUB_OUTPUT"
+          fi
+          # The packaging BUILD smoke (BACKLOG #1840). Nothing outside release.yml builds a
+          # distribution, and release.yml fires only on a tag -- so every packaging guard in the
+          # suite MODELS hatchling from config and the git index rather than measuring an
+          # artifact. That is how `messagefoundry/CLAUDE.md` reached PyPI on fifteen releases
+          # with those guards green.
+          #
+          # Gated on the config that decides what a build SHIPS, plus the gate script itself.
+          # NOT on the packaged trees (`messagefoundry/**`, `harness/**`): that is most pull
+          # requests, and a build on each is not worth it when push-to-main already forces this
+          # job. The tracked-tree half of the same question is free and DOES run on every PR --
+          # tests/test_packaged_tree_denylist.py -- so a file ADDED to a packaged tree is caught
+          # there without a build.
+          if echo "$changed" | grep -qE '^(pyproject\.toml|packaging/|scripts/release/|\.github/workflows/(ci|release)\.yml)'; then
+            echo "packaging=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "packaging=false" >> "$GITHUB_OUTPUT"
           fi
           # The ide job (VS Code extension build+test) only depends on ide/** (its own npm project)
           # and this workflow; a pure-Python PR can't change its result, so don't run it there.
@@ -2019,7 +2214,7 @@ jobs:
             -Q "IF DB_ID('MessageFoundry') IS NULL CREATE DATABASE MessageFoundry"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -2335,7 +2530,7 @@ jobs:
           python-version: "3.14"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -2533,7 +2728,7 @@ jobs:
           python-version: "3.14"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -2716,7 +2911,7 @@ jobs:
             -Q "IF DB_ID('MessageFoundry') IS NULL CREATE DATABASE MessageFoundry; ALTER DATABASE MessageFoundry SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE;"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -2869,7 +3064,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -3233,6 +3428,106 @@ jobs:
         if: always()
         run: docker rm -f mefor || true
 
+  packaging-build:
+    # BUILD every distribution this repo publishes, then run the release gates over the REAL
+    # artifacts (BACKLOG #1840).
+    #
+    # WHY THIS JOB EXISTS. Until it landed, `release.yml` was the only workflow that ran a build, and
+    # it fires only on a tag. So every packaging guard in the suite MODELS hatchling -- it reads
+    # pyproject.toml and `git ls-files` and reasons about what a build WOULD ship. A model is not a
+    # measurement, and this one was wrong in production: `messagefoundry/CLAUDE.md` reached PyPI on
+    # releases 0.1.0 through 0.2.15 with those guards green the whole time, because the thing they
+    # modelled and the thing hatchling did had diverged and nothing compared them.
+    #
+    # It also covers the one residual the tracked-tree scan states it cannot see: `force-include`
+    # walks the FILESYSTEM and consults no .gitignore, so an untracked file inside a whole-mapped
+    # directory reaches a wheel. Only a build can observe that.
+    #
+    # PATH-GATED, AND TRUE ON PUSH-TO-MAIN. The PR arm fires on packaging config; push-to-main forces
+    # it regardless, which is what catches a commit that merely adds a file to a packaged tree. See
+    # the `packaging` output in `changes` for why the packaged trees themselves are not in the PR arm.
+    #
+    # RIDES `ci-gate` rather than taking a required context of its own -- the same choice `webconsole`
+    # and `tooling` made, and for the same reason: a new required context is a branch-protection
+    # change, and until that lands a PR can never satisfy it.
+    if: needs.changes.outputs.packaging == 'true'
+    needs: changes
+    runs-on: ubuntu-latest
+    # Generous against a 4-vCPU runner doing four builds plus a hash-pinned install; a hang backstop,
+    # not a tightness gate.
+    timeout-minutes: 20
+    permissions:
+      contents: read   # builds and inspects only; it publishes nothing and signs nothing
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      - name: Build every published distribution
+        run: |
+          # The SAME hash-pinned lock release.yml installs, so this job builds with the backend the
+          # release will use. A floating `pip install build` here would let this gate pass against a
+          # hatchling the release never runs -- which is precisely the model-versus-measurement error
+          # this job exists to end, rebuilt one layer up.
+          python -m pip install --require-hashes -r ci/locks/release-tools.lock
+          python -m build --outdir dist .
+          python -m build --wheel ./packaging/messagefoundry-harness --outdir harness-dist
+          python -m build --wheel ./packaging/messagefoundry-webconsole --outdir webconsole-dist
+          ls -l dist harness-dist webconsole-dist
+
+      - name: Member gate over the real artifacts
+        run: |
+          # The same script, the same arguments, the same three distribution sets release.yml gates
+          # -- so a refusal here is the refusal a tag would have produced, minutes after the commit
+          # instead of at publish time.
+          python scripts/release/forbidden_members.py 'dist/*.tar.gz' 'dist/*.whl'
+          python scripts/release/forbidden_members.py 'harness-dist/*.whl'
+          python scripts/release/forbidden_members.py 'webconsole-dist/*.whl'
+
+      - name: Positive control -- the gate must REFUSE a poisoned copy
+        run: |
+          # A GREEN GATE AND A BROKEN GATE LOOK IDENTICAL, and this job's whole value is the four
+          # clean results above. So poison a COPY of a real artifact and require a refusal: if the
+          # gate cannot fail here, its passes upstream mean nothing. Runs on a copy, so nothing this
+          # job built is modified.
+          cp harness-dist/*.whl poisoned.whl
+          python - <<'PY'
+          import zipfile
+          with zipfile.ZipFile("poisoned.whl", "a") as zf:
+              zf.writestr("harness/CLAUDE.md", "internal\n")
+          PY
+          # A NON-ZERO EXIT IS NOT PROOF THE GATE INSPECTED ANYTHING. `forbidden_members.py` exits 1
+          # for a refused member AND for a pattern that matched no file at all -- and for an archive
+          # it could not open, and for one that listed zero members. So if this fixture is ever
+          # renamed or moved out from under the line below, an exit-code test would print "control
+          # fired" having opened ZERO archives: it would report the gate armed whether or not the
+          # gate saw anything, which is a control that cannot fail. That is the empty-corpus defect
+          # this gate exists to prevent, rebuilt one layer up.
+          #
+          # So assert on the REASON instead. Only the inspection path prints an archive name beside
+          # the member it refused, so requiring that line distinguishes "the gate rejected a poisoned
+          # member" from "the gate found nothing to look at". The trailing `-- <why>` clause is
+          # deliberately NOT pinned: this step owns the two names below, the script owns its wording.
+          refusal="poisoned.whl ships harness/CLAUDE.md"
+          status=0
+          log="$(python scripts/release/forbidden_members.py poisoned.whl 2>&1)" || status=$?
+          printf '%s\n' "$log"
+          if [ "$status" -eq 0 ]; then
+            echo "::error::the member gate ACCEPTED an artifact carrying harness/CLAUDE.md -- the gate is broken, and every clean result in this job is meaningless"
+            exit 1
+          fi
+          if [[ "$log" != *"$refusal"* ]]; then
+            echo "::error::the member gate exited $status without reporting '$refusal', so it did NOT refuse the poisoned member -- a missing fixture, an unreadable archive and a zero-member listing all exit non-zero too. This control proved NOTHING about the clean results above"
+            exit 1
+          fi
+          echo "control fired: the gate refused the poisoned copy BY NAME, so its clean verdicts above are real"
+          rm -f poisoned.whl
+
   # Single STABLE required status check standing in for the conditional / matrix heavy legs (SQL
   # Server, Postgres, load, Windows-service smoke). Those legs CANNOT be required directly:
   #   * the nightly/path-gated legs (`postgres-store`, `load-test`, `load-test-sqlserver`,
@@ -3270,7 +3565,24 @@ jobs:
       # line the harness tier would stop gating merges the moment it stopped being part of `test`. It IS
       # path-gated (unlike webconsole), so it skips on most PRs -- and a skipped need is not a failure
       # to the `contains(needs.*.result, ...)` check below, which is the behaviour wanted.
+      #
+      # THAT LAST CLAUSE IS TRUE OF A PULL REQUEST AND NOT OF A QUEUE ENTRY, and the difference is not
+      # visible from here. On a pull request a skipped need means path-gated-and-irrelevant; inside the
+      # merge queue it means NOT TESTED, because `changes` computes an empty diff there and so skips
+      # every path-gated job regardless of content. ONE EXCEPTION, so this is not read as an absolute:
+      # `windows-service-smoke` also carries `&& github.repository == '...'`, so on a FORK it skips for
+      # a deliberate cost reason that has nothing to do with this defect.
+      #
+      # The fact is stated once, at the `changes`
+      # job's "Remaining cases" comment; BACKLOG #1830 measured it and carries the fix. Nothing about
+      # this roll-up is wrong -- it is `if: always()` and still reports, which is what lets the five
+      # gated legs be path-gated at all. Only the inference "it skipped, so it did not need to run" is.
       - tooling
+      # `packaging-build` rides here on the same terms as the two above (BACKLOG #1840). It is
+      # path-gated, so it skips on most pull requests, and a skipped need is not a failure to the
+      # `contains(needs.*.result, ...)` check below -- which is the behaviour wanted, with the
+      # same merge_group caveat the `tooling` note states.
+      - packaging-build
     runs-on: ubuntu-latest
     steps:
       # TWO failing steps, not one, and the predicates PARTITION the old single condition -- their

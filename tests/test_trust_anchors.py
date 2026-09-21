@@ -156,6 +156,43 @@ def test_icacls_unresolved_broad_sid_write_is_not_owner_only() -> None:
     assert owner_only_from_icacls(text, anchor_path=_PATH) is False
 
 
+# The nt branch shells out; the POSIX branch reads mode bits. Run this where os.name == "nt" is REAL
+# rather than monkeypatched, matching tests/test_store.py's _windows_only note (forcing it makes
+# pathlib instantiate WindowsPath and crash pytest on Linux).
+_windows_only = pytest.mark.skipif(os.name != "nt", reason="the icacls DACL read is the nt path")
+
+
+@_windows_only
+def test_dacl_read_pins_icacls_to_the_system_directory(monkeypatch: pytest.MonkeyPatch) -> None:
+    # This call's OUTPUT decides whether a TLS trust anchor is owner-only, so it must name icacls by
+    # absolute path: CreateProcess resolves an unqualified name through a search path that reaches the
+    # caller's working directory, and a planted icacls.exe printing a clean DACL would turn a
+    # group-writable anchor into an accepted one (BACKLOG #1769). Same pin as store._secure_file,
+    # which writes a DACL rather than reading one.
+    from messagefoundry import service_status
+
+    captured: list[list[str]] = []
+
+    class _R:
+        returncode = 0
+        stdout = _icacls(r"DESKTOP-A\svc:(F)")
+        stderr = ""
+
+    monkeypatch.setattr(ta.subprocess, "run", lambda argv, **kw: (captured.append(argv), _R())[1])
+    # _PATH keeps the faked stdout's own prefix, so the parse behaves as it would on a real read.
+    assert dacl_is_owner_only(_PATH) is True
+    # Guard the guard: with no call recorded, every assertion below passes over nothing.
+    assert captured, "icacls was never invoked; the pin assertions would pass vacuously"
+    program = captured[0][0]
+    assert os.path.isabs(program), f"icacls must be pinned to an absolute path, got {program!r}"
+    assert os.path.basename(program).lower() == "icacls.exe"
+    # It must be the OS-reported system directory, not merely some absolute path. Compared against
+    # _system_dir rather than a literal "System32" because GetSystemDirectoryW answers "SysWOW64" to
+    # a 32-bit process, and that is the correct system directory there; _system_dir's own behaviour
+    # is tested beside it in tests/test_service_control.py.
+    assert os.path.dirname(program) == service_status._system_dir()
+
+
 @_posix_only
 def test_posix_mode_owner_only(tmp_path: Path) -> None:
     p = _pem(tmp_path, b"x")

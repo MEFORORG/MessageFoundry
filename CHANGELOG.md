@@ -7,6 +7,29 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **`[integrity].audit_anchor_file` — the startup audit check can now hold an anchor, so it can see a
+  truncated tail.** A previous release shipped `audit-anchor` / `audit-verify --expected-anchor` and
+  recorded, accurately at the time, that `[integrity].audit_verify_on_start` "is unchanged — it is a
+  bare walk and stays blind to a truncated tail". **That sentence no longer describes the engine.**
+  Point the new key at the `COUNT:HEAD` file `messagefoundry audit-anchor` writes and every startup
+  compares against it; leave it empty (the default) and the walk is byte-identical to before.
+  **It consumes the anchor as a PREFIX, not as the CLI's exact seal, and that is the whole reason a
+  startup setting can hold one.** The exact seal compares the *current* head, so it diverges on the
+  next appended row — and a running engine writes audit rows, so a startup check built on it would
+  alarm on essentially every restart. The prefix comparison asks instead whether the recorded state was
+  ever true and the chain has only **grown** since, which survives restarts while still catching a
+  truncated tail and a mid-chain rewrite. A stale anchor therefore stays valid; it just witnesses less.
+  **Alert-only in both directions.** A missing, unreadable or malformed anchor logs a WARNING naming
+  the file, the reason and the coverage lost, then lets the bare walk run — it never blocks startup,
+  and it never fires the tamper alert, because a config fault that raised a tamper alarm would train
+  operators to ignore the real one. `0:`, the anchor of an empty log, is reported rather than compared:
+  it can witness nothing, and passing it on would have alarmed on every start of an intact chain.
+  A truncated tail and a broken chain fire **different** alert subjects (`audit-chain-truncated` /
+  `audit-chain`) so they route and throttle separately — but they are not independent: a chain break is
+  reported *before* the anchor comparison runs, so a break should be read as *at least* a break.
+  **Scope.** It fires at startup and only at startup, so it detects a cut made since the last boot and
+  says nothing about the window between two boots. For continuous coverage the off-box log forward /
+  tee remains the control. ([BACKLOG #328](docs/BACKLOG.md))
 - **A startup preflight that reads the store principal's *effective* privileges, so the least-privilege
   grant the runbooks prescribe stops being a claim the engine cannot check.**
   [`DEPLOY-SERVER-DB.md`](docs/DEPLOY-SERVER-DB.md) told operators exactly which grant the engine's
@@ -432,6 +455,21 @@ All notable changes to MessageFoundry are documented here. The format follows
   dead ACK path that nonetheless delivered everything still passes when `connections >= sent`; an
   intake floor cannot catch a fault whose signature is a high read with no ACKs. Bounding that arm
   needs its own change.
+- **`messagefoundry adr-analyze` exited 0 over an ADR directory that does not exist.** `Path.glob`
+  yields nothing and raises nothing for a missing directory, so a missing, non-directory, or
+  ADR-less `--adr-dir` produced zero reports and `AnalysisResult.ok = True` — the exact shape of a
+  clean run. Withdrawing the ADRs would have silently turned a failing advisory check into a
+  passing one. `AnalysisResult` now carries an `error` field, set to a line naming the directory
+  when it is missing, is not a directory, or holds no file matching the ADR glob; discovery also
+  drops a directory that happens to be named like an ADR, which the glob alone would have matched.
+  **Visible change:** `adr-analyze` now exits **2**, with or without `--strict`, when there is no
+  corpus to analyze — the same "could not start" code the CLI's other subcommands already spend on
+  a store that fails to open, and distinct from `--strict`'s own coverage-gap exit of 1. `--json`
+  output gains a permanent `error` key (`null` on a normal run), and `ok` is now
+  `error is None and not coverage_gaps`. The error line says what was looked for, not why nothing
+  matched: both `Path.exists` and `Path.glob` swallow `OSError`, so a directory the process cannot
+  read is indistinguishable here from one that is absent, and a message guessing between them would
+  send an operator after the wrong cause.
 
 ## [0.3.2] — 2026-07-28 — Early Access
 

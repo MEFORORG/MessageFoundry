@@ -6,6 +6,8 @@
     "SIX SEATS. SPECIAL joined 2026-09-16 by owner decision, for work that falls outside the five",
     "standing seats. It is an ADDITION -- nothing retired to make room for it -- and it is the one",
     "seat whose work comes from the owner directly rather than from a brief or a red.",
+    "THE REGULATOR RETIRED 2026-09-19 and nothing replaced it. The WATCHDOG joined the same day and",
+    "is NOT its successor: it measures whether reds are being cleared and never says whose one is.",
     "An unmapped label resolves to NOTHING. The hook never guesses.",
     "THE MANAGER IS LIVE HERE, and it is the seat the owner talks to. The Console was RETIRED",
     "2026-09-10 and is NOT a synonym for it: a Manager's workers are subagents in its own",
@@ -14,13 +16,16 @@
   "live": [
     "manager",
     "builder",
-    "regulator",
+    "watchdog",
     "steward",
     "lander",
     "special"
   ],
   "_aliases_comment": [
-    "Observed and near-miss spellings, collapsed onto the canonical seat. A canonical name is",
+    "Observed and near-miss spellings, collapsed onto the canonical seat. THE WATCHDOG'S FOUR ARE",
+    "THE EXCEPTION: numbered forms added 2026-09-19 by parity with every other seat, not spellings",
+    "anyone has been seen to use. Said plainly so a later reader does not read them as measured",
+    "drift. A canonical name is",
     "never a key here: it resolves to itself. Numbered spellings exist because several",
     "sessions hold the same seat at once and the number was appended to tell them apart."
   ],
@@ -44,9 +49,10 @@
     "lander-1": "lander",
     "land": "lander",
     "landing": "lander",
-    "regulator1": "regulator",
-    "regulator-1": "regulator",
-    "reg": "regulator",
+    "watchdog1": "watchdog",
+    "watchdog2": "watchdog",
+    "watchdog-1": "watchdog",
+    "watchdog-2": "watchdog",
     "steward1": "steward",
     "steward-1": "steward",
     "stewart": "steward",
@@ -61,7 +67,11 @@
   "_retired_comment": [
     "A retired label resolves to NO CARD, and the hook says it was retired rather than",
     "staying silent. Silence would send the reader looking for a card that was removed.",
-    "CLAUDE.md records seven seats retired 2026-09-01 and the Console retired 2026-09-10.",
+    "CLAUDE.md records seven seats retired 2026-09-01, the Console retired 2026-09-10, and the",
+    "Regulator retired 2026-09-19. The Regulator's spellings are listed one by one for the reason",
+    "the next paragraph gives for the Console's; it is stated once, there, and not repeated here.",
+    "Its notice denies a successor because the WATCHDOG joined the same day, which makes",
+    "substituting it the exact error the notice exists to stop.",
     "The Console's observed spellings are listed individually ON PURPOSE: an alias must land on a",
     "live seat, so a spelling left out of this map would resolve to 'MATCHES NO SEAT' and read as a",
     "typo. The retirement has to be the loud answer, because substituting the Manager for the",
@@ -71,6 +81,10 @@
     "It is not named, here or anywhere else in this repository. Do not re-add it from git history."
   ],
   "retired": {
+    "regulator": "Retired 2026-09-19 by owner decision. NOTHING replaced it, and no seat attributes a red now: a red is the Lander's to triage and route, or the owner's to rule on. The WATCHDOG joined the same day and is NOT its successor -- it measures whether reds are being cleared and never says whose one is, so a red sent there gets evidence and no verdict. Do not carry a Regulator rule across, and do not wait for a verdict nobody issues.",
+    "regulator1": "Retired 2026-09-19, a spelling of 'regulator'. See the 'regulator' entry: nothing replaced it, and the Watchdog is not its successor.",
+    "regulator-1": "Retired 2026-09-19, a spelling of 'regulator'. See the 'regulator' entry: nothing replaced it, and the Watchdog is not its successor.",
+    "reg": "Retired 2026-09-19, a spelling of 'regulator'. See the 'regulator' entry: nothing replaced it, and the Watchdog is not its successor.",
     "console": "Retired 2026-09-10 by owner decision. The MANAGER replaces it, and is NOT a renamed Console: a Manager's workers are subagents inside its own process on its own account, several Managers run at once, and it needs no spawn grant. It also does not enqueue -- that moved to the Lander. Read docs/roles/manager.card.md and korus roles/MANAGER.md; do not carry a Console rule across.",
     "console1": "Retired 2026-09-10, a spelling of 'console'. See the 'console' entry: the Manager replaces it and is not a renamed Console.",
     "console-1": "Retired 2026-09-10, a spelling of 'console'. See the 'console' entry: the Manager replaces it and is not a renamed Console.",
@@ -81,7 +95,9 @@
     "project-manager": "Retired 2026-09-01 by owner decision. Nothing replaced it. It is NOT a spelling of the live 'manager' seat.",
     "cleaner": "Retired 2026-09-01 by owner decision. Nothing replaced it.",
     "role-manager": "Retired 2026-09-01 by owner decision. Nothing replaced it. It is NOT a spelling of the live 'manager' seat.",
-    "process-improvement": "Retired 2026-09-01 by owner decision. Nothing replaced it."
+    "process-improvement": "Retired 2026-09-01 by owner decision. Nothing replaced it.",
+    "asvs-tracker": "Retired 2026-09-01 by owner decision, one of section 5's seven. Nothing replaced it: the ASVS record is the vault's scorecard, and a general re-score is UNASSIGNED -- this entry named the Lander until the owner corrected that on 2026-09-21, and CLAUDE.md section 5 carries the Lander's actual duty. Added to this map 2026-09-18, having been the one of the seven that was missing -- 12 records carried the label and every one of them resolved to the 'MATCHES NO SEAT' typo branch instead of to a retirement.",
+    "asvs": "Retired 2026-09-01, a spelling of 'asvs-tracker'. See that entry."
   },
   "_elsewhere_comment": [
     "Seats a session may hold in korus that this table does not run. A label here resolves to no",

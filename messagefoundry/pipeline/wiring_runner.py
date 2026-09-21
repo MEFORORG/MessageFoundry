@@ -37,7 +37,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum, StrEnum
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 
 from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
 from messagefoundry.config.db_lookup import DbLookupError
@@ -67,7 +67,12 @@ from messagefoundry.config.models import (
     StallThreshold,
 )
 from messagefoundry.config.run_context import RunContext, run_contexts
-from messagefoundry.config.settings import DeliverySettings, EgressSettings, StoreBackend
+from messagefoundry.config.settings import (
+    BLOCK_UNLISTED_OUTBOUND_IN_FORCE,
+    DeliverySettings,
+    EgressSettings,
+    StoreBackend,
+)
 from messagefoundry.config.tls_policy import (
     HopPosture,
     TrustAnchorPolicy,
@@ -152,6 +157,7 @@ from messagefoundry.store import (
 )
 from messagefoundry.store.base import AuditStore, pool_over_provisioned_warning
 from messagefoundry.store.metadata import user_metadata
+from messagefoundry.store.store import ConnectionEventWrite
 from messagefoundry.transports import (
     DeliveryError,
     DestinationConnector,
@@ -169,9 +175,16 @@ from messagefoundry.transports.base import (
 from messagefoundry.transports.database import DatabaseLookupExecutor
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.mllp import build_ack
-from messagefoundry.transports.rest import PROXY_DEFAULT
+from messagefoundry.transports.rest import PROXY_DEFAULT, refuse_url_credentials
 
 __all__ = ["NotDeployedError", "RegistryRunner", "ShardLaneOwnershipError"]
+
+type Direction = Literal["inbound", "outbound"]
+"""Which table a connection name was declared in. A name may be in BOTH (``Registry._add``
+enforces uniqueness per table, and the API's ``_dual_role_control`` carries a ``role=`` to
+disambiguate the pair), so every per-connection map that can hold an entry for either direction
+is keyed by ``(Direction, name)`` rather than by the bare name."""
+
 
 log = logging.getLogger(__name__)
 
@@ -326,6 +339,13 @@ _BUILDUP_REALERT_SECONDS = 300.0
 _CONN_EVENT_QUEUE_MAX = 10000
 # How long teardown waits for the drain queue to flush before cancelling the drainer (bounded shutdown).
 _CONN_EVENT_FLUSH_GRACE = 2.0
+# Most events one drainer write takes (BACKLOG #1731). Bounded so a flood backlog is written in slices,
+# each holding the store's write lock briefly, rather than as one 10,000-row transaction.
+_CONN_EVENT_BURST_MAX = 256
+# Single-row failures in a row that end a refused burst's salvage. A burst refused for ONE bad row
+# never reaches this; a run of them says the STORE is refusing, and every further attempt pays a full
+# acquire wait to learn the same thing. See `_rewrite_connection_events_singly`.
+_CONN_EVENT_SALVAGE_GIVE_UP = 3
 
 # The ingress worker has no per-message "failure" to hang a buildup check on (a slow-but-working
 # router just falls behind), so it polls the lane depth at most this often — bounding the extra
@@ -933,7 +953,9 @@ class RegistryRunner:
         # Event set, so 'stopped' means truly quiesced, not merely "won't claim new".
         self._outbound_quiesced: dict[str, asyncio.Event] = {}
         # per_lane-mode resume Events: the delivery worker awaits its lane's Event at the loop-top pause
-        # gate; start_outbound sets it. Unused in pooled mode (the dispatcher's resume_lane re-arms).
+        # gate; start_outbound sets it. Unused for a lane the pooled OUTBOUND dispatcher drains (its
+        # resume_lane re-arms instead) — but a pooled ordering=unordered lane keeps its own worker
+        # and therefore its own gate (ADR 0066 D4), so this is NOT empty under pooled.
         self._outbound_resume: dict[str, asyncio.Event] = {}
         # Which of _outbound_paused this ENGINE parked (auto_start=False #115 / deployed=False #233) as
         # opposed to an OPERATOR pausing it. Both reuse _outbound_paused (so every consumer — status,
@@ -957,6 +979,14 @@ class RegistryRunner:
         # outbound's settings under a running worker without tearing the worker down.
         self._retry: dict[str, RetryPolicy] = {}
         self._ordering: dict[str, OrderingMode] = {}
+        # ADR 0066 D4: which OUTBOUND lanes a per-lane `_delivery_worker` drains (True) and which the
+        # pooled OUTBOUND StageDispatcher drains (False). The two sets are COMPLEMENTS — that is the
+        # single-consumer-per-lane invariant (ADR 0073) in one dict — so every branch that used to ask
+        # `self._claim_mode == "pooled"` about an outbound lane asks :meth:`_per_lane_delivery` instead.
+        # Decided ONCE per lane by :meth:`_resolve_lane_consumer` and never flipped while the engine
+        # runs; cleared on teardown so a start()-after-stop() re-decides. Empty in per_lane mode, where
+        # every lane has its own worker by definition.
+        self._worker_owned: dict[str, bool] = {}
         self._internal_error: dict[str, InternalErrorPolicy] = {}
         self._buildup: dict[str, BuildupThreshold] = {}
         self._stall: dict[str, StallThreshold] = {}
@@ -979,20 +1009,30 @@ class RegistryRunner:
         # success, so a retry storm emits one transition pair, not one per delivery. A partner reject
         # (NegativeAckError) is not a transport failure and never flips it.
         self._lane_healthy: dict[str, bool] = {}
-        # Connections that FAILED to build/bind at start (name → reason). A failed connection is
+        # Connections that FAILED to build/bind at start ((kind, name) → reason). A failed connection is
         # isolated, never fatal — the rest of the graph still comes up (a failed connection must not
         # crash the engine, ADR 0031). A failed OUTBOUND still gets its delivery worker, but with no
         # connector in _destinations, so rows routed to it are retried + alerted (never silently
         # dropped) and a reload/restart that builds it self-heals the lane; a failed INBOUND simply
         # isn't listening. Cleared when the connection later builds/binds (reload, start_inbound).
-        self._failed: dict[str, str] = {}
-        # Connections SKIPPED by the DR run-profile (#61, ADR 0048): name → reason (e.g. "DR profile
-        # threshold=critical: connection tier=normal is below threshold"). Distinct from _failed (ADR
-        # 0031): a filtered connection did not FAIL to build/bind — it was deliberately not started
+        #
+        # KEYED BY DIRECTION (see `Direction`), because under a bare-name key the two halves of a
+        # dual-role name aliased, in both directions: start() builds every outbound BEFORE any inbound,
+        # so the inbound's success pop ERASED its outbound namesake's real start failure and the engine
+        # reported itself healthy, while an operator restarting that outbound afterwards re-set the entry
+        # and made a status reader call the healthy inbound failed. Read it through the direction-scoped
+        # accessors (inbound_failed / outbound_failed), never by reaching in with a bare name.
+        self._failed: dict[tuple[Direction, str], str] = {}
+        # Connections SKIPPED by the DR run-profile (#61, ADR 0048): (kind, name) → reason (e.g. "DR
+        # profile threshold=critical: connection tier=normal is below threshold"). Distinct from _failed
+        # (ADR 0031): a filtered connection did not FAIL to build/bind — it was deliberately not started
         # because its resolved priority tier is below [dr].priority_threshold. Surfaced as
         # status:"filtered" on /connections + /connections/{name}/metadata so an operator can tell a
         # deliberately-parked DR feed from a broken one. Empty unless a DR run-profile is active.
-        self._filtered: dict[str, str] = {}
+        # Keyed by direction for the reason _failed above is, and here the two halves of a pair resolve
+        # INDEPENDENTLY (each reads its own ic.priority / oc.priority), so they can genuinely disagree
+        # about the threshold - a bare-name key silently gave one half's verdict to the other.
+        self._filtered: dict[tuple[Direction, str], str] = {}
         # Per-connection re-alert throttle: the earliest time a queue_buildup alert may fire again.
         self._next_buildup_alert: dict[str, float] = {}
         # Same per-connection re-alert throttle for the message_stall alert (#50), kept independent so a
@@ -1129,7 +1169,7 @@ class RegistryRunner:
         self._connection_events = connection_events
         # Master switch for "Response Sent" ACK capture (#46); a per-inbound capture_ack overrides it.
         self._response_sent_default = response_sent_default
-        self._conn_event_q: asyncio.Queue[dict[str, Any]] | None = None
+        self._conn_event_q: asyncio.Queue[ConnectionEventWrite] | None = None
         self._conn_event_drainer: asyncio.Task[None] | None = None
         self._conn_events_dropped = 0
         # ADR 0073: sharded-only read-only watchdog over NON-owned outbound lanes (hung-owner paging).
@@ -1143,12 +1183,19 @@ class RegistryRunner:
         # Per-inbound rather than one process-wide flag because the RE-ARM is per-connection: a
         # restart of inbound A must not silently re-arm B's processing while B's listener stays down.
         self._log_halted: set[str] = set()
+        # The DELIVERY tier's counterpart is :attr:`_delivery_halted`, a derived read below rather
+        # than a field here — see that property for why the tier links to the process latch instead
+        # of restating it.
         self._running = False
         self._reload_lock = asyncio.Lock()  # serialize concurrent reloads
         # B11 read-only worker-loop instrumentation: empty-claim counts (router/transform/delivery),
         # split into idle-poll re-SELECTs vs per-commit wake-fanout (the thundering herd). Surfaced via
         # /stats; default 0, so byte-identical when the connection-scale harness never reads it.
         self._empty_claims = EmptyClaimCounters()
+        # #122 (ADR 0189): OUTBOUND rows the pooled claim gate refused because the delivery tier was
+        # halted. See :attr:`halted_claim_gate_hits` for what a non-zero reading does and does not
+        # establish; it is the one signal this latch structurally cannot get from an enumeration.
+        self._halted_claim_gate_hits = 0
         # Bench-gated per-delivery phase timing (default OFF). Resolved ONCE here (not per delivery) so
         # the per-item body is a single bool check when off — no perf_counter, no allocation. BOTH the
         # pooled OUTBOUND StageDispatcher (_dispatch_delivery) and the per_lane _delivery_worker flow
@@ -1194,6 +1241,32 @@ class RegistryRunner:
         return self._empty_claims
 
     @property
+    def halted_claim_gate_hits(self) -> int:
+        """OUTBOUND rows the POOLED claim gate refused because :attr:`_delivery_halted` held (#122,
+        ADR 0189). Read-only; the ``/stats`` route surfaces it and nothing in the engine reads it back.
+
+        **What it is FOR: the one thing a latch cannot enumerate.** The latch's whole argument is that
+        counting doors is a completeness claim nobody can verify. That argument cuts both ways — it
+        also means nobody can verify that every door is now gated. A lane can only reach this gate if
+        some path brought it up UNPAUSED while the halt held, which is exactly what a missing door
+        looks like from the outside. This is the only signal that reports one.
+
+        **A non-zero reading is not automatically a defect, and the qualifier is load-bearing.** The
+        latch is set before :meth:`_stop_all_for_log_failure` takes the reload lock and pauses the
+        lanes, so a claim already in flight across that window lands here legitimately — a small,
+        BOUNDED count at the moment of the halt is the documented pause lag, not a door. What names a
+        door is a count that KEEPS CLIMBING while the halt holds: a paused lane is never claimed, so
+        every later hit is a lane that is not paused.
+
+        **POOLED ONLY, and zero is therefore NOT a clean bill** (the same shape as
+        ``claim_lock_timeouts``). The per_lane worker's gate is at its loop TOP, above the claim, so
+        nothing to count reaches a claim there — and it deliberately stays uncounted rather than being
+        made to tick at the loop top, because every running per_lane worker passes that gate once at
+        halt time and the resulting floor would bury the signal. A per_lane engine reports zero
+        forever; do not render that as "no door is missing"."""
+        return self._halted_claim_gate_hits
+
+    @property
     def coordinator(self) -> ClusterCoordinator:
         """The cluster coordinator threaded in by the engine (Track B Step 3). Step 4 consumes its
         cheap, synchronous ``is_leader`` gate; this exposes the object."""
@@ -1232,6 +1305,63 @@ class RegistryRunner:
         the purge handler's ownership 409) — ``None`` when unsharded."""
         return self._destination_owner(name)
 
+    # --- outbound delivery-consumer ownership (ADR 0066 D4) --------------------
+
+    def _lane_ordering(self, name: str) -> OrderingMode:
+        """The EFFECTIVE ordering mode of outbound lane ``name`` (its own ``ordering=`` or the
+        ``[delivery].ordering`` default). The one spelling of that lookup, so the delivery worker and
+        the consumer decision can never read it two different ways."""
+        return self._ordering.get(name, self._ordering_default)
+
+    def _per_lane_delivery(self, name: str) -> bool:
+        """Whether outbound lane ``name`` is drained by its OWN :meth:`_delivery_worker` rather than by
+        the pooled OUTBOUND StageDispatcher. Always True in per_lane mode. Under pooled it is True for
+        an UNORDERED lane (ADR 0066 D4) and False for every FIFO lane.
+
+        **This predicate and the OUTBOUND dispatcher's lane set are complements, and that is the whole
+        of the single-consumer guarantee.** Two consumers on one lane would break per-lane FIFO (ADR
+        0073), so every outbound branch that used to key off ``self._claim_mode`` — the wake, the
+        pause/park/resume gates, the retry wake timer, the reconcile liveness test — keys off THIS
+        instead. A pure read: :meth:`_resolve_lane_consumer` is the only writer."""
+        if self._claim_mode != "pooled":
+            return True
+        return self._worker_owned.get(name, False)
+
+    def _resolve_lane_consumer(self, name: str) -> bool:
+        """Decide, ONCE per outbound lane, which consumer drains it; returns :meth:`_per_lane_delivery`.
+        Called from ``_start_outbound`` / ``_reconcile_outbounds`` right after the lane's ordering mode
+        is resolved, BEFORE anything can spawn a worker or hand the lane to a dispatcher.
+
+        **The decision is sticky for the life of the engine, and a reload cannot move a lane between
+        consumers.** Handing a lane over mid-run means proving the old consumer has let go of it, and
+        neither direction is cheap: the dispatcher reaches its quiesce point only after an in-flight
+        send resolves, and a lane claimed by both for even one sweep is the exact FIFO hazard above.
+        Sticky costs almost nothing in exchange. A lane flipped FIFO -> UNORDERED on a reload keeps
+        head-of-line blocking until the next engine start (logged by the caller); a lane flipped the
+        other way keeps its worker, which reads :meth:`_lane_ordering` live and simply starts claiming
+        the strict head — byte-identical to how per_lane mode has always honoured that flip."""
+        if self._claim_mode != "pooled":
+            return True
+        known = self._worker_owned.get(name)
+        if known is not None:
+            return known
+        decided = self._lane_ordering(name) is OrderingMode.UNORDERED
+        self._worker_owned[name] = decided
+        return decided
+
+    def _wake_worker_lanes(self) -> None:
+        """Wake every pooled lane that runs its own delivery worker — the OUTBOUND half of a broadcast
+        (``notify_work`` / a reload nudge) that the dispatchers cannot carry, because no dispatcher
+        speaks for these lanes. A no-op in per_lane mode and on a graph with no UNORDERED outbound."""
+        if not any(self._worker_owned.values()):
+            return  # per_lane mode, or a pooled graph whose outbounds are all dispatcher-drained
+        if not self._per_lane_wake:
+            self._singleton_for_stage[Stage.OUTBOUND].set()  # every worker waits on this one Event
+            return
+        for name, owned in self._worker_owned.items():
+            if owned:
+                self._lane_event(Stage.OUTBOUND, name).set()
+
     def _wake_lane(self, stage: Stage, key: str) -> None:
         """Wake the worker for one (stage, lane). ADR 0066 pooled: route to the stage's dispatcher
         (``mark_ready`` — sync, await-free, ``Event.set()``-shaped, create-or-stick on an unknown lane)
@@ -1245,13 +1375,20 @@ class RegistryRunner:
         ``mark_ready`` is create-or-stick, so an ungated cross-shard wake would register the lane on
         THIS shard's dispatcher and make it a second concurrent claimer — the exact per-lane FIFO
         hazard the single-consumer invariant closes. The owning shard discovers cross-shard produce
-        via its sweep/idle poll instead (the documented wake gap)."""
+        via its sweep/idle poll instead (the documented wake gap).
+
+        ADR 0066 D4: an UNORDERED outbound lane runs its own delivery worker even under pooled, so its
+        wake takes the per_lane path below. Routing it to ``mark_ready`` would register it on the
+        OUTBOUND dispatcher (create-or-stick) and make that dispatcher a SECOND claimer of a lane a
+        worker already drains — the single-consumer hazard :meth:`_per_lane_delivery` exists to close."""
         if self.registry.shard_id is not None:
             if stage is Stage.OUTBOUND and not self._owns_destination(key):
                 return
             if stage is Stage.RESPONSE and key not in self.registry.inbound:
                 return  # the reingress_to loopback lives on (and is drained by) another shard
-        if self._claim_mode == "pooled":
+        if self._claim_mode == "pooled" and not (
+            stage is Stage.OUTBOUND and self._per_lane_delivery(key)
+        ):
             d = self._dispatchers.get(stage)
             if d is not None:
                 d.mark_ready(key)
@@ -1267,12 +1404,19 @@ class RegistryRunner:
         stage's dispatcher (re-ready every registry lane, unpark PARKED lanes, request an immediate
         sweep). OFF → the stage singletons; ON → every registered lane Event of those stages. MUST stay
         synchronous + await-free: it snapshots the Event list before iterating so a concurrent
-        reload/producer mutating _lane_events can't raise 'dict changed size during iteration'. ADR 0061."""
+        reload/producer mutating _lane_events can't raise 'dict changed size during iteration'. ADR 0061.
+
+        ADR 0066 D4: no dispatcher speaks for a pooled lane that runs its own delivery worker, so an
+        OUTBOUND broadcast also wakes those lanes directly (:meth:`_wake_worker_lanes`) — otherwise a
+        replay or DR failback would re-ready every FIFO lane and leave the UNORDERED ones asleep until
+        their idle backstop."""
         if self._claim_mode == "pooled":
             for stage in stages:
                 d = self._dispatchers.get(stage)
                 if d is not None:
                     d.notify_work()
+            if Stage.OUTBOUND in stages:
+                self._wake_worker_lanes()
             return
         if not self._per_lane_wake:
             for stage in stages:
@@ -1416,33 +1560,127 @@ class RegistryRunner:
             return None
         return _IntakeRateLimiter(per_peer=per_peer, glob=glob)
 
-    def _enqueue_connection_event(self, **fields: Any) -> None:
+    def _enqueue_connection_event(
+        self,
+        *,
+        connection: str,
+        transport: str,
+        direction: str,
+        kind: str,
+        peer_host: str | None,
+        message_id: str | None,
+        reason: str | None,
+    ) -> None:
         """Non-blocking enqueue onto the drain queue (#46). On overflow drop the event + count it — a
         connection-event flood must never block a listener/delivery lane or grow memory unbounded."""
         q = self._conn_event_q
         if q is None:
             return
         try:
-            q.put_nowait(fields)
+            q.put_nowait(
+                ConnectionEventWrite(
+                    connection=connection,
+                    transport=transport,
+                    direction=direction,
+                    kind=kind,
+                    peer_host=peer_host,
+                    message_id=message_id,
+                    reason=reason,
+                )
+            )
         except asyncio.QueueFull:
             self._conn_events_dropped += 1
 
     async def _connection_event_drainer(self) -> None:
-        """Write queued connection events to the store OFF the listener/delivery hot path (#46). One
-        write per event, **fail-soft**: a store error drops that one observation, never a message or the
-        listener. Cancelled (after a best-effort flush) on teardown."""
+        """Write queued connection events to the store OFF the listener/delivery hot path (#46), one
+        transaction per BURST (BACKLOG #1731): after the blocking get, whatever else is already queued,
+        up to ``_CONN_EVENT_BURST_MAX``, rides the same write. There is no linger timer, so an event on
+        a quiet connection is written as promptly as before. **Fail-soft**: a store error costs
+        observations, never a message or the listener. ``task_done`` runs once per event, after the
+        write resolves, so teardown's ``join`` still means "written or dropped". Cancelled (after a
+        best-effort flush) on teardown.
+
+        **A failed burst is re-written ROW BY ROW rather than dropped whole.** The store's write is
+        all-or-nothing by design, so one unwritable row would otherwise take up to 255 good
+        observations down with it — and the bad row is the one a reader most wants the neighbours
+        of, because they are the events around whatever went wrong."""
         q = self._conn_event_q
         assert q is not None
         while True:
-            fields = await q.get()
+            burst = [await q.get()]
+            while len(burst) < _CONN_EVENT_BURST_MAX:
+                try:
+                    burst.append(q.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
             try:
-                await self.store.record_connection_event(**fields)
+                await self.store.record_connection_events(burst)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await self._rewrite_connection_events_singly(burst, exc)
+            finally:
+                for _ in burst:
+                    q.task_done()
+
+    async def _rewrite_connection_events_singly(
+        self, burst: Sequence[ConnectionEventWrite], exc: BaseException
+    ) -> None:
+        """Salvage a burst the store refused as a unit: write each row on its own so only the rows
+        that fail alone are lost, then log the failure ONCE with the class that caused it.
+
+        The class is in the message because "the write failed" is the one detail that does not
+        narrow anything down — an ``IntegrityError`` from one malformed row and an
+        ``OperationalError`` from a store that is gone want opposite responses from an operator, and
+        the payload itself can never be logged (it carries connection metadata, and ``reason`` is
+        PHI-scrubbed only on its way into the store).
+
+        **IT GIVES UP AFTER ``_CONN_EVENT_SALVAGE_GIVE_UP`` FAILURES IN A ROW, and that bound is the
+        load-bearing part.** A burst refused for ONE unwritable row salvages every other row and
+        never sees two consecutive failures. A burst refused because the STORE is unreachable fails
+        every row, and each of those attempts pays a full connection-acquire wait — 30 seconds by
+        default on the server backends — so an unbounded retry would stall this drainer for hours to
+        salvage nothing, overflowing a 10,000-deep queue whose drops are counted and never logged.
+        The cutoff costs at most a few wasted waits and cannot cost more.
+
+        **The cutoff is on the COUNT and not on the exception class, deliberately.** Each backend
+        raises its own classes, so a class test here would make this module import-aware of every
+        driver and would silently stop discriminating on the next backend added — the same trap the
+        federated-binding race loser documents at ``AuthService._complete_ad_login``. A run of
+        failures says "the store is refusing" on every backend, present and future."""
+        written = 0
+        consecutive = 0
+        for event in burst:
+            try:
+                await self.store.record_connection_events([event])
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.warning("connection-event write failed; dropping one event")
-            finally:
-                q.task_done()
+                consecutive += 1
+                if consecutive >= _CONN_EVENT_SALVAGE_GIVE_UP:
+                    log.warning(
+                        "connection-event burst write failed (%s); salvaged %d of %d event(s), then"
+                        " gave up after %d single-row failures in a row and dropped %d",
+                        type(exc).__name__,
+                        written,
+                        len(burst),
+                        consecutive,
+                        len(burst) - written,
+                    )
+                    return
+            else:
+                written += 1
+                consecutive = 0
+        log.warning(
+            # SALVAGED, not attempted: the count has to be the one an operator can subtract from.
+            # This read `len(burst)` until a review caught it reporting "rewrote 3 ... dropped 1"
+            # for a 3-row burst of which 2 landed -- arithmetic nobody can act on.
+            "connection-event burst write failed (%s); salvaged %d of %d event(s) singly, dropped %d",
+            type(exc).__name__,
+            written,
+            len(burst),
+            len(burst) - written,
+        )
 
     def _outbound_transport(self, name: str) -> str:
         """The transport label of an outbound connection for a connection event, read live from the
@@ -1624,19 +1862,60 @@ class RegistryRunner:
             raise KeyError(name)
 
     def _mark_outbound_quiesced(self, name: str) -> None:
-        """Pooled dispatcher ``on_lane_paused`` callback: the outbound ``name`` lane reached PAUSED
-        (drained to zero in-flight). Set its quiescence Event so ``outbound_quiesced`` / ``outbound_status``
-        report 'stopped' (the purge precondition). Get-or-create so a pause on a never-seen lane still
-        signals."""
+        """The outbound ``name`` lane has DRAINED to zero in-flight. Set its quiescence Event so
+        ``outbound_quiesced`` / ``outbound_status`` report 'stopped' (the purge precondition).
+        Get-or-create so a pause on a never-seen lane still signals.
+
+        One helper for both claim modes, because the fact is one fact and a second spelling of it is
+        how the two drift: the pooled dispatcher calls this as its ``on_lane_paused`` callback, and
+        the per_lane :meth:`_delivery_worker` calls it at BOTH its loop-top exits — the operator-pause
+        gate and the #122 halt gate above it. The halt gate was the one that did not, and a lane that
+        stops claiming without signalling reads as 'stopping' for the life of the process."""
         self._outbound_quiesced.setdefault(name, asyncio.Event()).set()
+
+    @property
+    def _delivery_halted(self) -> bool:
+        """THE DELIVERY TIER'S ONE QUESTION: may this process deliver at all? (#122, ADR 0189.)
+
+        The counterpart of :attr:`_log_halted` for the delivery tier, read at the CLAIM GATE in both
+        claim modes — :meth:`_delivery_worker`'s loop top (per_lane) and :meth:`_dispatch_delivery`
+        (pooled) — because that is the point every delivery passes through whichever door started the
+        lane. Before it, the rule could only be re-asserted at each DOOR into resuming delivery, and
+        four of those were found one at a time, each only after the previous fix shipped:
+        ``start_outbound``, ``restart_outbound``, a ``stop()``+``start()`` teardown, and the reload's
+        :meth:`_unpark_outbound_lane`. An enumeration of doors is a completeness claim nobody can
+        verify; a claim gate is not. The four door gates are KEPT as defence in depth — they fail fast
+        with an operator-legible page — and this is the backstop behind them.
+
+        **DERIVED, not a second flag, and that is deliberate (SDS-3.5).** "This process cannot log and
+        has fail-closed" is one load-bearing fact and :attr:`_log_write_stopped` already states it:
+        both halt sites set it (:meth:`_stop_all_for_log_failure`, :meth:`start`) and the only path
+        that clears it is :meth:`_log_recovery_ok`, which re-tests the sinks by WRITING to them. A
+        parallel bool set and cleared at the same four moments would be state that must agree with
+        this one, with nothing checking that it does.
+
+        **It survives a teardown, which is the whole point.** :meth:`_teardown_body` clears
+        ``_outbound_paused`` on purpose (an operator pause is in-memory and must not outlive the
+        process's graph), and the halt's own pause went with it — which is exactly how the third and
+        fourth doors resumed delivery into a dead log. ``_log_write_stopped`` is not cleared there, so
+        neither is this.
+
+        Delivery is halted iff a halt has fired and no recovery has re-validated the sinks since, so
+        the ``continue`` log-write policy (which fail-closes nothing) reads False here throughout."""
+        return self._log_write_stopped
 
     def outbound_running(self, name: str) -> bool:
         """Whether the named outbound is actively delivering (operator intent): the engine is running
         AND the outbound is not operator-paused. Raises :class:`KeyError` for a name that is neither a
         declared nor a draining outbound, so the API 404s an unknown connection (mirrors
-        :meth:`inbound_running`'s membership semantics + the outbound control handlers)."""
+        :meth:`inbound_running`'s membership semantics + the outbound control handlers).
+
+        **False for every lane while :attr:`_delivery_halted`**, whatever the pause set says. A lane a
+        door never gated (or one an unguarded path brought up) is not in ``_outbound_paused`` and was
+        reporting as actively delivering while the claim gate refused every row — the console's own
+        running/stopped split reading the opposite of what the engine does."""
         self._validate_outbound(name)
-        return self._running and name not in self._outbound_paused
+        return self._running and not self._delivery_halted and name not in self._outbound_paused
 
     def outbound_quiesced(self, name: str) -> bool:
         """Whether a PAUSED outbound has fully DRAINED to zero in-flight — the PURGE precondition. True
@@ -1650,10 +1929,26 @@ class RegistryRunner:
         return ev is not None and ev.is_set()
 
     def outbound_status(self, name: str) -> str:
-        """Tri-state delivery status for one outbound: 'running' (not paused), 'stopping' (paused, an
+        """Delivery status for one outbound: 'log_halted' (#122 — this process cannot write its
+        application log, so NO lane delivers), 'running' (not paused), 'stopping' (paused, an
         in-flight head still resolving — the quiescence Event not yet set), or 'stopped' (paused AND
         quiesced — zero in-flight, safe to purge). A name not in ``_outbound_paused`` → 'running' (the
-        status-plumbing caller already special-cases failed/filtered; a real unknown 404s on control)."""
+        status-plumbing caller already special-cases failed/filtered; a real unknown 404s on control).
+
+        **'log_halted' is FIRST and process-wide, because the halt is (ADR 0189).** The cause is a
+        root-logger handler set with no per-connection attribution to narrow it with, so while
+        :attr:`_delivery_halted` holds, every lane this process owns is down for that one reason. It
+        used to read as 'stopped' — the halt takes a lane down by pausing it, and a pause is what an
+        OPERATOR does — which told an operator the lane was waiting for them to press start, when what
+        it was waiting for was a writable disk. Reporting the cause is also the only way the fifth-door
+        case is visible at all: a lane an unguarded path brought up is not in ``_outbound_paused``, so
+        it would have read 'running' while the claim gate refused every one of its rows.
+
+        Purge-eligibility is unaffected and deliberately separate: :meth:`outbound_quiesced` still
+        answers off the pause set, so a halted-and-quiesced lane stays purgeable (the API surfaces
+        that as its own ``paused`` field, never collapsed into this string)."""
+        if self._delivery_halted:
+            return "log_halted"
         if name not in self._outbound_paused:
             return "running"
         return "stopped" if self.outbound_quiesced(name) else "stopping"
@@ -1668,31 +1963,53 @@ class RegistryRunner:
         probe = getattr(connector, "waiting_for_reply", None)
         return bool(probe(time.monotonic())) if callable(probe) else False
 
-    def connection_failed(self, name: str) -> str | None:
-        """The failure reason if this connection failed to build/bind at start, else None. A failed
-        connection is isolated, not fatal (ADR 0031): the engine starts the rest of the graph and an
-        operator recovers it (fix the cause, then reload or — for an inbound — restart it)."""
-        return self._failed.get(name)
+    def inbound_failed(self, name: str) -> str | None:
+        """The failure reason if the INBOUND of this name failed to build/bind at start, else ``None``
+        (ADR 0031). A failed connection is isolated, not fatal: the engine starts the rest of the graph
+        and an operator recovers it (fix the cause, then reload or restart it)."""
+        return self._failed.get(("inbound", name))
 
-    def degraded_connections(self) -> dict[str, str]:
-        """Snapshot of ``{connection: reason}`` for connections that failed to start (ADR 0031).
-        Empty when every connection came up — the API/console use it to flag a degraded engine."""
-        return dict(self._failed)
+    def outbound_failed(self, name: str) -> str | None:
+        """The failure reason if the OUTBOUND of this name failed to build at start, else ``None``
+        (ADR 0031) - the outbound half of :meth:`inbound_failed`."""
+        return self._failed.get(("outbound", name))
 
-    def connection_filtered(self, name: str) -> str | None:
-        """The reason this connection was skipped by the DR run-profile (its resolved priority tier is
-        below ``[dr].priority_threshold``), else ``None`` (#61, ADR 0048). A filtered connection is
-        **not** failed (ADR 0031) — it was deliberately not started; the two are surfaced as the distinct
+    def degraded_inbound(self) -> dict[str, str]:
+        """Snapshot of ``{inbound: reason}`` for INBOUND connections that failed to bind (ADR 0031).
+        Empty when every inbound came up."""
+        return {name: reason for (kind, name), reason in self._failed.items() if kind == "inbound"}
+
+    def degraded_outbound(self) -> dict[str, str]:
+        """Snapshot of ``{outbound: reason}`` for OUTBOUND connections that failed to build (ADR 0031).
+        Empty when every outbound came up."""
+        return {name: reason for (kind, name), reason in self._failed.items() if kind == "outbound"}
+
+    def inbound_filtered(self, name: str) -> str | None:
+        """The reason the DR run-profile parked this INBOUND (its resolved priority tier is below
+        ``[dr].priority_threshold``), else ``None`` (#61, ADR 0048). A filtered connection is **not**
+        failed (ADR 0031) - it was deliberately not started; the two are surfaced as the distinct
         ``status:"filtered"`` vs ``status:"failed"`` so an operator can tell a parked DR feed from a
         broken one."""
-        return self._filtered.get(name)
+        return self._filtered.get(("inbound", name))
 
-    def filtered_connections(self) -> dict[str, str]:
-        """Snapshot of ``{connection: reason}`` for connections the DR run-profile parked below the
-        priority threshold (#61, ADR 0048). Empty unless a DR run-profile is active — the sibling of
-        :meth:`degraded_connections`, kept distinct so a parked DR feed is never confused with an
-        ADR-0031 failure."""
-        return dict(self._filtered)
+    def outbound_filtered(self, name: str) -> str | None:
+        """The reason the DR run-profile parked this OUTBOUND, else ``None`` (#61, ADR 0048) - the
+        outbound half of :meth:`inbound_filtered`."""
+        return self._filtered.get(("outbound", name))
+
+    def filtered_inbound(self) -> dict[str, str]:
+        """Snapshot of ``{inbound: reason}`` for INBOUNDs the DR run-profile parked below the priority
+        threshold (#61, ADR 0048). Empty unless a DR run-profile is active."""
+        return {
+            name: reason for (kind, name), reason in self._filtered.items() if kind == "inbound"
+        }
+
+    def filtered_outbound(self) -> dict[str, str]:
+        """Snapshot of ``{outbound: reason}`` for OUTBOUNDs the DR run-profile parked below the priority
+        threshold (#61, ADR 0048). Empty unless a DR run-profile is active."""
+        return {
+            name: reason for (kind, name), reason in self._filtered.items() if kind == "outbound"
+        }
 
     def resolved_priority(self, name: str) -> Priority:
         """The connection's resolved DR / priority tier (#61, ADR 0048): its own ``priority=`` override,
@@ -1707,7 +2024,7 @@ class RegistryRunner:
             return oc.priority or self._priority_default
         return self._priority_default
 
-    def _dr_filters_out(self, name: str, declared: Priority | None) -> bool:
+    def _dr_filters_out(self, name: str, declared: Priority | None, *, kind: Direction) -> bool:
         """Whether the DR run-profile parks this connection (its resolved tier is below the threshold).
 
         ``False`` when no DR run-profile is active (``_dr_threshold is None``) — every normal deployment,
@@ -1720,9 +2037,9 @@ class RegistryRunner:
             return False
         resolved = declared or self._priority_default
         if resolved.rank >= threshold.rank:
-            self._filtered.pop(name, None)  # at/above threshold — not parked
+            self._filtered.pop((kind, name), None)  # at/above threshold — not parked
             return False
-        self._filtered[name] = (
+        self._filtered[(kind, name)] = (
             f"DR run-profile threshold={threshold.value}: connection tier={resolved.value} is below "
             f"threshold — not started (status:filtered, ADR 0048)"
         )
@@ -1808,19 +2125,35 @@ class RegistryRunner:
         """Build a **fresh** connector for the named connection so it can be reachability-tested —
         never the live one in ``_sources``/``_destinations`` (probing the live connector would disturb
         running traffic). Resolves ``env()`` and enforces the ``[egress]`` allowlist fail-closed, the
-        same as a real build. Returns ``("in", source)`` or ``("out", destination)``. Raises
-        :class:`KeyError` if ``name`` isn't a connection, :class:`WiringError` on a bad ``env()`` /
-        egress. The caller closes the connector (``stop()`` / ``aclose()``) after testing."""
+        same as a real build. Returns ``("in", source)`` or ``("out", destination)``. The caller closes
+        the connector (``stop()`` / ``aclose()``) after testing.
+
+        Raises :class:`KeyError` if ``name`` isn't a connection, and :class:`WiringError` for EVERY
+        build failure — a bad ``env()`` / egress, and anything a connector constructor raises, which is
+        normalized here exactly as :func:`build_check_registry` normalizes the same seam. That
+        guarantee is the contract, not a courtesy: this docstring used to promise ``WiringError`` while
+        the body passed a connector's own exception straight through, so
+        :class:`~messagefoundry.transports.wincred.CredentialUnsupportedError` — a ``ValueError``, raised
+        when a File connection carries ``credential_*`` on a non-Windows host — escaped the API's
+        ``except WiringError`` as an unhandled 500 (BACKLOG #1824)."""
         ic = self.registry.inbound.get(name)
-        if ic is not None:
-            source_cfg = _source_config(ic, self._inbound_bind_host, self._env_values)
-            check_source_allowed(source_cfg, name, self._egress)
-            return "in", build_source(source_cfg)
         oc = self.registry.outbound.get(name)
-        if oc is not None:
-            dest_cfg = _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress)
-            check_egress_allowed(dest_cfg, self._egress)
-            return "out", build_destination(dest_cfg)
+        try:
+            if ic is not None:
+                source_cfg = _source_config(ic, self._inbound_bind_host, self._env_values)
+                check_source_allowed(source_cfg, name, self._egress)
+                return "in", build_source(source_cfg)
+            if oc is not None:
+                dest_cfg = _dest_config(
+                    oc, self._env_values, self._trust_anchor_policy, self._egress
+                )
+                check_egress_allowed(dest_cfg, self._egress)
+                return "out", build_destination(dest_cfg)
+        except WiringError:
+            raise
+        except Exception as exc:
+            raise WiringError(f"connector build failed: {exc}") from exc
+        # OUTSIDE the wrap on purpose: an unknown name is the caller's 404, not a build failure.
         raise KeyError(name)
 
     async def start_inbound(self, name: str) -> None:
@@ -1932,7 +2265,9 @@ class RegistryRunner:
             self._outbound_quiesced[name] = asyncio.Event()
         else:
             ev.clear()
-        if self._claim_mode == "pooled":
+        # ADR 0066 D4: the branch is per-LANE, not per-mode — a pooled UNORDERED lane has a delivery
+        # worker and no dispatcher entry, so pausing it through the dispatcher would never quiesce it.
+        if not self._per_lane_delivery(name):
             d = self._dispatchers.get(Stage.OUTBOUND)
             if d is not None:
                 d.pause_lane(name)  # fires on_lane_paused synchronously if the lane is already idle
@@ -1973,7 +2308,7 @@ class RegistryRunner:
         self._outbound_paused.add(name)
         self._gate_parked.add(name)
         self._outbound_quiesced.setdefault(name, asyncio.Event()).set()
-        if self._claim_mode == "pooled":
+        if not self._per_lane_delivery(name):  # ADR 0066 D4: per-LANE, see _stop_outbound_unsafe
             d = self._dispatchers.get(Stage.OUTBOUND)
             if d is not None:
                 d.pause_lane(name)
@@ -2003,7 +2338,7 @@ class RegistryRunner:
         ev = self._outbound_quiesced.get(name)
         if ev is not None:
             ev.clear()
-        if self._claim_mode == "pooled":
+        if not self._per_lane_delivery(name):  # ADR 0066 D4: per-LANE, see _stop_outbound_unsafe
             d = self._dispatchers.get(Stage.OUTBOUND)
             if d is not None:
                 d.resume_lane(name)
@@ -2032,7 +2367,7 @@ class RegistryRunner:
         recorded failed + alerted and the resume still proceeds, so rows are retried via the
         connector-None path and a later fix + reload/restart self-heals — rather than 500ing the control
         route and leaving the operator with no status to read."""
-        if name in self._destinations or name in self._filtered:
+        if name in self._destinations or ("outbound", name) in self._filtered:
             return
         oc = self.registry.outbound.get(name)
         if oc is None or not oc.deployed:
@@ -2056,7 +2391,7 @@ class RegistryRunner:
             self._record_failed(name, exc, kind="outbound")
             return
         self._destinations[name] = connector
-        self._failed.pop(name, None)
+        self._failed.pop(("outbound", name), None)
 
     async def _aclose_quietly(self, connector: DestinationConnector | None, name: str) -> None:
         """Release whatever a BUILT-but-rejected connector allocated (a File alternate-credential worker
@@ -2093,7 +2428,7 @@ class RegistryRunner:
         ev = self._outbound_quiesced.get(name)
         if ev is not None:
             ev.clear()
-        if self._claim_mode == "pooled":
+        if not self._per_lane_delivery(name):  # ADR 0066 D4: per-LANE, see _stop_outbound_unsafe
             d = self._dispatchers.get(Stage.OUTBOUND)
             if d is not None:
                 d.resume_lane(name)
@@ -2366,11 +2701,11 @@ class RegistryRunner:
             raise
         self._sources[name] = source
         self._failed.pop(
-            name, None
+            ("inbound", name), None
         )  # bound successfully — clear any prior start failure (ADR 0031)
         # An operator that explicitly starts a DR-parked inbound (POST /connections/{name}/start) is
         # overriding the run-profile, so it is no longer "filtered" — clear that marker too (#61).
-        self._filtered.pop(name, None)
+        self._filtered.pop(("inbound", name), None)
         # Once the source is live, note (start-time only, never per-tick) that a poll source's intake
         # is leader-gated, so an operator reading the log knows only the leader polls this resource.
         if getattr(source, "polls_shared_resource", False):
@@ -2405,13 +2740,17 @@ class RegistryRunner:
         if source is not None:
             await source.stop()
 
-    def _record_failed(self, name: str, exc: BaseException, *, kind: str) -> None:
+    def _record_failed(self, name: str, exc: BaseException, *, kind: Direction) -> None:
         """Isolate a connection that failed to build/bind (ADR 0031): record the reason, log it
         loudly, and alert — the engine keeps the rest of the graph running. Reuses the AlertSink
         ``connection_stopped`` signal: its meaning ("this connection is down until an operator
-        intervenes") fits a startup failure exactly, so no new sink method is needed."""
+        intervenes") fits a startup failure exactly, so no new sink method is needed.
+
+        ``kind`` is part of the KEY, not just the log line (see ``_failed``). The alert still carries the
+        bare name: an alert row is addressed to the operator's connection, and the detail says which
+        direction failed to start."""
         reason = safe_exc(exc)
-        self._failed[name] = reason
+        self._failed[(kind, name)] = reason
         log.error(
             "%s connection %r failed to start — ISOLATED, engine continues (fix the cause, then "
             "reload%s): %s",
@@ -2799,6 +3138,9 @@ class RegistryRunner:
         already-spawned worker)."""
         self._retry[name] = oc.retry or self._delivery_defaults
         self._ordering[name] = oc.ordering or self._ordering_default
+        # ADR 0066 D4: pick this lane's delivery consumer NOW, before the park/spawn branches below and
+        # before the dispatchers are built, so no window exists where both could claim it.
+        self._resolve_lane_consumer(name)
         self._internal_error[name] = oc.internal_error or self._internal_error_default
         self._buildup[name] = oc.buildup or self._buildup_default
         self._stall[name] = oc.stall or self._stall_default
@@ -2849,12 +3191,12 @@ class RegistryRunner:
         # connector for a claimed row" path), so the count-and-log + at-least-once invariants hold: the
         # row is queued + retried + buildup-alerted, never silently dropped. status:"filtered" (not
         # "failed") tells the operator it was deliberately parked.
-        if self._dr_filters_out(name, oc.priority):
+        if self._dr_filters_out(name, oc.priority, kind="outbound"):
             self._destinations.pop(name, None)  # no live connector for a parked lane
             self._spawn_worker(name)
             return
         self._filtered.pop(
-            name, None
+            ("outbound", name), None
         )  # at/above threshold this run — clear any prior parked marker
         connector: DestinationConnector | None = None
         try:
@@ -2897,7 +3239,7 @@ class RegistryRunner:
             self._spawn_worker(name)  # drains→retries routed rows via the connector-None path
             return
         self._destinations[name] = connector
-        self._failed.pop(name, None)
+        self._failed.pop(("outbound", name), None)
         self._spawn_worker(name)
 
     async def start(self) -> None:
@@ -2959,12 +3301,26 @@ class RegistryRunner:
                 # invisible to the supervisor and never pages itself), and warn on the per_lane_wake
                 # combination (cross-shard produce has no wake — only the 30s idle backstop).
                 self._shard_watchdog = asyncio.create_task(self._non_owned_lane_watchdog())
-                if self._claim_mode != "pooled" and self._per_lane_wake:
+                # ADR 0066 D4: the hazard is per-LANE, so the warning has to be too. A lane drained by
+                # its own delivery worker has no cross-shard wake and is not in the dispatcher's sweep
+                # set either, so it sits on the idle backstop — under pooled as much as under per_lane.
+                # Read from the REGISTRY, not from _worker_owned: the outbound loop below has not run
+                # yet, so no lane has been decided at this point.
+                _worker_lanes_expected = self._claim_mode != "pooled" or any(
+                    (oc.ordering or self._ordering_default) is OrderingMode.UNORDERED
+                    for oc in self.registry.outbound.values()
+                )
+                if _worker_lanes_expected and self._per_lane_wake:
                     log.warning(
                         "sharded engine with per_lane_wake=True: a cross-shard send into an idle "
-                        "owned lane is discovered only by the %.0fs idle backstop (no cross-process "
-                        "wake) — prefer claim_mode='pooled' (<=%.2fs sweep) for sharded fleets",
+                        "owned lane drained by its own delivery worker is discovered only by the "
+                        "%.0fs idle backstop (no cross-process wake). Under claim_mode=%r that is "
+                        "%s. The pooled OUTBOUND dispatcher's <=%.2fs sweep covers every OTHER lane",
                         _PER_LANE_IDLE_BACKSTOP_SECONDS,
+                        self._claim_mode,
+                        "every outbound lane"
+                        if self._claim_mode != "pooled"
+                        else "any ordering=unordered outbound (ADR 0066 D4)",
                         self._pooled_sweep_interval,
                     )
             try:
@@ -3012,10 +3368,10 @@ class RegistryRunner:
                     # still drains. The listener simply isn't accepting NEW work — the operator intent of
                     # a DR box running only its critical feeds. status:"filtered" (not "failed")
                     # distinguishes it from an ADR-0031 bind failure.
-                    if self._dr_filters_out(ic.name, ic.priority):
+                    if self._dr_filters_out(ic.name, ic.priority, kind="inbound"):
                         continue
                     self._filtered.pop(
-                        ic.name, None
+                        ("inbound", ic.name), None
                     )  # at/above threshold this run — clear the marker
                     try:
                         await self._start_inbound_unsafe(ic.name)
@@ -3076,7 +3432,7 @@ class RegistryRunner:
                     started,
                     total,
                     len(self._filtered),
-                    ", ".join(sorted(self._filtered)) or "(none)",
+                    ", ".join(f"{k} {n}" for k, n in sorted(self._filtered)) or "(none)",
                 )
             if self._failed:
                 log.warning(
@@ -3085,7 +3441,9 @@ class RegistryRunner:
                     len(self.registry.inbound),
                     len(self.registry.outbound),
                     len(self._failed),
-                    ", ".join(f"{n} ({r})" for n, r in self._failed.items()),
+                    # Named WITH the direction — an operator reading this has to know which half
+                    # of a dual-role name to go and fix.
+                    ", ".join(f"{k} {n} ({r})" for (k, n), r in sorted(self._failed.items())),
                 )
             else:
                 log.info(
@@ -3215,8 +3573,10 @@ class RegistryRunner:
         so they exit on their own once the CURRENT claimed prefix resolves. ``asyncio.wait`` never
         cancels and never raises on timeout; the existing cancel + gather below remains the fallback.
 
-        No-op in pooled mode: all FOUR dicts are empty there, because ``_ensure_inbound_workers``
-        returns early under ``pooled`` and ``_spawn_worker`` is a documented pooled no-op.
+        In pooled mode the three INBOUND dicts are empty (``_ensure_inbound_workers`` returns early),
+        and ``self._workers`` holds only the lanes ADR 0066 D4 keeps on a per-lane delivery worker — the
+        UNORDERED outbounds. Those need the same cooperative wait as in per_lane mode, so this is a
+        no-op on a pooled graph with no UNORDERED outbound and does real work on one that has any.
 
         MUST run ABOVE the source phase, or per_lane workers keep issuing post-demotion terminal writes
         for the whole source phase.
@@ -3368,9 +3728,13 @@ class RegistryRunner:
         # B12 (ADR 0061): break every waiting worker out of its wait so cancel()+gather lands promptly.
         # OFF sets the four stage singletons (byte-identical); ON sets every registered lane Event. ADR
         # 0066 pooled: skip — the shared _stop.set() already breaks the dispatchers' loops, and _wake_all
-        # here would notify_work() dispatchers we are about to stop.
+        # here would notify_work() dispatchers we are about to stop. ADR 0066 D4: a pooled graph may
+        # still hold worker-drained OUTBOUND lanes, so break those out of their wait directly (the
+        # cancel + gather below is still the fallback, exactly as in per_lane mode).
         if self._claim_mode != "pooled":
             self._wake_all(Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE, Stage.OUTBOUND)
+        else:
+            self._wake_worker_lanes()
         if demote:
             # ADR 0157 Inc 5: DEMOTE INVERTS the ADR 0066 D3 order below, deliberately. Egress is the
             # split-brain-relevant action, so its budget must start NOW rather than after the source
@@ -3486,6 +3850,10 @@ class RegistryRunner:
             _lane_dict.clear()
         # ADR 0066: reset pooled-mode transient state (no-ops in per_lane mode — empty/False already).
         self._pooled_buildup_at.clear()
+        # ADR 0066 D4: drop the per-lane delivery-consumer decisions. They are sticky for the life of a
+        # RUN, not of the process, so a start()-after-stop() re-decides each lane from the ordering the
+        # new graph declares — which is what makes a restart the documented way to move a lane.
+        self._worker_owned.clear()
         # Connection controls: operator pauses are in-memory and do NOT survive a full teardown — clear
         # them so a start()-after-stop() begins with every outbound running (a fresh dispatcher has no
         # PAUSED lanes; a stale _outbound_paused would make outbound_running lie about the new lane).
@@ -3504,15 +3872,36 @@ class RegistryRunner:
 
     def _spawn_worker(self, name: str) -> None:
         """Start a delivery worker for one outbound connection (drains its outbox rows). ADR 0066 D5:
-        in pooled mode the per-outbound delivery worker is replaced by the OUTBOUND StageDispatcher, so
-        this is a no-op — the mode gate lives HERE (not at each call site) so ``_start_outbound`` /
+        a pooled FIFO lane is drained by the OUTBOUND StageDispatcher instead, so this is a no-op for
+        one — the gate lives HERE (not at each call site) so ``_start_outbound`` /
         ``_reconcile_outbounds`` still build the connector into ``self._destinations`` (the pooled
-        delivery body re-resolves from it) without leaking a per_lane worker.
+        delivery body re-resolves from it) without leaking a second consumer.
+
+        ADR 0066 D4: a pooled UNORDERED lane DOES get a worker. :meth:`_per_lane_delivery` is the
+        single discriminator and ``_pooled_lane_provider`` is its complement, so the lane is drained by
+        exactly one of the two — never both, never neither. The guard below tests that directly: a
+        worker-owned lane must be unknown to the OUTBOUND dispatcher, which is one dict read. It is a
+        REFUSAL rather than an ``assert`` deliberately — ``python -O`` strips an assert, and the one
+        build where this invariant goes unchecked would be the production one. Refusing leaves the
+        lane on the consumer it already has, which is a slow lane at worst; spawning anyway would put
+        two claimers on it, which is the per-lane FIFO break (ADR 0073) this whole gate exists to stop.
 
         Sharded (ADR 0073): a lane another shard owns gets NO local worker — same choke-point
         placement, so start/reconcile/respawn all inherit the gate while the connector stays built
         (status, DR parking and the dead-letter sweeps keep keying off the full outbound map)."""
-        if self._claim_mode == "pooled":
+        if not self._per_lane_delivery(name):
+            return
+        out = self._dispatchers.get(Stage.OUTBOUND)
+        held = None if out is None else out.phase(name)
+        if held is not None:
+            log.error(
+                "outbound %r would have TWO consumers: a per-lane delivery worker and the pooled "
+                "OUTBOUND dispatcher, which already holds the lane at phase %r. Refusing to spawn "
+                "the worker — the dispatcher keeps draining it (ADR 0066 D4 / ADR 0073 single "
+                "consumer per lane). This is a bug in the lane-consumer partition; report it",
+                name,
+                held,
+            )
             return
         if not self._owns_destination(name):
             log.info(
@@ -3629,12 +4018,17 @@ class RegistryRunner:
         (registry ∪ any built connector still draining after a reload dropped it), each filtered to
         the lanes THIS shard owns (ADR 0073 — a no-op unsharded; the predicate form keeps a
         reload-dropped lane draining on exactly its owner). Read live so a reload's swapped graph is
-        reflected without rebuilding the dispatcher."""
+        reflected without rebuilding the dispatcher.
+
+        OUTBOUND also drops every lane that runs its own delivery worker (ADR 0066 D4) — this set is
+        the exact complement of :meth:`_per_lane_delivery`, which is what keeps each lane to one
+        consumer. Excluding a lane here stops the sweep readying it; the matching wake gate is in
+        :meth:`_wake_lane`, because ``mark_ready`` is create-or-stick and would register it anyway."""
         if stage is Stage.OUTBOUND:
             return lambda: {
                 dest
                 for dest in set(self.registry.outbound) | set(self._destinations)
-                if self._owns_destination(dest)
+                if self._owns_destination(dest) and not self._per_lane_delivery(dest)
             }
         if stage is Stage.RESPONSE:
             return lambda: {
@@ -3732,10 +4126,13 @@ class RegistryRunner:
         # auto_start=False lane is already in _outbound_paused with no dispatcher to tell — without this
         # replay the boot gate would be defeated by step (3)'s seed-all-READY. pause_lane on an
         # unregistered key registers it ALREADY-PAUSED, so the seed cannot arm it (#115).
+        # ADR 0066 D4: a worker-drained lane is NOT replayed — it has no dispatcher entry, and creating
+        # one here (pause_lane is create-or-stick) would hand the dispatcher a lane a worker owns.
         out = self._dispatchers.get(Stage.OUTBOUND)
         if out is not None:
             for n in self._outbound_paused:
-                out.pause_lane(n)
+                if not self._per_lane_delivery(n):
+                    out.pause_lane(n)
         # (2.6) THE #122 SIBLING OF (2.5), and it fails the same way if it is missing: replay an
         # in-force log-failure halt onto the FRESH INGRESS/ROUTED/RESPONSE dispatchers before step (3)
         # seeds every lane READY. Without it a runner that came up into an unwritable application log
@@ -3746,11 +4143,14 @@ class RegistryRunner:
         # (3) start each (seed-all-READY + immediate sweep). reset_stale_inflight already ran (engine).
         for dispatcher in self._dispatchers.values():
             await dispatcher.start()
-        # (4) per_lane_wake is subsumed by pooled precision (logged once).
+        # (4) per_lane_wake is subsumed by pooled precision for every DISPATCHER-drained lane (logged
+        # once). It still governs the wake of a lane ADR 0066 D4 keeps on its own delivery worker.
         if self._per_lane_wake:
             log.info(
-                "ADR 0066: per_lane_wake subsumed by pooled claim_mode (per-lane precision is "
-                "structural in the dispatcher; the sweep is the bounded backstop)"
+                "ADR 0066: per_lane_wake subsumed by pooled claim_mode for dispatcher-drained lanes "
+                "(per-lane precision is structural in the dispatcher; the sweep is the bounded "
+                "backstop). It still governs any ordering=unordered outbound, which keeps its own "
+                "delivery worker (D4)"
             )
         log.info(
             "pooled claim mode started: %d stage dispatcher(s) (%s)",
@@ -3892,6 +4292,9 @@ class RegistryRunner:
             await dispatcher.start()
         for dispatcher in self._dispatchers.values():
             dispatcher.notify_work()
+        # ADR 0066 D4: the dispatchers do not speak for a worker-drained outbound lane, so nudge those
+        # directly — otherwise a reload that added rows to one would leave it asleep until its backstop.
+        self._wake_worker_lanes()
         # Connection controls — reload survival (belt-and-suspenders): re-apply every operator pause
         # SYNCHRONOUSLY right after the notify_work broadcast — no await in the gap, still under
         # _reload_lock — so a claimer can't slip a row out of a deliberately-paused lane between the
@@ -3901,7 +4304,8 @@ class RegistryRunner:
         out = self._dispatchers.get(Stage.OUTBOUND)
         if out is not None:
             for n in self._outbound_paused:
-                out.pause_lane(n)
+                if not self._per_lane_delivery(n):  # ADR 0066 D4, as in _start_pooled_dispatchers
+                    out.pause_lane(n)
         # …and the #122 halt on the INTERNAL stages, for the same reason and in the same gap. A
         # reload never LIFTS a halt (that rides _resume_inbound_processing, which is gated on the log
         # working again), so re-applying it here can only ever be a no-op or a repair; a lane whose
@@ -3966,10 +4370,10 @@ class RegistryRunner:
         send at most fails and retries — outbounds are idempotent). An outbound dropped by ``new`` is
         left running so rows already queued to it still drain. Connector builds here cannot fail —
         :meth:`_build_check` already validated them before any quiesce."""
-        # #122 (ADR 0162) THE DOOR A RELOAD OPENS INTO RESUMING DELIVERY: `_unpark_outbound_lane`
-        # below, on a lane the ENGINE parked that the halt therefore skipped — :meth:`start_outbound`
-        # carries that mechanism, and its "says nothing about the lane the halt never touched"
-        # paragraph is what this gate closes.
+        # #122 (ADR 0162) THE DOORS A RELOAD OPENS INTO RESUMING DELIVERY, and there are TWO — the
+        # `_unpark_outbound_lane` below, and the lane this reload ADDS (ADR 0189 door six). One gate
+        # below covers both; it carries the reasoning, and :meth:`start_outbound` carries the
+        # mechanism behind the first.
         #
         # MEMOISED because :meth:`_outbound_start_permitted` must be asked at most once per operator
         # action and that helper's docstring says why. None = not asked yet; a reload with no parked
@@ -3980,6 +4384,19 @@ class RegistryRunner:
             # retunes (incl. re-arming a previously stopped connection) without a restart
             self._retry[name] = oc.retry or self._delivery_defaults
             self._ordering[name] = oc.ordering or self._ordering_default
+            # ADR 0066 D4: resolve (or re-read) the lane's delivery consumer before ANY branch below
+            # can park it, spawn a worker, or hand it to a dispatcher. A lane already running keeps the
+            # consumer it has — see _resolve_lane_consumer for why a mid-run handover is refused.
+            # Hoisted, NOT folded into the `if` below: this call RECORDS the decision, and a predicate
+            # with a side effect inside a condition is one operand reorder away from never running.
+            worker_drained = self._resolve_lane_consumer(name)
+            if not worker_drained and self._lane_ordering(name) is OrderingMode.UNORDERED:
+                log.info(
+                    "outbound %r now declares ordering=unordered, but the pooled OUTBOUND dispatcher "
+                    "is already draining it; the lane keeps head-of-line blocking until the next "
+                    "engine start (ADR 0066 D4 — a consumer handover on a live lane is refused)",
+                    name,
+                )
             self._internal_error[name] = oc.internal_error or self._internal_error_default
             self._buildup[name] = oc.buildup or self._buildup_default
             self._stall[name] = oc.stall or self._stall_default
@@ -3988,7 +4405,8 @@ class RegistryRunner:
             )  # BACKLOG #82 (see _start_outbound)
             self._simulate[name] = self._resolve_simulate(name, oc)
             worker = self._workers.get(name)
-            failed = name in self._failed  # ADR 0031: live worker, but no connector (start failed)
+            # ADR 0031: live worker, but no connector (start failed)
+            failed = self.outbound_failed(name) is not None
             # Present but NOT DEPLOYED (#233, ADR 0111) — checked FIRST, so deployed=False WINS over
             # auto_start. Unconditional (NOT keyed on the lane's live state, as the auto_start gate
             # below is): an operator start is a legitimate override of auto_start, but there is no
@@ -4001,7 +4419,7 @@ class RegistryRunner:
                 stale = self._destinations.pop(name, None)
                 if stale is not None:
                     await stale.aclose()
-                self._failed.pop(name, None)
+                self._failed.pop(("outbound", name), None)
                 self._park_outbound_lane(name)
                 continue
             # Per-connection auto-start (#115): a reload must not RESURRECT a start-disabled lane. It had
@@ -4016,7 +4434,7 @@ class RegistryRunner:
                 stale = self._destinations.pop(name, None)
                 if stale is not None:
                     await stale.aclose()
-                self._failed.pop(name, None)
+                self._failed.pop(("outbound", name), None)
                 self._park_outbound_lane(name)
                 if worker is None or worker.done():
                     self._spawn_worker(name)
@@ -4030,38 +4448,130 @@ class RegistryRunner:
             # own semantics (queued rows RETRIED, status:"filtered") to a clean, unpaused lane.
             #
             # REFUSED while a #122 halt is in force and the log is still unwritable (see the memo at
-            # the top of this method). Fail closed by leaving the lane exactly as it was — parked,
-            # connector-less, rows retained PENDING — so `continue` rather than a rebuild that would
-            # warm a connector for a lane that may not deliver. Recoverable: the marker is untouched,
-            # so the next reload on a repaired log lifts it.
-            if name in self._gate_parked:
+            # the top of this method), and the SAME refusal covers both of this method's doors.
+            #
+            # DOOR SIX (ADR 0189) is the `_delivery_halted` half of the condition: the lane this
+            # reload BRINGS UP that no door ever gated. An outbound the new graph ADDS is in neither
+            # `_gate_parked` nor `_outbound_paused`, so the un-park question was never asked about it
+            # and the branches below would build its connector and arm its lane — which the reload's
+            # own `notify_work` then seeds READY. No bytes ship (the claim gate refuses every row,
+            # which is the whole point of the latch); what the lane does instead is reach that gate
+            # once per `_WORKER_ERROR_BACKOFF_SECONDS` for the halt's whole duration, at the cost the
+            # ADR's *Negative / risks* states. Option 4's rejection named this case ("a lane BUILT
+            # AFTER the halt ... which is door six") and did not close it.
+            #
+            # ONE GATE FOR BOTH, rather than a raw `_delivery_halted` read beside this one, because
+            # `_outbound_start_permitted` is a PROBE and not a predicate: it re-validates the sinks by
+            # WRITING to them, it can CLEAR the latch, and a refusal PAGES. Reading the latch raw here
+            # would mean a repaired disk lifts the halt on a reload that happens to touch a
+            # gate-parked lane and not on one that only adds an outbound — the same repair, the same
+            # reload, two outcomes, decided by an unrelated lane's park state. It would also refuse
+            # door six SILENTLY, when the reason the ADR keeps door gates at all is that a refusal
+            # here pages with a cause. The memo keeps it at AT MOST one probe and one page per reload,
+            # and the `_delivery_halted` guard keeps a HEALTHY reload from probing at all.
+            #
+            # AT MOST, not exactly: once the narrowing below excludes the lanes the halt already took
+            # down, a halted reload on a graph with no gate-parked and no added lane asks ZERO times.
+            # No recovery waits on that. `reload` restarts the inbound listeners at step 2, BEFORE it
+            # reaches this method, and `_start_inbound_unsafe` -> `_resume_inbound_processing` probes
+            # `_log_recovery_ok` itself -- so on any graph this reload brings an inbound up for, a
+            # repaired disk has already cleared the latch by the time these lanes are reconciled and a
+            # still-dead one has already paged. Where it brings none up, the lane is resumed by
+            # `start_outbound` / `restart_outbound`, and those probe at their own door: the outbound
+            # lanes this arm now skips are PAUSED, and nothing here could have resumed them anyway
+            # (`_unpark_outbound_lane` is a no-op outside `_gate_parked`), so the only thing the
+            # skipped probe would have changed is how soon the latch reads clear.
+            #
+            # The two doors then differ only in what they leave behind, which is the fail-closed shape
+            # each needs. A lane the ENGINE parked keeps its `_gate_parked` marker — untouched,
+            # connector-less, rows retained PENDING — so a later reload on a repaired log lifts it. A
+            # lane this reload would have brought up goes DOWN through :meth:`_pause_delivery_lanes`,
+            # which owns HOW the halt takes a delivery lane down and says a third copy of that loop is
+            # how the two halts drift. It routes through `_stop_outbound_unsafe`, NOT
+            # `_park_outbound_lane`, and that difference is the fix: a park writes `_gate_parked`,
+            # which this very gate LIFTS the moment a probe succeeds, so a parked lane would re-open
+            # the hole one reload later off a marker this method wrote itself. Stopping leaves it in
+            # exactly the state the halt left every other lane in, so the only reachable spin path
+            # collapses into the ordinary paused one. Reusing the helper also inherits its per-lane
+            # `except`, so a lane that refuses to pause is logged and the rest of this reload's
+            # outbounds still reconcile instead of the raise aborting the loop partway down the list.
+            #
+            # The membership test is what separates them, and it is the caller's filter exactly as in
+            # :meth:`_stop_all_for_log_failure`: every `_gate_parked` lane is already in
+            # `_outbound_paused`, so it takes the no-write path. Re-stopping an already-paused lane
+            # would CLEAR its quiescence Event, flipping a drained lane's status back from 'stopped'
+            # to 'stopping' and withdrawing its purge-eligibility for a reload that changed nothing.
+            #
+            # NARROWED to the lane the halt has NOT already taken down, and it reuses the very
+            # membership test the paragraph above relies on. `_delivery_halted` is a PROCESS fact,
+            # true for every lane at once, so an un-narrowed read ran this `continue` for EVERY
+            # outbound in the graph -- including the lanes the halt itself paused, which stand at
+            # neither door. `_unpark_outbound_lane` is a no-op for a lane the halt left outside
+            # `_gate_parked`, so there is no resume there for a gate to refuse; what the `continue`
+            # skipped instead was the DR re-evaluation and the connector rebuild below.
+            #
+            # THE REBUILD IS THE HALF NO LATER RELOAD CAN REDO, which is what made the overreach
+            # unrecoverable rather than merely late. :meth:`reload` swaps `self.registry` BEFORE it
+            # calls this method, so the NEXT reload's `old` is the already-changed graph and its
+            # `old.outbound[name].spec != oc.spec` test reads False forever;
+            # :meth:`_ensure_destination_built` then returns early on the lane's live connector, so
+            # the operator's resume keeps the stale one too. MEASURED in both claim modes: an
+            # outbound retargeted at a new directory mid-halt delivered its retained row to the OLD
+            # target once the disk was repaired, while status, the console and the API all read the
+            # new one, and a second reload did not repair it -- it survived to process restart.
+            #
+            # Reconciling a PAUSED lane's connector resumes nothing and ships nothing. The claim
+            # gate refuses every row while the latch holds, the lane stays in `_outbound_paused`
+            # either way, and :meth:`build_check` has already constructed every connector in the
+            # new graph (side-effect-free by contract: no bind, no file I/O) at the top of this
+            # reload, before a single lane was touched.
+            if (
+                self._delivery_halted and name not in self._outbound_paused
+            ) or name in self._gate_parked:
                 if unpark_permitted is None:
                     unpark_permitted = self._outbound_start_permitted(name)
                 if not unpark_permitted:
+                    if name not in self._outbound_paused:
+                        self._pause_delivery_lanes([name])
                     continue
             self._unpark_outbound_lane(name)
             # DR run-profile (#61, ADR 0048): a reload re-evaluates against the threshold. A
             # below-threshold outbound keeps (or gets) its delivery worker but NO live connector — its
             # routed rows queue + back off + self-heal on the next full startup, exactly the parked-lane
             # behavior. Close any live connector from a prior (non-DR) run so it stops delivering.
-            if self._dr_filters_out(name, oc.priority):
+            if self._dr_filters_out(name, oc.priority, kind="outbound"):
                 stale = self._destinations.pop(name, None)
                 if stale is not None:
                     await stale.aclose()
-                self._failed.pop(name, None)
+                self._failed.pop(("outbound", name), None)
                 if worker is None or worker.done():
                     self._spawn_worker(name)
                 continue
-            self._filtered.pop(name, None)
-            # Per_lane has one delivery worker per outbound; pooled has ONE OUTBOUND dispatcher for all,
-            # so self._workers is always empty in pooled — judging "live" by worker presence would rebuild
-            # every connector on every reload (dropping every warm MLLP socket / DB pool / SMART token).
-            # In pooled a connector is live iff it is BUILT; the spec-mismatch elif below still rebuilds a
-            # genuinely-changed one. The per_lane branch is the exact negation of the old check (unchanged).
+            self._filtered.pop(("outbound", name), None)
+            # A lane with its OWN delivery worker is live iff that worker is alive — a dead one must be
+            # respawned or the lane stops draining. A lane the pooled OUTBOUND dispatcher drains has no
+            # worker to judge by, so it is live iff its connector is BUILT; judging that one by worker
+            # presence would rebuild every connector on every reload (dropping every warm MLLP socket /
+            # DB pool / SMART token). The spec-mismatch elif below still rebuilds a genuinely-changed
+            # connector in both cases. ADR 0066 D4: this is per-LANE, not per-mode — under pooled an
+            # UNORDERED lane takes the worker-keyed arm and a FIFO lane the connector-keyed one.
+            #
+            # CONNECTOR-KEYED WHILE THE HALT HOLDS, for the same reason a dispatcher-drained lane is.
+            # A lane's own worker RETURNS at :meth:`_delivery_worker`'s claim gate while
+            # `_delivery_halted`, which is the halt's designed terminal state and not a crash -- the
+            # resume doors respawn it through `_start_outbound_unsafe`. Reading `worker.done()` as 'not
+            # live' there made every halted reload pop, `aclose()` and rebuild EVERY paused lane's
+            # connector, and respawn a worker that dies at that gate on its first tick, for a reload
+            # that changed nothing. MEASURED in both claim modes on a reload with the connector spec
+            # identical: `same_connector` False in per_lane against True in pooled, and True in per_lane
+            # once this disjunct was added. Besides the warm MLLP socket / DB pool / SMART token the
+            # paragraph above is written to keep, that churn made the unguarded `await stale.aclose()`
+            # below newly reachable for a halted lane, where a raising close propagates into `reload`'s
+            # own except and rolls a routine reload's intake back.
             live = (
-                name in self._destinations
-                if self._claim_mode == "pooled"
-                else (worker is not None and not worker.done())
+                (worker is not None and not worker.done())
+                if self._per_lane_delivery(name) and not self._delivery_halted
+                else name in self._destinations
             )
             if not live:
                 # added (or replacing a crashed worker): close any stale connector, build + spawn.
@@ -4076,7 +4586,7 @@ class RegistryRunner:
                     self._destinations[name] = build_destination(
                         _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress)
                     )
-                self._failed.pop(name, None)
+                self._failed.pop(("outbound", name), None)
                 self._spawn_worker(name)
             elif (
                 failed
@@ -4095,16 +4605,16 @@ class RegistryRunner:
                 # site that records a failure has already popped the connector). MEASURED on a
                 # per_lane rig, where `live` above is WORKER-keyed and the boot gates spawn a worker
                 # without a connector: AC-4's "flip the flag back with no other change" un-parked a
-                # lane that then had nothing to deliver through, and its rows retried forever. Pooled
-                # is untouched — `live` is connector-keyed there, so reaching this elif already means
-                # the connector is built.
+                # lane that then had nothing to deliver through, and its rows retried forever. A lane
+                # whose `live` is connector-keyed cannot reach this elif with a missing connector, so
+                # for those the clause is inert — which is every pooled FIFO lane (ADR 0066 D4).
                 old_conn = self._destinations.get(name)
                 # #200 (ADR 0092): stamp the posture for the in-place rebuild too (see the branch above).
                 with active_hop_posture(self._hop_posture):
                     self._destinations[name] = build_destination(
                         _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress)
                     )
-                self._failed.pop(name, None)
+                self._failed.pop(("outbound", name), None)
                 if old_conn is not None:
                     await old_conn.aclose()
             # else: unchanged & live → leave the worker/connector as-is.
@@ -4197,9 +4707,9 @@ class RegistryRunner:
                     # threshold (the profile is a per-run decision read at start/reload), so a
                     # below-threshold inbound stays parked (status:"filtered") and is not re-bound; its
                     # workers below still drain any backlog. No DR profile → byte-identical to before.
-                    if self._dr_filters_out(ic.name, ic.priority):
+                    if self._dr_filters_out(ic.name, ic.priority, kind="inbound"):
                         continue
-                    self._filtered.pop(ic.name, None)
+                    self._filtered.pop(("inbound", ic.name), None)
                     await self._start_inbound_unsafe(ic.name)
                 # 2b. Ensure the router + transform workers run for every inbound in the new graph.
                 # Workers read self.registry live, so a Router/Handler change applies to rows processed
@@ -4238,7 +4748,8 @@ class RegistryRunner:
             # that asymmetry (a residual Stage.RESPONSE token on a reloaded loopback no longer waits out
             # the poll). A missed wake here still self-heals on the poll backstop, so this is promptness.
             # ADR 0066 pooled: the dispatchers were already nudged in _reload_pooled_dispatchers above,
-            # so skip the tail wake (it would be a redundant notify_work broadcast).
+            # and so were the worker-drained lanes it wakes directly (D4), so skip the tail wake (it
+            # would be a redundant notify_work broadcast).
             if self._claim_mode != "pooled":
                 _reload_stages = (
                     (Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE, Stage.OUTBOUND)
@@ -4962,6 +5473,27 @@ class RegistryRunner:
         # coalesces further rows inside _process_delivery_batch; those are not tracked here.
         claimed: list[str] = []
         while not self._stop.is_set():
+            # #122 (ADR 0189) THE CLAIM GATE, per_lane half: the application log is unwritable and this
+            # process has fail-closed, so this lane must not deliver no matter which door started it.
+            # Return BEFORE the claim so no row is left INFLIGHT — the same terminal state
+            # :meth:`_router_worker`'s gate leaves, and re-armed the same way (a door that finds the
+            # log working clears the latch and respawns this worker). Placed ABOVE the operator-pause
+            # gate because a halted lane that is ALSO paused must not sit in _wait_for_resume: a
+            # resume would release it straight into a claim.
+            #
+            # SIGNAL QUIESCENCE ON THE WAY OUT, and that is not tidiness — it is the half of the halt
+            # the operator can see. The halt takes a lane down through _stop_outbound_unsafe, which
+            # CLEARS this lane's quiescence Event and leaves the setting to the pause gate below; this
+            # gate sits ABOVE that gate and RETURNS, so the Event stayed cleared and no later caller
+            # could set it — the worker that owns the gate is gone. outbound_quiesced() then reads
+            # False forever: the console shows an in-flight head that does not exist, and the purge
+            # that would clear the rows the halt promises to RETAIN is refused with nothing left to
+            # wait for. Zero rows are in flight here for exactly the reason the pause gate below
+            # relies on — this is the loop TOP, above the claim, and the prior iteration's items have
+            # all resolved — so the signal states a fact rather than papering over one.
+            if self._delivery_halted:
+                self._mark_outbound_quiesced(name)
+                return
             try:
                 # Connection controls: loop-top operator-PAUSE gate, BEFORE the claim. When paused, signal
                 # quiescence (the <=1 in-flight _process_delivery_item below already finished on the prior
@@ -4969,17 +5501,25 @@ class RegistryRunner:
                 # block on the per-lane resume Event. COOPERATIVE — never a task.cancel; mirrors the
                 # _stop.is_set() loop guard. The in-flight item ALWAYS finishes before the loop re-checks.
                 if name in self._outbound_paused:
-                    self._outbound_quiesced.setdefault(name, asyncio.Event()).set()
+                    self._mark_outbound_quiesced(name)
                     woken = await self._wait_for_resume(name)
                     continue
                 # FIFO (default): claim only the due head — a backing-off head blocks the lane
                 # (head-of-line), so order is preserved. UNORDERED: claim a batch and rotate past a
                 # backing-off row to drain others. Resolved live so a reload can retune it.
+                # REACHABILITY: every lane that reaches this worker at all. In per_lane mode that is all
+                # of them; under pooled it is the UNORDERED ones, which ADR 0066 D4 keeps here rather
+                # than on the OUTBOUND dispatcher. The FIFO arm below is still reachable under pooled —
+                # a reload can flip a worker-drained lane to FIFO, and the worker honours that live.
+                # Neither rotation nor a batch claim ever overlaps sends: both modes send one row at a
+                # time per lane, so UNORDERED buys failure isolation and never intra-lane concurrency
+                # (pinned by tests/test_ordering_unordered_claims.py, whose positive control shows the
+                # concurrency comes from having more lanes).
                 # perf_counter_ns ONLY when the bench lever is on — otherwise a single bool check. A
                 # claim that RAISES is not timed (the worker's outer except logs it and backs off); a
                 # timeout-capped duration would distort the claim-latency figure this measures.
                 _claim_t0 = time.perf_counter_ns() if self._delivery_phase_timing else 0
-                if self._ordering.get(name, self._ordering_default) is OrderingMode.FIFO:
+                if self._lane_ordering(name) is OrderingMode.FIFO:
                     # FIFO: claim only the due head; the head blocks the lane while it backs off. Under
                     # active-passive HA the graph runs on the leader ONLY, so one node drains this lane;
                     # the Postgres claim also reclaims a prior leader's stranded head for failover FIFO.
@@ -5152,7 +5692,7 @@ class RegistryRunner:
             # outbound failed to build at start (ADR 0031) and its lane is degraded. Either
             # way RETRY the row (never strand/drop it) — it self-heals when a reload/restart
             # builds the connector — and alert on the growing backlog of a failed lane.
-            failure = self._failed.get(name)
+            failure = self.outbound_failed(name)
             detail = f"outbound failed to start: {failure}" if failure else "outbound reloading"
             retry_until = await self._mark_failed_and_arm(name, item.id, detail, retry)
             await self._maybe_alert_buildup(name)
@@ -5462,7 +6002,7 @@ class RegistryRunner:
         retry_until: float | None = None
         connector = self._destinations.get(name)
         if connector is None:
-            failure = self._failed.get(name)
+            failure = self.outbound_failed(name)
             detail = f"outbound failed to start: {failure}" if failure else "outbound reloading"
             retry_until = await self._mark_batch_failed_and_arm(name, ids, detail, retry)
             await self._maybe_alert_buildup(name)
@@ -5556,10 +6096,11 @@ class RegistryRunner:
     ) -> float | None:
         """``mark_batch_failed`` + (per_lane wake ON) arm a one-shot retry wake at the shared deadline —
         the batch counterpart of :meth:`_mark_failed_and_arm`. All N re-pend to the same
-        ``next_attempt_at``, so one timer re-claims the identical prefix. Pooled skips the arming (the
-        dispatcher parks off the returned deadline); per_lane arming is byte-identical to the single row."""
+        ``next_attempt_at``, so one timer re-claims the identical prefix. A dispatcher-drained lane skips
+        the arming (the dispatcher parks off the returned deadline); a worker-drained lane arms, exactly
+        as the single row does."""
         next_at = await self.store.mark_batch_failed(list(ids), error, retry)
-        if self._claim_mode != "pooled" and self._per_lane_wake and next_at is not None:
+        if self._per_lane_delivery(lane) and self._per_lane_wake and next_at is not None:
             delay = max(0.0, next_at - time.time()) + _RETRY_WAKE_SLACK_SECONDS
             asyncio.get_running_loop().call_later(delay, self._wake_lane, Stage.OUTBOUND, lane)
         return next_at
@@ -6818,6 +7359,28 @@ class RegistryRunner:
         return result
 
     async def _dispatch_delivery(self, lane: str, item: OutboxItem) -> LaneItemResult:
+        # #122 (ADR 0189) THE CLAIM GATE, pooled half: the same one question the per_lane delivery
+        # worker asks at its loop top, asked here because the runner does not own the pooled claim —
+        # this adapter is the first runner-owned code a claimed OUTBOUND row reaches, and it is
+        # upstream of BOTH the plain and the batch send seams below.
+        #
+        # RESCHEDULE rather than mark_failed, and PARK rather than STOP. A log-write halt is a
+        # machinery fault, not the message's (ADR 0070 fix A's reasoning verbatim): mark_failed would
+        # spend a retry and, under a finite max_attempts, eventually write terminal DEAD on a row that
+        # was never sent. A plain release_claimed leaves the head past-due, so the ~0.25 s sweep
+        # re-readies it and the gate re-fires ~4x/s for as long as the disk stays broken; dating it
+        # into the future collapses that to the backoff cadence. STOP would be worse than a park in
+        # one specific way — resume_lane only re-arms a PAUSED lane, so a later start_outbound could
+        # not lift a STOPPED one, while a PARKED lane's own timer unparks it.
+        if self._delivery_halted:
+            # Counted, because reaching this line means SOME path armed an unpaused lane while the
+            # halt held — the missing-door signal the latch cannot get by enumeration. See
+            # :attr:`halted_claim_gate_hits` for why a small count at the halt is expected and a
+            # climbing one is not.
+            self._halted_claim_gate_hits += 1
+            park_until = time.time() + _WORKER_ERROR_BACKOFF_SECONDS
+            await self.store.reschedule_claimed([item.id], park_until)
+            return LaneItemResult(LaneResultKind.RETRY, park_until)
         # BACKLOG #82: pace this lane's egress BEFORE the send seam (mirrors the per_lane worker) so one
         # hook covers the single-message AND batch bodies in the POOLED claim mode too.
         await self._pace_outbound(lane)
@@ -6884,10 +7447,12 @@ class RegistryRunner:
 
         Returns the row's re-pended ``next_attempt_at`` (``None`` when it dead-lettered/vanished) — the
         additive ADR 0066 return the delivery body surfaces as its ``retry_until`` so the pooled
-        dispatcher PARKs the lane on it. In ``pooled`` mode the timer arming is skipped (the dispatcher
-        arms its own exact park timer off the returned deadline); the per_lane arming is byte-identical."""
+        dispatcher PARKs the lane on it. The arming is skipped for a lane the DISPATCHER drains (it arms
+        its own exact park timer off the returned deadline) and taken for a lane a per-lane WORKER
+        drains — which under pooled means an UNORDERED lane (ADR 0066 D4), whose retry would otherwise
+        ride the idle backstop because no dispatcher parks on its behalf."""
         next_at = await self.store.mark_failed(outbox_id, error, retry)
-        if self._claim_mode != "pooled" and self._per_lane_wake and next_at is not None:
+        if self._per_lane_delivery(lane) and self._per_lane_wake and next_at is not None:
             delay = max(0.0, next_at - time.time()) + _RETRY_WAKE_SLACK_SECONDS
             asyncio.get_running_loop().call_later(delay, self._wake_lane, Stage.OUTBOUND, lane)
         return next_at
@@ -7321,13 +7886,13 @@ def check_source_allowed(source: Source, name: str, egress: EgressSettings) -> N
     if egress.deny_by_default:
         if source.type is ConnectorType.DATABASE and not egress.allowed_db:
             raise WiringError(
-                f"inbound {name!r}: [egress].deny_by_default is set and [egress].allowed_db is empty "
-                "— list the DATABASE server to permit it"
+                f"inbound {name!r}: {BLOCK_UNLISTED_OUTBOUND_IN_FORCE} and "
+                "[egress].allowed_db is empty — list the DATABASE server to permit it"
             )
         if source.type is ConnectorType.REMOTEFILE and not egress.allowed_remote:
             raise WiringError(
-                f"inbound {name!r}: [egress].deny_by_default is set and [egress].allowed_remote is "
-                "empty — list the REMOTEFILE host to permit it"
+                f"inbound {name!r}: {BLOCK_UNLISTED_OUTBOUND_IN_FORCE} and "
+                "[egress].allowed_remote is empty — list the REMOTEFILE host to permit it"
             )
     if source.type is ConnectorType.DATABASE and egress.allowed_db:
         host = str(source.settings.get("server", ""))
@@ -7365,8 +7930,8 @@ def check_lookup_allowed(name: str, settings: Mapping[str, Any], egress: EgressS
     ``[egress].deny_by_default`` an empty ``allowed_db`` refuses the lookup outright."""
     if egress.deny_by_default and not egress.allowed_db:
         raise WiringError(
-            f"DatabaseLookup {name!r}: [egress].deny_by_default is set and [egress].allowed_db is "
-            "empty — list the lookup server to permit it"
+            f"DatabaseLookup {name!r}: {BLOCK_UNLISTED_OUTBOUND_IN_FORCE} and "
+            "[egress].allowed_db is empty — list the lookup server to permit it"
         )
     if egress.allowed_db:
         host = str(settings.get("server", ""))
@@ -7421,8 +7986,16 @@ def _check_credential_token_url_egress(
     is a no-op. Call only when ``allowed_http`` is non-empty (matching the host gate's own guard)."""
     for key, what in _CREDENTIAL_EGRESS_URL_KEYS:
         token_url = str(settings.get(key, "") or "")
-        if token_url and not _http_egress_allowed(token_url, allowed_http):
-            host = urllib.parse.urlsplit(token_url).hostname or ""
+        if not token_url:
+            continue
+        refuse_url_credentials(
+            token_url,
+            f"{label} {key}",
+            use="the connection's client credential settings",
+            error=WiringError,
+        )
+        if not _http_egress_allowed(token_url, allowed_http):
+            host = _egress_host_label(token_url)
             log.warning(
                 "egress denied: %s %s host %r not in [egress].allowed_http",
                 label,
@@ -7476,7 +8049,7 @@ def _check_forward_proxy_egress(
             "list is deny-by-default, unlike the [egress].allowed_* destination lists)"
         )
     if not _http_egress_allowed(proxy_url, allowed_proxy):
-        host = urllib.parse.urlsplit(proxy_url).hostname or ""
+        host = _egress_host_label(proxy_url)
         log.warning(
             "egress denied: %s forward proxy host %r not in [egress].allowed_proxy", label, host
         )
@@ -7501,15 +8074,16 @@ def check_fhir_lookup_allowed(
     _check_forward_proxy_egress(f"FhirLookup {name!r}", settings, egress.allowed_proxy)
     if egress.deny_by_default and not egress.allowed_http:
         raise WiringError(
-            f"FhirLookup {name!r}: [egress].deny_by_default is set and [egress].allowed_http is "
-            "empty — list the FHIR host to permit it"
+            f"FhirLookup {name!r}: {BLOCK_UNLISTED_OUTBOUND_IN_FORCE} and "
+            "[egress].allowed_http is empty — list the FHIR host to permit it"
         )
     if egress.allowed_http:
         url = str(settings.get("url", ""))
+        refuse_url_credentials(url, f"FhirLookup {name!r} 'url'", error=WiringError)
         if not _http_egress_allowed(
             url, egress.allowed_http
         ):  # same host[:port] matching as the FHIR outbound
-            host = urllib.parse.urlsplit(url).hostname or url
+            host = _egress_host_label(url)
             log.warning(
                 "connect denied: FhirLookup %r host %r not in [egress].allowed_http", name, host
             )
@@ -7750,11 +8324,17 @@ def check_http_sync_reply(
     at serve.
 
     The ``ordering``/``max_attempts`` pair is the subtle one, and both are refusals rather than
-    warnings because together they make the feature's headline use case unserviceable. ``ordering``
-    resolves to **FIFO**, which drains one message at a time and blocks the head on failure — so N
-    concurrent HTTP callers do not get N concurrent downstream calls; they serialise behind a single
-    lane bounded by one partner round-trip, and one transiently-failing head message holds that lane
-    until an operator purges it, timing out **every** concurrent and subsequent caller.
+    warnings because together they make the feature's headline use case unserviceable.
+
+    **The ordering refusal is about FAILURE ISOLATION, and about nothing else.** An outbound lane
+    sends one message at a time whichever ordering mode it runs, so N concurrent HTTP callers never
+    get N concurrent downstream calls and no setting here changes that. What FIFO adds is
+    head-of-line blocking: one transiently-failing message holds the lane until it succeeds,
+    dead-letters, or an operator purges it, so a single stuck message times out **every** concurrent
+    and subsequent caller rather than only its own. UNORDERED rotates past a backing-off row, so the
+    damage stays with the one caller whose message is stuck. Read the refusal as "do not let one
+    stuck message become an outage", never as "turn this on for throughput".
+
     ``max_attempts`` resolves to retry-forever, which is not merely incoherent with "the caller gave
     up 30 seconds ago" — it is a total outage with a config-shaped cause.
 
@@ -7818,10 +8398,10 @@ def check_http_sync_reply(
         declared = oc.ordering.value if oc.ordering else "unset, inheriting [delivery].ordering"
         raise WiringError(
             f"inbound connection {name!r}: reply_from names {target!r}, whose EFFECTIVE ordering is "
-            f"FIFO (declared: {declared}). A FIFO lane drains one message at a time and blocks the "
-            "head on failure, so concurrent HTTP callers serialise behind a single partner "
-            "round-trip and one stuck message times out every caller — set ordering=UNORDERED on "
-            "that outbound"
+            f"FIFO (declared: {declared}). A FIFO lane blocks its head on failure, so one stuck "
+            "message holds the lane and times out every caller behind it, not just its own. Set "
+            "ordering=UNORDERED on that outbound so a backing-off message is passed over. Either "
+            "mode still sends one message at a time, so this is failure isolation, not concurrency"
         )
 
     effective_attempts = (
@@ -8020,13 +8600,21 @@ def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
     if dest.type in _HTTP_FAMILY_DEST_TYPES:
         _check_forward_proxy_egress(f"outbound {dest.name!r}", dest.settings, egress.allowed_proxy)
     if egress.deny_by_default and not _allowlist_for(dest.type, egress):
+        # Names the switch the way the raise below does, not the internal field. NSSM captures stderr
+        # to files, so this log line is a forensic surface an operator reads -- and "under
+        # deny_by_default", sitting beside "[egress] allowlist" in one sentence, reads as a settable
+        # [egress] key. It is not: ADR 0118 relocated it, and writing it there is refused at next
+        # start with "unrecognized config key(s)" (BACKLOG #1361). The spelling guard in
+        # tests/test_relocated_key_messages.py cannot see this line -- it reads print, add_argument
+        # and *Error constructors only -- so the fix is here rather than left for a red.
         log.warning(
-            "egress denied: outbound %r %s has no [egress] allowlist under deny_by_default",
+            "egress denied: outbound %r %s has no [egress] allowlist while %s",
             dest.name,
             dest.type.value,
+            BLOCK_UNLISTED_OUTBOUND_IN_FORCE,
         )
         raise WiringError(
-            f"outbound {dest.name!r}: [egress].deny_by_default is set and no allowlist permits a "
+            f"outbound {dest.name!r}: {BLOCK_UNLISTED_OUTBOUND_IN_FORCE} and no allowlist permits a "
             f"{dest.type.value} destination — add it to the matching [egress].allowed_* list"
         )
     if dest.type is ConnectorType.MLLP and egress.allowed_mllp:
@@ -8105,8 +8693,9 @@ def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
         # DICOMWEB (STOW-RS) folds into the HTTP host-check branch: it stores its endpoint under "url"
         # (the same key Rest()/FHIR() use), so the host gate reads it unchanged (ADR 0025 §6.4).
         url = str(dest.settings.get("url", ""))
+        refuse_url_credentials(url, f"outbound {dest.name!r} 'url'", error=WiringError)
         if not _http_egress_allowed(url, egress.allowed_http):
-            host = urllib.parse.urlsplit(url).hostname or ""
+            host = _egress_host_label(url)
             log.warning(
                 "egress denied: outbound %r %s host %r not in [egress].allowed_http",
                 dest.name,
@@ -8209,15 +8798,35 @@ def _dir_egress_allowed(directory: str, allowed: list[str]) -> bool:
     return False
 
 
+def _egress_host_label(url: str) -> str:
+    """The host an egress refusal may print (BACKLOG #1793). urllib unquotes the host, so one that
+    holds an ``@`` once unquoted is userinfo written as ``%40``, and printing it prints the password.
+
+    Every egress check runs BEFORE ``build_destination``, so the construction refusal in
+    ``transports/`` never speaks first. The data, token and FhirLookup arms therefore also call
+    ``refuse_url_credentials`` up front, for a refusal that names the setting. The proxy arm cannot,
+    since a proxy may carry its own userinfo, and this label is what keeps its message clean."""
+    host = urllib.parse.urlsplit(url).hostname or ""
+    return "(withheld: it holds a credential)" if "@" in urllib.parse.unquote(host) else host
+
+
 def _http_egress_allowed(url: str, allowed: list[str]) -> bool:
     """True if ``url``'s host (and port, when an allow entry pins one) is on the allowlist — the same
-    ``host`` / ``host:port`` matching as MLLP."""
+    ``host`` / ``host:port`` matching as MLLP.
+
+    A port ``urlsplit`` cannot read is NOT allowed, and this never raises (BACKLOG #1793). The
+    ``ValueError`` from ``.port`` quotes the port text, and a password holding an unencoded ``/``,
+    ``?`` or ``#`` ends the authority early, so its head IS that text. ``redact()`` does not match it."""
     parts = urllib.parse.urlsplit(url)
+    try:
+        port = parts.port
+    except ValueError:
+        return False
     host = (parts.hostname or "").lower()
     for entry in allowed:
         allow_host, _, allow_port = entry.partition(":")
         if allow_host.strip().lower() == host and (
-            not allow_port or str(parts.port) == allow_port.strip()
+            not allow_port or str(port) == allow_port.strip()
         ):
             return True
     return False

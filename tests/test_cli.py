@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.__main__ import main
+from messagefoundry.config.settings import load_settings
 
 SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
 ADT_A01 = (
@@ -1666,7 +1667,92 @@ def test_serve_ui_http_public_origin_refused_with_declared_tls(
         '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.2"]\n',
     )
     assert rc == 2
-    assert "public_origin is http://" in capsys.readouterr().err
+    # Anchored on the relocation map, not a literal, for the reason _relocated_public_origin_key
+    # gives: #1361 reworded this refusal off the rejected `[api].public_origin` spelling, and a
+    # hard-coded key here would have to be chased again at the next relocation.
+    assert f"{_relocated_public_origin_key()} is http://" in capsys.readouterr().err
+
+
+# The anchor for the off-loopback /ui exposure refusal, and the FIRST test to drive it: until BACKLOG
+# #1361 the only assertion on this string anywhere was a NEGATIVE one (it must not fire on a loopback
+# bind), which is why a remediation that cannot be followed sat in it unnoticed.
+_UI_OFFLOOPBACK_REFUSAL = "refusing to serve the browser ops dashboard"
+
+# Reaching that refusal needs BOTH stand-downs, and neither is incidental: the non-loopback bind gate
+# ABOVE it refuses first unless insecure_bind_ok (require_encryption_for_remote=false here, since
+# _l5b_serve passes no --allow-insecure-bind), and that flag is clamped shut while the dial enforces.
+_UI_OFFLOOPBACK_STANDDOWNS = (
+    'security.enforcement = "warn"\nsecurity.require_encryption_for_remote = false\n'
+)
+
+
+def test_serve_ui_offloopback_refusal_prescribes_a_config_that_loads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #1361: DRIVE the prescribed remediation back through the loader; never read it.
+
+    This refusal is the whole reason the #1361 row exists -- a message that hands an operator a config
+    key the loader then rejects. It reached HEAD having itself acquired that defect: the reworded text
+    said "Set [security].local_access_only=true", and ``_desugar_security`` REFUSES local_access_only
+    =true beside a non-loopback listen_address. Reaching this gate BY CONFIG FILE means exactly that
+    pair, so the prescribed edit was the one that could not be made.
+
+    "BY CONFIG FILE" IS A REAL NARROWING, NOT THROAT-CLEARING. ``--host`` is merged AFTER
+    ``_desugar_security`` (see ``load_settings``), so ``serve --host 0.0.0.0`` reaches this same gate
+    from a file that sets neither key -- and there the old prescription did not die at load, it simply
+    did nothing. This test drives the FILE route only. The CLI route is a separate, unfixed gap:
+    the message names no flag, so an operator who bound off-box with ``--host`` is told to edit a file
+    that is already correct.
+
+    A test that read the message could not have caught it -- the old text named a real, correctly-spelled
+    [security] field. Only running the prescribed config finds it.
+
+    WHICH ARM CATCHES A REVERT, stated exactly, because the obvious reading is wrong. Revert the message
+    and ONLY arm 1 reds, on its `[security].listen_address in refusal` assertion. Arm 2 builds its own
+    config and drives the LOADER, so it proves the old prescription dies at load without ever reading the
+    message -- it stays green through a full revert and is evidence about the loader, not a second guard
+    on the text. Arm 3 is the same shape for the new prescription. Do not count three guards here.
+    """
+
+    def cfg(local_only: str, addr: str) -> str:
+        """The two axes under test are the ARGUMENTS, so each arm reads as one edit to one config."""
+        return (
+            _UI_OFFLOOPBACK_STANDDOWNS + "security.serve_web_console = true\n"
+            "security.block_unlisted_outbound = true\n"
+            f"security.local_access_only = {local_only}\n"
+            f'security.listen_address = "{addr}"\n'
+        )
+
+    # 1. The gate fires, and its remediation names listen_address rather than local_access_only.
+    assert _l5b_serve(tmp_path, monkeypatch, cfg("false", "0.0.0.0")) == 2
+    err = capsys.readouterr().err
+    # A default rather than a bare next(): with no match that raises StopIteration, which pytest
+    # reports as a bare error and throws away the two assertion messages written to explain it.
+    refusal = next(
+        (line for line in err.splitlines() if _UI_OFFLOOPBACK_REFUSAL in line),
+        "",
+    )
+    assert refusal, f"the /ui exposure refusal did not fire; stderr was: {err!r}"
+    assert "[security].listen_address" in refusal, refusal
+    assert "local_access_only" not in refusal, (
+        "the refusal prescribes [security].local_access_only, which the loader REFUSES beside the "
+        f"non-loopback listen_address that is the only way to reach this gate by FILE: {refusal!r}"
+    )
+
+    # 2. The remediation the message used to give, applied to the config that tripped it, dies at
+    #    load -- and never reaches the /ui gate to be cleared. Evidence about the LOADER, not a
+    #    second reading of the message; see the docstring on which arm catches a revert.
+    assert _l5b_serve(tmp_path, monkeypatch, cfg("true", "0.0.0.0")) == 2
+    dead_err = capsys.readouterr().err
+    assert "is not a loopback address" in dead_err, dead_err
+    assert _UI_OFFLOOPBACK_REFUSAL not in dead_err
+
+    # 3. The remediation the message DOES give loads, binds loopback, and clears the gate.
+    rc = _l5b_serve(tmp_path, monkeypatch, cfg("false", "127.0.0.1"))
+    fixed_err = capsys.readouterr().err
+    assert rc == 0, fixed_err
+    assert _UI_OFFLOOPBACK_REFUSAL not in fixed_err
+    assert "is not a loopback address" not in fixed_err
 
 
 def test_serve_ui_warns_on_undeclared_proxy_signal(
@@ -2754,3 +2840,126 @@ def test_version_reports_the_package_directory_that_answered(
     assert str(package_dir) in out, f"--version does not say which tree answered:\n{out}"
     # the reported directory is the real one, not a plausible string
     assert (package_dir / "__main__.py").is_file()
+
+
+# --- BACKLOG #1673: which stream a failure goes to ---------------------------------------------
+
+
+def _unloadable_config(tmp_path: Path) -> Path:
+    """A config dir `graph` cannot load, so its failure goes through `_emit_error`.
+
+    `validate` is the wrong vehicle here: it REPORTS diagnostics as its output rather than failing
+    through `_emit_error`, so it proves nothing about which stream an error takes."""
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    (cfg / "broken.py").write_text("this is not python (", encoding="utf-8")
+    return cfg
+
+
+def test_text_mode_error_goes_to_stderr(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """A text-mode failure must not land in the file a shell redirect is capturing.
+
+    `messagefoundry graph --config <broken> > report.txt` wrote the reason into report.txt and left
+    the terminal blank; `2>/dev/null` could not silence diagnostics without silencing results."""
+    assert main(["graph", "--config", str(_unloadable_config(tmp_path))]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == "", f"the failure reached stdout: {captured.out!r}"
+    assert captured.err.startswith("error: "), captured.err
+
+
+def test_json_mode_error_stays_on_stdout(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The other half, and it is deliberate: under --json the error object is the output.
+
+    A consumer pipes stdout to `jq` and reads the non-zero exit code to tell a failure from a
+    success payload, so moving this to stderr would break the machine-readable contract."""
+    assert main(["graph", "--config", str(_unloadable_config(tmp_path)), "--json"]) == 1
+    captured = capsys.readouterr()
+    assert captured.err == "", f"the JSON payload reached stderr: {captured.err!r}"
+    payload = json.loads(captured.out)
+    assert isinstance(payload, dict), payload
+    assert "error" in payload
+
+
+# --- the boot path must not echo a configured value into an unattended service log --------------
+
+
+#: The value the boot-path tests below plant in the environment and then look for. Why it is short
+#: and why it must not look like a key are stated once, on ``_CANARY`` in
+#: ``tests/test_cli_cluster_vip.py``; the short form is that pydantic abbreviates a long
+#: ``input_value`` repr FROM THE MIDDLE, so an ``in`` test over a 32-character value reads False
+#: while its tail is plainly on screen. A separate constant rather than a cross-module test import:
+#: sharing it would let one suite's edit weaken another suite's guard with nothing reporting it.
+_BOOT_CANARY = "not-a-real-one"
+
+
+@pytest.mark.parametrize("command", ["serve", "supervise"])
+def test_the_boot_path_never_echoes_an_env_supplied_secret(
+    command: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A settings load that fails at boot reports the FIELD, never the value the field was given.
+
+    The failing config is a ``[store]`` with ``backend = "postgres"`` and none of the three keys
+    that backend requires. ``MEFOR_STORE_PASSWORD`` is set, as it would be on any real Postgres
+    node, so the store password is inside the mapping ``_require_server_db_fields`` rejects, and
+    ``str(ValidationError)`` renders that whole mapping as ``input_value=``.
+
+    WHY THIS PAIR AND NOT THE OTHER ``ValidationError`` ARMS IN THIS MODULE. ``serve`` and
+    ``supervise`` are the two commands the Windows service runs under NSSM, which captures stderr
+    to a file (``docs/SERVICE.md``). A ``[store]`` that fails to validate on a deploying site would
+    therefore write the store password into a PERSISTED service log on every start attempt, with no
+    operator present to see it happen, and support-bundle assembly then collects that log. No
+    instance runs this today, so that is what a first deployment WOULD hit, not something anyone is
+    living with.
+
+    THE CONTROL IS THE RAW RENDERING, ASSERTED FIRST. A test that only looked for the absence of a
+    string would pass just as well against an empty error, a renamed variable, or a value pydantic
+    never had -- so it first proves the planted secret IS in ``str(exc)`` on this exact config,
+    which is what makes its absence below attributable to the rendering rather than to luck.
+    """
+    monkeypatch.setenv("MEFOR_STORE_PASSWORD", _BOOT_CANARY)
+    cfg = tmp_path / "messagefoundry.toml"
+    cfg.write_text('[store]\nbackend = "postgres"\n', encoding="utf-8")
+
+    with pytest.raises(ValueError) as caught:  # ValidationError subclasses ValueError
+        load_settings(config_path=str(cfg))
+    assert _BOOT_CANARY in str(caught.value), (
+        "CONTROL FAILED: str(ValidationError) does not carry the planted secret on this config, so "
+        "the absence asserted below would prove nothing -- re-aim this guard at a config whose "
+        "rejected input still holds [store].password"
+    )
+
+    assert main([command, "--service-config", str(cfg)]) == 2
+    captured = capsys.readouterr()
+    err = captured.err
+
+    # BOTH streams, because NSSM captures both to files: asserting only on the one the error
+    # currently takes would go quiet the day a caller moved it to the other.
+    assert _BOOT_CANARY not in err + captured.out, (
+        f"`{command}` echoed an env-supplied secret into its config error, which NSSM would capture "
+        "to a service log file. Render the failure with settings_error_detail(); "
+        "str(ValidationError) carries input_value= for every failing field."
+    )
+    # Useful, not just quiet: an error that named no field would also satisfy the assertion above.
+    assert "store" in err and "server, database, username" in err
+
+
+@pytest.mark.parametrize("command", ["serve", "supervise"])
+def test_the_boot_path_reports_a_directory_service_config_without_a_traceback(
+    command: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--service-config`` naming a DIRECTORY is an operator error, not a crash.
+
+    Why a directory reaches the open at all, and why ``OSError`` has to be in the catch, are stated
+    once at ``_load_service_settings``. What this pins is that the two SERVICE commands exit 2 with
+    a reported line rather than a traceback, on the stream NSSM captures.
+
+    It asserts the BEHAVIOUR rather than the exception class, because the class differs by platform
+    and this test runs on both legs.
+    """
+    assert main([command, "--service-config", str(tmp_path)]) == 2
+    assert capsys.readouterr().err.startswith("error: ")

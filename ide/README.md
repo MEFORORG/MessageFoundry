@@ -179,9 +179,10 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
 - `messagefoundry.configDir` (default `samples/config`) — config modules directory.
 - `messagefoundry.serviceConfig` (default `messagefoundry.toml`) — the service-settings TOML the engine
   loads; the Alert Wizard and the security editor read/write their sections of it.
-- `messagefoundry.engineUrl` (default `http://127.0.0.1:8765`) — engine API URL used by
+- `messagefoundry.engineUrl` (default `https://127.0.0.1:8765`) — engine API URL used by
   *Stage → Promote* when no named environments are configured. **Machine-scoped** (a workspace file
-  cannot retarget a promote, and with it your credentials, at another host).
+  cannot retarget a promote, and with it your credentials, at another host). https by default
+  because the engine always serves TLS — see *Trusting the engine's certificate* below.
 - `messagefoundry.environments` (default `[]`) — named promote targets `[{ "name": "DEV", "url": … },
   { "name": "PROD", "url": … }]`; an entry may also list `shards` (engine instances), in which case
   promote asks which instance. When set, *Stage → Promote* asks which to target; each engine
@@ -199,6 +200,32 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
   polled from the engine's `GET /connections`.
 - `messagefoundry.revealViewOnStartup` (default `false`) — reveal the MessageFoundry sidebar instead of
   the Explorer when this workspace opens (best set per-workspace).
+
+### Trusting the engine's certificate
+
+The engine always serves TLS. When no certificate chain is configured it mints a self-signed one on
+its first run and writes it beside the store database. Nothing trusts that certificate by default, so
+the extension asks the engine where it is and verifies against it:
+
+1. It runs `messagefoundry cert inventory --service-config <your messagefoundry.serviceConfig> --json`,
+   which reports the scheme the API bind serves and the certificate it presents.
+2. It reads that certificate and uses it as the trust anchor for `messagefoundry.engineUrl`.
+
+**Verification is never disabled.** There is no "trust anyway" option, and the extension never imports
+anything into your OS certificate store. If it cannot verify, the request fails and says so.
+
+This happens at startup and again whenever you change `messagefoundry.engineUrl` or
+`messagefoundry.serviceConfig`. Every part of it fails soft — with no engine on `PATH`, an untrusted
+workspace, or a `serviceConfig` that names nothing, the extension simply trusts nothing extra.
+
+If a request reports that it cannot verify the certificate, check two things: that
+`messagefoundry.serviceConfig` names the settings TOML of the engine you are pointing at, and that
+that engine has run at least once (it mints its certificate on the first run, not at install).
+
+Where a reverse proxy terminates TLS in front of the engine (`[api].tls_terminated_upstream`), the
+engine mints nothing and speaks plaintext behind the proxy. Point `messagefoundry.engineUrl` at the
+proxy, or set it to `http://` — the extension reports the disagreement in its **MessageFoundry
+Engine** log rather than changing your setting for you.
 
 ## Develop
 

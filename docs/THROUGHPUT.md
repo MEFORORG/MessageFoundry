@@ -124,8 +124,6 @@ The bottleneck has moved outside MessageFoundry entirely.
 
 ### What you can do about a slow partner
 
-- **Relax ordering where it's safe.** If a feed tolerates out-of-order delivery, unordered mode lets the
-  engine keep many messages in flight at once, hiding the partner's round-trip behind concurrency (see §3).
 - **Open multiple connections to the partner.** Each destination connection is its own independent stream,
   so *N* connections give you *N* parallel ordered lanes (if the partner accepts concurrent connections).
 - **Fan out at the source.** Split one hot feed into several interfaces (see §7) so the aggregate isn't
@@ -133,21 +131,33 @@ The bottleneck has moved outside MessageFoundry entirely.
 - **Ask your partner about their acknowledgement latency.** It is often the cheapest thing to improve, and
   it's the term that matters most.
 
+**Relaxing ordering is not on that list.** An outbound connection sends one message at a time whichever
+ordering mode it runs, so unordered mode does not raise a single lane's throughput (see §3). More
+connections, not fewer ordering guarantees, is what adds parallelism.
+
 ---
 
-## 3. Ordering: the throughput-vs-order trade-off
+## 3. Ordering: what the two modes give you
 
-Ordering guarantees and raw throughput pull in opposite directions. MessageFoundry lets you choose per
-feed:
+Ordering is a failure-handling choice, not a speed choice. Both modes send one message at a time per
+destination. What they differ on is what happens when a message gets stuck.
+
+This is a property of the outbound connection, not of the payload. The engine's delivery path never
+reads the message format, so the same two rows hold for HL7, X12, DICOM, FHIR, JSON and database
+records alike. What changes between formats is only whether your feed can tolerate out-of-order
+delivery, never what the mode costs or buys:
 
 | Mode | Guarantee | Throughput | Use when |
 |---|---|---|---|
-| **Strict FIFO** *(default)* | Messages delivered in exactly the order received. | Bounded — one message in flight per destination (serial). | Order matters: ADT streams, anything where a later message corrects an earlier one. |
-| **Unordered** | No ordering guarantee. | Higher — many messages in flight at once; the partner round-trip is hidden by concurrency. | Order doesn't matter: independent results, logging, feeds keyed only by their own content. |
+| **Strict FIFO** *(default)* | Messages delivered in exactly the order received. A failing message holds the lane until it succeeds, dead-letters, or is purged. | Bounded — one message in flight per destination (serial). | Order matters: ADT streams, anything where a later message corrects an earlier one. |
+| **Unordered** | No ordering guarantee. A backing-off message is passed over so the rest of the batch drains. | The same as FIFO. Still one message in flight per destination, so relaxing ordering does not make a connection faster. | Rarely, and never for speed. It fits a feed whose messages do not depend on one another: standalone results, logging, DICOM instances within one study, events keyed only by their own content. That is rare in HL7, where a later message often corrects an earlier one. One built feature does require it: an HTTP `reply_from` lane, which rejects FIFO (ADR 0154 D4). |
 
-Strict ordering being serial is not unique to MessageFoundry — it is a property of *any* system that
-guarantees order over a single stream. This is exactly why integration engines let you opt out of ordering
-when a feed can tolerate it: it's the most direct throughput lever available for a single interface.
+Strict ordering being serial is not unique to MessageFoundry. It is a property of *any* system that
+guarantees order over a single stream.
+
+Other integration engines sell an unordered mode as the throughput lever for a single interface.
+MessageFoundry's is not that lever. It decides what happens to a stuck message, not how many messages
+are in flight, so the way to add throughput here is to add interfaces (see §7).
 
 ---
 
@@ -290,8 +300,8 @@ guarantees, and not measured against any live clinical system.**
 
 **Why these are conservative and why your mileage will vary:**
 
-- **Ordered, single interface.** The default strict-FIFO mode is serial by design. Unordered feeds and
-  multiple interfaces both go faster.
+- **Ordered, single interface.** The default strict-FIFO mode is serial by design, and so is unordered
+  mode. Multiple interfaces are what go faster.
 - **Instant partner.** The lab partner acknowledges immediately. **Real partners don't** — and as §2 shows,
   their round-trip time is usually the dominant factor. This is the single largest reason your end-to-end
   number will differ from the lab number.
@@ -307,8 +317,8 @@ guarantees, and not measured against any live clinical system.**
 1. MessageFoundry adds only a few milliseconds per message; **your partner systems and round-trip times set
    the real throughput.**
 2. There are **two** rates — fast intake and slower end-to-end delivery. Know which one a number refers to.
-3. **Strict ordering is serial** and therefore bounded; relax ordering, add connections, or fan out when you
-   need more.
+3. **Strict ordering is serial** and therefore bounded. Add connections or fan out when you need more.
+   Relaxing ordering does not help, because an unordered lane is serial too.
 4. Traffic is **bursty** — size to the **peak hour (≈ 2.7× the average)**, not the daily total. "Messages
    per day" alone tells you little.
 5. **Scale by fanning out** to multiple interfaces; one node's store has ample headroom.

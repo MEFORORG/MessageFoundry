@@ -390,9 +390,13 @@ def test_connection_event_row_names_exactly_the_shipped_kinds() -> None:
     invented = sorted(
         token
         for token in named
-        # `eof` is a close_reason, `on_connection_event` the wiring hook the cell names when
-        # explaining which listeners emit at all — neither is an event kind.
-        if token not in set(_EVENT_KINDS) and token not in {"eof", "on_connection_event"}
+        # `eof` and `frame_deadline` are close_reason VALUES, `on_connection_event` the wiring hook
+        # the cell names when explaining which listeners emit at all — none is an event kind. The
+        # row names the close reasons on purpose (they are the `closed` kind's whole vocabulary), so
+        # a reason has to be exempted here the way `eof` always has been. `idle_timeout` needs no
+        # entry: it is a close reason on MLLP AND an event kind on the HTTP listener.
+        if token not in set(_EVENT_KINDS)
+        and token not in {"eof", "frame_deadline", "on_connection_event"}
     )
     assert not invented, (
         f"the connection_event row names kind(s) no code path emits: {invented}. The shipped "
@@ -797,8 +801,9 @@ def test_every_socket_listener_that_emits_nothing_is_named_in_row_7() -> None:
     so a socket listener that emits **no** event must be named as an exception. Nothing derived that:
     the row said the DICOM C-STORE SCP was the only silent listener while the ``ISA``/``IEA``-framed
     X12 inbound was equally silent, so an operator reading it concluded an X12 feed's connects and
-    refusals were captured. They are not — ``transports/x12.py`` contains zero ``_emit_event`` calls,
-    and its ``max_connections`` refusal writes no log either.
+    refusals were captured. They were not. BACKLOG #1665 closed that by wiring X12 to the same seven
+    kinds its raw-TCP twin emits, so the row's exception list is once again just the DICOM SCP — and
+    this guard is what catches the next listener that arrives silent.
 
     Scoped to modules that actually call ``asyncio.start_server``: a poll/file source legitimately
     never emits (``SourceConnector.on_connection_event`` defaults to ``None`` precisely so those stay
