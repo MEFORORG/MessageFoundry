@@ -34,7 +34,8 @@
 > made, and it lost.** P0's first job is to measure **`txn/s`**, which has never been counted. If it sits far below
 > the store's ~27–29k commits/s ceiling, **the whole Phase-4 premise is dead and we stop.**
 
-**Status:** Proposed · **Date:** 2026-06-30 · **Supersedes/Amends:** ADR 0001 (staged pipeline), builds on ADR 0055 (group-commit durable-write). **ADR number to use: 0057** (next free; 0056 is the highest present).
+**Status:** Accepted (built, ships `default-OFF` **permanently**; the F2/F3 promote is **DECLINED** on the
+pre-registered A/B null -- see the banner above and [ADR 0107](0107-phase-4-is-closed-transaction-reduction-is-a-measured-dead-end.md)) · **Date:** 2026-06-30 · **Supersedes/Amends:** ADR 0001 (staged pipeline), builds on ADR 0055 (group-commit durable-write). **ADR number to use: 0057** (next free; 0056 is the highest present).
 
 This is the chosen design out of three candidates. It is the **smallest, default-OFF, byte-identical-when-OFF** lever that meaningfully cuts the 7-deep commit chain, and it survives adversarial review **with a fixed set of guardrails** (all of which are cheap, code-local, and verified against the checkout below). The two rejected alternatives and why are in *Consequences → Alternatives*.
 

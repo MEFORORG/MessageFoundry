@@ -1018,7 +1018,8 @@ def clear_oidc_flow_cookie(response: Response, request: Request) -> None:
 #: Legible fail-closed copy, shared by every affected surface (account page, enroll flow, reauth
 #: page) so the operator sees ONE consistent message + recovery path — never a redirect loop.
 WEBAUTHN_RP_MISSING_NOTICE = (
-    "Passkeys are unavailable: [api].public_origin is not set — contact your administrator."
+    "Passkeys are unavailable: [security].web_console_public_address is not set — "
+    "contact your administrator."
 )
 WEBAUTHN_EXTRA_MISSING_NOTICE = (
     "Passkeys are unavailable on this install (the [webauthn] extra is not installed) — "

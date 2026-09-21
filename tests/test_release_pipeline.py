@@ -23,9 +23,10 @@ drift is the documented real defect — hatchling's whole-repo VCS sweep leaked 
 PyPI on releases 0.1.0..0.2.15. If the two lists silently diverge a private doc can re-leak, so they are
 pinned together here.
 
-Sections (1) to (6) are pure text / `re` / `tomllib` checks; section (7) additionally shells out to bash
-and `tar` over tarballs it builds with `tarfile`. Neither needs `python -m build` or the network, so they
-run everywhere the suite runs. They do NOT and cannot assert the artifacts are actually
+Most sections are pure text / `re` / `tomllib` checks. At least two do more: section (7) shells out to
+bash and `tar` over tarballs it builds with `tarfile`, and section (8) spawns `sys.executable` to run the
+wheel smoke's own import probe against a planted checkout. None of them needs `python -m build` or the
+network, so they run everywhere the suite runs. They do NOT and cannot assert the artifacts are actually
 built/signed/SBOM'd/uploaded — that remains a CI-leg claim validated by the workflow_dispatch dry-run +
 a `vX.Y.Z-rc1` pre-release tag.
 """
@@ -37,6 +38,7 @@ import io
 import os
 import re
 import subprocess
+import sys
 import tarfile
 import tomllib
 from collections.abc import Callable, Sequence
@@ -44,6 +46,8 @@ from pathlib import Path
 
 import pytest
 from _bash_resolver import bash_candidates, explain_returncode, require_bash
+
+from tests._force_include import hatch_build
 
 _REPO = Path(__file__).resolve().parents[1]
 PYPROJECT = _REPO / "pyproject.toml"
@@ -79,8 +83,10 @@ def _release() -> str:
 
 
 def _only_include() -> list[str]:
-    data = _pyproject()
-    return data["tool"]["hatch"]["build"]["targets"]["sdist"]["only-include"]
+    # Through the shared reader (BACKLOG #1836), not a fourth descent of the same dotted path: this
+    # module and tests/test_packaging.py both read [tool.hatch.build], one target apart.
+    include: list[str] = hatch_build(PYPROJECT)["targets"]["sdist"]["only-include"]
+    return include
 
 
 def _leak_gate_regex() -> str:
@@ -518,8 +524,12 @@ def test_every_release_creating_job_is_rerunnable() -> None:
     # COMMENT LINES ARE STRIPPED FIRST. The workflow's own prose explains the v0.3.1 deadlock and names
     # `gh release create` twice while doing so; counting raw occurrences therefore found 4 "creators"
     # against 2 real ones and failed on documentation. Count executed shell, not narration.
+    # Through the module's ONE stripper. This was a second inline copy of `_executed_shell`, and two
+    # implementations of one rule drift the first time either is fixed — that helper will eventually
+    # learn about heredocs (this workflow embeds `#`-commented Python in `<<'PYVER'` blocks) and an
+    # inline twin would silently keep the old behaviour.
     body = RELEASE_YML.read_text(encoding="utf-8")
-    code = "\n".join(ln for ln in body.splitlines() if not ln.lstrip().startswith("#"))
+    code = _executed_shell(body)
     creators = code.count("gh release create")
     assert creators, "no job creates a GitHub release — the workflow shape moved"
     assert code.count("gh release view") >= creators, (
@@ -553,27 +563,33 @@ _CLEAN_MEMBERS = (
 )
 
 
-def _leak_gate_script() -> str:
-    """The leak gate's ``run:`` block, taken from the PARSED workflow rather than sliced out of the text.
+def _step_script_by_prefix(prefix: str, what: str) -> str:
+    """The ``run:`` block of the one step whose name starts with ``prefix``, from the PARSED workflow.
 
     Exactly one step may match. Two would mean the extractor is choosing between them arbitrarily, and a
     harness that silently exercises the wrong step is worse than no harness at all.
+
+    ONE COPY, deliberately. This was written twice — once for the leak gate, once for the wheel smoke —
+    and two extractors for one invariant drift apart the first time either is fixed.
     """
     steps = [
         step
         for job in _jobs().values()
         for step in (job.get("steps") or [])
-        if isinstance(step, dict) and str(step.get("name") or "").startswith(_LEAK_GATE_STEP_PREFIX)
+        if isinstance(step, dict) and str(step.get("name") or "").startswith(prefix)
     ]
     assert len(steps) == 1, (
-        f"expected exactly one release.yml step whose name starts with {_LEAK_GATE_STEP_PREFIX!r}, "
-        f"found {len(steps)} — the execution tests below cannot know which one to run"
+        f"expected exactly one release.yml step whose name starts with {prefix!r}, found "
+        f"{len(steps)} — the tests grading {what} cannot know which one they are looking at"
     )
     run = steps[0].get("run")
-    assert isinstance(run, str) and run.strip(), (
-        "the leak gate step has no `run:` script to execute"
-    )
+    assert isinstance(run, str) and run.strip(), f"the {what} step has no `run:` script"
     return run
+
+
+def _leak_gate_script() -> str:
+    """The leak gate's ``run:`` block."""
+    return _step_script_by_prefix(_LEAK_GATE_STEP_PREFIX, "the leak gate")
 
 
 def _write_sdist(path: Path, members: Sequence[str]) -> None:
@@ -658,9 +674,20 @@ def leak_gate(tmp_path: Path) -> tuple[str, Path, dict[str, str]]:
 
 def test_the_extracted_leak_gate_script_is_actually_the_gate() -> None:
     """Liveness for the extractor. If it ever returns another step's script — or an empty one — the
-    execution tests below would exercise the wrong thing and stay green while doing it."""
-    script = _leak_gate_script()
-    for token in ("dist/*.tar.gz", "tar tzf", "grep -vE"):
+    execution tests below would exercise the wrong thing and stay green while doing it.
+
+    GRADED OVER EXECUTED SHELL, and the token list changed with it. This asked for ``tar tzf``, which
+    the gate has not run since ``--ignore-zeros`` landed — the only occurrence left is the COMMENT
+    explaining why plain ``tar tzf`` is unsafe. So the liveness check for the whole of section (7)
+    was resting on narration: delete the listing and leave the prose, and it still passed. The
+    module's own ``_executed_shell`` helper exists for exactly this and neither this check nor its
+    sibling was calling it.
+    """
+    script = _executed_shell(_leak_gate_script())
+    # `--ignore-zeros` and `-tzf` as INDEPENDENT tokens, never the concatenation: `tar -tzf
+    # --ignore-zeros` is the same command and would red this whole section for a cosmetic edit, which
+    # is the trap `_LEAK_GATE_STEP_PREFIX`'s own comment warns about one screen down.
+    for token in ("dist/*.tar.gz", "--ignore-zeros", "-tzf", "grep -vE"):
         assert token in script, (
             f"the step extracted as the leak gate does not contain {token!r}; the extractor is picking "
             f"up the wrong step, so section (7) would be testing something else entirely"
@@ -858,4 +885,296 @@ def test_the_leak_gate_rejects(
         f"the leak gate failed (rc={rc}) but not for the reason under test — missing {missing} from its "
         f"output. A rejection that cannot name its own cause is indistinguishable from a rejection for "
         f"an unrelated harness fault.\n  {explain_returncode(rc, 'the leak gate step')}\n{out}"
+    )
+
+
+# --- (8) the wheel smoke must import the WHEEL; a rejected sdist must not ship as an artifact -------
+
+#: The engine's wheel-smoke step, located by name PREFIX for the same reason the leak gate is: the
+#: full name carries an arrow glyph, and pinning punctuation would break this on a cosmetic edit.
+_WHEEL_SMOKE_STEP_PREFIX = "Smoke-check the built wheel"
+
+#: The step id the artifact upload's guard dereferences, and the exact exclusion it must carry.
+_LEAK_GATE_ID = "leak-gate"
+_LEAK_GATE_EXCLUSION = f"steps.{_LEAK_GATE_ID}.outcome != 'failure'"
+
+#: ``if:`` expressions that let a step run after an EARLIER step in the same job failed. Anything
+#: else ANDs with the implicit ``success()``, so a gate failure already skips it.
+_SURVIVES_A_FAILED_STEP = ("always()", "!cancelled()", "failure()")
+
+#: A version no build can produce, planted in a fake checkout so it can only have come from there.
+_SHADOW_VERSION = "9999.0.0+checkoutshadow"
+
+
+def _squeeze(expr: str) -> str:
+    """``expr`` with all whitespace removed — GitHub expressions are whitespace-insensitive."""
+    return re.sub(r"\s+", "", expr)
+
+
+#: The engine smoke's import probe. ``flags`` is what the step passes the interpreter BEFORE ``-c``;
+#: the behavioural test below runs that exact list rather than a copy of it, so a revert in the
+#: workflow arrives here as a failure instead of leaving a test that still asserts the old string.
+_VERSION_PROBE = re.compile(
+    r'^\s*built=\$\(\S*python[0-9.]*(?P<flags>(?:\s+-[A-Za-z]+)*)\s+-c\s+"import messagefoundry;',
+    re.M,
+)
+
+
+def _engine_wheel_smoke_script() -> str:
+    """The engine wheel-smoke's EXECUTED shell — comments stripped.
+
+    Graded through ``_executed_shell`` for the reason that helper was written: this workflow explains
+    itself at length, so a check over the raw block is satisfied by a comment quoting the snippet it
+    is looking for. Move the empty-version guard into prose and a raw check stays green while the
+    dry-run arm is back to proving nothing.
+    """
+    return _executed_shell(
+        _step_script_by_prefix(_WHEEL_SMOKE_STEP_PREFIX, "the engine wheel smoke")
+    )
+
+
+def _wheel_smoke_import_flags() -> list[str]:
+    """The interpreter flags the engine smoke passes before ``-c``, e.g. ``['-I']``."""
+    m = _VERSION_PROBE.search(_engine_wheel_smoke_script())
+    assert m, (
+        "could not find the engine wheel smoke's `built=$(... python ... -c \"import messagefoundry;"
+        " ...\")` line — the step's shape moved, so the isolation check below is measuring nothing"
+    )
+    return m.group("flags").split()
+
+
+def test_the_engine_wheel_smoke_passes_an_isolating_flag() -> None:
+    """The static half. Whether the flag WORKS is the behavioural test below; this says one is there.
+
+    The interpreter was ALREADY a clean venv, which is exactly why the defect survived review: for
+    ``python -c`` ``sys.path[0]`` is the empty string, meaning the CURRENT WORKING DIRECTORY, and the
+    release job's cwd is the repository checkout. ``import messagefoundry`` therefore resolved to the
+    checkout's source tree, so a release WOULD ship a wheel missing the package entirely with this
+    smoke check green.
+
+    Spelling is not graded beyond "contains I or P" — the behavioural arms decide which routes are
+    actually closed, and ``-P`` fails them because it leaves ``PYTHONPATH`` open.
+    """
+    flags = _wheel_smoke_import_flags()
+    isolating = [flag for flag in flags if set("IP") & set(flag.lstrip("-"))]
+    assert isolating, (
+        f"the engine wheel smoke imports messagefoundry with no interpreter isolation (flags: "
+        f"{flags or 'none'}), so the checkout's source tree is back on sys.path ahead of the "
+        f"installed wheel and the check cannot fail on a broken wheel"
+    )
+
+
+def test_the_engine_wheel_smoke_refuses_an_empty_version_read() -> None:
+    """Split from the isolation check so a PR that breaks both is told about both in one run.
+
+    Matched on SHAPE, not on one shell spelling: ``[[ -z "$built" ]]``, ``[ -z "${built}" ]`` and
+    ``test -z "$built"`` are all the same guard, and pinning the punctuation reds this for a rewrite
+    that changed nothing.
+    """
+    script = _engine_wheel_smoke_script()
+    assert re.search(r'-z\s+"?\$\{?built', script), (
+        "the wheel smoke no longer rejects an empty __version__ read — on the workflow_dispatch "
+        "dry-run (the arm that exists to validate this path before a tag) an empty version is not "
+        "compared against anything, so the step would exit 0 having proved nothing"
+    )
+    assert "::error::" in script, (
+        "the empty-version guard no longer emits a ::error:: annotation, so a failure here would be "
+        "invisible in the run summary"
+    )
+
+
+def _plant_a_checkout(root: Path, version: str = _SHADOW_VERSION) -> Path:
+    """A directory shaped like the repository checkout the release job runs in."""
+    pkg = root / "messagefoundry"
+    pkg.mkdir(parents=True, exist_ok=True)
+    (pkg / "__init__.py").write_text(f'__version__ = "{version}"\n', encoding="utf-8")
+    return root
+
+
+def _run_probe(
+    flags: Sequence[str],
+    cwd: Path,
+    code: str,
+    *,
+    no_site: bool = True,
+    pythonpath: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run ``code`` under ``flags`` from ``cwd``.
+
+    ``no_site`` adds ``-S``, which is how the shadow arms stay attributable — see the test's
+    docstring. The site-reachability arm turns it OFF, because it asks the opposite question.
+    """
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    if pythonpath is not None:
+        env["PYTHONPATH"] = str(pythonpath)
+    return subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell, test-local paths
+        [sys.executable, *(["-S"] if no_site else []), *flags, "-c", code],
+        cwd=str(cwd),
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+        check=False,
+    )
+
+
+_IMPORT_CODE = "import messagefoundry; print(messagefoundry.__version__)"
+
+#: A second planted tree, reached only through ``PYTHONPATH``. ``-P`` leaves that route open and
+#: ``-I`` (which implies ``-E``) closes it, so this is what separates the two.
+_PYTHONPATH_VERSION = "8888.0.0+viapythonpath"
+
+
+def test_the_engine_wheel_smoke_cannot_read_its_version_from_the_checkout(tmp_path: Path) -> None:
+    """FOUR ARMS, one variable: the workflow's own flag list, run against planted source trees.
+
+    Reading the step can only say a flag is spelled there. Arm 1 is the finding: from a directory
+    holding intact source the bare command prints the SOURCE version and exits 0. Arm 2 is the fix.
+
+    ARM 3 IS WHY ARM 2 MEANS ANYTHING, AND IT ASKS THE HARDER QUESTION. Arm 2 asserts a NON-ZERO
+    exit, and flags that break the interpreter exit non-zero too — ``-IX`` dies on a missing ``-X``
+    argument, and ``-I -S`` starts fine but puts the relsmoke venv's site-packages, where the WHEEL
+    WAS JUST INSTALLED, off sys.path. Both satisfy arm 2 and the static flag check while killing
+    every release run. So arm 3 keeps ``site`` on and imports ``packaging``, which is the dependency
+    this very step installs into the venv and imports a few lines later: it fails for either shape.
+
+    ARM 4 IS WHY THE FLAG IS ``-I`` AND NOT ``-P``. ``-P`` drops the cwd and stops there, so a
+    ``PYTHONPATH`` naming any source tree walks straight back in; ``-I`` implies ``-E`` and ignores
+    it. The workflow's comment makes that claim, and without this arm nothing grades it — ``-P``
+    passes arms 1 to 3 identically.
+
+    ``-S`` on arms 1, 2 and 4 is the attribution. It takes site-packages out of the picture, so
+    ``messagefoundry`` can come from exactly ONE planted place, and the only thing separating the
+    runs is the flag list under test. Without it, this box's editable install answers the import on
+    every arm and they would all pass for a reason unrelated to the fix.
+    """
+    flags = _wheel_smoke_import_flags()
+    work = _plant_a_checkout(tmp_path / "checkout")
+
+    bare = _run_probe([], work, _IMPORT_CODE)
+    assert _SHADOW_VERSION in bare.stdout, (
+        f"CONTROL ARM FAILED: with no isolation flags the planted checkout should answer the import, "
+        f"and it did not — so the arms below are measuring a broken harness, not the workflow's flags."
+        f"\n  rc={bare.returncode}\n  stdout={bare.stdout!r}\n  stderr={bare.stderr!r}"
+    )
+
+    guarded = _run_probe(flags, work, _IMPORT_CODE)
+    assert guarded.returncode != 0 and _SHADOW_VERSION not in guarded.stdout, (
+        f"the engine wheel smoke's flags ({flags or 'none'}) still let the CHECKOUT answer "
+        f"`import messagefoundry`. A release WOULD then ship a wheel missing the package with this "
+        f"smoke check green, because the version it printed came from source, not from the wheel."
+        f"\n  rc={guarded.returncode}\n  stdout={guarded.stdout!r}\n  stderr={guarded.stderr!r}"
+    )
+
+    alive = _run_probe(flags, work, "import packaging; print('site ok')", no_site=False)
+    assert alive.returncode == 0 and "site ok" in alive.stdout, (
+        f"the engine wheel smoke's flags ({flags or 'none'}) leave an INSTALLED distribution "
+        f"unreachable (or the interpreter refuses them outright), so the arm above proved nothing "
+        f"and the release step would die on every run. The wheel is installed into the relsmoke "
+        f"venv's site-packages and this same step imports `packaging` from it a few lines later."
+        f"\n  rc={alive.returncode}\n  stdout={alive.stdout!r}\n  stderr={alive.stderr!r}"
+    )
+
+    other = _plant_a_checkout(tmp_path / "elsewhere", _PYTHONPATH_VERSION)
+    via_env = _run_probe(flags, work, _IMPORT_CODE, pythonpath=other)
+    assert _PYTHONPATH_VERSION not in via_env.stdout, (
+        f"the engine wheel smoke's flags ({flags or 'none'}) let PYTHONPATH put a source tree ahead "
+        f"of the installed wheel — `-P` alone does this, which is exactly why the workflow passes "
+        f"`-I`. The step would read its version from whatever that variable names."
+        f"\n  rc={via_env.returncode}\n  stdout={via_env.stdout!r}\n  stderr={via_env.stderr!r}"
+    )
+
+
+def test_no_step_survives_a_leak_gate_rejection_in_the_release_job() -> None:
+    """An archive the leak gate REFUSED TO PUBLISH must not be handed out as a workflow artifact.
+
+    The gate fails the release before the PyPI upload, so publication stops. The artifact upload
+    carried a bare ``if: always()`` and uploaded the whole of ``dist/`` regardless — so on a
+    packaging regression a deploying project WOULD find the rejected archive downloadable by any
+    signed-in reader of this public repository, which is the one place the refused bytes must not
+    go. No such upload has been established to have happened; this pins the shape.
+
+    DERIVED over every step after the gate, not hardcoded to the one that has the defect: a guard
+    naming a single step is a guard that has to be remembered when a second one is added. The
+    sibling jobs are out of scope for a measured reason rather than an assumed one —
+    ``release-harness`` carries ``needs: release`` so a failed release skips it entirely, and
+    ``release-webconsole`` is gated on a ``webconsole-`` ref that is mutually exclusive with this
+    job's; neither ever holds the engine's ``dist/``.
+
+    Mutation: drop the exclusion from the upload's ``if:``, or the ``id:`` from the gate. Red here.
+    """
+    steps = [step for step in _jobs()["release"]["steps"] if isinstance(step, dict)]
+    gates = [
+        i
+        for i, step in enumerate(steps)
+        if str(step.get("name") or "").startswith(_LEAK_GATE_STEP_PREFIX)
+    ]
+    assert len(gates) == 1, f"expected exactly one leak gate step in the release job, found {gates}"
+    gate_at = gates[0]
+
+    assert steps[gate_at].get("id") == _LEAK_GATE_ID, (
+        f"the leak gate lost its `id: {_LEAK_GATE_ID}`. THIS FAILS SILENTLY IN PRODUCTION: with no "
+        f"such step id the expression below resolves to an empty string, `'' != 'failure'` is true, "
+        f"and the upload is back to a plain always() while still LOOKING guarded."
+    )
+    assert "continue-on-error" not in steps[gate_at], (
+        "the leak gate acquired `continue-on-error`, which removes the gate's blocking power "
+        "entirely: its CONCLUSION becomes success, the job is not failed, and every later step's "
+        "implicit success() passes — so a rejected sdist WOULD be signed, attached to the release "
+        "and published to PyPI. The upload guard below keys on `outcome` and would still skip, which "
+        "makes this failure look handled when it is the worst version of the defect."
+    )
+    assert "if" not in steps[gate_at], (
+        f"the leak gate acquired an `if:` ({steps[gate_at].get('if')!r}). A SKIPPED gate is not a "
+        f"failed one: its outcome is 'skipped', so the upload's `!= 'failure'` passes AND every "
+        f"later step's implicit success() passes too — Sigstore signs, the release is created and "
+        f"PyPI publishes an sdist that nothing ever listed. The gate must be unconditional."
+    )
+
+    early = [
+        str(step.get("name") or step.get("uses") or "?")
+        for step in steps[:gate_at]
+        if "upload-artifact" in str(step.get("uses") or "")
+    ]
+    assert not early, (
+        f"artifact upload(s) sit BEFORE the leak gate: {early}. A step placed before the gate runs "
+        f"whatever the gate would have decided, so no `if:` can save it — the archive would be "
+        f"handed out before anything had read it."
+    )
+
+    after = steps[gate_at + 1 :]
+    assert any("upload-artifact" in str(step.get("uses") or "") for step in after), (
+        "no artifact upload sits after the leak gate any more — the subject of this guard moved, so "
+        "re-derive which steps can still hand out an archive the gate rejected"
+    )
+
+    # WHITESPACE-INSENSITIVE, because GitHub is. `${{ ! cancelled() }}` is a valid spelling that a
+    # literal `!cancelled()` substring test misses, so a new always()-class step could be added after
+    # the gate with this guard green; and `steps.leak-gate.outcome!='failure'` is equally valid and
+    # would be reported as an offender. Both directions are wrong, so squeeze before matching.
+    # AND `||` MUST BE ABSENT, because a substring test alone grades the wrong thing: both
+    # `always() || steps.leak-gate.outcome != 'failure'` and
+    # `always() && (steps.leak-gate.outcome != 'failure' || true)` CONTAIN the exclusion and are
+    # unconditionally true, so the guard is dead while the text still reads right. One character is
+    # the whole mutation. Nothing after this gate has a legitimate `||`, so refuse it outright.
+    wanted = _squeeze(_LEAK_GATE_EXCLUSION)
+    offenders: list[str] = []
+    for step in after:
+        raw = str(step.get("if") or "")
+        cond = _squeeze(raw)
+        if not any(_squeeze(token) in cond for token in _SURVIVES_A_FAILED_STEP):
+            continue  # ANDs with the implicit success(), so a gate failure already skips it
+        if wanted in cond and "||" not in cond:
+            continue
+        offenders.append(f"{step.get('name') or step.get('uses') or '?'} (if: {raw})")
+    assert not offenders, (
+        f"release step(s) after the leak gate still run when it REJECTED the sdist: {offenders}.\n"
+        f"Each must AND in `{_LEAK_GATE_EXCLUSION}`, with no `||` anywhere in the expression.\n"
+        f"The `!= 'failure'` spelling is deliberate and `== 'success'` is NOT equivalent: when an "
+        f"EARLIER step failed the gate never runs, its outcome is the empty string, and only the "
+        f"`!=` form still uploads — which is the always() behaviour this step exists for. That "
+        f"choice has a known cost, recorded beside the `if:` in release.yml; do not flip it here."
     )

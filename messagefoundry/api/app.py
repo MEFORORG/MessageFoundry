@@ -4483,7 +4483,7 @@ def create_app(
         # rejects exactly this pairing for dual-control config reload). The owner survives as DATA in
         # `detail.uploader`, which is where it belongs.
         try:
-            for pruned in await us.prune_expired():
+            for pruned in (await us.prune_expired()).pruned:
                 await engine.store.record_audit(
                     "upload.prune",
                     actor="system",
@@ -6613,8 +6613,10 @@ def create_managed_app(
         # #200 (ADR 0092 decision 2): thread the derived instance posture so the engine<->store weakened-
         # TLS refusal (connection_string / _build_ssl) clamps MEFOR_ALLOW_INSECURE_TLS — the escape can
         # never relax a production-PHI store hop. None when no [ai] (SQLite/test) → unclamped, unchanged.
+        # create=True (BACKLOG #1780): serve's first run is the ordinary way a SQLite store comes to exist.
         store = await open_store(
             resolved,
+            create=True,
             message_events=message_events,
             posture=_hop_posture,
         )

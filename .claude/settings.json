@@ -118,6 +118,18 @@
             ],
             "timeout": 15,
             "statusMessage": "Checking for GitHub API polling"
+          },
+          {
+            "type": "command",
+            "command": "pwsh",
+            "args": [
+              "-NoProfile",
+              "-NonInteractive",
+              "-File",
+              "${CLAUDE_PROJECT_DIR}/scripts/hooks/block-unbounded-fs-scan.ps1"
+            ],
+            "timeout": 15,
+            "statusMessage": "Checking for an unbounded filesystem scan"
           }
         ]
       }

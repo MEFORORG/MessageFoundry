@@ -155,11 +155,50 @@ def run_gate(
             # NOT ESTABLISHED: the size of the CI tail. The local arm reproduces the direction and
             # order of magnitude, not the 34x-68x maximum CI shows. Defender real-time scanning is
             # off on the box that measured it and on in CI; that gap is untested either way.
+            #
+            # THE GREEN BASELINE WAS THE MISSING HALF OF THAT SIZING, and it is now measured. Three
+            # windows-2025 harness jobs read 2026-09-16, one green and two red, each from its own
+            # `--durations=40` rather than from a carried-forward number:
+            #     test_a_LITERAL_backtick_in_a_cmd_payload...  green 30.55s | red 88.46s | red 87.42s
+            # That item makes THREE sequential gate launches, so green is about 10s per launch
+            # against a 45s ceiling -- roughly 4.4x of headroom, where a one-launch control_plane
+            # item green at ~2s per launch has about 22x. It is the tier's canary, not a random
+            # victim, and it is the item the budget is tightest on by a wide margin.
+            #
+            # WHY THAT TEST AND NOT A DIFFERENT ONE, counted by AST over both failing files. The
+            # unit is launches per test ITEM, because that is the unit a 45s budget is spent in:
+            #     escaped_quote    56 items: ONE at 3 launches, 21 at 2, 30 at 1, 4 at 0
+            #     control_plane   159 items: 18 at 2 launches, 139 at 1, 2 at 0
+            # escaped_quote has a UNIQUE maximum and that item is the one that reds. control_plane is
+            # flat, so the timeout lands on whichever item happens to be running and names a
+            # different test every run. THE ASYMMETRY IS FILE SHAPE. Reading control_plane's rotating
+            # names as randomness and escaped_quote's stable name as a regression gets both backwards.
+            #
+            # PARAMETRIZING THE THREE-LAUNCH ITEM APART IS NOT A FIX, recorded so nobody spends the
+            # change discovering it. The same three launches still run; only the failing NAME
+            # changes. It would flatten the one stable signal the tier has and make diagnosis worse.
+            #
+            # TOTAL WALL CLOCK DOES NOT PREDICT THE FAILURE, so do not reach for "the runner was
+            # slower that day": 1219.44s RED, 1276.96s GREEN, 1455.72s RED, same tier, same tests.
+            #
+            # A RE-RUN IS NOT A NEW SAMPLE, and mistaking one for three cost a session. Three jobs
+            # read as "the same test failed three times today, so something must have landed" were
+            # attempts 2 and 3 of runs CREATED the previous day, restarted within 8 seconds of each
+            # other. GitHub replays the recorded run and re-runs only the FAILED job -- the
+            # ubuntu-latest sibling carries byte-identical started_at/completed_at across attempts,
+            # which is how to check this in one API call. The tree cannot differ between two attempts
+            # of one run, so no commit on main can be the cause, and the same test had already failed
+            # on the earlier attempt anyway.
             "The observed correlation is with TIME rather than with repository content. RUNNER "
             "CONTENTION IS THE EVIDENCED CAUSE, measured 2026-09-13: a 16-process pwsh storm from "
             "tests/test_session_mail.py::_race, three times per job on a 4-vCPU runner. Every test "
             "over 20s in every run examined lands inside that overlap window. A pwsh startup "
             "regression is REFUTED. The SIZE of the tail is not established.\n"
+            "IF YOU ARE HERE BECAUSE ONE TEST FAILED SEVERAL RUNS RUNNING: read run_attempt before "
+            "you read the diff. Re-runs of a single run replay the recorded tree, so repeats across "
+            "them are ONE sample and no commit can explain them (measured 2026-09-16). The item that "
+            "reds most makes THREE launches where its neighbours make one, and runs 30.55s green "
+            "against about 88s when it reds; that is budget headroom, not a behaviour change.\n"
             "DO NOT read this as a regression in the change under test, and DO NOT rerun until green "
             "without recording that you did: a manufactured green and an earned one are "
             "indistinguishable afterwards.\n"
