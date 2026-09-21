@@ -1307,16 +1307,14 @@ class RegistryRunner:
         """Wake every pooled lane that runs its own delivery worker — the OUTBOUND half of a broadcast
         (``notify_work`` / a reload nudge) that the dispatchers cannot carry, because no dispatcher
         speaks for these lanes. A no-op in per_lane mode and on a graph with no UNORDERED outbound."""
-        if not self._worker_owned:
-            return  # per_lane mode, or a pooled graph with no outbound decided yet
-        lanes = [name for name, owned in self._worker_owned.items() if owned]
-        if not lanes:
-            return
+        if not any(self._worker_owned.values()):
+            return  # per_lane mode, or a pooled graph whose outbounds are all dispatcher-drained
         if not self._per_lane_wake:
-            self._singleton_for_stage[Stage.OUTBOUND].set()
+            self._singleton_for_stage[Stage.OUTBOUND].set()  # every worker waits on this one Event
             return
-        for name in lanes:
-            self._lane_event(Stage.OUTBOUND, name).set()
+        for name, owned in self._worker_owned.items():
+            if owned:
+                self._lane_event(Stage.OUTBOUND, name).set()
 
     def _wake_lane(self, stage: Stage, key: str) -> None:
         """Wake the worker for one (stage, lane). ADR 0066 pooled: route to the stage's dispatcher
@@ -3106,12 +3104,26 @@ class RegistryRunner:
                 # invisible to the supervisor and never pages itself), and warn on the per_lane_wake
                 # combination (cross-shard produce has no wake — only the 30s idle backstop).
                 self._shard_watchdog = asyncio.create_task(self._non_owned_lane_watchdog())
-                if self._claim_mode != "pooled" and self._per_lane_wake:
+                # ADR 0066 D4: the hazard is per-LANE, so the warning has to be too. A lane drained by
+                # its own delivery worker has no cross-shard wake and is not in the dispatcher's sweep
+                # set either, so it sits on the idle backstop — under pooled as much as under per_lane.
+                # Read from the REGISTRY, not from _worker_owned: the outbound loop below has not run
+                # yet, so no lane has been decided at this point.
+                _worker_lanes_expected = self._claim_mode != "pooled" or any(
+                    (oc.ordering or self._ordering_default) is OrderingMode.UNORDERED
+                    for oc in self.registry.outbound.values()
+                )
+                if _worker_lanes_expected and self._per_lane_wake:
                     log.warning(
                         "sharded engine with per_lane_wake=True: a cross-shard send into an idle "
-                        "owned lane is discovered only by the %.0fs idle backstop (no cross-process "
-                        "wake) — prefer claim_mode='pooled' (<=%.2fs sweep) for sharded fleets",
+                        "owned lane drained by its own delivery worker is discovered only by the "
+                        "%.0fs idle backstop (no cross-process wake). Under claim_mode=%r that is "
+                        "%s. The pooled OUTBOUND dispatcher's <=%.2fs sweep covers every OTHER lane",
                         _PER_LANE_IDLE_BACKSTOP_SECONDS,
+                        self._claim_mode,
+                        "every outbound lane"
+                        if self._claim_mode != "pooled"
+                        else "any ordering=unordered outbound (ADR 0066 D4)",
                         self._pooled_sweep_interval,
                     )
             try:
@@ -3670,8 +3682,12 @@ class RegistryRunner:
 
         ADR 0066 D4: a pooled UNORDERED lane DOES get a worker. :meth:`_per_lane_delivery` is the
         single discriminator and ``_pooled_lane_provider`` is its complement, so the lane is drained by
-        exactly one of the two — never both, never neither. The assert below tests that directly: a
-        worker-owned lane must be unknown to the OUTBOUND dispatcher, which is one dict read.
+        exactly one of the two — never both, never neither. The guard below tests that directly: a
+        worker-owned lane must be unknown to the OUTBOUND dispatcher, which is one dict read. It is a
+        REFUSAL rather than an ``assert`` deliberately — ``python -O`` strips an assert, and the one
+        build where this invariant goes unchecked would be the production one. Refusing leaves the
+        lane on the consumer it already has, which is a slow lane at worst; spawning anyway would put
+        two claimers on it, which is the per-lane FIFO break (ADR 0073) this whole gate exists to stop.
 
         Sharded (ADR 0073): a lane another shard owns gets NO local worker — same choke-point
         placement, so start/reconcile/respawn all inherit the gate while the connector stays built
@@ -3680,10 +3696,16 @@ class RegistryRunner:
             return
         out = self._dispatchers.get(Stage.OUTBOUND)
         held = None if out is None else out.phase(name)
-        assert held is None, (
-            f"outbound {name!r} would have two consumers: a per-lane delivery worker and the pooled "
-            f"OUTBOUND dispatcher, which already holds the lane at phase {held!r}"
-        )
+        if held is not None:
+            log.error(
+                "outbound %r would have TWO consumers: a per-lane delivery worker and the pooled "
+                "OUTBOUND dispatcher, which already holds the lane at phase %r. Refusing to spawn "
+                "the worker — the dispatcher keeps draining it (ADR 0066 D4 / ADR 0073 single "
+                "consumer per lane). This is a bug in the lane-consumer partition; report it",
+                name,
+                held,
+            )
+            return
         if not self._owns_destination(name):
             log.info(
                 "outbound %r: delivery lane owned by shard %r (this is shard %r) — no local "
@@ -4168,9 +4190,10 @@ class RegistryRunner:
             # ADR 0066 D4: resolve (or re-read) the lane's delivery consumer before ANY branch below
             # can park it, spawn a worker, or hand it to a dispatcher. A lane already running keeps the
             # consumer it has — see _resolve_lane_consumer for why a mid-run handover is refused.
-            if not self._resolve_lane_consumer(name) and (
-                self._lane_ordering(name) is OrderingMode.UNORDERED
-            ):
+            # Hoisted, NOT folded into the `if` below: this call RECORDS the decision, and a predicate
+            # with a side effect inside a condition is one operand reorder away from never running.
+            worker_drained = self._resolve_lane_consumer(name)
+            if not worker_drained and self._lane_ordering(name) is OrderingMode.UNORDERED:
                 log.info(
                     "outbound %r now declares ordering=unordered, but the pooled OUTBOUND dispatcher "
                     "is already draining it; the lane keeps head-of-line blocking until the next "
