@@ -9,8 +9,15 @@
   [`docs/benchmarks/step-b-write-amplification.md`](../benchmarks/step-b-write-amplification.md).
 - **Supersedes:** the inline-pipeline model described in [`ARCHITECTURE.md`](../ARCHITECTURE.md) and
   `CLAUDE.md` §2 (to be revised on acceptance).
-- **Related:** [`message-ordering-design.md`](../message-ordering-design.md) (Phase 1, now built),
-  [`BACKLOG.md`](../BACKLOG.md) "Next up" + items 1 (SQL Server concurrency) and 3 (per-key ordering).
+- **Amended 2026-09-20:** per-key (sequence-keyed) ordering is **declined**. The Context, Options and
+  Consequences below keep their 2026-06 argument, in which a home for per-key lanes was a genuine
+  consideration; dated italic notes were added in place where that argument would otherwise read as
+  a live commitment. Read every per-key mention below as part of the 2026-06 case, not as work still
+  planned. See
+  [Amendment 2026-09-20](#amendment-2026-09-20-sequence-keyed-ordering-is-declined).
+- **Related:** [`message-ordering-design.md`](../message-ordering-design.md) (Phase 1, now built; it
+  carries the per-key decline), and BACKLOG #1 (SQL Server concurrency), which is tracked in the
+  maintainer-internal ledger rather than in [`BACKLOG.md`](../BACKLOG.md).
 
 ## Context
 
@@ -37,7 +44,8 @@ has structural limits this can't reach:
   route+transform inline.
 - **FIFO + the configurable error policy + alerting apply only to outbound** — a router or transformer
   failure has no queue, no retry lane, no per-stage replay.
-- There is **no natural home for per-key lanes** (BACKLOG #3) — ordering is a property of the outbox only.
+- There is **no natural home for per-key lanes** — ordering is a property of the outbox only. *(A
+  limit that mattered in 2026-06. Per-key lanes were declined 2026-09-20, so it motivates nothing now.)*
 
 The decided target is a **staged, decoupled pipeline**: a durable queue between every stage, each
 drained by its own worker, with FIFO + the Phase-1 error policy applied **uniformly at every stage**.
@@ -218,7 +226,9 @@ boundary, then extend:
 - **Uniform FIFO + failure policy + alerting** at every stage — the Phase-1 settings layer and failure
   semantics transfer unchanged; the per-stage worker is the Phase-1 worker parameterized by stage.
 - **Durable backpressure / buffering**; ingress absorbs bursts.
-- A **natural home for per-key lanes** (BACKLOG #3) — partitioning becomes a stage-queue property.
+- A **natural home for per-key lanes** — partitioning becomes a stage-queue property. *Superseded: the
+  feature was declined 2026-09-20, so this is an unrealized affordance, not a benefit the engine
+  collects. See the [amendment](#amendment-2026-09-20-sequence-keyed-ordering-is-declined).*
 
 **Negative / risks**
 - **Write amplification** (~3× durable writes/message) on single-writer SQLite — latency/contention under
@@ -227,7 +237,10 @@ boundary, then extend:
   synchronous validation gate + `ack_after` setting preserve the escape hatch.
 - **Count-and-log weakens** at the ACK boundary — disposition is no longer final at ACK; the invariant is
   re-specified as "received-and-persisted at ACK; disposition recorded as it flows," with rewritten tests.
-- **Ordering now matters at every stage** — intertwines with per-key ordering (BACKLOG #3).
+- **Ordering now matters at every stage.** *The stated entanglement with per-key ordering lapsed with
+  the 2026-09-20 decline; every stage orders FIFO unless a connection opts out with
+  `ordering=unordered`. See the
+  [amendment](#amendment-2026-09-20-sequence-keyed-ordering-is-declined).*
 - **Config / API / console surface multiplies per stage** (per-stage depth, DLQ, replay, alerts).
 - **SQL Server path is blocked on BACKLOG #1** (concurrency-safety fixes) before it can carry staging.
 
@@ -243,6 +256,24 @@ The five sign-off questions were ratified to the recommended answers above:
 5. **No fixed throughput number is set up front** — Step A is built first and its write amplification is
    **measured**, and that data (not a guess) decides whether the full 4-stage split is worth it and when
    to pursue the SQL Server scale path. This deferral-to-data is itself the decision.
+
+## Amendment 2026-09-20: sequence-keyed ordering is declined
+
+**Per-key (sequence-keyed) ordering is declined by owner ruling.** It is not scheduled and not
+deferred. Every per-key mention above belongs to the 2026-06 argument for the staged split, in
+Context, in Options considered and in Consequences alike. None of them is a commitment this ADR
+still carries.
+
+**Nothing in the decision above changes.** The staged pipeline was chosen on per-stage isolation,
+uniform FIFO and failure policy, and durable backpressure; those held on their own and remain the
+reason the split was built. A home for per-key lanes was a secondary consideration, and it simply
+went unclaimed.
+
+**FIFO is what every stage applies by default**, and one strictly ordered feed is bound to one
+core. A per-connection `ordering=unordered` stays available as an explicit opt-out. The decision, the
+vocabulary (**sequence key**, **sequence group**, **sequence-keyed lanes**), what the engine
+guarantees instead, and why `OrderingMode.UNORDERED` is unaffected are recorded once in
+[`message-ordering-design.md`](../message-ordering-design.md#declined-sequence-keyed-ordering).
 
 ---
 

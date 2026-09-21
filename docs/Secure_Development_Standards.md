@@ -6,8 +6,8 @@
 | **Applies to** | Any application developed under this standard. **MessageFoundry (MEFOR)** is the reference implementation (Appendix A). |
 | **Maintained by** | Project maintainers (open-source). Each deploying organization assigns its own local owner. |
 | **Status** | Published — adopter-facing |
-| **Version** | 2.3 |
-| **Date** | August 7, 2026 |
+| **Version** | 2.4 |
+| **Date** | September 20, 2026 |
 | **License** | Publishable under the project's open-source license; intended to be shared with adopters and reused across projects. |
 | **Review cadence** | At least annually, and on any material architecture or threat change |
 | **Aligns to** | NIST SP 800-218 (SSDF) · NIST SP 800-115 · NIST SP 800-66 Rev. 2 (HIPAA Security Rule) · OWASP ASVS 5.0 Level 3. Its Spec-Driven Development practices (§5) are a distilled synthesis by this document — not an external standard or certification. |
@@ -570,7 +570,7 @@ The project maintains a current evidence set so any claim is backed:
 
 MessageFoundry (MEFOR) is an open-source **HL7 v2.x integration engine** — a candidate alternative to commercial engines (Corepoint, Mirth Connect, Rhapsody, Cloverleaf). It routes and transforms clinical messages between systems.
 
-**Technology stack:** Python 3.14+, FastAPI/uvicorn, aiosqlite/SQLite (WAL), `python-hl7`/`hl7apy`, PySide6 (desktop UI), Windows/PowerShell deployment; MLLP transport with native MLLP-over-TLS (opt-in via cert config — ADR 0002); application-layer AES-256-GCM encryption at rest (database-native where the backend provides it). Durable message store with FIFO/per-key ordering and dead-letter handling.
+**Technology stack:** Python 3.14+, FastAPI/uvicorn, aiosqlite/SQLite (WAL), `python-hl7`/`hl7apy`, a browser operator console at `/ui`, PySide6 (standalone test harness only — the desktop operator console was retired, see V3 below), Windows/PowerShell deployment; MLLP transport with native MLLP-over-TLS (opt-in via cert config — ADR 0002); application-layer AES-256-GCM encryption at rest (database-native where the backend provides it). Durable message store with FIFO-per-outbound-connection ordering and dead-letter handling.
 
 ### A.2 Interfaces and surfaces
 
@@ -578,8 +578,27 @@ MessageFoundry (MEFOR) is an open-source **HL7 v2.x integration engine** — a c
 - **REST and SOAP** web-service interfaces — **outbound destinations built** (per-connection bearer / Basic-over-TLS; SOAP WS-Security + XML-DSig per ADR 0015). A **generic inbound HTTP listener is built** (ADR 0023) as the substrate REST/SOAP-in ride on; ADR 0003/0004 framed the original non-HL7 transport + payload-agnostic ingress design.
 - **Database** source (inbound poll) and destination — ADR 0003.
 - **File-handler interface** (file-drop pickup / output).
-- **PySide6 desktop client**, plus an **opt-in read-only web ops dashboard** served under `/ui`
-  (`[api].serve_ui`, off by default — [ADR 0065](adr/0065-web-ops-dashboard.md)).
+- **Browser operator console** served same-origin under `/ui` — a **write-capable** surface
+  ([ADR 0065](adr/0065-web-ops-dashboard.md),
+  [ADR 0143](adr/0143-web-console-on-by-default-disableable-with-loopback-secure-context-browser-hardening.md)).
+  Two separate facts decide whether an install has it. The **config default is on** for a loopback
+  bind, and `serve_web_console` under `[security]` is a surface-*reducing* opt-out. The **console
+  is a second wheel** (`messagefoundry-webconsole`) that the base distribution does not carry, so an
+  engine installed without it serves no `/ui` and degrades to a JSON-only API with a warning.
+  Writes reach at least connection lifecycle control, queue purge, message and dead-letter replay,
+  edit-and-resend, log upload and resend, statistics reset, alert handling, disaster-recovery
+  activation, cluster step-down, config reload, and user/role/AD-group administration. Sensitive
+  actions require step-up re-authentication. Three of them — dead-letter replay, connection purge
+  and config reload — can additionally be placed behind dual-control approval, which is
+  `[approvals]`, **off by default**. The V3 row in A.3 carries the applicable ASVS scope, and the
+  off-loopback exposure ladder is in [CONFIGURATION.md](CONFIGURATION.md) and
+  [REMOTE-CONSOLE.md](REMOTE-CONSOLE.md).
+- **Windows tray service manager**, in the **base** wheel (`messagefoundry-tray`,
+  [ADR 0113](adr/0113-windows-tray-service-manager-stdlib-ctypes-tokenless.md)). It starts, stops and restarts the service
+  under per-action UAC, so it is a control surface that every `pip install messagefoundry` carries
+  — unlike the console above.
+- **VS Code extension** (`ide/`, [ADR 0112](adr/0112-ide-engine-lifecycle-from-the-status-bar-pill-guarded-start-stop-restart.md)) — authoring, plus
+  guarded start/stop/restart of the engine from its status-bar control.
 
 ### A.3 OWASP ASVS 5.0 Level 3 — chapter applicability
 
@@ -776,6 +795,7 @@ resolves to a row below rather than to whatever requirement later took the numbe
 
 | Version | Date | Change |
 |---|---|---|
+| 2.4 | September 20, 2026 | **A.2 corrected to match the shipped web console, and two control surfaces added.** A.2 described `/ui` as an opt-in, read-only dashboard configured at `[api].serve_ui`. All three were wrong in the shipped code, and each understated the surface. The config default is **on** for a loopback bind (`serve_ui: bool = True`; ADR 0143 makes disabling it surface-*reducing*). The console is **write-capable**, across at least connection control, queue purge, replay, log upload, disaster-recovery activation and user administration. The operator key is `serve_web_console` under `[security]`; the `[api]` spelling is refused at config load (ADR 0118), so the old text named a key that fails. A.2 now also records what the old text left out. The console arrives as a **second wheel** the base distribution does not carry. The **Windows tray** (ADR 0113) does ship in the base wheel, and it starts, stops and restarts the service. The **VS Code extension** (ADR 0112) can do the same. Step-up re-authentication is distinguished from dual-control approval, which is off by default and reaches three operations. **SDS-3.4** is the rule at issue: the old prose was reviewed for accuracy rather than for what an adopter would do with it, and an adopter could have sized their own review against it. A.1's technology-stack line names a retired PySide6 desktop UI and is **not** corrected here; it is rewritten by the change reconciling the message-ordering docs, and two pull requests must not rewrite one sentence. **No requirement was added, removed, weakened or strengthened**, and no rule identifier changed. |
 | 2.3 | August 7, 2026 | **Rules given stable identifiers.** 145 requirements now carry an `SDS-<section>.<n>` identifier, an RFC 2119 keyword in capitals, and the evidence that settles them; see *How to read the rules*. **Section numbers are unchanged** — identifiers were added alongside, so every existing citation still resolves. A.6 now names the rule each deviation departs from, replacing the `(§6.3 / §6.4)` / `(§7.4)` / `(§5.3)` positional citations that the §5–§9 → §6–§10 renumbering below had already broken elsewhere. A *Retired rules* table holds tombstones so a retired identifier is never reissued, and `tests/test_sds_rule_ids_are_stable.py` enforces the convention in CI. Two corrections of record: A.6 listed R2 (the executable dry-run gate) as outstanding after it had shipped, and the standing contract introduced four prose-review rules as "the three rules below". No requirement was added, removed, weakened or strengthened. |
 | 2.2 | July 30, 2026 | **Independent-review deviation reframed.** The independent ASVS-L3 review & DAST is no longer stated as a precondition for off-loopback/production exposure. MessageFoundry is self-hosted, so the deployment decision — and the assessment supporting it — belong to the implementing organization; this standard records what has and has not been independently verified rather than gating deployment on it. The engagement remains planned, at an estimated $25,000–$50,000, intended to be grant- or sponsor-funded. Also drops a dangling citation to `security/RELEASE-GATE.md`, which is not present in this repository. No change to the SSDF / ASVS / HIPAA mappings. |
 | 2.1 | July 29, 2026 | **Code-quality companion added.** Cross-linked the new [Code Quality & Anti-Slop Standards](Code_Quality_Standards.md) (evidence-based anti-slop rubric, ISO/IEC 25010): a companion-standards pointer in §1 and a test-*quality* + anti-metric note at PW.8. No change to the SSDF / ASVS / HIPAA mappings or Appendix A. |

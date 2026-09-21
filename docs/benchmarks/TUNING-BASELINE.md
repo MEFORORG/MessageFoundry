@@ -106,10 +106,15 @@ Tuning that materially affects throughput. Full reference: [`../CONFIGURATION.md
 > holds zero-loss at high fan-out; `per_lane` is the **byte-identical opt-out**
 > ([ADR 0066](../adr/0066-pooled-stage-claimers.md)).
 
-**Cross-cutting:** intake throughput scales with **per-inbound** parallelism and (future) **multi-process**
-deployment, not by relaxing FIFO order — see `docs/archive/throughput/THROUGHPUT-IMPROVEMENTS.md`.
-A single strictly-ordered feed is capped at one core in every engine; the order-preserving escape hatch
-is per-key lanes (0.2), not unordered delivery.
+**Cross-cutting:** intake throughput scales with **per-inbound** parallelism and **multi-process**
+deployment (engine shards, `serve --shard`, [ADR 0037](../adr/0037-multi-process-sharding-l3.md) — built),
+not by relaxing FIFO order.
+A single strictly-ordered feed is capped at one core in every engine. Per-key lanes were once the
+order-preserving escape hatch; they were **declined** on 2026-09-20. The order-preserving levers that
+remain are fanning out at source, opening more destination connections to the partner, and reducing
+the partner's acknowledgement latency — [`THROUGHPUT.md`](../THROUGHPUT.md) sizes them, and
+[`message-ordering-design.md`](../message-ordering-design.md#declined-sequence-keyed-ordering)
+carries the decline.
 
 ---
 

@@ -223,7 +223,7 @@ class Destination:
 class Channel:
     """A parsed Corepoint channel: one inbound, a router over N handlers, and the outbounds they use."""
 
-    module_name: str  # file stem + inbound connection name, e.g. IB_ACME_ADT
+    module_name: str  # file stem + inbound connection name, e.g. IB_DEMO_ADT
     inbound_connector: str  # "MLLP" | "File"
     inbound_call: str  # e.g. "MLLP(port=2600)"
     router_name: str
@@ -673,7 +673,7 @@ class Operand:
     # Whether a ``literal`` span carried its own quotes *inside* the span. The exporter is
     # inconsistent (most literals are wrapped, a large minority are bare), so the unwrap is
     # conditional and must happen exactly once — rendering a wrapped span verbatim would emit
-    # ``set_field(msg, "MSH-6", "\"ACME\"")``, a value carrying two stray quote characters.
+    # ``set_field(msg, "MSH-6", "\"DEMO\"")``, a value carrying two stray quote characters.
     quoted: bool = False
 
 
@@ -1239,13 +1239,24 @@ def _split_branches(steps: list[Step]) -> tuple[tuple[Step, ...], tuple[Control,
     """Split a container body at its branch markers into ``(body, branches)``.
 
     The export writes ``Else``/``ElseIf``/``Catch``/``Matching`` as ordinary statements *inside* the
-    construct's own ``<List>``, so everything after such a marker belongs to that branch. Recursing
-    keeps successive branches siblings (``if`` → ``elif`` → ``else``), not nested."""
+    construct's own ``<List>``, so everything after such a marker belongs to that branch. Walk once
+    to keep successive branches siblings without consuming stack space for a wide list."""
+    body: tuple[Step, ...] = ()
+    branches: list[Control] = []
+    marker: Control | None = None
+    start = 0
     for i, step in enumerate(steps):
         if isinstance(step, Control) and step.kind in _BRANCH_PARENT and not step.body:
-            body, rest = _split_branches(steps[i + 1 :])
-            return tuple(steps[:i]), (replace(step, body=body), *rest)
-    return tuple(steps), ()
+            if marker is None:
+                body = tuple(steps[:i])
+            else:
+                branches.append(replace(marker, body=tuple(steps[start:i])))
+            marker = step
+            start = i + 1
+    if marker is None:
+        return tuple(steps), ()
+    branches.append(replace(marker, body=tuple(steps[start:])))
+    return body, tuple(branches)
 
 
 # How deep the ``<List>`` tree may nest. The walk is mutually recursive (list → statement → list), so
@@ -1950,7 +1961,7 @@ def import_corepoint(export_path: str | Path, out_dir: str | Path) -> ImportResu
     assigned: set[str] = set()
     for ch in channels:
         # Two channels can resolve to the same ``module_name`` — either from equal source names or
-        # because ``_sanitize`` folds distinct names ("ACME ADT" vs "ACME-ADT") onto one stem. Since the
+        # because ``_sanitize`` folds distinct names ("DEMO ADT" vs "DEMO-ADT") onto one stem. Since the
         # module_name is BOTH the filename stem AND the emitted ``inbound()`` connection name, a naive
         # write would silently overwrite the earlier file (losing a channel while the summary claims
         # success) and collide in the registry. De-duplicate deterministically (``IB_DUP`` → ``IB_DUP_2``,
