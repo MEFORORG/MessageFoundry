@@ -343,8 +343,9 @@ def test_the_adr_sweep_is_invariant_under_the_console_code_page(
     xdist worker sharing that console to cp932 and never switched it back. A pwsh launched by another
     test then wrote an ellipsis as ``0x81 0x63``, and cp1252 cannot decode 0x81. ``subprocess``'s
     stderr reader died, so ``test_worktree_selfheal_wiring.py`` got ``stderr=None`` and a TypeError.
-    So the case checks that the shared console kept its page. It also has pwsh report the page it
-    started under: without that, a launch that never reached the DBCS page would pass everywhere.
+    So the case checks that the shared console did not take this case's page. It also has a pwsh
+    started in the private console, just before the sweep's, report its page: without that, a launch
+    that never reached the DBCS page would pass everywhere.
     """
     repo = _checkout(tmp_path / f"cp{codepage}", {"0100-primer.md": "# Primer\n"})
 
@@ -361,9 +362,11 @@ def test_the_adr_sweep_is_invariant_under_the_console_code_page(
     shared = (kernel32.GetConsoleOutputCP(), kernel32.GetConsoleCP())
     if shared == (0, 0):
         warnings.warn(
-            "this process has no console, so the check that chcp left the shared console alone "
-            "has nothing to measure; the sweep itself is still checked",
-            stacklevel=1,
+            pytest.PytestWarning(
+                f"code page {codepage}: this process has no console, so the check that chcp left "
+                "the shared console alone has nothing to measure; the sweep itself is still checked"
+            ),
+            stacklevel=1,  # B028 wants it explicit; 1 points at this test, which is the subject.
         )
     # shell=True, NOT ["cmd", "/c", ...]. The list form makes Python quote the whole command as one
     # argument and cmd.exe then hands pwsh the quotes as part of the filename -- measured, it fails
@@ -376,7 +379,10 @@ def test_the_adr_sweep_is_invariant_under_the_console_code_page(
         shell=True,
         cwd=str(repo),
         capture_output=True,
-        text=True,
+        # The private console writes in THIS page, so decode with it. The locale default (cp1252)
+        # would kill the reader thread on the first DBCS byte, the very crash this case once caused.
+        encoding=f"cp{codepage}",
+        errors="replace",
         # A new console with no window, so chcp reaches only cmd and the pwsh processes it starts.
         creationflags=subprocess.CREATE_NO_WINDOW,
     )
@@ -384,15 +390,19 @@ def test_the_adr_sweep_is_invariant_under_the_console_code_page(
     # Blame chcp only for a move TO its own page. A sibling worker can move this console too (at
     # least three repo scripts set it to 65001), and plain equality would red here for that. This
     # sees a leak only if it is still there once pwsh exits.
-    leaked = after[0] == codepage and shared[0] != codepage
+    leaked = any(now == codepage != before for before, now in zip(shared, after, strict=True))
+    restore = ""
     if leaked:
         # Put the page back before failing, so a regression reds THIS case rather than crashing
         # whichever test launches pwsh next.
-        kernel32.SetConsoleOutputCP(shared[0])
-        kernel32.SetConsoleCP(shared[1])
+        if kernel32.SetConsoleOutputCP(shared[0]) and kernel32.SetConsoleCP(shared[1]):
+            restore = "It was put back."
+        else:
+            restore = f"Putting it back FAILED, error {ctypes.get_last_error()}."
     assert not leaked, (
         f"chcp {codepage} changed the console this pytest process shares with its xdist siblings, "
-        f"from (output, input) {shared} to {after}. Any pwsh they launch now writes in that page."
+        f"from (output, input) {shared} to {after}. Any pwsh they launch writes in that page. "
+        + restore
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert re.search(rf"^page={codepage}$", proc.stdout, re.MULTILINE), (
