@@ -2,11 +2,12 @@
 
 **Context document for MessageFoundry development (Claude Code reference).**
 
-> **Status — the survey stands; the recommendation does not.** The engine comparison, the concept
+> **Status — the survey stands; one recommendation does not.** The engine comparison, the concept
 > definitions and the A40 cross-key hazard below are accurate research and are **not retracted**.
-> The design recommendation they led to — making per-key ordering a first-class MessageFoundry
-> setting — was **declined by owner ruling on 2026-09-20**. Read the "Design Implications" and
-> "Open Design Questions" sections as a record of what was considered, not as work to do. The
+> Most of "Design Implications" was built: ordering is a configurable per-connection property
+> defaulting to FIFO, order is derived from the durable store, and dead-letter with replay is a
+> first-class feature. **Design implication 2 — a first-class partition key — was declined by
+> owner ruling on 2026-09-20**, and the open questions that presuppose one are moot with it. The
 > decision and what the engine guarantees instead are recorded once, in
 > [`message-ordering-design.md`](message-ordering-design.md#declined-sequence-keyed-ordering).
 

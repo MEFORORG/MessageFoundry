@@ -10,7 +10,8 @@ Layer 4a (the configurable *stop-connection* override
 `connection_stopped` emit-point), and Layer 4b (the `queue_buildup` detector + its `buildup_max_depth`
 / `buildup_max_oldest_seconds` threshold and the `pending_depth` store query). A **real** alerting
 framework (routing the `AlertSink` events to notifications) remains [`BACKLOG-CLOSED.md`](BACKLOG.md) item 5;
-the next foundational step is **Phase 2** — per-stage durable queues (ADR-first, top of `BACKLOG.md`).
+**Phase 2** (per-stage durable queues) followed and is **built** — see
+[ADR 0001](adr/0001-staged-pipeline-architecture.md).
 Companion to the engine survey in
 [`hl7-message-ordering-reference.md`](hl7-message-ordering-reference.md). Per-key (sequence-keyed)
 ordering was once the long-term follow-on. It is now **declined** — see
@@ -219,20 +220,24 @@ a transient error still blocks-and-retries.
 
 **Per-key (sequence-keyed) ordering is declined by owner ruling, 2026-09-20.** It is not scheduled,
 not deferred, and not awaiting a design. Build around it rather than waiting for it. This section is
-the single record of the decision; the other engine documents point here instead of restating it.
+the single record of the **reasoning**; the other engine documents state the status and link here.
 
 **What was proposed.** Preserve order only *within* a **sequence group** — the messages sharing a
 **sequence key** such as an MRN, an encounter, or a sending facility — and run different groups in
-parallel on their own **sequence-keyed lanes**. `partition_key` and "order-group sharding" are
-retired names for the same idea.
+parallel on their own **sequence-keyed lanes**. `partition_key` is the retired name for the same
+idea, and no setting by that name exists anywhere in the engine.
 
 **What the engine guarantees instead.** **FIFO per outbound connection**, by enqueue time on that
 connection. That is the guarantee this document specifies and the engine has built. One strictly
-ordered feed is therefore bound to **one core**. A feed that outgrows a core is answered by
-**fanning out at source**, splitting it upstream into several inbound connections that each carry
-their own ordered outbound. The scaling axis stays per *connection* (engine shards,
-[ADR 0037](adr/0037-multi-process-sharding-l3.md)), which reaches the same throughput without
-introducing a new correctness boundary.
+ordered feed is therefore bound to **one core**, as it is in every engine. A feed that outgrows a
+core is answered by **fanning out at source**, splitting it upstream into several inbound
+connections that each carry their own ordered outbound; the scaling axis stays per *connection*
+(engine shards, [ADR 0037](adr/0037-multi-process-sharding-l3.md)).
+
+**Fan-out does not compose additively, and nothing here should be sized as though it did.** Lanes
+contend on a shared store-side wall. Summing per-interface ceilings was measured to over-report by
+roughly 11x, and [`THROUGHPUT.md`](THROUGHPUT.md) carries that correction plus the rule to take the
+measured concurrent run instead. Fan-out is still the sanctioned answer; it is simply not free.
 
 **The standing technical reason.** Sequence-keyed parallelism is sound only while no message's
 correct processing depends on another group's order. Real HL7 traffic breaks that assumption. The
@@ -242,6 +247,13 @@ or explicit two-group handling, and getting it wrong corrupts data silently rath
 loudly. The survey and hazard analysis in
 [`hl7-message-ordering-reference.md`](hl7-message-ordering-reference.md) are **not retracted**: what
 changed is the status of the feature, not the accuracy of the research.
+
+**Fan-out does not make that hazard disappear; it moves it.** Splitting a feed upstream partitions
+it by some key too, so a cross-key A40 can still land on two connections draining two independent
+FIFO lanes. What changes is where the boundary sits and who owns it. At the source it is chosen
+deliberately, by whoever splits the feed and knows what the split means. Inside the engine it would
+be an implied promise the engine cannot keep for a message that belongs to two groups at once.
+Declining sequence-keyed lanes declines the promise, not the hazard.
 
 **What this does not rule out.** `OrderingMode.UNORDERED`
 ([`config/models.py`](../messagefoundry/config/models.py)) is shipped and stays. An operator may set

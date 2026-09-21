@@ -108,8 +108,10 @@ Tuning that materially affects throughput. Full reference: [`../CONFIGURATION.md
 
 **Cross-cutting:** intake throughput scales with **per-inbound** parallelism and (future) **multi-process**
 deployment, not by relaxing FIFO order — see `docs/archive/throughput/THROUGHPUT-IMPROVEMENTS.md`.
-A single strictly-ordered feed is capped at one core in every engine; the order-preserving escape hatch
-is per-key lanes (0.2), not unordered delivery.
+A single strictly-ordered feed is capped at one core in every engine. Per-key lanes were once the
+order-preserving escape hatch; they were **declined** on 2026-09-20, so a feed that outgrows a core
+is answered by fanning out at source — see
+[`message-ordering-design.md`](../message-ordering-design.md#declined-sequence-keyed-ordering).
 
 ---
 

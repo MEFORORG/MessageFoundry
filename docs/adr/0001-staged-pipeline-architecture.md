@@ -11,7 +11,8 @@
   `CLAUDE.md` §2 (to be revised on acceptance).
 - **Amended 2026-09-20:** per-key (sequence-keyed) ordering is **declined**. The Context, Options and
   Consequences below are kept as the record of the 2026-06 argument, in which a home for per-key lanes
-  was a genuine consideration — but nothing below points at future work any more. See
+  was a genuine consideration. Read every per-key mention below as part of that argument, not as
+  work still planned. See
   [Amendment 2026-09-20](#amendment-2026-09-20-sequence-keyed-ordering-is-declined).
 - **Related:** [`message-ordering-design.md`](../message-ordering-design.md) (Phase 1, now built; it
   carries the per-key decline), [`BACKLOG.md`](../BACKLOG.md) "Next up" + item 1 (SQL Server
@@ -257,9 +258,9 @@ The five sign-off questions were ratified to the recommended answers above:
 ## Amendment 2026-09-20: sequence-keyed ordering is declined
 
 **Per-key (sequence-keyed) ordering is declined by owner ruling.** It is not scheduled and not
-deferred. Anywhere above that reads as future work — a "natural home for per-key lanes", ordering
-that "intertwines with per-key ordering" — should be read as the 2026-06 argument for the staged
-split, not as a commitment this ADR still carries.
+deferred. Every per-key mention above belongs to the 2026-06 argument for the staged split, in
+Context, in Options considered and in Consequences alike. None of them is a commitment this ADR
+still carries.
 
 **Nothing in the decision above changes.** The staged pipeline was chosen on per-stage isolation,
 uniform FIFO and failure policy, and durable backpressure; those held on their own and remain the
