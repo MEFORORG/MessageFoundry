@@ -362,6 +362,47 @@ jobs:
           cp dist/*.whl dist/*.tar.gz dist-pub/
           ls -l dist-pub/
 
+          # EVERY GATE ABOVE INSPECTED `dist/`. THE PYPI PUBLISH READS `dist-pub/` (BACKLOG #1841).
+          # Today this step is a plain `cp`, so the two are byte-identical and the gates transfer. That
+          # is a property of these three lines, not of the pipeline -- nothing downstream re-checks, and
+          # `tests/test_release_member_gate.py` pins the engine gate to `dist/`, so a future change here
+          # (a rebuild, a rename, a filter, a signature landing in the wrong directory) would move the
+          # published bytes out from under every check that ran, and no test would red.
+          #
+          # So PROVE the copy rather than assume it. Compare by CONTENT, not by name or size: a rebuild
+          # would produce the same filenames and a near-identical size while differing in members.
+          # COUNTED IN THE LOOP, NOT WITH `ls -1 dist-pub | wc -l`. This step runs under `bash -e`
+          # WITHOUT pipefail, so a pipeline takes its LAST command's status and `ls` failing on a
+          # missing directory would be discarded by `wc`, which happily reports 0 -- turning "the
+          # directory is gone" into "zero files", the reading that then trips the check below with the
+          # wrong diagnosis. tests/test_workflow_pipefail_screen.py caught exactly this line.
+          staged_count=0
+          for staged in dist-pub/*; do
+            # An unmatched glob is left LITERAL here (no nullglob), so this arm is also the empty-
+            # directory case and it must not be read as a missing-file case.
+            if [ ! -e "$staged" ]; then
+              echo "::error::dist-pub/ is EMPTY after staging, so nothing was compared and nothing would be published"; exit 1
+            fi
+            source="dist/$(basename "$staged")"
+            if [ ! -f "$source" ]; then
+              echo "::error::dist-pub/ holds $(basename "$staged"), which is not in dist/ -- the published set is not the inspected set"; exit 1
+            fi
+            if ! cmp -s "$staged" "$source"; then
+              echo "::error::$staged differs from $source -- every gate above inspected dist/, so the bytes about to reach PyPI were never checked"; exit 1
+            fi
+            staged_count=$((staged_count + 1))
+          done
+          if [ "$staged_count" -eq 0 ]; then
+            echo "::error::dist-pub/ yielded zero comparable files, so this check proved nothing"; exit 1
+          fi
+          echo "dist-pub is byte-identical to the inspected dist: verified $staged_count file(s)"
+
+          # AND re-run the member gate on the staged copy. Redundant while the check above holds, and
+          # deliberately so: it is the arm that still refuses if somebody replaces the `cp` with a build
+          # and updates the comparison to match. A gate costs a second; discovering this on PyPI is
+          # permanent, because a version number cannot be re-used.
+          python scripts/release/forbidden_members.py 'dist-pub/*.whl' 'dist-pub/*.tar.gz'
+
       - name: Generate the shipped CycloneDX SBOM (license-complete, hash-locked core runtime)
         run: |
           # Build the SBOM from the ACTUAL installed core runtime (docker/locks/requirements-core.lock,

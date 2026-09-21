@@ -29,8 +29,9 @@ from messagefoundry.api import create_managed_app  # noqa: E402
 ADT = "MSH|^~\\&|APP|FAC|RAPP|RFAC|20260604||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
 
 #: How long the fixture waits for uvicorn to report ``started``. A module constant so the
-#: leak regression below can drive the timeout path in well under a second instead of ten.
-_START_TIMEOUT_SECONDS = 10.0
+#: leak regression below can drive the timeout path in well under a second instead of forty.
+#: Match the scenarios fixture's single bring-up allowance; do not retry a slow lifespan.
+_START_TIMEOUT_SECONDS = 40.0
 
 
 def _free_port() -> int:
@@ -80,11 +81,19 @@ def server(tmp_path: Path) -> Iterator[tuple[str, Path]]:
     # open handle under `tmp_path` for the rest of the pytest worker's life (BACKLOG #1515).
     # `test_harness_scenarios.server` already had this right; this is that shape.
     try:
-        deadline = time.time() + _START_TIMEOUT_SECONDS
-        while not uv.started:
-            time.sleep(0.05)
-            if time.time() > deadline:
-                raise RuntimeError("server did not start")
+        deadline = time.monotonic() + _START_TIMEOUT_SECONDS
+        while True:
+            if not thread.is_alive():
+                raise RuntimeError(f"monitor server exited during startup (api_port={port})")
+            if uv.started:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    f"monitor server startup timed out after {_START_TIMEOUT_SECONDS:g}s "
+                    f"(api_port={port})"
+                )
+            time.sleep(min(0.05, remaining))
         yield f"http://127.0.0.1:{port}", inbox
     finally:
         uv.should_exit = True
@@ -294,7 +303,7 @@ def test_server_fixture_stops_its_thread_when_startup_times_out(
 
     before = {t.ident for t in threading.enumerate()}
     gen = server.__wrapped__(tmp_path)  # type: ignore[attr-defined]
-    with pytest.raises(RuntimeError, match="server did not start"):
+    with pytest.raises(RuntimeError, match="server startup timed out"):
         next(gen)
 
     leaked = [t for t in threading.enumerate() if t.ident not in before and t.is_alive()]

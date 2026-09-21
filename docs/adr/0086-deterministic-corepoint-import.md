@@ -183,6 +183,30 @@ The import summary counts mapped vs. unmapped actions per channel (the count-and
 §1). In the lens round-trip the stub degrades to a single in-place `code` row — never a whole-file
 refusal.
 
+**(c″) AMENDMENT 2026-09-16 — the passthrough stub is withdrawn; an unmapped action emits NO live
+code (BACKLOG #1681).** The paragraph above is kept as written, because the stub shipped and a reader
+needs to recognise the line in a module generated before this date. Two sentences of it no longer
+describe the code: the `msg.set(<target>, msg.field(<target>) or "")` stub is gone from every input
+layer, and with it the `code` row it contributed (the bare marker still classifies as one, so AC-4 is
+unchanged).
+
+The stub was not the inert passthrough its name claimed. `Message.set` **raises `KeyError`** on an
+absent segment, and on a present segment with an absent field it **materialises** that field and its
+empty components on the wire — so a line whose only job was to stay visible could dead-letter the
+message or change it. A generated handler carrying one would, on first deployment, dead-letter every
+message lacking the target segment and pad the segment of every message that has it. The validated
+role-parsed path (`_decline`) had already withdrawn it on those grounds; this amendment finishes the
+job on the two paths that had not — `_map_action` (the superseded JSON layer, §2(a)) and
+`_map_statement` (the fallback for an export whose `@Data` carries no span markup).
+
+**The recovered target is not lost — it rides into the marker text** as `; intended target <path>`, so
+the hand-finish still sees which field the source action meant. That move is what makes the value a
+*comment* problem rather than a *literal* problem, and the two escapes are not interchangeable: a
+`_lit` literal contains a newline by escaping it, while a comment simply ends at one. So on the JSON
+layer both the action class and the recovered target — neither of which has been through any grammar —
+are flattened through `_comment_text` before they enter the marker (BACKLOG #1683), which also deletes
+the control characters that would otherwise make the module uncompilable.
+
 **(c′) AMENDMENT 2026-07-24 — `@Disabled` is a third bucket.** An element carrying `@Disabled` is
 **never** emitted as live code and is **never** dropped either: its whole subtree is preserved as
 commented-out pseudo-source under a `# DISABLED in Corepoint (@Disabled)` header, and the summary
@@ -197,16 +221,25 @@ omitting it would claim it vanished.
   corresponding vocabulary call with the exported field paths as arguments.
   → `tests/test_corepoint_import.py::test_maps_every_vocabulary_class`
 - **AC-2 (count-and-log)** — WHERE an export action has no mapping, the importer SHALL emit an in-place
-  `# TODO: Corepoint …` marker (+ best-effort stub) and count it — never drop it silently.
-  → `tests/test_corepoint_import.py::test_unmapped_action_is_stubbed_not_dropped`
+  `# TODO: Corepoint …` marker naming the intended target field when one is recoverable, SHALL emit no
+  live code for it (amendment (c″)), and SHALL count it — never drop it silently.
+  → `tests/test_corepoint_import.py::test_unmapped_action_is_marked_not_dropped`
 - **AC-3 (check gate)** — the emitted modules SHALL pass `messagefoundry check` (validate leg).
   → `tests/test_corepoint_import.py::test_generated_module_passes_check`
 - **AC-4 (lens round-trip)** — every emitted `@handler` SHALL classify through `lens parse` into typed
   rows with no whole-file refusal; mapped calls become `action`/`lookup` rows, the `return` a `send` row.
   → `tests/test_lens_parse.py::test_generated_handler_round_trips_through_lens`
 - **AC-5 (untrusted input)** — a hostile value (quotes/newlines/backslashes) SHALL ride across as an
-  inert literal, never injected code; a malformed export SHALL raise `CorepointImportError`, not a
+  inert literal, never injected code; a hostile value bound for a **comment** SHALL be flattened to one
+  line with its non-whitespace control characters deleted; a value JSON can render but Python cannot
+  read back (`null`/`true`/`false`, a non-finite number, an unpaired surrogate) SHALL raise
+  `CorepointImportError` rather than be written into a module that fails at import or at encode
+  (amendment (c″), BACKLOG #1683); a malformed export SHALL raise `CorepointImportError`, not a
   traceback. → `tests/test_corepoint_import.py::test_hostile_values_are_escaped_not_injected`,
+  `::test_an_unmapped_actions_recovered_target_cannot_escape_its_comment`,
+  `::test_a_nul_in_an_action_class_cannot_make_the_module_uncompilable`,
+  `::test_a_json_scalar_python_cannot_read_is_refused_not_rendered`,
+  `::test_an_unpaired_surrogate_is_refused_before_it_reaches_the_file`,
   `::test_malformed_export_raises`
 
 ### AC-6 (amendment, 2026-07-24 — the validated XML layer)
