@@ -18,12 +18,14 @@ from __future__ import annotations
 import socket
 import time
 from dataclasses import dataclass
+from uuid import uuid4
 
 from messagefoundry.apiclient import ApiError, EngineClient
 from messagefoundry.generators import (
     _core,
     all_types,  # noqa: F401  (registers the built-in message types)
 )
+from messagefoundry.parsing.message import Message
 from messagefoundry.transports.mllp import MLLPDecoder, frame
 
 _TERMINAL = {"processed", "unrouted", "filtered", "error"}
@@ -101,13 +103,15 @@ def run_scenario(
     scenario: Scenario, client: EngineClient, *, timeout: float = 30.0
 ) -> ScenarioResult:
     """Run one scenario end-to-end: generate + send, then poll the API until the outcome settles."""
-    payloads = [
-        _core.generate_message(scenario.code, scenario.trigger, i)
-        for i in range(1, scenario.count + 1)
-    ]
-    control_ids = [
-        _core.control_id(scenario.code, scenario.trigger, i) for i in range(1, scenario.count + 1)
-    ]
+    # Keep the corpus deterministic; only a live run's correlation IDs must be fresh.
+    payloads: list[str] = []
+    control_ids: list[str] = []
+    for i in range(1, scenario.count + 1):
+        message = Message.parse(_core.generate_message(scenario.code, scenario.trigger, i))
+        control_id = uuid4().hex[:20]
+        message.set("MSH-10", control_id)
+        payloads.append(str(message))
+        control_ids.append(control_id)
     send_errors = [
         e for e in _send_mllp(scenario.inbound_host, scenario.inbound_port, payloads) if e
     ]
