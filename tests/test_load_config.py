@@ -20,6 +20,7 @@ from messagefoundry.config.wiring import load_config
 from messagefoundry.generators import _core, all_types  # noqa: F401  (registers message types)
 from messagefoundry.parsing import Peek, normalize
 from messagefoundry.pipeline.dryrun import dry_run
+from messagefoundry.transports.mllp import DEFAULT_MAX_CONNECTIONS_PER_HOST
 
 _CONFIG = "harness/config/load"
 
@@ -50,6 +51,18 @@ def test_graph_loads_and_validates() -> None:
     reg = load_config(_CONFIG)
     reg.validate()
     assert set(reg.inbound) == {"IB_Load_ADT", "IB_Load_Results", "IB_Load_Other"}
+
+
+def test_every_hub_turns_the_per_host_cap_off() -> None:
+    # The pool opens from ONE address and outgrows the shipped per-host cap (BACKLOG #1725), so a hub
+    # that kept it would refuse most of its own load. Every hub is checked, so a hub added without
+    # the override fails here instead of in a run.
+    pool = load_profile(PROFILES_DIR / "closed-loop.toml").pool_size
+    # Positive control: the shipped cap WOULD bite without the override.
+    assert pool > DEFAULT_MAX_CONNECTIONS_PER_HOST
+    reg = load_config(_CONFIG)
+    for name, ib in reg.inbound.items():
+        assert ib.spec.settings["max_connections_per_host"] is None, name
 
 
 def test_inbounds_carry_no_shard_by_default() -> None:

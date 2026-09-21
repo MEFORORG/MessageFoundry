@@ -574,14 +574,18 @@ async def test_per_host_cap_refuses_a_further_connection_from_the_same_address()
             w.close()
             with contextlib.suppress(ConnectionResetError):
                 await w.wait_closed()
+        # Checked BEFORE stop(), which clears the table itself: asserted after it, a `_release` that
+        # left `{host: 0}` behind would still read as empty and this guard would prove nothing.
+        assert await _wait_for(lambda: source._active == 0)
+        assert source._per_host == {}, (
+            "a peer address was left in the per-host table after every connection closed; a table "
+            f"that only grows is the leak the cap would otherwise introduce: {source._per_host}"
+        )
+        assert source._host_capacity_warned == set()
     finally:
         # Bound teardown so a listener-stop regression (the #55 Windows Proactor wedge) fails LOUD as a
         # fast timeout instead of silently hanging the shared session loop — mirrors test_connection_resilience.
         await asyncio.wait_for(source.stop(), timeout=5.0)
-    assert source._per_host == {}, (
-        "a peer address was left in the per-host table after every connection closed; a table that "
-        f"only grows is the leak the cap would otherwise introduce: {source._per_host}"
-    )
 
 
 async def test_the_global_cap_refusal_is_still_unqualified() -> None:
@@ -647,8 +651,15 @@ def test_a_negative_cap_is_refused_at_build_not_discovered_at_the_first_connecti
     """
     with pytest.raises(ValueError, match="max_connections_per_host must be at least 1"):
         _mllp(max_connections_per_host=-1)
-    with pytest.raises(ValueError, match="max_frame_seconds must not be negative"):
+    with pytest.raises(
+        ValueError, match="max_frame_seconds must be a number of seconds, zero or more"
+    ):
         _mllp(max_frame_seconds=-1.0)
+    # NaN is truthy and fails every comparison, so a `< 0` test let it through as a live deadline.
+    with pytest.raises(
+        ValueError, match="max_frame_seconds must be a number of seconds, zero or more"
+    ):
+        _mllp(max_frame_seconds=float("nan"))
     # 0 stays the documented "off" spelling for both, and is NOT caught by the refusal above.
     assert _mllp(max_connections_per_host=0).max_connections_per_host is None
     assert _mllp(max_frame_seconds=0).max_frame_seconds is None

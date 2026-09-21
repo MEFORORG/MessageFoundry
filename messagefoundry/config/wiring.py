@@ -1325,11 +1325,12 @@ def MLLP(
     tls_ciphers: str
     | None = None,  # BOTH: opt-in OpenSSL cipher string for THIS hop; unset = the inherited default (ADR 0188)
 ) -> ConnectionSpec:
-    """An MLLP endpoint. Inbound uses port + the resource caps below (the bind interface comes from
-    the service's ``[inbound].bind_host``, so ``host`` is rejected on an inbound); outbound uses
-    host/port/connect_timeout/timeout_seconds/max_frame_bytes. ``encoding`` applies to framing in both
-    directions. ``capture_response`` (outbound, ADR 0013) records the application ACK as a captured
-    reply (a negative ACK still dead-letters/retries unchanged).
+    """An MLLP endpoint. Inbound uses port plus the resource caps max_connections,
+    max_connections_per_host, receive_timeout, max_frame_seconds and max_frame_bytes (the bind
+    interface comes from the service's ``[inbound].bind_host``, so ``host`` is rejected on an
+    inbound); outbound uses host/port/connect_timeout/timeout_seconds/max_frame_bytes. ``encoding``
+    applies to framing in both directions. ``capture_response`` (outbound, ADR 0013) records the
+    application ACK as a captured reply (a negative ACK still dead-letters/retries unchanged).
 
     **Inbound resource caps (BACKLOG #1725).** ``max_connections`` (256) bounds concurrent sockets on
     the listener and ``max_connections_per_host`` (32) bounds concurrent sockets from ONE peer
@@ -1339,10 +1340,10 @@ def MLLP(
     end byte — that is what reaches a peer trickling a byte at a time, which is never idle.
     ``max_frame_bytes`` (16 MiB) bounds the same frame's size. Each is disabled by ``None``/``0``.
 
-    What each cap does NOT cover, and when to change one, is stated **once** on its ``DEFAULT_*``
-    constant in ``messagefoundry.transports.mllp`` — including the two cases an operator is most
-    likely to meet: a listener behind a source-NAT proxy, and a feed carrying large embedded
-    documents. Read those rather than a summary here; ``docs/CONNECTIONS.md`` carries the same two in
+    What the two #1725 caps do NOT cover, and when to change one, is stated **once** on
+    ``DEFAULT_MAX_CONNECTIONS_PER_HOST`` and ``DEFAULT_MAX_FRAME_SECONDS`` in
+    ``messagefoundry.transports.mllp`` — including the two cases an operator is most likely to meet:
+    a listener behind a source-NAT proxy, and a feed carrying large embedded documents. Read those rather than a summary here; ``docs/CONNECTIONS.md`` carries the same two in
     operator form.
 
     **Inbound message-rate pacing (BACKLOG #1249).** ``max_messages_per_second`` bounds how fast one
@@ -3657,7 +3658,9 @@ class InboundConnection:
     #   max_message_bytes: None (default) = inherit the engine 16 MiB ingress ceiling; set = the
     #     per-connection TOTAL body cap (the OOM guard that replaces the frame-cap-as-only-guard — a body
     #     over it is rejected/NAK'd BEFORE detach). A streaming inbound raises this above 16 MiB (and its
-    #     transport's max_frame_bytes) so the large frame is admitted, then detached under the cap.
+    #     transport's max_frame_bytes) so the large frame is admitted, then detached under the cap. On
+    #     an MLLP inbound raise max_frame_seconds with them: it bounds the same frame's arrival time
+    #     and ships at 60 s, so a big frame over a slow link is dropped mid-document (BACKLOG #1725).
     # Same override idiom as messages_days — code-first AND via connections.toml (ADR 0007).
     stream_threshold_bytes: int | None = None
     max_message_bytes: int | None = None

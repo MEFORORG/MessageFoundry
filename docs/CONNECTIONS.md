@@ -2444,7 +2444,7 @@ contract a reviewer needs. The two tables below cover **every** hop in the commu
 set**, and `tests/test_communications_inventory.py` fails the build if they diverge or if a stated
 default drifts from the constant in the code.
 
-Four facts that are easy to get wrong, stated plainly first:
+Facts that are easy to get wrong, stated plainly first:
 
 - **The MLLP, raw-TCP, X12 and HTTP listeners have no accept-rate throttle.** The bound is
   `max_connections` (default 256)
@@ -2708,7 +2708,7 @@ reading this page already applies to a file the scan never opened.
 
 | Service/hop | Concurrency bound (setting + default) | Behaviour when the limit is reached | Fallback / recovery |
 |---|---|---|---|
-| MLLP listener (inbound) | `max_connections` default 256 concurrent clients, plus `max_connections_per_host` default 32 from any one peer address | connection accepted, then immediately refused and closed with an `at_capacity` connection_event; the counter is not incremented. The per-host refusal carries a `max_connections_per_host` reason, which is the only thing distinguishing the two budgets | the peer reconnects; a slot frees as soon as any client finishes or trips `receive_timeout` or `max_frame_seconds` |
+| MLLP listener (inbound) | `max_connections` default 256 concurrent clients, plus `max_connections_per_host` default 32 from any one peer address | connection accepted, then immediately refused and closed with an `at_capacity` connection_event; the counter is not incremented. The per-host refusal carries a `max_connections_per_host` reason, which is the only thing distinguishing the two budgets | the peer reconnects; a slot frees as soon as any client finishes or trips `receive_timeout` or `max_frame_seconds`, except that a per-host refusal clears only when one of that same peer's own connections ends |
 | MLLP destination | 1 in-flight delivery per outbound connection (`per_lane`), else the `pooled_max_processing_lanes` budget | a lane waits for a slot; the socket itself is per-delivery unless `persistent=true` | transient failure re-queues into the `RetryPolicy` path; a stale persistent connection is not reused past `idle_timeout_seconds` |
 | Raw TCP listener (inbound) | `max_connections` default 256 concurrent clients | accepted then immediately refused and closed with an `at_capacity` connection_event | as MLLP |
 | X12 listener (inbound) | `max_connections` default 256 concurrent clients | connection accepted, then immediately refused and closed at the application layer; the active-client counter is not incremented. An ADR 0021 `at_capacity` connection_event is emitted, as on the raw-TCP listener (BACKLOG #1665); an allow-list refusal emits `peer_not_allowlisted` and a WARNING log | as MLLP |

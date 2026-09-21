@@ -71,15 +71,30 @@ _OTH_HANDLERS = _register_lane("OTH", _SHAPE.results_fanout, _SHAPE)
 # to its lane's full handler set (the sender sends only the matching types to each port). Each hub may
 # be tagged to a `supervise` shard via MEFOR_LOAD_SHARD_* (default unset → shard=None → no tag → a
 # single implicit shard = byte-identical to the unsharded graph); see _shape.
-inbound("IB_Load_ADT", MLLP(port=_SHAPE.adt_port), router="adt_router", shard=_SHAPE.shard_adt)
+#
+# The per-host connection cap is OFF on all three hubs (BACKLOG #1725). The load harness opens its
+# whole pool from ONE address -- up to 160 connections per hub in the closed-loop, spike-burst and
+# sustained-overload profiles -- so the shipped cap of 32 per peer address would refuse most of the
+# pool and the run would measure the refusals, not the engine. That is the single-address shape the
+# cap's own docs tell a source-NAT deployment to turn it off for.
+_NO_PER_HOST_CAP = None
+inbound(
+    "IB_Load_ADT",
+    MLLP(port=_SHAPE.adt_port, max_connections_per_host=_NO_PER_HOST_CAP),
+    router="adt_router",
+    shard=_SHAPE.shard_adt,
+)
 inbound(
     "IB_Load_Results",
-    MLLP(port=_SHAPE.results_port),
+    MLLP(port=_SHAPE.results_port, max_connections_per_host=_NO_PER_HOST_CAP),
     router="results_router",
     shard=_SHAPE.shard_results,
 )
 inbound(
-    "IB_Load_Other", MLLP(port=_SHAPE.other_port), router="other_router", shard=_SHAPE.shard_other
+    "IB_Load_Other",
+    MLLP(port=_SHAPE.other_port, max_connections_per_host=_NO_PER_HOST_CAP),
+    router="other_router",
+    shard=_SHAPE.shard_other,
 )
 
 

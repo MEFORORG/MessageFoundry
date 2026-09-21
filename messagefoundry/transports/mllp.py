@@ -1667,10 +1667,11 @@ class MLLPSource(SourceConnector):
     SILENCE between reads and ``max_frame_seconds`` bounds one frame's life; ``max_frame_bytes``
     bounds that frame's size. Each takes ``None``/``0`` to disable it.
 
-    Every one of those is documented once, on its ``DEFAULT_*`` constant above — what it bounds, why
-    the default is the number it is, and what it does NOT cover. Read those rather than a summary
-    here; this docstring deliberately does not restate them, and does not count them either, because
-    a closed count is a claim that goes stale the next time a cap is added.
+    The two caps BACKLOG #1725 added are documented once, on :data:`DEFAULT_MAX_CONNECTIONS_PER_HOST`
+    and :data:`DEFAULT_MAX_FRAME_SECONDS` above — what each bounds, why the default is the number it
+    is, and what it does NOT cover. Read those rather than a summary here; this docstring deliberately
+    does not restate them, and does not count the caps either, because a closed count is a claim that
+    goes stale the next time a cap is added.
     """
 
     def __init__(self, config: Source) -> None:
@@ -1703,12 +1704,15 @@ class MLLPSource(SourceConnector):
         self.max_frame_bytes: int | None = int(mf) if mf else None
         mfs = s.get("max_frame_seconds", DEFAULT_MAX_FRAME_SECONDS)
         self.max_frame_seconds: float | None = float(mfs) if mfs else None
-        if self.max_frame_seconds is not None and self.max_frame_seconds < 0:
+        if self.max_frame_seconds is not None and not self.max_frame_seconds >= 0:
             # Negative is truthy here too, and it would expire every frame the instant one opened —
             # a listener that drops every sender, configured from a value the author meant as "off".
+            # Written `not >= 0` rather than `< 0` so NaN is refused as well: TOML can spell `nan`,
+            # it is truthy, and every comparison with it is false, so `min()` against the idle bound
+            # would silently drop the deadline and a bare `wait_for(..., nan)` would fire at once.
             raise ValueError(
-                "MLLP max_frame_seconds must not be negative (use None or 0 to disable the frame "
-                f"deadline), got {self.max_frame_seconds}"
+                "MLLP max_frame_seconds must be a number of seconds, zero or more (use None or 0 to "
+                f"disable the frame deadline), got {self.max_frame_seconds}"
             )
         # Message-rate pacing. Absent -> OFF, unlike the caps above; see _pacing_settings and
         # DEFAULT_MAX_MESSAGES_PER_SECOND for why that deviation is deliberate and ruled.
