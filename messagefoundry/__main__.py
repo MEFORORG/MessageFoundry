@@ -4469,15 +4469,16 @@ def _resolve_expected_anchor(args: argparse.Namespace) -> tuple[int, str] | None
     Returns ``None`` when neither flag was given (an unanchored verify, the historical behaviour).
     Argparse's mutually-exclusive group has already refused both-at-once.
     """
-    from pathlib import Path
+    # The reader AND the parser live in the store package beside the comparators and `audit_anchor()`
+    # itself, because the engine's `[integrity].audit_anchor_file` startup check consumes the SAME
+    # artifact (BACKLOG #328). A copy here would be the one place a later hardening -- of the refusals,
+    # the encoding handling, or the byte bound -- could reach the CLI and miss the engine.
+    from messagefoundry.store.store import parse_audit_anchor, read_audit_anchor_file
 
     raw: str | None
     if args.expected_anchor_file is not None:
         try:
-            # `utf-8-sig` absorbs a leading BOM: PowerShell 5.1's `Out-File`/`Set-Content -Encoding
-            # utf8` writes UTF-8 WITH one, and this product is deployed as a Windows service, so that
-            # is a first-class way an operator produces this file.
-            raw = Path(args.expected_anchor_file).read_text(encoding="utf-8-sig")
+            raw = read_audit_anchor_file(args.expected_anchor_file)
         except (OSError, UnicodeDecodeError) as exc:
             # `UnicodeDecodeError` subclasses `ValueError`, NOT `OSError` — catching only the latter
             # let a mis-encoded file raise an unhandled traceback and exit 1, the SAME code
@@ -4495,12 +4496,6 @@ def _resolve_expected_anchor(args: argparse.Namespace) -> tuple[int, str] | None
         raw = args.expected_anchor
     if raw is None:
         return None
-    # The parser lives in the store package beside the comparators and `audit_anchor()` itself, because
-    # the engine's `[integrity].audit_anchor_file` startup check parses the SAME artifact (BACKLOG #328).
-    # A copy here would be the one place a later hardening of its refusals could reach the CLI and miss
-    # the engine.
-    from messagefoundry.store.store import parse_audit_anchor
-
     try:
         return parse_audit_anchor(raw)
     except ValueError as exc:

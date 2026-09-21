@@ -30,10 +30,13 @@ from messagefoundry.store.crypto import (
     make_cipher,
 )
 from messagefoundry.store.store import (
+    AUDIT_ANCHOR_MAX_BYTES,
     AUDIT_PREFIX_BREAK_MARKER,
+    AuditAnchorError,
     audit_prefix_verdict,
     audit_row_hash,
     parse_audit_anchor,
+    read_audit_anchor_file,
     should_record_event,
 )
 
@@ -1175,17 +1178,23 @@ class _EngineLogCapture:
         self._handler = logging.Handler()
         self._handler.emit = self._emit  # type: ignore[method-assign]
         self._logger = logging.getLogger("messagefoundry.pipeline.engine")
+        self._prev_level = logging.NOTSET
 
     def _emit(self, record: logging.LogRecord) -> None:
         self.records.append(record.getMessage())
 
     def __enter__(self) -> _EngineLogCapture:
         self._logger.addHandler(self._handler)
+        # RESTORED in __exit__: the suite runs in one process, so leaving the engine logger pinned at
+        # INFO would leak into every later test that asserts on captured output or log volume — an
+        # order-dependent failure whose cause sits several files away.
+        self._prev_level = self._logger.level
         self._logger.setLevel(logging.INFO)
         return self
 
     def __exit__(self, *exc: object) -> None:
         self._logger.removeHandler(self._handler)
+        self._logger.setLevel(self._prev_level)
 
     @property
     def text(self) -> str:
@@ -1278,7 +1287,7 @@ async def test_startup_anchor_alerts_on_a_truncated_tail(tmp_path: Path) -> None
     # DISTINGUISHABLE from a chain break, which is the constraint this limb was given. The subject is
     # the routing + throttle key, so sharing one is not "distinguishable in the reason text".
     assert subject == "audit-chain-truncated"
-    assert "TRUNCATED OR REWRITTEN TAIL" in cap.text, cap.records
+    assert "truncated or rewritten tail" in cap.text, cap.records
 
 
 async def test_startup_chain_break_keeps_its_own_alert_subject(tmp_path: Path) -> None:
@@ -1320,26 +1329,38 @@ async def test_startup_anchor_absent_file_warns_and_never_blocks(tmp_path: Path)
     assert sink.events == [], "a missing anchor file fired the tamper alert"
     assert "could not be read" in cap.text, cap.records
     # The operator must be told the coverage they did NOT get, in the same breath.
-    assert "BARE WALK" in cap.text
+    assert "bare walk" in cap.text
     # And the walk itself still ran and passed -- the chain is checked as far as it can be.
     assert "verified 3 audit row(s)" in cap.text
 
 
 @pytest.mark.parametrize(
-    "content",
+    ("content", "expected_reason"),
     [
-        "",  # an empty or truncated file
-        "not-an-anchor",  # no ':' separator
-        "3:" + "a" * 12,  # the FAIL-message display truncation, pasted back
-        "-1:" + "a" * 64,  # a negative count
-        "3:zzzz",  # neither hex nor an isolated-module MAC
+        ("", "no ':' separator"),  # an empty or truncated file
+        ("not-an-anchor", "no ':' separator"),
+        ("3:" + "a" * 12, "not a full 64-character digest"),  # a display truncation, pasted back
+        ("-1:" + "a" * 64, "is negative"),
+        ("3:zzzz", "neither a 64-character hex digest"),  # nor an isolated-module MAC
+        ("5:", "only producible from an EMPTY log"),  # an empty head with a nonzero count
     ],
-    ids=["empty", "no-separator", "display-truncated-head", "negative-count", "not-a-digest"],
+    ids=[
+        "empty",
+        "no-separator",
+        "display-truncated-head",
+        "negative-count",
+        "not-a-digest",
+        "empty-head-nonzero-count",
+    ],
 )
 async def test_startup_anchor_malformed_warns_and_never_blocks(
-    tmp_path: Path, content: str
+    tmp_path: Path, content: str, expected_reason: str
 ) -> None:
-    """Every malformed shape degrades to the bare walk with a WARNING -- none crashes, none alarms."""
+    """Every malformed shape degrades to the bare walk with a WARNING -- none crashes, none alarms.
+
+    The reason is asserted PER SHAPE rather than as one generic prefix: a shared assertion would pass
+    on a handler that reported every malformation identically, which is the failure an operator feels.
+    """
     db = tmp_path / "malformed.db"
     await _aseed_audit_rows(db, 3)
     anchor_file = tmp_path / "anchor.txt"
@@ -1349,8 +1370,32 @@ async def test_startup_anchor_malformed_warns_and_never_blocks(
 
     assert sink.events == [], f"a malformed anchor ({content!r}) fired the tamper alert"
     assert "does not hold a usable anchor" in cap.text, cap.records
-    assert "malformed audit anchor" in cap.text  # the parser's own reason reaches the operator
+    assert expected_reason in cap.text, cap.records
+    # The content-free reason reaches the operator, and the QUOTED value does not (that rendering is
+    # `str(exc)`, kept for the CLI's own terminal).
+    assert "malformed audit anchor" not in cap.text
     assert "verified 3 audit row(s)" in cap.text
+
+
+def test_operator_guidance_survives_the_phi_scrubber() -> None:
+    """The engine's own log text must not be eaten by the PHI redactor.
+
+    `redaction._NAME_RUN` treats 2-4 adjacent ALLCAPS tokens as a patient-name run, so emphasis like
+    "BARE WALK" or "TRUNCATED OR REWRITTEN TAIL" is rewritten to `[redacted]` and the operator reads
+    advice with the operative words removed. Measured during this change -- the log line really did
+    render as "runs as a [redacted]". Lowercase wording carries the same emphasis and survives.
+    """
+    from messagefoundry.redaction import redact
+
+    for phrase in (
+        "the startup audit check runs as a bare walk, which cannot see a truncated tail",
+        "startup audit-chain verification FAILED (alert-only, truncated or rewritten tail)",
+    ):
+        assert redact(phrase) == phrase, (
+            f"the scrubber rewrote operator guidance: {redact(phrase)!r}"
+        )
+    # The control: the scrubber IS active on this shape, so the assertions above are not vacuous.
+    assert redact("runs as a BARE WALK") != "runs as a BARE WALK"
 
 
 async def test_startup_anchor_reads_a_utf16_file_without_crashing(tmp_path: Path) -> None:
@@ -1421,5 +1466,132 @@ async def test_no_anchor_configured_is_byte_identical_to_today(tmp_path: Path) -
 
     assert sink.events == []
     assert "verified 2 audit row(s)" in cap.text
-    assert "[integrity].audit_anchor_file %s" not in cap.text
-    assert "could not be read" not in cap.text
+    # No COMPLAINT about a file. Asserting the bare stem is absent would be wrong now the passing
+    # verdict names the key it did not have; asserting on the literal "%s" would be worse — the
+    # capture stores `record.getMessage()`, so the format spec is interpolated away and could never
+    # be found, making the check vacuous.
+    for complaint in ("could not be read", "does not hold a usable anchor", "witness nothing"):
+        assert complaint not in cap.text, cap.records
+
+
+async def test_zero_count_anchor_never_alarms_on_an_intact_chain(tmp_path: Path) -> None:
+    """`0:` is the documented anchor of a fresh instance, and handing it to the comparator alarms
+    FOREVER on a chain nobody touched.
+
+    `verify_audit_chain` captures the head AT row `exp_count` while walking, and its position counter
+    is only ever >= 1, so row 0 is "never reached", `head_ok` is False, and an INTACT log is reported
+    as `truncated or rewritten` on every start. Measured directly below, so the reason this case is
+    handled is recorded rather than asserted. That is the false-alarm-from-input-handling defect
+    `parse_audit_anchor` exists to refuse, arriving through the one input it was letting past.
+    """
+    db = tmp_path / "zero.db"
+    await _aseed_audit_rows(db, 3)
+
+    # The defect itself, at the store, so this test fails loudly if the comparator ever starts
+    # handling row 0 and the engine's guard silently becomes dead code.
+    store = await MessageStore.open(db)
+    try:
+        raw_ok, raw_msg = await store.verify_audit_chain(expected_prefix=(0, ""))
+    finally:
+        await store.close()
+    assert raw_ok is False and "never reached" in (raw_msg or "")
+
+    anchor_file = tmp_path / "anchor.txt"
+    anchor_file.write_text("0:", encoding="utf-8")
+    sink, cap = await _verify_on_start(db, anchor_file)
+
+    assert sink.events == [], "a fresh-instance '0:' anchor raised a false truncation alarm"
+    assert "witness nothing" in cap.text, cap.records
+    assert "verified 3 audit row(s)" in cap.text
+
+
+def test_parse_audit_anchor_refuses_an_empty_head_with_a_nonzero_count() -> None:
+    """An empty head is producible only from an EMPTY log, so `5:` is a head the store can never emit.
+
+    Accepted, it parses to `(5, "")`, which no intact chain can match — so a line truncated while being
+    copied, or an anchor file caught half-written, is reported as `truncated or rewritten` on a chain
+    nobody touched. The docstring's own contract forbids handing a comparator such a head.
+    """
+    assert parse_audit_anchor("0:") == (0, "")  # the legal pairing still round-trips
+    with pytest.raises(ValueError, match="only producible from an EMPTY log"):
+        parse_audit_anchor("5:")
+
+
+def test_anchor_file_reader_refuses_an_oversized_file(tmp_path: Path) -> None:
+    """The byte bound is a LOG-DISCLOSURE control: every parse refusal quotes its input back.
+
+    Without it a path typo'd onto a config file, a key file or a captured message would put that
+    file's whole contents into the service log at WARNING (CLAUDE.md section 9).
+    """
+    big = tmp_path / "not-an-anchor.txt"
+    big.write_text("x" * (AUDIT_ANCHOR_MAX_BYTES + 1), encoding="utf-8")
+    with pytest.raises(OSError, match="larger than"):
+        read_audit_anchor_file(big)
+
+
+async def test_a_mispointed_anchor_file_is_not_echoed_into_the_log(tmp_path: Path) -> None:
+    """The leak this pair of controls closes, driven end to end at the engine.
+
+    A secret-looking line in the mis-pointed file must not reach the log — the refusal is `safe_exc`-
+    scrubbed and the read is bounded, so the operator learns the anchor is unusable without the
+    contents being published alongside.
+    """
+    db = tmp_path / "leak.db"
+    await _aseed_audit_rows(db, 2)
+    secret = "MEFOR_STORE_ENCRYPTION_KEY=" + "9" * 64
+    mispointed = tmp_path / "typo.env"
+    mispointed.write_text(secret + "\nsecond_line_should_never_be_read=1\n", encoding="utf-8")
+
+    sink, cap = await _verify_on_start(db, mispointed)
+
+    assert sink.events == []
+    assert "does not hold a usable anchor" in cap.text, cap.records
+    # The RECORD itself, before any downstream redaction filter. A filter is defence in depth, not the
+    # control: measured during this change, one scrubbed a key's VALUE and let its NAME plus 165
+    # further characters through. Asserting post-filter would have passed on that.
+    assert secret not in cap.text, "the mis-pointed file's contents reached the service log"
+    assert "MEFOR_STORE_ENCRYPTION_KEY" not in cap.text
+    assert "second_line_should_never_be_read" not in cap.text
+    # The operator still learns WHICH file and WHAT was wrong — scrubbing must not cost them the fix.
+    assert "typo.env" in cap.text and "no ':' separator" in cap.text
+    assert "verified 2 audit row(s)" in cap.text
+
+
+def test_anchor_error_separates_the_operator_quote_from_the_loggable_reason() -> None:
+    """`str(exc)` quotes the bad value for the terminal; `.reason` never does, for the service log.
+
+    The CLI operator typed the path and needs to see what they typed. The engine writes to a
+    persistent log NSSM captures to disk, where the same quote publishes whatever the path was
+    typo'd onto.
+    """
+    with pytest.raises(AuditAnchorError) as caught:
+        parse_audit_anchor("s3cr3t-value-not-an-anchor")
+    exc = caught.value
+    assert "s3cr3t-value-not-an-anchor" in str(exc)  # the CLI rendering keeps it
+    assert "s3cr3t-value-not-an-anchor" not in exc.reason  # the loggable one never does
+    assert exc.reason == "no ':' separator"
+    assert isinstance(exc, ValueError)  # every existing `except ValueError` still fires
+
+
+def test_integrity_settings_carries_the_anchor_key_and_the_app_passes_it() -> None:
+    """The key must be REACHABLE from `[integrity]`, or the feature is a documented dead setting.
+
+    `create_managed_app` is the only route an `[integrity]` key reaches the Engine, so a field added to
+    `IntegritySettings` and not named there is configurable, documented, and never read. That exact
+    scope-drop is on this row's record, which is why it is pinned rather than trusted.
+    """
+    import inspect
+
+    from messagefoundry.api.app import create_managed_app
+    from messagefoundry.config.settings import IntegritySettings
+
+    assert IntegritySettings().audit_anchor_file == ""  # default is off, walk stays bare
+    assert IntegritySettings(audit_anchor_file="a.txt").audit_anchor_file == "a.txt"
+    # The env layer comes free from `_SECTIONS`, but only if the field exists to receive it.
+    assert "audit_anchor_file" in IntegritySettings.model_fields
+
+    src = inspect.getsource(create_managed_app)
+    assert "audit_anchor_file=integ.audit_anchor_file" in src, (
+        "create_managed_app does not pass [integrity].audit_anchor_file to the Engine — the key "
+        "would be configurable, documented, and never read"
+    )

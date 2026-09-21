@@ -85,6 +85,7 @@ from messagefoundry.redaction import safe_exc
 from messagefoundry.store import MessageStore, SecretRotationMetaStore, Store
 from messagefoundry.store.store import (
     AUDIT_PREFIX_BREAK_MARKER,
+    AuditAnchorError,
     ConnectionMetrics,
     DestinationMetrics,
     InboundMetrics,
@@ -92,6 +93,7 @@ from messagefoundry.store.store import (
     ReingressOutcome,
     ResendOutcome,
     parse_audit_anchor,
+    read_audit_anchor_file,
 )
 
 __all__ = ["Engine", "ConfigReloadDenied", "ReloadOutcome", "ReloadStepFailure"]
@@ -932,30 +934,51 @@ class Engine:
         if path is None:
             return None
         try:
-            # `utf-8-sig` absorbs a leading BOM, matching --expected-anchor-file: PowerShell 5.1's
-            # `Set-Content -Encoding utf8` writes UTF-8 WITH one, and this is a Windows service.
-            raw = await asyncio.to_thread(path.read_text, encoding="utf-8-sig")
+            # The reader is shared with `audit-verify --expected-anchor-file`: same encoding handling,
+            # same byte bound, same first-line rule. It raises UnicodeDecodeError (which subclasses
+            # ValueError, NOT OSError) on a UTF-16 file, so both are caught here.
+            raw = await asyncio.to_thread(read_audit_anchor_file, path)
         except (OSError, UnicodeDecodeError) as exc:
-            # UnicodeDecodeError subclasses ValueError, NOT OSError — catching only the latter would let
-            # a UTF-16 file (PowerShell 5.1's `>`) escape as an unhandled traceback out of startup.
             log.warning(
                 "[integrity].audit_anchor_file %s could not be read (%s) — the startup audit check "
-                "runs as a BARE WALK, which cannot see a truncated tail; write the file with "
+                "runs as a bare walk, which cannot see a truncated tail; write the file with "
                 "'messagefoundry audit-anchor'",
                 path,
                 safe_exc(exc),
             )
             return None
         try:
-            return parse_audit_anchor(raw)
-        except ValueError as exc:
+            anchor = parse_audit_anchor(raw)
+        except AuditAnchorError as exc:
+            # `.reason`, NOT `str(exc)`: the full refusal quotes the offending text back, and this log
+            # is a persistent service log NSSM captures to disk. The file most likely to be here by
+            # mistake is whatever the path was typo'd onto -- a key file, a config, a captured message.
+            # The operator still learns WHAT was wrong and WHICH file; they do not get its contents
+            # published beside it. The reader's byte bound is the other half of that control.
             log.warning(
                 "[integrity].audit_anchor_file %s does not hold a usable anchor (%s) — the startup "
-                "audit check runs as a BARE WALK, which cannot see a truncated tail",
+                "audit check runs as a bare walk, which cannot see a truncated tail",
                 path,
-                exc,
+                exc.reason,
             )
             return None
+        if anchor[0] == 0:
+            # A ZERO-COUNT ANCHOR WITNESSES NOTHING, AND PASSING IT ON WOULD ALARM FOREVER. `0:` is the
+            # anchor of an EMPTY log, and it is a legal, documented thing for an operator to have taken
+            # on a fresh instance. But the comparator captures the head AT row `exp_count` while walking,
+            # and the walk's position counter is only ever >= 1 -- so row 0 is "never reached", `head_ok`
+            # is False, and an intact chain is reported as `truncated or rewritten` on EVERY start.
+            # Measured on an intact 3-row log. Refusing it here is honest in both directions: the claim
+            # "at row 0 the head was empty" is true of every chain ever, so it could detect nothing even
+            # if it compared cleanly, and saying so beats a green that checked nothing.
+            log.warning(
+                "[integrity].audit_anchor_file %s holds '0:', the anchor of an EMPTY log — it can "
+                "witness nothing, so the startup audit check runs as a bare walk. Re-run "
+                "'messagefoundry audit-anchor' against the quiesced store to take a real one",
+                path,
+            )
+            return None
+        return anchor
 
     async def _verify_audit_chain_on_start(self) -> None:
         """Startup audit-chain tamper check (#190-E), ALERT-ONLY: a broken chain logs a WARNING and
@@ -972,7 +995,14 @@ class Engine:
         a row an operator can go and read; a truncated tail names rows that are no longer there to read,
         and points at the anchor's custodian rather than at the database. They also want separate
         throttling — ``integrity_drift``'s subject is its re-alert and rule-matching key, so folding both
-        into ``"audit-chain"`` would let whichever fired first silence the other for a cooldown."""
+        into ``"audit-chain"`` would let whichever fired first silence the other for a cooldown.
+
+        **THEY ARE NOT INDEPENDENT, AND A ``"audit-chain"`` ALERT DOES NOT MEAN THE TAIL IS INTACT.**
+        ``verify_audit_chain`` returns on the chain break BEFORE the prefix comparator runs, so when a
+        row is edited AND the tail is cut — the likeliest real shape, an edit plus its cover-up — only
+        the break is reported and the truncation is never named. Lifting that needs the store to return a
+        structured verdict carrying both instead of one ``(ok, message)`` pair, across all three
+        backends; it is not done here. Read a break as *"at least* a break"."""
         expected_prefix = await self._load_audit_anchor()
         try:
             ok, msg = await self.store.verify_audit_chain(expected_prefix=expected_prefix)
@@ -997,7 +1027,7 @@ class Engine:
         subject = "audit-chain-truncated" if truncated else "audit-chain"
         log.warning(
             "startup audit-chain verification FAILED (alert-only, %s): %s",
-            "TRUNCATED OR REWRITTEN TAIL" if truncated else "chain break",
+            "truncated or rewritten tail" if truncated else "chain break",
             reason,
         )
         if self._alert_sink is not None:

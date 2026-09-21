@@ -1332,8 +1332,10 @@ def audit_prefix_verdict(
     return True, None
 
 
-#: The operator-facing shape of an audit anchor, quoted into every parse refusal below and into the
-#: ``audit-verify`` CLI help. One sentence, one place.
+#: The operator-facing shape of an audit anchor, quoted into every parse refusal below. One sentence,
+#: one place. The ``audit-verify`` CLI's ``--expected-anchor`` help writes its own shorter wording and
+#: does NOT interpolate this -- said plainly because a comment claiming otherwise would let a maintainer
+#: edit this constant believing the help moved with it.
 AUDIT_ANCHOR_FORM = (
     "expected COUNT:HEAD — the row count and the FULL head, copied verbatim from "
     "'messagefoundry audit-anchor' (the 12-character head printed inside a FAIL message is a display "
@@ -1353,6 +1355,72 @@ AUDIT_ANCHOR_DIGEST_HEX_LEN = 64
 #: isolated-module MAC provider with a different prefix MUST be added here, or a legitimate anchor from
 #: that deployment is refused as malformed.
 AUDIT_ANCHOR_ISOLATED_MAC_PREFIX = "vault:v"
+
+
+#: How much of an anchor file is read before it is refused. An anchor is ONE short line -- the longest
+#: producible form is a count plus a `vault:v1:<base64>` MAC, comfortably under 200 bytes -- so anything
+#: past this is not an anchor file and the excess must never be read, let alone quoted back.
+#:
+#: THE BOUND IS A LOG-DISCLOSURE CONTROL, NOT A PERFORMANCE ONE. Every refusal below interpolates the
+#: offending text with ``{text!r}``, and both callers log that refusal. A path typo'd onto
+#: ``messagefoundry.toml``, a key file, or a captured HL7 message would otherwise put that file's whole
+#: contents into the service log at WARNING -- which is the PHI rule in CLAUDE.md section 9, breached by
+#: a control whose own purpose is to avoid manufacturing bad outcomes from its input handling.
+AUDIT_ANCHOR_MAX_BYTES = 4096
+
+
+class AuditAnchorError(ValueError):
+    """A ``COUNT:HEAD`` anchor that :func:`parse_audit_anchor` refuses, carrying TWO renderings.
+
+    ``str(exc)`` quotes the offending text back, which is what an operator running ``audit-verify``
+    needs: they typed the path, the refusal lands on their own terminal, and seeing the bad value is
+    how they fix it. ``reason`` says what was wrong and **never includes the text**.
+
+    THE SPLIT EXISTS BECAUSE THE TWO CONSUMERS HAVE DIFFERENT EXPOSURE, not because one is tidier. The
+    engine's startup check logs to a persistent service log that NSSM captures to disk, so quoting the
+    file there publishes whatever the path was typo'd onto -- a key file, ``messagefoundry.toml``, a
+    captured message -- at WARNING, which is the PHI rule in CLAUDE.md section 9. Redaction filters
+    downstream of the logger do catch some of it, and a control resting on that is resting on a false
+    premise: measured, a filter scrubbed a key's VALUE and let its name and 165 further characters
+    through. Not putting the content in the record is the control; the filter is defence in depth.
+
+    It subclasses ``ValueError`` so every existing ``except ValueError`` around the parser still fires.
+    """
+
+    def __init__(self, reason: str, text: str) -> None:
+        #: What was wrong, with NO part of the offending text in it. Safe for a service log.
+        self.reason = reason
+        self.text = text
+        super().__init__(f"malformed audit anchor {text!r}: {reason} — {AUDIT_ANCHOR_FORM}")
+
+
+def read_audit_anchor_file(path: str | Path) -> str:
+    """Read an anchor file into the text :func:`parse_audit_anchor` takes. Raises ``OSError`` or
+    ``UnicodeDecodeError``; each caller words its own operator-facing refusal around those.
+
+    ``utf-8-sig`` absorbs a leading BOM: PowerShell 5.1's ``Set-Content -Encoding utf8`` writes UTF-8
+    WITH one, and this product deploys as a Windows service, so that is a first-class way an operator
+    produces this file. ``UnicodeDecodeError`` is raised, not swallowed, because PowerShell 5.1's ``>``
+    writes UTF-16LE -- the likely mistake, not an exotic one -- and it subclasses ``ValueError`` rather
+    than ``OSError``, so a caller that catches only the latter lets it escape as an unhandled traceback.
+
+    ONE READER FOR BOTH CONSUMERS (the ``audit-verify`` CLI and the engine's startup check), for the
+    same reason :func:`parse_audit_anchor` is one parser: the encoding handling, the byte bound and the
+    first-line rule are each a place a later hardening would otherwise reach one caller and miss the
+    other. Only the first line is returned, bounded by :data:`AUDIT_ANCHOR_MAX_BYTES`."""
+    with Path(path).open("rb") as fh:
+        # Read one byte past the bound so an oversized file is DETECTED rather than silently truncated
+        # into a parse failure that blames the operator's anchor for the reader's cap.
+        data = fh.read(AUDIT_ANCHOR_MAX_BYTES + 1)
+    if len(data) > AUDIT_ANCHOR_MAX_BYTES:
+        raise OSError(
+            f"anchor file is larger than {AUDIT_ANCHOR_MAX_BYTES} bytes, so it is not an anchor "
+            f"(an anchor is one short COUNT:HEAD line)"
+        )
+    # The first line only: a file whose SECOND line is something else is a refusal either way, and
+    # taking one line keeps whatever follows out of the refusal message that quotes this back.
+    lines = data.decode("utf-8-sig").splitlines()
+    return lines[0] if lines else ""
 
 
 def parse_audit_anchor(text: str) -> tuple[int, str]:
@@ -1381,6 +1449,11 @@ def parse_audit_anchor(text: str) -> tuple[int, str]:
 
     An EMPTY head is legal and load-bearing — :meth:`MessageStore.audit_anchor` returns ``(0, "")`` for
     an empty log, so ``0:`` must round-trip or a fresh instance is the one state that cannot be anchored.
+    **It is legal ONLY at count 0**, and that pairing is the whole of its legality: an empty head is
+    producible only from an empty log, so ``5:`` is a head the store can never emit and falls under the
+    refusal above. Left accepted it parses to ``(5, "")``, which no intact chain can match — so a line
+    truncated while being copied, or an anchor file caught half-written, would be reported as
+    ``truncated or rewritten`` on a chain nobody touched.
 
     IT LIVES HERE, BESIDE THE COMPARATORS AND THE PRODUCER, BECAUSE IT NOW HAS TWO CONSUMERS: the
     ``audit-verify`` CLI and the engine's ``[integrity].audit_anchor_file`` startup check (BACKLOG #328).
@@ -1391,34 +1464,38 @@ def parse_audit_anchor(text: str) -> tuple[int, str]:
     raw = text.strip()
     count_text, sep, head = raw.partition(":")
     if not sep:
-        raise ValueError(f"malformed audit anchor {text!r}: no ':' separator — {AUDIT_ANCHOR_FORM}")
+        raise AuditAnchorError("no ':' separator", text)
     try:
         count = int(count_text)
     except ValueError:
-        raise ValueError(
-            f"malformed audit anchor {text!r}: row count {count_text!r} is not an integer — "
-            f"{AUDIT_ANCHOR_FORM}"
-        ) from None
+        # The count is quoted in `str(exc)` via `text`, so the reason stays content-free: a row count
+        # is short and non-secret, but "content-free" has to be a rule, not a judgement per branch.
+        raise AuditAnchorError("the row count is not an integer", text) from None
     if count < 0:
-        raise ValueError(
-            f"malformed audit anchor {text!r}: row count {count} is negative — {AUDIT_ANCHOR_FORM}"
-        )
+        raise AuditAnchorError(f"the row count {count} is negative", text)
     head = head.strip()
     if not head:
+        if count != 0:
+            raise AuditAnchorError(
+                "an empty head is only producible from an EMPTY log, so it cannot carry a row count "
+                f"of {count}",
+                text,
+            )
         return count, head
     if all(c in _AUDIT_ANCHOR_HEX for c in head):
         if len(head) != AUDIT_ANCHOR_DIGEST_HEX_LEN:
-            raise ValueError(
-                f"malformed audit anchor {text!r}: head {head!r} is {len(head)} hex characters, not "
-                f"a full {AUDIT_ANCHOR_DIGEST_HEX_LEN}-character digest — {AUDIT_ANCHOR_FORM}"
+            raise AuditAnchorError(
+                f"the head is {len(head)} hex characters, not a full "
+                f"{AUDIT_ANCHOR_DIGEST_HEX_LEN}-character digest",
+                text,
             )
         return count, head.lower()
     if head.startswith(AUDIT_ANCHOR_ISOLATED_MAC_PREFIX):
         return count, head  # opaque by construction; never normalise what we do not define
-    raise ValueError(
-        f"malformed audit anchor {text!r}: head {head!r} is neither a "
-        f"{AUDIT_ANCHOR_DIGEST_HEX_LEN}-character hex digest nor an isolated-module "
-        f"{AUDIT_ANCHOR_ISOLATED_MAC_PREFIX}… MAC (ADR 0138) — {AUDIT_ANCHOR_FORM}"
+    raise AuditAnchorError(
+        f"the head is neither a {AUDIT_ANCHOR_DIGEST_HEX_LEN}-character hex digest nor an "
+        f"isolated-module {AUDIT_ANCHOR_ISOLATED_MAC_PREFIX}… MAC (ADR 0138)",
+        text,
     )
 
 
