@@ -40,6 +40,7 @@ import warnings
 from pathlib import Path
 
 import pytest
+from _docs_toml import TOML_FENCE_RE, dedent
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DOC = _ROOT / "docs" / "security" / "OFF-LOOPBACK-DEPLOYMENT.md"
@@ -122,27 +123,11 @@ def test_runbook_does_not_present_store_method_name_as_a_cli_command() -> None:
 
 
 # ── TOML config blocks: every fenced ``toml`` block must be copy-pasteable ────────────────────────
-
-# ```toml\n ... \n``` with the block's 1-based start line, so a failure names the line to fix. The
-# optional leading indent matters: a fence nested inside a numbered step is indented to stay part of
-# that list item, and a column-0-only pattern would silently skip it — an unguarded block is exactly
-# the defect class this module exists to stop. The closing fence must carry the SAME indent, so a
-# nested fence can't swallow the rest of the document.
-_TOML_FENCE_RE = re.compile(
-    r"^(?P<indent>[ ]{0,6})```toml[ \t]*$\n(?P<body>.*?)^(?P=indent)```[ \t]*$",
-    re.DOTALL | re.MULTILINE,
-)
-
-
-def _dedent(body: str, indent: str) -> str:
-    """Strip the fence's own list indent from each line, so the guard loads what a reader copies."""
-    if not indent:
-        return body
-    return "".join(
-        line.removeprefix(indent) if line.strip() else line
-        for line in body.splitlines(keepends=True)
-    )
-
+#
+# ``TOML_FENCE_RE`` + ``dedent`` moved to ``tests/_docs_toml.py`` on 2026-09-20 (PR #1373 review):
+# ``tests/test_runbook_proxy_tls_floor.py`` imported them FROM HERE, which is a test importing
+# another test, and ``tests/test_docs_cite_no_refused_config_keys.py`` then wanted the same fence
+# machinery for a third purpose. That module's docstring carries the regex's own reasoning.
 
 #: A ``toml`` fence whose first non-blank line is this marker is a **connections.toml** block, not a
 #: ``messagefoundry.toml`` one — different file, different loader, different (strict) key contract.
@@ -152,9 +137,9 @@ _CONNECTIONS_MARKER = "# connections.toml"
 def _all_toml_fences() -> list[tuple[int, str]]:
     text = _DOC.read_text(encoding="utf-8")
     fences: list[tuple[int, str]] = []
-    for match in _TOML_FENCE_RE.finditer(text):
+    for match in TOML_FENCE_RE.finditer(text):
         lineno = text.count("\n", 0, match.start()) + 2  # first line INSIDE the fence
-        fences.append((lineno, _dedent(match.group("body"), match.group("indent"))))
+        fences.append((lineno, dedent(match.group("body"), match.group("indent"))))
     return fences
 
 
@@ -255,11 +240,11 @@ def test_runbook_engine_config_block_declares_in_use_data_protection(
     heading = "### The engine config beside either proxy"
     start = text.find(heading)
     assert start != -1, f"runbook section {heading!r} missing from {_DOC.name}"
-    match = _TOML_FENCE_RE.search(text, start)
+    match = TOML_FENCE_RE.search(text, start)
     assert match is not None, f"no toml block under {heading!r}"
 
     path = tmp_path / "messagefoundry.toml"
-    path.write_text(_dedent(match.group("body"), match.group("indent")), encoding="utf-8")
+    path.write_text(dedent(match.group("body"), match.group("indent")), encoding="utf-8")
     settings = load_settings(config_path=path, environ={})
     assert settings.security.memory_encryption_operator_declared is True, (
         "the runbook's engine config block declares [api].tls_terminated_upstream (exposed) but not "
