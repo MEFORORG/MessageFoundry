@@ -129,11 +129,10 @@ class OrderingMode(str, Enum):  # noqa: UP042
     at a time**, so relaxing ordering does not raise a single connection's throughput. Parallelism
     comes from running more outbound connections.
 
-    ``UNORDERED`` is read only under ``claim_mode="per_lane"``, where the per-lane delivery worker
-    consults it. Under the shipped default ``claim_mode="pooled"`` the setting is **inert**: the pooled
-    OUTBOUND dispatcher claims one head per lane and never reads the ordering mode, so the lane drains
-    FIFO whatever this says. The member stays for at least two reasons: ADR 0154 D4 requires
-    ``UNORDERED`` on a ``reply_from`` lane, and retiring the mode is an owner decision nobody has made.
+    An ``UNORDERED`` lane runs its own delivery worker in **either** claim mode (ADR 0066 D4), so the
+    setting means the same thing under the shipped ``claim_mode="pooled"`` as under ``per_lane``. The
+    consumer is chosen when the lane starts and a reload does not move a live lane between consumers,
+    so switching a running lane from ``FIFO`` to ``UNORDERED`` takes effect at the next engine start.
     """
 
     FIFO = "fifo"
