@@ -229,3 +229,30 @@ def test_the_harness_pin_keeps_the_extra_the_harness_actually_needs() -> None:
         f"the harness depends on messagefoundry{sorted(engine.extras)}, not [harness] - the extra "
         f"is what installs PySide6, so the GUI would not start on a fresh install"
     )
+
+
+def test_the_harness_names_the_engine_once_in_the_table_the_release_counts() -> None:
+    """The release smoke insists on EXACTLY ONE, and this is the only place that can say so in CI.
+
+    release.yml's harness smoke reads the built wheel's ``Requires-Dist`` and exits non-zero on any
+    count but one (BACKLOG #1585). ``_engine_requirement`` above returns the FIRST match and ignores
+    the rest, so a second line naming the engine passes every other assertion in this file and reds
+    the release instead -- in a job with ``needs: release``, after the engine is on PyPI.
+
+    SCOPE, and it is the reason the release check still exists: this reads the pyproject, not the
+    built wheel, so it cannot see what the build backend actually emitted. What it does is move this
+    one shape from tag time to the merge queue.
+
+    ``project.optional-dependencies`` is deliberately NOT read. Those reach ``Requires-Dist`` marked
+    ``extra == "<name>"``, a plain install never pulls them in, and the smoke skips them for that
+    reason (tests/test_release_pipeline.py::test_the_harness_smoke_does_not_count_a_requirement_an
+    _extra_gates). Counting them here would forbid a table the sibling console already ships.
+    """
+    deps = tomllib.loads(_HARNESS_PYPROJECT.read_text(encoding="utf-8"))["project"]["dependencies"]
+    named = [raw for raw in deps if _normalise(Requirement(raw).name) == "messagefoundry"]
+    assert len(named) == 1, (
+        f"the harness base dependency table names the engine {len(named)} times: {named}. The "
+        f"release smoke counts them on the built wheel and accepts only one, so this fails at the "
+        f"tag rather than here. Keep one line in "
+        f"{_HARNESS_PYPROJECT.relative_to(_REPO).as_posix()}."
+    )

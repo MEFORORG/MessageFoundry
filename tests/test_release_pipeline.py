@@ -1113,6 +1113,7 @@ def _write_install(
     package_files: dict[str, str] | None,
     recorded_files: dict[str, str] | None = None,
     requires: list[str] | None = None,
+    provides_extra: list[str] | None = None,
 ) -> None:
     """Materialise an installed distribution in ``purelib``, the way a wheel install leaves one.
 
@@ -1120,7 +1121,13 @@ def _write_install(
     ``recorded_files`` is written to disk as well and becomes the ONLY package content RECORD claims,
     so an install whose recorded set and whose importable module disagree can be driven at all.
     ``requires`` overrides ``Requires-Dist``; the default is the lockstep pin the harness smoke
-    checks (the console's script ignores it, so one default serves both).
+    checks (the console's script ignores it, so one default serves both). ``provides_extra`` writes
+    the ``Provides-Extra`` lines a wheel carries when its pyproject declares
+    ``[project.optional-dependencies]``, and it is LOAD-BEARING rather than decoration: the harness
+    smoke decides that a requirement is an extra's, and not the base install's, by asking whether an
+    extra the wheel DECLARES turns that requirement's marker true. A fixture that writes the marker
+    and omits the declaration describes a wheel no build backend produces, and would exercise the
+    wrong branch.
 
     ``recorded_files`` MUST be written to disk, and that is a measured constraint rather than tidiness:
     ``importlib.metadata.Distribution.files`` SILENTLY DROPS every RECORD row whose file is missing
@@ -1152,6 +1159,8 @@ def _write_install(
                 "Metadata-Version: 2.1\n",
                 f"Name: {dist}\n",
                 f"Version: {version}\n",
+                # Before Requires-Dist, which is the order hatchling writes them in.
+                *(f"Provides-Extra: {extra}\n" for extra in provides_extra or []),
                 *(f"Requires-Dist: {req}\n" for req in declared),
             ]
         ),
@@ -1475,6 +1484,115 @@ def test_the_harness_smoke_checks_the_lockstep_pin_on_the_built_artifact(
     assert rc != 0, (
         f"the harness smoke published a wheel with {why} — a lockstep distribution that does not name "
         f"the engine it ships with drags an arbitrary engine onto the operator's box.\n{out}"
+    )
+    assert "1585" in out, (
+        f"the harness smoke rejected {why} without naming the row that explains it.\n{out}"
+    )
+
+
+# --- an extra's requirement is not the lockstep pin (BACKLOG #1585) ---------------------------------
+
+#: What ``dev = ["messagefoundry[dev]"]`` becomes in wheel metadata. Not hypothetical: that exact
+#: table is already in packaging/messagefoundry-webconsole/pyproject.toml, so the harness is one
+#: copied stanza away from shipping a second ``messagefoundry`` line.
+_EXTRA_GATED_ENGINE = 'messagefoundry[dev]; extra == "dev"'
+
+#: A second engine requirement that NO extra gates, and whose marker is false everywhere this suite
+#: can run (there is no Python 2 interpreter to run it on). It is the armed control for the filter
+#: being NARROW: skipping it would mean the filter drops any requirement its environment happens to
+#: exclude, and a drifted pin wearing a platform marker would then reach PyPI unchecked.
+_MARKER_GATED_ENGINE = 'messagefoundry==0.0.1; python_version < "3.0"'
+
+
+def test_the_harness_smoke_does_not_count_a_requirement_an_extra_gates(
+    venv_template: Path, tmp_path: Path
+) -> None:
+    """A correct wheel that also declares an extra must PASS, and the failure it used to raise landed
+    after the engine was on PyPI.
+
+    ``[project.optional-dependencies]`` reaches ``Requires-Dist`` as ``<req>; extra == "<name>"``, a
+    line a plain install never pulls in. The scan here counted those, insisted on exactly one, and so
+    turned any such table into ``declares 2 requirements on the engine``.
+
+    WHAT MAKES IT WORSE THAN AN ORDINARY RED, and why this test lives here rather than in
+    ``tests/test_packaging.py``: that suite reads ``project.dependencies`` and an extra is not in it,
+    so ci.yml stays GREEN. The step carries ``needs: release``, so the red arrives at TAG TIME with
+    the engine already published and the version burnt. The defect is in the workflow's scan, so the
+    only test that can catch it before the tag is one that RUNS that scan.
+    """
+    script, dist, pkg, exe, purelib = _prepared("release-harness", venv_template, tmp_path)
+    _write_install(
+        purelib,
+        dist,
+        pkg,
+        _SMOKE_VERSION,
+        package_files=_good_package(pkg, _SMOKE_VERSION),
+        requires=["messagefoundry[harness]==" + _SMOKE_VERSION, _EXTRA_GATED_ENGINE],
+        provides_extra=["dev"],
+    )
+
+    rc, stdout, out = _run_smoke(exe, script, tmp_path)
+    assert rc == 0, (
+        f"the harness smoke rejected a correctly pinned wheel because it also declares an extra "
+        f"naming the engine. The release would red AFTER the PyPI upload.\n{out}"
+    )
+    assert stdout.strip() == _SMOKE_VERSION, (
+        f"the harness smoke must still print the installed version on stdout, alone.\n{out}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("requires", "why"),
+    [
+        (
+            ["messagefoundry[harness]==0.0.1", _EXTRA_GATED_ENGINE],
+            "a drifted pin standing beside an extra-gated requirement",
+        ),
+        (
+            ["messagefoundry[harness]>=" + _SMOKE_VERSION, _EXTRA_GATED_ENGINE],
+            "a range standing beside an extra-gated requirement",
+        ),
+        (
+            [_EXTRA_GATED_ENGINE],
+            "an extra-gated requirement AS the only mention of the engine",
+        ),
+        (
+            ["messagefoundry[harness]==" + _SMOKE_VERSION, _MARKER_GATED_ENGINE],
+            "a second engine requirement no extra gates",
+        ),
+    ],
+    ids=["drift-beside-extra", "range-beside-extra", "extra-only", "second-not-an-extra"],
+)
+def test_the_extra_filter_did_not_disarm_the_lockstep_check(
+    requires: list[str], why: str, venv_template: Path, tmp_path: Path
+) -> None:
+    """The half worth not losing: the filter must skip an EXTRA, and nothing else.
+
+    The three arms above put the extra-gated line beside a pin that is wrong, missing, or the only
+    thing there, so a filter that swallowed the real pin along with the extra would show up as a
+    PASS. The fourth arm is the over-broad control: its marker is false in this interpreter too, but
+    no declared extra turns it true, so it is still counted. Drop that distinction -- skip every
+    requirement whose marker is false here -- and a drifted pin wearing ``; sys_platform == "win32"``
+    sails past a step that only ever runs on ubuntu.
+
+    Read beside ``test_the_harness_smoke_does_not_count_a_requirement_an_extra_gates``, which is the
+    positive control: without it every arm here passes on a smoke that rejects everything.
+    """
+    script, dist, pkg, exe, purelib = _prepared("release-harness", venv_template, tmp_path)
+    _write_install(
+        purelib,
+        dist,
+        pkg,
+        _SMOKE_VERSION,
+        package_files=_good_package(pkg, _SMOKE_VERSION),
+        requires=requires,
+        provides_extra=["dev"],
+    )
+
+    rc, _stdout, out = _run_smoke(exe, script, tmp_path)
+    assert rc != 0, (
+        f"the harness smoke PASSED {why} — the filter that lets an extra through is swallowing the "
+        f"lockstep pin with it, and BACKLOG #1585's check is disarmed.\n{out}"
     )
     assert "1585" in out, (
         f"the harness smoke rejected {why} without naming the row that explains it.\n{out}"

@@ -924,15 +924,45 @@ jobs:
           from packaging.requirements import Requirement
           from packaging.version import InvalidVersion, Version
 
+          # AN EXTRA'S REQUIREMENT IS NOT ONE OF THESE, and counting it was a defect that could only
+          # surface AFTER the upload. `[project.optional-dependencies]` reaches Requires-Dist as
+          # `<requirement>; extra == "<name>"`, a line a plain `pip install messagefoundry-harness`
+          # never installs. The sibling packaging/messagefoundry-webconsole/pyproject.toml already
+          # carries `dev = ["messagefoundry[dev]"]`, so the first such table added here puts a SECOND
+          # messagefoundry line in this wheel's metadata and the count below reads 2.
+          # tests/test_packaging.py cannot catch it -- that suite reads `project.dependencies`, and an
+          # extra is not in it -- so ci.yml stays GREEN and this step, which carries `needs: release`,
+          # reds with the engine already on PyPI. Half a release, and the version burnt.
+          #
+          # SKIPPED NARROWLY, AND THAT IS THE HALF WORTH NOT LOSING. Dropping every requirement whose
+          # marker is false in this venv reads simpler and would also drop a platform- or
+          # python_version-gated one, so a drifted pin wearing `; sys_platform == "win32"` would sail
+          # past the check BACKLOG #1585 exists to provide, on a step that only ever runs on ubuntu.
+          # A line is skipped only when an extra this wheel DECLARES is what turns its marker true;
+          # a marker false here for any other reason is still counted, and still fails loudly.
+          #
+          # NOT COVERED: `extra == "dev" and sys_platform == "win32"`, where the non-extra half is
+          # false on the runner too. No declared extra turns that marker true, so it is counted
+          # rather than skipped -- erring toward the loud failure, which is the safe side of this.
+          extras = dist.metadata.get_all("Provides-Extra") or []
+
+          def gated_by_an_extra(req: Requirement) -> bool:
+              if req.marker is None or req.marker.evaluate({"extra": ""}):
+                  return False
+              return any(req.marker.evaluate({"extra": extra}) for extra in extras)
+
           engine = [
               req
               for raw in (dist.metadata.get_all("Requires-Dist") or [])
               if (req := Requirement(raw)).name.replace("_", "-").lower() == "messagefoundry"
+              and not gated_by_an_extra(req)
           ]
           if len(engine) != 1:
+              # The surviving requirements are named because this message is read at tag time, with
+              # the engine already published: "2" alone does not say which line to delete.
               raise SystemExit(
                   f"::error::{DIST} {dist.version} declares {len(engine)} requirements on the engine, "
-                  f"expected exactly one (BACKLOG #1585)"
+                  f"expected exactly one (BACKLOG #1585): {[str(req) for req in engine]}"
               )
           # THE PINNED VERSION IS COMPARED AS A PEP 440 VERSION, NOT AS A SPECIFIER STRING. `packaging`
           # preserves the raw spelling: str(Requirement("messagefoundry[harness]==0.3.0-rc1").specifier)
