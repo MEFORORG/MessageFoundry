@@ -101,9 +101,26 @@ def _json_line(out: str) -> dict:
     return json.loads(lines[-1])
 
 
-def _assert_phi_free(out: str) -> None:
-    assert "raw-body" not in out, "raw HL7 body leaked to stdout"
-    assert "DOE^JOHN" not in out, "PHI summary leaked to stdout"
+def _refusal(capsys) -> str:
+    """The stream a refusal actually lands on, named once here rather than at each assertion.
+
+    ``_emit_error`` sends human-readable failures to **stderr** (BACKLOG #1673), so that a shell
+    redirect of a command's output cannot swallow the reason the command failed into the file it was
+    writing. Under ``--json`` the error object IS the machine-readable output and stays on stdout, so
+    those cases are read with :func:`_json_line` instead -- do not route them through here.
+
+    ``readouterr()`` CLEARS both buffers, so this is one call and the stdout half is deliberately
+    dropped: every caller is a refusal case, where stdout is empty by design."""
+    return capsys.readouterr().err
+
+
+def _assert_phi_free(out: str, err: str = "") -> None:
+    """Neither stream carries PHI. ``err`` is checked too because refusals moved there (BACKLOG
+    #1673): a guard that named only stdout would stop covering the whole error path the day that
+    landed, while still reading like a complete PHI check."""
+    for stream, text in (("stdout", out), ("stderr", err)):
+        assert "raw-body" not in text, f"raw HL7 body leaked to {stream}"
+        assert "DOE^JOHN" not in text, f"PHI summary leaked to {stream}"
 
 
 def _make_archive(
@@ -200,9 +217,9 @@ def test_restore_refuses_existing_destination(tmp_path, key_b64, capsys) -> None
 
     rc = main(["restore", archive, "--to", str(dest), "--service-config", toml])
     assert rc == 1
-    out = capsys.readouterr().out
-    assert "refusing to overwrite" in out
-    assert str(dest) in out  # the message names the path
+    err = _refusal(capsys)
+    assert "refusing to overwrite" in err
+    assert str(dest) in err  # the message names the path
     assert dest.read_bytes() == b"not-a-store-but-mine"  # untouched
 
 
@@ -216,8 +233,8 @@ def test_restore_refuses_existing_wal_sidecar(tmp_path, key_b64, capsys) -> None
 
     rc = main(["restore", archive, "--to", str(dest), "--service-config", toml])
     assert rc == 1
-    out = capsys.readouterr().out
-    assert "refusing to overwrite" in out and "-wal" in out
+    err = _refusal(capsys)
+    assert "refusing to overwrite" in err and "-wal" in err
     assert not dest.exists()  # nothing was written next to the sidecar
 
 
@@ -232,7 +249,7 @@ def test_restore_refuses_wrong_key(tmp_path, key_b64, capsys) -> None:
     dest = tmp_path / "restored.db"
     rc = main(["restore", archive, "--to", str(dest), "--service-config", wrong_toml])
     assert rc == 1
-    assert "KEY_MISMATCH" in capsys.readouterr().out
+    assert "KEY_MISMATCH" in _refusal(capsys)
     assert not dest.exists()
 
 
@@ -247,15 +264,15 @@ def test_restore_refuses_corrupt_archive(tmp_path, key_b64, capsys) -> None:
     dest = tmp_path / "restored.db"
     rc = main(["restore", str(corrupt), "--to", str(dest), "--service-config", toml])
     assert rc == 1
-    out = capsys.readouterr().out
-    assert "did not verify" in out
+    err = _refusal(capsys)
+    assert "did not verify" in err
     assert not dest.exists()
     # The refusal must keep BOTH halves of what the codec can tell: a failed tag means bad bytes OR the
     # wrong key. These two substrings come from backup_codec, deliberately -- an operator told only
     # "corrupt" goes hunting for bad media when the archive is intact and the DEK is not, so if a codec
     # reword ever drops the distinction, this is the assertion that should notice.
-    assert "wrong key" in out
-    assert "corrupt" in out
+    assert "wrong key" in err
+    assert "corrupt" in err
 
 
 def test_restore_refuses_an_archive_whose_header_will_not_parse(tmp_path, key_b64, capsys) -> None:
@@ -271,7 +288,7 @@ def test_restore_refuses_an_archive_whose_header_will_not_parse(tmp_path, key_b6
 
     rc = main(["restore", str(bad), "--to", str(dest), "--service-config", toml])
     assert rc == 1
-    assert "did not verify" in capsys.readouterr().out
+    assert "did not verify" in _refusal(capsys)
     assert not dest.exists()
 
 
@@ -291,9 +308,9 @@ def test_restore_key_mismatch_from_the_decrypt_is_not_reported_as_a_bad_archive(
 
     rc = main(["restore", archive, "--to", str(dest), "--service-config", toml])
     assert rc == 1
-    out = capsys.readouterr().out
-    assert "KEY_MISMATCH" in out
-    assert "did not verify" not in out  # NOT relabelled as a corrupt archive
+    err = _refusal(capsys)
+    assert "KEY_MISMATCH" in err
+    assert "did not verify" not in err  # NOT relabelled as a corrupt archive
     assert not dest.exists()
 
 
@@ -320,7 +337,7 @@ def test_restore_leaves_no_partial_store_when_the_copy_dies(
 
     rc = main(["restore", archive, "--to", str(dest), "--service-config", toml])
     assert rc == 1
-    assert "restore failed" in capsys.readouterr().out
+    assert "restore failed" in _refusal(capsys)
     assert not dest.exists()  # the truncated bytes were removed, not left to be activated
 
 
@@ -346,7 +363,7 @@ def test_restore_does_not_delete_the_winner_of_a_create_race(
 
     rc = main(["restore", archive, "--to", str(dest), "--service-config", toml])
     assert rc == 1
-    assert "refusing to overwrite" in capsys.readouterr().out
+    assert "refusing to overwrite" in _refusal(capsys)
     assert dest.read_bytes() == b"the winner's store"  # untouched by the loser's cleanup
 
 
@@ -363,7 +380,7 @@ def test_restore_missing_archive(tmp_path, key_b64, capsys) -> None:
         ]
     )
     assert rc == 1
-    assert "no archive at" in capsys.readouterr().out
+    assert "no archive at" in _refusal(capsys)
 
 
 # --- (4) --config-to ----------------------------------------------------------
@@ -412,7 +429,7 @@ def test_restore_config_to_refuses_non_empty_dir(tmp_path, key_b64, capsys) -> N
         ]
     )
     assert rc == 1
-    assert "non-empty" in capsys.readouterr().out
+    assert "non-empty" in _refusal(capsys)
     assert (cfg / "mine.py").exists()
 
 
@@ -447,9 +464,9 @@ def test_restore_refuses_a_config_member_aimed_at_the_restored_store(
     )
     assert rc == 1
     # Human output, not --json: the paths are compared verbatim, and JSON would escape the separators.
-    out = capsys.readouterr().out
-    assert "where this restore publishes the store" in out
-    assert str(dest) in out  # the colliding path is named
+    err = _refusal(capsys)
+    assert "where this restore publishes the store" in err
+    assert str(dest) in err  # the colliding path is named
     # Refused BEFORE the store was extracted, so nothing was published and nothing was clobbered: no
     # store at the --to path, and no half-written config bundle beside it.
     assert not dest.exists()
@@ -480,7 +497,7 @@ def test_restore_refuses_a_colliding_config_member_whatever_the_case(
         ]
     )
     assert rc == 1
-    assert "where this restore publishes the store" in capsys.readouterr().out
+    assert "where this restore publishes the store" in _refusal(capsys)
     assert not dest.exists()
 
 
@@ -537,7 +554,7 @@ def test_restore_refuses_a_config_dest_under_the_store_path(tmp_path, key_b64, c
         ]
     )
     assert rc == 1
-    assert "sits under the restored store's own path" in capsys.readouterr().out
+    assert "sits under the restored store's own path" in _refusal(capsys)
     assert not dest.exists()  # refused before any decrypt
 
 
@@ -562,7 +579,7 @@ def test_restore_refuses_a_config_dest_that_is_an_existing_file(tmp_path, key_b6
         ]
     )
     assert rc == 1
-    assert "names an existing file" in capsys.readouterr().out
+    assert "names an existing file" in _refusal(capsys)
     assert not_a_dir.read_text(encoding="utf-8") == "# a file, not a directory\n"
 
 
@@ -606,7 +623,7 @@ def test_restore_config_to_refuses_when_archive_has_no_config(tmp_path, key_b64,
         ]
     )
     assert rc == 1
-    assert "no config bundle" in capsys.readouterr().out
+    assert "no config bundle" in _refusal(capsys)
 
 
 # --- (5) config-only archive has no store to restore -------------------------
@@ -638,7 +655,7 @@ def test_restore_refuses_config_only_archive(tmp_path, key_b64, capsys) -> None:
     dest = tmp_path / "restored.db"
     rc = main(["restore", archive, "--to", str(dest), "--service-config", toml])
     assert rc == 1
-    assert "CONFIG-ONLY" in capsys.readouterr().out
+    assert "CONFIG-ONLY" in _refusal(capsys)
     assert not dest.exists()
 
 
@@ -661,4 +678,56 @@ def test_restore_stdout_is_phi_free(tmp_path, key_b64, capsys, as_json) -> None:
     if as_json:
         argv.append("--json")
     assert main(argv) == 0
-    _assert_phi_free(capsys.readouterr().out)
+    captured = capsys.readouterr()
+    _assert_phi_free(captured.out, captured.err)
+
+
+# --- (7) the pre-publish row-count compare -----------------------------------
+
+
+def _snap_with(tmp_path: Path, messages: int) -> Path:
+    """A minimal two-table SQLite file standing in for an extracted ``store.db``."""
+    import sqlite3
+
+    snap = tmp_path / "store.db"
+    conn = sqlite3.connect(snap)
+    try:
+        conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY)")
+        conn.execute("CREATE TABLE queue (id INTEGER PRIMARY KEY)")
+        conn.executemany(
+            "INSERT INTO messages (id) VALUES (?)", [(i,) for i in range(1, messages + 1)]
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return snap
+
+
+@pytest.mark.parametrize(
+    ("label", "manifest_counts", "raises"),
+    [
+        # The compare is keyed off the MANIFEST's keys, not dict equality, because `_count_tables`
+        # derives its table set from the snapshot's own sqlite_master (BACKLOG #1722). These pin both
+        # directions of that: what must still refuse, and what must no longer refuse.
+        ("exact match", {"messages": 3, "queue": 0}, False),
+        # Real data loss, which is the whole point of the check.
+        ("torn: manifest declares more rows than survived", {"messages": 5, "queue": 0}, True),
+        # A table the manifest tracked that the snapshot's schema lacks reads as 0, so a NONZERO
+        # manifest count for it is still loss and still refuses.
+        ("dropped table the manifest counted", {"messages": 3, "audit_log": 7}, True),
+        # ...and a zero one is the documented convention for a table absent from the schema.
+        ("absent table the manifest recorded as 0", {"messages": 3, "audit_log": 0}, False),
+        # The case dict equality got wrong: an archive whose manifest predates the widened table set
+        # is the ORDINARY thing to restore, and equality would have refused every one of them.
+        ("older, narrower manifest", {"messages": 3}, False),
+        ("manifest carrying no row_counts at all", None, False),
+    ],
+)
+def test_restore_row_count_compare(tmp_path, label, manifest_counts, raises) -> None:
+    snap = _snap_with(tmp_path, messages=3)
+    manifest: dict[str, object] = {} if manifest_counts is None else {"row_counts": manifest_counts}
+    if raises:
+        with pytest.raises(dr_backup.BackupError, match="row-count mismatch"):
+            dr_backup._verify_extracted_store(snap, manifest)
+    else:
+        assert dr_backup._verify_extracted_store(snap, manifest) == {"messages": 3, "queue": 0}

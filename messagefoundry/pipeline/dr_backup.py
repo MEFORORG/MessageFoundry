@@ -152,12 +152,14 @@ _MAX_RESTORE_MEMBER_BYTES = 16 * 1024 * 1024 * 1024  # 16 GiB
 #: **Why twice the member cap, and why a multiple rather than a literal.** A conforming archive is one
 #: ``store.db`` — admitted up to :data:`_MAX_RESTORE_MEMBER_BYTES`, above which the verify FAILs at the
 #: member cap anyway — plus the config bundle, the manifest and tar framing. So the cumulative ceiling
-#: cannot sit AT the member cap without refusing a store snapshot that is itself legal, and nothing on
-#: this branch bounds the config bundle, so there is no exact second term to add. Rather than fork a
-#: second number, the remainder gets the ceiling the store gets: one whole extra maximal snapshot of
-#: headroom, which no real config dir (a few Python modules, a TOML, some codesets) approaches.
-#: Written as a multiple so it TRACKS the member cap: a literal would silently begin false-refusing
-#: legal archives the day that cap was raised.
+#: cannot sit AT the member cap without refusing a store snapshot that is itself legal. The config
+#: bundle IS bounded, by :data:`_MAX_CONFIG_BYTES` (1 GiB), so an exact second term now exists and this
+#: ceiling is deliberately NOT written as that sum: ``member + config`` would be the tightest bound but
+#: it is also a THIRD thing to keep in step, and this one is strictly more generous than it (2 x 16 GiB
+#: against 16 GiB + 1 GiB), so it never false-refuses an archive the per-member and per-bundle caps
+#: would admit. Written as a multiple of the member cap so it TRACKS that cap: a literal would silently
+#: begin false-refusing legal archives the day the member cap was raised. Tightening it to the exact
+#: sum is a legitimate follow-up; it buys no refusal that the two component caps do not already make.
 #:
 #: A file-size cap (``max_plaintext_bytes = archive.stat().st_size``) looks like the exact bound and is
 #: not one — it can never fire. Each frame carries 12 nonce + 4 length + 16 tag bytes around at most
@@ -1604,8 +1606,17 @@ def _restore_blocking(
                 # A failed GCM tag is the point of the AEAD framing, so it is an ORDINARY outcome here,
                 # not a bug: refuse the way the destination check does rather than escape as a codec
                 # exception. Narrowed to the codec's own type so an OSError stays an OSError.
+                #
+                # Capped for the same ASVS 5.2.3 reason as the verify path's call: this decrypt is the
+                # first thing to write into the staging dir, so an oversized archive is refused before
+                # `_extract_member`'s per-member cap is ever reached. The staging dir is on the
+                # DESTINATION volume here, which makes the bound matter more than it does on verify --
+                # an unbounded decrypt would fill the very volume the restored store is about to land
+                # on. POST-AUTHENTICATION, like the verify site: see _MAX_RESTORE_PLAINTEXT_BYTES.
                 try:
-                    decrypt_stream(src, dst, match_key)
+                    decrypt_stream(
+                        src, dst, match_key, max_plaintext_bytes=_MAX_RESTORE_PLAINTEXT_BYTES
+                    )
                 except BackupCodecError as exc:
                     raise _codec_refusal(exc) from exc
             else:
@@ -1663,20 +1674,32 @@ def _restore_blocking(
 def _verify_extracted_store(snap: Path, manifest: dict[str, object]) -> dict[str, int]:
     """``integrity_check`` + the manifest row-count compare on the extracted ``store.db``, run on the
     exact file about to be placed. Same two checks (and the same helpers) as
-    :func:`_verify_archive_blocking` steps 3-4; returns the counts for the restore summary."""
+    :func:`_verify_archive_blocking` steps 3-4; returns the counts for the restore summary.
+
+    The compare is keyed off the MANIFEST's own keys rather than dict equality, for the reason
+    :func:`_verify_archive_blocking` gives at its step 4: :func:`_count_tables` derives its table set
+    from the snapshot's own ``sqlite_master`` (BACKLOG #1722), so a manifest written before that set
+    was widened records fewer tables than the archive really has. Restoring an archive taken by an
+    EARLIER build is the ordinary case for this subcommand, so dict equality would refuse on sight the
+    archives a restore exists to accept. A table the manifest tracked that the snapshot's schema lacks
+    reads as 0, so a manifest count of 0 still passes and a nonzero one still raises: real data loss is
+    still caught. A table the snapshot has that the manifest never tracked is not compared at all."""
     integrity_ok, integrity_msg = _integrity_check(snap)
     if not integrity_ok:
         raise BackupError("verify", f"the archive's store failed integrity_check: {integrity_msg}")
-    row_counts = _count_tables(snap, _VERIFY_TABLES)
+    row_counts = _count_tables(snap)
     raw_counts = manifest.get("row_counts")
     manifest_counts = (
         {str(k): int(v) for k, v in raw_counts.items()} if isinstance(raw_counts, dict) else {}
     )
-    if manifest_counts and row_counts != manifest_counts:
+    mismatches = sorted(
+        table for table in manifest_counts if row_counts.get(table, 0) != manifest_counts[table]
+    )
+    if mismatches:
         raise BackupError(
             "verify",
-            f"row-count mismatch (a torn or truncated snapshot): store={row_counts} "
-            f"manifest={manifest_counts}",
+            f"row-count mismatch on {mismatches} (a torn or truncated snapshot): "
+            f"store={row_counts} manifest={manifest_counts}",
         )
     return row_counts
 

@@ -415,7 +415,13 @@ application log files (`[logging].log_dir`).
     further in, and the distinction is the archive versus the cells inside it: `full_restore_verify`
     opens the extracted snapshot's cipher-covered cells through the **store** cipher
     (`build_store_cipher`, ADR 0049 AC-13) — the same cipher that wrote them — so under `vault_transit`
-    that read runs in Transit exactly as a live cell read would. And `[backup].allow_unencrypted = true`
+    that read runs in Transit exactly as a live cell read would. Two paths unseal an archive, and only
+    one of them crosses that frame: the `restore` subcommand (ADR 0049, BACKLOG #1717) unseals with the
+    same `resolve_active_key` DEK and then **stops at the seal** — it checks the extracted snapshot with
+    `PRAGMA integrity_check` and a row count over a plain read-only `sqlite3` connection, decrypts no
+    cell, and places the file. So a restore needs no store cipher at all, and under `vault_transit` it
+    makes no Transit call; a full restore-verify is the only one of the two that does.
+    And `[backup].allow_unencrypted = true`
     writes a **CLEARTEXT `.mfbak.plain`** — a plaintext PHI-body archive on disk.
   - *File-connector spill dirs* — **plaintext on disk**; there is no cipher on that path, only
     volume/share encryption and the directory ACL.

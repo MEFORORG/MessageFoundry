@@ -767,8 +767,30 @@ def test_pl1_encryption_rule_carves_out_the_backup_codec() -> None:
 #: ``dr_backup`` functions that SEAL or UNSEAL the ``.mfbak`` archive itself. §3's carve-out
 #: ("the archive's own seal is keyed by `resolve_active_key` and not `build_store_cipher`, so
 #: `vault_transit` never applies") is a claim about THESE functions and no others.
+#:
+#: ``_restore_blocking`` (the `restore` subcommand, BACKLOG #1717) was added to this set rather than
+#: waived, and the carve-out is re-derived for it rather than assumed. It unseals with ``match_key``,
+#: which comes from ``_select_decrypt_key`` over the keys ``_resolve_key`` resolved — RAW DEK BYTES,
+#: the same source the seal side uses — so §3's sentence is true of it verbatim. The part that had to
+#: be CHECKED rather than asserted is the other half: whether restoring also reads the snapshot's cells
+#: back, which is the operation that legitimately needs the store cipher. A full restore-verify does,
+#: through ``_full_open_check``/``_decrypt_check`` — which is what those two are doing in
+#: :data:`_SNAPSHOT_READ_FUNCS`. The restore path has no such companion. ``_restore_blocking`` stops
+#: at the seal: its post-extract checks are
+#: ``_integrity_check`` (``PRAGMA integrity_check``) and ``_count_tables`` (``SELECT COUNT(*)``), both
+#: on a plain read-only ``sqlite3`` connection with no cipher, and it then PLACES the file. No cell is
+#: decrypted on the restore path, so unlike a full restore-verify it needs no store cipher at all — and
+#: under ``vault_transit`` a restore makes no Transit call. Limb (2) below is what holds that to
+#: account: ``_restore_blocking`` is absent from :data:`_SNAPSHOT_READ_FUNCS`, so the day it acquires a
+#: store cipher this test reds again rather than passing on this note.
 _MFBAK_CODEC_FUNCS = frozenset(
-    {"_do_backup", "_resolve_key", "_build_archive_blocking", "_verify_archive_blocking"}
+    {
+        "_do_backup",
+        "_resolve_key",
+        "_build_archive_blocking",
+        "_verify_archive_blocking",
+        "_restore_blocking",
+    }
 )
 #: ``dr_backup`` functions that read the EXTRACTED snapshot's own store cells during a full
 #: restore-verify. Reading a store cell is what the store cipher is FOR, so these are where
@@ -973,6 +995,9 @@ def _build_archive_blocking(key):
     encrypt_stream(src, dst, key)
 
 def _verify_archive_blocking(keys):
+    decrypt_stream(src, dst, keys[0])
+
+def _restore_blocking(keys):
     decrypt_stream(src, dst, keys[0])
 
 def _full_open_check(snap, settings):
