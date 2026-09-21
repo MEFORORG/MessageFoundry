@@ -276,6 +276,25 @@ def test_select_inbound_names_its_three_failures_apart() -> None:
         assert issubclass(exc_type, ValueError), exc_type
 
 
+def test_select_inbound_caps_the_names_it_lists() -> None:
+    """A large config must not turn one selection error into a wall of names.
+
+    Both errors list the config's inbounds, and at scale that list would bury the one name that
+    matters. Twenty are shown and the rest are counted.
+    """
+    reg = Registry()
+    for i in range(25):
+        spec = ConnectionSpec(ConnectorType.MLLP, {"port": 3000 + i})
+        reg.add_inbound(InboundConnection(f"IB_{i:02d}", spec, router="r"))
+    with pytest.raises(UnknownInboundError) as unknown:
+        select_inbound(reg, "IB_TYPO")
+    with pytest.raises(AmbiguousInboundError) as ambiguous:
+        select_inbound(reg)
+    for text in (str(unknown.value), str(ambiguous.value)):
+        assert "IB_19 (and 5 more)" in text, text  # the 20th name, then the count
+        assert "IB_20" not in text, text
+
+
 # --- parse-once on the per-message fan-out (hotpath) --------------------------
 
 

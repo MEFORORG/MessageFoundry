@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import importlib
+import json
 import socket
 import ssl
 import subprocess
@@ -175,6 +176,7 @@ def test_self_smoke_ambiguous_inbound_skips() -> None:
     assert r.status is Status.SKIP, r.detail
     assert "choose one" in r.detail
     assert "IB_ACME_ADT" in r.detail
+    assert "--inbound" in r.detail  # how to choose, not only that a choice is owed
 
 
 def test_self_smoke_unknown_inbound_fails() -> None:
@@ -314,8 +316,8 @@ def test_self_smoke_redacts_a_handler_error_before_it_reaches_a_report(
     """A Handler's ``raise`` quoting PID-5 and PID-3 must not reach either report file.
 
     ``dryrun``, ``dryrun --trace`` and ``check`` already pass ``DryRunResult.error`` through
-    ``safe_error`` (BACKLOG #1668). The smoke was the fourth consumer, and the only one whose output
-    outlives the process.
+    ``safe_error`` (BACKLOG #1668). The smoke was the fourth consumer, and it writes report files
+    that are made to be pasted into tickets.
     """
     # Concatenation, not an f-string, as tests/test_cli.py PHI_RAISER_CONFIG does: the advisory
     # `raise-fstring` check would otherwise flag the probe it exists to model.
@@ -335,13 +337,16 @@ def test_self_smoke_redacts_a_handler_error_before_it_reaches_a_report(
     md, js = tmp_path / "verify.md", tmp_path / "verify.json"
     argv = ["verify", "--section", "smoke", "--smoke", "self", "--config", str(cfg)]
     argv += ["--inbound", "IB_SMOKE", "--report-md", str(md), "--report-json", str(js)]
-    # Still a FAIL: redaction decides what the row SAYS, never whether it fails.
+    # Still a FAIL: redaction decides what the row SAYS, never whether it fails. The exit code alone
+    # would also be 1 if some OTHER row failed, so the smoke row's own status is read from the report.
     assert main(argv) == 1
     written = {
         "report-md": md.read_text(encoding="utf-8"),
         "report-json": js.read_text(encoding="utf-8"),
         "stdout": capsys.readouterr().out,
     }
+    rows = {row["id"]: row for row in json.loads(written["report-json"])["results"]}
+    assert rows["smoke.self"]["status"] == Status.FAIL.value, rows["smoke.self"]
     for where, text in written.items():
         for value in phi:
             assert value not in text, (where, value)

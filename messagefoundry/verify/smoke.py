@@ -201,8 +201,9 @@ def smoke_self(
         # The only selection failure that SKIPs: nothing is wrong, the operator has a choice to make.
         # An unknown `--inbound` name or a config with no inbound is a defect, so it FAILs below.
         # `_classify_self_smoke` tells an operator to re-point `--inbound`, so a typo in that remedy
-        # must not read green (BACKLOG #1707).
-        return CheckResult(rid, title, Status.SKIP, str(exc))
+        # must not read green (BACKLOG #1707). The detail names the flag, or the operator is told to
+        # choose with no word on how.
+        return CheckResult(rid, title, Status.SKIP, f"{exc}; pass --inbound <name> to pick one")
     except (UnknownInboundError, NoInboundError) as exc:
         # Connection names and operator input only, never message content, so nothing to redact.
         return CheckResult(rid, title, Status.FAIL, str(exc))
@@ -217,8 +218,8 @@ def smoke_self(
     if result.error:
         # `verify --report-md`/`--report-json` write this detail to a file that gets pasted into
         # tickets, and the error quotes a Router/Handler's own `raise` (BACKLOG #1779). No `show_phi`
-        # opt-in, on purpose: a file that outlives the run is a stronger case for refusing one than
-        # the `check` gate's CI log, which already refuses it.
+        # opt-in, on purpose, for the reason the `check` gate refuses one: both write their output
+        # somewhere it is kept and passed on, so an opt-in would put PHI there on request.
         return CheckResult(rid, title, Status.FAIL, f"{summary} — {safe_error(result.error)}")
     # Gate on what the run PRODUCED, never on "the call returned" (BACKLOG #1707). A postcondition
     # over the disposition the pipeline already computed cannot drift out of step with the pipeline;

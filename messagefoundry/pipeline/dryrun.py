@@ -722,6 +722,19 @@ class AmbiguousInboundError(ValueError):
     """:func:`select_inbound` found several inbound connections and was not told which to use."""
 
 
+#: How many inbound names a selection error lists before it counts the rest. At the ADR 0052 scale
+#: target a full list runs to tens of KB, printed on one console line and in one report cell.
+_INBOUND_NAMES_SHOWN = 20
+
+
+def _inbound_names(registry: Registry) -> str:
+    """The config's inbound names for a selection error: sorted, capped, and the rest counted."""
+    names = sorted(registry.inbound)
+    shown = ", ".join(names[:_INBOUND_NAMES_SHOWN])
+    hidden = len(names) - _INBOUND_NAMES_SHOWN
+    return f"{shown} (and {hidden} more)" if hidden > 0 else shown
+
+
 def select_inbound(registry: Registry, name: str | None = None) -> InboundConnection:
     """Pick which inbound connection (Router) to simulate; defaults to the sole one.
 
@@ -740,14 +753,12 @@ def select_inbound(registry: Registry, name: str | None = None) -> InboundConnec
             return registry.inbound[name]
         except KeyError:
             raise UnknownInboundError(
-                f"no such inbound connection: {name!r}; the config has: "
-                + ", ".join(sorted(registry.inbound))
+                f"no such inbound connection: {name!r}; the config has: {_inbound_names(registry)}"
             ) from None
     if len(registry.inbound) == 1:
         return next(iter(registry.inbound.values()))
     raise AmbiguousInboundError(
-        "config has multiple inbound connections; choose one: "
-        + ", ".join(sorted(registry.inbound))
+        f"config has multiple inbound connections; choose one: {_inbound_names(registry)}"
     )
 
 
