@@ -2,15 +2,32 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #1361: an operator-facing message must not name a config key the loader REJECTS.
 
-ADR 0118 moved fifteen posture keys into ``[security]`` and ``_reject_relocated_keys`` REFUSES the old
+ADR 0118 moved the posture keys into ``[security]`` and ``_reject_relocated_keys`` REFUSES the old
 spellings as file or env input. So a refusal, warning or ``--help`` string that tells an operator to set
 one hands out a remediation that dies at load with "unrecognized config key(s)" -- authoritative-looking,
 because it came from the gate itself, and only discoverable by spending a restart.
+``_RELOCATED_TO_SECURITY`` holds FOURTEEN of those keys today. A fifteenth, ``[ai].data_class``, was
+REMOVED rather than relocated (BACKLOG #1279), so it left the map for ``_REMOVED_KEYS``.
 
-THIS FILE IS A BUDGET, NOT A BAN. Naming a relocated key is not automatically wrong: several messages name
-one to explain WHY a check fired while giving a remediation on a key that did NOT move, and those are
-confusing rather than broken. Grading them is in the #1361 row. What this test stops is the class GROWING
--- a new file, a new key, or more sites in a file already carrying some.
+THE BUDGET IS A MECHANISM, AND IT IS CURRENTLY EMPTY: across both corpus roots every relocated spelling
+now reds. That is a measured state, not a rule change -- #1361 graded and reworded every engine site, and
+#1365 did the same for the three web console ones. See ``_BUDGET`` for what each retired row was.
+
+DO NOT READ THAT EMPTY BUDGET AS "THE PRODUCT IS CLEAN". It says the two roots below are clean under the
+aperture below, and nothing wider. The harness, the IDE extension, ``scripts/`` and the docs are not
+scanned, and a message written in any of them can name a rejected key just as easily.
+
+Naming a relocated key is still not AUTOMATICALLY wrong, which is why the budget mechanism stays. A
+message may name one to explain WHY a check fired while prescribing a key that did not move. Grade such a
+site on what an operator would DO with the sentence: a description of state can be re-budgeted with its
+reason, an instruction to set a rejected key cannot.
+
+THE REPLACEMENT SPELLING NEEDS ITS OWN GUARD, which is
+``test_every_security_key_named_in_a_message_is_a_real_field``. Every check above asks whether a message
+names an OLD key; none asks whether the NEW one it was reworded to exists. A typo there reproduces the
+exact defect this file was written against -- ``[security].blok_unlisted_outbound`` is refused at load
+with "unrecognized config key(s)" just as the relocated spelling is -- and nothing else in this
+repository looks.
 
 SCANNED WITH ``ast``, NOT ``grep``. These messages are multi-line implicit concatenations: "requires " ends
 one line and "[api].public_origin" starts the next, so a line-based scan matches neither and reports a clean
@@ -32,10 +49,17 @@ there. None of the three is a ``print`` or a raise, and one is not a CALL at all
   that site visible, not a nicety on top of the call arms. It claims every string reached from the
   assignment, a table of notices included, rather than a lone literal only.
 
-BLAST RADIUS OF THE WIDENING WAS MEASURED, NOT ASSUMED: the engine census is byte-identical under the old
-and new apertures (the same 8 rows already in :data:`_BUDGET`), and after the #1361 fix the web console
-contributes zero. So no budget row was added for either root -- a widening that needed one would have been
-a finding, not paperwork.
+BLAST RADIUS OF THE WIDENING WAS MEASURED, NOT ASSUMED. Over the PRE-rework engine tree the census returns
+the same 8 (path, spelling) rows under the old aperture and the new one, so widening found nothing in the
+engine the narrow aperture had been missing. In the web console it found everything: ALL THREE sites were
+invisible to the old aperture, not two of them -- none is a ``print`` or a raise, so the number of missed
+sites equals the number of sites. An earlier draft of this docstring said two, counting the ``el`` render
+as though it were already reachable; re-measured 2026-09-20 with a positive control, the narrow aperture
+returns zero rows over that tree.
+
+So no budget row was added for either root -- a widening that needed one would have been a finding, not
+paperwork. Re-measured on THIS tree, after both reworks, each root returns zero, which is why
+:data:`_BUDGET` is empty rather than merely shorter.
 """
 
 from __future__ import annotations
@@ -43,10 +67,15 @@ from __future__ import annotations
 import ast
 import collections
 import pathlib
+import re
 
 from _ast_sites import find_funcs
 
-from messagefoundry.config.settings import _RELOCATED_TO_SECURITY, _REMOVED_KEYS
+from messagefoundry.config.settings import (
+    _RELOCATED_TO_SECURITY,
+    _REMOVED_KEYS,
+    SecuritySettings,
+)
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _ENGINE = _ROOT / "messagefoundry"
@@ -64,6 +93,17 @@ _WEBCONSOLE = _ROOT / "messagefoundry_webconsole"
 _CORPUS_FLOOR: dict[pathlib.Path, int] = {_ENGINE: 100, _WEBCONSOLE: 10}
 _CORPORA = tuple(_CORPUS_FLOOR)
 
+#: Per-root floor for the ``[security].X`` MENTION denominator, keyed like :data:`_CORPUS_FLOOR` so a
+#: new root without a floor is the same loud ``KeyError``. Separate from that dict because it counts
+#: mentions, not files.
+#:
+#: PER ROOT for the reason :func:`test_the_census_examined_a_population` gives about its own denominator.
+#: Measured 2026-09-20 the engine carries 123 of the 128 mentions and the web console 5, so ONE aggregate
+#: floor is cleared by the engine alone -- a ``_WEBCONSOLE`` that resolved to nothing would scan zero
+#: files and the total would still pass. The console's floor is 0 rather than a headcount because what
+#: this catches is an EMPTY root; pinning its handful of mentions would red on an ordinary reword.
+_MENTION_FLOOR: dict[pathlib.Path, int] = {_ENGINE: 50, _WEBCONSOLE: 0}
+
 #: Calls whose string arguments an operator reads. ``print``/``add_argument``/``*Error`` are the original
 #: three; the rest arrived with the web console corpus.
 #:
@@ -75,22 +115,49 @@ _OPERATOR_FACING_CALLS = frozenset({"print", "add_argument", "el"}) | _LOG_METHO
 
 # Sites tolerated today, keyed by (path, old spelling) with the count as a CEILING. A ceiling rather than an
 # equality so a fix that REMOVES one does not red the test -- PR 593 removes two from __main__.py.
-_BUDGET: dict[tuple[str, str], int] = {
-    # Describe the posture that triggered a refusal; the remediation is elsewhere or absent.
-    # The ([ai].data_class, 2) row that sat here is GONE with BACKLOG #1279: the key left the
-    # relocation map (it was removed, not relocated) and both sites in __main__.py went with it, so
-    # the row could never be read again -- a budget entry for a spelling the scanner no longer knows.
-    ("messagefoundry/__main__.py", "[ai].production"): 2,
-    ("messagefoundry/__main__.py", "[api].host"): 3,
-    ("messagefoundry/__main__.py", "[api].public_origin"): 6,
-    ("messagefoundry/__main__.py", "[api].serve_ui"): 3,
-    ("messagefoundry/api/app.py", "[api].serve_ui"): 1,
-    ("messagefoundry/config/settings.py", "[api].public_origin"): 2,
-    # Name the relocated SWITCH to explain why a connection was refused, while the fix they give is
-    # [egress].allowed_db / allowed_http -- keys that did NOT move, so the remediation works.
-    ("messagefoundry/pipeline/reference_sync.py", "[egress].deny_by_default"): 1,
-    ("messagefoundry/pipeline/wiring_runner.py", "[egress].deny_by_default"): 5,
-}
+_BUDGET: dict[tuple[str, str], int] = {}
+# EMPTY ON PURPOSE, AND THAT IS THE WHOLE OF BACKLOG #1361's REMAINING LIMB. It is not an accident,
+# and it is not a claim that the scanner stopped working -- test_the_census_examined_a_population,
+# test_the_scanner_actually_detects_a_violation and test_every_aperture_arm_still_fires exist to tell
+# those apart, so read their result before reading this dict's emptiness as good news. The third
+# matters most now that the aperture has several arms: one arm going quiet empties this dict too.
+#
+# What each retired row was, so nobody re-adds one thinking it was tolerated on merit:
+#
+#   ([ai].data_class, 2) left with BACKLOG #1279 -- the key was REMOVED rather than relocated, so it
+#   dropped out of the relocation map and the scanner can no longer produce that key at all.
+#
+#   The [api]/[ai] rows were graded REWORD under #1361, because none of them merely described state.
+#   17 BUDGETED, 13 LIVE -- re-counted 2026-09-20 by running the census over the pre-rework tree,
+#   which is the only way to read the live figure, since the budget is a CEILING and never had to
+#   match. (A first pass reported 12 and 10 from memory rather than from the scanner. The ceilings
+#   sum to 2+3+6+3+1+2 = 17; the census found [ai].production 1, [api].host 3, [api].public_origin 4
+#   + 2, [api].serve_ui 2 + 1 = 13.) Both figures re-verified on the rebase under the WIDENED aperture
+#   and are unchanged: the engine carried nothing that only the new arms can see. Four sites were
+#   outright instructions that die at load: `--host`
+#   help named [api].host as the file key the flag overrides, the DEBUG refusal said "set
+#   [ai].production=false", the /ui refusal said "Bind [api].host to a loopback address", and
+#   api/app.py said "set [api].serve_ui=false". The rest named [api].public_origin as the SUBJECT of
+#   a value complaint, which sends an operator to a key they cannot have set -- the only file route
+#   to that value is [security].web_console_public_address, which desugars into the internal field.
+#
+#   The [egress] six (reference_sync + wiring_runner) named the relocated SWITCH to explain a
+#   refusal while prescribing [egress].allowed_db / allowed_http, keys that did NOT move. The
+#   remediation always worked, so the FIX was never the defect and is unchanged. The EXPLANATION
+#   was, and worse here than anywhere else in the budget: [egress].deny_by_default sat in one
+#   sentence beside two live keys of that same real section, so it reads as equally settable. An
+#   operator adding it to their [egress] block gets "unrecognized config key(s)" at next start.
+#   All six now share settings.BLOCK_UNLISTED_OUTBOUND_IN_FORCE, one constant beside the field.
+#   The first rework gave each its own copy reading "[security].block_unlisted_outbound is set",
+#   which is FALSE on the common path: __main__ flips the switch on for any PHI instance that left
+#   it unset (announced there as "defaulted ON"), so the usual way this refusal fires is an operator
+#   who set nothing being told they set something. Six copies is also how five stay right while the
+#   sixth goes stale, which is the duplication class this whole row is about.
+#
+# Re-budgeting a site is still allowed -- add the row with the reason it DESCRIBES state rather than
+# prescribing a fix. The bar is what an operator would DO with the sentence, not whether it is
+# accurate about the internal field (docstrings, which do name the internal field, are excluded
+# above for exactly that reason).
 
 _PLANTED_VIOLATION = "\n".join(
     [
@@ -190,8 +257,8 @@ def _old_spellings() -> set[str]:
     return {f"[{section}].{key}" for (section, key) in _RELOCATED_TO_SECURITY}
 
 
-def _operator_facing_hits(source: str) -> list[str]:
-    """Old spellings inside operator-facing literals of ``source``.
+def _operator_facing_literals(source: str) -> list[str]:
+    """The string literals of ``source`` that reach an operator.
 
     Three kinds of site: a call an operator reads (:data:`_OPERATOR_FACING_CALLS`), anything raised as
     ``*Error``, and any string reached from a module-level UPPER_CASE assignment -- a bare constant, or
@@ -246,14 +313,24 @@ def _operator_facing_hits(source: str) -> list[str]:
         if value is not None and any(isinstance(t, ast.Name) and t.id.isupper() for t in targets):
             claim(value)
 
-    hits = []
-    for node in ast.walk(tree):
-        if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
-            continue
-        if id(node) in docstrings or id(node) not in operator_facing:
-            continue
-        hits.extend(spelling for spelling in _old_spellings() if spelling in node.value)
-    return hits
+    return [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and id(node) not in docstrings
+        and id(node) in operator_facing
+    ]
+
+
+def _operator_facing_hits(source: str) -> list[str]:
+    """Old spellings inside the operator-facing literals of ``source``."""
+    return [
+        spelling
+        for text in _operator_facing_literals(source)
+        for spelling in _old_spellings()
+        if spelling in text
+    ]
 
 
 def _corpus(root: pathlib.Path) -> list[pathlib.Path]:
@@ -342,9 +419,121 @@ def test_no_new_file_or_key_names_a_relocated_spelling() -> None:
 
 
 def test_no_file_grows_its_share_of_the_class() -> None:
+    """DORMANT WHILE ``_BUDGET`` IS EMPTY -- it iterates the budget, so an empty one makes it vacuous.
+
+    Say so rather than let it read as the guard that is holding: with no budgeted sites the weight is
+    entirely on test_no_new_file_or_key_names_a_relocated_spelling above, which reds on ANY hit. This
+    one wakes up again the moment a site is legitimately re-budgeted, and it is kept for that.
+    """
     counts = _census()
     grown = {k: (counts[k], ceiling) for k, ceiling in _BUDGET.items() if counts[k] > ceiling}
     assert not grown, f"more sites than budgeted (actual, ceiling): {grown}"
+
+
+# `[security].name`, plus the ` / name` tail that `--host` help uses for the two keys that together
+# replace one relocated key ("[security].local_access_only / listen_address"). Without the tail group
+# the second name goes unchecked, which is the quiet direction.
+_SECURITY_KEY = re.compile(r"\[security\]\.([a-z_][a-z0-9_]*)((?:\s*/\s*[a-z_][a-z0-9_]*)+)?")
+
+_PLANTED_TYPO = '"error: fail-closed egress requires [security].blok_unlisted_outbound=true"'
+
+
+def _security_keys_named(source: str) -> collections.Counter[str]:
+    """Every ``[security].X`` name in ``source``, across ALL string literals.
+
+    NOT scoped to ``_operator_facing_literals``, unlike every other check here, and the widening is
+    deliberate twice over. The exclusions that function makes are both wrong for this question:
+
+    * Its docstring carve-out exists because a docstring may legitimately name the INTERNAL field that
+      a relocated key desugars into. There is no such excuse under ``[security]`` -- that section IS
+      the operator-facing spelling, so a bad name there is wrong in a docstring too.
+    * Its aperture is a fixed set of call shapes plus module-level constants, which is the right
+      question for "did a message name an OLD key" and the wrong one here. Measured on this tree,
+      scoping to it drops 38 of the 128 ``[security].X`` mentions and loses ``organization_domains``
+      from view entirely. A key named somewhere the aperture does not reach still has to EXIST.
+
+    An earlier draft gave a different second reason -- that the aperture would miss
+    ``settings.BLOCK_UNLISTED_OUTBOUND_IN_FORCE``, the module-level constant six refusals interpolate.
+    That stopped being true when the web console widening added the constant arm, which now reaches 9
+    of that constant's 10 mentions. The widening above is still right, for the reason now given.
+    """
+    found: collections.Counter[str] = collections.Counter()
+    for node in ast.walk(ast.parse(source)):
+        if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+            continue
+        for head, tail in _SECURITY_KEY.findall(node.value):
+            found[head] += 1
+            found.update(part.strip() for part in tail.split("/") if part.strip())
+    return found
+
+
+def _nameable_security_keys() -> set[str]:
+    """Read from the settings models at RUN TIME -- never a list copied into this file.
+
+    A hand-copied roster is a second definition of the same fact, which is the defect class #1361
+    exists for: it would stay green through a rename and go stale exactly when it mattered.
+
+    ``_REMOVED_KEYS`` is unioned in because the refusal machinery has to SAY the retired name to
+    redirect the operator off it. Measured 2026-09-20 that is one key,
+    ``[security].handles_real_patient_data`` (BACKLOG #1279), named at three sites -- two docstrings
+    and the ``_REMOVED_KEYS`` message itself.
+    """
+    return set(SecuritySettings.model_fields) | {
+        key for (section, key) in _REMOVED_KEYS if section == "security"
+    }
+
+
+def test_the_security_key_scanner_actually_detects_a_typo() -> None:
+    """POSITIVE CONTROL for the test below, which is an ABSENCE check over a corpus it also chooses.
+
+    A regex that quietly stops matching reports a clean engine forever, and that is indistinguishable
+    from a real clean run. So prove it names a planted typo before believing a green one.
+    """
+    found = _security_keys_named(_PLANTED_TYPO)
+    assert set(found) - _nameable_security_keys() == {"blok_unlisted_outbound"}, (
+        f"the scanner missed a planted typo, so a clean scan means nothing: {dict(found)}"
+    )
+
+
+def test_every_security_key_named_in_a_message_is_a_real_field() -> None:
+    """BACKLOG #1361: the REPLACEMENT spelling must exist, or the rework recreates the defect it fixed.
+
+    Every other check in this file asks whether a message names an OLD key. None asks whether the NEW
+    one is real -- so a typo in a replacement passed ruff, mypy, the census above and every gate in
+    this repository, while handing an operator a key the loader refuses with "unrecognized config
+    key(s)": the same dead remediation, same restart to discover, arrived by the fix rather than by
+    the drift.
+    """
+    named: collections.Counter[str] = collections.Counter()
+    where: dict[str, set[str]] = collections.defaultdict(set)
+    per_root: dict[pathlib.Path, int] = {}
+    for root in _CORPORA:
+        seen = 0
+        for path in _corpus(root):
+            rel = path.relative_to(_ROOT).as_posix()
+            for key, count in _security_keys_named(path.read_text(encoding="utf-8")).items():
+                named[key] += count
+                where[key].add(rel)
+                seen += count
+        per_root[root] = seen
+
+    # THE DENOMINATOR, for the reason test_the_census_examined_a_population gives: "no bad keys in 128
+    # mentions" and "no bad keys in 0 mentions" print the same green. PER ROOT for that test's OTHER
+    # reason -- see _MENTION_FLOOR, where the split and the two numbers are justified.
+    for root in _CORPORA:
+        floor = _MENTION_FLOOR[root]
+        assert per_root[root] > floor, (
+            f"only {per_root[root]} [security].X mentions under {root.name} across "
+            f"{len(_corpus(root))} files, at or below its floor of {floor}; that is a broken scan of "
+            "that root, not a clean one, and the assertion below is vacuous for it when it happens"
+        )
+
+    unknown = {k: sorted(where[k]) for k in sorted(set(named) - _nameable_security_keys())}
+    assert not unknown, (
+        f"message(s) name a [security] key that is not a field on SecuritySettings: {unknown}. The "
+        "loader REFUSES an unrecognized key rather than ignoring it, so this is a remediation that "
+        "dies at load -- fix the spelling, or add the field."
+    )
 
 
 def test_the_two_fixed_refusals_name_the_key_the_loader_accepts() -> None:
