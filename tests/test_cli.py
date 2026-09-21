@@ -2800,16 +2800,12 @@ def test_json_mode_error_stays_on_stdout(
 # --- the boot path must not echo a configured value into an unattended service log --------------
 
 
-#: The value the two boot-path tests below plant in the environment and then look for. Not a
-#: credential, and shaped so it cannot be read as one: low entropy and dictionary words, so it does
-#: not trip the gitleaks hook and needs no entry in ``.gitleaks.toml``'s allowlist -- an allowlist
-#: entry is a scanner blind spot bought for nothing when the fixture can simply not look like a key.
-#:
-#: SHORT, which is load-bearing. Pydantic abbreviates a long ``input_value`` repr from the MIDDLE,
-#: so a 32-character value comes back with its head elided and its tail on screen, and an ``in``
-#: test over the whole string reads False while the value is plainly visible. A real 32-character
-#: password would disclose its tail exactly that way. The control below is what stops a future repr
-#: change from turning these tests green for that reason.
+#: The value the boot-path tests below plant in the environment and then look for. Why it is short
+#: and why it must not look like a key are stated once, on ``_CANARY`` in
+#: ``tests/test_cli_cluster_vip.py``; the short form is that pydantic abbreviates a long
+#: ``input_value`` repr FROM THE MIDDLE, so an ``in`` test over a 32-character value reads False
+#: while its tail is plainly on screen. A separate constant rather than a cross-module test import:
+#: sharing it would let one suite's edit weaken another suite's guard with nothing reporting it.
 _BOOT_CANARY = "not-a-real-one"
 
 
@@ -2853,9 +2849,12 @@ def test_the_boot_path_never_echoes_an_env_supplied_secret(
     )
 
     assert main([command, "--service-config", str(cfg)]) == 2
-    err = capsys.readouterr().err
+    captured = capsys.readouterr()
+    err = captured.err
 
-    assert _BOOT_CANARY not in err, (
+    # BOTH streams, because NSSM captures both to files: asserting only on the one the error
+    # currently takes would go quiet the day a caller moved it to the other.
+    assert _BOOT_CANARY not in err + captured.out, (
         f"`{command}` echoed an env-supplied secret into its config error, which NSSM would capture "
         "to a service log file. Render the failure with settings_error_detail(); "
         "str(ValidationError) carries input_value= for every failing field."
@@ -2870,15 +2869,12 @@ def test_the_boot_path_reports_a_directory_service_config_without_a_traceback(
 ) -> None:
     """``--service-config`` naming a DIRECTORY is an operator error, not a crash.
 
-    A directory passes ``load_settings``'s ``Path.exists()`` guard and then raises at the open:
-    ``PermissionError`` on Windows, ``IsADirectoryError`` on POSIX. Neither is a
-    ``FileNotFoundError``, so without ``OSError`` in the catch the service exits on a raw traceback
-    -- and Windows is the platform the NSSM service runs on, so narrowing to the POSIX spelling
-    would leave the traceback in place on exactly the nodes that have one. It is an easy typo for
-    the file inside the directory.
+    Why a directory reaches the open at all, and why ``OSError`` has to be in the catch, are stated
+    once at ``_load_service_settings``. What this pins is that the two SERVICE commands exit 2 with
+    a reported line rather than a traceback, on the stream NSSM captures.
 
-    This asserts the BEHAVIOUR rather than the exception class, because the class differs by
-    platform and this test runs on both legs.
+    It asserts the BEHAVIOUR rather than the exception class, because the class differs by platform
+    and this test runs on both legs.
     """
     assert main([command, "--service-config", str(tmp_path)]) == 2
     assert capsys.readouterr().err.startswith("error: ")

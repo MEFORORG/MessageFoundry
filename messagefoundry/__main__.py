@@ -1431,16 +1431,16 @@ def _load_service_settings(
 ) -> tuple[ServiceSettings | None, str | None]:
     """Load the service settings for a BOOT-PATH command, returning ``(settings, detail)``.
 
-    Exactly one side is non-``None``. This owns the catch and the rendering only -- each caller
-    keeps its own stream and exit code, because the part they got wrong was the same and the part
-    they do differently is not.
+    Exactly one side is non-``None``. The PAIR rather than a printed line, because that is the
+    shape :func:`messagefoundry.verify.runner._load_settings` already has for the same load, and
+    its caller needs the string for a report row rather than for a stream. Both callers here
+    happen to render it identically today; what is shared is the catch and the rendering, not the
+    emitting.
 
-    THE FAILURE IS RENDERED, NEVER STRINGIFIED. ``str(ValidationError)`` carries ``input_value=``
-    for every failing field, and for an ``after``-mode section validator that value is the whole
-    section's input mapping. The secrets in ``_FILE_SECRET_KEYS`` come from the environment, so a
-    ``[store]`` missing ``server`` on a node with ``MEFOR_STORE_PASSWORD`` set renders the store
-    password into the line. :func:`~messagefoundry.config.settings.settings_error_detail` gives the
-    field path and the message and no configured value at all.
+    THE FAILURE IS RENDERED, NEVER STRINGIFIED, for the reason
+    :func:`~messagefoundry.config.settings.settings_error_detail` states in full: ``str(exc)`` on a
+    ``ValidationError`` carries ``input_value=``, and for a failing section that is the whole input
+    mapping, env-supplied secrets included.
 
     WHY THIS PAIR OF COMMANDS IS WORTH A SHARED HELPER. ``serve`` and ``supervise`` are what the
     Windows service runs under NSSM, which captures stderr to a FILE (``docs/SERVICE.md``). A
@@ -1451,16 +1451,19 @@ def _load_service_settings(
     is still time to render it properly. The other ``ValidationError`` arms in this module answer
     an operator standing at a terminal; they are a separate question, deliberately untouched here.
 
-    ``OSError`` IS IN THE CATCH AND HAS TO BE. A ``--service-config`` naming a DIRECTORY passes
-    ``load_settings``'s ``Path.exists()`` guard and then raises at the open -- ``PermissionError``
-    on Windows (measured 2026-09-20: ``[Errno 13] Permission denied``), ``IsADirectoryError`` on
-    POSIX. Neither is a ``FileNotFoundError``, so narrowing this to the POSIX spelling would put a
-    raw traceback back on exactly the platform the NSSM service runs on. It is an easy typo for the
-    file inside the directory.
+    ``OSError`` IS IN THE CATCH, AND THIS IS THE ONE PLACE THAT SAYS WHY. A ``--service-config``
+    naming a DIRECTORY passes ``load_settings``'s ``Path.exists()`` guard and then raises at the
+    open -- ``PermissionError`` on Windows (measured 2026-09-20: ``[Errno 13] Permission denied``),
+    ``IsADirectoryError`` on POSIX. Neither is a ``FileNotFoundError``, so narrowing this to the
+    POSIX spelling would put a raw traceback back on exactly the platform the NSSM service runs on.
+    It is an easy typo for the file inside the directory. Sibling arms that need ``OSError`` should
+    POINT HERE rather than restate this: tightening the guard in ``load_settings`` to ``is_file()``
+    would invalidate every copy at once, and no gate would find the stale ones.
 
-    NOT reused from :mod:`messagefoundry.verify.runner`, whose ``_load_settings`` has this shape
-    already: ``verify/`` is a subcommand package, and the boot path depending on it to load its own
-    settings is the wrong direction.
+    NOT reused from :mod:`messagefoundry.verify.runner`: ``verify/`` is a subcommand package, and
+    the boot path depending on it to load its own settings is the wrong direction. The shared home
+    both of them would want is ``config/settings.py``, beside ``settings_error_detail`` -- a
+    follow-up, not this change.
     """
     from pydantic import ValidationError
 

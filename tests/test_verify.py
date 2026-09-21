@@ -1035,12 +1035,11 @@ def test_a_missing_explicit_config_path_fails_rather_than_skipping(tmp_path: Pat
 
 
 def test_a_directory_given_as_the_config_path_fails_rather_than_crashing(tmp_path: Path) -> None:
-    """A directory passes load_settings's Path.exists() guard and then raises at the open.
+    """A directory reaches load_settings's open, so `verify` must report it, not crash on it.
 
-    The class differs by platform -- PermissionError on Windows, IsADirectoryError on POSIX -- and
-    neither is a FileNotFoundError, so this asserts the row rather than the exception. Without
-    OSError in the catch `verify` exits on a traceback and writes no report at all, for what is an
-    easy typo: the directory instead of the file inside it."""
+    The mechanism is stated once at messagefoundry.__main__._load_service_settings. This asserts
+    the config.load ROW and the exit code rather than the exception class, because the class
+    differs by platform and this leg runs on both."""
     results = run_verify(sections=["store"], smoke_mode="none", service_config=str(tmp_path))
     load = [r for r in results if r.id == "config.load"]
     assert load and load[0].status is Status.FAIL

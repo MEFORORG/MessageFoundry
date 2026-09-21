@@ -71,11 +71,9 @@ def _load_settings(service_config: str | None) -> tuple[ServiceSettings | None, 
     try:
         return load_settings(config_path=service_config), None
     except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
-        # OSError, because a --service-config naming a DIRECTORY passes load_settings's
-        # Path.exists() guard and then raises at the open: PermissionError on Windows,
-        # IsADirectoryError on POSIX, and neither is a FileNotFoundError. Without it `verify` dies
-        # on a traceback for an easy typo -- the file inside the directory -- and writes no report
-        # at all, which is worse here than anywhere else because the report is the whole output.
+        # OSError covers a --service-config that names a DIRECTORY; the mechanism is stated once,
+        # at messagefoundry.__main__._load_service_settings. It costs more here than there: the
+        # report IS this command's output, so a traceback leaves an operator with no report at all.
         return None, settings_error_detail(exc)
 
 
