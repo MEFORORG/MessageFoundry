@@ -1701,8 +1701,9 @@ class RegistryRunner:
 
         **DERIVED, not a second flag, and that is deliberate (SDS-3.5).** "This process cannot log and
         has fail-closed" is one load-bearing fact and :attr:`_log_write_stopped` already states it:
-        both halt sites set it (:meth:`_stop_all_for_log_failure`, :meth:`start`) and the only path
-        that clears it is :meth:`_log_recovery_ok`, which re-tests the sinks by WRITING to them. A
+        both halt sites set it (:meth:`_stop_all_for_log_failure`, :meth:`start`) and it is cleared
+        only after the sinks are re-tested by WRITING to them -- :meth:`_log_recovery_ok` at the
+        recovery doors, and :meth:`start`'s own ``guard.revalidate()`` on a fresh start. A
         parallel bool set and cleared at the same four moments would be state that must agree with
         this one, with nothing checking that it does.
 

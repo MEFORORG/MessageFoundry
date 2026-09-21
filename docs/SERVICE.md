@@ -454,7 +454,7 @@ it — the engine refuses to start otherwise, naming the collision.
 waiting for you to press start, and `log_halted` means it is waiting for a writable disk — pressing
 start is refused until the disk is fixed. The state is process-wide because the broken thing is, so
 every lane this engine owns shows it at once, and `outbound_running` reports false for all of them
-(so `/stats`' running/stopped split counts them as not running). A lane that failed to build, was
+(so the running/stopped split in `/status`' KPIs counts them as not running). A lane that failed to build, was
 parked by the DR run-profile, or is `deployed = false` keeps showing `failed` / `filtered` /
 `not_deployed` instead: those are facts about that one connection, and the halt already has its own
 alert.
