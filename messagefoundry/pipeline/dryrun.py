@@ -730,7 +730,9 @@ def select_inbound(registry: Registry, name: str | None = None) -> InboundConnec
     :class:`NoInboundError`). Each is a ``ValueError``, so a caller catching that still works.
 
     The empty check runs first, even when a name is given: the missing name is a symptom there, and
-    the empty config is the cause. Refusing an empty graph at load time is BACKLOG #1648."""
+    the empty config is the cause. ``load_config`` already refuses a config with no connection at
+    all (BACKLOG #1648), but an outbound-only config still loads, so at least that shape reaches
+    here."""
     if not registry.inbound:
         raise NoInboundError("config loaded no inbound connection, so there is nothing to simulate")
     if name is not None:

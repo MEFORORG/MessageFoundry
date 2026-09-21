@@ -189,16 +189,34 @@ def test_self_smoke_unknown_inbound_fails() -> None:
     assert "IB_ACME_ADT" in r.detail  # and the names that were, so the fix is one read away
 
 
-def test_self_smoke_zero_inbounds_fails(tmp_path: Path) -> None:
-    """A config that loaded no inbound connection FAILs (BACKLOG #1707).
+@pytest.mark.parametrize("inbound", [None, "IB_ANY"], ids=["unnamed", "named"])
+def test_self_smoke_zero_inbounds_fails(tmp_path: Path, inbound: str | None) -> None:
+    """A config that loads with no inbound connection FAILs (BACKLOG #1707).
 
-    Refusing an empty graph at load time is BACKLOG #1648 and is deliberately not asserted here.
+    The fixture declares one outbound and nothing else. A directory with no connection at all never
+    reaches ``select_inbound`` now, because the loader refuses it first (BACKLOG #1648). An
+    outbound-only config still loads, which ``tests/test_wiring.py`` pins, so it is the shape that
+    reaches the selection step with nothing to pick. With a name given, the empty config is still
+    the reported cause: the missing name is only its symptom.
     """
+    from messagefoundry.config.wiring import load_config
+
     cfg = tmp_path / "config"
     cfg.mkdir()
-    r = smoke.smoke_self(str(cfg))
+    (cfg / "OB_ONLY.py").write_text(
+        "from messagefoundry import MLLP, outbound\n"
+        'outbound("OB_ONLY", MLLP(host="127.0.0.1", port=2602))\n',
+        encoding="utf-8",
+    )
+    # Positive control: the fixture LOADS and has no inbound. Without it, a future loader rule that
+    # refused this shape would red the assertions below while pointing at the smoke.
+    reg = load_config(cfg)
+    assert not reg.inbound and "OB_ONLY" in reg.outbound
+
+    r = smoke.smoke_self(str(cfg), inbound=inbound)
     assert r.status is Status.FAIL, r.detail
-    assert "no inbound connection" in r.detail
+    # NoInboundError's own words, which the loader's empty-graph refusal does not contain.
+    assert "no inbound connection, so there is nothing to simulate" in r.detail
 
 
 def test_self_smoke_routes_synthetic_adt() -> None:
