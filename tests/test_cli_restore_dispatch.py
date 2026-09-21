@@ -109,15 +109,30 @@ def _refusal(capsys) -> str:
     writing. Under ``--json`` the error object IS the machine-readable output and stays on stdout, so
     those cases are read with :func:`_json_line` instead -- do not route them through here.
 
-    ``readouterr()`` CLEARS both buffers, so this is one call and the stdout half is deliberately
-    dropped: every caller is a refusal case, where stdout is empty by design."""
-    return capsys.readouterr().err
+    ``readouterr()`` CLEARS both buffers, so this is one call. Both halves are checked before the
+    stderr half is returned:
+
+    * **stdout must be EMPTY.** That is the half of #1673 a stderr assertion cannot see -- a refusal
+      that printed to both streams would satisfy every caller below while still poisoning a redirect.
+    * **neither half may carry PHI.** Checking it HERE rather than in one test is deliberate: it puts
+      every refusal path in this module under the PHI guard, which is where the risk actually is. The
+      success-path test drives :func:`_assert_phi_free` directly; before this, no refusal's output was
+      PHI-checked at all, and #1673 had just moved every refusal onto a stream nothing examined."""
+    captured = capsys.readouterr()
+    assert captured.out == "", (
+        "a refusal wrote to STDOUT as well as stderr; BACKLOG #1673 moved human-readable failures to "
+        f"stderr precisely so a redirect of results cannot swallow them. Saw: {captured.out!r}"
+    )
+    _assert_phi_free(captured.out, captured.err)
+    return captured.err
 
 
-def _assert_phi_free(out: str, err: str = "") -> None:
-    """Neither stream carries PHI. ``err`` is checked too because refusals moved there (BACKLOG
-    #1673): a guard that named only stdout would stop covering the whole error path the day that
-    landed, while still reading like a complete PHI check."""
+def _assert_phi_free(out: str, err: str) -> None:
+    """Neither stream carries PHI.
+
+    ``err`` has NO default on purpose. With one, a caller that passes only ``out`` checks half the
+    surface while reading as a complete guard -- which is the exact defect #1673 created and this
+    signature closes. Omitting it is a ``TypeError``, not a quiet half-check."""
     for stream, text in (("stdout", out), ("stderr", err)):
         assert "raw-body" not in text, f"raw HL7 body leaked to {stream}"
         assert "DOE^JOHN" not in text, f"PHI summary leaked to {stream}"

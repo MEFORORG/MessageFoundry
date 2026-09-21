@@ -152,14 +152,20 @@ _MAX_RESTORE_MEMBER_BYTES = 16 * 1024 * 1024 * 1024  # 16 GiB
 #: **Why twice the member cap, and why a multiple rather than a literal.** A conforming archive is one
 #: ``store.db`` — admitted up to :data:`_MAX_RESTORE_MEMBER_BYTES`, above which the verify FAILs at the
 #: member cap anyway — plus the config bundle, the manifest and tar framing. So the cumulative ceiling
-#: cannot sit AT the member cap without refusing a store snapshot that is itself legal. The config
-#: bundle IS bounded, by :data:`_MAX_CONFIG_BYTES` (1 GiB), so an exact second term now exists and this
-#: ceiling is deliberately NOT written as that sum: ``member + config`` would be the tightest bound but
-#: it is also a THIRD thing to keep in step, and this one is strictly more generous than it (2 x 16 GiB
-#: against 16 GiB + 1 GiB), so it never false-refuses an archive the per-member and per-bundle caps
-#: would admit. Written as a multiple of the member cap so it TRACKS that cap: a literal would silently
-#: begin false-refusing legal archives the day the member cap was raised. Tightening it to the exact
-#: sum is a legitimate follow-up; it buys no refusal that the two component caps do not already make.
+#: cannot sit AT the member cap without refusing a store snapshot that is itself legal, and NOTHING
+#: bounds the config bundle at the point this ceiling has to hold, so there is no exact second term to
+#: add. Rather than fork a second number, the remainder gets the ceiling the store gets: one whole
+#: extra maximal snapshot of headroom, which no real config dir (a few Python modules, a TOML, some
+#: codesets) approaches. Written as a multiple so it TRACKS the member cap: a literal would silently
+#: begin false-refusing legal archives the day that cap was raised.
+#:
+#: **:data:`_MAX_CONFIG_BYTES` is NOT that second term, and must not be read as one.** It is a
+#: restore-EXTRACT bound: its only read is in :func:`_restore_config_members`, which runs solely when
+#: ``--config-to`` was given and solely AFTER the decrypt this ceiling exists to bound. The build side
+#: (:func:`_add_config_dir`) tars the config dir with no cap at all, and the verify path never extracts
+#: config. So a `.mfbak` can legally carry a config bundle larger than ``_MAX_CONFIG_BYTES``; that is
+#: caught on the way back out, not on the way in. Deriving this ceiling as ``member + config`` would
+#: therefore bound the decrypt by a number the archive was never built against.
 #:
 #: A file-size cap (``max_plaintext_bytes = archive.stat().st_size``) looks like the exact bound and is
 #: not one — it can never fire. Each frame carries 12 nonce + 4 length + 16 tag bytes around at most
@@ -1699,7 +1705,7 @@ def _verify_extracted_store(snap: Path, manifest: dict[str, object]) -> dict[str
         raise BackupError(
             "verify",
             f"row-count mismatch on {mismatches} (a torn or truncated snapshot): "
-            f"store={row_counts} manifest={manifest_counts}",
+            f"snapshot={row_counts} manifest={manifest_counts}",
         )
     return row_counts
 

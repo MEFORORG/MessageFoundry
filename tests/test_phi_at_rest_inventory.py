@@ -770,8 +770,12 @@ def test_pl1_encryption_rule_carves_out_the_backup_codec() -> None:
 #:
 #: ``_restore_blocking`` (the `restore` subcommand, BACKLOG #1717) was added to this set rather than
 #: waived, and the carve-out is re-derived for it rather than assumed. It unseals with ``match_key``,
-#: which comes from ``_select_decrypt_key`` over the keys ``_resolve_key`` resolved — RAW DEK BYTES,
-#: the same source the seal side uses — so §3's sentence is true of it verbatim. The part that had to
+#: which ``_select_decrypt_key`` picks by the archive header's ``key_id`` out of the set ``run_restore``
+#: resolved with ``resolve_decrypt_keys`` — the ACTIVE key plus RETIRED ones, so an archive sealed
+#: before a rotation still restores (ADR 0049 AC-5). Do not write ``_resolve_key`` here: that is
+#: ``BackupRunner._resolve_key``, the SEAL side, and it wraps ``resolve_active_key`` alone. Either way
+#: the material is RAW DEK BYTES and never a store cipher, which is the half §3's sentence turns on.
+#: The part that had to
 #: be CHECKED rather than asserted is the other half: whether restoring also reads the snapshot's cells
 #: back, which is the operation that legitimately needs the store cipher. A full restore-verify does,
 #: through ``_full_open_check``/``_decrypt_check`` — which is what those two are doing in
