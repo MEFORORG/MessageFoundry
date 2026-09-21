@@ -2,15 +2,18 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """No shipped document may present a config key the loader REFUSES as a key to write.
 
-BACKLOG #1383. `_RELOCATED_TO_SECURITY` maps 15 legacy `[section] key` spellings to their
+BACKLOG #1383. `_RELOCATED_TO_SECURITY` maps the legacy `[section] key` spellings to their
 `[security]` replacements, and `_reject_relocated_keys` RAISES on any of them. It is called at
 settings.py:4588, BEFORE `_desugar_security` at :4592, so a legacy spelling never reaches the
 desugarer -- refusing is the whole behaviour, not a fallback. A document that quotes one as
 config is telling a reader to write something that fails at load.
 
 THE TABLE IS THE SINGLE SOURCE OF TRUTH AND THIS TEST IMPORTS IT. A hand-copied key list would
-be a second definition that silently drifts the day someone relocates a sixteenth key -- the
-same rule `ledger_check.py` states for `PUBLIC_BACKLOG_FLOOR`.
+be a second definition that silently drifts the day someone relocates another key -- the
+same rule `ledger_check.py` states for `PUBLIC_BACKLOG_FLOOR`. That rule applies to a hand-
+written COUNT too, which is why this docstring no longer carries one: it read "maps 15" while
+the floor below had already been corrected to 14 for BACKLOG #1279, and nothing reported the
+contradiction between two lines of one file (BACKLOG #1361).
 
 WHAT COUNTS AS A CITATION, AND WHY IT IS NARROWER THAN "THE KEY APPEARS":
   * Only an ASSIGNMENT shape (`key = value`) counts. Prose that merely NAMES a key is
