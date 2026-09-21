@@ -117,11 +117,16 @@ __all__ = [
 
 
 class CorepointImportError(ValueError):
-    """The export could not be parsed into the ADR 0086 model (malformed XML/JSON or a missing field).
+    """The import could not be completed: the export is malformed, or the module it generates is not
+    valid Python.
 
     A subclass of :class:`ValueError`; the CLI turns it into a clean error + non-zero exit. The
     importer treats the export as untrusted data, so a structural problem — including a rejected DTD
-    or entity payload — is reported, never raised as an uncaught traceback."""
+    or entity payload — is reported, never raised as an uncaught traceback.
+
+    Most arms blame the EXPORT (malformed XML/JSON, a missing field). One does not: a
+    :class:`SyntaxError` caught by :func:`_verify_compilable` is a defect in this generator, so an
+    operator reading the message should not assume their export is at fault."""
 
 
 # --- intermediate action model ----------------------------------------------
@@ -1271,14 +1276,21 @@ def _split_branches(steps: list[Step]) -> tuple[tuple[Step, ...], tuple[Control,
 # surface as a RecursionError traceback instead of a clean, reported error (CLAUDE.md §6/§8). Real
 # packages nest a handful of levels; 100 is far past any plausible hand-authored action-list.
 #
-# This bounds DEPTH only, not the WIDTH of one branch list, and width has its own unbounded hazard the
-# fix for the earlier recursion-on-width defect moved rather than removed: ``generate_module`` renders
-# one ``elif False:`` per sibling branch (see the ``If``/``ChooseFrom`` renderer below) into the
-# generated module's source text. Measured: 5,000 siblings parse; 20,000 make CPython's own parser
-# raise ``MemoryError: Parser stack overflowed`` while ``import_corepoint`` still reports success and
-# returns 0 — an accept-and-drop with a success exit code. Not fixed here: bounding branch width in the
-# importer would refuse a legitimate long ``ElseIf`` chain, so it needs a width-limit decision, not a
-# default.
+# This bounds DEPTH only, not the WIDTH of one branch list, and width has its own bound the fix for the
+# earlier recursion-on-width defect moved rather than removed: ``generate_module`` renders one ``elif
+# False:`` per sibling branch (see the ``If``/``ChooseFrom`` renderer below) into the generated module's
+# source text, and past roughly 5,950 to 5,960 siblings CPython's own parser raises ``MemoryError:
+# Parser stack overflowed``. Two independent instruments put the edge in that band: a bisect over the
+# real generator and a bisect over synthetic source, landing one apart, the difference explained by how
+# much nesting frames the branch list. Treat it as a band and not a constant -- it moves with nesting
+# depth, and it belongs to the CPython build rather than to this module, so never assert an exact width.
+#
+# The accept-and-drop this used to describe is FIXED: ``import_corepoint`` now compiles every generated
+# module before writing it (:func:`_verify_compilable`), so crossing the wall is a reported
+# ``CorepointImportError`` and a non-zero exit instead of a bad file written under a success report.
+# What is still open is whether the importer should BOUND branch width at all: a limit low enough to
+# stay clear of the wall would refuse a legitimate long ``ElseIf`` chain, so that needs a width-limit
+# decision, not a default.
 _MAX_NESTING = 100
 
 
@@ -1958,12 +1970,45 @@ def _has_inline_send(steps: tuple[Step, ...]) -> bool:
 # --- top-level entry point ---------------------------------------------------
 
 
+def _verify_compilable(source: str, target: Path) -> None:
+    """Refuse generated source CPython cannot compile, before it reaches disk as a config module.
+
+    :func:`generate_module` builds the module as a STRING, so without this nothing on the import path
+    ever asked CPython whether the result parses -- the accept-and-drop the width note near
+    ``_MAX_NESTING`` records. Catching only the obvious class would repeat that defect, so the tuple
+    is deliberately broad: at least these four are reachable, and each is measured, not assumed.
+
+    * ``SyntaxError`` -- a codegen bug, and what 3.14 raises for a NUL in the source (``ValueError``
+      on older builds).
+    * ``MemoryError`` -- the width wall. A bounded parser-arena limit rather than heap exhaustion,
+      so the interpreter is fully usable afterwards.
+    * ``RecursionError`` -- the compiler re-descending source this module emitted; ``_MAX_NESTING``
+      bounds only this module's own walk. A flat chain of about 20,000 operands reaches it.
+    * ``ValueError`` -- covers ``UnicodeEncodeError``, which a lone surrogate reaching the source
+      raises. That is why the tuple names a BASE class here rather than one more leaf: enumerating
+      leaves is how the original defect was written.
+
+    Not a merge candidate with the lens's ``_assert_reparses``, which does the same job for rewritten
+    Handlers: it raises a different error type, and its own ``except`` is narrower than this one."""
+    name = str(target)
+    try:
+        compile(source, name, "exec")
+    except (SyntaxError, ValueError, MemoryError, RecursionError) as exc:
+        # Report the compiler's own message: it names the limit or character that was rejected, which
+        # a bare "could not be generated" would hide from the operator deciding what to do next.
+        raise CorepointImportError(
+            f"generated module {name!r} could not be compiled and was not written: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+
 def import_corepoint(export_path: str | Path, out_dir: str | Path) -> ImportResult:
     """Parse the export at ``export_path`` and write one config module per channel into ``out_dir``.
 
     Returns the :class:`ImportResult` count-and-log summary. Raises :class:`CorepointImportError` on a
-    malformed export -- including one that is not valid UTF-8 -- and :class:`OSError` on a filesystem
-    failure (the CLI maps both to a clean error)."""
+    malformed export -- including one that is not valid UTF-8, and one whose generated module CPython
+    cannot parse -- and :class:`OSError` on a filesystem failure (the CLI maps both to a clean
+    error)."""
     epath = Path(export_path)
     try:
         text = epath.read_text(encoding="utf-8")
@@ -2008,7 +2053,11 @@ def import_corepoint(export_path: str | Path, out_dir: str | Path) -> ImportResu
             unmapped_classes.extend(h_unmapped)
             disabled += h_disabled
         filename = f"{module_name}.py"
-        (out / filename).write_text(source, encoding="utf-8")
+        target = out / filename
+        # Raising here leaves an earlier channel's file in place, as an ``OSError`` from the write
+        # already would; the error names the module that failed and the command exits non-zero.
+        _verify_compilable(source, target)
+        target.write_text(source, encoding="utf-8")
         results.append(
             ChannelResult(
                 module_name,
