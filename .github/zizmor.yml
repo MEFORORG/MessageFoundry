@@ -13,9 +13,20 @@ rules:
       # pull_request_target risk (running attacker code with a write token) does not apply.
       #
       # THE ACTION IS LOCAL, NOT A SHA-PINNED REMOTE (BACKLOG #1381 vendored it):
-      # `uses: ./.github/actions/cla-assistant-lite`, from ca4a40a7d100 (v2.6.1). The bytes that run
+      # `uses: ./.github/actions/cla-assistant-lite`, from ca4a40a7d100 (v2.6.1). The action's bytes
       # are committed in this repository, so there is no remote reference for an upstream to change
       # or withdraw. It is still third-party Apache-2.0 code.
+      #
+      # WHAT CARRIES THE `pull_request_target` CLAIM IS THE CHECKOUT, AND IT IS NAMED HERE RATHER
+      # THAN LEFT IMPLIED. A SHA pin was immune to which ref got checked out; vendored bytes are not,
+      # because a local `uses:` resolves against GITHUB_WORKSPACE and therefore against whatever the
+      # checkout put there. The step named "Check out the base, so the vendored local action
+      # resolves" takes the BASE -- the default under `pull_request_target` -- with
+      # `persist-credentials: false`, and its own `NO ref: HERE, DELIBERATELY` block states why.
+      # ADDING a `ref:` that names the pull request's head would run FORK-AUTHORED code under this
+      # job's `contents: write` token and invalidate this suppression. Nothing lints for that: the
+      # local-action checker (scripts/quality/workflow_local_action_check.py) says outright that it
+      # does not police `ref:`. If that step changes, re-justify this entry or delete it.
       #
       # Upstream is ARCHIVED. That residual is recorded in docs/adr/0034 (amendment, 2026-08-01) and
       # no longer as an archived-uses entry in this file -- a local `uses:` gives that audit nothing
@@ -168,7 +179,7 @@ rules:
       # migration is items 3 and 4 done together, deliberately, by someone who can accept a live
       # required-context outage. Adopt it then, and delete this entry.
       #
-      # Line-anchored on purpose, same as the two entries above: a file-level entry would swallow a
+      # Line-anchored on purpose, same as the bot-conditions entry above: a file-level entry would swallow a
       # future local `uses:` added to this file, and that one might carry none of the four reasons.
       # Re-anchor if the line moves; do not broaden it to the file.
       - cla.yml:178
