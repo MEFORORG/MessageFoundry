@@ -54,21 +54,25 @@ import re
 from pathlib import Path
 
 import pytest
+from _docs_toml import TOML_FENCE_RE, dedent
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DOCS = _ROOT / "docs"
 _DOC = _DOCS / "security" / "OFF-LOOPBACK-DEPLOYMENT.md"
 
 if not _DOC.exists():
-    # Same deny-list/vault guard as tests/test_off_loopback_runbook.py, and it must sit BEFORE the import
-    # of that module: it skips at module level too, so importing it first would make this file's skip an
-    # incidental side effect of someone else's guard rather than its own stated reason.
+    # Same deny-list/vault guard as tests/test_off_loopback_runbook.py: the runbook is absent from the
+    # OSS mirror (and vaulted after the cutover), so every assertion below has nothing to say.
+    #
+    # IT USED TO HAVE TO SIT ABOVE THE IMPORT, because the fence machinery came from that sibling
+    # module, which skips at module level too -- importing it first would have made this file's skip
+    # an incidental side effect of someone else's guard rather than its own stated reason. The
+    # machinery moved to tests/_docs_toml.py on 2026-09-20 and that module skips nothing, so the
+    # ordering constraint is gone and the import sits with the others.
     pytest.skip(
         "docs/security/OFF-LOOPBACK-DEPLOYMENT.md is private-only (OSS-mirror deny-list / vault)",
         allow_module_level=True,
     )
-
-from tests.test_off_loopback_runbook import _TOML_FENCE_RE, _dedent  # noqa: E402
 
 #: Directory names the repo-wide Markdown walk never descends into: build output, dependency trees
 #: and caches. A vendored or generated copy of a page under one of these is not something we ship.
@@ -532,8 +536,8 @@ _KNOWN_POSTURE_B_PAGES = frozenset(
 def _declarations(text: str) -> list[tuple[int, str, str]]:
     """``(line, block, version)`` for every floor declared inside a ```toml fence of ``text``."""
     found: list[tuple[int, str, str]] = []
-    for fence in _TOML_FENCE_RE.finditer(text):
-        body = _dedent(fence.group("body"), fence.group("indent"))
+    for fence in TOML_FENCE_RE.finditer(text):
+        body = dedent(fence.group("body"), fence.group("indent"))
         lineno = text.count("\n", 0, fence.start()) + 2  # first line INSIDE the fence
         found.extend((lineno, body, m.group("version")) for m in _DECLARATION_RE.finditer(body))
     return found
@@ -551,8 +555,8 @@ def _declaring_docs() -> list[Path]:
 def _posture_blocks(text: str) -> list[tuple[int, str]]:
     """``(line, block)`` for every ```toml fence of ``text`` that declares an upstream terminator."""
     found: list[tuple[int, str]] = []
-    for fence in _TOML_FENCE_RE.finditer(text):
-        body = _dedent(fence.group("body"), fence.group("indent"))
+    for fence in TOML_FENCE_RE.finditer(text):
+        body = dedent(fence.group("body"), fence.group("indent"))
         if _POSTURE_RE.search(body):
             found.append((text.count("\n", 0, fence.start()) + 2, body))
     return found
@@ -745,11 +749,11 @@ def test_the_declared_floor_is_the_one_the_runbook_fences_pin(tmp_path: Path) ->
     heading = "### The engine config beside either proxy"
     start = text.find(heading)
     assert start != -1, f"runbook section {heading!r} missing from {_DOC.name}"
-    match = _TOML_FENCE_RE.search(text, start)
+    match = TOML_FENCE_RE.search(text, start)
     assert match is not None, f"no toml block under {heading!r}"
 
     block = tmp_path / "messagefoundry.toml"
-    block.write_text(_dedent(match.group("body"), match.group("indent")), encoding="utf-8")
+    block.write_text(dedent(match.group("body"), match.group("indent")), encoding="utf-8")
     settings = load_settings(config_path=block, environ={})
 
     assert settings.api.proxy_tls_floor_declared, (

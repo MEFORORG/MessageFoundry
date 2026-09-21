@@ -6771,6 +6771,10 @@ def create_managed_app(
             connection_events=connection_events,
             response_sent_default=response_sent_default,
             audit_verify_on_start=integ.audit_verify_on_start,
+            # #328: the COUNT:HEAD anchor the startup walk compares against, as a PREFIX. This is the
+            # ONLY route an [integrity] key reaches the Engine, so a new field on IntegritySettings that
+            # is not named here is a configurable, documented setting nothing ever reads.
+            audit_anchor_file=integ.audit_anchor_file or None,
             config_dir=config_dir,
             config_reload_roots=config_reload_roots,
             inbound_bind_host=inbound_bind_host,

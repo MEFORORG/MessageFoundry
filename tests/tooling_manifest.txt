@@ -180,6 +180,7 @@ tests/test_worktree_gate_rule_agnostic_coverage.py
 tests/test_worktree_gate_scope_wording.py
 tests/test_worktree_gate_shell_semantics.py
 tests/test_worktree_gate.py
+tests/test_worktree_install_daily_prune.py
 tests/test_worktree_new_cleanup_advice.py
 tests/test_worktree_new_no_track.py
 tests/test_worktree_prune_merged.py

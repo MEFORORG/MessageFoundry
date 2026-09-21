@@ -84,12 +84,16 @@ from messagefoundry.pipeline.wiring_runner import (
 from messagefoundry.redaction import safe_exc
 from messagefoundry.store import MessageStore, SecretRotationMetaStore, Store
 from messagefoundry.store.store import (
+    AUDIT_PREFIX_BREAK_MARKER,
+    AuditAnchorError,
     ConnectionMetrics,
     DestinationMetrics,
     InboundMetrics,
     OwnedLanes,
     ReingressOutcome,
     ResendOutcome,
+    parse_audit_anchor,
+    read_audit_anchor_file,
 )
 
 __all__ = ["Engine", "ConfigReloadDenied", "ReloadOutcome", "ReloadStepFailure"]
@@ -194,6 +198,7 @@ class Engine:
         connection_events: bool = True,
         response_sent_default: bool = True,
         audit_verify_on_start: bool = False,
+        audit_anchor_file: str | Path | None = None,
         config_dir: str | Path | None = None,
         config_reload_roots: Sequence[str | Path] = (),
         inbound_bind_host: str = "127.0.0.1",
@@ -311,6 +316,12 @@ class Engine:
         # [integrity].audit_verify_on_start (#190): re-walk the tamper-evident audit chain once at start.
         # ALERT-ONLY — a break logs WARNING + fires the AlertSink but NEVER crashes startup.
         self._audit_verify_on_start = audit_verify_on_start
+        # [integrity].audit_anchor_file (#328): the COUNT:HEAD anchor the startup walk compares against,
+        # as a PREFIX (`audit_prefix_verdict`) rather than as the CLI's exact seal — see
+        # _load_audit_anchor. None/"" → the walk stays the bare walk, blind to a truncated tail.
+        self._audit_anchor_file: Path | None = (
+            Path(audit_anchor_file) if audit_anchor_file else None
+        )
         # Where the runner reports operational alerts; None → the runner's default logging sink.
         self._alert_sink = alert_sink
         # [retention] enforcement. None (embedding/tests) → no retention task; the runner itself is a
@@ -517,6 +528,7 @@ class Engine:
         connection_events: bool = True,
         response_sent_default: bool = True,
         audit_verify_on_start: bool = False,
+        audit_anchor_file: str | Path | None = None,
         synchronous: str = "NORMAL",
         config_dir: str | Path | None = None,
         config_reload_roots: Sequence[str | Path] = (),
@@ -578,6 +590,7 @@ class Engine:
             connection_events=connection_events,
             response_sent_default=response_sent_default,
             audit_verify_on_start=audit_verify_on_start,
+            audit_anchor_file=audit_anchor_file,
             config_dir=config_dir,
             config_reload_roots=config_reload_roots,
             inbound_bind_host=inbound_bind_host,
@@ -895,25 +908,131 @@ class Engine:
             destinations=owned_destination_set(registry, registry.shard_id, registry.all_shard_ids),
         )
 
+    async def _load_audit_anchor(self) -> tuple[int, str] | None:
+        """Read ``[integrity].audit_anchor_file`` into the ``(count, head)`` the prefix comparator takes,
+        or ``None`` — having logged why — when it cannot be used (BACKLOG #328).
+
+        IT CONSUMES THE ANCHOR AS A PREFIX, NOT AS THE CLI'S EXACT SEAL, and that is the whole reason a
+        startup setting can hold one at all. ``audit-verify --expected-anchor`` compares the chain's
+        CURRENT head, so it diverges on the next appended row; a running engine writes audit rows, so a
+        startup check built on the exact seal would alarm on essentially every restart. ``expected_prefix``
+        asks instead whether the recorded state was ever true and the chain has only GROWN since, which
+        survives restarts while still catching the two things #328 is about — a truncated tail and a
+        mid-chain rewrite. A stale anchor therefore stays VALID here; it just witnesses less.
+
+        **Never raises, and never fires the tamper alert.** A missing, unreadable or malformed anchor is a
+        CONFIG fault, and routing it to ``integrity_drift`` would manufacture a tamper alarm out of input
+        handling — the same defect :func:`~messagefoundry.store.store.parse_audit_anchor` refuses on the
+        CLI side, and worse here, because an alarm that fires on a typo is an alarm operators learn to
+        ignore. It logs a WARNING naming the file and the reason, and the caller runs the bare walk: the
+        chain is still checked as far as it can be, and the operator is told, in the same line, that the
+        truncation half did not run.
+
+        The read goes through ``asyncio.to_thread`` like every other file the engine touches, so a slow or
+        hung filesystem cannot block the loop during startup."""
+        path = self._audit_anchor_file
+        if path is None:
+            return None
+        try:
+            # The reader is shared with `audit-verify --expected-anchor-file`: same encoding handling,
+            # same byte bound, same first-line rule. It raises UnicodeDecodeError (which subclasses
+            # ValueError, NOT OSError) on a UTF-16 file, so both are caught here.
+            raw = await asyncio.to_thread(read_audit_anchor_file, path)
+        except (OSError, UnicodeDecodeError) as exc:
+            log.warning(
+                "[integrity].audit_anchor_file %s could not be read (%s) — the startup audit check "
+                "runs as a bare walk, which cannot see a truncated tail; write the file with "
+                "'messagefoundry audit-anchor'",
+                path,
+                safe_exc(exc),
+            )
+            return None
+        try:
+            anchor = parse_audit_anchor(raw)
+        except AuditAnchorError as exc:
+            # `.reason`, NOT `str(exc)`: the full refusal quotes the offending text back, and this log
+            # is a persistent service log NSSM captures to disk. The file most likely to be here by
+            # mistake is whatever the path was typo'd onto -- a key file, a config, a captured message.
+            # The operator still learns WHAT was wrong and WHICH file; they do not get its contents
+            # published beside it. The reader's byte bound is the other half of that control.
+            log.warning(
+                "[integrity].audit_anchor_file %s does not hold a usable anchor (%s) — the startup "
+                "audit check runs as a bare walk, which cannot see a truncated tail",
+                path,
+                exc.reason,
+            )
+            return None
+        if anchor[0] == 0:
+            # A ZERO-COUNT ANCHOR WITNESSES NOTHING, AND PASSING IT ON WOULD ALARM FOREVER. `0:` is the
+            # anchor of an EMPTY log, and it is a legal, documented thing for an operator to have taken
+            # on a fresh instance. But the comparator captures the head AT row `exp_count` while walking,
+            # and the walk's position counter is only ever >= 1 -- so row 0 is "never reached", `head_ok`
+            # is False, and an intact chain is reported as `truncated or rewritten` on EVERY start.
+            # Measured on an intact 3-row log. Refusing it here is honest in both directions: the claim
+            # "at row 0 the head was empty" is true of every chain ever, so it could detect nothing even
+            # if it compared cleanly, and saying so beats a green that checked nothing.
+            log.warning(
+                "[integrity].audit_anchor_file %s holds '0:', the anchor of an EMPTY log — it can "
+                "witness nothing, so the startup audit check runs as a bare walk. Re-run "
+                "'messagefoundry audit-anchor' against the quiesced store to take a real one",
+                path,
+            )
+            return None
+        return anchor
+
     async def _verify_audit_chain_on_start(self) -> None:
         """Startup audit-chain tamper check (#190-E), ALERT-ONLY: a broken chain logs a WARNING and
         fires the AlertSink but NEVER crashes startup — refusing to boot on a tripped tamper alarm would
         be a self-inflicted DoS, and the alarm may itself be a false positive (e.g. keyed store opened
         without the DEK). Reuses the ``integrity_drift`` alert channel (the existing in-place-tamper
-        signal). Swallows every error: the check is defense-in-depth, never a startup gate."""
+        signal). Swallows every error: the check is defense-in-depth, never a startup gate.
+
+        With ``[integrity].audit_anchor_file`` set it also passes that anchor as ``expected_prefix``, which
+        is what lets the walk see a TRUNCATED TAIL — the walk alone cannot, because deleting the newest
+        rows leaves a prefix that still chains cleanly (BACKLOG #328).
+
+        **The two failures are reported as DIFFERENT alert subjects, deliberately.** A broken chain names
+        a row an operator can go and read; a truncated tail names rows that are no longer there to read,
+        and points at the anchor's custodian rather than at the database. They also want separate
+        throttling — ``integrity_drift``'s subject is its re-alert and rule-matching key, so folding both
+        into ``"audit-chain"`` would let whichever fired first silence the other for a cooldown.
+
+        **THEY ARE NOT INDEPENDENT, AND A ``"audit-chain"`` ALERT DOES NOT MEAN THE TAIL IS INTACT.**
+        ``verify_audit_chain`` returns on the chain break BEFORE the prefix comparator runs, so when a
+        row is edited AND the tail is cut — the likeliest real shape, an edit plus its cover-up — only
+        the break is reported and the truncation is never named. Lifting that needs the store to return a
+        structured verdict carrying both instead of one ``(ok, message)`` pair, across all three
+        backends; it is not done here. Read a break as *"at least* a break"."""
+        expected_prefix = await self._load_audit_anchor()
         try:
-            ok, msg = await self.store.verify_audit_chain()
+            ok, msg = await self.store.verify_audit_chain(expected_prefix=expected_prefix)
         except Exception as exc:  # never let a verify failure crash startup
             log.warning("startup audit-chain verification could not run: %s", safe_exc(exc))
             return
+        # Say what the pass COVERED beside the verdict: an anchored pass and a bare one read identically
+        # otherwise, and only one of them has ruled out a truncated tail.
+        coverage = (
+            f"anchored against {self._audit_anchor_file}"
+            if expected_prefix is not None
+            else "bare walk — no usable [integrity].audit_anchor_file, so a truncated tail would "
+            "NOT be detected"
+        )
         if ok:
-            log.info("startup audit-chain verification: %s", msg)
+            log.info("startup audit-chain verification: %s (%s)", msg, coverage)
             return
         reason = msg or "audit chain verification failed"
-        log.warning("startup audit-chain verification FAILED (alert-only): %s", reason)
+        # verify_audit_chain folds both verdicts into one (ok, message) and reports a chain break FIRST,
+        # so the marker is the only thing that separates them without walking the log a second time.
+        truncated = AUDIT_PREFIX_BREAK_MARKER in reason
+        subject = "audit-chain-truncated" if truncated else "audit-chain"
+        log.warning(
+            "startup audit-chain verification FAILED (alert-only, %s): %s",
+            "truncated or rewritten tail" if truncated else "chain break",
+            reason,
+        )
         if self._alert_sink is not None:
             try:
-                self._alert_sink.integrity_drift("audit-chain", reason=reason, drift_count=1)
+                self._alert_sink.integrity_drift(subject, reason=reason, drift_count=1)
             except Exception:  # an alert-sink failure must never break startup
                 log.warning("audit-chain integrity alert could not be delivered")
 
@@ -963,6 +1082,16 @@ class Engine:
         # after recovery so the chain is walked in its post-recovery state.
         if self._audit_verify_on_start:
             await self._verify_audit_chain_on_start()
+        elif self._audit_anchor_file is not None:
+            # An anchor configured behind a check that never runs is a control that exists only on paper:
+            # the operator did the work of holding a witness and gets none of the detection, with nothing
+            # else anywhere reporting it (#328). Name both keys, because the fix is to set the OTHER one.
+            log.warning(
+                "[integrity].audit_anchor_file is set (%s) but [integrity].audit_verify_on_start is "
+                "false, so the anchor is never read and a truncated audit tail would go undetected — "
+                "set audit_verify_on_start = true to arm it",
+                self._audit_anchor_file,
+            )
         # Bring cluster membership + leader election up BEFORE the workers run, so the node's heartbeat
         # is registered and leadership is contended the moment it starts processing (Track B Step 3/4).
         # NullCoordinator (the single-node default) is a no-op here, so this line is free for SQLite /
