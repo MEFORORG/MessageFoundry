@@ -32,8 +32,12 @@ see [Declined: sequence-keyed ordering](#declined-sequence-keyed-ordering).
   connection** — the order outbox rows were created for *that* destination. Fan-out (one inbound → N
   outbounds) and fan-in (multiple routers → one outbound) both resolve the same way: each outbound
   orders only its own rows, by enqueue time on it. A per-connection `ordering=UNORDERED` is opt-in
-  **today**: it claims a batch and rotates past a failing message, trading strict order for
-  throughput on that lane. Sequence-keyed lanes are a separate idea, and are declined (below).
+  **today**. It is read only under `claim_mode="per_lane"`, where it claims a batch and rotates past
+  a failing message, isolating a stuck row without holding the lane. Under the shipped default
+  `claim_mode="pooled"` the setting is inert: the lane drains strict FIFO, head-of-line blocking
+  included. Neither mode raises a lane's throughput — an outbound connection sends one message at a
+  time either way, so `UNORDERED` buys failure isolation, never concurrency. Sequence-keyed lanes are
+  a separate idea, and are declined (below).
 - **Nothing is silently lost** (conservative posture). Default failure policy, by failure *kind*:
   - **Internal/code error** at a **router, transformer, or connection** (a bug / unexpected
     exception) → **default: error the message and continue** — record the `ERROR` disposition
@@ -257,8 +261,10 @@ Declining sequence-keyed lanes declines the promise, not the hazard.
 
 **What this does not rule out.** `OrderingMode.UNORDERED`
 ([`config/models.py`](../messagefoundry/config/models.py)) is shipped and stays. An operator may set
-`ordering=UNORDERED` on an outbound connection to claim a batch and rotate past a failing message,
-trading strict order for throughput, and the
+`ordering=UNORDERED` on an outbound connection. Under `claim_mode="per_lane"` it claims a batch and
+rotates past a failing message, isolating a stuck row rather than raising throughput — a lane sends
+one message at a time either way. Under the shipped default `claim_mode="pooled"` the setting is
+inert. The
 [ADR 0154](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md)
-`reply_from` lane requires it. What is declined is **sequence-keyed lanes as the scaling answer for
-an ordered feed**, never the existence of an unordered mode.
+`reply_from` lane requires `UNORDERED`. What is declined is **sequence-keyed lanes as the scaling
+answer for an ordered feed**, never the existence of an unordered mode.
