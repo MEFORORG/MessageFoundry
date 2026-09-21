@@ -92,19 +92,59 @@ your tracked prose, and the hook blocks the commit.
 [`scripts/security/scan-tokens.local.txt.example`](scripts/security/scan-tokens.local.txt.example) is
 the source of record for the detail.
 
+**Blocked on an ordinary number you never chose as a placeholder?** No detector bans six-digit
+integers as such — each adds a condition — but two of them pin the width at exactly six, so an
+everyday value can satisfy one by coincidence. **Read the reason line of your hit**: it names which
+fired, and the two want different fixes. Other detectors match digits for their own reasons, a
+routable IP among them, and say so in the same place.
+
+- **`site code`** — a *loaded numeric prefix* followed by four digits, with a boundary each side that
+  is neither alphanumeric nor a dot. That prefix list is private, so you cannot tell by eye whether
+  your number starts with one, and **the value alone is enough**: a port, a row count or an offset
+  fires this with no identifier around it, while a dotted version or a longer alphanumeric run does
+  not. **Narrowing this detector is not the remedy** — the collision is the point of it, and a real
+  site code has exactly the shape of the number that annoyed you.
+- **`six-digit run inside an underscore-joined identifier`** — a *shape*, whatever the digits are:
+  six of them joined by `_` to a neighbouring segment, where the segment before starts with a letter
+  (`PT_<six digits>_ADT`) or the segment after contains one (`<six digits>_router.py`). It is matched
+  against a file's path as well as its lines, so a **directory** name can raise it.
+
+Fix by cause, not in sequence.
+
+- **`site code`** — only a different value clears it, because the value alone matched; reshaping the
+  identifier around it changes nothing. If it is a placeholder, use `SITEA` or `<site>`. If it is a
+  real figure that has to stay accurate, it is an allowlist case.
+- **The shape** — break the underscore join, or move the number out of the identifier.
+- **A hit at line `0`** — the finding is the **path**, which a per-line allowlist entry cannot reach.
+  If the reason is the shape, rename the offending segment, and check the directories rather than
+  only the file. If the reason names a private document, the fix is taking the file out of this tree;
+  never rename it past the pattern.
+
+Only for a genuine false positive you cannot rewrite, add a vetted regex with a written reason to
+[`scripts/security/scan-allowlist.txt`](scripts/security/scan-allowlist.txt). Keep it narrow: an
+entry vetoes the line **before any detector runs**, so an over-broad one switches this whole gate off
+for every line it covers, and the loader refuses a pattern that matches ordinary text. Never allowlist
+a real customer string — that has to be removed.
+
 `setup-leak-gate.ps1` always finishes by running the scanner and printing its per-section detector
-counts, because a green gate is evidence only if you confirmed it can see. The scanner labels its
-mode on every run, so a synthetic set can never be mistaken for a real one:
+counts, because a green gate is evidence only if you confirmed it can see. The scanner labels each of
+the two *unsafe* modes on every run, so neither can be mistaken for a real one:
 
 ```
-loaded names=7, estate=13, estate_file_scanned=12, site_prefixes=1
+loaded names=N, estate=N, estate_file_scanned=N, site_prefixes=N
 loaded names=5, estate=3,  ...  [SYNTHETIC EXAMPLE TOKENS — blind to real customer tokens; CI is authoritative]
 loaded names=0, estate=0,  ...  [STRUCTURAL-ONLY: no token source configured]
 ```
 
-Only the first is a real local scan. Note that the synthetic template is **below CI's per-section
-floor** (`names=7, estate=13, site_prefixes=1`) by design — passing locally with it does not mean you
-would pass CI's gate, only that nothing structural was found.
+Only the first is a real local scan, and the **absent mode label** is what says so. Its counts are
+shown as `N` because the real list grows: this file carried a concrete set of them for long enough to
+go stale. Note that the synthetic template is **below CI's per-section floor** by design — passing
+locally with it does not mean you would pass CI's gate, only that nothing structural was found. That
+floor is `MEFOR_MIN_DETECTORS`, set in
+[`.github/workflows/security.yml`](.github/workflows/security.yml) and
+[`.github/workflows/branch-leak-scan.yml`](.github/workflows/branch-leak-scan.yml) — read it there.
+A copy of the numbers here would be one more claim that nothing reconciles, which is what the copy
+this paragraph used to carry turned into.
 
 It also prints a `token source:` line naming **where those counts came from** — the
 `MEFOR_FORBIDDEN_TOKENS` path, that variable carrying the list inline (named, never printed), or
