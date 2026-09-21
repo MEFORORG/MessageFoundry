@@ -742,22 +742,12 @@ def allowlist_reason(step: Step) -> str | None:
 #: blessed: the screen's job is to stop the population growing while each site is fixed on its own
 #: merits. Removing a line is how a fix gets recorded; adding one needs a reason in the pull request
 #: that adds it.
-#:
-#: OVERLAP WITH UNMERGED WORK, recorded because whoever lands second has to act on it. Three ODBC
-#: installer steps below are already fixed on branch `b1544a-pipefail` (commit 73f0cb07e, unmerged
-#: when this was written): ci.yml `sqlserver-store`, ci.yml `load-test-sqlserver`, and benchmark.yml
-#: `baseline-sqlserver`. This branch is cut from `main` and does not contain that fix, so a baseline
-#: omitting them would red this screen on `main`. When the two meet, the second to land drops those
-#: three lines -- `test_the_baseline_is_not_stale` names them if it is forgotten.
 _GRANDFATHERED: frozenset[tuple[str, str, str]] = frozenset(
     {
         ("benchmark.yml", "baseline-postgres", "Environment stamp"),
         ("benchmark.yml", "baseline-sqlite", "Environment stamp"),
         ("benchmark.yml", "baseline-sqlserver", "Environment stamp"),
-        ("benchmark.yml", "baseline-sqlserver", "Install Microsoft ODBC Driver 18 + sqlcmd"),
         ("ci.yml", "docker-smoke", "Engine log (always)"),
-        ("ci.yml", "load-test-sqlserver", "Install Microsoft ODBC Driver 18 + sqlcmd"),
-        ("ci.yml", "sqlserver-store", "Install Microsoft ODBC Driver 18 + sqlcmd"),
         (
             "dependabot-auto-merge.yml",
             "auto-merge",
@@ -1239,9 +1229,9 @@ def test_the_baseline_is_not_stale() -> None:
     """Every grandfathered entry must still name a real, still-unguarded step.
 
     A baseline that outlives its sites is the quiet failure here: the line stops matching anything,
-    nothing reports it, and the list grows into a record of what USED to be wrong. It is also how
-    the overlap with branch `b1544a-pipefail` gets noticed -- when that fix lands, three of these
-    entries stop resolving and this test names them.
+    nothing reports it, and the list grows into a record of what USED to be wrong. It is also how a
+    fix from another branch gets noticed: when one guards a grandfathered step, its line stops
+    resolving and this test names it.
     """
     result = scan()
     assert_liveness(result)
