@@ -128,6 +128,12 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   revocation-checking reverse proxy (`[api].tls_terminated_upstream` + `trusted_proxies`); a managed admin
   host / mTLS (OFF-LOOPBACK-DEPLOYMENT.md).
 - **Still refused:** an off-box bind without TLS (unless `require_encryption_for_remote = false`, below).
+- **`serve --host <non-loopback>` counts as this deviation**, even with no `[security]` block in the file.
+  The flag is merged after the `[security]` desugar so it wins over the config, and the loader then folds
+  the effective bind back into the posture view: `local_access_only` reads `false` and `listen_address`
+  names the host actually bound. The exposure is therefore reported wherever loosenings are. The fold is
+  **one-way**: it only ever adds this deviation, so a declared `local_access_only = false` keeps
+  reporting even when the socket ends up on loopback.
 
 ### `allowed_client_networks = []` (empty) **while the console is exposed** — no source-network allow-list
 > **Conditional, unlike every other entry here.** An empty list is the **secure** position on the default

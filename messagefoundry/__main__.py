@@ -139,7 +139,14 @@ def main(argv: list[str] | None = None) -> int:
     # These override the corresponding settings; defaults live in ServiceSettings, not argparse, so
     # precedence (CLI > env > file > default) is honored — an unset flag falls through.
     serve.add_argument("--db", default=None, help="message store path (overrides [store].path)")
-    serve.add_argument("--host", default=None, help="API bind host (overrides [api].host)")
+    # NOT "[api].host": that key is REFUSED as file/env input (ADR 0118 relocated it), so naming it
+    # here pointed operators at a key they cannot set (BACKLOG #1852).
+    serve.add_argument(
+        "--host",
+        default=None,
+        help="API bind host (overrides [security].local_access_only / listen_address; an off-box "
+        "host is reported as a posture loosening)",
+    )
     serve.add_argument(
         "--port", type=int, default=None, help="API bind port (overrides [api].port)"
     )
@@ -3364,6 +3371,9 @@ def _serve(args: argparse.Namespace) -> int:
     # ADR 0118: reflect the serve-gate EFFECTIVE flips (egress deny-by-default, retention auto-bound) back
     # into the [security] view so GET /security/posture reports what is actually in effect, not just the
     # authored config. The internal egress/retention objects were mutated in place by the gates above.
+    # The BIND is folded back the same way, one layer earlier: `_reconcile_effective_bind` in
+    # config/settings.py does it inside load_settings, because `--host` is merged there. A third fold
+    # belongs next to one of these two, not in a third place.
     settings.security.block_unlisted_outbound = settings.egress.deny_by_default
     settings.security.delete_message_bodies_after_days = settings.retention.messages_days
 
@@ -6040,13 +6050,22 @@ def _security(args: argparse.Namespace) -> int:
     #: read at all (the file did not load); the scope string is the standing limitation above. It names
     #: ALL THREE connection-scoped deviations (#333) — naming only cleartext_accepted made the DECLARED
     #: scope itself incomplete, which is the same defect one level up.
+    #:
+    #: BACKLOG #1852 added a FOURTH gap and it is named for that same reason. This command reads the
+    #: AUTHORED file; `serve --host` is a CLI override that `load_settings` folds into the [security]
+    #: view at load, so an engine started with an off-box --host reports `local_access_only = false` on
+    #: GET /security/posture while this command still shows the file's `true`. Both readings are right
+    #: for what they describe, and a scope marker that did not say so would send an auditor comparing
+    #: the two surfaces looking for a defect in one of them.
     _loosenings_scope = {
         "loosenings_partial": _loosenings_partial,
         "loosenings_scope": (
             "settings only ([security]/[store]/[auth]/[alerts]); the per-connection "
             "cleartext_accepted, tls_allow_expired and generic-ODBC DATABASE TLS declarations are NOT "
             "included, and neither is the store-principal privilege observation (#1008 — this command "
-            "opens no store) — see `messagefoundry check` or GET /security/posture"
+            "opens no store). These are the AUTHORED values, so a `serve --host` bind override on a "
+            "running engine is not reflected here either — see `messagefoundry check` or "
+            "GET /security/posture"
         ),
     }
 
