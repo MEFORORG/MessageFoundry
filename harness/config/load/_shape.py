@@ -45,6 +45,19 @@ EDIT = "edit"  # representative whole-field rewrites via the Message model
 SLOW = "slow"  # edit + a deterministic CPU spin, to find the transform-cost ceiling on one core
 _TRANSFORMS = frozenset({CHEAP, EDIT, SLOW})
 
+#: ``max_connections_per_host=NO_PER_HOST_CAP`` turns the shipped per-peer connection cap off on a
+#: harness MLLP hub (BACKLOG #1725). It lives here rather than in one graph because **every** graph
+#: that reuses :func:`load_shape` inherits the shape that needs it: the sender opens its whole pool
+#: from ONE address — up to 160 connections per hub in the closed-loop, spike-burst and
+#: sustained-overload profiles, 64 in write-amplification — so the shipped cap of 32 per peer
+#: address would refuse most of the pool and the run would measure the refusals, not the engine.
+#: That is the single-address shape the cap's own docs tell a source-NAT deployment to turn it off
+#: for; see ``DEFAULT_MAX_CONNECTIONS_PER_HOST`` in ``messagefoundry.transports.mllp``.
+#:
+#: Named rather than written as a bare ``None`` at each hub so the reason is attached to the value
+#: and a hub added later is one import away from inheriting it.
+NO_PER_HOST_CAP = None
+
 
 def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
     raw = os.environ.get(name)

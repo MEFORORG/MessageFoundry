@@ -19,7 +19,7 @@ correlation clean. See ``docs/LOAD-TESTING.md``.
 
 from __future__ import annotations
 
-from harness.config.load._shape import Shape, apply_transform, load_shape
+from harness.config.load._shape import NO_PER_HOST_CAP, Shape, apply_transform, load_shape
 from messagefoundry import MLLP, Send, handler, inbound, outbound, router
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.config.wiring import HandlerFn
@@ -71,15 +71,26 @@ _OTH_HANDLERS = _register_lane("OTH", _SHAPE.results_fanout, _SHAPE)
 # to its lane's full handler set (the sender sends only the matching types to each port). Each hub may
 # be tagged to a `supervise` shard via MEFOR_LOAD_SHARD_* (default unset → shard=None → no tag → a
 # single implicit shard = byte-identical to the unsharded graph); see _shape.
-inbound("IB_Load_ADT", MLLP(port=_SHAPE.adt_port), router="adt_router", shard=_SHAPE.shard_adt)
+#
+# The per-host connection cap is OFF on all three hubs (BACKLOG #1725) — see NO_PER_HOST_CAP in
+# _shape, which carries the reason and is shared with every other graph built on this shape.
+inbound(
+    "IB_Load_ADT",
+    MLLP(port=_SHAPE.adt_port, max_connections_per_host=NO_PER_HOST_CAP),
+    router="adt_router",
+    shard=_SHAPE.shard_adt,
+)
 inbound(
     "IB_Load_Results",
-    MLLP(port=_SHAPE.results_port),
+    MLLP(port=_SHAPE.results_port, max_connections_per_host=NO_PER_HOST_CAP),
     router="results_router",
     shard=_SHAPE.shard_results,
 )
 inbound(
-    "IB_Load_Other", MLLP(port=_SHAPE.other_port), router="other_router", shard=_SHAPE.shard_other
+    "IB_Load_Other",
+    MLLP(port=_SHAPE.other_port, max_connections_per_host=NO_PER_HOST_CAP),
+    router="other_router",
+    shard=_SHAPE.shard_other,
 )
 
 

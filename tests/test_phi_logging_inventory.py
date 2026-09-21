@@ -390,9 +390,13 @@ def test_connection_event_row_names_exactly_the_shipped_kinds() -> None:
     invented = sorted(
         token
         for token in named
-        # `eof` is a close_reason, `on_connection_event` the wiring hook the cell names when
-        # explaining which listeners emit at all — neither is an event kind.
-        if token not in set(_EVENT_KINDS) and token not in {"eof", "on_connection_event"}
+        # `eof` and `frame_deadline` are close_reason VALUES, `on_connection_event` the wiring hook
+        # the cell names when explaining which listeners emit at all — none is an event kind. The
+        # row names the close reasons on purpose (they are the `closed` kind's whole vocabulary), so
+        # a reason has to be exempted here the way `eof` always has been. `idle_timeout` needs no
+        # entry: it is a close reason on MLLP AND an event kind on the HTTP listener.
+        if token not in set(_EVENT_KINDS)
+        and token not in {"eof", "frame_deadline", "on_connection_event"}
     )
     assert not invented, (
         f"the connection_event row names kind(s) no code path emits: {invented}. The shipped "
