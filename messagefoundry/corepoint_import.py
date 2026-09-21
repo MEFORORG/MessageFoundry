@@ -412,6 +412,17 @@ def parse_export(text: str) -> tuple[Channel, ...]:
         doc = json.loads(text)
     except json.JSONDecodeError as exc:
         raise CorepointImportError(f"export is not valid JSON: {exc}") from exc
+    except RecursionError as exc:
+        # THE ARM ABOVE CANNOT REACH THIS. ``json`` guards its own decode depth and raises
+        # ``RecursionError`` — a ``RuntimeError``, not a ``JSONDecodeError`` and not a ``ValueError`` —
+        # so a deeply nested export escaped every caller as an unreported crash. Converted HERE, at the
+        # call that raises it, so every caller of this library gets the contract stated above (a
+        # structural violation of untrusted input is a reported error), not just the CLI. The stack has
+        # already unwound to this shallow frame before the clause runs, so raising cannot re-trip the
+        # limit. 3.14 checks the real C stack rather than ``sys.getrecursionlimit()``, so the depth
+        # where it fires varies with the machine; measured here, 20,000 levels gave "Stack overflow
+        # (used 2912 kB) while decoding a JSON array" (BACKLOG #1682).
+        raise CorepointImportError(f"export nests JSON too deeply to decode: {exc}") from exc
     if not isinstance(doc, dict):
         raise CorepointImportError("export root must be a JSON object")
     channels_raw = doc.get("channels")
@@ -1242,31 +1253,41 @@ def _split_branches(steps: list[Step]) -> tuple[tuple[Step, ...], tuple[Control,
     construct's own ``<List>``, so everything after such a marker belongs to that branch. Successive
     branches come back as flat SIBLINGS (``if`` → ``elif`` → ``else``), never nested.
 
-    ONE PASS over the markers, not a recursion on ``steps[i + 1:]``. The recursive shape spent a stack
-    frame and a fresh tail slice per marker, so an export's branch WIDTH drove both — and width is a
-    dimension ``_MAX_NESTING`` does not bound, because that bounds DEPTH. Measured on 3.14 at engine
-    ``0447f96e5``: 1,500 bare ``<Line Data="Else"/>`` siblings under one ``<If>`` (and the same for
-    ``Catch`` under ``<Try>``) raised ``RecursionError`` out of an untrusted export, while 900 parsed.
-    A single pass is linear in both stack and work (BACKLOG #1682)."""
-    markers = [
-        (i, step)
-        for i, step in enumerate(steps)
-        if isinstance(step, Control) and step.kind in _BRANCH_PARENT and not step.body
-    ]
-    if not markers:
-        return tuple(steps), ()
-    branches: list[Control] = []
-    for pos, (start, marker) in enumerate(markers):
-        # A branch runs from just after its own marker to the next marker, or to the end.
-        end = markers[pos + 1][0] if pos + 1 < len(markers) else len(steps)
-        branches.append(replace(marker, body=tuple(steps[start + 1 : end])))
-    return tuple(steps[: markers[0][0]]), tuple(branches)
+    ONE PASS, appending each statement into the branch a marker opened, rather than a recursion on
+    ``steps[i + 1:]``. The recursive shape spent a stack frame and a fresh tail slice per marker, so an
+    export's branch WIDTH drove both — and width is a dimension ``_MAX_NESTING`` does not bound,
+    because that bounds DEPTH. **The width that broke it was ``sys.getrecursionlimit()``, not a
+    property of any machine:** on the stock limit of 1000, an ``<If>`` holding 900 bare
+    ``<Line Data="Else"/>`` siblings parsed and 1,500 raised ``RecursionError`` out of an untrusted
+    export, and the same for ``Catch`` under ``<Try>`` (BACKLOG #1682). This form is linear in stack
+    and in work, and it computes no slice bound at all, so no off-by-one can hand a branch its
+    neighbour's statements."""
+    head: list[Step] = []
+    opened: list[tuple[Control, list[Step]]] = []
+    for step in steps:
+        if isinstance(step, Control) and step.kind in _BRANCH_PARENT and not step.body:
+            opened.append((step, []))
+        elif opened:
+            opened[-1][1].append(step)
+        else:
+            head.append(step)
+    return tuple(head), tuple(replace(marker, body=tuple(body)) for marker, body in opened)
 
 
 # How deep the ``<List>`` tree may nest. The walk is mutually recursive (list → statement → list), so
 # an untrusted export nesting thousands of elements would otherwise exhaust the interpreter stack and
-# surface as a RecursionError traceback instead of a clean, reported error (CLAUDE.md §6/§8). Real
-# packages nest a handful of levels; 100 is far past any plausible hand-authored action-list.
+# surface as a RecursionError instead of a clean, reported error (CLAUDE.md §6/§8). Real packages nest
+# a handful of levels; 100 is far past any plausible hand-authored action-list.
+#
+# THIS BOUNDS DEPTH AND NOTHING BOUNDS WIDTH, which is deliberate: branches are siblings, so
+# :func:`_split_branches` needs no recursion and a cap would only refuse legitimate input (a long
+# ElseIf chain, a Case with many Matching arms). One consequence is recorded here rather than left for
+# the next reader to hit. The importer is now linear in width, but the module it GENERATES has a wall
+# of its own, because :func:`_generate_conditional` emits one ``elif`` per branch and CPython's parser
+# is right-recursive over them. Measured on 3.14: 5,000 branches produce a module that parses, 20,000
+# produce one that raises ``MemoryError: Parser stack overflowed`` — while the import reports success
+# and exit 0. Unbounded and unreported today; the artifact is caught only downstream, by the
+# ``messagefoundry check --config`` the CLI already tells the migrator to run.
 _MAX_NESTING = 100
 
 
@@ -1949,16 +1970,19 @@ def _has_inline_send(steps: tuple[Step, ...]) -> bool:
 def import_corepoint(export_path: str | Path, out_dir: str | Path) -> ImportResult:
     """Parse the export at ``export_path`` and write one config module per channel into ``out_dir``.
 
-    Returns the :class:`ImportResult` count-and-log summary. Raises :class:`CorepointImportError` on a
-    malformed export and :class:`OSError` on a filesystem failure writing ``out_dir``. A
-    ``RecursionError`` can also come back out: the superseded JSON layer decodes through
-    :func:`json.loads`, whose own depth guard raises one that is NOT a ``JSONDecodeError``, so
-    :func:`parse_export` cannot convert it. The CLI (``messagefoundry import corepoint``) maps all
-    three to a clean, reported error rather than a traceback — see ``__main__._import``."""
+    Returns the :class:`ImportResult` count-and-log summary. Raises :class:`CorepointImportError` on an
+    export it cannot read, decode or parse, and :class:`OSError` on a filesystem failure **writing**
+    ``out_dir``. The boundary is deliberate and asymmetric: the READ side is converted here, because
+    this function chose the encoding and owns the diagnosis; the WRITE side stays an ``OSError``
+    because the caller chose ``out_dir``. The CLI reports both — see ``__main__._import``."""
     epath = Path(export_path)
     try:
         text = epath.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
+        # ``UnicodeDecodeError`` is a ``ValueError``, NOT an ``OSError``, so it slipped this arm and
+        # every arm the CLI has beneath it. Measured on the real subprocess: a cp1252 export — routine
+        # for a Windows-authored XML file — produced an EMPTY stdout under ``--json``, so a consumer
+        # piping to ``jq`` got a parse failure instead of the error object ``_emit_error`` promises.
         raise CorepointImportError(f"cannot read export {epath}: {exc}") from exc
 
     channels = parse_any(text, source_name=epath.stem)

@@ -3983,9 +3983,17 @@ def _import(args: argparse.Namespace) -> int:
     """``import corepoint`` — translate a Corepoint action-list export into code-first config (ADR 0086).
 
     Writes one ``@router``/``@handler`` module per channel into ``--out`` and reports the count-and-log
-    summary (mapped vs. unmapped actions). The export is untrusted data, so a failure is reported as a
-    clean error + exit 1 rather than a traceback — at least a malformed export, a ``--out`` the engine
-    cannot write, and an export structured deeply enough to hit the interpreter's recursion limit."""
+    summary (mapped vs. unmapped actions). The export is untrusted data, so a failure is reported
+    through :func:`_emit_error` — at least a malformed or undecodable export, a ``--out`` the engine
+    cannot write, and a recursion fault.
+
+    WHAT AN UNCAUGHT ONE COSTS IS NOT A TRACEBACK, and saying so would rest this on a false premise.
+    :func:`main` installs ``last_resort``'s excepthook for every subcommand (BACKLOG #1674), so an
+    escape is already redacted to one ``CRITICAL`` line on stderr and exit 1. What it is NOT is an
+    error OBJECT: measured on the real subprocess, an escape under ``--json`` leaves **stdout empty**,
+    so a consumer piping to ``jq`` gets a parse failure rather than ``{"error": ...}`` — which is
+    exactly the contract :func:`_emit_error` documents. Diagnosis is the other half: the excepthook
+    prints the exception type, never which of the operator's inputs was at fault."""
     from messagefoundry.corepoint_import import CorepointImportError, import_corepoint
 
     try:
@@ -3993,26 +4001,28 @@ def _import(args: argparse.Namespace) -> int:
     except CorepointImportError as exc:
         return _emit_error(str(exc), as_json=args.json)
     except OSError as exc:
-        # ``import_corepoint`` already folds a failure READING the export into CorepointImportError, so
-        # an OSError arriving here came from writing: ``--out`` naming an existing FILE raises
-        # FileExistsError out of ``mkdir``, and a read-only or full target raises out of ``write_text``.
-        # Its own docstring promised the CLI maps this; without the arm the operator got the traceback
-        # this handler's docstring says never happens (BACKLOG #1684).
+        # ``import_corepoint`` converts the READ side to CorepointImportError, so an OSError arriving
+        # here came from WRITING: ``--out`` naming an existing FILE raises FileExistsError out of
+        # ``mkdir``, and a read-only or full target raises out of ``write_text``. Its own docstring
+        # already promised the CLI reports this and nothing did (BACKLOG #1684).
+        #
+        # The message deliberately does NOT assert that the directory is unwritable. ``import_corepoint``
+        # writes one module per channel in a loop, so a later channel can fail over a target that was
+        # perfectly writable, leaving earlier modules on disk that this message must not deny.
         return _emit_error(
-            f"cannot write the imported modules into {args.out}: {exc}", as_json=args.json
+            f"failed while writing the imported modules into {args.out}: {exc}", as_json=args.json
         )
     except RecursionError as exc:
-        # A structural refusal, not a crash — and RecursionError derives from RuntimeError, so neither
-        # arm above can reach it. Live trigger measured at engine 0447f96e5: the superseded JSON layer
-        # decodes through json.loads, whose depth guard raises RecursionError rather than a
-        # JSONDecodeError, so a 20,000-deep array in an export file escaped as a raw traceback. The XML
-        # layer's own depth is bounded by corepoint_import._MAX_NESTING and its branch WIDTH no longer
-        # recurses (BACKLOG #1682), so this arm is the last resort that keeps the promise if a future
-        # walk over untrusted export structure recurses without a bound of its own.
-        return _emit_error(
-            f"export is structured too deeply to import: {type(exc).__name__}: {exc}",
-            as_json=args.json,
-        )
+        # A BACKSTOP, and only a backstop: RecursionError derives from RuntimeError, so neither arm
+        # above can reach one. The known trigger is converted upstream now, at the ``json.loads`` call
+        # in ``corepoint_import.parse_export`` that raises it (read the reasoning there, not here);
+        # the XML layer's depth is bounded by ``corepoint_import._MAX_NESTING`` and its branch width no
+        # longer recurses (BACKLOG #1682).
+        #
+        # So anything still landing here is more likely an unbounded walk in THIS engine than a deep
+        # export, and the message must not blame the operator's file for a defect it has not
+        # established.
+        return _emit_error(f"import hit the interpreter recursion limit: {exc}", as_json=args.json)
 
     if args.json:
         _print_json(result.to_json(), compact=True)

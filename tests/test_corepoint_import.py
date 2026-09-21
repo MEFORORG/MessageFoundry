@@ -1222,40 +1222,60 @@ def test_hostile_xml_values_cannot_inject_code() -> None:
     ast.parse(src)  # still one well-formed module — no literal or comment breakout
 
 
-# --- branch WIDTH, and the structural errors the CLI promises (BACKLOG #1682, #1684) ------------
+# --- branch WIDTH, and the structural errors the CLI reports (BACKLOG #1682, #1684) -------------
 #
 # _MAX_NESTING bounds the export's DEPTH. Nothing bounded its branch WIDTH, and the old
 # _split_branches recursed once per branch marker over a fresh tail slice, so a wide chain in an
-# untrusted export exhausted the stack. These pin the width case end to end and the two error shapes
-# the CLI handler's own docstring says never reach the operator as a traceback.
+# untrusted export exhausted the stack.
+#
+# WHAT AN UNCAUGHT ERROR COSTS HERE IS NOT A TRACEBACK. main() installs last_resort's excepthook for
+# every subcommand (BACKLOG #1674), so an escape is redacted to one CRITICAL line and exit 1. What it
+# is not is an error OBJECT: under --json, stdout comes back EMPTY, breaking _emit_error's documented
+# contract that the error object IS the command's machine-readable output. These tests call main()
+# in-process, where sys.excepthook never fires, so an escape shows up as a raised exception -- that is
+# the harness, not the shipped behaviour, and the distinction is why the assertions below are written
+# on the error OBJECT rather than on the absence of a traceback.
 
-# Measured at engine 0447f96e5 on 3.14: 900 sibling markers parsed, 1,500 raised RecursionError.
+# The width that broke the old form was sys.getrecursionlimit()'s stock 1000, not a machine property:
+# 900 sibling markers parsed and 1,500 raised RecursionError. Keep this above 1000.
 _WIDE = 1500
 
 
-def test_a_wide_branch_chain_parses_as_flat_siblings() -> None:
-    """A branch chain's WIDTH must not cost stack: the split is one pass, not a recursion per marker.
+def _minimal_export(tmp_path: Path, name: str = "ok.xml") -> Path:
+    """A smallest valid ``<Package>`` on disk — for the CLI arms that fail for some OTHER reason."""
+    export = tmp_path / name
+    export.write_text(_package('<Line Data="ItemClear %ADT/PID-19"/>'), encoding="utf-8")
+    return export
 
-    RED when: ``_split_branches`` recurses on ``steps[i + 1:]`` again — both arms then raise
+
+@pytest.mark.parametrize(
+    ("wrapper", "marker", "branch_kind"),
+    [("If", "Else", "else"), ("Try", "Catch", "except")],
+)
+def test_a_wide_branch_chain_parses_as_flat_siblings(
+    wrapper: str, marker: str, branch_kind: str
+) -> None:
+    """A branch chain's WIDTH must not cost stack: one pass, not a recursion per marker.
+
+    RED when: ``_split_branches`` recurses on ``steps[i + 1:]`` again — both cases then raise
     ``RecursionError`` out of ``parse_package`` at this width (BACKLOG #1682)."""
-    for wrapper, marker, branch_kind in (("If", "Else", "else"), ("Try", "Catch", "except")):
-        body = f"<{wrapper}>" + f'<Line Data="{marker}"/>' * _WIDE + f"</{wrapper}>"
-        steps = parse_package(_package(body))[0].handlers[0].steps
-        assert len(steps) == 1
-        chain = steps[0]
-        assert isinstance(chain, Control)
-        # Flat SIBLINGS, not a chain nested one level per marker — the shape the recursion produced,
-        # and the reason the render walk stays shallow however wide the export gets.
-        assert len(chain.branches) == _WIDE
-        assert {b.kind for b in chain.branches} == {branch_kind}
-        assert all(b.body == () for b in chain.branches)
+    body = f"<{wrapper}>" + f'<Line Data="{marker}"/>' * _WIDE + f"</{wrapper}>"
+    steps = parse_package(_package(body))[0].handlers[0].steps
+    assert len(steps) == 1
+    chain = steps[0]
+    assert isinstance(chain, Control)
+    # Flat SIBLINGS, not a chain nested one level per marker — the shape the recursion produced, and
+    # the reason the render walk stays shallow however wide the export gets.
+    assert len(chain.branches) == _WIDE
+    assert {b.kind for b in chain.branches} == {branch_kind}
+    assert all(b.body == () for b in chain.branches)
 
 
 def test_each_branch_keeps_exactly_its_own_statements() -> None:
-    """The one-pass split must slice each branch's body at the NEXT marker, not inherit the tail.
+    """Each branch takes the statements between its own marker and the next, and no others.
 
-    RED when: a rewrite gets the slice bounds wrong — an off-by-one moves a statement into the
-    neighbouring branch, which the wide-chain arm above (every body empty) cannot see."""
+    RED when: a rewrite lets a branch inherit the tail — which the wide-chain cases above, where every
+    body is empty, cannot see."""
     body = (
         '<If Data="If (%ADT/PID-8 = &quot;M&quot;)"><List>'
         '<Line Data="ItemClear %ADT/PID-19"/>'
@@ -1282,85 +1302,122 @@ def test_the_cli_imports_a_wide_branch_chain_end_to_end(
 ) -> None:
     """The RENDER walk is the other half: a green split alone would not prove the crash stops.
 
-    ``_generate_conditional`` iterates ``branches`` flatly and only ``_block_body`` descends, so
-    render depth tracks the export's NESTING (bounded by ``_MAX_NESTING``) and never its width — but
-    that is a measurement, so it is pinned here through the real CLI entry point, not asserted.
+    ``_generate_conditional`` iterates ``branches`` flatly and only ``_block_body`` descends, so render
+    depth tracks the export's NESTING (bounded by ``_MAX_NESTING``) and never its width — but that is a
+    measurement, so it is pinned here through the real CLI entry point rather than asserted.
 
     RED when: either the split or the render recurses per branch marker (BACKLOG #1682)."""
     from messagefoundry.__main__ import main
 
     export = tmp_path / "wide.xml"
-    body = "<If>" + '<Line Data="Else"/>' * _WIDE + "</If>"
-    export.write_text(_package(body), encoding="utf-8")
+    export.write_text(_package("<If>" + '<Line Data="Else"/>' * _WIDE + "</If>"), encoding="utf-8")
     out = tmp_path / "config"
-    code = main(["import", "corepoint", str(export), "--out", str(out), "--json"])
-    assert code == 0
+    assert main(["import", "corepoint", str(export), "--out", str(out), "--json"]) == 0
     summary = json.loads(capsys.readouterr().out)
     # The construct plus one branch each — every marker accounted for, none collapsed (count-and-log).
     assert summary["total_mapped"] == _WIDE + 1
     ast.parse((out / "IB_ACME_X.py").read_text(encoding="utf-8"))
 
 
-def test_cli_reports_an_unwritable_out_directory_without_a_traceback(
+def test_cli_reports_an_unwritable_out_directory_as_an_error_object(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """``import_corepoint``'s docstring promised the CLI maps a filesystem failure; it did not.
+    """``import_corepoint``'s docstring promised the CLI reports a filesystem failure; nothing did.
 
     ``--out`` naming an existing FILE raises ``FileExistsError`` out of ``mkdir`` — an ``OSError``,
-    which is not a ``CorepointImportError``, so it printed the raw traceback the handler's own
-    docstring says never happens.
+    which is not a ``CorepointImportError``, so it escaped every arm (BACKLOG #1684).
 
-    RED when: the ``except OSError`` arm is dropped — the call then raises out of ``main`` instead of
-    returning 1 (BACKLOG #1684)."""
+    RED when: the ``except OSError`` arm is dropped."""
     from messagefoundry.__main__ import main
 
-    export = tmp_path / "ok.xml"
-    export.write_text(_package('<Line Data="ItemClear %ADT/PID-19"/>'), encoding="utf-8")
+    export = _minimal_export(tmp_path)
     occupied = tmp_path / "already-a-file"
     occupied.write_text("not a directory", encoding="utf-8")
+    args = ["import", "corepoint", str(export), "--out", str(occupied)]
 
-    code = main(["import", "corepoint", str(export), "--out", str(occupied), "--json"])
-    assert code == 1
-    assert "cannot write the imported modules into" in json.loads(capsys.readouterr().out)["error"]
+    assert main([*args, "--json"]) == 1
+    assert (
+        "failed while writing the imported modules" in json.loads(capsys.readouterr().out)["error"]
+    )
+    # The human leg too: _emit_error splits streams deliberately (BACKLOG #1673), and a JSON-only test
+    # leaves half of that split uncovered.
+    assert main(args) == 1
+    human = capsys.readouterr()
+    assert human.out == ""
+    assert "error: failed while writing the imported modules" in human.err
 
 
-def test_cli_reports_a_too_deeply_structured_export_without_a_traceback(
+def test_cli_reports_an_export_it_cannot_decode(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A non-UTF-8 export is untrusted input like any other, and it slipped every arm.
+
+    ``UnicodeDecodeError`` is a ``ValueError``, not an ``OSError``, so ``import_corepoint``'s read
+    guard missed it and so did the CLI. Measured on the real subprocess before the fix: exit 1, one
+    redacted CRITICAL line, and an EMPTY stdout under ``--json``.
+
+    RED when: ``import_corepoint``'s read arm narrows back to ``OSError`` alone."""
+    from messagefoundry.__main__ import main
+
+    export = tmp_path / "cp1252.xml"
+    # A real Windows-codepage byte: valid cp1252, invalid UTF-8, so the decode fails rather than the
+    # parse. An ASCII-only fixture could not reach this arm at all.
+    export.write_bytes(_package('<Line Data="ItemClear %ADT/PID-19"/>').encode("ascii") + b"\xc9")
+
+    assert main(["import", "corepoint", str(export), "--out", str(tmp_path / "o"), "--json"]) == 1
+    assert "cannot read export" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_a_json_export_nested_past_the_decoder_is_a_reported_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``json.loads`` guards its own decode depth with ``RecursionError``, which is a ``RuntimeError``.
+
+    So ``parse_export``'s ``JSONDecodeError`` arm could never catch it, and a deeply nested export
+    escaped every caller of the library — not only the CLI. Converted at the ``json.loads`` call now.
+
+    3.14 checks the real C stack rather than ``sys.getrecursionlimit()``, so the depth where it fires
+    varies with the machine. A bigger stack decodes the array instead and the root-shape check answers.
+    Both are reported errors, and the assertion admits exactly those two and nothing else.
+
+    RED when: ``parse_export``'s ``RecursionError`` arm is dropped — the decode then escapes."""
+    from messagefoundry.__main__ import main
+
+    deep = tmp_path / "deep.json"
+    deep.write_text("[" * 100_000 + "]" * 100_000, encoding="utf-8")
+
+    assert main(["import", "corepoint", str(deep), "--out", str(tmp_path / "o"), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "nests JSON too deeply" in error or "export root must be a JSON object" in error
+
+
+def test_the_cli_backstops_a_recursion_fault(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """``RecursionError`` is a ``RuntimeError``, so neither the ``ValueError`` nor the ``OSError`` arm
-    can reach it — it needs an arm of its own or it escapes as a traceback (BACKLOG #1682 limb 2).
+    """The known trigger is converted upstream, so this arm exists for an unbounded walk in the engine.
 
-    THE BINDING ARM RAISES ONE RATHER THAN RECURSING, on the discipline
-    ``tests/test_sandbox_codec.py`` already uses: 3.14's ``json`` scanner checks the real C stack, so
-    ``sys.setrecursionlimit`` does not bound it (measured: limit 80 still parsed 2,000 levels) and the
-    depth where it gives out varies with the machine. The live arm below therefore only requires a
-    clean exit, which holds whichever way that machine falls.
+    RAISES a ``RecursionError`` rather than recursing, on the discipline
+    ``tests/test_sandbox_codec.py`` already uses: the point is that the arm answers, and manufacturing
+    the exception is the only way to test that without a real defect to trigger it.
 
-    RED when: the ``except RecursionError`` arm is dropped."""
+    The message must not blame the operator's export, because at this point nothing has established
+    that the export is at fault.
+
+    RED when: the ``except RecursionError`` arm is dropped (BACKLOG #1682)."""
     import messagefoundry.corepoint_import as corepoint_import
     from messagefoundry.__main__ import main
 
+    # Why the arm cannot be folded into either arm above it.
     assert issubclass(RecursionError, RuntimeError)
     assert not issubclass(RecursionError, ValueError)  # so `except CorepointImportError` misses it
     assert not issubclass(RecursionError, OSError)  # and so does the arm beside it
-
-    export = tmp_path / "ok.xml"
-    export.write_text(_package('<Line Data="ItemClear %ADT/PID-19"/>'), encoding="utf-8")
 
     def _blow(*_args: object, **_kwargs: object) -> None:
         raise RecursionError("maximum recursion depth exceeded")
 
     monkeypatch.setattr(corepoint_import, "import_corepoint", _blow)
-    code = main(["import", "corepoint", str(export), "--out", str(tmp_path / "out"), "--json"])
-    assert code == 1
-    assert "too deeply" in json.loads(capsys.readouterr().out)["error"]
-    monkeypatch.undo()
-
-    # The live trigger that survives the #1682 fix: the superseded JSON layer decodes through
-    # json.loads, whose depth guard raises RecursionError rather than a JSONDecodeError, so
-    # parse_export cannot fold it into CorepointImportError. Measured at 0447f96e5: 20,000 levels
-    # escaped ``main`` as "Stack overflow (used 2912 kB) while decoding a JSON array".
-    deep = tmp_path / "deep.json"
-    deep.write_text("[" * 100_000 + "]" * 100_000, encoding="utf-8")
-    assert main(["import", "corepoint", str(deep), "--out", str(tmp_path / "out2"), "--json"]) == 1
-    assert json.loads(capsys.readouterr().out)["error"]
+    export = _minimal_export(tmp_path)
+    assert main(["import", "corepoint", str(export), "--out", str(tmp_path / "o"), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "hit the interpreter recursion limit" in error
+    assert "export" not in error
