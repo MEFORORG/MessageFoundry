@@ -1693,8 +1693,15 @@ def test_serve_ui_offloopback_refusal_prescribes_a_config_that_loads(
     This refusal is the whole reason the #1361 row exists -- a message that hands an operator a config
     key the loader then rejects. It reached HEAD having itself acquired that defect: the reworded text
     said "Set [security].local_access_only=true", and ``_desugar_security`` REFUSES local_access_only
-    =true beside a non-loopback listen_address. Since a non-loopback bind is the only state that
-    reaches this gate at all, that was the one edit guaranteed to die at load.
+    =true beside a non-loopback listen_address. Reaching this gate BY CONFIG FILE means exactly that
+    pair, so the prescribed edit was the one that could not be made.
+
+    "BY CONFIG FILE" IS A REAL NARROWING, NOT THROAT-CLEARING. ``--host`` is merged AFTER
+    ``_desugar_security`` (see ``load_settings``), so ``serve --host 0.0.0.0`` reaches this same gate
+    from a file that sets neither key -- and there the old prescription did not die at load, it simply
+    did nothing. This test drives the FILE route only. The CLI route is a separate, unfixed gap:
+    the message names no flag, so an operator who bound off-box with ``--host`` is told to edit a file
+    that is already correct.
 
     A test that read the message could not have caught it -- the old text named a real, correctly-spelled
     [security] field. Only running the prescribed config finds it.
