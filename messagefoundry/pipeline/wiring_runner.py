@@ -337,6 +337,10 @@ _CONN_EVENT_FLUSH_GRACE = 2.0
 # Most events one drainer write takes (BACKLOG #1731). Bounded so a flood backlog is written in slices,
 # each holding the store's write lock briefly, rather than as one 10,000-row transaction.
 _CONN_EVENT_BURST_MAX = 256
+# Single-row failures in a row that end a refused burst's salvage. A burst refused for ONE bad row
+# never reaches this; a run of them says the STORE is refusing, and every further attempt pays a full
+# acquire wait to learn the same thing. See `_rewrite_connection_events_singly`.
+_CONN_EVENT_SALVAGE_GIVE_UP = 3
 
 # The ingress worker has no per-message "failure" to hang a buildup check on (a slow-but-working
 # router just falls behind), so it polls the lane depth at most this often — bounding the extra
@@ -1472,10 +1476,15 @@ class RegistryRunner:
         """Write queued connection events to the store OFF the listener/delivery hot path (#46), one
         transaction per BURST (BACKLOG #1731): after the blocking get, whatever else is already queued,
         up to ``_CONN_EVENT_BURST_MAX``, rides the same write. There is no linger timer, so an event on
-        a quiet connection is written as promptly as before. **Fail-soft**: a store error drops that
-        burst, never a message or the listener. ``task_done`` runs once per event, after the write
-        resolves, so teardown's ``join`` still means "written or dropped". Cancelled (after a
-        best-effort flush) on teardown."""
+        a quiet connection is written as promptly as before. **Fail-soft**: a store error costs
+        observations, never a message or the listener. ``task_done`` runs once per event, after the
+        write resolves, so teardown's ``join`` still means "written or dropped". Cancelled (after a
+        best-effort flush) on teardown.
+
+        **A failed burst is re-written ROW BY ROW rather than dropped whole.** The store's write is
+        all-or-nothing by design, so one unwritable row would otherwise take up to 255 good
+        observations down with it — and the bad row is the one a reader most wants the neighbours
+        of, because they are the events around whatever went wrong."""
         q = self._conn_event_q
         assert q is not None
         while True:
@@ -1489,11 +1498,70 @@ class RegistryRunner:
                 await self.store.record_connection_events(burst)
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                log.warning("connection-event write failed; dropping %d event(s)", len(burst))
+            except Exception as exc:
+                await self._rewrite_connection_events_singly(burst, exc)
             finally:
                 for _ in burst:
                     q.task_done()
+
+    async def _rewrite_connection_events_singly(
+        self, burst: Sequence[ConnectionEventWrite], exc: BaseException
+    ) -> None:
+        """Salvage a burst the store refused as a unit: write each row on its own so only the rows
+        that fail alone are lost, then log the failure ONCE with the class that caused it.
+
+        The class is in the message because "the write failed" is the one detail that does not
+        narrow anything down — an ``IntegrityError`` from one malformed row and an
+        ``OperationalError`` from a store that is gone want opposite responses from an operator, and
+        the payload itself can never be logged (it carries connection metadata, and ``reason`` is
+        PHI-scrubbed only on its way into the store).
+
+        **IT GIVES UP AFTER ``_CONN_EVENT_SALVAGE_GIVE_UP`` FAILURES IN A ROW, and that bound is the
+        load-bearing part.** A burst refused for ONE unwritable row salvages every other row and
+        never sees two consecutive failures. A burst refused because the STORE is unreachable fails
+        every row, and each of those attempts pays a full connection-acquire wait — 30 seconds by
+        default on the server backends — so an unbounded retry would stall this drainer for hours to
+        salvage nothing, overflowing a 10,000-deep queue whose drops are counted and never logged.
+        The cutoff costs at most a few wasted waits and cannot cost more.
+
+        **The cutoff is on the COUNT and not on the exception class, deliberately.** Each backend
+        raises its own classes, so a class test here would make this module import-aware of every
+        driver and would silently stop discriminating on the next backend added — the same trap the
+        federated-binding race loser documents at ``AuthService._complete_ad_login``. A run of
+        failures says "the store is refusing" on every backend, present and future."""
+        written = 0
+        consecutive = 0
+        for event in burst:
+            try:
+                await self.store.record_connection_events([event])
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                consecutive += 1
+                if consecutive >= _CONN_EVENT_SALVAGE_GIVE_UP:
+                    log.warning(
+                        "connection-event burst write failed (%s); salvaged %d of %d event(s), then"
+                        " gave up after %d single-row failures in a row and dropped %d",
+                        type(exc).__name__,
+                        written,
+                        len(burst),
+                        consecutive,
+                        len(burst) - written,
+                    )
+                    return
+            else:
+                written += 1
+                consecutive = 0
+        log.warning(
+            # SALVAGED, not attempted: the count has to be the one an operator can subtract from.
+            # This read `len(burst)` until a review caught it reporting "rewrote 3 ... dropped 1"
+            # for a 3-row burst of which 2 landed -- arithmetic nobody can act on.
+            "connection-event burst write failed (%s); salvaged %d of %d event(s) singly, dropped %d",
+            type(exc).__name__,
+            written,
+            len(burst),
+            len(burst) - written,
+        )
 
     def _outbound_transport(self, name: str) -> str:
         """The transport label of an outbound connection for a connection event, read live from the

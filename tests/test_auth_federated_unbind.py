@@ -7,6 +7,10 @@ Before this there was no way to spell "this account has no federated binding":
 ``auth_provider='ad'``, revokes the account's live sessions in the same transaction, and audits
 the prior pair with the revoked count so the revocation is visible rather than inferred.
 
+Two of the tests below are about what the transaction BOUNDARY buys, which is the part an unbind
+that merely "works" gets wrong: the audited pair is read inside the same transaction that clears
+it, and a federated login already in flight cannot mint a session after the revocation has run.
+
 The bindings here are made by a REAL federated login through the shared OIDC helpers, so the state
 being unbound is the state the login path writes, not a hand-built row that might differ from it.
 """
@@ -131,5 +135,103 @@ async def test_unbind_of_an_unknown_user_is_refused(rsa_key: rsa.RSAPrivateKey) 
         with pytest.raises(ValueError, match="no such user"):
             await service.unbind_federated_subject("nobody", actor="admin")
         assert await _unbound_rows(store) == []
+    finally:
+        await store.close()
+
+
+async def test_the_audit_row_names_the_pair_the_unbind_itself_cleared(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The audited pair comes out of the unbind's own transaction, not a read taken before it.
+
+    A rebind is wedged in at the moment the service would previously have read the account -- so a
+    ``get_user`` above the store call would see ``S-1-alice``, while the transaction that runs
+    afterwards clears ``S-1-carol``. The row has to name what was cleared; naming the pair that was
+    there a moment earlier is a false record of whose access was withdrawn.
+
+    The wedge sits on ``get_user`` precisely BECAUSE the fixed code never calls it here: the test
+    fails loudly if that read comes back, and passes only while the reported pair is the
+    transaction's own.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+        assert (await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-alice")).ok
+        account = await store.get_user_by_username("jdoe")
+        assert account is not None and account.oidc_subject == "S-1-alice"
+        issuer = account.oidc_issuer
+        assert issuer is not None
+
+        # The state the unbind will actually meet: a different subject, bound after the read a
+        # careless implementation would have taken.
+        await store.clear_user_federated_subject(account.id, now=10.0)
+        await store.set_user_federated_subject(account.id, issuer, "S-1-carol", now=11.0)
+
+        async def unexpected_get_user(user_id: str) -> Any:
+            raise AssertionError(
+                "unbind_federated_subject read the account outside its transaction; the pair it"
+                " audits can then be one a concurrent rebind has already replaced"
+            )
+
+        monkeypatch.setattr(store, "get_user", unexpected_get_user)
+        await service.unbind_federated_subject(account.id, actor="admin")
+        monkeypatch.undo()
+
+        [row] = await _unbound_rows(store)
+        detail = json.loads(row["detail"])
+        assert detail["subject"] == "S-1-carol", "the audit row named a pair this unbind never saw"
+        assert detail["issuer"] == issuer and detail["username"] == "jdoe"
+    finally:
+        await store.close()
+
+
+async def test_an_unbind_racing_an_in_flight_login_refuses_the_session(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A login already past its checks must not mint a session the unbind's revocation cannot see.
+
+    The unbind is fired at the last possible instant -- once the login has resolved the account and
+    is about to persist its session -- which is the window the revocation cannot cover, because it
+    revokes what is LIVE when it runs and this session is not live yet. The login has to come back
+    refused, audited, with no session row of any kind for the account.
+
+    The CONTROL is the first login in the body: the same helper, the same subject, unwedged, and it
+    succeeds. Without it a refusal here could equally mean federated login is broken outright.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+        control = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-alice")
+        assert control.ok and control.token is not None
+        account = await store.get_user_by_username("jdoe")
+        assert account is not None
+
+        real_create = store.create_session
+        fired = False
+
+        async def unbinding_create_session(**kw: Any) -> bool:
+            nonlocal fired
+            if not fired:
+                fired = True
+                await service.unbind_federated_subject(account.id, actor="admin")
+            return await real_create(**kw)
+
+        monkeypatch.setattr(store, "create_session", unbinding_create_session)
+        raced = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-alice")
+        monkeypatch.undo()
+
+        assert fired, "the wedge never ran, so no unbind raced this login"
+        assert not raced.ok and raced.token is None
+        assert raced.reason == "federated_subject_unbound"
+        assert await store.list_sessions(account.id) == [], (
+            "the racing login left a live session the unbind's revocation never saw"
+        )
+        failures = [
+            a
+            for a in await store.list_audit()
+            if a["action"] == "auth.login_failed"
+            and '"reason": "federated_subject_unbound"' in (a["detail"] or "")
+        ]
+        assert len(failures) == 1
     finally:
         await store.close()

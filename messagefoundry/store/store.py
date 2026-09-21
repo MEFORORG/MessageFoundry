@@ -872,6 +872,13 @@ class ConnectionEventWrite(TypedDict):
     now: NotRequired[float | None]
 
 
+# The one sessions INSERT, shared by MessageStore.create_session's guarded and unguarded paths.
+_SESSION_INSERT: Final = (
+    "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
+    " revoked_at, client, reauth_at) VALUES (?,?,?,?,?,NULL,?,?)"
+)
+
+
 # The one connection_event INSERT, shared by MessageStore's singular and burst writers.
 _CONNECTION_EVENT_INSERT: Final = (
     "INSERT INTO connection_event"
@@ -1143,6 +1150,36 @@ class UserRecord:
             # column beats a quiet, permanent loss of the notification channel.
             notify_email=d["notify_email"],
         )
+
+
+@dataclass(frozen=True)
+class FederatedUnbind:
+    """What ONE ``clear_user_federated_subject`` transaction saw and did (BACKLOG #1474).
+
+    The fields are read **inside** the unbind's own transaction, so they are the values the UPDATE
+    actually cleared rather than a separate read's guess at them. That is the whole reason this is a
+    record and not an ``int``: the caller audits the prior pair, and a pair read outside the
+    transaction can name a binding a concurrent unbind-then-rebind replaced between the read and the
+    write.
+
+    **TWO OPTIONAL COLUMNS AND NOT ONE OPTIONAL TUPLE, because the schema permits a HALF row.**
+    A tuple type would encode "both set or both NULL", and nothing enforces that:
+    ``ux_users_federated_subject`` is FILTERED (``WHERE oidc_issuer IS NOT NULL AND oidc_subject IS
+    NOT NULL``) on all three backends, so it EXCLUDES a half row from uniqueness rather than
+    forbidding one, and there is no CHECK constraint. No code path writes a half row today —
+    ``set_user_federated_subject`` takes ``str`` for both halves — but a type that cannot spell the
+    state the table can hold sends the unbind down the "nothing to clear" arm for a row that has
+    something to clear, which is how the residual half becomes unclearable through the admin path.
+    """
+
+    username: str
+    #: The pair as the transaction read it, i.e. what this call cleared. BOTH ``None`` when the
+    #: account was already unbound — nothing was written and ``sessions_revoked`` is 0, because an
+    #: unbind of nothing must not sign anybody out. Either one set means there WAS something to
+    #: clear, and it was cleared.
+    issuer: str | None
+    subject: str | None
+    sessions_revoked: int
 
 
 @dataclass(frozen=True)
@@ -9442,22 +9479,46 @@ class MessageStore:
             )
             await self._commit()
 
-    async def clear_user_federated_subject(self, user_id: str, *, now: float | None = None) -> int:
+    async def clear_user_federated_subject(
+        self, user_id: str, *, now: float | None = None
+    ) -> FederatedUnbind | None:
         """Unbind the federated pair and revoke the account's live sessions in one transaction
         (BACKLOG #1474). See :meth:`Store.clear_user_federated_subject` for why the two cannot be
-        separated. Returns the number of sessions revoked."""
+        separated, and why the prior pair is read in here rather than by the caller."""
         now = time.time() if now is None else now
         async with _writer_txn(self._db, self._lock):
+            cur = await self._db.execute(
+                "SELECT username, oidc_issuer, oidc_subject FROM users WHERE id=?", (user_id,)
+            )
+            row = await cur.fetchone()
+            if row is None:
+                await self._db.rollback()
+                return None
+            issuer, subject = row["oidc_issuer"], row["oidc_subject"]
+            if issuer is None and subject is None:
+                # Already unbound: write NOTHING. Falling through would revoke this account's live
+                # sessions for a no-op change, and an unbind of nothing must not sign anybody out.
+                # AND, not OR: a half row has something to clear, and skipping it here would strand
+                # the residual column with no admin path to remove it (see FederatedUnbind).
+                await self._db.rollback()
+                return FederatedUnbind(
+                    username=row["username"], issuer=None, subject=None, sessions_revoked=0
+                )
             await self._db.execute(
                 "UPDATE users SET oidc_issuer=NULL, oidc_subject=NULL, updated_at=? WHERE id=?",
                 (now, user_id),
             )
-            cur = await self._db.execute(
+            revoked = await self._db.execute(
                 "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL",
                 (now, user_id),
             )
             await self._commit()
-            return int(cur.rowcount)
+            return FederatedUnbind(
+                username=row["username"],
+                issuer=issuer,
+                subject=subject,
+                sessions_revoked=int(revoked.rowcount),
+            )
 
     async def roles_for_ad_groups(self, groups: Iterable[str]) -> set[str]:
         normalized = sorted({g.strip().lower() for g in groups if g.strip()})
@@ -9532,18 +9593,36 @@ class MessageStore:
         client: str | None = None,
         seed_reauth: bool = True,
         now: float | None = None,
-    ) -> None:
+        require_federated_subject: tuple[str, str] | None = None,
+    ) -> bool:
         now = time.time() if now is None else now
-        async with self._lock:
-            await self._db.execute(
-                "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
-                " revoked_at, client, reauth_at) VALUES (?,?,?,?,?,NULL,?,?)",
-                # reauth_at = now seeds the step-up window from login (ASVS 7.5.3). seed_reauth=False for
-                # an MFA-PENDING session (WP-14) leaves it NULL, so enrollment/step-up needs an explicit
-                # password re-verify — a stolen pre-MFA token can't ride the login's step-up freshness.
-                (token_hash, user_id, now, expires_at, now, client, now if seed_reauth else None),
+        # reauth_at = now seeds the step-up window from login (ASVS 7.5.3). seed_reauth=False for an
+        # MFA-PENDING session (WP-14) leaves it NULL, so enrollment/step-up needs an explicit
+        # password re-verify — a stolen pre-MFA token can't ride the login's step-up freshness.
+        params = (token_hash, user_id, now, expires_at, now, client, now if seed_reauth else None)
+        if require_federated_subject is None:
+            async with self._lock:
+                await self._db.execute(_SESSION_INSERT, params)
+                await self._commit()
+            return True
+        # _writer_txn for the GUARDED path, not the bare lock the unguarded one keeps (BACKLOG
+        # #1474). The lock alone is what makes the read and the INSERT atomic against
+        # clear_user_federated_subject, which takes the same lock — but this branch is now a
+        # MULTI-statement writer, and those go through the one helper that unwinds on BaseException,
+        # so a cancellation between the two cannot leave a transaction open for the next writer to
+        # inherit (ADR 0159). The refusal below rolls back itself, as that helper's contract requires.
+        async with _writer_txn(self._db, self._lock):
+            cur = await self._db.execute(
+                "SELECT oidc_issuer, oidc_subject FROM users WHERE id=?", (user_id,)
             )
+            row = await cur.fetchone()
+            bound = None if row is None else (row["oidc_issuer"], row["oidc_subject"])
+            if bound != require_federated_subject:
+                await self._db.rollback()
+                return False
+            await self._db.execute(_SESSION_INSERT, params)
             await self._commit()
+        return True
 
     async def get_session(self, token_hash: str) -> SessionRecord | None:
         async with self._read() as db:

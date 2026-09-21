@@ -55,6 +55,7 @@ from messagefoundry.store.store import (
     ConnectionEventWrite,
     ConnectionMetrics,
     DbStatus,
+    FederatedUnbind,
     LatencyHistogram,
     MessageSearchResult,
     MessageStatus,
@@ -1121,8 +1122,12 @@ class QueueStore(StoreLifecycle, Protocol):
         """Append a burst of connection events in **one** transaction (BACKLOG #1731), each row
         scrubbed, sealed and AAD-bound exactly as :meth:`record_connection_event` does it. The runner's
         drainer calls this with whatever was already queued, so the cost is one commit per burst
-        rather than one per event. All-or-nothing: a failure writes none of the burst, and the caller
-        drops it fail-soft. An empty sequence writes nothing."""
+        rather than one per event. All-or-nothing: a failure writes none of the burst. An empty
+        sequence writes nothing.
+
+        All-or-nothing is a TRANSACTION guarantee and nothing more: a caller that would rather keep
+        the writable rows of a refused burst has to re-submit them itself, one at a time. What such
+        a caller then does with the rows that still fail is its own policy, not this method's."""
         ...
 
     async def list_connection_events(
@@ -1924,9 +1929,13 @@ class AuthStore(Protocol):
         carries a different subject is refused, not handed the account."""
         ...
 
-    async def clear_user_federated_subject(self, user_id: str, *, now: float | None = None) -> int:
+    async def clear_user_federated_subject(
+        self, user_id: str, *, now: float | None = None
+    ) -> FederatedUnbind | None:
         """Unbind a user's federated ``(issuer, sub)`` identity and revoke every live session the
-        account holds, in ONE transaction (BACKLOG #1474). Returns the number of sessions revoked.
+        account holds, in ONE transaction (BACKLOG #1474). Returns what that transaction saw and
+        did — its ``issuer``/``subject`` being the binding this call cleared, both ``None`` when
+        there was none — or ``None`` in place of the whole record for a user that does not exist.
 
         The complement of :meth:`set_user_federated_subject`, which takes ``str`` for both halves and
         so cannot spell "no binding". Both columns go NULL together, which puts the row back in the
@@ -1939,7 +1948,18 @@ class AuthStore(Protocol):
         did not, those sessions would outlive the identity that earned them, with the account
         reporting itself unbound. So a failure in either statement rolls both back.
 
-        A missing user is a no-op returning 0; the caller decides whether that is an error.
+        **THE PRIOR PAIR IS READ IN HERE, AND THAT IS NOT A CONVENIENCE.** The caller audits what it
+        cleared, and a pair read by a separate ``get_user`` is a pair a concurrent unbind-and-rebind
+        can have replaced before this transaction runs — the audit row would then name a binding this
+        call never touched, which is worse than no record at all. Reading it inside the same
+        transaction makes the reported pair the one the UPDATE actually cleared.
+
+        **An already-unbound account writes NOTHING and revokes nothing**, reporting a NULL pair and
+        0 sessions. The check is in here rather than above so it is atomic with the write: an unbind
+        of nothing must not sign anybody out, and a caller checking first would be checking a state
+        that can change underneath it. "Already unbound" means BOTH halves NULL — a row holding one
+        of them has something to clear, and is cleared (see :class:`FederatedUnbind` for why the
+        schema allows that state at all).
         """
         ...
 
@@ -1982,7 +2002,25 @@ class AuthStore(Protocol):
         client: str | None = None,
         seed_reauth: bool = True,
         now: float | None = None,
-    ) -> None: ...
+        require_federated_subject: tuple[str, str] | None = None,
+    ) -> bool:
+        """Insert a session row. Returns ``True`` when one was written.
+
+        ``require_federated_subject`` makes the insert CONDITIONAL on the account still carrying
+        that verified ``(issuer, sub)``, checked in the same transaction (BACKLOG #1474): the row is
+        written only if the binding is still there, and the call returns ``False`` otherwise. A user
+        id that resolves to no row is a mismatch like any other, so it too returns ``False`` rather
+        than inserting a session against an account that is not there.
+
+        **It closes a race a caller cannot close for itself.** A federated login and an admin unbind
+        can overlap, and the unbind revokes the sessions that EXIST when it runs. Without this guard
+        the login's own ``INSERT`` can land just after that sweep, so the revocation misses it and
+        the withdrawn identity keeps a live session. Checking the binding before calling would only
+        narrow the window, because the check and the insert would still be two transactions.
+
+        Every other caller passes nothing and is byte-identical: no extra read, no extra statement.
+        """
+        ...
 
     async def get_session(self, token_hash: str) -> SessionRecord | None: ...
 

@@ -594,6 +594,18 @@ async def test_federated_unbind_store_contract(store) -> None:
     await _assert_federated_unbind_contract(store)
 
 
+async def test_session_binding_guard_store_contract(store) -> None:
+    """BACKLOG #1474 ``create_session(require_federated_subject=...)`` on real SQL Server.
+
+    The shared body is the one the SQLite and Postgres suites run. What this leg executes that no
+    other does: the ``WITH (UPDLOCK, ROWLOCK)`` read on one cursor under ``autocommit=False``,
+    whose refusal path rolls back to release the lock rather than committing an empty transaction.
+    """
+    from tests._federated_unbind_store_contract import _assert_session_binding_guard_contract
+
+    await _assert_session_binding_guard_contract(store)
+
+
 async def test_directory_binding_column_is_unconstrained_and_username_is_not(store) -> None:
     """The layer under the lookup, on the real SQL Server backend.
 
@@ -4584,13 +4596,18 @@ async def test_record_connection_events_writes_a_burst_all_or_nothing(store) -> 
     assert events[0].message_id == "m-1" and events[0].direction == "outbound"
     assert events[2].peer_host == "10.0.0.1"
 
-    # The second row carries a value the driver cannot bind, so the first has already executed when
-    # the burst fails. The transaction must take it back out.
-    with pytest.raises(Exception):  # noqa: B017 -- the driver's own bind error class, which differs
+    # THE FAILING ROW IS REJECTED BY THE SERVER, not by the driver: a NULL into ``connection``,
+    # which is NVARCHAR(256) NOT NULL. pyodbc binds NULL happily, so row 2 fails at the server with
+    # row 1 already executed on the same cursor -- which is exactly the state the rollback has to
+    # undo. A value the driver refuses would prove less: the failure would land at bind time and say
+    # nothing about what the server had accepted.
+    with pytest.raises(Exception):  # noqa: B017 -- pyodbc's IntegrityError, via its base
         await store.record_connection_events(
-            [ev("established", 200.0), ev("closed", 201.0, peer_host=object())]
+            [ev("established", 200.0), ev("closed", 201.0, connection=None)]
         )
-    assert len(await store.list_connection_events()) == 3
+    # Asserted on the CONTENT, not the count: what a missing rollback would leave behind is the
+    # ts=200.0 row, and naming it is what tells "rolled back" from "never arrived".
+    assert sorted(e.ts for e in await store.list_connection_events()) == [100.0, 101.0, 102.0]
 
     await store.record_connection_events([])  # an empty burst is a no-op
     assert len(await store.list_connection_events()) == 3
