@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.__main__ import main
+from messagefoundry.config.settings import load_settings
 
 SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
 ADT_A01 = (
@@ -2794,3 +2795,86 @@ def test_json_mode_error_stays_on_stdout(
     payload = json.loads(captured.out)
     assert isinstance(payload, dict), payload
     assert "error" in payload
+
+
+# --- the boot path must not echo a configured value into an unattended service log --------------
+
+
+#: The value the boot-path tests below plant in the environment and then look for. Why it is short
+#: and why it must not look like a key are stated once, on ``_CANARY`` in
+#: ``tests/test_cli_cluster_vip.py``; the short form is that pydantic abbreviates a long
+#: ``input_value`` repr FROM THE MIDDLE, so an ``in`` test over a 32-character value reads False
+#: while its tail is plainly on screen. A separate constant rather than a cross-module test import:
+#: sharing it would let one suite's edit weaken another suite's guard with nothing reporting it.
+_BOOT_CANARY = "not-a-real-one"
+
+
+@pytest.mark.parametrize("command", ["serve", "supervise"])
+def test_the_boot_path_never_echoes_an_env_supplied_secret(
+    command: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A settings load that fails at boot reports the FIELD, never the value the field was given.
+
+    The failing config is a ``[store]`` with ``backend = "postgres"`` and none of the three keys
+    that backend requires. ``MEFOR_STORE_PASSWORD`` is set, as it would be on any real Postgres
+    node, so the store password is inside the mapping ``_require_server_db_fields`` rejects, and
+    ``str(ValidationError)`` renders that whole mapping as ``input_value=``.
+
+    WHY THIS PAIR AND NOT THE OTHER ``ValidationError`` ARMS IN THIS MODULE. ``serve`` and
+    ``supervise`` are the two commands the Windows service runs under NSSM, which captures stderr
+    to a file (``docs/SERVICE.md``). A ``[store]`` that fails to validate on a deploying site would
+    therefore write the store password into a PERSISTED service log on every start attempt, with no
+    operator present to see it happen, and support-bundle assembly then collects that log. No
+    instance runs this today, so that is what a first deployment WOULD hit, not something anyone is
+    living with.
+
+    THE CONTROL IS THE RAW RENDERING, ASSERTED FIRST. A test that only looked for the absence of a
+    string would pass just as well against an empty error, a renamed variable, or a value pydantic
+    never had -- so it first proves the planted secret IS in ``str(exc)`` on this exact config,
+    which is what makes its absence below attributable to the rendering rather than to luck.
+    """
+    monkeypatch.setenv("MEFOR_STORE_PASSWORD", _BOOT_CANARY)
+    cfg = tmp_path / "messagefoundry.toml"
+    cfg.write_text('[store]\nbackend = "postgres"\n', encoding="utf-8")
+
+    with pytest.raises(ValueError) as caught:  # ValidationError subclasses ValueError
+        load_settings(config_path=str(cfg))
+    assert _BOOT_CANARY in str(caught.value), (
+        "CONTROL FAILED: str(ValidationError) does not carry the planted secret on this config, so "
+        "the absence asserted below would prove nothing -- re-aim this guard at a config whose "
+        "rejected input still holds [store].password"
+    )
+
+    assert main([command, "--service-config", str(cfg)]) == 2
+    captured = capsys.readouterr()
+    err = captured.err
+
+    # BOTH streams, because NSSM captures both to files: asserting only on the one the error
+    # currently takes would go quiet the day a caller moved it to the other.
+    assert _BOOT_CANARY not in err + captured.out, (
+        f"`{command}` echoed an env-supplied secret into its config error, which NSSM would capture "
+        "to a service log file. Render the failure with settings_error_detail(); "
+        "str(ValidationError) carries input_value= for every failing field."
+    )
+    # Useful, not just quiet: an error that named no field would also satisfy the assertion above.
+    assert "store" in err and "server, database, username" in err
+
+
+@pytest.mark.parametrize("command", ["serve", "supervise"])
+def test_the_boot_path_reports_a_directory_service_config_without_a_traceback(
+    command: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--service-config`` naming a DIRECTORY is an operator error, not a crash.
+
+    Why a directory reaches the open at all, and why ``OSError`` has to be in the catch, are stated
+    once at ``_load_service_settings``. What this pins is that the two SERVICE commands exit 2 with
+    a reported line rather than a traceback, on the stream NSSM captures.
+
+    It asserts the BEHAVIOUR rather than the exception class, because the class differs by platform
+    and this test runs on both legs.
+    """
+    assert main([command, "--service-config", str(tmp_path)]) == 2
+    assert capsys.readouterr().err.startswith("error: ")

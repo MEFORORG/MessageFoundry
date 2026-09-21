@@ -266,8 +266,6 @@ retractions. At least these went:
 
 - plan, then wait for the owner's "go" before writing code, as a rule binding a Builder. It still
   binds the Manager;
-- the ultracode warn-and-offer gate, as a rule binding a Builder. It still binds the Manager, for
-  the same reason the planning gate does: the Manager is the seat that can warn somebody and wait;
 - `/clear` and `/compact` as the fix for a stuck session;
 - declaring your own seat with `seat.ps1 -Declare`, **as a RULE. The MECHANISM stayed and has
   since become load-bearing for something that did not exist then -- see "Declare your seat"
@@ -490,9 +488,6 @@ gates a merge**, and no seat has to clear one.
 - **Plan first, then dispatch.** For anything past a trivial change the Manager produces a plan and
   waits for the owner's explicit "go". Point the brief at the relevant existing code; it measurably
   improves the result.
-- Prefer **ultracode** for substantive work. The keyword is session-only and opt-in, so the Manager
-  warns the owner up front and offers to re-send with it. You cannot switch it on yourself. This gate
-  never applies to a Builder, which has no user to warn and exits without a reply.
 - One brief per Builder. After about two failed attempts at the same problem, dispatch a fresh Builder
   with a better brief rather than reuse a poisoned context. A Builder cannot do this. When you are
   stuck after two attempts, push what is green and say in the PR body that the brief needs re-cutting.

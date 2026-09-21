@@ -266,8 +266,32 @@ refusal text now names the recorded worktree and branch and lists the three reco
 *(Those last two pairs are written without the `#` sigil on purpose: the numbers are allocated, but
 their items are still in an unmerged pull request, so a live cross-reference would dangle today.)*
 
+**`alloc.ps1` is re-entrant now, which closes the cheapest limb of this (BACKLOG #1703).** Re-running
+it with the same title for the same owner prints the number already recorded and allocates nothing,
+so the reflex that spends a second number on one title no longer does so by itself.
+
+**It covers ADR numbers only, which is not the half the pairs above are drawn from.** Every pair
+named there is a *backlog* number, and `-Kind backlog` has been refused at parameter binding since
+the ledger left this repository (BACKLOG #1250, #1754) — so re-entrancy cannot be read as a control
+over the population that measurement describes. It prevents the same mistake in the one namespace
+this allocator can still issue into.
+
+**It is a recovery for exactly one of the rows below, and not for the others.** The check keys on the
+recorded `worktree`, so it hands back a number recorded to the owner you are asking as. That owner is
+the tree you are standing in — or, with `-For`, the tree you name, which makes
+`alloc.ps1 -Title "<the recorded title>" -For <recorded worktree>` a way to recover a number stranded
+in another live worktree of this clone without spending a new one. It cannot help when the recorded
+title is not the one you would type, and it does nothing for a worktree that is gone: those still
+need the rows in the table.
+
 **Read the state first, then pick the row.** `scripts/coord/alloc_strand_sweep.py` is read-only and
 prints, for every allocation, which worktree can still commit it:
+
+> **That script is NOT in this repository — it left with the ledger tooling (BACKLOG #1250, #1754),
+> along with `tests/test_coord_alloc_strand_sweep.py` cited below.** Run the three commands from the
+> maintainer-internal clone. They are kept here because the recovery table under them is keyed on the
+> sweep's own verdict words, which nothing else prints. The 19-titles measurement above is dated and
+> stands on its own; only the instrument moved.
 
 ```bash
 python scripts/coord/alloc_strand_sweep.py --detail       # every unlanded claim, and where to commit it
@@ -306,7 +330,7 @@ the gate correctly refuses a commit nobody can make from the right place. That i
 claim is born pointing at the wrong tree, which is the third limb #1414 does not name.
 
 ```powershell
-pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind backlog -Title "<title>" -For <builder-worktree>
+pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind adr -Title "<title>" -For <builder-worktree>
 ```
 
 **`-For` is not the `-Reassign` this file declined, and the difference is the whole argument.** A

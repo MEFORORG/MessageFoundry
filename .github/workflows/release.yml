@@ -259,6 +259,26 @@ jobs:
           # Print the COUNT, not just a word: a green log line has to show the gate inspected something.
           echo "sdist is package-only: inspected $count members in $sd, none outside the allowlist"
 
+      # PAIRED WITH THE ALLOWLIST ABOVE, and it asks the other question (BACKLOG #1832). The gate
+      # above asks WHERE a member sits; its allowlist is a path regex. It cannot ask WHAT KIND of file
+      # something is, which is why `messagefoundry/CLAUDE.md` — this project's instructions to its own
+      # coding agents — matched the `messagefoundry/` branch and shipped to PyPI on every release from
+      # 0.1.0 to 0.2.15. Widening the regex would not have helped: the next internal note inside the
+      # package tree passes a location test identically. So the pair is allowlist-by-location plus
+      # DENYLIST-by-name, and the denylist is also what reaches the WHEEL — the step above reads
+      # `dist/*.tar.gz` only, so the engine wheel had no member gate at all.
+      #
+      # The rule lives in the script, not here, so the console and harness jobs share one copy instead
+      # of carrying two bash transcriptions that drift. Stdlib only, and it runs before the wheel smoke
+      # for the obvious reason: nothing downstream should touch an archive that is about to be refused.
+      - name: Member gate — no distribution may ship a maintainer-internal file (sdist AND wheel)
+        # Referenced by the artifact-upload step's `if:` below, exactly as the leak gate above is:
+        # a refused archive must not be handed out as a downloadable workflow artifact. Keep the id
+        # if you rename the step. (BACKLOG #1838 — this gate shipped without the guard its sibling
+        # already had, so a refused sdist and wheel were still uploaded.)
+        id: member-gate
+        run: python scripts/release/forbidden_members.py 'dist/*.tar.gz' 'dist/*.whl'
+
       - name: Smoke-check the built wheel (clean venv → import + version)
         run: |
           python -m venv /tmp/relsmoke
@@ -530,7 +550,11 @@ jobs:
         # what is built; the trade is recorded here rather than left for someone to rediscover.
         # tests/test_release_pipeline.py pins the gate itself as unconditional and free of
         # `continue-on-error`, which are the two ways the skipped-gate case could be made common.
-        if: always() && steps.leak-gate.outcome != 'failure'
+        #
+        # BOTH gates are named here, not just the leak gate (BACKLOG #1838). They refuse different
+        # things -- the leak gate asks where a member sits, the member gate asks what kind of file it
+        # is -- so guarding on one and not the other uploads whatever the other one caught.
+        if: always() && steps.leak-gate.outcome != 'failure' && steps.member-gate.outcome != 'failure'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: release-artifacts
@@ -601,6 +625,17 @@ jobs:
           python -m build --wheel ./packaging/messagefoundry-webconsole --outdir webconsole-dist
           ls -l webconsole-dist/
 
+      # The same gate the engine job runs, on this job's own output (BACKLOG #1832). This job had NO
+      # member gate before: its only check was a version comparison, so any file the force-include
+      # swept in shipped unexamined. Shares the engine's script rather than re-deriving the denylist,
+      # because two copies of a rule are two rules.
+      - name: Member gate — no distribution may ship a maintainer-internal file
+        # Referenced by this job's artifact-upload `if:` below (BACKLOG #1838). This job had
+        # a BARE always() there, so a refused wheel was uploaded as a downloadable artifact
+        # regardless -- the engine job's leak gate already had this guard and these did not.
+        id: member-gate
+        run: python scripts/release/forbidden_members.py 'webconsole-dist/*.whl'
+
       - name: Smoke-check the console wheel (version == the console's OWN __version__ == tag)
         run: |
           built=$(python -c "import glob,re; print(re.search(r'messagefoundry_webconsole-([^-]+)-', glob.glob('webconsole-dist/*.whl')[0]).group(1))")
@@ -669,7 +704,9 @@ jobs:
           fi
 
       - name: Upload console artifact (dry-run / always)
-        if: always()
+        # always() so a FAILED build still yields something to inspect -- but never an
+        # archive the member gate refused, which is what a bare always() did (BACKLOG #1838).
+        if: always() && steps.member-gate.outcome != 'failure'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: webconsole-artifacts
@@ -730,6 +767,18 @@ jobs:
           python -m build --wheel ./packaging/messagefoundry-harness --outdir harness-dist
           ls -l harness-dist/
 
+      # THE ARTIFACT THAT MOST NEEDS THIS, and the one that had no gate at all (BACKLOG #1832, #1702).
+      # `harness/` is FORCE-INCLUDED from the repo root, and hatchling's `exclude` does not filter a
+      # force-included tree — so unlike the engine sdist, the harness wheel has no build-time defence
+      # to fall back on, and `harness/CLAUDE.md` was inside it by construction. #1702 fixed the build
+      # config; this is the release-time backstop, and for this distribution it is the only one.
+      - name: Member gate — no distribution may ship a maintainer-internal file
+        # Referenced by this job's artifact-upload `if:` below (BACKLOG #1838). This job had
+        # a BARE always() there, so a refused wheel was uploaded as a downloadable artifact
+        # regardless -- the engine job's leak gate already had this guard and these did not.
+        id: member-gate
+        run: python scripts/release/forbidden_members.py 'harness-dist/*.whl'
+
       - name: Smoke-check the harness wheel (version == engine == tag)
         run: |
           built=$(python -c "import glob,re; print(re.search(r'messagefoundry_harness-([^-]+)-', glob.glob('harness-dist/*.whl')[0]).group(1))")
@@ -783,7 +832,9 @@ jobs:
         run: gh release upload "${GITHUB_REF_NAME}" harness-dist/*.whl --clobber
 
       - name: Upload harness artifact (dry-run / always)
-        if: always()
+        # always() so a FAILED build still yields something to inspect -- but never an
+        # archive the member gate refused, which is what a bare always() did (BACKLOG #1838).
+        if: always() && steps.member-gate.outcome != 'failure'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: harness-artifacts

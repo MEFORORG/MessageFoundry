@@ -103,6 +103,11 @@ def db_lookup(
     (always parameterized — a value can never inject SQL); a ``:name`` with no matching ``params`` key
     fails loud. The query runs **off the event loop** against a pooled connection.
 
+    "Read-only" is checked as a statement shape, not granted as authority: the engine refuses a
+    statement that does not open with SELECT/WITH or that carries a write/EXEC keyword or a second
+    statement, but it cannot stop a write that an over-privileged account is allowed to make. Point
+    this connection at a read-only login — see ``docs/CONNECTIONS.md``.
+
     Raises :class:`DbLookupError` if there is no active runner (called on a Router, in dry-run / Test
     Bench, or in a graph with no ``DatabaseLookup``), if ``connection`` is unknown, if a parameter is
     missing, or if the connection/query fails — surfacing as that message's ``ERROR`` / dead-letter."""

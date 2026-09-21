@@ -19,6 +19,19 @@ nested ``CLAUDE.md`` -- maintainer process text, not product -- out to whoever i
 the sdist allowlist nor release.yml's leak grep objected, because both ask whether a member sits inside
 the package tree and the instructions file does. Build config plus the git index, no build and no
 network: the third guard shells out to ``git ls-files``, which the first two do not.
+
+The .gitignore/force-include contradiction (BACKLOG #1835) is the fourth, and it is the one the
+third cannot reach. ``_tracked`` below models the wheel from ``git ls-files``, so an IGNORED file inside
+a force-included tree is invisible to it by construction, while ``recurse_forced_files`` walks the
+filesystem and ships it anyway. That guard reads .gitignore text against the force-include map, needs
+no build, and is the cheap half of a question whose expensive half is listing a built artifact.
+
+The shared build-config reader (BACKLOG #1836) is the fifth, and its subject is the other four
+rather than the product. Three modules here walked ``[tool.hatch.build]`` by hand and two of them
+disagreed about it silently; ``tests/_force_include`` is now the single reader, its global-table
+branch is driven by synthetic pyprojects because no real distribution reaches it, and a scan over
+both ``testpaths`` roots names the next module to re-derive the descent.
+
 """
 
 from __future__ import annotations
@@ -30,6 +43,8 @@ import tomllib
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
+
+from tests._force_include import hatch_build, wheel_force_include
 
 _REPO = Path(__file__).resolve().parents[1]
 
@@ -78,6 +93,10 @@ _INSTRUCTIONS_FILE = "CLAUDE.md"
 #: to this, which is why resolving needs it.
 _HARNESS_PROJECT = _REPO / "packaging" / "messagefoundry-harness"
 
+#: The second `testpaths` collection root (see the root pyproject.toml). The drift scan below reads
+#: both, because a guard named for every test module must actually see every test module.
+_WEBCONSOLE_TESTS = _REPO / "packaging" / "messagefoundry-webconsole" / "tests"
+
 
 @functools.cache
 def _tracked(*prefixes: str) -> frozenset[str]:
@@ -101,27 +120,6 @@ def _tracked(*prefixes: str) -> frozenset[str]:
     return frozenset(p for p in out.split("\0") if p)
 
 
-def _hatch_build(pyproject: Path) -> dict[str, Any]:
-    """The ``[tool.hatch.build]`` table, or an empty one."""
-    data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
-    build: dict[str, Any] = data.get("tool", {}).get("hatch", {}).get("build", {})
-    return build
-
-
-def _wheel_force_include(pyproject: Path) -> dict[str, str]:
-    """The map that reaches the WHEEL, resolved the way hatchling resolves it.
-
-    ``BuilderConfig.force_include`` reads the TARGET table when it carries the key and otherwise falls
-    back to the global ``[tool.hatch.build]`` one. Reading only the target table would skip a
-    distribution that used the global spelling -- the natural choice when one map should serve two
-    targets -- and skipping is silent.
-    """
-    build = _hatch_build(pyproject)
-    target: dict[str, str] = build.get("targets", {}).get("wheel", {}).get("force-include", {})
-    fallback: dict[str, str] = build.get("force-include", {})
-    return target or fallback
-
-
 def _repo_relative(pyproject: Path, source: str) -> str:
     """A ``force-include`` source as a repo-relative POSIX path.
 
@@ -143,9 +141,7 @@ def _repo_relative(pyproject: Path, source: str) -> str:
 
 def _force_include_sources(pyproject: Path) -> frozenset[str]:
     """The repo-relative paths a ``force-include`` map pulls from."""
-    return frozenset(
-        _repo_relative(pyproject, source) for source in _wheel_force_include(pyproject)
-    )
+    return frozenset(_repo_relative(pyproject, source) for source in wheel_force_include(pyproject))
 
 
 def _shipped_by(sources: frozenset[str], tracked: frozenset[str]) -> frozenset[str]:
@@ -275,7 +271,7 @@ def test_the_harness_force_include_maps_every_source_to_its_own_path() -> None:
     invariant is that the wheel mirrors the tree: ``../../harness/<x>`` lands at ``harness/<x>``.
     """
     pyproject = _HARNESS_PROJECT / "pyproject.toml"
-    include = _wheel_force_include(pyproject)
+    include = wheel_force_include(pyproject)
     assert len(include) >= 10, (
         f"the harness force-include map has {len(include)} entries -- too few"
     )
@@ -285,6 +281,128 @@ def test_the_harness_force_include_maps_every_source_to_its_own_path() -> None:
         if _repo_relative(pyproject, source) != target
     }
     assert not wrong, f"these force-include entries rename what they ship: {wrong}"
+
+
+# --- BACKLOG #1836: the shared reader, and the branch no distribution in this repo takes ----------
+#
+# `wheel_force_include` reaches the global `[tool.hatch.build].force-include` table whenever the wheel
+# target omits the key. Nothing under packaging/ is written that way today, so against the real tree
+# that branch never runs -- and an extraction whose only new behaviour is never executed is a third
+# definition wearing a shared name. These arms drive it over pyprojects written here.
+#
+# tmp_path rather than the tree, and that is the whole point: the shapes below are the ones this
+# repository does NOT currently use, so there is nothing real to read them off.
+
+
+def _synthetic_pyproject(tmp_path: Path, build_tables: str) -> Path:
+    """A real pyproject -- ``[project]`` and all -- carrying ``build_tables`` verbatim."""
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        f"""[project]
+name = "synthetic"
+version = "0"
+{build_tables}""",
+        encoding="utf-8",
+    )
+    return pyproject
+
+
+def test_the_reader_falls_back_to_the_global_force_include_table(tmp_path: Path) -> None:
+    """The branch the real tree does not exercise, and the disagreement that motivated the extraction.
+
+    One map serving both the wheel and the sdist is written in the global table, and hatchling honours
+    it. Before BACKLOG #1836, ``_packaged_import_trees`` in test_install_instruction_provenance.py read
+    the target table alone: such a distribution would have contributed NO import tree there, while the
+    #1702 guards above went on reading the same file correctly. Neither side would have failed.
+
+    Mutation: drop the fallback from ``tests/_force_include.wheel_force_include``. Red: empty map.
+    """
+    pyproject = _synthetic_pyproject(
+        tmp_path,
+        """[tool.hatch.build.force-include]
+"../../harness" = "harness"
+""",
+    )
+    assert wheel_force_include(pyproject) == {"../../harness": "harness"}
+
+
+def test_the_reader_prefers_the_wheel_target_and_does_not_merge(tmp_path: Path) -> None:
+    """hatchling REPLACES rather than merges -- the same rule ``exclude`` follows two tests below.
+
+    A reader that merged would report a source the wheel never pulls, and
+    ``test_no_force_include_entry_outlives_the_file_it_names`` would then demand git track it.
+    """
+    pyproject = _synthetic_pyproject(
+        tmp_path,
+        """[tool.hatch.build.force-include]
+"../../sdist_only" = "sdist_only"
+
+[tool.hatch.build.targets.wheel.force-include]
+"../../harness" = "harness"
+""",
+    )
+    assert wheel_force_include(pyproject) == {"../../harness": "harness"}
+
+
+def test_the_reader_branches_on_presence_and_not_on_emptiness(tmp_path: Path) -> None:
+    """``'force-include' in self.target_config``, not ``target or fallback``.
+
+    A declared-but-empty wheel map says "this target force-includes nothing", and reopening the global
+    table there would credit the wheel with a tree the build does not put in it. The predecessor's
+    ``or`` did exactly that. The case is narrow; getting it right once is what a shared reader buys
+    over two near-copies that each looked obviously fine.
+    """
+    pyproject = _synthetic_pyproject(
+        tmp_path,
+        """[tool.hatch.build.force-include]
+"../../sdist_only" = "sdist_only"
+
+[tool.hatch.build.targets.wheel]
+force-include = {}
+""",
+    )
+    assert wheel_force_include(pyproject) == {}
+
+
+def test_no_test_module_walks_the_hatch_build_table_for_itself() -> None:
+    """The drift guard. Two hand-walked readers is what #1836 was; a third would be just as silent.
+
+    WIDER THAN THE DEFECT, on purpose. #1836 was two readings of one key, but the same table holds
+    ``exclude``, ``only-include`` and every build target, and a hand walk into any of them is free to
+    disagree with the next one the same silent way. So the scan matches the KEY ACCESS for either the
+    hatch table or the force-include map, and names any module but the shared reader.
+
+    Matching the access and not the word matters: every module here writes both names in prose and in
+    TOML headings, and a bare-word scan would red on a comment -- CLAUDE.md section 11's first-match
+    hazard.
+
+    THAT HAZARD FIRED HERE WHILE THIS WAS BEING WRITTEN, which is why the mutation below is spelled
+    in words. A key access quoted in a docstring is still a key access to this scan, so writing the
+    old code out reddened this very file. Mutation: descend the dotted TOML path by hand in any test
+    module, the way three of them did before #1836. Red: names that file.
+    """
+    key_access = re.compile(r"""(?:get\(|\[)\s*["'](?:hatch|force-include)["']""")
+    shared = _REPO / "tests" / "_force_include.py"
+    assert key_access.search(shared.read_text(encoding="utf-8")), (
+        "tests/_force_include.py no longer reads either key, so this scan's pattern has stopped "
+        "matching the thing it looks for and its silence would mean nothing"
+    )
+    # BOTH `testpaths` roots, not just this one. The console's suite is a second collection root
+    # (pyproject.toml's testpaths names it), and a scan that stopped at tests/ would carry a name
+    # claiming more reach than it has -- the next hand reader could land there unguarded.
+    modules = [*(_REPO / "tests").glob("*.py"), *_WEBCONSOLE_TESTS.glob("*.py")]
+    assert len(modules) >= 100, f"the module scan matched only {len(modules)} files -- it broke"
+    others = sorted(
+        path.relative_to(_REPO).as_posix()
+        for path in modules
+        if path != shared and key_access.search(path.read_text(encoding="utf-8", errors="replace"))
+    )
+    assert not others, (
+        f"these test modules walk hatchling's build config themselves instead of calling "
+        f"tests._force_include: {others}. A second reader is free to disagree with the first -- "
+        f"#1836 was exactly that, and the disagreement is silent: one side keeps guarding a "
+        f"distribution while the other quietly stops seeing it."
+    )
 
 
 def test_the_engine_excludes_its_nested_instructions_from_every_build_target() -> None:
@@ -304,7 +422,7 @@ def test_the_engine_excludes_its_nested_instructions_from_every_build_target() -
     Mutation: change the pattern to ``/CLAUDE.md``, empty the list, or add
     ``exclude = ["*.pyc"]`` to ``[tool.hatch.build.targets.sdist]``.
     """
-    build = _hatch_build(_REPO / "pyproject.toml")
+    build = hatch_build(_REPO / "pyproject.toml")
     excluded: list[str] = build.get("exclude", [])
     assert _INSTRUCTIONS_FILE in excluded, (
         f"[tool.hatch.build].exclude in the root pyproject.toml must carry the bare "
@@ -380,4 +498,133 @@ def test_every_build_system_pins_its_backend_exactly_and_they_agree() -> None:
     assert len({tuple(reqs) for reqs in tables.values()}) == 1, (
         f"the [build-system] tables disagree: {tables}. The release builds all of them from one tag, "
         "so bump them together."
+    )
+
+
+# --- BACKLOG #1835: .gitignore must not name a path a wheel force-include ships -------------------
+#
+# The section above asks which TRACKED files a map ships. This one asks a question the tracked tree
+# cannot answer at all. git is asked what to TRACK; hatchling's force-include is asked what to SHIP,
+# and `recurse_forced_files` answers it by walking the FILESYSTEM. So a file git is told to ignore,
+# sitting inside a force-included tree, reaches the wheel of whoever holds it -- and `_tracked` above
+# cannot see it, which its own docstring records as this model's residual.
+#
+# Measured 2026-09-19 at 444c15d68 with the two profiles .gitignore then named planted on disk: the
+# harness wheel listed 103 members carrying both, and 102 still carrying both when built against
+# #1702's enumerated map, because `harness/load` is still mapped whole. Release CI checks out fresh,
+# so no published wheel has carried them; a build on the machine that holds them does.
+#
+# WHAT THIS GUARD DOES NOT SEE, said plainly rather than left for someone to discover: only ANCHORED
+# LITERAL entries. A glob (`*.local.toml`), an unanchored basename (`scratch.toml`, which git matches
+# at any depth), a rule in a nested .gitignore, and a path excluded through .git/info/exclude or a
+# global core.excludesFile all slip past it. Catching those needs a gate that lists the BUILT
+# artifact. BACKLOG #1832 built that mechanism for release.yml, but its denylist is maintainer-
+# instruction basenames, so it would NOT catch a leaked .toml -- do not read it as covering this.
+# This is the cheap half: it runs in PR CI, needs no build, and refuses the shape that has happened.
+
+#: Characters that make a .gitignore line a pattern rather than a path. `\` is deliberately absent:
+#: it is gitignore's escape character, not a wildcard, and no rule in this repo uses one.
+_GITIGNORE_GLOB_CHARS = frozenset("*?[]")
+
+
+def _force_include_roots() -> dict[str, str]:
+    """Every wheel force-include SOURCE: repo-relative POSIX path -> the project that declares it.
+
+    Built on ``_build_pyprojects`` and ``_force_include_sources`` rather than a second glob and a
+    second resolver. Those already define which distributions exist and how a source resolves, and a
+    second spelling of either would be free to drift from the one the ship emulator above uses -- at
+    which point this guard would be checking a map no build ever reads. The root project is dropped
+    because its package tree is WALKED, not mapped, so it declares no wheel force-include.
+    """
+    roots: dict[str, str] = {}
+    for pyproject in (p for p in _build_pyprojects() if p.parent != _REPO):
+        label = pyproject.relative_to(_REPO).as_posix()
+        for source in _force_include_sources(pyproject):
+            roots[source] = label
+    return roots
+
+
+def _anchored_literal_ignores(text: str) -> list[tuple[int, str]]:
+    """``(line number, repo-relative path)`` for each root-anchored, glob-free .gitignore entry.
+
+    Negations are dropped: ``!x`` UN-ignores, so it cannot create the contradiction this guard looks
+    for. Everything else that is not a plain anchored path is dropped too -- the limits are recorded
+    above the constants rather than left to be rediscovered.
+    """
+    out: list[tuple[int, str]] = []
+    for number, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith("!"):
+            continue
+        if not line.startswith("/"):
+            continue
+        if _GITIGNORE_GLOB_CHARS & set(line):
+            continue
+        path = line.strip("/")
+        if not path:
+            continue
+        out.append((number, path))
+    return out
+
+
+def test_the_gitignore_parser_reads_the_shapes_this_guard_depends_on() -> None:
+    """A parser that silently matched nothing would make the guard below pass forever.
+
+    The first two lines are the exact text #1835 removed from .gitignore. The rest are shapes the
+    parser must NOT return, each for its own reason.
+    """
+    parsed = _anchored_literal_ignores(
+        "\n".join(
+            [
+                "/harness/load/profiles/hospital-baseline.toml",
+                "/harness/load/profiles/soak-12h.toml",
+                "# /harness/load/profiles/commented-out.toml",
+                "",
+                "!/harness/load/profiles/unignored.toml",
+                "harness/load/profiles/unanchored.toml",
+                "/harness/load/profiles/*.local.toml",
+                "/docs/marketing/",
+            ]
+        )
+    )
+    assert parsed == [
+        (1, "harness/load/profiles/hospital-baseline.toml"),
+        (2, "harness/load/profiles/soak-12h.toml"),
+        (8, "docs/marketing"),
+    ], parsed
+
+
+def test_no_gitignore_entry_names_a_path_inside_a_force_included_tree() -> None:
+    """The guard itself.
+
+    Mutation: re-add ``/harness/load/profiles/hospital-baseline.toml`` to .gitignore. Red: names the
+    line, the path, and the distribution that would ship it.
+
+    Both directions are contradictions and both are reported. An entry INSIDE a source is the shape
+    #1835 hit. An entry that is a PARENT of one (``/harness/``) would leave the whole mapped tree
+    untracked while the map still shipped whatever sat there.
+    """
+    roots = _force_include_roots()
+    # POSITIVE CONTROL: the harness and the web console both arrive by force-include, so an empty or
+    # broken pyproject parse cannot read as a clean result.
+    assert len(roots) >= 2, f"only found force-include roots {roots}: the pyproject parse broke"
+
+    entries = _anchored_literal_ignores((_REPO / ".gitignore").read_text(encoding="utf-8"))
+    # POSITIVE CONTROL, the other half: .gitignore really does carry anchored literal entries. 22 of
+    # them once #1835 removed its two; a floor well under that catches a parser which stopped matching
+    # without pinning a count that moves on every ordinary edit.
+    assert len(entries) >= 15, f"the .gitignore parse returned only {len(entries)} entries"
+
+    problems: list[str] = []
+    for number, path in entries:
+        for root, label in sorted(roots.items()):
+            if path == root or path.startswith(f"{root}/") or root.startswith(f"{path}/"):
+                problems.append(f".gitignore:{number} '/{path}' vs {label} force-include '{root}'")
+
+    assert not problems, (
+        f"these .gitignore entries name paths a wheel force-include ships, so git skips the file and "
+        f"the wheel carries it anyway: {problems}. hatchling walks the filesystem for a force-included "
+        f"source and reads no .gitignore, and `exclude` does not reach one either (BACKLOG #1702). Move "
+        f"the file OUT of the mapped tree (migration-local/ is this repo's ignored tree for "
+        f"site-specific material) rather than ignoring it where the build can still see it."
     )

@@ -124,11 +124,15 @@ The staged pipeline makes **~7 durable commits per message** at the default sing
 single-destination fan-out. Those commits are the pre-ACK ingress commit; a claim + handoff
 commit pair at each of the two producer boundaries (ingress→routed, then routed→outbound); and a
 delivery claim + `mark_done` pair on the outbound stage, where `mark_done` also runs the finalizer
-inside its single commit. That totals 1 + 2 + 2 + 2 = ~7. The general formula is **3 + 2H + 2N**
-for H handlers and N destinations, so a fan-out of 2 is 9. See
+inside its single commit. That totals 1 + 2 + 2 + 2 = ~7. The general formula is **3 + 2H + 2N**,
+so a fan-out of 2 is 9. `H` and `N` are defined once, on `QueueStore.committed_txns` in
+[`messagefoundry/store/base.py`](../messagefoundry/store/base.py) — read them there. The one that
+bites when sizing: **`N` counts outbound ROWS, one per `Send`, not distinct destination
+connections**, so a handler sending twice to one partner costs 9, not 7. See
 [`benchmarks/step-b-write-amplification.md`](benchmarks/step-b-write-amplification.md),
-[ADR 0051](adr/0051-corepoint-throughput-parity-strategy.md), and
-[ADR 0055](adr/0055-group-commit-durable-write.md). An inline fast-path that cuts 7 → 5 exists,
+[ADR 0051](adr/0051-corepoint-throughput-parity-strategy.md),
+[ADR 0055](adr/0055-group-commit-durable-write.md), and the runner-level gate
+[`tests/test_runner_txn_cost_model.py`](../tests/test_runner_txn_cost_model.py). An inline fast-path that cuts 7 → 5 exists,
 but it is **default-off**: it is a per-inbound `inline=True` opt-in on `inbound()`, with no
 service-level `[transform]` setting ([ADR 0057](adr/0057-inline-step-a-fast-path.md)). Plan around
 ~7.

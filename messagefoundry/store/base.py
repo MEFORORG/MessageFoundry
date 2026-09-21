@@ -225,8 +225,22 @@ class QueueStore(StoreLifecycle, Protocol):
 
     #: A1 live cost counters (always-on, additive; surfaced via ``/stats``). ``committed_txns`` = durable
     #: **write**-path transactions committed on this handle — the *committed transactions per message*
-    #: currency ADR 0051 sizes capacity on (``3 + 2H + 2N`` per ingress message, H = handlers routed,
-    #: N = destinations). Read-snapshot-release commits (e.g. the RCSI hygiene commit a SQL Server read
+    #: currency ADR 0051 sizes capacity on (``3 + 2H + 2N`` per ingress message).
+    #:
+    #: **This is the CANONICAL definition of H and N. Every other site links here rather than restating
+    #: it** (CLAUDE.md SDS-3.5 — state a load-bearing fact once). ``H`` = the routed rows the Router
+    #: materializes: one per handler it SELECTS, after any ``accepts=`` decline (ADR 0084). ``N`` = the
+    #: **outbound ROWS** the handlers' transforms emit — one per ``Send`` — **not** the number of
+    #: distinct outbound connections addressed. Two ``Send``s aimed at the SAME outbound cost the same
+    #: 2 transactions each as two aimed at different ones, because every outbound row is claimed in its
+    #: own transaction and resolved in its own, and a shared destination shares neither. So one handler
+    #: emitting two ``Send``s to one outbound is ``N = 2`` (9 txn/msg), never ``N = 1`` (7). That
+    #: reading is settled by execution through the real ``RegistryRunner`` in
+    #: ``tests/test_runner_txn_cost_model.py`` (BACKLOG #1736), which also records why the DEFAULT
+    #: pooled claimer reads slightly above the model on a multi-message run: its claim commit is per
+    #: ``claim_fifo_heads`` SWEEP, not per row.
+    #:
+    #: Read-snapshot-release commits (e.g. the RCSI hygiene commit a SQL Server read
     #: needs, or SQLite's read-pool ``COMMIT``) are excluded, so the counter stays the write currency the
     #: cost model validates rather than a superset that also counts every live lookup.
     #: ``body_copies`` = raw/payload body strings durably written (the ``2 + H + N`` per-message

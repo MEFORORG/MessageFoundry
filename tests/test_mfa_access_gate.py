@@ -47,8 +47,26 @@ async def _service(engine: Engine, settings: AuthSettings | None = None) -> Auth
     return service
 
 
-def _client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
-    transport = httpx.ASGITransport(app=create_app(engine, auth=service))
+#: httpx's own ASGITransport default, named rather than left implicit. ``_client`` in
+#: tests/test_api_auth.py carries the reasoning; this is the same constant for the same reason.
+_DEFAULT_PEER = ("127.0.0.1", 123)
+
+
+def _client(
+    engine: Engine, service: AuthService, *, peer: tuple[str, int] | None = None
+) -> httpx.AsyncClient:
+    """``peer`` pins the ASGI scope's client address; omitted, ``_DEFAULT_PEER`` stands.
+
+    Either way ``request.client`` is a real address and never None, so an assertion on the audited
+    ``client`` cannot degenerate to ``None == None`` and pass against unfixed code. Pass ``peer``
+    wherever the address is the subject.
+
+    The full rationale -- including when modelling an absent peer IS the right thing to do, and why
+    the loopback default is not neutral for the network allowlist -- is on ``_client`` in
+    tests/test_api_auth.py, stated once there rather than restated here (BACKLOG #1644)."""
+    transport = httpx.ASGITransport(
+        app=create_app(engine, auth=service), client=_DEFAULT_PEER if peer is None else peer
+    )
     return httpx.AsyncClient(transport=transport, base_url="http://t")
 
 
@@ -126,7 +144,9 @@ async def test_the_refusal_is_audited_so_probing_is_not_silent(engine: Engine) -
     """
     service = await _service(engine)
     await _add(service, "vw", Role.VIEWER)
-    async with _client(engine, service) as c:
+    # RFC 5737 TEST-NET-1, so it cannot resolve to a real host. See ``_client`` for why the address
+    # has to be set here at all.
+    async with _client(engine, service, peer=("192.0.2.77", 51234)) as c:
         tok = await _login(c, "vw")
         assert (await c.get("/messages", headers=_auth(tok))).status_code == 403
     denied = [a for a in await engine.store.list_audit() if a["action"] == "auth.mfa_denied"]
@@ -135,6 +155,11 @@ async def test_the_refusal_is_audited_so_probing_is_not_silent(engine: Engine) -
     assert "/messages" in (denied[-1]["detail"] or "")
     # The row must never carry the bearer token or a code — only the path.
     assert "Bearer" not in (denied[-1]["detail"] or "")
+    # BACKLOG #1644 (ADR 0150): and it records WHERE FROM. This row is the ONLY evidence a stolen
+    # password-only token was used at all — the paragraph above says the trail would otherwise be
+    # empty — so the address is the half an incident responder acts on. RED when ``client=`` is
+    # dropped from require()'s ``audit_mfa_denied`` call.
+    assert denied[-1]["client"] == "192.0.2.77"
 
 
 async def test_exempt_routes_stay_reachable_while_pending(engine: Engine) -> None:

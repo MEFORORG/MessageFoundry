@@ -326,6 +326,181 @@ async def test_keep_n_prunes_the_oldest_once_the_kept_set_is_full(tmp_path, key_
     await store.close()
 
 
+# --- BACKLOG #1724: keep-N spans both archive extensions ---------------------
+
+
+async def test_keep_n_prunes_plaintext_archives_left_by_a_pre_key_box(tmp_path, key_b64) -> None:
+    """Configuring a store key must not strand every `.mfbak.plain` outside keep-N.
+
+    Pruning globbed only the extension the CURRENT pass wrote, and the two anchored patterns are
+    disjoint. So a box that had been writing plaintext under `[backup].allow_unencrypted`, then had
+    a key configured, kept every plaintext archive it had ever written -- forever, with nothing
+    reporting it. The retention window silently stopped applying to a whole generation.
+    """
+    dest = tmp_path / "backups"
+    dest.mkdir()
+    # Three archives an earlier, key-less configuration would have left behind. Written directly so
+    # the test states its own precondition rather than depending on the no-key path.
+    stale = [dest / f"mefor-backup-dev-2026010{i}T000000Z.mfbak.plain" for i in (1, 2, 3)]
+    for p in stale:
+        p.write_bytes(b"old plaintext archive")
+
+    store = await _store_with_rows(tmp_path / "msg.db", key_b64)
+    runner = BackupRunner(
+        store,
+        _settings(dest, key_b64, retention_keep=2),
+        store_settings=_store_settings(tmp_path / "msg.db", key_b64),
+        config_dir=None,
+        instance="dev",
+    )
+    result = await runner.run_once(now=1000.0)
+    await store.close()
+
+    assert result is not None
+    remaining = {p.name for p in dest.iterdir() if p.is_file()}
+    # retention_keep counts archives TOTAL, which test_keep_n_prunes_the_oldest_once_the_kept_set_is_full
+    # pins. keep=2 over these four leaves the new archive plus the single newest plaintext.
+    assert stale[0].name not in remaining, "the oldest plaintext archive survived keep-N"
+    assert stale[1].name not in remaining, "the second plaintext archive survived keep-N"
+    assert stale[2].name in remaining, "keep-N pruned past its own retention count"
+    assert Path(result.archive_path).name in remaining, "keep-N pruned the archive it just wrote"
+    assert result.pruned == 2
+
+
+async def test_keep_n_does_not_reserve_a_slot_for_an_archive_that_is_not_there(
+    tmp_path, key_b64
+) -> None:
+    """The reserved retention slot must be COUNTED, not assumed. At keep=1 the bug empties the dir.
+
+    `just_written` is excluded from the candidate set and is meant to occupy one of the N retained
+    slots, so the slice leaves room for it. If it is not actually at the destination, reserving the
+    slot anyway retains `keep - 1` archives -- and at `retention_keep = 1`, zero. The pass still
+    returns a success BackupResult and writes a `dr_backup` audit row naming an archive that is gone.
+
+    Ordinary causes: antivirus quarantining a freshly published multi-GB opaque file on a share, a
+    cleanup script, or a second engine sharing the instance and destination (the default
+    NullCoordinator does not prevent that). Made deterministic here by unlinking after the publish.
+    """
+    dest = tmp_path / "backups"
+    dest.mkdir()
+    prior = dest / "mefor-backup-dev-20260101T000000Z.mfbak"
+    prior.write_bytes(b"the only surviving backup")
+
+    store = await _store_with_rows(tmp_path / "msg.db", key_b64)
+    runner = BackupRunner(
+        store,
+        _settings(dest, key_b64, retention_keep=1),
+        store_settings=_store_settings(tmp_path / "msg.db", key_b64),
+        config_dir=None,
+        instance="dev",
+    )
+    real_prune = runner._prune_keep_n
+
+    def prune_with_the_published_archive_gone(dest_dir, inst, *, just_written):
+        Path(just_written).unlink(missing_ok=True)
+        return real_prune(dest_dir, inst, just_written=just_written)
+
+    runner._prune_keep_n = prune_with_the_published_archive_gone  # type: ignore[method-assign]
+    result = await runner.run_once(now=1000.0)
+    await store.close()
+
+    assert result is not None
+    assert prior.exists(), (
+        "keep-N reserved a slot for an archive that was not at the destination and deleted the only "
+        "one that was; at retention_keep=1 that empties the backup destination"
+    )
+    assert result.pruned == 0
+
+
+async def test_keep_n_orders_case_insensitively_where_its_glob_does(tmp_path, key_b64) -> None:
+    """The sort must fold case wherever `Path.glob` does, or it reads the newest as the oldest.
+
+    On Windows -- the platform this ships on -- `Path.glob` is case-INSENSITIVE, so an
+    all-uppercase archive name enters the candidate set. A case-SENSITIVE sort then compares `M`
+    (0x4D) against `m` (0x6D) at the FIRST character of the prefix, decides the ordering there, and
+    never reaches the timestamp. The newest archive sorts last and gets pruned.
+
+    MEANINGFUL ONLY ON WINDOWS, and it says so rather than pretending otherwise: on a
+    case-sensitive filesystem the uppercase name never matches the glob, so it is not a candidate,
+    and this test passes for a different and uninteresting reason. Stated because a test that
+    passes everywhere for two different reasons is one somebody will later trust on the wrong one.
+    """
+    dest = tmp_path / "backups"
+    dest.mkdir()
+    # Newest by timestamp, but first by a case-sensitive sort, so it is the one at risk.
+    newest_upper = dest / "MEFOR-BACKUP-DEV-20260109T000000Z.MFBAK"
+    older = [dest / f"mefor-backup-dev-2026010{i}T000000Z.mfbak" for i in (1, 2)]
+    for p in (newest_upper, *older):
+        p.write_bytes(b"archive")
+
+    # Decide BEFORE the run whether this platform makes the uppercase name a candidate. Deciding
+    # AFTERWARDS from the surviving files is what made the first version of this test
+    # unfalsifiable: when the defect fires that file is GONE, so a post-hoc "was it a candidate?"
+    # test reads False and skips the very assertion it guards.
+    glob_is_case_insensitive = any(
+        q.name == newest_upper.name for q in dest.glob("mefor-backup-dev-????????T??????Z.mfbak")
+    )
+
+    store = await _store_with_rows(tmp_path / "msg.db", key_b64)
+    runner = BackupRunner(
+        store,
+        _settings(dest, key_b64, retention_keep=3),
+        store_settings=_store_settings(tmp_path / "msg.db", key_b64),
+        config_dir=None,
+        instance="dev",
+    )
+    result = await runner.run_once(now=1000.0)
+    await store.close()
+    assert result is not None
+
+    if glob_is_case_insensitive:
+        assert newest_upper.exists(), (
+            "the newest archive by timestamp was pruned because the sort compared case before it "
+            "reached the stamp; the sort key must fold case wherever the glob does"
+        )
+
+
+async def test_widening_to_both_extensions_does_not_readmit_part_or_failed(
+    tmp_path, key_b64
+) -> None:
+    """The #1724 widening must not reopen BACKLOG #1587.
+
+    #1587 keeps a bad archive out of the candidate set by SUFFIXING it -- `.part` while staging,
+    `.failed` after a failed verify -- which works because both land AFTER the extension, so a
+    pattern ending in the extension cannot match them. Adding a second extension is exactly the kind
+    of change that could undo that, and nothing else here would notice: the suffixed files would
+    simply start consuming retention slots.
+    """
+    dest = tmp_path / "backups"
+    dest.mkdir()
+    decoys = [
+        dest / "mefor-backup-dev-20260101T000000Z.mfbak.part",
+        dest / "mefor-backup-dev-20260102T000000Z.mfbak.failed",
+        dest / "mefor-backup-dev-20260103T000000Z.mfbak.plain.part",
+        dest / "mefor-backup-dev-20260104T000000Z.mfbak.plain.failed",
+    ]
+    for p in decoys:
+        p.write_bytes(b"must never be a keep-N candidate")
+
+    store = await _store_with_rows(tmp_path / "msg.db", key_b64)
+    runner = BackupRunner(
+        store,
+        _settings(dest, key_b64, retention_keep=1),
+        store_settings=_store_settings(tmp_path / "msg.db", key_b64),
+        config_dir=None,
+        instance="dev",
+    )
+    result = await runner.run_once(now=1000.0)
+    await store.close()
+
+    assert result is not None
+    for p in decoys:
+        assert p.exists(), f"{p.name} was pruned, so the widening readmitted a #1587 suffix"
+    # ...and they did not silently consume the retention slot either.
+    assert result.pruned == 0
+    assert Path(result.archive_path).exists()
+
+
 async def test_a_verify_failed_archive_never_takes_a_retention_slot(
     tmp_path, key_b64, monkeypatch
 ) -> None:

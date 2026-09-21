@@ -30,7 +30,10 @@ import re
 import shlex
 import subprocess
 import unittest
+from functools import cache
 from pathlib import Path
+
+import pytest
 
 _REPO = Path(__file__).resolve().parents[1]
 
@@ -129,8 +132,11 @@ def session_start_args() -> list[list[str]]:
     args-only reader guards the shape the 2026-09-08 duplicate happened to take and no other. That
     other shape is live on this machine, in the user-scope `settings.json`.
 
-    SCOPE IS THIS FILE ONLY. `.claude/settings.local.json` and the user-scope roots also carry
-    SessionStart hooks, and nothing here can see them.
+    SCOPE IS THIS FUNCTION ONLY. `.claude/settings.local.json` and the user-scope roots also carry
+    SessionStart hooks, and this reader sees neither. The user-scope wrapper IS graded, further down
+    this file under "the USER-SCOPE wrapper" -- by a separate reader, on a different question. Do
+    not merge the two: this one asks whether the REPOSITORY wires the hook once and correctly, and
+    that one asks whether N machine-local copies still agree and still warn.
     """
     wired = json.loads(read(SETTINGS))["hooks"]["SessionStart"]
     out: list[list[str]] = []
@@ -685,6 +691,10 @@ class TheHookNeverGuessesASeat(unittest.TestCase):
 
     A card is injected at the weight of the working agreement, so a WRONG card outranks the document
     the session should have been reading. Silence costs one printed line.
+
+    THIS CLASS READS ONE PATH, AND THAT IS NOT THE WHOLE RULE. `NoHookGuessesASeatFromAName` below
+    carries it across every hook in the directory, which is the scope an untracked `builder-nudge.ps1`
+    broke for a month without anything going red.
     """
 
     def test_the_hook_reads_no_branch_or_directory_name(self):
@@ -697,6 +707,405 @@ class TheHookNeverGuessesASeat(unittest.TestCase):
         source = read(HOOK)
         self.assertIn(MARKER_RELPATH, source)
         self.assertIn("KORUS_SEAT", source)
+
+
+# ------------------------------------------------- the same rule, over every hook rather than one
+
+HOOKS_DIR = _REPO / "scripts" / "hooks"
+
+#: The extensions a hook is written in here. Three languages, and the scan below handles all three
+#: because the defect it was written against could have been written in any of them.
+HOOK_SUFFIXES = (".ps1", ".py", ".sh")
+
+#: Ways a script can learn a NAME instead of reading a declaration. AT LEAST these -- the list is
+#: the shapes measured in this directory on 2026-09-20, not a proof that no other shape exists.
+#: `(Get-Item $PWD).Name`, `$PWD.Path.Split('\')[-1]` and `%CD%` are all unmodelled.
+NAME_SOURCES = re.compile(
+    r"Split-Path[^\n]*?-Leaf"
+    r"|-Leaf[^\n]*?Split-Path"
+    r"|--abbrev-ref"
+    r"|--show-toplevel"
+    r"|symbolic-ref"
+    r"|basename"
+    r"|GetFileName",
+    re.I,
+)
+
+#: An assignment in any of the three languages: `$x = ...`, `x = ...`, `x: str = ...`,
+#: `export X=...`. Scanned with `finditer` rather than matched at the start of the line, so an
+#: assignment nested inside an `if` body on one line is still tracked. The `[^=]` tail keeps `==`
+#: out. A derivation that never lands in a named variable -- passed straight to a function, or
+#: built in a pipeline -- is still a miss, and so is one handed to a dot-sourced library.
+#:
+#: THE LOOKBEHIND REJECTS A LEADING HYPHEN, and without it `--path-format=absolute` reads as an
+#: assignment to a variable called `format`. Measured 2026-09-20: five hooks then carried a phantom
+#: `format`, and any later line mentioning that common word would have been graded against the seat
+#: labels.
+_ASSIGNMENT = re.compile(r"(?<![-\w])\$?([A-Za-z_][\w:]*)\s*(?::\s*[^=\n]+?)?\s*=[^=]")
+
+_POWERSHELL_BLOCK_COMMENT = re.compile(r"<#.*?#>", re.S)
+
+# `.*?` UNDER `re.S`, NEVER `(?:.|\n)*?`. The alternation is the ReDoS shape CodeQL already named
+# once in this file: with DOTALL both branches match a newline, so every position has two ways to
+# match and a lazy run that never finds its terminator backtracks exponentially. Measured
+# 2026-09-20 while arming this scan -- `scripts/coord/claim.ps1` carries a PowerShell escaped-quote
+# run that reads as an unterminated `"""`, and the ambiguous pattern hung for over three minutes on
+# one file before it was killed. The safe form scans each start position once.
+_PYTHON_TRIPLE_QUOTE = re.compile(r'""".*?"""|\'\'\'.*?\'\'\'', re.S)
+
+#: The hook this rule was written against, reconstructed from the two lines that mattered, and the
+#: positive control for the scan below. `NoHookGuessesASeatFromAName` carries the incident.
+BUILDER_NUDGE_SOURCE = (
+    "$seat = Split-Path (git rev-parse --show-toplevel) -Leaf\n"
+    "if ($seat -notmatch '(?i)builder') { exit 0 }\n"
+)
+
+#: Hooks that DO pair a name read with a seat label today. The ratchet: the scan's result must equal
+#: this map exactly, so a new violator goes red and so does a stale entry left behind after a fix.
+#: Each entry states the defect, because a bare name here is an allow-list nobody can review.
+KNOWN_NAME_DERIVED_SEAT_HOOKS: dict[str, str] = {
+    "lane-level.ps1": (
+        "Lines 183-186 and 205 take the worktree leaf and the branch name and match them against "
+        "'builder' and 'dispatcher' to decide which role THIS session holds. The same file states "
+        "the opposite rule 45 lines further down and applies it correctly to every OTHER lane it "
+        "discovers: 'MATCH ON THE DECLARED SEAT ONLY, NEVER ON THE WORKTREE NAME', measured "
+        "2026-08-23 when a Cleaner sat in a worktree named builder-handoff-seat. Two further facts "
+        "for whoever repairs it: 'dispatcher' was retired on 2026-09-01, so that arm matches no "
+        "seat the roster runs; and the installed Stop wrapper prefers the VAULT copy of this "
+        "script over the engine copy, which no test here can read. NOT REPAIRED IN THE CHANGE THAT "
+        "ADDED THIS GUARD, on purpose: fixing a hook and widening its guard together means nothing "
+        "independent checked either."
+    ),
+}
+
+
+def hook_files() -> list[Path]:
+    """EVERY file in the hooks directory whatever its extension, tracked or not, sorted by name.
+
+    THE WORKING TREE IS THE SUBJECT, and that is deliberate: `builder-nudge.ps1` was never
+    committed, so a reader built on `git ls-files` would have returned a clean result for the whole
+    month it ran. The cost is that CI, which checks out only tracked files, cannot see an untracked
+    hook either -- so the untracked arm below only ever grades a developer box, the way the
+    user-scope wrapper test at the foot of this file does.
+
+    UNFILTERED, because the provenance question does not care what language a hook is written in
+    and a suffix filter would hide a `.cmd` or `.psm1` one from it entirely.
+    """
+    return sorted((p for p in HOOKS_DIR.iterdir() if p.is_file()), key=lambda p: p.name)
+
+
+def hook_scripts() -> list[Path]:
+    """The hook files the content scan can read. A file of any other type is a finding, not a skip.
+
+    Kept apart from `hook_files` so an unreadable type -- an image, an archive -- errors in the
+    suffix assertion with a clear message instead of a decode failure mid-scan.
+    """
+    return [p for p in hook_files() if p.suffix in HOOK_SUFFIXES]
+
+
+def seat_labels() -> list[str]:
+    """Every label that names a seat: live, alias, retired. Two characters or fewer are dropped.
+
+    DRIVEN BY THE ROSTER rather than hand-listed, so a seat added tomorrow is covered without an
+    edit here. RETIRED LABELS ARE IN because guessing a retired seat from a name is the same defect
+    with a worse outcome -- the session acts on rules no seat holds. The length floor drops `pm`,
+    which is too short to distinguish a seat from a variable.
+    """
+    roster = seats()
+    every = set(roster["live"]) | set(roster["aliases"]) | set(roster["retired"])
+    return sorted(label for label in every if len(label) >= 3)
+
+
+def _code_lines(text: str, suffix: str = "") -> list[str]:
+    """Source with comments and docstrings blanked, one entry per original line.
+
+    Blanked rather than removed so a reported line number still points at the file. This has to
+    happen: `lane-level.ps1` explains the very rule it breaks, in prose, naming both 'builder' and
+    the worktree name in one paragraph, and a scan that reads comments reports the explanation.
+
+    THE TRIPLE-QUOTE STRIP IS SCOPED TO PYTHON, and the reason is the same claim.ps1 line that
+    exposed the ReDoS above. PowerShell escapes a quote by doubling it, so an escaped quote at the
+    very end of a double-quoted string puts three quote characters in a row and that is not a
+    triple quote. Run the Python strip over PowerShell and two such runs in one file blank
+    everything between them -- hiding a real violation, quietly, in the language every hook here is
+    written in. This paragraph is why the sentence above spells the shape out in words rather than
+    showing it: written literally, it would end this docstring.
+    """
+    blanked = _POWERSHELL_BLOCK_COMMENT.sub(lambda m: "\n" * m.group(0).count("\n"), text)
+    if suffix == ".py":
+        blanked = _PYTHON_TRIPLE_QUOTE.sub(lambda m: "\n" * m.group(0).count("\n"), blanked)
+    return ["" if ln.lstrip().startswith("#") else ln for ln in blanked.splitlines()]
+
+
+@cache
+def _label_pattern(labels: tuple[str, ...]) -> re.Pattern[str]:
+    """One compiled alternation over every seat label, built once per label set.
+
+    THE ONLY BOUNDARY IS A WORD CHARACTER, deliberately, and a hyphen is not one. Worktree names
+    here are hyphenated, so `'^mefor-builder'` is the likeliest spelling of the defect this scan
+    hunts; a lookbehind that excluded a leading hyphen would read that line as clean.
+    """
+    return re.compile(r"(?<!\w)(" + "|".join(re.escape(x) for x in labels) + r")(?!\w)", re.I)
+
+
+def name_derived_seat_hits(
+    text: str, labels: list[str] | None = None, suffix: str = ""
+) -> list[str]:
+    """Lines where a value read from a NAME is tested against a SEAT LABEL. Empty means clean.
+
+    TWO STEPS, because neither half is a finding alone. A hook may read `--show-toplevel` all day
+    to resolve a path -- `worktree_gate.ps1` does it eight times -- and a hook may name a seat all
+    day in the text it prints. The defect is the JOIN: a variable assigned from a name source, then
+    compared against a seat label.
+
+    WHAT IT CANNOT SEE, stated because a scan that implies completeness is worse than one that does
+    not. It follows a variable NAME within one file, so a derivation handed to a function or a
+    dot-sourced library escapes it. It models the name sources listed in `NAME_SOURCES` and no
+    others. And it reads text, so a label built at runtime is invisible.
+    """
+    labels = labels if labels is not None else seat_labels()
+    lines = _code_lines(text, suffix)
+
+    tracked: set[str] = set()
+    for line in lines:
+        for m in _ASSIGNMENT.finditer(line):
+            if NAME_SOURCES.search(line[m.end(1) :]):
+                tracked.add(m.group(1))
+    if not tracked:
+        return []
+
+    label_rx = _label_pattern(tuple(labels))
+    # `\bNAME\b` catches `$leaf` in PowerShell, `$SEAT` in sh and a bare `seat` in Python with one
+    # pattern, because `$` is not a word character. CASE-INSENSITIVE, because PowerShell variable
+    # names are: `$Leaf = Split-Path ... -Leaf` and `if ($leaf -match ...)` are one variable, and a
+    # case-sensitive reader calls that file clean.
+    used_rx = {name: re.compile(r"\b" + re.escape(name) + r"\b", re.I) for name in tracked}
+
+    hits = []
+    for number, line in enumerate(lines, start=1):
+        if not any(rx.search(line) for rx in used_rx.values()):
+            continue
+        found = sorted({x.lower() for x in label_rx.findall(line)})
+        if found:
+            hits.append(f"line {number} tests a name against {found}: {line.strip()[:120]}")
+    return hits
+
+
+class NoHookGuessesASeatFromAName(unittest.TestCase):
+    """`TheHookNeverGuessesASeat` above pins ONE path. This pins the directory.
+
+    WHAT THE NARROW SCOPE COST. An untracked Stop hook, `scripts/hooks/builder-nudge.ps1`, took the
+    worktree basename and matched it against 'builder' to decide whether to nag. It broke the rule
+    the class above exists to enforce, for about a month, and nothing reported it -- because that
+    class reads `role-card-inject.ps1` and nothing else. A guard scoped to one file grades one file.
+
+    BOTH CLASSES STAY. They ask different questions. The one above asks whether the reference
+    implementation still resolves a seat the one correct way, by the marker and the variable; it can
+    demand the total ABSENCE of a probe because that hook needs none. This one cannot: most hooks
+    here legitimately call `rev-parse` for a path, so it asks the narrower question of whether a
+    name ever reaches a seat comparison.
+    """
+
+    def test_no_hook_tests_a_name_against_a_seat_label(self):
+        labels = seat_labels()
+        found = {
+            p.name: hits
+            for p in hook_scripts()
+            if (hits := name_derived_seat_hits(read(p), labels, p.suffix))
+        }
+        self.assertEqual(
+            sorted(KNOWN_NAME_DERIVED_SEAT_HOOKS),
+            sorted(found),
+            "the set of hooks that derive a seat from a name has changed.\n"
+            + "\n".join(f"  {name}: {'; '.join(h)}" for name, h in sorted(found.items()))
+            + "\nA NEW name is a new defect: resolve the seat from .claude/seat.local.txt the way "
+            "role-card-inject.ps1 does. A name that DISAPPEARED means the hook was repaired, so "
+            "delete its row from KNOWN_NAME_DERIVED_SEAT_HOOKS -- a stale row is an allow-list "
+            "entry that would let the same file re-offend in silence.",
+        )
+
+    def test_every_known_violator_still_exists_and_carries_a_reason(self):
+        """A row for a deleted file would sit here forever, unreachable and unfalsifiable."""
+        present = {p.name for p in hook_scripts()}
+        for name, why in KNOWN_NAME_DERIVED_SEAT_HOOKS.items():
+            with self.subTest(hook=name):
+                self.assertIn(name, present, f"{name} is listed as a violator and does not exist")
+                self.assertGreater(len(why.strip()), 80, f"{name} is listed with no usable reason")
+
+    def test_the_scan_grades_the_files_it_claims_to(self):
+        """The empty-corpus control. Every assertion above passes against a broken glob."""
+        names = [p.name for p in hook_scripts()]
+        self.assertGreaterEqual(
+            len(names), 15, f"only {len(names)} hook scripts discovered: {names}"
+        )
+        for expected in ("role-card-inject.ps1", "lane-level.ps1", "push_guard.py"):
+            self.assertIn(expected, names, f"the scan cannot see {expected}, so it grades a subset")
+
+    def test_no_hook_is_written_in_a_language_the_scan_cannot_read(self):
+        """A fourth language arriving must be a decision, not a silent exemption.
+
+        `hook_scripts` filters by suffix, so a `.cmd` or `.psm1` hook would be skipped by every
+        content check above while looking like it had passed them.
+        """
+        unreadable = sorted(p.name for p in hook_files() if p.suffix not in HOOK_SUFFIXES)
+        self.assertEqual(
+            [],
+            unreadable,
+            f"files in scripts/hooks the scan does not read: {unreadable}. Either these are not "
+            f"hooks and belong elsewhere, or HOOK_SUFFIXES needs the new language and "
+            "name_derived_seat_hits needs a control proving it reads that language.",
+        )
+
+    def test_the_scan_fires_on_the_hook_this_guard_was_written_against(self):
+        """The positive control. A scan that matches nothing is indistinguishable from a clean tree."""
+        self.assertTrue(
+            name_derived_seat_hits(BUILDER_NUDGE_SOURCE, suffix=".ps1"),
+            "the scan did not fire on builder-nudge.ps1's own two lines, so it guards nothing",
+        )
+
+    def test_the_scan_fires_on_the_same_shape_in_python_and_in_shell(self):
+        """Hooks here are written in three languages, so one working control proves one third."""
+        python = 'seat = os.path.basename(toplevel)\nif seat.startswith("builder"):\n    pass\n'
+        shell = 'SEAT=$(basename "$(git rev-parse --show-toplevel)")\ncase "$SEAT" in builder*) ;; esac\n'
+        self.assertTrue(
+            name_derived_seat_hits(python, suffix=".py"), "the scan is blind to the Python shape"
+        )
+        self.assertTrue(
+            name_derived_seat_hits(shell, suffix=".sh"), "the scan is blind to the shell shape"
+        )
+
+    def test_the_scan_fires_on_a_hyphenated_name_and_on_a_recased_variable(self):
+        """Two shapes a first draft of this scan missed, and both are the likely spelling here.
+
+        HYPHEN. Worktree names in this repository are hyphenated, so a hook matching `'^mefor-
+        builder'` is more probable than one matching a bare `'builder'`. A lookbehind that excluded
+        a leading hyphen read that line as clean.
+
+        CASE. PowerShell variable names are case-insensitive, so `$Leaf` and `$leaf` are one
+        variable and a case-sensitive reader loses the link between the assignment and the test.
+        """
+        hyphenated = (
+            "$leaf = Split-Path $PWD -Leaf\nif ($leaf -match '^mefor-builder') { exit 0 }\n"
+        )
+        recased = "$Leaf = Split-Path $PWD -Leaf\nif ($leaf -match 'builder') { exit 0 }\n"
+        self.assertTrue(
+            name_derived_seat_hits(hyphenated, suffix=".ps1"),
+            "a seat label behind a hyphen is invisible to the scan",
+        )
+        self.assertTrue(
+            name_derived_seat_hits(recased, suffix=".ps1"),
+            "the scan loses a PowerShell variable to a change of case",
+        )
+
+    def test_the_scan_does_not_invent_a_variable_out_of_a_command_flag(self):
+        """`--path-format=absolute` reads as an assignment to `format` unless the scan says no.
+
+        A phantom variable named after a common word grades every later line mentioning that word
+        against the seat labels, which is how a scan like this starts reporting noise and gets
+        switched off. Measured 2026-09-20: five hooks carried this one before the fix.
+        """
+        flag_only = (
+            "$top = (& git rev-parse --path-format=absolute --show-toplevel 2>$null)\n"
+            "Write-Output 'format: the builder report'\n"
+        )
+        self.assertEqual([], name_derived_seat_hits(flag_only, suffix=".ps1"))
+
+    def test_the_python_docstring_strip_does_not_run_over_powershell(self):
+        """The regression arm for the ReDoS repair, and it guards the OTHER half of that fix.
+
+        PowerShell escapes a quote by doubling it, so a string ending in an escaped quote puts
+        three quote characters in a row without being a triple quote -- `scripts/coord/claim.ps1`
+        carries exactly that. Two such runs in one file would blank everything between them if the
+        Python strip ran over PowerShell, and a violation sitting in that gap would never be
+        reported. `planted` below holds the shape; it is built rather than shown for the reason
+        `_code_lines` states.
+        """
+        planted = (
+            '$first = "say ""hi"""\n'
+            "$leaf = Split-Path $PWD -Leaf\n"
+            '$second = "say ""bye"""\n'
+            "if ($leaf -match 'builder') { exit 0 }\n"
+        )
+        self.assertTrue(
+            name_derived_seat_hits(planted, suffix=".ps1"),
+            "the scan lost a PowerShell violation between two doubled-quote runs",
+        )
+        # The other half of the control: this input IS swallowed when the Python strip runs, so the
+        # arm above is measuring the scoping rather than passing for an unrelated reason.
+        self.assertEqual(
+            [],
+            name_derived_seat_hits(planted, suffix=".py"),
+            "the planted source survives the Python strip, so the arm above proves nothing",
+        )
+
+    def test_the_scan_accepts_a_hook_that_reads_the_marker_at_a_resolved_path(self):
+        """The negative arm, and it is the whole discriminator.
+
+        Resolving the worktree PATH with `rev-parse` and reading the declaration out of it is the
+        correct shape. Taking that path's LEAF is the defect. A guard that cannot tell them apart
+        would red every hook here and be switched off within a week.
+        """
+        correct = (
+            "$top = (& git rev-parse --path-format=absolute --show-toplevel 2>$null)\n"
+            "$seat = (Get-Content (Join-Path $top '.claude/seat.local.txt') -Raw).Trim()\n"
+            "if ($seat -eq 'builder') { Write-Output 'hello' }\n"
+        )
+        self.assertEqual(
+            [],
+            name_derived_seat_hits(correct, suffix=".ps1"),
+            "the scan flagged the shape role-card-inject.ps1 uses, so it forbids the fix",
+        )
+
+    def test_the_reference_implementation_is_clean_under_this_scan_too(self):
+        self.assertEqual([], name_derived_seat_hits(read(HOOK), suffix=HOOK.suffix))
+
+    def test_the_label_set_covers_live_and_retired_seats(self):
+        """Control for `seat_labels()`: an empty or live-only set makes the scan quietly weaker."""
+        labels = set(seat_labels())
+        self.assertLessEqual(set(EXPECTED_SEATS), labels, "a live seat is missing from the labels")
+        self.assertIn("dispatcher", labels, "retired seats dropped out of the label set")
+        self.assertNotIn("pm", labels, "a two-character label is too short to be a seat name here")
+
+
+class EveryHookScriptIsTracked(unittest.TestCase):
+    """An untracked script in this directory runs in real sessions and is reviewed by nobody.
+
+    `builder-nudge.ps1`, the hook the class above records, was exactly that. This one asks about
+    PROVENANCE rather than content, which is the half a pattern match cannot cover: it fires on a
+    new hook whatever the hook is written in and whatever it does.
+
+    IT ONLY EVER GRADES A DEVELOPER BOX, for the reason `hook_files` gives. The control below is
+    what keeps the emptiness meaningful where the arm is not vacuous.
+    """
+
+    def _tracked(self) -> set[str]:
+        # `-z` because `git ls-files` otherwise QUOTES and octal-escapes any path outside ASCII,
+        # and a quoted name never equals the name on disk -- a tracked file would read as untracked.
+        out = subprocess.run(
+            ["git", "ls-files", "-z", "--", "scripts/hooks"],
+            cwd=_REPO,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return {path.rsplit("/", 1)[-1] for path in out.stdout.split("\0") if path.strip()}
+
+    def test_the_tracked_read_returns_something(self):
+        """The control. An empty read makes the assertion below pass by examining nothing."""
+        tracked = self._tracked()
+        self.assertIn(
+            "role-card-inject.ps1", tracked, f"git ls-files returned {len(tracked)} paths"
+        )
+
+    def test_no_hook_script_is_untracked(self):
+        untracked = sorted({p.name for p in hook_files()} - self._tracked())
+        self.assertEqual(
+            [],
+            untracked,
+            f"hook scripts in scripts/hooks that git does not track: {untracked}. One of these "
+            "runs in every session on this machine and has been through no review. Commit it, or "
+            "delete it and unwire it.",
+        )
 
 
 class TheConsoleRetirementSaysTheManagerIsNotARenameOfIt(unittest.TestCase):
@@ -894,3 +1303,115 @@ class TheRegulatorRetirementDeniesTheWatchdogSucceededIt(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ================================================================ the USER-SCOPE wrapper
+#
+# `session_start_args()` above says, correctly, that its scope is this repository's own
+# `.claude/settings.json` and that nothing there can see the user-scope roots. This section is the
+# other half. It reads those roots directly.
+#
+# WHAT IT GUARDS, AND WHY THAT IS NOT THE SAME QUESTION. The project wiring names a path inside the
+# worktree, so a stale worktree simply has no file to run. The USER-SCOPE wrapper is different: it
+# tries the worktree, falls back to the parent of `--git-common-dir` (the primary checkout), and
+# until 2026-09-20 it `exit 0`-ed in silence when neither had the hook. That silence is how the
+# whole defect went unnoticed for two weeks -- 13 of 171 worktrees on the development box resolved
+# nothing and said nothing. The wrapper now prints one line in that case, in the shape
+# `mefor-announce` beside it already used.
+#
+# THE WRAPPER HAS NO COMMITTED SOURCE. It exists only as N copies, one per config root, with no
+# installer and no parity check -- which is precisely the installed-copy drift this suite keeps
+# meeting. Nothing here can say which copy is authoritative, so it does not try: it asserts they
+# AGREE WITH EACH OTHER and that each still carries the warning branch. A hand-edit to one root
+# fails; an identical edit to all of them does not, and that limit is stated rather than papered
+# over.
+
+
+USER_SCOPE_MARKER = "korus-role-card"
+#: The branch whose absence is the silent failure. Matched on the emitted text, not on the code
+#: around it, so reformatting the wrapper does not red this while a deleted warning would.
+WARNING_SUBSTRING = "is absent from this worktree"
+
+
+def user_scope_role_card_wrappers() -> list[tuple[Path, str]]:
+    """Every user-scope `settings.json` carrying the role-card wrapper, with its command text.
+
+    Reads `Path.home().glob(".claude*")` the way `test_selfheal_installed_parity.py` does -- the
+    box runs several config roots and a session uses exactly one, so any of them can be the one
+    that matters and none of them is discoverable from the repository.
+    """
+    out: list[tuple[Path, str]] = []
+    for d in sorted(Path.home().glob(".claude*")):
+        if not d.is_dir():
+            continue
+        f = d / "settings.json"
+        if not f.is_file():
+            continue
+        try:
+            cfg = json.loads(f.read_text(encoding="utf-8-sig"))
+        except (json.JSONDecodeError, OSError):
+            continue  # a root this test cannot parse is not a finding about role cards
+        for groups in cfg.get("hooks", {}).values():
+            for group in groups:
+                for hook in group.get("hooks", []):
+                    command = str(hook.get("command", ""))
+                    if USER_SCOPE_MARKER in command:
+                        out.append((f, command))
+    return out
+
+
+def wrapper_disagreements(wrappers: list[tuple[Path, str]]) -> list[str]:
+    """Findings over a set of wrapper copies. Empty list means they agree and each warns.
+
+    PURE, so the failing paths can be driven without touching a real config root. Every arm below
+    that matters is unreachable on a healthy box, which is the state in which a guard is least
+    likely to be correct and least likely to be noticed.
+    """
+    if not wrappers:
+        return []
+    findings = []
+    bodies = {command for _, command in wrappers}
+    if len(bodies) > 1:
+        findings.append(
+            f"{len(bodies)} DIFFERENT wrapper bodies across {len(wrappers)} config root(s): "
+            + ", ".join(sorted(str(p) for p, _ in wrappers))
+        )
+    missing = sorted(str(p) for p, command in wrappers if WARNING_SUBSTRING not in command)
+    if missing:
+        findings.append(
+            "the no-hit warning branch is GONE from: "
+            + ", ".join(missing)
+            + " -- these roots go back to exiting 0 in silence when neither the worktree nor the "
+            "primary has role-card-inject.ps1, which is the failure that hid this for two weeks"
+        )
+    return findings
+
+
+def test_the_user_scope_wrappers_agree_and_still_warn() -> None:
+    wrappers = user_scope_role_card_wrappers()
+    if not wrappers:
+        pytest.skip(
+            "SKIP (nothing compared): no user-scope settings.json on this machine carries the "
+            f"{USER_SCOPE_MARKER!r} wrapper. Expected on CI, which has no config roots -- so this "
+            "arm is honest there and only ever grades a developer box."
+        )
+    print(f"compared {len(wrappers)} user-scope wrapper(s): {[str(p) for p, _ in wrappers]}")
+    findings = wrapper_disagreements(wrappers)
+    assert not findings, "\n".join("  * " + f for f in findings)
+
+
+@pytest.mark.parametrize(
+    ("bodies", "expect"),
+    [
+        ([], 0),  # nothing installed -- not a finding, the caller skips
+        (["A warns: is absent from this worktree"], 0),
+        (["A warns: is absent from this worktree"] * 6, 0),
+        (["A warns: is absent from this worktree", "B differs: is absent from this worktree"], 1),
+        (["silent wrapper with no warning"], 1),
+        (["silent one", "another silent one"], 2),  # both disagreement AND missing warning
+    ],
+)
+def test_the_wrapper_probe_reports_each_failure_shape(bodies: list[str], expect: int) -> None:
+    """Exhaustive over the decision, because five of these six cannot occur on a healthy box."""
+    made = [(Path(f"root{i}/settings.json"), b) for i, b in enumerate(bodies)]
+    assert len(wrapper_disagreements(made)) == expect, wrapper_disagreements(made)

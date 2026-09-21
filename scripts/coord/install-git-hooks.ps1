@@ -84,7 +84,7 @@ $postCommit = Join-Path $hooksDir "post-commit"
 # THIS FILE ALREADY EXISTED ON THIS BOX AND THIS INSTALLER DID NOT KNOW IT. Measured 2026-09-19 in
 # the engine clone: .git/hooks/post-merge was byte-identical to the VAULT clone's copy of
 # durability_push.sh and three weeks older than the post-commit beside it -- written by the vault's
-# installer, which has always managed both. -Status never mentioned it, -Arm never replaced it and
+# installer, which has always managed both. -Status never mentioned it, no re-install replaced it and
 # -Uninstall never removed it, so it sat there carrying the pre-2026-09-19 matcher that refuses the
 # private vault. A `git pull` in that clone printed the refusal while the post-commit beside it was
 # current. An unmanaged hook is worse than an absent one: it runs, and no audit here can see it.
@@ -180,7 +180,7 @@ if ($Status) {
         Write-Host "             ^ THE TWO DISAGREE. They are the same script and a commit reaches one or" -ForegroundColor Yellow
         Write-Host "               the other depending on whether it came from a commit or a merge, so one" -ForegroundColor Yellow
         Write-Host "               installed alone leaves that whole class of commit covered by nothing." -ForegroundColor Yellow
-        Write-Host "               Re-run with -Arm." -ForegroundColor Yellow
+        Write-Host "               Re-run this script with NO flags -- the bare invocation IS the install." -ForegroundColor Yellow
     }
 
     # CONTENT PARITY, because the marker above is not content. The marker is one line in a header
@@ -200,7 +200,7 @@ if ($Status) {
         if ($iSha -ne $durSrcSha) {
             Write-Host "             ^ STALE. The copy that RUNS is not the one in this checkout, so every" -ForegroundColor Red
             Write-Host "               rule in it -- including which remotes it refuses to publish to -- is" -ForegroundColor Red
-            Write-Host "               whatever it was when it was installed. Re-run with -Arm." -ForegroundColor Red
+            Write-Host "               whatever it was when it was installed. Re-run with NO flags to replace it." -ForegroundColor Red
             Write-Host "               Read the branch you are on first: arming from a checkout that PREDATES" -ForegroundColor Red
             Write-Host "               the installed copy downgrades it for every worktree of this clone." -ForegroundColor Red
         }
@@ -587,10 +587,21 @@ if ($armedRemote) {
     # refs/tags/rescue/auto/main collided between the engine and the vault, which push to one
     # remote; the bare shape this line used to print still resolves, to that contested fossil. So
     # an operator who built a query from the old wording got a CONFIDENT HIT at a commit belonging
-    # to neither repository and concluded their work was backed up. Keep this in step with
-    # scripts/hooks/durability_push.sh:122 and :126 -- the two lines that assign $TAG.
+    # to neither repository and concluded their work was backed up. Keep this in step with the two
+    # lines in scripts/hooks/durability_push.sh that assign $TAG.
+    #
+    # ANCHORED BY CONTENT, BECAUSE THE LINE NUMBERS THAT USED TO SIT HERE HAD ROTTED. This citation
+    # read `:122 and :126` while those assignments sat at 194 and 198 -- measured 2026-09-20 against
+    # origin/main. A pointer and the thing it points at are two edits, only one of which ever gets
+    # made, and no gate anywhere reports the gap. `$TAG` is greppable; a line number is not.
     Write-Host "             Every commit now also lands as refs/tags/rescue/auto/<repo>/<branch>"
     Write-Host "             there, or refs/tags/rescue/auto/<repo>/detached/<sha> off a branch."
+    # A REWRITE ALSO LEAVES A REF NOW, and an operator who does not expect it reads it as a stray.
+    # A rebase, amend or reset followed by a commit preserves the tip the moving tag steps off, at
+    # refs/tags/rescue/orphan/<repo>/<branch>/<sha>. Why, and what it does not cover, is stated once
+    # in scripts/hooks/durability_push.sh under "preserve before the tag moves off a discarded tip".
+    Write-Host "             A rebase or amend also leaves refs/tags/rescue/orphan/<repo>/<branch>/<sha>"
+    Write-Host "             holding the tip it discarded, so the rewrite does not drop it."
 } else {
     Write-Host "!! DURABILITY HOOK IS INSTALLED BUT NOT ARMED." -ForegroundColor Yellow
     Write-Host "   mefor.durabilityRemote is unset, so it exits 0 without pushing and nothing is" -ForegroundColor Yellow

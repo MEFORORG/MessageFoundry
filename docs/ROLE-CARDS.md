@@ -557,7 +557,17 @@ from #970 as `1584742b2` on 2026-09-08. So no single commit matches this table, 
 heading names the branch commit rather than the merge.
 
 `seats.json` has since gained a fourth map, `elsewhere`, and its roster key was renamed from `seats`
-to `live`. The shipped card set today is `manager`, `builder`, `regulator`, `steward`, `lander`.
+to `live`. The shipped card set today is `builder`, `lander`, `manager`, `special`, `steward` and
+`watchdog`.
+
+**That last sentence read "`manager`, `builder`, `regulator`, `steward`, `lander`" until 2026-09-20,
+and it was wrong at both ends.** It named a card that does not exist and omitted two that do.
+Measured with `git ls-files docs/roles/`: seven entries, six `*.card.md` files and `seats.json`.
+There is no `regulator.card.md` — the Regulator retired 2026-09-19 and nothing replaced it, so no
+seat attributes a red check now. `special` and `watchdog` were absent from the list.
+
+Control, the same listing read against `seats.json`'s `live` array: each of the six live names
+resolves to a shipped card, so the read above was of a populated directory and not an empty match.
 
 ### Files changed
 

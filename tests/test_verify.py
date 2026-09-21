@@ -1034,6 +1034,18 @@ def test_a_missing_explicit_config_path_fails_rather_than_skipping(tmp_path: Pat
     assert exit_code(results) == 1
 
 
+def test_a_directory_given_as_the_config_path_fails_rather_than_crashing(tmp_path: Path) -> None:
+    """A directory reaches load_settings's open, so `verify` must report it, not crash on it.
+
+    The mechanism is stated once at messagefoundry.__main__._load_service_settings. This asserts
+    the config.load ROW and the exit code rather than the exception class, because the class
+    differs by platform and this leg runs on both."""
+    results = run_verify(sections=["store"], smoke_mode="none", service_config=str(tmp_path))
+    load = [r for r in results if r.id == "config.load"]
+    assert load and load[0].status is Status.FAIL
+    assert exit_code(results) == 1
+
+
 def test_settings_error_never_echoes_a_configured_value(tmp_path: Path) -> None:
     """A verify report is written to disk and pasted into tickets, so a pydantic ValidationError must
     contribute loc+msg only — never `input`, which for a password or DSN would be a credential."""
