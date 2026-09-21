@@ -1770,7 +1770,17 @@ def _generate_steps(steps: tuple[Step, ...], indent: int, *, in_loop: bool) -> l
 
 
 def _generate_control(ctrl: Control, indent: int, *, in_loop: bool) -> list[str]:
-    """Render one control construct. Conditions are never guessed — they become dead placeholders."""
+    """Render one control construct, then whatever branches it could not continue.
+
+    The tail runs for EVERY kind, so a construct added later cannot silently drop an adopted branch by
+    forgetting to ask for it — see :func:`_stray_branches` (BACKLOG #1854)."""
+    out = _generate_construct(ctrl, indent, in_loop=in_loop)
+    out.extend(_stray_branches(ctrl, indent, in_loop=in_loop))
+    return out
+
+
+def _generate_construct(ctrl: Control, indent: int, *, in_loop: bool) -> list[str]:
+    """Render the construct itself. Conditions are never guessed — they become dead placeholders."""
     pad = "    " * indent
     label = _comment_text(ctrl.detail)
     suffix = f" — hand-finish: {label}" if label else ""
@@ -1815,16 +1825,16 @@ def _generate_control(ctrl: Control, indent: int, *, in_loop: bool) -> list[str]
     if ctrl.kind == "try":
         out = [f"{pad}try:"]
         out.extend(_block_body(ctrl.body, indent + 1, in_loop=in_loop))
-        handlers = [b for b in ctrl.branches if b.kind == "except"] or None
-        if handlers is None:
+        # The complement of this filter is what :func:`_stray_branches` marks, so both sides read the
+        # same predicate — a ``try`` that learns a new branch kind cannot leave one in neither set.
+        handlers = [b for b in ctrl.branches if _renders_as_branch(ctrl.kind, b.kind)]
+        if not handlers:
             out.append(f"{pad}except Exception:  # TODO: Corepoint Try with no Catch — hand-finish")
             out.append(f"{pad}    raise")
-            return out
         for branch in handlers:
-            note = _comment_text(branch.detail)
             out.append(
-                f"{pad}except Exception:  # TODO: Corepoint {branch.source_verb} — hand-finish"
-                + (f": {note}" if note else "")
+                f"{pad}except Exception:  # TODO: Corepoint {branch.source_verb}"
+                f"{_hint(_comment_text(branch.detail))}"
             )
             out.extend(_block_body(branch.body, indent + 1, in_loop=in_loop))
         return out
@@ -1842,6 +1852,65 @@ def _generate_control(ctrl: Control, indent: int, *, in_loop: bool) -> list[str]
     # bare ``else:`` would not even parse, so it degrades to a marker + its body inline — never lost.
     out = [f"{pad}# TODO: Corepoint {ctrl.source_verb} with no enclosing construct{suffix}"]
     out.extend(_generate_steps(ctrl.body, indent, in_loop=in_loop))
+    return out
+
+
+def _renders_as_branch(parent_kind: str, branch_kind: str) -> bool:
+    """Whether :func:`_generate_construct` emits this branch as real Python control flow.
+
+    THE single answer, asked by the render and by :func:`_count_steps` alike, because the summary is a
+    count-and-log record and a branch the render only marks must not be reported as shipped. An
+    ``if``/``case`` chain takes every branch as an arm — a stray marker there is a mislabelled arm,
+    not a loss — while a ``try`` speaks only ``except`` and a loop speaks no branch at all.
+
+    Spelled out rather than read off ``_BRANCH_PARENT``: that table says which construct may ADOPT a
+    marker, which is a parse question. This is a render question, and the two part company the moment
+    a construct adopts a kind it has no faithful form for — a ``finally`` added to the table would
+    otherwise be rendered as ``except Exception:``, which is worse than being marked."""
+    if parent_kind in ("if", "case"):
+        return True
+    return parent_kind == "try" and branch_kind == "except"
+
+
+def _stray_branches(ctrl: Control, indent: int, *, in_loop: bool) -> list[str]:
+    """Render the branches ``ctrl`` cannot continue: a TODO marker, then the body inline.
+
+    :func:`_split_branches` adopts ANY bodyless branch marker written inside a container's own
+    ``<List>`` without checking that the marker's construct matches that container, so an ``Else``
+    lands on a ``Try`` and a ``Catch`` on a ``ForEach``. Keeping only the branches a render understood
+    dropped the rest with their whole bodies, while the summary counted every dropped statement as
+    mapped — worse than a plain drop, because it asserted the statement shipped (BACKLOG #1854).
+
+    The marker's own scope is unknowable (the export's intent is not recoverable from a misplaced
+    marker), so this degrades exactly as the ``unknown`` arm above does: say what was found, say the
+    scope was lost, and inline the body at THIS indentation rather than invent a construct for it.
+
+    A ``@Disabled`` subtree never reaches here (:func:`_parse_statement` returns it before branches are
+    split, so it carries none), and the explicit guard keeps it that way: its whole contract is that
+    nothing under it is emitted as live code, which inlining a body would break."""
+    if ctrl.kind == "disabled":
+        return []
+    strays = [b for b in ctrl.branches if not _renders_as_branch(ctrl.kind, b.kind)]
+    if not strays:
+        return []
+    # The body is being lifted OUT of the loop it was written inside, so a ``LoopExit`` in it no
+    # longer names that loop. Emitting a live ``break`` here would bind it to whatever loop encloses
+    # the construct — a silent change of which loop exits — so the loop context is dropped and the
+    # ``LoopExit`` degrades to its own marker instead.
+    in_loop = in_loop and ctrl.kind not in ("for", "while")
+    pad = "    " * indent
+    out: list[str] = []
+    for branch in strays:
+        out.append(
+            f"{pad}# TODO: Corepoint {branch.source_verb} cannot continue a Corepoint "
+            f"{ctrl.source_verb}{_hint(_comment_text(branch.detail))}"
+        )
+        if branch.body:
+            out.append(
+                f"{pad}#   its body is inlined below at THIS indentation — the branch's own scope "
+                f"is lost, re-scope by hand"
+            )
+        out.extend(_generate_steps(branch.body, indent, in_loop=in_loop))
     return out
 
 
@@ -2027,7 +2096,8 @@ def import_corepoint(export_path: str | Path, out_dir: str | Path) -> ImportResu
 # Control kinds that ARE faithfully represented in the emitted Python (real ``if``/``for``/``try``/…),
 # so they count as mapped. ``block`` is a section label (never an action, so never counted); ``exit``
 # has no faithful form and ``unknown`` is an unmodelled element tag — both count unmapped, emitted as a
-# TODO marker.
+# TODO marker. The four ``_BRANCH_PARENT`` kinds are faithful only while a construct ADOPTS them, so a
+# BRANCH asks :func:`_renders_as_branch` rather than this set, and an orphaned marker counts unmapped.
 _MAPPED_CONTROL_KINDS = frozenset(
     {
         "if",
@@ -2071,10 +2141,14 @@ def _count_steps(steps: tuple[Step, ...]) -> tuple[int, list[str], int]:
             # Counted as one preserved element; its whole subtree rides along in the comment block.
             disabled += 1
         else:
-            if step.kind in _MAPPED_CONTROL_KINDS:
+            if step.kind in _MAPPED_CONTROL_KINDS and step.kind not in _BRANCH_PARENT:
                 mapped += 1
-            elif step.kind in ("exit", "unknown"):
-                # "unknown": an unmodelled element TAG. Counted here (and surfaced by name in
+            elif step.kind in ("exit", "unknown") or step.kind in _BRANCH_PARENT:
+                # "unknown": an unmodelled element TAG. A ``_BRANCH_PARENT`` kind here is a branch
+                # marker standing where a statement should be, with no construct to continue: its
+                # kind names real Python control flow, so it sits in ``_MAPPED_CONTROL_KINDS``, but
+                # only an ADOPTED marker is ever EMITTED as control flow and an orphan degrades to a
+                # TODO marker (BACKLOG #1854). Either way it is counted here (and surfaced by name in
                 # ``unmapped_classes``) so it is reported, never skipped — its body counts on below.
                 unmapped.append(step.source_verb)
             for nested in (step.body, *(b.body for b in step.branches)):
@@ -2083,8 +2157,12 @@ def _count_steps(steps: tuple[Step, ...]) -> tuple[int, list[str], int]:
                 unmapped.extend(n_unmapped)
                 disabled += n_disabled
             for branch in step.branches:
-                if branch.kind in _MAPPED_CONTROL_KINDS:
+                # A branch the render cannot emit as control flow becomes a TODO marker instead, so
+                # it lands in the unmapped bucket; its body statements are real and counted above.
+                if _renders_as_branch(step.kind, branch.kind):
                     mapped += 1
+                else:
+                    unmapped.append(branch.source_verb)
     return mapped, unmapped, disabled
 
 
