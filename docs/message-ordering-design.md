@@ -31,9 +31,9 @@ see [Declined: sequence-keyed ordering](#declined-sequence-keyed-ordering).
 - **FIFO per outbound connection** is the default. Ordering is by **enqueue time on the outbound
   connection** — the order outbox rows were created for *that* destination. Fan-out (one inbound → N
   outbounds) and fan-in (multiple routers → one outbound) both resolve the same way: each outbound
-  orders only its own rows, by enqueue time on it. Parallelism *within* one connection is opt-in
-  **today** through `ordering=UNORDERED`, which trades order for throughput on that lane;
-  sequence-keyed lanes are a separate idea and are declined (below).
+  orders only its own rows, by enqueue time on it. A per-connection `ordering=UNORDERED` is opt-in
+  **today**: it claims a batch and rotates past a failing message, trading strict order for
+  throughput on that lane. Sequence-keyed lanes are a separate idea, and are declined (below).
 - **Nothing is silently lost** (conservative posture). Default failure policy, by failure *kind*:
   - **Internal/code error** at a **router, transformer, or connection** (a bug / unexpected
     exception) → **default: error the message and continue** — record the `ERROR` disposition
@@ -257,7 +257,8 @@ Declining sequence-keyed lanes declines the promise, not the hazard.
 
 **What this does not rule out.** `OrderingMode.UNORDERED`
 ([`config/models.py`](../messagefoundry/config/models.py)) is shipped and stays. An operator may set
-`ordering=UNORDERED` on an outbound connection to trade order for parallelism within that lane, and
-the [ADR 0154](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md)
+`ordering=UNORDERED` on an outbound connection to claim a batch and rotate past a failing message,
+trading strict order for throughput, and the
+[ADR 0154](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md)
 `reply_from` lane requires it. What is declined is **sequence-keyed lanes as the scaling answer for
 an ordered feed**, never the existence of an unordered mode.

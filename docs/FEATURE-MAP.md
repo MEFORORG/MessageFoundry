@@ -96,7 +96,7 @@ is sourced, and the Mirth/NextGen Connect parity reference lives in
 | FIFO-per-outbound ordering | ✅ | Ordering Phase 1 |
 | Failure classification/policy (`NegativeAckError`, AR/CR fail-fast vs AE/CE retry) | ✅ | Per-connection overridable |
 | Retry/backoff, dead-letter, **bulk replay** | ✅ | `/dead-letters` + CLI |
-| Sequence-keyed ordering lanes (per-key / partition-key) | Declined | Declined-by-design (2026-09-20) — FIFO per outbound connection stays the guarantee; an ordered feed that outgrows one core fans out at source. [message-ordering-design.md](message-ordering-design.md#declined-sequence-keyed-ordering) |
+| Sequence-keyed ordering lanes (per-key / partition-key) | Declined | Declined-by-design (2026-09-20) — FIFO per outbound connection stays the default guarantee. Reasoning in [message-ordering-design.md](message-ordering-design.md#declined-sequence-keyed-ordering) |
 | `ack_after=delivered` (deferred ACK) | ⏭️ | Fail-closed at wiring today |
 
 ## 5. Message Store & Backends

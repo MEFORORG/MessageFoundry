@@ -10,13 +10,14 @@
 - **Supersedes:** the inline-pipeline model described in [`ARCHITECTURE.md`](../ARCHITECTURE.md) and
   `CLAUDE.md` §2 (to be revised on acceptance).
 - **Amended 2026-09-20:** per-key (sequence-keyed) ordering is **declined**. The Context, Options and
-  Consequences below are kept as the record of the 2026-06 argument, in which a home for per-key lanes
-  was a genuine consideration. Read every per-key mention below as part of that argument, not as
-  work still planned. See
+  Consequences below keep their 2026-06 argument, in which a home for per-key lanes was a genuine
+  consideration; dated italic notes were added in place where that argument would otherwise read as
+  a live commitment. Read every per-key mention below as part of the 2026-06 case, not as work still
+  planned. See
   [Amendment 2026-09-20](#amendment-2026-09-20-sequence-keyed-ordering-is-declined).
 - **Related:** [`message-ordering-design.md`](../message-ordering-design.md) (Phase 1, now built; it
-  carries the per-key decline), [`BACKLOG.md`](../BACKLOG.md) "Next up" + item 1 (SQL Server
-  concurrency).
+  carries the per-key decline), and BACKLOG #1 (SQL Server concurrency), which is tracked in the
+  maintainer-internal ledger rather than in [`BACKLOG.md`](../BACKLOG.md).
 
 ## Context
 
@@ -237,7 +238,8 @@ boundary, then extend:
 - **Count-and-log weakens** at the ACK boundary — disposition is no longer final at ACK; the invariant is
   re-specified as "received-and-persisted at ACK; disposition recorded as it flows," with rewritten tests.
 - **Ordering now matters at every stage.** *The stated entanglement with per-key ordering lapsed with
-  the 2026-09-20 decline; every stage orders FIFO. See the
+  the 2026-09-20 decline; every stage orders FIFO unless a connection opts out with
+  `ordering=unordered`. See the
   [amendment](#amendment-2026-09-20-sequence-keyed-ordering-is-declined).*
 - **Config / API / console surface multiplies per stage** (per-stage depth, DLQ, replay, alerts).
 - **SQL Server path is blocked on BACKLOG #1** (concurrency-safety fixes) before it can carry staging.
@@ -267,7 +269,8 @@ uniform FIFO and failure policy, and durable backpressure; those held on their o
 reason the split was built. A home for per-key lanes was a secondary consideration, and it simply
 went unclaimed.
 
-**Every stage orders FIFO**, and one strictly ordered feed is bound to one core. The decision, the
+**FIFO is what every stage applies by default**, and one strictly ordered feed is bound to one
+core. A per-connection `ordering=unordered` stays available as an explicit opt-out. The decision, the
 vocabulary (**sequence key**, **sequence group**, **sequence-keyed lanes**), what the engine
 guarantees instead, and why `OrderingMode.UNORDERED` is unaffected are recorded once in
 [`message-ordering-design.md`](../message-ordering-design.md#declined-sequence-keyed-ordering).
