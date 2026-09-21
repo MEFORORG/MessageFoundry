@@ -77,6 +77,10 @@ _NOT_KEY_MATERIAL: dict[str, str] = {
     "password-screening corpus), recorded so its .NOTICE cannot describe a file that no longer "
     "exists; not a key, a secret, or a message authenticator. The input is a published MIT-licensed "
     "third-party wordlist committed beside the digest, so nothing user- or PHI-derived is hashed",
+    "Vendored CLA action provenance": "keyless digests over the vendored third-party CLA action "
+    "(BACKLOG #1578) -- SHA-256 file pins, git's SHA-1 blob id and a uuid5 serial -- that detect "
+    "change and re-derive upstream's published ids; not a key, a secret, or a message authenticator, "
+    "and every input is third-party code or a public URL committed beside the digest",
     "ASVS scorecard revision identifier": "a keyless content hash over the scorecard file, printed "
     "truncated so a --prove-absences run states which revision of the record it read; not a key, a "
     "secret, or a message authenticator, and unlike the corpus pin above nothing is gated on it",

@@ -71,7 +71,11 @@ from messagefoundry.config.models import RetryPolicy
 # may not import `messagefoundry.store` — can rebuild the SAME class the engine publishes. Re-exported
 # here so every existing `from messagefoundry.store.store import CapturedResponse` keeps working.
 from messagefoundry.config.response import CapturedResponse as CapturedResponse  # re-export
-from messagefoundry.config.settings import StoreBackend, StorePrivilegeStatus
+from messagefoundry.config.settings import (
+    AlertSeverity,
+    StoreBackend,
+    StorePrivilegeStatus,
+)
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
 from messagefoundry.service_status import _system_exe
@@ -248,9 +252,19 @@ async def _writer_txn(db: aiosqlite.Connection, lock: asyncio.Lock) -> AsyncIter
 
 
 class _GroupPoisoned(Exception):  # noqa: N818 — control-flow signal, not an error condition
-    """Raised inside the group-commit batch's writer transaction when a member failed, so the shared
-    transaction unwinds through :func:`_writer_txn` (under the lock) instead of being rolled back by
-    hand. Caught by :meth:`_GroupCommitter._flush`, which then rejects every member's future."""
+    """Raised by :meth:`_GroupCommitter._unwind_member` when a member's SAVEPOINT unwind itself
+    failed, so the shared transaction unwinds through :func:`_writer_txn` (under the lock) instead of
+    being rolled back by hand. One of the whole-batch failures listed on :class:`_GroupCommitter`; an
+    ordinary member failure is contained and never reaches here.
+
+    It carries the failing ``member`` and the ``cause`` that member raised, because that member never
+    returns an outcome: without them :meth:`_GroupCommitter._reject_all` would hand it this signal
+    instead of its own error."""
+
+    def __init__(self, message: str, *, member: _Member, cause: Exception) -> None:
+        super().__init__(message)
+        self.member = member
+        self.cause = cause
 
 
 class _AbortMember(Exception):  # noqa: N818 — control-flow signal, not an error condition
@@ -276,9 +290,9 @@ class _Member:
     """One mutation enrolled in the open group-commit batch.
 
     ``run`` executes the member's prepared statements on the shared write connection between the
-    committer's single ``BEGIN`` and ``COMMIT`` (it must NOT issue BEGIN/commit/rollback itself). Its
-    return value (or an :class:`_AbortMember`'s ``result``) is delivered via ``future`` once the batch
-    commits; on a group rollback every member's ``future`` is rejected so each caller re-runs."""
+    committer's single ``BEGIN`` and ``COMMIT`` (it must NOT issue BEGIN/commit/rollback itself), inside
+    its own ``SAVEPOINT``. Its return value (or an :class:`_AbortMember`'s ``result``) is delivered via
+    ``future`` once the batch commits. See :class:`_GroupCommitter` for what a failure does to it."""
 
     run: Callable[[], Awaitable[Any]]
     future: asyncio.Future[Any]
@@ -291,6 +305,18 @@ class _Member:
     on_commit: Callable[[Any], None] | None = None
 
 
+#: What one member's pass through :meth:`_GroupCommitter._run_member` produced: the member, the value
+#: its body returned (``None`` if it raised), and the exception it raised (``None`` if it did not).
+#: A member carrying an exception has already been rolled back to its own savepoint.
+_MemberOutcome = tuple[_Member, Any, Exception | None]
+
+#: The one savepoint name the committer uses. A member's savepoint is always released before the next
+#: member's is opened, so the stack is never deeper than one and the name is never ambiguous. Constant
+#: rather than per-member so the three statements stay three cached prepared statements, instead of
+#: churning ``max_batch`` x 3 distinct SQL strings through sqlite3's statement cache every batch.
+_MEMBER_SAVEPOINT: Final = "gc_member"
+
+
 class _GroupCommitter:
     """App-side group-commit committer for the SQLite write connection (ADR 0055).
 
@@ -298,12 +324,25 @@ class _GroupCommitter:
     lock, amortizing the per-commit fsync (a large win under ``synchronous=FULL``). A member is
     enrolled via :meth:`submit`; the committer coroutine drains the open batch under ``self._lock``,
     runs each member's statements inside one :func:`_writer_txn` (``BEGIN`` … ``COMMIT``), then
-    resolves every member's future. If ANY member raises (other than :class:`_AbortMember`), or the
-    commit itself fails, or the committer task is CANCELLED, the whole batch is rolled back and EVERY
-    member's future is rejected — each caller re-runs (a coordinated form of the crash-re-run the
-    INFLIGHT-guarded idempotent handoffs already tolerate). Resolving the futures on the cancellation
-    path matters as much as the rollback does: a member's caller parks on its future (the ACK gate
-    among them), so a batch abandoned without rejection would park every one of them forever.
+    resolves every member's future.
+
+    **A failing member is contained, not contagious (BACKLOG #1632).** Each member runs inside its own
+    ``SAVEPOINT``; if it raises (other than :class:`_AbortMember`) the committer issues ``ROLLBACK TO``
+    on that savepoint alone, so the member's statements are undone, its own future is rejected, and its
+    co-batched siblings still commit with the batch. Without that containment one poisoned message
+    converted every message that happened to share its coalescing window into a rejected future — each
+    innocent sibling then taking its lane's error backoff and logging a stack trace it did nothing to
+    earn, and re-running work that had already succeeded.
+
+    A failure outside a member's own body still fails the WHOLE batch, because then nothing is
+    committable. That includes at least the ``COMMIT`` itself failing, the committer task being
+    CANCELLED, a statement the committer issues itself (``BEGIN``, ``SAVEPOINT``, ``RELEASE``)
+    failing, and a member's savepoint unwind failing (:class:`_GroupPoisoned`). There EVERY member's
+    future is rejected and each caller re-runs
+    (a coordinated form of the crash-re-run the INFLIGHT-guarded idempotent handoffs already tolerate).
+    Resolving the futures on the cancellation path matters as much as the rollback does: a member's
+    caller parks on its future (the ACK gate among them), so a batch abandoned without rejection would
+    park every one of them forever.
 
     Enabled only when ``window_ms > 0``; otherwise the store never constructs one and each grouped
     method commits inline (byte-identical to the pre-feature path)."""
@@ -350,7 +389,7 @@ class _GroupCommitter:
         """Enrol a member's statements in the open batch and await its committed result.
 
         The returned awaitable resolves to the member body's value once the batch commits, or raises
-        whatever the body raised (group rollback re-raises the body's own exception in every member).
+        whatever the body raised — or, on a whole-batch rollback, that failure (see the class).
 
         ``on_commit`` (a read-through cache publish) runs in the COMMITTER's frame at commit, before the
         future resolves — so it cannot be skipped by this caller being cancelled while parked on the
@@ -397,30 +436,25 @@ class _GroupCommitter:
         if not batch:
             return
         self._pending = self._pending[len(batch) :]
-        results: list[Any] = []
+        results: list[_MemberOutcome] = []
         try:
             async with _writer_txn(self._db, self._lock):
                 for member in batch:
-                    try:
-                        results.append((member, await member.run(), None))
-                    except _AbortMember as abort:
-                        # Zero-mutation early exit (idempotent no-op) — stays in the batch.
-                        results.append((member, abort.result, None))
-                    except Exception as exc:  # noqa: BLE001 — captured to fail the whole group
-                        results.append((member, None, exc))
-                # If ANY member raised a real error, the shared transaction is poisoned: roll the whole
-                # batch back and reject EVERY member's future (each re-runs). We cannot selectively keep
-                # the good members — they share one transaction with the failed mutation.
-                if any(e is not None for _, _, e in results):
-                    raise _GroupPoisoned
+                    results.append(await self._run_member(member))
                 await self._db.commit()
                 # A1 live cost counter: one physical commit covers the whole batch (group-commit's whole
                 # point is fewer fsyncs), so count ONE committed transaction here, not one per member.
                 self._note_commit()
-        except _GroupPoisoned:
-            self._reject_all(batch, results)
+        except _GroupPoisoned as exc:
+            # A member's savepoint unwind failed, so there is no version of the batch that holds only
+            # the healthy members. That member never returned its outcome, so record it here: it then
+            # gets the error it raised, and only its siblings get the poison.
+            results.append((exc.member, None, exc.cause))
+            self._reject_all(batch, results, fallback=exc)
             return
         except Exception as exc:  # noqa: BLE001 — a commit failure fails the whole group
+            # The COMMIT, or a statement the committer issues itself (BEGIN, SAVEPOINT, RELEASE),
+            # failed: nothing in the batch is durable.
             self._reject_all(batch, results, fallback=exc)
             return
         except BaseException:
@@ -441,7 +475,13 @@ class _GroupCommitter:
         # resolves so a co-batched sibling that wakes on its own result already sees this delta, and so
         # a caller cancelled while parked on the future never causes a committed write to skip the cache.
         # A failing hook must not strand siblings, so it is isolated per member (logged, never raised).
-        for member, value, _ in results:
+        for member, value, err in results:
+            if err is not None:
+                # Rolled back to its own savepoint: nothing of this member's is durable, so it gets its
+                # own cause and NO cache publish (AC-4) while its siblings below keep their commit.
+                if not member.future.done():
+                    member.future.set_exception(err)
+                continue
             if member.on_commit is not None:
                 try:
                     member.on_commit(value)
@@ -450,23 +490,83 @@ class _GroupCommitter:
             if not member.future.done():
                 member.future.set_result(value)
 
+    async def _run_member(self, member: _Member) -> _MemberOutcome:
+        """Run ONE member inside :data:`_MEMBER_SAVEPOINT`, so its failure cannot reach its siblings.
+
+        The savepoint is the whole of the containment (BACKLOG #1632). A member that raises is undone
+        by ``ROLLBACK TO`` — its statements leave the shared transaction and the batch keeps every
+        healthy sibling's work, committable as one transaction and one fsync. Returning the failure as
+        a value rather than raising it is what lets the loop carry on to the next member.
+
+        Re-running the healthy members in fresh transactions was the other candidate and was rejected:
+        it degenerates to N transactions and N fsyncs on the failure path (which is group-commit
+        inverted), and it invokes ``member.run()`` a second time, relying on a double-invocation safety
+        nobody has established for these bodies.
+
+        ``SAVEPOINT``/``ROLLBACK TO``/``RELEASE`` are transaction control, and
+        ``tests/test_writer_txn_is_the_only_begin.py`` pins each of them by count in
+        ``_ALLOWED_NESTED``, so a new one here or anywhere else in the module reds that test. They are
+        confined to this method and :meth:`_unwind_member` on purpose, because both run only inside
+        :meth:`_flush`'s :func:`_writer_txn`; keep them here.
+
+        Cancellation is deliberately NOT caught: :class:`asyncio.CancelledError` derives from
+        ``BaseException``, so it passes through :func:`_writer_txn` — which unwinds the whole batch —
+        and :meth:`_flush` rejects everyone. A cancelled committer has nothing to commit for anybody."""
+        await self._db.execute(f"SAVEPOINT {_MEMBER_SAVEPOINT}")
+        try:
+            value = await member.run()
+        except _AbortMember as abort:
+            # Zero-mutation early exit (idempotent no-op): nothing to undo, so it is RELEASEd into the
+            # batch exactly as before. The savepoint would make rolling it back available should that
+            # zero-mutation property ever weaken — see :class:`_AbortMember`.
+            value = abort.result
+        except Exception as exc:  # noqa: BLE001 — contained to this member; siblings still commit
+            await self._unwind_member(member, exc)
+            return (member, None, exc)
+        await self._db.execute(f"RELEASE {_MEMBER_SAVEPOINT}")
+        return (member, value, None)
+
+    async def _unwind_member(self, member: _Member, cause: Exception) -> None:
+        """Undo one member's statements, leaving the rest of the open batch intact.
+
+        ``ROLLBACK TO`` leaves the savepoint on the stack, so the ``RELEASE`` after it is what pops it
+        — without it the stack deepens on every failure and the name stops being unambiguous."""
+        try:
+            await self._db.execute(f"ROLLBACK TO {_MEMBER_SAVEPOINT}")
+            await self._db.execute(f"RELEASE {_MEMBER_SAVEPOINT}")
+        except Exception as exc:
+            # SQLite can abandon the savepoint under the member (an error that rolls the whole
+            # transaction back, e.g. SQLITE_FULL/SQLITE_IOERR). Either way nothing here is safe to
+            # commit. If SQLite rolled everything back, the healthy siblings' writes are gone too, and
+            # resolving their futures would ACK rows that were never stored. If it did not, the
+            # transaction may still carry this member's partial write, and committing it would make a
+            # mixture durable. Both are worse than the over-rejection this change exists to remove, so
+            # poison the batch instead.
+            raise _GroupPoisoned(
+                f"group commit rolled back (a member's savepoint unwind failed: {exc})",
+                member=member,
+                cause=cause,
+            ) from cause
+
     @staticmethod
     def _reject_all(
         batch: list[_Member],
-        results: list[tuple[_Member, Any, Exception | None]],
+        results: list[_MemberOutcome],
         *,
-        fallback: Exception | None = None,
+        fallback: Exception,
     ) -> None:
-        """Reject every member's future on a group rollback so each caller re-runs.
+        """Reject every member's future on a WHOLE-batch rollback so each caller re-runs.
+
+        Reached only for a whole-batch failure (see :class:`_GroupCommitter`); an ordinary member
+        failure is contained by :meth:`_run_member` and rejects only its own future.
 
         A member that itself raised gets its OWN exception (so its caller sees the true cause); the
-        rest get a coordinated rollback error (or the commit failure) and re-run idempotently."""
+        rest get ``fallback`` and re-run idempotently."""
         own: dict[int, Exception | None] = {id(m): e for m, _, e in results}
-        group_err = fallback or RuntimeError("group commit rolled back (sibling member failed)")
         for member in batch:
             if member.future.done():
                 continue
-            err = own.get(id(member)) or group_err
+            err = own.get(id(member)) or fallback
             member.future.set_exception(err)
 
 
@@ -913,6 +1013,80 @@ class AlertInstance:
     # #81 — highest occurrence-driven escalation tier reached on this open instance (0 = base tier). Set by
     # the notifier's escalation logic (ADR 0133); monotonic within an open instance, resets on reopen.
     escalation_tier: int = 0
+
+
+@dataclass(frozen=True)
+class AlertSummary:
+    """The whole-of-scope aggregate over **active** (open + acknowledged) alert instances (BACKLOG
+    #1564) — what the nav bell needs, and the one thing a page of rows cannot give it.
+
+    The bell used to count ``len(list_active_alert_instances(limit=200))`` and rank the severities of
+    that page. Both answers go wrong past 200 active instances, and they go wrong SILENTLY: 200
+    warnings plus one older critical reported ``count=200, severity=warning``, hiding the critical
+    entirely. Raising the limit only moves the threshold, so the aggregate is computed in the store
+    over every row in scope instead.
+
+    **Scoped exactly like the list it summarises.** :meth:`QueueStore.summarize_active_alert_instances`
+    takes the same ``allowed_channels`` allow-set, because a total computed outside the per-channel
+    RBAC filter would disclose the existence and severity of alerts the caller may not read — a worse
+    defect than the truncation it fixes.
+    """
+
+    #: Active instances in the caller's scope. Unbounded by any page limit.
+    total: int
+    #: The worst severity among them; ``None`` when there are none, or when none carries a severity
+    #: this build ranks (an unrecognised value is ignored rather than allowed to win).
+    worst_severity: str | None
+
+
+#: The "active" predicate, shared by every alert read so the list and its aggregate cannot disagree
+#: about what they are counting. Open OR acknowledged — an acked instance is still a live condition on
+#: the dashboard, which is why this is NOT ``count_open_alerts_by_connection``'s open-only predicate.
+_ACTIVE_ALERT_STATUS_SQL: Final[str] = "status IN ('open','acknowledged')"
+
+#: ADR 0014's severity vocabulary ranked worst-highest. The keys come from :class:`AlertSeverity` so
+#: the store cannot hold a stale copy of a vocabulary ``config`` owns; the ranks stay explicit so
+#: reordering that enum cannot silently re-rank the bell. A member added there with no rank here is a
+#: RED TEST (``test_severity_rank_covers_the_whole_vocabulary``) rather than a silent ``ELSE 0``.
+#: The RANK is what the aggregate maximises; the NAME must never be, because SQL ``MAX`` over
+#: ``'warning'``/``'critical'`` is ``'warning'`` — alphabetical order inverts the answer with no error.
+_ALERT_SEVERITY_RANK: Final[dict[str, int]] = {
+    AlertSeverity.INFO.value: 1,
+    AlertSeverity.WARNING.value: 2,
+    AlertSeverity.CRITICAL.value: 3,
+}
+
+#: That rank as a portable SQL expression (SQLite / Postgres / T-SQL all take a simple ``CASE``),
+#: DERIVED from the map above so the two cannot drift apart. Every interpolated part is a
+#: code-controlled literal out of that dict — no caller value reaches this string. ``ELSE 0`` ranks an
+#: unrecognised severity below every known one, so a stray value can never be reported as the worst.
+_ALERT_SEVERITY_RANK_SQL: Final[str] = (
+    "CASE severity"
+    + "".join(f" WHEN '{name}' THEN {rank}" for name, rank in _ALERT_SEVERITY_RANK.items())
+    + " ELSE 0 END"
+)
+
+_SEVERITY_BY_RANK: Final[dict[int, str]] = {r: n for n, r in _ALERT_SEVERITY_RANK.items()}
+
+
+def _alert_summary(row: Any) -> AlertSummary:
+    """Build an :class:`AlertSummary` from one backend's ``COUNT(*) AS n, MAX(rank) AS worst`` row.
+
+    Shared by all three backends so the rank-to-name mapping cannot drift between them. ``MAX`` over
+    zero rows is NULL and an unrecognised severity ranks 0; both land on ``worst_severity=None``.
+    """
+    if row is None:
+        # An un-grouped aggregate always returns exactly one row, so this is unreachable by design --
+        # but it must RAISE rather than fall back to an empty summary. AlertSummary(total=0) is not a
+        # safe default here: it paints a confident gray "no active alerts" bell over an estate that may
+        # be full of criticals, which is the silent-wrong class this whole item exists to remove. The
+        # nav route already degrades correctly on an exception (alerts=None HIDES the bell rather than
+        # asserting zero), so raising reaches a better answer than any value this could invent.
+        raise RuntimeError("active-alert aggregate returned no row")
+    return AlertSummary(
+        total=int(row["n"] or 0),
+        worst_severity=_SEVERITY_BY_RANK.get(int(row["worst"] or 0)),
+    )
 
 
 @dataclass(frozen=True)
@@ -2998,9 +3172,11 @@ class MessageStore:
         explicit ``rollback(); return <sentinel>``.
 
         Group-commit ENABLED: enrol ``body`` in the committer, which runs it between the batch's single
-        ``BEGIN`` … ``COMMIT`` and resolves this caller's future post-commit (so an inbound ACK waiting on
-        the returned value never releases before the data is durable — Hazard B). A group rollback
-        rejects the future and the caller re-runs (licensed by the INFLIGHT-guarded idempotent handoffs).
+        ``BEGIN`` … ``COMMIT`` — inside its own ``SAVEPOINT``, so a failing body harms only itself, just
+        as it does inline — and resolves this caller's future post-commit (so an inbound ACK waiting on
+        the returned value never releases before the data is durable — Hazard B). A rejected future means
+        this caller re-runs (licensed by the INFLIGHT-guarded idempotent handoffs); see
+        :class:`_GroupCommitter` for which failures reject only this member and which reject the batch.
 
         ``on_commit`` is an optional read-through cache publish run AFTER a successful commit and only
         then (a rolled-back/aborted body never runs it, so an uncommitted delta never leaks — AC-4). In
@@ -8147,7 +8323,7 @@ class MessageStore:
         # scope as list_connection_events (None = unrestricted; a set restricts to instances whose
         # connection is in the allow-set). limit is clamped server-side.
         limit = max(1, min(limit, 1000))
-        where = ["status IN ('open','acknowledged')"]
+        where = [_ACTIVE_ALERT_STATUS_SQL]
         params: list[Any] = []
         if allowed_channels is not None:
             _append_channel_scope(where, params, "connection", allowed_channels)
@@ -8162,6 +8338,27 @@ class MessageStore:
                 params,
             )
             return [self._alert_instance_row(r) for r in await cur.fetchall()]
+
+    async def summarize_active_alert_instances(
+        self, *, allowed_channels: Sequence[str] | None = None
+    ) -> AlertSummary:
+        # BACKLOG #1564: the nav bell's count + worst severity over EVERY active instance in scope, not
+        # over a page of them. Same predicate and same RBAC scope as list_active_alert_instances above —
+        # deliberately NOT count_open_alerts_by_connection's, which is open-only and would silently drop
+        # the acknowledged instances the bell has always counted. Lockfree read; no row leaves the store.
+        where = [_ACTIVE_ALERT_STATUS_SQL]
+        params: list[Any] = []
+        if allowed_channels is not None:
+            _append_channel_scope(where, params, "connection", allowed_channels)
+        clause = " WHERE " + " AND ".join(where)
+        async with self._read() as db:
+            cur = await db.execute(
+                f"SELECT COUNT(*) AS n, MAX({_ALERT_SEVERITY_RANK_SQL}) AS worst"
+                f" FROM alert_instance{clause}",
+                params,
+            )
+            row = await cur.fetchone()
+        return _alert_summary(row)
 
     async def get_alert_instance(
         self, alert_id: int, *, allowed_channels: Sequence[str] | None = None

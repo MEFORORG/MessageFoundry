@@ -112,7 +112,7 @@ def test_wrong_identifier_is_its_own_class(tmp_path: Path, declared: str) -> Non
 
 
 # --------------------------------------------------------------------------------------------------
-# VENDORED_LICENCES (BACKLOG #1364): a named exception must still assert a value, not just skip.
+# VENDORED_LICENCES (BACKLOG #1381): a named exception must still assert a value, not just skip.
 # --------------------------------------------------------------------------------------------------
 
 
@@ -150,7 +150,7 @@ def test_an_unlisted_path_still_uses_the_project_licence(tmp_path: Path) -> None
 
 
 def test_the_real_vendored_cla_action_file_is_compliant() -> None:
-    """The one real VENDORED_LICENCES entry (BACKLOG #1364) names an actual, compliant file."""
+    """The one real VENDORED_LICENCES entry (BACKLOG #1381) names an actual, compliant file."""
     assert _MOD.VENDORED_LICENCES, "no entries left to check -- update or remove this test"
     for rel_path in _MOD.VENDORED_LICENCES:
         real = _ROOT / rel_path
@@ -159,7 +159,7 @@ def test_the_real_vendored_cla_action_file_is_compliant() -> None:
 
 
 # --------------------------------------------------------------------------------------------------
-# The lookup must not depend on HOW the path is addressed (BACKLOG #1364).
+# The lookup must not depend on HOW the path is addressed (BACKLOG #1381).
 #
 # VENDORED_LICENCES is keyed the way ``git ls-files`` emits paths -- repo-relative -- but nothing
 # stops a caller handing ``check_file`` an absolute path. The two overrides above register an

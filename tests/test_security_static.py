@@ -1127,6 +1127,10 @@ _CRYPTO_SITES_OUTSIDE_THE_PACKAGE = {
     # block of its .NOTICE so the notice cannot describe a file that no longer exists. A change
     # detector over a published third-party wordlist -- no key, no secret, nothing PHI-derived.
     "scripts/security/build_password_corpus.py": frozenset({"hashlib"}),
+    # BACKLOG #1578: the vendored CLA action's provenance builder. It hashes third-party code to
+    # detect change and holds no key -- see crypto_inventory_check.py's INVENTORY entry for the same
+    # file, which this duplicates and which names the digests.
+    "scripts/security/build_cla_action_provenance.py": frozenset({"hashlib"}),
     # BACKLOG #1426: `secrets.token_hex` names a symbol that CANNOT be on the ref, for the negative
     # arm of the subject-exists screen's own control. ABSENCE is the property bought here, not
     # unpredictability -- a random 128-bit tail is the cheapest way to be sure the name was never

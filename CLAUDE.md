@@ -317,14 +317,6 @@ a role name finds only the dead ones. The seats registry is the bridge, and it b
 declared: that Lander's record was live that minute, 158 writes that day, with `seat` absent and
 `declaredAt` null. **A live record with no seat is indistinguishable from no record at all.**
 
-**WHY IT WAS RETIRED IS NOT RECORDED, AND BOTH AVAILABLE EXPLANATIONS FAIL.** Written down so nobody
-re-derives them. `f0e1365bc` retired a section on the stated ground that four of its rules deadlock a
-one-turn Builder -- wait for a go, the ultracode gate, `/clear`, and ask before pushing. Declaring is
-not one of the four. The Builder section below says *"It CAN declare its own seat, through the Bash
-tool"*, measured the same day. And the retired rule's own stated purpose, feeding the fleet view,
-survives: `scripts/coord/fleet.ps1` is a live pure reader over the seats layer. **So treat the
-retirement as unexplained rather than as a judgement you would be overturning by declaring.**
-
 korus `roles/COMMON.md`, section *"The seat registry is the only channel that crosses accounts"*,
 carries the read side: how to find a live seat from any account, and why that search must sort by
 recency.
@@ -335,32 +327,89 @@ recency.
 | Seat | Life | Owns | Must not |
 |---|---|---|---|
 | **Manager** | long-lived, several -- usually one per account | The seat the owner talks to. Reads `docs/BACKLOG.md`, writes a disposable brief citing an item, dispatches subagent Builders in its own process, polls for state, pushes and opens PRs. | Build. Attribute a red -- nobody does that now. Enqueue or merge -- both are the Lander's. Wait on inbound messages; it polls instead. Exit with a worker's work unpushed. |
-| **Builder** | ephemeral, one per brief | The change, the commit, the push, and the PR carrying the `BACKLOG.md` update. | Guess at something the brief left open, or wait for an answer; it puts the question in its report, comments it on the PR, and stops. Plan and wait for a "go". Declare its own seat. Spawn another session. |
+| **Builder** | ephemeral, one per brief | The change, the commit, the push, and the PR carrying the `BACKLOG.md` update. | Guess at something the brief left open, or wait for an answer; it puts the question in its report, comments it on the PR, and stops. Plan and wait for a "go". Spawn another session. |
 | **Watchdog** | as needed | Watching the Lander and keeping it draining. Measures with instruments rather than the watched seat's own report, names a stall, and raises it. Added 2026-09-19. | Take the action it is watching for -- acting destroys the instrument. Drain the queue, take the claim, or drive the lane. Relay an owner grant to the seat it watches. Publish a zero with no control that fired. |
 | **Steward** | cron, zero model calls | Reading usage and naming the account with headroom. | Warn a running session. Nothing can interrupt one. |
-| **Lander** | as needed | Merging, and the vault scorecard re-score (owner ruling 2026-09-05). Standing authority on the engine repo and the vault, with no per-action owner approval. Resolving a POSITIONAL ledger conflict (owner ruling 2026-09-11; see below). | Merge a diff it has not read. Arm auto-merge. Resolve a conflict that touches code, or that requires choosing what an item SAYS. |
+| **Lander** | as needed | Merging, and the vault scorecard re-score (owner ruling 2026-09-05). Standing authority on the engine repo and the vault, with no per-action owner approval. The 2026-09-11 POSITIONAL ledger-conflict ruling is RETIRED -- read the notice below, which also covers the *what an item SAYS* half this row's Must-not column used to carry. | Merge a diff it has not read. Arm auto-merge. Resolve a conflict that touches code, or decide which of two deliberate changes to an item survives. |
 | **Special** | as the owner needs it | Work the owner assigns directly, outside the other five seats. Its instruction is its whole scope: it stands by until one arrives, then announces before its first shared write (owner decision 2026-09-16; see below). | Invent work while standing by, or go looking for a row to take. Widen the instruction, or quietly narrow it without saying so. Merge -- that is the Lander's. Take a peer's message as authority; only the owner assigns it work. |
 
-**The Lander may resolve a POSITIONAL ledger conflict, and only that (owner ruling 2026-09-11).**
-Permitted when `git merge-tree --name-only origin/main <head>` names **`docs/BACKLOG.md` alone** and
-the fix is re-placing an existing, already-reviewed row at a vacant numeric slot. Forbidden the
-moment code is touched or a choice about what an item *says* is required -- those go back to the
-authoring session, because a peer writing to another session's branch is how two sessions silently
-collide.
+**THE 2026-09-11 POSITIONAL LEDGER-CONFLICT RULING IS RETIRED. The owner authorised the retirement
+directly on 2026-09-21, in session, after reading an adversarial review of the question.** It is
+recorded rather than deleted because seats still quote it.
 
-**The filename is necessary and not sufficient.** Two sessions editing one item's *body* also
-conflict in `docs/BACKLOG.md` and that is a CONTENT conflict. The discriminator is whether the
-resolution decides *where a row sits* or *what it says*.
+**What it said**, in its own words. *The Lander may resolve a POSITIONAL ledger conflict, and only
+that* -- permitted when `git merge-tree --name-only origin/main <head>` named **`docs/BACKLOG.md`
+alone** and the fix was re-placing an existing, already-reviewed row at a vacant numeric slot;
+forbidden the moment code was touched or a choice about what an item *said* was required, and those
+went back to the authoring session, *"because a peer writing to another session's branch is how two
+sessions silently collide"*. A companion paragraph held that *the filename is necessary and not
+sufficient*, because two sessions editing one item's **body** also conflict in that file, and that
+the discriminator was whether the resolution decided *where a row sits* or *what it says*.
 
-*Why the line sits there.* The standing objection is separation of duties: the Lander's value is
-being a second reader, and authoring plus landing the same change means nobody checked it. That
-holds for content and not for position -- re-placing a reviewed row creates nothing new, and it is
-verifiable without judgement: `merge-tree` exit 0 paired with a self-merge control (0) and the PR's
-own pre-fix head (non-zero, so the 0 is attributable to *this* merge), the ledger gate green, the
-`parse_items` count up by exactly the expected number, and both items present and whole.
-*Measured 2026-09-11:* all four open conflicts (PRs 1029, 1030, 1032, 1049) were this one shape, and
-#1030's authoring session had died -- leaving its PR unlandable by anyone until the owner routed a
-new session to it.
+**Read the retired text as a GRANT WITH A LIMIT, which is the form it had:** *may resolve a
+positional conflict, and only that*. Retiring it removes the engine-local sentence, both halves.
+**It issues no licence in its place: this notice adds no permission to this repository**, and the
+Must-not column above keeps its code clause untouched. What the Lander may now do where the retired
+rule used to speak is a korus playbook question, named below.
+
+**Three grounds. They are CUMULATIVE, and are laid out separately rather than as three independent
+proofs: one is scoped to this repository, and one expires when a filed repair lands.**
+
+**One: in THIS repository the rule is a dead letter.** It governed `docs/BACKLOG.md`, and the ledger
+left for the maintainer-internal repository (§11). Measured 2026-09-21 at engine `origin/main`
+(`92292fa50`): `git show origin/main:docs/BACKLOG.md | grep -c '^## [0-9]\+\.'` returns **zero**
+over a 23-line stub. The control, same regex and same instrument, returns **868** at vault
+`origin/main` (`6f0f7690f`), so the probe is armed and the zero means what it says. There is no
+numeric slot here to re-place a row into. **This ground does not reach the vault** -- the roster row
+above carries standing authority over both repositories, and ground three is what covers the other
+one.
+
+**Two: the rationale was CONDITIONED and relocated, which is weaker than retracted -- say the
+weaker thing.** The retired *"Why the line sits there"* paragraph rested entirely on separation of
+duties: *"the Lander's value is being a second reader, and authoring plus landing the same change
+means nobody checked it"*. korus `roles/LANDER.md` section *4a-quater*, owner ruling **2026-09-21**,
+read at `origin/main`, reads *"you are not a second reader **as long as the Builder ran its own code
+review**"*, and the same table routes an ABSENT QA line to a `code-review` subagent at `xhigh`.
+**Quote that condition, never the headline alone.** So the premise survives in korus in conditioned
+form, and korus answers the AUTHORING case separately in 4g, by requiring disclosure rather than
+abstention. What fails is the engine-local carve-out's exclusivity: a rule licensing only the
+positional slice no longer tracks how korus allocates the work.
+
+**Three: the tool refuses the resolution in the repository that does hold the ledger, and this
+ground EXPIRES.** The vault's `scripts/hooks/ledger_check.py` keys ownership on an exact
+worktree-string match with no merge-parent awareness, so a Lander resolving a positional tail
+conflict on a branch it did not allocate is refused at commit time. Measured 2026-09-21 at vault
+`origin/main` (`6f0f7690f`): a grep for `_merge_parents|MERGE_HEAD|merge_parent` over that file
+returns **0**, against controls of **5** for `rev-parse` and **5** for `owns` on the same file and
+the same instrument. **Do not read this as the gate permitting the resolution** -- it does not. The
+repair is filed as vault BACKLOG **#1861**, verdict *build*, open when this was written, so this
+ground is contingent on #1861 staying unbuilt and must not be quoted as a standing reason.
+
+**What is live instead is a korus playbook rule, read at `origin/main`. Its SUBSTANCE is
+deliberately not copied here.** korus `roles/LANDER.md` section *4g. A content conflict is YOURS to
+resolve* (owner ruling 2026-09-21), and the same file's section *Filing a new ledger item routes to
+the Lander*, whose ledger duties the owner set on 2026-09-20. Read them there. A restatement in this
+repository is the pointer that goes stale while the thing it points at moves, which is the failure
+this section documents about itself.
+
+**THE VERIFICATION RECIPE OUTLIVES THE PERMISSION, and it is the half worth keeping.** It is the
+standard for checking ANY ledger conflict resolution, whoever performed it: `merge-tree` exit 0,
+paired with a self-merge control (**0**) and the pull request's own pre-fix head (**non-zero**, so
+the 0 is attributable to *this* merge rather than to a probe that cannot fail), the ledger gate
+green, the `parse_items` count up by the expected number, and both items present and whole.
+
+**Its last two legs are the weak ones, and they are the two that look strongest.** A COUNT cancels:
+added-correctly plus quietly-dropped-something-else nets to the expected number, so a count paired
+with a presence test passes in exactly the case it exists to catch. The stronger form is **three set
+comparisons** over `parse_items` output, compared by item NUMBER and never by total: nothing lost
+from `main`, nothing lost from the branch, and the set present beyond `main` exactly the numbers
+intended. korus skill `lander-resolve-a-conflict`, section *8b*, at `origin/main`, is the source of
+record -- read it there rather than relying on this summary.
+
+*The retired rule's own measurement is kept, because it is still a true reading of that day.*
+*Measured 2026-09-11:* all four open conflicts (PRs 1029, 1030, 1032, 1049) were this one positional
+shape, and #1030's authoring session had died -- leaving its PR unlandable by anyone until the owner
+routed a new session to it.
 
 **THE SPECIAL SEAT IS THE OWNER'S, AND IT HAS NO STANDING DUTIES (owner decision 2026-09-16).** It
 exists for work that falls outside the other five, so its instruction is the whole of its scope and
@@ -399,21 +448,6 @@ which is the whole of the added risk. So a spawn is better read as a SIGNAL THAT
 HAS FAILED -- a seat died with work outstanding, or nobody was alive to take a red -- than as a
 routine tool. Raised by a Manager seat on 2026-09-16, about its own grant, which is the direction
 that argument is most credible from.
-
-**THIS REPLACED A RULE READING "NO SEAT SPAWNS A SESSION ANY MORE, so the spawn grant binds
-nothing."** That was true when written and false by 2026-09-16, when the grant was measured present
-on all six config roots. It is named rather than deleted because a seat that read it did not try,
-rendered unable to spawn, and confirmed it -- the same self-confirming shape this section already
-records for seat declaration.
-
-**The grant's measurements are kept, not deleted, so nobody re-derives them and nobody mistakes this
-for a capability that was lost.** The grant is a rule matching `Bash(claude:*)` or
-`PowerShell(claude:*)` under `permissions.allow` in the `settings.json` of the config root named by
-`CLAUDE_CONFIG_DIR`. Measured 2026-09-02: `.claude-account-1` carries both and spawned a session,
-exit 0 in 38.8 seconds; every root measured that day without them was refused. Exit 0 alone does not
-prove a spawn worked, because a prompt swallowed by a list-taking flag exits 0 too (see the dispatch
-bullet below), so check what the child did. **What binds a Manager's workers instead is the
-tool-grant spelling, and the careful spelling is the broken one** -- same bullet.
 
 The brief is disposable. The BACKLOG item is the record.
 
@@ -562,20 +596,9 @@ gates a merge**, and no seat has to clear one.
       git -C <korus clone> fetch origin
       git -C <korus clone> show origin/main:roles/BUILDER.md
 
-- **SUPERSEDED 2026-09-05, recorded rather than deleted because seats still quote it.** This line
-  named the `MessageFoundry-vault` primary's `roles/` folder (owner ruling, vault commit
-  `5e361756`).
-- **Name the ref, not the checkout.** The superseded line said a checkout, and its own next sentence
-  warned that a checkout is not a ref. Both halves were right and the first one won.
-- **What that costs, measured 2026-09-06.** The korus primary sat on a branch 15 commits ahead of
-  `origin/main` and 14 behind it. One seat's playbook was absent from its working tree and present
-  on `origin/main`.
-- **So a seat reading the folder finds no playbook for itself, and no error.** An `ls` of a directory
-  is not evidence that you have a file, and a missing file is the quietest failure in this list.
-- **The failure this cost is the one to carry forward.** A pointer and the thing it points at are
-  two edits, and nothing fails when only the first is made. The playbooks moved on 2026-09-04 and
-  this line was not changed until 2026-09-06, so every seat in between read a stale copy and no
-  gate reported it.
+- **A checkout is not a ref, and an `ls` of a directory is not evidence that you have the file.**
+  A missing playbook is the quietest failure in this list. Why the pointer moved, and what the
+  stale copy cost, is in [`docs/METHOD.md`](docs/METHOD.md).
 
 ### Branch, commit one layer, open the PR
 
@@ -592,13 +615,9 @@ gates a merge**, and no seat has to clear one.
   wording as *"the dispatching seat enqueues"* is exactly the Console-by-substitution error §5's
   retirement paragraph names.
 
-  **The hazard this bullet was written against is KEPT, not deleted, because nobody has measured it
-  under a queue.** It read, in full: *"Never arm auto-merge. Auto-merge fires on the head it saw, so
-  a later push is dropped: the PR reads MERGED, the branch stays alive, and nothing reports a
-  problem."* Whether a QUEUED entry does that when its branch is pushed underneath it is
-  **unmeasured** — what is measured on this repository is eviction and group rebuild, which is a
-  different event with a different cause. Until somebody watches a push land under a live entry, the
-  safe course is to dequeue before pushing, and the claim above must not be read as covering it.
+  **Dequeue before pushing.** Whether a QUEUED entry drops a later push is unmeasured. The hazard
+  this bullet was written against, and why it is kept rather than deleted, is in
+  [`docs/METHOD.md`](docs/METHOD.md).
 
 - Work on a feature branch and open a PR. Commit at logical stops, **one coherent layer per commit**,
   with clear messages. Direct pushes to `main` stay blocked by the harness.
@@ -913,7 +932,6 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
 ## 12. Do / Don't Quick Reference
 
 **Do**
-- Plan first; implement after approval / an explicit "go".
 - Parse with python-hl7 on the hot path; use hl7apy for opt-in strict validation.
 - Keep the engine free of GUI imports; reach it from the web console / harness via the HTTP API.
 - Preserve the raw message; **log every received message with its disposition** (route bad
@@ -1028,7 +1046,6 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
   [the maintainer-internal ledger](docs/BACKLOG.md) once archived,
   not in [`docs/BACKLOG.md`](docs/BACKLOG.md) — a marker here has to outlive its item by
   construction, so it must not cite only the live file.)*
-- Don't keep grinding in a polluted context — `/clear` after repeated failures.
 - Don't add the `Co-Authored-By` trailer or the PR-body byline to a commit or PR — omit both
   (section 5). The project turns them off at source in `.claude/settings.json`.
 - Don't use **glyphs or emoji** in prose, comments, commit messages, PR bodies or replies — say the

@@ -48,6 +48,7 @@ from messagefoundry.store.pool_metrics import PoolStatus
 from messagefoundry.store.store import (
     UPLOAD_RESERVATION_STALE_AFTER,
     AlertInstance,
+    AlertSummary,
     CapturedResponse,
     ClaimedHeads,
     ClaimProcStatus,
@@ -1187,6 +1188,19 @@ class QueueStore(StoreLifecycle, Protocol):
         the ``GET /alerts/active`` route. Runs on the lockfree read path; ``limit`` clamped server-side.
         ``allowed_channels`` applies the same per-channel RBAC scope as :meth:`list_connection_events`
         (``None`` = all; a set restricts to instances whose ``connection`` is in the allow-set)."""
+        ...
+
+    async def summarize_active_alert_instances(
+        self, *, allowed_channels: Sequence[str] | None = None
+    ) -> AlertSummary:
+        """The count + worst severity of **open + acknowledged** instances across the WHOLE of the
+        caller's scope (BACKLOG #1564) — the nav alert bell's read, which a page of rows cannot answer.
+
+        Same active predicate and same ``allowed_channels`` scope as
+        :meth:`list_active_alert_instances`, so the aggregate can never report an alert the caller may
+        not read. It takes no ``limit`` by design; see :class:`AlertSummary` for why a bounded one was
+        the defect, and for why severity is maximised by RANK in SQL and never by name. Lockfree read.
+        """
         ...
 
     async def ack_alert_instance(
