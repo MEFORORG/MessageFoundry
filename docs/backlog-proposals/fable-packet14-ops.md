@@ -279,8 +279,14 @@ health`.
 > or more characters, which `_LONG_B64` sweeps regardless (the #1183 shape the module docstring warns
 > about); only the secret-domain family test went red. Separately, nothing pins the tray's import
 > layering (`tests/test_dependency_boundaries.py` has no `tray` rule; `test_tray_boundary.py` pins the
-> render model only), and `tests/test_semgrep_handler_rules.py::test_rules_file_resolves_through_the_package`
+> render model only), and `tests/test_semgrep_handler_rules.py::test_rules_file_ships_in_the_package`
 > resolves the rules file through the source tree in an editable install rather than a built wheel.
+
+**Since filing (BACKLOG #1716).** The quote above is left as it read on 2026-09-12 rather than
+retro-edited. Three of its statements have since changed: the bundle fixtures are hyphenated and
+under 24 characters, `tests/test_dependency_boundaries.py` now carries a fresh-interpreter tray
+import guard, and the semgrep test was renamed to `test_rules_file_resolves_through_the_package`
+because the old name asserted the wheel claim the same change retracted.
 
 **Cluster:** Quality & Testing. **Priority:** P3. **Verdict:** build.
 **Severity:** low. The live controls exist elsewhere in each case; these are tests that would stay

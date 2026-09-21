@@ -23,11 +23,22 @@ a guarantee would overstate it.
 
 ``pyproject.toml`` grades the same mechanism the other way for the sibling common-password corpus,
 saying an ``importlib.resources`` test IS the guard against a build-config change that dropped it.
-Both cannot be right, and the disagreement is recorded here rather than settled here: hatchling does
-package every file under ``messagefoundry/``, which makes resolution good evidence against the whole
-directory going missing and no evidence at all against a narrower ``exclude``. Whether a built wheel
-carries this file is BACKLOG #1701's question, and answering it here would mean building a wheel in
-this suite -- slow, and network-dependent.
+Both cannot be right, and the disagreement is recorded here rather than settled here. THE NARROWER
+CASE IS NOT HYPOTHETICAL: ``[tool.hatch.build]`` carries ``exclude = ["CLAUDE.md"]`` (BACKLOG #1702),
+which hatchling matches with gitignore semantics, so one slashless pattern drops a file from every
+build target at any depth under ``messagefoundry/``. Resolution here is therefore good evidence
+against the whole directory going missing and no evidence at all against a pattern that reaches this
+one file.
+
+WHAT COVERS THAT LIST IS A CONFIG READ, NOT A BUILD, and it lives in another file. In
+``tests/test_packaging.py``, the test named
+``test_the_engine_excludes_its_nested_instructions_from_every_build_target``
+reads the table and grades the pattern; its own docstring carries why, and the hatchling semantics
+are recorded beside the key in ``pyproject.toml``. The limit worth knowing HERE is that it is
+pinned to the ``CLAUDE.md`` value, so a SECOND pattern added beside that one -- the pattern that
+could reach this rules file -- passes it. Whether a built wheel carries this file is BACKLOG
+#1701's question, and answering it here would mean building a wheel in this suite -- slow, and
+network-dependent.
 """
 
 from __future__ import annotations

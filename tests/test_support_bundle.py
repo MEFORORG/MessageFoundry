@@ -159,11 +159,12 @@ _MFB64_SENTINEL = "SGVsbG9Xb3JsZA=="
 _MEFOR_NAME_SENTINEL = "dek-Bndl_Wrp-12"
 
 # The fixture TEXT is hoisted beside the sentinels so the control below can assert over the same
-# bytes the tests feed in. ``_LONG_B64`` spans whatever base64-alphabet characters NEIGHBOUR a
-# sentinel, so backstop reachability is a property of the LINE, not of the constant: a value that is
-# clear on its own can still be swept where it sits. Checking the constant alone would agree with the
-# real property only by luck -- today the labels happen to supply a "_", a ":" or a space that breaks
-# every run.
+# bytes the tests feed in. BOTH label-free passes are properties of the LINE, not of the constant:
+# ``_LONG_B64`` spans whatever base64-alphabet characters NEIGHBOUR a sentinel, and ``_redact_phi``
+# reaches a capitalized name run or a date run anywhere on the line, so a value that is clear on its
+# own can still be swept where it sits. Checking a constant alone would agree with the real property
+# only by luck -- today the labels happen to supply a "_", a ":" or a space that breaks every run,
+# and to carry no name or date run the PHI pass would extend over the value.
 _LEAKY_LOG = (
     "2026-06-27 INFO routing message\n"
     "PID|1||123456^^^MR||DOE^JANE^Q||19800101|F\n"
@@ -172,6 +173,26 @@ _LEAKY_LOG = (
     f"blob mfb64:v1:{_MFB64_SENTINEL}\n"
 )
 _MEFOR_NAME_LINE = f"env MEFOR_STORE_VAULT_WRAPPED_DEK={_MEFOR_NAME_SENTINEL} loaded"
+
+
+def _line_holding(sentinel: str) -> str:
+    """The fixture line a sentinel sits in -- the bytes a redaction pass actually sees."""
+    for line in (*_LEAKY_LOG.splitlines(), _MEFOR_NAME_LINE):
+        if sentinel in line:
+            return line
+    raise AssertionError(f"{sentinel!r} sits in no fixture line above")
+
+
+#: Each sentinel beside its own line, derived rather than written out so the two cannot drift.
+_SENTINEL_LINES = tuple(
+    (sentinel, _line_holding(sentinel))
+    for sentinel in (
+        _STORE_KEY_SENTINEL,
+        _BEARER_SENTINEL,
+        _MFB64_SENTINEL,
+        _MEFOR_NAME_SENTINEL,
+    )
+)
 
 
 def test_no_bundle_log_sentinel_is_reachable_by_a_label_free_pass() -> None:
@@ -184,8 +205,25 @@ def test_no_bundle_log_sentinel_is_reachable_by_a_label_free_pass() -> None:
     reaches a capitalized name run or a date run with no label in sight. The PHI pass is read off the
     redactor module rather than imported by name, so swapping the chain's PHI implementation moves
     this control with it.
+
+    Both passes are fed the fixture LINE rather than the bare constant, for the reason recorded
+    above the fixtures: either can reach a value through the characters beside it, so a control that
+    only ever sees the constant certifies a property adjacent to the one that matters.
+
+    ``_LONG_B64`` is asked twice, because the chain runs it LAST -- after ``_redact_phi`` has already
+    rewritten the line. As-written answers "was the fixture authored over the sweep"; post-PHI
+    answers "does the sweep reach the sentinel where it actually runs". The two agree today (the PHI
+    pass only ever substitutes a bracketed placeholder, which breaks a base64 run rather than
+    joining one), and a fixture that made them disagree is exactly the case worth a red.
     """
     from messagefoundry.support import redact as redact_mod
+
+    # Read off the module's namespace, not written as an attribute access: `_redact_phi` is an
+    # import ALIAS in that module and not re-exported, so strict mypy rejects `redact_mod._redact_phi`
+    # with "does not explicitly export attribute" (and ruff's B009 rejects the `getattr` spelling).
+    # Reading it off the chain module is the property under test -- swap the chain's PHI
+    # implementation and this control moves with it -- so the read stays.
+    redact_phi = vars(redact_mod)["_redact_phi"]
 
     for what, text in (("the leaky log", _LEAKY_LOG), ("the mefor-name line", _MEFOR_NAME_LINE)):
         assert not redact_mod._LONG_B64.search(text), (
@@ -194,16 +232,17 @@ def test_no_bundle_log_sentinel_is_reachable_by_a_label_free_pass() -> None:
             "a hyphen and an underscore, and check the characters NEIGHBOURING it"
         )
 
-    for sentinel in (
-        _STORE_KEY_SENTINEL,
-        _BEARER_SENTINEL,
-        _MFB64_SENTINEL,
-        _MEFOR_NAME_SENTINEL,
-    ):
-        assert redact_mod._redact_phi(sentinel) == sentinel, (
-            f"{sentinel!r} is reachable by the shared PHI pass, which needs no credential label, so "
-            "its fixture would stay green with the named rule deleted -- avoid a capitalized word "
-            "run and an 8-digit date run"
+    for sentinel, line in _SENTINEL_LINES:
+        after_phi: str = redact_phi(line)
+        assert sentinel in after_phi, (
+            f"{sentinel!r} is reachable by the shared PHI pass WHERE IT SITS, in {line!r}. That "
+            "pass needs no credential label, so the fixture using it would stay green with the "
+            "named rule deleted -- keep a capitalized word run and an 8-digit date run away from "
+            "the value, not merely out of it"
+        )
+        assert not redact_mod._LONG_B64.search(after_phi), (
+            f"the PHI pass leaves {line!r} as {after_phi!r}, which carries a 24+ base64 run, so the "
+            "backstop reaches the sentinel at the point in the chain where it actually runs"
         )
 
 
@@ -224,6 +263,21 @@ def test_log_tail_redacted_no_phi_no_secret(tmp_path: Path) -> None:
     members = _members(out)
     assert "app-log.txt" in members
     tail = members["app-log.txt"]
+    # LIVENESS FIRST, because every assertion below is "value absent" and a line that never reached
+    # the tail -- dropped, truncated, or cut by a tail-length change -- satisfies those exactly as
+    # well as a working redactor does. Each fixture line is pinned by a token of its own that
+    # survives redaction. Measured on this tree: the tail is one line per fixture line.
+    for marker in (
+        "INFO routing message",
+        "PID|",
+        "MEFOR_STORE_ENCRYPTION_KEY",
+        "Authorization",
+        "blob ",
+    ):
+        assert marker in tail, (
+            f"{marker!r} never reached the bundle tail, so the assertions below would pass on the "
+            "line being ABSENT rather than on the redactor having worked"
+        )
     # PHI patient name + MRN must be gone (HL7 PID segment collapsed) -- the shared engine PHI pass
     # earns both of these: with it stubbed out, both values survive the whole chain verbatim.
     assert "DOE^JANE" not in tail
