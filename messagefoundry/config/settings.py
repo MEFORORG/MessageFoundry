@@ -117,6 +117,7 @@ __all__ = [
     "DrActivationMode",
     "ServiceSettings",
     "load_settings",
+    "settings_error_detail",
 ]
 
 #: Known config sections (used to parse ``MEFOR_<SECTION>_<KEY>`` env vars).
@@ -152,6 +153,10 @@ _SECTIONS = (
 )
 _ENV_PREFIX = "MEFOR_"
 _DEFAULT_FILE = "messagefoundry.toml"
+
+#: How many failing fields :func:`settings_error_detail` names before it counts the rest. A bad
+#: section can fail every key in it, and an unbounded list is unreadable in a one-line CLI error.
+_ERROR_DETAIL_ROWS = 5
 
 _log = logging.getLogger(__name__)
 
@@ -5379,6 +5384,50 @@ def security_loosenings(
                 )
             )
     return out
+
+
+def settings_error_detail(exc: Exception) -> str:
+    """Render a :func:`load_settings` failure WITHOUT echoing any configured value.
+
+    WHY ``str(exc)`` IS NOT SAFE HERE. ``str(ValidationError)`` carries ``input_value=`` for every
+    failing field, and for an ``after``-mode model validator that value is the whole section's input
+    mapping. The secrets in ``_FILE_SECRET_KEYS`` come from the environment
+    (``MEFOR_STORE_PASSWORD`` and siblings) and are in that mapping, so one missing ``[store].server``
+    renders the store password into whatever the caller does with the string -- stdout, a pasted
+    ticket, a PowerShell ``throw`` in a transcript. Field path plus message, never ``input`` and never
+    ``ctx``, is enough for an operator to find the key and carries no configured value at all.
+
+    A LONG VALUE IS NOT SAFER: pydantic abbreviates a long ``input_value`` repr from the middle, so a
+    32-character password loses its head and discloses its tail.
+
+    THIS IS THE RENDERER TO REACH FOR, AND SIX CALLERS STILL DO NOT REACH FOR IT. Measured over
+    ``messagefoundry/__main__.py`` at ``f6d2c7bef``, the commit BACKLOG #1523 landed as: of 20
+    ``except`` arms naming ``ValidationError``, 7 render ``str(exc)`` in the handler --
+    ``_admin_unlock``, ``_provision_admin``, ``_backup``, ``_restore_verify``, ``_ai_policy``,
+    ``_cluster_vip`` and ``_connection``. This change fixes the sixth; the other six stand, and five
+    of them reach the operator through ``_emit_error``. ``ai-policy`` was RUN and confirmed to
+    disclose a planted ``MEFOR_STORE_PASSWORD`` on the same config
+    ``tests/test_cli_cluster_vip.py`` plants one against. The rest were read, not run, so this
+    counts arms rather than confirmed disclosures. That sweep is NOT part of #1523 and is stated
+    rather than done, so nobody reads this docstring as covering it.
+    """
+    from pydantic import ValidationError
+
+    if isinstance(exc, ValidationError):
+        errors = exc.errors(include_url=False)
+        rows = [
+            f"{'.'.join(str(part) for part in err['loc']) or '<root>'}: {err['msg']}"
+            for err in errors[:_ERROR_DETAIL_ROWS]
+        ]
+        extra = (
+            ""
+            if len(errors) <= _ERROR_DETAIL_ROWS
+            else f" (+{len(errors) - _ERROR_DETAIL_ROWS} more)"
+        )
+        return "; ".join(rows) + extra
+    # Our own model validators raise plain ValueError with hand-authored text naming the key, and
+    # FileNotFoundError/OSError carry a path. Neither reflects a configured value back.
+    return str(exc)
 
 
 def load_settings(

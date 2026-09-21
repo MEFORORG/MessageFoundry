@@ -675,3 +675,164 @@ def test_the_term_memo_does_not_change_the_answer(many_peers: Path, tmp_path: Pa
     warm = _budgeted(many_peers, tmp_path, "0")
     assert warm.returncode == 0, f"the warm walk failed: {warm.stderr}"
     assert cold.stdout.strip() == warm.stdout.strip(), "the memo changed the map it replayed"
+
+
+# ------------------------------------------------- Dirty is a CLASSIFICATION, not a line of text
+#
+# ``Dirty`` used to be parsed straight out of ``git status --porcelain``: take each line, drop the
+# two status columns and the space, keep the rest. That is wrong in BOTH directions at once, and the
+# two failures are not variants of each other -- they cost opposite things and need opposite fixes,
+# so they are pinned by separate tests below.
+#
+#   UNDER-REPORT, the silent one. Porcelain writes a rename as ``R  <old> -> <new>`` on ONE line, so
+#   the old parse yielded the single literal string ``old -> new``. Dirty is matched by exact
+#   normalised equality, and that string equals NEITHER path -- so a session asking about either side
+#   of a peer's staged rename was told nobody was touching it. Measured before the fix against the
+#   fixture below: Dirty came back as
+#   ``['eol_only.txt', 'real_edit.txt', 'rename_src.txt -> rename_dst.txt']``.
+#
+#   OVER-REPORT, the loud one. Porcelain classifies from the index stat and oid WITHOUT converting
+#   content, so a file whose only change is CRLF-vs-LF reads as modified. This repository pins a
+#   dozen paths ``text eol=lf`` precisely so they check out LF on Windows, which is what makes a
+#   stray CRLF rewrite an everyday artifact here rather than a curiosity. Same fixture, same run:
+#   ``eol_only.txt`` sat in Dirty while ``git diff --name-only`` reported it unchanged.
+
+
+@pytest.fixture
+def classification_peer(tmp_path: Path) -> tuple[Path, Path]:
+    """A peer worktree set up so both misclassifications can be provoked deliberately.
+
+    Two things are pinned rather than inherited, because the fixture has to state its own conditions:
+    ``core.autocrlf`` (the runner's global value would otherwise decide whether the CRLF case is
+    reachable at all) and ``eol_only.txt text eol=lf`` (which forces an LF checkout on every box, so
+    the rewrite in the test is a genuine line-ending-only difference).
+
+    Content goes in with ``write_bytes`` throughout. ``write_text`` applies newline translation on
+    Windows and would quietly destroy the one distinction this whole fixture rests on.
+    """
+    origin = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True, capture_output=True
+    )
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(primary)], check=True, capture_output=True
+    )
+    git(primary, "config", "user.email", "t@example.invalid")
+    git(primary, "config", "user.name", "t")
+    git(primary, "config", "core.autocrlf", "false")
+    (primary / ".gitattributes").write_bytes(b"eol_only.txt text eol=lf\n")
+    (primary / "eol_only.txt").write_bytes(b"alpha\nbeta\ngamma\n")
+    (primary / "real_edit.txt").write_bytes(b"base\n")
+    (primary / "rename_src.txt").write_bytes(b"one\ntwo\n")
+    git(primary, "add", "-A")
+    git(primary, "commit", "-qm", "base")
+    git(primary, "remote", "add", "origin", str(origin))
+    git(primary, "push", "-q", "origin", "main")
+
+    peer = tmp_path / "peer-wt"
+    git(primary, "worktree", "add", "-q", "-b", "peer-branch", str(peer))
+    return primary, peer
+
+
+def test_a_staged_rename_reports_both_of_its_paths_as_dirty(
+    classification_peer: tuple[Path, Path], tmp_path: Path
+) -> None:
+    """THE UNDER-REPORT: a lost rename makes the gate report NO overlap where one exists.
+
+    Both sides are asserted and both are load-bearing. The peer has emptied the old path and filled
+    the new one, so a session editing either collides; reporting only the destination would still
+    leave a session free to recreate the source under a peer that is mid-rename.
+    """
+    primary, peer = classification_peer
+    git(peer, "mv", "rename_src.txt", "rename_dst.txt")
+
+    porcelain = git(peer, "--no-optional-locks", "status", "--porcelain")
+    assert "rename_src.txt -> rename_dst.txt" in porcelain, (
+        "the control did not fire: git no longer writes a rename as a single 'old -> new' line, so "
+        f"this test is not exercising the parse it was written for. porcelain was {porcelain!r}"
+    )
+
+    for path in ("rename_src.txt", "rename_dst.txt"):
+        rows = query(primary, tmp_path, path)
+        assert rows, f"overlap reported nobody is touching {path} during a peer's staged rename"
+        assert rows[0]["MatchedDirty"] is True, (
+            f"{path} is a live working-tree change and must report MatchedDirty: {rows[0]['Dirty']}"
+        )
+        assert not [d for d in rows[0]["Dirty"] if " -> " in d], (
+            f"an unparsed porcelain rename line leaked into Dirty: {rows[0]['Dirty']}"
+        )
+
+
+def test_a_line_ending_only_rewrite_is_not_reported_as_dirty(
+    classification_peer: tuple[Path, Path], tmp_path: Path
+) -> None:
+    """THE OVER-REPORT, and the same run proves the acquittal DISCRIMINATES.
+
+    ``real_edit.txt`` is the positive control and it is not optional: a "fix" that simply stopped
+    reporting unstaged modifications would satisfy the first half and silently disarm the gate for
+    every session that has not committed yet.
+    """
+    primary, peer = classification_peer
+    (peer / "eol_only.txt").write_bytes(b"alpha\r\nbeta\r\ngamma\r\n")
+    (peer / "real_edit.txt").write_bytes(b"base\nreally changed\n")
+
+    porcelain = git(peer, "--no-optional-locks", "status", "--porcelain")
+    assert " M eol_only.txt" in porcelain, (
+        "the control did not fire: git status no longer calls a CRLF-only rewrite modified, so this "
+        f"test is not exercising the misclassification it was written for. porcelain: {porcelain!r}"
+    )
+    changed = git(peer, "--no-optional-locks", "diff", "--name-only").split()
+    assert "eol_only.txt" not in changed, (
+        "git diff agrees the file changed, so the fixture did not build a line-ending-only "
+        f"difference and this test proves nothing about one: {changed}"
+    )
+    assert "real_edit.txt" in changed, (
+        f"the positive control is not a real content change, so it cannot control anything: {changed}"
+    )
+
+    assert query(primary, tmp_path, "eol_only.txt") == [], (
+        "a line-ending-only difference was reported as a peer editing the file, which costs the "
+        "asking session a stand-down for no change at all"
+    )
+
+    rows = query(primary, tmp_path, "real_edit.txt")
+    assert rows, "the positive control vanished: a REAL uncommitted edit stopped being reported"
+    assert rows[0]["MatchedDirty"] is True, (
+        f"a real uncommitted edit must still report MatchedDirty: {rows[0]['Dirty']}"
+    )
+
+
+def test_the_acquittal_compares_like_with_like_on_a_non_ascii_path(
+    classification_peer: tuple[Path, Path], tmp_path: Path
+) -> None:
+    """THE ACQUITTAL'S OWN UNDER-REPORT, found by review and pinned here because it is invisible.
+
+    The two commands do not agree on how to spell a path. ``status --porcelain -z`` emits it raw;
+    ``diff --name-only`` C-quotes anything non-ASCII, because ``core.quotePath`` defaults on. Compare
+    the raw form against the quoted one and every non-ASCII path looks absent from the diff, so a
+    REAL uncommitted edit is acquitted and drops out of Dirty -- silently, and only for the files
+    whose names happen to carry an accent.
+
+    Measured before the second fix, on this fixture: status gave the path raw, plain
+    ``diff --name-only`` gave ``"r\\303\\251sum\\303\\251.md"``, and the acquittal count went to 1.
+    """
+    primary, peer = classification_peer
+    name = "r\u00e9sum\u00e9.md"
+    (peer / name).write_bytes(b"base\n")
+    git(peer, "add", name)
+    git(peer, "commit", "-qm", "add a non-ascii path")
+    (peer / name).write_bytes(b"base\nreally changed\n")
+
+    quoted = git(peer, "--no-optional-locks", "diff", "--name-only").strip()
+    assert quoted.startswith('"'), (
+        "the control did not fire: git stopped quoting non-ASCII paths in diff --name-only, so the "
+        f"mismatch this test exists for is not reachable. diff said {quoted!r}"
+    )
+
+    rows = query(primary, tmp_path, name)
+    assert rows, f"a real uncommitted edit to {name!r} was dropped from the map entirely"
+    assert rows[0]["MatchedDirty"] is True, (
+        f"a real uncommitted edit to a non-ASCII path must report MatchedDirty: {rows[0]['Dirty']}"
+    )

@@ -239,7 +239,7 @@ export interface ScanLimits {
  * `{name, kind, file, line}`, never file content, so nothing can leak through it. Making the cap
  * sound would take a bounded `readSync` into a pre-sized buffer.
  */
-function readCapped(file: string, maxBytes: number): string | undefined {
+export function readCapped(file: string, maxBytes: number): string | undefined {
   let fd: number | undefined; // outside the try so `finally` can release it on EVERY exit path
   try {
     fd = fs.openSync(file, "r");

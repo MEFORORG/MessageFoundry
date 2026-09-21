@@ -3321,10 +3321,18 @@ async def test_ad_group_map_asymmetric_rows_never_cross_bind(engine: Engine) -> 
 async def test_stale_stepup_bounces_body_less_action_via_reauth(engine: Engine) -> None:
     # A body-less auto-retry action under a stale window 303s to /ui/reauth carrying ITS OWN path
     # (no reauth_next mapping) — and nothing is deleted until the retry actually runs.
-    service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=-1))
+    # require_mfa=False takes the MFA leg out of the gate, so the stale window below is what
+    # redirects; without it _boss_client's unenrolled session is refused first with the SAME 303 and
+    # the window measures nothing (BACKLOG #1850). Reasoning, and the third new-IP leg that stays
+    # unpinned: the docstring of test_purge_stale_stepup_redirects_to_reauth (BACKLOG #1700).
+    service = AuthService(engine.store, AuthSettings(require_mfa=False, step_up_max_age_seconds=-1))
     await service.initialize()
     await _add(service, "u9", Role.VIEWER)
     async with _boss_client(engine, service) as c:
+        tok = c.cookies.get("mf_session")
+        assert tok is not None
+        assert await service.mfa_satisfied(tok) is True  # the MFA leg is NOT what refuses here
+        assert await service.has_recent_step_up(tok) is False  # the stale window is
         uid = await _uid(service, "u9")
         r = await c.post(f"/ui/users/{uid}/delete", headers={"Sec-Fetch-Site": "same-origin"})
         assert r.status_code == 303
@@ -3335,19 +3343,28 @@ async def test_stale_stepup_bounces_body_less_action_via_reauth(engine: Engine) 
 async def test_stale_stepup_bounces_all_unlock_form_pages(engine: Engine) -> None:
     # Every unlock FORM page is step-up-gated: a stale window 303s each to /ui/reauth with its own
     # path as next (a regression to plain require_ui would silently drop the step-up gate).
-    service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=-1))
+    # require_mfa=False takes the MFA leg out of the gate, so the stale window below is what
+    # redirects; without it _boss_client's unenrolled session is refused first with the SAME 303 and
+    # the window measures nothing (BACKLOG #1850). Reasoning, and the third new-IP leg that stays
+    # unpinned: the docstring of test_purge_stale_stepup_redirects_to_reauth (BACKLOG #1700).
+    service = AuthService(engine.store, AuthSettings(require_mfa=False, step_up_max_age_seconds=-1))
     await service.initialize()
     await _add(service, "u9", Role.VIEWER)
     async with _boss_client(engine, service) as c:
+        tok = c.cookies.get("mf_session")
+        assert tok is not None
+        assert await service.mfa_satisfied(tok) is True  # the MFA leg is NOT what refuses here
+        assert await service.has_recent_step_up(tok) is False  # the stale window is
         uid = await _uid(service, "u9")
         for path in (f"/ui/users/{uid}", "/ui/roles/new", "/ui/ad-groups"):
             r = await c.get(path)
             assert r.status_code == 303, path
             assert r.headers["location"] == f"/ui/reauth?next={path}", path
-        # The custom-role edit form too (its role id is percent-encoded in the redirect).
+        # The custom-role edit form too. Pin the percent-encoding the comment used to only claim:
+        # _reauth_redirect quotes with safe="/", so the role id's colon rides as %3A.
         r = await c.get("/ui/roles/custom:x/edit")
         assert r.status_code == 303
-        assert r.headers["location"].startswith("/ui/reauth?next=")
+        assert r.headers["location"] == "/ui/reauth?next=/ui/roles/custom%3Ax/edit"
 
 
 async def test_users_read_only_role_cannot_reach_admin_writes(engine: Engine) -> None:
@@ -6009,15 +6026,25 @@ async def test_purge_confirm_lists_only_quiesced_and_validates_scope(
 
 
 async def test_purge_confirm_stale_stepup_redirects_to_reauth(engine: Engine) -> None:
-    service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=0))
+    # require_mfa=False takes the MFA leg out of the gate, so the stale window below is what
+    # redirects; without it this unenrolled fixture session is refused first with the SAME 303 and
+    # the window measured nothing (BACKLOG #1850). Reasoning, and the third new-IP leg that stays
+    # unpinned: the docstring of test_purge_stale_stepup_redirects_to_reauth (BACKLOG #1700).
+    # -1 replaces a 0 that sat exactly on has_recent_step_up's `elapsed <= max_age` boundary.
+    service = AuthService(engine.store, AuthSettings(require_mfa=False, step_up_max_age_seconds=-1))
     await service.initialize()
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
-        await _cookie_login(c, "op")  # step-up window is zero-length -> immediately stale
+        await _cookie_login(c, "op")  # negative window -> the fresh login is already stale
+        tok = c.cookies.get("mf_session")
+        assert tok is not None
+        assert await service.mfa_satisfied(tok) is True  # the MFA leg is NOT what refuses here
+        assert await service.has_recent_step_up(tok) is False  # the stale window is
         r = await c.get("/ui/connections/purge-confirm", params={"scope": "all", "dest": "out1"})
         assert r.status_code == 303
-        loc = r.headers["location"]
-        assert loc.startswith("/ui/reauth") and "purge-confirm" in loc  # unlock re-auth, not a 403
+        # The EXACT continuation: this GET passes no reauth_next, so _reauth_redirect falls back to
+        # quote(request.url.path), which drops scope/dest -- the operator re-picks after re-auth.
+        assert r.headers["location"] == "/ui/reauth?next=/ui/connections/purge-confirm"
 
 
 async def test_purge_bulk_per_dest_409_unknown_and_scope(engine: Engine, tmp_path: Path) -> None:

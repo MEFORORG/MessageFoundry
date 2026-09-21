@@ -51,8 +51,17 @@ tests/test_claim_shared_registry.py
 tests/test_coord_alloc_floor.py
 tests/test_coord_alloc_reentrancy.py
 tests/test_coord_fleet_fetch_clock.py
+# The three below share one SUBJECT: scripts/hooks/durability_push.sh, copied off disk and run as a
+# real post-commit hook. They are listed rather than left off because the diff that can break them is
+# a diff to that file, which trips this job's scripts/** path gate -- so the tooling job faces the
+# change that would break them. None of them reads anything under messagefoundry/** or
+# packaging/messagefoundry-webconsole/**, so the reason that keeps a scanner in
+# _STAYS_WITHOUT_IMPORTING does not apply: there is no engine diff that can break them and then
+# arrive at a leg where they are deselected. The header's "when ambiguous, leave it off" is not in
+# play, because nothing here is ambiguous about which tier owns the subject.
 tests/test_durability_hook_provenance.py
 tests/test_durability_hook_remote_guard.py
+tests/test_durability_hook_rewrite_coverage.py
 tests/test_gate_ci_mirror_parity.py
 tests/test_hook_prose_folding.py
 tests/test_hook_prose_folding_push_ledger.py
@@ -135,6 +144,7 @@ tests/test_serverdb_ci_coverage.py
 tests/test_session_context_presence.py
 tests/test_session_mail_held.py
 tests/test_session_mail.py
+tests/test_session_mail_watch_standdown.py
 tests/test_session_registry.py
 tests/test_setup_leak_gate_reports_source.py
 tests/test_shipped_line_endings_pinned.py
