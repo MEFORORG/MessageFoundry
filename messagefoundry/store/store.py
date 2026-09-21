@@ -60,7 +60,7 @@ from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Final, NoReturn, Protocol, runtime_checkable
+from typing import Any, Final, NoReturn, NotRequired, Protocol, TypedDict, runtime_checkable
 from uuid import uuid4
 
 import aiosqlite
@@ -956,6 +956,37 @@ class ConnectionEvent:
     reason: str | None
 
 
+class ConnectionEventWrite(TypedDict):
+    """One connection event on its way INTO the store (#46): the write-side twin of
+    :class:`ConnectionEvent`, without the ``id`` the store assigns. A ``TypedDict`` rather than a
+    dataclass because it is also the runner's drain-queue item, which stays a plain dict.
+    ``now`` absent or ``None`` stamps the row at write time, as the singular writer does."""
+
+    connection: str
+    transport: str
+    direction: str
+    kind: str
+    peer_host: str | None
+    message_id: str | None
+    reason: str | None
+    now: NotRequired[float | None]
+
+
+# The one sessions INSERT, shared by MessageStore.create_session's guarded and unguarded paths.
+_SESSION_INSERT: Final = (
+    "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
+    " revoked_at, client, reauth_at) VALUES (?,?,?,?,?,NULL,?,?)"
+)
+
+
+# The one connection_event INSERT, shared by MessageStore's singular and burst writers.
+_CONNECTION_EVENT_INSERT: Final = (
+    "INSERT INTO connection_event"
+    " (ts, connection, transport, direction, kind, peer_host, message_id, reason)"
+    " VALUES (?,?,?,?,?,?,?,?)"
+)
+
+
 @dataclass(frozen=True)
 class AlertInstance:
     """One resolvable operator-alert instance (ADR 0044, #56), as returned by
@@ -1293,6 +1324,36 @@ class UserRecord:
             # column beats a quiet, permanent loss of the notification channel.
             notify_email=d["notify_email"],
         )
+
+
+@dataclass(frozen=True)
+class FederatedUnbind:
+    """What ONE ``clear_user_federated_subject`` transaction saw and did (BACKLOG #1474).
+
+    The fields are read **inside** the unbind's own transaction, so they are the values the UPDATE
+    actually cleared rather than a separate read's guess at them. That is the whole reason this is a
+    record and not an ``int``: the caller audits the prior pair, and a pair read outside the
+    transaction can name a binding a concurrent unbind-then-rebind replaced between the read and the
+    write.
+
+    **TWO OPTIONAL COLUMNS AND NOT ONE OPTIONAL TUPLE, because the schema permits a HALF row.**
+    A tuple type would encode "both set or both NULL", and nothing enforces that:
+    ``ux_users_federated_subject`` is FILTERED (``WHERE oidc_issuer IS NOT NULL AND oidc_subject IS
+    NOT NULL``) on all three backends, so it EXCLUDES a half row from uniqueness rather than
+    forbidding one, and there is no CHECK constraint. No code path writes a half row today —
+    ``set_user_federated_subject`` takes ``str`` for both halves — but a type that cannot spell the
+    state the table can hold sends the unbind down the "nothing to clear" arm for a row that has
+    something to clear, which is how the residual half becomes unclearable through the admin path.
+    """
+
+    username: str
+    #: The pair as the transaction read it, i.e. what this call cleared. BOTH ``None`` when the
+    #: account was already unbound — nothing was written and ``sessions_revoked`` is 0, because an
+    #: unbind of nothing must not sign anybody out. Either one set means there WAS something to
+    #: clear, and it was cleared.
+    issuer: str | None
+    subject: str | None
+    sessions_revoked: int
 
 
 @dataclass(frozen=True)
@@ -8085,8 +8146,45 @@ class MessageStore:
     ) -> None:
         # Pure observer: a single short INSERT under the write lock — NOT inside any handoff txn, no
         # queue row, no finalizer call (connection_event is invisible to _maybe_finalize_message, which
-        # scans `FROM queue`). reason goes through the safe_text PHI chokepoint (#120) + the cipher.
-        now = time.time() if now is None else now
+        # scans `FROM queue`). Deliberately no BEGIN of its own: the #1548 cancel-unwind tests use this
+        # writer as their probe for an inherited open transaction
+        # (tests/test_backlog1548_writer_txn_cancel_unwind.py).
+        params = self._connection_event_params(
+            ConnectionEventWrite(
+                connection=connection,
+                transport=transport,
+                direction=direction,
+                kind=kind,
+                peer_host=peer_host,
+                message_id=message_id,
+                reason=reason,
+                now=now,
+            )
+        )
+        async with self._lock:
+            await self._db.execute(_CONNECTION_EVENT_INSERT, params)
+            await self._commit()
+
+    async def record_connection_events(self, events: Sequence[ConnectionEventWrite]) -> None:
+        # A burst in ONE transaction (BACKLOG #1731): the runner's drainer hands over everything
+        # already queued, so a connect-per-message sender pays one commit per burst, not per event.
+        # _writer_txn rather than the bare lock the singular takes: teardown cancels the drainer, and a
+        # multi-row write cancelled mid-flight must not leave its transaction open (ADR 0159).
+        rows = [self._connection_event_params(ev) for ev in events]
+        if not rows:
+            return
+        async with _writer_txn(self._db, self._lock):
+            await self._db.executemany(_CONNECTION_EVENT_INSERT, rows)
+            await self._commit()
+
+    def _connection_event_params(self, ev: ConnectionEventWrite) -> tuple[Any, ...]:
+        """The INSERT parameters for one connection event, shared by both writers so the scrub and
+        seal can never drift between them. ``reason`` goes through the safe_text PHI chokepoint
+        (#120), then the cipher."""
+        now = ev.get("now")
+        if now is None:
+            now = time.time()
+        connection, kind, reason = ev["connection"], ev["kind"], ev["reason"]
         # Bound to (connection, ts, kind) — the row's insert-time-known identity; connection_event.id is
         # autoincrement, unknown here, so cell_aad can't use it (ASVS 11.3.3).
         reason_enc = (
@@ -8097,14 +8195,16 @@ class MessageStore:
             if reason
             else None
         )
-        async with self._lock:
-            await self._db.execute(
-                "INSERT INTO connection_event"
-                " (ts, connection, transport, direction, kind, peer_host, message_id, reason)"
-                " VALUES (?,?,?,?,?,?,?,?)",
-                (now, connection, transport, direction, kind, peer_host, message_id, reason_enc),
-            )
-            await self._commit()
+        return (
+            now,
+            connection,
+            ev["transport"],
+            ev["direction"],
+            kind,
+            ev["peer_host"],
+            ev["message_id"],
+            reason_enc,
+        )
 
     async def list_connection_events(
         self,
@@ -9566,12 +9666,56 @@ class MessageStore:
         federated login so a later login carrying a different ``sub`` for a reassigned username is
         refused rather than handed the prior subject's account."""
         now = time.time() if now is None else now
-        async with self._lock:
+        # _writer_txn, not a bare lock: ux_users_federated_subject refusing this UPDATE is EXPECTED
+        # (the #1256 race loser), and the unwind rolls back the transaction the refusal would
+        # otherwise leave open for the next writer's BEGIN to fail on (BACKLOG #1801).
+        async with _writer_txn(self._db, self._lock):
             await self._db.execute(
                 "UPDATE users SET oidc_issuer=?, oidc_subject=?, updated_at=? WHERE id=?",
                 (issuer, subject, now, user_id),
             )
             await self._commit()
+
+    async def clear_user_federated_subject(
+        self, user_id: str, *, now: float | None = None
+    ) -> FederatedUnbind | None:
+        """Unbind the federated pair and revoke the account's live sessions in one transaction
+        (BACKLOG #1474). See :meth:`Store.clear_user_federated_subject` for why the two cannot be
+        separated, and why the prior pair is read in here rather than by the caller."""
+        now = time.time() if now is None else now
+        async with _writer_txn(self._db, self._lock):
+            cur = await self._db.execute(
+                "SELECT username, oidc_issuer, oidc_subject FROM users WHERE id=?", (user_id,)
+            )
+            row = await cur.fetchone()
+            if row is None:
+                await self._db.rollback()
+                return None
+            issuer, subject = row["oidc_issuer"], row["oidc_subject"]
+            if issuer is None and subject is None:
+                # Already unbound: write NOTHING. Falling through would revoke this account's live
+                # sessions for a no-op change, and an unbind of nothing must not sign anybody out.
+                # AND, not OR: a half row has something to clear, and skipping it here would strand
+                # the residual column with no admin path to remove it (see FederatedUnbind).
+                await self._db.rollback()
+                return FederatedUnbind(
+                    username=row["username"], issuer=None, subject=None, sessions_revoked=0
+                )
+            await self._db.execute(
+                "UPDATE users SET oidc_issuer=NULL, oidc_subject=NULL, updated_at=? WHERE id=?",
+                (now, user_id),
+            )
+            revoked = await self._db.execute(
+                "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL",
+                (now, user_id),
+            )
+            await self._commit()
+            return FederatedUnbind(
+                username=row["username"],
+                issuer=issuer,
+                subject=subject,
+                sessions_revoked=int(revoked.rowcount),
+            )
 
     async def roles_for_ad_groups(self, groups: Iterable[str]) -> set[str]:
         normalized = sorted({g.strip().lower() for g in groups if g.strip()})
@@ -9646,18 +9790,36 @@ class MessageStore:
         client: str | None = None,
         seed_reauth: bool = True,
         now: float | None = None,
-    ) -> None:
+        require_federated_subject: tuple[str, str] | None = None,
+    ) -> bool:
         now = time.time() if now is None else now
-        async with self._lock:
-            await self._db.execute(
-                "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
-                " revoked_at, client, reauth_at) VALUES (?,?,?,?,?,NULL,?,?)",
-                # reauth_at = now seeds the step-up window from login (ASVS 7.5.3). seed_reauth=False for
-                # an MFA-PENDING session (WP-14) leaves it NULL, so enrollment/step-up needs an explicit
-                # password re-verify — a stolen pre-MFA token can't ride the login's step-up freshness.
-                (token_hash, user_id, now, expires_at, now, client, now if seed_reauth else None),
+        # reauth_at = now seeds the step-up window from login (ASVS 7.5.3). seed_reauth=False for an
+        # MFA-PENDING session (WP-14) leaves it NULL, so enrollment/step-up needs an explicit
+        # password re-verify — a stolen pre-MFA token can't ride the login's step-up freshness.
+        params = (token_hash, user_id, now, expires_at, now, client, now if seed_reauth else None)
+        if require_federated_subject is None:
+            async with self._lock:
+                await self._db.execute(_SESSION_INSERT, params)
+                await self._commit()
+            return True
+        # _writer_txn for the GUARDED path, not the bare lock the unguarded one keeps (BACKLOG
+        # #1474). The lock alone is what makes the read and the INSERT atomic against
+        # clear_user_federated_subject, which takes the same lock — but this branch is now a
+        # MULTI-statement writer, and those go through the one helper that unwinds on BaseException,
+        # so a cancellation between the two cannot leave a transaction open for the next writer to
+        # inherit (ADR 0159). The refusal below rolls back itself, as that helper's contract requires.
+        async with _writer_txn(self._db, self._lock):
+            cur = await self._db.execute(
+                "SELECT oidc_issuer, oidc_subject FROM users WHERE id=?", (user_id,)
             )
+            row = await cur.fetchone()
+            bound = None if row is None else (row["oidc_issuer"], row["oidc_subject"])
+            if bound != require_federated_subject:
+                await self._db.rollback()
+                return False
+            await self._db.execute(_SESSION_INSERT, params)
             await self._commit()
+        return True
 
     async def get_session(self, token_hash: str) -> SessionRecord | None:
         async with self._read() as db:
