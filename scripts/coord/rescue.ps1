@@ -9,6 +9,26 @@
     A rescue ref is consulted once, in the moment the original is already gone. That is the whole
     hazard: it is the one instrument whose failure surfaces only when it is too late to fix.
 
+    AND THE SECOND HAZARD IS THAT A TIDY-UP CAN DESTROY THEM, WITH NO REMOTE COPY TO RESTORE FROM.
+    A rescue ref is UNPUSHABLE BY DESIGN: `scripts/hooks/push_guard.py` carries an allowlist,
+    `PUSHABLE_NAMESPACES = ("refs/heads/", "refs/tags/")`, and refuses everything else. So a ref
+    under `refs/rescue/` has never left this machine. Deleting one and then running `gc` is
+    unrecoverable loss of the only copy, and nothing reports it.
+
+    SO NO CLEANUP, PRUNE OR REAPER MAY DELETE A `refs/rescue/` REF. Measured 2026-09-20: this
+    checkout holds 328 of them, at least one being the sole remaining copy of files deleted from the
+    working tree. Some are named `POISONED-DO-NOT-RESTORE-*` and are deliberate records of what must
+    not be brought back, not junk to sweep up.
+
+    AN AGE HEURISTIC IS NOT A SAFE FILTER, AND IT IS THE FIRST THING SUCH A TOOL REACHES FOR. Most of
+    those refs are weeks old, because OLD IS THE NORMAL STATE OF AN ANCHOR -- outliving the session
+    that wrote it is the entire function. "Stale" and "safe to delete" are unrelated here.
+
+    IF YOU ANCHOR SOMETHING YOU CANNOT AFFORD TO LOSE, DO NOT LET THE REF BE THE ONLY COPY. Write
+    plain files outside the ref namespace as well, where no prune or `gc` can reach them, and read
+    them back against the ref before deleting the original. `.git/mefor-coord/backups/<date>-<subject>/`
+    is untracked and serves.
+
     THE DEFECT IS NOT THAT REFS GO STALE. Dated rescue tags are SNAPSHOTS BY DESIGN -- nothing
     re-takes them, so a tag older than its branch is working as intended, not broken. The argument
     that short refs are a writer defect was made and WITHDRAWN by its author: 374 of 730 tags holding
