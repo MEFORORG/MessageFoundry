@@ -131,8 +131,9 @@ filing and build, and the fix that shipped is not the one proposed. Left above v
 - **The fix is savepoints, not an inline re-run.** Re-running the healthy members each in its own
   transaction degenerates to N transactions and N fsyncs on the failure path — group-commit inverted —
   and calls a member body a second time on a double-invocation safety nobody has established. Each
-  member now runs inside `SAVEPOINT m<i>`, so a failure is undone by `ROLLBACK TO` on that savepoint
-  alone: one transaction, one fsync, nothing invoked twice. See ADR 0055 AC-1, amended in the same PR.
+  member now runs inside its own savepoint, so a failure is undone by `ROLLBACK TO` on that savepoint
+  alone: one transaction, one fsync, nothing invoked twice. (The name is one constant, `gc_member`,
+  reused because each member's savepoint is released before the next opens.) See ADR 0055 AC-1, amended in the same PR.
 
 ---
 

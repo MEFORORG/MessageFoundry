@@ -250,8 +250,17 @@ async def _writer_txn(db: aiosqlite.Connection, lock: asyncio.Lock) -> AsyncIter
 class _GroupPoisoned(Exception):  # noqa: N818 — control-flow signal, not an error condition
     """Raised by :meth:`_GroupCommitter._unwind_member` when a member's SAVEPOINT unwind itself
     failed, so the shared transaction unwinds through :func:`_writer_txn` (under the lock) instead of
-    being rolled back by hand. One of the three whole-batch failures listed on
-    :class:`_GroupCommitter`; an ordinary member failure is contained and never reaches here."""
+    being rolled back by hand. One of the whole-batch failures listed on :class:`_GroupCommitter`; an
+    ordinary member failure is contained and never reaches here.
+
+    It carries the failing ``member`` and the ``cause`` that member raised, because that member never
+    returns an outcome: without them :meth:`_GroupCommitter._reject_all` would hand it this signal
+    instead of its own error."""
+
+    def __init__(self, message: str, *, member: _Member, cause: Exception) -> None:
+        super().__init__(message)
+        self.member = member
+        self.cause = cause
 
 
 class _AbortMember(Exception):  # noqa: N818 — control-flow signal, not an error condition
@@ -321,9 +330,11 @@ class _GroupCommitter:
     innocent sibling then taking its lane's error backoff and logging a stack trace it did nothing to
     earn, and re-running work that had already succeeded.
 
-    Three paths still fail the WHOLE batch, because on each of them nothing is committable: the
-    ``COMMIT`` itself failing, the committer task being CANCELLED, and a member's savepoint unwind
-    failing (:class:`_GroupPoisoned`). There EVERY member's future is rejected and each caller re-runs
+    A failure outside a member's own body still fails the WHOLE batch, because then nothing is
+    committable. That includes at least the ``COMMIT`` itself failing, the committer task being
+    CANCELLED, a statement the committer issues itself (``BEGIN``, ``SAVEPOINT``, ``RELEASE``)
+    failing, and a member's savepoint unwind failing (:class:`_GroupPoisoned`). There EVERY member's
+    future is rejected and each caller re-runs
     (a coordinated form of the crash-re-run the INFLIGHT-guarded idempotent handoffs already tolerate).
     Resolving the futures on the cancellation path matters as much as the rollback does: a member's
     caller parks on its future (the ACK gate among them), so a batch abandoned without rejection would
@@ -431,12 +442,15 @@ class _GroupCommitter:
                 # point is fewer fsyncs), so count ONE committed transaction here, not one per member.
                 self._note_commit()
         except _GroupPoisoned as exc:
-            # A member's savepoint unwind failed, so the batch may still carry its partial write and
-            # there is no version of it that holds only the healthy members.
+            # A member's savepoint unwind failed, so there is no version of the batch that holds only
+            # the healthy members. That member never returned its outcome, so record it here: it then
+            # gets the error it raised, and only its siblings get the poison.
+            results.append((exc.member, None, exc.cause))
             self._reject_all(batch, results, fallback=exc)
             return
         except Exception as exc:  # noqa: BLE001 — a commit failure fails the whole group
-            # The COMMIT itself failed: nothing in the batch is durable.
+            # The COMMIT, or a statement the committer issues itself (BEGIN, SAVEPOINT, RELEASE),
+            # failed: nothing in the batch is durable.
             self._reject_all(batch, results, fallback=exc)
             return
         except BaseException:
@@ -503,12 +517,12 @@ class _GroupCommitter:
             # zero-mutation property ever weaken — see :class:`_AbortMember`.
             value = abort.result
         except Exception as exc:  # noqa: BLE001 — contained to this member; siblings still commit
-            await self._unwind_member(exc)
+            await self._unwind_member(member, exc)
             return (member, None, exc)
         await self._db.execute(f"RELEASE {_MEMBER_SAVEPOINT}")
         return (member, value, None)
 
-    async def _unwind_member(self, cause: Exception) -> None:
+    async def _unwind_member(self, member: _Member, cause: Exception) -> None:
         """Undo one member's statements, leaving the rest of the open batch intact.
 
         ``ROLLBACK TO`` leaves the savepoint on the stack, so the ``RELEASE`` after it is what pops it
@@ -518,11 +532,16 @@ class _GroupCommitter:
             await self._db.execute(f"RELEASE {_MEMBER_SAVEPOINT}")
         except Exception as exc:
             # SQLite can abandon the savepoint under the member (an error that rolls the whole
-            # transaction back, e.g. SQLITE_FULL/SQLITE_IOERR). The transaction may then still carry
-            # this member's partial write, and committing it would make a mixture durable — worse than
-            # the over-rejection this change exists to remove. Poison the batch instead.
+            # transaction back, e.g. SQLITE_FULL/SQLITE_IOERR). Either way nothing here is safe to
+            # commit. If SQLite rolled everything back, the healthy siblings' writes are gone too, and
+            # resolving their futures would ACK rows that were never stored. If it did not, the
+            # transaction may still carry this member's partial write, and committing it would make a
+            # mixture durable. Both are worse than the over-rejection this change exists to remove, so
+            # poison the batch instead.
             raise _GroupPoisoned(
-                f"group commit rolled back (a member's savepoint unwind failed: {exc})"
+                f"group commit rolled back (a member's savepoint unwind failed: {exc})",
+                member=member,
+                cause=cause,
             ) from cause
 
     @staticmethod
@@ -534,7 +553,7 @@ class _GroupCommitter:
     ) -> None:
         """Reject every member's future on a WHOLE-batch rollback so each caller re-runs.
 
-        Reached only for the three whole-batch failures on :class:`_GroupCommitter`; an ordinary member
+        Reached only for a whole-batch failure (see :class:`_GroupCommitter`); an ordinary member
         failure is contained by :meth:`_run_member` and rejects only its own future.
 
         A member that itself raised gets its OWN exception (so its caller sees the true cause); the
