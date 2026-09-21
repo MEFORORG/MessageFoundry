@@ -945,7 +945,9 @@ class RegistryRunner:
         # Event set, so 'stopped' means truly quiesced, not merely "won't claim new".
         self._outbound_quiesced: dict[str, asyncio.Event] = {}
         # per_lane-mode resume Events: the delivery worker awaits its lane's Event at the loop-top pause
-        # gate; start_outbound sets it. Unused in pooled mode (the dispatcher's resume_lane re-arms).
+        # gate; start_outbound sets it. Unused for a lane the pooled OUTBOUND dispatcher drains (its
+        # resume_lane re-arms instead) — but a pooled ordering=unordered lane keeps its own worker
+        # and therefore its own gate (ADR 0066 D4), so this is NOT empty under pooled.
         self._outbound_resume: dict[str, asyncio.Event] = {}
         # Which of _outbound_paused this ENGINE parked (auto_start=False #115 / deployed=False #233) as
         # opposed to an OPERATOR pausing it. Both reuse _outbound_paused (so every consumer — status,
@@ -969,6 +971,14 @@ class RegistryRunner:
         # outbound's settings under a running worker without tearing the worker down.
         self._retry: dict[str, RetryPolicy] = {}
         self._ordering: dict[str, OrderingMode] = {}
+        # ADR 0066 D4: which OUTBOUND lanes a per-lane `_delivery_worker` drains (True) and which the
+        # pooled OUTBOUND StageDispatcher drains (False). The two sets are COMPLEMENTS — that is the
+        # single-consumer-per-lane invariant (ADR 0073) in one dict — so every branch that used to ask
+        # `self._claim_mode == "pooled"` about an outbound lane asks :meth:`_per_lane_delivery` instead.
+        # Decided ONCE per lane by :meth:`_resolve_lane_consumer` and never flipped while the engine
+        # runs; cleared on teardown so a start()-after-stop() re-decides. Empty in per_lane mode, where
+        # every lane has its own worker by definition.
+        self._worker_owned: dict[str, bool] = {}
         self._internal_error: dict[str, InternalErrorPolicy] = {}
         self._buildup: dict[str, BuildupThreshold] = {}
         self._stall: dict[str, StallThreshold] = {}
@@ -1287,6 +1297,63 @@ class RegistryRunner:
         the purge handler's ownership 409) — ``None`` when unsharded."""
         return self._destination_owner(name)
 
+    # --- outbound delivery-consumer ownership (ADR 0066 D4) --------------------
+
+    def _lane_ordering(self, name: str) -> OrderingMode:
+        """The EFFECTIVE ordering mode of outbound lane ``name`` (its own ``ordering=`` or the
+        ``[delivery].ordering`` default). The one spelling of that lookup, so the delivery worker and
+        the consumer decision can never read it two different ways."""
+        return self._ordering.get(name, self._ordering_default)
+
+    def _per_lane_delivery(self, name: str) -> bool:
+        """Whether outbound lane ``name`` is drained by its OWN :meth:`_delivery_worker` rather than by
+        the pooled OUTBOUND StageDispatcher. Always True in per_lane mode. Under pooled it is True for
+        an UNORDERED lane (ADR 0066 D4) and False for every FIFO lane.
+
+        **This predicate and the OUTBOUND dispatcher's lane set are complements, and that is the whole
+        of the single-consumer guarantee.** Two consumers on one lane would break per-lane FIFO (ADR
+        0073), so every outbound branch that used to key off ``self._claim_mode`` — the wake, the
+        pause/park/resume gates, the retry wake timer, the reconcile liveness test — keys off THIS
+        instead. A pure read: :meth:`_resolve_lane_consumer` is the only writer."""
+        if self._claim_mode != "pooled":
+            return True
+        return self._worker_owned.get(name, False)
+
+    def _resolve_lane_consumer(self, name: str) -> bool:
+        """Decide, ONCE per outbound lane, which consumer drains it; returns :meth:`_per_lane_delivery`.
+        Called from ``_start_outbound`` / ``_reconcile_outbounds`` right after the lane's ordering mode
+        is resolved, BEFORE anything can spawn a worker or hand the lane to a dispatcher.
+
+        **The decision is sticky for the life of the engine, and a reload cannot move a lane between
+        consumers.** Handing a lane over mid-run means proving the old consumer has let go of it, and
+        neither direction is cheap: the dispatcher reaches its quiesce point only after an in-flight
+        send resolves, and a lane claimed by both for even one sweep is the exact FIFO hazard above.
+        Sticky costs almost nothing in exchange. A lane flipped FIFO -> UNORDERED on a reload keeps
+        head-of-line blocking until the next engine start (logged by the caller); a lane flipped the
+        other way keeps its worker, which reads :meth:`_lane_ordering` live and simply starts claiming
+        the strict head — byte-identical to how per_lane mode has always honoured that flip."""
+        if self._claim_mode != "pooled":
+            return True
+        known = self._worker_owned.get(name)
+        if known is not None:
+            return known
+        decided = self._lane_ordering(name) is OrderingMode.UNORDERED
+        self._worker_owned[name] = decided
+        return decided
+
+    def _wake_worker_lanes(self) -> None:
+        """Wake every pooled lane that runs its own delivery worker — the OUTBOUND half of a broadcast
+        (``notify_work`` / a reload nudge) that the dispatchers cannot carry, because no dispatcher
+        speaks for these lanes. A no-op in per_lane mode and on a graph with no UNORDERED outbound."""
+        if not any(self._worker_owned.values()):
+            return  # per_lane mode, or a pooled graph whose outbounds are all dispatcher-drained
+        if not self._per_lane_wake:
+            self._singleton_for_stage[Stage.OUTBOUND].set()  # every worker waits on this one Event
+            return
+        for name, owned in self._worker_owned.items():
+            if owned:
+                self._lane_event(Stage.OUTBOUND, name).set()
+
     def _wake_lane(self, stage: Stage, key: str) -> None:
         """Wake the worker for one (stage, lane). ADR 0066 pooled: route to the stage's dispatcher
         (``mark_ready`` — sync, await-free, ``Event.set()``-shaped, create-or-stick on an unknown lane)
@@ -1300,13 +1367,20 @@ class RegistryRunner:
         ``mark_ready`` is create-or-stick, so an ungated cross-shard wake would register the lane on
         THIS shard's dispatcher and make it a second concurrent claimer — the exact per-lane FIFO
         hazard the single-consumer invariant closes. The owning shard discovers cross-shard produce
-        via its sweep/idle poll instead (the documented wake gap)."""
+        via its sweep/idle poll instead (the documented wake gap).
+
+        ADR 0066 D4: an UNORDERED outbound lane runs its own delivery worker even under pooled, so its
+        wake takes the per_lane path below. Routing it to ``mark_ready`` would register it on the
+        OUTBOUND dispatcher (create-or-stick) and make that dispatcher a SECOND claimer of a lane a
+        worker already drains — the single-consumer hazard :meth:`_per_lane_delivery` exists to close."""
         if self.registry.shard_id is not None:
             if stage is Stage.OUTBOUND and not self._owns_destination(key):
                 return
             if stage is Stage.RESPONSE and key not in self.registry.inbound:
                 return  # the reingress_to loopback lives on (and is drained by) another shard
-        if self._claim_mode == "pooled":
+        if self._claim_mode == "pooled" and not (
+            stage is Stage.OUTBOUND and self._per_lane_delivery(key)
+        ):
             d = self._dispatchers.get(stage)
             if d is not None:
                 d.mark_ready(key)
@@ -1322,12 +1396,19 @@ class RegistryRunner:
         stage's dispatcher (re-ready every registry lane, unpark PARKED lanes, request an immediate
         sweep). OFF → the stage singletons; ON → every registered lane Event of those stages. MUST stay
         synchronous + await-free: it snapshots the Event list before iterating so a concurrent
-        reload/producer mutating _lane_events can't raise 'dict changed size during iteration'. ADR 0061."""
+        reload/producer mutating _lane_events can't raise 'dict changed size during iteration'. ADR 0061.
+
+        ADR 0066 D4: no dispatcher speaks for a pooled lane that runs its own delivery worker, so an
+        OUTBOUND broadcast also wakes those lanes directly (:meth:`_wake_worker_lanes`) — otherwise a
+        replay or DR failback would re-ready every FIFO lane and leave the UNORDERED ones asleep until
+        their idle backstop."""
         if self._claim_mode == "pooled":
             for stage in stages:
                 d = self._dispatchers.get(stage)
                 if d is not None:
                     d.notify_work()
+            if Stage.OUTBOUND in stages:
+                self._wake_worker_lanes()
             return
         if not self._per_lane_wake:
             for stage in stages:
@@ -2082,7 +2163,9 @@ class RegistryRunner:
             self._outbound_quiesced[name] = asyncio.Event()
         else:
             ev.clear()
-        if self._claim_mode == "pooled":
+        # ADR 0066 D4: the branch is per-LANE, not per-mode — a pooled UNORDERED lane has a delivery
+        # worker and no dispatcher entry, so pausing it through the dispatcher would never quiesce it.
+        if not self._per_lane_delivery(name):
             d = self._dispatchers.get(Stage.OUTBOUND)
             if d is not None:
                 d.pause_lane(name)  # fires on_lane_paused synchronously if the lane is already idle
@@ -2123,7 +2206,7 @@ class RegistryRunner:
         self._outbound_paused.add(name)
         self._gate_parked.add(name)
         self._outbound_quiesced.setdefault(name, asyncio.Event()).set()
-        if self._claim_mode == "pooled":
+        if not self._per_lane_delivery(name):  # ADR 0066 D4: per-LANE, see _stop_outbound_unsafe
             d = self._dispatchers.get(Stage.OUTBOUND)
             if d is not None:
                 d.pause_lane(name)
@@ -2153,7 +2236,7 @@ class RegistryRunner:
         ev = self._outbound_quiesced.get(name)
         if ev is not None:
             ev.clear()
-        if self._claim_mode == "pooled":
+        if not self._per_lane_delivery(name):  # ADR 0066 D4: per-LANE, see _stop_outbound_unsafe
             d = self._dispatchers.get(Stage.OUTBOUND)
             if d is not None:
                 d.resume_lane(name)
@@ -2243,7 +2326,7 @@ class RegistryRunner:
         ev = self._outbound_quiesced.get(name)
         if ev is not None:
             ev.clear()
-        if self._claim_mode == "pooled":
+        if not self._per_lane_delivery(name):  # ADR 0066 D4: per-LANE, see _stop_outbound_unsafe
             d = self._dispatchers.get(Stage.OUTBOUND)
             if d is not None:
                 d.resume_lane(name)
@@ -2953,6 +3036,9 @@ class RegistryRunner:
         already-spawned worker)."""
         self._retry[name] = oc.retry or self._delivery_defaults
         self._ordering[name] = oc.ordering or self._ordering_default
+        # ADR 0066 D4: pick this lane's delivery consumer NOW, before the park/spawn branches below and
+        # before the dispatchers are built, so no window exists where both could claim it.
+        self._resolve_lane_consumer(name)
         self._internal_error[name] = oc.internal_error or self._internal_error_default
         self._buildup[name] = oc.buildup or self._buildup_default
         self._stall[name] = oc.stall or self._stall_default
@@ -3113,12 +3199,26 @@ class RegistryRunner:
                 # invisible to the supervisor and never pages itself), and warn on the per_lane_wake
                 # combination (cross-shard produce has no wake — only the 30s idle backstop).
                 self._shard_watchdog = asyncio.create_task(self._non_owned_lane_watchdog())
-                if self._claim_mode != "pooled" and self._per_lane_wake:
+                # ADR 0066 D4: the hazard is per-LANE, so the warning has to be too. A lane drained by
+                # its own delivery worker has no cross-shard wake and is not in the dispatcher's sweep
+                # set either, so it sits on the idle backstop — under pooled as much as under per_lane.
+                # Read from the REGISTRY, not from _worker_owned: the outbound loop below has not run
+                # yet, so no lane has been decided at this point.
+                _worker_lanes_expected = self._claim_mode != "pooled" or any(
+                    (oc.ordering or self._ordering_default) is OrderingMode.UNORDERED
+                    for oc in self.registry.outbound.values()
+                )
+                if _worker_lanes_expected and self._per_lane_wake:
                     log.warning(
                         "sharded engine with per_lane_wake=True: a cross-shard send into an idle "
-                        "owned lane is discovered only by the %.0fs idle backstop (no cross-process "
-                        "wake) — prefer claim_mode='pooled' (<=%.2fs sweep) for sharded fleets",
+                        "owned lane drained by its own delivery worker is discovered only by the "
+                        "%.0fs idle backstop (no cross-process wake). Under claim_mode=%r that is "
+                        "%s. The pooled OUTBOUND dispatcher's <=%.2fs sweep covers every OTHER lane",
                         _PER_LANE_IDLE_BACKSTOP_SECONDS,
+                        self._claim_mode,
+                        "every outbound lane"
+                        if self._claim_mode != "pooled"
+                        else "any ordering=unordered outbound (ADR 0066 D4)",
                         self._pooled_sweep_interval,
                     )
             try:
@@ -3371,8 +3471,10 @@ class RegistryRunner:
         so they exit on their own once the CURRENT claimed prefix resolves. ``asyncio.wait`` never
         cancels and never raises on timeout; the existing cancel + gather below remains the fallback.
 
-        No-op in pooled mode: all FOUR dicts are empty there, because ``_ensure_inbound_workers``
-        returns early under ``pooled`` and ``_spawn_worker`` is a documented pooled no-op.
+        In pooled mode the three INBOUND dicts are empty (``_ensure_inbound_workers`` returns early),
+        and ``self._workers`` holds only the lanes ADR 0066 D4 keeps on a per-lane delivery worker — the
+        UNORDERED outbounds. Those need the same cooperative wait as in per_lane mode, so this is a
+        no-op on a pooled graph with no UNORDERED outbound and does real work on one that has any.
 
         MUST run ABOVE the source phase, or per_lane workers keep issuing post-demotion terminal writes
         for the whole source phase.
@@ -3524,9 +3626,13 @@ class RegistryRunner:
         # B12 (ADR 0061): break every waiting worker out of its wait so cancel()+gather lands promptly.
         # OFF sets the four stage singletons (byte-identical); ON sets every registered lane Event. ADR
         # 0066 pooled: skip — the shared _stop.set() already breaks the dispatchers' loops, and _wake_all
-        # here would notify_work() dispatchers we are about to stop.
+        # here would notify_work() dispatchers we are about to stop. ADR 0066 D4: a pooled graph may
+        # still hold worker-drained OUTBOUND lanes, so break those out of their wait directly (the
+        # cancel + gather below is still the fallback, exactly as in per_lane mode).
         if self._claim_mode != "pooled":
             self._wake_all(Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE, Stage.OUTBOUND)
+        else:
+            self._wake_worker_lanes()
         if demote:
             # ADR 0157 Inc 5: DEMOTE INVERTS the ADR 0066 D3 order below, deliberately. Egress is the
             # split-brain-relevant action, so its budget must start NOW rather than after the source
@@ -3642,6 +3748,10 @@ class RegistryRunner:
             _lane_dict.clear()
         # ADR 0066: reset pooled-mode transient state (no-ops in per_lane mode — empty/False already).
         self._pooled_buildup_at.clear()
+        # ADR 0066 D4: drop the per-lane delivery-consumer decisions. They are sticky for the life of a
+        # RUN, not of the process, so a start()-after-stop() re-decides each lane from the ordering the
+        # new graph declares — which is what makes a restart the documented way to move a lane.
+        self._worker_owned.clear()
         # Connection controls: operator pauses are in-memory and do NOT survive a full teardown — clear
         # them so a start()-after-stop() begins with every outbound running (a fresh dispatcher has no
         # PAUSED lanes; a stale _outbound_paused would make outbound_running lie about the new lane).
@@ -3660,15 +3770,36 @@ class RegistryRunner:
 
     def _spawn_worker(self, name: str) -> None:
         """Start a delivery worker for one outbound connection (drains its outbox rows). ADR 0066 D5:
-        in pooled mode the per-outbound delivery worker is replaced by the OUTBOUND StageDispatcher, so
-        this is a no-op — the mode gate lives HERE (not at each call site) so ``_start_outbound`` /
+        a pooled FIFO lane is drained by the OUTBOUND StageDispatcher instead, so this is a no-op for
+        one — the gate lives HERE (not at each call site) so ``_start_outbound`` /
         ``_reconcile_outbounds`` still build the connector into ``self._destinations`` (the pooled
-        delivery body re-resolves from it) without leaking a per_lane worker.
+        delivery body re-resolves from it) without leaking a second consumer.
+
+        ADR 0066 D4: a pooled UNORDERED lane DOES get a worker. :meth:`_per_lane_delivery` is the
+        single discriminator and ``_pooled_lane_provider`` is its complement, so the lane is drained by
+        exactly one of the two — never both, never neither. The guard below tests that directly: a
+        worker-owned lane must be unknown to the OUTBOUND dispatcher, which is one dict read. It is a
+        REFUSAL rather than an ``assert`` deliberately — ``python -O`` strips an assert, and the one
+        build where this invariant goes unchecked would be the production one. Refusing leaves the
+        lane on the consumer it already has, which is a slow lane at worst; spawning anyway would put
+        two claimers on it, which is the per-lane FIFO break (ADR 0073) this whole gate exists to stop.
 
         Sharded (ADR 0073): a lane another shard owns gets NO local worker — same choke-point
         placement, so start/reconcile/respawn all inherit the gate while the connector stays built
         (status, DR parking and the dead-letter sweeps keep keying off the full outbound map)."""
-        if self._claim_mode == "pooled":
+        if not self._per_lane_delivery(name):
+            return
+        out = self._dispatchers.get(Stage.OUTBOUND)
+        held = None if out is None else out.phase(name)
+        if held is not None:
+            log.error(
+                "outbound %r would have TWO consumers: a per-lane delivery worker and the pooled "
+                "OUTBOUND dispatcher, which already holds the lane at phase %r. Refusing to spawn "
+                "the worker — the dispatcher keeps draining it (ADR 0066 D4 / ADR 0073 single "
+                "consumer per lane). This is a bug in the lane-consumer partition; report it",
+                name,
+                held,
+            )
             return
         if not self._owns_destination(name):
             log.info(
@@ -3785,12 +3916,17 @@ class RegistryRunner:
         (registry ∪ any built connector still draining after a reload dropped it), each filtered to
         the lanes THIS shard owns (ADR 0073 — a no-op unsharded; the predicate form keeps a
         reload-dropped lane draining on exactly its owner). Read live so a reload's swapped graph is
-        reflected without rebuilding the dispatcher."""
+        reflected without rebuilding the dispatcher.
+
+        OUTBOUND also drops every lane that runs its own delivery worker (ADR 0066 D4) — this set is
+        the exact complement of :meth:`_per_lane_delivery`, which is what keeps each lane to one
+        consumer. Excluding a lane here stops the sweep readying it; the matching wake gate is in
+        :meth:`_wake_lane`, because ``mark_ready`` is create-or-stick and would register it anyway."""
         if stage is Stage.OUTBOUND:
             return lambda: {
                 dest
                 for dest in set(self.registry.outbound) | set(self._destinations)
-                if self._owns_destination(dest)
+                if self._owns_destination(dest) and not self._per_lane_delivery(dest)
             }
         if stage is Stage.RESPONSE:
             return lambda: {
@@ -3888,10 +4024,13 @@ class RegistryRunner:
         # auto_start=False lane is already in _outbound_paused with no dispatcher to tell — without this
         # replay the boot gate would be defeated by step (3)'s seed-all-READY. pause_lane on an
         # unregistered key registers it ALREADY-PAUSED, so the seed cannot arm it (#115).
+        # ADR 0066 D4: a worker-drained lane is NOT replayed — it has no dispatcher entry, and creating
+        # one here (pause_lane is create-or-stick) would hand the dispatcher a lane a worker owns.
         out = self._dispatchers.get(Stage.OUTBOUND)
         if out is not None:
             for n in self._outbound_paused:
-                out.pause_lane(n)
+                if not self._per_lane_delivery(n):
+                    out.pause_lane(n)
         # (2.6) THE #122 SIBLING OF (2.5), and it fails the same way if it is missing: replay an
         # in-force log-failure halt onto the FRESH INGRESS/ROUTED/RESPONSE dispatchers before step (3)
         # seeds every lane READY. Without it a runner that came up into an unwritable application log
@@ -3902,11 +4041,14 @@ class RegistryRunner:
         # (3) start each (seed-all-READY + immediate sweep). reset_stale_inflight already ran (engine).
         for dispatcher in self._dispatchers.values():
             await dispatcher.start()
-        # (4) per_lane_wake is subsumed by pooled precision (logged once).
+        # (4) per_lane_wake is subsumed by pooled precision for every DISPATCHER-drained lane (logged
+        # once). It still governs the wake of a lane ADR 0066 D4 keeps on its own delivery worker.
         if self._per_lane_wake:
             log.info(
-                "ADR 0066: per_lane_wake subsumed by pooled claim_mode (per-lane precision is "
-                "structural in the dispatcher; the sweep is the bounded backstop)"
+                "ADR 0066: per_lane_wake subsumed by pooled claim_mode for dispatcher-drained lanes "
+                "(per-lane precision is structural in the dispatcher; the sweep is the bounded "
+                "backstop). It still governs any ordering=unordered outbound, which keeps its own "
+                "delivery worker (D4)"
             )
         log.info(
             "pooled claim mode started: %d stage dispatcher(s) (%s)",
@@ -4048,6 +4190,9 @@ class RegistryRunner:
             await dispatcher.start()
         for dispatcher in self._dispatchers.values():
             dispatcher.notify_work()
+        # ADR 0066 D4: the dispatchers do not speak for a worker-drained outbound lane, so nudge those
+        # directly — otherwise a reload that added rows to one would leave it asleep until its backstop.
+        self._wake_worker_lanes()
         # Connection controls — reload survival (belt-and-suspenders): re-apply every operator pause
         # SYNCHRONOUSLY right after the notify_work broadcast — no await in the gap, still under
         # _reload_lock — so a claimer can't slip a row out of a deliberately-paused lane between the
@@ -4057,7 +4202,8 @@ class RegistryRunner:
         out = self._dispatchers.get(Stage.OUTBOUND)
         if out is not None:
             for n in self._outbound_paused:
-                out.pause_lane(n)
+                if not self._per_lane_delivery(n):  # ADR 0066 D4, as in _start_pooled_dispatchers
+                    out.pause_lane(n)
         # …and the #122 halt on the INTERNAL stages, for the same reason and in the same gap. A
         # reload never LIFTS a halt (that rides _resume_inbound_processing, which is gated on the log
         # working again), so re-applying it here can only ever be a no-op or a repair; a lane whose
@@ -4136,6 +4282,19 @@ class RegistryRunner:
             # retunes (incl. re-arming a previously stopped connection) without a restart
             self._retry[name] = oc.retry or self._delivery_defaults
             self._ordering[name] = oc.ordering or self._ordering_default
+            # ADR 0066 D4: resolve (or re-read) the lane's delivery consumer before ANY branch below
+            # can park it, spawn a worker, or hand it to a dispatcher. A lane already running keeps the
+            # consumer it has — see _resolve_lane_consumer for why a mid-run handover is refused.
+            # Hoisted, NOT folded into the `if` below: this call RECORDS the decision, and a predicate
+            # with a side effect inside a condition is one operand reorder away from never running.
+            worker_drained = self._resolve_lane_consumer(name)
+            if not worker_drained and self._lane_ordering(name) is OrderingMode.UNORDERED:
+                log.info(
+                    "outbound %r now declares ordering=unordered, but the pooled OUTBOUND dispatcher "
+                    "is already draining it; the lane keeps head-of-line blocking until the next "
+                    "engine start (ADR 0066 D4 — a consumer handover on a live lane is refused)",
+                    name,
+                )
             self._internal_error[name] = oc.internal_error or self._internal_error_default
             self._buildup[name] = oc.buildup or self._buildup_default
             self._stall[name] = oc.stall or self._stall_default
@@ -4287,28 +4446,30 @@ class RegistryRunner:
                     self._spawn_worker(name)
                 continue
             self._filtered.pop(("outbound", name), None)
-            # Per_lane has one delivery worker per outbound; pooled has ONE OUTBOUND dispatcher for all,
-            # so self._workers is always empty in pooled — judging "live" by worker presence would rebuild
-            # every connector on every reload (dropping every warm MLLP socket / DB pool / SMART token).
-            # In pooled a connector is live iff it is BUILT; the spec-mismatch elif below still rebuilds a
-            # genuinely-changed one.
+            # A lane with its OWN delivery worker is live iff that worker is alive — a dead one must be
+            # respawned or the lane stops draining. A lane the pooled OUTBOUND dispatcher drains has no
+            # worker to judge by, so it is live iff its connector is BUILT; judging that one by worker
+            # presence would rebuild every connector on every reload (dropping every warm MLLP socket /
+            # DB pool / SMART token). The spec-mismatch elif below still rebuilds a genuinely-changed
+            # connector in both cases. ADR 0066 D4: this is per-LANE, not per-mode — under pooled an
+            # UNORDERED lane takes the worker-keyed arm and a FIFO lane the connector-keyed one.
             #
-            # CONNECTOR-KEYED WHILE THE HALT HOLDS, for the same reason pooled is. A per_lane worker
-            # RETURNS at :meth:`_delivery_worker`'s claim gate while `_delivery_halted`, which is the
-            # halt's designed terminal state and not a crash -- the resume doors respawn it through
-            # `_start_outbound_unsafe`. Reading `worker.done()` as 'not live' there made every halted
-            # reload pop, `aclose()` and rebuild EVERY paused lane's connector, and respawn a worker
-            # that dies at that gate on its first tick, for a reload that changed nothing. MEASURED in
-            # both claim modes on a reload with the connector spec identical: `same_connector` False in
-            # per_lane against True in pooled, and True in per_lane once this disjunct was added.
-            # Besides the warm MLLP socket / DB pool / SMART token the line above is written to keep,
-            # that churn made the unguarded `await stale.aclose()` below newly reachable for a halted
-            # lane, where a raising close propagates into `reload`'s own except and rolls a routine
-            # reload's intake back.
+            # CONNECTOR-KEYED WHILE THE HALT HOLDS, for the same reason a dispatcher-drained lane is.
+            # A lane's own worker RETURNS at :meth:`_delivery_worker`'s claim gate while
+            # `_delivery_halted`, which is the halt's designed terminal state and not a crash -- the
+            # resume doors respawn it through `_start_outbound_unsafe`. Reading `worker.done()` as 'not
+            # live' there made every halted reload pop, `aclose()` and rebuild EVERY paused lane's
+            # connector, and respawn a worker that dies at that gate on its first tick, for a reload
+            # that changed nothing. MEASURED in both claim modes on a reload with the connector spec
+            # identical: `same_connector` False in per_lane against True in pooled, and True in per_lane
+            # once this disjunct was added. Besides the warm MLLP socket / DB pool / SMART token the
+            # paragraph above is written to keep, that churn made the unguarded `await stale.aclose()`
+            # below newly reachable for a halted lane, where a raising close propagates into `reload`'s
+            # own except and rolls a routine reload's intake back.
             live = (
-                name in self._destinations
-                if self._claim_mode == "pooled" or self._delivery_halted
-                else (worker is not None and not worker.done())
+                (worker is not None and not worker.done())
+                if self._per_lane_delivery(name) and not self._delivery_halted
+                else name in self._destinations
             )
             if not live:
                 # added (or replacing a crashed worker): close any stale connector, build + spawn.
@@ -4342,9 +4503,9 @@ class RegistryRunner:
                 # site that records a failure has already popped the connector). MEASURED on a
                 # per_lane rig, where `live` above is WORKER-keyed and the boot gates spawn a worker
                 # without a connector: AC-4's "flip the flag back with no other change" un-parked a
-                # lane that then had nothing to deliver through, and its rows retried forever. Pooled
-                # is untouched — `live` is connector-keyed there, so reaching this elif already means
-                # the connector is built.
+                # lane that then had nothing to deliver through, and its rows retried forever. A lane
+                # whose `live` is connector-keyed cannot reach this elif with a missing connector, so
+                # for those the clause is inert — which is every pooled FIFO lane (ADR 0066 D4).
                 old_conn = self._destinations.get(name)
                 # #200 (ADR 0092): stamp the posture for the in-place rebuild too (see the branch above).
                 with active_hop_posture(self._hop_posture):
@@ -4485,7 +4646,8 @@ class RegistryRunner:
             # that asymmetry (a residual Stage.RESPONSE token on a reloaded loopback no longer waits out
             # the poll). A missed wake here still self-heals on the poll backstop, so this is promptness.
             # ADR 0066 pooled: the dispatchers were already nudged in _reload_pooled_dispatchers above,
-            # so skip the tail wake (it would be a redundant notify_work broadcast).
+            # and so were the worker-drained lanes it wakes directly (D4), so skip the tail wake (it
+            # would be a redundant notify_work broadcast).
             if self._claim_mode != "pooled":
                 _reload_stages = (
                     (Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE, Stage.OUTBOUND)
@@ -5243,11 +5405,19 @@ class RegistryRunner:
                 # FIFO (default): claim only the due head — a backing-off head blocks the lane
                 # (head-of-line), so order is preserved. UNORDERED: claim a batch and rotate past a
                 # backing-off row to drain others. Resolved live so a reload can retune it.
+                # REACHABILITY: every lane that reaches this worker at all. In per_lane mode that is all
+                # of them; under pooled it is the UNORDERED ones, which ADR 0066 D4 keeps here rather
+                # than on the OUTBOUND dispatcher. The FIFO arm below is still reachable under pooled —
+                # a reload can flip a worker-drained lane to FIFO, and the worker honours that live.
+                # Neither rotation nor a batch claim ever overlaps sends: both modes send one row at a
+                # time per lane, so UNORDERED buys failure isolation and never intra-lane concurrency
+                # (pinned by tests/test_ordering_unordered_claims.py, whose positive control shows the
+                # concurrency comes from having more lanes).
                 # perf_counter_ns ONLY when the bench lever is on — otherwise a single bool check. A
                 # claim that RAISES is not timed (the worker's outer except logs it and backs off); a
                 # timeout-capped duration would distort the claim-latency figure this measures.
                 _claim_t0 = time.perf_counter_ns() if self._delivery_phase_timing else 0
-                if self._ordering.get(name, self._ordering_default) is OrderingMode.FIFO:
+                if self._lane_ordering(name) is OrderingMode.FIFO:
                     # FIFO: claim only the due head; the head blocks the lane while it backs off. Under
                     # active-passive HA the graph runs on the leader ONLY, so one node drains this lane;
                     # the Postgres claim also reclaims a prior leader's stranded head for failover FIFO.
@@ -5824,10 +5994,11 @@ class RegistryRunner:
     ) -> float | None:
         """``mark_batch_failed`` + (per_lane wake ON) arm a one-shot retry wake at the shared deadline —
         the batch counterpart of :meth:`_mark_failed_and_arm`. All N re-pend to the same
-        ``next_attempt_at``, so one timer re-claims the identical prefix. Pooled skips the arming (the
-        dispatcher parks off the returned deadline); per_lane arming is byte-identical to the single row."""
+        ``next_attempt_at``, so one timer re-claims the identical prefix. A dispatcher-drained lane skips
+        the arming (the dispatcher parks off the returned deadline); a worker-drained lane arms, exactly
+        as the single row does."""
         next_at = await self.store.mark_batch_failed(list(ids), error, retry)
-        if self._claim_mode != "pooled" and self._per_lane_wake and next_at is not None:
+        if self._per_lane_delivery(lane) and self._per_lane_wake and next_at is not None:
             delay = max(0.0, next_at - time.time()) + _RETRY_WAKE_SLACK_SECONDS
             asyncio.get_running_loop().call_later(delay, self._wake_lane, Stage.OUTBOUND, lane)
         return next_at
@@ -7174,10 +7345,12 @@ class RegistryRunner:
 
         Returns the row's re-pended ``next_attempt_at`` (``None`` when it dead-lettered/vanished) — the
         additive ADR 0066 return the delivery body surfaces as its ``retry_until`` so the pooled
-        dispatcher PARKs the lane on it. In ``pooled`` mode the timer arming is skipped (the dispatcher
-        arms its own exact park timer off the returned deadline); the per_lane arming is byte-identical."""
+        dispatcher PARKs the lane on it. The arming is skipped for a lane the DISPATCHER drains (it arms
+        its own exact park timer off the returned deadline) and taken for a lane a per-lane WORKER
+        drains — which under pooled means an UNORDERED lane (ADR 0066 D4), whose retry would otherwise
+        ride the idle backstop because no dispatcher parks on its behalf."""
         next_at = await self.store.mark_failed(outbox_id, error, retry)
-        if self._claim_mode != "pooled" and self._per_lane_wake and next_at is not None:
+        if self._per_lane_delivery(lane) and self._per_lane_wake and next_at is not None:
             delay = max(0.0, next_at - time.time()) + _RETRY_WAKE_SLACK_SECONDS
             asyncio.get_running_loop().call_later(delay, self._wake_lane, Stage.OUTBOUND, lane)
         return next_at
@@ -8049,11 +8222,17 @@ def check_http_sync_reply(
     at serve.
 
     The ``ordering``/``max_attempts`` pair is the subtle one, and both are refusals rather than
-    warnings because together they make the feature's headline use case unserviceable. ``ordering``
-    resolves to **FIFO**, which drains one message at a time and blocks the head on failure — so N
-    concurrent HTTP callers do not get N concurrent downstream calls; they serialise behind a single
-    lane bounded by one partner round-trip, and one transiently-failing head message holds that lane
-    until an operator purges it, timing out **every** concurrent and subsequent caller.
+    warnings because together they make the feature's headline use case unserviceable.
+
+    **The ordering refusal is about FAILURE ISOLATION, and about nothing else.** An outbound lane
+    sends one message at a time whichever ordering mode it runs, so N concurrent HTTP callers never
+    get N concurrent downstream calls and no setting here changes that. What FIFO adds is
+    head-of-line blocking: one transiently-failing message holds the lane until it succeeds,
+    dead-letters, or an operator purges it, so a single stuck message times out **every** concurrent
+    and subsequent caller rather than only its own. UNORDERED rotates past a backing-off row, so the
+    damage stays with the one caller whose message is stuck. Read the refusal as "do not let one
+    stuck message become an outage", never as "turn this on for throughput".
+
     ``max_attempts`` resolves to retry-forever, which is not merely incoherent with "the caller gave
     up 30 seconds ago" — it is a total outage with a config-shaped cause.
 
@@ -8117,10 +8296,10 @@ def check_http_sync_reply(
         declared = oc.ordering.value if oc.ordering else "unset, inheriting [delivery].ordering"
         raise WiringError(
             f"inbound connection {name!r}: reply_from names {target!r}, whose EFFECTIVE ordering is "
-            f"FIFO (declared: {declared}). A FIFO lane drains one message at a time and blocks the "
-            "head on failure, so concurrent HTTP callers serialise behind a single partner "
-            "round-trip and one stuck message times out every caller — set ordering=UNORDERED on "
-            "that outbound"
+            f"FIFO (declared: {declared}). A FIFO lane blocks its head on failure, so one stuck "
+            "message holds the lane and times out every caller behind it, not just its own. Set "
+            "ordering=UNORDERED on that outbound so a backing-off message is passed over. Either "
+            "mode still sends one message at a time, so this is failure isolation, not concurrency"
         )
 
     effective_attempts = (
