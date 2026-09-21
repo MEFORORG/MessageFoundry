@@ -2752,11 +2752,11 @@ def _reject_envref_odbc_params(odbc_params: Mapping[str, Any] | None) -> None:
     or the file: ``_build_spec`` re-raises a factory ``WiringError`` unwrapped, ahead of the arm that
     adds that context, so every factory refusal is un-located in the same way.
 
-    From ``connections.toml``, the loader's type check (BACKLOG #1809) refuses first wherever it can
-    judge the value, and its message does name the connection. It judges a string or array
-    ``odbc_params``, and a whole-table ref whose ``default`` is not a table. It cannot judge a ref with
-    no ``default``, or one whose ``default`` is a table, so those still reach the mapping check below.
-    So does every code-first call, which that check never sees.
+    From ``connections.toml``, the loader's type check (``connections_file._check_setting_types``,
+    BACKLOG #1809) runs before this function, and where it refuses, its message names the
+    connection. What it lets through reaches the mapping check below, as does every code-first call,
+    which that check never sees. Which whole-table shapes land where is pinned in
+    ``tests/test_odbc_params_envref_toml_shape.py``.
 
     **The residual is a marker one container deep**, and it is deliberately still open here: a dict
     carrying ``env`` plus an unrecognised key, or a marker inside a list, fails ``set(v) <=

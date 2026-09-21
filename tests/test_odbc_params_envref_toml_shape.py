@@ -193,47 +193,66 @@ def _write_whole_table_ref(tmp_path: Path, marker: str) -> None:
 
 
 @pytest.mark.parametrize(
-    ("label", "marker"),
+    "marker",
     [
-        ("no default", '{ env = "pg_params" }'),
-        ("a cast and no default", '{ env = "pg_params", cast = "str" }'),
-        ("a TABLE default", '{ env = "pg_params", default = { PORT = "5432" } }'),
+        pytest.param('{ env = "pg_params" }', id="no default"),
+        pytest.param('{ env = "pg_params", cast = "str" }', id="a cast and no default"),
+        pytest.param(
+            '{ env = "pg_params", default = { PORT = "5432" } }', id="a table default of strings"
+        ),
     ],
 )
-def test_an_env_ref_on_the_odbc_params_table_itself_is_refused(
-    label: str, marker: str, tmp_path: Path
-) -> None:
+def test_an_env_ref_on_the_odbc_params_table_itself_is_refused(marker: str, tmp_path: Path) -> None:
     """`parse_env_setting` DOES decode this one -- it is a top-level settings value -- so the factory
     used to receive an `EnvRef`, call `.items()` on it, and die with a bare `AttributeError` that
     `connections_file._build_spec` does not convert (it catches only TypeError/ValueError). The fix
     makes it a typed WiringError; it stays un-located, because `_build_spec` re-raises a factory
     WiringError ahead of the arm that adds the connection and file.
 
-    Every arm here is a marker the loader's type check does NOT refuse first: it judges an env ref
-    only through an inline `default`, so it skips one with no default and passes one whose default
-    is a table. Those are the shapes that reach the factory, so they are the ones this refusal owns.
-    A NON-table default is refused earlier; see the next test."""
+    Every arm here is a marker the loader's type check lets through. It judges an env ref only
+    through an inline `default`, so it skips one with no default, and it passes a table default
+    whose entries are strings. Those shapes reach the factory, so this refusal owns them. A default
+    the type check can fault is refused earlier; see the next test."""
     _write_whole_table_ref(tmp_path, marker)
     with pytest.raises(WiringError, match="must be a table of ODBC keyword"):
         load_config(tmp_path)
 
 
-def test_a_whole_table_env_ref_with_a_string_default_is_refused_by_the_type_check(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    ("marker", "refusal", "value"),
+    [
+        pytest.param(
+            f'{{ env = "pg_params", default = "{FALLBACK_PROBE}" }}',
+            "'odbc_params' env() default must be a table, got a string",
+            FALLBACK_PROBE,
+            id="a string default",
+        ),
+        pytest.param(
+            '{ env = "pg_params", default = { PORT = 5432 } }',
+            "'odbc_params' env() default entry 'PORT' must be a string, got an integer",
+            "5432",
+            id="a table default with a non-string entry",
+        ),
+    ],
+)
+def test_a_whole_table_env_ref_the_type_check_can_fault_is_refused_there(
+    marker: str, refusal: str, value: str, tmp_path: Path
 ) -> None:
     """The loader's type check (BACKLOG #1809) judges an env ref's inline `default` against the
-    `odbc_params` annotation, a table, so a STRING default is refused before the factory runs. That
-    refusal names the connection; the factory's does not. This arm pins which refusal owns the shape,
-    so a change to either one shows up here rather than as a silent hand-off to the other.
+    `odbc_params` annotation, a table of strings, so each default here is refused before the factory
+    runs. That refusal names the connection; the factory's does not. These arms and the ones above
+    pin which refusal owns which shape, so a change to either shows up here rather than as a silent
+    hand-off to the other.
 
-    The default is the probe, so the last assertion is a live control on value echo."""
-    _write_whole_table_ref(tmp_path, f'{{ env = "pg_params", default = "{_NON_MAPPING_PROBE}" }}')
+    `value` is the offending default as written, so the last assertion is a live control on value
+    echo in each arm."""
+    _write_whole_table_ref(tmp_path, marker)
     with pytest.raises(WiringError) as exc:
         load_config(tmp_path)
     message = str(exc.value)
     assert message.startswith("outbound connection 'OB_PG': invalid 'database' settings")
-    assert "'odbc_params' env() default must be a table, got a string" in message
-    assert _NON_MAPPING_PROBE not in message
+    assert refusal in message
+    assert value not in message
 
 
 #: Every arm carries `_NON_MAPPING_PROBE` somewhere inside it, so the value-echo assertion below is
