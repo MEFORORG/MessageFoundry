@@ -124,9 +124,16 @@ class OrderingMode(str, Enum):  # noqa: UP042
     ``FIFO`` (default): strict in-order per outbound connection — the worker delivers the oldest
     enqueued message and **blocks the head on failure** (a stuck message holds the lane until it
     succeeds, dead-letters, or is purged) so HL7 dependencies (ADT→ORM→ORU) are never reordered.
-    ``UNORDERED``: the legacy throughput mode — claim a batch and rotate past a failing message
-    (a failure backs off and later messages proceed), trading order for parallelism within the
-    connection.
+    ``UNORDERED``: failure isolation, **not** concurrency. It claims a batch and rotates past a
+    backing-off message, so one stuck row does not hold the lane. The lane still sends **one message
+    at a time**, so relaxing ordering does not raise a single connection's throughput. Parallelism
+    comes from running more outbound connections.
+
+    ``UNORDERED`` is read only under ``claim_mode="per_lane"``, where the per-lane delivery worker
+    consults it. Under the shipped default ``claim_mode="pooled"`` the setting is **inert**: the pooled
+    OUTBOUND dispatcher claims one head per lane and never reads the ordering mode, so the lane drains
+    FIFO whatever this says. The member stays for at least two reasons: ADR 0154 D4 requires
+    ``UNORDERED`` on a ``reply_from`` lane, and retiring the mode is an owner decision nobody has made.
     """
 
     FIFO = "fifo"

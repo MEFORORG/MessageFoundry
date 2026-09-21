@@ -5037,6 +5037,13 @@ class RegistryRunner:
                 # FIFO (default): claim only the due head — a backing-off head blocks the lane
                 # (head-of-line), so order is preserved. UNORDERED: claim a batch and rotate past a
                 # backing-off row to drain others. Resolved live so a reload can retune it.
+                # REACHABILITY: this branch is per_lane-mode ONLY. Pooled never runs _delivery_worker
+                # (_spawn_worker returns early with no ordering carve-out), so the ordering mode is not
+                # consulted at all under the shipped default and an UNORDERED lane drains FIFO there.
+                # Neither rotation nor a batch claim ever overlaps sends: both modes send one row at a
+                # time per lane, so UNORDERED buys failure isolation and never intra-lane concurrency
+                # (pinned by tests/test_ordering_unordered_claims.py, whose positive control shows the
+                # concurrency comes from having more lanes).
                 # perf_counter_ns ONLY when the bench lever is on — otherwise a single bool check. A
                 # claim that RAISES is not timed (the worker's outer except logs it and backs off); a
                 # timeout-capped duration would distort the claim-latency figure this measures.
