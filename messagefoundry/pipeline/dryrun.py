@@ -732,7 +732,7 @@ def _inbound_names(registry: Registry) -> str:
     names = sorted(registry.inbound)
     shown = ", ".join(names[:_INBOUND_NAMES_SHOWN])
     hidden = len(names) - _INBOUND_NAMES_SHOWN
-    return f"{shown} (and {hidden} more)" if hidden > 0 else shown
+    return f"{shown} (+{hidden} more)" if hidden > 0 else shown  # checks.py's overflow wording
 
 
 def select_inbound(registry: Registry, name: str | None = None) -> InboundConnection:

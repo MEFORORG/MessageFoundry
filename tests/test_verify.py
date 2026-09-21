@@ -313,11 +313,15 @@ def test_self_smoke_fails_without_a_delivery(
 def test_self_smoke_redacts_a_handler_error_before_it_reaches_a_report(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A Handler's ``raise`` quoting PID-5 and PID-3 must not reach either report file.
+    """A Handler's ``raise`` quoting whole PID-5 and PID-3 fields must not reach either report file.
 
     ``dryrun``, ``dryrun --trace`` and ``check`` already pass ``DryRunResult.error`` through
     ``safe_error`` (BACKLOG #1668). The smoke was the fourth consumer, and it writes report files
     that are made to be pasted into tickets.
+
+    Whole fields only. A single component such as ``msg["PID-3.1"]`` is one token with no HL7
+    delimiter, which is the residual ``messagefoundry/redaction.py`` documents, so it passes through.
+    This test does not claim otherwise.
     """
     # Concatenation, not an f-string, as tests/test_cli.py PHI_RAISER_CONFIG does: the advisory
     # `raise-fstring` check would otherwise flag the probe it exists to model.

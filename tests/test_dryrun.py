@@ -291,7 +291,7 @@ def test_select_inbound_caps_the_names_it_lists() -> None:
     with pytest.raises(AmbiguousInboundError) as ambiguous:
         select_inbound(reg)
     for text in (str(unknown.value), str(ambiguous.value)):
-        assert "IB_19 (and 5 more)" in text, text  # the 20th name, then the count
+        assert "IB_19 (+5 more)" in text, text  # the 20th name, then the count
         assert "IB_20" not in text, text
 
 
