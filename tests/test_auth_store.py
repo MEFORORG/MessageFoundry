@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from pathlib import Path
 
@@ -19,6 +20,10 @@ from tests._directory_identity_store_contract import (
     _assert_the_binding_column_is_unconstrained_and_username_is_not,
     _assert_username_compare_is_byte_exact,
     _assert_username_refresh_contract,
+)
+from tests._federated_unbind_store_contract import (
+    _assert_federated_unbind_contract,
+    _assert_session_binding_guard_contract,
 )
 from tests._lockout_store_contract import _assert_lockout_contract
 
@@ -409,3 +414,179 @@ async def test_the_directory_id_column_upgrade_carries_no_backfill_and_reruns_cl
             assert (await store.get_user("u1")).directory_object_id is None
         finally:
             await store.close()
+
+
+# --- federated unbind (BACKLOG #1474) ------------------------------------------
+
+
+async def test_the_federated_unbind_contract_on_sqlite() -> None:
+    """``clear_user_federated_subject`` on the SQLite backend, against the same shared body the
+    PostgreSQL and SQL Server suites run."""
+    store = await _store()
+    try:
+        await _assert_federated_unbind_contract(store)
+    finally:
+        await store.close()
+
+
+async def test_the_session_binding_guard_contract_on_sqlite() -> None:
+    """``create_session(require_federated_subject=...)`` on the SQLite backend, against the same
+    shared body the PostgreSQL and SQL Server suites run."""
+    store = await _store()
+    try:
+        await _assert_session_binding_guard_contract(store)
+    finally:
+        await store.close()
+
+
+async def test_the_guard_reads_the_binding_while_holding_the_sqlite_writer_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guard's read and its INSERT are ONE hold of the writer lock (BACKLOG #1474).
+
+    The contract body above asserts the DECISION sequentially; this asserts the mechanism that makes
+    the decision worth anything, because ``clear_user_federated_subject`` takes the same lock and so
+    cannot land between the two.
+
+    **The assertion is on the LOCK AT THE MOMENT OF THE READ, and that choice is the whole test.**
+    An earlier version wedged the INSERT and asserted only the end state -- no live session
+    afterwards -- and a review measured it passing against three implementations: the shipped one,
+    one taking the guard's read OUTSIDE the lock, and one ignoring ``require_federated_subject``
+    entirely. It could not fail, because an unbind launched at the INSERT is already too late to
+    interleave under any of them. Reading ``_lock.locked()`` where the guard reads the binding
+    separates those cases: the outside-the-lock variant reports False there, and the no-guard
+    variant never issues the read, so ``read_ran`` stays False.
+
+    An unbind still races alongside, so the end-state invariant is asserted against a real
+    concurrent unbind rather than an empty window.
+    """
+    store = await _store()
+    try:
+        await store.create_user(user_id="u1", username="alice", auth_provider="ad", now=1.0)
+        await store.set_user_federated_subject("u1", "https://idp.example", "S-1-a", now=1.0)
+
+        real_execute = store._db.execute
+        unbind: asyncio.Task[object] | None = None
+        read_ran = False
+        lock_held_at_read: bool | None = None
+
+        async def wedged_execute(sql: str, *args: object, **kwargs: object) -> object:
+            nonlocal unbind, read_ran, lock_held_at_read
+            # The guard's own read. The unbind's read starts "SELECT username," so it cannot match.
+            if sql.startswith("SELECT oidc_issuer, oidc_subject FROM users") and not read_ran:
+                read_ran = True
+                lock_held_at_read = store._lock.locked()
+                unbind = asyncio.create_task(
+                    store.clear_user_federated_subject("u1", now=2.0)  # type: ignore[arg-type]
+                )
+                await asyncio.sleep(0)  # hand the loop over; the lock must keep the unbind out
+            return await real_execute(sql, *args, **kwargs)
+
+        monkeypatch.setattr(store._db, "execute", wedged_execute)
+        issued = await store.create_session(
+            token_hash="t-race",
+            user_id="u1",
+            expires_at=9e9,
+            now=1.5,
+            require_federated_subject=("https://idp.example", "S-1-a"),
+        )
+        monkeypatch.undo()
+        assert read_ran, "create_session never read the binding, so there was no guard to race"
+        assert lock_held_at_read is True, (
+            "the guard read the binding without the writer lock, so an unbind can commit between"
+            " that read and the INSERT and the session it then misses stays live"
+        )
+        assert unbind is not None
+        await unbind
+
+        # THE END-STATE INVARIANT: no live session for this account afterwards. Refused and
+        # written-then-revoked are both correct -- which one you get is a matter of who reached the
+        # lock first. A session still live is the failure, and it is the only one.
+        session = await store.get_session("t-race")
+        assert session is None or session.revoked_at == 2.0, (
+            "the session outlived the unbind that was meant to revoke it"
+        )
+        assert issued is (session is not None)
+        assert await store.list_sessions("u1") == []
+    finally:
+        await store.close()
+
+
+async def test_an_unbind_clears_a_half_row_rather_than_calling_it_nothing_to_remove() -> None:
+    """A row holding ONE of the two federated columns still has something to unbind.
+
+    ``ux_users_federated_subject`` is FILTERED on every backend, so it excludes a half row from
+    uniqueness instead of forbidding one, and no CHECK constraint stands behind it. No shipped code
+    path writes such a row -- ``set_user_federated_subject`` takes ``str`` for both halves -- so the
+    row is CONSTRUCTED here: a case the corpus cannot produce is still a case the store must answer,
+    and the "nothing to clear" short circuit is the one place the answer goes wrong. Reading that
+    short circuit as "either half NULL" strands the residual column with no admin path to remove it.
+    """
+    store = await _store()
+    try:
+        await store.create_user(user_id="u1", username="alice", auth_provider="ad", now=1.0)
+        # Straight to the column, because the typed setter cannot spell a half binding.
+        await store._db.execute("UPDATE users SET oidc_issuer=? WHERE id=?", ("https://idp", "u1"))
+        await store._db.commit()
+        await store.create_session(token_hash="t1", user_id="u1", expires_at=9e9, now=1.0)
+        half = await store.get_user("u1")
+        assert half is not None and (half.oidc_issuer, half.oidc_subject) == ("https://idp", None)
+
+        outcome = await store.clear_user_federated_subject("u1", now=2.0)
+
+        assert outcome is not None
+        assert (outcome.issuer, outcome.subject) == ("https://idp", None)
+        assert outcome.sessions_revoked == 1, "a half row is a binding, so its sessions go with it"
+        after = await store.get_user("u1")
+        assert after is not None
+        assert (after.oidc_issuer, after.oidc_subject) == (None, None), (
+            "the residual issuer survived the unbind, so nothing can ever clear it"
+        )
+    finally:
+        await store.close()
+
+
+async def test_a_failed_revocation_leaves_the_binding_in_place(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The unbind and the revocation commit together or not at all.
+
+    The failure is injected into the SESSIONS statement, the second of the two, so the users UPDATE
+    has already run when it fires. Split into two commits, the pair would be NULL here while every
+    session issued under it stayed live -- the account reporting itself unbound while the old
+    identity's sessions still work. Measured: with the method split that way, this test fails on the
+    first assertion below.
+    """
+    store = await _store()
+    try:
+        await store.create_user(user_id="u1", username="alice", auth_provider="ad", now=1.0)
+        await store.set_user_federated_subject("u1", "https://idp.example", "S-1-a", now=1.0)
+        await store.create_session(token_hash="t1", user_id="u1", expires_at=9e9, now=1.0)
+
+        real_execute = store._db.execute
+
+        def failing_execute(sql: str, *args: object, **kwargs: object) -> object:
+            if sql.startswith("UPDATE sessions"):
+                raise sqlite3.OperationalError("injected: revocation failed")
+            return real_execute(sql, *args, **kwargs)
+
+        monkeypatch.setattr(store._db, "execute", failing_execute)
+        with pytest.raises(sqlite3.OperationalError, match="injected"):
+            await store.clear_user_federated_subject("u1", now=2.0)
+        monkeypatch.undo()
+
+        user = await store.get_user("u1")
+        assert user is not None
+        assert (user.oidc_issuer, user.oidc_subject) == ("https://idp.example", "S-1-a"), (
+            "the pair was cleared although the revocation failed"
+        )
+        assert user.updated_at == 1.0
+        session = await store.get_session("t1")
+        assert session is not None and session.revoked_at is None
+
+        # The writer is clean afterwards: the rollback ran under the lock, so the retry succeeds.
+        retry = await store.clear_user_federated_subject("u1", now=3.0)
+        assert retry is not None and retry.sessions_revoked == 1
+        assert (retry.issuer, retry.subject) == ("https://idp.example", "S-1-a")
+    finally:
+        await store.close()
