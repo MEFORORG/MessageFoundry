@@ -58,6 +58,12 @@ _EXPECTED = {
     "code": "true",
     "ide": "false",
     "tooling": "false",
+    # `packaging-build` reads ONLY `packaging == 'true'` and names merge_group nowhere, so unlike
+    # `serverdb` above this row does decide the job: false here is the job off in the queue. It is
+    # what the residual arm already computed off the empty diff, so pinning it changes no behaviour
+    # -- it puts the arm's newest output under the same guard as the rest, where a later edit to it
+    # cannot go unread.
+    "packaging": "false",
 }
 
 #: Jobs whose own `if:` names merge_group, so they run on a queue entry whatever `changes` emits.
