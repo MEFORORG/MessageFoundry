@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 from pathlib import Path
 
 import pytest
 
+from messagefoundry import corepoint_import
 from messagefoundry.checks import run_checks
 from messagefoundry.corepoint_import import (
     Action,
@@ -556,6 +558,45 @@ def test_malformed_export_raises() -> None:
 def test_import_corepoint_missing_file_raises(tmp_path: Path) -> None:
     with pytest.raises(CorepointImportError):
         import_corepoint(tmp_path / "nope.json", tmp_path / "out")
+
+
+def test_non_utf8_export_raises_corepoint_import_error(tmp_path: Path) -> None:
+    """`UnicodeDecodeError` subclasses `ValueError`, not `OSError` — a non-UTF-8 export must still
+    become the clean `CorepointImportError` the function's docstring promises, not a raw traceback."""
+    export = tmp_path / "export.json"
+    export.write_bytes(b"\xff\xfe not valid utf-8: \x80\x81\xfe")
+    with pytest.raises(CorepointImportError, match=re.escape(str(export))):
+        import_corepoint(export, tmp_path / "out")
+
+
+def test_parse_export_converts_a_recursion_error_from_json_loads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`json.loads` also raises `RecursionError` on deeply nested input, and that is a `RuntimeError`
+    — not a `ValueError` — so the `except json.JSONDecodeError` arm above never sees it.
+
+    Drives :func:`parse_export` directly, not through the CLI: ``_import`` in ``__main__.py`` already
+    catches ``RecursionError`` too, so a CLI-level test would pass for the wrong reason even with this
+    conversion missing from :func:`parse_export` itself — exactly what a library caller other than the
+    CLI would hit.
+
+    Manufactures the ``RecursionError`` rather than nesting real input deeply enough to trigger one:
+    ``json.loads``'s C accelerator does not respect ``sys.getrecursionlimit()``, and the depth where it
+    actually raises is both far larger and measured to vary widely by platform/runner — a sibling case
+    in ``tests/test_sandbox_codec.py`` (``test_recursion_error_is_not_a_value_error``, BACKLOG #1222)
+    recorded a 6x spread between two boxes and a CI runner that never raised at all at 100,000. Real
+    nesting is therefore both unreliable as a test trigger and, at extreme depth, a risk of a native
+    stack overflow rather than a clean Python exception. This test uses that sibling's own technique,
+    adapted: :func:`parse_export`'s ``except`` arm names ``json.JSONDecodeError`` explicitly (the
+    codec's does not), so only ``json.loads`` itself is replaced -- swapping the whole ``json``
+    reference would leave that name unresolvable and fail for an unrelated reason."""
+
+    def _raise_recursion(*_args: object, **_kwargs: object) -> object:
+        raise RecursionError("simulated deep nesting")
+
+    monkeypatch.setattr(corepoint_import.json, "loads", _raise_recursion)
+    with pytest.raises(CorepointImportError, match="nested too deeply"):
+        parse_export('{"channels": []}')
 
 
 # --- the VALIDATED <Package> XML layer (ADR 0086 §2 amendment, BACKLOG #105) -------------------
