@@ -9,6 +9,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import re
 import sqlite3
 from pathlib import Path
@@ -16,6 +17,8 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.__main__ import main
+from messagefoundry.pipeline.alerts import LoggingAlertSink
+from messagefoundry.pipeline.engine import Engine
 from messagefoundry.store import MessageStore
 from messagefoundry.store.crypto import (
     _GCM_MAX_INVOCATIONS,
@@ -26,7 +29,13 @@ from messagefoundry.store.crypto import (
     generate_key,
     make_cipher,
 )
-from messagefoundry.store.store import audit_row_hash, should_record_event
+from messagefoundry.store.store import (
+    AUDIT_PREFIX_BREAK_MARKER,
+    audit_prefix_verdict,
+    audit_row_hash,
+    parse_audit_anchor,
+    should_record_event,
+)
 
 
 @pytest.fixture
@@ -472,28 +481,41 @@ def test_audit_anchor_cli_keeps_exit_0_on_an_empty_log(
 # hash, so it is checked against a quiesced chain, not carried across normal operation.
 
 
-def _seed_audit_rows(db: Path, n: int) -> None:
+async def _aseed_audit_rows(db: Path, n: int) -> None:
     """Write ``n`` audit rows into a fresh store at ``db`` and close it."""
+    s = await MessageStore.open(db)
+    for i in range(n):
+        await s.record_audit(f"act{i}", actor="x")
+    await s.close()
 
-    async def _run() -> None:
-        s = await MessageStore.open(db)
-        for i in range(n):
-            await s.record_audit(f"act{i}", actor="x")
+
+async def _atruncate_audit_tail(db: Path, keep: int) -> None:
+    """Delete every audit row past the first ``keep`` — the attack the chain walk cannot see."""
+    s = await MessageStore.open(db)
+    await s._db.execute("DELETE FROM audit_log WHERE id > ?", (keep,))
+    await s._db.commit()
+    await s.close()
+
+
+async def _aread_anchor(db: Path) -> str:
+    """The ``COUNT:HEAD`` anchor for ``db``, as ``messagefoundry audit-anchor`` would print it."""
+    s = await MessageStore.open(db)
+    try:
+        count, head = await s.audit_anchor()
+    finally:
         await s.close()
+    return f"{count}:{head}"
 
-    asyncio.run(_run())
+
+# The sync wrappers exist for the CLI tests, which are sync because `main()` is. They DELEGATE rather
+# than re-implement: `asyncio.run` cannot be called from inside a running loop, so the async tests
+# below need the coroutine form, and two bodies writing the same fixture rows would drift.
+def _seed_audit_rows(db: Path, n: int) -> None:
+    asyncio.run(_aseed_audit_rows(db, n))
 
 
 def _truncate_audit_tail(db: Path, keep: int) -> None:
-    """Delete every audit row past the first ``keep`` — the attack the chain walk cannot see."""
-
-    async def _run() -> None:
-        s = await MessageStore.open(db)
-        await s._db.execute("DELETE FROM audit_log WHERE id > ?", (keep,))
-        await s._db.commit()
-        await s.close()
-
-    asyncio.run(_run())
+    asyncio.run(_atruncate_audit_tail(db, keep))
 
 
 def test_audit_anchor_cli_prints_count_and_head(
@@ -733,12 +755,10 @@ def test_parse_anchor_passes_an_isolated_module_mac_through() -> None:
     control would have been unusable on the one store mode where the audit chain is keyed with no
     in-heap key. Unit-level because reaching it end-to-end needs a live Transit backend.
     """
-    from messagefoundry.__main__ import _parse_anchor
-
     head = "vault:v1:" + base64.b64encode(b"\x01" * 32).decode("ascii")
     assert not all(c in "0123456789abcdefABCDEF" for c in head)  # the reason this case exists
     # The count/head split must survive the MAC's own internal colons (partition on the FIRST only).
-    assert _parse_anchor(f"7:{head}") == (7, head)
+    assert parse_audit_anchor(f"7:{head}") == (7, head)
 
 
 def test_expected_anchor_and_file_are_mutually_exclusive(tmp_path: Path) -> None:
@@ -1114,3 +1134,292 @@ def test_a_prefix_anchor_is_not_satisfied_by_row_count_alone(tmp_path: Path) -> 
     ok, msg = asyncio.run(_replace_and_verify())
     assert ok is False, "a same-count tail replacement passed the prefix comparator"
     assert msg is not None and "truncated or rewritten" in msg
+
+
+# --- BACKLOG #328 remaining limb: the STARTUP check consumes a stored anchor ---------------------
+#
+# ADR 0185's ordering section ranks this first of the retention levers -- "make the anchor a real
+# operational step first, before any deletion lever ships", because "today nothing holds one".
+# `audit-anchor` printed one and only a human could feed it back; `[integrity].audit_anchor_file` is
+# the engine end of that loop.
+#
+# It feeds `expected_prefix`, NOT `expected_anchor`. The exact seal compares the CURRENT head, so a
+# running engine -- which writes audit rows -- would alarm on essentially every restart; the prefix
+# comparator asks the survivable question instead (see `audit_prefix_verdict`).
+
+
+class _AnchorRecordingSink(LoggingAlertSink):
+    """Records the `integrity_drift` SUBJECT, not merely that one fired.
+
+    The subject is what separates a truncated tail from a chain break downstream: it is the
+    `AlertRule.connection` match key AND the re-alert throttle key, so collapsing the two would let
+    whichever fired first silence the other for a cooldown.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str, int]] = []
+
+    def integrity_drift(self, name: str, *, reason: str, drift_count: int) -> None:
+        self.events.append((name, reason, drift_count))
+
+
+class _EngineLogCapture:
+    """Collect `messagefoundry.pipeline.engine` records with their args already interpolated.
+
+    Not `caplog`: these assertions are about the *rendered* operator-facing sentence, and the
+    engine logs with %-args, so a raw `record.msg` check would pass on a line that renders wrong.
+    """
+
+    def __init__(self) -> None:
+        self.records: list[str] = []
+        self._handler = logging.Handler()
+        self._handler.emit = self._emit  # type: ignore[method-assign]
+        self._logger = logging.getLogger("messagefoundry.pipeline.engine")
+
+    def _emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record.getMessage())
+
+    def __enter__(self) -> _EngineLogCapture:
+        self._logger.addHandler(self._handler)
+        self._logger.setLevel(logging.INFO)
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._logger.removeHandler(self._handler)
+
+    @property
+    def text(self) -> str:
+        return "\n".join(self.records)
+
+
+async def _verify_on_start(
+    db: Path, anchor_file: Path | None
+) -> tuple[_AnchorRecordingSink, _EngineLogCapture]:
+    """Run ONLY the startup audit check against `db`, returning the sink and the log lines.
+
+    The method rather than `start()`: `start()` also brings up recovery, the coordinator and the
+    graph, none of which this behaviour depends on. The `start()`-level gating is pinned separately.
+    """
+    store = await MessageStore.open(db)
+    sink = _AnchorRecordingSink()
+    eng = Engine(
+        store,
+        alert_sink=sink,
+        audit_verify_on_start=True,
+        audit_anchor_file=str(anchor_file) if anchor_file is not None else None,
+    )
+    cap = _EngineLogCapture()
+    try:
+        with cap:
+            await eng._verify_audit_chain_on_start()
+    finally:
+        await store.close()
+    return sink, cap
+
+
+def test_prefix_break_marker_appears_in_a_real_prefix_failure() -> None:
+    """The marker the engine classifies on must be what the comparator actually emits.
+
+    `verify_audit_chain` folds a chain break and a prefix failure into one `(ok, message)` pair and
+    returns on the break FIRST, so a caller holding only `ok=False` cannot say which fired. The engine
+    separates them by substring. That seam is weak by nature -- this test is what stops it rotting
+    unobserved, by failing the day the message is reworded rather than the day an operator gets a
+    truncation filed as a chain break.
+    """
+    ok, msg = audit_prefix_verdict((3, "a" * 64), None, 2)
+    assert ok is False
+    assert msg is not None and AUDIT_PREFIX_BREAK_MARKER in msg
+    # And it must NOT match the other verdict, or the discriminator calls everything a truncation.
+    assert AUDIT_PREFIX_BREAK_MARKER not in "audit chain broken at row id=4"
+
+
+async def test_startup_anchor_passes_when_the_log_only_grew(tmp_path: Path) -> None:
+    """The case that makes the key usable at all: anchor, keep running, restart.
+
+    The exact seal fails here BY DESIGN (`test_an_anchor_goes_stale_on_the_next_appended_row`), which
+    is exactly why this limb had to wait for the prefix comparator.
+    """
+    db = tmp_path / "grew.db"
+    await _aseed_audit_rows(db, 3)
+    anchor = await _aread_anchor(db)
+    await _aseed_audit_rows(db, 2)  # the engine kept writing audit rows, as a running engine does
+
+    anchor_file = tmp_path / "anchor.txt"
+    anchor_file.write_text(anchor, encoding="utf-8")
+    sink, cap = await _verify_on_start(db, anchor_file)
+
+    assert sink.events == [], f"a grown-but-intact chain alarmed: {sink.events}"
+    # The verdict line must say what it COVERED, or an anchored pass and a bare one read identically.
+    assert "anchored against" in cap.text, cap.records
+    assert "verified 5 audit row(s)" in cap.text
+
+
+async def test_startup_anchor_alerts_on_a_truncated_tail(tmp_path: Path) -> None:
+    """The whole point of the row: the walk alone reports CLEAN once the newest rows are cut."""
+    db = tmp_path / "cut.db"
+    await _aseed_audit_rows(db, 5)
+    anchor = await _aread_anchor(db)
+    await _atruncate_audit_tail(db, keep=2)
+
+    # Half (a): pin the blindness this closes -- a BARE startup walk sees nothing wrong.
+    bare_sink, bare_cap = await _verify_on_start(db, None)
+    assert bare_sink.events == [], "the bare walk detected a truncated tail; the gap has moved"
+    assert "truncated tail would" in bare_cap.text, bare_cap.records
+
+    # Half (b): the same store, the same walk, with the anchor -- now it fires.
+    anchor_file = tmp_path / "anchor.txt"
+    anchor_file.write_text(anchor, encoding="utf-8")
+    sink, cap = await _verify_on_start(db, anchor_file)
+
+    assert len(sink.events) == 1, sink.events
+    subject, reason, count = sink.events[0]
+    assert count == 1
+    assert "truncated or rewritten" in reason
+    # DISTINGUISHABLE from a chain break, which is the constraint this limb was given. The subject is
+    # the routing + throttle key, so sharing one is not "distinguishable in the reason text".
+    assert subject == "audit-chain-truncated"
+    assert "TRUNCATED OR REWRITTEN TAIL" in cap.text, cap.records
+
+
+async def test_startup_chain_break_keeps_its_own_alert_subject(tmp_path: Path) -> None:
+    """The other half of the pair: an edited row must NOT be filed as a truncation.
+
+    Guards the discriminator in the direction a substring test fails silently -- over-matching turns
+    every chain break into a truncation, and both still produce an alert, so nothing else notices.
+    """
+    db = tmp_path / "broken.db"
+    await _aseed_audit_rows(db, 4)
+    anchor = await _aread_anchor(db)
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE audit_log SET actor='HACKED' WHERE id=2")
+        conn.commit()
+
+    anchor_file = tmp_path / "anchor.txt"
+    anchor_file.write_text(anchor, encoding="utf-8")
+    sink, cap = await _verify_on_start(db, anchor_file)
+
+    assert len(sink.events) == 1, sink.events
+    subject, reason, _ = sink.events[0]
+    assert subject == "audit-chain", "a chain break was filed under the truncation subject"
+    assert "broken at row id=2" in reason
+    assert "chain break" in cap.text, cap.records
+
+
+async def test_startup_anchor_absent_file_warns_and_never_blocks(tmp_path: Path) -> None:
+    """ALERT-ONLY on a config fault: warn, fall back to the bare walk, fire NO tamper alert.
+
+    Routing a missing file to `integrity_drift` would manufacture a tamper alarm out of input
+    handling, and an alarm that fires on a typo is one operators learn to ignore -- the same reason
+    `parse_audit_anchor` refuses a short head rather than reporting it as tampering.
+    """
+    db = tmp_path / "absent.db"
+    await _aseed_audit_rows(db, 3)
+
+    sink, cap = await _verify_on_start(db, tmp_path / "not-there.txt")
+
+    assert sink.events == [], "a missing anchor file fired the tamper alert"
+    assert "could not be read" in cap.text, cap.records
+    # The operator must be told the coverage they did NOT get, in the same breath.
+    assert "BARE WALK" in cap.text
+    # And the walk itself still ran and passed -- the chain is checked as far as it can be.
+    assert "verified 3 audit row(s)" in cap.text
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "",  # an empty or truncated file
+        "not-an-anchor",  # no ':' separator
+        "3:" + "a" * 12,  # the FAIL-message display truncation, pasted back
+        "-1:" + "a" * 64,  # a negative count
+        "3:zzzz",  # neither hex nor an isolated-module MAC
+    ],
+    ids=["empty", "no-separator", "display-truncated-head", "negative-count", "not-a-digest"],
+)
+async def test_startup_anchor_malformed_warns_and_never_blocks(
+    tmp_path: Path, content: str
+) -> None:
+    """Every malformed shape degrades to the bare walk with a WARNING -- none crashes, none alarms."""
+    db = tmp_path / "malformed.db"
+    await _aseed_audit_rows(db, 3)
+    anchor_file = tmp_path / "anchor.txt"
+    anchor_file.write_text(content, encoding="utf-8")
+
+    sink, cap = await _verify_on_start(db, anchor_file)
+
+    assert sink.events == [], f"a malformed anchor ({content!r}) fired the tamper alert"
+    assert "does not hold a usable anchor" in cap.text, cap.records
+    assert "malformed audit anchor" in cap.text  # the parser's own reason reaches the operator
+    assert "verified 3 audit row(s)" in cap.text
+
+
+async def test_startup_anchor_reads_a_utf16_file_without_crashing(tmp_path: Path) -> None:
+    """PowerShell 5.1's `>` writes UTF-16LE, and this ships as a Windows service.
+
+    `UnicodeDecodeError` subclasses `ValueError`, not `OSError`, so catching only the latter would let
+    it escape `_load_audit_anchor` as an unhandled traceback out of `Engine.start()` -- turning an
+    encoding mistake into a refusal to boot, on a path whose entire contract is alert-only.
+    """
+    db = tmp_path / "utf16.db"
+    await _aseed_audit_rows(db, 3)
+    anchor_file = tmp_path / "anchor.txt"
+    anchor_file.write_text(await _aread_anchor(db), encoding="utf-16")
+
+    sink, cap = await _verify_on_start(db, anchor_file)
+
+    assert sink.events == []
+    assert "could not be read" in cap.text, cap.records
+
+
+async def test_startup_anchor_accepts_a_utf8_bom(tmp_path: Path) -> None:
+    """`Set-Content -Encoding utf8` on PowerShell 5.1 writes a BOM, and that is the documented way to
+    make this file on Windows. It must anchor, not degrade to a bare walk."""
+    db = tmp_path / "bom.db"
+    await _aseed_audit_rows(db, 3)
+    anchor_file = tmp_path / "anchor.txt"
+    anchor_file.write_text(await _aread_anchor(db), encoding="utf-8-sig")
+
+    sink, cap = await _verify_on_start(db, anchor_file)
+
+    assert sink.events == []
+    assert "anchored against" in cap.text, cap.records
+
+
+async def test_anchor_file_without_verify_on_start_is_reported(tmp_path: Path) -> None:
+    """A configured anchor behind a disarmed check is a control that exists only on paper.
+
+    The operator did the work of holding a witness and gets none of the detection, and nothing else
+    anywhere reports it -- so `start()` says so, naming the key that arms it.
+    """
+    db = tmp_path / "disarmed.db"
+    await _aseed_audit_rows(db, 2)
+    anchor_file = tmp_path / "anchor.txt"
+    anchor_file.write_text(await _aread_anchor(db), encoding="utf-8")
+
+    store = await MessageStore.open(db)
+    eng = Engine(store, audit_verify_on_start=False, audit_anchor_file=str(anchor_file))
+    cap = _EngineLogCapture()
+    try:
+        with cap:
+            await eng.start()
+    finally:
+        await eng.stop()
+        await store.close()
+
+    assert "audit_anchor_file is set" in cap.text, cap.records
+    assert "audit_verify_on_start" in cap.text  # it names the key that arms it
+    # It must NOT have walked: the whole point is that the check is off.
+    assert "verified" not in cap.text
+
+
+async def test_no_anchor_configured_is_byte_identical_to_today(tmp_path: Path) -> None:
+    """The default must not change behaviour: no anchor => the bare walk, and no talk of a file."""
+    db = tmp_path / "default.db"
+    await _aseed_audit_rows(db, 2)
+
+    sink, cap = await _verify_on_start(db, None)
+
+    assert sink.events == []
+    assert "verified 2 audit row(s)" in cap.text
+    assert "[integrity].audit_anchor_file %s" not in cap.text
+    assert "could not be read" not in cap.text
