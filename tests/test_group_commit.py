@@ -4,8 +4,11 @@
 
 Exercises the acceptance criteria with group-commit ENABLED (``group_commit_window_ms > 0``):
 
-* **AC-1** — a group rollback re-runs EVERY member (a failure mid-batch rejects every member's future;
-  no member is silently dropped or partially applied).
+* **AC-1** — a failing member is contained to its own ``SAVEPOINT``: its write is rolled back and its
+  own future is rejected (so it re-runs), while every co-batched sibling still commits. A WHOLE-batch
+  rollback — for example the commit failing, the committer being cancelled, or a member's savepoint
+  unwind failing — still rejects every member's future, because nothing is durable there. Amended
+  2026-09-16 (BACKLOG #1632); before that a single poisoned member rejected the whole batch.
 * **AC-2** — ``claim_next_fifo`` never groups: the ``attempts+1`` poison-guard commits standalone,
   *before* the post-claim work, and never shares the post-claim batch's rollback fate (so a poisoned
   message increments ``attempts`` durably even when later work rolls back — no infinite loop / FIFO
@@ -26,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -60,24 +64,52 @@ async def _claim_ingress(store: MessageStore, channel: str):
     return await store.claim_next_fifo(channel, stage=Stage.INGRESS.value)
 
 
-# --- AC-1: a group rollback re-runs EVERY member (no member dropped, no partial apply) ----------
+# --- AC-1: a poisoned member is contained; its co-batched siblings still commit ------------------
+#
+# AMENDED 2026-09-16 (BACKLOG #1632, ADR 0055 AC-1). The committer used to roll the WHOLE batch back
+# when any member raised, so one poisoned message rejected every message that happened to arrive in
+# its coalescing window. Each innocent sibling then took its lane's error backoff and logged a stack
+# trace for a failure that was not its own, and re-ran work that had already succeeded. Each member
+# now runs inside its own SAVEPOINT, so a failure is undone on that savepoint alone.
+#
+# The whole-batch rollback still exists and still rejects everyone:
+# `test_commit_failure_still_rejects_every_member` below covers the commit-failure arm across several
+# members, `test_unwind_failure_rejects_every_member_and_keeps_each_cause` the failed-unwind arm, and
+# `tests/test_backlog1548_writer_txn_cancel_unwind.py::test_group_commit_writer_unwinds`
+# covers the cancellation arm (it parks the writer inside the flush to land the cancel deterministically).
 
 
-async def test_group_rollback_reruns_all(tmp_path: Path) -> None:
-    """A failure in ONE member of a batch rolls the WHOLE batch back: every member's future is
-    rejected (so each caller re-runs — nothing is silently dropped), and NO member's write is left
-    partially applied. Driven directly against the committer so the batch membership is deterministic:
-    three members enrolled together, the middle one raises mid-batch."""
+def _batch_size_spy(gc: _GroupCommitter) -> list[int]:
+    """Record the member count of each flush, so a co-batching claim is a receipt and not a hope.
+
+    Without this a test that expected three members in one batch would pass just as happily on three
+    batches of one, where there is no sibling to poison and nothing under test."""
+    sizes: list[int] = []
+    real_flush = gc._flush
+
+    async def spy() -> None:
+        sizes.append(min(len(gc._pending), gc._max_batch))
+        await real_flush()
+
+    gc._flush = spy  # type: ignore[method-assign]
+    return sizes
+
+
+async def test_poisoned_member_does_not_reject_its_siblings(tmp_path: Path) -> None:
+    """A failure in ONE member rolls back ONLY that member: its own future is rejected with its own
+    cause (so it re-runs), its write is gone, and both co-batched siblings commit and resolve. Driven
+    directly against the committer so the batch membership is deterministic: three members enrolled
+    together, the middle one raises AFTER writing its marker row."""
     s = await MessageStore.open(tmp_path / "ac1.db", group_commit_window_ms=GC_WINDOW_MS)
     try:
         gc = s._group_commit
         assert gc is not None
+        sizes = _batch_size_spy(gc)
 
-        # Three members share one open transaction. Each writes a distinct marker row into a scratch
-        # table; the middle one raises AFTER writing, so the whole batch must roll back and leave the
-        # table empty — proving member 1's already-issued write is NOT partially applied.
         await s._db.execute("CREATE TABLE gc_marker (n INTEGER)")
         await s._db.commit()
+
+        published: list[int] = []
 
         async def write(n: int, *, boom: bool) -> int:
             await s._db.execute("INSERT INTO gc_marker (n) VALUES (?)", (n,))
@@ -87,41 +119,45 @@ async def test_group_rollback_reruns_all(tmp_path: Path) -> None:
 
         # Enrol all three into the SAME batch (gather → they queue before the committer drains).
         results = await asyncio.gather(
-            gc.submit(lambda: write(1, boom=False)),
-            gc.submit(lambda: write(2, boom=True)),
-            gc.submit(lambda: write(3, boom=False)),
+            gc.submit(lambda: write(1, boom=False), on_commit=published.append),
+            gc.submit(lambda: write(2, boom=True), on_commit=published.append),
+            gc.submit(lambda: write(3, boom=False), on_commit=published.append),
             return_exceptions=True,
         )
 
-        # EVERY member's future was rejected — none silently succeeded/dropped.
-        assert all(isinstance(r, Exception) for r in results), results
-        # The failing member sees its OWN cause; the innocent siblings see a coordinated rollback.
+        assert 3 in sizes, f"the three members did not share one batch: flush sizes {sizes}"
+
+        # The failing member alone is rejected, and with its OWN cause — never a sibling's rollback.
         assert isinstance(results[1], RuntimeError) and "member 2 failed" in str(results[1])
-        assert isinstance(results[0], RuntimeError) and isinstance(results[2], RuntimeError)
-        assert "rolled back" in str(results[0]) and "rolled back" in str(results[2])
+        assert "rolled back" not in str(results[1])
+        # Its innocent siblings COMMITTED and resolved with their own values.
+        assert results[0] == 1 and results[2] == 3
 
-        # NO partial apply: member 1's INSERT was rolled back with the rest — the table is empty.
-        cur = await s._db.execute("SELECT COUNT(*) AS n FROM gc_marker")
-        assert (await cur.fetchone())["n"] == 0
+        # The poisoned member's INSERT is gone (ROLLBACK TO its savepoint); the siblings' rows stand.
+        cur = await s._db.execute("SELECT n FROM gc_marker ORDER BY n")
+        assert [r["n"] for r in await cur.fetchall()] == [1, 3]
 
-        # And each rejected caller can RE-RUN to success (the re-run the rejection licenses). Re-submit
-        # the two innocent members (and a fixed member 2) — this clean batch commits.
-        again = await asyncio.gather(
-            gc.submit(lambda: write(1, boom=False)),
-            gc.submit(lambda: write(2, boom=False)),
-            gc.submit(lambda: write(3, boom=False)),
-        )
-        assert sorted(again) == [1, 2, 3]
+        # AC-4 holds per member: on_commit ran for the survivors, never for the rolled-back member.
+        assert sorted(published) == [1, 3]
+
+        # And the rejected caller can RE-RUN to success — the re-run its rejection licenses.
+        assert await gc.submit(lambda: write(2, boom=False)) == 2
         cur = await s._db.execute("SELECT n FROM gc_marker ORDER BY n")
         assert [r["n"] for r in await cur.fetchall()] == [1, 2, 3]
     finally:
         await s.close()
 
 
-async def test_group_rollback_reruns_all_via_store_api(store: MessageStore) -> None:
-    """The same property through the public store API: a real grouped handoff that raises mid-batch
-    rejects its co-batched siblings too, none of their writes land, and a clean re-run then succeeds —
-    so no received message is silently dropped by a sibling's failure."""
+async def test_poisoned_member_does_not_reject_its_siblings_via_store_api(
+    store: MessageStore,
+) -> None:
+    """The same property through the public store API: one real grouped handoff raises mid-batch, and
+    the two messages sharing its coalescing window still route. Only the poisoned message is held back
+    — recoverable, and re-running it then routes it too."""
+    gc = store._group_commit
+    assert gc is not None
+    sizes = _batch_size_spy(gc)
+
     # Three ingress messages, each claimed, ready to route_handoff.
     mids = [await store.enqueue_ingress(channel_id="IB", raw=RAW) for _ in range(3)]
     items = [await _claim_ingress(store, "IB") for _ in mids]
@@ -151,34 +187,175 @@ async def test_group_rollback_reruns_all_via_store_api(store: MessageStore) -> N
         *(do_handoff(m, it) for m, it in zip(mids, items)),  # noqa: B905
         return_exceptions=True,  # noqa: B905
     )
-    # Every co-batched caller was rejected (rolled back together) — not just the failing one.
-    assert all(isinstance(r, Exception) for r in results), results
+    assert 3 in sizes, f"the three handoffs did not share one batch: flush sizes {sizes}"
 
-    # NO partial apply: zero routed rows leaked for ANY of the three, and every ingress row is still
-    # inflight (recoverable), so nothing was silently dropped.
+    # Only the poisoned message's caller was rejected; its two siblings routed.
+    assert results[0] is True and results[2] is True
+    assert isinstance(results[1], RuntimeError) and "middle message" in str(results[1])
+
+    # Exactly the two healthy messages produced routed rows, and they are ROUTED.
     cur = await store._db.execute(
-        "SELECT COUNT(*) AS n FROM queue WHERE stage=?", (Stage.ROUTED.value,)
+        "SELECT message_id FROM queue WHERE stage=? ORDER BY message_id", (Stage.ROUTED.value,)
     )
-    assert (await cur.fetchone())["n"] == 0
-    for mid in mids:
-        assert (await store.get_message(mid))["status"] == MessageStatus.RECEIVED.value
+    assert sorted(r["message_id"] for r in await cur.fetchall()) == sorted([mids[0], mids[2]])
+    assert (await store.get_message(mids[0]))["status"] == MessageStatus.ROUTED.value
+    assert (await store.get_message(mids[2]))["status"] == MessageStatus.ROUTED.value
 
-    # Recover the inflight ingress rows and re-run cleanly — all three now route (re-run re-derives).
+    # The poisoned one produced nothing, is still RECEIVED, and its ingress row is still inflight —
+    # held for recovery, never silently dropped (count-and-log intact).
+    assert (await store.get_message(mids[1]))["status"] == MessageStatus.RECEIVED.value
+    cur = await store._db.execute("SELECT status FROM queue WHERE id=?", (items[1].id,))  # type: ignore[union-attr]
+    assert (await cur.fetchone())["status"] == OutboxStatus.INFLIGHT.value
+
+    # Recover just that row and re-run cleanly — it routes (the re-run its rejection licenses), and no
+    # sibling had to be re-run to get there.
     armed["boom"] = False
     store._event = real_event  # type: ignore[method-assign]
-    assert await store.reset_stale_inflight(stage=Stage.INGRESS.value) == 3
-    for mid in mids:  # noqa: B007
-        item = await _claim_ingress(store, "IB")
-        assert item is not None
-        assert await store.route_handoff(
-            ingress_id=item.id,
-            message_id=item.message_id,
-            channel_id="IB",
-            handlers=[("h", RAW)],
-            disposition=MessageStatus.ROUTED,
-        )
+    assert await store.reset_stale_inflight(stage=Stage.INGRESS.value) == 1
+    item = await _claim_ingress(store, "IB")
+    assert item is not None and item.message_id == mids[1]
+    assert await store.route_handoff(
+        ingress_id=item.id,
+        message_id=item.message_id,
+        channel_id="IB",
+        handlers=[("h", RAW)],
+        disposition=MessageStatus.ROUTED,
+    )
     for mid in mids:
         assert (await store.get_message(mid))["status"] == MessageStatus.ROUTED.value
+
+
+async def test_commit_failure_still_rejects_every_member(tmp_path: Path) -> None:
+    """The arm savepoint containment does NOT change: if the batch's ``COMMIT`` fails, NOTHING is
+    durable, so EVERY member's future is still rejected and every caller re-runs. Rejecting only a
+    'failing' member here would strand the rest — on this path no member failed at all.
+
+    Three healthy members, one injected commit failure. (The cancellation arm of the same rule is
+    ``tests/test_backlog1548_writer_txn_cancel_unwind.py::test_group_commit_writer_unwinds``, which
+    parks the writer inside the flush to land the cancel deterministically.)"""
+    s = await MessageStore.open(tmp_path / "commitfail.db", group_commit_window_ms=GC_WINDOW_MS)
+    try:
+        gc = s._group_commit
+        assert gc is not None
+        sizes = _batch_size_spy(gc)
+        await s._db.execute("CREATE TABLE gc_marker (n INTEGER)")
+        await s._db.commit()
+
+        real_commit = s._db.commit
+        armed = {"boom": True}
+
+        async def failing_commit() -> None:
+            if armed["boom"]:
+                armed["boom"] = False  # one shot: the store must still be closable afterwards
+                raise RuntimeError("injected COMMIT failure")
+            await real_commit()
+
+        async def write(n: int) -> int:
+            await s._db.execute("INSERT INTO gc_marker (n) VALUES (?)", (n,))
+            return n
+
+        s._db.commit = failing_commit  # type: ignore[method-assign]
+        results = await asyncio.gather(
+            *(gc.submit(lambda n=n: write(n)) for n in range(3)), return_exceptions=True
+        )
+        s._db.commit = real_commit  # type: ignore[method-assign]
+
+        assert 3 in sizes, f"the three members did not share one batch: flush sizes {sizes}"
+        # Every member rejected, each carrying the commit failure — none resolved with a value.
+        assert all(isinstance(r, RuntimeError) for r in results), results
+        assert all("injected COMMIT failure" in str(r) for r in results), results
+        # And nothing landed: the whole batch really did roll back.
+        cur = await s._db.execute("SELECT COUNT(*) AS n FROM gc_marker")
+        assert (await cur.fetchone())["n"] == 0
+    finally:
+        await s.close()
+
+
+async def test_unwind_failure_rejects_every_member_and_keeps_each_cause(tmp_path: Path) -> None:
+    """The poison arm: if a failing member's ``ROLLBACK TO`` itself fails, the batch cannot be trusted
+    to hold only the healthy members, so EVERY member is rejected and nothing lands. The failing
+    member still gets the error IT raised, not the poison signal: it never returns an outcome, so
+    without the member carried on :class:`_GroupPoisoned` its caller would lose its own cause."""
+    s = await MessageStore.open(tmp_path / "unwindfail.db", group_commit_window_ms=GC_WINDOW_MS)
+    try:
+        gc = s._group_commit
+        assert gc is not None
+        sizes = _batch_size_spy(gc)
+        await s._db.execute("CREATE TABLE gc_marker (n INTEGER)")
+        await s._db.commit()
+
+        real_execute = s._db.execute
+        armed = {"boom": True}
+
+        def failing_execute(sql: str, *args: Any) -> Any:
+            if armed["boom"] and sql.startswith("ROLLBACK TO"):
+                armed["boom"] = False  # one shot: the store must still be usable afterwards
+                raise RuntimeError("injected ROLLBACK TO failure")
+            return real_execute(sql, *args)
+
+        async def write(n: int, *, boom: bool) -> int:
+            await s._db.execute("INSERT INTO gc_marker (n) VALUES (?)", (n,))
+            if boom:
+                raise ValueError(f"member {n} failed mid-batch")
+            return n
+
+        s._db.execute = failing_execute  # type: ignore[method-assign]
+        try:
+            results = await asyncio.gather(
+                gc.submit(lambda: write(1, boom=False)),
+                gc.submit(lambda: write(2, boom=True)),
+                gc.submit(lambda: write(3, boom=False)),
+                return_exceptions=True,
+            )
+        finally:
+            s._db.execute = real_execute  # type: ignore[method-assign]
+
+        assert 3 in sizes, f"the three members did not share one batch: flush sizes {sizes}"
+        assert not armed["boom"], "the ROLLBACK TO failure was never injected"
+        # The failing member gets its OWN error back; its siblings get the poison.
+        assert isinstance(results[1], ValueError) and "member 2 failed" in str(results[1])
+        for sibling in (results[0], results[2]):
+            assert isinstance(sibling, Exception) and "savepoint unwind failed" in str(sibling)
+        # Nothing landed: the whole batch went back through _writer_txn's rollback.
+        cur = await s._db.execute("SELECT COUNT(*) AS n FROM gc_marker")
+        assert (await cur.fetchone())["n"] == 0
+        # And the writer is healthy afterwards: the next batch commits.
+        assert await gc.submit(lambda: write(4, boom=False)) == 4
+    finally:
+        await s.close()
+
+
+async def test_two_failing_members_in_one_batch_are_each_contained(tmp_path: Path) -> None:
+    """The committer reuses ONE savepoint name for every member, which is safe only if a failed
+    member's ``ROLLBACK TO`` plus ``RELEASE`` leaves the stack empty for the next. Two failures in one
+    batch exercise that reuse: each is undone alone, and the healthy members between them commit."""
+    s = await MessageStore.open(tmp_path / "twofail.db", group_commit_window_ms=GC_WINDOW_MS)
+    try:
+        gc = s._group_commit
+        assert gc is not None
+        sizes = _batch_size_spy(gc)
+        await s._db.execute("CREATE TABLE gc_marker (n INTEGER)")
+        await s._db.commit()
+
+        async def write(n: int, *, boom: bool) -> int:
+            await s._db.execute("INSERT INTO gc_marker (n) VALUES (?)", (n,))
+            if boom:
+                raise RuntimeError(f"member {n} failed mid-batch")
+            return n
+
+        results = await asyncio.gather(
+            *(gc.submit(lambda n=n: write(n, boom=n % 2 == 1)) for n in range(4)),
+            return_exceptions=True,
+        )
+
+        assert 4 in sizes, f"the four members did not share one batch: flush sizes {sizes}"
+        assert results[0] == 0 and results[2] == 2
+        for n in (1, 3):
+            assert isinstance(results[n], RuntimeError) and f"member {n} failed" in str(results[n])
+        cur = await s._db.execute("SELECT n FROM gc_marker ORDER BY n")
+        assert [r["n"] for r in await cur.fetchall()] == [0, 2]
+    finally:
+        await s.close()
 
 
 # --- AC-2: claim_next_fifo poison-guard commits standalone, never shares the batch's rollback ----

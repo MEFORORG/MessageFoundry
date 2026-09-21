@@ -73,6 +73,9 @@ __all__ = [
     "disposition_for",
     "dry_run",
     "select_inbound",
+    "AmbiguousInboundError",
+    "NoInboundError",
+    "UnknownInboundError",
     "read_messages",
     "read_message_sets",
     "split_messages",
@@ -707,18 +710,55 @@ class DryRunResult:
     error: str | None = None
 
 
+class NoInboundError(ValueError):
+    """:func:`select_inbound` found no inbound connection at all, so there is nothing to simulate."""
+
+
+class UnknownInboundError(ValueError):
+    """:func:`select_inbound` was given a name the config does not declare (a typo, or a rename)."""
+
+
+class AmbiguousInboundError(ValueError):
+    """:func:`select_inbound` found several inbound connections and was not told which to use."""
+
+
+#: How many inbound names a selection error lists before it counts the rest. At the ADR 0052 scale
+#: target a full list runs to tens of KB, printed on one console line and in one report cell.
+_INBOUND_NAMES_SHOWN = 20
+
+
+def _inbound_names(registry: Registry) -> str:
+    """The config's inbound names for a selection error: sorted, capped, and the rest counted."""
+    names = sorted(registry.inbound)
+    shown = ", ".join(names[:_INBOUND_NAMES_SHOWN])
+    hidden = len(names) - _INBOUND_NAMES_SHOWN
+    return f"{shown} (+{hidden} more)" if hidden > 0 else shown  # checks.py's overflow wording
+
+
 def select_inbound(registry: Registry, name: str | None = None) -> InboundConnection:
-    """Pick which inbound connection (Router) to simulate; defaults to the sole one."""
+    """Pick which inbound connection (Router) to simulate; defaults to the sole one.
+
+    **Three failures, three types (BACKLOG #1707),** so a caller can tell an operator's open choice
+    (:class:`AmbiguousInboundError`) from a defect (:class:`UnknownInboundError`,
+    :class:`NoInboundError`). Each is a ``ValueError``, so a caller catching that still works.
+
+    The empty check runs first, even when a name is given: the missing name is a symptom there, and
+    the empty config is the cause. ``load_config`` already refuses a config with no connection at
+    all (BACKLOG #1648), but an outbound-only config still loads, so at least that shape reaches
+    here."""
+    if not registry.inbound:
+        raise NoInboundError("config loaded no inbound connection, so there is nothing to simulate")
     if name is not None:
         try:
             return registry.inbound[name]
         except KeyError:
-            raise ValueError(f"no such inbound connection: {name!r}") from None
+            raise UnknownInboundError(
+                f"no such inbound connection: {name!r}; the config has: {_inbound_names(registry)}"
+            ) from None
     if len(registry.inbound) == 1:
         return next(iter(registry.inbound.values()))
-    raise ValueError(
-        "config has multiple inbound connections; choose one: "
-        + ", ".join(sorted(registry.inbound))
+    raise AmbiguousInboundError(
+        f"config has multiple inbound connections; choose one: {_inbound_names(registry)}"
     )
 
 

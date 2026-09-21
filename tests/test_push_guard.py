@@ -9,13 +9,19 @@ because it rots (``.github/required-contexts.txt`` is the checked-in claim, and 
 the claim files ``tests/test_required_contexts.py`` scans for exactly that). Those checks gate
 MERGING a pull request, not the push these tests exercise.
 
-``enforce_admins`` was ON from 2026-07-28 but is OFF again as of 2026-07-29 -- the documented escape
-hatch in the hook's own HISTORY note -- so for an admin protection does not apply to a direct push at
-all, and this hook is the ONLY thing refusing it, exactly as when it was first written. An earlier
-revision of this docstring called it "defence-in-depth"; that rested on the same false premise the
-hook's own deny message carried, that the server would refuse the push anyway. It covers
-``cla-signatures`` either way, which branch protection does not. The realistic trigger is unchanged:
-one click on VS Code's Sync button while the current branch happens to be ``main``.
+``enforce_admins`` DECIDES WHETHER THE SERVER REFUSES AN ADMIN'S DIRECT PUSH TOO, AND ITS VALUE IS
+DELIBERATELY NOT WRITTEN HERE. It is a server setting, it has moved more than once, and this docstring
+carried it WRONG IN BOTH DIRECTIONS: first asserting the server would refuse the push anyway while the
+setting was off -- the same false premise the hook's own deny message carried, which is why that
+string stopped restating it -- and then asserting it was off after it had been switched back. Read it
+when it matters instead of transcribing it:
+
+    gh api repos/MEFORORG/MessageFoundry/branches/main/protection/enforce_admins
+
+WHAT THESE TESTS ASSERT IS TRUE UNDER EITHER VALUE, which is why none of them reads that setting: the
+hook refuses the push locally, fast, with an explanation, before any round trip. It also covers
+``cla-signatures``, which branch protection does not cover either way. The realistic trigger is
+unchanged: one click on VS Code's Sync button while the current branch happens to be ``main``.
 
 THREE GUARDS, THREE QUESTIONS, and the sections below follow that split. PROTECTED asks WHERE a push
 lands. Guard A (``PUSHABLE_NAMESPACES``) asks WHICH REFS it offers -- the ``--mirror`` shape. Guard B
