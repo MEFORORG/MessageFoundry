@@ -117,6 +117,7 @@ __all__ = [
     "DrActivationMode",
     "ServiceSettings",
     "load_settings",
+    "settings_error_detail",
 ]
 
 #: Known config sections (used to parse ``MEFOR_<SECTION>_<KEY>`` env vars).
@@ -152,6 +153,10 @@ _SECTIONS = (
 )
 _ENV_PREFIX = "MEFOR_"
 _DEFAULT_FILE = "messagefoundry.toml"
+
+#: How many failing fields :func:`settings_error_detail` names before it counts the rest. A bad
+#: section can fail every key in it, and an unbounded list is unreadable in a one-line CLI error.
+_ERROR_DETAIL_ROWS = 5
 
 _log = logging.getLogger(__name__)
 
@@ -5379,6 +5384,85 @@ def security_loosenings(
                 )
             )
     return out
+
+
+def settings_error_detail(exc: Exception) -> str:
+    """Render a :func:`load_settings` failure WITHOUT echoing any configured value.
+
+    WHY ``str(exc)`` IS NOT SAFE HERE. ``str(ValidationError)`` carries ``input_value=`` for every
+    failing field, and for an ``after``-mode model validator that value is the whole section's input
+    mapping. The secrets in ``_FILE_SECRET_KEYS`` come from the environment
+    (``MEFOR_STORE_PASSWORD`` and siblings) and are in that mapping, so one missing ``[store].server``
+    renders the store password into whatever the caller does with the string -- stdout, a pasted
+    ticket, a PowerShell ``throw`` in a transcript. Field path plus message, never ``input`` and never
+    ``ctx``, is enough for an operator to find the key and carries no configured value at all.
+
+    A LONG VALUE IS NOT SAFER: pydantic abbreviates a long ``input_value`` repr from the middle, so a
+    32-character password loses its head and discloses its tail.
+
+    THIS IS THE RENDERER TO REACH FOR, AND AT LEAST FIFTEEN CALLERS STILL DO NOT REACH FOR IT.
+    "At least", and never an enumeration, for two reasons this paragraph has already been wrong about
+    once each.
+
+    FIRST, THE NUMBER IS A MEASUREMENT AND NOT AN INVARIANT. Nothing gates a new ``except`` arm, so
+    the next one lands without touching this paragraph; PR 1141 was open with one in it while this
+    was being written. Re-measure before you quote it.
+
+    SECOND, AND THIS IS THE ONE THAT BIT: THE INSTRUMENT DECIDES THE ANSWER, so read what it asked.
+    This paragraph used to say SEVEN arms, then SIX, then FIVE, each from an AST walk for a literal
+    ``str(<bound>)`` in the handler. That walk is BLIND TO AN F-STRING, and most of these sites use
+    one. Re-run over ``messagefoundry/__main__.py`` at ``19c98e023`` asking instead whether the bound
+    exception reaches ANY string rendering -- ``str()``, an f-string, ``%`` or ``.format`` -- of the
+    20 ``except`` arms naming ``ValidationError``, **16** render it, not five. The narrow instrument
+    was not measuring a smaller problem; it was measuring a smaller part of the same one. The earlier
+    counts are kept above as what they were: readings, from a tool that answered an adjacent question.
+
+    SO NO LIST HERE IS THE POPULATION. #1523 fixed ``_cluster_vip``; this change fixed ``_ai_policy``
+    (and this paragraph said those five were what remained, under the narrow walk, until the broad
+    one was run). ``ai-policy`` is also the only one RUN and confirmed to disclose a planted
+    ``MEFOR_STORE_PASSWORD``, first here and now pinned by ``tests/test_cli_ai_policy.py``; every
+    other site was read, not run, so what follows counts ARMS, not confirmed disclosures.
+
+    WHERE TO START, IF YOU ARE THE ONE DOING THE SWEEP, because the arms are not equally bad and a
+    count flattens them. ``_serve`` (``__main__.py`` around line 1495) and ``_supervise`` are the
+    two that matter most: both render a boot-time ``load_settings`` failure with
+    ``print(f"error: {exc}", file=sys.stderr)``, and the engine runs as a Windows service under NSSM,
+    which captures that stream to a file (docs/SERVICE.md). On first deployment a ``[store]`` that
+    fails validation would therefore write ``MEFOR_STORE_PASSWORD`` into a persisted service log, on
+    every start attempt, with no operator present to see it -- and support-bundle assembly collects
+    logs. ``ai-policy`` reached one IDE bridge read; that one reaches a file that keeps it. A third
+    group -- ``_security`` and ``_alert`` -- validates JSON the operator just typed at a named path,
+    where echoing the input back is arguably the point; do not sweep those without deciding that
+    question separately.
+
+    ``_emit_error`` IS NOT THE CHOKEPOINT, and the shape of the sweep depends on knowing that. It
+    takes an already-rendered ``str``, not an exception, so it cannot call this function without a
+    signature change; many of its 56 call sites pass hand-authored or deliberately value-carrying
+    text that must NOT be re-rendered (the JSON-echo group above is the clearest kind); and half the
+    arms above never touch it, printing straight to stderr through their own emitter. The shape that
+    DOES work is already written, in ``messagefoundry/verify/runner.py``'s ``_load_settings``: a
+    wrapper returning ``(settings, detail)`` so each caller keeps its own emitter, stream and exit
+    code. That one renders safely and is still missing ``OSError``, so it is a third site holding
+    half the fix. The sweep is NOT part of #1523 or of this change, and is stated rather than done,
+    so nobody reads this docstring as covering it.
+    """
+    from pydantic import ValidationError
+
+    if isinstance(exc, ValidationError):
+        errors = exc.errors(include_url=False)
+        rows = [
+            f"{'.'.join(str(part) for part in err['loc']) or '<root>'}: {err['msg']}"
+            for err in errors[:_ERROR_DETAIL_ROWS]
+        ]
+        extra = (
+            ""
+            if len(errors) <= _ERROR_DETAIL_ROWS
+            else f" (+{len(errors) - _ERROR_DETAIL_ROWS} more)"
+        )
+        return "; ".join(rows) + extra
+    # Our own model validators raise plain ValueError with hand-authored text naming the key, and
+    # FileNotFoundError/OSError carry a path. Neither reflects a configured value back.
+    return str(exc)
 
 
 def load_settings(

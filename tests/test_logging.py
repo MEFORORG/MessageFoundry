@@ -11,7 +11,8 @@ import re
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from functools import lru_cache
 from types import SimpleNamespace
 from typing import Any
 
@@ -34,6 +35,7 @@ from messagefoundry.logging_setup import (
     configure_logging,
     configure_stderr_logging,
 )
+from messagefoundry.redaction import clamp_untrusted, redact
 
 #: Synthetic HL7 (never real PHI) embedded in a log record so a redaction assertion has something to
 #: find. HL7-shaped, so ``redact`` rewrites the span rather than passing it through.
@@ -267,6 +269,160 @@ def test_redaction_filter_residual_bare_name_not_caught() -> None:
     )
     out = _format_with_redaction(rec)
     assert "DOE^JANE" in out  # accepted residual: a single-delimiter bare name passes through
+
+
+# --- BACKLOG #1576: the filter bounds its input before it scans ---------------
+#
+# A ``logging.Filter`` is synchronous by the stdlib's contract, so this one runs on whatever thread
+# emitted the record -- for the engine, the asyncio event loop. It had no ceiling at all, and its
+# input is a whole rendered traceback whose length a remote peer chooses: an MLLP negative
+# acknowledgment's MSA-3 runs to the 16 MiB frame cap. Measured unbounded, 0.29 s (segment-shaped) to
+# 0.78 s (prose) of loop time per record.
+
+#: A rendered-traceback-sized hostile message. Repeated identifier-bearing HL7 rather than one solid
+#: run: a solid run has no whitespace, so the clamp drops it whole and an absence assertion would pass
+#: for the wrong reason.
+#:
+#: **The ``\\r`` is not decoration, it is what makes the fixture cost anything.** ``_HL7_SEGMENT``
+#: matches ``[^\\r\\n]*``, to end of LINE, so a unit with no line break makes the whole 8 MiB one
+#: match and the scan finishes in 36 ms -- under the budget below, which left the control arm unable
+#: to fail. Real HL7 is line-broken; so is this.
+_HOSTILE_UNIT = "PID|1||Z9998887^^^H^MR||DOE^JANE^Q||19800101|F patient DOE JANE failed\r"
+
+#: Sized to the MLLP frame cap, because that is the length a peer can actually choose.
+_HOSTILE_CHARS = 16 * 1024 * 1024
+
+#: The line the two arms below share, sitting between the bounded and unbounded costs: a ceiling with
+#: a separate floor beneath it would open a band where a half-fix cleared both.
+#:
+#: **It equals ``tests/test_redaction.py::_SCAN_BUDGET_SECONDS`` and nothing enforces that**, so this
+#: says only that the two were derived the same way, not that they are coupled. Stating a coupling the
+#: code does not hold is how the next person re-derives one number and leaves the other behind
+#: believing it followed.
+_FILTER_BUDGET_SECONDS = 0.05
+
+
+@lru_cache(maxsize=1)
+def _hostile_text() -> str:
+    """Cached: five call sites, and each build allocates about 33 MiB and costs about 8 ms. The value
+    is immutable and a pure function of two module constants, so one build serves them all."""
+    return (_HOSTILE_UNIT * (_HOSTILE_CHARS // len(_HOSTILE_UNIT) + 1))[:_HOSTILE_CHARS]
+
+
+def _best_of(work: Callable[[], object], reps: int = 3) -> float:
+    """Best-of-``reps`` seconds. The MINIMUM is the noise-free estimate -- a scheduling hiccup can
+    inflate a sample but never deflate one, so a loaded runner cannot fake a red."""
+    best = float("inf")
+    for _ in range(reps):
+        start = time.perf_counter()
+        work()
+        best = min(best, time.perf_counter() - start)
+    return best
+
+
+def test_the_filter_bounds_a_peer_sized_message() -> None:
+    hostile = _hostile_text()
+
+    def run() -> None:
+        rec = logging.LogRecord("t", logging.ERROR, __file__, 1, "%s", (hostile,), None)
+        RedactionFilter().filter(rec)
+
+    elapsed = _best_of(run)
+    assert elapsed < _FILTER_BUDGET_SECONDS, (
+        f"redacting a {len(hostile)}-character record cost {elapsed:.4f}s of the event loop against "
+        f"a {_FILTER_BUDGET_SECONDS}s budget"
+    )
+
+
+def test_control_the_same_record_is_expensive_unbounded() -> None:
+    """Non-vacuity for the arm above: without it, a fast filter would be equally consistent with a
+    fixture too cheap to measure anything. ``redact`` alone is what the filter did before the bound."""
+    hostile = _hostile_text()
+    elapsed = _best_of(lambda: redact(hostile))
+    assert elapsed > _FILTER_BUDGET_SECONDS, (
+        f"the unbounded scan cost only {elapsed:.4f}s, inside the {_FILTER_BUDGET_SECONDS}s budget "
+        f"the bounded arm clears -- this fixture no longer discriminates"
+    )
+
+
+#: What the WHOLE filter may cost on a frame-cap traceback, as opposed to what the SCAN may cost.
+#:
+#: **The two are different questions and this arm used to ask the wrong one** (SDS-3.8). Rendering the
+#: exception is ``Formatter.formatException``, which joins a 16 MiB message into a traceback string
+#: before any pattern here sees it, and that is a linear string copy the bound cannot reach. Measured
+#: on one box: render 58.6 ms, clamp 0.1 ms, scan 0.9 ms — against a 255.5 ms scan before the bound.
+#: So the fix takes the filter from about 314 ms to about 60 ms, and what is left is the render.
+#:
+#: The unbounded RENDER is a real residual and it is named in ``RedactionFilter``'s docstring rather
+#: than hidden inside a loose budget here. This number is set to catch a regression in the scan while
+#: tolerating the render, and the scan is asserted separately below at its own budget.
+_TRACEBACK_BUDGET_SECONDS = 0.20
+
+
+def test_the_filter_bounds_a_peer_sized_traceback() -> None:
+    """The realistic vector, and the one the row calls the worst of the three surfaces: a Handler
+    raises carrying the received body and an outer ``log.exception`` renders the whole thing."""
+    try:
+        raise ValueError(f"cannot transform {_hostile_text()}")
+    except ValueError:
+        rec = logging.LogRecord(
+            "t", logging.ERROR, __file__, 1, "transform worker failed", (), sys.exc_info()
+        )
+        rendered = logging.Formatter().formatException(sys.exc_info())
+
+    elapsed = _best_of(lambda: RedactionFilter().filter(rec), reps=1)
+    assert elapsed < _TRACEBACK_BUDGET_SECONDS
+
+    # The part the bound is actually responsible for, measured apart from the render it cannot reach.
+    scan = _best_of(lambda: redact(clamp_untrusted(rendered)))
+    assert scan < _FILTER_BUDGET_SECONDS, (
+        f"the bounded scan of a rendered traceback cost {scan:.4f}s against a "
+        f"{_FILTER_BUDGET_SECONDS}s budget"
+    )
+
+    assert rec.exc_text is not None
+    assert len(rec.exc_text) < 1_000_000  # bounded, not the 8 MiB that was raised
+    for identifier in ("Z9998887", "DOE^JANE^Q", "19800101", "DOE JANE"):
+        assert identifier not in rec.exc_text
+    # Head-first is the right end for a traceback: Python renders the frames before the exception
+    # message, so the bound drops the peer-sized payload and keeps what an operator reads.
+    assert "Traceback (most recent call last)" in rec.exc_text
+    assert "test_logging.py" in rec.exc_text
+
+
+def test_a_bounded_record_says_so_rather_than_ending_mid_sentence() -> None:
+    """A silent truncation is a worse diagnostic than a loud one: an operator reading a cut traceback
+    needs to know it was cut, or they debug the absence of a frame that was really there."""
+    rec = logging.LogRecord("t", logging.ERROR, __file__, 1, "%s", (_hostile_text(),), None)
+    RedactionFilter().filter(rec)
+    assert "[redaction bound:" in rec.getMessage()
+
+
+def test_two_handlers_scrub_one_oversized_record_to_the_same_text() -> None:
+    """``_install_phi_filters`` attaches a chain per handler, so a record going to stdout AND the
+    off-box forwarder is filtered twice. A bound that re-cut on the second pass would ship the two
+    sinks different text."""
+    rec = logging.LogRecord("t", logging.ERROR, __file__, 1, "%s", (_hostile_text(),), None)
+    RedactionFilter().filter(rec)
+    after_one = rec.getMessage()
+    RedactionFilter().filter(rec)
+    assert rec.getMessage() == after_one
+
+
+def test_control_the_bound_costs_an_ordinary_record_nothing() -> None:
+    """THE CONTROL. Every arm above asserts that something is absent or fast, and a filter that
+    dropped every record would satisfy all of them. An ordinary record must come through unchanged,
+    and an ordinary PHI-bearing one must still be scrubbed."""
+    rec = logging.LogRecord(
+        "t", logging.INFO, __file__, 1, "connection %s stopped", ("OB_ACME",), None
+    )
+    RedactionFilter().filter(rec)
+    assert rec.getMessage() == "connection OB_ACME stopped"
+
+    phi = logging.LogRecord("t", logging.WARNING, __file__, 1, "bad: %s", (_PHI_RAW,), None)
+    out = _format_with_redaction(phi)
+    assert "DOE" not in out and "Z9998887" not in out
+    assert "[redacted]" in out and "[redaction bound:" not in out
 
 
 # --- BACKLOG #335: the control-char scrub covers exc_text / stack_info -------

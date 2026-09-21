@@ -817,12 +817,21 @@ async def test_edit_stale_stepup_redirects_get_and_post_to_edit_form(engine: Eng
     # With an expired step-up window BOTH the GET editor and the body-carrying POST bounce to
     # /ui/reauth pointing at the /edit FORM page — never at the POST path (a re-POST across re-auth
     # would drop the edited body). No child is minted from the bounced request.
-    service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=-1))
+    # require_mfa=False takes the MFA leg out of require_ui_step_up, so the stale window below is
+    # what redirects; without it this unenrolled session is refused first with the SAME 303 and the
+    # same Location, and the window measured nothing (BACKLOG #1851). Reasoning, and the third
+    # new-IP leg that stays unpinned: the docstring of
+    # test_purge_stale_stepup_redirects_to_reauth (BACKLOG #1700).
+    service = AuthService(engine.store, AuthSettings(require_mfa=False, step_up_max_age_seconds=-1))
     await service.initialize()
     await _add(service, "op", Role.OPERATOR)
     mid = await _seed(engine)
     async with _client(engine, service) as c:
-        await _cookie_login(c, "op")
+        await _cookie_login(c, "op")  # negative window -> the fresh login is already stale
+        tok = c.cookies.get("mf_session")
+        assert tok is not None
+        assert await service.mfa_satisfied(tok) is True  # the MFA leg is NOT what refuses here
+        assert await service.has_recent_step_up(tok) is False  # the stale window is
         r = await c.get(f"/ui/messages/{mid}/edit")
         assert r.status_code == 303
         assert r.headers["location"] == f"/ui/reauth?next=/ui/messages/{mid}/edit"
@@ -2829,9 +2838,17 @@ async def test_stale_stepup_redirects_body_post_to_unlock_form(engine: Engine) -
     # THE reauth_next mapping: with an expired step-up window, the body-carrying POST /ui/users is
     # redirected to /ui/reauth pointing at its FORM PAGE (/ui/users/new) — never at the POST path —
     # and the form GET itself bounces the same way (its own path IS the unlock target).
-    service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=-1))
+    # require_mfa=False takes the MFA leg out of require_ui_step_up, so the stale window below is
+    # what redirects; without it _boss_client's unenrolled session is refused first with the SAME
+    # 303 and the window measured nothing (BACKLOG #1851). Reasoning, and the third new-IP leg that
+    # stays unpinned: the docstring of test_purge_stale_stepup_redirects_to_reauth (BACKLOG #1700).
+    service = AuthService(engine.store, AuthSettings(require_mfa=False, step_up_max_age_seconds=-1))
     await service.initialize()
     async with _boss_client(engine, service) as c:
+        tok = c.cookies.get("mf_session")
+        assert tok is not None
+        assert await service.mfa_satisfied(tok) is True  # the MFA leg is NOT what refuses here
+        assert await service.has_recent_step_up(tok) is False  # the stale window is
         r = await c.post(
             "/ui/users",
             data={"username": "x", "password": PW},
@@ -3321,10 +3338,18 @@ async def test_ad_group_map_asymmetric_rows_never_cross_bind(engine: Engine) -> 
 async def test_stale_stepup_bounces_body_less_action_via_reauth(engine: Engine) -> None:
     # A body-less auto-retry action under a stale window 303s to /ui/reauth carrying ITS OWN path
     # (no reauth_next mapping) — and nothing is deleted until the retry actually runs.
-    service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=-1))
+    # require_mfa=False takes the MFA leg out of the gate, so the stale window below is what
+    # redirects; without it _boss_client's unenrolled session is refused first with the SAME 303 and
+    # the window measures nothing (BACKLOG #1850). Reasoning, and the third new-IP leg that stays
+    # unpinned: the docstring of test_purge_stale_stepup_redirects_to_reauth (BACKLOG #1700).
+    service = AuthService(engine.store, AuthSettings(require_mfa=False, step_up_max_age_seconds=-1))
     await service.initialize()
     await _add(service, "u9", Role.VIEWER)
     async with _boss_client(engine, service) as c:
+        tok = c.cookies.get("mf_session")
+        assert tok is not None
+        assert await service.mfa_satisfied(tok) is True  # the MFA leg is NOT what refuses here
+        assert await service.has_recent_step_up(tok) is False  # the stale window is
         uid = await _uid(service, "u9")
         r = await c.post(f"/ui/users/{uid}/delete", headers={"Sec-Fetch-Site": "same-origin"})
         assert r.status_code == 303
@@ -3335,19 +3360,28 @@ async def test_stale_stepup_bounces_body_less_action_via_reauth(engine: Engine) 
 async def test_stale_stepup_bounces_all_unlock_form_pages(engine: Engine) -> None:
     # Every unlock FORM page is step-up-gated: a stale window 303s each to /ui/reauth with its own
     # path as next (a regression to plain require_ui would silently drop the step-up gate).
-    service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=-1))
+    # require_mfa=False takes the MFA leg out of the gate, so the stale window below is what
+    # redirects; without it _boss_client's unenrolled session is refused first with the SAME 303 and
+    # the window measures nothing (BACKLOG #1850). Reasoning, and the third new-IP leg that stays
+    # unpinned: the docstring of test_purge_stale_stepup_redirects_to_reauth (BACKLOG #1700).
+    service = AuthService(engine.store, AuthSettings(require_mfa=False, step_up_max_age_seconds=-1))
     await service.initialize()
     await _add(service, "u9", Role.VIEWER)
     async with _boss_client(engine, service) as c:
+        tok = c.cookies.get("mf_session")
+        assert tok is not None
+        assert await service.mfa_satisfied(tok) is True  # the MFA leg is NOT what refuses here
+        assert await service.has_recent_step_up(tok) is False  # the stale window is
         uid = await _uid(service, "u9")
         for path in (f"/ui/users/{uid}", "/ui/roles/new", "/ui/ad-groups"):
             r = await c.get(path)
             assert r.status_code == 303, path
             assert r.headers["location"] == f"/ui/reauth?next={path}", path
-        # The custom-role edit form too (its role id is percent-encoded in the redirect).
+        # The custom-role edit form too. Pin the percent-encoding the comment used to only claim:
+        # _reauth_redirect quotes with safe="/", so the role id's colon rides as %3A.
         r = await c.get("/ui/roles/custom:x/edit")
         assert r.status_code == 303
-        assert r.headers["location"].startswith("/ui/reauth?next=")
+        assert r.headers["location"] == "/ui/reauth?next=/ui/roles/custom%3Ax/edit"
 
 
 async def test_users_read_only_role_cannot_reach_admin_writes(engine: Engine) -> None:
@@ -3752,16 +3786,57 @@ async def test_mfa_confirm_form_is_unlock_reentry(engine: Engine) -> None:
 
 
 async def test_stale_reauth_only_bounces_to_reauth(engine: Engine) -> None:
-    # require_ui_reauth_only under a stale window: enroll (body-less) carries its own path; the
-    # body-carrying verify maps to its unlock confirm form via reauth_next.
+    # require_ui_reauth_only_action under a stale window: enroll (body-less) carries its own path;
+    # the body-carrying verify maps to its unlock confirm form via reauth_next.
+    #
+    # NOT the require_mfa=False shape of the step-up twins (BACKLOG #1850), and the _action suffix
+    # in that factory name is the load-bearing part. Its base passes allow_mfa_pending=True
+    # precisely so an un-enrolled account can reach the route that enrolls it -- there is no MFA leg
+    # to take out, and require_mfa=False would pin nothing here. Under ADR 0077 the gate reads
+    # has_action_step_up, never has_recent_step_up, so the negative window is load-bearing only
+    # through the GRANT's TTL, which _grant_action_step_up sets to now + step_up_max_age_seconds.
+    # So each lane below is driven TWICE (BACKLOG #1851): an ungranted arm, which bounces under
+    # every window and therefore measures the window not at all, and a minted arm, which bounces
+    # only because the negative window expired the grant on its way out of the mint.
     service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=-1))
     await service.initialize()
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
+        # Arm 1, ungranted and window-independent, kept when the minted arm was added. The ENROLL
+        # half of it is driven independently by test_require_mfa_unenrolled_can_enroll_end_to_end
+        # under a DEFAULT window -- which is also the proof that the -1 above changed nothing here
+        # before arm 2 existed. The VERIFY half is why this arm stays: every other verify POST in
+        # this file mints a grant first, to get past this very refusal. That is a census of the
+        # file, not a proof about the suite, so re-measure before deleting the arm.
         r = await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
         assert r.status_code == 303
         assert r.headers["location"] == "/ui/reauth?next=/ui/account/mfa/enroll"
+        # Arm 2: a grant IS minted, and the negative window has already expired it. Not read back
+        # with has_action_step_up -- that read POPS the grant (single-use), so checking it here
+        # would consume what the route must find and the gate would go untested. The re-auth
+        # response is the non-destructive evidence instead: 200 plus the auto-submit form for a
+        # body-less auto_retry action, 303 to the target for an unlock one. BOTH halves are
+        # asserted, because a WRONG password also answers 200 -- pages.reauth carrying an error.
+        minted = await _mint_action(c, "/ui/account/mfa/enroll")
+        assert minted.status_code == 200
+        assert 'action="/ui/account/mfa/enroll"' in minted.text
+        r = await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
+        assert r.status_code == 303
+        assert r.headers["location"] == "/ui/reauth?next=/ui/account/mfa/enroll"
+        # The verify lane, both arms again. Its grant binds to the REGISTERED confirm action, never
+        # to the body-carrying verify path -- deliberately not a continuation, so /ui/reauth would
+        # mint nothing for it. That is the same mapping reauth_next applies to the refusal.
+        r = await c.post(
+            "/ui/account/mfa/verify",
+            data={"code": "123456"},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 303
+        assert r.headers["location"] == "/ui/reauth?next=/ui/account/mfa/confirm"
+        minted = await _mint_action(c, "/ui/account/mfa/confirm")
+        assert minted.status_code == 303
+        assert minted.headers["location"] == "/ui/account/mfa/confirm"
         r = await c.post(
             "/ui/account/mfa/verify",
             data={"code": "123456"},
@@ -4540,6 +4615,19 @@ async def test_webauthn_rp_fail_closed_legible(engine: Engine) -> None:
     # AC-7: public_origin unset + request-derivation disallowed (the declared-proxy topology) —
     # ceremonies fail closed with the shared notice on every surface, never a redirect loop.
     pytest.importorskip("webauthn")
+    # BACKLOG #1361: PINNED AGAINST THE RELOCATION MAP, NOT A REMEMBERED LITERAL. `[api].public_origin`
+    # is the INTERNAL field this code reads; ADR 0118 relocated the OPERATOR-FACING key and
+    # `_reject_relocated_keys` REFUSES the old spelling as file or env input, so a notice naming it
+    # hands the operator a remediation that dies at load. Asserting some literal here would pass just
+    # as well after the next relocation moved the key again -- the notice and the loader would drift
+    # apart silently, which is the defect the pin exists to stop. Same shape, and the same reasoning,
+    # as tests/test_api_tls.py::test_the_refusal_names_a_key_the_loader_actually_accepts.
+    from messagefoundry.config.settings import _RELOCATED_TO_SECURITY
+
+    # The SECTION is part of the remediation: "[api].web_console_public_address" is the right key in a
+    # section the loader still refuses, and a bare-key assertion would pass on it. So pin the spelling an
+    # operator can actually paste into messagefoundry.toml.
+    expected_key = f"[security].{_RELOCATED_TO_SECURITY[('api', 'public_origin')]}"
     service = await _service(engine)
     await _add(service, "boss", Role.ADMINISTRATOR)
     transport = httpx.ASGITransport(
@@ -4548,10 +4636,14 @@ async def test_webauthn_rp_fail_closed_legible(engine: Engine) -> None:
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         await _cookie_login(c, "boss")
         r = await c.get("/ui/account")
-        assert "public_origin is not set" in r.text
+        assert expected_key in r.text
+        # The OLD spelling must be ABSENT, so a revert reds HERE -- on the rendered page a user
+        # actually reads -- and not only in the #1361 static census.
+        assert "[api].public_origin" not in r.text
         await _mint_action(c, "/ui/account/webauthn/enroll")  # 7.5.1: enroll is action-bound
         r = await c.post("/ui/account/webauthn/enroll", headers=_SFS)
-        assert r.status_code == 409 and "public_origin is not set" in r.text
+        assert r.status_code == 409 and expected_key in r.text
+        assert "[api].public_origin" not in r.text
         r = await c.post("/ui/reauth/webauthn", json={"response": {}}, headers=_SFS)
         assert r.status_code == 409 and r.json()["error"] == "rp_unavailable"
 
@@ -5238,6 +5330,14 @@ async def test_sessions_posts_reject_cross_site(engine: Engine) -> None:
 async def test_revoke_one_stale_bounces_to_reauth(engine: Engine) -> None:
     # A stale window 303s the terminate POST to /ui/reauth carrying its OWN path as next, and
     # nothing is revoked until the retry actually runs (the registration makes the continuation work).
+    #
+    # NOT the require_mfa=False shape of the step-up twins (BACKLOG #1850): this route rides
+    # require_ui_reauth_only_action, whose base passes allow_mfa_pending=True, so there is no MFA leg
+    # to take out and require_mfa=False would pin nothing. Under ADR 0077 the gate reads
+    # has_action_step_up -- never has_recent_step_up -- so the negative window is load-bearing only
+    # through the GRANT minted below, which _grant_action_step_up deadlines at
+    # now + step_up_max_age_seconds, i.e. already expired. The mint is the CONTROL, not setup: drop
+    # it and the POST bounces for want of ANY grant, which it does under any window (BACKLOG #1851).
     service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=-1))
     await service.initialize()
     await _add(service, "op", Role.OPERATOR)
@@ -5246,16 +5346,28 @@ async def test_revoke_one_stale_bounces_to_reauth(engine: Engine) -> None:
         await _cookie_login(c, "op")
         op_id = await _uid(service, "op")
         other_id = hash_token(other.token or "")
-        r = await c.post(
-            f"/ui/account/sessions/{other_id}/revoke", headers={"Sec-Fetch-Site": "same-origin"}
-        )
+        path = f"/ui/account/sessions/{other_id}/revoke"
+        # No ungranted arm here, deliberately: test_sessions_revoke_one already asserts that
+        # refusal under a DEFAULT window, which is also the proof that the -1 above changed nothing
+        # before this mint existed. Do not re-add a grant-less POST. Why the grant is evidenced by
+        # the re-auth response rather than read back, and why both halves are checked:
+        # test_stale_reauth_only_bounces_to_reauth.
+        minted = await _mint_action(c, path)
+        assert minted.status_code == 200
+        assert f'action="{path}"' in minted.text
+        r = await c.post(path, headers={"Sec-Fetch-Site": "same-origin"})
+        # The LOCATION carries the property: a SUCCESSFUL revoke also answers 303, to
+        # /ui/account/sessions?m=revoked, so the status alone would not say the gate refused.
         assert r.status_code == 303
-        assert r.headers["location"] == f"/ui/reauth?next=/ui/account/sessions/{other_id}/revoke"
+        assert r.headers["location"] == f"/ui/reauth?next={path}"
         remaining = {s.token_hash for s in await service.store.list_sessions(op_id)}
         assert other_id in remaining  # nothing revoked yet
 
 
 async def test_revoke_others_stale_bounces_to_reauth(engine: Engine) -> None:
+    # The revoke-others twin of the per-session test above, and the same correction applies: the
+    # negative window bites through the ADR 0077 GRANT's TTL, not through has_recent_step_up, so the
+    # _mint_action below is what puts the window under test (BACKLOG #1851). Reasoning: that twin.
     service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=-1))
     await service.initialize()
     await _add(service, "op", Role.OPERATOR)
@@ -5263,11 +5375,16 @@ async def test_revoke_others_stale_bounces_to_reauth(engine: Engine) -> None:
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
         op_id = await _uid(service, "op")
-        r = await c.post(
-            "/ui/account/sessions/revoke-others", headers={"Sec-Fetch-Site": "same-origin"}
-        )
+        path = "/ui/account/sessions/revoke-others"
+        # Ungranted arm: test_sessions_revoke_others, under a default window. See the twin above.
+        minted = await _mint_action(c, path)
+        assert minted.status_code == 200
+        assert f'action="{path}"' in minted.text
+        r = await c.post(path, headers={"Sec-Fetch-Site": "same-origin"})
+        # The LOCATION, again: a SUCCESSFUL revoke-others also answers 303, to
+        # /ui/account/sessions?m=signed_out_others.
         assert r.status_code == 303
-        assert r.headers["location"] == "/ui/reauth?next=/ui/account/sessions/revoke-others"
+        assert r.headers["location"] == f"/ui/reauth?next={path}"
         assert len(await service.store.list_sessions(op_id)) == 2  # both still present
 
 
@@ -6009,15 +6126,25 @@ async def test_purge_confirm_lists_only_quiesced_and_validates_scope(
 
 
 async def test_purge_confirm_stale_stepup_redirects_to_reauth(engine: Engine) -> None:
-    service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=0))
+    # require_mfa=False takes the MFA leg out of the gate, so the stale window below is what
+    # redirects; without it this unenrolled fixture session is refused first with the SAME 303 and
+    # the window measured nothing (BACKLOG #1850). Reasoning, and the third new-IP leg that stays
+    # unpinned: the docstring of test_purge_stale_stepup_redirects_to_reauth (BACKLOG #1700).
+    # -1 replaces a 0 that sat exactly on has_recent_step_up's `elapsed <= max_age` boundary.
+    service = AuthService(engine.store, AuthSettings(require_mfa=False, step_up_max_age_seconds=-1))
     await service.initialize()
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
-        await _cookie_login(c, "op")  # step-up window is zero-length -> immediately stale
+        await _cookie_login(c, "op")  # negative window -> the fresh login is already stale
+        tok = c.cookies.get("mf_session")
+        assert tok is not None
+        assert await service.mfa_satisfied(tok) is True  # the MFA leg is NOT what refuses here
+        assert await service.has_recent_step_up(tok) is False  # the stale window is
         r = await c.get("/ui/connections/purge-confirm", params={"scope": "all", "dest": "out1"})
         assert r.status_code == 303
-        loc = r.headers["location"]
-        assert loc.startswith("/ui/reauth") and "purge-confirm" in loc  # unlock re-auth, not a 403
+        # The EXACT continuation: this GET passes no reauth_next, so _reauth_redirect falls back to
+        # quote(request.url.path), which drops scope/dest -- the operator re-picks after re-auth.
+        assert r.headers["location"] == "/ui/reauth?next=/ui/connections/purge-confirm"
 
 
 async def test_purge_bulk_per_dest_409_unknown_and_scope(engine: Engine, tmp_path: Path) -> None:
