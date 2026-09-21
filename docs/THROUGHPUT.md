@@ -140,12 +140,17 @@ connections, not fewer ordering guarantees, is what adds parallelism.
 ## 3. Ordering: what the two modes give you
 
 Ordering is a failure-handling choice, not a speed choice. Both modes send one message at a time per
-destination. What they differ on is what happens when a message gets stuck:
+destination. What they differ on is what happens when a message gets stuck.
+
+This is a property of the outbound connection, not of the payload. The engine's delivery path never
+reads the message format, so the same two rows hold for HL7, X12, DICOM, FHIR, JSON and database
+records alike. What changes between formats is only whether your feed can tolerate out-of-order
+delivery, never what the mode costs or buys:
 
 | Mode | Guarantee | Throughput | Use when |
 |---|---|---|---|
 | **Strict FIFO** *(default)* | Messages delivered in exactly the order received. A failing message holds the lane until it succeeds, dead-letters, or is purged. | Bounded — one message in flight per destination (serial). | Order matters: ADT streams, anything where a later message corrects an earlier one. |
-| **Unordered** | No ordering guarantee. A backing-off message is passed over so the rest of the batch drains. Read only under `claim_mode="per_lane"`; inert under the default `pooled`, where the lane drains FIFO regardless. | The same as FIFO. Still one message in flight per destination, so relaxing ordering does not make a connection faster. | Essentially never for an HL7 feed. It buys failure isolation, not speed. One built feature does require it: an HTTP `reply_from` lane, which rejects FIFO (ADR 0154 D4). |
+| **Unordered** | No ordering guarantee. A backing-off message is passed over so the rest of the batch drains. Read only under `claim_mode="per_lane"`; inert under the default `pooled`, where the lane drains FIFO regardless. | The same as FIFO. Still one message in flight per destination, so relaxing ordering does not make a connection faster. | Rarely, and never for speed. It fits a feed whose messages do not depend on one another: standalone results, logging, DICOM instances within one study, events keyed only by their own content. That is rare in HL7, where a later message often corrects an earlier one. One built feature does require it: an HTTP `reply_from` lane, which rejects FIFO (ADR 0154 D4). |
 
 Strict ordering being serial is not unique to MessageFoundry. It is a property of *any* system that
 guarantees order over a single stream.
