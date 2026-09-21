@@ -140,7 +140,7 @@ def main(argv: list[str] | None = None) -> int:
     # precedence (CLI > env > file > default) is honored — an unset flag falls through.
     serve.add_argument("--db", default=None, help="message store path (overrides [store].path)")
     # NOT "[api].host": that key is REFUSED as file/env input (ADR 0118 relocated it), so naming it
-    # here pointed operators at a key they cannot set (BACKLOG #1852).
+    # here pointed operators at a key they cannot set (BACKLOG #1852, #1361).
     serve.add_argument(
         "--host",
         default=None,
@@ -183,7 +183,7 @@ def main(argv: list[str] | None = None) -> int:
     serve.add_argument(
         "--allow-insecure-bind",
         action="store_true",
-        help="permit a non-loopback [api].host WITHOUT TLS (bearer tokens and PHI would cross the "
+        help="permit a non-loopback bind address WITHOUT TLS (bearer tokens and PHI would cross the "
         "network in cleartext); a dev override for a trusted, firewalled network. Prefer configuring "
         "[api].tls_cert_file (+ tls_key_file) for in-process TLS, which is allowed off-loopback "
         "without this flag. Does not relax the no-auth refuse.",
@@ -1873,9 +1873,10 @@ def _serve(args: argparse.Namespace) -> int:
     # instance may use DEBUG for diagnostics.
     if production and settings.logging.level.upper() == "DEBUG":
         print(
-            "error: DEBUG logging is refused on a production instance ([ai].production=true) — it can "
-            "surface PHI (full message bodies / raw field values) into logs. Use INFO or higher in "
-            "production (set [ai].production=false on a non-production instance for verbose "
+            "error: DEBUG logging is refused on a production instance "
+            "([security].production_instance=true) — it can surface PHI (full message bodies / raw "
+            "field values) into logs. Use INFO or higher in production (set "
+            "[security].production_instance=false on a non-production instance for verbose "
             "diagnostics).",
             file=sys.stderr,
         )
@@ -2389,17 +2390,37 @@ def _serve(args: argparse.Namespace) -> int:
     # therefore REQUIRES exposure_protected (in-process TLS or a declared upstream terminator) and is
     # refused even under --allow-insecure-bind (that dev override covers only the JSON API's cleartext
     # risk, never the browser surface). The loopback default never trips this.
+    # The local-only remediation names [security].listen_address, NOT local_access_only=true (BACKLOG
+    # #1361). This gate is reachable TWO ways, and the remediation below is verified on only one:
+    #  1. BY CONFIG: [security].local_access_only=false with a non-loopback listen_address. The loader
+    #     REFUSES local_access_only=true beside a non-loopback listen_address, so an operator who only
+    #     set listen_address never gets here, and adding local_access_only=true to the config that
+    #     tripped this dies at load with that contradiction refusal. Moving listen_address to loopback
+    #     does work, and is verified by
+    #     tests/test_cli.py::test_serve_ui_offloopback_refusal_prescribes_a_config_that_loads, which
+    #     drives the prescribed config back through the real loader rather than reading the message.
+    #  2. BY FLAG: `serve --host <non-loopback>`. load_settings merges the CLI AFTER _desugar_security,
+    #     so a file that sets NEITHER key reaches this gate. The settings object does read
+    #     local_access_only=false with that host by the time it gets here, but only because
+    #     _reconcile_effective_bind (BACKLOG #1852) folded the effective bind back into the [security]
+    #     view -- that is not what the operator wrote. Applying the prescribed edit on this route
+    #     (local_access_only=false, listen_address="127.0.0.1", with --host 0.0.0.0 still on the
+    #     command line) leaves this refusal firing, rc 2, because the flag still wins. Measured
+    #     2026-09-21. The fix on this route is to drop or change the flag, which the message does not
+    #     yet say. The test above drives the FILE route only and says so; do not read it as covering
+    #     this one.
     if (
         settings.api.serve_ui
         and not settings.api.is_loopback
         and not settings.api.exposure_protected
     ):
         print(
-            "error: refusing to serve the browser ops dashboard ([api].serve_ui) on non-loopback host "
-            f"{settings.api.host!r} without TLS. The /ui surface requires in-process TLS "
-            "([api].tls_cert_file) or a declared TLS-terminating proxy ([api].tls_terminated_upstream "
-            "+ trusted_proxies); --allow-insecure-bind does not cover it. Bind [api].host to a loopback "
-            "address for local-only access, or configure TLS.",
+            "error: refusing to serve the browser ops dashboard ([security].serve_web_console) on "
+            f"non-loopback host {settings.api.host!r} without TLS. The /ui surface requires "
+            "in-process TLS ([api].tls_cert_file) or a declared TLS-terminating proxy "
+            "([api].tls_terminated_upstream + trusted_proxies); --allow-insecure-bind does not cover "
+            "it. Set [security].listen_address to a loopback address (127.0.0.1) for local-only "
+            "access, or configure TLS.",
             file=sys.stderr,
         )
         return 2
@@ -2435,7 +2456,7 @@ def _serve(args: argparse.Namespace) -> int:
         # An http:// public origin contradicts a declared TLS posture in EITHER termination mode
         # (settings deliberately admit http:// public_origin for the loopback dev flow only).
         print(
-            "error: [api].public_origin is http:// while a TLS posture is declared "
+            "error: [security].web_console_public_address is http:// while a TLS posture is declared "
             "([api].tls_terminated_upstream or [api].tls_cert_file) — the browser console would "
             "bind its origin checks and WebAuthn passkeys to a cleartext origin. Use the https:// "
             "external origin. See docs/security/OFF-LOOPBACK-DEPLOYMENT.md (ADR 0068).",
@@ -2448,7 +2469,7 @@ def _serve(args: argparse.Namespace) -> int:
         # the session cookie would ship without Secure and HSTS stays suppressed. (A truly
         # signal-less undeclared proxy is undetectable in-engine — runbook-only.)
         print(
-            "warning: [api].public_origin is set but the proxy posture is undeclared "
+            "warning: [security].web_console_public_address is set but the proxy posture is undeclared "
             "(no [api].tls_cert_file, and no [api].tls_terminated_upstream + trusted_proxies) — "
             "until it is declared, the /ui session cookie ships WITHOUT Secure and HSTS is "
             "suppressed. See docs/security/OFF-LOOPBACK-DEPLOYMENT.md.",
@@ -2460,9 +2481,10 @@ def _serve(args: argparse.Namespace) -> int:
         # connects DIRECTLY to the engine), but origin-stability is on the operator, and WebAuthn
         # ceremonies fail closed until public_origin is set (ADR 0068 §7; owner kept warn-not-refuse).
         print(
-            "warning: [api].serve_ui is bound off-loopback without [api].public_origin — the /ui "
-            "origin checks use the request Host and WebAuthn passkeys are unavailable (fail-closed) "
-            "until public_origin is set. See docs/security/OFF-LOOPBACK-DEPLOYMENT.md.",
+            "warning: [security].serve_web_console is bound off-loopback without "
+            "[security].web_console_public_address — the /ui origin checks use the request Host and "
+            "WebAuthn passkeys are unavailable (fail-closed) until it is set. See "
+            "docs/security/OFF-LOOPBACK-DEPLOYMENT.md.",
             file=sys.stderr,
         )
     ui_exposed = settings.api.serve_ui and (
@@ -2632,7 +2654,8 @@ def _serve(args: argparse.Namespace) -> int:
         and not settings.auth.require_mfa
     ):
         print(
-            "warning: [api].public_origin is set with no declared TLS terminator on a PHI instance "
+            "warning: [security].web_console_public_address is set with no declared TLS terminator "
+            "on a PHI instance "
             f"({env_name!r}) with [security].require_mfa off — if that origin is served by an "
             "UNDECLARED reverse proxy, every account in [security].require_mfa_scope is single-factor over "
             "the network and "
