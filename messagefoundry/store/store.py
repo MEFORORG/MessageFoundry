@@ -485,9 +485,11 @@ class _GroupCommitter:
         inverted), and it invokes ``member.run()`` a second time, relying on a double-invocation safety
         nobody has established for these bodies.
 
-        ``SAVEPOINT``/``ROLLBACK TO`` are transaction control, and
-        ``tests/test_writer_txn_is_the_only_begin.py`` pins ``BEGIN`` only — it does NOT cover these.
-        They are confined to this method and :meth:`_unwind_member` on purpose; keep them here.
+        ``SAVEPOINT``/``ROLLBACK TO``/``RELEASE`` are transaction control, and
+        ``tests/test_writer_txn_is_the_only_begin.py`` pins each of them by count in
+        ``_ALLOWED_NESTED``, so a new one here or anywhere else in the module reds that test. They are
+        confined to this method and :meth:`_unwind_member` on purpose, because both run only inside
+        :meth:`_flush`'s :func:`_writer_txn`; keep them here.
 
         Cancellation is deliberately NOT caught: :class:`asyncio.CancelledError` derives from
         ``BaseException``, so it passes through :func:`_writer_txn` — which unwinds the whole batch —
