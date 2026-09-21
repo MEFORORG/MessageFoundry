@@ -12,7 +12,12 @@ file opened."""
 from __future__ import annotations
 
 import base64
+import io
+import json
 import sqlite3
+import tarfile
+import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
 from messagefoundry.config.settings import BackupSettings, StoreSettings
@@ -23,6 +28,7 @@ from messagefoundry.pipeline.dr_backup import (
     run_restore_verify,
 )
 from messagefoundry.store import MessageStatus, MessageStore
+from messagefoundry.store.backup_codec import decrypt_stream, encrypt_stream
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import Stage
 
@@ -127,6 +133,83 @@ async def test_verify_accepts_a_retired_key_after_rotation(tmp_path) -> None:
     )
     km = await run_restore_verify(archive, store_settings=foreign)
     assert km.status == "KEY_MISMATCH"
+
+
+def _reseal_with_mutated_manifest(
+    archive_path: str, key: bytes, out_path: Path, mutate: Callable[[dict[str, object]], None]
+) -> None:
+    """Decrypt ``archive_path`` under ``key``, apply ``mutate`` to its parsed ``manifest.json`` in
+    place, then re-encrypt the resulting tar to ``out_path`` under the SAME key. Every other member
+    (``store.db``, any ``config/`` entries) is carried over byte for byte — only the manifest changes.
+
+    This is how BACKLOG #1722's pin proves the row-count compare fires: a real attacker can't get a
+    tampered manifest.json past the archive's AES-GCM tag, but an operator restoring last week's
+    tape after this week's schema migration, or a truncated snapshot whose write raced the manifest,
+    can produce exactly this shape — a well-formed, correctly-keyed archive whose manifest counts
+    disagree with what is actually in ``store.db``. The compare has to catch that on its own,
+    because nothing else in the verify (the key precheck, the GCM tags, ``PRAGMA integrity_check``)
+    looks at logical row counts at all."""
+    with tempfile.TemporaryDirectory(prefix="mefor-test-reseal-") as tmp:
+        tar_path = Path(tmp) / "archive.tar"
+        with open(archive_path, "rb") as src, open(tar_path, "wb") as dst:
+            decrypt_stream(src, dst, key)
+
+        with tarfile.open(tar_path, "r:") as tar:
+            payload: dict[str, tuple[tarfile.TarInfo, bytes]] = {}
+            for member in tar.getmembers():
+                fh = tar.extractfile(member)
+                payload[member.name] = (member, fh.read() if fh is not None else b"")
+
+        manifest = json.loads(payload[dr_backup._MANIFEST_MEMBER][1])
+        assert isinstance(manifest, dict)
+        mutate(manifest)
+        manifest_bytes = json.dumps(manifest, sort_keys=True).encode("utf-8")
+
+        rewritten_tar = Path(tmp) / "rewritten.tar"
+        with tarfile.open(rewritten_tar, "w") as tar:
+            for name, (member, data) in payload.items():
+                if name == dr_backup._MANIFEST_MEMBER:
+                    continue
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                info.mtime = member.mtime
+                tar.addfile(info, io.BytesIO(data))
+            info = tarfile.TarInfo(dr_backup._MANIFEST_MEMBER)
+            info.size = len(manifest_bytes)
+            tar.addfile(info, io.BytesIO(manifest_bytes))
+
+        with open(rewritten_tar, "rb") as src, open(out_path, "wb") as dst:
+            encrypt_stream(src, dst, key)
+
+
+async def test_verify_fails_when_the_manifest_row_counts_disagree_with_the_snapshot(
+    tmp_path,
+) -> None:
+    """BACKLOG #1722: pin the row-count compare itself. A manifest whose recorded ``messages`` count
+    is one higher than the snapshot's real count must FAIL with a "row-count mismatch" reason —
+    ``store.db`` is untouched, so the GCM tags authenticate fine and ``PRAGMA integrity_check`` still
+    passes; only step (4), the compare this row is about, can catch it.
+
+    Before this test, nothing in the suite could tell a working compare from a disabled one: every
+    other test only asserts ``row_counts == manifest_counts`` on a GOOD archive, which holds whether
+    or not the compare actually runs."""
+    key_b64 = generate_key()
+    store, archive, ss = await _backup(tmp_path, key_b64)
+    key = base64.b64decode(key_b64)
+
+    def _bump_messages_count(manifest: dict[str, object]) -> None:
+        counts = dict(manifest["row_counts"])  # type: ignore[arg-type]
+        counts["messages"] = counts.get("messages", 0) + 1
+        manifest["row_counts"] = counts
+
+    tampered = tmp_path / "tampered.mfbak"
+    _reseal_with_mutated_manifest(archive, key, tampered, _bump_messages_count)
+
+    res = await run_restore_verify(str(tampered), store_settings=ss)
+    assert res.status == "FAIL", res.reason
+    assert res.integrity_ok is True  # the snapshot itself is fine; only the manifest lied
+    assert res.reason is not None and "row-count mismatch" in res.reason
+    await store.close()
 
 
 async def test_full_restore_verify_opens_through_open_store(tmp_path) -> None:

@@ -78,11 +78,6 @@ __all__ = [
 
 log = logging.getLogger(__name__)
 
-#: Tables whose row counts are recorded in the manifest + re-checked by the restore-verify (a truncated
-#: snapshot the integrity check misses at the logical level shows up as a row-count mismatch). These
-#: exist on every SQLite store schema (messages + the staged queue + the audit chain).
-_VERIFY_TABLES = ("messages", "queue", "message_events", "audit_log")
-
 #: Archive members inside the encrypted tar.
 _STORE_MEMBER = "store.db"
 _CONFIG_PREFIX = "config/"
@@ -166,8 +161,9 @@ _MAX_RESTORE_PLAINTEXT_BYTES = 2 * _MAX_RESTORE_MEMBER_BYTES
 #: than this out of an archive. The store member is STREAMED to disk under its own cap; the manifest
 #: is the one member parsed into memory (``json.loads`` holds the decoded object on top of the raw
 #: bytes), so an unbounded read here is the only place a forged archive could balloon the verifying
-#: process's memory. 1 MiB is roughly 100x the largest manifest this writer produces — a fixed field
-#: set plus one row count per table in :data:`_VERIFY_TABLES`.
+#: process's memory. 1 MiB is many times the largest manifest this writer produces — a fixed field
+#: set plus one row count per table in the snapshot's own schema (BACKLOG #1722; every table, not a
+#: hand-picked sample — see :func:`_count_tables`).
 _MAX_MANIFEST_BYTES = 1024 * 1024  # 1 MiB
 
 
@@ -590,7 +586,7 @@ class BackupRunner:
         row_counts: dict[str, int] = {}
         if snap_path is not None:
             snapshot_sha256 = _sha256_file(snap_path)
-            row_counts = _count_tables(snap_path, _VERIFY_TABLES)
+            row_counts = _count_tables(snap_path)
 
         manifest = {
             "format": "mfbak",
@@ -993,7 +989,7 @@ def _verify_archive_blocking(
                 if isinstance(raw_counts, dict)
                 else {}
             )
-            row_counts = _count_tables(snap, _VERIFY_TABLES)
+            row_counts = _count_tables(snap)
             if not integrity_ok:
                 return VerifyResult(
                     "FAIL",
@@ -1106,20 +1102,38 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def _count_tables(db_path: Path, tables: tuple[str, ...]) -> dict[str, int]:
-    """Per-table row counts on a snapshot file via a plain read-only sqlite3 connection (no engine
-    store). A table absent from the schema is reported as 0 rather than raising."""
+def _count_tables(db_path: Path) -> dict[str, int]:
+    """Row counts for EVERY table in ``db_path``'s own schema, via a plain read-only sqlite3
+    connection (no engine store). The table set is DERIVED from ``sqlite_master`` at count time
+    rather than a hand-picked sample (BACKLOG #1722): the old fixed four-table list
+    (``messages``/``queue``/``message_events``/``audit_log``) let a truncated or absent ``users``,
+    ``state``, ``reference``, ``response``, ``attachment_chunk`` or ``search_presets`` table pass
+    restore-verify PASS undetected — the row-count compare simply never looked at it. Called once
+    against the just-taken snapshot when the manifest is written and once against the restored
+    snapshot at verify time; both reads are against the identical file (the ``.mfbak`` codec is
+    authenticated encryption, not a transform), so an untampered archive always compares equal
+    regardless of which tables are in scope, and a widened scope only ever ADDS coverage.
+
+    ``sqlite_%`` names are excluded: they are sqlite's own bookkeeping (e.g. ``sqlite_sequence`` for
+    an ``AUTOINCREMENT`` column), not store data, and are not guaranteed to exist at all until some
+    other operation (a first autoincrement insert, an ``ANALYZE``) creates them."""
     import sqlite3
 
-    counts: dict[str, int] = {}
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
-        names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        for table in tables:
-            if table not in names:
-                counts[table] = 0
-                continue
-            (n,) = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()  # table is a constant
+        names = sorted(
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
+            )
+        )
+        counts: dict[str, int] = {}
+        for table in names:
+            # table is a real identifier read back from this same file's own sqlite_master, but
+            # quote + escape it anyway rather than trust that no engine table name will ever need
+            # quoting (ASVS: parameterize/escape identifiers, don't rely on today's schema).
+            quoted = table.replace('"', '""')
+            (n,) = conn.execute(f'SELECT COUNT(*) FROM "{quoted}"').fetchone()
             counts[table] = int(n)
     finally:
         conn.close()
