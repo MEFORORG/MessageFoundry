@@ -6,8 +6,11 @@ ADR 0118 moved the posture keys into ``[security]`` and ``_reject_relocated_keys
 spellings as file or env input. So a refusal, warning or ``--help`` string that tells an operator to set
 one hands out a remediation that dies at load with "unrecognized config key(s)" -- authoritative-looking,
 because it came from the gate itself, and only discoverable by spending a restart.
-``_RELOCATED_TO_SECURITY`` holds FOURTEEN of those keys today. A fifteenth, ``[ai].data_class``, was
-REMOVED rather than relocated (BACKLOG #1279), so it left the map for ``_REMOVED_KEYS``.
+``_RELOCATED_TO_SECURITY`` is the roster of those keys, and this file reads it at run time rather than
+restating its size here. A hand-written count is a second definition of the same fact, and it goes stale
+the day a key is relocated or retired -- tests/test_docs_cite_no_refused_config_keys.py dropped one for
+exactly that reason. One key, ``[ai].data_class``, was REMOVED rather than relocated (BACKLOG #1279), so
+it left that map for ``_REMOVED_KEYS``.
 
 THE BUDGET IS A MECHANISM, AND IT IS CURRENTLY EMPTY: across both corpus roots every relocated spelling
 now reds. That is a measured state, not a rule change -- #1361 graded and reworded every engine site, and

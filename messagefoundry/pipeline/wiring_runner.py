@@ -8104,10 +8104,10 @@ def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
         # tests/test_relocated_key_messages.py cannot see this line -- it reads print, add_argument
         # and *Error constructors only -- so the fix is here rather than left for a red.
         log.warning(
-            "egress denied: outbound %r %s has no [egress] allowlist while "
-            "[security].block_unlisted_outbound is in force",
+            "egress denied: outbound %r %s has no [egress] allowlist while %s",
             dest.name,
             dest.type.value,
+            BLOCK_UNLISTED_OUTBOUND_IN_FORCE,
         )
         raise WiringError(
             f"outbound {dest.name!r}: {BLOCK_UNLISTED_OUTBOUND_IN_FORCE} and no allowlist permits a "

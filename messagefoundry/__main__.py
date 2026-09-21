@@ -2391,13 +2391,24 @@ def _serve(args: argparse.Namespace) -> int:
     # refused even under --allow-insecure-bind (that dev override covers only the JSON API's cleartext
     # risk, never the browser surface). The loopback default never trips this.
     # The local-only remediation names [security].listen_address, NOT local_access_only=true (BACKLOG
-    # #1361). Reaching this gate REQUIRES local_access_only=false with a non-loopback listen_address:
-    # the loader REFUSES local_access_only=true beside a non-loopback listen_address, so an operator
-    # who only set listen_address never gets here either. Adding local_access_only=true on top of the
-    # config that tripped this is therefore the one edit that CANNOT work -- it dies at load with that
-    # contradiction refusal. Moving listen_address to loopback does work, and is verified by
-    # tests/test_cli.py::test_serve_ui_offloopback_refusal_prescribes_a_config_that_loads, which drives
-    # the prescribed config back through the real loader rather than reading the message.
+    # #1361). This gate is reachable TWO ways, and the remediation below is verified on only one:
+    #  1. BY CONFIG: [security].local_access_only=false with a non-loopback listen_address. The loader
+    #     REFUSES local_access_only=true beside a non-loopback listen_address, so an operator who only
+    #     set listen_address never gets here, and adding local_access_only=true to the config that
+    #     tripped this dies at load with that contradiction refusal. Moving listen_address to loopback
+    #     does work, and is verified by
+    #     tests/test_cli.py::test_serve_ui_offloopback_refusal_prescribes_a_config_that_loads, which
+    #     drives the prescribed config back through the real loader rather than reading the message.
+    #  2. BY FLAG: `serve --host <non-loopback>`. load_settings merges the CLI AFTER _desugar_security,
+    #     so a file that sets NEITHER key reaches this gate. The settings object does read
+    #     local_access_only=false with that host by the time it gets here, but only because
+    #     _reconcile_effective_bind (BACKLOG #1852) folded the effective bind back into the [security]
+    #     view -- that is not what the operator wrote. Applying the prescribed edit on this route
+    #     (local_access_only=false, listen_address="127.0.0.1", with --host 0.0.0.0 still on the
+    #     command line) leaves this refusal firing, rc 2, because the flag still wins. Measured
+    #     2026-09-21. The fix on this route is to drop or change the flag, which the message does not
+    #     yet say. The test above drives the FILE route only and says so; do not read it as covering
+    #     this one.
     if (
         settings.api.serve_ui
         and not settings.api.is_loopback
