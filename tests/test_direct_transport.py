@@ -438,14 +438,14 @@ def test_egress_allow_and_deny() -> None:
 
 def test_egress_deny_by_default_refuses_empty() -> None:
     e = EgressSettings(deny_by_default=True)
-    with pytest.raises(Exception, match="deny_by_default"):
+    with pytest.raises(Exception, match="block_unlisted_outbound"):
         check_egress_allowed(_egress_dest("hisp.partner.example"), e)
 
 
 def test_egress_separate_from_smtp() -> None:
     # A DIRECT host listed only on allowed_smtp is NOT permitted — the lists are independent (ADR 0085).
     e = EgressSettings(deny_by_default=True, allowed_smtp=["hisp.partner.example:587"])
-    with pytest.raises(Exception, match="deny_by_default"):
+    with pytest.raises(Exception, match="block_unlisted_outbound"):
         check_egress_allowed(_egress_dest("hisp.partner.example", 587), e)
 
 
