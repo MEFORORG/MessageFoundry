@@ -6,8 +6,8 @@
 | **Applies to** | Any application developed under this standard. **MessageFoundry (MEFOR)** is the reference implementation (Appendix A). |
 | **Maintained by** | Project maintainers (open-source). Each deploying organization assigns its own local owner. |
 | **Status** | Published — adopter-facing |
-| **Version** | 2.4 |
-| **Date** | September 20, 2026 |
+| **Version** | 2.5 |
+| **Date** | September 21, 2026 |
 | **License** | Publishable under the project's open-source license; intended to be shared with adopters and reused across projects. |
 | **Review cadence** | At least annually, and on any material architecture or threat change |
 | **Aligns to** | NIST SP 800-218 (SSDF) · NIST SP 800-115 · NIST SP 800-66 Rev. 2 (HIPAA Security Rule) · OWASP ASVS 5.0 Level 3. Its Spec-Driven Development practices (§5) are a distilled synthesis by this document — not an external standard or certification. |
@@ -653,13 +653,29 @@ current position on it.
   (certificate-validated; cleartext `ldap://` refused fail-closed), **Kerberos / SPNEGO** Windows SSO,
   and **AD security-group → role** mapping for RBAC. These authenticate **human operators** to the
   console/API, not data-plane systems.
+- **Federated operator SSO (control plane):** an **OIDC authorization-code + PKCE relying party**
+  ([ADR 0142](adr/0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md),
+  `messagefoundry_webconsole/routes/oidc.py`). It is **default-off and self-gating**: registration
+  returns before declaring a route unless `[auth].oidc_enabled` is set, so the federated paths are
+  absent from the route table on a default install. Enabling it is **refused at config load** unless at
+  least `ad_enabled` is on, an external origin is set (`[security].web_console_public_address`, from
+  which the federated redirect URI is derived), a non-empty client secret is supplied, and a non-empty
+  `oidc_allowed_endpoints` allow-list pins the issuer and endpoint hosts, each over https. It is
+  **hybrid-only** — federation authenticates an identity that already exists in on-prem AD, **roles
+  resolve through LDAP and never from a token claim**, and a principal with no AD object is refused.
+  ADR 0142 is **Proposed with the code complete**, pending the lab cells it names. **Review it as
+  shipped code, not as a future feature:** a site that turns this on is enabling a live authentication
+  path whose real-IdP validation has not yet been recorded.
 
 **Designed but deferred (ADR 0002 — build before off-loopback exposure):**
 
-- **Federated SSO for operators (OAuth 2.0 / OIDC / SAML via Entra)** — gets a dedicated federated-SSO
-  ADR when 0.2 design begins; today's operator directory auth is direct LDAPS bind + Kerberos SSO, not
-  federation. (Native TOTP MFA, transport TLS, MLLP-over-TLS, and client-cert mTLS are all **built** —
-  see above.)
+- *None outstanding.* The item previously listed here — **federated SSO for operators** — has since
+  been **built**. The dedicated federated-SSO ADR that ADR 0002 promised is
+  [ADR 0142](adr/0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md),
+  and its relying party ships in the **Built** tier above. The old entry read "OAuth 2.0 / OIDC / SAML
+  via Entra"; the mechanism is **OIDC only**, because **SAML 2.0 is declined on XML-signature-wrapping
+  grounds** — not on CSP grounds, which ADR 0142 states explicitly so the decline is not later
+  reversed against the wrong reason.
 
 **Aspirational / planned (not built, no ADR yet):**
 
@@ -700,10 +716,17 @@ rule it departs from by identifier**, so the departure and the requirement canno
   MessageFoundry is **self-hosted**, so the decision to deploy it beyond loopback, and the assessment
   that justifies that decision, rest with the **implementing organization**: this standard states what
   has and has not been independently verified, and does not gate your deployment on it.
-- **Federated operator SSO — SDS-7.4.25.** API/WSS/MLLP **TLS and client-cert mTLS are built** (opt-in via
-  cert config) and **native TOTP MFA for local accounts is built** (ADR 0002 WP-14); the remaining
-  deferred operator-auth item is **federated SSO (OIDC/SAML via Entra)**, held safe by the fail-closed
-  `127.0.0.1` bind guard. Federation gets a dedicated ADR before off-loopback exposure.
+- **Federated operator SSO — SDS-7.4.25.** This deviation has **changed character rather than closed**.
+  The capability gap is gone: an **OIDC relying party is built**, recorded in A.4's **Built** tier with
+  its gating and its hybrid AD contract. What remains is a **default-posture** deviation.
+  `[auth].oidc_enabled` defaults **false**, so a default install does not federate: operators
+  authenticate against the **local user store** that SDS-7.4.25 asks a site to move off, and the
+  directory alternatives the engine does ship — direct LDAPS bind and Kerberos SSO — are themselves
+  opt-in (`ad_enabled`, `kerberos_enabled`, both default false). Federating is an operator decision,
+  not the shipped state. Its ADR is also **not yet
+  Accepted**: A.4 carries the outstanding lab validation and why a green suite does not substitute for
+  it. *Compensating control:* the fail-closed `127.0.0.1` bind guard. The rest of the §7.4 operator-auth
+  hierarchy — transport TLS, client-cert mTLS, and native TOTP MFA — is **built** (A.4).
 - **Mechanical requirement→test traceability — SDS-5.3.1.** Not yet enforced: acceptance criteria are
   not uniformly ID'd and linked to tests. This is **not a deviation from a hard requirement** —
   SDS-5.3.1 is **SHOULD**, adopted incrementally — but it is recorded here for honesty. Tracked as
@@ -764,7 +787,7 @@ connected. Recorded honestly below, with three recommended (SHOULD) improvements
 | Layer | MEFOR artifact | Notes | SSDF |
 |---|---|---|---|
 | Constitution | [`../CLAUDE.md`](../CLAUDE.md) | Always-loaded standing contract of invariants + vocabulary. | PO.1 |
-| Decisions | [`adr/`](adr/) (`docs/adr/*.md`) | Build-gating lifecycle (`README.md`: Proposed = drafted, no code → Accepted = ratified, build may start → Superseded/Rejected; plus `Reserved` number-allocations and `Dropped`). **ADRs numbered through 0105; some numbers are Reserved/Dropped.** The house pattern includes Context / Decision / Options considered / Consequences / "To resolve on acceptance". | PW.1–PW.2 |
+| Decisions | [`adr/`](adr/) (`docs/adr/*.md`) | Build-gating lifecycle (`README.md`: Proposed = drafted, no code → Accepted = ratified, build may start → Superseded/Rejected; plus `Reserved` number-allocations and `Dropped`). **`Proposed` does not reliably mean "no code yet"** — some ADRs sit there with the code complete, held short of `Accepted` by a validation the ADR itself names, so read the Status line rather than inferring maturity from the value ([ADR 0142](adr/0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md) is the worked case; see A.4). **ADRs numbered through 0188, 178 numbered files; some numbers are Reserved/Dropped.** The house pattern includes Context / Decision / Options considered / Consequences / "To resolve on acceptance". | PW.1–PW.2 |
 | Requirements / sequencing | [`BACKLOG.md`](BACKLOG.md) + [`FEATURE-MAP.md`](FEATURE-MAP.md) | Numbered requirement IDs (e.g. #20, #26, #34), cross-referenced by ADRs; each item names its originating review finding. | PO.1 |
 | Tasks | `docs/releases/*-PLAN.md`, `docs/releases/MULTISESSION-PLAN-11.md` (current) | Decompose ADRs/backlog into per-worktree lanes, gates, per-window quartet re-check. | PW.1–PW.2 |
 | Verification | `messagefoundry check` ([`../messagefoundry/checks.py`](../messagefoundry/checks.py)) + conformance reviews under `security/` | `validate` (required) + `dryrun` (required when `*.hl7` fixtures exist) + advisory ruff/mypy; reviews: `SDS-CONFORMANCE-REVIEW-*.md`, `ASVS-L3-ASSESSMENT.md`. | PW.8 (test); reviews → PW.7 |
@@ -795,6 +818,7 @@ resolves to a row below rather than to whatever requirement later took the numbe
 
 | Version | Date | Change |
 |---|---|---|
+| 2.5 | September 21, 2026 | **A.4 and the A.6 SDS-7.4.25 deviation corrected: federated operator SSO is built, not undesigned.** Both said federated SSO would get a dedicated ADR — A.4 "when 0.2 design begins", A.6 "before off-loopback exposure" — when [ADR 0142](adr/0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md) already exists and its OIDC authorization-code + PKCE relying party already ships, self-gated behind `[auth].oidc_enabled` in `messagefoundry_webconsole/routes/oidc.py`. **The error runs opposite to 2.4's**: that one understated a *surface*, this one understated **design maturity**, and the consequence is the same shape — a site could skip reviewing a shipping authentication path on the belief that it is a future feature. **SDS-3.4** is the rule at issue: the prose was accurate about ADR 0002's promise and wrong about what a reader would do with it. A.4 now records the mechanism, the default-off self-gating, the config-load preconditions, the hybrid contract in which roles resolve through LDAP and never from a token claim, and that ADR 0142 stands at `Proposed` with its code complete. Its "Designed but deferred" tier is now empty, and the old "OIDC / SAML via Entra" phrasing narrows to **OIDC only** because SAML 2.0 is declined on XML-signature-wrapping grounds. A.6's deviation is **not** withdrawn: it changes character from a missing capability to a **shipped default posture** that does not federate. That row also carried a second stale clause, "native TOTP MFA **for local accounts**", which had understated the coverage since BACKLOG #1144 retired the AD/Entra delegation; the qualifier is dropped and A.4 owns the statement. Corrected in the same pass, because A.4 would otherwise contradict it inside one document: the A.7.1 inventory said "ADRs numbered through 0105" against a measured high-water of **0188** across **178** numbered files, and its lifecycle gloss said `Proposed` means no code yet. **No requirement was added, removed, weakened or strengthened**, and no rule identifier changed. |
 | 2.4 | September 20, 2026 | **A.2 corrected to match the shipped web console, and two control surfaces added.** A.2 described `/ui` as an opt-in, read-only dashboard configured at `[api].serve_ui`. All three were wrong in the shipped code, and each understated the surface. The config default is **on** for a loopback bind (`serve_ui: bool = True`; ADR 0143 makes disabling it surface-*reducing*). The console is **write-capable**, across at least connection control, queue purge, replay, log upload, disaster-recovery activation and user administration. The operator key is `serve_web_console` under `[security]`; the `[api]` spelling is refused at config load (ADR 0118), so the old text named a key that fails. A.2 now also records what the old text left out. The console arrives as a **second wheel** the base distribution does not carry. The **Windows tray** (ADR 0113) does ship in the base wheel, and it starts, stops and restarts the service. The **VS Code extension** (ADR 0112) can do the same. Step-up re-authentication is distinguished from dual-control approval, which is off by default and reaches three operations. **SDS-3.4** is the rule at issue: the old prose was reviewed for accuracy rather than for what an adopter would do with it, and an adopter could have sized their own review against it. A.1's technology-stack line names a retired PySide6 desktop UI and is **not** corrected here; it is rewritten by the change reconciling the message-ordering docs, and two pull requests must not rewrite one sentence. **No requirement was added, removed, weakened or strengthened**, and no rule identifier changed. |
 | 2.3 | August 7, 2026 | **Rules given stable identifiers.** 145 requirements now carry an `SDS-<section>.<n>` identifier, an RFC 2119 keyword in capitals, and the evidence that settles them; see *How to read the rules*. **Section numbers are unchanged** — identifiers were added alongside, so every existing citation still resolves. A.6 now names the rule each deviation departs from, replacing the `(§6.3 / §6.4)` / `(§7.4)` / `(§5.3)` positional citations that the §5–§9 → §6–§10 renumbering below had already broken elsewhere. A *Retired rules* table holds tombstones so a retired identifier is never reissued, and `tests/test_sds_rule_ids_are_stable.py` enforces the convention in CI. Two corrections of record: A.6 listed R2 (the executable dry-run gate) as outstanding after it had shipped, and the standing contract introduced four prose-review rules as "the three rules below". No requirement was added, removed, weakened or strengthened. |
 | 2.2 | July 30, 2026 | **Independent-review deviation reframed.** The independent ASVS-L3 review & DAST is no longer stated as a precondition for off-loopback/production exposure. MessageFoundry is self-hosted, so the deployment decision — and the assessment supporting it — belong to the implementing organization; this standard records what has and has not been independently verified rather than gating deployment on it. The engagement remains planned, at an estimated $25,000–$50,000, intended to be grant- or sponsor-funded. Also drops a dangling citation to `security/RELEASE-GATE.md`, which is not present in this repository. No change to the SSDF / ASVS / HIPAA mappings. |

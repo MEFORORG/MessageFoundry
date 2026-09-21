@@ -118,6 +118,23 @@ with two healthy members and one poisoned one asserting the healthy rows commit.
 **Duplicate search.** No match. Searched both ledgers for `group commit`, `group-commit`, `sibling`,
 `poison`, `rolled back`, `P3-03`, `reschedule_claimed`.
 
+**Amendment 2026-09-16 (built as BACKLOG #1632).** Two of this proposal's claims went stale between
+filing and build, and the fix that shipped is not the one proposed. Left above verbatim; corrected here.
+
+- **The stall no longer lasts "until a restart", and it is no longer invisible to `pending_depth`.**
+  The runner half named above (P3-03) merged as `79a6375c0` (PR 1164, BACKLOG #1611): every per-lane
+  worker now calls `RegistryRunner._repend_claimed_on_fault`, which re-pends the claimed rows through
+  `reschedule_claimed`. That commits inline rather than enrolling in the committer, so it is unaffected
+  by the batch it is recovering from. What remained was the unnecessary rejection itself — each innocent
+  sibling taking its lane's error backoff and logging a stack trace for a failure that was not its own,
+  then re-running work that had already succeeded. Read the heading above without its stalling clause.
+- **The fix is savepoints, not an inline re-run.** Re-running the healthy members each in its own
+  transaction degenerates to N transactions and N fsyncs on the failure path — group-commit inverted —
+  and calls a member body a second time on a double-invocation safety nobody has established. Each
+  member now runs inside its own savepoint, so a failure is undone by `ROLLBACK TO` on that savepoint
+  alone: one transaction, one fsync, nothing invoked twice. (The name is one constant, `gc_member`,
+  reused because each member's savepoint is released before the next opens.) See ADR 0055 AC-1, amended in the same PR.
+
 ---
 
 ## Proposal 4. Store-level guarantees that are asserted only by reading: the inline ACK gate, every-stage recovery, the read pool snapshot, and the no-row replay guard at the store
