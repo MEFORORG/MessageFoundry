@@ -997,19 +997,22 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
   (BACKLOG #27 — closed, so it lives in
   [the maintainer-internal ledger](docs/BACKLOG.md), not in the
   live ledger; the connector-parity row is [`docs/CONNECTIONS.md`](docs/CONNECTIONS.md)).
-- Don't build **per-key (partition-key) message ordering** — sequence-keyed lanes, sequence groups,
-  a `partition_key` expression, order-group sharding: every name for the same thing —
-  **declined-by-design (owner ruling 2026-09-21)**: the demand gate closed **unfired**. Its trigger
-  was specifically **one ordered interface exceeding about 60 msg/s**, and the owner has ruled that
-  trigger is not expected to fire. The 45M/day target does not imply it — 45M/day across 1,500
-  connections is about 0.35 events per second per connection, roughly 170x below the one-lane bound,
-  so the target is met by **concentration**, not per-lane speed. **This is not a claim that the
-  feature is impossible or unsound:** it is a real capability with a real cost the owner has decided
-  never to pay. The accepted consequence is that one strictly-ordered feed stays core-bound — there
-  is no `UNORDERED` queue either — so a feed that outgrows a core is answered by fanning out at
-  source. **The decline does not rest on the purity argument and nothing should:** the 2026-07-09
-  decline that did was overturned as **invalid**, because purity binds `@router`/`@handler`, not
-  connectors (§8). (BACKLOG #3 — closed, so it lives in
+- Don't build **per-key message ordering** — canonically **sequence-keyed lanes** over a **sequence
+  key**; older text writes it `partition_key` or "order-group sharding", both retired by the
+  2026-06-30 naming lock — **declined-by-design (owner ruling 2026-09-21)**: the demand gate closed
+  **unfired**. Its trigger was specifically **one ordered interface exceeding about 60 msg/s**, and
+  the owner has ruled that trigger is not expected to fire. The
+  [ADR 0052](docs/adr/0052-enterprise-scale-target.md) scale target does not imply it — 45M/day
+  across 1,500 connections is about 0.35 events per second per connection, roughly 170x below the
+  one-lane bound, so the target is met by **concentration**, not per-lane speed. **This is not a
+  claim that the feature is impossible or unsound:** it is a real capability with a real cost the
+  owner has decided never to pay. The accepted consequence is that one strictly-ordered feed stays
+  core-bound, and the owner has separately ruled out relaxing order as the alternative, so a feed
+  that outgrows a core is answered by fanning out at source. **The decline does not rest on the
+  purity argument and nothing should:** the 2026-07-09 decline that did was overturned as
+  **invalid**, because purity binds `@router`/`@handler` and not connectors (§2, the reliability
+  invariant; the side-effects half is in
+  [`messagefoundry/CLAUDE.md`](messagefoundry/CLAUDE.md)). (BACKLOG #3 — closed, so it lives in
   [the maintainer-internal ledger](docs/BACKLOG.md), not in the
   live ledger.)
 - Don't adopt **ISO/IEC 5055:2021 / OMG ASCQM** as a quality **measure** — **declined-by-design
