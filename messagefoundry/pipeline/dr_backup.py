@@ -999,13 +999,34 @@ def _verify_archive_blocking(
                     reason=f"integrity_check failed: {integrity_msg}",
                 )
             # (4) row-count sanity vs the manifest (catches a torn/truncated snapshot).
-            if manifest_counts and row_counts != manifest_counts:
+            #
+            # Compared over the MANIFEST's own keys, not by dict equality (BACKLOG #1722 follow-up).
+            # `_count_tables` derives its table set from the file it is given, so `row_counts` here
+            # reflects the RESTORED snapshot's own schema, which can legitimately be a superset of
+            # what an OLDER manifest recorded — a manifest written before this table set was widened
+            # (or before a later table existed at all) has fewer keys than the archive it describes
+            # really has tables. `run_restore_verify` is explicitly a standalone check of an OLDER
+            # archive (see its docstring and the AC-5 comment above), so that gap is an ordinary
+            # thing to hit, not tampering, and dict equality would FAIL every such archive on sight.
+            # A table the manifest tracked but the snapshot's schema no longer has (dropped, or never
+            # existed there) reads as a 0, the same convention the old fixed-list `_count_tables` used
+            # for a table absent from the schema — so a manifest count of 0 for it still passes, and a
+            # nonzero one still correctly FAILs (real data loss). A table `row_counts` has that the
+            # manifest never tracked is not compared at all: an older manifest cannot be faulted for
+            # not knowing about a table it never counted.
+            mismatches = {
+                table: (manifest_counts[table], row_counts.get(table, 0))
+                for table in manifest_counts
+                if row_counts.get(table, 0) != manifest_counts[table]
+            }
+            if mismatches:
                 return VerifyResult(
                     "FAIL",
                     integrity_ok=True,
                     row_counts=row_counts,
                     manifest_counts=manifest_counts,
-                    reason=f"row-count mismatch: snapshot={row_counts} manifest={manifest_counts}",
+                    reason=f"row-count mismatch on {sorted(mismatches)}: "
+                    f"snapshot={row_counts} manifest={manifest_counts}",
                 )
             decrypted_cells = 0
             if full:
@@ -1106,13 +1127,24 @@ def _count_tables(db_path: Path) -> dict[str, int]:
     """Row counts for EVERY table in ``db_path``'s own schema, via a plain read-only sqlite3
     connection (no engine store). The table set is DERIVED from ``sqlite_master`` at count time
     rather than a hand-picked sample (BACKLOG #1722): the old fixed four-table list
-    (``messages``/``queue``/``message_events``/``audit_log``) let a truncated or absent ``users``,
-    ``state``, ``reference``, ``response``, ``attachment_chunk`` or ``search_presets`` table pass
-    restore-verify PASS undetected — the row-count compare simply never looked at it. Called once
-    against the just-taken snapshot when the manifest is written and once against the restored
-    snapshot at verify time; both reads are against the identical file (the ``.mfbak`` codec is
-    authenticated encryption, not a transform), so an untampered archive always compares equal
-    regardless of which tables are in scope, and a widened scope only ever ADDS coverage.
+    (``messages``/``queue``/``message_events``/``audit_log``) covered 4 of this schema's 30 tables —
+    a truncated or absent table among the other 26 (at least the auth tables ``users``/``sessions``/
+    ``roles``/``webauthn_credentials`` and the audit chain's ``audit_chain_meta``) passed
+    restore-verify PASS undetected, and the old list could not have named all of them: it predates
+    several of those tables entirely, and the next one added to the schema would have been silently
+    out of scope again. Called once against the just-taken snapshot when the manifest is written and
+    once against the restored snapshot at verify time.
+
+    Both calls read the identical file (the ``.mfbak`` codec is authenticated encryption, not a
+    transform), so for a manifest and archive written by the SAME build of this function the two
+    calls always return the same keys. They can still return DIFFERENT keys across a build boundary
+    — a manifest written before this table set was widened (or before a later table existed at all)
+    has fewer keys than a snapshot's schema really has — and that is expected, not tampering:
+    ``run_restore_verify`` is a standalone check of an archive from any earlier point (AC-5), so an
+    older, narrower manifest is an ordinary thing to verify. The compare in
+    :func:`_verify_archive_blocking` is written to tolerate exactly that (keyed off the manifest's
+    own keys, not dict equality) — this function only ever reports what IS in the schema, and does
+    not itself guarantee cross-build equality.
 
     ``sqlite_%`` names are excluded: they are sqlite's own bookkeeping (e.g. ``sqlite_sequence`` for
     an ``AUTOINCREMENT`` column), not store data, and are not guaranteed to exist at all until some

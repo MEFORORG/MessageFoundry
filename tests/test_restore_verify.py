@@ -212,6 +212,65 @@ async def test_verify_fails_when_the_manifest_row_counts_disagree_with_the_snaps
     await store.close()
 
 
+async def test_verify_passes_when_an_older_manifest_records_only_a_subset_of_tables(
+    tmp_path,
+) -> None:
+    """The reverse of the test above, and the compatibility half of the same fix. Widening
+    ``_count_tables`` to every table (from the old fixed four) means a manifest written by an OLDER
+    build of this function has fewer keys than a snapshot's schema really has — that is expected, not
+    tampering: ``run_restore_verify`` is documented as a standalone check of an archive from any
+    earlier point (AC-5), so a narrower older manifest has to keep verifying PASS.
+
+    Simulated by re-sealing a good archive with its manifest cut down to the OLD four-table shape
+    (``messages``/``queue``/``message_events``/``audit_log``), values unchanged — the shape an
+    archive taken before BACKLOG #1722 actually has."""
+    key_b64 = generate_key()
+    store, archive, ss = await _backup(tmp_path, key_b64)
+    key = base64.b64decode(key_b64)
+
+    def _shrink_to_the_old_four_tables(manifest: dict[str, object]) -> None:
+        counts = dict(manifest["row_counts"])  # type: ignore[arg-type]
+        old_style = {
+            table: counts[table]
+            for table in ("messages", "queue", "message_events", "audit_log")
+            if table in counts
+        }
+        manifest["row_counts"] = old_style
+
+    older = tmp_path / "older-shape.mfbak"
+    _reseal_with_mutated_manifest(archive, key, older, _shrink_to_the_old_four_tables)
+
+    res = await run_restore_verify(str(older), store_settings=ss)
+    assert res.status == "PASS", res.reason
+    await store.close()
+
+
+async def test_verify_fails_when_the_manifest_expects_a_table_the_snapshot_does_not_have(
+    tmp_path,
+) -> None:
+    """A manifest tracking a table with a NONZERO count that the snapshot's schema does not have at
+    all is real data loss (the table existed when the archive was made and does not now), not a
+    build-boundary artifact — it must still FAIL. ``_count_tables`` reports an absent table as 0 (the
+    same convention the old fixed-list version used), so the compare treats a missing-with-count-0
+    entry as agreement and a missing-with-nonzero-count entry as the mismatch it is."""
+    key_b64 = generate_key()
+    store, archive, ss = await _backup(tmp_path, key_b64)
+    key = base64.b64decode(key_b64)
+
+    def _add_a_phantom_table(manifest: dict[str, object]) -> None:
+        counts = dict(manifest["row_counts"])  # type: ignore[arg-type]
+        counts["a_table_this_snapshot_does_not_have"] = 3
+        manifest["row_counts"] = counts
+
+    tampered = tmp_path / "phantom-table.mfbak"
+    _reseal_with_mutated_manifest(archive, key, tampered, _add_a_phantom_table)
+
+    res = await run_restore_verify(str(tampered), store_settings=ss)
+    assert res.status == "FAIL", res.reason
+    assert res.reason is not None and "row-count mismatch" in res.reason
+    await store.close()
+
+
 async def test_full_restore_verify_opens_through_open_store(tmp_path) -> None:
     key_b64 = generate_key()
     store, archive, ss = await _backup(tmp_path, key_b64)
