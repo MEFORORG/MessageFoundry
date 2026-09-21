@@ -625,12 +625,16 @@ INVENTORY: dict[str, frozenset[str]] = {
     # checkout was made on. SHA-256 rather than a cheaper non-cryptographic digest only because it
     # is already this tree's convention for pinning a file, and a second convention buys nothing.
     "scripts/security/build_password_corpus.py": frozenset({"hashlib"}),
-    # BACKLOG #1578: SHA-256 over the vendored CLA action's files and over the upstream bundle body,
-    # recorded in `.github/actions/cla-assistant-lite/provenance.cdx.json`. Same class as the row
-    # above -- A CHANGE DETECTOR AND A PROVENANCE DERIVATION, not a security control: no secret, no
-    # key, no message authentication, and every input is third-party code committed beside the
-    # digest. The one thing it does beyond change detection is re-derive the upstream blob's digest
-    # from the vendored copy offline, which is a comparison of two published artifacts.
+    # BACKLOG #1578: at least three digests, recorded in or checked against
+    # `.github/actions/cla-assistant-lite/provenance.cdx.json`. SHA-256 over the vendored CLA
+    # action's files and over the upstream bundle body. SHA-1 as git's blob id for the vendored
+    # lockfile (`usedforsecurity=False`), because git names the upstream file by that id. And SHA-1
+    # inside `uuid.uuid5` for the record's serial number, which this gate cannot see because `uuid`
+    # is not a trigger. Same class as the row above -- A CHANGE DETECTOR AND A PROVENANCE
+    # DERIVATION, not a security control: no secret, no key, no message authentication, and every
+    # input is third-party code or a public URL committed beside the digest. The one thing it does
+    # beyond change detection is re-derive the upstream digests from the vendored copy offline,
+    # which is a comparison of two published artifacts.
     "scripts/security/build_cla_action_provenance.py": frozenset({"hashlib"}),
     # BACKLOG #1323 -- ELEVEN SITES THE GATE COULD NOT SEE AT ALL until the TLS-policy seam was
     # added above. Each imports messagefoundry.config.tls_policy and NONE of the six stdlib crypto
