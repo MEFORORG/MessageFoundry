@@ -491,15 +491,20 @@ jobs:
           #
           # `set -o pipefail` is FORWARD-DEFENSIVE here, and saying so is the honest form. The
           # hazard it names elsewhere — a status read through a pipe is the last command's, so a
-          # silent failure upstream reads as success — applied to the DELETED
-          # `grep " ${asset}$" sbomqs-checksums.txt | sha256sum -c -`, where the grep could fail.
+          # silent failure upstream reads as success — was only LATENT in the DELETED
+          # `grep " ${asset}$" sbomqs-checksums.txt | sha256sum -c -`. A grep that matched nothing
+          # still failed the step, but only because `sha256sum -c -` exits 1 on empty input: safe
+          # by the downstream tool, not by design.
           # The one pipeline left is `echo … | sha256sum -c -`, whose first element cannot fail, so
           # this line guards nothing TODAY. Kept because it costs nothing and the next edit that
           # adds a pipe here inherits it; the leak gate's note at the top of this job records the
           # matching measurement, that pipefail is not what fixes a status-through-a-pipe bug.
-          # NOTE the hazard it describes is live in security.yml's twin of this step, which still
-          # runs `grep " ${asset}$" sbomqs-checksums.txt | sha256sum -c -` and carries no pipefail.
-          # That file is not in this change's scope; the asymmetry is recorded, not fixed here.
+          # It is NOT free to delete, though: tests/test_workflow_pipefail_screen.py reads it, and
+          # that screen's baseline no longer grandfathers this step. Remove the line and the screen
+          # reports the `echo` pipe as a new finding.
+          # security.yml's twin of this step still runs the grep form with no pipefail, so it sits
+          # in the same latent state; security.yml's gitleaks step records that shape in so many
+          # words. That file is not in this change's scope.
           set -o pipefail
           VER=2.0.11
           SBOMQS_SHA256=14fd58b89d4948265cce0fdb95d9b635ff667f352b5a9a05b3d13dbefa5d0195
