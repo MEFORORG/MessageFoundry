@@ -7,6 +7,9 @@ Read linked resources relative to the Claude skill's directory.
 User-level sources come from `$CLAUDE_CONFIG_DIR/skills` when set, otherwise
 `~/.claude/skills`. This follows junctions into `.claude-shared-skills` too.
 Repo skill names take precedence over user-level names.
+Git ignores `.claude/skills/`, so a repo skill exists only in the checkout that holds it.
+Every pointer therefore finds its source at run time through `source-skill`.
+A link into that folder would break in every other clone.
 
 ## Hooks follow Claude's repo settings
 

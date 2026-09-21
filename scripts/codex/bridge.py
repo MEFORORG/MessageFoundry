@@ -81,19 +81,17 @@ def sync_skills(
                 backup.parent.mkdir(parents=True, exist_ok=True)
                 if not backup.exists():
                     backup.write_bytes(target.read_bytes())
-        source_ref = (
-            f"Read [the current Claude Code skill](../../../.claude/skills/{source.parent.name}/SKILL.md) "
-            if source.is_relative_to(root / ".claude/skills")
-            else f"Run `pwsh -NoProfile -File scripts/codex/invoke.ps1 source-skill {source.parent.name}` "
-            "from the repo root, then read the returned file "
-        )
+        # Never a markdown link into .claude/skills/: .gitignore keeps everything under .claude/
+        # except settings.json out of git, so such a link dangles in every other clone and fails
+        # tests/test_link_resolution.py. source_skill() applies the repo-first precedence at run time.
         pointer = (
             match[0].rstrip()
             + "\n\n"
             + POINTER_MARKER
             + "\n\n"
-            + source_ref
-            + "before doing this task. That file is authoritative; do not copy its procedure here.\n\n"
+            + f"Run `pwsh -NoProfile -File scripts/codex/invoke.ps1 source-skill {source.parent.name}` "
+            "from the repo root, then read the returned file "
+            "before doing this task. That file is authoritative; do not copy its procedure here.\n\n"
             "Resolve its linked resources relative to its source directory. "
             "Read [the Codex transport notes](../../../docs/CODEX.md) for host-specific differences. "
             "Use this Codex task's identity, never Claude's session files.\n"
@@ -104,11 +102,13 @@ def sync_skills(
         source_label = source.relative_to(root) if source.is_relative_to(root) else source
         messages.append(f"Pointer: {target.relative_to(root)} -> {source_label}")
     for target in (root / ".agents/skills").glob("*/SKILL.md"):
-        pointer_text = target.read_text(encoding="utf-8-sig")
-        if user_skills is None and f"source-skill {target.parent.name}`" in pointer_text:
-            # A repo-only refresh has not inspected this user-level source.
+        if POINTER_MARKER not in target.read_text(encoding="utf-8-sig"):
             continue
-        if POINTER_MARKER in pointer_text and target.parent.name not in sources_by_name:
+        # The invocation-time resolver decides. A repo-only refresh did not enumerate user-level
+        # sources, so it falls back to the default user directory exactly as an invocation would.
+        try:
+            source_skill(root, target.parent.name, user_skills=user_skills)
+        except (FileNotFoundError, ValueError):
             messages.append(
                 f"MISSING SOURCE: {target.relative_to(root)}; remove or rename this pointer"
             )

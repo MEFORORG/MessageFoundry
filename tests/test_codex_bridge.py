@@ -146,7 +146,9 @@ def test_skill_pointer_reads_source_and_refresh_keeps_unrelated_skills(bridge, t
     bridge.sync_skills(tmp_path)
     target = tmp_path / ".agents/skills/example/SKILL.md"
     assert "Old procedure" not in target.read_text()
-    assert "../../../.claude/skills/example/SKILL.md" in target.read_text()
+    # .claude/ is gitignored, so a committed link into it dangles in every other clone.
+    assert "source-skill example`" in target.read_text()
+    assert ".claude/skills" not in target.read_text()
     source.write_text("---\nname: example\ndescription: New metadata\n---\nNew procedure\n")
     bridge.sync_skills(tmp_path)
     assert "New metadata" in target.read_text()
@@ -172,6 +174,26 @@ def test_user_skill_discovery_and_repo_precedence(bridge, tmp_path):
         bridge.source_skill(tmp_path, "seat", user_skills=user_skills)
         == user_skills / "seat/SKILL.md"
     )
+
+
+def test_repo_only_refresh_reports_a_pointer_no_invocation_can_resolve(
+    bridge, tmp_path, monkeypatch
+):
+    """Every pointer shares one text form, so the resolver, not the text, decides what is missing."""
+    user_skills = tmp_path / "claude-user/skills"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(user_skills.parent))
+    for directory, name in ((user_skills, "seat"), (tmp_path / ".claude/skills", "example")):
+        source = directory / name / "SKILL.md"
+        source.parent.mkdir(parents=True)
+        source.write_text(f"---\nname: {name}\ndescription: {name}\n---\nProcedure\n")
+    bridge.sync_skills(tmp_path, user_skills=user_skills)
+    (tmp_path / ".claude/skills/example/SKILL.md").unlink()
+    (tmp_path / ".claude/skills/kept/SKILL.md").parent.mkdir()
+    (tmp_path / ".claude/skills/kept/SKILL.md").write_text("---\nname: kept\n---\nProcedure\n")
+    missing = [m for m in bridge.sync_skills(tmp_path) if m.startswith("MISSING SOURCE")]
+    assert missing == [
+        f"MISSING SOURCE: {Path('.agents/skills/example/SKILL.md')}; remove or rename this pointer"
+    ]
 
 
 @pytest.fixture
