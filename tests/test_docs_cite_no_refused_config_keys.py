@@ -15,12 +15,17 @@ same rule `ledger_check.py` states for `PUBLIC_BACKLOG_FLOOR`.
 WHAT COUNTS AS A CITATION, AND WHY IT IS NARROWER THAN "THE KEY APPEARS":
   * Only an ASSIGNMENT shape (`key = value`) counts. Prose that merely NAMES a key is
     descriptive and harmless.
-  * THREE SPELLINGS of that assignment count: bare `key = value`, the space form
-    `[section] key = value`, and the dotted form `[section].key = value`. The dotted one is
-    what documents in this repo actually write, and it matched NOTHING until 2026-09-20.
-  * Python ATTRIBUTE ACCESS still does not count. `settings.api.public_origin = "..."` reaches
-    the key through an identifier and a dot, not through a `[section].` prefix, and excluding
-    it is what the dotted form was blocked by for as long as it was. See `_assignment`.
+  * TWO BRANCHES match, and only one of them reads the section. `[section].key = value` is
+    matched with the section ANCHORED; everything else is matched by a BARE `key = value` that
+    ignores any bracket on the line. The dotted branch is new on 2026-09-20 -- before it, the
+    spelling documents here actually write matched nothing at all.
+  * SO THE BARE BRANCH IS SECTION-BLIND, and `[cluster] enabled = true` is still reported as a
+    citation of the refused `[auth].enabled`. That is a KNOWN GAP, not a claim of correctness;
+    `test_the_bare_branch_is_still_section_blind` pins it and the `_BASELINE` comment says what
+    it means for the rows below.
+  * Python ATTRIBUTE ACCESS still does not count -- `settings.api.public_origin = "..."` is
+    read, not written. `_assignment` holds how the two are told apart, and what excluding
+    attribute access cost for as long as it also excluded the dotted spelling.
   * TOML booleans are LOWERCASE. `serve_ui=True` is a Python keyword argument to `create_app`,
     not config, and capitalised `True`/`False` is what separates the two. That one character is
     what stops this test flagging the API surface.
@@ -60,7 +65,16 @@ _VALUE = r'("[^"]*"|true|false|\d+)(?![\w])'
 
 
 def _assignment(section: str, key: str) -> str:
-    r"""The citation pattern for one refused ``[section] key``, in every spelling docs use.
+    r"""The citation pattern for one refused ``[section] key``.
+
+    IT HAS TWO BRANCHES AND ONLY THE DOTTED ONE READS THE SECTION. The optional
+    `[section].` prefix is anchored; drop into the bare alternative and the pattern matches
+    `key = value` anywhere, with no idea what section it sits under. `[auth] enabled = true`
+    therefore matches through the BARE branch -- the bracket is not part of the match -- and so
+    does `[cluster] enabled = true`, which is a false positive this scanner cannot see.
+    `test_the_bare_branch_is_still_section_blind` pins that gap so it stays visible; closing it
+    means dropping the bare branch, which would discard most of the corpus and is a separate,
+    larger change (see the fence-scoping note below).
 
     THE `(?<![\w.])` GUARD IS WHAT KEEPS PYTHON ATTRIBUTE ACCESS OUT, and it is why the dotted
     TOML spelling was excluded by ACCIDENT for as long as it was. `settings.api.public_origin =`
@@ -79,20 +93,40 @@ def _assignment(section: str, key: str) -> str:
     to name. `test_the_dotted_form_is_anchored_to_the_keys_own_section` holds this line.
 
     The BRACKETLESS dotted path (`api.host = "..."`) is deliberately NOT matched: it is
-    indistinguishable from attribute access, and it occurs zero times in docs/**/*.md, so
-    admitting the ambiguity would buy nothing.
+    indistinguishable from attribute access ON A BARE LINE, and it occurs zero times in
+    docs/**/*.md, so admitting the ambiguity would buy nothing.
+
+    SCOPING TO TOML CODE FENCES IS THE ALTERNATIVE THAT WAS NOT TAKEN, and it is this
+    directory's house pattern: `tests/test_runbook_proxy_tls_floor.py` and
+    `tests/test_off_loopback_runbook.py` both scope their scans by fence language. Tracking the
+    fence and the `[section]` header in force would make the section readable on EVERY branch,
+    which collapses the section-blindness above and the bracketless case with it. It is not a
+    drop-in swap: most of the citations here are PROSE outside any fence, so fence scoping
+    would drop them and force a full re-baseline. It is worth its own item, not this one.
     """
     return rf"(?<![\w.])(?:\[{re.escape(section)}\]\.)?{re.escape(key)}\s*=\s*{_VALUE}"
+
+
+#: Built once. `_citations` runs this inner loop per surviving line, so the corpus pass makes
+#: about 1.4 million of them; rebuilding the pattern string each time cost a measured 3.37s
+#: against 2.26s compiled at import.
+_PATTERNS: tuple[tuple[str, str, re.Pattern[str]], ...] = tuple(
+    (section, key, re.compile(_assignment(section, key))) for section, key in _REFUSED_KEYS
+)
 
 
 def _citations(text: str) -> list[tuple[int, str, str]]:
     """Every line presenting a refused key as config, with the fragment that made it match."""
     hits: list[tuple[int, str, str]] = []
     for lineno, line in enumerate(text.splitlines(), 1):
-        if _DISCLAIMS.search(line):
+        # Every pattern embeds a literal `=`, so a line without one cannot match any of the 16.
+        # 94 percent of docs/**/*.md is such a line, and skipping them before the regexes run
+        # took a measured corpus pass from 3.0s to 0.33s. `test_every_pattern_needs_an_equals`
+        # is what keeps the shortcut honest if the pattern ever widens.
+        if "=" not in line or _DISCLAIMS.search(line):
             continue
-        for section, key in _REFUSED_KEYS:
-            match = re.search(_assignment(section, key), line)
+        for section, key, pattern in _PATTERNS:
+            match = pattern.search(line)
             if match:
                 hits.append((lineno, f"[{section}].{key}", match.group(0)))
     return hits
@@ -112,35 +146,61 @@ def test_the_relocated_table_is_populated() -> None:
     assert len(_REFUSED_KEYS) >= 16, _REFUSED_KEYS
 
 
-def test_the_scanner_catches_a_deliberately_bad_line() -> None:
-    """POSITIVE CONTROL for the SPACE form. A scanner that finds nothing anywhere is
-    indistinguishable from a clean corpus, so make it fire on purpose before trusting a zero."""
-    section, key = next(iter(_RELOCATED_TO_SECURITY))
-    planted = f"Set `[{section}] {key} = true` in your config.\n"
-    assert _citations(planted), f"the scanner did not catch a planted citation of {key}"
+@pytest.mark.parametrize("spelling", ["bare", "space", "dotted"])
+def test_the_scanner_catches_a_deliberately_bad_line(spelling: str) -> None:
+    """POSITIVE CONTROL, one case per spelling a DOCUMENT may use.
 
+    A scanner that finds nothing anywhere is indistinguishable from a clean corpus, so make it
+    fire on purpose before trusting a zero. EACH SPELLING NEEDS ITS OWN CASE: this was a single
+    test planting `[section] key`, and that spelling kept working throughout the window in which
+    `[section].key = value` matched nothing at all. A control that can only exercise the working
+    path reports a clean scan and a broken scan identically, which is what happened here.
 
-def test_the_scanner_catches_a_dotted_toml_section_citation() -> None:
-    """POSITIVE CONTROL for the DOTTED form, which is the spelling documents here actually use.
-
-    IT IS A SEPARATE TEST BECAUSE THE SPACE-FORM CONTROL ABOVE SHARED THE SCANNER'S BLIND SPOT.
-    It plants `[section] key`, the one spelling that always worked, so it stayed green through
-    the whole window in which `[section].key = value` matched nothing at all. A control that
-    can only exercise the working path reports a clean scan and a broken scan identically.
+    THESE ARE THREE SPELLINGS, NOT THREE BRANCHES. Only `dotted` exercises the anchored branch;
+    `bare` and `space` both match through the bare alternative, and `space` would pass even if
+    the bracket were garbage. See `_assignment`.
     """
     section, key = next(iter(_RELOCATED_TO_SECURITY))
-    planted = f"Set `[{section}].{key} = true` in your config.\n"
-    assert _citations(planted), f"the scanner did not catch a dotted citation of [{section}].{key}"
+    prefix = {"bare": "", "space": f"[{section}] ", "dotted": f"[{section}]."}[spelling]
+    planted = f"Set `{prefix}{key} = true` in your config.\n"
+    assert _citations(planted), f"the scanner did not catch a {spelling} citation of {key}"
+
+
+def test_the_bare_branch_is_still_section_blind() -> None:
+    """KNOWN GAP, pinned so it cannot be mistaken for correctness.
+
+    The anchored prefix guards the DOTTED spelling only. Written with a space, a foreign
+    section still reaches the bare alternative and is reported as a citation of the refused
+    key -- the matched fragment is `enabled = true`, with the bracket outside the match.
+    Measured 2026-09-20 over docs/**/*.md, 10 of the 52 baselined hits sit under a section
+    header that is not the refused key's; the `_BASELINE` comment breaks them down.
+
+    THIS ASSERTS THE WRONG ANSWER ON PURPOSE. Closing the gap means dropping the bare branch or
+    tracking the section header, which re-baselines the whole corpus; until then, a test that
+    FAILS when someone fixes it is how the next person finds the note instead of the surprise.
+    """
+    assert ("auth", "enabled") in _REFUSED_KEYS, _REFUSED_KEYS
+    hits = _citations("Under `[cluster]`, `enabled = true` starts the coordinator.\n")
+    assert hits == [(1, "[auth].enabled", "enabled = true")], hits
+
+
+def test_every_pattern_needs_an_equals() -> None:
+    """`_citations` skips any line with no `=`, leaving 94 percent of the corpus unscanned.
+
+    That is sound only while every pattern requires one. A future widening that admitted a
+    citation shape without `=` would silently under-report -- the same blind-spot shape the
+    dotted spelling had, found the same way it was: by checking the claim instead of the code.
+    """
+    for section, key in _REFUSED_KEYS:
+        assert "=" in _assignment(section, key), (section, key)
 
 
 def test_the_dotted_form_is_anchored_to_the_keys_own_section() -> None:
     """NEGATIVE CONTROL, PAIRED with a positive arm so it cannot pass by matching nothing.
 
-    `enabled` is refused under `[auth]` and is ordinary live config under `[cluster]`. A prefix
-    that accepted any section would read the second as a citation of the first: measured
-    2026-09-20, that mistake added 14 hits across docs/**/*.md and every one was a correct line
-    of supported config. The FIRES arm proves the scanner is live on this key, so a regression
-    that broke dotted matching outright could not turn the MISSES arm green.
+    `_assignment` records why the `[section].` prefix is anchored and what an unanchored one
+    measured; this is the test that holds that line. The FIRES arm proves the scanner is live on
+    this key, so a regression that broke dotted matching outright could not turn MISSES green.
     """
     assert ("auth", "enabled") in _REFUSED_KEYS, _REFUSED_KEYS
     assert _citations("Set `[auth].enabled = true` in your config.\n")
@@ -150,7 +210,7 @@ def test_the_dotted_form_is_anchored_to_the_keys_own_section() -> None:
 def test_the_scanner_does_not_flag_python_attribute_access() -> None:
     """NEGATIVE CONTROL: admitting the dotted form must not admit attribute access with it.
 
-    Every probe here carries a LOWERCASE TOML value, so the capitalisation rule below cannot
+    Every probe here carries a LOWERCASE TOML value, so the `_VALUE` capitalisation rule cannot
     rescue it -- the lookbehind in `_assignment` is the only thing rejecting these, and this
     test fails the moment it is dropped.
     """
@@ -164,7 +224,15 @@ def test_the_scanner_does_not_flag_python_attribute_access() -> None:
 
 def test_the_scanner_does_not_flag_a_line_documenting_the_refusal() -> None:
     """NEGATIVE CONTROL, and it is the one that has already burned somebody. Flagging this
-    line would send a builder to 'fix' the only place the doc states the rule correctly."""
+    line would send a builder to 'fix' the only place the doc states the rule correctly.
+
+    IT ONLY STARTED TESTING THAT ON 2026-09-20. The line it plants uses the DOTTED spelling,
+    which matched nothing at all until the dotted branch was admitted -- so it passed whether
+    or not `_DISCLAIMS` existed, and the exemption it exists to protect was never exercised.
+    Measured that day against both patterns: the planted line matches the new one with the
+    disclaim filter removed, and did not match the old one. This control was vacuous; the
+    widening is what made `_DISCLAIMS` load-bearing here.
+    """
     section, key = next(iter(_REFUSED_KEYS))
     documented = f"The `[{section}].{key} = true` TOML spelling is refused at load.\n"
     assert not _citations(documented)
@@ -178,10 +246,10 @@ def test_the_scanner_does_not_flag_a_python_keyword_argument() -> None:
 
 # THE MEASURED BASELINE, AND WHY THIS IS A RATCHET RATHER THAN A CLEAN GATE.
 #
-# 28 documents carry 66 of these citations -- the row count and the sum of the table below,
-# which is the only authority for both numbers. Two drafts of this line have already drifted from
-# the dict they describe: one said 58 against a sum of 59, and the document count read 27 against
-# 26 rows. BACKLOG #1383's agreed scope is docs/SECURITY.md ONLY
+# 28 documents carry 66 of these "citations" -- the row count and the sum of the table below,
+# pinned by test_the_header_count_matches_the_table, because two drafts of this line have already
+# drifted from the dict they describe: one said 58 against a sum of 59, and the document count
+# read 27 against 26 rows. BACKLOG #1383's agreed scope is docs/SECURITY.md ONLY
 # -- the ASVS tracker recommended that scope, the Liaison endorsed it unaltered, and widening it
 # here would be a scope decision nobody made. SECURITY.md is now 0 and is absent from this table.
 #
@@ -209,14 +277,38 @@ def test_the_scanner_does_not_flag_a_python_keyword_argument() -> None:
 # rewriting a decision record is the wrong remedy for a scan finding.
 #
 # THE TWO WITHHELD ROWS BELOW COULD NOT BE RE-MEASURED, AND NO CHECKOUT CAN DETECT THAT. Their
-# documents are not in any clone (see _WITHHELD_FROM_PUBLIC_CHECKOUTS), so 12 and 2 are now LOWER
-# BOUNDS carried over from the narrower scan rather than measurements of this one -- widening can
-# only ever raise a count. Whoever holds those two documents must re-measure them with the dotted
-# form admitted and correct these rows; until then the ratchet is inert on them, exactly as it
-# already was, and no instrument here will say so.
+# documents are in no clone (see _WITHHELD_FROM_PUBLIC_CHECKOUTS), and widening can only ever
+# RAISE a count, so those two rows are now LOWER BOUNDS carried over from the narrower scan
+# rather than measurements of this one. Whoever holds those documents must re-measure them with
+# the dotted branch admitted. Note that both sibling guards this exemption was borrowed from
+# ship an env override letting the holder point the guard at their own copy and enforce it;
+# this file has none, so re-measuring here means editing the table by hand.
+#
+# "CITATION" IS THE INSTRUMENT'S WORD, NOT A VERDICT ON THE LINE. The bare branch is
+# section-blind (see `_assignment`), so some rows below count lines that are CORRECT config.
+# Measured 2026-09-20, by tracking the fence language and the `[section]` header in force, all
+# 52 on-disk hits fall out as:
+#
+#     7  dotted, section anchored                      -- right by construction
+#     1  bare, under its OWN section header            -- a true citation
+#     7  bare, under a FOREIGN header ([cluster], [backup], [inbound], ...)    WRONG
+#     3  bare, under [security] -- the very replacement spelling this gate     WRONG
+#        exists to steer readers toward
+#    34  bare, no header in force (prose, or an unheaded fence)  -- a line scanner cannot say,
+#        and 6 of those are Python keyword arguments in a `python` fence, which lowercase
+#        string values slip past because `_VALUE` only separates `True` from `true`
+#
+# The 3 are the sharp case: `_DISCLAIMS` exempts `[security]` per LINE, and a section header is
+# per BLOCK, so the exemption never reaches those key lines. That is the "would have had a
+# builder FIX IT INTO BEING WRONG" failure the module docstring cites, sitting in this table.
+#
+# SO A ROW GOING DOWN IS NOT ALWAYS A DOCUMENT BEING FIXED -- it may be the instrument learning
+# to read. Do not treat this table as a list of defects, and do not edit a document because it
+# appears here without reading the line first.
 _BASELINE: dict[str, int] = {
-    # Dotted-spelling rows below (PR #1364 review): was 1, the added one is `[ai].data_class`.
+    # Dotted branch, PR #1364 review: was 1, the added one is `[ai].data_class`.
     "docs/adr/0014-alerting-rules-engine.md": 2,
+    # Dotted branch, PR #1364 review: a NEW row, both hits `[ai].data_class` in this ADR's prose.
     "docs/adr/0019-pluggable-keyprovider-hsm-kms-vault.md": 2,
     "docs/adr/0022-fhir-resource-codec-rest-client.md": 1,
     "docs/adr/0027-per-connection-retention.md": 1,
@@ -225,10 +317,12 @@ _BASELINE: dict[str, int] = {
     "docs/adr/0096-cluster-leader-preference-and-non-promotable-standby.md": 1,
     # #1279: was 2. The three added are the retired posture lever, quoted in this ADR's own
     # amendment banner and in the two config blocks that show what the section looked like.
-    # PR #1364 review: was 5, the added one is the `# was [ai].data_class = "phi"` migration note.
+    # Dotted branch, PR #1364 review: was 5, the added one is the `# was [ai].data_class = "phi"`
+    # migration note. Two of this row's six are the section-blind `[security]`-block case above.
     "docs/adr/0118-secure-by-default-security-configuration-section.md": 6,
-    # PR #1364 review: three `[store].allow_unencrypted_phi=true`, all of them this ADR stating
-    # what the audited opt-out did, including its acceptance criterion.
+    # Dotted branch, PR #1364 review: a NEW row -- three `[store].allow_unencrypted_phi=true`,
+    # all of them this ADR stating what the audited opt-out did, including its acceptance
+    # criterion.
     "docs/adr/0109-at-rest-encryption-fail-closed-on-an-undeclared-phi-posture.md": 3,
     # #1279 rows below: each records what the removed key did, in a decision record.
     "docs/adr/0115-asvs-l3-drive-to-pass-secure-by-default-flips-and-residual-closure.md": 1,
@@ -275,6 +369,17 @@ _WITHHELD_FROM_PUBLIC_CHECKOUTS = frozenset(
 
 class BaselineRowUnenforced(UserWarning):
     """A baseline row names a document this checkout does not carry."""
+
+
+def test_the_header_count_matches_the_table() -> None:
+    """The comment above `_BASELINE` states a row count and a sum. Pin both.
+
+    That sentence has drifted twice already: one draft read 58 against a sum of 59, another read
+    27 documents against 26 rows. This file's whole argument is that the table is the single
+    source of truth, and that is worth nothing while the sentence introducing it can quietly
+    disagree. Change a row, change the header -- this is what makes you.
+    """
+    assert (len(_BASELINE), sum(_BASELINE.values())) == (28, 66)
 
 
 def test_every_withheld_row_is_still_a_baseline_row() -> None:
