@@ -1531,7 +1531,8 @@ an **editable** install (`pip install -e .` — no RECORD baseline) is a **no-op
 |---|---|---|---|
 | `enabled` | bool | `true` | run startup attestation at all. On by default (alert-only is harmless); a **no-op** off an editable install. Set `false` only to suppress the check entirely (e.g. an unusual packaging where RECORD is known-stale) — you then lose the in-place-tamper tripwire. |
 | `fail_closed_on_drift` | bool | `false` | when `true`, drift makes `serve` **refuse to start** (after recording the audit row + alerting), and so does an attestation that verified **nothing** — no `RECORD` baseline, a `RECORD` stripped of its package rows, or the package loaded from outside the install root (a pass that compared zero files cannot say the bytes are clean). Default `false` = **alert-only**: a legitimate reviewed in-place security hotfix (the documented vendored-parser patch contingency) would itself trip a RECORD mismatch, so fail-closed-by-default would brick a legitimate patch. Alert-only still logs a WARNING, records the row and alerts for both shapes. An install that **declares** itself editable (`pip install -e .`) is exempt either way, so dev is never bricked — and because that exemption silently cancels the opt-in, setting this on an editable install logs a WARNING naming the reason at startup (BACKLOG #1679). Opt in for hard enforcement on a locked-down instance. **Read the boundary before you record this as tamper-proof:** the baseline ships inside the same install the adversary would be writing, so it detects an *inconsistent* in-place edit and not a *consistent* one. Why no runtime anchor fixes that, where the out-of-domain anchoring actually lives, and what the resolution assumes about the install root are in [ADR 0041](adr/0041-load-path-attestation-and-change-attribution.md) D3, *"The baseline's trust domain"*. |
-| `audit_verify_on_start` | bool | `false` | when `true`, the engine **re-walks the `audit_log` hash chain once at startup** (#190). **Alert-only by construction:** a broken chain logs a WARNING and fires the `AlertSink` but **never** crashes startup — a refuse-to-start on a tripped tamper alarm would be a self-inflicted DoS. Default `false` (opt in): on a very large `audit_log` the full re-walk adds startup latency, so it is not on by default. **It is a bare walk: it passes no anchor, so it is blind to a truncated tail** (below). Nothing here consumes an anchor — that is `messagefoundry audit-verify --expected-anchor`, run by an operator against a quiesced chain. **Read the two limits below before citing this as tamper detection.** |
+| `audit_verify_on_start` | bool | `false` | when `true`, the engine **re-walks the `audit_log` hash chain once at startup** (#190). **Alert-only by construction:** a broken chain logs a WARNING and fires the `AlertSink` but **never** crashes startup — a refuse-to-start on a tripped tamper alarm would be a self-inflicted DoS. Default `false` (opt in): on a very large `audit_log` the full re-walk adds startup latency, so it is not on by default. **On its own it is a bare walk, and a bare walk is blind to a truncated tail** (below) — set `audit_anchor_file` beside it to close that. **Read the two limits below before citing this as tamper detection.** |
+| `audit_anchor_file` | str | `""` | path to a file holding one `COUNT:HEAD` anchor as written by `messagefoundry audit-anchor`. Empty (the default) leaves the startup walk exactly as it was. When set **and** `audit_verify_on_start` is `true`, the startup walk also compares the live chain against that anchor, which is **what lets it see a truncated tail** (BACKLOG #328). **The engine consumes it as a PREFIX, not as the CLI's exact seal** — `--expected-anchor` compares the *current* head and so diverges on the very next appended row, which a running engine produces constantly; this asks instead whether the recorded state was ever true and the chain has only **grown** since. It still catches a truncated tail and a mid-chain rewrite, and a **stale anchor stays valid** — it simply witnesses less, so re-anchor when you want the witness moved forward. **Alert-only, like its partner:** a missing, unreadable or malformed anchor logs a WARNING, names the file and the reason, and lets the bare walk run — it never crashes startup and **never fires the tamper alert**, because a config fault that raised a tamper alarm would train operators to ignore the real one. The refusal never quotes the file's contents into the log (a mis-pointed path is usually a path typo'd onto something else); the CLI still quotes it, because that lands on the operator's own terminal. `0:`, the anchor of an **empty** log, is reported rather than compared — it can witness nothing. Setting this **without** `audit_verify_on_start` is warned at startup: the anchor is never read. A truncated tail and a broken chain fire **different** alert subjects (`audit-chain-truncated` / `audit-chain`), so they route and throttle separately |
 
 **The chain is *tamper-evident* only when the store is keyed.** With no store encryption key the cipher
 is `IdentityCipher`, whose `audit_mac_key()` returns `None` — "no DEK → no derived key → the audit chain
@@ -1548,36 +1549,51 @@ deployment does get the keyed chain. The unkeyed chain is what an **acknowledged
 runs — and since [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md) that acknowledgment is the only route to it. Check `[store].encryption_key` /
 `encryption_key_file` before you record "tamper-evident audit log" in a risk register.
 
-**And the walk does not catch a truncated tail.** `verify_audit_chain` detects modified or deleted
+**And a bare walk does not catch a truncated tail.** `verify_audit_chain` detects modified or deleted
 **older** rows, but deleting the **newest** rows leaves a prefix that still chains cleanly, so a bare
 walk returns CLEAN after a tail-truncation. An attacker hiding what they just did truncates the newest
-rows. `audit_verify_on_start` is a bare walk and is therefore blind to exactly that.
+rows. `audit_verify_on_start` **on its own** is a bare walk and is therefore blind to exactly that.
 
-**What closes it is an anchor, and it is an operator command, not a startup setting**
-([BACKLOG #328](BACKLOG.md)). `messagefoundry audit-anchor` prints `COUNT:HEAD`; passing it back as
-`messagefoundry audit-verify --expected-anchor COUNT:HEAD` (or `--expected-anchor-file PATH`) compares
-the live chain against it and reports `truncated or rewritten` when they differ. The anchor is a row
-count plus a digest — no PHI, no secret — so it is safe to hold in a ticket or an object store, which
-is what makes it an *external* witness.
+**What closes it is an anchor, and there are now two ways to hold one**
+([BACKLOG #328](BACKLOG.md)). `messagefoundry audit-anchor` prints `COUNT:HEAD`. Either pass it back by
+hand as `messagefoundry audit-verify --expected-anchor COUNT:HEAD` (or `--expected-anchor-file PATH`),
+or point `[integrity].audit_anchor_file` at the file and let **every startup** compare against it. The
+anchor is a row count plus a digest — no PHI, no secret — so it is safe to hold in a ticket or an
+object store, which is what makes it an *external* witness.
 
-**The anchor is an EXACT point-in-time seal.** It compares the count **and** the head hash, so an
-anchor taken before any subsequent audit row reports `truncated or rewritten` on a chain that merely
-**grew**. The head half is not redundant with the count: an attacker who cuts the newest rows and
-forges the same number of replacements restores the count *and* leaves a chain that walks cleanly, so
-the head hash is the only thing that differs. The sharp edge and that detection are the same check.
+**The two consume it differently, and the difference is the whole reason the startup one can exist.**
 
-**So it seals a chain AT REST between two offline checks — that is the whole workflow, and it is the
-only one with detection power.** Anchoring and immediately re-verifying compares a value to itself and
-proves nothing; re-checking a held anchor against a **running** engine alarms on every ordinary boot,
-because a running engine writes audit rows. What sits between those two useless readings is a real
-control: **stop or quiesce the engine, take the anchor, hold it somewhere the engine's operator cannot
-rewrite, and re-verify while the chain is still quiesced** — across a maintenance window, a database
-move, a backup/restore, or a hand-off between custodians. Anything that happened to the DB in that gap
-is what the anchor detects. Do not build a periodic job against a live engine on it.
+**The CLI's `--expected-anchor` is an EXACT point-in-time seal.** It compares the count **and** the
+head hash, so an anchor taken before any subsequent audit row reports `truncated or rewritten` on a
+chain that merely **grew**. The head half is not redundant with the count: an attacker who cuts the
+newest rows and forges the same number of replacements restores the count *and* leaves a chain that
+walks cleanly, so the head hash is the only thing that differs. The sharp edge and that detection are
+the same check.
+
+**So the CLI check seals a chain AT REST between two offline readings — that is its whole workflow.**
+Anchoring and immediately re-verifying compares a value to itself and proves nothing; re-checking an
+*exact* anchor against a **running** engine alarms on every ordinary boot, because a running engine
+writes audit rows. What sits between those two useless readings is a real control: **stop or quiesce
+the engine, take the anchor, hold it somewhere the engine's operator cannot rewrite, and re-verify
+while the chain is still quiesced** — across a maintenance window, a database move, a backup/restore,
+or a hand-off between custodians. Anything that happened to the DB in that gap is what it detects. Do
+not build a periodic job against a live engine on the **exact** comparison.
+
+**`[integrity].audit_anchor_file` is the same artifact under a WEAKER comparison, and that is what
+makes it survivable on a running engine.** It asks whether the recorded state was ever true and the
+chain has only **grown** since — the head captured *at the recorded row position* against the recorded
+one — so appended rows are irrelevant to it and it does not alarm on an ordinary restart. It still
+catches the two shapes that matter: **fewer rows than recorded** (a truncated tail) and **a different
+head at that position** (a mid-chain rewrite). What it gives up is the exact seal's sharpness about
+*when*: it cannot tell you the chain is unchanged, only that it has not been cut or rewritten below
+the anchor. Use both — the startup check for continuous coverage of every boot, the quiesced CLI check
+for the custodial hand-offs above.
 
 The full reasoning is the [`[retention]`](#retention) `audit_days` row, which is the source of record
-for it. **For continuous coverage of a running engine, an off-box log forward / tee remains the answer**
-— the anchor does not replace it and cannot, because the anchor is a seal on a stationary object.
+for it. **An off-box log forward / tee remains the answer for continuous coverage, and neither anchor
+check replaces it.** `audit_anchor_file` fires **at startup and only at startup**, so it detects a cut
+made since the last boot — it says nothing about the window between two boots, and a host that never
+restarts never checks. The tee is the only control that sees the trail as it is written.
 
 ### `[engine]`
 **Not implemented.** There is **no `EngineSettings` model**, so an `[engine]` block in

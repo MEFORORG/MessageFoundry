@@ -7,6 +7,29 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **`[integrity].audit_anchor_file` — the startup audit check can now hold an anchor, so it can see a
+  truncated tail.** A previous release shipped `audit-anchor` / `audit-verify --expected-anchor` and
+  recorded, accurately at the time, that `[integrity].audit_verify_on_start` "is unchanged — it is a
+  bare walk and stays blind to a truncated tail". **That sentence no longer describes the engine.**
+  Point the new key at the `COUNT:HEAD` file `messagefoundry audit-anchor` writes and every startup
+  compares against it; leave it empty (the default) and the walk is byte-identical to before.
+  **It consumes the anchor as a PREFIX, not as the CLI's exact seal, and that is the whole reason a
+  startup setting can hold one.** The exact seal compares the *current* head, so it diverges on the
+  next appended row — and a running engine writes audit rows, so a startup check built on it would
+  alarm on essentially every restart. The prefix comparison asks instead whether the recorded state was
+  ever true and the chain has only **grown** since, which survives restarts while still catching a
+  truncated tail and a mid-chain rewrite. A stale anchor therefore stays valid; it just witnesses less.
+  **Alert-only in both directions.** A missing, unreadable or malformed anchor logs a WARNING naming
+  the file, the reason and the coverage lost, then lets the bare walk run — it never blocks startup,
+  and it never fires the tamper alert, because a config fault that raised a tamper alarm would train
+  operators to ignore the real one. `0:`, the anchor of an empty log, is reported rather than compared:
+  it can witness nothing, and passing it on would have alarmed on every start of an intact chain.
+  A truncated tail and a broken chain fire **different** alert subjects (`audit-chain-truncated` /
+  `audit-chain`) so they route and throttle separately — but they are not independent: a chain break is
+  reported *before* the anchor comparison runs, so a break should be read as *at least* a break.
+  **Scope.** It fires at startup and only at startup, so it detects a cut made since the last boot and
+  says nothing about the window between two boots. For continuous coverage the off-box log forward /
+  tee remains the control. ([BACKLOG #328](docs/BACKLOG.md))
 - **A startup preflight that reads the store principal's *effective* privileges, so the least-privilege
   grant the runbooks prescribe stops being a claim the engine cannot check.**
   [`DEPLOY-SERVER-DB.md`](docs/DEPLOY-SERVER-DB.md) told operators exactly which grant the engine's

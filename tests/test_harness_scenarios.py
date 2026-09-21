@@ -8,6 +8,7 @@ scenarios end-to-end. Also smoke-tests the CLI dispatch (list / unknown name) wi
 
 from __future__ import annotations
 
+import importlib
 import socket
 import threading
 import time
@@ -18,10 +19,12 @@ from types import SimpleNamespace
 import pytest
 import uvicorn
 
+from harness import scenarios
 from harness.__main__ import main
 from harness.scenarios import Scenario, _verify_dead_letter, _verify_disposition, run_scenario
 from messagefoundry.api import create_managed_app
 from messagefoundry.apiclient import EngineClient
+from messagefoundry.parsing.message import Message
 
 
 def _free_port() -> int:
@@ -69,44 +72,39 @@ def handle(msg):
 
 @pytest.fixture
 def server(tmp_path: Path) -> Iterator[tuple[str, int]]:
-    # _free_port() returns a port that is free *now* but closes the socket before uvicorn / the MLLP
-    # listener actually binds it — a TOCTOU race that intermittently loses the port to another process
-    # on a busy CI runner (EADDRINUSE → uvicorn never sets `started` → "server did not start"). Retry the
-    # whole bring-up on a FRESH set of ports (and a fresh db) instead of reding the leg; a re-roll almost
-    # never collides twice.
-    last_error = "server did not start"
-    for attempt in range(4):
-        mllp_port = _free_port()
-        dead_port = (
-            _free_port()
-        )  # nothing listens here → echo deliveries are refused → dead-lettered
-        _write_config(tmp_path / "config", mllp_port, tmp_path / "out", dead_port)
-        app = create_managed_app(
-            db_path=tmp_path / f"scenarios-{attempt}.db",
-            config_dir=tmp_path / "config",
-            poll_interval=0.05,
-        )
-        api_port = _free_port()
-        uv = uvicorn.Server(
-            uvicorn.Config(app, host="127.0.0.1", port=api_port, log_level="warning")
-        )
-        thread = threading.Thread(target=uv.run, daemon=True)
-        thread.start()
-        deadline = time.time() + 10
-        while not uv.started and thread.is_alive() and time.time() < deadline:
-            time.sleep(0.05)
-        if uv.started:
-            try:
-                yield f"http://127.0.0.1:{api_port}", mllp_port
-            finally:
-                uv.should_exit = True
-                thread.join(timeout=10)
-            return
-        # bring-up failed (a port-bind race or the listener died) — tear down and re-roll the ports
+    mllp_port = _free_port()
+    dead_port = _free_port()  # nothing listens here: echo delivery dead-letters
+    _write_config(tmp_path / "config", mllp_port, tmp_path / "out", dead_port)
+    app = create_managed_app(
+        db_path=tmp_path / "scenarios.db",
+        config_dir=tmp_path / "config",
+        poll_interval=0.05,
+    )
+    api_port = _free_port()
+    uv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=api_port, log_level="warning"))
+    thread = threading.Thread(target=uv.run, daemon=True)
+    thread.start()
+    # Keep the former four ten-second attempts' total readiness allowance, but let one
+    # live startup finish. Restarting a slow startup every ten seconds cannot help it.
+    deadline = time.monotonic() + 40.0
+    try:
+        while True:
+            if not thread.is_alive():
+                raise RuntimeError(
+                    f"server exited during startup (api_port={api_port}, mllp_port={mllp_port})"
+                )
+            if uv.started:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    f"server startup timed out after 40s (api_port={api_port}, mllp_port={mllp_port})"
+                )
+            time.sleep(min(0.05, remaining))
+        yield f"http://127.0.0.1:{api_port}", mllp_port
+    finally:
         uv.should_exit = True
         thread.join(timeout=10)
-        last_error = f"server did not start (api_port={api_port}, mllp_port={mllp_port})"
-    raise RuntimeError(last_error)
 
 
 @pytest.mark.parametrize(
@@ -193,3 +191,95 @@ def test_cli_lists_scenarios(capsys: pytest.CaptureFixture[str]) -> None:
 def test_cli_rejects_unknown_scenario(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["--scenario", "does-not-exist"]) == 2
     assert "unknown scenario" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("expect", ["processed", "dead_letter"])
+def test_repeated_scenario_cannot_pass_with_previous_run_rows(
+    monkeypatch: pytest.MonkeyPatch, expect: str
+) -> None:
+    stored: set[str] = set()
+    runs: list[set[str]] = []
+
+    def send(host: str, port: int, payloads: list[str]) -> list[str]:
+        ids = {Message.parse(raw)["MSH-10"] for raw in payloads}
+        runs.append(ids)
+        if len(runs) == 1:
+            stored.update(ids)
+        return [""] * len(payloads)
+
+    class Client:
+        def list_messages(self, *, control_id: str, **kwargs: object) -> object:
+            rows = [SimpleNamespace(status="processed")] if control_id in stored else []
+            return SimpleNamespace(messages=rows)
+
+        def list_dead_letters(self, **kwargs: object) -> object:
+            return SimpleNamespace(dead_letters=[SimpleNamespace(control_id=c) for c in stored])
+
+    monkeypatch.setattr(scenarios, "_send_mllp", send)
+    scenario = Scenario(
+        "repeat", "", "ADT", "A05", count=3, expect=expect, dead_letter_destination="echo"
+    )
+    client = Client()
+    assert run_scenario(scenario, client, timeout=0.01).ok
+    assert not run_scenario(scenario, client, timeout=0.01).ok
+    assert len(runs[0]) == len(runs[1]) == 3
+    assert runs[0].isdisjoint(runs[1])
+
+
+@pytest.mark.parametrize("fixture_module", ["test_harness_scenarios", "test_harness_monitor"])
+@pytest.mark.parametrize("mode", ["slow", "dead", "dead_ready", "timeout"])
+def test_server_readiness_uses_one_budget_and_always_cleans_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str, fixture_module: str
+) -> None:
+    clock = [0.0]
+    servers: list[Server] = []
+    joins: list[float | None] = []
+
+    class Server:
+        def __init__(self, config: object) -> None:
+            self.should_exit = False
+            servers.append(self)
+
+        @property
+        def started(self) -> bool:
+            return mode == "dead_ready" or (mode == "slow" and clock[0] >= 11)
+
+        def run(self) -> None:
+            pass
+
+    class Thread:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def is_alive(self) -> bool:
+            return mode not in {"dead", "dead_ready"}
+
+        def join(self, timeout: float | None = None) -> None:
+            joins.append(timeout)
+
+    def sleep(seconds: float) -> None:
+        clock[0] += seconds
+
+    monkeypatch.setattr(uvicorn, "Server", Server)
+    monkeypatch.setattr(threading, "Thread", Thread)
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    monkeypatch.setattr(time, "sleep", sleep)
+    module = importlib.import_module(fixture_module)
+    fixture = module.server.__wrapped__(tmp_path)
+    if mode == "slow":
+        next(fixture)
+        fixture.close()
+        assert 11 <= clock[0] < 12
+    else:
+        with pytest.raises(
+            RuntimeError, match="exited" if mode.startswith("dead") else "timed out"
+        ):
+            next(fixture)
+        assert clock[0] == 0 if mode.startswith("dead") else 40 <= clock[0] < 41
+    assert len(servers) == 1
+    assert servers[0].should_exit
+    assert joins == [10]

@@ -1266,6 +1266,24 @@ def audit_row_hash(
     return hmac.new(key, data, hashlib.sha256).hexdigest()
 
 
+#: The phrase :func:`audit_prefix_verdict` puts in its failure message, exported so a CALLER can tell a
+#: TRUNCATED/REWRITTEN TAIL from a BROKEN CHAIN without walking the log twice (BACKLOG #328).
+#:
+#: ``verify_audit_chain`` folds both verdicts into one ``(ok, message)`` pair and reports the chain break
+#: FIRST, returning before the prefix comparator runs. So a caller holding only ``ok=False`` cannot say
+#: which fired -- and the two want different handling: a break names a row an operator can go and read,
+#: while a truncation names rows that are no longer there to read. ``Engine._verify_audit_chain_on_start``
+#: routes them to DIFFERENT alert subjects on the strength of this marker, so they throttle and route
+#: independently.
+#:
+#: IT IS A SHARED CONSTANT RATHER THAN A STRING THE CALLER RESTATES, and that is the whole point: a
+#: restated copy drifts silently the day this message is reworded, and the caller then quietly
+#: reclassifies every truncation as a chain break. Substring-matching a message is a weak seam either
+#: way; making the producer and the consumer read the SAME name is what stops the seam rotting
+#: unobserved. Pinned by ``test_prefix_break_marker_appears_in_a_real_prefix_failure``.
+AUDIT_PREFIX_BREAK_MARKER = "is not an extension of the recorded prefix"
+
+
 def audit_prefix_verdict(
     expected_prefix: tuple[int, str], prefix_head: str | None, count: int
 ) -> tuple[bool, str | None]:
@@ -1308,10 +1326,177 @@ def audit_prefix_verdict(
         have = "(never reached)" if prefix_head is None else f"{prefix_head[:12]!r}"
         return (
             False,
-            f"audit log is not an extension of the recorded prefix (have {count} row(s), head at "
+            f"audit log {AUDIT_PREFIX_BREAK_MARKER} (have {count} row(s), head at "
             f"row {exp_count} {have}, expected {exp_head[:12]!r}) — truncated or rewritten",
         )
     return True, None
+
+
+#: The operator-facing shape of an audit anchor, quoted into every parse refusal below. One sentence,
+#: one place. The ``audit-verify`` CLI's ``--expected-anchor`` help writes its own shorter wording and
+#: does NOT interpolate this -- said plainly because a comment claiming otherwise would let a maintainer
+#: edit this constant believing the help moved with it.
+AUDIT_ANCHOR_FORM = (
+    "expected COUNT:HEAD — the row count and the FULL head, copied verbatim from "
+    "'messagefoundry audit-anchor' (the 12-character head printed inside a FAIL message is a display "
+    "truncation, not an anchor); an empty log anchors as '0:'"
+)
+
+#: Every hex character, both cases. The store only ever emits lowercase (``hexdigest()``); uppercase is
+#: admitted and NORMALISED rather than rejected, because an operator who upper-cased the value in a
+#: ticket must get a verify, not a tamper alarm.
+_AUDIT_ANCHOR_HEX = frozenset("0123456789abcdefABCDEF")
+#: ``hashlib.sha256``/``hmac.new(..., sha256)`` ``hexdigest()`` width — the only hex head length the
+#: chain can produce, keyless or keyed (:func:`audit_row_hash`).
+AUDIT_ANCHOR_DIGEST_HEX_LEN = 64
+#: ADR 0138 ``vault_transit``: the row MAC is computed INSIDE Vault/OpenBao Transit
+#: (``crypto_transit.TransitCipher.audit_hmac``), which returns its own opaque ``vault:v<N>:<base64>``
+#: string — not hex, not 64 characters — and that string lands in ``row_hash`` verbatim. A future
+#: isolated-module MAC provider with a different prefix MUST be added here, or a legitimate anchor from
+#: that deployment is refused as malformed.
+AUDIT_ANCHOR_ISOLATED_MAC_PREFIX = "vault:v"
+
+
+#: How much of an anchor file is read before it is refused. An anchor is ONE short line -- the longest
+#: producible form is a count plus a `vault:v1:<base64>` MAC, comfortably under 200 bytes -- so anything
+#: past this is not an anchor file and the excess must never be read, let alone quoted back.
+#:
+#: THE BOUND IS A LOG-DISCLOSURE CONTROL, NOT A PERFORMANCE ONE. Every refusal below interpolates the
+#: offending text with ``{text!r}``, and both callers log that refusal. A path typo'd onto
+#: ``messagefoundry.toml``, a key file, or a captured HL7 message would otherwise put that file's whole
+#: contents into the service log at WARNING -- which is the PHI rule in CLAUDE.md section 9, breached by
+#: a control whose own purpose is to avoid manufacturing bad outcomes from its input handling.
+AUDIT_ANCHOR_MAX_BYTES = 4096
+
+
+class AuditAnchorError(ValueError):
+    """A ``COUNT:HEAD`` anchor that :func:`parse_audit_anchor` refuses, carrying TWO renderings.
+
+    ``str(exc)`` quotes the offending text back, which is what an operator running ``audit-verify``
+    needs: they typed the path, the refusal lands on their own terminal, and seeing the bad value is
+    how they fix it. ``reason`` says what was wrong and **never includes the text**.
+
+    THE SPLIT EXISTS BECAUSE THE TWO CONSUMERS HAVE DIFFERENT EXPOSURE, not because one is tidier. The
+    engine's startup check logs to a persistent service log that NSSM captures to disk, so quoting the
+    file there publishes whatever the path was typo'd onto -- a key file, ``messagefoundry.toml``, a
+    captured message -- at WARNING, which is the PHI rule in CLAUDE.md section 9. Redaction filters
+    downstream of the logger do catch some of it, and a control resting on that is resting on a false
+    premise: measured, a filter scrubbed a key's VALUE and let its name and 165 further characters
+    through. Not putting the content in the record is the control; the filter is defence in depth.
+
+    It subclasses ``ValueError`` so every existing ``except ValueError`` around the parser still fires.
+    """
+
+    def __init__(self, reason: str, text: str) -> None:
+        #: What was wrong, with NO part of the offending text in it. Safe for a service log.
+        self.reason = reason
+        self.text = text
+        super().__init__(f"malformed audit anchor {text!r}: {reason} — {AUDIT_ANCHOR_FORM}")
+
+
+def read_audit_anchor_file(path: str | Path) -> str:
+    """Read an anchor file into the text :func:`parse_audit_anchor` takes. Raises ``OSError`` or
+    ``UnicodeDecodeError``; each caller words its own operator-facing refusal around those.
+
+    ``utf-8-sig`` absorbs a leading BOM: PowerShell 5.1's ``Set-Content -Encoding utf8`` writes UTF-8
+    WITH one, and this product deploys as a Windows service, so that is a first-class way an operator
+    produces this file. ``UnicodeDecodeError`` is raised, not swallowed, because PowerShell 5.1's ``>``
+    writes UTF-16LE -- the likely mistake, not an exotic one -- and it subclasses ``ValueError`` rather
+    than ``OSError``, so a caller that catches only the latter lets it escape as an unhandled traceback.
+
+    ONE READER FOR BOTH CONSUMERS (the ``audit-verify`` CLI and the engine's startup check), for the
+    same reason :func:`parse_audit_anchor` is one parser: the encoding handling, the byte bound and the
+    first-line rule are each a place a later hardening would otherwise reach one caller and miss the
+    other. Only the first line is returned, bounded by :data:`AUDIT_ANCHOR_MAX_BYTES`."""
+    with Path(path).open("rb") as fh:
+        # Read one byte past the bound so an oversized file is DETECTED rather than silently truncated
+        # into a parse failure that blames the operator's anchor for the reader's cap.
+        data = fh.read(AUDIT_ANCHOR_MAX_BYTES + 1)
+    if len(data) > AUDIT_ANCHOR_MAX_BYTES:
+        raise OSError(
+            f"anchor file is larger than {AUDIT_ANCHOR_MAX_BYTES} bytes, so it is not an anchor "
+            f"(an anchor is one short COUNT:HEAD line)"
+        )
+    # The first line only: a file whose SECOND line is something else is a refusal either way, and
+    # taking one line keeps whatever follows out of the refusal message that quotes this back.
+    lines = data.decode("utf-8-sig").splitlines()
+    return lines[0] if lines else ""
+
+
+def parse_audit_anchor(text: str) -> tuple[int, str]:
+    """Parse a ``COUNT:HEAD`` audit anchor into the tuple ``verify_audit_chain`` expects.
+
+    Raises ``ValueError`` naming the form. It must RAISE rather than fall back to an unanchored
+    verify: a silently-ignored anchor turns the whole control into a gate that reports green while
+    checking nothing, which is precisely the failure the anchor exists to close.
+
+    It must ALSO refuse rather than hand a comparator a head the store can never emit. Both comparators
+    compare the head byte-exactly and report *any* difference as ``truncated or rewritten``, so an
+    accepted-but-impossible head becomes a FALSE tamper alarm — a red light on an intact chain,
+    indistinguishable from a real detection. A control whose whole value is that a FAIL means something
+    cannot be allowed to manufacture FAILs out of its own input handling — the inverse of the
+    green-while-checking-nothing hole above, and it costs just as much.
+
+    Two head shapes are legal, because exactly two are producible:
+
+    * a **hex digest** — :func:`audit_row_hash`'s keyless SHA-256 or in-heap HMAC-SHA256 ``hexdigest()``,
+      always exactly 64 lowercase hex characters. Case is normalised, and the length is *required*: a
+      12-character head pasted out of a FAIL message's display truncation is refused as malformed
+      input instead of being reported as tampering.
+    * an **isolated-module MAC** — ADR 0138 ``vault_transit`` mode, whose ``vault:v1:…`` string is
+      passed through UNCHANGED. ``partition`` splits on the FIRST colon, so its internal colons
+      survive the ``COUNT:HEAD`` split.
+
+    An EMPTY head is legal and load-bearing — :meth:`MessageStore.audit_anchor` returns ``(0, "")`` for
+    an empty log, so ``0:`` must round-trip or a fresh instance is the one state that cannot be anchored.
+    **It is legal ONLY at count 0**, and that pairing is the whole of its legality: an empty head is
+    producible only from an empty log, so ``5:`` is a head the store can never emit and falls under the
+    refusal above. Left accepted it parses to ``(5, "")``, which no intact chain can match — so a line
+    truncated while being copied, or an anchor file caught half-written, would be reported as
+    ``truncated or rewritten`` on a chain nobody touched.
+
+    IT LIVES HERE, BESIDE THE COMPARATORS AND THE PRODUCER, BECAUSE IT NOW HAS TWO CONSUMERS: the
+    ``audit-verify`` CLI and the engine's ``[integrity].audit_anchor_file`` startup check (BACKLOG #328).
+    A second copy beside the second consumer is the copy-versus-single-source defect BACKLOG #1253
+    catalogues, and it would be the worst possible place for one: a later hardening of the refusals
+    above would reach one caller and leave the other accepting what it had learned to reject.
+    """
+    raw = text.strip()
+    count_text, sep, head = raw.partition(":")
+    if not sep:
+        raise AuditAnchorError("no ':' separator", text)
+    try:
+        count = int(count_text)
+    except ValueError:
+        # The count is quoted in `str(exc)` via `text`, so the reason stays content-free: a row count
+        # is short and non-secret, but "content-free" has to be a rule, not a judgement per branch.
+        raise AuditAnchorError("the row count is not an integer", text) from None
+    if count < 0:
+        raise AuditAnchorError(f"the row count {count} is negative", text)
+    head = head.strip()
+    if not head:
+        if count != 0:
+            raise AuditAnchorError(
+                "an empty head is only producible from an EMPTY log, so it cannot carry a row count "
+                f"of {count}",
+                text,
+            )
+        return count, head
+    if all(c in _AUDIT_ANCHOR_HEX for c in head):
+        if len(head) != AUDIT_ANCHOR_DIGEST_HEX_LEN:
+            raise AuditAnchorError(
+                f"the head is {len(head)} hex characters, not a full "
+                f"{AUDIT_ANCHOR_DIGEST_HEX_LEN}-character digest",
+                text,
+            )
+        return count, head.lower()
+    if head.startswith(AUDIT_ANCHOR_ISOLATED_MAC_PREFIX):
+        return count, head  # opaque by construction; never normalise what we do not define
+    raise AuditAnchorError(
+        f"the head is neither a {AUDIT_ANCHOR_DIGEST_HEX_LEN}-character hex digest nor an "
+        f"isolated-module {AUDIT_ANCHOR_ISOLATED_MAC_PREFIX}… MAC (ADR 0138)",
+        text,
+    )
 
 
 def audit_mac_bytes(value: str | None) -> bytes:

@@ -146,6 +146,20 @@ def test_show_declares_that_it_cannot_see_connection_scoped_deviations(
     assert "messagefoundry check" in data["loosenings_scope"]
 
 
+def test_show_declares_that_it_cannot_see_a_cli_bind_override(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The fourth gap, for the same reason as the three above (BACKLOG #1852).
+
+    ``load_settings`` folds an off-box ``serve --host`` into the ``[security]`` view, so a running
+    engine's ``GET /security/posture`` reports ``local_access_only = false`` while this command, which
+    reads the AUTHORED file, still shows ``true``. Both are right for what they describe. An unmarked
+    disagreement between two operator surfaces on one host reads as a defect in one of them, which is
+    what sends an auditor hunting."""
+    data = _show(tmp_path / "mf.toml", capsys)
+    assert "--host" in data["loosenings_scope"]
+
+
 def test_show_reports_store_and_auth_deviations_from_the_whole_file(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
