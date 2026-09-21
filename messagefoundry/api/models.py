@@ -394,9 +394,22 @@ class AlertSuspendRequest(RequestModel):
 
 
 class AlertInstanceList(BaseModel):
-    """The active (open + acknowledged) operator-alert instances, newest ``last_seen`` first (ADR 0044)."""
+    """The active (open + acknowledged) operator-alert instances, newest ``last_seen`` first (ADR 0044),
+    plus the store-computed aggregate over **every** such instance in the caller's scope."""
 
+    #: This page of instances — at most ``limit`` of them.
     alerts: list[AlertInstanceInfo]
+    #: Active instances in scope, counted in the store and NOT bounded by ``limit`` (BACKLOG #1564).
+    #:
+    #: **``total`` is a SECOND read, not a count of** ``alerts``, so the two are separate snapshots and
+    #: ``len(alerts) <= total`` is NOT guaranteed: a concurrent ack or resolve between them can leave a
+    #: full page beside a smaller total. Do not render "len(alerts) of total" off this pair without
+    #: clamping — the sibling listings that use that phrasing count and page in one query, and this one
+    #: does not. The nav alert bell is unaffected: it reads ``total`` alone and no rows at all.
+    total: int
+    #: The worst severity among all ``total`` of them, or ``None`` when there are none. Ranked in the
+    #: store; ``store.AlertSummary`` carries why neither field may be derived from ``alerts``.
+    worst_severity: str | None
 
 
 class DeadLetterReplayRequest(RequestModel):

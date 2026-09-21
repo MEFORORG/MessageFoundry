@@ -1814,7 +1814,18 @@ async def test_a_reload_that_retargets_a_lane_during_a_halt_still_rebuilds_its_c
         await runner.start_outbound(OUTBOUND)
         assert not runner._delivery_halted, "a repaired start left the latch closed"
 
-        assert await _until(lambda: any(newdir.iterdir()) or any(outdir.iterdir())), (
+        # ASK THE STORE, NOT THE DIRECTORY, WHETHER THE DELIVERY RESOLVED (see
+        # :func:`_until_delivery_status`). Waiting on "an entry appeared" returns on the connector's
+        # OWN temp file: `FileDestination._write` calls `tempfile.mkstemp(dir=..., suffix=".part")`
+        # inside the destination directory before it writes a byte, claims the final name from it,
+        # and unlinks it in a `finally`. `_write` runs off the event loop via `asyncio.to_thread`,
+        # so this poller runs DURING that window, and the name check below then reads `tmpXXXX.part`
+        # and fails with "the row missed the new target". Reproduced by widening the window: both
+        # claim modes failed on exactly that value. A `done` row lands strictly after `_write`
+        # returns, so it is the one signal that the final name is claimed and the temp unlink has
+        # run. CLAIMED, not renamed: `overwrite` defaults off, so this rig takes `_claim_unique`'s
+        # hard-link and never the `os.replace` branch.
+        assert await _until_delivery_status(store, message_id, OUTBOUND, "done"), (
             "the repaired resume never delivered the retained row"
         )
         assert [p.name for p in newdir.iterdir()] == ["R2.hl7"], "the row missed the new target"

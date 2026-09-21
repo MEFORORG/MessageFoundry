@@ -117,11 +117,16 @@ __all__ = [
 
 
 class CorepointImportError(ValueError):
-    """The export could not be parsed into the ADR 0086 model (malformed XML/JSON or a missing field).
+    """The import could not be completed: the export is malformed, or the module it generates is not
+    valid Python.
 
     A subclass of :class:`ValueError`; the CLI turns it into a clean error + non-zero exit. The
     importer treats the export as untrusted data, so a structural problem — including a rejected DTD
-    or entity payload — is reported, never raised as an uncaught traceback."""
+    or entity payload — is reported, never raised as an uncaught traceback.
+
+    Most arms blame the EXPORT (malformed XML/JSON, a missing field). One does not: a
+    :class:`SyntaxError` caught by :func:`_verify_compilable` is a defect in this generator, so an
+    operator reading the message should not assume their export is at fault."""
 
 
 # --- intermediate action model ----------------------------------------------
@@ -1271,14 +1276,33 @@ def _split_branches(steps: list[Step]) -> tuple[tuple[Step, ...], tuple[Control,
 # surface as a RecursionError traceback instead of a clean, reported error (CLAUDE.md §6/§8). Real
 # packages nest a handful of levels; 100 is far past any plausible hand-authored action-list.
 #
-# This bounds DEPTH only, not the WIDTH of one branch list, and width has its own unbounded hazard the
-# fix for the earlier recursion-on-width defect moved rather than removed: ``generate_module`` renders
-# one ``elif False:`` per sibling branch (see the ``If``/``ChooseFrom`` renderer below) into the
-# generated module's source text. Measured: 5,000 siblings parse; 20,000 make CPython's own parser
-# raise ``MemoryError: Parser stack overflowed`` while ``import_corepoint`` still reports success and
-# returns 0 — an accept-and-drop with a success exit code. Not fixed here: bounding branch width in the
-# importer would refuse a legitimate long ``ElseIf`` chain, so it needs a width-limit decision, not a
-# default.
+# This bounds DEPTH only, not the WIDTH of one branch list, and width has its own bound the fix for the
+# earlier recursion-on-width defect moved rather than removed: ``generate_module`` renders one ``elif
+# False:`` per sibling branch (see the ``If``/``ChooseFrom`` renderer below) into the generated module's
+# source text, and past roughly 5,950 to 5,960 siblings CPython's own parser raises ``MemoryError:
+# Parser stack overflowed``. Two independent instruments put the edge in that band: a bisect over the
+# real generator and a bisect over synthetic source, landing one apart, the difference explained by how
+# much nesting frames the branch list. Treat it as a band and not a constant -- it moves with nesting
+# depth, and it belongs to the CPython build rather than to this module, so never assert an exact width.
+#
+# The accept-and-drop this used to describe is FIXED: ``import_corepoint`` now compiles every generated
+# module before writing it (:func:`_verify_compilable`), so crossing the wall is a reported
+# ``CorepointImportError`` and a non-zero exit instead of a bad file written under a success report.
+# WHETHER TO BOUND BRANCH WIDTH WAS THE OPEN QUESTION, AND IT IS ANSWERED: DO NOT. The fear was that
+# a limit low enough to stay clear of the wall would refuse a legitimate long ``ElseIf`` chain. That
+# is a claim about how wide a REAL export gets, which nobody had measured -- the wall was quoted
+# precisely while the number that actually decides the question was assumed. Measured 2026-09-21
+# against a real production Corepoint export (4.3 MB, roughly 500x the test fixture), walked with
+# this module's own ``parse_package``: 206 branching constructs, WIDEST SIBLING CHAIN 5, median 2,
+# the ten widest all between 3 and 5. Against a wall near 5,950 that is about three orders of
+# magnitude of headroom, so a width bound would protect nothing and is not worth its risk.
+#
+# n=1: one export from one site, and it is the only real one that was available. The conclusion
+# survives a site two orders of magnitude wider, but do not read 5 as a surveyed maximum -- it is one
+# measurement, and a second export is what would upgrade it.
+#
+# The guard that DOES matter is the post-condition above, which is not a limit at all: it refuses
+# nothing legitimate and fires only on source this module could not itself parse.
 _MAX_NESTING = 100
 
 
@@ -1770,7 +1794,17 @@ def _generate_steps(steps: tuple[Step, ...], indent: int, *, in_loop: bool) -> l
 
 
 def _generate_control(ctrl: Control, indent: int, *, in_loop: bool) -> list[str]:
-    """Render one control construct. Conditions are never guessed — they become dead placeholders."""
+    """Render one control construct, then whatever branches it could not continue.
+
+    The tail runs for EVERY kind, so a construct added later cannot silently drop an adopted branch by
+    forgetting to ask for it — see :func:`_stray_branches` (BACKLOG #1854)."""
+    out = _generate_construct(ctrl, indent, in_loop=in_loop)
+    out.extend(_stray_branches(ctrl, indent, in_loop=in_loop))
+    return out
+
+
+def _generate_construct(ctrl: Control, indent: int, *, in_loop: bool) -> list[str]:
+    """Render the construct itself. Conditions are never guessed — they become dead placeholders."""
     pad = "    " * indent
     label = _comment_text(ctrl.detail)
     suffix = f" — hand-finish: {label}" if label else ""
@@ -1815,16 +1849,16 @@ def _generate_control(ctrl: Control, indent: int, *, in_loop: bool) -> list[str]
     if ctrl.kind == "try":
         out = [f"{pad}try:"]
         out.extend(_block_body(ctrl.body, indent + 1, in_loop=in_loop))
-        handlers = [b for b in ctrl.branches if b.kind == "except"] or None
-        if handlers is None:
+        # The complement of this filter is what :func:`_stray_branches` marks, so both sides read the
+        # same predicate — a ``try`` that learns a new branch kind cannot leave one in neither set.
+        handlers = [b for b in ctrl.branches if _renders_as_branch(ctrl.kind, b.kind)]
+        if not handlers:
             out.append(f"{pad}except Exception:  # TODO: Corepoint Try with no Catch — hand-finish")
             out.append(f"{pad}    raise")
-            return out
         for branch in handlers:
-            note = _comment_text(branch.detail)
             out.append(
-                f"{pad}except Exception:  # TODO: Corepoint {branch.source_verb} — hand-finish"
-                + (f": {note}" if note else "")
+                f"{pad}except Exception:  # TODO: Corepoint {branch.source_verb}"
+                f"{_hint(_comment_text(branch.detail))}"
             )
             out.extend(_block_body(branch.body, indent + 1, in_loop=in_loop))
         return out
@@ -1842,6 +1876,65 @@ def _generate_control(ctrl: Control, indent: int, *, in_loop: bool) -> list[str]
     # bare ``else:`` would not even parse, so it degrades to a marker + its body inline — never lost.
     out = [f"{pad}# TODO: Corepoint {ctrl.source_verb} with no enclosing construct{suffix}"]
     out.extend(_generate_steps(ctrl.body, indent, in_loop=in_loop))
+    return out
+
+
+def _renders_as_branch(parent_kind: str, branch_kind: str) -> bool:
+    """Whether :func:`_generate_construct` emits this branch as real Python control flow.
+
+    THE single answer, asked by the render and by :func:`_count_steps` alike, because the summary is a
+    count-and-log record and a branch the render only marks must not be reported as shipped. An
+    ``if``/``case`` chain takes every branch as an arm — a stray marker there is a mislabelled arm,
+    not a loss — while a ``try`` speaks only ``except`` and a loop speaks no branch at all.
+
+    Spelled out rather than read off ``_BRANCH_PARENT``: that table says which construct may ADOPT a
+    marker, which is a parse question. This is a render question, and the two part company the moment
+    a construct adopts a kind it has no faithful form for — a ``finally`` added to the table would
+    otherwise be rendered as ``except Exception:``, which is worse than being marked."""
+    if parent_kind in ("if", "case"):
+        return True
+    return parent_kind == "try" and branch_kind == "except"
+
+
+def _stray_branches(ctrl: Control, indent: int, *, in_loop: bool) -> list[str]:
+    """Render the branches ``ctrl`` cannot continue: a TODO marker, then the body inline.
+
+    :func:`_split_branches` adopts ANY bodyless branch marker written inside a container's own
+    ``<List>`` without checking that the marker's construct matches that container, so an ``Else``
+    lands on a ``Try`` and a ``Catch`` on a ``ForEach``. Keeping only the branches a render understood
+    dropped the rest with their whole bodies, while the summary counted every dropped statement as
+    mapped — worse than a plain drop, because it asserted the statement shipped (BACKLOG #1854).
+
+    The marker's own scope is unknowable (the export's intent is not recoverable from a misplaced
+    marker), so this degrades exactly as the ``unknown`` arm above does: say what was found, say the
+    scope was lost, and inline the body at THIS indentation rather than invent a construct for it.
+
+    A ``@Disabled`` subtree never reaches here (:func:`_parse_statement` returns it before branches are
+    split, so it carries none), and the explicit guard keeps it that way: its whole contract is that
+    nothing under it is emitted as live code, which inlining a body would break."""
+    if ctrl.kind == "disabled":
+        return []
+    strays = [b for b in ctrl.branches if not _renders_as_branch(ctrl.kind, b.kind)]
+    if not strays:
+        return []
+    # The body is being lifted OUT of the loop it was written inside, so a ``LoopExit`` in it no
+    # longer names that loop. Emitting a live ``break`` here would bind it to whatever loop encloses
+    # the construct — a silent change of which loop exits — so the loop context is dropped and the
+    # ``LoopExit`` degrades to its own marker instead.
+    in_loop = in_loop and ctrl.kind not in ("for", "while")
+    pad = "    " * indent
+    out: list[str] = []
+    for branch in strays:
+        out.append(
+            f"{pad}# TODO: Corepoint {branch.source_verb} cannot continue a Corepoint "
+            f"{ctrl.source_verb}{_hint(_comment_text(branch.detail))}"
+        )
+        if branch.body:
+            out.append(
+                f"{pad}#   its body is inlined below at THIS indentation — the branch's own scope "
+                f"is lost, re-scope by hand"
+            )
+        out.extend(_generate_steps(branch.body, indent, in_loop=in_loop))
     return out
 
 
@@ -1958,12 +2051,45 @@ def _has_inline_send(steps: tuple[Step, ...]) -> bool:
 # --- top-level entry point ---------------------------------------------------
 
 
+def _verify_compilable(source: str, target: Path) -> None:
+    """Refuse generated source CPython cannot compile, before it reaches disk as a config module.
+
+    :func:`generate_module` builds the module as a STRING, so without this nothing on the import path
+    ever asked CPython whether the result parses -- the accept-and-drop the width note near
+    ``_MAX_NESTING`` records. Catching only the obvious class would repeat that defect, so the tuple
+    is deliberately broad: at least these four are reachable, and each is measured, not assumed.
+
+    * ``SyntaxError`` -- a codegen bug, and what 3.14 raises for a NUL in the source (``ValueError``
+      on older builds).
+    * ``MemoryError`` -- the width wall. A bounded parser-arena limit rather than heap exhaustion,
+      so the interpreter is fully usable afterwards.
+    * ``RecursionError`` -- the compiler re-descending source this module emitted; ``_MAX_NESTING``
+      bounds only this module's own walk. A flat chain of about 20,000 operands reaches it.
+    * ``ValueError`` -- covers ``UnicodeEncodeError``, which a lone surrogate reaching the source
+      raises. That is why the tuple names a BASE class here rather than one more leaf: enumerating
+      leaves is how the original defect was written.
+
+    Not a merge candidate with the lens's ``_assert_reparses``, which does the same job for rewritten
+    Handlers: it raises a different error type, and its own ``except`` is narrower than this one."""
+    name = str(target)
+    try:
+        compile(source, name, "exec")
+    except (SyntaxError, ValueError, MemoryError, RecursionError) as exc:
+        # Report the compiler's own message: it names the limit or character that was rejected, which
+        # a bare "could not be generated" would hide from the operator deciding what to do next.
+        raise CorepointImportError(
+            f"generated module {name!r} could not be compiled and was not written: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+
 def import_corepoint(export_path: str | Path, out_dir: str | Path) -> ImportResult:
     """Parse the export at ``export_path`` and write one config module per channel into ``out_dir``.
 
     Returns the :class:`ImportResult` count-and-log summary. Raises :class:`CorepointImportError` on a
-    malformed export -- including one that is not valid UTF-8 -- and :class:`OSError` on a filesystem
-    failure (the CLI maps both to a clean error)."""
+    malformed export -- including one that is not valid UTF-8, and one whose generated module CPython
+    cannot parse -- and :class:`OSError` on a filesystem failure (the CLI maps both to a clean
+    error)."""
     epath = Path(export_path)
     try:
         text = epath.read_text(encoding="utf-8")
@@ -2008,7 +2134,11 @@ def import_corepoint(export_path: str | Path, out_dir: str | Path) -> ImportResu
             unmapped_classes.extend(h_unmapped)
             disabled += h_disabled
         filename = f"{module_name}.py"
-        (out / filename).write_text(source, encoding="utf-8")
+        target = out / filename
+        # Raising here leaves an earlier channel's file in place, as an ``OSError`` from the write
+        # already would; the error names the module that failed and the command exits non-zero.
+        _verify_compilable(source, target)
+        target.write_text(source, encoding="utf-8")
         results.append(
             ChannelResult(
                 module_name,
@@ -2027,7 +2157,8 @@ def import_corepoint(export_path: str | Path, out_dir: str | Path) -> ImportResu
 # Control kinds that ARE faithfully represented in the emitted Python (real ``if``/``for``/``try``/…),
 # so they count as mapped. ``block`` is a section label (never an action, so never counted); ``exit``
 # has no faithful form and ``unknown`` is an unmodelled element tag — both count unmapped, emitted as a
-# TODO marker.
+# TODO marker. The four ``_BRANCH_PARENT`` kinds are faithful only while a construct ADOPTS them, so a
+# BRANCH asks :func:`_renders_as_branch` rather than this set, and an orphaned marker counts unmapped.
 _MAPPED_CONTROL_KINDS = frozenset(
     {
         "if",
@@ -2071,10 +2202,14 @@ def _count_steps(steps: tuple[Step, ...]) -> tuple[int, list[str], int]:
             # Counted as one preserved element; its whole subtree rides along in the comment block.
             disabled += 1
         else:
-            if step.kind in _MAPPED_CONTROL_KINDS:
+            if step.kind in _MAPPED_CONTROL_KINDS and step.kind not in _BRANCH_PARENT:
                 mapped += 1
-            elif step.kind in ("exit", "unknown"):
-                # "unknown": an unmodelled element TAG. Counted here (and surfaced by name in
+            elif step.kind in ("exit", "unknown") or step.kind in _BRANCH_PARENT:
+                # "unknown": an unmodelled element TAG. A ``_BRANCH_PARENT`` kind here is a branch
+                # marker standing where a statement should be, with no construct to continue: its
+                # kind names real Python control flow, so it sits in ``_MAPPED_CONTROL_KINDS``, but
+                # only an ADOPTED marker is ever EMITTED as control flow and an orphan degrades to a
+                # TODO marker (BACKLOG #1854). Either way it is counted here (and surfaced by name in
                 # ``unmapped_classes``) so it is reported, never skipped — its body counts on below.
                 unmapped.append(step.source_verb)
             for nested in (step.body, *(b.body for b in step.branches)):
@@ -2083,8 +2218,12 @@ def _count_steps(steps: tuple[Step, ...]) -> tuple[int, list[str], int]:
                 unmapped.extend(n_unmapped)
                 disabled += n_disabled
             for branch in step.branches:
-                if branch.kind in _MAPPED_CONTROL_KINDS:
+                # A branch the render cannot emit as control flow becomes a TODO marker instead, so
+                # it lands in the unmapped bucket; its body statements are real and counted above.
+                if _renders_as_branch(step.kind, branch.kind):
                     mapped += 1
+                else:
+                    unmapped.append(branch.source_verb)
     return mapped, unmapped, disabled
 
 

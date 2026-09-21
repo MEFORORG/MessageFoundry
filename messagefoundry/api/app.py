@@ -1317,11 +1317,24 @@ class _SummaryAuditCoalescer:
             await self._emit(store, a, sc, win_hour, win_count, win_masked)
 
     async def flush(self, store: Store) -> None:
-        """Emit every pending window (e.g. on engine shutdown) so an active window isn't lost."""
+        """Emit every pending window (e.g. on engine shutdown) so an active window isn't lost.
+
+        Every window is attempted even when one write fails, and the failures are raised together
+        afterwards. The dict is cleared first, so stopping at the first error would drop every window
+        after it with no trace (BACKLOG #1640)."""
         windows = list(self._windows.items())
         self._windows.clear()
+        errors: list[Exception] = []
         for (a, sc), win in windows:
-            await self._emit(store, a, sc, win["hour"], win["count"], win.get("masked", 0))
+            try:
+                await self._emit(store, a, sc, win["hour"], win["count"], win.get("masked", 0))
+            except Exception as exc:  # re-raised below, grouped; the caller decides what to do
+                errors.append(exc)
+        if errors:
+            raise ExceptionGroup(
+                f"{len(errors)} of {len(windows)} summary-access windows could not be written",
+                errors,
+            )
 
     @staticmethod
     async def _emit(
@@ -2797,11 +2810,19 @@ def create_app(
     ) -> AlertInstanceList:
         """The open + acknowledged operator-alert instances (ADR 0044, #56), newest ``last_seen`` first —
         **metadata only, no PHI**. Diagnostic operator state, so gated by ``monitoring:diagnose`` (the
-        ack/resolve tier), with the same per-channel RBAC scope as ``GET /events``."""
-        rows = await engine.store.list_active_alert_instances(
-            limit=limit, allowed_channels=_scope(identity)
+        ack/resolve tier), with the same per-channel RBAC scope as ``GET /events``.
+
+        ``total``/``worst_severity`` aggregate EVERY active instance in that scope, not this page of
+        them. One ``allowed_channels`` value feeds both reads, so the aggregate is scoped identically
+        to the rows and can never report an alert the caller may not read."""
+        scope = _scope(identity)
+        rows = await engine.store.list_active_alert_instances(limit=limit, allowed_channels=scope)
+        summary = await engine.store.summarize_active_alert_instances(allowed_channels=scope)
+        return AlertInstanceList(
+            alerts=[_alert_instance_info(r) for r in rows],
+            total=summary.total,
+            worst_severity=summary.worst_severity,
         )
-        return AlertInstanceList(alerts=[_alert_instance_info(r) for r in rows])
 
     @app.post("/alerts/{alert_id}/ack", response_model=AlertInstanceInfo)
     async def ack_alert(
@@ -6177,8 +6198,8 @@ def create_app(
             # if this drifts back to an extra that does not exist or a name nobody has claimed.
             raise RuntimeError(
                 "serve_ui requires the web console, which is not installed. It ships as a separate "
-                "distribution: `pip install messagefoundry-webconsole`, or set [api].serve_ui=false "
-                "to run JSON-only."
+                "distribution: `pip install messagefoundry-webconsole`, or set "
+                "[security].serve_web_console=false to run JSON-only."
             ) from exc
 
         # Assert the seam BEFORE building the deps bundle (review fix): a package that changed the
@@ -7116,6 +7137,24 @@ def create_managed_app(
                 # gather(return_exceptions): absorb our cancellation + any stored exception so it can't
                 # propagate here and skip engine.stop() (the reaper precedent).
                 await asyncio.gather(bootstrap_reminder, return_exceptions=True)
+            # M-5 (BACKLOG #1640): flush the open summary-access window before the store closes.
+            # `_SummaryAuditCoalescer.flush` documents itself as the engine-shutdown path and NOTHING
+            # called it, so every clean restart dropped the open hour's PHI-summary access audit --
+            # the rows the control exists to produce, lost exactly when an operator restarts after a
+            # bulk census fetch.
+            #
+            # BEFORE engine.stop(), because that ends in store.close() and the emit needs the store.
+            # Guarded like the reaper above: a store error here must not skip engine.stop(), or the
+            # non-daemon aiosqlite worker keeps the process alive and a lost audit row becomes a hung
+            # service. Read directly, not through getattr: create_app always sets the auditor, so a
+            # rename should fail loudly inside this guard rather than silently skip the flush.
+            try:
+                await app.state.summary_auditor.flush(store)
+            except Exception:
+                _log.exception(
+                    "summary-access coalescer: the shutdown flush failed, so at least one open "
+                    "window's audit row is lost; continuing the teardown"
+                )
             await engine.stop()
             # B11: shut down the harness-only instrumented executor (None in production / other tests).
             # The engine is stopped (no more to_thread work), so a non-blocking shutdown is clean.
