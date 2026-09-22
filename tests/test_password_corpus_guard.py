@@ -171,7 +171,11 @@ def test_startup_is_silent_when_screening_is_turned_off(
 #   `suppress_breach_check` default flipped to True (a blanket suppression)  -> 7 arms fail, both
 #       controls among them. This is the one-character mutation the controls exist for.
 #   `self.check_breached` dropped from the gate (the override becomes two-way) -> 2 arms fail:
-#       `..._can_only_suppress_never_assert_a_screen` and #1438's `..._screening_is_turned_off`.
+#       `test_the_per_call_override_can_only_suppress_never_assert_a_screen` and #1438's
+#       `test_the_guard_stays_out_of_the_way_when_screening_is_turned_off`. Both names are spelled
+#       out because this file holds a SECOND test ending `..._screening_is_turned_off`
+#       (`test_startup_is_silent_when_screening_is_turned_off`) which that mutation cannot fail --
+#       it never reaches `violations` -- so an abbreviated citation resolves to a plausible wrong arm.
 
 
 def test_the_per_call_override_suppresses_the_clause_the_policy_still_enforces(
@@ -273,12 +277,17 @@ async def test_a_user_password_change_still_refuses_while_the_same_service_mints
 async def test_an_admin_reset_issues_a_credential_on_an_unusable_corpus(
     bundled_corpus: Callable[[Sequence[str] | None], None], empty_store: MessageStore
 ) -> None:
-    """`admin_reset_password` reaches the same generator, so it is covered by the same suppression.
+    """`admin_reset_password` reaches the same generator, so the same suppression covers it. Worth its
+    own arm because it is a SECOND caller of `_generate_policy_password`: a fix applied at the
+    bootstrap call rather than inside the generator would pass every arm above and fail this one.
 
-    Its failure mode was never a dead engine -- the store is non-empty by then -- but a 500 on a
-    running one, on the path an administrator uses to unstick a locked-out user. Worth its own arm
-    because it is a SECOND caller of `_generate_policy_password`, and a fix applied at the bootstrap
-    call rather than inside the generator would pass every arm above and fail this one.
+    SCOPE, because the assertion is weaker than the test name suggests. This proves only that
+    GENERATING the temporary credential no longer raises. It does NOT prove the reset is usable end to
+    end: the credential is set with `must_change_password=True`, and the holder's forced rotation runs
+    through `change_password`, which the arm above pins as still refusing while the corpus is unusable.
+    So on a broken corpus this call now succeeds, audits success and emails the user, while the user it
+    was meant to unstick cannot finish rotating -- the failure moves from the acting administrator to
+    the user. Recorded here as a known consequence of the #1447 ruling, not asserted as a good one.
     """
     bundled_corpus([])
     service = AuthService(empty_store, AuthSettings())
@@ -287,3 +296,57 @@ async def test_an_admin_reset_issues_a_credential_on_an_unusable_corpus(
     assert admin is not None
     issued = await service.admin_reset_password(admin.id, actor="admin")
     assert issued.password and len(issued.password) >= 20
+
+
+#: Every production call site allowed to suppress the breach clause, as `module: (symbol, ...)`.
+#: The docstring on `violations` used to ENUMERATE this in prose, which is the completeness claim
+#: SDS-3.6 warns about: nothing pinned it, so a second caller could appear -- a temp password on a
+#: bulk-import path, or a route copying the kwarg to quieten a red corpus leg -- and silently stop
+#: screening an operator-supplied password with all thirteen arms above still green. Neither measured
+#: mutation detects that shape, because both mutate the gate rather than adding a caller.
+_BREACH_SUPPRESSION_CALL_SITES = {"messagefoundry/auth/service.py": ("_generate_policy_password",)}
+
+
+def _suppression_call_sites() -> dict[str, tuple[str, ...]]:
+    """Walk the engine package for `suppress_breach_check=` and return the enclosing function per file.
+
+    Read from the AST rather than by grep so a call split across lines is still attributed, and so a
+    keyword buried in a nested call is found at the function that contains it.
+    """
+    import ast
+
+    repo = Path(__file__).resolve().parent.parent
+    found: dict[str, tuple[str, ...]] = {}
+    for path in sorted((repo / "messagefoundry").rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        holders: list[str] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            if any(
+                kw.arg == "suppress_breach_check"
+                for inner in ast.walk(node)
+                if isinstance(inner, ast.Call)
+                for kw in inner.keywords
+            ):
+                holders.append(node.name)
+        if holders:
+            found[path.relative_to(repo).as_posix()] = tuple(sorted(holders))
+    return found
+
+
+def test_only_the_recorded_call_sites_suppress_the_breach_clause() -> None:
+    """The bypass is a permanent public kwarg on what `policy.py` calls the single enforcement point,
+    so the number of callers is pinned rather than described. A new one is not forbidden -- it has to
+    be recorded here, which is the review this arm exists to force.
+    """
+    assert _suppression_call_sites() == _BREACH_SUPPRESSION_CALL_SITES
+
+
+def test_the_call_site_scanner_would_notice_a_new_suppression() -> None:
+    """Anti-vacuity in both directions: a scanner that found nothing would pass the arm above on an
+    empty result, and one that cannot parse a keyword argument would pass it for the wrong reason.
+    """
+    found = _suppression_call_sites()
+    assert found, "the scanner found no suppression at all -- it has stopped measuring"
+    assert "_generate_policy_password" in found["messagefoundry/auth/service.py"]

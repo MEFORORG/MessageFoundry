@@ -112,9 +112,10 @@ def _error_if_bundled_corpus_unusable(check_breached: bool) -> None:
     not running. ``PasswordPolicy.violations`` refuses passwords in that state; this is only the loud
     half. THIS FUNCTION deliberately does not stop the engine -- HL7 flow does not depend on password
     screening, and bricking a message engine over an auth data asset would trade a contained failure for
-    an outage. Nothing else stops it either, since BACKLOG #1447: a FIRST run used to fail here, and
-    :meth:`AuthService._generate_policy_password` now suppresses this screen on its own candidate --
-    see that call for why.
+    an outage. The engine's own ``serve`` lifespan no longer stops either, since BACKLOG #1447: a FIRST
+    run used to fail there, and :meth:`AuthService._generate_policy_password` now suppresses this screen
+    on its own candidate -- see that call for why. Stated as that ONE path rather than as "nothing
+    anywhere": the ``provision-first-administrator`` CLI still halts on this, and uncaught.
 
     Skipped when the operator has turned screening off: a corpus nobody consults is not a defect.
     """

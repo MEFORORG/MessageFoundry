@@ -102,10 +102,16 @@ class BreachCorpusUnavailable(RuntimeError):
     *change* paths screen a password, so this never touches login, never invalidates a session, and
     never stops message flow.
 
-    **A FIRST RUN WAS THE EXCEPTION AND IS NO LONGER** (BACKLOG #1447): a raise out of the bootstrap
-    generator escaped an unguarded lifespan call, so the engine did not start at all. That generator now
-    suppresses this screen on its own candidate -- the reasoning is stated once, at its call to
-    :meth:`PasswordPolicy.violations` -- so the narrow radius above covers a first run too.
+    **A FIRST RUN IS NO LONGER A STARTUP FAILURE, AND IT IS STILL NOT THE NARROW CASE ABOVE**
+    (BACKLOG #1447). The bootstrap generator used to raise out of an unguarded lifespan call, so the
+    engine did not start at all; it now suppresses this screen on its own candidate, for the reason
+    given at its call to :meth:`PasswordPolicy.violations`. The engine therefore starts and carries
+    messages. What does NOT follow is the paragraph above: the minted credential is born
+    ``must_change_password=True``, and that forced rotation is an operator-chosen password, which this
+    still refuses. So a first deployment on an unusable corpus would reach a console holding one
+    account that cannot complete its own rotation until the corpus is repaired. That is deliberate --
+    screening an operator's password is what #1438 exists for -- and much narrower than refusing to
+    start, but it is not "never touches login".
     ``AuthService`` also loads the corpus eagerly at startup and logs the same defect as an error, so
     an operator learns about it from the log rather than from a user's failed password change.
     """
@@ -223,13 +229,12 @@ class PasswordPolicy:
         unusable (BACKLOG #1438) -- a refusal, not a silent pass. Callers get a list or an exception,
         never a list that quietly stopped screening.
 
-        ``suppress_breach_check=True`` drops the breach clause for ONE call (BACKLOG #1447), for a
-        caller whose candidate no corpus of human-chosen passwords can contain -- today only
-        ``AuthService._generate_policy_password``, whose call states the reasoning. It is AND-ed with
-        ``check_breached``, so it can only ever SUPPRESS: it cannot assert a screen an operator turned
-        off. The ``False`` default reproduces the field exactly, so every other call site keeps
-        failing closed, which is right for them -- each screens an operator- or user-supplied
-        password, and there the corpus is the whole point."""
+        ``suppress_breach_check=True`` drops the breach clause for ONE call (BACKLOG #1447). It is
+        AND-ed with ``check_breached``, so it can only ever SUPPRESS -- it cannot assert a screen an
+        operator turned off -- and the ``False`` default reproduces the field exactly, so a caller
+        that passes nothing keeps failing closed. WHY a caller may legitimately pass it is stated at
+        the call site, in ``AuthService._generate_policy_password``. Read that before adding a second
+        one; a static arm in ``tests/test_password_corpus_guard.py`` pins how many there are."""
         problems: list[str] = []
         if len(password) < self.min_length:
             problems.append(f"be at least {self.min_length} characters")
