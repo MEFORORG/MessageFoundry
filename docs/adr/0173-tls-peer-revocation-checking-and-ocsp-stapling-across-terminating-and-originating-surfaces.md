@@ -3,10 +3,11 @@
 
 # ADR 0173 — TLS peer revocation checking and OCSP stapling across terminating and originating surfaces
 
-- **Status:** Proposed (2026-08-23) — no code in this change. The accept half needs owner ratification;
-  the one build rider in §4.3 is a separate, small change that this ADR authorizes but does not perform.
-- **Date:** 2026-08-23
-- **Deciders:** owner (to ratify) · security working group
+- **Status:** **Accepted (2026-08-23; the accept half ratified by the owner 2026-09-22).** The original
+  change carried no code. The one build rider in §4.3 is a separate, small change that this ADR
+  authorizes but did not perform; it is tracked by BACKLOG **#1498**.
+- **Date:** 2026-08-23 (ratified 2026-09-22)
+- **Deciders:** owner (ratified the accept half 2026-09-22, owner ruling) · security working group
 - **Related:** **extends [ADR 0078](0078-certificate-revocation-posture.md)** (Accepted 2026-07-10,
   owner-ratified — that ADR made the `[api]` in-process delegation an *enforced* start-time refusal;
   this one grades the two remaining directions and records why one of them is unbuildable) ·
