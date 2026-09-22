@@ -348,6 +348,23 @@ reproducer and a narrow discriminator to be added at all.
 
 ## What this deliberately does NOT cover
 
+**Two of the four targets still have an unpinned accessor sweep, and saying so is the point.** The
+HL7 and X12 sweeps are now pinned by tests holding their own copy of the expected property list, so
+shortening either list -- or the loop that reads it -- reds. `hl7_tree` walks a node structure and
+`dicom_peek` reads its own accessors, and neither has an equivalent pin, so either could be quietly
+narrowed and the advisory job would go on reporting that every target survived its budget. A
+half-closed hole reads as a closed one, so it is recorded here rather than left to be inferred from
+which tests happen to exist.
+
+**A `Peek.field()` target is missing and it is the widest surface there is.** `field()` takes an
+arbitrary path expression and `summarize()` alone calls it seven times on the pre-ACK path; no
+target calls it directly today. The named properties reach it internally, which is how the known
+finding surfaced, but that is incidental coverage rather than a target.
+
+**No size ceiling is fuzzed.** `-max_len=8192` sits 2048x below every parser's 16 MiB bound, so
+those guards are unreachable in any CI pass; exercising one needs a deliberate long run with
+`-max_len` raised past 16 MiB.
+
 Stated plainly, because a fuzzing job's name invites the reader to assume more than it does.
 
 - **The strict validators.** `hl7apy` (`parsing/validate.py`) and `pyx12`

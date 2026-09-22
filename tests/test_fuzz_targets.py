@@ -35,6 +35,7 @@ import pytest
 
 from fuzz.targets import (
     _HL7_ROUTING_PROPERTIES,
+    _X12_ISA_PROPERTIES,
     DEFAULT_MAX_LEN,
     KNOWN_FINDINGS,
     TARGETS,
@@ -48,6 +49,7 @@ from fuzz.targets import (
     write_seed_corpus,
 )
 from messagefoundry.parsing import Peek
+from messagefoundry.parsing.x12 import X12Peek
 
 #: A conformant synthetic message with no blank segment -- the negative control for the carve-out.
 CLEAN_ADT = (
@@ -73,6 +75,22 @@ _EXPECTED_ROUTING_PROPERTIES = (
     "receiving_app",
     "receiving_facility",
     "timestamp",
+)
+
+#: The X12 ISA identity accessors ``_x12_peek`` must sweep. Own literal, same reasoning as above --
+#: the HL7 sweep had no pin at all until recently and the X12 one had none either, so closing only
+#: HL7 would leave a half-shut hole that reads as a shut one.
+_EXPECTED_ISA_PROPERTIES = (
+    "sender_qual",
+    "sender_id",
+    "receiver_qual",
+    "receiver_id",
+    "date",
+    "time",
+    "version",
+    "control_number",
+    "usage",
+    "is_test",
 )
 
 #: Inputs a tolerant parser must survive without breaking its contract. Not a corpus -- just the
@@ -110,20 +128,47 @@ def test_the_registry_is_coherent() -> None:
         assert target.summary, f"target {target.name} has no summary"
 
 
-def test_every_available_target_accepts_its_own_seeds() -> None:
+#: Targets that need no optional extra, so they can never be legitimately skipped.
+#:
+#: The two sweeps below ``continue`` past an unavailable target, which is right -- ``dicom_peek``
+#: needs ``[dicom]`` and refusing to run the rest without it would be worse. But a bare ``continue``
+#: makes "every target passed" and "no target ran" the same green, which is the exact confusion this
+#: whole harness exists to remove. Asserting this floor was reached keeps the skip honest without
+#: making an optional extra mandatory.
+_ALWAYS_AVAILABLE = ("hl7_peek", "hl7_tree", "x12_peek")
+
+
+def _exercise(run: Callable[[FuzzTarget], None]) -> None:
+    """Drive ``run`` over every available target, then prove the sweep was not vacuous."""
+    exercised: list[str] = []
     for target in TARGETS:
         if not target.available():
             continue
+        run(target)
+        exercised.append(target.name)
+
+    missing = [name for name in _ALWAYS_AVAILABLE if name not in exercised]
+    assert not missing, (
+        f"{missing} reported themselves unavailable, but they need no optional extra. Read that as "
+        "a broken import or a broken `available()` probe -- not as a legitimate skip. Without this "
+        "check a run that exercised NOTHING would report the same green as a run that passed."
+    )
+
+
+def test_every_available_target_accepts_its_own_seeds() -> None:
+    def _run(target: FuzzTarget) -> None:
         for seed in target.seeds:
             target.run(seed)  # must not raise: these are conformant synthetic inputs
 
+    _exercise(_run)
+
 
 def test_every_available_target_survives_degenerate_input() -> None:
-    for target in TARGETS:
-        if not target.available():
-            continue
+    def _run(target: FuzzTarget) -> None:
         for data in GARBAGE:
             target.run(data)
+
+    _exercise(_run)
 
 
 def test_an_injected_non_contract_exception_escapes_the_hl7_target(
@@ -252,6 +297,58 @@ def test_the_hl7_target_reads_every_named_routing_property(
         "the pre-ACK path and the three MSH-9 components are reachable only through this sweep, so "
         "a target that does not touch them cannot find a contract break there. Restore the accessor "
         "sweep in `_hl7_peek` -- do not relax this list."
+    )
+
+
+def test_the_x12_target_reads_every_named_isa_property(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same pin for X12, because fixing HL7 alone leaves the pattern live next door.
+
+    ``_x12_peek`` sweeps ``_X12_ISA_PROPERTIES`` and nothing asserted it did. Deleting that loop, or
+    emptying the constant, leaves the target reading no identity fields while the advisory job goes
+    on reporting that every target survived its budget -- the identical end state the HL7 pin exists
+    to prevent.
+
+    Structured like its HL7 sibling and for the same reason: its own literal, asserted against the
+    source constant first, so shrinking the constant is a deliberate two-file edit rather than a
+    silent narrowing of what is checked.
+    """
+    assert _X12_ISA_PROPERTIES == _EXPECTED_ISA_PROPERTIES, (
+        "fuzz/targets.py changed the ISA property list. The target's loop and this test's "
+        "expectation both read it, so shortening it silently shortens what is checked. Update "
+        "_EXPECTED_ISA_PROPERTIES only alongside a deliberate change to the accessor tier."
+    )
+    target = TARGETS_BY_NAME["x12_peek"]
+    seed = next((s for s in target.seeds if s.startswith(b"ISA") and len(s) > 106), None)
+    assert seed is not None, "no conformant ISA seed to drive the accessor sweep with"
+
+    seen: list[str] = []
+    for name in _EXPECTED_ISA_PROPERTIES:
+        descriptor = inspect.getattr_static(X12Peek, name)
+        assert isinstance(descriptor, property), (
+            f"X12Peek.{name} is no longer a property, so this recorder cannot wrap it. Read that "
+            "as a change in the accessor tier, not as a failure of this test."
+        )
+        fget = descriptor.fget
+        assert fget is not None, f"X12Peek.{name} is a property with no getter"
+
+        def _record(
+            peek: X12Peek,
+            _name: str = name,
+            _fget: Callable[[X12Peek], object] = fget,
+        ) -> object:
+            seen.append(_name)
+            return _fget(peek)
+
+        monkeypatch.setattr(X12Peek, name, property(_record))
+
+    target.run(seed)
+
+    missing = [name for name in _EXPECTED_ISA_PROPERTIES if name not in seen]
+    assert not missing, (
+        f"the x12_peek target never read {missing} off the parsed X12Peek. Restore the accessor "
+        "sweep in `_x12_peek` -- do not relax this list."
     )
 
 
