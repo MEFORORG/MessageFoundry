@@ -58,8 +58,8 @@ register_ui_action(
     r"^/ui/uploaded-logs/file/[^/?#]+$", Permission.FILES_BROWSE, auto_retry=False, unlock=True
 )
 register_ui_action(r"^/ui/uploaded-logs/file/[^/?#]+/delete$", Permission.FILES_DELETE)
-# The resend confirm page (BACKLOG #1227). QUERY-TOLERANT ON PURPOSE, and the only such pattern in
-# this registry — every other one forbids ``?`` by construction via ``[^/?#]+``. It has to be:
+# The resend confirm page (BACKLOG #1227). QUERY-TOLERANT ON PURPOSE — see ``_auth.is_unlock_action``
+# for what that trailing group widens and what still bounds it. It has to be:
 # ``reauth_next`` puts ``?index=N&to=NAME`` into ``next``, and ``lookup_ui_action`` /
 # ``is_unlock_action`` fullmatch the RAW value, so a path-only pattern matches nothing and dead-ends
 # the whole flow at /ui with both parameters silently gone. ``auto_retry=False`` because it is a GET;

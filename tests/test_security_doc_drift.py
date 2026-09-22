@@ -66,9 +66,11 @@ _H_CONTEXT = "### Contextual and environmental security inputs (ASVS 8.1.3 / 8.1
 # control plane -- so each basis moved by one.
 # BACKLOG #1495 added six /ui routes -- the High Availability page, its live fragment, and a confirm
 # GET plus a stepdown POST for each of the planned and forced variants -- and no JSON route.
+# BACKLOG #1500 (ADR 0090 residual (a)) added two /ui routes -- the message resend confirm GET and the
+# body-less resend POST behind it -- and no JSON route: the resend endpoint already shipped with #123.
 _ROUTES_DEFAULT = 109
 _ROUTES_WITH_DOCS = 113
-_ROUTES_WITH_UI = 216
+_ROUTES_WITH_UI = 218
 
 #: The ``/ui`` routes that legitimately carry no gate: the sign-in, re-auth and second-factor entry
 #: points. The three ``/ui/reauth*`` routes authenticate the session cookie MANUALLY — a gate
@@ -788,7 +790,7 @@ def test_route_count_parity_with_the_console_mounted() -> None:
     pytest.importorskip("messagefoundry_webconsole")
     assert len(create_app(serve_ui=True).routes) == _ROUTES_WITH_UI, (
         "the /ui plane's route count changed; update docs/SECURITY.md's counting basis and the "
-        "'106 routes + one /ui/static mount' statement in the same change."
+        "'N routes + one /ui/static mount' statement in the same change."
     )
 
 
@@ -938,9 +940,11 @@ def _ui_route_rows() -> list[tuple[str, str, tuple[str, ...], str | None]]:
 
 
 def test_every_ui_route_appears_in_the_ui_route_map() -> None:
-    """The console plane is 106 of the 216 route objects a ``serve_ui=True`` app serves — 215 endpoint
-    functions plus the one ``/ui/static`` mount — and the SOLE operator UI in the deployed posture, so
-    8.1.1's "every function" includes it.
+    """The console plane is the larger half of the route objects a ``serve_ui=True`` app serves — the
+    endpoint functions plus the one ``/ui/static`` mount — and the SOLE operator UI in the deployed
+    posture, so 8.1.1's "every function" includes it. The live totals are ``_ROUTES_WITH_UI`` and
+    ``_ROUTES_DEFAULT`` above, which CI checks; a second copy spelled out here is a number nothing
+    reads and that every /ui lane silently falsifies.
 
     RULE: a ``/ui`` route needs a row stating its permission and its wrapper, in both directions.
     ~20 of them have no JSON counterpart from which the authorization could be inferred.

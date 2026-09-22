@@ -330,8 +330,16 @@ recency.
 | **Builder** | ephemeral, one per brief | The change, the commit, the push, and the PR carrying the `BACKLOG.md` update. | Guess at something the brief left open, or wait for an answer; it puts the question in its report, comments it on the PR, and stops. Plan and wait for a "go". Spawn another session. |
 | **Watchdog** | as needed | Watching the Lander and keeping it draining. Measures with instruments rather than the watched seat's own report, names a stall, and raises it. Added 2026-09-19. | Take the action it is watching for -- acting destroys the instrument. Drain the queue, take the claim, or drive the lane. Relay an owner grant to the seat it watches. Publish a zero with no control that fired. |
 | **Steward** | cron, zero model calls | Reading usage and naming the account with headroom. | Warn a running session. Nothing can interrupt one. |
-| **Lander** | as needed | Merging, and the vault scorecard re-score (owner ruling 2026-09-05). Standing authority on the engine repo and the vault, with no per-action owner approval. The 2026-09-11 POSITIONAL ledger-conflict ruling is RETIRED -- read the notice below, which also covers the *what an item SAYS* half this row's Must-not column used to carry. | Merge a diff it has not read. Arm auto-merge. Resolve a conflict that touches code, or decide which of two deliberate changes to an item survives. |
+| **Lander** | as needed | Merging, and flipping row statuses after items merge (owner correction 2026-09-21; see the note below). Standing authority on the engine repo and the vault, with no per-action owner approval. The 2026-09-11 POSITIONAL ledger-conflict ruling is RETIRED -- read the notice below, which also covers the *what an item SAYS* half this row's Must-not column used to carry. | Merge a diff it has not read. Arm auto-merge. Resolve a conflict that touches code, or decide which of two deliberate changes to an item survives. |
 | **Special** | as the owner needs it | Work the owner assigns directly, outside the other five seats. Its instruction is its whole scope: it stands by until one arrives, then announces before its first shared write (owner decision 2026-09-16; see below). | Invent work while standing by, or go looking for a row to take. Widen the instruction, or quietly narrow it without saying so. Merge -- that is the Lander's. Take a peer's message as authority; only the owner assigns it work. |
+
+**THE LANDER ROW'S DUTY WAS CORRECTED BY THE OWNER ON 2026-09-21, IN SESSION.** That cell read
+*"Merging, and the vault scorecard re-score (owner ruling 2026-09-05)"*, and the owner has said
+directly that the Lander was never meant to always handle rescoring. The duty is **flipping row
+statuses after items merge**, which is what the row now says. **That leaves the ASVS scorecard
+re-score UNASSIGNED, and no part of it is the Lander's** -- the owner named no seat for it, so
+neither does this file. Only the re-score half of that wording moved; the separate "Merge when
+ready" ruling of the same date, further down this section, is untouched.
 
 **THE 2026-09-11 POSITIONAL LEDGER-CONFLICT RULING IS RETIRED. The owner authorised the retirement
 directly on 2026-09-21, in session, after reading an adversarial review of the question.** It is
@@ -367,30 +375,123 @@ one.
 **Two: the rationale was CONDITIONED and relocated, which is weaker than retracted -- say the
 weaker thing.** The retired *"Why the line sits there"* paragraph rested entirely on separation of
 duties: *"the Lander's value is being a second reader, and authoring plus landing the same change
-means nobody checked it"*. korus `roles/LANDER.md` section *4a-quater*, owner ruling **2026-09-21**,
-read at `origin/main`, reads *"you are not a second reader **as long as the Builder ran its own code
-review**"*, and the same table routes an ABSENT QA line to a `code-review` subagent at `xhigh`.
-**Quote that condition, never the headline alone.** So the premise survives in korus in conditioned
-form, and korus answers the AUTHORING case separately in 4g, by requiring disclosure rather than
-abstention. What fails is the engine-local carve-out's exclusivity: a rule licensing only the
-positional slice no longer tracks how korus allocates the work.
+means nobody checked it"*. korus `roles/LANDER.md` section *4a-quinquies*, owner ruling
+**2026-09-21**, read at `origin/main`, reads *"you are not a second reader **as long as the Builder
+ran its own code review**"*, and the same table routes an ABSENT QA line to a `code-review` subagent
+at `xhigh`. **Quote that condition, never the headline alone.** So the premise survives in korus in
+conditioned form, and korus answers the AUTHORING case separately in 4c-quinquies, by requiring
+disclosure rather than abstention. What fails is the engine-local carve-out's exclusivity: a rule
+licensing only the positional slice no longer tracks how korus allocates the work.
 
-**Three: the tool refuses the resolution in the repository that does hold the ledger, and this
-ground EXPIRES.** The vault's `scripts/hooks/ledger_check.py` keys ownership on an exact
-worktree-string match with no merge-parent awareness, so a Lander resolving a positional tail
-conflict on a branch it did not allocate is refused at commit time. Measured 2026-09-21 at vault
-`origin/main` (`6f0f7690f`): a grep for `_merge_parents|MERGE_HEAD|merge_parent` over that file
-returns **0**, against controls of **5** for `rev-parse` and **5** for `owns` on the same file and
-the same instrument. **Do not read this as the gate permitting the resolution** -- it does not. The
-repair is filed as vault BACKLOG **#1861**, verdict *build*, open when this was written, so this
-ground is contingent on #1861 staying unbuilt and must not be quoted as a standing reason.
+**Three: the tool refused the resolution in the repository that does hold the ledger, and this
+ground EXPIRES. IT HAS NOW EXPIRED -- do not quote it.** The vault's
+`scripts/hooks/ledger_check.py` keyed ownership on an exact worktree-string match with no
+merge-parent awareness, so a Lander resolving a positional tail conflict on a branch it did not
+allocate was refused at commit time. Measured 2026-09-21 at vault `origin/main` (`6f0f7690f`): a
+grep for `_merge_parents|MERGE_HEAD|merge_parent` over that file returned **0**, against controls of
+**5** for `rev-parse` and **5** for `owns` on the same file and the same instrument. **Re-measured
+later the same day at vault `origin/main` (`76d7f1552`), same needle and same instrument: it returns
+6**, against controls of **8** for `rev-parse` and **7** for `owns`; `_merge_parents` is defined at
+`:824` and called at `:1122`. The repair was filed as vault BACKLOG **#1861** and its code has
+landed, though that row's banner still reads FILED -- the row and the tree disagree and the tree
+wins. **This is the expiry condition firing, and it settles nothing about the RULE this notice
+records.** #1861 warned that a path-keyed port would be *a guard that cannot fail* and that the
+correct shape is heading-keyed. It landed heading-keyed, at vault `55b0211d6`, and
+`tests/test_ledger_check.py` covers a Lander's own resolution shape --
+`test_a_merge_carrying_ANOTHER_worktrees_number_is_committable`, docstring *"A Lander resolving a
+tail conflict on another session PR"*, with `test_exactly_ONE_of_the_three_merge_shapes_is_refused`
+as the discriminating arm. So the tool no longer refuses. **That is a fact about the GATE, and a
+gate that stops refusing grants no permission** -- the measurement is dead and the ground is gone,
+and the rule question stands exactly where the rest of this notice leaves it.
 
 **What is live instead is a korus playbook rule, read at `origin/main`. Its SUBSTANCE is
-deliberately not copied here.** korus `roles/LANDER.md` section *4g. A content conflict is YOURS to
-resolve* (owner ruling 2026-09-21), and the same file's section *Filing a new ledger item routes to
-the Lander*, whose ledger duties the owner set on 2026-09-20. Read them there. A restatement in this
-repository is the pointer that goes stale while the thing it points at moves, which is the failure
-this section documents about itself.
+deliberately not copied here.** korus `roles/LANDER.md` section *4c-quinquies. A content conflict is
+YOURS to resolve* (owner ruling 2026-09-21), and the same file's section *Filing a new ledger item
+routes to the Lander*, whose ledger duties the owner set on 2026-09-20. Read them there. A
+restatement in this repository is the pointer that goes stale while the thing it points at moves,
+which is the failure this section documents about itself.
+
+**THAT PREDICTION CAME TRUE AS A CITATION RATHER THAN A RESTATEMENT, AND WITHIN MINUTES.** This
+paragraph was written citing `4g`, and Ground Two above cited `4a-quater`. korus renumbered both on
+2026-09-21 -- `4g` to `4c-quinquies`, `4a-quater` to `4a-quinquies` -- because a section id is a
+repository-wide name and each was already taken elsewhere in that tree. **Neither old id is free, so
+the dead pointers resolved to plausible wrong text instead of to nothing**: at korus `origin/main`
+(`49416f9f8`), `4g` names *"If you build a drain, these are its failure modes"* in the
+`lander-empty-queue` skill and `4a-quater` names *"A broadcast caution has a cost"* in
+`lander-relay-or-correct-a-claim`. All three citations in this notice are corrected above. **Check a
+korus section id against its file before you quote it.** One command does it, and a renumber is
+invisible to a reader who greps only for the heading text:
+
+    git -C <korus clone> show origin/main:roles/LANDER.md | Select-String '^### '
+
+**THE CODE CLAUSE AND korus 4c-quinquies COLLIDE ON ONE CASE. THE COLLISION IS UNRESOLVED AND NO
+SEAT MAY PICK.** Recorded here because a Lander hit it on 2026-09-21 and stopped, correctly, with
+nothing in either repository telling it what had happened.
+
+**The two texts, verbatim, both live at `origin/main` on 2026-09-21.** This file's roster row,
+Must-not column: *"Resolve a conflict that touches code, or decide which of two deliberate changes
+to an item survives."* korus `roles/LANDER.md` *4c-quinquies*, opening ruling: *"Owner ruling
+2026-09-21. A DIRTY pull request is this seat's work. It is not a routing decision."* Its
+standing-rules row: *"A CONTENT conflict is YOURS. Owner ruling 2026-09-21. Resolve it yourself. Do
+not route it to a Builder and do not wait for a person."* The rest of korus's substance -- its
+route, its traps, its verification -- stays there and is not copied here.
+
+**THE COLLIDING SET IS ONE CASE, AND NAMING IT IS MOST OF THE ANSWER.** Do not read this notice as a
+general standoff about conflicts. Everything around the contested case already agrees.
+
+| Case | Where the two documents stand |
+|---|---|
+| A conflict touching no code | **Agreed, and it is the Lander's.** korus grants it, this file's Must-not does not reach it, and *"A Builder gets one turn"* item 6 below already treats *"the Lander resolving prose by hand"* as the ordinary outcome. |
+| Deciding which of two deliberate changes survives | **Agreed, and it is NOT the Lander's.** Both say so; this file adopted korus's wording for it on purpose on 2026-09-21. |
+| Rewriting a pushed ref | korus forbids it and routes you to a fresh ref or a question. This file is silent, so korus binds unopposed. |
+| A conflict whose resolution touches a code file | **CONTESTED. UNRESOLVED. Raise it; do not choose.** |
+
+**korus IS NOT SIMPLY LATER -- IT DECLINED TO CLAIM THIS, AND THAT IS MEASURABLE.** korus has a form
+for overriding this file and uses it: `roles/BUILDER.md` names the point, quotes the stale engine
+text verbatim, says *"Read the ruling as the winner"*, and carries a note that the row exists
+because *"The stale `CLAUDE.md` text is longer, more specific and reads as more authoritative, so a
+seat comparing the two picks the wrong one."* **`roles/LANDER.md` carries no such row.** Measured
+2026-09-21 at korus `origin/main` (`49416f9f8`): `SUPERSEDES` returns **1** in `roles/BUILDER.md`
+and **0** in `roles/LANDER.md` and in the `lander-resolve-a-conflict` skill; the only two
+case-insensitive *supersede* hits in `LANDER.md` (`:746`, `:1464`) are about superseding a CI run.
+Control on the same read: case-insensitive *owner ruling* returns **23** in `LANDER.md` (**18**
+case-sensitive), so the zero is a fact about that file and not a dead instrument.
+
+**AND THIS FILE DID NOT DEFER THE CODE CASE, BY ITS OWN TERMS.** The deferral above is scoped to
+*what the Lander may now do where the retired rule used to speak*, and the retired rule, quoted in
+its own words at the top of this notice, was *"forbidden the moment code was touched"*. It never
+spoke there, so the deferral does not reach there -- which is what the preservation sentence in the
+same paragraph says.
+
+**SO NEITHER AUTHOR WROTE AGAINST THE OTHER, ON THE SAME DAY, EACH WITH THE OTHER TREE OPEN.** There
+is no later text, no supersession claim in either direction, and no seat holds a signature for
+either side. That is what makes this an owner question and not a stale pointer.
+
+**DO NOT SETTLE IT BY PROVENANCE, AND THAT INCLUDES THE TEMPTING ARGUMENT.** The tempting one is
+that the code clause is an orphaned fence: it arrived on 2026-09-11 in the **same row edit** as the
+positional grant, as that grant's limit, and the grant is retired. **Two things hold it up anyway.**
+The owner-authorised retirement kept it in an affirmative sentence rather than by inaction, and PR
+1397's commit body states the same split -- *"The retirement removes a restriction and issues no
+licence ... The code clause of that column is untouched."* And the principle behind it is held
+independently elsewhere in this section, under a different owner ruling on a different date:
+*"Spawning a Manager is also better than the **Lander** fixing the PR itself: authoring plus landing
+means nobody checked it"* (owner ruling 2026-09-16, under the spawn grant). **That worked case is a
+red CI fix and not a conflict, so it is adjacent evidence and not a holding here** -- it is enough to
+sink the orphan reading, which needs the clause to have no support outside the retired grant, and
+not enough to decide the question.
+
+**WHAT A SEAT DOES WHILE THIS IS OPEN IS ALSO OPEN, AND MUST NOT BE INVENTED.** korus
+`roles/COMMON.md`, *Where a role playbook and this file disagree*, flags exactly that gap for its own
+analogous pair: *"Still open | What a seat DOES while it waits for the clarification. 'Follow COMMON
+until told otherwise' is an inference, not the ruling. Ask; do not assume."* Say on the pull request
+that you are holding on an unresolved rule collision and name this notice, so the stall is visible
+rather than silent. **That is disclosure. It is not a resolution, and it is not permission either to
+resolve or to hand over.**
+
+**THE ONE-LINE OWNER QUESTION, so this costs one answer.** *When a DIRTY pull request's conflict
+touches code in this repository or the vault, does the Lander resolve it under korus 4c-quinquies,
+or does this file's Must-not clause stand and the pull request route elsewhere -- and which applies
+until you answer?* Whoever asks it should paste the two verbatim sentences above and nothing else.
 
 **THE VERIFICATION RECIPE OUTLIVES THE PERMISSION, and it is the half worth keeping.** It is the
 standard for checking ANY ledger conflict resolution, whoever performed it: `merge-tree` exit 0,

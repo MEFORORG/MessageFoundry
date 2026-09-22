@@ -112,6 +112,29 @@ regexes = [
   '''pk-Sm4rt_Key-11''',
   # Family "intake_api_key_rotation_partner" -- `intake_api_key_next=`, the ADR 0154 rotation partner.
   '''nk-N3xt_Key-22''',
+  # --- BACKLOG #1716 -- support-BUNDLE log-tail sentinels -----------------------------------------
+  # Four SYNTHETIC needles invented for tests/test_support_bundle.py -- THREE of them to the #1183
+  # block's construction and for its reason, both stated there and not restated here. The FOURTH is
+  # the mfb64 body, which is base64 and can carry neither a hyphen nor an underscore; it is held
+  # under the 24-character `_LONG_B64` sweep by LENGTH instead, and that file records the exception
+  # beside it. Applying the #1183 rule to it literally lengthens it back over the sweep.
+  #
+  # WHAT IS SPECIFIC TO THIS BLOCK: the #1183 file covers the redactor IN ISOLATION, this one covers
+  # the same redactor reached END TO END through `build_bundle`. Distinct values keep each file's
+  # needles its own, so neither block is edited when the other's fixtures move. Before #1716 these
+  # four were pure base64, which the redactor's `_LONG_B64` backstop covered on its own -- every
+  # assertion passed with the rule in its own name deleted. The entropy that trips this scanner is
+  # the fix.
+  #
+  # ONE of the four is listed, because one is what gitleaks flags. Measured with gitleaks 8.30.1,
+  # default rules, this allowlist stripped: exactly one finding, generic-api-key on the CONSTANT
+  # DEFINITION line `_STORE_KEY_SENTINEL = "ek-Bndl_Enc-41"`, and none on the other three. THE
+  # CREDENTIAL KEYWORD THE RULE NEEDS BESIDE THE ENTROPY COMES FROM THE PYTHON IDENTIFIER, not from
+  # the `MEFOR_STORE_ENCRYPTION_KEY=` fixture line -- that line holds the constant's NAME, never the
+  # literal, so it cannot trip anything. Rename `_STORE_KEY_SENTINEL` to something without "key" and
+  # this entry stops being needed, which would make it an allowlist widening rather than a
+  # suppression. In the redactor the value is reached by _MEFOR_SECRET + _KEY_MATERIAL.
+  '''ek-Bndl_Enc-41''',
 ]
 
 # BACKLOG #1091's `mefor-defaulted-credential` RULE LIVED HERE AND WAS DELIBERATELY REMOVED, not

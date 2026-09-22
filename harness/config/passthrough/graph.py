@@ -18,7 +18,7 @@ Synthetic + generic; reuses the load graph's ``_shape`` for the entry port and s
 
 from __future__ import annotations
 
-from harness.config.load._shape import load_shape
+from harness.config.load._shape import NO_PER_HOST_CAP, load_shape
 from messagefoundry import MLLP, PassThrough, Send, handler, inbound, outbound, router
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.parsing.message import Message, RawMessage
@@ -38,7 +38,12 @@ outbound(
 )
 
 # The entry hub: an external MLLP inbound whose handler hands every message off to the PT inbound.
-inbound("IB_PT_Entry", MLLP(port=_SHAPE.adt_port), router="pt_entry_router")
+# The per-host cap is off on this hub (BACKLOG #1725) — see NO_PER_HOST_CAP in _shape for the reason.
+inbound(
+    "IB_PT_Entry",
+    MLLP(port=_SHAPE.adt_port, max_connections_per_host=NO_PER_HOST_CAP),
+    router="pt_entry_router",
+)
 
 # The internal pass-through inbound: no socket; fed only by the Send-into-PT handoff below. Its own
 # router/handler re-route the re-ingressed body to the real sink outbound.
