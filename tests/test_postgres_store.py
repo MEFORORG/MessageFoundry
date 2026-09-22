@@ -943,6 +943,30 @@ async def test_directory_identity_store_contract(store) -> None:
     await _assert_directory_identity_contract(store)
 
 
+async def test_federated_unbind_store_contract(store) -> None:
+    """BACKLOG #1474 ``clear_user_federated_subject`` on the real Postgres backend.
+
+    The shared body is the one the SQLite and SQL Server suites run. What this leg executes that no
+    other does: the ``conn.transaction()`` block holding the two UPDATEs together, and the ``$1``
+    placeholders in both. Neither runs anywhere but here, so this is the first place they execute.
+    """
+    from tests._federated_unbind_store_contract import _assert_federated_unbind_contract
+
+    await _assert_federated_unbind_contract(store)
+
+
+async def test_session_binding_guard_store_contract(store) -> None:
+    """BACKLOG #1474 ``create_session(require_federated_subject=...)`` on the real Postgres backend.
+
+    The shared body is the one the SQLite and SQL Server suites run. What this leg executes that no
+    other does: the ``SELECT ... FOR UPDATE`` inside ``conn.transaction()`` that the guard leans on,
+    which has no SQLite equivalent and a different spelling on SQL Server.
+    """
+    from tests._federated_unbind_store_contract import _assert_session_binding_guard_contract
+
+    await _assert_session_binding_guard_contract(store)
+
+
 async def test_directory_id_comparison_is_byte_exact_on_postgres(store) -> None:
     """Postgres compares ``directory_object_id`` byte-for-byte, so case is significant.
 
@@ -3784,6 +3808,8 @@ async def test_summary_access_census_survives_and_coalesces_pg(store) -> None:
 
 
 async def test_alert_instance_lifecycle_pg(store) -> None:
+    from messagefoundry.store.store import AlertSummary
+
     # first fire opens one `open` instance (count 1, first_seen==last_seen).
     await store.upsert_alert_instance(
         event_type="connection_error", connection="OB_X", severity="critical", now=100.0
@@ -3811,6 +3837,18 @@ async def test_alert_instance_lifecycle_pg(store) -> None:
     assert got.acked_by == "scott" and got.acked_at == 200.0
     assert await store.ack_alert_instance(999999, actor="scott") is False
     assert await store.count_open_alerts_by_connection() == {"OB_Y": 1}
+    # BACKLOG #1564: run the scoped aggregate on a REAL server. The generated severity CASE, the
+    # `AS n`/`AS worst` aliases, the dialect scope bind and the row unpack never execute under the
+    # SQLite suite, so a dialect error in this leg is discoverable nowhere else.
+    assert await store.summarize_active_alert_instances() == AlertSummary(
+        total=2, worst_severity="critical"
+    )
+    assert await store.summarize_active_alert_instances(allowed_channels=["OB_Y"]) == AlertSummary(
+        total=1, worst_severity="critical"
+    )
+    assert await store.summarize_active_alert_instances(allowed_channels=[]) == AlertSummary(
+        total=0, worst_severity=None
+    )
     # an acknowledged re-fire folds in (count++) but does NOT pop back to open.
     await store.upsert_alert_instance(
         event_type="connection_error", connection="OB_X", severity="critical", now=210.0
@@ -4583,3 +4621,64 @@ async def test_audit_chain_survives_two_process_append(store, tmp_path: Path) ->
     assert ok is True, detail
     count, _head = await store.audit_anchor()
     assert count == 2 * _AUDIT_ROWS_PER_PROCESS
+
+
+async def test_record_connection_events_writes_a_burst_all_or_nothing(store) -> None:
+    """BACKLOG #1731: the drainer's burst writer. Every row lands with the singular's scrub, seal and
+    AAD binding, and a burst that fails part-way writes none of its rows."""
+    from messagefoundry.store.store import ConnectionEventWrite
+
+    def ev(kind: str, now: float, **over: object) -> ConnectionEventWrite:
+        e = ConnectionEventWrite(
+            connection="IB_BURST",
+            transport="mllp",
+            direction="inbound",
+            kind=kind,
+            peer_host="10.0.0.1",
+            message_id=None,
+            reason=None,
+            now=now,
+        )
+        e.update(over)  # type: ignore[typeddict-item]
+        return e
+
+    await store.record_connection_events(
+        [
+            ev("established", 100.0),
+            ev("closed", 101.0, reason="clean eof"),
+            ev(
+                "connection_lost",
+                102.0,
+                connection="OB_BURST",
+                direction="outbound",
+                peer_host=None,
+                message_id="m-1",
+                reason="connect refused",
+            ),
+        ]
+    )
+    events = await store.list_connection_events()
+    assert [(e.kind, e.reason) for e in events] == [
+        ("connection_lost", "connect refused"),
+        ("closed", "clean eof"),
+        ("established", None),
+    ]
+    assert events[0].message_id == "m-1" and events[0].direction == "outbound"
+    assert events[2].peer_host == "10.0.0.1"
+
+    # THE FAILING ROW IS REJECTED BY THE SERVER, not by the driver: a NULL into ``connection``,
+    # which is TEXT NOT NULL. asyncpg encodes NULL for a text parameter without complaint, so the
+    # burst really does reach the server, and the rollback under test is a server-side one. A value
+    # the DRIVER refuses (an ``object()``, say) would fail while asyncpg was still encoding, before
+    # any row was sent -- and a table that never received row 1 does not need a rollback to look
+    # unchanged, so such a test passes whether or not the transaction is there.
+    with pytest.raises(Exception):  # noqa: B017 -- asyncpg's NotNullViolationError, via its base
+        await store.record_connection_events(
+            [ev("established", 200.0), ev("closed", 201.0, connection=None)]
+        )
+    # Asserted on the CONTENT, not the count: what a missing rollback would leave behind is the
+    # ts=200.0 row, and naming it is what tells "rolled back" from "never arrived".
+    assert sorted(e.ts for e in await store.list_connection_events()) == [100.0, 101.0, 102.0]
+
+    await store.record_connection_events([])  # an empty burst is a no-op
+    assert len(await store.list_connection_events()) == 3

@@ -18,7 +18,12 @@ from pathlib import Path
 from messagefoundry.config.settings import AlertRule, AlertSeverity
 from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
 from messagefoundry.store.crypto import MARKER_PREFIX, generate_key, make_cipher
-from messagefoundry.store.store import MessageStore
+from messagefoundry.store.store import (
+    _ALERT_SEVERITY_RANK,
+    _ALERT_SEVERITY_RANK_SQL,
+    AlertSummary,
+    MessageStore,
+)
 
 # --- store lifecycle ---------------------------------------------------------
 
@@ -170,6 +175,116 @@ async def test_count_open_by_connection(tmp_path: Path) -> None:
         assert await store.count_open_alerts_by_connection() == {"OB_X": 2}
     finally:
         await store.close()
+
+
+async def test_summary_counts_past_any_page_and_ranks_by_severity(tmp_path: Path) -> None:
+    # #1564, the defect itself: 200 warnings plus ONE older critical. The bell derived both numbers
+    # from list_active_alert_instances(limit=200), so the critical fell off the newest-first page and
+    # it reported count=200, severity=warning. The aggregate sees all 201 rows and the critical wins.
+    store = await MessageStore.open(tmp_path / "a.db")
+    try:
+        await store.upsert_alert_instance(
+            event_type="connection_error", connection="OB_OLD", severity="critical", now=1.0
+        )
+        for i in range(200):
+            await store.upsert_alert_instance(
+                event_type=f"queue_buildup_{i}",
+                connection="OB_X",
+                severity="warning",
+                now=100.0 + i,
+            )
+        # The page the bell used to count: full, and the older critical is not on it.
+        page = await store.list_active_alert_instances(limit=200)
+        assert len(page) == 200 and all(a.severity == "warning" for a in page)
+
+        summary = await store.summarize_active_alert_instances()
+        assert summary.total == 201
+        assert summary.worst_severity == "critical"
+    finally:
+        await store.close()
+
+
+async def test_summary_is_scoped_and_counts_acknowledged(tmp_path: Path) -> None:
+    # Two properties the aggregate must not lose, either of which would be silent:
+    #   1. it applies `allowed_channels`, so it cannot disclose the existence or severity of an alert
+    #      outside the caller's channels (a leak strictly worse than the truncation being fixed);
+    #   2. "active" is open OR acknowledged -- the predicate list_active_alert_instances uses, NOT
+    #      count_open_alerts_by_connection's open-only one, which would drop acked rows the bell counts.
+    store = await MessageStore.open(tmp_path / "a.db")
+    try:
+        await store.upsert_alert_instance(
+            event_type="connection_error", connection="IN_MINE", severity="warning", now=100.0
+        )
+        await store.upsert_alert_instance(
+            event_type="connection_error", connection="IN_THEIRS", severity="critical", now=101.0
+        )
+        (mine,) = [
+            r for r in await store.list_active_alert_instances() if r.connection == "IN_MINE"
+        ]
+        await store.ack_alert_instance(mine.id, actor="scott")
+
+        scoped = await store.summarize_active_alert_instances(allowed_channels=["IN_MINE"])
+        assert scoped.total == 1, "acknowledged instances stay active and stay counted"
+        assert scoped.worst_severity == "warning", (
+            "the out-of-scope critical must not reach the bell"
+        )
+
+        assert await store.summarize_active_alert_instances(allowed_channels=[]) == AlertSummary(
+            total=0, worst_severity=None
+        )
+        unscoped = await store.summarize_active_alert_instances()
+        assert unscoped == AlertSummary(total=2, worst_severity="critical")
+    finally:
+        await store.close()
+
+
+async def test_summary_ignores_resolved_and_unrankable_severities(tmp_path: Path) -> None:
+    # A resolved instance leaves the aggregate entirely. And a severity outside ADR 0014's vocabulary
+    # ranks below every known one (SQL `ELSE 0`), so it is counted but can never be reported as the
+    # worst -- the same thing the console helper did with a list it could not rank.
+    store = await MessageStore.open(tmp_path / "a.db")
+    try:
+        await store.upsert_alert_instance(
+            event_type="connection_error", connection="OB_X", severity="critical", now=100.0
+        )
+        await store.upsert_alert_instance(
+            event_type="queue_buildup", connection="OB_X", severity="nonsense", now=101.0
+        )
+        assert await store.summarize_active_alert_instances() == AlertSummary(
+            total=2, worst_severity="critical"
+        )
+
+        (crit,) = [r for r in await store.list_active_alert_instances() if r.severity == "critical"]
+        await store.resolve_alert_instance(crit.id)
+        assert await store.summarize_active_alert_instances() == AlertSummary(
+            total=1, worst_severity=None
+        )
+
+        await store.resolve_alert_instances_for(event_type="queue_buildup", connection="OB_X")
+        assert await store.summarize_active_alert_instances() == AlertSummary(
+            total=0, worst_severity=None
+        )
+    finally:
+        await store.close()
+
+
+def test_severity_rank_covers_the_whole_vocabulary() -> None:
+    # The store ranks severities; `config.settings.AlertSeverity` OWNS the vocabulary. A member added
+    # there and not ranked here would fall to the SQL `ELSE 0` floor -- counted, but never able to win
+    # the bell, silently and with no import error. That is the same shape as the defect #1564 fixed,
+    # one layer down, so the coupling is asserted rather than left to a comment.
+    assert set(_ALERT_SEVERITY_RANK) == {s.value for s in AlertSeverity}
+    assert sorted(_ALERT_SEVERITY_RANK.values()) == list(range(1, len(AlertSeverity) + 1))
+
+
+def test_severity_rank_sql_quotes_its_literals() -> None:
+    # The ranking BEHAVIOUR is guarded by test_summary_counts_past_any_page_and_ranks_by_severity,
+    # which a name-MAX implementation fails. This pins the one property that test cannot see, because
+    # SQLite would accept it either way in some shapes: each severity is single-QUOTED. Unquoted,
+    # `WHEN info` parses as a column reference rather than a literal.
+    for name in _ALERT_SEVERITY_RANK:
+        assert f"'{name}'" in _ALERT_SEVERITY_RANK_SQL
+    assert _ALERT_SEVERITY_RANK["critical"] > _ALERT_SEVERITY_RANK["warning"]
 
 
 async def test_reason_encrypted_at_rest(tmp_path: Path) -> None:
@@ -449,6 +564,7 @@ _ALERT_API = frozenset(
         "resume_alert_instance",  # #143 windowed resume
         "get_alert_instance",
         "count_open_alerts_by_connection",
+        "summarize_active_alert_instances",  # #1564 scoped nav-bell aggregate
         "purge_alert_instances",
     }
 )

@@ -27,6 +27,9 @@ GET /ui/messages/{message_id}/attachments/{attachment_id}	attachment_id	path	-	-
 GET /ui/messages/{message_id}/attachments/{attachment_id}	message_id	path	-	-
 GET /ui/messages/{message_id}/edit	message_id	path	-	-
 GET /ui/messages/{message_id}/parse-tree	message_id	path	-	-
+GET /ui/messages/{message_id}/resend-confirm	message_id	path	-	-
+GET /ui/messages/{message_id}/resend-confirm	source	query	-	-
+GET /ui/messages/{message_id}/resend-confirm	to	query	-	-
 GET /ui/reauth	next	query	-	-
 GET /ui/roles/{role_id}/edit	role_id	path	-	-
 GET /ui/uploaded-logs	e	query	-	-
@@ -52,6 +55,10 @@ POST /ui/dead-letters/{channel_id}/{destination_name}/replay	destination_name	pa
 POST /ui/messages/search/presets/{preset_id}/delete	preset_id	path	-	-
 POST /ui/messages/{message_id}/edit-resend	message_id	path	-	-
 POST /ui/messages/{message_id}/replay	message_id	path	-	-
+POST /ui/messages/{message_id}/resend	idempotency_key	query	-	-
+POST /ui/messages/{message_id}/resend	message_id	path	-	-
+POST /ui/messages/{message_id}/resend	source	query	-	-
+POST /ui/messages/{message_id}/resend	to	query	-	-
 POST /ui/roles/custom/{role_id}/delete	role_id	path	-	-
 POST /ui/roles/custom/{role_id}/update	role_id	path	-	-
 POST /ui/uploaded-logs/file/{file_id}/delete	file_id	path	-	-

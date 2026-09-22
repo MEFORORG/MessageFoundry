@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry import __main__ as cli
 from messagefoundry.__main__ import main
 from messagefoundry.config import codeset_edit
 from messagefoundry.config.code_sets import load_code_set, load_code_sets
@@ -729,6 +730,40 @@ def test_cli_upsert_bad_json_emits_error(
     )
     assert rc == 1
     assert json.loads(out)["error"].startswith("invalid code set JSON:")
+
+
+def test_cli_upsert_reports_code_set_json_nested_past_the_decoder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A malformed spec and a too-deep one now share one arm, but they did not always: a
+    `RecursionError` is a `RuntimeError`, so the bare `except json.JSONDecodeError` this subcommand
+    used to carry could not reach the case the test above covers, and deeply nested `--data` escaped
+    uncaught, taking the whole JSON report with it (BACKLOG #1855).
+
+    The conversion is scoped by TYPE, to the `json.loads` call alone, NOT to this subcommand's wide
+    `try`: that `try` also wraps `upsert_code_set` and the post-write loader, and a `RecursionError`
+    from either is not an `_OperatorJsonError`, so the arm below still does not blame the operator's
+    input for it.
+
+    Why, and why the trigger below is manufactured rather than real nesting: `_load_operator_json`
+    in `messagefoundry/__main__.py`. The type facts are pinned once, by the anchor test
+    `tests/test_security_cli.py::test_cli_set_reports_security_json_nested_past_the_decoder`.
+
+    RED when: `_load_operator_json`'s `except RecursionError` arm, or `_codeset`'s
+    `except _OperatorJsonError` arm, is dropped."""
+
+    def _raise_recursion(*_args: object, **_kwargs: object) -> object:
+        raise RecursionError("simulated deep nesting")
+
+    monkeypatch.setattr(cli.json, "loads", _raise_recursion)
+    rc, out = _run(
+        ["codeset", "upsert", "--config", str(tmp_path), "--data", "[]", "--json"], capsys
+    )
+    monkeypatch.undo()  # restore json.loads before parsing the captured payload with it
+
+    assert rc == 1
+    assert json.loads(out)["error"].startswith("code set JSON is nested too deeply to parse")
+    assert not _codesets(tmp_path).exists()  # refused before any write
 
 
 def test_cli_upsert_non_csv_format_emits_error(

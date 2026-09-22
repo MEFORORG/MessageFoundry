@@ -272,6 +272,9 @@ function Get-SessionKey {
     elseif ($Payload -and ($Payload.PSObject.Properties.Name -contains 'session_id')) {
         $sid = [string]$Payload.session_id; $src = 'payload'
     }
+    elseif ($env:KORUS_AGENT -eq 'codex' -and $env:KORUS_SESSION_ID) {
+        $sid = $env:KORUS_SESSION_ID; $src = 'codex-env'
+    }
     elseif ($env:CLAUDE_CODE_SESSION_ID) {
         # THE CLI PATH, AND IT IS THE ONE THE BANNER TELLS EVERY SEAT TO RUN. The two hooks read
         # session_id off their stdin payload and pass it as -SessionId; a person or agent typing
@@ -304,12 +307,16 @@ function Get-SessionKey {
         # 60 seats where there is one.
         return @{ Key = 'nosid'; Id = $null; Source = 'absent' }
     }
+    if ($env:KORUS_AGENT -eq 'codex') { $sid = "codex-$sid" }
     $clean = $sid -replace '[^A-Za-z0-9._-]', '-'
     if ($clean.Length -gt 80) { $clean = $clean.Substring(0, 80) }
     return @{ Key = $clean; Id = $sid; Source = $src }
 }
 
 function Get-ConfigRootLabel {
+    if ($env:KORUS_AGENT -eq 'codex') {
+        return @{ Label = 'codex'; Source = 'agent-transport' }
+    }
     # Deliberately NOT a fallback to 'default'. Measured: .claude-account-3 and -4 hold zero session
     # records against 22 and 229 transcripts, so the session-join route provably fails there, and a
     # wrong label is worse than an honest 'unknown' -- it would attribute a record to a pool it never
@@ -659,6 +666,10 @@ try {
     }
 
     $script:SeatsDir = Join-Path $coord 'seats'
+    # Claude's process inventory cannot establish Codex liveness. Keep its inputs unchanged.
+    if ($env:KORUS_AGENT -eq 'codex') {
+        $script:SeatsDir = Join-Path $coord 'codex-seats'
+    }
     if (-not (Test-Path -LiteralPath $script:SeatsDir)) {
         New-Item -ItemType Directory -Path $script:SeatsDir -Force | Out-Null
     }
@@ -846,6 +857,10 @@ try {
     if ($Declare -and $Seat -and $seatRoster.Canonical) {
         try {
             $markerPath = Join-Path $wt '.claude/seat.local.txt'
+            if ($env:KORUS_AGENT -eq 'codex') {
+                if (-not $env:KORUS_STATE_REL) { throw 'Codex state path missing; use scripts/codex/invoke.ps1 run.' }
+                $markerPath = Join-Path $wt "$env:KORUS_STATE_REL/seat.local.txt"
+            }
             $markerDir = Split-Path -Parent $markerPath
             if (-not (Test-Path -LiteralPath $markerDir)) {
                 New-Item -ItemType Directory -Path $markerDir -Force | Out-Null

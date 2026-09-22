@@ -1614,15 +1614,6 @@ def test_derive_health_connection_issue_wins_the_tie_against_another_warn() -> N
     assert reason == "inbound IB_A failed to start"
 
 
-def test_worst_severity_ranks_critical_highest() -> None:
-    from messagefoundry_webconsole.routes.status import _worst_severity
-
-    assert _worst_severity(["info", "critical", "warning"]) == "critical"
-    assert _worst_severity(["info", "warning"]) == "warning"
-    assert _worst_severity(["info"]) == "info"
-    assert _worst_severity([]) is None
-
-
 def test_dashboard_has_connections_filter_box() -> None:
     """The connections dashboard renders a client-side filter-as-you-type box (app.js hides rows that
     don't match). It's an <input type=search> outside the polled table so its value survives the swap."""
@@ -1970,7 +1961,9 @@ def test_alerts_builder_escapes_hostile() -> None:
                 count=3,
                 reason="<script>alert(1)</script>",
             )
-        ]
+        ],
+        total=1,
+        worst_severity="critical",
     )
     config = AlertsConfig(
         webhook_configured=False,
@@ -2222,7 +2215,9 @@ def test_alerts_builder_renders_write_controls() -> None:
                 last_seen=0.0,
                 count=1,
             )
-        ]
+        ],
+        total=1,
+        worst_severity="critical",
     )
     config = AlertsConfig(
         webhook_configured=False,
@@ -5791,6 +5786,28 @@ async def test_nav_status_route_counts_active_alerts_worst_severity(engine: Engi
         }  # worst of warning+critical
 
 
+async def test_nav_status_sees_a_critical_past_the_first_page_of_alerts(engine: Engine) -> None:
+    """BACKLOG #1564, measured through the real route. The bell derived its count AND its severity from
+    ``list_active_alerts(limit=200)``, so 200 warnings plus one OLDER critical reported
+    ``count=200, severity=warning`` -- the critical fell off the newest-first page, and the label said
+    nothing about having truncated. Both numbers now come from the store's scoped aggregate, so the
+    page limit cannot bound either one."""
+    await engine.store.upsert_alert_instance(
+        event_type="dead_letter", connection="in1", severity="critical", now=1.0
+    )
+    for i in range(200):
+        await engine.store.upsert_alert_instance(
+            event_type=f"queue_depth_{i}", connection="in2", severity="warning", now=100.0 + i
+        )
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        r = await c.get("/ui/nav-status")
+        assert r.status_code == 200, r.text
+        assert r.json()["alerts"] == {"count": 201, "severity": "critical"}
+
+
 # --- bulk-control (dual-role start/stop/restart over a selection) ----------------------------------
 
 
@@ -6459,7 +6476,12 @@ async def test_oidc_full_round_trip_lands_a_session_via_meta_refresh(
             encryption_algorithm=_ser.NoEncryption(),
         ).decode("ascii")
         now = _time.time()
-        id_token = _Signer(private_key=pem, algorithm=_Alg.RS256, key_id="k1").sign(
+        id_token = _Signer(
+            private_key=pem,
+            algorithm=_Alg.RS256,
+            key_id="k1",
+            setting="test_idp_signing_key",
+        ).sign(
             {
                 "iss": "https://idp.example",
                 "aud": "mefor-console",

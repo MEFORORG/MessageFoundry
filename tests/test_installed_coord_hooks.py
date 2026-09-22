@@ -38,7 +38,22 @@ The tests in the second half of this module are modelled on
 ``test_gate_installed_parity.py::test_the_installed_gate_matches_the_committed_source`` and use the same
 comparison basis; ``-Status`` now reports the same parity from the PowerShell side.
 
-THIRD MECHANISM, SAME FILE, added for BACKLOG #1376: the OTHER governed roots. Everything above roots
+THIRD MECHANISM, SAME FILE, added for BACKLOG #1463: the VERBATIM hooks. ``install-git-hooks.ps1``
+also ``Copy-Item``s ``durability_push.sh`` into that same common git dir, but under TWO names -- as
+``post-commit`` and as ``post-merge``. There is no shim and no payload: the installed file IS the
+hook. It is therefore outside ``$payloads`` by design, which is exactly why the section above never
+looked at it and never reported that it had not looked. The installer now declares the mapping, this
+module parses it out of the installer, and ``-Status`` reads the same declaration.
+
+**THE VERBATIM HALF IS SCOPED TO THIS CHECKOUT, and saying so is the point of this paragraph.** The
+fourth mechanism below sweeps every governed root for its PAYLOAD parity; nothing sweeps them for
+verbatim parity, so a second governed checkout that installs verbatim hooks of its own is not covered
+here. ``audit_verbatim_hooks`` is root-parameterised and ready for that sweep, and the extension is a
+one-line call -- it is left undone deliberately rather than overlooked, because that sweep's test is
+red for an unrelated reason (BACKLOG #1376) and a second finding threaded into it would be read as
+part of that one. Do not infer coverage from the function being parameterised.
+
+FOURTH MECHANISM, SAME FILE, added for BACKLOG #1376: the OTHER governed roots. Everything above roots
 its git-hook half at THIS repository, so it answers the question for one checkout and says nothing about
 any other. The worktree gate's machine allowlist
 (``~/.claude/hooks/worktree-gate.repos.txt``) names more than one primary checkout, and a second
@@ -464,6 +479,481 @@ def test_the_payload_parity_check_still_detects_a_content_difference() -> None:
 
 
 # --------------------------------------------------------------------------------------------------
+# THE VERBATIM HOOKS -- BACKLOG #1463. Everything above this point audits a .py PAYLOAD that a
+# generated shim execs. A verbatim hook is not that shape: install-git-hooks.ps1 Copy-Items
+# scripts/hooks/durability_push.sh straight into the common git dir, so the installed file IS the
+# hook and nothing regenerates around it.
+#
+# So it drifts the same way a payload does and was audited by nothing on this side. ``$payloads``
+# deliberately excludes it -- the installer's own comment says so -- and ``PAYLOADS`` is parsed from
+# that list, which means the parity test above never looked at it and never said it had not looked.
+#
+# ONE SOURCE, MORE THAN ONE INSTALLED NAME, and the second name is where this actually bit. Measured
+# 2026-09-19 in the engine clone: ``.git/hooks/post-merge`` was byte-identical to the VAULT clone's
+# copy of durability_push.sh and three weeks older than the ``post-commit`` beside it, carrying a
+# matcher that refused this clone's PRIVATE remote. It ran on every ``git pull`` for three weeks
+# while -Status printed INSTALLED for it and nothing compared its bytes to anything. That is why the
+# declaration maps a source to a LIST: an audit that checked one name per source would have gone
+# green across exactly that condition.
+#
+# ``install-git-hooks.ps1 -Status`` reports the same parity from the PowerShell side and reads the
+# same declaration, so the two cannot drift apart into disagreeing about which names exist.
+
+# The block terminator is the brace at the OPENER'S OWN INDENT (``^\1\}``), never the first
+# ``^\s*\}`` anywhere below. Any-brace termination ends the block early at a NESTED hashtable's
+# closer, and every entry past it then vanishes into a map that is still non-empty -- so no
+# UNAUDITABLE, no red, and a silently short list. Losing a NAME is the orphan defect #1463 exists to
+# close, so the parser must not be able to lose one quietly.
+VERBATIM_DECL = re.compile(
+    r"(?m)^([ \t]*)\$verbatimHooks\s*=\s*@\{[ \t]*\r?\n(.*?)^\1\}[ \t]*$", re.S
+)
+#: An entry this parser can read. Both PowerShell quote styles, because both are legal and a parser
+#: that silently skipped one would drop a real entry.
+VERBATIM_ENTRY = re.compile(r"""(?m)^[ \t]*(['"])([^'"]+)\1\s*=\s*@\(([^)]*)\)""")
+#: Anything that LOOKS like an entry line, read only to count. See the mismatch guard below.
+VERBATIM_CANDIDATE = re.compile(r"""(?m)^[ \t]*['"][^'"]*['"][ \t]*=""")
+VERBATIM_NAME = re.compile(r"""(['"])([^'"]+)\1""")
+
+
+def verbatim_hooks_declared_by(root: Path) -> dict[str, list[str]]:
+    """``root``'s own installer's map of verbatim SOURCE -> every installed name, or {} if unreadable.
+
+    Parameterised by root for the same reason ``payloads_declared_by`` is, and recognising ONE
+    declaration shape for the same reason: an installer written differently returns {}, which
+    ``audit_verbatim_hooks`` reports as UNAUDITABLE rather than as clean. Inferring the map from, say,
+    a ``Copy-Item`` scan would produce a confident answer for a file nobody has read, and a wrong map
+    audits the wrong pair of files -- which reads as agreement.
+
+    Line-anchored twice over (``(?m)^[ \\t]*``), on the opener AND on each entry, so neither a
+    commented-out ``# $verbatimHooks = @{`` nor a commented-out ``# "x.sh" = @("y")`` inside a live
+    block can be credited. ``re.search`` takes the first hit anywhere in a file and a ``#`` prefix
+    would otherwise satisfy an unanchored pattern -- the defect already fixed in
+    ``payloads_declared_by`` and in ``test_gate_installed_parity.py``'s ``handled_tools``.
+
+    **PARTIAL IS WORSE THAN NOTHING HERE, so a shape this parser half-reads returns {}.** An empty
+    map is loud: it reports UNAUDITABLE. A map that parsed three entries out of four, or two names
+    out of three, is quiet -- it reports confident parity over the subset it managed to read while
+    the entry it dropped is audited by nothing. That dropped name is the 2026-09-19 orphan exactly.
+    So every line inside the block that LOOKS like an entry must be one this parser actually read;
+    a count mismatch means some declaration shape here is unreadable, and the honest answer to that
+    is the same {} as for an unrecognised opener.
+    """
+    try:
+        src = (root / "scripts" / "coord" / "install-git-hooks.ps1").read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    block = VERBATIM_DECL.search(src)
+    if not block:
+        return {}
+    body = block.group(2)
+    out: dict[str, list[str]] = {}
+    for _q, source, names in VERBATIM_ENTRY.findall(body):
+        installed = [n for _nq, n in VERBATIM_NAME.findall(names)]
+        if installed:
+            out[source] = installed
+    if len(out) != len(VERBATIM_CANDIDATE.findall(body)):
+        return {}
+    return out
+
+
+VERBATIM: dict[str, list[str]] = verbatim_hooks_declared_by(ROOT)
+
+
+def audit_verbatim_hooks(root: Path, hooks_dir: Path | None) -> tuple[list[str], list[str]]:
+    """Does ``root`` run the verbatim hooks ``root`` itself committed? Returns (findings, notes).
+
+    Same contract and same carve-outs as ``audit_governed_root``: findings are the assertion, notes
+    print either way so a run that compared nothing says so instead of looking like a run that
+    compared everything and agreed. A root is only ever measured against its own installer and its
+    own sources.
+
+    An installer that is PRESENT but declares nothing this parser can read is a FINDING, not a note.
+    An empty map skips every loop body below and reports clean, which is indistinguishable from a
+    root with nothing wrong -- the same silent-vacuity defect ``audit_governed_root`` reports as
+    UNAUDITABLE, arriving here the moment a second checkout's installer is written a little
+    differently.
+
+    Not findings, because each is a normal state rather than drift: a root that ships no installer is
+    not running this machinery; git declining to name a hooks directory is a broken-git condition the
+    caller cannot act on; an installed copy that is simply absent means nobody has run that root's
+    installer on this box, which is a human step CI never performs; and an uncommitted source is
+    SUPPOSED to differ mid-edit.
+    """
+    findings: list[str] = []
+    notes: list[str] = []
+
+    installer = root / "scripts" / "coord" / "install-git-hooks.ps1"
+    if not installer.is_file():
+        notes.append(f"  {root}: no scripts/coord/install-git-hooks.ps1 -- not governed by this")
+        return findings, notes
+
+    declared = verbatim_hooks_declared_by(root)
+    if not declared:
+        findings.append(
+            f"{root}: UNAUDITABLE. Its install-git-hooks.ps1 is present but declares no "
+            f"$verbatimHooks map this parser can read, so NOTHING about the hooks it installs "
+            f"VERBATIM was compared -- and an empty map reads exactly like agreement. A verbatim "
+            f"hook IS the installed file, so an unaudited one runs whatever bytes it was given "
+            f"whenever it was given them, for every worktree of that clone at once. REMEDY: either "
+            f"that root's installer gains the $verbatimHooks declaration this one has, or "
+            f"verbatim_hooks_declared_by learns that installer's shape. Do not guess a map for a "
+            f"shape nobody has read: a wrong map reports confident parity over the wrong files"
+        )
+        return findings, notes
+
+    if hooks_dir is None:
+        notes.append(f"  {root}: git named no hooks directory -- nothing compared")
+        return findings, notes
+
+    notes.append(f"  {root}: verbatim={declared} hooks_dir={hooks_dir}")
+    for source_name, installed_names in sorted(declared.items()):
+        source = root / "scripts" / "hooks" / source_name
+        if not source.is_file():
+            findings.append(
+                f"{root}: its installer declares {source_name}, which has no source at "
+                f"scripts/hooks/{source_name} -- installing there would fail, and until then those "
+                f"hooks run from whatever copies are already in place. REMEDY: reconcile that root's "
+                f"installer with that root's sources"
+            )
+            continue
+        committed = source_is_committed_in(root, source_name)
+        source_hash = content_hash(source.read_bytes())
+        for name in installed_names:
+            installed = hooks_dir / name
+            if not installed.is_file():
+                notes.append(f"    {name} <- {source_name}: not installed -- nothing compared")
+                continue
+            if not committed:
+                notes.append(
+                    f"    {name} <- {source_name}: source uncommitted there -- nothing compared"
+                )
+                continue
+            installed_hash = content_hash(installed.read_bytes())
+            notes.append(
+                f"    {name} <- {source_name}: installed={installed_hash[:12]} "
+                f"source={source_hash[:12]} "
+                f"{'match' if installed_hash == source_hash else 'DIFFER'}"
+            )
+            if installed_hash != source_hash:
+                findings.append(
+                    f"{root}: CONTENT DRIFT. .git/hooks/{name} is installed VERBATIM from "
+                    f"scripts/hooks/{source_name}, and the copy that RUNS is not the one this "
+                    f"checkout committed (installed={installed_hash[:12]} at {installed}, "
+                    f"source={source_hash[:12]}). Line endings are folded out of this comparison, so "
+                    f"CRLF vs LF cannot account for it -- they differ in content. There is no shim "
+                    f"here: the installed file IS the hook, so every rule in it is whatever it was "
+                    f"when it was installed, for every worktree of this clone at once. WORK OUT "
+                    f"WHICH COPY IS OLDER FIRST -- re-installing from the older side downgrades the "
+                    f"hook everywhere:\n"
+                    f"    git -C {root} log --oneline -5 -- scripts/hooks/{source_name}\n"
+                    f"Only once that checkout is the newer of the two, from a plain terminal in it:\n"
+                    f"    pwsh -NoProfile -File scripts\\coord\\install-git-hooks.ps1"
+                )
+    return findings, notes
+
+
+def test_the_verbatim_hook_map_was_parsed_from_the_installer() -> None:
+    """Guard the source of every check below, the way ``test_the_payload_list_was_parsed_from_the_installer``
+    guards ``PAYLOADS``.
+
+    An empty map makes ``audit_verbatim_hooks`` report UNAUDITABLE rather than clean, so it cannot go
+    silently green -- but it would go red with a message about a parser rather than about a hook,
+    which sends the reader to the wrong file. Say here, once, that the declaration is the thing that
+    moved.
+    """
+    print(f"verbatim hooks parsed from {HOOK_INSTALLER.name}: {VERBATIM or 'NONE'}")
+    assert VERBATIM, (
+        f"no $verbatimHooks map parsed from {HOOK_INSTALLER} -- either the declaration was removed or "
+        f"its shape moved away from verbatim_hooks_declared_by"
+    )
+    missing = [s for s in VERBATIM if not (HOOK_SOURCE_DIR / s).is_file()]
+    assert not missing, (
+        f"the installer declares verbatim hooks with no source in this checkout: {missing} -- "
+        f"installing would fail, and until then those hooks run from whatever copies are in place"
+    )
+    # The list half of the declaration is the part BACKLOG #1463 turned on, so pin that the known
+    # two-name source still declares both. A map that quietly lost post-merge would restore the
+    # 2026-09-19 blind spot with every test here still green.
+    #
+    # A FLOOR, not an equality, and the difference is which reds are true ones. Both names must be
+    # there; a THIRD name added later (post-rewrite, say) is a correct extension and must not red
+    # this, and neither must a reordering, which means nothing. An exact pin would report both as
+    # failures, and a red nobody believes is a red nobody reads.
+    assert set(VERBATIM.get("durability_push.sh") or []) >= {"post-commit", "post-merge"}, (
+        f"durability_push.sh is installed under BOTH post-commit and post-merge -- a map naming "
+        f"fewer leaves an entire class of commit audited by nothing: "
+        f"{VERBATIM.get('durability_push.sh')}"
+    )
+
+
+def test_this_checkout_runs_the_verbatim_hooks_it_committed() -> None:
+    """BACKLOG #1463: nothing checked that a verbatim-installed git hook matches its source.
+
+    The payload parity test above answers this for the .py hooks a shim execs. This one answers it for
+    the hooks that ARE the installed file, which is the harder case: a payload at least has a shim
+    whose marker someone was looking at, while a verbatim hook has nothing beside it to look at.
+
+    LOCAL-MACHINE TEST, for the same reason as every parity test in this module: these hooks are
+    installed per box by a human running the installer, and CI installs none. The notes print before
+    any assertion so a run that compared nothing says so.
+    """
+    hooks_dir = installed_hooks_dir()
+    findings, notes = audit_verbatim_hooks(ROOT, hooks_dir)
+    print(f"hooks dir: {hooks_dir or '(git named none)'}")
+    for line in notes:
+        print(line)
+    assert not findings, "\n".join(findings)
+
+
+def test_the_verbatim_audit_detects_a_copy_that_was_not_committed_here(tmp_path: Path) -> None:
+    """ANTI-VACUITY CONTROL, with the untouched baseline beside it.
+
+    An audit that reported nothing whatever it was pointed at would pass on every box forever and
+    read as coverage. The drifted case ALONE proves less than it looks: it cannot rule out an audit
+    that finds a problem everywhere, so the clean root is not decoration, it is the half that makes
+    the other half mean something.
+
+    The clean root's installed copy is written in CRLF against an LF source, which pins that the eol
+    fold still holds here -- otherwise a re-encoding could masquerade as content drift, and the first
+    red this check ever produced would be a false one.
+
+    Both roots are constructed under ``tmp_path`` and neither is a real checkout. The verbatim hooks
+    on this box fire on every commit, merge and pull in every worktree of their clone; a test may not
+    take one out from under a concurrent session.
+
+    **AND THE FIXTURE NAMES ARE LIVE HOOK NAMES, which is why the containment is asserted rather than
+    assumed.** ``hooks_dir_for`` honours ``core.hooksPath``, and that setting reads the global
+    cascade: on a box where an operator has set it to an absolute path, both fixtures would resolve to
+    that one real directory and this test would write ``post-commit`` and ``post-merge`` into it --
+    files git then EXECUTES. ``_seed_verbatim_root`` pins the fixture's own ``core.hooksPath`` in its
+    LOCAL config, which wins, and the assertions below refuse to write anywhere outside ``tmp_path``.
+    The older governed-root control has the same shape and gets away without this because the file it
+    writes is ``claim_check.py``, which git never invokes.
+    """
+    committed = b"#!/bin/sh\n# MessageFoundry durability hook\nexit 0\n"
+
+    clean = tmp_path / "Clean"
+    clean.mkdir()
+    _seed_verbatim_root(clean, {"durability_push.sh": ["post-commit", "post-merge"]}, committed)
+    clean_hooks = hooks_dir_for(clean)
+    assert clean_hooks is not None, "the fixture root resolved no hooks dir -- control is vacuous"
+    assert tmp_path in clean_hooks.parents, (
+        f"the fixture's hooks dir resolved OUTSIDE tmp_path ({clean_hooks}) -- writing live hook "
+        f"names there would plant executable hooks in a real directory"
+    )
+    for name in ("post-commit", "post-merge"):
+        (clean_hooks / name).write_bytes(committed.replace(b"\n", b"\r\n"))
+
+    # Drift ONLY the second installed name. A source installed twice is where this class of defect
+    # actually lived, and an audit that stopped at the first name would report this root clean --
+    # which is precisely the 2026-09-19 orphan post-merge, reconstructed.
+    drifted = tmp_path / "Drifted"
+    drifted.mkdir()
+    _seed_verbatim_root(drifted, {"durability_push.sh": ["post-commit", "post-merge"]}, committed)
+    drifted_hooks = hooks_dir_for(drifted)
+    assert drifted_hooks is not None, "the fixture root resolved no hooks dir -- control is vacuous"
+    assert tmp_path in drifted_hooks.parents, (
+        f"the fixture's hooks dir resolved OUTSIDE tmp_path ({drifted_hooks}) -- writing live hook "
+        f"names there would plant executable hooks in a real directory"
+    )
+    assert drifted_hooks != clean_hooks, (
+        "both fixture roots resolved to ONE hooks directory, so the clean baseline and the drifted "
+        "case are writing over each other and neither measures what it claims to"
+    )
+    (drifted_hooks / "post-commit").write_bytes(committed)
+    (drifted_hooks / "post-merge").write_bytes(committed + b"# installed three weeks earlier\n")
+
+    clean_findings, clean_notes = audit_verbatim_hooks(clean, clean_hooks)
+    drift_findings, drift_notes = audit_verbatim_hooks(drifted, drifted_hooks)
+    for line in (*clean_notes, *drift_notes):
+        print(line)
+
+    assert not clean_findings, (
+        f"the audit reported drift for a root whose installed copies match its committed source, "
+        f"differing only in line endings: {clean_findings}"
+    )
+    assert drift_findings, (
+        "the audit found nothing for a root whose SECOND installed name differs in content from the "
+        "source that root committed -- it cannot detect the condition it exists to detect"
+    )
+    assert "post-merge" in drift_findings[0] and "durability_push.sh" in drift_findings[0], (
+        f"the finding names neither the installed hook nor its source, so a reader cannot act on it: "
+        f"{drift_findings[0]}"
+    )
+    assert not any("post-commit" in f for f in drift_findings), (
+        f"the audit reported the matching post-commit as drifted too, so it is not comparing "
+        f"per installed name: {drift_findings}"
+    )
+
+
+def test_the_verbatim_audit_reports_an_installer_whose_map_it_cannot_read(tmp_path: Path) -> None:
+    """The other way this audit goes silently vacuous: an installer it cannot parse.
+
+    An unreadable ``$verbatimHooks`` yields an empty map, every loop body is skipped, and the root
+    reports clean -- indistinguishable from a root with nothing wrong. Modelled on
+    ``test_the_governed_root_audit_reports_an_installer_whose_payload_list_it_cannot_read``, which
+    exists because the same hole opened one level up.
+    """
+    root = tmp_path / "Unparseable"
+    root.mkdir()
+    _seed_verbatim_root(root, {"durability_push.sh": ["post-commit"]}, b"#!/bin/sh\nexit 0\n")
+    (root / "scripts" / "coord" / "install-git-hooks.ps1").write_text(
+        "# an installer this parser cannot read\n$verbatim = @{ 'durability_push.sh' = 'post-commit' }\n",
+        encoding="utf-8",
+    )
+
+    findings, notes = audit_verbatim_hooks(root, hooks_dir_for(root))
+    for line in notes:
+        print(line)
+    assert findings and "UNAUDITABLE" in findings[0], (
+        f"a root whose installer cannot be parsed reported clean: {findings}"
+    )
+    assert "$verbatimHooks" in findings[0], (
+        f"the finding does not name what could not be read, so a reader cannot act on it: "
+        f"{findings[0]}"
+    )
+
+
+def test_the_verbatim_declaration_parser_refuses_a_commented_out_map(tmp_path: Path) -> None:
+    """Line-anchoring is the whole of what keeps a COMMENT from being read as a declaration.
+
+    Two shapes, because the parser anchors twice and only the pair exercises both anchors: a fully
+    commented-out block, and a live block with one entry commented out. The second is the one a
+    reader is most likely to write -- disabling a hook by prefixing its line -- and an unanchored
+    entry pattern would go on auditing it.
+
+    A positive control sits beside them, because a parser that returned {} for EVERYTHING would pass
+    both negative assertions while reporting every installer on the box UNAUDITABLE.
+    """
+    live = tmp_path / "Live"
+    (live / "scripts" / "coord").mkdir(parents=True)
+    installer = live / "scripts" / "coord" / "install-git-hooks.ps1"
+
+    installer.write_text(
+        '# $verbatimHooks = @{\n#     "durability_push.sh" = @("post-commit", "post-merge")\n# }\n',
+        encoding="utf-8",
+    )
+    print(f"fully commented out -> {verbatim_hooks_declared_by(live)}")
+    assert verbatim_hooks_declared_by(live) == {}, (
+        "a commented-out declaration was credited as the real one -- the opener is not line-anchored"
+    )
+
+    installer.write_text(
+        '$verbatimHooks = @{\n    "durability_push.sh" = @("post-commit")\n'
+        '#    "retired_hook.sh" = @("pre-rebase")\n}\n',
+        encoding="utf-8",
+    )
+    partial = verbatim_hooks_declared_by(live)
+    print(f"one entry commented out -> {partial}")
+    assert partial == {"durability_push.sh": ["post-commit"]}, (
+        f"a commented-out ENTRY inside a live block was credited: {partial}"
+    )
+
+    installer.write_text(
+        '$verbatimHooks = @{\n    "durability_push.sh" = @("post-commit", "post-merge")\n}\n',
+        encoding="utf-8",
+    )
+    positive = verbatim_hooks_declared_by(live)
+    print(f"positive control -> {positive}")
+    assert positive == {"durability_push.sh": ["post-commit", "post-merge"]}, (
+        f"the parser failed to read a well-formed declaration, so the two assertions above prove "
+        f"nothing about anchoring: {positive}"
+    )
+
+
+def test_a_declaration_this_parser_half_reads_returns_nothing_rather_than_a_short_list(
+    tmp_path: Path,
+) -> None:
+    """A PARTIAL read is the dangerous one, because it is the quiet one.
+
+    An empty map is loud: ``audit_verbatim_hooks`` reports UNAUDITABLE. A map that read three entries
+    out of four, or two names out of three, is silent -- it reports confident parity over the subset
+    and the entry it dropped is compared to nothing. A dropped installed NAME is the 2026-09-19
+    orphan exactly, so the parser has to be unable to drop one without saying so.
+
+    Each shape below is one this parser genuinely cannot read. The assertion is that every one yields
+    {} rather than a short list; the two positive controls at the end are what stop a parser broken
+    to always-{} from passing this whole test.
+    """
+    root = tmp_path / "Shapes"
+    (root / "scripts" / "coord").mkdir(parents=True)
+    installer = root / "scripts" / "coord" / "install-git-hooks.ps1"
+
+    half_read = {
+        "nested hashtable closes the block early": "$verbatimHooks = @{\n"
+        '    "a.sh" = @("x")\n    "b.sh" = @{ k = 1 }\n    "c.sh" = @("y")\n}\n',
+        "a value that is not an array": "$verbatimHooks = @{\n"
+        '    "a.sh" = @("x")\n    "b.sh" = "post-commit"\n}\n',
+        "an entry declaring no names at all": "$verbatimHooks = @{\n"
+        '    "a.sh" = @("x")\n    "b.sh" = @()\n}\n',
+    }
+    for label, text in half_read.items():
+        installer.write_text(text, encoding="utf-8")
+        got = verbatim_hooks_declared_by(root)
+        print(f"{label} -> {got}")
+        assert got == {}, (
+            f"the parser returned a SHORT list for a declaration it can only half read ({label}): "
+            f"{got}. A short list reads as agreement over the entries it dropped"
+        )
+
+    # Both PowerShell quote styles are legal, and a parser that silently skipped one would drop a
+    # real entry -- the same defect from the other direction. These must PARSE, not return {}.
+    installer.write_text(
+        "$verbatimHooks = @{\n    'a.sh' = @('post-commit', \"post-merge\")\n}\n", encoding="utf-8"
+    )
+    quoted = verbatim_hooks_declared_by(root)
+    print(f"mixed quote styles -> {quoted}")
+    assert quoted == {"a.sh": ["post-commit", "post-merge"]}, (
+        f"a legal single-quoted declaration was dropped or half-read: {quoted}"
+    )
+
+    installer.write_text(
+        '$verbatimHooks = @{\n    "a.sh" = @("x")\n    "b.sh" = @("y", "z")\n}\n', encoding="utf-8"
+    )
+    two = verbatim_hooks_declared_by(root)
+    print(f"two well-formed entries -> {two}")
+    assert two == {"a.sh": ["x"], "b.sh": ["y", "z"]}, (
+        f"the parser failed on two well-formed entries, so every {{}} above proves nothing about "
+        f"the guard and only that the parser is broken: {two}"
+    )
+
+
+def _seed_verbatim_root(root: Path, verbatim: dict[str, list[str]], body: bytes) -> None:
+    """A throwaway checkout shaped like a governed root, declaring verbatim hooks instead of payloads.
+
+    Sibling of ``_seed_governed_root`` below rather than a parameter on it: that one seeds a
+    ``$payloads`` installer, and folding both shapes into one helper would let a test that meant to
+    exercise one declaration silently exercise the other.
+    """
+    (root / "scripts" / "coord").mkdir(parents=True)
+    (root / "scripts" / "hooks").mkdir(parents=True)
+    entries = "\n".join(
+        f'    "{source}" = @({", ".join(f'"{n}"' for n in names)})'
+        for source, names in verbatim.items()
+    )
+    (root / "scripts" / "coord" / "install-git-hooks.ps1").write_text(
+        f"# fixture installer\n$verbatimHooks = @{{\n{entries}\n}}\n", encoding="utf-8"
+    )
+    for source in verbatim:
+        (root / "scripts" / "hooks" / source).write_bytes(body)
+    for args in (
+        ("init", "-q"),
+        ("config", "user.email", "t@example.invalid"),
+        ("config", "user.name", "T"),
+        # PIN THE FIXTURE'S OWN HOOKS DIRECTORY IN LOCAL CONFIG, which beats the global cascade.
+        # hooks_dir_for honours core.hooksPath, so on a box where an operator has set it globally to
+        # an absolute path every fixture would otherwise resolve to that one real directory -- and
+        # the caller writes LIVE hook names, files git executes. Local config makes the containment
+        # a property of the fixture rather than of the box it runs on.
+        ("config", "core.hooksPath", str(root / ".git" / "hooks")),
+        ("add", "--", "scripts"),
+        ("commit", "-q", "-m", "seed"),
+    ):
+        subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True, text=True)
+    (root / ".git" / "hooks").mkdir(parents=True, exist_ok=True)
+
+
+# --------------------------------------------------------------------------------------------------
 # IS IT INSTALLED AT ALL? -- the gap every test above leaves open.
 #
 # The parity test asks "does the installed copy match source" and SKIPS when nothing is installed.
@@ -879,7 +1369,7 @@ def test_the_installed_shim_matches_the_installer_here_string(var: str) -> None:
 
 
 # --------------------------------------------------------------------------------------------------
-# The OTHER governed roots -- the third mechanism described in the module docstring (BACKLOG #1376).
+# The OTHER governed roots -- the fourth mechanism described in the module docstring (BACKLOG #1376).
 # Everything above roots its git-hook half at THIS repository. A second primary checkout on the same
 # box that also ships install-git-hooks.ps1 installs its own payloads into its own common git dir, and
 # nothing anywhere compared them. Read the comparison rule in the docstring before editing anything
