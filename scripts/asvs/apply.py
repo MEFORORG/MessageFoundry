@@ -149,8 +149,23 @@ def toml_str(s: str) -> str:
 #: keeps; it enumerates only what it ORDERS, and everything else survives by default.
 _ORDERED = ("id", "level", "verdict", "residual", "last_verified", "verified_at", "reviewed_by")
 
-#: Every field that can carry free text. anchor_repair must hold ALL of these byte-identical, not just
-#: the one the glyph check reads -- otherwise the exemption is a bypass with a narrow mouth.
+#: AT LEAST these top-level keys carry free text. **NOT every field that can** -- `posture`,
+#: `decision_closed_on`, anything a payload invents, and all sub-table text (`evidence[].expect`,
+#: `absence[].pattern`, and their siblings) are free text this tuple does not name and neither guard
+#: below covers. An enumeration that calls itself complete is the liability SDS-3.6 names, and this
+#: one said "every field" while covering none of that. Widening the guards to the whole emitted
+#: surface is a real defect and not this tuple's job to hide.
+#:
+#: TWO guards read the tuple -- the `anchor_repair` byte-identity check and the banned-glyph
+#: introduction scan -- and BOTH must read all of it. Narrow either and the exemption becomes a
+#: bypass with a narrow mouth. That is not hypothetical: the scan read `residual` alone while this
+#: tuple named five, so a glyph could enter the other four unremarked (BACKLOG #1333). The two are
+#: coupled tighter still, because the scan skips itself under `anchor_repair` on the strength of the
+#: byte-identity loop, so narrowing THAT one silently opens the scan as well.
+#:
+#: Tests pin all three edges -- each guard's loop, and the membership of this tuple itself. The
+#: tuple needs its own arm because the tests parametrize OVER it: shrink it and the parametrized
+#: arms shrink with it, reporting fewer passes rather than a failure.
 _PROSE_FIELDS = (
     "residual",
     "reviewed_by",
@@ -625,10 +640,12 @@ def main(argv: list[str] | None = None) -> int:
                     "prose field must stay byte-identical or this run refuses."
                 )
         if anchor_repair:
-            # Assert byte-identity on EVERY prose-bearing field, not just the two the glyph check
-            # reads. Holding only verdict+residual was sound by argument -- the writer never rewrites
-            # the others -- but an argument is worth less than a check, and it left the next reader to
-            # reconstruct why two were sufficient.
+            # Assert byte-identity on EVERY prose-bearing field. Holding only verdict+residual was
+            # sound by argument -- the writer never rewrites the others -- but an argument is worth
+            # less than a check, and it left the next reader to reconstruct why two were sufficient.
+            #
+            # THIS is the guard on prose under `anchor_repair`; the glyph scan below skips itself
+            # and stays inert here. `_PROSE_FIELDS` carries the coupling.
             for f in _PROSE_FIELDS:
                 if c.get(f, live.get(f, "")) != live.get(f, ""):
                     problems.append(
@@ -687,18 +704,44 @@ def main(argv: list[str] | None = None) -> int:
         #
         # FAIL-CLOSED WHERE THERE IS NO RECORD: a cell with no live counterpart has a live count of
         # zero for everything, so any banned character in a NEW cell is introduced and refused.
-        payload_residual = "" if anchor_repair else str(c.get("residual", "") or "")
-        introduced = _introduced_banned(
-            payload_residual, str((live or {}).get("residual", "") or "")
-        )
-        if introduced:
-            # Report the codepoint, never the character: echoing it to a cp1252 console raises
-            # UnicodeEncodeError and the refusal turns into a traceback that hides its own reason.
-            ch, extra = introduced
-            problems.append(
-                f"{c['id']}: residual INTRODUCES a banned glyph U+{ord(ch):04X} "
-                f"({extra} more than the record already carries)"
-            )
+        # EVERY `_PROSE_FIELDS` ENTRY, NOT `residual` ALONE (BACKLOG #1333). That tuple's comment
+        # carries the coupling and what these five names still leave uncovered.
+        #
+        # PER FIELD ON BOTH SIDES: payload field against the live field of the SAME NAME. Comparing
+        # against the cell's prose as a whole would let one field that already carries a glyph
+        # launder new vocabulary into all the others. The cost is that a glyph MOVED between two
+        # prose fields now reads as an introduction, where `_introduced_banned`'s docstring promises
+        # a move is writable -- that promise holds within a field, not across them.
+        #
+        # THE `anchor_repair` SKIP IS BELT-AND-BRACES AND INERT TODAY, kept deliberately and marked
+        # so nobody reads it as load-bearing. The byte-identity loop above already forces all five
+        # fields to equal the record, so `_introduced_banned(x, x)` finds nothing whether this runs
+        # or not: replacing the condition with `if True` leaves the suite green. It stays because it
+        # says the exemption out loud where the old spelling said it by feeding the scan a blanked
+        # payload, which reads like sanitisation rather than the decision it is.
+        #
+        # IT IS NOT A CLAIM ABOUT THE CELL. A repair rewrites `evidence` entries by definition, and
+        # no guard here scans sub-table text, under `anchor_repair` or without it.
+        if not anchor_repair:
+            for prose_field in _PROSE_FIELDS:
+                introduced = _introduced_banned(
+                    str(c.get(prose_field, "") or ""), str(live.get(prose_field, "") or "")
+                )
+                if introduced:
+                    # Report the codepoint, never the character: echoing it to a cp1252 console
+                    # raises UnicodeEncodeError and the refusal turns into a traceback that hides
+                    # its own reason. NAME THE FIELD too -- this said "residual" whatever carried
+                    # the glyph, which sends the author to edit prose that is fine.
+                    #
+                    # `c.get('id')`, not `c['id']`: a missing id is APPENDED to problems above
+                    # rather than returned on, so a payload with no id reaches here and the
+                    # subscript would raise KeyError -- a traceback in place of the refusal list
+                    # that names the real problem. The widening made four more fields reach it.
+                    ch, extra = introduced
+                    problems.append(
+                        f"{c.get('id')}: {prose_field} INTRODUCES a banned glyph "
+                        f"U+{ord(ch):04X} ({extra} more than that field already carries)"
+                    )
     if problems:
         print("REFUSING TO APPLY:")
         for p in problems:
