@@ -23,11 +23,29 @@ funded penetration test.** Its Lane 1 names four instruments: OWASP ZAP, Schemat
 FastAPI schema, boofuzz against the MLLP listener, and coverage-guided fuzzing of the tolerant
 parsers. This ADR covers the fourth and only the fourth.
 
-**Nothing of the kind was wired.** Measured at `origin/main` 2026-09-22: a grep of `.github/`,
-`pyproject.toml` and `scripts/` for `zap|schemathesis|atheris|boofuzz` returned one hit, inside a
-vendored `package-lock.json`. The control -- `bandit|pip-audit|semgrep` on the same instrument --
-fired across five files, so the near-zero was a measurement and not a dead probe. So the
-Secure_Development_Standards section 6.1 *Dynamic* tier was defined and never run.
+**Nothing of the kind was wired.** The instrument is given rather than only its result, because a
+count is a fact about one ref and one scope and moves when either does. Read at `origin/main`
+(`e290caef2`), 2026-09-22:
+
+```
+git grep -lEi 'zap|schemathesis|atheris|boofuzz' origin/main -- .github pyproject.toml scripts
+git grep -lEi 'bandit|pip-audit|semgrep'         origin/main -- .github pyproject.toml scripts
+```
+
+The needle returns **one** file, and that hit is a **false positive**: `zAp` inside a base64
+`integrity` hash in the vendored `.github/actions/cla-assistant-lite/upstream-package-lock.json`.
+Drop the `i` and it returns **zero**. So the true count of coverage-guided fuzzing or DAST tooling
+in that scope is **zero**, not one, which strengthens this section's argument while invalidating the
+arithmetic its first draft carried. The control, same instrument and same scope, returns **22** files
+(21 case-sensitive) -- 9 restricted to `.github/workflows/`, 75 over the whole tree -- so the zero is
+a measurement and not a dead probe.
+
+**The first draft of this paragraph said the control "fired across five files". That reproduces at no
+scope, and it is corrected here rather than quietly dropped.** It came from the dispatching brief and
+was carried in good faith; a figure in an accepted ADR is a permanent record, so a reader who checked
+it would have found the evidence for a near-zero unreproducible and had no way to tell a bad number
+from a bad claim. So the Secure_Development_Standards section 6.1 *Dynamic* tier was defined and
+never run.
 
 **The parsers are the right first slice, for a reason that is a property of the code rather than a
 preference.** `messagefoundry/parsing/` is a pure, side-effect-free library (CLAUDE.md section 4's
