@@ -413,9 +413,10 @@ _ADDED = "OB_ADDED"
 def _mixed_registry(inbox: Path, lanes: list[tuple[str, OrderingMode]]) -> Registry:
     """Like :func:`_registry`, but every lane declares its OWN ordering mode — which is what a reload
     that adds one unordered outbound beside an existing FIFO one needs. Handler ``i`` sends ``p{i}``
-    to ``lanes[i]``."""
+    to ``lanes[i]``. Lane names are deduped exactly as :func:`_registry` does, so a caller that
+    repeats one (to exercise the ordering flip, say) registers the outbound once."""
     reg = Registry()
-    for lane, ordering in lanes:
+    for lane, ordering in dict(lanes).items():
         reg.add_outbound(_dest(lane, ordering))
     for i, (lane, _ordering) in enumerate(lanes):
         reg.add_handler(f"h{i}", (lambda ln, pl: lambda m: Send(ln, pl))(lane, f"p{i}"))
