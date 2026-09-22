@@ -26,10 +26,20 @@ merge-queue batch until someone bumps a date, it recurs annually by construction
 because ``_MAX_LIFETIME`` forces the next value under a year out, and it lands the
 remediation on whoever's pull request is red rather than on whoever owns the policy --
 who is the only person able to do the half that matters, which is re-checking that both
-contact channels still reach a maintainer. The right home is a non-blocking lane with
-lead time (``.github/workflows/quality-advisory.yml`` is the repository's one place a
-check can report without being able to gate, watched by ``nightly-notice.yml``). That
-is filed, not built here. Until it exists, renewal rests on the note in the file itself.
+contact channels still reach a maintainer.
+
+The right home is a non-blocking lane with lead time.
+``.github/workflows/quality-advisory.yml`` is the repository's one place a check can
+report without being able to gate, so that is where such an arm belongs. **It is NOT
+enough on its own, and saying so is the point of this paragraph.** Measured 2026-09-22:
+``nightly-notice.yml`` watches ``["CI", "Security", "DAST", "Stalled PRs", "Required
+workflow state"]`` and names ``quality-advisory`` nowhere, and that file's own header
+warns that several scheduled workflows here are unwatched. A reminder added to the
+advisory lane and not to that watch list reports into nothing, which would be a
+compensating control resting on a false premise (SDS-3.7). Both halves are filed, not
+built here: wiring a workflow is Lane 1's and outside this brief. Until they exist,
+renewal rests on the note in the file itself and on nothing else -- which is a real gap,
+not a covered one.
 
 ``test_expires_is_not_more_than_a_year_out`` is what remains, and it cannot go red with
 the passage of time, because the gap it measures only shrinks. It catches an author who
@@ -77,21 +87,35 @@ _CONTACT_SCHEMES = ("https://", "mailto:", "tel:")
 _MAX_LIFETIME = dt.timedelta(days=366)
 
 #: A GitHub blob URL, captured so the arm below can resolve the path it publishes against
-#: the tree rather than trusting that the URL contains a plausible-looking filename.
-_BLOB_URL = re.compile(r"^https://github\.com/[^/]+/[^/]+/blob/[^/]+/(?P<path>\S+)$")
+#: the tree rather than trusting that the URL contains a plausible-looking filename. The
+#: ref is `.+?` and not `[^/]+` because a branch name may contain a slash
+#: (`release/1.0`), and the path capture stops at `#` or `?` so a deep link to a heading
+#: resolves to the file rather than to a name git cannot possibly track.
+_BLOB_URL = re.compile(r"^https://github\.com/[^/]+/[^/]+/blob/.+?/(?P<path>[^#?\s]+)")
+
+#: RFC 9116's grammar is ``field-name ":" SP value``: a token name, then a colon, then one
+#: space. Anchored at the line start, so an indented line fails, and the name class is
+#: explicit, so a bare pasted URL does not parse as a field called ``https``.
+_FIELD_LINE = re.compile(r"^[A-Za-z][A-Za-z0-9-]*: \S")
 
 
 def _significant_lines(text: str) -> list[str]:
-    """Stripped lines that are neither blank nor a comment, per RFC 9116 section 4.
+    """Lines that are neither blank nor a comment, per RFC 9116's grammar.
 
     Shared with the field parser so the comment convention is defined once. Kept
     separate from ``_fields`` because ``partition(":")`` cannot answer the malformed-line
     question: on a colon-less line it yields ``(line, "", "")``, which is indistinguishable
     from a real field with an empty value.
+
+    **Only the trailing newline is stripped, deliberately.** RFC 9116's grammar is
+    ``field-name ":" SP value`` with no leading whitespace, so an indented field line is
+    one a conforming researcher-side parser may reject. Stripping the left side here
+    would hide exactly that from ``test_every_significant_line_is_a_well_formed_field``,
+    which is the arm that exists to catch it.
     """
     return [
         line
-        for line in (raw.strip() for raw in text.splitlines())
+        for line in (raw.rstrip() for raw in text.splitlines())
         if line and not line.startswith("#")
     ]
 
@@ -123,7 +147,9 @@ def _tracked(relpath: str) -> list[str]:
         capture_output=True,
         text=True,
         check=True,
-    ).stdout.split()
+        # `splitlines`, never `split`: git separates paths by newline, and a path
+        # containing a space would otherwise come back as two entries and read as untracked.
+    ).stdout.splitlines()
 
 
 def test_the_parser_reads_fields_and_skips_comments() -> None:
@@ -134,12 +160,17 @@ def test_the_parser_reads_fields_and_skips_comments() -> None:
         ("expires", "2030-01-01T00:00:00Z"),
     ]
     assert _fields("# only a comment\n") == []
-    assert _significant_lines("# c\n\n  Contact: x\n") == ["Contact: x"]
+    # Leading whitespace SURVIVES, so the well-formed-field arm can see and reject it.
+    assert _significant_lines("# c\n\n  Contact: x\n") == ["  Contact: x"]
+    assert not _FIELD_LINE.match("  Contact: x")
+    assert not _FIELD_LINE.match("https://example.com/report")
+    assert not _FIELD_LINE.match("Contact:mailto:a@b.c")
+    assert _FIELD_LINE.match("Contact: mailto:a@b.c")
 
 
 def test_the_file_sits_where_rfc9116_requires() -> None:
     assert _FILE.is_file(), (
-        f"{_RELPATH} is missing. RFC 9116 section 3 requires the file under /.well-known/."
+        f"{_RELPATH} is missing. RFC 9116 requires the file under the /.well-known/ path."
     )
 
 
@@ -153,12 +184,24 @@ def test_the_file_is_tracked_and_not_swallowed_by_the_root_txt_ignore_rule() -> 
     )
 
 
-def test_every_non_comment_line_is_a_field() -> None:
-    """A line with no colon is neither a comment nor a field, and stops some parsers."""
+def test_every_significant_line_is_a_well_formed_field() -> None:
+    """Rejects the malformed shapes a hand edit actually produces.
+
+    A colon-only check was the first version of this arm and was not enough: a pasted
+    contact URL that lost its ``Contact: `` prefix contains a colon, so it passed while
+    parsing as a field named ``https`` that ``_values("contact")`` never sees. An
+    indented field and a missing space after the colon slipped through the same way.
+    """
     bad = [
-        line for line in _significant_lines(_FILE.read_text(encoding="utf-8")) if ":" not in line
+        line
+        for line in _significant_lines(_FILE.read_text(encoding="utf-8"))
+        if not _FIELD_LINE.match(line)
     ]
-    assert bad == [], f"{_RELPATH} carries lines that are neither a comment nor a field: {bad}"
+    assert bad == [], (
+        f"{_RELPATH} carries lines that are neither a comment nor a well-formed field: "
+        f"{bad}. RFC 9116's grammar is `field-name: value` -- a token name, a colon, one "
+        "space -- with no leading whitespace and no bare values."
+    )
 
 
 def test_contact_is_present_and_every_value_is_a_uri() -> None:
@@ -234,27 +277,53 @@ def test_a_canonical_if_present_names_the_well_known_path() -> None:
         )
 
 
-def test_the_policy_field_resolves_to_a_tracked_disclosure_policy() -> None:
-    """A substring check would stay green while the published URI 404s for every reader."""
+def test_a_policy_is_published_and_a_blob_link_resolves_to_a_tracked_file() -> None:
+    """A substring check would stay green while the published URI 404s for every reader.
+
+    **Requiring a GitHub blob URL would punish the right change**, which is the trap the
+    Canonical arm above is shaped to avoid and which the first version of this arm walked
+    straight into: the day the policy is served from the project's own domain, a
+    hard requirement reds CI for doing the correct thing. So the resolution is
+    conditional on the URL being a blob link, and what is unconditional is only that a
+    `Policy` exists and is an https URI.
+    """
     policies = _values("policy")
     assert policies, f"{_RELPATH} publishes no Policy link to the disclosure policy."
 
-    resolved: list[str] = []
-    for value in policies:
-        matched = _BLOB_URL.match(value)
-        assert matched is not None, (
-            f"{_RELPATH} Policy should be a GitHub blob URL so its path can be resolved "
-            f"against the tree: {value!r}"
-        )
+    offenders = [p for p in policies if not p.startswith("https://")]
+    assert offenders == [], f"{_RELPATH} Policy must be an https URI: {offenders}"
+
+    blobs = [matched for matched in (_BLOB_URL.match(p) for p in policies) if matched]
+    for matched in blobs:
         path = matched.group("path")
         assert _tracked(path) == [path], (
             f"{_RELPATH} Policy points at {path!r}, which git does not track. The "
             "published URI would 404 for every researcher who fetched this file. Move "
             "the link with the file."
         )
-        resolved.append(path)
 
-    assert _POLICY_RELPATH in resolved, (
-        f"{_RELPATH} Policy should point at {_POLICY_RELPATH}, which carries the "
-        f"authorization and safe-harbor terms: {resolved}"
+    # Only meaningful while the policy IS a blob link. Once it is served elsewhere there
+    # is no tree path to compare, and the arm above has already stopped applying.
+    if blobs:
+        resolved = [matched.group("path") for matched in blobs]
+        assert _POLICY_RELPATH in resolved, (
+            f"{_RELPATH} Policy should point at {_POLICY_RELPATH}, which carries the "
+            f"authorization and safe-harbor terms: {resolved}"
+        )
+
+
+def test_the_advisory_channel_is_published_first() -> None:
+    """The file declares its Contact order load-bearing, so something must hold it.
+
+    RFC 9116 reads `Contact` in decreasing order of preference, and
+    `.github/SECURITY.md` designates the private advisory the recommended channel while
+    warning that ordinary email is not end-to-end encrypted. Swap the two lines -- a
+    plausible edit when alphabetizing or adding a channel -- and every other arm here
+    stays green while researcher tooling starts preferring the unencrypted route.
+    """
+    contacts = _values("contact")
+    assert contacts and contacts[0].startswith("https://"), (
+        f"{_RELPATH} must publish the private advisory channel as its FIRST Contact, "
+        f"because RFC 9116 reads the order as decreasing preference and the policy page "
+        f"makes the advisory the recommended route: {contacts}"
     )

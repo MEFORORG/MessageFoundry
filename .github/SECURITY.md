@@ -32,7 +32,7 @@ real PHI — use synthetic HL7 (the `messagefoundry generate` corpus is ideal).
 We aim to acknowledge within a few business days and credit reporters who wish to be named once a
 fix is released.
 
-**Machine-readable contact.** The same two channels are published as
+**Machine-readable contact.** The channels above are also published as
 [`.well-known/security.txt`](../.well-known/security.txt), per
 [RFC 9116](https://www.rfc-editor.org/rfc/rfc9116).
 
@@ -52,17 +52,27 @@ CISA, the US Cybersecurity and Infrastructure Security Agency, in its
 The wording is CISA's, changed in two ways only: the template's `AGENCY NAME` placeholder is
 filled with this project's legal entity, and the template's bold and italic emphasis is dropped.
 
-### Test your own installation, not somebody else's
+### What is in scope: the software, and your own installation of it
 
-Install MessageFoundry from source or from PyPI, run it on hardware you control, and attack that.
-The source in this repository is equally in scope.
+In scope is **this repository's source** and **an installation you run yourself**. Install
+MessageFoundry from source or from PyPI, run it on hardware you control, and attack that. There is
+no MessageFoundry-operated service hosting the engine, so there is no instance of ours to point a
+scanner at.
 
-There is no hosted service and no production instance to point a scanner at, so do not go looking
-for one. The engine's default network posture is in **Scope notes** below; read it there rather
-than assuming it, because an operator can change it.
+The engine's default network posture is in **Scope notes** below. Read it there rather than
+assuming it, because an operator can change it.
 
-Nothing here authorizes you to test a **third party's** installation. A site running this engine
-has not consented to your testing, and their permission is theirs alone to give.
+**Out of scope, and the authorization above does not reach them:**
+
+- **A third party's installation.** A site running this engine has not consented to your testing,
+  and their permission is theirs alone to give.
+- **The project website and any third-party services we use**, including the website contact form
+  mentioned above and our hosting, email and package-index providers. They are not ours to
+  authorize testing against. If you believe you have found something affecting one of them, report
+  it through a channel above and we will route it.
+
+Ask first if you want something outside this list covered. We would rather widen the scope in
+writing than have you guess.
 
 ### What a good-faith effort means here
 
@@ -70,7 +80,9 @@ At least the following. This names the cases with a real chance of arising rathe
 be a closed list.
 
 1. Report through a channel above, and honor the coordinated-disclosure ask in **Response &
-   remediation timeline** below. That section states the window; this one does not restate it.
+   remediation timeline** below. That section asks for a reasonable window rather than naming a
+   fixed number of days, and says we will agree the timing with you, so agree it with us there
+   rather than reading a deadline into this list.
 2. Stop at proof. Once you can show the vulnerability exists, stop, rather than pivoting further
    or running the exploit wider than a demonstration needs.
 3. Use synthetic HL7 only, as **Reporting a vulnerability** above already requires of a report.

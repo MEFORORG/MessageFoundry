@@ -152,7 +152,7 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # arm, and the tooling job's `if:` names merge_group nowhere, so THE TOOLING TIER DOES NOT
         # RUN IN THE MERGE QUEUE AT ALL. A manifest entry would take this guard off the engine legs
         # via `-m 'not tooling'` AND out of every queue entry, where `ci-gate` reads a skipped need
-        # as a pass -- the same defect ci.yml already records against `.gitignore` (BACKLOG #277).
+        # as a pass -- the same defect ci.yml already records against `.gitignore` (BACKLOG #327).
         "test_security_txt_rfc9116.py",
         # Engine-subject for the same reason as control_char_check and escape_sequence_check above,
         # and the reason is the one arm that does not use tmp_path: the screen's DEFAULT SCOPE is

@@ -8,9 +8,10 @@
 # drift, and the drifting copy is the one a researcher reads.
 #
 # THIS IS A STATIC DISCLOSURE FILE, NOT ENDPOINT DISCOVERY. The engine performs
-# no .well-known discovery of any kind: SMART and OIDC endpoints are
-# operator-pinned, per docs/adr/0024-smart-backend-services-token-provider.md.
-# A search for ".well-known" that lands here has found an unrelated thing.
+# no .well-known discovery of any kind. SMART endpoints are operator-pinned per
+# docs/adr/0024-smart-backend-services-token-provider.md, and the OIDC relying
+# party per ADR 0142 -- two subsystems, so two citations. A search for
+# ".well-known" that lands here has found an unrelated thing.
 #
 # EXPIRES IS A COMMITMENT TO RE-CHECK, NOT A FORMALITY. Past the date below a
 # reader should stop trusting this file (RFC 9116 section 2.5.5), so renewing it
