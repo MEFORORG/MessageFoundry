@@ -911,3 +911,92 @@ def test_the_webconsole_nesting_arithmetic_in_ci_yml_is_read_and_checks_out() ->
     # Same reasoning as the headroom check: the loop walks `_EXPECTED_LEGS`, so a counter over it is
     # vacuous. The count is pinned by `len(found) == len(rows)` and `set(rows) == _EXPECTED_LEGS`,
     # both of which fire -- the first was falsified by duplicating a row, the second by renaming one.
+
+
+#: Flags the web console suite step must carry, each with WHY it is load-bearing (BACKLOG #1879). The
+#: reason travels with the assertion, so a reader who deletes one is told what it cost rather than only
+#: that a test went red -- the move `step_margin_baseline.toml` already makes for the recorded maxima.
+_WEBCONSOLE_XDIST_FLAGS: dict[str, str] = {
+    "--dist loadfile": (
+        "`--dist load` scatters one file's tests across workers, which splinters the session-scoped "
+        "`rate_table` aggregation in the console suite's test_authz_audit_rate.py -- the ASVS 16.3.2 "
+        "table then prints in fragments, with nothing reporting that it did"
+    ),
+    "--max-worker-restart=0": (
+        "without it a worker that dies without `workerfinished` is CLONED, and a clone that never "
+        "reports ready leaves the controller polling a silent queue until the step cap fires -- a "
+        "kill, which this gate keys CENSORED, so it stops measuring exactly when it matters"
+    ),
+}
+
+
+def _webconsole_suite_step() -> dict:
+    """The gated web console suite step, addressed by NAME rather than by position."""
+    step_name = _GATED["webconsole"][0]
+    step = next((s for s in _job("webconsole")["steps"] if s.get("name") == step_name), None)
+    assert step is not None, (
+        f"ci.yml's `webconsole` job has no {step_name!r} step. Either the gated step was renamed "
+        f"without updating _GATED, or this extraction has rotted."
+    )
+    return step
+
+
+def test_the_web_console_suite_runs_under_xdist_fed_from_the_matrix() -> None:
+    """BACKLOG #1879: the `-n` that stopped this step ejecting merge groups, pinned at the wiring.
+
+    THIS IS THE ONLY CHECK IN THIS FILE THAT READS THE WORK RATHER THAN THE CAPS, and that asymmetry
+    is the reason it exists. Deleting `-n` restores a serial step whose worst observed runs sat at
+    1.229x (windows-2022) and 1.179x (windows-2025) against the 1.30x floor: green tests, red gate,
+    merge group ejected. Every other assertion in this file stays green through that, because a cap is
+    still a cap when the work under it has doubled.
+
+    Falsified by deleting `-n "$PYTEST_WORKERS"`: RED, naming the serial regression. By hardcoding
+    `-n 4`: RED, naming the matrix indirection. By swapping `--dist loadfile` for `--dist load`: RED,
+    carrying the `rate_table` reason. By dropping `--max-worker-restart=0`: RED. Restored.
+    """
+    step = _webconsole_suite_step()
+    run = str(step.get("run", ""))
+    env = {str(k): str(v) for k, v in (step.get("env") or {}).items()}
+    print(f"[xdist] web console suite run line: {run}")
+
+    # PRESENCE AND INDIRECTION ARE TWO QUESTIONS, ASKED SEPARATELY ON PURPOSE. One regex demanding
+    # `-n "$VAR"` answers both at once and mislabels a hardcoded `-n 4` as "passes no -n" -- a
+    # confidently wrong message that closes the question instead of inviting a look, which is the
+    # BACKLOG #1254 failure this repo keeps paying for. Caught here by falsifying this very test.
+    present = re.search(r"(?:^|\s)-n\s+(\S+)", run)
+    assert present, (
+        "the web console suite step passes no `-n`, so it runs SERIALLY again. That is the state "
+        f"BACKLOG #1879 measured at 7 merge-group ejections over 66 runs per leg. Run: {run!r}"
+    )
+    token = present.group(1)
+    indirect = re.fullmatch(r'"?\$\{?(\w+)\}?"?', token)
+    assert indirect, (
+        f"the step passes `-n {token}` -- a LITERAL worker count rather than a shell variable. It "
+        f"cannot be re-sized per leg that way, and it drifts silently from the engine step's own "
+        f"count on the same runner. Feed it from the matrix through `env:`, as the engine step does."
+    )
+    var = indirect.group(1)
+    assert var in env, (
+        f"the step feeds `-n` from ${var}, which its own `env:` does not set -- the flag expands to "
+        f"empty and pytest reads the next token as the worker count. Its env is {sorted(env)}"
+    )
+    knob = re.fullmatch(r"\$\{\{\s*matrix\.(\w+)\s*\}\}", env[var])
+    assert knob, (
+        f"the step's worker count is {env[var]!r}, not a matrix knob. A literal cannot be re-sized "
+        f"per leg, and it drifts silently from the engine step's own count on the same runner."
+    )
+    print(f"[xdist] worker count <- matrix.{knob.group(1)} via ${var}")
+
+    for flag, why in _WEBCONSOLE_XDIST_FLAGS.items():
+        assert flag in run, f"the web console suite step has lost `{flag}`: {why}"
+        print(f"[xdist] {flag} is present")
+
+    legs = {leg["os"]: leg for leg in _matrix_legs()}
+    assert set(legs) == _EXPECTED_LEGS, f"matrix legs {sorted(legs)} != {sorted(_EXPECTED_LEGS)}"
+    for name in sorted(_EXPECTED_LEGS):
+        count = legs[name].get(knob.group(1))
+        assert isinstance(count, int) and count > 1, (
+            f"{name} sets {knob.group(1)}={count!r}; `-n` needs an integer above 1 there, or this "
+            f"leg quietly returns to one worker while the flag still reads as parallel"
+        )
+        print(f"[xdist] {name}: {knob.group(1)}={count}")

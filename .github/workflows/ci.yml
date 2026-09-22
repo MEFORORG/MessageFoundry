@@ -1089,10 +1089,79 @@ jobs:
       # relying on `testpaths` to exclude them, which it no longer does. The package is installed
       # editable above, so both suites exercise the same engine source.
       #
-      # NO `-n` HERE, deliberately. xdist buys the engine suite ~2x across ~13,000 tests; this is ~356
-      # tests in 2-to-4 minutes, where worker startup would eat most of the gain, and the job now runs
-      # concurrently with the engine one anyway -- its wall-clock is already off the critical path.
-      # Adding workers would spend the contention risk the -n 8 trial measured to buy nothing.
+      # `-n` IS HERE NOW (BACKLOG #1879). This step ran serially until 2026-09-22 under a comment that
+      # read, in full: "NO `-n` HERE, deliberately. xdist buys the engine suite ~2x across ~13,000
+      # tests; this is ~356 tests in 2-to-4 minutes, where worker startup would eat most of the gain,
+      # and the job now runs concurrently with the engine one anyway -- its wall-clock is already off
+      # the critical path. Adding workers would spend the contention risk the -n 8 trial measured to
+      # buy nothing." It is quoted rather than deleted because THREE of its four clauses were true when
+      # written and only the premise rotted: the suite is 644 tests now, not 356, and it is no longer
+      # in the 2-to-4 minute band on either Windows leg.
+      #
+      # THE CLAUSE THAT STOPPED HOLDING IS "its wall-clock is already off the critical path" -- not
+      # because the clause is false, but because the inference drawn from it does not follow. Being off
+      # the critical path makes the DURATION cheap; it does not make the MARGIN GATE cheap. `ci-gate`
+      # needs this job, so a LOW margin here ejects the merge group whatever the engine leg is doing --
+      # which is the defect, and it is measured below rather than projected.
+      #
+      # WHAT THE SERIAL STEP WAS ACTUALLY COSTING. Pool: the 80 most recent ci.yml runs, spanning
+      # 2026-09-22T00:57Z to 2026-09-22T13:11Z -- about twelve hours of ONE DAY, not a long tail. 211
+      # web console jobs, 66 STEP observations per leg (61 concluding success), read from the jobs API
+      # and keyed on `Web console tests (pytest)`'s OWN conclusion, never the job's -- see
+      # scripts/ci/step_margin.py trap 2. Margin-gate reds, and EVERY ONE was a `merge_group` event, so
+      # every one ejected an entry rather than merely warning on a pull request:
+      #
+      #   ubuntu-latest   max 3:43   0 of 66 red
+      #   windows-2022    max 4:53   6 of 66 red   (4:53 4:46 4:42 4:41 4:40 4:38)
+      #   windows-2025    max 7:38   1 of 66 red   (7:38, run 35679500397, 02:27Z)
+      #
+      # At the margin caps in force -- 5 / 6 / 9 -- the observed maxima sit at 1.345x, 1.229x and
+      # 1.179x. Two legs are under the gate's 1.30x floor AT THEIR OWN WORST RUN. Seven ejections in
+      # twelve hours is what that looks like from the inside. ubuntu clears at 1.345x and is next.
+      #
+      # WHAT xdist BUYS, MEASURED RATHER THAN ASSUMED, and measured LOCALLY because a Windows runner is
+      # not available to size this from. 644 tests, one box, 641 passed + 3 skipped on every arm.
+      # THE GOVERNING PAIR IS THE ONE RUN UNDER THIS STEP'S OWN FLAGS -- `-o faulthandler_timeout=150
+      # --timeout=120`, the windows values -- because a ratio measured without them is a ratio for a
+      # command this file does not run:
+      #
+      #   serial                 3:39
+      #   -n 4 --dist loadfile   2:20   1.563x
+      #
+      # A second pair, taken WITHOUT those two flags, is kept because it is what the first draft of this
+      # note published and the correction is the useful part: serial 3:09 against `-n 4 --dist loadfile`
+      # 1:41, which is 1.861x. Both pairs are one-variable and both are honest; they disagree because
+      # the instrumentation costs time on BOTH arms, and no mechanism for that is asserted here because
+      # none was measured. The smaller ratio is the one every number below is reasoned against.
+      #
+      # TWO ARMS THAT DID NOT SURVIVE, recorded so nobody re-runs them. `-n 8 --dist loadfile` came in
+      # at 1:54, SLOWER than `-n 4`: the loadfile buckets have a long pole, so extra workers buy
+      # startup cost and no parallelism. `-n 4 --dist load` came in at 1:03, and is rejected on
+      # correctness rather than speed -- see the next paragraph.
+      #
+      # THE LOCAL BOX HAS 20 CORES, so its 4 workers never contend; a 4-vCPU hosted runner will realise
+      # LESS than 1.563x. That is why no cap below is sized from this ratio. It establishes the
+      # DIRECTION and the worker count, never the hosted duration.
+      #
+      # `--dist loadfile`, NOT the faster `--dist load`, AND THE GAP IS BOUGHT ON PURPOSE. The measured
+      # gap is 38 seconds -- 1:41 against 1:03 -- and it belongs to the FLAGLESS pair above, because
+      # `--dist load` was never re-run under this step's own flags once it had been rejected. Do not
+      # carry that 38 into an arithmetic over the 2:20 governing figure; the two pairs do not compose.
+      # `tests/test_authz_audit_rate.py` has a SESSION-scoped `rate_table` fixture that three tests in
+      # that one file append to, and whose teardown prints the ASVS 16.3.2 rate table once. Under
+      # `--dist load` those three tests scatter across workers, each builds its own list, and the table
+      # comes out in fragments with nothing reporting that it did. `loadfile` keeps a file's tests on
+      # one worker, so the aggregation survives. It is also the spelling the engine step already uses,
+      # so the two suites cannot drift into two parallelism models.
+      #
+      # `--max-worker-restart=0` IS CARRIED OVER DELIBERATELY AND IS NOT DECORATION. The engine step's
+      # own note is the source of record for the mechanism: with restarts allowed, a worker that dies
+      # without `workerfinished` is CLONED, and if the clone never reports ready the controller polls a
+      # silent queue until the step cap fires. Adding `-n` here without this flag would install that
+      # hang in the one step whose entire defect is timing -- a step killed at its cap reports
+      # `failure`, which `step_margin.py` keys CENSORED, so the gate would stop measuring exactly when
+      # it mattered. The per-item `--timeout` and `faulthandler_timeout` above cannot cover it: both arm
+      # inside `pytest_runtest_protocol(item)`, and under `-n` the controller runs no items.
       #
       # WINDOWS-2025's MARGIN CAP IS 9, NOT 6, AND THE CAUSE IS RUNNER VARIANCE RATHER THAN SUITE
       # GROWTH. Every "cap" in this note means `webconsole_margin_cap`, which is what these four runs
@@ -1162,10 +1231,17 @@ jobs:
       #
       # THE MARGIN CAPS ARE UNCHANGED AND ARE NOT SIZED BY THIS CHANGE: 5 / 6 / 9, exactly the values
       # that were in force as `webconsole_step_timeout`. Sizing them honestly needs a sample collected
-      # under a kill that does not truncate it, which does not exist yet and cannot exist until this
-      # arrangement has been live for a while. Shipping a decoupling and a re-size together would bury
+      # under a kill that does not truncate it. Shipping a decoupling and a re-size together would bury
       # the one change that can be reasoned about, so the re-size is deliberately a later, separate
       # change with its own measurement.
+      #
+      # THAT SAMPLE NOW EXISTS, and this paragraph's next clause used to deny it: it said such a sample
+      # "does not exist yet and cannot exist until this arrangement has been live for a while". The
+      # while has passed. BACKLOG #1879 collected 66 step observations per leg under this very split,
+      # every one of them far below its kill of 9 / 10 / 12, so the pool is uncensored exactly as the
+      # decoupling intended. The clause is struck rather than the paragraph rewritten, because the rest
+      # of it -- why a decoupling and a re-size do not ship together -- is still the governing reason
+      # and #1879 followed it. What that pool says about the caps is set out above the suite step.
       #
       # THE KILLS ARE 9 / 10 / 12, and each is at least 1.30x its leg's margin cap -- the same ratio
       # the gate's own floor reserves below the cap, so the band a run may be observed in ABOVE the cap
@@ -1193,15 +1269,53 @@ jobs:
       # The split below is what finally separates the two hazards: a green suite is now killed at
       # `webconsole_step_timeout`, minutes above the margin cap, rather than at the margin cap itself.
       #
-      # THE UNDERLYING ITEM IS REAL AND IS NOT CLOSED BY THIS. Two things feed the runtime and only one is
-      # the runner: this suite went from about 356 tests to 497, roughly 40 percent, since the cap was set.
-      # Whether the answer is xdist on this step (it runs with no -n today, on the stale premise that 356
-      # tests in 2-to-4 minutes would not repay worker startup) or a slower-runner escalation, it is its
-      # own change with its own measurement. Named rather than numbered: no item has been allocated for it,
-      # and citing a number nobody allocated is worse than citing none.
+      # THE UNDERLYING ITEM IS BACKLOG #1879, AND THIS IS IT. The paragraph here used to say "no item
+      # has been allocated for it, and citing a number nobody allocated is worse than citing none".
+      # #1879 is that allocation, so the note is now stale in the one way that matters and is replaced
+      # rather than left standing. It named two candidate answers -- xdist on this step, or a
+      # slower-runner escalation. This change takes the first.
       #
-      # THE ~356 FIGURE ABOVE IS STALE AND IS LEFT AS WRITTEN so the drift stays visible: this suite was
-      # about 356 tests when that line was authored and is 497 now. The 2-to-4 minute range went with it.
+      # THE TEST COUNT HAS ROTTED TWICE AND IS RECORDED BOTH TIMES so the growth stays legible: about
+      # 356 when the "NO `-n`" note was authored (DATE NOT RECORDED, so no rate is claimed across that
+      # leg), 497 when the windows-2025 cap was re-derived on 2026-09-13, and 644 counted in-tree on
+      # 2026-09-22. The dated leg is the one that carries the argument: 497 to 644, 29 percent, in NINE
+      # DAYS. That is why a cap raise was excluded as the fix -- at that rate a raise is overtaken
+      # before anyone re-derives it, and windows-2025's raise to 9 was indeed overtaken -- a breach at
+      # 7:38 on 2026-09-22, nine days later. Not necessarily its FIRST: the pool above is twelve hours
+      # wide, so it can date a breach and cannot date the earliest one.
+      #
+      # THE MARGIN CAPS ARE RE-DERIVED AND THE RE-DERIVATION CAME BACK "UNCHANGED" -- 5 / 6 / 9, and
+      # saying that out loud is the point of this paragraph. A cap that nobody moved and a cap that was
+      # checked and found right look identical in a diff, so here is the arithmetic. Each cap divided by
+      # the 1.30x floor gives the longest the step may take on that leg, set beside the WORST SERIAL run
+      # in the 66-observation pool above:
+      #
+      #   ubuntu-latest   5:00 / 1.30 = 3:51   worst serial 3:43   already clears with no speedup
+      #   windows-2022    6:00 / 1.30 = 4:37   worst serial 4:53   needs 1.058x
+      #   windows-2025    9:00 / 1.30 = 6:55   worst serial 7:38   needs 1.103x
+      #
+      # So the caps as they stand bet that xdist delivers 1.06x and 1.10x on the two breaching legs.
+      # Measured locally at 1.563x under this step's own flags. A bet that small against a margin that
+      # large is the whole argument for leaving the numbers alone, and it is falsifiable: if either leg
+      # still reds after this lands, the bet was wrong and the number, not the reasoning, is the fix.
+      #
+      # WHAT THE 1.563x PROJECTS TO, stated so the first post-xdist run can be read against it rather
+      # than merely noted: ubuntu 3:43 -> about 2:23, windows-2022 4:53 -> about 3:07, windows-2025
+      # 7:38 -> about 4:53, giving 2.10x, 1.92x and 1.84x. Those are PROJECTIONS off a 20-core box and
+      # are not evidence; a hosted leg landing materially above them means the contention penalty is
+      # real and the re-derivation below matters sooner.
+      #
+      # WHY THE CAPS ARE NOT LOWERED, WHICH IS THE OTHER HALF OF "RE-DERIVED". Sizing them at 1.30x a
+      # PROJECTED post-xdist time would need a hosted post-xdist sample, and none exists -- this change
+      # creates the first one. Projecting the local 1.861x onto a 4-vCPU runner and sizing from it is
+      # precisely the move that reds the gate on the first merge group if the hosted ratio comes in at
+      # 1.15x, which is the harm being fixed rather than a cost of fixing it. The honest cost of waiting
+      # is named instead of hidden: until the caps come down, the gate tolerates roughly another
+      # doubling before it speaks, and at the growth rate above that is about a quarter of cover.
+      #
+      # RE-DERIVING THEM LATER NEEDS NO NEW INSTRUMENT. The pool above was collected from the jobs API
+      # by keying on this step's name and its OWN conclusion, per leg; repeat that once a few dozen
+      # post-xdist merge_group runs exist, take each leg's worst PASSING run, and size at 1.30x it.
       - name: Web console tests (pytest)
         id: webconsole
         if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
@@ -1212,7 +1326,8 @@ jobs:
           # env-passed (not a ${{ }} expansion into run:) -- see the engine Tests step for why.
           FAULT_TIMEOUT: ${{ matrix.fault_timeout }}
           PYTEST_TIMEOUT: ${{ matrix.pytest_timeout }}
-        run: pytest packaging/messagefoundry-webconsole/tests -q -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT"
+          PYTEST_WORKERS: ${{ matrix.pytest_workers }}
+        run: pytest packaging/messagefoundry-webconsole/tests -q -n "$PYTEST_WORKERS" --dist loadfile --max-worker-restart=0 -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT"
 
       # This job's half of the margin check (BACKLOG #344 proposal 1), moved here with the suite it
       # measures. Same contract as the engine one: last in the job, `if: always()` so a step killed at
