@@ -648,11 +648,51 @@ def test_the_completion_sentinel_is_written_last_and_is_checked_by_the_refusal_s
         "or it certifies a step that had not yet reported its result."
     )
 
-    refusal_body = _step_body("Fail if the harness never ran")
-    assert "MEFOR_FUZZ_COMPLETE" in refusal_body, (
-        "the refusal step does not check the completion sentinel. A fuzz step that died partway "
-        "would then leave the job green with nobody reporting it -- `continue-on-error` already "
-        "rewrote its own conclusion to success."
+
+def _run_refusal_step(tmp_path: Path, refusals: str, complete: str) -> int:
+    """Execute the shipped refusal step verbatim and return its exit code."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    bash = require_bash(tmp_path)
+    script = tmp_path / "refusal.sh"
+    script.write_text(_step_body("Fail if the harness never ran"), encoding="utf-8", newline="\n")
+    env = probe_env(Path(bash), dict(os.environ))
+    env.update({"MEFOR_FUZZ_REFUSALS": refusals, "MEFOR_FUZZ_COMPLETE": complete})
+    proc = subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell, test-local paths
+        [bash, script.as_posix()],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+        check=False,
+    )
+    assert proc.returncode != BASH_HARNESS_FAILURE, explain_returncode(
+        proc.returncode, "the fuzz refusal step"
+    )
+    return proc.returncode
+
+
+def test_the_refusal_step_reds_on_a_missing_sentinel_and_on_a_refusal(tmp_path: Path) -> None:
+    """Execute the gate rather than grep it, because grepping it measured the wrong thing.
+
+    **THIS TEST REPLACES A SUBSTRING CHECK THAT A MUTATION ARM CAUGHT PASSING.** The first draft
+    asserted ``"MEFOR_FUZZ_COMPLETE" in refusal_body``. Replacing the step's actual condition with
+    ``if false; then`` left that assertion green, because the variable is still named in the
+    comment above the condition -- so the guard certified a gate that had stopped gating. Running
+    the body cannot be satisfied by a comment.
+
+    A missing sentinel must red for the same reason a refusal does: both mean the harness did not
+    do what it was asked, which is a fault rather than a fuzz result.
+    """
+    assert _run_refusal_step(tmp_path / "ok", "", "1") == 0, (
+        "a completed run with no refusals must pass the gate"
+    )
+    assert _run_refusal_step(tmp_path / "dead", "", "") != 0, (
+        "the refusal step passed a run whose fuzz step never finished. `continue-on-error` already "
+        "rewrote that step's own conclusion to success, so this gate is the only thing left that "
+        "can report it."
+    )
+    assert _run_refusal_step(tmp_path / "refused", " dicom_peek", "1") != 0, (
+        "the refusal step passed a run where a target never executed"
     )
 
 
