@@ -15,12 +15,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import errno
 import inspect
 import io
 import json
 import os
 import shutil
 import tarfile
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -779,6 +781,79 @@ def test_discard_partial_restore_removes_only_the_recorded_paths(tmp_path) -> No
     assert stranger_in_shared.is_file() and shared_dir.is_dir()
     assert d.is_dir()
     assert sorted(p.name for p in d.iterdir()) == ["mefor-restore-bystander", "shared"]
+
+
+_REAL_TEMPORARY_DIRECTORY = tempfile.TemporaryDirectory
+
+
+class _StagingWhoseTeardownFails:
+    """The restore's staging directory, with the teardown that fails on Windows whenever a scanner or
+    the indexer still holds the just-extracted store open: the directory is created and handed out as
+    usual, and on exit its removal raises ``PermissionError`` and leaves it behind, exactly as a real
+    ``TemporaryDirectory`` does when ``rmtree`` cannot delete an open file. Holding a handle would
+    reproduce that on Windows alone; raising from the exit reproduces it everywhere."""
+
+    def __init__(self, *, prefix: str, dir: Path) -> None:
+        self.name = tempfile.mkdtemp(prefix=prefix, dir=dir)
+
+    def __enter__(self) -> str:
+        return self.name
+
+    def __exit__(self, *exc: object) -> None:
+        raise PermissionError(errno.EACCES, "another process holds a file in it open", self.name)
+
+
+def _staging_that_cannot_be_removed(*args, **kwargs):
+    """Intercept the RESTORE's staging directory only, by its prefix; every other caller (the backup
+    that builds the fixture archive stages under ``mefor-backup-``) gets the real class."""
+    if kwargs.get("prefix") == "mefor-restore-":
+        return _StagingWhoseTeardownFails(**kwargs)
+    return _REAL_TEMPORARY_DIRECTORY(*args, **kwargs)
+
+
+def test_restore_keeps_a_whole_restore_when_its_staging_teardown_fails(
+    tmp_path, key_b64, capsys
+) -> None:
+    # The regression the rollback brought in. `completed` flipped AFTER the staging block closed, so
+    # the one thing between "config bundle written" and "completed" was the staging directory's own
+    # teardown -- and when that raised, the rollback read a whole restore as a failed one and deleted
+    # the placed, verified store. Before the rollback existed the same event left the store in place.
+    # The operator was then left with no store, no bundle, a traceback instead of a refusal line (an
+    # OSError, which the CLI does not translate), and the plaintext staging directory still on disk,
+    # because the thing that failed was its remover.
+    archive, toml = _make_archive(tmp_path, key_b64, capsys)
+    dest = tmp_path / "restored" / "msg.db"
+    config_dest = tmp_path / "bundle"
+    rollbacks: list[list[Path]] = []
+    real_discard = dr_backup._discard_partial_restore
+
+    def spy(dest_store_path: Path, written: list[Path]) -> None:
+        rollbacks.append(list(written))
+        real_discard(dest_store_path, written)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(tempfile, "TemporaryDirectory", _staging_that_cannot_be_removed)
+        mp.setattr(dr_backup, "_discard_partial_restore", spy)
+        rc = main(_restore_argv(archive, toml, dest, config_dest))
+    # Reported, as a refusal line and not a traceback, under a kind that does not say the restore
+    # failed -- because it did not.
+    assert rc == 1
+    err = _refusal(capsys)
+    assert "restore failed (cleanup)" in err and "staging directory" in err, err
+    # The restore is whole, and no rollback ran. Two detectors on one event: the spy records a
+    # rollback whether or not it deleted anything, and the file check catches one the spy missed.
+    assert dest.is_file() and (config_dest / "feed.py").is_file()
+    assert rollbacks == [], "a whole restore was rolled back over its staging teardown"
+    # The leftover is named, so the operator can find and remove it. It survived because the thing
+    # that failed was its remover, and it still holds the decrypted store.
+    leftovers = [p for p in dest.parent.iterdir() if p.name.startswith("mefor-restore-")]
+    assert len(leftovers) == 1, sorted(p.name for p in dest.parent.iterdir())
+    assert leftovers[0].name in err and str(dest) in err, err
+    assert (leftovers[0] / "extracted_store.db").is_file()
+    # And the retry is refused for the RIGHT reason now: the destination holds a good store.
+    assert main(_restore_argv(archive, toml, dest, config_dest)) == 1
+    assert "restore failed (destination)" in _refusal(capsys)
+    assert dest.is_file()
 
 
 # --- (5) config-only archive has no store to restore -------------------------

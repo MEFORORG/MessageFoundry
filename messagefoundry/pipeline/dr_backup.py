@@ -1588,7 +1588,8 @@ def _restore_blocking(
     keys: list[bytes],
 ) -> RestoreResult:
     """The off-loop half of :func:`run_restore`: refuse -> decrypt -> extract -> verify -> place. Raises
-    :class:`BackupError` with the failing ``kind`` (``archive``/``destination``/``verify``/``restore``).
+    :class:`BackupError` with the failing ``kind`` (``archive``/``destination``/``verify``/``restore``,
+    and ``cleanup`` for the one failure that follows a whole restore -- see below).
 
     It runs the verify's checks itself rather than calling :func:`_verify_archive_blocking` first, for
     two reasons. A .mfbak archive is the size of the store, so a verify pass followed by a restore pass
@@ -1602,7 +1603,16 @@ def _restore_blocking(
     the never-overwrite refusal on the retry and having to delete a PHI-bearing file by hand. The
     cleanup runs AFTER the staging directory is gone and removes only the paths this restore recorded
     writing (:func:`_discard_partial_restore`), so it cannot reach the staging directory or anything
-    else that shares the destination's parent."""
+    else that shares the destination's parent.
+
+    **A restore that is whole is never rolled back, whatever happens after it.** The one thing that
+    runs after the config bundle lands is the staging directory's own removal, and it can fail: on
+    Windows an antivirus scanner or the indexer holding the just-written store open makes that
+    ``rmtree`` raise ``PermissionError``. That is a leftover to report, not a restore to undo --
+    undoing it would delete a placed, verified store to answer a directory that could not be
+    deleted, and leave the operator with no store, no bundle, and the plaintext staging directory
+    still on disk. It raises ``BackupError("cleanup", ...)`` naming the directory instead, with the
+    store and bundle intact."""
     from messagefoundry.store.store import _secure_file
 
     if not Path(archive_path).is_file():
@@ -1643,13 +1653,20 @@ def _restore_blocking(
     dest_store_path.parent.mkdir(parents=True, exist_ok=True)
     # The rollback's three facts, kept outside the staging block so the `finally` can read them after
     # it: whether the store was published (before that, every refusal already leaves nothing behind),
-    # which config paths this restore created, and whether the whole restore completed. `finally`
-    # rather than `except`: nothing is caught, so no failure mode is missed -- a cancelled or
-    # interrupted restore rolls back too, and a staging-dir cleanup that fails on the way out counts
-    # as a failure of the restore that reported it.
+    # which config paths this restore created, and whether the restore itself completed. `finally`
+    # rather than `except` for the rollback: nothing is caught on its account, so no failure mode is
+    # missed -- a cancelled or interrupted restore rolls back too.
+    #
+    # `completed` flips on the LAST LINE INSIDE the staging block, not after the block closes, and
+    # the difference is the regression this ordering exists to prevent. What runs between the two is
+    # the staging directory's own teardown, and `TemporaryDirectory` raises when that fails. A flag
+    # set after the block read the failed teardown as a failed restore and rolled back a store that
+    # was placed, verified and published -- the one outcome worse than the leftover it was reporting.
+    # So the teardown failure is its own arm below: reported, never rolled back.
     published = False
     completed = False
     config_written: list[Path] = []
+    staging: Path | None = None
     try:
         # Stage on the DESTINATION volume, not the system temp dir: the extracted store is then placed
         # by a hard link rather than a second multi-GB copy, and the decrypted PHI never lands on a
@@ -1665,7 +1682,8 @@ def _restore_blocking(
         with tempfile.TemporaryDirectory(
             prefix="mefor-restore-", dir=dest_store_path.parent
         ) as tmp:
-            tar_path = Path(tmp) / "archive.tar"
+            staging = Path(tmp)
+            tar_path = staging / "archive.tar"
             with open(archive_path, "rb") as src, open(tar_path, "wb") as dst:
                 _secure_file(tar_path)
                 if match_key is not None:
@@ -1784,7 +1802,25 @@ def _restore_blocking(
                 config_files = _restore_config_members(
                     tar_path, config_dest, written=config_written
                 )
-        completed = True
+            # The restore is whole from here. Nothing after this line may roll it back.
+            completed = True
+    except OSError as exc:
+        if not completed:
+            raise
+        # Only the staging directory's teardown runs after `completed`, so an OSError here IS that
+        # teardown failing (on Windows, a scanner or the indexer still holding the extracted store
+        # open). The store and bundle are intact; what is left is the plaintext staging directory,
+        # which its own remover just failed to delete. A BackupError, so the CLI prints a refusal
+        # line rather than a traceback, and a kind of its own, so the line does not read as the
+        # restore having failed. The `finally` below sees `completed` and leaves the restore alone.
+        bundle = f", and the config bundle at {config_dest}" if config_dest is not None else ""
+        raise BackupError(
+            "cleanup",
+            f"the restore completed, but its staging directory {staging} could not be removed: "
+            f"{safe_exc(exc)}. Intact: the restored store at {dest_store_path}{bundle}. The staging "
+            "directory still holds the decrypted archive and store: delete it by hand once nothing "
+            "holds it open. Do not re-run the restore; the destination is now in use.",
+        ) from exc
     finally:
         if published and not completed:
             _discard_partial_restore(dest_store_path, config_written)
