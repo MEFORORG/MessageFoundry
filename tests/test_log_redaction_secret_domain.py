@@ -1290,8 +1290,8 @@ _MAX_GROWTH = 24.0
 #: application is the safe direction and under-reporting one is the failure this set exists to stop. A
 #: recorder watching ``.sub`` alone would miss a future ``_run`` reaching for ``.subn`` or a
 #: ``.finditer`` loop: the same walk, the same cost, and an arm below that stays green while a second
-#: pass runs on every line. The membership is checked against ``re.Pattern`` itself in that arm, since
-#: a typo in one of these strings would narrow the reading with nothing to report it.
+#: pass runs on every line. That arm checks this set COVERS every public callable of ``re.Pattern``,
+#: because a name dropped or misspelled here narrows the reading and reports nothing.
 _PATTERN_APPLICATIONS = frozenset(
     {"findall", "finditer", "fullmatch", "match", "scanner", "search", "split", "sub", "subn"}
 )
@@ -1519,17 +1519,27 @@ def test_the_dsn_scan_grows_linearly_in_line_length() -> None:
     )
 
     # POSITIVE CONTROL ON THE TWO INSTRUMENTS THIS ARM RUNS ON, because a zero from either is otherwise
-    # indistinguishable from the code having stopped. First the method list: a typo in one of those
-    # strings silently narrows what counts as an application, so tie it to the real type. `re.Pattern`
-    # may grow a method, which is why this is a subset check and not equality.
-    pattern_methods = {
+    # indistinguishable from the code having stopped.
+    #
+    # FIRST THE METHOD LIST, AND THE DIRECTION OF THIS CHECK IS THE WHOLE OF IT. The failure that
+    # matters is a name MISSING from the set: the recorder is then blind to that way of applying a
+    # pattern, and the arm below reads a quiet zero it reports as the pass having stopped. So require
+    # every public callable of the real type to be covered. The opposite direction -- a name in the set
+    # that `re.Pattern` does not have -- is harmless, since it simply never fires, and checking it
+    # would red on a stdlib method being removed, for a reason that has nothing to do with this
+    # pattern. A misspelled member fails the check below anyway: the name it should have been is then
+    # uncovered.
+    uncovered = {
         name
         for name in dir(re.Pattern)
-        if not name.startswith("_") and callable(getattr(re.Pattern, name, None))
+        if not name.startswith("_")
+        and callable(getattr(re.Pattern, name, None))
+        and name not in _PATTERN_APPLICATIONS
     }
-    assert not _PATTERN_APPLICATIONS - pattern_methods, (
-        f"{sorted(_PATTERN_APPLICATIONS - pattern_methods)} in _PATTERN_APPLICATIONS is not a "
-        "re.Pattern method, so the recorder can never see it fire -- fix the spelling"
+    assert not uncovered, (
+        f"re.Pattern applies a pattern to text through {sorted(uncovered)} and _PATTERN_APPLICATIONS "
+        "does not name it, so the recorder below cannot see it fire. Add it rather than letting the "
+        "reading narrow."
     )
 
     # Then the recorder, driven through the module global by a line that MUST match, so a broken swap
