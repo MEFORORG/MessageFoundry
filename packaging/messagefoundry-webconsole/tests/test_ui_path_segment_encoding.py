@@ -263,6 +263,7 @@ def test_a_percent_encoded_slash_does_not_survive_to_the_routing_layer() -> None
     """
     import socket
     import threading
+    import time
     from urllib.parse import quote
 
     import httpx
@@ -279,15 +280,30 @@ def test_a_percent_encoded_slash_does_not_survive_to_the_routing_layer() -> None
     def destination_scoped(channel_id: str, destination_name: str) -> dict[str, str]:
         return {"route": "destination", "channel_id": channel_id, "dest": destination_name}
 
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = int(probe.getsockname()[1])
+    # BOUND ONCE AND HANDED STRAIGHT TO UVICORN -- never probed, closed, and rebound. That gap is a
+    # race from the moment this suite runs under `-n` (BACKLOG #1879): a sibling worker can be handed
+    # the port between the close and uvicorn's own bind. The loser's bind then fails inside a daemon
+    # thread, `server.started` never flips, and an UNBOUNDED wait here spins until `--timeout` fires
+    # `--timeout-method=thread`, which calls `os._exit(1)`. That kills the xdist worker, and under
+    # `--max-worker-restart=0` it fails the whole step -- a merge-group ejection, which is the exact
+    # harm #1879 exists to remove. Passing the socket closes the window instead of narrowing it.
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    port = int(listener.getsockname()[1])
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error"))
-    thread = threading.Thread(target=server.run, daemon=True)
+    thread = threading.Thread(target=lambda: server.run(sockets=[listener]), daemon=True)
     thread.start()
     try:
+        # BOUNDED, AND THE BOUND IS THE POINT rather than a tidiness. Any startup failure now surfaces
+        # as this one test failing with a readable message; unbounded, it surfaced as a dead worker and
+        # a step the margin gate keys CENSORED, which is a report that says nothing about the cause.
+        deadline = time.monotonic() + 30.0
         waiter = threading.Event()
         while not server.started:
+            assert time.monotonic() < deadline, (
+                f"uvicorn did not start on 127.0.0.1:{port} within 30s -- it never set `started`. "
+                f"Most likely its bind failed in the daemon thread (log_level='error' swallows it)."
+            )
             waiter.wait(0.05)
         with httpx.Client(base_url=f"http://127.0.0.1:{port}") as client:
             seg = quote("IB/ACME", safe="")
@@ -299,6 +315,7 @@ def test_a_percent_encoded_slash_does_not_survive_to_the_routing_layer() -> None
     finally:
         server.should_exit = True
         thread.join(timeout=10)
+        listener.close()  # idempotent: uvicorn closes it too when it owned a successful startup
 
     assert slashed.json() == {"route": "destination", "channel_id": "IB", "dest": "ACME"}, (
         "GOOD NEWS IF THIS FAILS: a %2F now survives to the routing layer, so _seg contains '/' "
