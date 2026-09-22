@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "asvs")
 
 from scripts.asvs.apply import (  # noqa: E402
     _BANNED,
+    _PROSE_FIELDS,
     _SUBTABLES,
     _control_keys,
     _introduced_banned,
@@ -1415,6 +1416,339 @@ def test_a_glyph_in_a_cell_with_no_live_record_is_refused(tmp_path: Path) -> Non
     """
     assert _introduced_banned(f"brand new {_GLYPH} text", "") is not None
     assert _introduced_banned("brand new text", "") is None
+
+
+# --- BOTH guards over `_PROSE_FIELDS`, pinned field by field (BACKLOG #1333) -----------------------
+#
+# The defect and the reasoning live beside the guards, in `apply.py`'s `_PROSE_FIELDS` comment. What
+# these arms add is the PIN: each is parametrized over the imported tuple and never a hand-written
+# list, so narrowing either guard's LOOP reddens here and a sixth prose field arrives covered on
+# both sides rather than one.
+#
+# THAT LEAVES ONE EDGE PARAMETRIZATION CANNOT REACH, and it has to be closed separately: the tuple
+# drives the test cases as well as the guards, so shrinking THE TUPLE shrinks this suite instead of
+# reddening it. Measured BEFORE the membership arm existed -- drop the three `decision_*` names and
+# the file reported 85 passed and ZERO failed. Fewer passes is not a failing test, and nothing reads
+# the count. So `test_the_prose_field_tuple_still_names_every_field_the_guards_must_read` holds the
+# membership against literal names, which is the one place here a hand-written list is correct.
+#
+# BOTH READINGS ARE KEPT, because quoting only the first would leave a figure that no longer
+# reproduces. Re-run the same mutation today and it reports 2 failed against a green baseline: the
+# membership arm, and the closed-cell arm, which names `decision_closed_by` as a literal too.
+#
+# `residual` rides along as the control. It is the one parameter that passed before the widening, so
+# a run where the whole set is green proves nothing until you check WHICH cases moved.
+
+
+def test_the_prose_field_tuple_still_names_every_field_the_guards_must_read() -> None:
+    """THE ARM THE PARAMETRIZED ONES CANNOT BE. Everything else here inherits its cases from it.
+
+    A control has to be able to produce a different answer. Parametrizing over `_PROSE_FIELDS`
+    pins each guard's loop against the tuple, but it cannot pin the tuple: shrink that and the arms
+    shrink with it, silently, because a suite that runs fewer cases still reports green.
+
+    Literal names, deliberately. `>=` rather than equality so ADDING a sixth field is not a failure
+    -- a new prose field should arrive and be covered, not be blocked by this arm.
+    """
+    assert set(_PROSE_FIELDS) >= {
+        "residual",
+        "reviewed_by",
+        "decision_closed_by",
+        "decision_reopen_requires",
+        "decision_permits_without_owner",
+    }
+
+
+def _record_carrying_a_glyph_in(tmp_path: Path, field: str) -> tuple[Path, str]:
+    """The two-cell record with `field` on 1.1.1 already carrying a glyph, and that live value.
+
+    `residual` delegates to the #1308 block's own `_record_with_glyph` rather than re-splicing the
+    same fixture literal. `str.replace` returns the string unchanged when it matches nothing, so a
+    second copy of a literal is how a splice starts silently no-opping and an arm starts passing
+    against a record with no glyph in it.
+
+    `reviewed_by` is in the fixture and gets REPLACED. The three `decision_*` fields are not, so they
+    are spliced in after `reviewed_by`, which keeps them inside the `1.1.1` table and ahead of its
+    `[[cell.evidence]]` sub-tables -- a scalar written after a sub-table binds to the sub-table.
+
+    Every caller asserts the splice landed before it trusts the record.
+    """
+    if field == "residual":
+        return _record_with_glyph(tmp_path), _live_residual()
+    carried = f"carried {_GLYPH} forward"
+    if field == "reviewed_by":
+        text = FIXTURE.replace('reviewed_by = "fixture"', f'reviewed_by = "{carried}"', 1)
+    else:
+        text = FIXTURE.replace(
+            'reviewed_by = "fixture"\n', f'reviewed_by = "fixture"\n{field} = "{carried}"\n', 1
+        )
+    p = tmp_path / "asvs-scorecard.toml"
+    p.write_text(text, encoding="utf-8")
+    return p, carried
+
+
+@pytest.mark.parametrize("field", _PROSE_FIELDS)
+def test_a_glyph_introduced_into_any_prose_field_is_refused(tmp_path: Path, field: str) -> None:
+    """THE ARM THAT WAS OPEN. Four of these five wrote the glyph through without a murmur.
+
+    The record is asserted byte-unchanged as well as the return code, because a refusal that returns
+    1 after writing is the worst of both: the operator re-runs it, and the glyph is already in.
+    """
+    rec = _record(tmp_path)
+    before = rec.read_bytes()
+    rc = main(
+        [
+            str(_payload(tmp_path, [_cell_111(**{field: f"words {_GLYPH} more words"})])),
+            "--scorecard",
+            str(rec),
+            "--apply",
+        ]
+    )
+    assert rc == 1, f"a glyph introduced into {field} must refuse"
+    assert rec.read_bytes() == before
+
+
+@pytest.mark.parametrize("field", _PROSE_FIELDS)
+def test_the_refusal_names_the_field_and_reports_the_codepoint(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], field: str
+) -> None:
+    """The message must name the field that carried the glyph, and report it as a CODEPOINT.
+
+    Before this, every refusal said `residual`. Both halves of the assertion are load-bearing and
+    `apply.py` says why; what this pins is that the output carries `U+26D4` and NOT the character,
+    which a cp1252 console cannot print.
+    """
+    rec = _record(tmp_path)
+    rc = main(
+        [
+            str(_payload(tmp_path, [_cell_111(**{field: f"words {_GLYPH} more words"})])),
+            "--scorecard",
+            str(rec),
+            "--apply",
+        ]
+    )
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert f"1.1.1: {field} INTRODUCES a banned glyph U+26D4" in out
+    assert _GLYPH not in out, "the refusal echoed the character; cp1252 turns that into a traceback"
+
+
+@pytest.mark.parametrize("field", _PROSE_FIELDS)
+def test_a_prose_field_with_no_glyph_in_it_is_still_written(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], field: str
+) -> None:
+    """THE ATTRIBUTION CONTROL for the two arms above, and it is not optional.
+
+    Without it, `rc == 1` above is satisfied by a writer that refuses these fields for ANY reason --
+    an unknown key, a closed-cell guard, a typo in the name. This arm pins the refusal to the GLYPH
+    by sending the same field with ordinary words and watching the scan stay silent.
+
+    IT ASSERTS THE SCAN'S SILENCE, NOT A SUCCESSFUL WRITE, and the distinction is load-bearing.
+    `1.1.1` is an open cell, so the three `decision_*` parameters put closure keys on a cell that
+    was never closed. Asserting those land would freeze the writer's acceptance of them as a tested
+    contract -- and the day someone narrows the closed-cell guard, which today compares only verdict
+    and residual, three of these five cases turn red and read as a regression in the glyph scan.
+    `INTRODUCES` staying out of the output isolates what this arm is actually for.
+    """
+    rec = _record(tmp_path)
+    rc = main(
+        [
+            str(_payload(tmp_path, [_cell_111(**{field: "plain words, no vocabulary"})])),
+            "--scorecard",
+            str(rec),
+            "--apply",
+        ]
+    )
+    assert rc == 0, f"{field} must stay writable when it carries nothing banned"
+    assert "INTRODUCES" not in capsys.readouterr().out, f"the scan fired on a clean {field}"
+
+
+@pytest.mark.parametrize("field", _PROSE_FIELDS)
+def test_carrying_a_glyph_forward_in_any_prose_field_still_applies(
+    tmp_path: Path, field: str
+) -> None:
+    """#1308's semantics widened WITH the scan rather than left behind by it.
+
+    A presence check widened to four more fields would re-create #1308's unwritability in four new
+    places. This arm proves the widened check still compares against the live field of the same
+    name, so carrying a glyph forward is not introducing one.
+    """
+    rec, carried = _record_carrying_a_glyph_in(tmp_path, field)
+    live = {c["id"]: c for c in tomllib.loads(rec.read_text(encoding="utf-8"))["cell"]}
+    assert live["1.1.1"][field] == carried, "the fixture splice did not land"
+    rc = main(
+        [
+            str(_payload(tmp_path, [_cell_111(**{field: carried})])),
+            "--scorecard",
+            str(rec),
+            "--apply",
+        ]
+    )
+    assert rc == 0, f"carrying {field} forward byte-identically introduces nothing"
+    # READ IT BACK. `rc == 0` alone stays green on a write that keeps the key and empties the
+    # value, which is the green-while-lossy shape this whole file exists to catch.
+    got = {c["id"]: c for c in tomllib.loads(rec.read_text(encoding="utf-8"))["cell"]}
+    assert got["1.1.1"][field] == carried, f"{field} survived the guard but not the write"
+
+
+@pytest.mark.parametrize("field", _PROSE_FIELDS)
+def test_a_SECOND_copy_of_a_glyph_the_field_already_carries_is_refused(
+    tmp_path: Path, field: str
+) -> None:
+    """COUNTING, NOT PRESENCE, on every field and not just the one #1308 happened to build on.
+
+    Every other arm here exercises each field at zero-to-one (introduce) and one-to-one (carry), and
+    a presence check answers those two identically. So downgrading `_introduced_banned` to
+    `live_counts[ch] == 0` reddened exactly ONE case in this file -- the residual-only arm #1308
+    left behind -- while all twenty parametrized cases stayed green. A refactor that branched per
+    field, or replaced the shared helper, would have shipped presence semantics for four fields out
+    of five against a fully green suite.
+
+    One-to-two is the only shape that tells the two predicates apart, and it is the shape that
+    matters: adding a second banned character to a field that already has one is new vocabulary,
+    which is the whole point of the ban.
+    """
+    rec, carried = _record_carrying_a_glyph_in(tmp_path, field)
+    live = {c["id"]: c for c in tomllib.loads(rec.read_text(encoding="utf-8"))["cell"]}
+    assert live["1.1.1"][field] == carried, "the fixture splice did not land"
+    rc = main(
+        [
+            str(_payload(tmp_path, [_cell_111(**{field: f"{carried} {_GLYPH}"})])),
+            "--scorecard",
+            str(rec),
+            "--apply",
+        ]
+    )
+    assert rc == 1, f"a second copy in {field} is new vocabulary; counting is what catches it"
+
+
+def test_a_glyph_introduced_into_a_closed_cells_prose_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The one cell in the fixture that is GENUINELY closed, which every other arm here misses.
+
+    `5.4.3` is the only cell carrying a real `decision_closed_by`, so this is the only arm where the
+    scan reads a live value for that field rather than one the payload or a splice invented.
+
+    IT DOES NOT PIN AN ORDERING, and saying so stops the next reader trusting it for that. The
+    refusal is appended to `problems` and `main` returns before the write loop where the
+    `decision_closed` branch lives, so that branch is never reached here and moving it would not
+    redden this arm. Verdict and residual are carried forward byte-identically precisely so the
+    closed-cell guard has nothing to say and the glyph is the only thing left to refuse on.
+    """
+    rec = _record(tmp_path)
+    before = rec.read_bytes()
+    closed = {
+        "id": "5.4.3",
+        "level": 2,
+        "verdict": "na",
+        "residual": "enterprise-provided control, outside the declared scope",
+        "last_verified": "2026-08-09",
+        "verified_at": "6666666666666666666666666666666666666666",
+        "reviewed_by": "owner",
+        "decision_closed": True,
+        "decision_closed_by": f"owner {_GLYPH} and deputy",
+        "evidence": [{"path": "messagefoundry/m.py", "line": 30, "expect": "_no_scan"}],
+    }
+    rc = main([str(_payload(tmp_path, [closed])), "--scorecard", str(rec), "--apply"])
+    assert rc == 1
+    assert rec.read_bytes() == before
+    out = capsys.readouterr().out
+    assert "5.4.3: decision_closed_by INTRODUCES a banned glyph U+26D4" in out
+
+
+def test_a_glyph_the_residual_carries_does_not_license_one_in_reviewed_by(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The comparison is per FIELD, not against the record's prose as a whole.
+
+    A scan that compared the payload field against every banned character anywhere in the live cell
+    would pass this: the record does carry U+26D4, just not in `reviewed_by`. It would also let one
+    frozen field launder new vocabulary into all the others, which is the opposite of what widening
+    the scan is for.
+    """
+    rec = _record_with_glyph(tmp_path)
+    before = rec.read_bytes()
+    cell = _cell_111(residual=_live_residual(), reviewed_by=f"test {_GLYPH} reviewer")
+    rc = main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"])
+    assert rc == 1
+    assert rec.read_bytes() == before
+    out = capsys.readouterr().out
+    assert "1.1.1: reviewed_by INTRODUCES" in out
+    assert "residual INTRODUCES" not in out, "the carried residual must not be reported as new"
+
+
+@pytest.mark.parametrize("field", _PROSE_FIELDS)
+def test_anchor_repair_refuses_a_prose_edit_in_any_field(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], field: str
+) -> None:
+    """PIN THE ONLY GUARD ON PROSE UNDER `anchor_repair`, field for field.
+
+    The scan skips itself whole under `anchor_repair` and is inert there, so this loop is the whole
+    of the protection. It was pinned by hand at two of the five while the scan beside it is pinned
+    at all five, so narrowing it back to `residual` and `reviewed_by` left the suite green while
+    opening a real bypass: declare a repair, edit `decision_closed_by`, and nothing looks.
+
+    `reviewed_by` is set to the live value so the refusal is attributable to `field` alone --
+    `_cell_111` defaults it to something the record does not carry, which would report on every
+    parameter and prove nothing about any of them. The other four fields are asserted ABSENT from
+    the output for the same reason.
+    """
+    rec = _record(tmp_path)
+    before = rec.read_bytes()
+    over: dict[str, object] = {"anchor_repair": True, "reviewed_by": "fixture"}
+    over[field] = "quietly different"
+    rc = main([str(_payload(tmp_path, [_cell_111(**over)])), "--scorecard", str(rec), "--apply"])
+    assert rc == 1
+    assert rec.read_bytes() == before
+    out = capsys.readouterr().out
+    assert f"declared anchor_repair but {field!r} differs from the record" in out
+    for other in _PROSE_FIELDS:
+        if other != field:
+            assert f"but {other!r} differs" not in out, (
+                f"{other} was reported; arm not attributable"
+            )
+
+
+def test_anchor_repair_still_refuses_a_reviewed_by_edit_that_carries_a_glyph(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The exemption must not become the narrow mouth `_PROSE_FIELDS` warns about.
+
+    The glyph here is never scanned -- the scan skips itself. The edit is refused anyway by the
+    byte-identity check, which is what `anchor_repair` BUYS the exemption with, and the refusal
+    names the prose reason rather than the glyph. Declaring a repair must not be a way to edit
+    prose unwatched.
+    """
+    rec = _record(tmp_path)
+    before = rec.read_bytes()
+    cell = _cell_111(anchor_repair=True, reviewed_by=f"fixture {_GLYPH} team")
+    rc = main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"])
+    assert rc == 1
+    assert rec.read_bytes() == before
+    out = capsys.readouterr().out
+    assert "declared anchor_repair but 'reviewed_by' differs from the record" in out
+
+
+def test_an_anchor_repair_on_a_cell_frozen_by_a_glyph_still_applies(tmp_path: Path) -> None:
+    """The other half of the exemption: the repair path stays OPEN on the cells #1333 is about.
+
+    A frozen cell is one whose own prose holds a retired glyph, and an anchor repair is the one edit
+    the method permits on it without re-opening the assessment. A widening that closed that path
+    would have re-frozen exactly the cells the item exists to free, and `rc == 1` everywhere is not
+    a guard, it is a wall.
+    """
+    rec, carried = _record_carrying_a_glyph_in(tmp_path, "reviewed_by")
+    live = {c["id"]: c for c in tomllib.loads(rec.read_text(encoding="utf-8"))["cell"]}
+    assert live["1.1.1"]["reviewed_by"] == carried, "the fixture splice did not land"
+    repair = _cell_111(anchor_repair=True, reviewed_by=carried)
+    rc = main([str(_payload(tmp_path, [repair])), "--scorecard", str(rec), "--apply"])
+    assert rc == 0, "a byte-identical anchor repair must survive the widened scan"
+    # READ IT BACK, as the carrying-forward arm does. This write is the more complex of the two --
+    # `render` strips `anchor_repair` and stamps `anchor_repaired_at` on this same path -- so a
+    # writer that emptied the field while returning 0 would leave `rc == 0` alone green.
+    got = {c["id"]: c for c in tomllib.loads(rec.read_text(encoding="utf-8"))["cell"]}
+    assert got["1.1.1"]["reviewed_by"] == carried, "the repair kept the key and lost the value"
 
 
 # --- BACKLOG #1369: the writer persisted its own control declarations into the record --------------
