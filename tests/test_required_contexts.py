@@ -96,6 +96,10 @@ _MUST_NOT_BE_REQUIRED = (
     "gate liveness (advisory)",
     "SBOMs (CycloneDX, multi-ecosystem)",
     "trivy (container image vulnerabilities)",
+    # Coverage-guided parser fuzzing (ADR 0191). Paths-gated on a pull request AND advisory by
+    # design: a fuzzer reports what it happened to reach inside a time budget, so its result is not
+    # a property of the diff and must never gate a merge.
+    "parser fuzzing (advisory)",
 )
 
 

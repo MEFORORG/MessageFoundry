@@ -1,0 +1,124 @@
+# Coverage-guided fuzzing of the tolerant parsers (ADR 0191, BACKLOG #277 Lane 1).
+#
+# ADVISORY, AND THAT IS STRUCTURAL RATHER THAN A SETTING. Three things keep it advisory and they are
+# independent: this job's context is not in `.github/required-contexts.txt` (branch-protection
+# membership is the only thing that gates a merge), the fuzz step carries `continue-on-error: true`,
+# and `tests/test_required_contexts.py` lists this context in `_MUST_NOT_BE_REQUIRED` so promoting it
+# reds that test. There is deliberately NO job-level `continue-on-error`: GitHub reports such a job
+# as SUCCESS, which makes a job that cannot fail, and `tests/test_security_posture.py` refuses the
+# idiom outright. The advisory posture belongs on the step.
+#
+# UBUNTU ONLY, BY CONSTRUCTION AND NOT BY CHOICE. Atheris is a libFuzzer binding and publishes
+# manylinux x86-64 wheels only -- 3.1.0 ships cp312/cp313/cp314 manylinux2014_x86_64 and nothing else
+# (measured against PyPI 2026-09-22). The `[fuzz]` extra in pyproject.toml carries the matching
+# environment marker, so this dependency cannot leak into the Windows legs' install even though
+# `requirements.lock` is exported `--all-extras`.
+#
+# WHY THE PARSERS ARE THE TARGET. `messagefoundry/parsing/` is a pure, side-effect-free library whose
+# entire job is untrusted input, so it fuzzes in-process with no server, no listener, no store and no
+# network. The rest of BACKLOG #277's Lane 1 -- ZAP, Schemathesis, boofuzz -- all need a live
+# endpoint and is deliberately NOT wired here or scaffolded for here.
+#
+# WHAT THE FUZZER DECIDES. Each codec documents its own contract: a malformed body raises that
+# codec's ValueError subclass, so a Router's `except ValueError` dead-letters it. A target lets every
+# OTHER exception propagate, and a propagating exception is what libFuzzer records as a crash. So
+# this job asks one question -- does a tolerant parser ever accept a body and then break its own
+# exception contract on a path the inbound pipeline already relies on.
+#
+# PHI (CLAUDE.md section 9), AND READ THIS BEFORE POINTING THE HARNESS AT A NEW CORPUS. libFuzzer
+# prints and writes the input it crashed on, so a fuzz log is message-shaped by construction. That is
+# acceptable HERE for one reason only: the corpus is synthetic by construction -- the committed
+# synthetic samples under `samples/messages/` plus small inline literals in `fuzz/targets.py` -- so
+# nothing derived from it is PHI. The hazard this note exists for is the obvious next step of seeding
+# from captured traffic. DO NOT: a real or captured corpus would put payload content into a public
+# CI log and into a crash artifact. De-identify first (messagefoundry/anon/, ADR 0030) and keep such
+# a run local.
+name: fuzz
+
+on:
+  pull_request:
+    # Path-gated on purpose. Nothing here gates a merge, and runner capacity is the merge queue's
+    # bottleneck, so this must not cost a slot on a pull request that cannot have changed its result.
+    paths:
+      - "messagefoundry/parsing/**"
+      - "fuzz/**"
+      - "tests/test_fuzz_targets.py"
+      - ".github/workflows/fuzz.yml"
+  workflow_dispatch:
+  schedule:
+    # Nightly, and this is the run that matters. A 60-second pull-request pass re-walks known
+    # branches and is really a smoke test of the harness itself; coverage-guided fuzzing finds new
+    # branches with TIME, so the nightly pass gets five minutes per target against a corpus that
+    # persists no further than the job. Neither pass is a substitute for a long local run.
+    - cron: "41 5 * * *"
+
+concurrency:
+  # security.yml's pattern: per-ref for pull-request events so a rapid re-push supersedes its own
+  # in-flight run, and a unique group for schedule/dispatch runs so a nightly is never superseded.
+  # Nothing here is a required context, so a cancelled run gates nothing.
+  group: fuzz-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Deny-by-default at the workflow level; the one job grants only what it needs.
+permissions: {}
+
+jobs:
+  parsers:
+    name: parser fuzzing (advisory)
+    runs-on: ubuntu-latest
+    # Bounds the whole job well above the sum of the per-target budgets (4 targets x 300s nightly =
+    # 20 minutes) so a hung install cannot sit on a runner, while never truncating a healthy pass.
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python 3.14
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      - name: Install the engine plus the fuzzing toolchain
+        run: |
+          set -euo pipefail
+          # `--constraint constraints.lock` is mandatory on every install in this repository: without
+          # it, uv re-resolves from pyproject's `>=` floors and silently adopts whatever upstream
+          # published since. [dicom] is here because the dicom_peek target refuses to run without
+          # pydicom rather than skipping silently; tolerant HL7 and X12 need no extra.
+          uv pip install --system --constraint constraints.lock -e ".[dicom,fuzz]"
+      - name: Report the toolchain versions
+        run: |
+          set -euo pipefail
+          # Read from distribution metadata, not a `__version__` attribute: Atheris does not promise
+          # one, and an AttributeError here would red the job for a reason unrelated to fuzzing.
+          python -c 'from importlib.metadata import version; print("atheris", version("atheris"))'
+          python -c 'from importlib.metadata import version; print("pydicom", version("pydicom"))'
+      - name: Fuzz the tolerant parsers (advisory - never gates)
+        continue-on-error: true
+        env:
+          # Resolved here rather than in the shell body: zizmor's template-injection audit refuses a
+          # `${{ }}` inside a `run:`, and the pipefail screen reads the body as bash either way.
+          FUZZ_SECONDS: ${{ github.event_name == 'schedule' && '300' || '60' }}
+        run: |
+          set -euo pipefail
+          findings=""
+          for target in hl7_peek hl7_tree x12_peek dicom_peek; do
+            echo "=== ${target}: ${FUZZ_SECONDS}s ==="
+            if MEFOR_FUZZ_TARGET="${target}" python -m fuzz.fuzz_parsers \
+                -max_total_time="${FUZZ_SECONDS}" \
+                -print_final_stats=1; then
+              echo "${target}: no finding in this budget"
+            else
+              echo "::warning title=Fuzz finding::${target} broke its parser's exception contract. Reproduce locally: see fuzz/README.md"
+              findings="${findings} ${target}"
+            fi
+          done
+          if [ -n "${findings}" ]; then
+            echo "=== targets with findings:${findings} ==="
+            exit 1
+          fi
+          echo "=== every target survived its budget ==="
