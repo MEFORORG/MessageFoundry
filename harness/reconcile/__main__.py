@@ -62,7 +62,7 @@ async def _run_capture(args: argparse.Namespace) -> int:
     await sink.start()
     print(
         f"capture sink listening on {args.host}:{','.join(map(str, sink.bound_ports))} "
-        f"→ {args.out} (Ctrl-C to stop)",
+        f"-> {args.out} (Ctrl-C to stop)",
         file=sys.stderr,
     )
     try:

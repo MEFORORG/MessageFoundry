@@ -367,6 +367,21 @@ class _DirectoryLoginRefused(Exception):
         self.reason = reason
 
 
+class _FederatedBindingWithdrawn(Exception):
+    """An admin unbound the account's federated identity while this login was still in flight.
+
+    Raised by :meth:`AuthService._issue_session` when the store refuses the conditional insert, and
+    caught by :meth:`AuthService._complete_ad_login`, which renders it as an audited refusal
+    (BACKLOG #1474).
+
+    **Signalled by raising because the alternative loses the race it exists to close.** The store
+    refuses inside the same transaction that re-reads the binding, so there is no point at which the
+    caller could have asked "is it still bound?" and acted on the answer — a second call would be a
+    second transaction. The exception carries the refusal out of a method whose whole contract is
+    "returns the token", without giving every other caller a ``None`` to handle.
+    """
+
+
 def _directory_login_refusal(user: UserRecord, now: float) -> str | None:
     """The closed-set reason a directory login must refuse ``user``'s mirror row, or ``None``.
 
@@ -1954,13 +1969,29 @@ class AuthService:
         # blanket literal. Kerberos passes False -- a ticket asserts nothing about directory-side
         # strength, so the engine assumes the minimum (BACKLOG #1144); the federated leg passes the
         # engine-verified amr/acr result. See the callers for each rationale.
-        token = await self._issue_session(
-            user.id,
-            client,
-            mfa_verified=mfa_verified,
-            seed_reauth=seed_reauth,
-            max_expires_at=max_expires_at,
-        )
+        try:
+            token = await self._issue_session(
+                user.id,
+                client,
+                mfa_verified=mfa_verified,
+                seed_reauth=seed_reauth,
+                max_expires_at=max_expires_at,
+                # BACKLOG #1474. THE UNBIND'S SESSION SWEEP CANNOT SEE A SESSION THAT DOES NOT EXIST
+                # YET, which is the race this closes: an admin unbinding this account mid-login
+                # revokes what is live at that instant, and without the guard this login's own
+                # INSERT lands just after it. The Kerberos and password legs pass nothing here, so
+                # they take no extra read and no extra statement.
+                require_federated_subject=federated_subject,
+            )
+        except _FederatedBindingWithdrawn:
+            await self._directory_reject_audit(
+                principal.username, "oidc", "federated_subject_unbound"
+            )
+            return LoginOutcome(
+                ok=False,
+                error="federated sign-in failed",
+                reason="federated_subject_unbound",
+            )
         # The password-AD and Kerberos paths must keep emitting EXACTLY {"provider","roles"}: _json is
         # json.dumps(sort_keys=True), so a null-valued key is a different stored string, not a no-op.
         # Only the federated path passes mech/evidence, so it alone grows the row.
@@ -2689,7 +2720,10 @@ class AuthService:
         mfa_verified: bool,
         seed_reauth: bool | None = None,
         max_expires_at: float | None = None,
+        require_federated_subject: tuple[str, str] | None = None,
     ) -> str:
+        """Mint a session token and persist the row. Callers passing
+        ``require_federated_subject`` must handle :class:`_FederatedBindingWithdrawn`."""
         token = mint_token()
         token_hash = hash_token(token)
         expires_at = time.time() + self._settings.session_absolute_hours * 3600
@@ -2698,7 +2732,7 @@ class AuthService:
             # signature-verified federated `id_token.exp`) caps the local absolute lifetime, never
             # extends it. Local and AD/Kerberos callers pass nothing and are byte-identical.
             expires_at = min(expires_at, max_expires_at)
-        await self._store.create_session(
+        issued = await self._store.create_session(
             token_hash=token_hash,
             user_id=user_id,
             expires_at=expires_at,
@@ -2711,7 +2745,16 @@ class AuthService:
             # proof is AMBIENT, so it must not be born with a free step-up window — the first
             # sensitive action forces the directory-password step-up.
             seed_reauth=mfa_verified if seed_reauth is None else seed_reauth,
+            # BACKLOG #1474: on the federated leg the INSERT is conditional on the account still
+            # carrying this verified pair, checked in the store's own transaction. See
+            # ``Store.create_session`` for why the check cannot live out here.
+            require_federated_subject=require_federated_subject,
         )
+        if not issued:
+            # Only reachable with a guard requested: an unbind revoked this account's sessions while
+            # this login was in flight, so issuing now would hand back a token the revocation could
+            # never have seen. Nothing was written, so there is nothing to undo.
+            raise _FederatedBindingWithdrawn()
         if mfa_verified:
             # No second factor pending (MFA is not required for this user, or the federated IdP
             # asserted one): mark the session's 2nd factor satisfied at issuance so the step-up gate
@@ -4276,6 +4319,52 @@ class AuthService:
                 None if stamped is None else stamped.password_changed_at
             ),
         )
+
+    async def unbind_federated_subject(self, user_id: str, *, actor: str) -> int:
+        """Admin: remove an account's federated ``(issuer, sub)`` binding and revoke every live
+        session it holds (BACKLOG #1474). Returns the number of sessions revoked.
+
+        The account keeps ``auth_provider='ad'``. A federated account is an AD row carrying an extra
+        pair, so a NULL pair is exactly the state every AD account is in before its first federated
+        login: a coherent directory account, still swept by :meth:`reconcile_directory_sessions`.
+        The next federated login for it binds whatever subject then presents, which is what an
+        operator unbinding it wants.
+
+        The store clears the pair and revokes the sessions in one transaction, so a session issued
+        under the old binding cannot outlive it. The audit row carries the prior pair and the
+        revoked count, so an operator can SEE that the unbind killed sessions rather than infer it.
+
+        **EVERY FIELD IN THAT ROW COMES OUT OF THE UNBIND'S OWN TRANSACTION**, which is why nothing
+        here reads the account first. A ``get_user`` above would be a separate read, and a rebind
+        landing between it and the write would produce an audit row naming a binding this call never
+        cleared — a false record of who was unbound, which is worse than none.
+
+        Raises :class:`ValueError` for an unknown user, and for an account with no binding: an
+        unbind of nothing would still revoke sessions, and a no-op should not sign anybody out. The
+        store decides both, inside the transaction, and writes nothing in either case.
+        """
+        outcome = await self._store.clear_user_federated_subject(user_id)
+        if outcome is None:
+            raise ValueError("no such user")
+        # BOTH halves, matching the store's own predicate: either one set means the row had
+        # something to clear and the store cleared it, so raising here would report "nothing to
+        # remove" about a write that just happened.
+        if outcome.issuer is None and outcome.subject is None:
+            raise ValueError("the account has no federated binding to remove")
+        await self._audit(
+            "auth.federated_subject_unbound",
+            actor=actor,
+            detail=_json(
+                {
+                    "user_id": user_id,
+                    "username": outcome.username,
+                    "issuer": outcome.issuer,
+                    "subject": outcome.subject,
+                    "sessions_revoked": outcome.sessions_revoked,
+                }
+            ),
+        )
+        return outcome.sessions_revoked
 
     async def set_channel_scope(
         self, user_id: str, channels: Sequence[str] | None, *, actor: str
