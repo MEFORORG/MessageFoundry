@@ -985,3 +985,92 @@ def test_the_downgrade_note_points_at_this_guard() -> None:
             "noting that tests/test_security_posture.py refuses it for any job in the required set. "
             "Point the reader at the guard, so the documented remedy and the enforced rule agree."
         )
+
+
+# --- the ONE graded job outside security.yml: advisory posture that must sit on a STEP ------------
+#
+# WHY A JOB IN ANOTHER FILE IS GRADED HERE. Everything above reads `jobs_of(_SECURITY)`, and the one
+# sweep that crosses files -- `test_required_jobs_carry_no_continue_on_error` -- reaches only the jobs
+# backing a REQUIRED context, which an advisory job by definition is not. Meanwhile `fuzz.yml`'s
+# header and ADR 0191 both told the reader that this module refuses a job-level `continue-on-error`
+# on that job. It did not. That is a compensating control resting on a false premise (CLAUDE.md
+# section 11, SDS-3.7), and the repository has already paid for the underlying defect once in
+# `freethread-smoke.yml`. The claim is made true here rather than deleted, because the property it
+# asserts is worth holding.
+#
+# THE PROPERTY IS NOT THE REQUIRED-GATE ONE, so do not read the rules above onto it. A job-level
+# `continue-on-error` on an advisory job wedges no merge -- nothing required sits behind it. What it
+# does is rewrite EVERY step's failure to SUCCESS, checkout, install and the toolchain-version report
+# included. The advisory posture is meant to soften exactly one thing: a fuzz result, which is a
+# function of the time budget and the random seed rather than of the diff. Soften the job instead and
+# a harness that never ran still reports that every target survived its budget -- the "a clean run
+# and a run that never executed look identical" failure that harness exists to avoid.
+#
+# THE SECOND ARM IS NOT DECORATION. Asserting only the absence of a job-level flag would pass just as
+# happily against a job with no steps, a renamed job key, or a file this module failed to parse. The
+# softened-step list is read from the same parse and compared against a named expectation, so the
+# test cannot pass while seeing nothing -- and it catches the opposite move too, an advisory job
+# quietly losing its step-level flag and starting to fail for a reason nobody chose.
+
+#: ``(workflow file, job key, the job's `name:` -- its status-check context -- and the one step name
+#: that may carry ``continue-on-error``)``.
+_STEP_ADVISORY_JOBS: tuple[tuple[str, str, str, str], ...] = (
+    (
+        "fuzz.yml",
+        "parsers",
+        "parser fuzzing (advisory)",
+        "Fuzz the tolerant parsers (advisory - never gates)",
+    ),
+)
+
+
+def test_step_advisory_jobs_soften_only_their_named_step() -> None:
+    """An advisory job must be advisory at the STEP level, never at the job level."""
+    for workflow, key, job_name, soft_step in _STEP_ADVISORY_JOBS:
+        jobs = jobs_of(workflow)
+        assert key in jobs, (
+            f"{workflow} declares no job {key!r} (it has: {sorted(jobs)}). Re-point this entry at "
+            "the job that now carries the advisory posture -- a renamed key would otherwise leave "
+            "this test grading nothing while still passing."
+        )
+        job = jobs[key]
+
+        # The CONTEXT NAME, pinned because nothing else resolves it against a real job.
+        # `_MUST_NOT_BE_REQUIRED` in tests/test_required_contexts.py is free text matched at one
+        # place, so renaming this `name:` leaves that guard protecting a dead string while the job's
+        # new context is free to be promoted into branch protection. Measured: of ten mutations to
+        # this workflow, nine red this test and renaming `name:` was the one that survived.
+        assert job.get("name") == job_name, (
+            f"{workflow}:{key} reports context {job.get('name')!r}, not {job_name!r}. That string "
+            "is what branch protection and _MUST_NOT_BE_REQUIRED match on, so a rename here "
+            "silently decouples both from this job."
+        )
+
+        assert job.get("continue-on-error") in (None, False), (
+            f"{workflow}:{key} carries a job-level `continue-on-error`. GitHub rewrites the job's "
+            "conclusion to SUCCESS, so every step in it -- checkout, install, the toolchain-version "
+            "report -- stops being able to report a failure, and a harness that broke before it ran "
+            "still says it passed. Put the flag on the single step whose result is genuinely "
+            "advisory, or take the job out of _STEP_ADVISORY_JOBS deliberately."
+        )
+
+        steps = job.get("steps") or []
+        # `>= 1`, not `> 1`: the only thing this needs to exclude is an EMPTY list, which is the
+        # parse failure that would make the assertion below pass over nothing. A job legitimately
+        # refactored down to one step is not a fault, and blaming a parse error for it would send
+        # the reader looking in the wrong place.
+        assert len(steps) >= 1, (
+            f"{workflow}:{key} parsed to no steps. Read that as a parse or locator failure -- the "
+            "softened-step assertion below would otherwise pass over nothing."
+        )
+        softened = [
+            (step or {}).get("name") or (step or {}).get("uses") or "<unnamed step>"
+            for step in steps
+            if (step or {}).get("continue-on-error") not in (None, False)
+        ]
+        assert softened == [soft_step], (
+            f"{workflow}:{key} should soften exactly one step, {soft_step!r}; it softens {softened}. "
+            "Softening a second step widens what the job is allowed to ignore. Softening none makes "
+            "an advisory job blocking-shaped, which is the same move in the other direction: both "
+            "have to be a deliberate edit to _STEP_ADVISORY_JOBS."
+        )

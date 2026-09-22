@@ -214,6 +214,37 @@ webauthn = ["webauthn>=3.0.0,<4"]
 # plus charset-normalizer/idna/certifi. hvac ships NO type stubs — mypy-strict containment lives inside
 # store/keyprovider_vault.py (a targeted typed local), never a repo-wide ignore.
 vault = ["hvac>=2.3.0,<3"]
+# Coverage-guided fuzzing of the tolerant parsers (ADR 0191) -- the `fuzz/` harness and the advisory
+# `.github/workflows/fuzz.yml` job, never the engine. Atheris is Google's libFuzzer binding for
+# CPython; it instruments the parser at import and mutates toward new branches.
+# THE MARKER IS LOAD-BEARING, NOT A TIDINESS. Atheris publishes manylinux x86-64 wheels ONLY -- 3.1.0
+# ships cp312/cp313/cp314 manylinux2014_x86_64 and nothing else, no Windows wheel and no macOS wheel
+# (measured against PyPI 2026-09-22). Without the marker, `uv lock`'s universal resolution has to find
+# atheris for win32 and arm64 too, where no wheel and no usable sdist exist. So the marker is what
+# keeps this extra out of every non-Linux resolution rather than a preference about where it is useful.
+# It also means `requirements.lock` (exported --all-extras) carries the line harmlessly on Windows:
+# pip and uv skip a requirement whose marker does not apply.
+# A `>=` floor, not the `==` its CI-toolchain siblings in [dependency-groups] carry, and deliberately:
+# those are pinned because the version is the contract of a gate that can red a pull request, whereas
+# nothing reads the fuzz JOB's result as a gate (see that workflow's header), so a newer Atheris
+# adopting a newer libFuzzer is a better fuzzer, not a changed verdict. Floor is 3.1.0 because that is
+# the first release with a cp314 wheel, and this project requires Python >=3.14.
+#
+# THE JOB IS ADVISORY; THE DEPENDENCY IS NOT, AND AN EARLIER VERSION OF THIS COMMENT CONFLATED THEM.
+# It argued the floor was safe because "the fuzz job is advisory by construction". True of the job,
+# and it says nothing about the package. `requirements.lock` is exported `--all-extras`, so atheris
+# is IN it, and security.yml audits that lock with `pip-audit` in a step the REQUIRED
+# `dependency-and-secret-scan` context covers. A CVE in a fuzzing tool can therefore red a required
+# context and hold the merge queue for everyone. Stated here because the reader deciding whether to
+# relax the floor needs the real blast radius, not a reassuring one.
+#
+# Accepted rather than engineered around, on the reasoning security.yml's DEP-1 step already states
+# for the toolchain locks it audits deliberately: ruff, mypy and pytest are in the blocking set by
+# this same route. Keeping atheris out would need a fourth ci/locks group -- an edit to the blocking
+# gate in three places, which is exactly what choosing an extra avoided -- and would make the fuzzer
+# the one pinned, sticky toolchain nothing audits. The escape hatch if it ever fires is the one used
+# throughout that step: `--ignore-vuln <ID>` with the triage reason beside it.
+fuzz = ["atheris>=3.1.0; sys_platform == 'linux' and platform_machine == 'x86_64'"]
 # The browser ops console ([api].serve_ui, ADR 0065) is a separately-versioned second wheel
 # (messagefoundry-webconsole, in packaging/messagefoundry-webconsole/) mounted same-origin in-process via
 # mount_ui. It is deliberately NOT declared as a [webconsole] extra yet: the wheel isn't published to an
