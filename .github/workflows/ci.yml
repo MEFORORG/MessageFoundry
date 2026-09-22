@@ -40,12 +40,17 @@ concurrency:
   # The PUSH arm gets its own group too, keyed on the commit, for the SAME reason the nightly does.
   # Without it every push to main shares `ci-refs/heads/main`, so each merge cancel-in-progress'd the
   # PREVIOUS merge's validation run. Measured 2026-09-07: of 163 push-event runs since 2026-09-01,
-  # 85 concluded `cancelled` -- more than half of all merges. That is not a cosmetic loss. `repo
-  # harness tests` and `ide build` are the only two jobs with NO merge_group arm and no schedule arm,
-  # so the push run is the ONLY place they execute; this file already calls that arm the SAFETY NET
-  # and says of it: "Set this false and the tier is effectively unguarded against everything except
-  # its own edits." Cancelling it has the same effect as switching it off, on 52 percent of merges,
-  # and a cancellation reports nothing.
+  # 85 concluded `cancelled` -- more than half of all merges. That is not a cosmetic loss. THREE jobs
+  # have NO merge_group arm and no schedule arm and are path-gated on a pull request: `repo harness
+  # tests` (tooling), `ide build` (ide) and `packaging-build`. The push run is the only place any of
+  # the three runs REGARDLESS OF WHAT CHANGED; on a pull request each fires only when its own paths
+  # moved. This line used to name only the first two and say the push run was "the ONLY place they
+  # execute" -- it undercounted by one, and packaging-build is a third job of exactly that shape
+  # rather than a counterexample to it. This file already calls the push arm the SAFETY NET and says
+  # of `tooling`: "Set this false and the tier is effectively unguarded against everything except its
+  # own edits." It calls the same arm's `packaging` half "the more important half of this gate".
+  # Cancelling the push run has the same effect as switching both off, on 52 percent of merges, and a
+  # cancellation reports nothing.
   #
   # Pull requests are deliberately NOT changed: cancelling a superseded PR run is where
   # cancel-in-progress earns its keep, because a new push to the branch supersedes the old answer.
@@ -996,14 +1001,17 @@ jobs:
   # so.
   #
   # MERGE-QUEUE COVERAGE IS EXPLICIT, NOT INCIDENTAL -- READ THIS BEFORE EDITING `changes`. The four
-  # gated steps below each carry a `merge_group` arm, spelled the way `test`'s eight are. That arm is
-  # BEHAVIOUR-NEUTRAL as the file stands: `changes` has no merge_group arm, so a queue entry falls
-  # through to its pull_request branch, `github.event.pull_request.base.sha` is empty, the diff comes
-  # back empty, and the `-z "$changed"` case already sets `code=true`. The arm exists so that
-  # fall-through stops being the SOLE path. With `push` gated off at the job level above, the queue is
-  # this job's only look at a tree before it lands, and giving `changes` a merge_group arm that sets
-  # `code=false` -- proposed once as PR 710, closed unmerged -- would otherwise have stopped this job
-  # running there, leaving the PR as its only coverage, with nothing reporting the loss. Commit
+  # gated steps below each carry a `merge_group` arm, spelled the way `test`'s eight are. `changes` NOW
+  # HAS a merge_group arm of its own that pins `code=true`, so these four step arms are BELT-AND-BRACES
+  # rather than the sole path: either side alone keeps these STEPS running in the queue. It is the
+  # STEPS and not the job -- this job's own `if:` is `github.event_name != 'push'`, so the job itself
+  # runs on a queue entry either way, and the docs-only axis stays per-step. Until that arm landed the
+  # `changes` side reached `code=true` by fall-through and by accident; that is measured once in the
+  # `changes` job's "Remaining cases" comment and is deliberately not repeated here (SDS-3.5). With
+  # `push` gated off at the job level above, the queue is this job's only look at a tree before it
+  # lands, and flipping that arm to `code=false` -- proposed once as PR 710, closed unmerged -- would
+  # leave these four step arms as the only thing still running these steps there; delete them too and
+  # the coverage goes with nothing reporting the loss. Commit
   # 080fb235b armed `test` and the five heavy legs this way and named seven gates it left untouched --
   # four of them this job's, on the grounds that none backs a required context. Those four are these.
   webconsole:
@@ -1876,25 +1884,85 @@ jobs:
             echo "tooling_matrix=$TOOLING_DOCS" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # Remaining cases: ANY event not returned above. Compute the path-based filters from the diff.
-          # Today that is pull_request and merge_group; it is written as a residual rather than a list
-          # because the list is what went wrong -- see the next paragraph, and SDS-3.6.
+          # MERGE QUEUE. This arm says the queue's gating OUT LOUD. Without it a merge_group event
+          # fell through to the residual arm below on an EMPTY base, so every path grep there missed
+          # and the queue's gating was settled by the `[ -z "$changed" ]` fail-safe near the bottom of
+          # this step. WHY the base is empty, and what the diff returns when it is, is measured and
+          # stated once in the "Remaining cases" comment directly below -- read it there rather than
+          # here (SDS-3.5).
           #
-          # THE SECOND EVENT IS A DEFECT, AND IT IS STATED HERE BECAUSE THIS IS WHERE IT LIVES -- the
-          # gates that mislead a reader are elsewhere, but they only mislead because of this line
+          # THAT REACHED THE RIGHT ANSWER FOR THE WRONG REASON, AND THE WRONG REASON IS ONE EDIT DEEP.
+          # The fail-safe reads "no files changed -> run everything". That is right for an empty PR
+          # diff and right here only by accident. Flip it to `code=false` -- the reading it invites in
+          # isolation, "nothing changed, so there is nothing to test" -- and every queue run skips
+          # install, lint, type-check and the whole of pytest, then reports GREEN, on the one commit
+          # that actually reaches `main`. Nothing downstream would report a problem, because a skipped
+          # required leg reports success. That is the silent-control decay ADR 0158 names, sitting on
+          # the merge path, which is the worst place to put it.
+          #
+          # THE VALUES BELOW ARE THE BEHAVIOUR THAT WAS ALREADY RUNNING, written down rather than
+          # inferred. They are deliberately NOT the whole of what a queue entry runs: `test` and
+          # `webconsole` name merge_group in their own step `if:` (so `code` here is belt-and-braces
+          # for them), and sqlserver-store, postgres-store, load-test, load-test-sqlserver and
+          # windows-service-smoke name it in their JOB `if:`, which is why `serverdb=false` here does
+          # not stop them. THE JOBS GATED ON AN OUTPUT OF THIS STEP THAT NAME merge_group NOWHERE are
+          # decided by that output and by nothing else -- docker-smoke, ide, tooling and
+          # packaging-build, via `docker`, `ide`, `tooling` and `packaging` below.
+          #
+          # BOTH HALVES OF THAT PREDICATE ARE LOAD-BEARING, because dropping either changes the
+          # answer. "Names merge_group nowhere" ALONE is true of SIX of this file's 13 jobs -- it also
+          # takes in `changes`, which has no `if:` at all, and `ci-gate`, which is `always()` and
+          # reads no output of this step. Neither is decided by anything emitted here. Scanned over
+          # all 13 job blocks rather than sampled, and the six-way scan is the one
+          # tests/test_ci_merge_group_gate.py pins, from the other side: it asserts the SEVEN jobs
+          # whose own job-level or step-level `if:` names merge_group, and the four named above are
+          # what is left once `changes` and `ci-gate` come out. Re-run both halves after adding a job
+          # or a `needs.changes.outputs` reference rather than trusting this list.
+          #
+          # WHETHER THAT HEAVY TIER SHOULD RUN PER QUEUE ENTRY IS A COVERAGE QUESTION THIS ARM DOES
+          # NOT ANSWER. It only stops the answer being an accident. Note while re-opening it that the
+          # nightly `schedule` comment at the top of this file, and sqlserver-store's own header,
+          # both justify the nightly cadence by saying these legs no longer re-run per merge. Via
+          # merge_group they do -- roughly the same count, one step earlier, where a finding can still
+          # stop the merge. The cadence may well be right; the stated cost rationale is stale.
+          if [ "$EVENT_NAME" = "merge_group" ]; then
+            echo "serverdb=false" >> "$GITHUB_OUTPUT"
+            echo "docker=false" >> "$GITHUB_OUTPUT"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "ide=false" >> "$GITHUB_OUTPUT"
+            echo "tooling=false" >> "$GITHUB_OUTPUT"
+            # BEHAVIOUR-NEUTRAL, and emitted so this arm sets every output the other three early-exit
+            # arms set: the residual arm already computed false here off the empty diff, so
+            # packaging-build skipped in the queue before this arm and skips now.
+            echo "packaging=false" >> "$GITHUB_OUTPUT"
+            # Emitted even though `tooling` is false on this arm: fromJSON on an unset output fails
+            # the whole job rather than falling back, so no arm may leave it blank. FULL rather than
+            # DOCS because it tracks `code`, which is true here.
+            echo "tooling_matrix=$TOOLING_FULL" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Remaining cases: ANY event not returned above. Compute the path-based filters from the diff.
+          # Today that is pull_request ALONE -- a queue entry returns at the merge_group arm above. It
+          # is still written as a residual rather than a list because the list is what went wrong --
+          # see the next paragraph, and SDS-3.6.
+          #
+          # THE SECOND EVENT WAS A DEFECT, AND IT IS RECORDED HERE BECAUSE THIS IS WHERE IT LIVED -- the
+          # gates that mislead a reader are elsewhere, but they only misled because of this line
           # (BACKLOG #1830, which is FILED IN THE INTERNAL LEDGER AND NOT YET MERGED THERE -- so the
           # citation may not resolve yet). This comment used to read "Remaining case: pull_request",
-          # naming the one event the code below is written for. merge_group falls through to here too,
-          # and `BASE_SHA` is `github.event.pull_request.base.sha`, which is EMPTY on merge_group.
-          # `git diff --name-only "...HEAD"` with an empty left side resolves to HEAD...HEAD: exit 0,
-          # ZERO output. Verified by RUNNING it rather than reasoning about it -- 2026-08-26, recorded
-          # in 080fb235b as a residual, and re-measured 2026-09-19.
+          # naming the one event the code below is written for. merge_group USED TO FALL THROUGH here
+          # too, because `BASE_SHA` is `github.event.pull_request.base.sha`, which is EMPTY on a
+          # merge_group payload. `git diff --name-only "...HEAD"` with an empty left side resolves to
+          # HEAD...HEAD: exit 0, ZERO output. Verified by RUNNING it rather than reasoning about it --
+          # 2026-08-26, recorded in 080fb235b as a residual, and re-measured 2026-09-19. The arm above
+          # ended that fall-through; the measurement is KEPT because it is why the arm has to exist.
           #
-          # SO EVERY PATH FILTER THIS JOB COMPUTES IS FALSE ON A QUEUE ENTRY -- that follows from the
-          # empty base, not from a sample. `code` is true there only because an empty diff takes the
-          # `-z "$changed"` arm far below. The corroborating observation is narrower and is stated as
-          # such: on three merge_group runs sampled 2026-09-19, `ide`, `tooling` and `docker-smoke`
-          # each skipped.
+          # EVERY PATH FILTER IS STILL FALSE ON A QUEUE ENTRY -- now because the arm above PINS each one
+          # explicitly, not because this code computes them off an empty base. It no longer runs there
+          # at all. `code` is true in the queue because that arm sets it directly, no longer because an
+          # empty diff takes the `-z "$changed"` arm far below. The corroborating observation is
+          # narrower and is stated as such: on three merge_group runs sampled 2026-09-19, BEFORE the arm
+          # landed, `ide`, `tooling` and `docker-smoke` each skipped.
           #
           # WHAT IT MEANS FOR A GATE ELSEWHERE IN THIS FILE, which is the part worth carrying away. An
           # `if:` of the shape `... || github.event_name == 'merge_group' || needs.changes.outputs.X ==
@@ -3588,15 +3656,28 @@ jobs:
       #
       # THAT LAST CLAUSE IS TRUE OF A PULL REQUEST AND NOT OF A QUEUE ENTRY, and the difference is not
       # visible from here. On a pull request a skipped need means path-gated-and-irrelevant; inside the
-      # merge queue it means NOT TESTED, because `changes` computes an empty diff there and so skips
-      # every path-gated job regardless of content. ONE EXCEPTION, so this is not read as an absolute:
+      # merge queue it means NOT TESTED, because `changes` returns at its merge_group arm and PINS
+      # `tooling` false there, so this need skips regardless of content. `packaging-build` below skips
+      # on the same terms. NOT EVERY SKIP HERE HAS THAT CAUSE, so this is not read as an absolute:
       # `windows-service-smoke` also carries `&& github.repository == '...'`, so on a FORK it skips for
       # a deliberate cost reason that has nothing to do with this defect.
       #
-      # The fact is stated once, at the `changes`
+      # THE FIVE PATH-GATED LEGS LISTED ABOVE GO THE OTHER WAY, ON THIS REPOSITORY. sqlserver-store,
+      # postgres-store, load-test, load-test-sqlserver and windows-service-smoke each name merge_group
+      # in their own job `if:`, so a queue entry runs them whatever `changes` emits -- windows-service-
+      # smoke only where its `github.repository` clause ALSO holds, so on a fork it skips in the queue
+      # for the same cost reason it skips on a pull request. They are ENUMERATED here rather than
+      # called "the heavy legs" because that phrase is not single-valued in this file: the `schedule`
+      # block at the top and the `changes` nightly arm both use it for SIX jobs, docker-smoke
+      # included, and docker-smoke is the one job this sentence would be false for.
+      #
+      # THE TWO HALVES DESCRIBE DIFFERENT EVENTS, so neither generalises. Path-gating is a
+      # pull_request property; running whatever `changes` emits is a merge_group one. WHAT THE QUEUE
+      # GATES ON is stated once, at the `changes`
       # job's "Remaining cases" comment; BACKLOG #1830 measured it and carries the fix. Nothing about
-      # this roll-up is wrong -- it is `if: always()` and still reports, which is what lets the five
-      # gated legs be path-gated at all. Only the inference "it skipped, so it did not need to run" is.
+      # this roll-up is wrong -- it is `if: always()` and still reports, which is what lets those five
+      # be path-gated ON A PULL REQUEST at all. Only the inference "it skipped, so it did not need to
+      # run" is.
       - tooling
       # `packaging-build` rides here on the same terms as the two above (BACKLOG #1840). It is
       # path-gated, so it skips on most pull requests, and a skipped need is not a failure to the
