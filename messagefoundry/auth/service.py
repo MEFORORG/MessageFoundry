@@ -112,9 +112,9 @@ def _error_if_bundled_corpus_unusable(check_breached: bool) -> None:
     not running. ``PasswordPolicy.violations`` refuses passwords in that state; this is only the loud
     half. THIS FUNCTION deliberately does not stop the engine -- HL7 flow does not depend on password
     screening, and bricking a message engine over an auth data asset would trade a contained failure for
-    an outage. Read that as scoped to this function and not to the change as a whole: on a FIRST run
-    ``initialize`` mints the bootstrap admin, whose generator screens its own candidate, so the raise
-    from ``violations`` escapes an unguarded lifespan call and startup fails. Tracked separately.
+    an outage. Nothing else stops it either, since BACKLOG #1447: a FIRST run used to fail here, and
+    :meth:`AuthService._generate_policy_password` now suppresses this screen on its own candidate --
+    see that call for why.
 
     Skipped when the operator has turned screening off: a corpus nobody consults is not a defect.
     """
@@ -833,8 +833,11 @@ class AuthService:
     def _generate_policy_password(self) -> str:
         """A random password that satisfies the active policy — so the printed bootstrap credential
         is held to the same bar operators are. ``token_urlsafe(n)`` yields ~1.33·n chars (so length is
-        guaranteed ≥ ``min_length``); the loop covers the astronomically-unlikely breach/context hit
-        or an opt-in character-class requirement a given token happens to miss."""
+        guaranteed ≥ ``min_length``); the loop covers the astronomically-unlikely context hit or an
+        opt-in character-class requirement a given token happens to miss.
+
+        Every clause except the breach screen, which is suppressed per-call for the reason stated at
+        the call below (BACKLOG #1447)."""
         # 24 BYTES (192 bits), not 16. token_urlsafe's argument is a byte count, and the floor is
         # raised here rather than left at the policy minimum because min_length is a CHARACTER count
         # -- passing it as bytes happens to be safe but ties an entropy floor to a legibility knob an
@@ -842,7 +845,18 @@ class AuthService:
         length = max(24, self._policy.min_length)
         for _ in range(16):
             candidate = secrets.token_urlsafe(length)
-            if not self._policy.violations(candidate):
+            # THE ONE PLACE THIS REASONING IS WRITTEN OUT (BACKLOG #1447). The candidate is a 192-bit
+            # CSPRNG token, not a human-chosen password, so a corpus OF human-chosen passwords cannot
+            # contain it -- the breach clause is inert on this input by construction. Honouring
+            # `check_breached` here therefore converts a screen that can never FIRE into one that
+            # always BLOCKS: the corpus load raises on an unusable install (BACKLOG #1438), and this
+            # is the generator a first run's bootstrap admin comes from, so the raise escaped an
+            # unguarded lifespan call and the engine did not start at all.
+            #
+            # Scoped to this ONE call on purpose. Every other caller of `violations` screens an
+            # operator- or user-supplied password, where the corpus is the whole point and refusing is
+            # right -- so do NOT widen this to the policy field or the `[auth]` setting.
+            if not self._policy.violations(candidate, suppress_breach_check=True):
                 return candidate
         return secrets.token_urlsafe(length) + "aA1!"  # defensive: satisfies any class requirement
 

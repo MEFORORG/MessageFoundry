@@ -102,11 +102,10 @@ class BreachCorpusUnavailable(RuntimeError):
     *change* paths screen a password, so this never touches login, never invalidates a session, and
     never stops message flow.
 
-    **A FIRST RUN IS THE EXCEPTION, and it is not narrow.** On an empty store ``AuthService.initialize``
-    mints the bootstrap admin, whose generator screens its own candidate, so this raises out of an
-    unguarded lifespan call and the engine does not start at all. That is fail-closed but arguably
-    disproportionate, because the candidate is a 192-bit random token the breach clause can never match.
-    Tracked separately; do not read the paragraph above as covering a first run.
+    **A FIRST RUN WAS THE EXCEPTION AND IS NO LONGER** (BACKLOG #1447): a raise out of the bootstrap
+    generator escaped an unguarded lifespan call, so the engine did not start at all. That generator now
+    suppresses this screen on its own candidate -- the reasoning is stated once, at its call to
+    :meth:`PasswordPolicy.violations` -- so the narrow radius above covers a first run too.
     ``AuthService`` also loads the corpus eagerly at startup and logs the same defect as an error, so
     an operator learns about it from the log rather than from a user's failed password change.
     """
@@ -211,7 +210,9 @@ class PasswordPolicy:
             lockout_minutes=settings.lockout_minutes,
         )
 
-    def violations(self, password: str, *, username: str | None = None) -> list[str]:
+    def violations(
+        self, password: str, *, username: str | None = None, suppress_breach_check: bool = False
+    ) -> list[str]:
         """Return clauses completing *"password must …"*; an empty list means the password is
         acceptable. Order: length → opt-in character classes → breach → username → context.
 
@@ -220,7 +221,15 @@ class PasswordPolicy:
 
         Raises :class:`BreachCorpusUnavailable` when ``check_breached`` is on and the bundled corpus is
         unusable (BACKLOG #1438) -- a refusal, not a silent pass. Callers get a list or an exception,
-        never a list that quietly stopped screening."""
+        never a list that quietly stopped screening.
+
+        ``suppress_breach_check=True`` drops the breach clause for ONE call (BACKLOG #1447), for a
+        caller whose candidate no corpus of human-chosen passwords can contain -- today only
+        ``AuthService._generate_policy_password``, whose call states the reasoning. It is AND-ed with
+        ``check_breached``, so it can only ever SUPPRESS: it cannot assert a screen an operator turned
+        off. The ``False`` default reproduces the field exactly, so every other call site keeps
+        failing closed, which is right for them -- each screens an operator- or user-supplied
+        password, and there the corpus is the whole point."""
         problems: list[str] = []
         if len(password) < self.min_length:
             problems.append(f"be at least {self.min_length} characters")
@@ -240,8 +249,10 @@ class PasswordPolicy:
         # screen. A large operator export therefore does not excuse it -- the repair is to reinstall the
         # wheel, which is cheap, and the alternative is honouring `check_breached=True` with a screen
         # nobody has validated.
-        if self.check_breached and (
-            lowered in _common_passwords() or self._in_operator_corpus(password)
+        if (
+            self.check_breached
+            and not suppress_breach_check
+            and (lowered in _common_passwords() or self._in_operator_corpus(password))
         ):
             problems.append("not be a common or breached password")
         if (
