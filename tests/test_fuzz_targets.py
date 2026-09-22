@@ -16,6 +16,7 @@ carve-out must **not** swallow.
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Callable
 from pathlib import Path
 from typing import Never
@@ -28,6 +29,7 @@ from fuzz.targets import (
     TARGETS,
     TARGETS_BY_NAME,
     WORK_DIR_ENV,
+    FuzzTarget,
     libfuzzer_argv,
     work_paths,
     work_root,
@@ -161,11 +163,38 @@ def test_rerunning_the_seed_writer_does_not_grow_the_corpus(tmp_path: Path) -> N
     assert len(list(corpus.iterdir())) == len(target.seeds)
 
 
-def test_an_unavailable_target_reports_itself_unavailable() -> None:
-    """A target declaring a missing module must answer ``available()`` false, never skip silently."""
-    for target in TARGETS:
-        if target.requires_module is None:
-            assert target.available()
+def test_a_target_whose_module_is_missing_reports_itself_unavailable() -> None:
+    """The availability probe actually probes.
+
+    Asserting only that the no-dependency targets are available would pass even if
+    ``available()`` were ``return True``, which is the arm that matters: the runner refuses an
+    unavailable target rather than passing over it, so a probe stuck on True would fuzz nothing and
+    report success. Drive the real branch with a module name that cannot exist.
+    """
+    probe = FuzzTarget(
+        name="probe",
+        summary="availability probe",
+        run=lambda _data: None,
+        seeds=(b"",),
+        requires_module="mefor_no_such_module_0191",
+    )
+    assert not probe.available()
+    assert TARGETS_BY_NAME["hl7_peek"].available(), "a target with no optional dependency"
+
+
+def test_every_target_in_the_fuzz_workflow_exists_in_the_registry() -> None:
+    """The advisory job's target list must match the registry exactly.
+
+    A renamed or added target leaves the workflow fuzzing a subset while still reporting success
+    per target it does know, and the entrypoint exits for an unknown name -- inside a step that is
+    deliberately ``continue-on-error``. So a drifted list degrades silently, which is the one
+    failure mode this whole harness is built to avoid.
+    """
+    workflow = Path(__file__).resolve().parent.parent / ".github" / "workflows" / "fuzz.yml"
+    text = workflow.read_text(encoding="utf-8")
+    match = re.search(r"for target in ([a-z0-9_ ]+); do", text)
+    assert match, f"no target loop found in {workflow.name}; did the job shape change?"
+    assert sorted(match.group(1).split()) == sorted(TARGETS_BY_NAME)
 
 
 def test_the_work_root_is_outside_the_repository_by_default(
