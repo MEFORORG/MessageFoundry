@@ -58,7 +58,7 @@ from branch protection. **Ten** of the workflow's jobs are now out of the set, i
 
 | Bucket | Jobs | Why it is out |
 | --- | --- | --- |
-| advisory by **design** | `sbom`, `trivy` | they declare `continue-on-error: true`, so a finding never reddens them |
+| advisory by **design** | `sbom`, `trivy` | they declare `continue-on-error: true` (`sbom` on the job, `trivy` on its one scan step), so a finding never reddens them; `trivy` still goes red when its scan produces no verdict |
 | advisory by **placement** | `released-line-audit` | schedule/dispatch-only, so it can never report on a PR — it deliberately does **not** carry `continue-on-error` and still goes red on a finding (the `dast.yml` posture) |
 | **superseded** | the seven original scan jobs | they hard-fail and they report on every PR; a required composite now runs the same scan, so the original no longer gates the merge. Deleted at step 3 below |
 

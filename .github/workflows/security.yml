@@ -564,17 +564,30 @@ jobs:
     # image build is the one step here whose honest duration nobody has measured. Advisory and
     # schedule-only. Err high: 30 minutes still bounds the six-hour case by an order of magnitude.
     timeout-minutes: 30
-    # ADVISORY for its first cycle (continue-on-error): scan the built engine image for OS-package and
-    # Python CVEs — the supply-chain layer pip-audit (lockfile only) and bandit/semgrep (source only)
-    # never see: the Debian base, system libs, and (on the -sqlserver variant) the msodbcsql18/unixODBC
-    # apt layer. Once a baseline run confirms it's clean, DELETE `continue-on-error` to make it BLOCKING
-    # like the other gates here. There's now a real docker/Dockerfile, so the image is a live surface.
-    continue-on-error: true
+    # ADVISORY: scan the built engine image for OS-package and Python CVEs — the supply-chain layer
+    # pip-audit (lockfile only) and bandit/semgrep (source only) never see: the Debian base, system
+    # libs, and (on the -sqlserver variant) the msodbcsql18/unixODBC apt layer. There's now a real
+    # docker/Dockerfile, so the image is a live surface.
+    #
+    # THE ADVISORY FLAG SITS ON THE SCAN STEP, NEVER ON THIS JOB. A job-level `continue-on-error`
+    # rewrites the job's conclusion to SUCCESS, so the checkout, the image build and the Trivy install
+    # all lose the ability to red it too, and a job that never scanned reads exactly like a clean scan.
+    # It also left a FINDING nowhere but the raw log: no summary, no SARIF, no artifact. So the scan
+    # step alone is softened, it hands its verdict on through `$GITHUB_ENV`, and the reporting step
+    # after it writes that verdict to the job summary. A finding stays green; a scan that could not
+    # produce a verdict reds the job. `tests/test_security_posture.py::
+    # test_step_advisory_jobs_soften_only_their_named_step` pins the shape and this job's `name:`;
+    # the same file runs the two step bodies against each other.
+    #
+    # TO PROMOTE IT TO BLOCKING, remove the scan step's `continue-on-error` AND this job's `if:` below,
+    # add the context to `.github/required-contexts.txt` and branch protection, and take it out of
+    # `_MUST_NOT_BE_REQUIRED` in tests/test_required_contexts.py. That is an owner decision.
+    #
     # Daily cron + on-demand only (CI cost): the scan INPUT (Dockerfile + base image + locks) changes
     # rarely while trivy's vuln DB changes daily — the cron is the natural cadence, and ci.yml's
     # docker-smoke still covers image buildability on merges. Advisory and NOT a required check, so
-    # this gate can never wedge a PR. If trivy is later promoted to BLOCKING (deleting
-    # continue-on-error per the note above), REMOVE this gate too so it runs pre-merge again.
+    # this gate can never wedge a PR. If trivy is later promoted to BLOCKING, REMOVE this gate too so
+    # it runs pre-merge again.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -585,19 +598,26 @@ jobs:
         run: |
           # Pin the release; bump deliberately (same posture as the gitleaks job). Verify the tag exists
           # at https://github.com/aquasecurity/trivy/releases if this step 404s.
+          # Checksum-verified against the release's own checksums file, the sbomqs step's shape. This
+          # job has no job-level `continue-on-error` any more, so it now falls under
+          # tests/test_ci_venv_pinning.py's release-asset rule, which refuses `curl | tar`.
           VER=0.71.2
-          curl -sSfL "https://github.com/aquasecurity/trivy/releases/download/v${VER}/trivy_${VER}_Linux-64bit.tar.gz" \
-            | tar -xz -C /tmp trivy
+          asset="trivy_${VER}_Linux-64bit.tar.gz"
+          base="https://github.com/aquasecurity/trivy/releases/download/v${VER}"
+          curl -sSfL "${base}/${asset}" -o "/tmp/${asset}"
+          curl -sSfL "${base}/trivy_${VER}_checksums.txt" -o /tmp/trivy-checksums.txt
+          (cd /tmp && grep " ${asset}$" trivy-checksums.txt | sha256sum -c -)
+          tar -xzf "/tmp/${asset}" -C /tmp trivy
           sudo install -m 0755 /tmp/trivy /usr/local/bin/trivy
           trivy --version
       - name: Generate the container-image SBOM (CycloneDX — OS + Python layers)
         # The image SBOM is the "container contents" manifest NTIA's Consumer Playbook expects for a
         # containerized artifact: the Debian base + system libs AND the installed Python runtime, none of
         # which the lockfile/npm SBOMs capture. Retained so an operator can inventory the running image.
-        # RUN BEFORE the vuln scan on purpose: the scan's `--exit-code 1` fails its step on a fixable CVE,
-        # which (default `if: success()`) would SKIP any SBOM step placed after it — so the inventory would
-        # vanish exactly on the vulnerable runs that need it. ubuntu-latest ships python3; sbom_finalize is
-        # stdlib-only. ADR 0149.
+        # RUN BEFORE the vuln scan on purpose: the scan fails its step on a fixable CVE, and if that step
+        # ever loses its `continue-on-error`, the default `if: success()` would SKIP any SBOM step placed
+        # after it — so the inventory would vanish exactly on the vulnerable runs that need it.
+        # ubuntu-latest ships python3; sbom_finalize is stdlib-only. ADR 0149.
         run: |
           trivy image --no-progress --format cyclonedx --output sbom-image.cdx.json messagefoundry:scan
           python3 scripts/security/sbom_finalize.py sbom-image.cdx.json --phase build
@@ -606,7 +626,8 @@ jobs:
         with:
           name: sbom-container-image
           path: sbom-image.cdx.json
-      - name: Scan the image (fixable HIGH/CRITICAL fail the build)
+      - name: Scan the image (advisory - fixable HIGH/CRITICAL reported, never gates)
+        continue-on-error: true
         # --ignore-unfixed keeps the gate ACTIONABLE: a Debian CVE with no upstream fix can't be
         # remediated by us and shouldn't redden CI; only patchable HIGH/CRITICAL fail. --scanners vuln
         # keeps this to CVEs (secrets stay gitleaks' job). --vex applies our maintained OpenVEX so a
@@ -620,12 +641,112 @@ jobs:
         # rebuild, so it passes this filter and reddens the job indefinitely. Measured: this job went
         # red on every run from 2026-08-06 onward on exactly two such advisories, which is what kept it
         # from ever being promoted out of `continue-on-error`. See security/trivy/trivyignore.yaml.
+        # That red was also invisible: a JOB-level `continue-on-error` turned it into a green job with
+        # the finding only in the raw log, which is why the flag now sits on this step instead.
+        # Measured 2026-09-22 on the nightly, run 35719016246: 0 HIGH/CRITICAL, 4 suppressed.
+        #
+        # A FINDING EXITS 5, NOT 1, AND THAT IS HOW THE REPORTER TELLS THE TWO APART. Trivy exits 1 on
+        # its own fatal errors (vuln DB download, image not found), so `--exit-code 1` made "found a
+        # CVE" and "could not scan" the same number. Anything other than 0 or 5 is a scan that produced
+        # no verdict, and the next step reds the job for it.
         run: |
+          set -euo pipefail
+          # RUNNER_TEMP is outside the checkout, so nothing here can be committed by accident.
+          report="${RUNNER_TEMP:-/tmp}/trivy-scan.txt"
+          status=0
           trivy image --no-progress --scanners vuln \
             --vex security/vex/messagefoundry.openvex.json --show-suppressed \
             --ignorefile security/trivy/trivyignore.yaml \
-            --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 \
-            messagefoundry:scan
+            --severity HIGH,CRITICAL --ignore-unfixed --exit-code 5 \
+            --output "${report}" \
+            messagefoundry:scan || status=$?
+          # Handed on AS SOON AS IT IS KNOWN, before anything else in this step can fail.
+          echo "MEFOR_TRIVY_REPORT=${report}" >> "${GITHUB_ENV}"
+          echo "MEFOR_TRIVY_STATUS=${status}" >> "${GITHUB_ENV}"
+          if [ -f "${report}" ]; then
+            cat "${report}"
+          fi
+          # WRITTEN LAST, AND THE ORDER IS THE POINT. The status above is already recorded, so if the
+          # print dies under `set -e` a status of 0 is on record for a step that did not finish, and
+          # this step's `continue-on-error` rewrites that death to success. The reporter claims a
+          # verdict only with this sentinel present, so that case reads as no verdict, not as clean.
+          echo "MEFOR_TRIVY_COMPLETE=1" >> "${GITHUB_ENV}"
+          # Kept as honest step metadata, NOT as the reporting channel: `continue-on-error` hides it.
+          if [ "${status}" -ne 0 ]; then
+            exit 1
+          fi
+      - name: Report the scan to the job summary
+        # NOT SOFTENED, AND NOT A GATE ON A FINDING. A finding writes the summary and exits 0, because
+        # this job is advisory. A scan that produced no verdict -- missing sentinel, or a Trivy exit
+        # other than 0 or 5 -- exits 1, because that is a harness fault and not a scan result. A red
+        # here reaches `nightly-notice.yml`, which watches this workflow's scheduled runs.
+        #
+        # The summary is a PULL channel: it renders on the run page without opening the log. A
+        # finding does not red the job, so no issue is opened for one.
+        #
+        # `!cancelled()` rather than `always()`: it still runs after an earlier step FAILED, so a
+        # broken build or install says so here instead of leaving an empty summary, but a cancelled
+        # run is not reported as a scan fault.
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          complete="${MEFOR_TRIVY_COMPLETE:-}"
+          status="${MEFOR_TRIVY_STATUS:-}"
+          report="${MEFOR_TRIVY_REPORT:-}"
+          verdict="fault"
+          if [ -n "${complete}" ] && [ "${status}" = "0" ]; then
+            verdict="clean"
+          elif [ -n "${complete}" ] && [ "${status}" = "5" ]; then
+            verdict="finding"
+          fi
+          {
+            case "${verdict}" in
+              clean)
+                echo "## trivy: no fixable HIGH/CRITICAL vulnerability in the engine image"
+                ;;
+              finding)
+                echo "## trivy: fixable HIGH/CRITICAL vulnerabilities in the engine image"
+                echo
+                echo "Advisory: this job stays green. Remediate by bumping the lock or the base image,"
+                echo "or record an assessed not_affected in security/vex/messagefoundry.openvex.json."
+                ;;
+              *)
+                echo "## trivy: the scan produced no verdict"
+                echo
+                if [ -z "${complete}" ]; then
+                  echo "The scan did not finish: it failed part-way, or an earlier step (checkout, image"
+                  echo "build, Trivy install, SBOM) failed and it never ran. See the first red step."
+                else
+                  echo "Trivy exited ${status}, which is neither 0 (clean) nor 5 (finding)."
+                fi
+                echo "NOTHING is claimed about the image. This step reds the job."
+                ;;
+            esac
+            if [ -n "${report}" ] && [ -f "${report}" ]; then
+              echo
+              echo '```text'
+              # Bounded: the job summary is capped at 1 MiB per step.
+              head -n 400 "${report}"
+              echo '```'
+              lines=$(wc -l < "${report}")
+              if [ "${lines}" -gt 400 ]; then
+                echo
+                echo "Truncated: showing 400 of ${lines} lines. The full table is in the scan step's log."
+              fi
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+          case "${verdict}" in
+            clean)
+              echo "trivy: clean"
+              ;;
+            finding)
+              echo "::warning title=trivy finding::fixable HIGH/CRITICAL vulnerabilities in the engine image. See the job summary."
+              ;;
+            *)
+              echo "::error title=trivy produced no verdict::complete='${complete}' status='${status}'. See the scan step's log."
+              exit 1
+              ;;
+          esac
       - name: Lint the Dockerfile for misconfig (informational)
         # IaC checks (non-root USER, pinned base, secrets in layers). Informational only — never fails.
         if: always()

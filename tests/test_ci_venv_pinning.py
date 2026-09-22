@@ -1008,10 +1008,11 @@ def test_release_asset_downloads_in_blocking_jobs_are_checksum_verified() -> Non
     of this same sbomqs step is therefore pinned to an in-repo SHA-256 literal instead, and
     `test_release_asset_downloads_in_oidc_jobs_are_pinned_in_repo` below holds that stronger line.
 
-    Scoped to BLOCKING jobs. An advisory job cannot turn a required context green while compromised,
-    so `trivy` AND `sbom` (both `continue-on-error: true`) are out — worth hardening, but not on
-    this rule. Naming both: the earlier wording named only `trivy`, which read as though `sbom` were
-    covered.
+    Scoped to jobs WITHOUT a job-level `continue-on-error`. An advisory job cannot turn a required
+    context green while compromised, so `sbom` (job-level `continue-on-error: true`) is out -- worth
+    hardening, but not on this rule. `trivy` used to be out for the same reason; since 2026-09-22 its
+    flag sits on the scan step instead, so this rule now examines its Trivy install too. "Blocking"
+    in this test's name means "not job-level softened", not "a required context".
     """
     yaml = pytest.importorskip("yaml")
     wf = yaml.safe_load((_WORKFLOWS / "security.yml").read_text(encoding="utf-8"))

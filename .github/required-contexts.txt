@@ -197,7 +197,8 @@ test (windows-2025, py3.14)
 # `continue-on-error: true`. There are now THREE reasons a security.yml job is absent from this list,
 # and only the first is about the job's own posture:
 #
-#   * `sbom`, `trivy`             -- advisory BY DESIGN; they declare `continue-on-error: true`.
+#   * `sbom`, `trivy`             -- advisory BY DESIGN; they declare `continue-on-error: true`
+#                                    (`sbom` on the job, `trivy` on its scan step).
 #   * `released-line-audit`       -- advisory BY PLACEMENT; schedule/dispatch-only, so it can never
 #                                    report on a pull request. It still goes red on a finding.
 #   * the SEVEN original scans    -- SUPERSEDED. See the block below. They hard-fail and they report
