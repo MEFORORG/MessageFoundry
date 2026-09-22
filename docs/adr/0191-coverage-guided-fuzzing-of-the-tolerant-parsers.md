@@ -352,10 +352,47 @@ not gate a merge.
 which is enough to reproduce, and an artifact upload is one more permission and one more action for no
 new information. Revisit if a nightly finding proves hard to reproduce locally.
 
+**REVISITED 2026-09-22 against a real crash artifact, and the decline HOLDS -- now on a measurement
+rather than on an expectation.** The revisit was owed: this option was declined before anyone had
+produced an artifact to lose, and run 35761703252 produced one
+(`crash-e407a7c52d06668011f7624709f6f8927cbeb2b1`) and discarded it with the runner. The premise was
+tested rather than assumed. libFuzzer printed that unit twice, as a hex dump and as base64; the two
+decode to the **same 155 bytes**, and replaying those bytes through
+`TARGETS_BY_NAME["dicom_peek"].run` on **Windows** against the same pydicom 3.0.2 raises the same
+`BytesLengthException` with the same traceback. So the printed form is a complete reproducer across
+platforms, and the artifact would carry identical bytes to a place that is *harder* to reach -- a zip
+behind a download, with its own retention clock.
+
+**What the incident actually showed is a reporting defect, not a preservation one, and those have
+different fixes.** The reproducer was never lost; it was unread, on line 568,190 of a 568,245-line
+log. The job summary added alongside this revisit carries that same base64 to the run page, which is
+strictly closer than an artifact. Uploading as well would also widen the surface the header's PHI
+note fences, for no information the summary does not already hold.
+
+**One caveat, measured the hard way.** Transcribing the base64 by hand is a real hazard: a
+three-character error during this revisit produced a 158-byte unit that parsed cleanly and reported
+**no finding at all** -- a false all-clear from a reproducer that looked right. `fuzz/README.md` says
+so where the recipe is, because the failure is silent. Copy the block, never retype it.
+
 ## Consequences
 
 **The Secure_Development_Standards section 6.1 *Dynamic* tier now has one instrument that runs.** One,
 not all of them: three of Lane 1's four instruments are still unwired, and #277 stays open.
+
+**A FINDING NOW LEAVES THE ADVISORY STEP, WHICH IT DID NOT WHEN THIS ADR WAS WRITTEN.** The first
+finding this harness produced in CI reached nobody: `continue-on-error` rewrites the fuzz step's
+conclusion to `success`, so its `exit 1` left only an `outcome` that nothing in this repository
+reads. The job went green and the pull request merged with the finding unread. A finding therefore
+travels the same `$GITHUB_ENV` channel a refusal does, to a step that writes it and its reproducer
+to the job summary. `.github/workflows/fuzz.yml` is the source of record for the mechanism and the
+measurement; it is not restated here.
+
+**That changed the reporting and NOT the posture, and the two must not be read as one.** The job is
+still not a required context, the fuzz step keeps its softening, `_MUST_NOT_BE_REQUIRED` still lists
+the context, and the reporting step exits 0 on any finding -- so option 6 above stands and a finding
+still gates nothing. The consumer is a person reading the run page or the checks list, which is a
+*pull* channel: no push channel exists for this job without widening its permissions or reding it,
+and both were declined.
 
 **This closes the engine half of ADR 0034's accepted risk for Scorecard's `Fuzzing` check
 (WP-BL3-02), and it cannot close the record half.** The ASVS scorecard is a `[[cell]]` record in the
