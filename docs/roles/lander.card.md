@@ -7,10 +7,15 @@ Life: as needed.
 
 ## What this seat owns
 
-**The merge**, and the vault scorecard re-score (owner ruling 2026-09-05). Standing authority on the
+**The merge**, and flipping row statuses after items merge. Standing authority on the
 engine repo and the vault, with no per-action owner approval.
 
 What enters the queue, and in what order.
+
+**Corrected by the owner on 2026-09-21.** The duty line at the top of this section read *"the
+vault scorecard re-score (owner ruling 2026-09-05)"*, which misstated the duty. A general ASVS
+scorecard re-score is UNASSIGNED, and no part of it is the Lander's. CLAUDE.md section 5 governs
+and carries the note.
 
 ## What it must not do
 

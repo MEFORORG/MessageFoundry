@@ -116,9 +116,11 @@ from messagefoundry.store.store import (
     ClaimLockTimeout,
     ClaimProcStatus,
     ConnectionEvent,
+    ConnectionEventWrite,
     ConnectionMetrics,
     DbStatus,
     DestinationMetrics,
+    FederatedUnbind,
     InboundMetrics,
     LatencyHistogram,
     MessageSearchResult,
@@ -5112,10 +5114,51 @@ class SqlServerStore:
         reason: str | None = None,
         now: float | None = None,
     ) -> None:
-        # Pure observer: a single committed INSERT in its own txn (_execute) — no queue row, no
-        # finalizer, never inside a handoff. reason rides safe_text (#120) + the cipher (H4 parity).
+        # Pure observer: no queue row, no finalizer, never inside a handoff. A burst of one, so the
+        # scrub and seal live in ONE place for both writers.
+        await self.record_connection_events(
+            [
+                ConnectionEventWrite(
+                    connection=connection,
+                    transport=transport,
+                    direction=direction,
+                    kind=kind,
+                    peer_host=peer_host,
+                    message_id=message_id,
+                    reason=reason,
+                    now=now,
+                )
+            ]
+        )
+
+    async def record_connection_events(self, events: Sequence[ConnectionEventWrite]) -> None:
+        # A burst in ONE committed transaction (BACKLOG #1731): one commit per drained burst, not per
+        # event. Row-by-row execute, as everywhere else in this file: it has no executemany at all.
+        rows = [self._connection_event_params(ev) for ev in events]
+        if not rows:
+            return
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                for params in rows:
+                    await cur.execute(
+                        "INSERT INTO connection_event"
+                        " (ts, connection, transport, direction, kind, peer_host, message_id,"
+                        " reason) VALUES (?,?,?,?,?,?,?,?)",
+                        params,
+                    )
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+
+    def _connection_event_params(self, ev: ConnectionEventWrite) -> tuple[Any, ...]:
+        """The INSERT parameters for one connection event. ``reason`` rides safe_text (#120), then
+        the cipher (H4 parity)."""
+        now = ev.get("now")
+        if now is None:
+            now = time.time()
+        connection, kind, reason = ev["connection"], ev["kind"], ev["reason"]
         # Bound to (connection, ts, kind) — the id is IDENTITY, unknown here (ASVS 11.3.3).
-        now = time.time() if now is None else now
         reason_enc = (
             self._enc(
                 safe_text(reason)[:200],
@@ -5124,11 +5167,15 @@ class SqlServerStore:
             if reason
             else None
         )
-        await self._execute(
-            "INSERT INTO connection_event"
-            " (ts, connection, transport, direction, kind, peer_host, message_id, reason)"
-            " VALUES (?,?,?,?,?,?,?,?)",
-            (now, connection, transport, direction, kind, peer_host, message_id, reason_enc),
+        return (
+            now,
+            connection,
+            ev["transport"],
+            ev["direction"],
+            kind,
+            ev["peer_host"],
+            ev["message_id"],
+            reason_enc,
         )
 
     # --- process-in-place dedup ledger (ADR 0129, BACKLOG #142) --------------
@@ -10348,6 +10395,62 @@ class SqlServerStore:
             (issuer, subject, now, user_id),
         )
 
+    async def clear_user_federated_subject(
+        self, user_id: str, *, now: float | None = None
+    ) -> FederatedUnbind | None:
+        """Unbind the federated pair and revoke the account's live sessions in one transaction
+        (BACKLOG #1474). This leg is CI-only, so a divergence from the SQLite and Postgres bodies
+        surfaces first in CI.
+
+        ``UPDLOCK, ROWLOCK`` on the prior-pair read, this file's ``FOR UPDATE`` analog and the same
+        hint pair :meth:`register_failed_login` and :meth:`consume_totp_step` take: it acquires the
+        update lock this transaction will need anyway and holds it to commit, so a concurrent unbind
+        cannot slip between the read and the UPDATE and leave the reported pair naming a binding this
+        call never cleared. NOT ``HOLDLOCK`` -- in this file that is the MERGE range-lock, and range
+        locking a PK lookup buys nothing here while widening the deadlock surface."""
+        now = time.time() if now is None else now
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute(
+                    "SELECT username, oidc_issuer, oidc_subject FROM users"
+                    " WITH (UPDLOCK, ROWLOCK) WHERE id=?",
+                    (user_id,),
+                )
+                # fetchall reads the pair AND drains the SELECT so the same-cursor UPDATEs below are
+                # clean; `_cursor` closes the cursor before the pooled connection is reused (EF-6).
+                rows = await cur.fetchall()
+                if not rows:
+                    await conn.rollback()
+                    return None
+                username, issuer, subject = rows[0][0], rows[0][1], rows[0][2]
+                if issuer is None and subject is None:
+                    # Already unbound: write NOTHING, so a no-op cannot sign the account out. The
+                    # rollback releases the UPDLOCK taken above; there is nothing else to undo.
+                    # AND, not OR: a half row has something to clear (see FederatedUnbind).
+                    await conn.rollback()
+                    return FederatedUnbind(
+                        username=username, issuer=None, subject=None, sessions_revoked=0
+                    )
+                await cur.execute(
+                    "UPDATE users SET oidc_issuer=NULL, oidc_subject=NULL, updated_at=? WHERE id=?",
+                    (now, user_id),
+                )
+                await cur.execute(
+                    "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL",
+                    (now, user_id),
+                )
+                count = cur.rowcount
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        return FederatedUnbind(
+            username=username,
+            issuer=issuer,
+            subject=subject,
+            sessions_revoked=int(count) if count is not None else 0,
+        )
+
     async def roles_for_ad_groups(self, groups: Iterable[str]) -> set[str]:
         normalized = sorted({g.strip().lower() for g in groups if g.strip()})
         if not normalized:
@@ -10421,15 +10524,45 @@ class SqlServerStore:
         client: str | None = None,
         seed_reauth: bool = True,
         now: float | None = None,
-    ) -> None:
+        require_federated_subject: tuple[str, str] | None = None,
+    ) -> bool:
         now = time.time() if now is None else now
-        await self._execute(
-            # reauth_at seeds the step-up window from login (ASVS 7.5.3); seed_reauth=False leaves it
-            # NULL for an MFA-PENDING session (WP-14) so a stolen pre-MFA token can't enroll/step-up.
+        # reauth_at seeds the step-up window from login (ASVS 7.5.3); seed_reauth=False leaves it
+        # NULL for an MFA-PENDING session (WP-14) so a stolen pre-MFA token can't enroll/step-up.
+        insert = (
             "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
-            " revoked_at, client, reauth_at) VALUES (?,?,?,?,?,NULL,?,?)",
-            (token_hash, user_id, now, expires_at, now, client, now if seed_reauth else None),
+            " revoked_at, client, reauth_at) VALUES (?,?,?,?,?,NULL,?,?)"
         )
+        params = (token_hash, user_id, now, expires_at, now, client, now if seed_reauth else None)
+        if require_federated_subject is None:
+            await self._execute(insert, params)
+            return True
+        # BACKLOG #1474. UPDLOCK/ROWLOCK, not a plain read: the lock is the whole guard. Either a
+        # concurrent unbind committed first and this read sees the cleared pair (so the insert is
+        # refused), or this transaction holds the users row and the unbind waits behind it — and its
+        # session sweep, which runs after its own users UPDATE, then sees this session and revokes
+        # it. An unlocked read admits the interleaving that loses the session. The hint pair is this
+        # file's FOR UPDATE analog, as register_failed_login and consume_totp_step take it.
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute(
+                    "SELECT oidc_issuer, oidc_subject FROM users"
+                    " WITH (UPDLOCK, ROWLOCK) WHERE id=?",
+                    (user_id,),
+                )
+                # fetchall drains the SELECT so the same-cursor INSERT below is clean; `_cursor`
+                # closes the cursor before the pooled connection is reused (EF-6).
+                rows = await cur.fetchall()
+                bound = None if not rows else (rows[0][0], rows[0][1])
+                if bound != require_federated_subject:
+                    await conn.rollback()
+                    return False
+                await cur.execute(insert, params)
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        return True
 
     async def get_session(self, token_hash: str) -> SessionRecord | None:
         d = await self._fetchone("SELECT * FROM sessions WHERE token_hash=?", (token_hash,))

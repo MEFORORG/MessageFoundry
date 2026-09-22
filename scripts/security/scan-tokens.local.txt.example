@@ -23,9 +23,11 @@
 #     * The scanner LABELS this set on every run: "[SYNTHETIC EXAMPLE TOKENS - blind to real customer
 #       tokens; CI is authoritative]". The placeholders below populate every section, so the count
 #       FLOOR alone cannot tell this apart from a real install -- the label is what does.
-#     * These counts (names=5, estate=3, site_prefix=1) are BELOW CI's per-section floor
-#       (MEFOR_MIN_DETECTORS=names=7,estate=13,site_prefixes=1 in .github/workflows/security.yml), so
-#       passing locally with this file does not predict CI's leak gate.
+#     * These counts (names=5, estate=3, site_prefix=1) are BELOW CI's per-section floor, so passing
+#       locally with this file does not predict CI's leak gate. The floor itself is NOT copied here:
+#       it is `MEFOR_MIN_DETECTORS` in .github/workflows/security.yml and
+#       .github/workflows/branch-leak-scan.yml, it rises as the real token list grows, and the copy
+#       this line used to carry sat stale behind it. Read it there.
 #
 # FORMAT (sectioned; `#` comments and blank lines ignored)
 #   [names]        one entry per line:  REGEX | REASON | CASE
