@@ -1913,11 +1913,15 @@ jobs:
           # answer. "Names merge_group nowhere" ALONE is true of SIX of this file's 13 jobs -- it also
           # takes in `changes`, which has no `if:` at all, and `ci-gate`, which is `always()` and
           # reads no output of this step. Neither is decided by anything emitted here. Scanned over
-          # all 13 job blocks rather than sampled, and the six-way scan is the one
-          # tests/test_ci_merge_group_gate.py pins, from the other side: it asserts the SEVEN jobs
-          # whose own job-level or step-level `if:` names merge_group, and the four named above are
-          # what is left once `changes` and `ci-gate` come out. Re-run both halves after adding a job
-          # or a `needs.changes.outputs` reference rather than trusting this list.
+          # all 13 job blocks rather than sampled, and tests/test_ci_merge_group_gate.py pins BOTH
+          # SIDES OF THAT SCAN BY NAME: the SEVEN jobs whose own job-level or step-level `if:` names
+          # merge_group, the FOUR named above, and the SIX of this paragraph as a membership set
+          # rather than a count. A count is what that module held until 2026-09-22, and a count holds
+          # at six while a job key is renamed underneath it. That module also fails outright if the
+          # two halves ever select the SAME jobs, which is the state that would make this paragraph
+          # false; it cannot be satisfied by moving its pins. So do not re-derive this list by hand
+          # after adding a job or a `needs.changes.outputs` reference -- run that module, and move
+          # this paragraph and its pins together.
           #
           # WHETHER THAT HEAVY TIER SHOULD RUN PER QUEUE ENTRY IS A COVERAGE QUESTION THIS ARM DOES
           # NOT ANSWER. It only stops the answer being an accident. Note while re-opening it that the

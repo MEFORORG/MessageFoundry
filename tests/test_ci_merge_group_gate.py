@@ -36,6 +36,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
@@ -97,15 +98,68 @@ _DECIDED_BY_THE_ARM_ALONE = {
     "packaging-build",
 }
 
-#: The control for the pin above: the jobs that satisfy only the second half of that predicate. It
-#: is the pin above plus exactly the two the arm's comment names -- `changes` (no `if:` at all) and
-#: `ci-gate` (`always()`, and it reads no output of this step) -- neither of which anything emitted
-#: here decides. Written as the union so the two pins cannot be edited into equality.
+#: The two jobs that satisfy the SECOND half of that predicate and not the first, which is the whole
+#: of why the wider set is wider: `changes`, which has no `if:` at all, and `ci-gate`, which is
+#: `always()` and reads no output of this step. The arm's comment in ci.yml names both.
+_NOWHERE_AND_DECIDED_HERE_BY_NOTHING = {"changes", "ci-gate"}
+
+#: The control for the pin above: every job that satisfies only that second half.
 #:
-#: This was a COUNT of six until 2026-09-22, and a count holds while membership moves: renaming the
-#: `changes` job key, renaming `ci-gate`, and swapping `ci-gate` for another always-on job each left
-#: six at six. A set names the job that moved.
-_NAMES_MERGE_GROUP_NOWHERE = _DECIDED_BY_THE_ARM_ALONE | {"changes", "ci-gate"}
+#: SPELLED OUT, NOT DERIVED, and that is the point of it. Writing this as
+#: ``_DECIDED_BY_THE_ARM_ALONE | _NOWHERE_AND_DECIDED_HERE_BY_NOTHING`` reads the same and controls
+#: nothing, because a control derived from the pin it controls FOLLOWS that pin. Measured on this
+#: file 2026-09-22: give `tooling` a merge_group mention and drop it from the pin above -- which is
+#: what that pin's own failure message asks for -- and a derived wider set shrinks in step, stays
+#: green, and reports nothing, while the population the ci.yml comment cites has gone from six to
+#: five. The count this replaced went red there, so a derived set would have been WEAKER than the
+#: count it was meant to improve on.
+#:
+#: This was a COUNT of six until 2026-09-22, and a count holds while membership moves. Renaming the
+#: `ci-gate` job key left six at six in this module while a set names it. (It is caught outside this
+#: module, by tests/test_required_contexts.py -- "silent" here means silent HERE.) The `changes`
+#: rename is NOT an example of the same thing and must not be cited as one: it raises KeyError in
+#: `_changes_step_script` below and in tests/test_ci_tooling_gate.py, and trips an assert in
+#: tests/test_ci_odbc_installer_pipefail.py. Measured 2026-09-22 by renaming the job key: 17 tests
+#: failed across those three modules. It was never a silent mutation.
+_NAMES_MERGE_GROUP_NOWHERE = {
+    "changes",
+    "ci-gate",
+    "docker-smoke",
+    "ide",
+    "tooling",
+    "packaging-build",
+}
+
+# THE RELATION BETWEEN THE TWO PINS, CHECKED AT IMPORT RATHER THAN CLAIMED IN PROSE.
+#
+# The prose above says the wider pin is the narrower one plus exactly two named jobs. Until
+# 2026-09-22 that was a claim and nothing more: the wider constant was spelled as a union, and a
+# comment said the union "means the two pins cannot be edited into equality". A union gives a
+# superset, not a STRICT one -- add both names to `_DECIDED_BY_THE_ARM_ALONE` and the two sets are
+# equal, which was measured true. That is the compensating-control-on-a-false-premise defect
+# (Secure_Development_Standards SDS-3.6/SDS-3.7) sitting in a module whose whole job is catching it.
+#
+# The second assertion is where disjointness lives: the difference of the two pins is disjoint from
+# the narrower one by construction, so requiring that difference to EQUAL the two-name literal
+# requires those two names to be out of the narrower pin.
+assert _DECIDED_BY_THE_ARM_ALONE < _NAMES_MERGE_GROUP_NOWHERE, (
+    "the two pins in this module are no longer a strict narrowing: the wider one does not properly "
+    f"contain the narrower one.\n  narrower: {sorted(_DECIDED_BY_THE_ARM_ALONE)}\n"
+    f"  wider:    {sorted(_NAMES_MERGE_GROUP_NOWHERE)}\n"
+    "If they came out EQUAL, the gated-on-an-output half of the arm's predicate in ci.yml has "
+    "stopped discriminating and that arm's comment is now false. Read it before moving either pin."
+)
+_EXTRAS_IN_THE_WIDER_PIN = _NAMES_MERGE_GROUP_NOWHERE - _DECIDED_BY_THE_ARM_ALONE
+assert _EXTRAS_IN_THE_WIDER_PIN == _NOWHERE_AND_DECIDED_HERE_BY_NOTHING, (
+    "the wider pin is no longer the narrower one plus exactly the two jobs the arm's comment in "
+    "ci.yml names.\n"
+    f"  unexpected extras: {sorted(_EXTRAS_IN_THE_WIDER_PIN - _NOWHERE_AND_DECIDED_HERE_BY_NOTHING)}\n"
+    f"  missing extras:    {sorted(_NOWHERE_AND_DECIDED_HERE_BY_NOTHING - _EXTRAS_IN_THE_WIDER_PIN)}\n"
+    "A name in the first list is gated on an output of the `changes` step in a spelling the "
+    "detector below does not read, or is a genuinely new kind of job the arm's comment does not "
+    "cover. A name in the second means one of those two jobs moved. Either way the ci.yml comment "
+    "is the thing to re-read, not this literal."
+)
 
 
 def _changes_step_script() -> str:
@@ -292,31 +346,29 @@ def test_the_jobs_that_run_on_a_queue_entry_regardless_are_pinned(workdir: Path)
     )
 
 
-def test_the_jobs_the_arm_alone_decides_are_pinned_and_so_is_the_wider_set() -> None:
-    """The four jobs whose queue fate `changes` settles by itself -- with the control for that four.
+def _partition_jobs(data: dict[str, Any]) -> tuple[set[str], set[str]]:
+    """(jobs the merge_group arm alone decides, jobs that name merge_group nowhere).
 
-    The arm's comment in ci.yml enumerates these. An earlier draft enumerated the SAME four under a
-    wider predicate, "the jobs that name merge_group nowhere", which also takes in `changes` itself
-    and `ci-gate`. Neither is decided by anything this step emits, so the enumeration read as checked
-    while being wrong about what it had checked.
-
-    Both sets are pinned by membership. The wider pin is what makes the narrowing legible: it is the
-    decided set plus exactly the two jobs the comment names, so a job that crosses between the two
-    predicates is reported by name in whichever pin it left.
-
-    A third assertion, ``decided < names_it_nowhere``, once followed the two pins. It could not fail:
-    ``decided`` is a subset of ``names_it_nowhere`` by construction, so only equality could break it,
-    and the pins ahead of it had already fixed the two sets at different sizes. It was removed rather
-    than moved ahead of the pins, because the pins entail it there too -- it would fire only on an
-    edit that was about to fire one of them, and with a vaguer message.
+    A function rather than a loop inside the test, so the predicate can be EXERCISED on a constructed
+    workflow and not only pinned against the one real one. A detector that is only ever pinned is a
+    detector whose own behaviour nobody has measured.
     """
-    data = yaml.safe_load(_CI.read_text(encoding="utf-8"))
     decided: set[str] = set()
     names_it_nowhere: set[str] = set()
     for name, job in data["jobs"].items():
         conditions = [str(job.get("if", ""))]
         conditions += [str(step.get("if", "")) for step in job.get("steps", []) or []]
-        gated_on_an_output = any("needs.changes.outputs." in c for c in conditions)
+        # BOTH SPELLINGS OF THE SAME REFERENCE. An Actions expression indexes a context with a dot
+        # or with brackets, and `needs.changes.outputs['code']` is the same read as
+        # `needs.changes.outputs.code`. ci.yml uses the dot form throughout (measured 2026-09-22:
+        # zero bracket occurrences), so this clause changes no verdict on today's file. It is here
+        # because a bracket-spelled gate is what a job DECIDED by the arm looks like while falling
+        # outside this set, which would make the wider pin below report that the job reads no output
+        # of this step. That is backwards, and backwards in the direction a reader would act on.
+        # test_the_detector_reads_a_bracket_spelled_output_gate is the constructed row for it.
+        gated_on_an_output = any(
+            "needs.changes.outputs." in c or "needs.changes.outputs[" in c for c in conditions
+        )
         # A substring test, so it is blind to an `if:` that is TRUE on merge_group without naming
         # it, such as webconsole's job-level `github.event_name != 'push'`. webconsole is caught
         # today only because its step `if:` lines name the event outright. Known limit, not widened.
@@ -325,7 +377,73 @@ def test_the_jobs_the_arm_alone_decides_are_pinned_and_so_is_the_wider_set() -> 
             names_it_nowhere.add(name)
         if gated_on_an_output and not self_gated:
             decided.add(name)
+    return decided, names_it_nowhere
 
+
+def test_the_detector_reads_a_bracket_spelled_output_gate() -> None:
+    """A constructed row, because ci.yml cannot exercise this case: it has no bracket spellings.
+
+    Without it the bracket clause in `_partition_jobs` is a line nothing measures, and a later edit
+    could drop it with every pin below still green. `unrelated` is the control: a bracket spelling of
+    some OTHER job's outputs must not count as gated on this step, or the widening would be matching
+    the bracket rather than the reference.
+    """
+    data: dict[str, Any] = {
+        "jobs": {
+            "dotted": {"if": "needs.changes.outputs.code == 'true'"},
+            "bracketed": {"if": "needs.changes.outputs['code'] == 'true'"},
+            "unrelated": {"if": "needs.other.outputs['code'] == 'true'"},
+        }
+    }
+    decided, names_it_nowhere = _partition_jobs(data)
+    assert decided == {"dotted", "bracketed"}, (
+        f"the detector read {sorted(decided)} as gated on an output of the `changes` step. Both "
+        "spellings of that reference must count, and nothing else may"
+    )
+    assert names_it_nowhere == {"dotted", "bracketed", "unrelated"}, (
+        f"the wider half of the predicate read {sorted(names_it_nowhere)}; none of these three names "
+        "merge_group, so all three belong to it"
+    )
+
+
+def test_the_jobs_the_arm_alone_decides_are_pinned_and_so_is_the_wider_set() -> None:
+    """The four jobs whose queue fate `changes` settles by itself -- with the control for that four.
+
+    The arm's comment in ci.yml enumerates these. An earlier draft enumerated the SAME four under a
+    wider predicate, "the jobs that name merge_group nowhere", which also takes in `changes` itself
+    and `ci-gate`. Neither is decided by anything this step emits, so the enumeration read as checked
+    while being wrong about what it had checked.
+
+    Both sets are pinned by membership, and each is its own literal. The wider pin is what makes the
+    narrowing legible: it is the decided set plus exactly the two jobs the comment names, so a job
+    that crosses between the two predicates is reported by name in whichever pin it left.
+
+    THE STRICTNESS CHECK COMES FIRST, and where it sits is the whole of what it is worth. The same
+    assertion, ``decided < names_it_nowhere``, once sat BEHIND the two pins, where it could not fire:
+    the pins had already fixed both sets at their pinned membership, and the module-level assert
+    above makes that membership a strict narrowing, so equality was excluded before a reader reached
+    it. It was then deleted as an assertion that could not fail -- which is true of where it sat and
+    false of the property it asserts. The state that separates the two, measured 2026-09-22: give a
+    step in `changes` an `if:` naming merge_group and a step in `ci-gate` an `if:` reading
+    ``needs.changes.outputs.code``, then follow every failure message that produces. Every pin goes
+    green with the two predicates selecting IDENTICAL jobs, the gated-on-an-output half doing no
+    work, and ci.yml's "BOTH HALVES OF THAT PREDICATE ARE LOAD-BEARING" false. Ahead of the pins,
+    the same assertion fires on exactly that state, and the module-level assert above catches the
+    constants an editor would have edited to reach it.
+    """
+    data = yaml.safe_load(_CI.read_text(encoding="utf-8"))
+    decided, names_it_nowhere = _partition_jobs(data)
+
+    assert decided != names_it_nowhere, (
+        "the two predicates now select the SAME jobs, so the gated-on-an-output half of the arm's "
+        "predicate in ci.yml is doing no work and that arm's comment, which says BOTH HALVES ARE "
+        "LOAD-BEARING, is false.\n"
+        f"  both sets: {sorted(decided)}\n"
+        "This fires AHEAD of the two pins below on purpose. Their messages invite you to move a "
+        "pin, and moving both to match this state is green and wrong. Re-read the arm's comment in "
+        "ci.yml and rewrite it, or restore whatever made the two halves differ, before you touch "
+        "either pin."
+    )
     assert decided == _DECIDED_BY_THE_ARM_ALONE, (
         "the set of jobs the merge_group arm alone decides has moved.\n"
         f"  added:   {sorted(decided - _DECIDED_BY_THE_ARM_ALONE)}\n"
