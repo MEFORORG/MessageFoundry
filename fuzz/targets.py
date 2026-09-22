@@ -115,6 +115,12 @@ def _sample(name: str) -> tuple[bytes, ...]:
 # A bare MSH, an ISA fragment that stops mid-header, and the Part-10 magic with nothing after it.
 # Each sits on a different early branch (accepted / truncated envelope / magic-only), which is where
 # a mutator gets the most leverage from a tiny seed.
+#
+# MEASURED for the DICOM one, in CI run 35761703252: from these 132 bytes and nothing else, the
+# mutator reached pydicom's file-meta reader at exec #4495 and produced a real contract violation at
+# execution unit 8,326, inside a 60-second budget. A magic-only seed reaching a reporting tier was
+# an open question when these were chosen; it is no longer one, so do not shrink this seed on the
+# theory that it cannot get anywhere.
 _MINIMAL_HL7 = b"MSH|^~\\&|APP|FAC|R|RF|20260101||ADT^A01|MSG1|P|2.5\r"
 _TRUNCATED_X12 = b"ISA*00*          *00*"
 _MAGIC_ONLY_DICOM = b"\x00" * 128 + b"DICM"

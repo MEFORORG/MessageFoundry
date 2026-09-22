@@ -117,8 +117,15 @@ its own exception contract on a path the inbound pipeline already relies on?
 **Targets parse and then read the accessors, which is the load-bearing design choice.** A Router does
 not stop at `parse`; it reads routing fields off the result, before the ACK. So `hl7_peek` parses and
 then reads all eleven named routing properties plus `routing()` and `segments()`, and `x12_peek`
-parses and then reads the ten ISA identity properties plus the group and segment walk. Fuzzing
-`parse` alone would have found nothing: the finding below lives entirely in the accessor tier.
+parses and then reads the ten ISA identity properties plus the group and segment walk.
+
+**This paragraph used to end "Fuzzing `parse` alone would have found nothing: the finding below lives
+entirely in the accessor tier." That is now false as a general claim, and only ever held for HL7.**
+`dicom_peek` has no accessor tier to sweep -- `DicomPeek.parse` returns a frozen dataclass of
+already-materialised strings -- so `parse` really is its whole surface, and `parse` alone produced
+this harness's second finding. Run 35761703252 reached it from the 132-byte magic-only seed in
+**8,326 executions**. The accessor sweep is what the HL7 and X12 targets need to be able to report at
+all; it is not a property of every target.
 
 **Four targets**, in `fuzz/targets.py`: `hl7_peek`, `hl7_tree` (the tolerant structural view),
 `x12_peek`, `dicom_peek`.
@@ -281,10 +288,33 @@ manager is open. **`pydicom` did not, and this line used to claim it did.** `par
 imports pydicom inside function bodies, deliberately, to keep the engine importable without the
 `[dicom]` extra; those run at parse time, after instrumentation has stopped. So `dicom_peek` was
 guided only by the engine's thin wrapper and the mutator was blind to the DICOM parse surface.
-`fuzz/fuzz_parsers.py` now imports pydicom explicitly inside the block; that is reasoned from
-Atheris's documented behaviour rather than measured, because Atheris has no Windows wheel, and the
-module docstring names the Linux check that would confirm it. Cost: Linux x86-64 only, which the
-marker contains.
+`fuzz/fuzz_parsers.py` now imports pydicom explicitly inside the block.
+
+**That import was recorded as reasoned rather than measured. It is now measured, and this paragraph
+replaces the caveat rather than deleting it.** The old text read: *"that is reasoned from Atheris's
+documented behaviour rather than measured, because Atheris has no Windows wheel, and the module
+docstring names the Linux check that would confirm it."* The observation is GitHub Actions run
+**35761703252** -- workflow `fuzz`, head `cdeb0fa9393bcfc39ccd3bd571f621de84d867ef`, `ubuntu-latest`,
+atheris 3.1.0, pydicom 3.0.2:
+
+* Atheris logs `INFO: Instrumenting` for **58 pydicom names** -- the package plus 57 submodules,
+  among them `filereader`, `filebase`, `fileutil`, `tag`, `datadict`, `encaps`, `charset` and
+  `valuerep`. All four target processes report the same 58, which is what 232 such lines over four
+  targets means.
+* The `dicom_peek` mutator climbs from `cov: 136` at `INITED` to `cov: 341` at its last new unit,
+  over 31 readings. Two step changes land immediately after a pydicom parse warning: **+74 at exec
+  #4495** (147 to 221, after `filereader.py:487`) and **+69 at #7996** (259 to 328, after
+  `filereader.py:402`).
+
+**The control arm was not run, and the claim does not rest on it.** The recipe this ADR and the
+module docstring both prescribed was a *two-arm* comparison against a build with the import removed;
+only the with-import arm exists, so the coverage delta is not attributable in a controlled sense and
+must not be quoted as though it were. It is not needed for the claim that was in doubt. The doubt was
+whether pydicom gets instrumented at all, and the `INFO: Instrumenting pydicom.*` lines observe that
+directly -- stronger evidence than the coverage proxy that was proposed to infer it, because the
+proxy answers an adjacent question (CLAUDE.md section 11, SDS-3.8).
+
+Cost: Linux x86-64 only, which the marker contains.
 Provenance checked before adding it, per CLAUDE.md section 7: `atheris` on PyPI, source at
 `github.com/google/atheris`, latest 3.1.0 -- the intended package, not a name-alike.
 
@@ -309,7 +339,11 @@ unexpected error (ADR 0054's guard, logging and continuing), and the python-hl7 
 exception into `HL7PeekError`, which every target treats as the contract being honoured. So the
 HL7 parse tier is total with respect to this harness's question -- the fuzzer *traverses* those
 branches but can never *report through* them. Every HL7 finding must come from the accessor tier,
-and the one finding to date does.
+and the one HL7 finding to date does. **Read "one finding to date" as scoped to HL7, which is how
+this line was written and not how it reads on its own**: run 35761703252 produced a second finding,
+on `dicom_peek`, and it came through `parse`. That is consistent rather than contradictory -- the
+argument above is about what the *HL7* fallback guard can report through, and `dicom_peek` has a
+different parse tier with no such guard.
 
 **6. Make the job blocking.** Rejected; see the Decision. A time-budget-and-seed-dependent result must
 not gate a merge.
