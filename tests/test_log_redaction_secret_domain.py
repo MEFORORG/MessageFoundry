@@ -70,6 +70,7 @@ import re
 import re._constants as sre_constants
 import re._parser as sre_parser
 import time
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import partial
@@ -1227,35 +1228,141 @@ _GROWTH_LENGTHS = (2048, 16384)
 #: one endpoint more than twofold before this flakes, and a reverted head cannot hide underneath it.
 _MAX_GROWTH = 24.0
 
-#: The least of ``scrub_credentials``'s cost on the adversarial run that the DSN pass must itself
-#: account for, before the growth readings above count as evidence ABOUT THAT PASS. Measured at 16 KB:
-#: whole call 0.207 ms, ``_DSN_PASSWORD.sub`` alone 0.171 ms, share 0.824. 0.5 leaves better than 1.6x
-#: of headroom, and it is still a strong claim -- half the marked run is this one pattern.
-#:
-#: IT REPLACED A CROSS-INPUT RATIO THAT COULD NOT CARRY THE CLAIM IT MADE, and the flaw is worth
-#: stating because the arithmetic looked sound. That gate compared ``scrub_credentials`` on a MARKED
-#: run against an UNMARKED one and required 4x, reading it as "the DSN pass is at least three quarters
-#: of the marked run". The two runs are different INPUTS, and an unmarked run names no credential word
-#: at all, so it fails ``_ANY_HINT`` and returns having executed ZERO patterns -- one substring sweep,
-#: not six gates and a pass. So the denominator was not the marked run's non-DSN cost, it was a
-#: strictly smaller thing. Measured at 16 KB: the marked call spends 0.036 ms outside the DSN pass
-#: against an unmarked baseline of 0.023 ms, 1.57x, so at the old 4x threshold the guaranteed share was
-#: about 61 percent rather than the 75 the comment asserted. Holding the INPUT constant and measuring
-#: the pass directly states the same property without the substitution.
-#:
-#: IT INHERITS THE OLD GATE'S ONE GOOD WARNING AND THE NUMBER IS RESTATED, because a threshold pinned
-#: to the pass's own cost fails on a FUTURE IMPROVEMENT rather than on a regression. The share is
-#: D / (F + D) with F the roughly 0.036 ms the call spends outside this pass, so making the pattern
-#: about 4.7x faster still reds this arm -- for a good change. Move the floor then, and say what it was
-#: measured against; do not read the red as a defect.
-#:
-#: IT ALSO REDS WHEN F GROWS, WHICH IS A DIFFERENT CHANGE WITH THE SAME SYMPTOM. A seventh pattern in
-#: ``_run``, more members in ``_ANY_HINT`` (15 substring sweeps over the line today), or a costlier
-#: fold all shrink the share without touching this pattern. A share is capped at 1.0, so unlike the
-#: ratio it replaced it cannot be given headroom by measuring better -- roughly 1.66x is what there is.
-#: Before treating a red here as a DSN regression, check the growth arm above: if the pattern's own
-#: ratio is still near 8x, the denominator moved and this floor is what needs revisiting.
-_MIN_DSN_COST_SHARE = 0.5
+# A SHARE OF WALL-CLOCK COST STOOD HERE, AND IT IS DELETED RATHER THAN RETUNED. ``_MIN_DSN_COST_SHARE``
+# required ``_DSN_PASSWORD.sub`` to be at least 0.5 of ``scrub_credentials``'s cost on the marked run,
+# with the input held constant. It went red on ``test (windows-2025, py3.14)`` at a share of 0.467 --
+# 0.591 ms of 1.266 ms, one failure in 15201 -- and the decomposition condemns it more thoroughly than
+# the miss does. The share is D / (F + D), F being what the call spends outside the pass. On the box
+# this file was written on: D 0.170 ms, F 0.033 ms, share 0.84, across 15 trials spanning 0.817 to
+# 0.874. On that runner: D 0.591 ms, F 0.675 ms. D scaled 3.5x and F scaled 20x, so F/D moved from
+# 0.19 to 1.14 -- a 6x swing in the composition, against the roughly 1.66x of headroom a quantity
+# capped at 1.0 can offer at all. The tight local spread was read as though it said something about
+# another box, and it does not.
+#
+# F IS MEASURED HERE RATHER THAN INFERRED: on that same box the 16 KB casefold costs 0.0033 ms, and
+# the seven ``_admits`` calls one ``scrub_credentials`` makes (one at the entry gate, six inside
+# ``_run``) cost 0.0295 ms. That is F to three decimal places. On this fixture those seven calls walk
+# the folded line 22 times, not once per hint word: ``_admits`` short-circuits, and the entry gate
+# hits on its first word. So the denominator is a substring-sweep cost and the numerator a scan -- two
+# different primitives, timed separately and divided. WHY they scale apart on a shared runner is not
+# established here, and a guess does not belong in a test; THAT they do is the whole finding, since
+# the ratio is then a reading about the box as much as about the code.
+#
+# THE GENERAL SHAPE IS WORTH NAMING, BECAUSE THIS FILE SHIPPED IT TWICE. The deleted arm itself
+# replaced a cross-input ratio (marked run over unmarked, 4x), on the correct finding that varying the
+# input varies the gate work, so the denominator was not the thing the claim named. Holding the input
+# constant fixed that one substitution and kept the shape: A COST SHARE IS A FRAGILE WITNESS WHATEVER
+# YOU HOLD CONSTANT, because the denominator still moves for reasons that have nothing to do with the
+# subject. Lowering the floor would be the same defect in a third costume, a threshold sized from one
+# hosted observation. THIS FILE ALREADY KNEW, twice: both the mitigation guard and the scan-prefix
+# guard are structural "for the reason the narrow version already gave: a timing assertion on a shared
+# runner flakes". That reason was never carried across to this arm.
+#
+# THIS IS NOT A RULE AGAINST STOPWATCHES, AND THE GROWTH ARM ABOVE IS THE CONTRAST THAT SHOWS WHY. It
+# is also a ratio of two timings, and it is sound for a reason the share could never have: it divides
+# THE SAME WORK AT TWO INPUT LENGTHS, so a box that runs everything k times slower multiplies both
+# endpoints by k and k cancels. That holds for the composite subjects too, where each endpoint mixes a
+# scan with the sweeps: while both components stay linear in length, their relative weight drops out
+# of the quotient, so even a component inflated 20x shifts the LEVEL and not the ratio. A slope change
+# would move it, and that is the regression the arm is for.
+#
+# THE RED RUN IS ITSELF THE EVIDENCE FOR THAT, which is why it is worth keeping. On the runner where F
+# came back 20x inflated, all five growth subjects passed and only the share failed. The share divided
+# a regex scan by a substring sweep -- two different primitives at ONE length -- so nothing cancelled
+# and the quotient was never only about the code. Measured over 12 runs here, the growth arm's margins
+# run 2.05x to 3.32x against its threshold, where the share had 1.66x in total. ASK OF ANY TIMING
+# RATIO WHAT CANCELS OUT OF IT. A tight spread on the box you measured it on answers a narrower
+# question, and answers it for that box only.
+#
+# WHAT THE SHARE WAS REACHING FOR IS ALREADY CARRIED ABOVE, which is why removing it costs at least no
+# coverage of #1547. The property #1547 is about is this pattern's own linearity, and the growth loop
+# measures that on the BARE ``.sub`` in two subjects, armed by a positive control on the same bare
+# call. The surface subjects assert that nothing inside ``scrub_credentials`` or ``redact_log_line`` is
+# quadratic, and that stands without attributing the cost to any one pass. What is genuinely gone is a
+# bound on the NON-DSN cost inside the ``scrub_credentials`` subject; no assertion here consumed it.
+#
+# WHAT REPLACES IT IS A COUNT. "Did this pass run, and how often" was always a fact about the code, and
+# the recorder below reads it directly.
+
+
+#: Every ``re.Pattern`` method that APPLIES the pattern to text, whether or not it scans -- ``match``
+#: and ``fullmatch`` anchor at a position and are in the set anyway, because over-reporting an
+#: application is the safe direction and under-reporting one is the failure this set exists to stop. A
+#: recorder watching ``.sub`` alone would miss a future ``_run`` reaching for ``.subn`` or a
+#: ``.finditer`` loop: the same walk, the same cost, and an arm below that stays green while a second
+#: pass runs on every line. The membership is checked against ``re.Pattern`` itself in that arm, since
+#: a typo in one of these strings would narrow the reading with nothing to report it.
+_PATTERN_APPLICATIONS = frozenset(
+    {"findall", "finditer", "fullmatch", "match", "scanner", "search", "split", "sub", "subn"}
+)
+
+
+class _RecordingPattern:
+    """A compiled pattern that counts applications of itself and is otherwise the real object.
+
+    NOT a ``re.Pattern`` subclass, because the type refuses subclassing, so ``isinstance(x,
+    re.Pattern)`` is False for the length of a swap. Nothing on the ``scrub_credentials`` path
+    type-checks a pattern today and the swap is undone before anything else looks, but a future
+    ``_run`` spelled ``re.sub(_DSN_PASSWORD, ...)`` rather than ``_DSN_PASSWORD.sub(...)`` would red
+    here with a TypeError from inside ``re``, naming this fixture for a change that is fine.
+    """
+
+    def __init__(self, name: str, pattern: re.Pattern[str], seen: Counter[str]) -> None:
+        self._name = name
+        self._pattern = pattern
+        self._seen = seen
+
+    def __getattr__(self, attr: str) -> Any:
+        # An instance whose __dict__ is empty -- one built by copy, pickle, or a pytest assertion
+        # repr, none of which run __init__ -- would otherwise ask itself for _pattern forever. Raise
+        # AttributeError rather than let the lookup fail some other way: it is what `hasattr`
+        # swallows, and `copy.copy` probes `hasattr(y, "__setstate__")` on exactly such an instance.
+        if "_pattern" not in self.__dict__:
+            raise AttributeError(attr)
+        target = getattr(self._pattern, attr)
+        if attr not in _PATTERN_APPLICATIONS:
+            return target
+        name, seen = self._name, self._seen
+
+        def recorded(*args: Any, **kwargs: Any) -> Any:
+            # Forward verbatim: a bounded `count=` or `pos=` on a future call site must reach the real
+            # method, or this fixture reds with a TypeError naming itself instead of the property.
+            seen[name] += 1
+            return target(*args, **kwargs)
+
+        return recorded
+
+
+def _patterns_applied_during(
+    module: ModuleType, names: set[str], call: Callable[[], object]
+) -> Counter[str]:
+    """How many times each of ``names`` was applied to text during ``call()``.
+
+    Each is swapped for a recorder that delegates everything else to the real object, so this reads
+    what RAN rather than what could have run. ``secretscrub._run`` is straight-line over module
+    globals precisely so a swap here reaches the object it reads -- its own docstring says so, and a
+    dispatch table would hold the pre-swap pattern by value and record nothing.
+
+    Derive ``names`` BEFORE calling this. The derivation selects on ``isinstance(value, re.Pattern)``
+    over the live namespace and a recorder is not one, so a set read during the swap comes back empty
+    rather than wrong.
+
+    The swap is module-global, which is why it is undone immediately. A log record scrubbed from
+    another thread inside the window lands in this count if it opens a gate, and the caller reads that
+    as one pattern applied twice; a record opening no gate applies nothing and leaves the reading
+    alone. The window is one call wide and pytest drives it from one thread, so this is a caveat on
+    the diagnosis rather than a live hazard.
+    """
+    seen: Counter[str] = Counter()
+    originals = {name: getattr(module, name) for name in names}
+    try:
+        for name, pattern in originals.items():
+            setattr(module, name, _RecordingPattern(name, pattern, seen))
+        call()
+    finally:
+        for name, pattern in originals.items():
+            setattr(module, name, pattern)
+    return seen
 
 
 def _adversarial_run(length: int, *, marker: bool) -> str:
@@ -1305,12 +1412,12 @@ def test_the_dsn_scan_grows_linearly_in_line_length() -> None:
     own docstring, one layer down and wearing a stopwatch.
 
     THE OTHER WAY THIS COULD GO VACUOUSLY GREEN is an input that never reaches the pattern: that is
-    linear for a reason which has nothing to do with the fix. Two arms below close it, and they are
-    deliberately split. One is STRUCTURAL -- the marked run opens the DSN gate and no other, and the
-    unmarked run opens none at all -- because "did the pass run" is a fact about the gates, not
-    something a clock should be asked to infer. The other is a SHARE OF COST measured with the input
-    held constant. The single cross-input ratio they replaced conflated the two and could support
-    neither cleanly; ``_MIN_DSN_COST_SHARE`` carries that reasoning and the numbers.
+    linear for a reason which has nothing to do with the fix. Two arms below close it, and NEITHER
+    CARRIES A STOPWATCH, because "did the pass run" is a fact about the code that a clock can only
+    infer. One reads which admission gates the marked run opens, and that the unmarked run opens none.
+    The other counts which patterns one ``scrub_credentials`` call actually applies. A share of
+    wall-clock cost stood beside them until it went red on a hosted runner; the comment above
+    ``_PATTERN_APPLICATIONS`` is the record of that, and is the one place this file argues it.
 
     NEITHER ARM IS RUN AGAINST ``redact_log_line``, and that is a property of the surface rather than
     an omission. Its copy is ungated and scans every line either way, so no input distinguishes
@@ -1351,10 +1458,10 @@ def test_the_dsn_scan_grows_linearly_in_line_length() -> None:
         )
 
     # THE GROWTH READINGS ARE ONLY EVIDENCE ABOUT THIS PASS IF THIS PASS IS WHAT RAN, and that splits
-    # into two questions a single cross-input ratio used to answer as one. The first is structural and
-    # needs no clock: does the marked run reach the pattern at all, and is the DSN gate the only one it
-    # opens? The second is the share of the cost the pass owns, and it is measured with the INPUT HELD
-    # CONSTANT -- see _MIN_DSN_COST_SHARE for what the old marked-against-unmarked ratio could not say.
+    # into two questions a single cross-input ratio used to answer as one. The first is which gates the
+    # marked run opens, below. The second is which patterns then actually run, further down. Both are
+    # structural; a third arm answered the second question with a stopwatch and is deleted, for the
+    # reasons recorded once above _PATTERN_APPLICATIONS.
     longest = _GROWTH_LENGTHS[1]
     marked_run = _adversarial_run(longest, marker=True)
     folded = marked_run.casefold()
@@ -1367,9 +1474,9 @@ def test_the_dsn_scan_grows_linearly_in_line_length() -> None:
         sorted(name for name in gates if scrub_mod._admits(folded, getattr(scrub_mod, name)))
     )
     assert opened == ("_DSN_HINT",), (
-        f"the marked adversarial run opens {opened} on secretscrub, not the DSN gate alone, so the "
-        "share measured below is diluted by another pass and the growth readings above are not about "
-        "this pattern. THE LIKELY CAUSE IS THE FIXTURE, NOT THE GATES: _adversarial_run spells its "
+        f"the marked adversarial run opens {opened} on secretscrub, not the DSN gate alone, so a "
+        "second pass runs on this input and the growth readings above are not about this pattern. "
+        "THE LIKELY CAUSE IS THE FIXTURE, NOT THE GATES: _adversarial_run spells its "
         "own prose ('upstream error ... host') and a credential word that is a substring of it opens "
         "a second gate. Change the fixture's wording, and only then look at _run."
     )
@@ -1380,13 +1487,73 @@ def test_the_dsn_scan_grows_linearly_in_line_length() -> None:
         "fixture has drifted -- fix the run, do not drop this assertion."
     )
 
-    whole = _fastest(scrub_credentials, marked_run, rounds=5)
-    dsn_only = _fastest(lambda text: scrub_mod._DSN_PASSWORD.sub("x", text), marked_run, rounds=5)
-    assert dsn_only >= whole * _MIN_DSN_COST_SHARE, (
-        f"the whole call cost {whole * 1000:.3f} ms on the marked run and the DSN pass alone "
-        f"{dsn_only * 1000:.3f} ms, a share of {dsn_only / whole:.3f} against the "
-        f"{_MIN_DSN_COST_SHARE} this arm needs. The growth readings above are then mostly some other "
-        "pass, and a linear total is not evidence that THIS pattern is linear."
+    # THE SECOND QUESTION IS WHETHER THE PASS ACTUALLY RAN, AND IT IS A COUNT RATHER THAN A CLOCK. The
+    # arm above reads which gates ADMIT; this one reads which patterns were APPLIED, and how often.
+    # They are not the same reading, and the gap between them is the case the deleted share could only
+    # ever report as an unattributed number: a pattern reached WITHOUT a gate admits nothing and still
+    # walks every line. Asserting both, a disagreement names that case.
+    #
+    # DERIVED OVER THE WHOLE ENTRY PATH, NOT `_run` ALONE. `CREDENTIAL_SURFACES` pairs this module with
+    # `_run` because that is where its patterns are APPLIED, which is the right domain for the
+    # structural guard. This arm asks a different question -- what does one `scrub_credentials` CALL
+    # touch -- so a pattern applied in the entry function above `_run` belongs to it too. Reading
+    # `_run` alone would be this file's own failure 2, a domain narrower than the surface.
+    #
+    # THE ENTRY FUNCTION APPLIES NO PATTERN TODAY, so the union adds no name to the six and is a no-op
+    # on this tree. It is here for the day that stops being true, which is the day reading `_run`
+    # alone would start being wrong with nothing to report it. THE DERIVATION IS ONE LEVEL DEEP either
+    # way -- it walks a function body for module-level names and does not follow calls -- so a pattern
+    # applied inside a NEW helper that `_run` calls is outside this domain. That limit is shared with
+    # the structural guard above, which derives the same way; widening it is one change for both.
+    applied = _applied_pattern_names(scrub_mod, "_run") | _applied_pattern_names(
+        scrub_mod, "scrub_credentials"
+    )
+    assert "_DSN_PASSWORD" in applied, (
+        f"the pattern derivation found {sorted(applied)} across secretscrub.scrub_credentials and "
+        "._run, and _DSN_PASSWORD is not among them. Either the pattern was renamed or it is no "
+        "longer applied on this path; nothing below can be about it until that is resolved."
+    )
+    assert len(applied) >= 6, (
+        f"the pattern derivation found only {sorted(applied)}, which does not look like the per-pass "
+        "patterns. A hardcoded list here would assert less than it reads as asserting."
+    )
+
+    # POSITIVE CONTROL ON THE TWO INSTRUMENTS THIS ARM RUNS ON, because a zero from either is otherwise
+    # indistinguishable from the code having stopped. First the method list: a typo in one of those
+    # strings silently narrows what counts as an application, so tie it to the real type. `re.Pattern`
+    # may grow a method, which is why this is a subset check and not equality.
+    pattern_methods = {
+        name
+        for name in dir(re.Pattern)
+        if not name.startswith("_") and callable(getattr(re.Pattern, name, None))
+    }
+    assert not _PATTERN_APPLICATIONS - pattern_methods, (
+        f"{sorted(_PATTERN_APPLICATIONS - pattern_methods)} in _PATTERN_APPLICATIONS is not a "
+        "re.Pattern method, so the recorder can never see it fire -- fix the spelling"
+    )
+
+    # Then the recorder, driven through the module global by a line that MUST match, so a broken swap
+    # reds here rather than being read as "the pass stopped running" thirty lines down.
+    control = _patterns_applied_during(
+        scrub_mod,
+        {"_DSN_PASSWORD"},
+        lambda: scrub_mod._DSN_PASSWORD.sub("x", "postgres://user:pw@host"),
+    )
+    assert control == Counter({"_DSN_PASSWORD": 1}), (
+        f"the recorder read {dict(control)} for one direct application of _DSN_PASSWORD through the "
+        "module global. The swap or the counting is broken, so every reading below is about this "
+        "fixture rather than about secretscrub."
+    )
+
+    ran = _patterns_applied_during(scrub_mod, applied, partial(scrub_credentials, marked_run))
+    assert ran == Counter({"_DSN_PASSWORD": 1}), (
+        f"one scrub_credentials call on the marked adversarial run applied {dict(ran)}, not "
+        "_DSN_PASSWORD exactly once, so the growth readings above are not about this pattern alone. "
+        "Read it this way. AN EMPTY reading means the pass stopped running at all. A COUNT ABOVE ONE "
+        "means one pattern is now walked repeatedly per call. A SECOND NAME, while the gate arm above "
+        f"still sees only {opened} open, means that pattern is reached with no gate in front of it -- "
+        "a cost defect in _run or in scrub_credentials. A second name WITH a red on the gate arm is "
+        "the fixture drifting instead; fix the run's wording, as that assertion says."
     )
 
 

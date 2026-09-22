@@ -381,7 +381,10 @@ _KEY_MATERIAL = re.compile(
 #
 # Pinned five ways in ``tests/test_log_redaction_secret_domain.py``, which guards BOTH copies of this
 # vocabulary: the anchor structurally, the growth with a stopwatch against the pre-#1547 pattern as its
-# control, the share of that cost the pass actually owns, the shapes that must still redact BY VALUE --
+# control, a COUNT of which patterns one ``scrub_credentials`` call actually applies -- which was a
+# share of wall-clock cost until that share went red on a hosted runner for a reason that was not a
+# regression here, recorded in full beside the test's ``_PATTERN_APPLICATIONS`` -- the shapes that must
+# still redact BY VALUE --
 # including the glued run above and the non-letter leading runs, so neither narrowing can come back
 # without a red -- and a differential arm that fails if either earlier head ever redacts something this
 # one does not.
