@@ -4,8 +4,13 @@
 # ADR 0173 — TLS peer revocation checking and OCSP stapling across terminating and originating surfaces
 
 - **Status:** **Accepted (2026-08-23; the accept half ratified by the owner 2026-09-22).** The original
-  change carried no code. The one build rider in §4.3 is a separate, small change that this ADR
-  authorizes but did not perform; it is tracked by BACKLOG **#1498**.
+  change carried no code. The §4.3 build rider, tracked by BACKLOG **#1498**, is **PARTLY BUILT** as of
+  2026-09-22: the SMART token endpoint and the syslog TLS forwarder are guarded; **the OIDC token and
+  JWKS legs are not** (AC-4 carries the recipe and the reason). **Three of this document's own premises
+  moved under that build and are corrected in place rather than rewritten** — see §4.3's amendment and
+  the notice in §1.4. One of them reaches a *decision* and not only evidence: §2.1 declines a
+  direction-2 file CRL that BACKLOG #299 has since built, which is an owner question this ADR does not
+  settle.
 - **Date:** 2026-08-23 (ratified 2026-09-22)
 - **Deciders:** owner (ratified the accept half 2026-09-22, owner ruling) · security working group
 - **Related:** **extends [ADR 0078](0078-certificate-revocation-posture.md)** (Accepted 2026-07-10,
@@ -129,7 +134,7 @@ not revocation checking**"* (`:202`).
 | Engine-to-store (asyncpg) | `store/postgres.py:752`, and `:760` where asyncpg builds it (`:729` is the `trust_server_certificate` escape, `CERT_NONE` at `:731`) | the whole PHI store |
 | Syslog / SIEM forwarder (RFC 5425) | `logging_setup.py:310` | audit records |
 | OIDC / IdP token and JWKS legs | `auth/oidc_http.py:99-101` | the client secret, the authorization code |
-| SMART Backend Services token endpoint | **NOT A TLS SITE -- row withdrawn 2026-08-23.** `transports/smart.py` contains ZERO `ssl` usage (`create_default_context`, `SSLContext`, `ssl.` all absent; control: 153 hits package-wide). `:183-184` is an opener and redirect handler. It rides urllib's own context. | -- |
+| SMART Backend Services token endpoint | **GUARDED 2026-09-22 (BACKLOG #1498) -- and this row's withdrawal was over-applied; see §4.3 correction 1.** The `ssl`-usage measurement stands: `transports/smart.py` contains ZERO `ssl` usage (`create_default_context`, `SSLContext`, `ssl.` all absent; control: 153 hits package-wide), `:183-184` is an opener and redirect handler, and it rides urllib's own context. **That makes it no member of the `harden_verify_flags` population and does NOT make it a non-hop**: the guard takes a scheme and a url. | the signed `client_assertion` |
 | Shared engine-API client | `apiclient/client.py:214`, `:222` | session credentials |
 | Windows tray probe | `tray/probe.py:123` | health only |
 | TLS version prober | `config/tls_probe.py:97` | nothing; it scopes itself out at `:32` |
@@ -154,6 +159,31 @@ Two axes, not one:
 direction 2 — check the peer — performed in the **server** role, against a partner's client
 certificate under mTLS. It staples nothing, so direction 1 is untouched. It never runs on an
 originating context, so direction 2 is untouched.
+
+> **THE MEASUREMENT BELOW IS FALSE AT HEAD, AND SO IS THIS SECTION'S CONCLUSION ABOUT DIRECTION 2.
+> BACKLOG #299 IS WHY. Recorded 2026-09-22 with the #1498 build; nothing here was reversed by that
+> build, which added no `harden_crl_check` call site.** #299 limb A (`3aa07e5d5`, *"outbound CRL
+> revocation checking and the blanket-attestation clamp"*) landed **after** this ADR was drafted.
+>
+> Re-measured at HEAD, same instrument (`grep -rn '^\s*harden_crl_check('` over `messagefoundry/`):
+> **seven call sites, not three, and four of the seven are CLIENT contexts** — `auth/oidc_http.py`,
+> `logging_setup.py`, and `config/tls_policy.py` inside `build_verifying_client_context` and
+> `build_anchored_https_handler`. The three original server-side sites are unchanged and still
+> mTLS-only. Positive control on the same read: `harden_verify_flags` returns **eight** files (the
+> ADR's seven plus `verify/smoke.py`), so the grep and the path are live.
+>
+> **What that costs this section:** its table cell *"Direction 2. ABSENT"* and its sentence *"It never
+> runs on an originating context, so direction 2 is untouched"* no longer hold. Direction 2 now has a
+> real, **opt-in, default-off** in-engine file CRL on originating hops. The two-axis framing this
+> section exists to teach is unaffected and still correct — what moved is which cell is empty.
+>
+> **And it reaches the DECISION, not only the evidence: §2.1's *"Direction 2's buildable half is
+> declined for now, on cost rather than on principle"* describes a build that has since happened.**
+> #299 built the file-CRL-on-originating-hops that §2.1 declined, anchor-keyed, which is §2.1's own
+> reason 1 accepted rather than avoided. **This notice does not reverse anything and no seat should
+> read it as doing so** — it records that the accept half was ratified over a decline the tree had
+> already overtaken, so the owner can decide whether §2.1 needs restating. Direction 3's *"must not be
+> counted toward either graded direction"* is untouched: that is still the terminating axis.
 
 The measurement, with a positive control:
 
@@ -188,6 +218,10 @@ false-premise defect:
    the operator-facing detail at `:1032-1038`; `enforce_construction` at `:1040`. Wired at
    `transports/mllp.py:751-752`, `rest.py:1347`, `soap.py:403`, `fhir.py:370`, `dicomweb.py:261`,
    `email.py:239`, and `store/postgres.py:745` via `_refuse_store_revocation` (`:763`).
+   **Nine sites since BACKLOG #1498 (2026-09-22), not seven** — `transports/smart.py` (the SMART
+   token endpoint) and `logging_setup.py:_refuse_forward_revocation` (the syslog forwarder) joined
+   under §4.3. Read the list as *"at least these"* and locate each by symbol: these line numbers were
+   written in August and the §4.3 build moved several of them.
 2. **Terminating `[api]` TLS — `in_process_tls_revocation_refused`** (`config/tls_policy.py:344`),
    wired at `__main__.py:1722`. `serve` refuses an in-process off-loopback `[api]` TLS bind unless a
    declared TLS-terminating reverse proxy (WP-15) or `MEFOR_TLS_REVOCATION_ATTESTED` proves
@@ -218,9 +252,9 @@ of the three carry authentication material:
 
 | Hop | Site | Crosses with |
 |---|---|---|
-| SMART Backend Services token endpoint | **NOT A TLS SITE -- see the withdrawal in §1.3.** No `ssl` usage in the file at all. | -- |
+| SMART Backend Services token endpoint | **GUARDED 2026-09-22 (BACKLOG #1498).** No `ssl` usage in the file at all, which is why the row was withdrawn -- over-applied, see §4.3 correction 1. | the signed `client_assertion` |
 | OIDC / IdP token and JWKS legs | `auth/oidc_http.py:99-101` | the client secret, the authorization code, the identity assertion (its own comment, `:105-107`) |
-| Syslog / SIEM TLS forwarder | `logging_setup.py:310` | audit records; no `harden_verify_flags` either -- shared with the other two unguarded hops, not peculiar to this one |
+| Syslog / SIEM TLS forwarder | `logging_setup.py`, `_build_tls_context` | audit records. **GUARDED 2026-09-22 (BACKLOG #1498)**, and it now calls `harden_verify_flags` -- which per §4.3 correction 2 asserts a flag `create_default_context` had already set, so read the "no `harden_verify_flags` either" clause this cell used to carry as a grep fact and not as a gap |
 
 Measured: a grep for `revocation` in `transports/smart.py` returns **zero**. Positive control on the
 same file, same technique: `refuse_cleartext_credential_hop` is imported at `:61` and called at
@@ -334,14 +368,47 @@ Do not restate it as one. §6 names what would flip it.
   `::test_harden_crl_check_refuses_a_file_carrying_no_crl`,
   `::test_harden_crl_check_refuses_an_already_expired_crl`.
 - **AC-4** — WHERE an originating hop carries authentication material or audit records over verified
-  TLS to a non-loopback host (the SMART token endpoint, the OIDC token and JWKS legs, the syslog
-  forwarder), THE SYSTEM SHALL apply the same posture-keyed revocation disposition the other
-  verifying hops apply, and SHALL NOT cross with no refusal, no warning and no audit entry
-  → test ref added by the §4.3 build.
+  TLS to a non-loopback host, THE SYSTEM SHALL apply the same posture-keyed revocation disposition the
+  other verifying hops apply, and SHALL NOT cross with no refusal, no warning and no audit entry
+  → all in `tests/test_hop_refusal_revocation.py`, beside the #201 and #299 arms for the same guard.
+  **The SMART token endpoint**:
+  `::test_the_smart_token_hop_is_refused_when_it_checks_no_revocation`,
+  `::test_the_smart_token_hop_on_loopback_still_crosses`,
+  `::test_the_smart_token_hop_crosses_on_a_per_connection_revocation_attestation`,
+  `::test_a_cleartext_smart_token_hop_is_the_200_gates_refusal_not_this_one`,
+  `::test_the_smart_revocation_attestation_comes_from_its_own_settings_key`.
+  **The `[logging]` syslog TLS forwarder**:
+  `::test_the_syslog_tls_forwarder_is_refused_when_it_checks_no_revocation`,
+  `::test_the_syslog_tls_forwarder_on_loopback_still_crosses`,
+  `::test_the_syslog_tls_forwarder_crosses_on_a_crl_that_really_loaded`,
+  `::test_a_verify_off_syslog_forwarder_takes_no_revocation_guard`,
+  `::test_a_syslog_forwarder_with_no_posture_is_unchanged`,
+  `::test_the_forwarder_refusal_names_a_lever_that_exists_for_it`.
+  **The not-refused arms are the load-bearing ones**, for the same reason AC-2's untouched baseline
+  is: a guard that refuses everything passes a refusal arm on its own, and the CRL arm is the only one
+  that proves the finished context reached the guard rather than a setting being read.
+
+  **AC-4 IS PARTIAL: TWO HOPS OF THE THREE. THE OIDC TOKEN AND JWKS LEGS ARE NOT BUILT.** The wording
+  above deliberately stopped enumerating the three hops, because a criterion that names a hop is read
+  as covering it, which is the SDS-3.6 defect this ADR was careful about elsewhere. What remains is
+  small and fully specified: `auth/oidc_http.py:build_idp_opener` builds the context both legs share,
+  so the guard belongs there with `context=` (its `[auth].oidc_tls_crl_file` must relax it), and the
+  posture has to be **threaded** rather than read ambiently because `AuthService` is constructed in
+  the API lifespan, outside the `active_hop_posture` scope — the position `auth/ldap.py` and
+  `store/postgres.py` are already in. `RevocationHopGuard.capture` now takes `posture=` and
+  `ways_across=` (added by #1498) so that hop needs no new mechanism, only its call. Guard the two
+  legs **separately**: they may be different hosts with different loopback status, so one guard keyed
+  on the token host alone would let an off-box JWKS cross.
+  *It was held out of #1498 for a coordination reason and not a technical one* — the caller change
+  lands in `auth/service.py`, which another session held at the time. Recorded plainly because a
+  dormant guard plus a caveat in an operator-facing security page is worse than an honest gap.
 - **AC-5** — THE SYSTEM SHALL NOT assert in code, docstring, error text or documentation that it
   performs certificate revocation checking on either graded direction, and any prose naming the
   shipped client-certificate CRL SHALL state that it is the peer's certificate on a terminating
-  listener → review gate; no test.
+  listener → review gate; no test. **Re-checked against the #1498 build:** each new guard's
+  `description` says the hop "performs no certificate revocation checking", which is the admission
+  every sibling makes rather than a claim, and the new `harden_verify_flags` call sites are commented
+  as strict validation and explicitly *not* revocation checking. No new prose asserts a check.
 
 ## 4. What this decides, hop by hop
 
@@ -373,11 +440,51 @@ lands on the not-PHI ALLOW arm and gets nothing.
 
 ### 4.3 NOT accepted — the build rider
 
+> **PARTLY BUILT 2026-09-22 under BACKLOG #1498, and this section's own premises moved under it. Read
+> the amendment below before quoting anything in the original text that follows it.** Two of the three
+> hops are now guarded — the SMART token endpoint and the syslog forwarder. **The OIDC token and JWKS
+> legs are NOT**, and AC-4 carries the recipe and the reason. **The rider's number is #1498, not a
+> fresh allocation** — the text below says to allocate one when the build starts, and it predates
+> #1498, which was filed to be this rider's tracking item.
+>
+> **Correction 1 — the SMART hop was withdrawn on a ground that does not reach it.** §1.3, §1.6 and §7
+> withdrew the SMART row because `transports/smart.py` contains **zero `ssl` usage**. That measurement
+> is TRUE and it was over-applied. It removes the file from the `harden_verify_flags` population,
+> which is what it was taken for; it does **not** remove the hop, because
+> `refuse_unrevoked_verified_hop` takes a **scheme and a url and never a context** — exactly for hops
+> that ride urllib's shared opener and build no context of their own, which is the whole HTTP family.
+> The hop is real and separately addressable: #1660 resolves this hop's trust anchor against
+> `token_url` precisely because *"the authorization server is frequently a different host from the
+> FHIR/REST endpoint"*, so the sibling guard on the REST/FHIR destination keys on a different host and
+> cannot answer for it. It is now guarded in `SmartBackendTokenProvider.__init__`, one statement,
+> beside the cleartext refusal already there.
+>
+> **Correction 2 — the `harden_verify_flags` half of this section is an ASSERTION, not a gap, and the
+> inference below does not follow.** The grep is right: the call was absent from `logging_setup.py`
+> and `auth/oidc_http.py`. The conclusion drawn from it is wrong. Measured 2026-09-22 on CPython
+> 3.14.6 / OpenSSL 3.5.7, two arms: `ssl.create_default_context()` sets `VERIFY_X509_STRICT`
+> **itself**, while a raw `ssl.SSLContext(...)` does **not**. Both unguarded hops build their context
+> through `create_default_context`, so both already had strict path validation; the seven control
+> files build raw contexts, where the call is load-bearing. The call #1498 added to the forwarder
+> makes the property explicit and survives a future switch to a raw context — it closed nothing, and
+> **this correction is the reason no such call was added to `auth/oidc_http.py`**, which would have
+> been pure churn in a file with no other change. Both arms are pinned at
+> `tests/test_hop_refusal_revocation.py::test_a_default_context_already_carries_the_strict_flag_a_raw_one_does_not`.
+>
+> **Correction 3 — "no signal at all" was already stale when this was ratified, and BACKLOG #299 is
+> why.** #299 limb A landed after this ADR was drafted and gave both remaining hops a real, opt-in,
+> in-engine CRL (`[auth].oidc_tls_crl_file`, `[logging].forward_tls_crl_file`), plus
+> `context_checks_revocation` and the guard's `crl_checked` relaxation. So the honest statement of the
+> gap at ratification was narrower than the one below: an operator had a way to close it and **nothing
+> asked them to**, which is what #1498 fixed. §1.3's *"Thirteen originating hops. None checks
+> revocation"* and §1.4's *"exactly three call sites, all `PROTOCOL_TLS_SERVER`"* are both false at
+> HEAD for the same reason — see the note in §1.4.
+
 The three hops at §1.6 get the same posture-keyed treatment their siblings already have. The helper
 exists and the call is one statement: `refuse_unrevoked_verified_hop(scheme, url, connector=,
 revocation_attested=)` at `transports/rest.py:656-679`, called in exactly that shape by five
 siblings (`fhir.py:370`, `dicomweb.py:261`, `rest.py:1347`, `soap.py:403`, and `email.py:239` via
-`RevocationHopGuard.capture`). **The unguarded hops also lack `harden_verify_flags`** -- measured at HEAD, it occurs zero times in `logging_setup.py`, `auth/oidc_http.py` and `transports/rest.py` alike, against a positive control of seven files that do carry it. (`transports/smart.py` was in this measured list and is REMOVED: it has no `ssl` usage at all, so it is not a member of the population -- see the withdrawal in §4.3.) An earlier draft of this ADR presented the omission as peculiar to syslog; it is not, and the corrected reading strengthens the rider rather than weakening it -- the gap spans the group.
+`RevocationHopGuard.capture`). **The unguarded hops also lack `harden_verify_flags`** -- measured at HEAD, it occurs zero times in `logging_setup.py`, `auth/oidc_http.py` and `transports/rest.py` alike, against a positive control of seven files that do carry it. *(Stale two ways as of 2026-09-22: `logging_setup.py` now carries the call, and **correction 2 above retracts the inference** -- these builders use `create_default_context`, which sets the flag itself. The control is also eight files now, not seven.)* (`transports/smart.py` was in this measured list and is REMOVED: it has no `ssl` usage at all, so it is not a member of the population -- see the withdrawal in §4.3.) An earlier draft of this ADR presented the omission as peculiar to syslog; it is not, and the corrected reading strengthens the rider rather than weakening it -- the gap spans the group.
 
 **Filed by subject, deliberately unallocated** (CLAUDE.md §"Never CITE a `#N` you have not
 allocated"): *revocation-guard parity for the SMART token endpoint, the OIDC token and JWKS legs, and
@@ -479,11 +586,21 @@ What a cell may take from here:
 - **Direction 1** is **runtime-blocked**, evidenced by the §1.2 probe with its positive controls, not
   by an absence of code.
 - **Direction 2** is a **delegated residual with an enforced construction-time refusal**, evidenced at
-  `config/tls_policy.py:963-973` and `:1040`, wired at the seven sites in §1.5 rider 1.
+  `config/tls_policy.py:963-973` and `:1040`, wired at **at least nine** sites (§1.5 rider 1; seven
+  until BACKLOG #1498). A cell citing this **must also carry the §1.4 correction**: direction 2 is no
+  longer *absent* in-engine, because BACKLOG #299 added an opt-in, default-off file CRL on originating
+  hops. *Delegated residual* remains the right grade for the **default** posture; *absent* is not.
 - **Direction 3** is **present and must not be counted toward either**, evidenced at
-  `config/tls_policy.py:215-276` with exactly three call sites, all on `PROTOCOL_TLS_SERVER` contexts.
-- **The unguarded-hop population is LARGER THAN TWO AND UNGRADED** -- corrected 2026-08-23. Two hops are confirmed and evidenced below. A third citation, `transports/smart.py:183-184`, is **WITHDRAWN: that file has no `ssl` usage at all** and cannot carry a guard. Separately, at least six further unguarded context constructions exist (`apiclient/client.py:214`, `store/postgres.py:729`, `rest.py:275`, `:296`, `soap.py:202`, `tls_policy.py:1218`) and **NONE of them has been graded** -- several are outbound client contexts where the answer may differ. **Do not scope this rider as a well-specified three-hop job.** The confirmed two are at
-  `auth/oidc_http.py:99-101`, `logging_setup.py:310`; the build rider is §4.3.
+  `config/tls_policy.py:215-276`. **Its "exactly three call sites, all `PROTOCOL_TLS_SERVER`" evidence
+  is stale** — seven at HEAD, four of them client contexts (§1.4). The three terminating sites that
+  make direction 3 what it is are unchanged and still mTLS-only; cite those three by symbol, and do
+  not cite the total.
+- **The unguarded-hop population is LARGER THAN TWO AND UNGRADED** -- corrected 2026-08-23. Two hops are confirmed and evidenced below. A third citation, `transports/smart.py:183-184`, is **WITHDRAWN as a `ssl`-usage citation: that file has no `ssl` usage at all.** *The clause that used to follow — "and cannot carry a guard" — is RETRACTED, 2026-09-22.* It does not follow from the measurement and it was wrong: `refuse_unrevoked_verified_hop` takes a scheme and a url, never a context, so a hop riding urllib's shared opener carries the guard exactly as the four HTTP-family cells do. That hop **is** guarded as of BACKLOG #1498 (§4.3, correction 1). What the zero-`ssl` measurement correctly establishes is only that the file is not in the `harden_verify_flags` population. Separately, at least six further unguarded context constructions exist (`apiclient/client.py:214`, `store/postgres.py:729`, `rest.py:275`, `:296`, `soap.py:202`, `tls_policy.py:1218`) and **NONE of them has been graded** -- several are outbound client contexts where the answer may differ. **Do not scope this rider as a well-specified three-hop job.** The confirmed two were at
+  `auth/oidc_http.py` and `logging_setup.py`; the build rider is §4.3.
+  **Of that confirmed pair, the syslog forwarder is now GUARDED (BACKLOG #1498) and the OIDC legs are
+  not** — so a cell citing this bullet must say *one confirmed hop remains ungraded-and-unguarded*,
+  not two. The six further ungraded constructions are untouched and still ungraded; #1498 graded none
+  of them.
 
 Anchor these to code, not to this ADR's line numbers. **This document is prose and will be edited;
 the code is the evidence.** Nothing in this section is scorecard content, and nothing from the
