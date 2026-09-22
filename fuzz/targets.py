@@ -29,18 +29,20 @@ these are "the accessors the inbound path actually touches". They are not, in bo
 later reader pruning the list by that reason would prune the wrong entries. Measured 2026-09-22
 against ``pipeline/wiring_runner.py``, ``transports/`` and ``api/``:
 
-* ``Peek.routing()`` and ``Peek.segments()`` are read **nowhere** in the engine -- zero hits across
-  those three packages, against 13 for ``control_id`` on the same instrument. The sweep drives them
-  anyway, and that is defensible: they are public surface on a pure library, so a contract break
-  there is a finding whether or not today's pipeline calls it.
+* ``Peek.routing()`` and ``Peek.segments()`` are read **nowhere in the message path** -- zero hits
+  across ``pipeline/``, ``transports/`` and ``api/``, against 13 for ``control_id`` on the same
+  instrument. (``segments()`` does have one caller elsewhere, ``generators/adt.py``, which is a test
+  generator and not the inbound path; the scope of the claim is the three packages named.) The
+  sweep drives them anyway, and that is defensible: they are public surface on a pure library, so a
+  contract break there is a finding whether or not today's pipeline calls it.
 * The pre-ACK path reads **more** than the eleven named properties: ``control_id``,
   ``message_type`` and ``summarize(peek)`` at the ingress commit, then ``build_ack``
   (``transports/mllp.py``) reads eight further accessors before the ACK frame goes out.
 * ``Peek.field()`` is the widest input-dependent surface of all -- ``summarize`` alone calls it up
-  to seven times, for ``PID-3.1``, ``PID-5.1``, ``PID-5.2``, ``ORC-2.1``, ``OBR-2.1``, ``OBR-3.1``
-  and ``ORC-3.1`` -- and **no target calls it directly.** The named properties reach it internally,
-  which is how the known finding surfaced at all; a direct ``field()`` target is the obvious next
-  addition and is deliberately not in this change.
+  to seven times, for ``PID-3.1``, ``PID-5.1``, ``PID-5.2`` and, on an ORM/ORU only, ``ORC-2.1``,
+  ``OBR-2.1``, ``OBR-3.1`` and ``ORC-3.1`` -- and **no target calls it directly.** The named
+  properties reach it internally, which is how the known finding surfaced at all; a direct
+  ``field()`` target is the obvious next addition and is deliberately not in this change.
 
 **PHI (CLAUDE.md section 9).** Seeds are the repository's committed synthetic samples plus small
 inline literals -- no new message-shaped files, and never real PHI. No target prints a body, and the
@@ -120,13 +122,19 @@ _MAGIC_ONLY_DICOM = b"\x00" * 128 + b"DICM"
 #: The HL7 routing properties this harness sweeps off a ``Peek``.
 #:
 #: **Not "every one is on the pre-ACK path", which is what this comment used to claim.** Measured
-#: 2026-09-22: six of the eleven are read pre-ACK by ``build_ack`` (``sending_app``,
-#: ``sending_facility``, ``receiving_app``, ``receiving_facility``, ``version``, ``control_id``) and
-#: ``message_type`` is read at the ingress commit. The three MSH-9 components -- ``message_code``,
-#: ``trigger_event``, ``message_structure`` -- are **unique to this sweep**, which is exactly why the
-#: loop earns its place: ``Peek.routing()`` independently reads eight of the eleven, so a fault
-#: injected on any of those eight would still be caught with this loop deleted. See the module
-#: docstring for the full accounting, including what the pre-ACK path reads that is NOT listed here.
+#: 2026-09-22: six are read pre-ACK by ``build_ack`` (``sending_app``, ``sending_facility``,
+#: ``receiving_app``, ``receiving_facility``, ``version``, ``control_id``), ``message_type`` is read
+#: at the ingress commit, and ``message_code`` is reached pre-ACK inside ``summarize`` (it selects
+#: the ORM/ORU branch). That leaves ``trigger_event``, ``message_structure`` and ``timestamp`` with
+#: no pre-ACK reader found.
+#:
+#: **"Unique to this sweep" is a separate question from "pre-ACK", and the two must not be read as
+#: one.** ``Peek.routing()`` independently reads eight of the eleven, so a fault injected on any of
+#: those eight is still caught with this loop deleted; only the three MSH-9 components --
+#: ``message_code``, ``trigger_event``, ``message_structure`` -- are reachable *solely* through this
+#: loop, which is what makes the loop earn its place and what the pinning test keys on. See the
+#: module docstring for the full accounting, including what the pre-ACK path reads that is NOT
+#: listed here.
 _HL7_ROUTING_PROPERTIES = (
     "message_code",
     "trigger_event",

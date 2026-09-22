@@ -81,11 +81,17 @@ def _refuse(message: str) -> Never:
 
     **A refusal is not a finding, and exit code 1 could not tell them apart.** Every refusal here
     predates any fuzzing: no target selected, an unknown name, a missing extra, or a work directory
-    that would write into the repository. ``.github/workflows/fuzz.yml`` reads the process status,
-    and on 1 it publishes "this parser broke its exception contract" -- so a failed ``[dicom]``
-    install, a renamed target or an OOM kill each announced a parser defect that did not exist. The
+    that the PHI fence rejected or that cannot be written. ``.github/workflows/fuzz.yml`` reads the
+    process status, and on 1 it publishes "this parser broke its exception contract" -- so a failed
+    ``[dicom]`` install or a renamed target announced a parser defect that did not exist. The
     distinct code lets the workflow separate "the harness could not run" from "the harness ran and
     found something", which are opposite instructions to whoever reads the log.
+
+    **It separates the refusals this module raises, and nothing else.** A crash the process does not
+    choose the status for -- an OOM kill at 137, a signal, an Atheris-internal abort -- still exits
+    non-zero without reaching here, and the workflow still buckets it as a finding. Narrowing that
+    would mean enumerating status codes the harness does not control, which trades one wrong bucket
+    for a more confident wrong bucket.
     """
     print(message, file=sys.stderr)
     raise SystemExit(REFUSAL_EXIT)
@@ -112,13 +118,20 @@ def main() -> None:
             f"fuzz target {target.name!r} needs the {target.requires_module!r} module, which is "
             f"not importable; install the matching extra or choose another target"
         )
+    # EVERY work-directory step is inside the guard, not just the path computation. Resolving the
+    # path, creating the artifacts directory and materialising the seeds are one operation from the
+    # caller's point of view -- "prepare somewhere to work" -- and all three happen before any input
+    # is fuzzed. Guarding only the first left an unwritable or full work directory raising OSError,
+    # exiting 1, and being published as a parser finding: the misreport this exit code exists to end.
     try:
         corpus, artifacts = work_paths(target)
+        artifacts.mkdir(parents=True, exist_ok=True)
+        written = write_seed_corpus(target, corpus)
     except HarnessRefusal as exc:
         # The PHI fence in `work_root`. Refusing is the control; see that function's docstring.
         _refuse(str(exc))
-    artifacts.mkdir(parents=True, exist_ok=True)
-    written = write_seed_corpus(target, corpus)
+    except OSError as exc:
+        _refuse(f"cannot prepare the fuzz work directory for {target.name!r}: {exc}")
     print(f"fuzzing {target.name}: {target.summary} ({written} seeds in {corpus})")
     atheris.Setup(libfuzzer_argv(sys.argv, corpus, artifacts), target.run)
     atheris.Fuzz()

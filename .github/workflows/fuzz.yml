@@ -12,6 +12,14 @@
 # `tests/test_security_posture.py::test_step_advisory_jobs_soften_only_their_named_step` pins three
 # things: no job-level flag, exactly that step carrying one, and the job's `name:` below.
 #
+# THE SAME ARGUMENT SPLIT THE VERDICT ACROSS TWO STEPS. A FINDING is budget-and-seed dependent, so
+# it belongs in the softened step. A REFUSAL is not: it means a target never executed, from a
+# missing extra, a renamed target, or a work directory the PHI fence rejected. Inside the softened
+# step that outcome was reported and then thrown away, so "the harness could not run" and "every
+# target survived" produced the same green check. The fuzz step now hands refusals to a second,
+# UNSOFTENED step that reds the job -- which stays advisory, because the job is not a required
+# context and nothing gates on it.
+#
 # THE `name:` IS PINNED BECAUSE THE THIRD GUARD WAS RENAME-FRAGILE. `_MUST_NOT_BE_REQUIRED` holds
 # free text and never resolves it against a real job, so renaming `name:` left that guard protecting
 # a dead string while this job's NEW context was free to be promoted into branch protection. Of ten
@@ -144,7 +152,34 @@ jobs:
           if [ -n "${findings}" ]; then
             echo "=== targets with findings:${findings} ==="
           fi
-          if [ -n "${refusals}" ] || [ -n "${findings}" ]; then
+          if [ -z "${refusals}" ] && [ -z "${findings}" ]; then
+            echo "=== every target survived its budget ==="
+          fi
+          # Handed to the next step rather than decided here. A refusal must be able to RED the job,
+          # and this step cannot red anything -- see that step's comment. Written as an env var the
+          # next step reads straight from the environment, so it needs no GitHub expression
+          # interpolation and zizmor's template-injection audit has nothing to screen. (Do not write
+          # an empty expression literal in a `run:` comment either: actionlint parses the run body
+          # for expressions and rejects one, which is how this line first failed the hook.)
+          echo "MEFOR_FUZZ_REFUSALS=${refusals}" >> "${GITHUB_ENV}"
+          if [ -n "${findings}" ]; then
             exit 1
           fi
-          echo "=== every target survived its budget ==="
+      - name: Fail if the harness never ran
+        # DELIBERATELY NOT SOFTENED, and it is the same argument the header makes against a job-level
+        # flag. The step above is advisory because a FINDING is a function of the time budget and the
+        # random seed. A REFUSAL is not: it means a target never executed -- a missing extra, a
+        # renamed target, or a work directory the PHI fence rejected. Left inside the softened step
+        # that outcome was reported and then discarded, so "the harness could not run" and "every
+        # target survived" produced the same green check, which is the confusion this whole harness
+        # exists to remove.
+        run: |
+          set -euo pipefail
+          # Defaulted: if the step above died before writing the variable, treat that as nothing to
+          # report here rather than as an unbound-variable crash under `set -u`. That step's own
+          # failure is what reports it.
+          if [ -n "${MEFOR_FUZZ_REFUSALS:-}" ]; then
+            echo "::error title=Fuzz harness refused::these targets never ran:${MEFOR_FUZZ_REFUSALS}. This is a harness or environment fault, not a parser finding. See the previous step's log."
+            exit 1
+          fi
+          echo "the harness ran every target it was asked to"
