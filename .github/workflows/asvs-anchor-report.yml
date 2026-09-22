@@ -28,9 +28,21 @@ name: ASVS anchor report
 # and this file does not create them. Read that workflow's decision block before proposing to.
 #
 # The consequence is stated rather than papered over: with no input configured the `report` job below
-# is SKIPPED, and the anchors on the record are read by the vault's own daily `asvs-scorecard.yml`
-# cron rather than at engine-merge time. Wiring it here while adoption is zero is the first half of a
-# two-step -- the same posture, for the same reason, as the prove-absences `prove` job.
+# is SKIPPED, so any reading of the anchors has to happen on the RECORD's side rather than at
+# engine-merge time. That is where the decision puts it -- the scorecard is in the vault, and the
+# paragraph above is why a credential to reach it from here does not exist -- and the vault's
+# `asvs-scorecard.yml` is the workflow the decision placed it in.
+#
+# WHETHER THAT READING IS ACTUALLY RUNNING IS THE VAULT'S STATE, which this repository cannot see and
+# must not assert on its behalf. Two things that look like the answer are not: a DISABLED workflow
+# keeps its `schedule:` and fires nothing, so the vault's trigger block records what was CONFIGURED
+# rather than what runs; and ENABLED proves only that a cron MAY fire, since a schedule fires from
+# the default branch alone and scheduled runs are dropped under load. The instrument is that
+# workflow's RUN HISTORY, filtered to schedule events (SDS-3.8). Check it before treating this gap
+# as covered.
+#
+# Wiring the `report` job here while adoption is zero is the first half of a two-step -- the same
+# posture, for the same reason, as the prove-absences `prove` job.
 #
 # WHY A JOB-LEVEL `if:` AND NOT A SECOND `paths:` FILTER. The two fail differently:
 #     workflow paths: filter  -> no check reported at all -> ABSENCE, which reads as success
