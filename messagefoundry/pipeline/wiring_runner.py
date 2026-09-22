@@ -3924,7 +3924,14 @@ class RegistryRunner:
             # answer; the guard is stated rather than re-tested here because no reachable path brings
             # one.
             self._worker_owned[name] = False
-            if name in self._outbound_paused:
+            if name not in self._outbound_paused:
+                # RE-ARM IT, or the message below repeats the old one's mistake in a new place. A lane
+                # the dispatcher left STOPPED stays halted on `_pooled_lane_provider` membership alone:
+                # `mark_ready` only REMEMBERS a STOPPED lane (T7) and the sweep deliberately leaves one
+                # alone, so `notify_work` is the documented re-arm. It SKIPS a PAUSED lane, which is
+                # why this is the not-paused arm rather than an unconditional call.
+                out.notify_work()
+            else:
                 # …and replay the pause onto the dispatcher, which was never told about it. A lane
                 # parked or stopped WHILE worker-owned takes the per_lane arm of `_park_outbound_lane`
                 # / `_stop_outbound_unsafe` (both gate on `_per_lane_delivery`), so they gated the
