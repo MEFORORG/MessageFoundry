@@ -5384,9 +5384,10 @@ def _restore(args: argparse.Namespace) -> int:
         return _emit_error(str(exc), as_json=args.json)
 
     try:
-        # allow_unencrypted is deliberately NOT passed: the downgrade guard (a plaintext archive on a
-        # box that has a store key) stays at its strictest on the one path that writes bytes to disk,
-        # matching `restore-verify` and DR activation.
+        # `run_restore` carries no `allow_unencrypted` knob at all (unlike `run_restore_verify`): the
+        # downgrade guard (a plaintext archive on a box that has a store key) stays at its strictest on
+        # the one path that writes bytes to disk. It used to carry one this call withheld, and the
+        # refusal then prescribed a setting this path never read.
         result = asyncio.run(
             run_restore(
                 args.archive,

@@ -15,9 +15,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import errno
+import inspect
+import io
 import json
 import os
 import shutil
+import tarfile
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -622,23 +627,233 @@ def test_restore_config_bundle_never_overwrites_an_existing_file(tmp_path, key_b
 
 def test_restore_config_to_refuses_when_archive_has_no_config(tmp_path, key_b64, capsys) -> None:
     # OPEN QUESTION, decided as a REFUSAL: an operator who asked for the config back and silently got
-    # an empty directory would believe the config was restored. The store is still restored -- the
-    # refusal names the missing bundle -- so this asserts the error, not a rollback of the store.
+    # an empty directory would believe the config was restored.
+    #
+    # This test used to say "the store is still restored" and assert only the error. That WAS the
+    # behaviour and it was the defect: the config bundle is written after the store, so every way it
+    # can fail left a reported failure beside a published PHI-bearing store -- and the retry then met
+    # the never-overwrite refusal, leaving a manual delete as the only way forward. The rollback
+    # assertion and the retry below are the pin; this is the cheapest reachable arm that gets past
+    # `_place_restored_store` and then fails.
     archive, toml = _make_archive(tmp_path, key_b64, capsys, config=False)
-    rc = main(
-        [
-            "restore",
-            archive,
-            "--to",
-            str(tmp_path / "restored.db"),
-            "--config-to",
-            str(tmp_path / "restored-config"),
-            "--service-config",
-            toml,
-        ]
-    )
-    assert rc == 1
+    dest = tmp_path / "restored.db"
+    config_dest = tmp_path / "restored-config"
+    argv = [
+        "restore",
+        archive,
+        "--to",
+        str(dest),
+        "--config-to",
+        str(config_dest),
+        "--service-config",
+        toml,
+    ]
+    assert main(argv) == 1
     assert "no config bundle" in _refusal(capsys)
+    assert not dest.exists(), "a failed restore left the store it had already published"
+    for sidecar in ("-wal", "-shm"):
+        assert not dest.with_name(dest.name + sidecar).exists()
+
+    # The payoff, and the half an existence assertion alone would miss: the SAME command now runs
+    # again. Before the rollback it met the never-overwrite refusal on the store it had just left.
+    assert main(argv) == 1
+    assert "no config bundle" in _refusal(capsys)
+
+
+def _restore_argv(archive: str, toml: str, dest: Path, config_dest: Path) -> list[str]:
+    return [
+        "restore",
+        archive,
+        "--to",
+        str(dest),
+        "--config-to",
+        str(config_dest),
+        "--service-config",
+        toml,
+    ]
+
+
+def test_restore_rollback_removes_the_partial_config_bundle_too(tmp_path, key_b64, capsys) -> None:
+    # The other half of the rollback: files the bundle DID write before it failed. The member-count
+    # cap is the cheapest lever that fails PART-WAY THROUGH rather than before the first write, so
+    # one member lands and the next refuses.
+    archive, toml = _make_archive(tmp_path, key_b64, capsys)
+    dest = tmp_path / "restored" / "msg.db"
+    config_dest = tmp_path / "bundle"
+    argv = _restore_argv(archive, toml, dest, config_dest)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(dr_backup, "_MAX_CONFIG_MEMBERS", 1)
+        assert main(argv) == 1
+    assert "member-count cap" in _refusal(capsys)
+    assert not dest.exists(), "the published store survived a mid-bundle failure"
+    # The directory is kept (a retry re-creates or reuses it); what it held must be gone.
+    assert config_dest.is_dir()
+    assert not any(config_dest.iterdir()), (
+        "a partially written config bundle survived, which blocks the retry's empty-dir check"
+    )
+    # The control: with the shipped cap the SAME command restores, so the rollback left a destination
+    # the retry can use. Without this arm a rollback that deleted too much would pass the asserts above.
+    assert main(argv) == 0
+    assert dest.is_file() and any(config_dest.iterdir())
+
+
+def test_restore_rollback_in_the_one_directory_form_never_reaches_the_staging_dir(
+    tmp_path, key_b64, capsys
+) -> None:
+    # `--to D/msg.db --config-to D` is the one-directory form `_refuse_colliding_config_members`
+    # defends by name, and it puts the STAGING directory (`D/mefor-restore-*`) inside `--config-to`.
+    # A rollback that empties `--config-to` on the strength of the emptiness check -- which ran
+    # before the staging directory existed -- deletes the live staging directory out from under the
+    # restore. The rollback must therefore run only after the staging directory is gone, and must
+    # delete only what the restore recorded writing. Both are observed AT THE CALL, through a spy,
+    # because the end state alone cannot tell the two designs apart: `TemporaryDirectory` tolerates
+    # its directory having been removed from under it, so the wrong design leaves the same tree.
+    archive, toml = _make_archive(tmp_path, key_b64, capsys)
+    d = tmp_path / "dr"
+    dest = d / "msg.db"
+    argv = _restore_argv(archive, toml, dest, d)
+    calls: list[tuple[list[str], list[Path]]] = []
+    real_discard = dr_backup._discard_partial_restore
+
+    def spy(dest_store_path: Path, written: list[Path]) -> None:
+        calls.append((sorted(p.name for p in d.iterdir()), list(written)))
+        real_discard(dest_store_path, written)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(dr_backup, "_MAX_CONFIG_MEMBERS", 1)
+        mp.setattr(dr_backup, "_discard_partial_restore", spy)
+        assert main(argv) == 1
+    assert "member-count cap" in _refusal(capsys)
+
+    # Exactly one rollback, and when it ran the staging directory no longer existed: the cleanup runs
+    # AFTER `TemporaryDirectory` has unlinked it, so it could not have been the thing that removed it.
+    assert len(calls) == 1, calls
+    names_at_call, ledger = calls[0]
+    assert not any(n.startswith("mefor-restore-") for n in names_at_call), names_at_call
+    # The ledger names only paths under `--config-to` that the bundle created -- one member landed
+    # before the cap -- and never the staging directory or the store.
+    assert ledger and all(p.is_relative_to(d.resolve()) for p in ledger), ledger
+    assert not any(p.name.startswith("mefor-restore-") for p in ledger), ledger
+    assert dest.resolve() not in ledger
+
+    # End state: the directory is back to empty, with no staging leftover and no store.
+    assert d.is_dir() and not any(d.iterdir()), sorted(p.name for p in d.iterdir())
+    # And the control: the same command, with the shipped cap, restores into that directory.
+    assert main(argv) == 0
+    assert dest.is_file() and (d / "feed.py").is_file()
+
+
+def test_discard_partial_restore_removes_only_the_recorded_paths(tmp_path) -> None:
+    # The unit contract under the two tests above, with the counter-case they cannot plant: a
+    # BYSTANDER in the same directory that the restore did not record. The one-directory form makes
+    # the staging directory exactly such a bystander, so it is shaped like one here.
+    d = tmp_path / "dr"
+    store = d / "msg.db"
+    recorded_dir = d / "codesets"
+    recorded_file = recorded_dir / "sex.csv"
+    top_file = d / "feed.py"
+    shared_dir = d / "shared"
+    shared_recorded = shared_dir / "ours.toml"
+    stranger_in_shared = shared_dir / "theirs.toml"
+    bystander_dir = d / "mefor-restore-bystander"
+    bystander_file = bystander_dir / "archive.tar"
+    for path in (
+        store,
+        recorded_file,
+        top_file,
+        shared_recorded,
+        stranger_in_shared,
+        bystander_file,
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x")
+    ledger = [top_file, recorded_dir, recorded_file, shared_dir, shared_recorded]
+
+    dr_backup._discard_partial_restore(store, ledger)
+
+    gone = [
+        p for p in (store, top_file, recorded_file, recorded_dir, shared_recorded) if not p.exists()
+    ]
+    assert len(gone) == 5, f"recorded paths that survived: {[p for p in ledger if p.exists()]}"
+    # Kept: the bystander directory and its file, the stranger's file, and the directory holding it
+    # (recorded, but no longer empty -- so it is not this restore's to remove), and the root itself.
+    assert bystander_file.is_file() and bystander_dir.is_dir()
+    assert stranger_in_shared.is_file() and shared_dir.is_dir()
+    assert d.is_dir()
+    assert sorted(p.name for p in d.iterdir()) == ["mefor-restore-bystander", "shared"]
+
+
+_REAL_TEMPORARY_DIRECTORY = tempfile.TemporaryDirectory
+
+
+class _StagingWhoseTeardownFails:
+    """The restore's staging directory, with the teardown that fails on Windows whenever a scanner or
+    the indexer still holds the just-extracted store open: the directory is created and handed out as
+    usual, and on exit its removal raises ``PermissionError`` and leaves it behind, exactly as a real
+    ``TemporaryDirectory`` does when ``rmtree`` cannot delete an open file. Holding a handle would
+    reproduce that on Windows alone; raising from the exit reproduces it everywhere."""
+
+    def __init__(self, *, prefix: str, dir: Path) -> None:
+        self.name = tempfile.mkdtemp(prefix=prefix, dir=dir)
+
+    def __enter__(self) -> str:
+        return self.name
+
+    def __exit__(self, *exc: object) -> None:
+        raise PermissionError(errno.EACCES, "another process holds a file in it open", self.name)
+
+
+def _staging_that_cannot_be_removed(*args, **kwargs):
+    """Intercept the RESTORE's staging directory only, by its prefix; every other caller (the backup
+    that builds the fixture archive stages under ``mefor-backup-``) gets the real class."""
+    if kwargs.get("prefix") == "mefor-restore-":
+        return _StagingWhoseTeardownFails(**kwargs)
+    return _REAL_TEMPORARY_DIRECTORY(*args, **kwargs)
+
+
+def test_restore_keeps_a_whole_restore_when_its_staging_teardown_fails(
+    tmp_path, key_b64, capsys
+) -> None:
+    # The regression the rollback brought in. `completed` flipped AFTER the staging block closed, so
+    # the one thing between "config bundle written" and "completed" was the staging directory's own
+    # teardown -- and when that raised, the rollback read a whole restore as a failed one and deleted
+    # the placed, verified store. Before the rollback existed the same event left the store in place.
+    # The operator was then left with no store, no bundle, a traceback instead of a refusal line (an
+    # OSError, which the CLI does not translate), and the plaintext staging directory still on disk,
+    # because the thing that failed was its remover.
+    archive, toml = _make_archive(tmp_path, key_b64, capsys)
+    dest = tmp_path / "restored" / "msg.db"
+    config_dest = tmp_path / "bundle"
+    rollbacks: list[list[Path]] = []
+    real_discard = dr_backup._discard_partial_restore
+
+    def spy(dest_store_path: Path, written: list[Path]) -> None:
+        rollbacks.append(list(written))
+        real_discard(dest_store_path, written)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(tempfile, "TemporaryDirectory", _staging_that_cannot_be_removed)
+        mp.setattr(dr_backup, "_discard_partial_restore", spy)
+        rc = main(_restore_argv(archive, toml, dest, config_dest))
+    # Reported, as a refusal line and not a traceback, under a kind that does not say the restore
+    # failed -- because it did not.
+    assert rc == 1
+    err = _refusal(capsys)
+    assert "restore failed (cleanup)" in err and "staging directory" in err, err
+    # The restore is whole, and no rollback ran. Two detectors on one event: the spy records a
+    # rollback whether or not it deleted anything, and the file check catches one the spy missed.
+    assert dest.is_file() and (config_dest / "feed.py").is_file()
+    assert rollbacks == [], "a whole restore was rolled back over its staging teardown"
+    # The leftover is named, so the operator can find and remove it. It survived because the thing
+    # that failed was its remover, and it still holds the decrypted store.
+    leftovers = [p for p in dest.parent.iterdir() if p.name.startswith("mefor-restore-")]
+    assert len(leftovers) == 1, sorted(p.name for p in dest.parent.iterdir())
+    assert leftovers[0].name in err and str(dest) in err, err
+    assert (leftovers[0] / "extracted_store.db").is_file()
+    # And the retry is refused for the RIGHT reason now: the destination holds a good store.
+    assert main(_restore_argv(archive, toml, dest, config_dest)) == 1
+    assert "restore failed (destination)" in _refusal(capsys)
+    assert dest.is_file()
 
 
 # --- (5) config-only archive has no store to restore -------------------------
@@ -672,6 +887,192 @@ def test_restore_refuses_config_only_archive(tmp_path, key_b64, capsys) -> None:
     assert rc == 1
     assert "CONFIG-ONLY" in _refusal(capsys)
     assert not dest.exists()
+
+
+# --- (5b) a corrupt or forged archive refuses, it does not traceback ----------
+
+
+_DIRECTORY_MEMBER = object()  # a tar member that is a directory wearing the given name
+
+
+def _plain_tar(path: Path, members: list[tuple[str, bytes | object]]) -> Path:
+    """An uncompressed tar carrying exactly ``members``, in order -- the plaintext shape
+    ``_restore_blocking`` consumes on a no-key box, and the one a forged archive would have. A body
+    of ``_DIRECTORY_MEMBER`` adds a directory under that name instead of a file."""
+    with tarfile.open(path, "w") as tar:
+        for name, body in members:
+            info = tarfile.TarInfo(name)
+            if body is _DIRECTORY_MEMBER:
+                info.type = tarfile.DIRTYPE
+                tar.addfile(info)
+                continue
+            assert isinstance(body, bytes)
+            info.size = len(body)
+            tar.addfile(info, io.BytesIO(body))
+    return path
+
+
+def _archive_with_manifest(tmp_path: Path, payload: bytes | object | None) -> Path:
+    """A plaintext archive whose manifest is ``payload``: absent when ``None``, a directory member
+    when ``_DIRECTORY_MEMBER``, else exactly those bytes. The store member is always present, so the
+    manifest is the only thing wrong with the archive."""
+    members: list[tuple[str, bytes | object]] = []
+    if payload is not None:
+        members.append((dr_backup._MANIFEST_MEMBER, payload))
+    members.append(("store.db", b"SQLite format 3\x00"))
+    return _plain_tar(tmp_path / "manifest-case.tar", members)
+
+
+# Every shape of manifest that is not one, each labelled by the limb it exercises. Absent is the
+# `KeyError` limb; the next two are the two `ValueError`s `json.loads` raises -- a `JSONDecodeError`
+# on bytes that decode and then fail to parse, and a `UnicodeDecodeError` on bytes that fail to
+# DECODE one step earlier, which is a `ValueError` but NOT a `JSONDecodeError` (so a guard naming
+# only the latter let it through; an all-ASCII body can never reach that limb). The last three are
+# the shapes that used to fold to `{}` and RESTORE with no manifest check at all, while an absent
+# manifest refused: valid JSON that is not an object, and a directory wearing the member's name.
+_UNUSABLE_MANIFESTS = [
+    ("absent", None),
+    ("not json", b"{not json at all"),
+    ("not utf-8", b"{\xff"),
+    ("a list", b"[]"),
+    ("null", b"null"),
+    ("a directory", _DIRECTORY_MEMBER),
+]
+
+
+def test_restore_refuses_an_archive_with_no_manifest(tmp_path, capsys) -> None:
+    # `_read_manifest_from_tar` used to raise KeyError when the manifest member was absent, and at
+    # this call site nothing caught it, so it escaped the CLI's BackupError handler as a traceback
+    # from the last-resort excepthook while every other archive fault on this path refuses cleanly.
+    # Driven through the CLI so the observable IS the refusal (rc 1 and a reason on stderr) rather
+    # than an exception type a caller might or might not translate. The reason names the member, so
+    # an operator reading the line knows what the archive lacks.
+    tar = _archive_with_manifest(tmp_path, None)
+    toml = _service_toml(tmp_path, key_b64=None)
+    dest = tmp_path / "out" / "msg.db"
+    assert main(["restore", str(tar), "--to", str(dest), "--service-config", toml]) == 1
+    err = _refusal(capsys)
+    assert "restore failed (restore)" in err and "no manifest.json member" in err
+    assert not dest.exists()
+
+
+@pytest.mark.parametrize(("label", "payload"), _UNUSABLE_MANIFESTS)
+def test_restore_refuses_an_archive_whose_manifest_is_unusable(
+    tmp_path, capsys, label, payload
+) -> None:
+    tar = _archive_with_manifest(tmp_path, payload)
+    toml = _service_toml(tmp_path, key_b64=None)
+    dest = tmp_path / "out" / "msg.db"
+    assert main(["restore", str(tar), "--to", str(dest), "--service-config", toml]) == 1, label
+    err = _refusal(capsys)
+    assert "restore failed (restore)" in err and "manifest could not be read" in err, (label, err)
+    assert not dest.exists()
+
+
+@pytest.mark.parametrize(("label", "payload"), _UNUSABLE_MANIFESTS)
+def test_restore_verify_fails_an_archive_whose_manifest_is_unusable(
+    tmp_path, capsys, label, payload
+) -> None:
+    # The SAME archives through `restore-verify`, which is the command the runbook tells an operator
+    # to run FIRST to triage. The translation for these shapes used to live at the restore call site
+    # alone, so `restore` refused a forged manifest-less archive cleanly while `restore-verify` on the
+    # identical file raised a traceback (`_verify_archive_blocking` caught neither the KeyError nor
+    # the ValueError, and the CLI calls it outside any try). Normalised inside
+    # `_read_manifest_from_tar`, both commands now see one `TarError` and both refuse: here as a
+    # FAIL verdict with a reason that names the manifest, on the same stream a good verify reports on.
+    tar = _archive_with_manifest(tmp_path, payload)
+    toml = _service_toml(tmp_path, key_b64=None)
+    assert main(["restore-verify", str(tar), "--service-config", toml, "--json"]) == 1, label
+    verdict = _json_line(capsys.readouterr().out)
+    assert verdict["status"] == "FAIL", (label, verdict)
+    assert "manifest.json" in verdict["reason"], (label, verdict)
+
+
+def test_restore_refuses_a_config_member_landing_on_a_directory(tmp_path) -> None:
+    # The mirror image of the parent-mkdir collision the extractor already refuses. A forged archive
+    # carrying `config/a/b` and then `config/a` asks the exclusive create to make a FILE where the
+    # first member just made a DIRECTORY. Windows reports that as EACCES, not EEXIST, so the
+    # FileExistsError arm written to refuse exactly this collision did not catch it and it escaped as
+    # a traceback.
+    tar = _plain_tar(
+        tmp_path / "collide.tar",
+        [("config/a/b", b"inner"), ("config/a", b"outer")],
+    )
+    cfg = tmp_path / "bundle"
+    with pytest.raises(dr_backup.BackupError) as excinfo:
+        dr_backup._restore_config_members(tar, cfg)
+    assert excinfo.value.kind == "restore"
+    assert str(cfg / "a") in str(excinfo.value)
+
+
+def test_restore_caps_the_plaintext_staging_copy(tmp_path, capsys) -> None:
+    # The plaintext limb had no cap under a constant whose own rationale said it "moves the bound to
+    # the first write". It is the limb that needs the bound MOST: there is no AEAD tag to fail on, so
+    # a forged archive is simply copied onto the destination volume. The cap is lowered rather than a
+    # multi-GiB file written; the bound under test is the counting, not the number.
+    archive, toml = _make_archive(tmp_path, None, capsys)  # keyless box -> a plaintext .mfbak.plain
+    dest = tmp_path / "restored" / "msg.db"
+    argv = ["restore", archive, "--to", str(dest), "--service-config", toml]
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(dr_backup, "_MAX_RESTORE_PLAINTEXT_BYTES", 64)
+        assert main(argv) == 1
+    err = _refusal(capsys)
+    assert "restore failed (verify)" in err and "exceeds the restore staging cap" in err
+    assert not dest.exists()
+
+    # The control: the same archive, the same command, the shipped cap -- it must RESTORE. Without
+    # this the test above would pass against a path that refuses everything.
+    assert main(argv) == 0
+    assert dest.is_file()
+
+
+def test_restore_downgrade_refusal_does_not_prescribe_a_setting_it_ignores(
+    tmp_path, key_b64, capsys
+) -> None:
+    # A plaintext archive on a box that HAS a store key is a downgrade signal and is refused. The
+    # refusal used to end "Set [backup].allow_unencrypted to accept it." -- and `run_restore` never
+    # read that setting: its parameter existed, the CLI documented in a comment that it withheld it on
+    # purpose, and nothing else called it. So the remedy named a knob an operator could set and watch
+    # do nothing. The parameter is gone and the message now says the true thing.
+    plain, _keyless_toml = _make_archive(tmp_path, None, capsys)  # a plaintext archive...
+    keyed_toml = _service_toml(tmp_path, key_b64=key_b64, name="keyed.toml")  # ...on a keyed box
+    dest = tmp_path / "restored" / "msg.db"
+    assert main(["restore", plain, "--to", str(dest), "--service-config", keyed_toml]) == 1
+    message = _refusal(capsys)
+    assert "KEY_MISMATCH" in message and "possible downgrade" in message
+    assert "allow_unencrypted" not in message
+    assert not dest.exists()
+    assert "allow_unencrypted" not in inspect.signature(dr_backup.run_restore).parameters
+
+
+def test_restore_secures_every_staged_file_before_its_first_byte(tmp_path, key_b64, capsys) -> None:
+    # The staging directory sits on the DESTINATION volume, where `TemporaryDirectory` inherits the
+    # parent's ACL on Windows, and the files staged in it are the whole decrypted archive and the
+    # whole store. Locking each to its owner AFTER its write completes leaves a multi-GB write of PHI
+    # under the inherited ACL for as long as the write takes; the contract is that the lock lands on
+    # the EMPTY file. The spy records each file's size at the moment it is secured, which is the
+    # observable that separates "secured" from "secured in time".
+    archive, toml = _make_archive(tmp_path, key_b64, capsys)
+    dest = tmp_path / "restored" / "msg.db"
+    config_dest = tmp_path / "bundle"
+    seen: list[tuple[str, int]] = []
+
+    def spy(path: Path, **_kw: object) -> None:
+        seen.append((path.name, path.stat().st_size))
+
+    from messagefoundry.store import store as store_module
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(store_module, "_secure_file", spy)
+        assert main(_restore_argv(archive, toml, dest, config_dest)) == 0
+    # The control that the spy did not break the path: a real store and a real bundle landed.
+    assert dest.is_file() and (config_dest / "feed.py").is_file()
+
+    secured_empty = sorted(name for name, size in seen if size == 0)
+    # Both staged files and both config members, each at size 0 -- four sightings, no more.
+    assert secured_empty == ["archive.tar", "extracted_store.db", "feed.py", "sex.csv"], seen
+    # The published store is secured too (by `_place_restored_store`, on the full file it links).
+    assert any(name == "msg.db" and size > 0 for name, size in seen), seen
 
 
 # --- (6) PHI-safe stdout, JSON and human -------------------------------------
