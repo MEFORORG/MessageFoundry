@@ -773,11 +773,6 @@ _GRANDFATHERED: frozenset[tuple[str, str, str]] = frozenset(
             "mutation",
             "Mutation-test a bounded scope (advisory - never fails)",
         ),
-        (
-            "release.yml",
-            "release",
-            "Score the SBOM quality (sbomqs — advisory, never blocks a release)",
-        ),
         ("release.yml", "release", "Smoke-check the built wheel (clean venv → import + version)"),
         (
             "release.yml",

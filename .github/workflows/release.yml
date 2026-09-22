@@ -4,10 +4,31 @@
 # Cut a release:  git tag v0.1.0 && git push origin v0.1.0   (on a commit that already passed CI on main).
 # Dry-run:        run this workflow manually (workflow_dispatch) — it builds + SBOMs + signs and uploads
 #                 the artifacts for inspection. It does NOT create a GitHub release and does NOT publish
-#                 to PyPI (both are gated on a tag push), so the dry-run validates build/SBOM/sign/upload
-#                 ONLY — the publish step never runs on a branch ref. The first live PyPI publish is the
-#                 first real tag; validate it with a `vX.Y.Z-rc1` pre-release tag (also matched below)
-#                 once Trusted Publishing is configured.
+#                 to PyPI, so the dry-run validates build/SBOM/sign/upload ONLY. The first live PyPI
+#                 publish is the first real tag; validate it with a `vX.Y.Z-rc1` pre-release tag (also
+#                 matched below) once Trusted Publishing is configured.
+#
+#                 EVERY STEP THAT PUBLISHES A RELEASE ARTIFACT TESTS THE EVENT AS WELL AS THE REF —
+#                 `github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')` (BACKLOG
+#                 #1584). A ref test ALONE does not keep the dry-run promise above:
+#                 `workflow_dispatch` accepts any ref this workflow is present on, a TAG included,
+#                 and on such a run `github.ref` IS `refs/tags/...`. So a manual dispatch picked
+#                 against a tag would satisfy a ref-only guard and publish to PyPI — which is what
+#                 "run it manually to dry-run it" invites an operator to do. Reading the old guard as
+#                 "a branch ref isn't `refs/tags/...`" is what hid this: a true sentence about the
+#                 wrong half of the trigger. The steps carrying the pair are at least the three PyPI
+#                 publishes and the three GitHub-release mutations; the COUNT is pinned in
+#                 tests/test_release_pipeline.py, which is its one authority — do not restate a
+#                 number here that nothing keeps in sync with that test.
+#
+#                 THE DRY-RUN IS NOT SILENT, AND THE SENTENCE ABOVE IS DELIBERATELY NARROWER THAN
+#                 "every mutating step". Two steps below write to public, append-only sinks on a
+#                 dispatch and carry NEITHER half of that pair: `python -m sigstore sign` is
+#                 unconditional and, being keyless, appends an entry to the public Rekor transparency
+#                 log; `actions/attest-build-provenance` is gated on `!github.event.repository.private`
+#                 alone. Both predate #1584 — a dispatch against a BRANCH already reached them — and
+#                 both are filed as BACKLOG #1805. The promise this file keeps today is that a manual
+#                 run publishes no release ARTIFACT, not that it writes nothing public.
 #
 # PyPI publish uses Trusted Publishing (OIDC) — no API token. OWNER PREREQ (one-time, before the first
 # tag): claim the `messagefoundry` PyPI project + configure a Trusted Publisher (a PENDING publisher works
@@ -446,14 +467,46 @@ jobs:
         continue-on-error: true
         run: |
           # Machine-score the SBOM (0-10) and print the NTIA-minimum-elements breakdown, so a regression in
-          # SBOM completeness is visible in the release log. Advisory — SBOM quality is a signal, not a gate.
-          # Pinned + checksum-verified against the release's own goreleaser checksums.txt. ADR 0149.
+          # SBOM completeness is visible in the release log. Advisory — SBOM quality is a signal, not a
+          # gate. ADR 0149.
+          #
+          # PINNED IN-REPO, not against the asset's own checksums.txt (BACKLOG #1698). The security.yml
+          # twin still verifies same-origin and that is adequate THERE. It is not adequate here, and the
+          # difference is the job, not the tool: this step runs inside `id-token: write` — the identity
+          # that Sigstore-signs the artifacts and publishes to PyPI a few steps below — and it runs
+          # BEFORE the signing step, so anything that executes here executes next to the credential that
+          # vouches for the release. A backdoored sbomqs at this point is in position before every
+          # control standing after it.
+          #
+          # A checksums.txt fetched from the SAME origin as the asset is signed by nothing and moves
+          # with it: whoever can replace the tarball can replace the line attesting it, so that check
+          # establishes the bytes are self-consistent, never that they are the bytes anyone reviewed.
+          # The literal below was recorded at review time and can only change in a reviewed commit, so
+          # a re-tagged, re-uploaded or substituted asset fails here rather than running beside the key.
+          #
+          # BUMPING: change VER and SBOMQS_SHA256 in the same commit, and take the new digest from BOTH
+          # checksums.txt and GitHub's server-side asset digest (the releases API `digest` field). Two
+          # independent routes agreeing is what makes the literal evidence instead of a copied line;
+          # this one was established that way on 2026-09-18.
+          #
+          # `set -o pipefail` IS READ BY A TEST, though it guards nothing at run time TODAY.
+          # tests/test_workflow_pipefail_screen.py no longer grandfathers this step, so deleting
+          # the line makes that screen report the `echo` pipe below as a new finding.
+          # At run time the one pipeline left is `echo … | sha256sum -c -`, and its first element
+          # cannot fail. The line stays so the next edit that adds a pipe here inherits it.
+          # The DELETED `grep " ${asset}$" sbomqs-checksums.txt | sha256sum -c -` was a latent
+          # hazard, not a live one. security.yml's "Install gitleaks (pinned + checksum-verified)"
+          # step records why that shape fails safe. security.yml's sbomqs twin still runs it with
+          # no pipefail, in the same latent state; that file is not in this change's scope.
+          set -o pipefail
           VER=2.0.11
+          SBOMQS_SHA256=14fd58b89d4948265cce0fdb95d9b635ff667f352b5a9a05b3d13dbefa5d0195
           asset="sbomqs_${VER}_Linux_x86_64.tar.gz"
           base="https://github.com/interlynk-io/sbomqs/releases/download/v${VER}"
           curl -sSfL "${base}/${asset}" -o "${asset}"
-          curl -sSfL "${base}/checksums.txt" -o sbomqs-checksums.txt
-          grep " ${asset}$" sbomqs-checksums.txt | sha256sum -c -
+          # Verify BY the canonical asset name: sha256sum -c reads "<digest>  <filename>" and checks
+          # that file, so the name must match what curl wrote.
+          echo "${SBOMQS_SHA256}  ${asset}" | sha256sum -c -
           tar -xzf "${asset}" sbomqs
           sudo install -m 0755 sbomqs /usr/local/bin/sbomqs
           sbomqs score -b messagefoundry-sbom.cdx.json
@@ -531,7 +584,7 @@ jobs:
       # leave a failure here with an un-retryable PyPI version and no release. The defect was never the
       # ordering — it was that the reversible half could not be repeated.
       - name: Create or update the GitHub release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -609,15 +662,16 @@ jobs:
 
       # LAST step on purpose: PyPI is the one IRREVERSIBLE sink (uploads can't be replaced), so it runs
       # after build/smoke/sign/release — the step's `if` has an implicit success(), so any earlier
-      # failure skips it and nothing can fail AFTER an upload. Tag-gated, so the workflow_dispatch
-      # dry-run skips it entirely (a branch ref isn't `refs/tags/...`). Reads dist-pub/ (clean wheel +
+      # failure skips it and nothing can fail AFTER an upload. Gated on a tag PUSH — the EVENT and the
+      # ref, not the ref alone: a `workflow_dispatch` can be pointed at a tag, where `github.ref` is
+      # `refs/tags/...` and a ref-only guard would have published (BACKLOG #1584). Reads dist-pub/ (clean wheel +
       # sdist; dist/ now also holds the *.sigstore bundles, which twine would reject). Trusted Publishing
       # (OIDC) — no token, uses the job's `id-token: write`. attestations: PEP 740 provenance ON PyPI,
       # distinct from the Sigstore bundle attached to the GitHub release above. skip-existing: a re-run /
       # same-version re-push is a no-op, NOT a failure (a version bump is required to republish; the
       # version==tag smoke check already prevents a wrong-version upload).
       - name: Publish to PyPI (Trusted Publishing / OIDC)
-        if: startsWith(github.ref, 'refs/tags/')
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           packages-dir: dist-pub/
@@ -722,7 +776,7 @@ jobs:
       # engine: the reversible action (a GitHub release, deletable) precedes the irreversible one (a PyPI
       # upload burns that version forever).
       - name: Create or update the console GitHub release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -758,7 +812,7 @@ jobs:
       # build + version-check above still run on every console tag, so the publish path is exercised
       # before it is armed. Flipping the variable is what actually claims the PyPI name.
       - name: Publish messagefoundry-webconsole to PyPI (Trusted Publishing / OIDC)
-        if: ${{ startsWith(github.ref, 'refs/tags/') && vars.PUBLISH_WEBCONSOLE == 'true' }}
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && vars.PUBLISH_WEBCONSOLE == 'true' }}
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           packages-dir: webconsole-dist/
@@ -867,7 +921,7 @@ jobs:
           fi
 
       - name: Attach the harness wheel to the GitHub release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "${GITHUB_REF_NAME}" harness-dist/*.whl --clobber
@@ -885,7 +939,7 @@ jobs:
       # GATED: no-op until the owner configures the messagefoundry-harness PyPI Trusted Publisher AND sets
       # repo variable PUBLISH_HARNESS=true. The build + version-check above still run every release.
       - name: Publish messagefoundry-harness to PyPI (Trusted Publishing / OIDC)
-        if: ${{ startsWith(github.ref, 'refs/tags/') && vars.PUBLISH_HARNESS == 'true' }}
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && vars.PUBLISH_HARNESS == 'true' }}
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           packages-dir: harness-dist/
