@@ -28,7 +28,7 @@ from this project's own ``messagefoundry/anon/``) is already fully compliant, as
 
 ``VENDORED_LICENCES`` is the one narrow exception, and it is a FILE list, not a tree exemption: each
 entry still asserts an exact expected value, just not this project's own. It exists because BACKLOG
-#1364 vendored genuinely third-party, differently-licensed code (an Apache-2.0 GitHub Action,
+#1381 vendored genuinely third-party, differently-licensed code (an Apache-2.0 GitHub Action,
 authored by SAP, pinned to a specific upstream commit) into ``.github/actions/``. Stamping this
 project's AGPL identifier on someone else's Apache-2.0 file would be exactly the affirmative
 misstatement this gate exists to catch, and worse than the omission it would paper over. Add an

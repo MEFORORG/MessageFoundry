@@ -20,6 +20,8 @@ also blocks ordinary work gets routed around, and then it guards nothing.
 
 from __future__ import annotations
 
+import itertools
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -1468,6 +1470,220 @@ def test_GIT_DIR_does_not_reach_rules_3_and_3d(repo: SimpleNamespace) -> None:
     for verb in ("clean -fd", "reset --hard"):
         command = f'GIT_DIR="{repo.primary}/.git" git {verb}'
         assert run_gate(shell(command, cwd=repo.other), repo.repos) is None, verb
+
+
+def _render(env: dict[str, str], args: list[str]) -> str:
+    """ONE SOURCE for the two spellings of a command: the argv git runs, and the line the gate reads.
+
+    Writing them separately is how a row starts judging one command and executing another while
+    staying green -- which is the very verdict-versus-consequence gap the row below exists to close.
+    """
+    prefix = "".join(f'{name}="{value}" ' for name, value in env.items())
+    rendered = " ".join(f'"{a}"' if ("/" in a or "\\" in a) else a for a in args)
+    return f"{prefix}git {rendered}"
+
+
+def test_the_tokens_rule_3_excludes_really_cannot_move_a_governed_tree(
+    repo: SimpleNamespace, tmp_path: Path
+) -> None:
+    """Why the ALLOW above is correct, pinned by CONSEQUENCE rather than by verdict.
+
+    The row above asserts what the gate ANSWERS. Nothing asserted the answer was RIGHT, and that gap
+    is what makes a false deny look like prudence: re-adding ``--git-dir`` to rule 3's candidate list
+    reads as tightening a guard, and the row above then looks like the thing standing in the way. So
+    run each command against real git and read the governed tree back.
+
+    ``--git-dir`` and ``GIT_DIR`` select the REPOSITORY; ``--work-tree`` and ``GIT_WORK_TREE`` select
+    the TREE. Of the tokens in the promoted-versus-explicit argument, only the second pair decides
+    which tree a verb rewrites, which is why the resolver hands that pair to rule 3 and withholds the
+    first. Read that as a statement about those four tokens and NOT as an enumeration of every way to
+    aim a verb at a governed tree: the cwd, an explicit ``-C`` and a prefix ``cd`` all do it too, and
+    are resolved elsewhere.
+
+    TWO OBSERVABLES, BECAUSE ONE CANNOT SEE BOTH VERBS. ``reset --hard`` reverts a MODIFIED TRACKED
+    file; ``clean -fd`` removes an UNTRACKED one and leaves a modified tracked file exactly as it
+    found it. The first version of this row watched only the tracked file, so its ``clean`` arm passed
+    identically whether or not the clean was aimed at the governed tree -- measured, not supposed.
+
+    A FRESH UNGOVERNED CWD PER ARM, EACH CARRYING ITS OWN MARKER. ``reset --hard`` aimed by
+    ``--git-dir`` alone checks the governed HEAD tree out INTO the cwd it runs from, so one arm
+    silently seeds the next arm's directory and a later ``clean`` finds nothing untracked left to
+    remove. The marker is the other half: it makes each arm prove the command DID something
+    somewhere, without which every allow would pass against a git stubbed to exit 0.
+
+    WHAT THE ALLOW DOES NOT SAY is pinned at the end of this row and explained beside rule 3's text
+    fallback in the gate: it is scoped to the working TREE. The index moves, and so does HEAD.
+    """
+    assert " " not in str(repo.primary), (
+        "this row goes vacuous on a path containing a space: the gate's own -C / --git-dir reader "
+        'matches [^"\\s]+ and truncates at the space, so a truncated path resolves to nothing '
+        "governed and every allow arm passes without measuring anything. That is a documented "
+        "resolver residual, not a defect in this row -- but it must fail loudly rather than pass."
+    )
+
+    gitdir = f"{repo.primary}/.git"
+    tracked = repo.primary / "seed.txt"
+    untracked = repo.primary / "untracked.txt"
+
+    def arm_the_primary() -> None:
+        tracked.write_text("LOCAL EDIT\n", encoding="utf-8")
+        untracked.write_text("untracked\n", encoding="utf-8")
+
+    def observe() -> tuple[str, bool]:
+        """Never raises: a missing file is an observation, not a crash that hides the arm's message."""
+        edit = tracked.read_text(encoding="utf-8").strip() if tracked.exists() else "<gone>"
+        return edit, untracked.exists()
+
+    armed = ("LOCAL EDIT", True)
+    serial = itertools.count(1)
+
+    def fresh_cwd() -> Path:
+        """A directory no earlier arm has written into, carrying one untracked marker of its own."""
+        path = tmp_path / f"Ungoverned-{next(serial)}"
+        path.mkdir()
+        (path / "marker.txt").write_text("local\n", encoding="utf-8")
+        return path
+
+    def run_for_real(env: dict[str, str], args: list[str], cwd: Path) -> None:
+        subprocess.run(
+            ["git", *args],
+            cwd=str(cwd),
+            check=True,
+            capture_output=True,
+            env={**os.environ, **env},
+        )
+
+    # THE ALLOW ARMS -- both repository spellings against both verbs, so neither token nor verb is
+    # covered only by inference. git leaves the governed tree exactly as it found it, and the gate
+    # allows: a deny here would name a checkout the command never reached.
+    #
+    # ``landed`` is the arm's OWN positive control. A null in the governed tree means nothing unless
+    # the command did something SOMEWHERE, and each verb proves that differently: ``reset --hard``
+    # writes the governed HEAD tree into the cwd it runs from, ``clean -fd`` deletes the marker there.
+    allow_arms: tuple[tuple[dict[str, str], list[str], str], ...] = (
+        ({}, ["--git-dir", gitdir, "reset", "--hard"], "seeded"),
+        ({"GIT_DIR": gitdir}, ["reset", "--hard"], "seeded"),
+        ({}, ["--git-dir", gitdir, "clean", "-fd"], "cleaned"),
+        ({"GIT_DIR": gitdir}, ["clean", "-fd"], "cleaned"),
+    )
+    for env, args, landed in allow_arms:
+        command = _render(env, args)
+        arm_the_primary()
+        cwd = fresh_cwd()
+        run_for_real(env, args, cwd)
+        assert observe() == armed, command
+        if landed == "seeded":
+            assert (cwd / "seed.txt").is_file(), f"{command}: the command did nothing anywhere"
+        else:
+            assert not (cwd / "marker.txt").exists(), f"{command}: the command did nothing anywhere"
+        assert run_gate(shell(command, cwd=fresh_cwd()), repo.repos) is None, command
+
+    # THE SAME QUESTION FROM THE CWD THE VERDICT ROW ABOVE USES -- a REGISTERED LINKED WORKTREE of the
+    # governed repo, not an unrelated directory. Without this the consequence measured here is for a
+    # cwd that row never drives, and its allow stays justified by nothing. Both repository spellings,
+    # because the flag form is gated from this cwd by nothing else in the file.
+    for env, args in (
+        ({"GIT_DIR": gitdir}, ["clean", "-fd"]),
+        ({}, ["--git-dir", gitdir, "clean", "-fd"]),
+    ):
+        command = _render(env, args)
+        arm_the_primary()
+        marker = repo.other / "marker.txt"
+        marker.write_text("local\n", encoding="utf-8")
+        run_for_real(env, args, repo.other)
+        assert observe() == armed, command
+        assert not marker.exists(), f"{command}: the command did nothing anywhere"
+        assert run_gate(shell(command, cwd=repo.other), repo.repos) is None, command
+
+    # THE CARRIED SPELLING, which no other row drives. ``$carried`` still LEADS the candidate list in
+    # the else branch; it is empty only because rules 3 and 3d call the resolver without
+    # ``-CarriedGitDir``. Passing it at either call site is a one-token change that re-creates exactly
+    # the false deny this row guards, and every arm above would stay green through it.
+    for cwd in (fresh_cwd(), repo.other):
+        carried = f'export GIT_DIR="{gitdir}" && git clean -fd'
+        assert run_gate(shell(carried, cwd=cwd), repo.repos) is None, carried
+
+    # THE CONTROLS, ONE PER VERB. Adding the working-tree token really moves the governed tree, and
+    # the gate denies that spelling. Without these, four commands that leave the tree alone are
+    # indistinguishable from four commands that did nothing at all. The gate runs BEFORE git, so each
+    # deny is asserted against a tree that still has something to lose.
+    def drive_control(env: dict[str, str], args: list[str]) -> tuple[str, bool]:
+        command = _render(env, args)
+        arm_the_primary()
+        reason = assert_denied(run_gate(shell(command, cwd=fresh_cwd()), repo.repos))
+        assert "working tree of the SHARED PRIMARY checkout" in reason, command
+        run_for_real(env, args, fresh_cwd())
+        return observe()
+
+    moved = "the control did not fire: the working-tree token left the governed tree alone too, so "
+    moved += "the allow arms above prove nothing about which token aims at a tree"
+
+    edit, _ = drive_control(
+        {}, ["--git-dir", gitdir, "--work-tree", str(repo.primary), "reset", "--hard"]
+    )
+    assert edit == "seed", moved  # reverted to the content the fixture committed
+
+    _, still_there = drive_control(
+        {"GIT_DIR": gitdir, "GIT_WORK_TREE": str(repo.primary)}, ["clean", "-fd"]
+    )
+    assert not still_there, moved
+
+    # THE RESIDUAL THE GATE'S COMMENT NAMES, EXECUTED HERE RATHER THAN CERTIFIED THERE. The allow is
+    # scoped to the working TREE: the same command still rewrites the governed repository's INDEX. A
+    # comment saying "measured" beside no running assertion certifies evidence that exists nowhere,
+    # and nothing fails if git's behaviour changes under it.
+    staged = repo.primary / "staged.txt"
+    staged.write_text("s\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "staged.txt"], cwd=str(repo.primary), check=True, capture_output=True
+    )
+
+    def staged_status() -> str:
+        return subprocess.run(
+            ["git", "status", "--porcelain", "--", "staged.txt"],
+            cwd=str(repo.primary),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+    assert staged_status().startswith("A"), staged_status()
+    run_for_real({}, ["--git-dir", gitdir, "reset", "--hard"], fresh_cwd())
+    assert staged_status().startswith("??"), (
+        "the index residual named beside rule 3's text fallback no longer reproduces: the allowed "
+        f"command left the staged file as {staged_status()!r}. Re-measure before trusting that note."
+    )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "KNOWN FAIL-OPEN, not an accepted behaviour. Withholding the promoted repository token from "
+        "rule 3 fixes the false deny on tree-only verbs and leaves `--git-dir <governed> checkout "
+        "<branch>` allowed, which really moves the primary's HEAD. Attributed by measurement: the "
+        "pre-correction resolver denied it. Closing it needs a verb split rule 3 does not have -- "
+        "`clean` and `reset --hard` must keep allowing. strict=True so the day it is fixed this row "
+        "goes XPASS and forces its own removal rather than rotting green."
+    ),
+)
+def test_a_repository_token_cannot_move_a_governed_HEAD_either(
+    repo: SimpleNamespace, tmp_path: Path
+) -> None:
+    """The gap the row above stops short of, pinned so it cannot be forgotten or re-derived.
+
+    ``checkout`` moves HEAD without rewriting the files, so a co-tenant session standing in the
+    primary sees modifications it never made -- verbatim the harm rule 3's own deny text describes.
+    The row above proves the tree is safe; this one records that the same token class is NOT safe for
+    HEAD, and that rule 3b does not cover it (3b judges a linked worktree's HEAD, not a repository
+    named by ``--git-dir`` from outside).
+    """
+    subprocess.run(
+        ["git", "branch", "sidebranch"], cwd=str(repo.primary), check=True, capture_output=True
+    )
+    ungoverned = tmp_path / "Ungoverned-head"
+    ungoverned.mkdir()
+    command = f'git --git-dir "{repo.primary}/.git" checkout sidebranch'
+    assert_denied(run_gate(shell(command, cwd=ungoverned), repo.repos))
 
 
 def test_a_repository_token_owned_by_an_EARLIER_command_is_not_the_disarm_s_target(

@@ -182,7 +182,13 @@ def smoke_self(
             f"no config dir at {config_dir!r} — pass --config <your config repo>",
         )
     from messagefoundry.config.wiring import WiringError, load_config
-    from messagefoundry.pipeline.dryrun import dry_run
+    from messagefoundry.pipeline.dryrun import (
+        AmbiguousInboundError,
+        NoInboundError,
+        UnknownInboundError,
+        dry_run,
+    )
+    from messagefoundry.redaction import safe_error, safe_exc
 
     try:
         reg = load_config(config_dir)
@@ -191,25 +197,31 @@ def smoke_self(
     msg = synthetic_message()  # a module constant since #1192 — cannot fail
     try:
         result = dry_run(reg, msg, inbound=inbound, snapshot_on_send=snapshot_on_send)
-    except ValueError as exc:  # ambiguous/unknown inbound
-        # KNOWN GAP, left as-is deliberately and recorded because BACKLOG #1707 makes it load-bearing.
-        # `select_inbound` raises one ValueError for three different situations: a genuinely ambiguous
-        # config (a fair SKIP — the operator must choose), an UNKNOWN `--inbound` name, and a config
-        # that loaded ZERO inbounds. The last two are deployment defects reading as exit 0. That
-        # matters more now: the FAIL above tells an operator to re-point `--inbound`, so a typo in
-        # the remedy this check just prescribed lands HERE and reads green. Splitting the three is
-        # the second limb of the same proposal (docs/backlog-proposals/fable-packet14-ops.md,
-        # "Proposal 2") and is not in this change's scope.
-        return CheckResult(rid, title, Status.SKIP, str(exc))
+    except AmbiguousInboundError as exc:
+        # The only selection failure that SKIPs: nothing is wrong, the operator has a choice to make.
+        # An unknown `--inbound` name or a config with no inbound is a defect, so it FAILs below.
+        # `_classify_self_smoke` tells an operator to re-point `--inbound`, so a typo in that remedy
+        # must not read green (BACKLOG #1707). The detail names the flag, or the operator is told to
+        # choose with no word on how. NAME, not `<name>`: a Markdown report reads that as an HTML tag
+        # and drops it.
+        return CheckResult(rid, title, Status.SKIP, f"{exc}; pass --inbound NAME to pick one")
+    except (UnknownInboundError, NoInboundError) as exc:
+        # Connection names and operator input only, never message content, so nothing to redact.
+        return CheckResult(rid, title, Status.FAIL, str(exc))
     except Exception as exc:
-        return CheckResult(rid, title, Status.ERROR, f"dry-run raised: {exc!r}")
+        # Raised while the message was in flight, so its text can quote the message (BACKLOG #1779).
+        return CheckResult(rid, title, Status.ERROR, f"dry-run raised: {safe_exc(exc)}")
 
     summary = (
         f"inbound={result.inbound}, disposition={result.disposition.value}, "
         f"handlers={len(result.handlers)}, deliveries={len(result.deliveries)}"
     )
     if result.error:
-        return CheckResult(rid, title, Status.FAIL, f"{summary} — {result.error}")
+        # `verify --report-md`/`--report-json` write this detail to a file that gets pasted into
+        # tickets, and the error quotes a Router/Handler's own `raise` (BACKLOG #1779). No `show_phi`
+        # opt-in, on purpose, for the reason the `check` gate refuses one: both write their output
+        # somewhere it is kept and passed on, so an opt-in would put PHI there on request.
+        return CheckResult(rid, title, Status.FAIL, f"{summary} — {safe_error(result.error)}")
     # Gate on what the run PRODUCED, never on "the call returned" (BACKLOG #1707). A postcondition
     # over the disposition the pipeline already computed cannot drift out of step with the pipeline;
     # re-deriving "did it deliver" here from the counts would be a second classifier to keep in sync.

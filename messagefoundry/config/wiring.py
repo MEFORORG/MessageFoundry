@@ -1276,8 +1276,10 @@ def MLLP(
     encoding: str = "utf-8",
     # Inbound DoS guards (defaults mirror transports.mllp.DEFAULT_*; pass None/0 to disable):
     max_connections: int | None = 256,  # cap concurrent clients (connection-flood guard)
+    max_connections_per_host: int | None = 32,  # cap concurrent clients from ONE peer address
     receive_timeout: float | None = 60.0,  # close a client idle this many seconds (slowloris)
     max_frame_bytes: int | None = 16 * 1024 * 1024,  # cap one frame's bytes (OOM guard); both dirs
+    max_frame_seconds: float | None = 60.0,  # cap one frame's life, start byte to end byte
     # INBOUND message-RATE pacing. Unlike the caps above these default to OFF, and that is ruled
     # rather than accidental: a rate on a clinical interface is only safe at a number taken from a
     # real feed profile. Both are parameters of this factory, and a connections.toml inbound entry
@@ -1323,11 +1325,26 @@ def MLLP(
     tls_ciphers: str
     | None = None,  # BOTH: opt-in OpenSSL cipher string for THIS hop; unset = the inherited default (ADR 0188)
 ) -> ConnectionSpec:
-    """An MLLP endpoint. Inbound uses port/max_connections/receive_timeout/max_frame_bytes (the
-    bind interface comes from the service's ``[inbound].bind_host``, so ``host`` is rejected on an
+    """An MLLP endpoint. Inbound uses port plus the resource caps max_connections,
+    max_connections_per_host, receive_timeout, max_frame_seconds and max_frame_bytes (the bind
+    interface comes from the service's ``[inbound].bind_host``, so ``host`` is rejected on an
     inbound); outbound uses host/port/connect_timeout/timeout_seconds/max_frame_bytes. ``encoding``
     applies to framing in both directions. ``capture_response`` (outbound, ADR 0013) records the
     application ACK as a captured reply (a negative ACK still dead-letters/retries unchanged).
+
+    **Inbound resource caps (BACKLOG #1725).** ``max_connections`` (256) bounds concurrent sockets on
+    the listener and ``max_connections_per_host`` (32) bounds concurrent sockets from ONE peer
+    address, which is the term ``max_connections`` does not carry since it counts sockets rather than
+    hosts. ``receive_timeout`` (60 s) bounds SILENCE between reads and **resets on every byte
+    received**, so ``max_frame_seconds`` (60 s) bounds one frame's life from its start byte to its
+    end byte — that is what reaches a peer trickling a byte at a time, which is never idle.
+    ``max_frame_bytes`` (16 MiB) bounds the same frame's size. Each is disabled by ``None``/``0``.
+
+    What the two #1725 caps do NOT cover, and when to change one, is stated **once** on
+    ``DEFAULT_MAX_CONNECTIONS_PER_HOST`` and ``DEFAULT_MAX_FRAME_SECONDS`` in
+    ``messagefoundry.transports.mllp`` — including the two cases an operator is most likely to meet:
+    a listener behind a source-NAT proxy, and a feed carrying large embedded documents. Read those rather than a summary here; ``docs/CONNECTIONS.md`` carries the same two in
+    operator form.
 
     **Inbound message-rate pacing (BACKLOG #1249).** ``max_messages_per_second`` bounds how fast one
     accepted inbound connection may feed messages in; ``None``/``0`` (the default) is no bound.
@@ -1439,8 +1456,10 @@ def MLLP(
             "port": port,
             "encoding": encoding,
             "max_connections": max_connections,
+            "max_connections_per_host": max_connections_per_host,
             "receive_timeout": receive_timeout,
             "max_frame_bytes": max_frame_bytes,
+            "max_frame_seconds": max_frame_seconds,
             "max_messages_per_second": max_messages_per_second,
             "message_burst": message_burst,
             "connect_timeout": connect_timeout,
@@ -2728,18 +2747,67 @@ def _is_db_proc_call(statement_lower: str) -> bool:
 
 
 def _reject_envref_odbc_params(odbc_params: Mapping[str, Any] | None) -> None:
-    """Refuse an ``env()`` ref inside ``odbc_params`` (#66). Nested settings are NOT env-resolved (only
-    top-level ones are — see :func:`resolve_env_settings`), so an ``EnvRef`` here would stringify to a
-    broken literal at connect. Fail loud at authoring, pointing to the top-level ``username``/``password``
-    fields (which ARE env-resolved + secret-redacted) for a per-environment/secret value."""
+    """Refuse an ``env()`` ref inside ``odbc_params`` (#66), in **both** spellings. Nested settings are
+    NOT env-resolved (only top-level ones are — see :func:`resolve_env_settings`), so an env ref here
+    would stringify to a broken literal at connect. Fail loud at authoring, pointing to the top-level
+    ``username``/``password`` fields (which ARE env-resolved + secret-redacted) for a
+    per-environment/secret value.
+
+    The two spellings reach this function as **different objects**, and testing only the first let the
+    second through (BACKLOG #1806). Code-first ``odbc_params={"PWD": env("acme_pw")}`` arrives as an
+    :class:`EnvRef`. A ``connections.toml`` ``[settings.odbc_params]`` inline table arrives as a **raw
+    dict** — :func:`parse_env_setting` decodes only *top-level* settings values and does not descend, so
+    ``PWD = { env = "acme_pw", default = "…" }`` is copied through verbatim. Both factories that take
+    ``odbc_params`` are reachable from a TOML table (see :mod:`messagefoundry.config.connections_file`),
+    so that raw dict used to pass unrefused and stringify into the DSN with its fallback attached.
+
+    At least one further position exists and is not nested: ``odbc_params = { env = "..." }`` names
+    the *whole table*, which IS a top-level settings value, so ``parse_env_setting`` decodes it to an
+    :class:`EnvRef`. That object has no ``items()``, and the resulting :class:`AttributeError` is
+    neither a ``TypeError`` nor a ``ValueError``, so ``connections_file._build_spec`` did not convert
+    it — the operator got a bare traceback. The mapping check below makes that a typed
+    :class:`WiringError` instead; ``_build_odbc_dsn`` already refuses a non-mapping at connect, so
+    this only moves an existing refusal earlier. It does **not** make the refusal name the connection
+    or the file: ``_build_spec`` re-raises a factory ``WiringError`` unwrapped, ahead of the arm that
+    adds that context, so every factory refusal is un-located in the same way.
+
+    From ``connections.toml``, the loader's type check (``connections_file._check_setting_types``,
+    BACKLOG #1809) runs before this function, and where it refuses, its message names the
+    connection. What it lets through reaches the mapping check below, as does every code-first call,
+    which that check never sees. Which whole-table shapes land where is pinned in
+    ``tests/test_odbc_params_envref_toml_shape.py``.
+
+    **The residual is a marker one container deep**, and it is deliberately still open here: a dict
+    carrying ``env`` plus an unrecognised key, or a marker inside a list, fails ``set(v) <=
+    _ENVREF_KEYS`` and reaches ``_build_odbc_dsn``, which ``str()``-splices it into the DSN with any
+    ``default`` attached. Closing it means refusing every non-scalar ``odbc_params`` value (no ODBC
+    keyword takes a container), which is a wider rule than mirroring the decoder and wants its own
+    row rather than being folded in here.
+
+    Offenders are reported as **keys only**; the refusal must never echo the value, which may be a
+    fallback secret. The non-mapping arm reports the type name for the same reason."""
+    if odbc_params is None:
+        return
+    # Ahead of the empty-table short-circuit on purpose: `odbc_params = ""` is falsy AND not a table,
+    # and `_build_odbc_dsn`'s `or {}` would otherwise read it as "no params" with no diagnostic.
+    if not isinstance(odbc_params, Mapping):
+        raise WiringError(
+            "Database odbc_params must be a table of ODBC keyword -> value pairs, not "
+            f"{type(odbc_params).__name__} — write it as a table (TOML "
+            "[settings.odbc_params], or a Python dict). An env() reference naming the whole table "
+            "is refused here too; put a credential/password in the top-level username/password "
+            "fields (env-resolved + redacted)."
+        )
     if not odbc_params:
         return
-    offenders = sorted(k for k, v in odbc_params.items() if isinstance(v, EnvRef))
+    offenders = sorted(k for k, v in odbc_params.items() if _is_nested_envref(v))
     if offenders:
         raise WiringError(
             f"Database odbc_params may not use env() ({', '.join(offenders)}) — nested settings are "
-            "not env-resolved. Put a credential/password in the top-level username/password fields "
-            "(env-resolved + redacted); odbc_params carries only static driver keywords."
+            "not env-resolved, in either spelling (a code-first env() ref, or a connections.toml "
+            'inline table like PWD = { env = "acme_pw" }). Put a credential/password in the top-level '
+            "username/password fields (env-resolved + redacted); odbc_params carries only static "
+            "driver keywords."
         )
 
 
@@ -3639,7 +3707,9 @@ class InboundConnection:
     #   max_message_bytes: None (default) = inherit the engine 16 MiB ingress ceiling; set = the
     #     per-connection TOTAL body cap (the OOM guard that replaces the frame-cap-as-only-guard — a body
     #     over it is rejected/NAK'd BEFORE detach). A streaming inbound raises this above 16 MiB (and its
-    #     transport's max_frame_bytes) so the large frame is admitted, then detached under the cap.
+    #     transport's max_frame_bytes) so the large frame is admitted, then detached under the cap. On
+    #     an MLLP inbound raise max_frame_seconds with them: it bounds the same frame's arrival time
+    #     and ships at 60 s, so a big frame over a slow link is dropped mid-document (BACKLOG #1725).
     # Same override idiom as messages_days — code-first AND via connections.toml (ADR 0007).
     stream_threshold_bytes: int | None = None
     max_message_bytes: int | None = None

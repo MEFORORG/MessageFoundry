@@ -174,19 +174,28 @@ def test_run_load_end_to_end_no_loss(engine: tuple[str, int, int]) -> None:
     # strand a large share of in-flight frames at teardown — observed ~half (timeouts=46/sent=90) with
     # zero loss — so a fixed small cap flakes.
     #
-    # That observation used to be recorded HERE while the reconcile's own stranding budget still
-    # capped at `sent // 2` — so this assertion tolerated 75% stranding (`acked >= sent // 4`) while
-    # the budget failed at half + 1, and `main` red at 9b03057f on exactly the 46/90 case above. The
-    # budget is now three quarters, so the two detectors encode the SAME tolerance; keep them in step
-    # if either moves. Pinned by tests/test_harness_reconcile.py, which asserts those exact counters
-    # reconcile clean. What this MUST still catch is a systemic ACK-path
-    # regression: an engine that receives-but-never-ACKs strands the WHOLE run (acked~0, timeouts~sent)
-    # yet still passes no_loss (internal delivery is fine, only the client-facing ACK never returns).
-    # nak==0 + the identity alone would pass that, so require that a real fraction of sends were
-    # ACKed — proof the client-facing ACK path works — which acked~0 fails while teardown weather does
-    # not.
+    # WHAT THIS MUST CATCH is a systemic ACK-path regression: an engine that receives-but-never-ACKs
+    # strands the WHOLE run (acked~0, timeouts~sent) yet still passes no_loss, because internal
+    # delivery is fine and only the client-facing ACK never returns. nak == 0 plus the identity below
+    # would pass that, so the run must also PROVE the client-facing ACK path ran.
+    #
+    # THE PROOF IS `acked > 0`, AND IT USED TO BE `acked >= sent // 4` (BACKLOG #1866). A quarter of
+    # `sent` is not a property of the engine: an open-loop phase paces sends by the wall clock, so
+    # `sent` reaches ~90 whatever the host serviced, and the assertion reduced to "this runner
+    # confirmed at least a quarter of the offered rate". On windows-2025 run 35657866239 it fired at
+    # 90 sent / 11 acked / 79 timeouts and ejected PR 1283 from the merge queue.
+    #
+    # A dead ACK path returns NO reply, so it lands on exactly `acked == 0`, and no host speed moves
+    # that. What it gives up is a PARTIAL ACK regression — an engine ACKing between 1 and sent // 4
+    # of what it commits — which the old bound caught and this does not.
+    #
+    # `harness/load/report.py::_reconcile` IS THE SOURCE OF RECORD for the rest: the family of three
+    # offered-volume detectors this belonged to, the run evidence, the fact that the MECHANISM
+    # behind the merge-queue trigger is NOT established (do not invent one here), and the full list
+    # of what the change gives up. Read it there rather than restating it — an earlier draft copied
+    # that reasoning into six files and two copies were stale before the change was even reviewed.
     assert report.counters.nak == 0
-    assert report.counters.acked >= report.counters.sent // 4, report.counters
+    assert report.counters.acked > 0, report.counters
     assert report.counters.acked + report.counters.timeouts == report.counters.sent
     assert report.no_loss.ok, report.no_loss.detail
     # Fan-out 2 → every ACKed message (ACK == durable ingress commit) MUST reach the sink twice; the
@@ -194,6 +203,18 @@ def test_run_load_end_to_end_no_loss(engine: tuple[str, int, int]) -> None:
     # ACKed-then-dead-lettered message (dead rows leave backlog at 0 and are excluded from written).
     assert report.no_loss.sink_received == report.no_loss.engine_written
     assert report.no_loss.sink_received >= 2 * report.counters.acked
+    # ANCHOR THE FAN-OUT ARM TO `engine_read`, NOT TO `acked`, or relaxing the ACK assertion above
+    # silently relaxes this one too: every check here scaled by `acked` shrinks with it, so at
+    # acked == 1 the line above would demand two sink arrivals out of ~180 and pass. `engine_read`
+    # is what the engine actually ingested, so this stays a real bound whatever the host confirmed,
+    # and it fires at magnitude ONE on a lost or dead-lettered delivery. Measured on the
+    # ingress-sabotage control: read/written ran 90/180, 89/178 and 85/170 across three arms — the
+    # ratio holds exactly while the absolute numbers move. `>=` rather than `==` because this is a
+    # LOWER bound on the fan-out and the config's other paths carry their own (MEFOR_LOAD_FANOUT is
+    # the ADT one); it is not about re-delivery, which does NOT raise `written` — that counter is a
+    # count of DONE outbound ROWS, and a re-delivered row is still one row. A re-delivery shows up
+    # instead as `sink_received` running past `written`, which is what `at_least_once` measures.
+    assert report.no_loss.engine_written >= 2 * report.no_loss.engine_read
     # Name the violated SLO(s) on failure — a bare `assert False` here cost a CI-triage round trip.
     assert report.result_ok and report.exit_code == 0, [c for c in report.slos if not c.ok]
     assert report.engine.drain_seconds is not None  # backlog drained within the timeout

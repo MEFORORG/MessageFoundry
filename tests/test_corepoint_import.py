@@ -10,18 +10,22 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 from pathlib import Path
 
 import pytest
 
+from messagefoundry import corepoint_import
 from messagefoundry.checks import run_checks
 from messagefoundry.corepoint_import import (
     Action,
     Control,
     CorepointImportError,
+    Step,
     UnmappedAction,
     _corepoint_path,
     _corepoint_segment,
+    _count_steps,
     _operands_from_roles,
     _role_prose,
     _role_verb,
@@ -558,6 +562,45 @@ def test_import_corepoint_missing_file_raises(tmp_path: Path) -> None:
         import_corepoint(tmp_path / "nope.json", tmp_path / "out")
 
 
+def test_non_utf8_export_raises_corepoint_import_error(tmp_path: Path) -> None:
+    """`UnicodeDecodeError` subclasses `ValueError`, not `OSError` — a non-UTF-8 export must still
+    become the clean `CorepointImportError` the function's docstring promises, not a raw traceback."""
+    export = tmp_path / "export.json"
+    export.write_bytes(b"\xff\xfe not valid utf-8: \x80\x81\xfe")
+    with pytest.raises(CorepointImportError, match=re.escape(str(export))):
+        import_corepoint(export, tmp_path / "out")
+
+
+def test_parse_export_converts_a_recursion_error_from_json_loads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`json.loads` also raises `RecursionError` on deeply nested input, and that is a `RuntimeError`
+    — not a `ValueError` — so the `except json.JSONDecodeError` arm above never sees it.
+
+    Drives :func:`parse_export` directly, not through the CLI: ``_import`` in ``__main__.py`` already
+    catches ``RecursionError`` too, so a CLI-level test would pass for the wrong reason even with this
+    conversion missing from :func:`parse_export` itself — exactly what a library caller other than the
+    CLI would hit.
+
+    Manufactures the ``RecursionError`` rather than nesting real input deeply enough to trigger one:
+    ``json.loads``'s C accelerator does not respect ``sys.getrecursionlimit()``, and the depth where it
+    actually raises is both far larger and measured to vary widely by platform/runner — a sibling case
+    in ``tests/test_sandbox_codec.py`` (``test_recursion_error_is_not_a_value_error``, BACKLOG #1222)
+    recorded a 6x spread between two boxes and a CI runner that never raised at all at 100,000. Real
+    nesting is therefore both unreliable as a test trigger and, at extreme depth, a risk of a native
+    stack overflow rather than a clean Python exception. This test uses that sibling's own technique,
+    adapted: :func:`parse_export`'s ``except`` arm names ``json.JSONDecodeError`` explicitly (the
+    codec's does not), so only ``json.loads`` itself is replaced -- swapping the whole ``json``
+    reference would leave that name unresolvable and fail for an unrelated reason."""
+
+    def _raise_recursion(*_args: object, **_kwargs: object) -> object:
+        raise RecursionError("simulated deep nesting")
+
+    monkeypatch.setattr(corepoint_import.json, "loads", _raise_recursion)
+    with pytest.raises(CorepointImportError, match="nested too deeply"):
+        parse_export('{"channels": []}')
+
+
 # --- the VALIDATED <Package> XML layer (ADR 0086 §2 amendment, BACKLOG #105) -------------------
 #
 # Everything below drives the real export shape: the recursive <List> tree, the rich-text markup
@@ -748,6 +791,164 @@ def test_try_without_catch_reraises_rather_than_swallowing() -> None:
     assert "except Exception:  # TODO: Corepoint Try with no Catch" in src
     assert "        raise" in src
     ast.parse(src)
+
+
+# --- a branch marker its container cannot continue (BACKLOG #1854) -----------------------------
+#
+# Why a ``Try`` can end up holding an ``Else`` at all is stated once, in ``_stray_branches``.
+
+
+def _handler_steps(body: str) -> tuple[Step, ...]:
+    """The parsed step tree of the one handler in a minimal synthetic ``<Package>``."""
+    return parse_package(_package(body))[0].handlers[0].steps
+
+
+_STRAY_ELSE_UNDER_TRY = (
+    "<Try>"
+    '<Line Data="ItemClear %ADT/PID-19"/>'
+    '<Line Data="Catch"/>'
+    '<Line Data="ItemClear %ADT/PID-20"/>'
+    '<Line Data="Else"/>'
+    '<Line Data="ItemClear %ADT/PID-21"/>'
+    "</Try>"
+)
+
+
+def test_a_stray_branch_under_try_keeps_its_body(tmp_path: Path) -> None:
+    """An ``Else`` a ``Try`` cannot continue keeps its body and is flagged, never dropped (#1854)."""
+    src = _handler_source(_STRAY_ELSE_UNDER_TRY)
+    # The Catch still renders as a real ``except``; what the Try cannot continue degrades to a marker.
+    # The tail is the house ``_hint`` wording, pinned whole so the two markers cannot drift apart.
+    assert "    except Exception:  # TODO: Corepoint Catch — hand-finish\n" in src
+    assert "# TODO: Corepoint Else cannot continue a Corepoint Try" in src
+    # The dropped half. Its scope is unknowable, so the body rides inline under the marker.
+    assert 'set_field(msg, "PID-21", "")' in src
+    ast.parse(src)
+
+    # And the summary must not claim the branch itself shipped: a marker-only element is unmapped,
+    # exactly as ``exit`` and ``unknown`` are, while its body statements keep counting on normally.
+    assert _count_steps(_handler_steps(_STRAY_ELSE_UNDER_TRY)) == (5, ["Else"], 0)
+
+    # The same accounting through the public entry point the CLI prints.
+    export = tmp_path / "stray.xml"
+    export.write_text(_package(_STRAY_ELSE_UNDER_TRY), encoding="utf-8")
+    result = import_corepoint(export, tmp_path / "out")
+    assert result.total_mapped == 5
+    assert result.channels[0].unmapped_classes == ("Else",)
+
+
+def test_a_stray_branch_under_a_loop_keeps_its_body() -> None:
+    """A loop render reads no branches at all, so an adopted marker took its body with it (#1854)."""
+    body = (
+        "<Foreach>"
+        '<Line Data="ItemClear %ADT/PID-19"/>'
+        '<Line Data="Catch"/>'
+        '<Line Data="ItemClear %ADT/PID-21"/>'
+        "</Foreach>"
+    )
+    src = _handler_source(body)
+    assert "    for _item in []:  # TODO: Corepoint Foreach" in src
+    assert "# TODO: Corepoint Catch cannot continue a Corepoint Foreach" in src
+    assert 'set_field(msg, "PID-21", "")' in src
+    ast.parse(src)
+    assert _count_steps(_handler_steps(body)) == (3, ["Catch"], 0)
+
+    # ``while`` reads its branches through the same render path.
+    loop = body.replace("Foreach", "Loop")
+    loop_src = _handler_source(loop)
+    assert "    while False:  # TODO: Corepoint Loop" in loop_src
+    assert "# TODO: Corepoint Catch cannot continue a Corepoint Loop" in loop_src
+    assert '    set_field(msg, "PID-21", "")' in loop_src
+    ast.parse(loop_src)
+    assert _count_steps(_handler_steps(loop)) == (3, ["Catch"], 0)
+
+
+def test_a_stray_branch_body_is_live_code_outside_the_loop_it_was_adopted_by() -> None:
+    """The inlined body lands OUTSIDE the ``for`` block, and it is real code, not a comment (#1854).
+
+    Two things ride on the indentation. A ``LoopExit`` there is no longer inside a Python loop, so a
+    bare ``break`` would not even parse; and a ``MsgSend`` there must still reach the handler's
+    ``sends`` list, or the emitted call would dangle."""
+    src = _handler_source(
+        "<Foreach>"
+        '<Line Data="ItemClear %ADT/PID-19"/>'
+        '<Line Data="Catch"/>'
+        '<Line Data="LoopExit"/>'
+        '<Line Data="MsgSend $out [OB_ACME_ADT]"/>'
+        "</Foreach>"
+    )
+    assert "# TODO: Corepoint LoopExit outside a loop" in src
+    assert "break" not in src
+    assert "    sends = []" in src
+    assert '    sends.append(Send("OB_ACME_ADT", msg))' in src
+    ast.parse(src)
+
+    # And nested, where an enclosing loop WOULD make a ``break`` parse. It must still not be emitted:
+    # it would bind the outer loop, silently changing which loop the export meant to exit.
+    nested = _handler_source(
+        '<Foreach Data="ForEach %ADT/PID-3(*)"><List>'
+        "<Foreach>"
+        '<Line Data="Catch"/>'
+        '<Line Data="LoopExit"/>'
+        '<Line Data="ItemClear %ADT/PID-5"/>'
+        "</Foreach>"
+        "</List></Foreach>"
+    )
+    assert "# TODO: Corepoint LoopExit outside a loop" in nested
+    assert "break" not in nested
+    # The statement after the LoopExit is still emitted, and is not left unreachable behind a break.
+    assert 'set_field(msg, "PID-5", "")' in nested
+    ast.parse(nested)
+
+
+def test_a_branch_marker_with_no_construct_is_counted_unmapped() -> None:
+    """An orphaned marker emits a TODO and nothing else, so it may not be counted mapped (#1854).
+
+    ``else``/``elif``/``except``/``match`` are all in ``_MAPPED_CONTROL_KINDS`` -- they name real
+    Python control flow when a construct adopts them. Standing alone there is no construct to
+    continue, the render degrades to a marker, and the count has to follow the render."""
+    body = '<Line Data="Else"/><Line Data="ItemClear %ADT/PID-21"/>'
+    src = _handler_source(body)
+    assert "# TODO: Corepoint Else with no enclosing construct" in src
+    assert 'set_field(msg, "PID-21", "")' in src
+    assert _count_steps(_handler_steps(body)) == (1, ["Else"], 0)
+
+
+def test_a_stray_branch_under_a_conditional_keeps_its_scope() -> None:
+    """The ``If``/``ChooseFrom`` render iterates EVERY branch, so it drops nothing (#1854).
+
+    A stray ``Catch`` there is a mislabelled arm, not an accept-and-drop: the body is emitted, the
+    scope is preserved, and the arm stays dead like every other. That is real control flow, so it
+    counts mapped -- pinned here so the Try/loop fix above is not mistaken for a licence to degrade
+    a render that was never losing anything."""
+    body = (
+        '<If Data="If (a)">'
+        '<Line Data="ItemClear %ADT/PID-19"/>'
+        '<Line Data="Catch"/>'
+        '<Line Data="ItemClear %ADT/PID-21"/>'
+        "</If>"
+    )
+    src = _handler_source(body)
+    assert "    if False:  # TODO: Corepoint If condition" in src
+    assert "    elif False:  # TODO: Corepoint Catch" in src
+    assert '        set_field(msg, "PID-21", "")' in src
+    ast.parse(src)
+    assert _count_steps(_handler_steps(body)) == (4, [], 0)
+
+    # Same for a ``ChooseFrom``: its ``Matching`` arms and a stray marker alike become real arms.
+    case = (
+        '<Line Data="ChooseFrom"><List>'
+        '<Line Data="ItemClear %ADT/PID-19"/>'
+        '<Line Data="Matching (a)"/>'
+        '<Line Data="ItemClear %ADT/PID-20"/>'
+        '<Line Data="Catch"/>'
+        '<Line Data="ItemClear %ADT/PID-21"/>'
+        "</List></Line>"
+    )
+    case_src = _handler_source(case)
+    assert "    if False:  # TODO: Corepoint Matching" in case_src
+    assert "    elif False:  # TODO: Corepoint Catch" in case_src
+    assert _count_steps(_handler_steps(case)) == (6, [], 0)
 
 
 def test_exit_verbs_are_flagged_never_flattened() -> None:
