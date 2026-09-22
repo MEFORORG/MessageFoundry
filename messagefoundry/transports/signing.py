@@ -164,8 +164,8 @@ def _read_key_material(setting: str, private_key: str) -> bytes:
             f"could not read the signing-key file named by {setting!r}: {reason} "
             "(a value with no '-----BEGIN' header is read as a file path)"
         )
-    # Outside the try: a SigningError is a ValueError, so it would not be caught above anyway, and
-    # keeping it out says so rather than leaving a reader to work it out.
+    # Outside the try on purpose: a SigningError IS a ValueError, and the handler above now catches
+    # ValueError, so a raise inside the try would be swallowed into the read-failed arm.
     if len(material) > _MAX_KEY_FILE_BYTES:
         raise SigningError(
             f"the signing-key file named by {setting!r} is over the {_MAX_KEY_FILE_BYTES}-byte "
