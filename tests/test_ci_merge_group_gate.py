@@ -97,10 +97,15 @@ _DECIDED_BY_THE_ARM_ALONE = {
     "packaging-build",
 }
 
-#: The control for the pin above: how many jobs satisfy only the second half of that predicate. The
-#: wider set adds `changes` (no `if:` at all) and `ci-gate` (`always()`, and it reads no output of
-#: this step), neither of which anything emitted here decides.
-_NAMES_MERGE_GROUP_NOWHERE_COUNT = 6
+#: The control for the pin above: the jobs that satisfy only the second half of that predicate. It
+#: is the pin above plus exactly the two the arm's comment names -- `changes` (no `if:` at all) and
+#: `ci-gate` (`always()`, and it reads no output of this step) -- neither of which anything emitted
+#: here decides. Written as the union so the two pins cannot be edited into equality.
+#:
+#: This was a COUNT of six until 2026-09-22, and a count holds while membership moves: renaming the
+#: `changes` job key, renaming `ci-gate`, and swapping `ci-gate` for another always-on job each left
+#: six at six. A set names the job that moved.
+_NAMES_MERGE_GROUP_NOWHERE = _DECIDED_BY_THE_ARM_ALONE | {"changes", "ci-gate"}
 
 
 def _changes_step_script() -> str:
@@ -295,9 +300,15 @@ def test_the_jobs_the_arm_alone_decides_are_pinned_and_so_is_the_wider_set() -> 
     and `ci-gate`. Neither is decided by anything this step emits, so the enumeration read as checked
     while being wrong about what it had checked.
 
-    Both halves are asserted, because the wider count is what makes the narrowing legible: if the two
-    sets ever come out the same size, the gated-on-an-output half has stopped discriminating and this
-    test is no longer measuring the thing its name claims.
+    Both sets are pinned by membership. The wider pin is what makes the narrowing legible: it is the
+    decided set plus exactly the two jobs the comment names, so a job that crosses between the two
+    predicates is reported by name in whichever pin it left.
+
+    A third assertion, ``decided < names_it_nowhere``, once followed the two pins. It could not fail:
+    ``decided`` is a subset of ``names_it_nowhere`` by construction, so only equality could break it,
+    and the pins ahead of it had already fixed the two sets at different sizes. It was removed rather
+    than moved ahead of the pins, because the pins entail it there too -- it would fire only on an
+    edit that was about to fire one of them, and with a vaguer message.
     """
     data = yaml.safe_load(_CI.read_text(encoding="utf-8"))
     decided: set[str] = set()
@@ -306,6 +317,9 @@ def test_the_jobs_the_arm_alone_decides_are_pinned_and_so_is_the_wider_set() -> 
         conditions = [str(job.get("if", ""))]
         conditions += [str(step.get("if", "")) for step in job.get("steps", []) or []]
         gated_on_an_output = any("needs.changes.outputs." in c for c in conditions)
+        # A substring test, so it is blind to an `if:` that is TRUE on merge_group without naming
+        # it, such as webconsole's job-level `github.event_name != 'push'`. webconsole is caught
+        # today only because its step `if:` lines name the event outright. Known limit, not widened.
         self_gated = any("merge_group" in c for c in conditions)
         if not self_gated:
             names_it_nowhere.add(name)
@@ -319,13 +333,13 @@ def test_the_jobs_the_arm_alone_decides_are_pinned_and_so_is_the_wider_set() -> 
         "A job entering this set gains the queue as a place it can be switched off by a path filter "
         "alone. If that is deliberate, move this pin and the arm's comment in ci.yml together."
     )
-    assert len(names_it_nowhere) == _NAMES_MERGE_GROUP_NOWHERE_COUNT, (
-        f"the CONTROL moved: {len(names_it_nowhere)} jobs name merge_group nowhere "
-        f"({sorted(names_it_nowhere)}), pinned at {_NAMES_MERGE_GROUP_NOWHERE_COUNT}. The assertion "
-        "above only means something while this number is the LARGER one -- it is what the arm's "
-        "comment cites as the reason the predicate carries a gated-on-an-output half at all."
-    )
-    assert decided < names_it_nowhere, (
-        "the two predicates now select the same jobs, so the gated-on-an-output half of the arm's "
-        "comment is no longer doing any work. Re-read that comment before editing this pin"
+    assert names_it_nowhere == _NAMES_MERGE_GROUP_NOWHERE, (
+        "the CONTROL moved: the set of jobs that name merge_group nowhere is not the pinned one.\n"
+        f"  added:   {sorted(names_it_nowhere - _NAMES_MERGE_GROUP_NOWHERE)}\n"
+        f"  removed: {sorted(_NAMES_MERGE_GROUP_NOWHERE - names_it_nowhere)}\n"
+        "The assertion above passed, so the jobs the arm alone decides are where they were; what "
+        "moved reads no output of this step -- a job renamed, added, deleted, or given or stripped "
+        "of a merge_group mention. This set is what the arm's comment cites as the reason the "
+        "predicate carries a gated-on-an-output half at all, so move this pin and that comment "
+        "together."
     )
