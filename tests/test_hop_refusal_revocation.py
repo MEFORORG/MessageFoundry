@@ -439,9 +439,22 @@ def test_the_blanket_env_does_not_cross_the_enforcing_store_hop(
     monkeypatch.setenv(TLS_REVOCATION_ATTESTED_ENV, "1")
     with pytest.raises(InsecureHopRefused, match="revocation"):
         _build_ssl(_pg(), posture=PROD_PHI)
-    # NEGATIVE CONTROL, and it is mandatory: without it the refusal above would also pass if the env
-    # were simply never read. On a non-enforcing posture the same env still crosses, byte-identical to
-    # the pre-clamp behaviour, which proves the env IS read and only the enforcing rung moved.
+    # NEGATIVE CONTROL, and it has to be read off the DISPOSITION rather than off the return value.
+    # `_build_ssl(..., posture=STAGING_PHI) is True` was the obvious control and it is a FALSE one: it
+    # returns True whether the env was read (ALLOW) or not (WARN, which also crosses), so it passes in
+    # exactly the world it exists to exclude. The guard's own field is the discriminating observable.
+    assert (
+        RevocationHopGuard.capture(
+            host=REMOTE,
+            cell="control",
+            description="control",
+            attested=False,
+            posture=STAGING_PHI,
+        ).blanket_attested
+        is True
+    )
+    # ...and the env still CROSSES a non-enforcing hop, byte-identical to the pre-clamp behaviour, so
+    # only the enforcing rung moved.
     assert _build_ssl(_pg(), posture=STAGING_PHI) is True
 
 
@@ -457,25 +470,30 @@ def test_store_pinned_ca_also_refuses_prod_phi_remote(crl_bundle: str) -> None:
         _build_ssl(_pg(ssl_root_cert=crl_bundle), posture=PROD_PHI)
 
 
-def test_the_store_crl_closes_its_own_gate_on_the_pinned_ca_branch(crl_bundle: str) -> None:
+def test_the_store_crl_closes_its_own_gate_on_the_pinned_ca_branch(
+    ca_only: str, crl_bundle: str
+) -> None:
     """``[store].ssl_crl_file`` (BACKLOG #299) is the store hop's OWN way across an enforcing posture.
 
     Closing the clamp above removed this hop's only existing one, and ``StoreSettings`` carries no
     per-store revocation attestation -- so without a knob a remote Postgres store on an enforcing
     posture would be refused with no remediation the error text could honestly name. The CRL loads onto
     the pinned-CA branch, the one arm where engine code builds the context asyncpg uses, and the guard
-    reads ``VERIFY_CRL_CHECK_LEAF`` off that very object rather than off the setting."""
-    ctx = _build_ssl(_pg(ssl_root_cert=crl_bundle, ssl_crl_file=crl_bundle), posture=PROD_PHI)
+    reads ``VERIFY_CRL_CHECK_LEAF`` off that very object rather than off the setting.
+
+    The two arguments take DIFFERENT files on purpose. Passing the bundle for both cannot tell them
+    apart, so ``harden_crl_check(ctx, settings.ssl_root_cert)`` -- an argument swap -- would pass."""
+    ctx = _build_ssl(_pg(ssl_root_cert=ca_only, ssl_crl_file=crl_bundle), posture=PROD_PHI)
     assert isinstance(ctx, ssl.SSLContext)
     # The line above passed for the RIGHT reason: the CRL really landed on the returned context.
     assert context_checks_revocation(ctx) is True
     # NEGATIVE CONTROL: the SAME hop with the SAME CA and no CRL is still refused, so the crossing is
     # attributable to the CRL rather than to the guard having stopped firing on this branch.
     with pytest.raises(InsecureHopRefused, match="revocation"):
-        _build_ssl(_pg(ssl_root_cert=crl_bundle), posture=PROD_PHI)
+        _build_ssl(_pg(ssl_root_cert=ca_only), posture=PROD_PHI)
 
 
-def test_the_store_refusal_names_a_lever_that_exists_for_it(crl_bundle: str) -> None:
+def test_the_store_refusal_names_a_lever_that_exists_for_it() -> None:
     """SDS-3.7 applied to the refusal TEXT. The guard's connection-shaped default names
     ``[tls].crl_file``, an egress terminator and a connection's ``tls_revocation_attested``; none
     reaches the store, which resolves no trust anchor and is not a connection. Telling that operator to
@@ -494,12 +512,38 @@ def test_the_default_store_path_has_no_context_for_a_crl_to_reach(crl_bundle: st
     ``ssl_root_cert``) ``_build_ssl`` returns ``True`` and asyncpg builds the context, so there is no
     engine-side object for a CRL to load into -- ``ssl_crl_file`` alone cannot close this arm, and
     loopback is its only way across an enforcing posture. Closing it means building the verifying
-    default context here instead, which changes what asyncpg receives: a separate decision."""
+    default context here instead, which changes what asyncpg receives: a separate decision.
+
+    The residual is REFUSED AT LOAD rather than left silent. A setting that is read, ignored and still
+    reports success is how an operator comes to believe revocation checking is on when it is not --
+    worse than an absent control, and the reason `_ssl_crl_file_reachable` exists."""
+    with pytest.raises(ValueError, match=r"requires \[store\].ssl_root_cert"):
+        _pg(ssl_crl_file=crl_bundle)
+    # The hop itself is still refused off-loopback, and still crosses on loopback -- the residual is
+    # that loopback is the ONLY way across here, which is exactly what the refusal text says.
     with pytest.raises(InsecureHopRefused, match="revocation"):
-        _build_ssl(_pg(ssl_crl_file=crl_bundle), posture=PROD_PHI)
-    # ...and the same settings on loopback cross, so the refusal above is the posture gate rather than
-    # the CRL file being rejected.
-    assert _build_ssl(_pg(server=LOOPBACK, ssl_crl_file=crl_bundle), posture=PROD_PHI) is True
+        _build_ssl(_pg(), posture=PROD_PHI)
+    assert _build_ssl(_pg(server=LOOPBACK), posture=PROD_PHI) is True
+
+
+def test_the_store_crl_is_refused_where_it_could_not_be_loaded(crl_bundle: str) -> None:
+    """The other two silent-no-op shapes `_ssl_crl_file_reachable` closes. Neither server-DB sibling
+    can load a CRL: SQL Server pins through an ODBC keyword string and never sees an SSLContext, and
+    SQLite has no TLS at all. Refuse rather than ignore, the `_ssl_root_cert_backend` convention."""
+    for backend in (StoreBackend.SQLSERVER, StoreBackend.SQLITE):
+        with pytest.raises(ValueError, match="requires the postgres backend"):
+            StoreSettings(
+                backend=backend,
+                server=REMOTE,
+                database="mefor",
+                username="mefor",
+                ssl_crl_file=crl_bundle,
+            )
+    # A missing path is caught at LOAD too, naming [store].ssl_crl_file -- harden_crl_check would
+    # catch it at store open but hard-codes the prefix "[tls] crl file" for every call site, so it
+    # would report a store setting against the wrong config section.
+    with pytest.raises(ValueError, match=r"\[store\].ssl_crl_file path does not exist"):
+        _pg(ssl_root_cert=crl_bundle, ssl_crl_file=str(crl_bundle) + ".absent")
 
 
 # --- SMTP-over-TLS email (use_tls verify path; a different construction seam) ------------------------
@@ -628,11 +672,28 @@ def crl_bundle(tmp_path_factory: pytest.TempPathFactory) -> str:
         .next_update(now + 30 * day)
         .sign(key, hashes.SHA256())
     )
-    path = tmp_path_factory.mktemp("crl299") / "ca_and_crl.pem"
+    directory = tmp_path_factory.mktemp("crl299")
+    path = directory / "ca_and_crl.pem"
     path.write_bytes(
         ca.public_bytes(serialization.Encoding.PEM) + crl.public_bytes(serialization.Encoding.PEM)
     )
+    # The SAME CA with NO CRL appended, written beside it. A test that needs a trust anchor and a CRL
+    # in two different arguments must not pass one file for both: that cannot tell the arguments
+    # apart, so an argument-swap bug reads as a pass. Measured -- `create_default_context(cafile=<the
+    # bundle>)` already reports `cert_store_stats()["crl"] == 1`, which pre-satisfies harden_crl_check's
+    # own "the CRL really landed" assertion and leaves it proving nothing about which argument loaded it.
+    (directory / "ca_only.pem").write_bytes(ca.public_bytes(serialization.Encoding.PEM))
     return str(path)
+
+
+@pytest.fixture(scope="module")
+def ca_only(crl_bundle: str) -> str:
+    """The `crl_bundle` CA with its CRL stripped -- a valid anchor that sets NO VERIFY_CRL_CHECK_LEAF.
+    Depends on `crl_bundle` so the two files are always the same CA and a test using both is anchoring
+    the CRL it loads."""
+    from pathlib import Path as _Path
+
+    return str(_Path(crl_bundle).with_name("ca_only.pem"))
 
 
 def _crl_policy(crl: str) -> TrustAnchorPolicy:

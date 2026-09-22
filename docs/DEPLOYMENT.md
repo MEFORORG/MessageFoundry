@@ -624,7 +624,12 @@ bind-guard ladder above:
   (the PostgreSQL store and the syslog forwarder) carry their own remediation text, because the
   connection-shaped advice — `[tls].crl_file`, a per-connection attestation — cannot be applied to
   something that is not a connection. The forwarder's refusal names
-  `[logging].forward_tls_crl_file` and the loopback topology instead.
+  `[logging].forward_tls_crl_file` and the loopback topology instead; the store's names
+  `[store].ssl_root_cert` with `[store].ssl_crl_file`, and loopback. **The store names both settings
+  because its CRL only loads on the pinned-CA branch** — on the default store path asyncpg builds the
+  TLS context, so there is no engine-side context for a CRL to reach and loopback is that path's only
+  way across. Setting `[store].ssl_crl_file` without `[store].ssl_root_cert` is refused at load rather
+  than ignored.
 
 **Every other verifying TLS hop the engine dials is ungated.** It validates the chain — and nothing
 asks it for an attestation, warns, or refuses. **Do not book revocation as an estate-wide engine
@@ -664,10 +669,19 @@ attestation:
    authority has a "declared revocation-checking egress terminator" input, but no call site ever sets it
    — routing your egress through such a proxy is good practice and does not change the engine's
    decision, so an outbound hop still needs option 2 or 3.
-2. **Attest it** — set the environment variable `MEFOR_TLS_REVOCATION_ATTESTED=1`. It is **blanket**:
-   it clears both gates for the whole process, for every hop. This is you taking responsibility for
-   revocation, not the engine acquiring it; an attestation that suppresses a would-be refusal is
-   **logged at WARNING at every construction**, so it stays visible.
+2. **Attest it** — set the environment variable `MEFOR_TLS_REVOCATION_ATTESTED=1`. **It no longer
+   clears the OUTBOUND gate on an enforcing instance, and this bullet said for a while that it did.**
+   BACKLOG #299 clamped it: the env is held apart from a per-connection attestation and ranks *below*
+   the enforcing refusal, so on `enforcement = enforce` it crosses **no** outbound hop. One
+   process-wide variable could not say which hop's PKI had been reviewed, and that is the whole reason
+   it was demoted. **This bullet is catching up to that rule rather than announcing a new one.** The
+   clamp already governed the guard-routed hops; the PostgreSQL store hop was the last one still
+   crossing on the env, because it decided its own disposition beside the shared authority instead of
+   through it, and routing it through the guard brought it under the rule the others already had. What it still does: it clears the **listener** gate (there is exactly one `[api]`
+   bind, so the variable unambiguously names that hop — ADR 0078's documented opt-out, deliberately
+   left intact), and it still crosses an outbound hop on a **non-enforcing** instance, where the
+   alternative is a warning rather than a refusal. An attestation that suppresses a would-be refusal
+   is **logged at WARNING at every construction**, so it stays visible.
    (A per-connection `tls_revocation_attested` field exists on the outbound model and the connectors do
    read it — but like `tls_hop_attested` it has **no authoring surface**: no connector-factory parameter
    and no `connections.toml` key, so it is unreachable from config today. The blanket env var is the

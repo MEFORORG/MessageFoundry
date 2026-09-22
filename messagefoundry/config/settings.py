@@ -794,6 +794,51 @@ class StoreSettings(_Section):
             )
         return self
 
+    @field_validator("ssl_crl_file")
+    @classmethod
+    def _ssl_crl_file_exists(cls, value: str | None) -> str | None:
+        """Fail loud at load if the CRL path is missing, the ``_ssl_root_cert_exists`` shape (#299).
+
+        ``harden_crl_check`` would catch it at store open, but its three refusals hard-code the
+        prefix ``[tls] crl file`` for every call site, so a bad ``[store].ssl_crl_file`` would be
+        reported against the wrong config section. Statting it here names the setting the operator
+        actually set. A path, not a secret."""
+        if value and not Path(value).is_file():
+            raise ValueError(
+                f"[store].ssl_crl_file path does not exist or is not a file: {value!r}"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _ssl_crl_file_reachable(self) -> StoreSettings:
+        """``ssl_crl_file`` only reaches a handshake on the POSTGRES pinned-CA branch, so refuse the
+        two configurations where it would be a silent no-op (#299).
+
+        Refuse rather than ignore, exactly as ``_ssl_root_cert_backend`` does — and the stakes are
+        higher here, because this is the setting that crosses the #201 revocation refusal. An
+        operator who sets it and gets nothing believes revocation checking is on when it is not, and
+        a security control that silently does nothing is worse than an absent one.
+
+        * WITHOUT ``ssl_root_cert``: ``_build_ssl`` returns ``True`` and asyncpg builds the context,
+          so there is no engine-side object to load a CRL into. Loopback is that path's only way
+          across an enforcing posture.
+        * On SQL SERVER or SQLITE: neither ever sees an ``SSLContext`` — SQL Server pins via an ODBC
+          keyword string and SQLite uses no TLS — so no CRL can be loaded on either."""
+        if not self.ssl_crl_file:
+            return self
+        if self.backend is not StoreBackend.POSTGRES:
+            raise ValueError(
+                "[store].ssl_crl_file requires the postgres backend; SQL Server pins its certificate "
+                "through an ODBC keyword and SQLite uses no TLS, so neither can load a CRL."
+            )
+        if not self.ssl_root_cert:
+            raise ValueError(
+                "[store].ssl_crl_file requires [store].ssl_root_cert; without a pinned CA the engine "
+                "hands asyncpg the job of building the TLS context, so there is no context for the "
+                "CRL to load into and revocation would NOT be checked."
+            )
+        return self
+
     @model_validator(mode="after")
     def _db_schema_backend(self) -> StoreSettings:
         """``db_schema`` is honoured only by Postgres, which points the pool's ``search_path`` at it.

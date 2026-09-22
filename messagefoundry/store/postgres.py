@@ -54,18 +54,14 @@ import json
 import logging
 import os
 import socket
+import ssl
 import time
 from collections.abc import AsyncIterator, Collection, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from time import perf_counter
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any
+from typing import Any
 from uuid import uuid4
-
-if TYPE_CHECKING:
-    # Annotation-only: this module builds its SSLContexts behind local `import ssl as _ssl` calls, so
-    # the name is needed for typing alone and must not become a module-level import cost here.
-    import ssl
 
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.config.settings import (
@@ -786,12 +782,10 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
     if not settings.encrypt:
         return False  # escape set (checked above) — plaintext connection, dev/test only
     if settings.trust_server_certificate:
-        import ssl as _ssl
-
         # escape set (checked above) — encrypt but skip server-cert verification (trusted-net dev).
-        ctx = _ssl.create_default_context()
+        ctx = ssl.create_default_context()
         ctx.check_hostname = False
-        ctx.verify_mode = _ssl.CERT_NONE
+        ctx.verify_mode = ssl.CERT_NONE
         # Verification is off but the store hop is still encrypted, so the suite list still decides
         # whether recorded PHI traffic survives a future key compromise (ASVS 12.1.2).
         harden_cipher_suites(ctx, connector="Postgres store (TLS verification disabled)")
@@ -806,12 +800,10 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
     # settings.server is str | None; an empty host reads as loopback (is_loopback_hop_host) → ALLOW, so a
     # missing server (a Postgres config that would fail elsewhere) never trips the revocation refusal.
     if settings.ssl_root_cert:
-        import ssl as _ssl
-
         # Pin a private / self-signed CA WITHOUT touching the OS trust store: verify the server cert
         # (+ hostname) against this PEM bundle. create_default_context() already sets CERT_REQUIRED +
         # check_hostname=True, so this stays a fully-verifying posture (a bad path raises at connect).
-        ctx = _ssl.create_default_context(cafile=settings.ssl_root_cert)
+        ctx = ssl.create_default_context(cafile=settings.ssl_root_cert)
         harden_cipher_suites(ctx, connector="Postgres store (pinned CA)")
         if settings.ssl_crl_file is not None:
             # BACKLOG #299: revocation checking against the DB server's certificate. Loads AFTER the CA,
@@ -881,7 +873,7 @@ def _refuse_store_revocation(
     naming what was reviewed is the blanket env wearing a different key.
 
     ``context`` is the :class:`ssl.SSLContext` the handshake will really use, supplied on the pinned-CA
-    branch so :func:`context_checks_revocation` reads ``VERIFY_CRL_CHECK_LEAF` off that object rather
+    branch so :func:`context_checks_revocation` reads ``VERIFY_CRL_CHECK_LEAF`` off that object rather
     than off the presence of a setting. It is ``None`` on the DEFAULT store path, where ``_build_ssl``
     returns ``True`` and asyncpg builds the context -- a stated residual, not a gap in this guard:
     there is no engine-side object for a CRL to load into there, so loopback is that path's only way
