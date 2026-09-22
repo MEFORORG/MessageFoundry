@@ -25,8 +25,8 @@ absence assertion below therefore waits for the MOVING tag to reach its new comm
 then asks about the orphan -- the push that would have written one has demonstrably finished.
 
 **AND THE REMOTE TAG IS NOT THE HOOK'S LAST WRITE.** The local ``$LAST`` ref lands after it. So a
-test that reads ``$LAST`` next, or commits again and so makes the hook read it, waits on
-``wait_for_landed`` instead, which waits for both.
+test that reads ``$LAST`` next, or commits again on the same branch and so makes the hook read it,
+waits on ``wait_for_landed`` instead, which waits for both.
 """
 
 from __future__ import annotations
@@ -40,8 +40,11 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-#: Overridable so this file can be run against a modified hook, the control the sibling suites
-#: established:  MEFOR_DURABILITY_HOOK=/tmp/old.sh pytest <this file>
+#: Overridable, as in the sibling suites, so this file can be run against a MODIFIED copy of the
+#: current hook -- for example one with a delay before its ``update-ref``:
+#:     MEFOR_DURABILITY_HOOK=/tmp/delayed.sh pytest <this file>
+#: NOT a red-first control against a hook older than ``$LAST``: every ``wait_for_landed`` then fails
+#: in setup, the negative control included, before any test reaches the defect it exists for.
 HOOK = Path(
     os.environ.get("MEFOR_DURABILITY_HOOK") or (ROOT / "scripts" / "hooks" / "durability_push.sh")
 )
@@ -186,7 +189,7 @@ def _feature_with_two_commits(repo: Path, bare: Path) -> tuple[str, str]:
     git(repo, "checkout", "-q", "-b", "feature")
     first = commit(repo, "a.txt", "one\n")
     # Landed before the next commit, so the two detached pushes cannot finish out of order and put
-    # ``$LAST`` back on ``first`` after the wait below has already seen it on ``tip``.
+    # the remote tag or ``$LAST`` back on ``first`` after the wait below has seen both on ``tip``.
     assert wait_for_landed(repo, bare, MOVING, first), "the first capture never landed"
     tip = commit(repo, "b.txt", "two\n")
     assert wait_for_landed(repo, bare, MOVING, tip), "the pre-rewrite capture never landed"
@@ -235,7 +238,9 @@ def test_an_AMEND_preserves_the_commit_it_replaced(armed: tuple[Path, Path]) -> 
     commit(repo, "base.txt", "base\n")
     git(repo, "checkout", "-q", "-b", "feature")
     replaced = commit(repo, "a.txt", "one\n")
-    assert wait_for_landed(repo, bare, MOVING, replaced)
+    assert wait_for_landed(repo, bare, MOVING, replaced), (
+        "the pre-amend capture never reached both the remote tag and $LAST"
+    )
 
     (repo / "a.txt").write_text("one, corrected\n", encoding="utf-8")
     git(repo, "add", "-A")
@@ -302,7 +307,9 @@ def test_the_orphan_ref_is_SELF_DESCRIBING_and_names_what_displaced_it(
     replaced = commit(repo, "base.txt", "base\n")
     git(repo, "checkout", "-q", "-b", "feature")
     replaced = commit(repo, "a.txt", "one\n")
-    assert wait_for_landed(repo, bare, MOVING, replaced)
+    assert wait_for_landed(repo, bare, MOVING, replaced), (
+        "the pre-amend capture never reached both the remote tag and $LAST"
+    )
     (repo / "a.txt").write_text("one, corrected\n", encoding="utf-8")
     git(repo, "add", "-A")
     git(repo, "commit", "-q", "--amend", "-m", "one, corrected")
@@ -339,7 +346,7 @@ def test_the_bookkeeping_ref_is_outside_refs_tags_so_a_tag_sweep_cannot_publish_
     repo, bare = armed
     sha = commit(repo, "base.txt", "base\n")
     assert wait_for_landed(repo, bare, "refs/tags/rescue/auto/r/main", sha), (
-        "the hook never wrote its local bookkeeping ref"
+        "the remote tag and the local bookkeeping ref never both reached the commit"
     )
 
     # Read ONCE, so the message shows the value that was compared and not a later one.
