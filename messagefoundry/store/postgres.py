@@ -54,6 +54,7 @@ import json
 import logging
 import os
 import socket
+import ssl
 import time
 from collections.abc import AsyncIterator, Collection, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -71,12 +72,10 @@ from messagefoundry.config.settings import (
     weakened_tls_escape_permitted,
 )
 from messagefoundry.config.tls_policy import (
-    HopDisposition,
     HopPosture,
+    RevocationHopGuard,
     harden_cipher_suites,
-    is_loopback_hop_host,
-    revocation_hop_disposition,
-    tls_revocation_attested,
+    harden_crl_check,
 )
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
@@ -783,12 +782,10 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
     if not settings.encrypt:
         return False  # escape set (checked above) — plaintext connection, dev/test only
     if settings.trust_server_certificate:
-        import ssl as _ssl
-
         # escape set (checked above) — encrypt but skip server-cert verification (trusted-net dev).
-        ctx = _ssl.create_default_context()
+        ctx = ssl.create_default_context()
         ctx.check_hostname = False
-        ctx.verify_mode = _ssl.CERT_NONE
+        ctx.verify_mode = ssl.CERT_NONE
         # Verification is off but the store hop is still encrypted, so the suite list still decides
         # whether recorded PHI traffic survives a future key compromise (ASVS 12.1.2).
         harden_cipher_suites(ctx, connector="Postgres store (TLS verification disabled)")
@@ -796,64 +793,103 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
     # #201 (ADR 0078 amendment): the engine->store hop below VERIFIES the peer cert (a pinned CA or the
     # system trust store) but asyncpg rides stdlib ssl, which does NO OCSP/CRL revocation — a
     # revoked-but-unexpired store cert would still be accepted. Refuse an off-loopback production-PHI
-    # verifying store hop unless the operator attests a revocation-checking PKI (the blanket
-    # MEFOR_TLS_REVOCATION_ATTESTED env — the store has no per-connection attestation surface). Byte-
-    # identical when the posture is unstamped / non-prod / synthetic / loopback / attested; composes with
-    # (never loosens) the weakened-TLS refusal above (that fires first on the verify-off / cleartext path).
+    # verifying store hop unless revocation is really checked on it. Byte-identical when the posture is
+    # unstamped / non-prod / loopback / CRL-checked; composes with (never loosens) the weakened-TLS
+    # refusal above (that fires first on the verify-off / cleartext path, and the two gates key on
+    # disjoint conditions so one hop is never refused twice).
     # settings.server is str | None; an empty host reads as loopback (is_loopback_hop_host) → ALLOW, so a
     # missing server (a Postgres config that would fail elsewhere) never trips the revocation refusal.
-    _refuse_store_revocation(host=settings.server or "", posture=posture)
     if settings.ssl_root_cert:
-        import ssl as _ssl
-
         # Pin a private / self-signed CA WITHOUT touching the OS trust store: verify the server cert
         # (+ hostname) against this PEM bundle. create_default_context() already sets CERT_REQUIRED +
         # check_hostname=True, so this stays a fully-verifying posture (a bad path raises at connect).
-        ctx = _ssl.create_default_context(cafile=settings.ssl_root_cert)
+        ctx = ssl.create_default_context(cafile=settings.ssl_root_cert)
         harden_cipher_suites(ctx, connector="Postgres store (pinned CA)")
+        if settings.ssl_crl_file is not None:
+            # BACKLOG #299: revocation checking against the DB server's certificate. Loads AFTER the CA,
+            # so harden_crl_check's "the CRL really landed" assertion answers for the final trust store.
+            harden_crl_check(ctx, settings.ssl_crl_file)
+        # The guard runs LAST on this branch and takes the FINISHED context, which is the whole point of
+        # `context=`: an ssl_crl_file that really loaded sets VERIFY_CRL_CHECK_LEAF on the very object
+        # asyncpg hands to the handshake, and the guard reads that flag rather than the setting.
+        _refuse_store_revocation(host=settings.server or "", posture=posture, context=ctx)
         return ctx
     # A RESIDUAL, stated rather than papered over: `True` hands asyncpg the job of building the
     # context, so no context exists in engine code for harden_cipher_suites to assert on. Asserting a
     # look-alike built here would grade an object the connection never uses. Closing it means building
     # the verifying default context here and returning it instead, which changes what asyncpg receives
     # on the DEFAULT store path — a separate decision, not a rider on this change.
+    #
+    # BACKLOG #299 lands a SECOND consequence on that same residual, and it is the reason the refusal
+    # below passes no context: with no engine-side context there is nowhere to load a CRL, so
+    # `ssl_crl_file` cannot reach this branch and `crl_checked` is necessarily False here. An enforcing
+    # off-loopback default-path store hop therefore has exactly one way across — loopback — until that
+    # separate decision is taken. The refusal's remediation says so rather than naming a knob that
+    # cannot reach this arm.
+    _refuse_store_revocation(host=settings.server or "", posture=posture, context=None)
     return True  # verifying TLS against the system trust store (the secure default)
 
 
-def _refuse_store_revocation(*, host: str, posture: HopPosture | None) -> None:
+#: The store hop's OWN ways across, replacing the connection-shaped default that names `[tls].crl_file`
+#: and a per-connection flag -- neither of which can reach a hop that is not a connection.
+#: `[store].ssl_crl_file` only loads onto the pinned-CA branch, so it is named WITH `ssl_root_cert`:
+#: from the default path the operator has to set both, and telling them only half would be a remedy
+#: that cannot be performed. Loopback is the other way, and it is the ONLY one on the default path.
+_STORE_WAYS_ACROSS = (
+    "Set [store].ssl_root_cert and [store].ssl_crl_file so the engine checks a CRL on this hop, or "
+    "put the database on the loopback interface (or a local revocation-checking proxy)."
+)
+
+
+def _refuse_store_revocation(
+    *, host: str, posture: HopPosture | None, context: ssl.SSLContext | None = None
+) -> None:
     """Refuse a VERIFYING engine->store TLS hop that does no certificate revocation checking (#201).
 
-    The store-hop twin of :class:`~messagefoundry.config.tls_policy.RevocationHopGuard` — the store is
-    opened outside the connectors' ``active_hop_posture`` construction gate, so it keys directly on the
-    ``posture`` threaded from ``open_store``. ``None`` (a direct test / embedding that derives no posture)
-    is a no-op (byte-identical). Attestation is the blanket ``MEFOR_TLS_REVOCATION_ATTESTED`` env only
-    (the store has no per-connection TOML); no ``proxy_proven`` (an engine->store hop has no declared
-    revocation-checking egress terminator). Raises ``ValueError`` (surfaced at store open, exactly like the
-    weakened-TLS refusal it sits beside) on a production-PHI verifying store hop off-loopback; WARNs on a
-    non-production PHI hop; allows loopback / synthetic / attested (byte-identical)."""
-    if posture is None:
-        return
-    disposition = revocation_hop_disposition(
-        enforcing=posture.enforcing,
-        is_loopback_hop=is_loopback_hop_host(host),
-        proxy_proven=False,
-        attested=tls_revocation_attested(),
-    )
-    if disposition is HopDisposition.REFUSE:
-        raise ValueError(
-            f"Postgres store TLS verifies the peer certificate for host {host!r} but performs NO "
-            "certificate revocation checking (asyncpg rides stdlib ssl — no OCSP/CRL; ASVS 12.1.4, "
-            "ADR 0078). On a production-PHI instance a revoked-but-unexpired store certificate would "
-            "still be accepted. Terminate the store TLS at a revocation-checking proxy, run short-lived "
-            "certs, or set MEFOR_TLS_REVOCATION_ATTESTED=1 to attest a revocation-checking PKI backs it."
-        )
-    if disposition is HopDisposition.WARN:
-        log.warning(
-            "Postgres store TLS to host %r verifies the peer but performs no certificate revocation "
-            "checking (no OCSP/CRL); a revoked store cert would be accepted. Non-production PHI instance "
-            "— crossing. Set MEFOR_TLS_REVOCATION_ATTESTED=1 once a revocation-checking PKI backs it.",
-            host,
-        )
+    Delegates to :class:`~messagefoundry.config.tls_policy.RevocationHopGuard` rather than re-deciding
+    beside it -- the store is opened outside the connectors' ``active_hop_posture`` construction gate,
+    so it threads the ``posture`` derived by ``open_store`` through ``capture(posture=...)``, the
+    position the syslog forwarder and the OIDC IdP legs are also in. ``None`` (a direct test /
+    embedding that derives no posture) falls through to the ambient ``current_hop_posture``, which is
+    unstamped at every ``open_store`` call site -- the store is opened from the API lifespan and the
+    CLI, never inside ``build_check_registry``'s scope -- so it stays the shipped no-op. No
+    ``proxy_proven``: an engine->store hop has no declared revocation-checking egress terminator. Raises
+    :class:`~messagefoundry.config.tls_policy.InsecureHopRefused` -- a ``ValueError`` subclass, so it
+    still surfaces at store open exactly like the weakened-TLS refusal it sits beside -- on a
+    production-PHI verifying store hop off-loopback; WARNs on a non-production one; allows loopback and
+    a hop whose own context really checks a CRL.
+
+    **This used to hand the blanket ``MEFOR_TLS_REVOCATION_ATTESTED`` env to the PER-CONNECTION
+    ``attested`` slot, which defeated the BACKLOG #299 clamp on this hop.** That slot sits ABOVE the
+    enforcing REFUSE arm, so one process-wide env var crossed the engine-to-store hop on an enforcing
+    posture -- the exact unreviewable shape the clamp removes. ``capture`` reads the env itself into
+    the separate ``blanket_attested`` field, which ranks BELOW that refusal, so routing it through the
+    guard is what closes it. A non-enforcing posture still crosses on the env, byte-identical to before.
+
+    ``attested=False`` deliberately, and it is NOT an oversight to be fixed by adding a flag.
+    ``StoreSettings`` carries no per-store revocation attestation, and inventing one here would
+    re-create the clamp's problem at one remove: the value of a per-connection attestation is that a
+    reviewer can check one named hop against that hop's PKI, and a claim the operator can set without
+    naming what was reviewed is the blanket env wearing a different key.
+
+    ``context`` is the :class:`ssl.SSLContext` the handshake will really use, supplied on the pinned-CA
+    branch so :func:`context_checks_revocation` reads ``VERIFY_CRL_CHECK_LEAF`` off that object rather
+    than off the presence of a setting. It is ``None`` on the DEFAULT store path, where ``_build_ssl``
+    returns ``True`` and asyncpg builds the context -- a stated residual, not a gap in this guard:
+    there is no engine-side object for a CRL to load into there, so loopback is that path's only way
+    across an enforcing posture until that separate decision is taken."""
+    RevocationHopGuard.capture(
+        host=host,
+        cell="[store] Postgres TLS (verified TLS, no revocation check)",
+        description=(
+            "carries the PHI message store over verified TLS but performs no certificate revocation "
+            "checking (asyncpg rides stdlib ssl -- no OCSP/CRL)"
+        ),
+        attested=False,
+        context=context,
+        posture=posture,
+        ways_across=_STORE_WAYS_ACROSS,
+    ).enforce_construction()
 
 
 class PostgresStore:
