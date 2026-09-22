@@ -15,9 +15,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
+import io
 import json
 import os
 import shutil
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -622,23 +625,62 @@ def test_restore_config_bundle_never_overwrites_an_existing_file(tmp_path, key_b
 
 def test_restore_config_to_refuses_when_archive_has_no_config(tmp_path, key_b64, capsys) -> None:
     # OPEN QUESTION, decided as a REFUSAL: an operator who asked for the config back and silently got
-    # an empty directory would believe the config was restored. The store is still restored -- the
-    # refusal names the missing bundle -- so this asserts the error, not a rollback of the store.
+    # an empty directory would believe the config was restored.
+    #
+    # This test used to say "the store is still restored" and assert only the error. That WAS the
+    # behaviour and it was the defect: the config bundle is written after the store, so every way it
+    # can fail left a reported failure beside a published PHI-bearing store -- and the retry then met
+    # the never-overwrite refusal, leaving a manual delete as the only way forward. The rollback
+    # assertion and the retry below are the pin; this is the cheapest reachable arm that gets past
+    # `_place_restored_store` and then fails.
     archive, toml = _make_archive(tmp_path, key_b64, capsys, config=False)
-    rc = main(
-        [
-            "restore",
-            archive,
-            "--to",
-            str(tmp_path / "restored.db"),
-            "--config-to",
-            str(tmp_path / "restored-config"),
-            "--service-config",
-            toml,
-        ]
-    )
-    assert rc == 1
+    dest = tmp_path / "restored.db"
+    config_dest = tmp_path / "restored-config"
+    argv = [
+        "restore",
+        archive,
+        "--to",
+        str(dest),
+        "--config-to",
+        str(config_dest),
+        "--service-config",
+        toml,
+    ]
+    assert main(argv) == 1
     assert "no config bundle" in _refusal(capsys)
+    assert not dest.exists(), "a failed restore left the store it had already published"
+    for sidecar in ("-wal", "-shm"):
+        assert not dest.with_name(dest.name + sidecar).exists()
+
+    # The payoff, and the half an existence assertion alone would miss: the SAME command now runs
+    # again. Before the rollback it met the never-overwrite refusal on the store it had just left.
+    assert main(argv) == 1
+    assert "no config bundle" in _refusal(capsys)
+
+
+def test_restore_rollback_removes_the_partial_config_bundle_too(tmp_path, key_b64, capsys) -> None:
+    # The other half of the rollback: files the bundle DID write before it failed. Driven at
+    # `_restore_blocking` rather than the CLI, because a mid-bundle failure needs the extractor to get
+    # part-way and the CLI's up-front refusals are built to make that unreachable. The member-count cap
+    # is the cheapest lever that fails PART-WAY THROUGH rather than before the first write.
+    archive, _toml = _make_archive(tmp_path, key_b64, capsys)
+    dest = tmp_path / "restored" / "msg.db"
+    config_dest = tmp_path / "bundle"
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(dr_backup, "_MAX_CONFIG_MEMBERS", 1)
+        with pytest.raises(dr_backup.BackupError) as excinfo:
+            dr_backup._restore_blocking(
+                archive_path=archive,
+                dest_store_path=dest,
+                config_dest=config_dest,
+                keys=[base64.b64decode(key_b64)],
+            )
+    assert "member-count cap" in str(excinfo.value)
+    assert not dest.exists(), "the published store survived a mid-bundle failure"
+    # The directory is kept (a retry re-creates or reuses it); what it held must be gone.
+    assert not config_dest.exists() or not any(config_dest.iterdir()), (
+        "a partially written config bundle survived, which blocks the retry's empty-dir check"
+    )
 
 
 # --- (5) config-only archive has no store to restore -------------------------
@@ -672,6 +714,122 @@ def test_restore_refuses_config_only_archive(tmp_path, key_b64, capsys) -> None:
     assert rc == 1
     assert "CONFIG-ONLY" in _refusal(capsys)
     assert not dest.exists()
+
+
+# --- (5b) a corrupt or forged archive refuses, it does not traceback ----------
+
+
+def _plain_tar(path: Path, members: list[tuple[str, bytes]]) -> Path:
+    """An uncompressed tar carrying exactly ``members``, in order -- the plaintext shape
+    ``_restore_blocking`` consumes on a no-key box, and the one a forged archive would have."""
+    with tarfile.open(path, "w") as tar:
+        for name, body in members:
+            info = tarfile.TarInfo(name)
+            info.size = len(body)
+            tar.addfile(info, io.BytesIO(body))
+    return path
+
+
+def test_restore_refuses_an_archive_with_no_manifest(tmp_path) -> None:
+    # `_read_manifest_from_tar` raises three ways -- ReadError on an unreadable tar, KeyError when the
+    # manifest member is absent, JSONDecodeError on a damaged one. At this call site none of them was
+    # caught, so all three escaped the CLI's BackupError handler as a traceback from the last-resort
+    # excepthook, while every other archive fault on this path refuses cleanly.
+    tar = _plain_tar(tmp_path / "no-manifest.tar", [("store.db", b"SQLite format 3\x00")])
+    with pytest.raises(dr_backup.BackupError) as excinfo:
+        dr_backup._restore_blocking(
+            archive_path=str(tar),
+            dest_store_path=tmp_path / "out" / "msg.db",
+            config_dest=None,
+            keys=[],
+        )
+    assert excinfo.value.kind == "restore"
+    assert "no manifest.json member" in str(excinfo.value)
+    assert not (tmp_path / "out" / "msg.db").exists()
+
+
+def test_restore_refuses_an_archive_whose_manifest_is_not_json(tmp_path) -> None:
+    # The JSONDecodeError limb of the same guard, which a KeyError-only fix would leave open.
+    tar = _plain_tar(
+        tmp_path / "bad-manifest.tar",
+        [("manifest.json", b"{not json at all"), ("store.db", b"SQLite format 3\x00")],
+    )
+    with pytest.raises(dr_backup.BackupError) as excinfo:
+        dr_backup._restore_blocking(
+            archive_path=str(tar),
+            dest_store_path=tmp_path / "out" / "msg.db",
+            config_dest=None,
+            keys=[],
+        )
+    assert "manifest could not be read" in str(excinfo.value)
+
+
+def test_restore_refuses_a_config_member_landing_on_a_directory(tmp_path) -> None:
+    # The mirror image of the parent-mkdir collision the extractor already refuses. A forged archive
+    # carrying `config/a/b` and then `config/a` asks the exclusive create to make a FILE where the
+    # first member just made a DIRECTORY. Windows reports that as EACCES, not EEXIST, so the
+    # FileExistsError arm written to refuse exactly this collision did not catch it and it escaped as
+    # a traceback.
+    tar = _plain_tar(
+        tmp_path / "collide.tar",
+        [("config/a/b", b"inner"), ("config/a", b"outer")],
+    )
+    cfg = tmp_path / "bundle"
+    with pytest.raises(dr_backup.BackupError) as excinfo:
+        dr_backup._restore_config_members(tar, cfg)
+    assert excinfo.value.kind == "restore"
+    assert str(cfg / "a") in str(excinfo.value)
+
+
+def test_restore_caps_the_plaintext_staging_copy(tmp_path, capsys) -> None:
+    # The plaintext limb had no cap under a constant whose own rationale said it "moves the bound to
+    # the first write". It is the limb that needs the bound MOST: there is no AEAD tag to fail on, so
+    # a forged archive is simply copied onto the destination volume. The cap is lowered rather than a
+    # multi-GiB file written; the bound under test is the counting, not the number.
+    archive, _toml = _make_archive(
+        tmp_path, None, capsys
+    )  # keyless box -> a plaintext .mfbak.plain
+    dest = tmp_path / "restored" / "msg.db"
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(dr_backup, "_MAX_RESTORE_PLAINTEXT_BYTES", 64)
+        with pytest.raises(dr_backup.BackupError) as excinfo:
+            dr_backup._restore_blocking(
+                archive_path=archive, dest_store_path=dest, config_dest=None, keys=[]
+            )
+    assert "exceeds the restore staging cap" in str(excinfo.value)
+    assert not dest.exists()
+
+    # The control: the same archive, the same call, the shipped cap -- it must RESTORE. Without this
+    # the test above would pass against a path that refuses everything.
+    assert (
+        dr_backup._restore_blocking(
+            archive_path=archive, dest_store_path=dest, config_dest=None, keys=[]
+        ).store_bytes
+        > 0
+    )
+
+
+def test_restore_downgrade_refusal_does_not_prescribe_a_setting_it_ignores(
+    tmp_path, key_b64, capsys
+) -> None:
+    # A plaintext archive on a box that HAS a store key is a downgrade signal and is refused. The
+    # refusal used to end "Set [backup].allow_unencrypted to accept it." -- and `run_restore` never
+    # read that setting: its parameter existed, the CLI documented in a comment that it withheld it on
+    # purpose, and nothing else called it. So the remedy named a knob an operator could set and watch
+    # do nothing. The parameter is gone and the message now says the true thing.
+    plain, _toml = _make_archive(tmp_path, None, capsys)  # a plaintext archive...
+    with pytest.raises(dr_backup.BackupError) as excinfo:
+        dr_backup._restore_blocking(  # ...offered to a box that holds a key
+            archive_path=plain,
+            dest_store_path=tmp_path / "restored" / "msg.db",
+            config_dest=None,
+            keys=[base64.b64decode(key_b64)],
+        )
+    message = str(excinfo.value)
+    assert "KEY_MISMATCH" in message and "possible downgrade" in message
+    assert "allow_unencrypted" not in message
+    assert not hasattr(dr_backup.run_restore, "__wrapped__")
+    assert "allow_unencrypted" not in inspect.signature(dr_backup.run_restore).parameters
 
 
 # --- (6) PHI-safe stdout, JSON and human -------------------------------------

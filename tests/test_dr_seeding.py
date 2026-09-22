@@ -290,6 +290,80 @@ async def test_partially_restored_store_aborts(tmp_path: Path) -> None:
         await primary.close()
 
 
+async def test_config_only_seed_on_sqlite_aborts(tmp_path: Path) -> None:
+    # The hole the LOAD gate left open, and the one it exists to close. A config-only archive verifies
+    # PASS with EMPTY row_counts, so the gate used to return early and hand the box through; the
+    # server-DB gate returns early too, because the backend is SQLite. Both gates no-op, and a
+    # deploying site would record a dr_seed marker and a dr.activate row against a store nothing was
+    # ever restored into -- the exact silent success ADR 0048's amendment says is refused
+    # unconditionally. It cannot be a false refusal: `run_restore` refuses a config-only archive
+    # outright (tests/test_cli_restore_dispatch.py), so no SQLite box could have been seeded from one.
+    key = generate_key()
+    primary, _full_archive, ss = await _make_seed(tmp_path, key)
+    try:
+        runner = BackupRunner(
+            primary,
+            BackupSettings(enabled=True, destination=str(tmp_path / "cfgonly")),
+            store_settings=ss,
+            config_dir=None,
+        )
+        config_only = await runner.run_once(now=2.0, force_config_only=True)
+        assert config_only is not None and config_only.config_only
+    finally:
+        await primary.close()
+    # A fresh, never-restored DR box on SQLite, pointed at that archive as its cold seed.
+    dr_store = await MessageStore.open(tmp_path / "dr.db", cipher=make_cipher(key))
+    try:
+        dr_ss = StoreSettings(path=str(tmp_path / "dr.db"), encryption_key=key)
+        coord, state = _coord(
+            dr_store, dr_ss, seed_archive=config_only.archive_path, takeover_hook="exit 0"
+        )
+        with pytest.raises(DrActivationError) as exc:
+            await coord.activate(actor="bob")
+        assert exc.value.kind == "seed"
+        assert "NO store row counts" in str(exc.value)
+        assert not coord.active and not state["active"]
+        actions = await _actions(dr_store)
+        assert "dr_activation_aborted" in actions
+        # The defect in one assertion: no marker and no activation row for a seed carrying no store.
+        assert "dr_seed" not in actions and "dr.activate" not in actions
+    finally:
+        await dr_store.close()
+
+
+async def test_empty_seed_and_empty_store_names_both_readings(tmp_path: Path) -> None:
+    # The neighbouring wording case. A seed taken from a primary that held zero messages restores to a
+    # store holding zero, and so does a restore that never ran -- one number, two readings. The gate
+    # refuses either way, and the message must not ASSERT the second: an operator running an
+    # empty-primary drill would go looking for a restore step they had already done correctly.
+    key = generate_key()
+    primary = await MessageStore.open(tmp_path / "empty.db", cipher=make_cipher(key))
+    ss = StoreSettings(path=str(tmp_path / "empty.db"), encryption_key=key)
+    try:
+        runner = BackupRunner(
+            primary,
+            BackupSettings(enabled=True, destination=str(tmp_path / "b")),
+            store_settings=ss,
+            config_dir=None,
+        )
+        empty = await runner.run_once(now=1.0)
+        assert empty is not None and empty.row_counts.get("messages", 0) == 0
+    finally:
+        await primary.close()
+    dr_store = await MessageStore.open(tmp_path / "dr.db", cipher=make_cipher(key))
+    try:
+        dr_ss = StoreSettings(path=str(tmp_path / "dr.db"), encryption_key=key)
+        coord, _state = _coord(dr_store, dr_ss, seed_archive=empty.archive_path)
+        with pytest.raises(DrActivationError) as exc:
+            await coord.activate(actor="bob")
+        assert exc.value.kind == "seed"
+        message = str(exc.value)
+        assert "cannot be told apart" in message
+        assert "was never restored" not in message  # the cause it is not entitled to name
+    finally:
+        await dr_store.close()
+
+
 async def test_restored_store_activates(tmp_path: Path) -> None:
     # The positive control for the two aborts above: a DR store actually RESTORED from the archive
     # (via the run_restore primitive the `messagefoundry restore` CLI drives) activates cleanly. Without

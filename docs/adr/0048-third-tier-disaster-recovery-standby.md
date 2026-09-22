@@ -239,6 +239,13 @@ of activation. The engine owns only the feed-priority + selective-startup half; 
 > so activation now **also refuses when the DR store does not carry the verified seed**. Before that gate, a DR
 > box that skipped the restore verified a perfectly good archive, recorded a `dr_seed` marker for an archive it
 > had never loaded, and reported a successful promotion onto an empty store.
+>
+> **"Unconditionally" includes the seed that carries no store.** A config-only archive verifies `PASS` with no
+> row counts, and the gate first shipped reading that as nothing to compare and returning early — so on a
+> SQLite box, where the DBA-attestation gate does not apply either, both gates passed an unseeded store
+> through and the unconditional sentence above was not true of the code. It is now: a seed declaring no store
+> row counts is itself the refusal. It cannot be a false refusal, because `messagefoundry restore` rejects a
+> config-only archive outright — an archive carrying no store is one no SQLite box could have been seeded from.
 
 - **Cold — restore from #60 backups (the default and only built seed path).** The DR box is seeded from #60's
   scheduled, **encrypted** config + store backup (restore-verified). **RPO** = backup cadence (e.g. daily, the #60
