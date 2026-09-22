@@ -150,6 +150,7 @@ try {
     # box can hold many and only some are declared; taking the newest DECLARED one is what restores
     # intent rather than the most recent heartbeat.
     $seatsDir = Join-Path $coord 'seats'
+    if ($env:KORUS_AGENT -eq 'codex') { $seatsDir = Join-Path $coord 'codex-seats' }
     $declared = $null
     if (Test-Path -LiteralPath $seatsDir) {
         $cands = Get-ChildItem -LiteralPath $seatsDir -Recurse -Filter '*.json' -File -EA SilentlyContinue |
@@ -159,6 +160,12 @@ try {
             $wt = [string]$j.worktree
             if (-not $wt) { continue }
             if (($wt -replace '/', '\').TrimEnd('\') -ne $topNorm) { continue }
+            # A Codex restart may not inherit the goal of a Claude session in this tree.
+            if ($env:KORUS_AGENT -eq 'codex') {
+                if (-not $env:KORUS_SESSION_ID) { continue }
+                if (-not $j.PSObject.Properties['sessionId'] -or
+                    $j.sessionId -ne "codex-$env:KORUS_SESSION_ID") { continue }
+            }
             if ($j.PSObject.Properties['goal'] -and $j.goal) { $declared = $j; break }
         }
     }

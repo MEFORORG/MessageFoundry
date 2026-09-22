@@ -178,6 +178,10 @@ scripts/security/scan-tokens.local.txt
 # NOTHING under `.claude/` may be negated except `settings.json`; tests/test_private_paths_stay_ignored.py
 # pins the tracked set so widening it fails a required check instead of shipping.
 /.claude/worktrees/
+
+# Codex transport is tracked; session state and migration backups are local.
+/.codex/sessions/
+/.codex/migration-backup/
 /TRANSCRIPTS.md
 /docs/security/
 /docs/reviews/

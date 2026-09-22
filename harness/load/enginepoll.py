@@ -461,9 +461,17 @@ async def sample_until_reconciled(
     write-buffer time, so the frame may never have left the closed socket. Waiting for ``read`` to
     reach the full ``sent`` would poll the entire timeout for a message that may never arrive; the
     reconcile applies the same accounting, so the settled condition must match it. With
-    ``timeouts == 0`` (every healthy run) this is exactly ``read >= sent``. (This is only the
-    STOP-SAMPLING heuristic — the reconcile itself additionally caps how many unconfirmed sends are
-    excusable, so a timeout flood still fails the run regardless of when sampling stopped.)"""
+    ``timeouts == 0`` (every healthy run) this is exactly ``read >= sent``.
+
+    **WHAT BACKS THE STOP CONDITION DEPENDS ON WHICH RECONCILE CONSUMES IT, and the two have
+    parted.** This used to say the reconcile "additionally caps how many unconfirmed sends are
+    excusable, so a timeout flood still fails the run regardless of when sampling stopped". That
+    still holds for the connscale and estate copies. It does NOT hold for the load runner's copy
+    (``harness/load/report.py``, this function's caller via ``harness/load/runner.py``): that cap no
+    longer decides a verdict. Settling here is therefore not evidence of a clean run for that
+    caller — this condition and its remaining checks are the same inequalities. ``_reconcile``'s own
+    comment is the source of record for what still fails there and what no longer does; read it
+    before treating an early settle as a result."""
     loop = asyncio.get_running_loop()
     base = poller.baseline
     start = loop.time()

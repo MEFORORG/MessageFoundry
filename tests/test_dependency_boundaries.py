@@ -6,6 +6,8 @@ importing the api package's pure models must not drag the server into a GUI proc
 from __future__ import annotations
 
 import ast
+import json
+import os
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
@@ -112,10 +114,16 @@ def test_forbidden_engine_imports_all_name_something_real() -> None:
     still reads as enforced, and nothing reports that it now guards nothing. That is what
     `messagefoundry.console` did after the desktop console was retired.
 
-    Third-party names (`fastapi`, `pyside6`) are exempt -- they are import names, not paths in this
-    tree, and the suite would not run at all if they were absent."""
+    Third-party names (`fastapi`, `pyside6`, `PySide6`) are exempt -- they are import names, not
+    paths in this tree, and the suite would not run at all if they were absent.
+
+    `_TRAY_FORBIDDEN` is covered here too (BACKLOG #1716). Its positive control plants an importable
+    stub for any name without a dot, so a misspelled third-party entry there passes its own control
+    by construction; this is what catches a misspelled in-tree one."""
     repo = Path(__file__).resolve().parents[1]
-    for entry in _FORBIDDEN + tuple(m for v in _PACKAGE_FORBIDDEN.values() for m in v):
+    for entry in (
+        _FORBIDDEN + _TRAY_FORBIDDEN + tuple(m for v in _PACKAGE_FORBIDDEN.values() for m in v)
+    ):
         if not entry.startswith("messagefoundry"):
             continue
         target = repo / Path(*entry.split("."))
@@ -443,3 +451,255 @@ def test_importing_api_does_not_eagerly_pull_fastapi() -> None:
     )
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+
+
+# --- BACKLOG #1716: the tray's layering claim, checked in a FRESH interpreter -----------------------
+#
+# `messagefoundry/tray/__init__.py` states the ADR 0113 §1 rule in prose: the package may import only
+# `messagefoundry.apiclient` and the stdlib-only NSSM helpers, and never PySide6, FastAPI, or the
+# api/store/pipeline/transports packages. Nothing enforced it. `test_tray_windows_modules_import_and
+# _build_structs` in `tests/test_tray_shell.py` does import the tray shell, but INSIDE the pytest
+# process, where a sibling test may already have imported fastapi or PySide6 — so it certifies that
+# the ctypes structs load and says nothing at all about what the tray drags in behind them.
+#
+# CONFIG IS FORBIDDEN OUTRIGHT, AND THAT IS A CHANGE OF FACT RATHER THAN OF POLICY. This block once
+# omitted `messagefoundry.config` because the PACKAGE ROOT dragged it in: `messagefoundry/
+# __init__.py` imported `actions`, which imports `parsing.message`, so any `import messagefoundry.*`
+# paid for config, parsing, hl7 and pydantic whatever the tray itself asked for. `3005dd073` (BACKLOG
+# #1675) made that root lazy -- a PEP 562 `__getattr__` importing an export's owning module on first
+# touch -- and the pull-in is gone. Re-measured on this tree: a fresh interpreter that imports
+# `messagefoundry.tray.app` holds 0 `messagefoundry.config`, 0 `messagefoundry.parsing`, 0 `hl7` and
+# 0 `pydantic` modules, against 14, 41, 8 and 42 at baf53b3ae. The omission bought tolerance for a
+# pull-in no tray module caused; nothing causes it now, so config is named like any other package.
+#
+# `messagefoundry.tray.config` is a DIFFERENT module and the matcher does not reach it: the match is
+# exact or on a dotted prefix, and the tray's own config module is neither `messagefoundry.config`
+# nor anything under `messagefoundry.config.`. It loads on every probe call, so the main guard
+# ASSERTS it is in the run rather than leaving that to this paragraph. BE EXACT ABOUT WHAT THAT
+# CATCHES, because the near-miss is narrower than it looks: a matcher loosened to compare LAST
+# SEGMENTS reds on it, and a matcher loosened to a plain substring test does NOT -- measured,
+# `"messagefoundry.config" in "messagefoundry.tray.config"` is False, the `tray.` segment sits
+# between. So the assertion pins one loosening, not every one.
+#
+# THIS IS AN ABSENCE LIST, NOT AN ALLOWLIST, and the difference is load-bearing. Every name below
+# must be missing; nothing here says what the tray MAY import, so a package no entry names arrives
+# silently.
+#
+# THE API ENTRY IS THE SERVER MODULE, NOT THE PACKAGE, and that is a correction rather than a
+# nicety. ADR 0113 §1 PERMITS the tray `messagefoundry.apiclient`, and importing apiclient loads
+# `messagefoundry.api.models` and `messagefoundry.api.auth_models` by design -- they are the pure
+# pydantic response models this file's own opening docstring exists to keep separable from the
+# server (ADR 0088). Measured: `import messagefoundry.apiclient` puts `messagefoundry.api` and five
+# of its submodules in `sys.modules` and pulls neither `messagefoundry.api.app` nor `fastapi`. A bare
+# `messagefoundry.api` here would therefore red the day the tray takes the import the ADR invites,
+# which is a guard that punishes the compliant change. `messagefoundry.api.app` is the FastAPI
+# application, so it still reds on a tray reaching for the server.
+#
+# THAT PERMITTED IMPORT REACHES CONFIG TOO, SO THE TOLERANCE IS CONDITIONAL AND NOT STANDING.
+# `messagefoundry/api/models.py` imports `messagefoundry.config.ai_policy`, which brings the
+# `messagefoundry.config` package plus its `models` and `tls_policy` siblings -- measured, exactly
+# those four config modules and no other. `_APICLIENT_CARRIES` names that pull-in, and both tests
+# below allow it ONLY when the child actually loaded `messagefoundry.apiclient`. The tray takes no
+# apiclient import today, so config still reds outright here. Each unconditional answer is wrong in
+# one direction: forbidding it flat reds the first compliant change, which is the defect the
+# `api` -> `api.app` narrowing above exists to avoid, and allowing it flat blinds the direct import
+# the entry was added for.
+#
+# WHAT THIS GUARD DOES NOT COVER, NAMED RATHER THAN IMPLIED, because a reader who takes it for the
+# whole ADR rule gets a stronger control than the one that exists. Four limits, all measured here:
+#
+# 1. THE API ENTRY IS A SUBMODULE, NOT THE PACKAGE, for the reason just above. Measured: a tray
+#    importing `messagefoundry.api.auth_models` directly -- rather than through the apiclient the
+#    ADR permits -- brings no config and no `api.app`, so it passes this guard. `api.models` does
+#    not slip through the same way: it reaches config, which reds.
+# 2. A TRAY THAT TAKES THE APICLIENT IMPORT LOSES THE CONFIG SIGNAL. With `messagefoundry.apiclient`
+#    in the child's `sys.modules`, a DIRECT `import messagefoundry.config` beside it is
+#    indistinguishable from the one apiclient brings. Inherent to a runtime probe, and the reason
+#    the static walk below is a complement rather than a nicety.
+# 3. FOURTEEN OF THE SEVENTEEN TRAY MODULES. This reaches what `tray.app` imports; `branding`,
+#    `instance` and `__main__` -- the actual entrypoint -- are never loaded, so a forbidden import in
+#    one of those is invisible.
+# 4. IMPORTS THAT RUN AT IMPORT TIME. A deferred `def _show(): import PySide6`, the ordinary shape
+#    for an optional GUI dependency, never reaches `sys.modules` here.
+#
+# All four are closed by a STATIC walk rather than a runtime probe, which is a complement and not a
+# replacement: an AST walk cannot see a forbidden package arriving TRANSITIVELY behind an allowed
+# import, which is the one thing this probe is for. Measured on this tree: a walk over all 17 tray
+# files for all seven names finds zero hits, so it would pass on arrival. It is not built here
+# because the walk helper it would reuse (`_imported_modules` above) does not record the
+# `from messagefoundry import config` spelling, and repairing that belongs to the walk's own change,
+# not to this one. Unfiled; named by subject rather than by a number nobody has allocated.
+_TRAY_FORBIDDEN = (
+    "PySide6",
+    "fastapi",
+    "messagefoundry.api.app",
+    "messagefoundry.config",
+    "messagefoundry.store",
+    "messagefoundry.pipeline",
+    "messagefoundry.transports",
+)
+
+#: The one forbidden name `messagefoundry.apiclient` legitimately brings, through
+#: `messagefoundry/api/models.py`'s `messagefoundry.config.ai_policy` import. Pinned as a constant so
+#: the tests below and the paragraph above cannot drift apart.
+_APICLIENT_CARRIES = frozenset({"messagefoundry.config"})
+
+#: Prefix on the child's one JSON line, so the parse SELECTS it rather than taking the last line.
+#: Last-line reading defends only against output written BEFORE the print; a ResourceWarning at
+#: interpreter shutdown, an `atexit` writer or `-X dev` all land AFTER it, and a child that exits 0
+#: printing nothing gives an IndexError before any assertion here can say what went wrong.
+_PROBE_MARK = "MEFOR-TRAY-PROBE:"
+
+
+class _TrayProbe(NamedTuple):
+    """What one fresh-interpreter tray import saw."""
+
+    #: The `_TRAY_FORBIDDEN` names that landed in the child's `sys.modules`.
+    found: frozenset[str]
+    #: Every `messagefoundry` name in it, so a caller can ask its own question of the same run.
+    loaded: frozenset[str]
+
+
+def _tray_import_probe(plant: str = "", *, path_head: Path | None = None) -> _TrayProbe:
+    """Import the tray shell in a fresh interpreter and report what landed in `sys.modules`.
+
+    Fresh, because `sys.modules` inside the pytest process already carries most of this tree — the
+    same reason `test_importing_api_does_not_eagerly_pull_fastapi` above spawns one.
+
+    `plant` is executed BEFORE the tray import, so it stands in for the MATCHER's input rather than
+    for a tray module: it proves the probe resolves a forbidden name, including the dotted-prefix
+    case, and not that the tray reached it. `path_head` is prepended to `PYTHONPATH` so a control can
+    supply a name this environment may not have installed.
+    """
+    code = (
+        "import json, sys\n"
+        f"{plant}\n"
+        "import messagefoundry.tray.app\n"
+        f"forbidden = {_TRAY_FORBIDDEN!r}\n"
+        "found = {f for f in forbidden for m in sys.modules\n"
+        "         if m.lower() == f.lower() or m.lower().startswith(f.lower() + '.')}\n"
+        "loaded = [m for m in sys.modules\n"
+        "          if m == 'messagefoundry' or m.startswith('messagefoundry.')]\n"
+        f"print({_PROBE_MARK!r} + json.dumps("
+        "{'found': sorted(found), 'loaded': sorted(loaded)}))\n"
+    )
+    env = dict(os.environ)
+    if path_head is not None:
+        inherited = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = f"{path_head}{os.pathsep}{inherited}" if inherited else str(path_head)
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, env=env, timeout=300
+    )
+    assert result.returncode == 0, result.stderr
+    marked = [ln for ln in result.stdout.splitlines() if ln.startswith(_PROBE_MARK)]
+    assert len(marked) == 1, f"the probe printed {len(marked)} marked lines: {result.stdout!r}"
+    payload = json.loads(marked[0].removeprefix(_PROBE_MARK))
+    loaded = frozenset(payload["loaded"])
+    # The tray import is the whole subject, and a plant runs BEFORE it, so without this line deleting
+    # `import messagefoundry.tray.app` would leave every positive control below passing on the plant
+    # alone. Asserting it here makes the tray import load-bearing in every call.
+    assert "messagefoundry.tray.app" in loaded, "the probe never imported messagefoundry.tray.app"
+    return _TrayProbe(frozenset(payload["found"]), loaded)
+
+
+def test_the_tray_pulls_in_no_gui_toolkit_web_framework_or_engine_runtime() -> None:
+    # All seven are absent today, so this is a regression guard rather than a fix: it fails the day a
+    # tray module reaches for the server, engine config, the store, the pipeline, a connector or a
+    # GUI toolkit.
+    probe = _tray_import_probe()
+    # The config tolerance is CONDITIONAL on the tray having taken the apiclient import ADR 0113 §1
+    # permits, which it has not; `expected` is therefore empty here and a direct
+    # `import messagefoundry.config` reds. See the paragraph above for why neither unconditional
+    # answer works.
+    expected = _APICLIENT_CARRIES if "messagefoundry.apiclient" in probe.loaded else frozenset()
+    assert probe.found == expected, (
+        f"importing messagefoundry.tray.app pulled in {sorted(probe.found)}, expected "
+        f"{sorted(expected)}"
+    )
+    # The green above is only discriminating while the tray's OWN `config` module is in the run: it
+    # is the near-miss the exact/dotted-prefix match has to keep clear of `messagefoundry.config`.
+    # A last-segment comparison reds here; a plain substring test does not. See the paragraph above.
+    assert "messagefoundry.tray.config" in probe.loaded, (
+        "the tray shell no longer loads its own `config` module, so this green stops proving the "
+        "matcher holds `messagefoundry.tray.config` apart from `messagefoundry.config`"
+    )
+
+
+@pytest.mark.parametrize("name", _TRAY_FORBIDDEN)
+def test_the_tray_probe_sees_a_planted_forbidden_import(tmp_path: Path, name: str) -> None:
+    # Prove the probe can SEE what it is looking for. A fresh-interpreter check that cannot detect
+    # the import it names returns the same clean answer as a tray that is genuinely clean, and the
+    # two are indistinguishable from the green alone.
+    path_head = None
+    if "." not in name:
+        # A third-party name may not be installed on every leg, and a control that SKIPS is a control
+        # that did not run. Plant an importable stub on the path instead: what is under test is that
+        # the probe sees the name arrive in `sys.modules`, and a stub arrives there through the same
+        # import machinery the real package would use.
+        #
+        # THE RESIDUE, because a stub is importable BY CONSTRUCTION: this leg cannot tell a real
+        # third-party name from a misspelled one, so `pysides6` in the set above would plant, match
+        # and pass while the main guard looked for a package that does not exist -- the shape
+        # `test_forbidden_engine_imports_all_name_something_real` above exists to stop. That test now
+        # covers `_TRAY_FORBIDDEN`'s in-tree names; the two third-party ones are not reachable that
+        # way, for the same reason it exempts them from `_FORBIDDEN`.
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "__init__.py").write_text("", encoding="utf-8")
+        path_head = tmp_path
+
+    probe = _tray_import_probe(f"import {name}", path_head=path_head)
+    assert name in probe.found, (
+        f"planted `import {name}` and the probe reported {sorted(probe.found)}"
+    )
+    # ...and it must not be answering yes to everything. `messagefoundry.pipeline` legitimately
+    # brings the store and transports with it, so those cannot be pinned; nothing at all brings a GUI
+    # toolkit, so PySide6 discriminates a real match from a blanket one. The PySide6 leg needs a
+    # discriminator of its own, or `assert name in probe.found` is the whole of it and a matcher
+    # answering yes to everything passes: `fastapi` serves, being absent from a PySide6 plant.
+    discriminator = "fastapi" if name == "PySide6" else "PySide6"
+    assert discriminator not in probe.found, sorted(probe.found)
+
+
+def test_the_tray_probe_passes_the_import_adr_0113_permits() -> None:
+    """The negative control: the ADR-PERMITTED import must trip nothing else (BACKLOG #1716).
+
+    ADR 0113 §1 allows the tray `messagefoundry.apiclient`, and the tray does not take that import
+    today -- its only non-tray engine imports are `messagefoundry.service_status` and
+    `messagefoundry.service`. So nothing else in this file would notice if the forbidden set were
+    drawn to red on a legal import, and the guard would fail the first compliant change instead of
+    the first violation.
+
+    This is not hypothetical, which is why it is a test and not a comment: it FAILED when written,
+    against a set naming a bare `messagefoundry.api`. Importing apiclient loads that package's pure
+    response models by design, so the entry was narrowed to `messagefoundry.api.app`, the server.
+
+    `messagefoundry.config` is the one name apiclient still brings, so it is EXEMPTED here rather
+    than dropped from the forbidden set: the tray must not reach config on its own, and the day it
+    takes the apiclient import this control says which forbidden name that is allowed to carry.
+    Asserted in BOTH directions -- an apiclient that stops pulling config should retire
+    `_APICLIENT_CARRIES`, not keep a tolerance that no longer tolerates anything.
+    """
+    assert _tray_import_probe("import messagefoundry.apiclient").found == _APICLIENT_CARRIES
+
+
+def test_the_tray_probe_resolves_a_forbidden_package_by_its_dotted_prefix() -> None:
+    """The matcher's PREFIX branch, which no other control here reaches (BACKLOG #1716).
+
+    Importing `a.b.c` registers `a` and `a.b` too, so every plant above is satisfied by the matcher's
+    EXACT-equality branch alone. Measured: delete `m.startswith(f + '.')` and all of them stay green,
+    while `_tray_import_probe`'s own docstring tells the next reader the dotted-prefix case was
+    proven. It matters because the real defect this guard is for arrives that way -- a tray reaching
+    `messagefoundry.store.queue`, never bare `messagefoundry.store`.
+
+    Planting straight into `sys.modules` rather than importing, because a real import would register
+    the parent package and satisfy the exact branch, which is the case this test exists to exclude.
+    """
+    probe = _tray_import_probe(
+        "import types\n"
+        "sys.modules['messagefoundry.store.queue'] = types.ModuleType('messagefoundry.store.queue')"
+    )
+    assert probe.found == {"messagefoundry.store"}, sorted(probe.found)
+    assert "messagefoundry.store" not in probe.loaded, (
+        "the parent package is in the run, so the EXACT branch could have produced that match and "
+        "this test no longer isolates the prefix branch"
+    )
