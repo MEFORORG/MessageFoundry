@@ -1482,10 +1482,13 @@ DBA-delegated (#52): config-only, or skipped, per `config_only_on_server_db`.
 A **right-sized DR box** that activates only when the whole HA pair / site is gone and then runs **only the
 high-priority feeds** in a deliberately degraded mode — the inverse of the dropped active-active scale-out
 (it runs *less*, not more) (#61, [ADR 0048](adr/0048-third-tier-disaster-recovery-standby.md)). **Opt-in:**
-`enabled = false` (the default) is a complete no-op. On activation the engine cold-seeds the store from a
-`[backup]` `.mfbak` archive (fail-closed if the KeyProvider/DEK is unreachable at the DR site), starts only
-the connections whose resolved priority tier is at or above `priority_threshold` (the rest report
-`status: "filtered"`), and is fenced by **acquire-VIP-or-abort**. **Activation is manual** — `POST
+`enabled = false` (the default) is a complete no-op. The cold seed is **two steps, and the engine does not do
+the first one for you**: restore the `[backup]` `.mfbak` archive to the DR box's store path yourself with
+`messagefoundry restore <archive> --to <store path>` (it refuses to overwrite an existing store), then
+activate. On activation the engine restore-**verifies** that archive (fail-closed if the KeyProvider/DEK is
+unreachable at the DR site), **refuses if the DR store does not carry the verified seed** — an empty store
+means the restore never happened — starts only the connections whose resolved priority tier is at or above
+`priority_threshold` (the rest report `status: "filtered"`), and is fenced by **acquire-VIP-or-abort**. **Activation is manual** — `POST
 /dr/activate`, gated by the `dr:operate` permission; no health probe ever activates it. `enabled`/`activate`
 are read at engine start. `[dr].activate` **cannot be combined with `[cluster].enabled`** (refused at load):
 a warm DR-site engine is a non-promotable cluster member, not a lease-contending DR box.
@@ -1499,7 +1502,7 @@ a warm DR-site engine is a non-promotable cluster member, not a lease-contending
 | `takeover_hook` | str | `""` | **optional** operator command run before binding the priority listeners: exit 0 = "VIP acquired", any non-zero or timeout = "not acquired" and **activation aborts**. For an ADR 0047 load-balancer topology the passive LB is the fence and this is belt-and-braces only. `""` = no hook; a whitespace-only value is rejected at load (it would run an empty shell and "succeed") |
 | `release_hook` | str | `""` | the symmetric command run on `POST /dr/release` to hand the VIP back to the recovered primary. `""` = no hook; whitespace-only rejected at load |
 | `takeover_timeout_seconds` | float (>0) | `30.0` | bound on the takeover/release hook **and** on the KeyProvider-reachability check at the DR site: a hook or key probe that doesn't succeed within this **aborts activation closed** — no hang, no silent retry-forever |
-| `seed_archive` | path | `""` | the `.mfbak` archive to cold-seed the DR store from on activation. `""` = the operator supplies the archive path in the `POST /dr/activate` request body instead (the runbook path). A cloud URL is rejected — local/UNC only, like the backup destination |
+| `seed_archive` | path | `""` | the `.mfbak` archive activation **verifies** the cold seed against. Activation does not load it — restore it first with `messagefoundry restore <archive> --to <store path>`, and name the same archive here so activation can check the store actually carries it. `""` = the operator supplies the archive path in the `POST /dr/activate` request body instead (the runbook path). A cloud URL is rejected — local/UNC only, like the backup destination |
 | `restore_token` | path | `""` | **opt-in server-DB DR restore token** (BACKLOG #223, [ADR 0102](adr/0102-server-db-dr-restore-vintage-completeness-attestation-residual.md)). A local/UNC path to a small JSON token the DBA places on the DR box recording the **expected** source-backup anchor of a native (Postgres/SQL Server) restore. When set, the server-DB seed gate cross-checks it against the restored database's own latest successful `dr_backup` archive — a **vintage floor** a bare boolean attestation cannot give: a stale or wrong native restore's latest anchor differs, so activation **refuses closed**. `""` (default) = off (the gate is byte-unchanged; SQLite is a no-op). A cloud URL is rejected |
 
 ### `[approvals]`

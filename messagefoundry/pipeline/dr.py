@@ -17,7 +17,10 @@ owns the **priority-feed startup** half (the DR run-profile in
    integrity / row-count) **aborts** activation closed (clear error, never start against an
    unverified/plaintext store) and records a ``dr_activation_aborted`` audit row. A configured
    KeyProvider endpoint that is unreachable from the DR site within ``takeover_timeout_seconds`` is the
-   same fail-closed abort (AC-14), distinct from the in-archive decrypt failure (AC-9).
+   same fail-closed abort (AC-14), distinct from the in-archive decrypt failure (AC-9). Verifying the
+   archive is not loading it — the restore is the operator's separate ``messagefoundry restore`` step —
+   so activation then **also** refuses when the DR store does not carry the verified seed
+   (:meth:`DrCoordinator._verify_seeded_store`), rather than promoting onto an empty store.
 2. **Recover the cold-restored store + start a NEW audit-chain segment.** ``reset_stale_inflight``
    recovers in-flight rows of every stage carried in the backup (AC-15), then a ``dr_seed`` marker
    (seed-marker genesis = source-snapshot SHA-256 + config/DEK fingerprints + the restored chain's tip
@@ -213,6 +216,11 @@ class DrCoordinator:
             # restore-provenance probe here. No-op on SQLite (the archive verified the whole store already).
             await self._verify_live_server_seed(dba_attests_restored, actor, now)
 
+            # (1c) COLD-SEED *LOAD* GATE (fail-closed, BEFORE any store mutation or VIP step). Step (1)
+            # proved the ARCHIVE is good; this proves the box's own store carries it. The SQLite twin of
+            # the server-DB gate above.
+            await self._verify_seeded_store(verify, actor, now)
+
             # (2) Recover the cold-restored store (every stage, AC-15) + open a NEW audit-chain segment
             # (the seed-marker genesis; do NOT blindly extend the restored chain — ADR 0049/0041).
             # Ownership-scoped when sharded (ADR 0073) — see _owned_lanes in __init__.
@@ -394,6 +402,81 @@ class DrCoordinator:
             )
         return verify
 
+    async def _verify_seeded_store(self, verify: VerifyResult, actor: str, now: float) -> None:
+        """COLD-SEED LOAD GATE — refuse to promote onto a DR store the seed archive was never loaded into.
+
+        Activation *verifies* the ``.mfbak`` seed (step 1) and never loads it: the restore is a separate,
+        deliberate step (``messagefoundry restore <archive> --to <store path>``) the operator runs before
+        the engine opens the store. A DR box that skipped it opens an EMPTY store — SQLite creates the
+        file on open, so an **absent** store and an **empty** one are the same thing by the time
+        activation runs — and every earlier check still passes, because they all examine the archive.
+
+        The refusal is one condition with two wordings: the DR store holds **fewer messages than the
+        verified seed declares**, zero included. Fail-closed, recorded as ``dr_activation_aborted``.
+
+        Two limits, stated rather than hidden. A seed taken from a primary that held zero messages
+        restores to a store that also holds zero, so it is refused too — the conservative side of a gate
+        whose whole job is to stop a promotion onto a store with nothing in it, and the error names the
+        condition so an operator running an empty-primary drill sees why. And a store restored from a
+        *different* primary of the same size passes: the count is a load check, not a provenance check.
+        Exact provenance is the ``[dr].restore_token`` vintage floor's job (BACKLOG #223) and extending
+        it to SQLite is unfiled work, not something this gate claims.
+
+        **Not** ``Store.has_prior_backup_history()``, which the server-DB gate uses and which looks like
+        the obvious answer here: the ``dr_backup`` audit row is written AFTER the snapshot it describes
+        (:meth:`BackupRunner._record_success`), so a store restored from a first-ever archive carries
+        zero of them and that probe would refuse a perfectly good restore.
+
+        The cost is one ``COUNT(*)`` over the restored ``messages`` table, inside the activation lock and
+        outside ``takeover_timeout_seconds``. That is a full scan of a multi-GB restored store on the
+        takeover path, paid deliberately: the alternative is promoting onto an unseeded one.
+
+        **No-op on a server-DB store**: there the cold seed is config-only and the live DB is DBA-restored,
+        which :meth:`_verify_live_server_seed` already gates (BACKLOG #102). Also a no-op when the verified
+        archive carried no store member, since there is then nothing it could have been loaded from."""
+        if self._is_server_db():
+            return
+        if not verify.row_counts:
+            # A config-only archive (or a verify that reported no counts) gives nothing to compare the
+            # DR store against; leave that path to the server-DB gate rather than guess.
+            return
+        seeded = int(verify.row_counts.get("messages", 0))
+        try:
+            present = await self._store.count_messages()
+        except Exception as exc:  # a store that cannot be counted cannot be shown to hold the seed
+            await self._record_aborted(
+                "state",
+                f"could not read the DR store's message count to confirm the cold seed was restored "
+                f"into it: {safe_exc(exc)}",
+                actor,
+                now,
+            )
+        if present == 0:
+            await self._record_aborted(
+                "seed",
+                "the cold-seed archive VERIFIED but was never restored into this box's store: the DR "
+                f"store holds 0 messages while the seed carries {seeded}. Restore it first "
+                "(messagefoundry restore <archive> --to <store path>), then activate. Refusing to "
+                "promote onto an empty store (ADR 0048 fail-closed)",
+                actor,
+                now,
+            )
+        if present < seeded:
+            await self._record_aborted(
+                "seed",
+                f"the DR store holds {present} messages but the verified cold seed carries {seeded} — "
+                "the restore is partial or this store came from a different archive. Refusing to promote "
+                "onto a store that does not carry the seed (ADR 0048 fail-closed)",
+                actor,
+                now,
+            )
+
+    def _is_server_db(self) -> bool:
+        """Whether the store is a DBA-delegated server DB (BACKLOG #52). The two seed gates below and
+        above split on it in OPPOSITE directions, so it lives in one place: adding a backend, or moving
+        one across the DBA-delegated line, must not land it in both the gated and the ungated bucket."""
+        return self._store.backend in (StoreBackend.POSTGRES, StoreBackend.SQLSERVER)
+
     async def _verify_live_server_seed(
         self, dba_attests_restored: bool, actor: str, now: float
     ) -> None:
@@ -430,7 +513,7 @@ class DrCoordinator:
            it is still an attestation (does not prove message-table completeness), an explicitly WEAKER
            posture than SQLite (which snapshot-verifies the whole store), not a match for it. Unset (the
            default) → this method is byte-identical to the #102 gate."""
-        if self._store.backend not in (StoreBackend.POSTGRES, StoreBackend.SQLSERVER):
+        if not self._is_server_db():
             # SQLite: the cold-seed archive verified the whole store.db (integrity_check + row counts).
             # Nothing to add — leave the path byte-identical (BACKLOG #102 is a server-DB-only gap).
             return

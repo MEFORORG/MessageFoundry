@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Turnkey DR backup: scheduled + on-demand config + SQLite-store backup (ADR 0049, #60).
+"""Turnkey DR backup and restore: scheduled + on-demand config + SQLite-store backup, the
+``restore-verify`` primitive, and the ``restore`` that puts an archive back (ADR 0049, #60).
+
+:func:`run_restore` is the read half: it decrypts a ``.mfbak`` once, verifies the extracted
+``store.db``, and places those exact bytes at a destination it refuses to overwrite (with an optional
+config-bundle restore). ADR 0048's cold-seed activation is its consumer.
 
 :class:`BackupRunner` is a sibling of the :class:`~messagefoundry.pipeline.retention.RetentionRunner`:
 a **leader-gated, daily-clock** background singleton that, on its schedule (and on demand via the
@@ -50,6 +55,7 @@ from messagefoundry.store.backup_codec import (
     FORMAT_VERSION,
     BackupCodecError,
     BackupKeyMismatch,
+    archive_key_id,
     decrypt_stream,
     encrypt_stream,
     key_fingerprint,
@@ -71,8 +77,10 @@ from messagefoundry.store.crypto import (
 __all__ = [
     "BackupRunner",
     "BackupResult",
+    "RestoreResult",
     "VerifyResult",
     "BackupError",
+    "run_restore",
     "run_restore_verify",
 ]
 
@@ -144,12 +152,20 @@ _MAX_RESTORE_MEMBER_BYTES = 16 * 1024 * 1024 * 1024  # 16 GiB
 #: **Why twice the member cap, and why a multiple rather than a literal.** A conforming archive is one
 #: ``store.db`` — admitted up to :data:`_MAX_RESTORE_MEMBER_BYTES`, above which the verify FAILs at the
 #: member cap anyway — plus the config bundle, the manifest and tar framing. So the cumulative ceiling
-#: cannot sit AT the member cap without refusing a store snapshot that is itself legal, and nothing on
-#: this branch bounds the config bundle, so there is no exact second term to add. Rather than fork a
-#: second number, the remainder gets the ceiling the store gets: one whole extra maximal snapshot of
-#: headroom, which no real config dir (a few Python modules, a TOML, some codesets) approaches.
-#: Written as a multiple so it TRACKS the member cap: a literal would silently begin false-refusing
-#: legal archives the day that cap was raised.
+#: cannot sit AT the member cap without refusing a store snapshot that is itself legal, and NOTHING
+#: bounds the config bundle at the point this ceiling has to hold, so there is no exact second term to
+#: add. Rather than fork a second number, the remainder gets the ceiling the store gets: one whole
+#: extra maximal snapshot of headroom, which no real config dir (a few Python modules, a TOML, some
+#: codesets) approaches. Written as a multiple so it TRACKS the member cap: a literal would silently
+#: begin false-refusing legal archives the day that cap was raised.
+#:
+#: **:data:`_MAX_CONFIG_BYTES` is NOT that second term, and must not be read as one.** It is a
+#: restore-EXTRACT bound: its only read is in :func:`_restore_config_members`, which runs solely when
+#: ``--config-to`` was given and solely AFTER the decrypt this ceiling exists to bound. The build side
+#: (:func:`_add_config_dir`) tars the config dir with no cap at all, and the verify path never extracts
+#: config. So a `.mfbak` can legally carry a config bundle larger than ``_MAX_CONFIG_BYTES``; that is
+#: caught on the way back out, not on the way in. Deriving this ceiling as ``member + config`` would
+#: therefore bound the decrypt by a number the archive was never built against.
 #:
 #: A file-size cap (``max_plaintext_bytes = archive.stat().st_size``) looks like the exact bound and is
 #: not one — it can never fire. Each frame carries 12 nonce + 4 length + 16 tag bytes around at most
@@ -215,6 +231,21 @@ class BackupResult:
     verify: VerifyResult | None
     pruned: int
     encrypted: bool
+
+
+@dataclass(frozen=True)
+class RestoreResult:
+    """What one ``messagefoundry restore`` produced — the CLI summary + tests. PHI-free: paths, sizes,
+    counts, and one-way fingerprints only (never a body or key bytes)."""
+
+    archive_path: str
+    store_path: str
+    store_bytes: int
+    row_counts: dict[str, int]
+    encrypted: bool
+    key_id: str | None
+    config_dir: str | None
+    config_files: int
 
 
 class BackupRunner:
@@ -1419,3 +1450,538 @@ def _day_key(now: float) -> str:
 def _safe_segment(value: str) -> str:
     """Reduce a free-form instance name to a filename-safe segment (letters/digits/._-)."""
     return "".join(ch for ch in value if ch.isalnum() or ch in "._-")
+
+
+# --- restore (the `messagefoundry restore` entry point) ----------------------
+#
+# The engine could WRITE a .mfbak archive and VERIFY one, and had no way to RESTORE one. A backup you
+# cannot restore is not a backup, so the whole DR story rested on an operator hand-extracting the tar,
+# which no shipped code or doc described. This section is that missing half; ADR 0048's cold-seed
+# activation is the consumer (the DR box restores here, then activates onto the restored store).
+
+#: A WAL-mode store is three files. Restoring `store.db` beside a leftover `store.db-wal` from a
+#: DIFFERENT database would let SQLite replay that stale WAL over the restored pages, so the sidecars
+#: are refused as destinations too, not just the main file.
+_SIDECAR_SUFFIXES = ("-wal", "-shm")
+
+#: ASVS 5.2.3 bounds on the restored CONFIG bundle, which the per-member cap alone cannot give: N
+#: members each just under that cap would still fill the destination volume. A real config dir is a
+#: handful of Python modules, a TOML and some codesets, so these are generous by orders of magnitude.
+_MAX_CONFIG_BYTES = 1024 * 1024 * 1024  # 1 GiB across the whole bundle
+_MAX_CONFIG_MEMBERS = 10_000
+
+#: The one place the never-overwrite refusal is worded, so the operator who loses the create race reads
+#: the same sentence as the one who was refused up front.
+_OVERWRITE_REFUSAL = (
+    "refusing to overwrite an existing path at {path} — restoring over a live store is unrecoverable; "
+    "choose an empty --to path (or move the existing store aside first)"
+)
+
+#: The one place the RESTORE path words a codec-level archive failure, so the operator whose header will
+#: not parse reads the same sentence as the one whose GCM tag failed. ``{reason}`` keeps the codec's own
+#: scrubbed message rather than summarizing it: a failed AEAD tag cannot tell bad bytes from the wrong
+#: key, and the codec is the only thing that says so.
+#:
+#: **Scope is restore only.** :func:`_verify_archive_blocking` words its own codec branch
+#: (``decrypt failed: ...``), so ``restore-verify`` — the command an operator runs FIRST to triage —
+#: does not carry the remediation sentence. Rendering both from here is the right end state, left to
+#: whoever next edits the verify path.
+_DECRYPT_REFUSAL = (
+    "the archive did not verify: {reason}. Nothing was written to the destination. Confirm the .mfbak "
+    "is intact (size and checksum against the source) and that the configured store key is the DEK the "
+    "archive was sealed under"
+)
+
+
+def _codec_refusal(exc: BackupCodecError) -> BackupError:
+    """Translate a ``.mfbak`` codec failure into the restore path's refusal — the single seam, so both
+    the header read and the decrypt word it once and order the arms once.
+
+    ``BackupKeyMismatch`` is a SUBCLASS of :class:`BackupCodecError`, so it must be separated here or it
+    reads as a generic bad archive. :func:`_verify_archive_blocking` keeps that distinction in its own
+    ordered arms and the two paths must not disagree about it. It is reachable despite the fingerprint
+    precheck: ``archive_key_id`` reads the header, ``decrypt_stream`` re-reads it, and an archive
+    replaced between those two reads authenticates against a key the precheck already approved. Telling
+    that operator "the archive did not verify" would point at the bytes when the key is the subject."""
+    if isinstance(exc, BackupKeyMismatch):
+        return BackupError("verify", f"KEY_MISMATCH: {safe_exc(exc)}")
+    return BackupError("verify", _DECRYPT_REFUSAL.format(reason=safe_exc(exc)))
+
+
+async def run_restore(
+    archive_path: str,
+    *,
+    dest_store_path: str | Path,
+    store_settings: object,
+    config_dest: str | Path | None = None,
+    allow_unencrypted: bool = False,
+) -> RestoreResult:
+    """Restore a ``.mfbak`` archive's store member to ``dest_store_path`` (ADR 0049's missing half; the
+    primitive ADR 0048's cold seed consumes).
+
+    Resolves the store's decrypt-capable keyring exactly as :func:`run_restore_verify` does (active +
+    retired, AC-5 "incl. retired keys"), then decrypts the archive ONCE and verifies the extracted
+    ``store.db`` — ``integrity_check`` plus the manifest row-count compare, the same checks
+    :func:`run_restore_verify` runs — before handing those exact bytes to the destination. All heavy work
+    runs off the event loop.
+
+    **It never overwrites** an existing destination (see :func:`_refuse_existing_destination`).
+
+    ``config_dest`` additionally restores the archive's ``config/`` bundle into that directory. It is a
+    **refusal**, not a no-op, when the archive carries no config member: an operator who asked for the
+    config back and silently got an empty directory would believe the config was restored. The bundle is
+    written AFTER the store, so a member aimed at the store's own path would overwrite it: that is
+    refused before the store is extracted (see :func:`_refuse_colliding_config_members`), as is a
+    ``config_dest`` sitting under ``dest_store_path`` (:func:`_refuse_config_dest_under_the_store`)."""
+    import base64
+
+    keys = [
+        base64.b64decode(k)
+        for k in resolve_decrypt_keys(store_settings)  # type: ignore[arg-type]
+    ]
+    return await asyncio.to_thread(
+        _restore_blocking,
+        archive_path=archive_path,
+        dest_store_path=Path(dest_store_path),
+        config_dest=Path(config_dest) if config_dest is not None else None,
+        keys=keys,
+        allow_unencrypted=allow_unencrypted,
+    )
+
+
+def _restore_blocking(
+    *,
+    archive_path: str,
+    dest_store_path: Path,
+    config_dest: Path | None,
+    keys: list[bytes],
+    allow_unencrypted: bool,
+) -> RestoreResult:
+    """The off-loop half of :func:`run_restore`: refuse -> decrypt -> extract -> verify -> place. Raises
+    :class:`BackupError` with the failing ``kind`` (``archive``/``destination``/``verify``/``restore``).
+
+    It runs the verify's checks itself rather than calling :func:`_verify_archive_blocking` first, for
+    two reasons. A .mfbak archive is the size of the store, so a verify pass followed by a restore pass
+    would decrypt and extract every byte TWICE on the one path where an operator is already waiting. And
+    the verify owns its own temp dir, so the file it checked is deleted and a second, unchecked
+    extraction is what would reach the destination — here the bytes checked are the bytes placed."""
+    import shutil
+
+    if not Path(archive_path).is_file():
+        raise BackupError("archive", f"no archive at {archive_path}")
+    _refuse_existing_destination(dest_store_path, config_dest)
+
+    # Key precheck BEFORE any decrypt, and the same ASVS 5.2.3 downgrade guard the verify applies: with a
+    # store key configured, a PLAINTEXT archive is a downgrade signal (an attacker swapping the
+    # AEAD-sealed archive for an unauthenticated one), not an archive to restore.
+    encrypted = _looks_encrypted(archive_path)
+    key_id: str | None = None
+    match_key: bytes | None = None
+    if encrypted:
+        # The header read is already a codec operation: a .mfbak whose magic survived but whose version
+        # or JSON header did not fails HERE, one step before the decrypt, and must refuse the same way.
+        try:
+            key_id = archive_key_id(archive_path)
+        except BackupCodecError as exc:
+            raise _codec_refusal(exc) from exc
+        if not keys:
+            raise BackupError(
+                "verify", "archive is encrypted but no store key is configured to decrypt it"
+            )
+        match_key = _select_decrypt_key(keys, key_id)
+        if match_key is None:
+            raise BackupError(
+                "verify",
+                f"KEY_MISMATCH: no resolved key (active or retired) matches archive key_id={key_id}",
+            )
+    elif keys and not allow_unencrypted:
+        raise BackupError(
+            "verify",
+            "KEY_MISMATCH: the archive is plaintext but a store key is configured; refusing to restore "
+            "a plaintext archive (possible downgrade). Set [backup].allow_unencrypted to accept it.",
+        )
+
+    dest_store_path.parent.mkdir(parents=True, exist_ok=True)
+    # Stage on the DESTINATION volume, not the system temp dir: the extracted store is then placed by a
+    # hard link rather than a second multi-GB copy, and the decrypted PHI never lands on a shared temp
+    # volume that may be less protected than the store's own.
+    with tempfile.TemporaryDirectory(prefix="mefor-restore-", dir=dest_store_path.parent) as tmp:
+        tar_path = Path(tmp) / "archive.tar"
+        with open(archive_path, "rb") as src, open(tar_path, "wb") as dst:
+            if match_key is not None:
+                # A failed GCM tag is the point of the AEAD framing, so it is an ORDINARY outcome here,
+                # not a bug: refuse the way the destination check does rather than escape as a codec
+                # exception. Narrowed to the codec's own type so an OSError stays an OSError.
+                #
+                # Capped for the same ASVS 5.2.3 reason as the verify path's call: this decrypt is the
+                # first thing to write into the staging dir, so an oversized archive is refused before
+                # `_extract_member`'s per-member cap is ever reached. The staging dir is on the
+                # DESTINATION volume here, which makes the bound matter more than it does on verify --
+                # an unbounded decrypt would fill the very volume the restored store is about to land
+                # on. POST-AUTHENTICATION, like the verify site: see _MAX_RESTORE_PLAINTEXT_BYTES.
+                try:
+                    decrypt_stream(
+                        src, dst, match_key, max_plaintext_bytes=_MAX_RESTORE_PLAINTEXT_BYTES
+                    )
+                except BackupCodecError as exc:
+                    raise _codec_refusal(exc) from exc
+            else:
+                shutil.copyfileobj(src, dst, 1024 * 1024)
+
+        manifest = _read_manifest_from_tar(tar_path)
+        if manifest.get("config_only"):
+            raise BackupError(
+                "restore",
+                "this is a CONFIG-ONLY archive (a server-DB store's backup is DBA-delegated, BACKLOG "
+                "#52) — it carries no store to restore; restore the database from the DBA's own backup "
+                "and use --config-to for the config bundle",
+            )
+        # Before the store is extracted, let alone published: a config member aimed at the store's own
+        # path is a destination refusal, and finding it here costs neither the extract nor a restore
+        # that half-finished (BACKLOG #1717).
+        if config_dest is not None:
+            _refuse_colliding_config_members(tar_path, dest_store_path, config_dest)
+
+        try:
+            # The BOUNDED extractor: its declared-size and streamed-byte caps are what keep a forged
+            # archive from exhausting the staging dir (ASVS 5.2.3).
+            snap = _extract_member(tar_path, _STORE_MEMBER, Path(tmp))
+        except tarfile.TarError as exc:
+            raise BackupError("restore", safe_exc(exc)) from exc
+        if snap is None:
+            raise BackupError("restore", f"archive has no {_STORE_MEMBER} member to restore")
+
+        row_counts = _verify_extracted_store(snap, manifest)
+        try:
+            store_bytes = _place_restored_store(snap, dest_store_path)
+        except FileExistsError as exc:
+            raise BackupError(
+                "destination", _OVERWRITE_REFUSAL.format(path=dest_store_path)
+            ) from exc
+        except OSError as exc:
+            raise BackupError("destination", safe_exc(exc)) from exc
+
+        config_files = 0
+        if config_dest is not None:
+            config_files = _restore_config_members(tar_path, config_dest)
+
+    return RestoreResult(
+        archive_path=archive_path,
+        store_path=str(dest_store_path),
+        store_bytes=store_bytes,
+        row_counts=row_counts,
+        encrypted=encrypted,
+        key_id=key_id,
+        config_dir=str(config_dest) if config_dest is not None else None,
+        config_files=config_files,
+    )
+
+
+def _verify_extracted_store(snap: Path, manifest: dict[str, object]) -> dict[str, int]:
+    """``integrity_check`` + the manifest row-count compare on the extracted ``store.db``, run on the
+    exact file about to be placed. Same two checks (and the same helpers) as
+    :func:`_verify_archive_blocking` steps 3-4; returns the counts for the restore summary.
+
+    The compare is keyed off the MANIFEST's own keys rather than dict equality, for the reason
+    :func:`_verify_archive_blocking` gives at its step 4: :func:`_count_tables` derives its table set
+    from the snapshot's own ``sqlite_master`` (BACKLOG #1722), so a manifest written before that set
+    was widened records fewer tables than the archive really has. Restoring an archive taken by an
+    EARLIER build is the ordinary case for this subcommand, so dict equality would refuse on sight the
+    archives a restore exists to accept. A table the manifest tracked that the snapshot's schema lacks
+    reads as 0, so a manifest count of 0 still passes and a nonzero one still raises: real data loss is
+    still caught. A table the snapshot has that the manifest never tracked is not compared at all."""
+    integrity_ok, integrity_msg = _integrity_check(snap)
+    if not integrity_ok:
+        raise BackupError("verify", f"the archive's store failed integrity_check: {integrity_msg}")
+    row_counts = _count_tables(snap)
+    raw_counts = manifest.get("row_counts")
+    manifest_counts = (
+        {str(k): int(v) for k, v in raw_counts.items()} if isinstance(raw_counts, dict) else {}
+    )
+    mismatches = sorted(
+        table for table in manifest_counts if row_counts.get(table, 0) != manifest_counts[table]
+    )
+    if mismatches:
+        raise BackupError(
+            "verify",
+            f"row-count mismatch on {mismatches} (a torn or truncated snapshot): "
+            f"snapshot={row_counts} manifest={manifest_counts}",
+        )
+    return row_counts
+
+
+def _refuse_existing_destination(dest_store_path: Path, config_dest: Path | None) -> None:
+    """Refuse every destination that already holds something, BEFORE any decrypt work. Restoring over a
+    live store is unrecoverable and a CLI cannot ask for permission, so the answer is no and the message
+    names the path the operator must move or choose differently.
+
+    The last arm refuses a pair of destinations that are individually empty and still collide, because
+    this restore writes BOTH of them: see :func:`_refuse_config_dest_under_the_store`. Its mirror image
+    needs the archive's member list and so runs later, in :func:`_refuse_colliding_config_members`."""
+    for path in (
+        dest_store_path,
+        *(dest_store_path.with_name(dest_store_path.name + s) for s in _SIDECAR_SUFFIXES),
+    ):
+        if path.exists():
+            raise BackupError("destination", _OVERWRITE_REFUSAL.format(path=path))
+    if config_dest is not None:
+        # is_file() BEFORE iterdir(): a --config-to that names an existing FILE is a typo to report, and
+        # iterdir() on one raises NotADirectoryError, which escapes the CLI's BackupError handler as a
+        # traceback.
+        if config_dest.is_file():
+            raise BackupError(
+                "destination",
+                f"--config-to names an existing file at {config_dest}, not a directory — choose an "
+                "empty or absent directory for the config bundle",
+            )
+        if config_dest.is_dir() and any(config_dest.iterdir()):
+            raise BackupError(
+                "destination",
+                f"refusing to restore the config bundle into the non-empty directory {config_dest} — "
+                "choose an empty or absent --config-to path",
+            )
+        _refuse_config_dest_under_the_store(dest_store_path, config_dest)
+
+
+def _refuse_config_dest_under_the_store(dest_store_path: Path, config_dest: Path) -> None:
+    """Refuse a ``--config-to`` directory at or under the ``--to`` store's own path.
+
+    ``--to D --config-to D/cfg`` passes both emptiness checks, because both destinations really are
+    absent when they are read. The restore then publishes the verified store as the regular file ``D``,
+    and the config bundle's ``mkdir(parents=True)`` needs ``D`` to be a directory -- so it dies with an
+    uncaught ``FileExistsError`` while a restored store already sits at ``D`` and the retry is blocked by
+    the never-overwrite refusal.
+
+    No legitimate invocation has this shape: a directory cannot live under a regular file. Refusing the
+    pair up front costs nothing and there is no decrypt to waste. The other direction (a ``--config-to``
+    that CONTAINS the store) is a real invocation and is checked per member instead, against the
+    archive's own member list -- see :func:`_refuse_colliding_config_members`."""
+    if not _is_within(dest_store_path, config_dest):
+        return
+    raise BackupError(
+        "destination",
+        f"refusing to restore the config bundle into {config_dest}, which sits under the restored "
+        f"store's own path {dest_store_path} — the store is written first, as a file, so the bundle "
+        "could not be created beneath it. Choose a --config-to directory outside the --to path",
+    )
+
+
+def _refuse_colliding_config_members(
+    tar_path: Path, dest_store_path: Path, config_dest: Path
+) -> None:
+    """Refuse an archive whose config bundle would land ON a file this restore publishes.
+
+    This is the control for the P1 (BACKLOG #1717). ``--to D/store.db --config-to D`` passes every
+    emptiness check, because both destinations really are absent when they are read. The restore then
+    publishes the verified store at ``D/store.db`` and extracts the config bundle over the top of it, so
+    a ``config/store.db`` member -- which the backup writer happily includes, since
+    :meth:`BackupRunner._add_config_dir` takes every regular file under the config dir -- replaces the
+    database that just passed ``integrity_check`` and the row-count compare. The summary still reports
+    the pre-overwrite counts, so the operator is told a store was restored that is no longer there.
+
+    It asks the PRECISE question -- does a member's output path equal one this restore writes -- rather
+    than the proxy "does ``--config-to`` contain ``--to``". The proxy would refuse
+    ``--to /srv/dr/store.db --config-to /srv/dr``, which is the one-directory form the early-adopter
+    drill documents and which is perfectly safe for an archive with no colliding member.
+
+    Run before the store is extracted, so a refusal costs neither the extract nor a half-finished
+    restore. Traversal names are compared like any other: a ``../store.db`` member resolving back onto
+    the store is the same collision, and refusing it here beats refusing it after placement. The
+    exclusive create in :func:`_restore_config_members` is the backstop under this, not the control."""
+    published = {
+        _norm_for_compare(p)
+        for p in (
+            dest_store_path,
+            *(dest_store_path.with_name(dest_store_path.name + s) for s in _SIDECAR_SUFFIXES),
+        )
+    }
+    try:
+        with tarfile.open(tar_path, "r:") as tar:
+            for member in tar.getmembers():
+                if not member.isfile() or not member.name.startswith(_CONFIG_PREFIX):
+                    continue
+                out = config_dest / member.name[len(_CONFIG_PREFIX) :]
+                if _norm_for_compare(out) not in published:
+                    continue
+                raise BackupError(
+                    "destination",
+                    f"the archive's config bundle carries a member that would be written to {out}, "
+                    f"which is where this restore publishes the store ({dest_store_path}) — it would "
+                    "overwrite the database this restore just verified, and the summary would still "
+                    "report the verified row counts. Choose a --config-to directory that does not "
+                    "contain the --to path",
+                )
+    except (OSError, ValueError, tarfile.TarError) as exc:
+        # The same catch-all shape :func:`_verify_archive_blocking` uses. ValueError is in it because
+        # this reads ATTACKER-SUPPLIED member names into ``Path``: a name the platform cannot parse
+        # must be a refusal, not a traceback out of a check whose whole job is to refuse.
+        raise BackupError("restore", safe_exc(exc)) from exc
+
+
+def _norm_for_compare(path: Path) -> Path:
+    """``path`` resolved and lower-cased, for comparison against another destination path.
+
+    Neither path need exist yet, so the comparison has to be lexical; ``resolve`` first, so ``..``, a
+    relative spelling and a symlinked destination all reduce to one form.
+
+    Case is folded UNCONDITIONALLY, not via :func:`os.path.normcase`, which is the identity function on
+    POSIX and would therefore miss case-insensitive macOS and every case-insensitive mount. The cost is
+    a false refusal where two paths differing only in case really are two files; that costs the operator
+    a rename, where a missed collision costs the restored database. ``lower`` rather than ``casefold``
+    because ``casefold`` maps ``ss`` onto the sharp s and would fuse two genuinely distinct paths."""
+    return Path(str(path.resolve()).lower())
+
+
+def _is_within(root: Path, path: Path) -> bool:
+    """Is ``path`` at or under ``root``? Both reduced by :func:`_norm_for_compare` first."""
+    return _norm_for_compare(path).is_relative_to(_norm_for_compare(root))
+
+
+def _place_restored_store(src: Path, dest: Path) -> int:
+    """Put the verified ``store.db`` at ``dest`` without ever overwriting, and return its size.
+
+    A hard link first: ``src`` was staged on the destination's own volume, so this costs nothing where
+    a multi-GB copy would, and ``os.link`` raises ``FileExistsError`` on a collision — closing the
+    check-then-write race that a concurrent creator could otherwise slip through. Where links are
+    unavailable (FAT, some SMB shares) the fallback is an EXCLUSIVE-create copy, which has the same
+    never-overwrite property. Either way the restored file is a full copy of the PHI-bearing store, so
+    it is locked down the way ``Store.snapshot_to`` locks its own output down."""
+    import shutil
+
+    # Reuse the store's own PHI-at-rest primitive rather than a second chmod/icacls path.
+    from messagefoundry.store.store import _secure_file
+
+    size = src.stat().st_size
+    try:
+        os.link(src, dest)
+    except FileExistsError:
+        raise
+    except OSError:
+        # The exclusive create sits OUTSIDE the cleanup guard on purpose: a lost create race raises
+        # FileExistsError here, and the file then at ``dest`` belongs to the winner — deleting it would
+        # turn a refusal into the unrecoverable overwrite the refusal exists to prevent.
+        out = open(dest, "xb")  # noqa: SIM115 — held open across the guard below
+        placed = False
+        try:
+            with out, open(src, "rb") as fh:
+                shutil.copyfileobj(fh, out, 1024 * 1024)
+                out.flush()
+                os.fsync(out.fileno())
+            placed = True
+        finally:
+            # A copy that dies mid-stream (a full volume, a dropped share) would otherwise leave a
+            # TRUNCATED store beside a reported failure: a valid-looking SQLite file an operator could
+            # activate, and debris that then fails the retry's never-overwrite check. ``finally``, not
+            # ``except``, so nothing is caught and no failure mode is missed. It runs after ``with out``
+            # has closed the handle, which Windows requires before an unlink.
+            if not placed:
+                dest.unlink(missing_ok=True)
+    _secure_file(dest)
+    return size
+
+
+def _restore_config_members(tar_path: Path, config_dest: Path) -> int:
+    """Extract the archive's ``config/`` members into ``config_dest`` and return how many files landed.
+
+    It cannot reuse :func:`_extract_member`, which streams ONE member to a single fixed output name;
+    a config bundle is many files that must keep their relative layout. It carries the same ASVS 5.2.3
+    bound (the uncompressed-pinned ``"r:"`` reader, the declared size rejected before streaming, the
+    streamed bytes counted). Member names are gated by the shared ASVS 5.3.2 check
+    (:func:`~messagefoundry.parsing.sniff.archive_member_name_reason`) rather than a second private one,
+    so a traversal, a backslash separator, a drive-relative prefix or a control character is refused
+    here exactly as it is on the inbound-archive path.
+
+    The per-member cap is not enough on its own here — N members each just under it would still fill the
+    disk — so the bundle also carries an AGGREGATE byte ceiling and a member-count ceiling.
+
+    The restored bundle can carry secrets (``connections.toml``), so each file is locked to its owner.
+
+    An archive with no config member is a REFUSAL, not a quiet empty directory — see :func:`run_restore`.
+    """
+    from messagefoundry.parsing.sniff import archive_member_name_reason
+    from messagefoundry.store.store import _secure_file
+
+    config_dest.mkdir(parents=True, exist_ok=True)
+    root = config_dest.resolve()
+    written = 0
+    total = 0
+    with tarfile.open(tar_path, "r:") as tar:
+        for member in tar.getmembers():
+            if not member.isfile() or not member.name.startswith(_CONFIG_PREFIX):
+                continue
+            if written >= _MAX_CONFIG_MEMBERS:
+                raise BackupError(
+                    "restore",
+                    f"config bundle exceeds the restore member-count cap ({_MAX_CONFIG_MEMBERS})",
+                )
+            rel = member.name[len(_CONFIG_PREFIX) :]
+            reason = archive_member_name_reason(rel)
+            if reason is not None:
+                raise BackupError(
+                    "restore", f"archive carries an unsafe config member name ({reason})"
+                )
+            out = (root / rel).resolve()
+            if not out.is_relative_to(root):  # backstop: the name gate is the primary control
+                raise BackupError(
+                    "restore",
+                    "archive carries a config member that resolves outside the destination; "
+                    "refusing to extract it",
+                )
+            if member.size > _MAX_RESTORE_MEMBER_BYTES:
+                raise BackupError(
+                    "restore",
+                    f"config member exceeds the restore extract cap ({_MAX_RESTORE_MEMBER_BYTES} bytes)",
+                )
+            src = tar.extractfile(member)
+            if src is None:
+                continue
+            # A forged archive can carry `config/a` as a regular file AND `config/a/b` under it. Both
+            # pass the name gate, and the second one's mkdir then re-raises FileExistsError because the
+            # existing path is not a directory -- uncaught all the way out to a CLI traceback.
+            try:
+                out.parent.mkdir(parents=True, exist_ok=True)
+            except (FileExistsError, NotADirectoryError) as exc:
+                raise BackupError(
+                    "restore",
+                    f"archive carries a config member at {member.name} whose parent directory "
+                    "collides with a member already extracted as a file",
+                ) from exc
+            streamed = 0
+            # EXCLUSIVE create, so a member can never land on a file that is already there. The
+            # overlapping-destination refusal is the control for the case that made this reachable
+            # (BACKLOG #1717); this is the backstop, and it also covers a forged archive carrying the
+            # same member name twice, where the second copy would otherwise silently replace the first.
+            try:
+                fh = open(out, "xb")  # noqa: SIM115 -- the `with` below owns it
+            except FileExistsError as exc:
+                raise BackupError(
+                    "restore",
+                    f"refusing to overwrite the existing file at {out} while restoring the config "
+                    "bundle",
+                ) from exc
+            with fh:
+                while True:
+                    buf = src.read(1024 * 1024)
+                    if not buf:
+                        break
+                    # Counting the streamed bytes IS the cap enforcement here (a lying header declares a
+                    # small size and streams an unbounded one), so this loop cannot become copyfileobj.
+                    streamed += len(buf)
+                    if streamed > _MAX_RESTORE_MEMBER_BYTES or total + streamed > _MAX_CONFIG_BYTES:
+                        raise BackupError(
+                            "restore",
+                            "config bundle stream exceeds the restore extract cap "
+                            f"(per member {_MAX_RESTORE_MEMBER_BYTES} bytes, bundle total "
+                            f"{_MAX_CONFIG_BYTES} bytes)",
+                        )
+                    fh.write(buf)
+            _secure_file(out)
+            total += streamed
+            written += 1
+    if written == 0:
+        raise BackupError(
+            "restore",
+            "the archive carries no config bundle, so there is nothing for --config-to to restore "
+            "(the backup was taken with [backup].include_config=false, or with no config dir loaded)",
+        )
+    return written
