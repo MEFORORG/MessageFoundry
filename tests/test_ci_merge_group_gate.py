@@ -12,10 +12,20 @@ empty left operand is ``HEAD...HEAD``: exit 0, no output, nothing on stderr. Eve
 step then missed, and the queue's gating fell to the ``[ -z "$changed" ]`` fail-safe near the bottom.
 
 That fail-safe reads "no files changed, so run everything". It is correct for an empty PR diff and was
-correct here only by accident -- and the accident is one edit deep. Read in isolation it invites the
-opposite reading, "nothing changed, so there is nothing to test". Flip it and every queue run skips
-install, lint, type-check and the whole of pytest, then reports GREEN, because a skipped required leg
-reports success. That is the silent-control shape ADR 0158 names, on the merge path.
+correct here only by accident: nothing about a queue entry means "run everything", it just happened to
+produce an empty diff. Read in isolation the fail-safe invites the opposite reading, "nothing changed,
+so there is nothing to test". Flip it and, ON A PULL REQUEST whose diff comes back empty, ``test``
+skips install, lint, format check, both type-checks and the whole of pytest, ``webconsole`` skips
+install and the console suite, and the run reports GREEN, because a skipped required leg reports
+success. That is the silent-control shape ADR 0158 names.
+
+**THAT HAZARD IS NOT ON THE MERGE PATH, AND AN EARLIER VERSION OF THIS DOCSTRING SAID IT WAS.** Measured
+2026-09-21, at the tree this module ships in and at ``origin/main`` alike: 12 steps are gated on
+``code == 'true'`` -- 8 in ``test``, 4 in ``webconsole`` -- and all twelve also carry
+``|| github.event_name == 'merge_group'``, so in the queue not one of them can skip on account of
+``code``, however it is set. What the arm fixes is that the queue's gating was an accident of an empty
+base rather than a decision, and that the queue sat inside the fail-safe's blast radius at all. That is
+worth fixing; it is not a silent green merge, and saying so was a false premise (SDS-3.7).
 
 So this module pins two different things, and BOTH are needed:
 
@@ -97,10 +107,42 @@ _DECIDED_BY_THE_ARM_ALONE = {
     "packaging-build",
 }
 
-#: The control for the pin above: how many jobs satisfy only the second half of that predicate. The
-#: wider set adds `changes` (no `if:` at all) and `ci-gate` (`always()`, and it reads no output of
-#: this step), neither of which anything emitted here decides.
-_NAMES_MERGE_GROUP_NOWHERE_COUNT = 6
+#: The control for the pin above: WHICH jobs satisfy only the second half of that predicate. The wider
+#: set adds `changes` (no `if:` at all) and `ci-gate` (`always()`). Neither is DECIDED by anything this
+#: step emits. `ci-gate` does READ all of it -- both its failing steps pass `toJSON(needs)` into the
+#: log -- and reading an output is not being gated on one; only the second settles whether a job runs.
+#:
+#: A SET, NOT A COUNT, AND THE DIFFERENCE WAS MEASURED (2026-09-21). A bare `== 6` stayed green under
+#: three edits a reader of the arm's comment in ci.yml would want to hear about: renaming the job key
+#: `ci-gate`, deleting `ci-gate` and adding an always-on job in its place, and renaming `changes`
+#: itself, which is the job every `needs: changes` here points at. This set fires on all three. What
+#: ELSE sees a key rename is incidental rather than pinned: the required branch-protection context is
+#: a job's `name:` ("CI gate"), so tests/test_required_contexts.py resolves the renamed job to the same
+#: context and trips only through a literal `["ci-gate"]` lookup, and a `changes` rename reaches this
+#: module's other tests only as a KeyError in `_changes_step_script`. Pinning the set costs two string
+#: literals beyond the count and names nothing the arm's comment does not already assert out loud.
+_NAMES_MERGE_GROUP_NOWHERE = {
+    "changes",
+    "ci-gate",
+    "docker-smoke",
+    "ide",
+    "packaging-build",
+    "tooling",
+}
+
+
+def _if_conditions(job: dict[str, object]) -> list[str]:
+    """Every `if:` expression a job carries -- its own, then each step's -- as strings.
+
+    `if:` EXPRESSIONS ONLY, at job level and step level. Searching the whole job -- which the first
+    draft of the gating tests did -- matches comments and `run:` bodies too, so it reported the
+    `changes` job itself the moment that job gained an arm NAMING the event it gates. A gate that
+    cannot tell "decides on this event" from "mentions this event" is not measuring the thing its
+    failure message claims.
+    """
+    steps = job.get("steps") or []
+    assert isinstance(steps, list)
+    return [str(job.get("if", ""))] + [str(step.get("if", "")) for step in steps]
 
 
 def _changes_step_script() -> str:
@@ -269,14 +311,7 @@ def test_the_jobs_that_run_on_a_queue_entry_regardless_are_pinned(workdir: Path)
     data = yaml.safe_load(_CI.read_text(encoding="utf-8"))
     found = set()
     for name, job in data["jobs"].items():
-        # `if:` EXPRESSIONS ONLY, at job level and step level. Searching the whole job -- which the
-        # first draft of this test did -- matches comments and `run:` bodies too, so it reported the
-        # `changes` job itself the moment that job gained an arm NAMING the event it gates. A gate
-        # that cannot tell "decides on this event" from "mentions this event" is not measuring the
-        # thing its failure message claims.
-        conditions = [job.get("if", "")]
-        conditions += [step.get("if", "") for step in job.get("steps", []) or []]
-        if any("merge_group" in str(c) for c in conditions):
+        if any("merge_group" in c for c in _if_conditions(job)):
             found.add(name)
     assert found == _SELF_GATED_ON_QUEUE, (
         "the set of jobs that run on a merge_group entry regardless of the path filters has moved.\n"
@@ -295,17 +330,38 @@ def test_the_jobs_the_arm_alone_decides_are_pinned_and_so_is_the_wider_set() -> 
     and `ci-gate`. Neither is decided by anything this step emits, so the enumeration read as checked
     while being wrong about what it had checked.
 
-    Both halves are asserted, because the wider count is what makes the narrowing legible: if the two
-    sets ever come out the same size, the gated-on-an-output half has stopped discriminating and this
-    test is no longer measuring the thing its name claims.
+    BOTH SETS ARE PINNED BY NAME, and the wider one is what makes the narrowing legible: a reader can
+    see the difference is exactly `changes` and `ci-gate`.
+
+    A THIRD ASSERTION USED TO SIT BELOW THESE TWO AND HAS BEEN REMOVED: ``decided < names_it_nowhere``,
+    docstring'd as catching the two sets coming out the same. It could not fire. `decided` is built as
+    ``gated_on_an_output and not self_gated`` and `names_it_nowhere` as ``not self_gated``, so the
+    first is a subset of the second BY CONSTRUCTION, and the strict form can only break on equality --
+    which the two pins above forbid (a four-name set never equals a six-name one) and reach first.
+    Measured 2026-09-21 over ten mutations of ci.yml chosen to red each pin alone and both together,
+    in both directions (a job leaving a set, a job entering one): the first pin fired on five, the
+    second on eight, the subset guard on NONE. A guard that cannot fail is worse than none, because it
+    licenses the behaviour it appears to check.
+
+    That guard was also the premise of an argument for dropping the wider pin altogether: "a strict
+    subset test already guarantees the two sets differ". Both readings hold at once -- the subset test
+    is redundant in logic AND inert at runtime -- so it guaranteed nothing. What forbids the two sets
+    coinciding is the pair of by-name pins, which is why the wider one stays and the guard goes. The
+    count it replaced went for its own measured reason, recorded at `_NAMES_MERGE_GROUP_NOWHERE`. Do
+    not restore either one.
     """
     data = yaml.safe_load(_CI.read_text(encoding="utf-8"))
     decided: set[str] = set()
     names_it_nowhere: set[str] = set()
     for name, job in data["jobs"].items():
-        conditions = [str(job.get("if", ""))]
-        conditions += [str(step.get("if", "")) for step in job.get("steps", []) or []]
+        conditions = _if_conditions(job)
         gated_on_an_output = any("needs.changes.outputs." in c for c in conditions)
+        # KNOWN LIMIT, recorded because a green run cannot show it: this is a SUBSTRING test, so it
+        # sees only conditions that NAME the event. A negation-shaped condition that is true on a
+        # queue entry without naming it -- `webconsole`'s job `if:` is `github.event_name != 'push'`
+        # -- reads here as not-self-gated; webconsole lands in `_SELF_GATED_ON_QUEUE` only because
+        # its STEP `if:`s do name merge_group. Widen by hand, not by regex, if a job ever gains a
+        # negation as its only queue arm.
         self_gated = any("merge_group" in c for c in conditions)
         if not self_gated:
             names_it_nowhere.add(name)
@@ -319,13 +375,13 @@ def test_the_jobs_the_arm_alone_decides_are_pinned_and_so_is_the_wider_set() -> 
         "A job entering this set gains the queue as a place it can be switched off by a path filter "
         "alone. If that is deliberate, move this pin and the arm's comment in ci.yml together."
     )
-    assert len(names_it_nowhere) == _NAMES_MERGE_GROUP_NOWHERE_COUNT, (
-        f"the CONTROL moved: {len(names_it_nowhere)} jobs name merge_group nowhere "
-        f"({sorted(names_it_nowhere)}), pinned at {_NAMES_MERGE_GROUP_NOWHERE_COUNT}. The assertion "
-        "above only means something while this number is the LARGER one -- it is what the arm's "
-        "comment cites as the reason the predicate carries a gated-on-an-output half at all."
-    )
-    assert decided < names_it_nowhere, (
-        "the two predicates now select the same jobs, so the gated-on-an-output half of the arm's "
-        "comment is no longer doing any work. Re-read that comment before editing this pin"
+    assert names_it_nowhere == _NAMES_MERGE_GROUP_NOWHERE, (
+        "the CONTROL moved: the jobs naming merge_group nowhere are no longer the pinned set.\n"
+        f"  added:   {sorted(names_it_nowhere - _NAMES_MERGE_GROUP_NOWHERE)}\n"
+        f"  removed: {sorted(_NAMES_MERGE_GROUP_NOWHERE - names_it_nowhere)}\n"
+        f"  now:     {sorted(names_it_nowhere)}\n"
+        "The assertion above only means something while this set is the strictly LARGER one -- it is "
+        "what the arm's comment cites as the reason the predicate carries a gated-on-an-output half "
+        "at all. A job renamed rather than re-gated lands here, and nothing else in this suite sees "
+        "a renamed job key: the required branch-protection context is a job's `name:`, not its key."
     )
