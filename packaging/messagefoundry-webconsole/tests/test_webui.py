@@ -6476,7 +6476,12 @@ async def test_oidc_full_round_trip_lands_a_session_via_meta_refresh(
             encryption_algorithm=_ser.NoEncryption(),
         ).decode("ascii")
         now = _time.time()
-        id_token = _Signer(private_key=pem, algorithm=_Alg.RS256, key_id="k1").sign(
+        id_token = _Signer(
+            private_key=pem,
+            algorithm=_Alg.RS256,
+            key_id="k1",
+            setting="test_idp_signing_key",
+        ).sign(
             {
                 "iss": "https://idp.example",
                 "aud": "mefor-console",

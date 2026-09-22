@@ -118,39 +118,67 @@ b64u_encode = _b64u_encode
 b64u_decode = _b64u_decode
 
 
-def _read_key_material(private_key: str) -> bytes:
+def _read_key_material(setting: str, private_key: str) -> bytes:
     """The PEM bytes of the signing key: the value verbatim if it is inline PEM, else read from the
     path it names (a PEM key file, OS-protected like a TLS key).
+
+    **Neither raise below may interpolate ``private_key`` (BACKLOG #1664).** A value with no
+    ``-----BEGIN`` header is treated as a path, so a mis-set ``env()`` holding a bare base64 key body
+    arrives here *as* the path; echoing it would put private-key material into ``check`` output, the
+    reload error, the connection's metadata error field and the log, none of which the redactor
+    covers. They name ``setting`` instead -- the operator-facing key the value arrived under
+    (``sign_private_key``, ``smart_private_key``). Argument order and rule both follow
+    :func:`messagefoundry.transports.direct._read_file`, the other implementation of the same rule.
+
+    One accepted cost: an ordinary typo in a genuine path lands in the same arm, so that operator gets
+    a message with no path in it and a hint aimed at the other failure. Telling the two apart needs a
+    filesystem probe, and probing to decide whether echoing is safe is the defect wearing a hat.
 
     The file read is bounded at :data:`_MAX_KEY_FILE_BYTES` (ASVS 15.2.2), so a path that turns out to
     name a huge file raises a :class:`SigningError` at connector construction instead of buffering it.
     """
     if "-----BEGIN" in private_key:
         return private_key.encode("utf-8")
+    # The raise sits OUTSIDE the handler on purpose, like the one in `_load_private_key`:
+    # `raise ... from None` clears `__cause__` but LEAVES `__context__`, and a chain-walking log
+    # renderer (`wiring_runner` logs with `exc_info=`) would reach the OSError there -- whose
+    # `filename` IS `private_key`, i.e. the key value itself when a mis-set env() arrives as the
+    # "path". So nothing referencing `exc` may escape the handler; only the strerror text does.
+    material = b""
+    read_failed = False
+    reason = ""
     try:
         with open(private_key, "rb") as handle:
             # One byte past the ceiling: getting it proves the file is over the bound without ever
             # buffering the whole of it. Nothing is truncated silently -- an over-cap file raises.
             material = handle.read(_MAX_KEY_FILE_BYTES + 1)
-    except OSError as exc:
-        # Name the failure but never echo the path's contents; the path itself is operator config.
+    except (OSError, ValueError) as exc:
+        # ValueError as well as OSError: a NUL byte in the value makes `open()` raise ValueError,
+        # which would otherwise escape as a raw traceback carrying the value. `strerror` is absent
+        # on a ValueError and can be None on an OSError, so fall back to the type name -- never
+        # render `None` at an operator.
+        read_failed = True
+        reason = getattr(exc, "strerror", None) or type(exc).__name__
+    if read_failed:
         raise SigningError(
-            f"could not read the signing-key file {private_key!r}: {exc.strerror}"
-        ) from exc
-    # Outside the try: a SigningError is a ValueError, so it would not be caught above anyway, and
-    # keeping it out says so rather than leaving a reader to work it out.
+            f"could not read the signing-key file named by {setting!r}: {reason} "
+            "(a value with no '-----BEGIN' header is read as a file path)"
+        )
+    # Outside the try on purpose: a SigningError IS a ValueError, and the handler above now catches
+    # ValueError, so a raise inside the try would be swallowed into the read-failed arm.
     if len(material) > _MAX_KEY_FILE_BYTES:
         raise SigningError(
-            f"the signing-key file {private_key!r} is over the {_MAX_KEY_FILE_BYTES}-byte "
+            f"the signing-key file named by {setting!r} is over the {_MAX_KEY_FILE_BYTES}-byte "
             "bound; a PEM private key is a few kilobytes -- check the path"
         )
     return material
 
 
-def _load_private_key(private_key: str, password: str | None) -> _PrivateKey:
+def _load_private_key(setting: str, private_key: str, password: str | None) -> _PrivateKey:
     """Load + validate the PEM private key (RSA or EC). Errors are PHI/secret-free — they never
-    interpolate the key bytes or the (cryptography) deserialization detail, which could echo material."""
-    material = _read_key_material(private_key)
+    interpolate the key bytes or the (cryptography) deserialization detail, which could echo material.
+    ``setting`` is passed through to :func:`_read_key_material`, which states the rule."""
+    material = _read_key_material(setting, private_key)
     pw = password.encode("utf-8") if password else None
     # The raise sits OUTSIDE the handler on purpose: `raise ... from None` would leave the
     # deserialization error on `__context__`, where a chain-walking handler could still render the
@@ -315,7 +343,12 @@ class MessageSigner:
         self.algorithm: SignatureAlgorithm = config.algorithm
         self.key_id: str | None = config.key_id
         self.header_name: str = config.header_name
-        self._key: _PrivateKey = _load_private_key(config.private_key, config.private_key_password)
+        # `sign_private_key`, not `private_key`: `with_signing` and `OutboundSigning.from_settings`
+        # both cross the parameter name to that settings key, and the settings key is what an
+        # operator can go and edit.
+        self._key: _PrivateKey = _load_private_key(
+            "sign_private_key", config.private_key, config.private_key_password
+        )
         _require_key_for_alg(self._key, self.algorithm)
         # The protected header is static per connection (only the signature varies per payload); a
         # compact, sorted JSON encoding makes RS256 byte-stable across runs.
@@ -362,12 +395,17 @@ class CompactJwtSigner:
         *,
         private_key: str,
         algorithm: SignatureAlgorithm,
+        setting: str,
         private_key_password: str | None = None,
         key_id: str | None = None,
     ) -> None:
         self.algorithm = algorithm
         self.key_id = key_id
-        self._key: _PrivateKey = _load_private_key(private_key, private_key_password)
+        # `setting` is required rather than defaulted: it is what a key-read failure names in place of
+        # the value, and there is no safe default. `private_key` would be the obvious one and it is
+        # already taken -- it is the SFTP key on `remotefile`, so defaulting to it would send an
+        # operator to a setting on a connector they are not configuring.
+        self._key: _PrivateKey = _load_private_key(setting, private_key, private_key_password)
         _require_key_for_alg(self._key, algorithm)
 
     @property

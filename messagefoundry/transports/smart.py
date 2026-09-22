@@ -196,6 +196,7 @@ class SmartBackendTokenProvider:
             algorithm=algorithm,
             private_key_password=private_key_password,
             key_id=key_id,
+            setting="smart_private_key",
         )
         # ADR 0126: route the token-endpoint POST through the connection's forward proxy — resolved for the
         # TOKEN host (its own bypass decision, #128). None / bypassed → the shared opener (byte-identical).
