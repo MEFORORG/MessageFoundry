@@ -250,6 +250,10 @@ def test_a_headerless_key_value_is_not_echoed_by_the_read_error() -> None:
     # -- but a bare "private_key" would match all three spellings and pass on a wrong one.
     assert "named by 'sign_private_key'" in message
     assert "-----BEGIN" in message
+    # A chained OSError carries the key value as its `filename`, so a traceback renderer
+    # (`exc_info=`) would print what the message withheld. Both chains must be empty.
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
 
 
 def test_the_compact_jwt_signer_reports_the_setting_its_caller_named() -> None:
@@ -263,6 +267,10 @@ def test_the_compact_jwt_signer_reports_the_setting_its_caller_named() -> None:
         )
     assert _HEADERLESS_BLOB not in str(caught.value)
     assert "named by 'smart_private_key'" in str(caught.value)
+    # A chained OSError carries the key value as its `filename`, so a traceback renderer
+    # (`exc_info=`) would print what the message withheld. Both chains must be empty.
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
 
 
 def test_verify_rejects_malformed_jws_and_alg_pinning(rsa_pem: str, ec_pem: str) -> None:

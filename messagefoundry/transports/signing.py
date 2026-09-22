@@ -139,16 +139,31 @@ def _read_key_material(setting: str, private_key: str) -> bytes:
     """
     if "-----BEGIN" in private_key:
         return private_key.encode("utf-8")
+    # The raise sits OUTSIDE the handler on purpose, like the one in `_load_private_key`:
+    # `raise ... from None` clears `__cause__` but LEAVES `__context__`, and a chain-walking log
+    # renderer (`wiring_runner` logs with `exc_info=`) would reach the OSError there -- whose
+    # `filename` IS `private_key`, i.e. the key value itself when a mis-set env() arrives as the
+    # "path". So nothing referencing `exc` may escape the handler; only the strerror text does.
+    material = b""
+    read_failed = False
+    reason = ""
     try:
         with open(private_key, "rb") as handle:
             # One byte past the ceiling: getting it proves the file is over the bound without ever
             # buffering the whole of it. Nothing is truncated silently -- an over-cap file raises.
             material = handle.read(_MAX_KEY_FILE_BYTES + 1)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
+        # ValueError as well as OSError: a NUL byte in the value makes `open()` raise ValueError,
+        # which would otherwise escape as a raw traceback carrying the value. `strerror` is absent
+        # on a ValueError and can be None on an OSError, so fall back to the type name -- never
+        # render `None` at an operator.
+        read_failed = True
+        reason = getattr(exc, "strerror", None) or type(exc).__name__
+    if read_failed:
         raise SigningError(
-            f"could not read the signing-key file named by {setting!r}: {exc.strerror} "
+            f"could not read the signing-key file named by {setting!r}: {reason} "
             "(a value with no '-----BEGIN' header is read as a file path)"
-        ) from exc
+        )
     # Outside the try: a SigningError is a ValueError, so it would not be caught above anyway, and
     # keeping it out says so rather than leaving a reader to work it out.
     if len(material) > _MAX_KEY_FILE_BYTES:
