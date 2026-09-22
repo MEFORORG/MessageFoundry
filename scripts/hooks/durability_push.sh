@@ -355,9 +355,81 @@ fi
 # $LAST IS UPDATED ONLY AFTER THE MOVING PUSH SUCCEEDS, so it keeps meaning "what the remote has"
 # rather than "what was attempted". A commit made offline leaves it alone, and the first push that
 # does land still preserves the right tip.
+# EVERY OPERATION THAT CAN BLOCK INDEFINITELY IS BOUNDED. Today those are the two pushes, and the
+# invariant is the rule -- the list is only today's reading of it. `git update-ref` below is left
+# unbounded deliberately: it is a local ref write governed by core.filesRefLockTimeout and cannot
+# wait on a network or on a person. Anything added here that talks to a remote -- a fetch, an
+# ls-remote, a push --delete -- belongs inside the bound.
+#
+# WHY, MEASURED 2026-09-22 ON A DEVELOPER MACHINE. Eighteen `sh .git/hooks/post-commit` processes
+# were alive across nine commits, the oldest 40 hours, three of them spinning -- 57 CPU-hours
+# between them. Six `git commit` processes were still alive above them, so those commits had not
+# returned in 40 hours either. Both hook names leak the same way; `post-merge` is this same file
+# under another name, so a `git pull` loop reaches it too.
+#
+# THE BOUND DOES NOT EXPLAIN THAT LEAK AND MUST NOT BE READ AS ITS FIX. In every one of those repos
+# the push had already SUCCEEDED -- the moving tag matched HEAD and `$LAST` had been written, which
+# is this function's last statement. The work finished and the shells stayed anyway. That failure is
+# unexplained and unfixed. Do not close it on the strength of this block.
+#
+# WHAT THE BOUND DOES FIX IS A SEPARATE AND REPRODUCIBLE MODE: a push that never finishes leaves
+# these same shells alive forever. Reproduced on demand by pointing `core.sshCommand` at a sleep,
+# which wedges the push offline, and pinned by tests/test_durability_hook_push_bound.py.
+#
+# A BOUND IS NOT A RETRY, AND IT MUST NOT BECOME ONE. A timed-out push simply did not land, so it
+# falls through to the `$LAST` rule above and the next commit tries again -- the same path a commit
+# made offline already takes.
+#
+# THE BOUND IS PER PUSH, SO THE WORST CASE IS NOT ITS VALUE. With an orphan capture to preserve, the
+# fork can live 2 x (timeout + 10), about 620s at the default, before it goes.
+#
+# AND IT DOES NOT REACH GRANDCHILDREN. Measured on this platform: when the bound fired, `git push`
+# and the transport helper it spawned both died, and the helper's OWN child survived and reparented.
+# MSYS process-group emulation does not carry a group kill that far. Bounding the shells is the large
+# majority of the harm measured above; the residue is real, and is named here rather than assumed
+# away.
+#
+# INTERACTIVE PROMPTING IS OFF, BECAUSE A BACKGROUND PUSH HAS NOBODY TO ANSWER IT. A push that
+# reaches a terminal credential prompt waits for input that cannot arrive, with no error recorded
+# anywhere -- one concrete way a push "never finishes". This disables only the TERMINAL prompt;
+# configured credential helpers still answer, so a properly provisioned remote is unaffected. It
+# sits below every foreground git call in this file, so it scopes to the pushes.
+GIT_TERMINAL_PROMPT=0
+export GIT_TERMINAL_PROMPT
+
 _durability_push() {
-  [ -n "$KEEP" ] && git push --quiet "$REMOTE" "$KEEP"
-  git push --quiet --force "$REMOTE" "$SRC:$TAG" || return 1
+  # READ ON THIS SIDE OF THE FORK. Nothing above the background job needs either value, and this
+  # hook's synchronous path is paid on every commit in every armed checkout -- a `git config` spawn
+  # plus a PATH walk is about 65ms there and nothing here.
+  #
+  # `timeout` ships with Git for Windows and with coreutils. Where it is absent the push runs
+  # unbounded rather than not at all: durability is the point of this hook, and it must not come to
+  # depend on a helper being installed.
+  _timeout=$(git config --get mefor.durabilityPushTimeout 2>/dev/null)
+  case "$_timeout" in
+    '' | *[!0-9]* | 0) _timeout=300 ;;
+  esac
+  if command -v timeout >/dev/null 2>&1; then
+    # -k follows a declined TERM with a KILL, so a push wedged below the signal still goes.
+    _bounded() { timeout -k 10 "$_timeout" "$@"; }
+  else
+    _bounded() { "$@"; }
+  fi
+
+  if [ -n "$KEEP" ]; then
+    # A REFUSAL HERE IS FINE; A TIMEOUT IS NOT, AND THE ORDERING RULE ABOVE IS WHY. A refusal means
+    # the name is already taken by the capture this one would duplicate, so the tip IS held and the
+    # moving push may proceed -- that is the existing "deliberately not checked" reasoning, and it
+    # stands. A TIMEOUT is a new kind of non-success with the opposite meaning: the capture did not
+    # land, so moving the tag now discards exactly the commits it exists to preserve, and `$LAST`
+    # would then advance past them. Stop instead and let the next commit repair it.
+    # 124 is timeout's own exit code; 137 is the -k KILL landing.
+    _bounded git push --quiet "$REMOTE" "$KEEP"
+    case "$?" in
+      124 | 137) return 1 ;;
+    esac
+  fi
+  _bounded git push --quiet --force "$REMOTE" "$SRC:$TAG" || return 1
   [ -n "$COMMIT" ] || return 0
   git update-ref "$LAST" "$COMMIT"
 }
