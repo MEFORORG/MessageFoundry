@@ -27,6 +27,7 @@ from __future__ import annotations
 import inspect
 import os
 import re
+import subprocess
 from collections.abc import Callable
 from pathlib import Path
 from typing import Never
@@ -50,6 +51,13 @@ from fuzz.targets import (
 )
 from messagefoundry.parsing import Peek
 from messagefoundry.parsing.x12 import X12Peek
+from tests._bash_resolver import (
+    BASH_HARNESS_FAILURE,
+    explain_returncode,
+    probe_env,
+    require_bash,
+)
+from tests._workflow_contexts import jobs_of
 
 #: A conformant synthetic message with no blank segment -- the negative control for the carve-out.
 CLEAN_ADT = (
@@ -425,6 +433,383 @@ def test_every_target_in_the_fuzz_workflow_exists_in_the_registry() -> None:
     match = re.search(r"for target in ([a-z0-9_ ]+); do", text)
     assert match, f"no target loop found in {workflow.name}; did the job shape change?"
     assert sorted(match.group(1).split()) == sorted(TARGETS_BY_NAME)
+
+
+def _fuzz_job_steps() -> list[dict[str, object]]:
+    """The advisory job's steps, parsed.
+
+    Parsed rather than grepped, because the property under test is *which step* does what, and a
+    whole-file text search cannot tell two steps apart.
+    """
+    jobs = jobs_of("fuzz.yml")
+    assert "parsers" in jobs, f"fuzz.yml declares no job 'parsers' (it has: {sorted(jobs)})"
+    steps = jobs["parsers"].get("steps") or []
+    assert steps, "fuzz.yml:parsers parsed to no steps; read that as a parse failure, not a pass"
+    return [step or {} for step in steps]
+
+
+#: A libFuzzer-shaped crash log: the lines the reporter extracts, in the order CI emits them.
+#:
+#: Trimmed from the real output of run 35761703252 rather than invented, so the patterns are tested
+#: against the shape they will actually meet. `_REPRO_B64` is that run's real 155-byte crash unit.
+_REPRO_B64 = (
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "RElDTQAAAAACAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABESUNNAgAAAAAAAAAAAP//AABESUNNAgAAAPz/"
+    "//8AAAAAAAAA//////////8="
+)
+#: The exception line is kept WHOLE, including the ``repr()`` of the offending bytes.
+#:
+#: An earlier draft trimmed it at "per value." -- which is precisely where pydicom embeds the value
+#: it choked on (``pydicom/values.py`` reprs any value of 256 bytes or fewer). That trim removed the
+#: one property worth exercising: the exception line is itself message-shaped, so it is a PHI sink
+#: as much as the base64 is, and `.github/workflows/fuzz.yml`'s header now says so. A fixture that
+#: drops the bytes cannot show the reporter carrying them.
+_CRASH_EXC = (
+    "BytesLengthException: Expected total bytes to be an even multiple of bytes per value. "
+    "Instead received b'\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\xff\\xff\\xff\\xff\\xff\\xff\\xff"
+    "\\xff' with length 15 and struct format 'L' which corresponds to bytes per value of 4."
+)
+_CRASH_LOG = (
+    "#8214\tNEW    cov: 341 ft: 513 corp: 22/3240b lim: 167 exec/s: 0 rss: 82Mb\n"
+    " === Uncaught Python exception: ===\n"
+    f"{_CRASH_EXC}\n"
+    "Traceback (most recent call last):\n"
+    '  File "fuzz/targets.py", line 290, in _dicom_peek\n'
+    "==2305== ERROR: libFuzzer: fuzz target exited\n"
+    f"Base64: {_REPRO_B64}\n"
+    "stat::number_of_executed_units: 8326\n"
+)
+
+
+def _step_body(prefix: str) -> str:
+    """The SHIPPED `run:` body of the one step whose name starts with ``prefix``.
+
+    Asserts the body interpolates no Actions expression. Running it verbatim is only sound while
+    that holds: a ``${{ }}`` is substituted by Actions and would be left literal here, so this
+    harness would silently stop executing what CI executes. Borrowed from
+    ``tests/test_nightly_notice.py``, which makes the same argument for the same reason.
+    """
+    named = [s for s in _fuzz_job_steps() if str(s.get("name", "")).startswith(prefix)]
+    assert len(named) == 1, f"expected one step named {prefix!r}, found {len(named)}"
+    body = str(named[0].get("run", ""))
+    assert body, f"step {prefix!r} has an empty run body"
+    assert "${{" not in body, (
+        f"step {prefix!r} interpolates an Actions expression, so this harness is no longer "
+        "executing what CI executes"
+    )
+    return body
+
+
+def _run_reporter(
+    tmp_path: Path,
+    findings: str,
+    refusals: str,
+    log_dir: Path,
+    complete: str = "1",
+) -> tuple[int, str]:
+    """Execute the shipped reporting step verbatim and return its exit code and the summary."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    bash = require_bash(tmp_path)
+    script = tmp_path / "report.sh"
+    script.write_text(_step_body("Report any finding"), encoding="utf-8", newline="\n")
+    summary = tmp_path / "summary.md"
+    summary.write_text("", encoding="utf-8")
+    env = probe_env(Path(bash), dict(os.environ))
+    env.update(
+        {
+            "MEFOR_FUZZ_FINDINGS": findings,
+            "MEFOR_FUZZ_REFUSALS": refusals,
+            "MEFOR_FUZZ_LOG_DIR": log_dir.as_posix(),
+            "MEFOR_FUZZ_COMPLETE": complete,
+            "GITHUB_STEP_SUMMARY": summary.as_posix(),
+        }
+    )
+    proc = subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell, test-local paths
+        [bash, script.as_posix()],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+        check=False,
+    )
+    assert proc.returncode != BASH_HARNESS_FAILURE, explain_returncode(
+        proc.returncode, "the fuzz reporting step"
+    )
+    return proc.returncode, summary.read_text(encoding="utf-8")
+
+
+def test_the_reporter_really_extracts_the_reproducer_from_a_crash_log(tmp_path: Path) -> None:
+    """Run the shipped reporting step against a crash log and assert the base64 lands.
+
+    **A SUBSTRING CHECK OVER THE YAML CANNOT SEE THIS BREAK, WHICH IS WHY THIS RUNS THE BODY.**
+    `test_the_finding_reporter_carries_the_reproducer_and_gates_nothing` asserts the step *mentions*
+    libFuzzer's `Base64:` line, and that assertion passes just as happily against a `sed` expression
+    that matches nothing. A typo in the pattern, a `head`/`tail` picking the wrong line, or an
+    upstream change to libFuzzer's output would all leave the summary announcing a defect with no
+    input attached -- which is most of the defect this whole step was added to fix.
+
+    It also closes the `${log_dir}/${target}.log` path round trip: the writer and the reader spell
+    that filename separately, so nothing else would notice if one of them changed.
+    """
+    log_dir = tmp_path / "fuzz-logs"
+    log_dir.mkdir()
+    (log_dir / "dicom_peek.log").write_text(_CRASH_LOG, encoding="utf-8")
+
+    code, summary = _run_reporter(tmp_path, " dicom_peek", "", log_dir)
+
+    assert code == 0, f"the reporter must never red this advisory job; it exited {code}"
+    assert _REPRO_B64 in summary, (
+        "the reporter did not carry libFuzzer's base64 reproducer into the job summary. The "
+        "summary would name a defect and leave the reader to re-derive its input from the step "
+        f"log. Summary was:\n{summary}"
+    )
+    assert _CRASH_EXC in summary, (
+        "the escaped exception did not reach the summary WHOLE. The tail of that line is where "
+        "pydicom embeds a repr of the bytes it choked on, so truncating it would drop the part a "
+        "reader needs and the part the PHI note in the workflow header accounts for."
+    )
+    assert "8326" in summary, "the execution count did not reach the summary"
+    assert "### dicom_peek" in summary, "the finding is not attributed to a named target"
+
+
+def test_the_two_steps_name_the_same_log_directory_variable() -> None:
+    """The capture path is spelled in two steps and nothing else would notice them diverging.
+
+    The reporter half is covered by execution -- a renamed read there makes the round-trip test
+    report "No captured output". The WRITE half is not: the fuzz step could rename what it exports
+    and every other test would stay green while every summary lost its reproducer, which is the
+    drift the workflow comment beside that export names.
+    """
+    producer = _step_body("Fuzz the tolerant parsers")
+    reporter = _step_body("Report any finding")
+    assert "MEFOR_FUZZ_LOG_DIR" in producer, "the fuzz step no longer exports the log directory"
+    assert "MEFOR_FUZZ_LOG_DIR" in reporter, "the reporter no longer reads the log directory"
+
+
+def test_the_reporter_never_reds_the_job_and_never_claims_a_clean_run_it_cannot_claim(
+    tmp_path: Path,
+) -> None:
+    """Four outcomes, none of which may red the job or overstate what ran.
+
+    The refusal-plus-finding row is here because the first draft got it wrong. That draft reported
+    refusals only on the no-findings path, so a run with both took the findings arm, said nothing
+    about the refusal, and asserted the check beside it was green -- while the refusal step was
+    redding the job. A reporter that contradicts its own check is the defect this step exists to
+    fix, one level up.
+    """
+    log_dir = tmp_path / "fuzz-logs"
+    log_dir.mkdir()
+    (log_dir / "dicom_peek.log").write_text(_CRASH_LOG, encoding="utf-8")
+
+    clean_code, clean = _run_reporter(tmp_path / "a", "", "", log_dir)
+    assert clean_code == 0
+    assert "Every target survived its budget" in clean
+    assert _REPRO_B64 not in clean, "a clean run must not carry a reproducer"
+
+    refused_code, refused = _run_reporter(tmp_path / "b", "", " dicom_peek", log_dir)
+    assert refused_code == 0
+    assert "never ran" in refused
+    assert "Every target survived its budget" not in refused, (
+        "a run where a target never started must not be reported as every target surviving"
+    )
+
+    both_code, both = _run_reporter(tmp_path / "c", " dicom_peek", " x12_peek", log_dir)
+    assert both_code == 0
+    assert "never ran" in both and "x12_peek" in both, (
+        "a run with BOTH a refusal and a finding dropped the refusal. That is the first draft's "
+        f"defect. Summary was:\n{both}"
+    )
+    assert _REPRO_B64 in both, (
+        "the finding's reproducer was dropped when a refusal was also present"
+    )
+
+    missing_code, missing = _run_reporter(tmp_path / "d", " dicom_peek", "", tmp_path / "gone")
+    assert missing_code == 0, "a missing capture must degrade, never red the job"
+    assert "No captured output" in missing
+
+
+def test_the_completion_sentinel_is_written_last_and_is_checked_by_the_refusal_step() -> None:
+    """Both ends of the sentinel, because each is useless without the other.
+
+    The reporter's handling of a MISSING sentinel is covered by executing it. What that cannot see
+    is the producing end: if the fuzz step stopped writing the sentinel, or wrote it before the
+    work it certifies, the reporter's guard would still behave correctly and certify nothing.
+
+    ORDER IS THE PROPERTY, not presence. A sentinel written before the loop says only "this step
+    started", which is what its `continue-on-error` conclusion already says.
+    """
+    fuzz_body = _step_body("Fuzz the tolerant parsers")
+    assert "MEFOR_FUZZ_COMPLETE=1" in fuzz_body, (
+        "the fuzz step no longer writes the completion sentinel, so a step that dies partway is "
+        "indistinguishable from one that ran clean"
+    )
+    assert fuzz_body.index("MEFOR_FUZZ_COMPLETE=1") > fuzz_body.index("MEFOR_FUZZ_FINDINGS="), (
+        "the completion sentinel is written BEFORE the findings channel. It must be written last, "
+        "or it certifies a step that had not yet reported its result."
+    )
+
+
+def _run_refusal_step(tmp_path: Path, refusals: str, complete: str) -> int:
+    """Execute the shipped refusal step verbatim and return its exit code."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    bash = require_bash(tmp_path)
+    script = tmp_path / "refusal.sh"
+    script.write_text(_step_body("Fail if the harness never ran"), encoding="utf-8", newline="\n")
+    env = probe_env(Path(bash), dict(os.environ))
+    env.update({"MEFOR_FUZZ_REFUSALS": refusals, "MEFOR_FUZZ_COMPLETE": complete})
+    proc = subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell, test-local paths
+        [bash, script.as_posix()],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+        check=False,
+    )
+    assert proc.returncode != BASH_HARNESS_FAILURE, explain_returncode(
+        proc.returncode, "the fuzz refusal step"
+    )
+    return proc.returncode
+
+
+def test_the_refusal_step_reds_on_a_missing_sentinel_and_on_a_refusal(tmp_path: Path) -> None:
+    """Execute the gate rather than grep it, because grepping it measured the wrong thing.
+
+    **THIS TEST REPLACES A SUBSTRING CHECK THAT A MUTATION ARM CAUGHT PASSING.** The first draft
+    asserted ``"MEFOR_FUZZ_COMPLETE" in refusal_body``. Replacing the step's actual condition with
+    ``if false; then`` left that assertion green, because the variable is still named in the
+    comment above the condition -- so the guard certified a gate that had stopped gating. Running
+    the body cannot be satisfied by a comment.
+
+    A missing sentinel must red for the same reason a refusal does: both mean the harness did not
+    do what it was asked, which is a fault rather than a fuzz result.
+    """
+    assert _run_refusal_step(tmp_path / "ok", "", "1") == 0, (
+        "a completed run with no refusals must pass the gate"
+    )
+    assert _run_refusal_step(tmp_path / "dead", "", "") != 0, (
+        "the refusal step passed a run whose fuzz step never finished. `continue-on-error` already "
+        "rewrote that step's own conclusion to success, so this gate is the only thing left that "
+        "can report it."
+    )
+    assert _run_refusal_step(tmp_path / "refused", " dicom_peek", "1") != 0, (
+        "the refusal step passed a run where a target never executed"
+    )
+
+
+def test_the_reporter_claims_nothing_when_the_fuzz_step_did_not_finish(tmp_path: Path) -> None:
+    """An empty findings list is not evidence of a clean run, and must not be reported as one.
+
+    **THE SENTINEL IS THE WHOLE POINT AND THIS IS THE ONLY TEST THAT CAN SEE IT.** The fuzz step
+    carries ``continue-on-error``, so if it dies partway -- under ``set -e``, in the ``mkdir``, in
+    a ``cat`` on an unwritable log -- its conclusion is rewritten to ``success`` and it writes no
+    channel variables at all. The reporter then sees an empty findings list, which is exactly what
+    a genuinely clean run also produces. Guessing "clean" there turns a harness fault into an
+    affirmative all-clear on the run page: strictly worse than the silence it replaced, because a
+    reader now has a sentence telling them the parsers are fine.
+
+    ``MEFOR_FUZZ_COMPLETE`` is written LAST by the fuzz step, so its absence means "did not
+    finish". Every other test in this file passes it, which is why none of them would notice its
+    removal.
+    """
+    log_dir = tmp_path / "fuzz-logs"
+    log_dir.mkdir()
+
+    code, summary = _run_reporter(tmp_path / "e", "", "", log_dir, complete="")
+
+    assert code == 0, "the reporter still must not red the job, even on a harness fault"
+    assert "did not finish" in summary, (
+        f"the reporter did not say the fuzz step failed to finish. Summary was:\n{summary}"
+    )
+    assert "Every target survived its budget" not in summary, (
+        "the reporter claimed a clean run from a fuzz step that never reported one. An empty "
+        "findings list means EITHER nothing was found OR the step died before it could say, and "
+        "this step cannot tell those apart without the sentinel."
+    )
+
+
+def test_a_finding_reaches_a_step_that_writes_the_job_summary() -> None:
+    """A finding must leave the softened step through a channel something downstream reads.
+
+    THE DEFECT THIS PINS IS MEASURED, not imagined. On run 35761703252 the fuzz step found a real
+    contract violation, annotated it and exited 1 -- and ``continue-on-error`` rewrote that step's
+    conclusion to ``success``, leaving an ``outcome`` no workflow in this repository reads. The job
+    went green and PR 1423 merged with the finding unread (run finished 17:39:41Z, merge 18:16:20Z).
+
+    So this asserts the three links of the chain separately: the producing step WRITES the findings
+    variable, a DIFFERENT step READS it, and that reader writes the job summary. Producer and
+    consumer being distinct is the load-bearing half -- a step that hands a value to itself is the
+    arrangement that failed, and it satisfies any check that only looks for both strings somewhere
+    in the file.
+    """
+    steps = _fuzz_job_steps()
+    producers = [s for s in steps if "MEFOR_FUZZ_FINDINGS=" in str(s.get("run", ""))]
+    assert len(producers) == 1, (
+        f"expected exactly one step to WRITE MEFOR_FUZZ_FINDINGS, found {len(producers)}. Without "
+        "it a finding leaves the fuzz step only through `exit 1`, which `continue-on-error` "
+        "discards -- the measured defect this channel exists to fix."
+    )
+    # The two halves MATCHED ON ONE LINE, not merely both present in the body. The producer writes
+    # three variables to $GITHUB_ENV, so a bare `"GITHUB_ENV" in body` is satisfied by the other
+    # two: redirect the findings line to /dev/null and that check stays green while its own failure
+    # message claims to catch exactly that. Answering the adjacent question is the defect this file
+    # keeps finding elsewhere (CLAUDE.md section 11, SDS-3.8).
+    assert re.search(
+        r"MEFOR_FUZZ_FINDINGS=[^\n]*>>[^\n]*GITHUB_ENV", str(producers[0].get("run", ""))
+    ), (
+        "the findings variable is not written into $GITHUB_ENV on its own line, so no later step "
+        "can read it. A finding would then leave the fuzz step only through `exit 1`, which "
+        "`continue-on-error` discards."
+    )
+
+    consumers = [
+        s
+        for s in steps
+        if s is not producers[0]
+        and "MEFOR_FUZZ_FINDINGS" in str(s.get("run", ""))
+        and "GITHUB_STEP_SUMMARY" in str(s.get("run", ""))
+    ]
+    assert len(consumers) == 1, (
+        f"expected exactly one step OTHER THAN the producer to read MEFOR_FUZZ_FINDINGS and write "
+        f"$GITHUB_STEP_SUMMARY, found {len(consumers)}. A finding that is handed from a step to "
+        "itself reaches nobody, which is precisely what happened on run 35761703252."
+    )
+
+
+def test_the_finding_reporter_carries_the_reproducer_and_gates_nothing() -> None:
+    """The reporter must be readable, actionable, and incapable of blocking a merge.
+
+    Three properties, and dropping any one of them re-creates a different half of the defect.
+    Without the reproducer the summary says a defect exists and leaves the reader to re-derive the
+    input from a log line among half a million. With a ``continue-on-error`` of its own the reporter
+    could die silently and report nothing, which is the failure mode the fuzz step already has. With
+    an ``exit 1`` it would red an advisory job on a budget-and-seed-dependent result, which ADR 0191
+    option 6 rejected and which this change does not reopen.
+    """
+    steps = _fuzz_job_steps()
+    reporters = [
+        s
+        for s in steps
+        if "MEFOR_FUZZ_FINDINGS" in str(s.get("run", ""))
+        and "GITHUB_STEP_SUMMARY" in str(s.get("run", ""))
+    ]
+    assert len(reporters) == 1, f"expected one reporting step, found {len(reporters)}"
+    reporter = reporters[0]
+    body = str(reporter.get("run", ""))
+
+    assert "Base64: " in body, (
+        "the reporter does not lift libFuzzer's `Base64:` line out of the captured log, so the "
+        "summary would name a defect without carrying the input that provokes it. Verified against "
+        "run 35761703252: that line decodes to the 155-byte unit, and it reproduces."
+    )
+    assert reporter.get("continue-on-error") in (None, False), (
+        "the reporting step must not be softened. A softened reporter can fail silently, which is "
+        "the same defect one layer up -- and it would also red "
+        "test_step_advisory_jobs_soften_only_their_named_step."
+    )
+    assert not re.search(r"^\s*exit [1-9]", body, re.MULTILINE), (
+        "the reporting step exits non-zero somewhere. A finding must not red this advisory job "
+        "(ADR 0191 option 6); only the refusal step is allowed to."
+    )
 
 
 def test_the_work_root_is_outside_the_repository_by_default(

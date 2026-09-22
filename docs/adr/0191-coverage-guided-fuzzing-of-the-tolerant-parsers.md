@@ -117,8 +117,15 @@ its own exception contract on a path the inbound pipeline already relies on?
 **Targets parse and then read the accessors, which is the load-bearing design choice.** A Router does
 not stop at `parse`; it reads routing fields off the result, before the ACK. So `hl7_peek` parses and
 then reads all eleven named routing properties plus `routing()` and `segments()`, and `x12_peek`
-parses and then reads the ten ISA identity properties plus the group and segment walk. Fuzzing
-`parse` alone would have found nothing: the finding below lives entirely in the accessor tier.
+parses and then reads the ten ISA identity properties plus the group and segment walk.
+
+**This paragraph used to end "Fuzzing `parse` alone would have found nothing: the finding below lives
+entirely in the accessor tier." That is now false as a general claim, and only ever held for HL7.**
+`dicom_peek` has no accessor tier to sweep -- `DicomPeek.parse` returns a frozen dataclass of
+already-materialised strings -- so `parse` really is its whole surface, and `parse` alone produced
+this harness's second finding. Run 35761703252 reached it from the 132-byte magic-only seed in
+**8,326 executions**. The accessor sweep is what the HL7 and X12 targets need to be able to report at
+all; it is not a property of every target.
 
 **Four targets**, in `fuzz/targets.py`: `hl7_peek`, `hl7_tree` (the tolerant structural view),
 `x12_peek`, `dicom_peek`.
@@ -281,10 +288,35 @@ manager is open. **`pydicom` did not, and this line used to claim it did.** `par
 imports pydicom inside function bodies, deliberately, to keep the engine importable without the
 `[dicom]` extra; those run at parse time, after instrumentation has stopped. So `dicom_peek` was
 guided only by the engine's thin wrapper and the mutator was blind to the DICOM parse surface.
-`fuzz/fuzz_parsers.py` now imports pydicom explicitly inside the block; that is reasoned from
-Atheris's documented behaviour rather than measured, because Atheris has no Windows wheel, and the
-module docstring names the Linux check that would confirm it. Cost: Linux x86-64 only, which the
-marker contains.
+`fuzz/fuzz_parsers.py` now imports pydicom explicitly inside the block.
+
+**That import was recorded as reasoned rather than measured. It is now measured, and this paragraph
+replaces the caveat rather than deleting it.** The old text read: *"that is reasoned from Atheris's
+documented behaviour rather than measured, because Atheris has no Windows wheel, and the module
+docstring names the Linux check that would confirm it."* The observation is GitHub Actions run
+**35761703252** -- workflow `fuzz`, head `cdeb0fa9393bcfc39ccd3bd571f621de84d867ef`, `ubuntu-latest`,
+atheris 3.1.0, pydicom 3.0.2:
+
+* Atheris logs `INFO: Instrumenting` for **58 pydicom names** -- the package plus 57 submodules,
+  among them `filereader`, `filebase`, `fileutil`, `tag`, `datadict`, `encaps`, `charset` and
+  `valuerep`. All four target processes report the same 58, and the warrant for that is a
+  per-name count rather than the total: **each of the 58 names appears exactly 4 times** across the
+  run. The first draft argued it from "232 such lines over four targets", which does not establish
+  it -- 232 is equally consistent with 60/58/58/56, so a total cannot settle a partition.
+* The `dicom_peek` mutator climbs from `cov: 136` at `INITED` to `cov: 341` at its last new unit,
+  over 31 readings. Two step changes land immediately after a pydicom parse warning: **+74 at exec
+  #4495** (147 to 221, after `filereader.py:487`) and **+69 at #7996** (259 to 328, after
+  `filereader.py:402`).
+
+**The control arm was not run, and the claim does not rest on it.** The recipe this ADR and the
+module docstring both prescribed was a *two-arm* comparison against a build with the import removed;
+only the with-import arm exists, so the coverage delta is not attributable in a controlled sense and
+must not be quoted as though it were. It is not needed for the claim that was in doubt. The doubt was
+whether pydicom gets instrumented at all, and the `INFO: Instrumenting pydicom.*` lines observe that
+directly -- stronger evidence than the coverage proxy that was proposed to infer it, because the
+proxy answers an adjacent question (CLAUDE.md section 11, SDS-3.8).
+
+Cost: Linux x86-64 only, which the marker contains.
 Provenance checked before adding it, per CLAUDE.md section 7: `atheris` on PyPI, source at
 `github.com/google/atheris`, latest 3.1.0 -- the intended package, not a name-alike.
 
@@ -309,7 +341,11 @@ unexpected error (ADR 0054's guard, logging and continuing), and the python-hl7 
 exception into `HL7PeekError`, which every target treats as the contract being honoured. So the
 HL7 parse tier is total with respect to this harness's question -- the fuzzer *traverses* those
 branches but can never *report through* them. Every HL7 finding must come from the accessor tier,
-and the one finding to date does.
+and the one HL7 finding to date does. **Read "one finding to date" as scoped to HL7, which is how
+this line was written and not how it reads on its own**: run 35761703252 produced a second finding,
+on `dicom_peek`, and it came through `parse`. That is consistent rather than contradictory -- the
+argument above is about what the *HL7* fallback guard can report through, and `dicom_peek` has a
+different parse tier with no such guard.
 
 **6. Make the job blocking.** Rejected; see the Decision. A time-budget-and-seed-dependent result must
 not gate a merge.
@@ -318,10 +354,63 @@ not gate a merge.
 which is enough to reproduce, and an artifact upload is one more permission and one more action for no
 new information. Revisit if a nightly finding proves hard to reproduce locally.
 
+**REVISITED 2026-09-22 against a real crash artifact, and the decline HOLDS -- now on a measurement
+rather than on an expectation.** The revisit was owed: this option was declined before anyone had
+produced an artifact to lose, and run 35761703252 produced one
+(`crash-e407a7c52d06668011f7624709f6f8927cbeb2b1`) and discarded it with the runner. The premise was
+tested rather than assumed. libFuzzer printed that unit twice, as a hex dump and as base64; the two
+decode to the **same 155 bytes**, and replaying those bytes through
+`TARGETS_BY_NAME["dicom_peek"].run` on **Windows** against the same pydicom 3.0.2 raises the same
+`BytesLengthException` with the same traceback. So the printed form is a complete reproducer across
+platforms.
+
+**That the artifact would have carried the SAME bytes is MEASURED, not inferred, and the control was
+sitting in the log all along.** libFuzzer names a crash file by the SHA-1 of the unit it wrote.
+`sha1` of the 155 decoded bytes is `e407a7c52d06668011f7624709f6f8927cbeb2b1`, which is exactly the
+filename above. The discarded artifact is therefore byte-identical to the printed form, and an upload
+would have moved those same bytes to a place that is *harder* to reach -- a zip behind a download.
+On a change whose first commit is titled "measured now, not reasoned", leaving this leg reasoned
+would have been the odd note.
+
+**The reproducer is now durable in the repository, which is what finishes the argument.** Run
+35761703252 predates the summary step, so its base64 lived only in that run's raw log, under the
+retention clock that would otherwise have been artifact upload's best argument.
+`tests/test_fuzz_targets.py` now commits those 155 bytes as a fixture and runs the reporting step
+against them, so the bytes outlive every clock either option depends on.
+
+**What the incident actually showed is a reporting defect, not a preservation one, and those have
+different fixes.** The reproducer was never lost; it was unread, on line 568,193 of a 568,245-line
+log. The job summary added alongside this revisit carries that same base64 to the run page, which is
+strictly closer than an artifact. Uploading as well would also widen the surface the header's PHI
+note fences, for no information the summary does not already hold.
+
+**One caveat, measured the hard way.** Transcribing the base64 by hand is a real hazard: during this
+revisit a retyped copy decoded to **158 bytes rather than 155**, parsed cleanly, and reported **no
+finding at all** -- a false all-clear from a reproducer that looked right. It was caught only by
+decoding libFuzzer's hex dump as well and comparing the two, which is the control worth keeping: the
+hex dump and the base64 are independent encodings of one unit, so they agree or you mis-copied one.
+`fuzz/README.md` says so where the recipe is, because the failure is silent. Copy the block, never
+retype it.
+
 ## Consequences
 
 **The Secure_Development_Standards section 6.1 *Dynamic* tier now has one instrument that runs.** One,
 not all of them: three of Lane 1's four instruments are still unwired, and #277 stays open.
+
+**A FINDING NOW LEAVES THE ADVISORY STEP, WHICH IT DID NOT WHEN THIS ADR WAS WRITTEN.** The first
+finding this harness produced in CI reached nobody: `continue-on-error` rewrites the fuzz step's
+conclusion to `success`, so its `exit 1` left only an `outcome` that nothing in this repository
+reads. The job went green and the pull request merged with the finding unread. A finding therefore
+travels the same `$GITHUB_ENV` channel a refusal does, to a step that writes it and its reproducer
+to the job summary. `.github/workflows/fuzz.yml` is the source of record for the mechanism and the
+measurement; it is not restated here.
+
+**That changed the reporting and NOT the posture, and the two must not be read as one.** The job is
+still not a required context, the fuzz step keeps its softening, `_MUST_NOT_BE_REQUIRED` still lists
+the context, and the reporting step exits 0 on any finding -- so option 6 above stands and a finding
+still gates nothing. The consumer is a person reading the run page or the checks list, which is a
+*pull* channel: no push channel exists for this job without widening its permissions or reding it,
+and both were declined.
 
 **This closes the engine half of ADR 0034's accepted risk for Scorecard's `Fuzzing` check
 (WP-BL3-02), and it cannot close the record half.** The ASVS scorecard is a `[[cell]]` record in the

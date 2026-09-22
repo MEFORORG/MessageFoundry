@@ -115,6 +115,18 @@ def _sample(name: str) -> tuple[bytes, ...]:
 # A bare MSH, an ISA fragment that stops mid-header, and the Part-10 magic with nothing after it.
 # Each sits on a different early branch (accepted / truncated envelope / magic-only), which is where
 # a mutator gets the most leverage from a tiny seed.
+#
+# MEASURED for the DICOM one, in CI run 35761703252: from these 132 bytes and nothing else, the
+# mutator produced a real contract violation at execution unit 8,326, through pydicom's file-meta
+# reader, inside a 60-second budget. A magic-only seed reaching a tier that can report was an open
+# question when these were chosen; it is no longer one, so do not shrink this seed on the theory
+# that it cannot get anywhere.
+#
+# An earlier draft also pinned "reached the file-meta reader" to exec #4495. That pairs the wrong
+# two facts: #4495's coverage jump follows a warning from `filereader.py:487`, which is the
+# end-of-file handler inside `read_dataset`, while the finding's own traceback enters
+# `_read_file_meta_info` at `filereader.py:686`. The tier attribution is right and the exec number
+# belonged to a different event, so the number is dropped rather than re-pointed.
 _MINIMAL_HL7 = b"MSH|^~\\&|APP|FAC|R|RF|20260101||ADT^A01|MSG1|P|2.5\r"
 _TRUNCATED_X12 = b"ISA*00*          *00*"
 _MAGIC_ONLY_DICOM = b"\x00" * 128 + b"DICM"

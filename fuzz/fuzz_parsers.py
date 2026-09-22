@@ -29,14 +29,22 @@ manager has closed -- so on the previous arrangement pydicom was loaded uninstru
 ``dicom_peek`` mutator saw coverage only from the thin engine wrapper, blind to the entire DICOM
 parse surface it was supposed to be exploring. The explicit import below is what fixes that.
 
-**That fix is reasoned, not measured, and the distinction matters here.** Atheris publishes no
-Windows wheel, so nothing on a developer Windows leg can observe instrumentation at all; the claim
-rests on Atheris's documented behaviour (it instruments modules imported while the manager is open)
-plus the measured fact that ``import pydicom`` loads the parse surface eagerly through pydicom's own
-``__init__``. To verify it rather than infer it, run ``dicom_peek`` on Linux and compare the
-``cov:`` counter in ``-print_final_stats=1`` output against a run with the import removed; a mutator
-that gained pydicom's branches reports materially more coverage. Recorded as unverified rather than
-asserted, because an unmeasured claim in this file is the exact defect this change is correcting.
+**That fix was reasoned rather than measured. It is measured now, on Linux, in CI.** This paragraph
+used to say "Recorded as unverified rather than asserted", and the sentence it replaces is quoted in
+ADR 0191's option 1 alongside the figures. GitHub Actions run **35761703252** (workflow ``fuzz``,
+head ``cdeb0fa9393bcfc39ccd3bd571f621de84d867ef``, atheris 3.1.0, pydicom 3.0.2) logs Atheris
+instrumenting **58 pydicom names** -- the package plus 57 submodules, ``filereader`` and ``encaps``
+and ``valuerep`` among them -- and the ``dicom_peek`` mutator then climbs from ``cov: 136`` to
+``cov: 341``, stepping +74 at exec #4495 straight after a ``pydicom/filereader.py`` warning. The
+target went on to produce a real finding through the DICOM file-meta reader at execution unit 8,326.
+
+**One arm of the original recipe is still missing, and saying which matters.** That recipe was a
+comparison against a build with this import removed, and only the with-import arm has ever run, so
+the coverage *delta* is not attributable in a controlled sense -- do not quote it as though a
+control existed. The instrumentation claim does not need it: ``INFO: Instrumenting pydicom.*``
+observes the thing directly, where the ``cov:`` delta was only ever a proxy for it. To run the
+missing arm, delete the import below, fuzz ``dicom_peek`` on Linux, and compare ``cov:`` from
+``-print_final_stats=1`` against a run with it restored.
 """
 
 from __future__ import annotations

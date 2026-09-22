@@ -97,6 +97,47 @@ real corpus would put payload content into a CI log and into a crash artifact. D
 (`messagefoundry/anon/`, ADR 0030) and keep such a run local. Synthetic messages come from
 `messagefoundry generate`; that corpus is git-ignored and should stay so.
 
+## Reproducing a finding from a CI run
+
+The advisory job writes any finding to the **run's job summary**, with the crashing input as
+base64. Read it there rather than in the step log: on run 35761703252 that input sat on line
+568,193 of a 568,245-line log, which is why the summary exists.
+
+Copy the base64 out of the summary and run the target on it. This needs no Atheris, so it works on
+Windows. **Install the extra the target needs first**, or the run raises `RuntimeError: DICOM
+parsing requires the optional 'dicom' extra` -- which `_dicom_peek` does not catch, so a missing
+extra reads exactly like a confirmed finding:
+
+```powershell
+uv pip install --constraint constraints.lock -e ".[dicom]"
+
+python -c "import base64; from fuzz.targets import TARGETS_BY_NAME; TARGETS_BY_NAME['dicom_peek'].run(base64.b64decode('<paste the base64 here>'))"
+```
+
+It raises the escaped exception, or returns silently if the contract holds. **A silent return means
+you have the wrong bytes, not that the finding was spurious** -- a mis-copied base64 decodes to a
+different unit, and a wrong unit parses cleanly and reads as an all-clear. Verified against run
+35761703252: the printed unit is 155 bytes and reproduces byte-exact on Windows against the same
+pydicom version, while a retyped copy decoded to 158 bytes and reported no finding at all.
+
+**Check your bytes against the crash filename before you conclude anything.** libFuzzer names the
+artifact by the SHA-1 of the unit, so the name in the log is a checksum you already have:
+
+```powershell
+python -c "import base64,hashlib; print(hashlib.sha1(base64.b64decode('<paste the base64 here>')).hexdigest())"
+```
+
+That matched `crash-e407a7c52d06668011f7624709f6f8927cbeb2b1` for run 35761703252. It catches any
+mis-copy, including one that leaves the length unchanged, which comparing the hex dump against the
+base64 does not.
+
+On Linux you can also hand the decoded file straight to libFuzzer, which re-runs it under the
+instrumented harness:
+
+```bash
+MEFOR_FUZZ_TARGET=dicom_peek python -m fuzz.fuzz_parsers ./crash-unit.bin
+```
+
 ## Known findings
 
 `KNOWN_FINDINGS` in `fuzz/targets.py` records a contract violation this harness has produced but
