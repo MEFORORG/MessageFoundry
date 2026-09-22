@@ -8,9 +8,9 @@
   2026-09-22: the SMART token endpoint and the syslog TLS forwarder are guarded; **the OIDC token and
   JWKS legs are not** (AC-4 carries the recipe and the reason). **Three of this document's own premises
   moved under that build and are corrected in place rather than rewritten** — see §4.3's amendment and
-  the notice in §1.4. One of them reaches a *decision* and not only evidence: §2.1 declines a
-  direction-2 file CRL that BACKLOG #299 has since built, which is an owner question this ADR does not
-  settle.
+  the notice in §1.4. One of them reached a *decision* and not only evidence: §2.1 declined a
+  direction-2 file CRL that BACKLOG #299 has since built. **Settled by the owner 2026-09-22. §2.1's
+  amendment is the record, it is the only place this file states it, and it leaves reason 2 open.**
 - **Date:** 2026-08-23 (ratified 2026-09-22)
 - **Deciders:** owner (ratified the accept half 2026-09-22, owner ruling) · security working group
 - **Related:** **extends [ADR 0078](0078-certificate-revocation-posture.md)** (Accepted 2026-07-10,
@@ -182,7 +182,8 @@ originating context, so direction 2 is untouched.
 > #299 built the file-CRL-on-originating-hops that §2.1 declined, anchor-keyed, which is §2.1's own
 > reason 1 accepted rather than avoided. **This notice does not reverse anything and no seat should
 > read it as doing so** — it records that the accept half was ratified over a decline the tree had
-> already overtaken, so the owner can decide whether §2.1 needs restating. Direction 3's *"must not be
+> already overtaken. **The owner has since settled it; §2.1's amendment is the whole record and this
+> notice does not restate it.** Direction 3's *"must not be
 > counted toward either graded direction"* is untouched: that is still the terminating axis.
 
 The measurement, with a positive control:
@@ -318,6 +319,62 @@ interface engines and modality gateways. Asserting that they consume stapled res
 compensating control resting on an unverified assumption about third-party software, which SDS-3.7
 forbids.
 
+> **AMENDMENT 2026-09-22 — BACKLOG #299 BUILT THE CONTROL THE PARAGRAPH BELOW DECLINES. Read this
+> before quoting that paragraph or any of its three reasons.** **Reason 1 fell. The cost framing did
+> not.** One of the three cost reasons is false at HEAD, so the decline no longer rests on what it was
+> written on — but reasons 2 and 3 still carry real cost, so *"on cost rather than on principle"*
+> remains the right shape for what is left. **The accept in §2 is unchanged and this amendment reverses
+> nothing** — the owner ratified the accept half on 2026-09-22 and chose to restate reason 1 rather than
+> reopen the decision. The accept stands on its other legs: direction 1 is RUNTIME-BLOCKED (§1.2), and
+> the delegation-and-enforcement reasoning (§1.5) is untouched.
+>
+> **Every *"at HEAD"* in this amendment was measured at `d3a7ef505`. Re-measure rather than trust it**,
+> and note that this document's `3f18051b` code-reference baseline predates #299, so the line numbers
+> in the original text below resolve against a tree that no longer exists. Locate by symbol.
+>
+> **Reason 1's stated limit is false at HEAD, and the shipped prose is where it says so.** The reason
+> claims a file CRL *"reaches only hops with a pinned per-connection anchor"* and *"cannot reach the
+> HTTP family"*. Neither holds. `resolve_trust_anchor`'s docstring records that the policy CRL *"rides
+> along on every non-loopback arm, including the per-connection-CA arm and the `system` default
+> (BACKLOG #299)"*. The HTTP family's single opener construction goes through
+> `build_anchored_https_handler`, which loads the CRL onto urllib's own context. `[tls].crl_file`'s own
+> comment states the rule plainly: every hop that resolves a trust anchor loads the CRL onto its own
+> context. So #299 did not merely accept reason 1's narrower coverage — it reached past the limit the
+> reason states. Locate each of these by symbol. §1.4's notice carries the call-site reading and this
+> amendment does not restate it.
+>
+> **Two hops carry their own CRL key, because no trust anchor resolves for them:** the OIDC token and
+> JWKS legs (`[auth].oidc_tls_crl_file`) and the syslog forwarder (`[logging].forward_tls_crl_file`).
+> Read that as *"at least these"*. **The SMART token endpoint is NOT one of them** — it resolves an
+> anchor against its own `token_url` and takes the instance-wide key, so it has no CRL setting of its
+> own for a reader to go looking for (§4.3 correction 1).
+>
+> **What remains declined, which is the half still worth having a reason for.** The control is opt-in
+> and default-off, so the **default** posture is what §2 accepts and what §7 grades as a delegated
+> residual. No fetch of any kind is in scope in either direction (§5). Reason 3's publication-latency
+> bound therefore stands, and so does its live-expiry hazard. That hazard is in fact **worse on this
+> axis than on the terminating one**: `harden_crl_check` catches a stale CRL only at construction, and
+> §1.5 rider 5's expiry monitoring enrols **inbound** CRLs only, so an originating CRL ships with no
+> expiry alarm at all. The `capath=` refreshable drop that would answer this is still out (§5). And the
+> CRL reaches a hop only where engine code can reach the context. A context engine code never touches
+> at all never sees the policy — an `ldap3.Tls` or a `truststore` context, **not** urllib's, which
+> `build_anchored_https_handler` does reach and load the CRL onto. And the requests-based client's CRL
+> refusal is **pre-armed rather than active**: its own docstring records it as unreachable while those
+> callers pass a default policy. So grade a hop by asking its context, not by reading a setting, which
+> is what `context_checks_revocation` exists for.
+>
+> **Reason 2's premise is CONFIRMED, not moved — and reason 2 is NOT amended here.** #299 shipped the
+> CRL-plus-system-roots combination reason 2 said would need a hard refusal, and shipped it without
+> that refusal. `[tls].crl_file`'s own WARNING carries the premise live: `VERIFY_CRL_CHECK_LEAF`
+> refuses a peer whose issuer has no CRL in the store, not only a revoked one. What changed is the
+> remedy rather than the hazard — a documented warning, fail-closed, opt-in, loopback exempt. Whether
+> reason 2 should say so in its own text is an open owner question this amendment does not settle.
+>
+> **What this amendment deliberately leaves alone — read it as *"at least these"*.** Reason 2's text
+> and reason 3's text, both left standing unedited. And §6 rider 4, whose first trigger, *"the
+> HTTP-family hops gain a pinned per-connection trust anchor"*, has already fired at HEAD — so the
+> section a reader consults for *when do we revisit this* still reads as pending where it is not.
+
 **Direction 2's buildable half is declined for now, on cost rather than on principle.** ADR 0078's
 rejection of an in-engine client attacked **fetching**, and that reasoning does not reach a CRL an
 operator drops on disk. A file-based CRL on originating hops is implementable today with the existing
@@ -326,12 +383,16 @@ operator drops on disk. A file-based CRL on originating hops is implementable to
 1. **Coverage is narrower than the delegation it would sit beside.** File CRL reaches only hops with a
    pinned per-connection anchor. It cannot reach the HTTP family (REST, FHIR, DICOMweb, SOAP), which
    rides urllib's own context on the OS trust store — the largest group of originating hops. A site
-   that terminates outbound at a revocation-checking egress proxy covers all of them.
+   that terminates outbound at a revocation-checking egress proxy covers all of them. *(Overtaken
+   2026-09-22: BACKLOG #299 built this, and wider than the limit stated here — see the amendment
+   above. The egress-proxy sentence is unaffected and still true.)*
 2. **It is unusable on the default trust posture.** `build_verifying_client_context`
    (`tls_policy.py:1171-1178`) loads the OS roots on the `system` and `augment` postures. With the
    check flag set and a CRL loaded for one CA only, a peer chaining to any other trusted CA is refused
    with `unable to get certificate CRL`. So the build would need a hard refusal of CRL-plus-system-
-   roots, which narrows it further.
+   roots, which narrows it further. *(Premise CONFIRMED and still live as of 2026-09-22 — but #299
+   shipped this combination WITHOUT that hard refusal, so the conclusion in the last sentence no longer
+   describes the tree. See the amendment above; this reason is not amended here.)*
 3. **It converts a confidentiality gap into an availability hazard on the delivery path.** The engine
    already says so at `tls_policy.py:231-233`: an expired CRL refuses every peer. `harden_crl_check`
    catches a stale file **at construction**, where `check` and dry-run see it — but not the live case,
