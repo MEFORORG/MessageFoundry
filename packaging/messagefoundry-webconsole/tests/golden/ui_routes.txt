@@ -24,6 +24,7 @@ GET /ui/messages/{message_id}
 GET /ui/messages/{message_id}/attachments/{attachment_id}
 GET /ui/messages/{message_id}/edit
 GET /ui/messages/{message_id}/parse-tree
+GET /ui/messages/{message_id}/resend-confirm
 GET /ui/mfa
 GET /ui/monitoring
 GET /ui/monitoring/live
@@ -83,6 +84,7 @@ POST /ui/messages/search/presets/{preset_id}/delete
 POST /ui/messages/search/run
 POST /ui/messages/{message_id}/edit-resend
 POST /ui/messages/{message_id}/replay
+POST /ui/messages/{message_id}/resend
 POST /ui/mfa
 POST /ui/reauth
 POST /ui/reauth/webauthn

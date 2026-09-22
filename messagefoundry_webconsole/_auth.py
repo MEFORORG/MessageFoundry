@@ -565,13 +565,18 @@ def is_unlock_action(next_path: str | None) -> bool:
     target) and same append-only registry as the only source of truth — a lane opts a form page in by
     *registering* it, not by editing this function.
 
-    ONE REGISTERED PATTERN IS QUERY-TOLERANT and the promise above is correspondingly weaker for it:
-    the uploaded-logs resend confirm page (BACKLOG #1227) matches ``resend-confirm(\\?[^#]*)?``, so an
-    arbitrary same-site query on THAT ONE PATH reaches the re-auth. It has to, because the action's
-    two parameters ride the query and ``_reauth_redirect`` puts the whole continuation into ``next``.
-    The path prefix is still anchored, the ``..`` rejection above still applies first, and the
-    confirm route's own ``Query(..., ge=0)`` / ``max_length=256`` bounds reject anything the pattern
-    admits — so the widening is bounded to a query string on a single registered page.
+    A PATTERN ENDING ``(\\?[^#]*)?`` IS QUERY-TOLERANT and the promise above is correspondingly
+    weaker for it: an arbitrary same-site query on that one path reaches the re-auth. Such a lane has
+    to be, because its action's parameters ride the query and ``_reauth_redirect`` puts the whole
+    continuation into ``next``. Every other pattern forbids ``?`` by construction via ``[^/?#]+``.
+    The path prefix is still anchored, the ``..`` rejection above still applies first, and each such
+    route's own ``Query`` bounds reject anything the pattern admits — so the widening is bounded to a
+    query string on the pages that opted in.
+
+    DELIBERATELY NOT A COUNT. This paragraph read "ONE REGISTERED PATTERN", then "TWO", each time
+    edited by hand in three files at once; the shape is what a reader needs, and a number in prose is
+    wrong on the next instance. ``tests/golden/ui_write_actions.txt`` is where the live set is
+    pinned, and it is machine-checked.
     """
     if not next_path or ".." in next_path:
         return False
