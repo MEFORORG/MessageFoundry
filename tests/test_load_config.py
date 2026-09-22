@@ -11,10 +11,12 @@ estate tokens, so synthetic-only stays enforced, not just intended.
 from __future__ import annotations
 
 import importlib.util
+from fnmatch import fnmatch
 from pathlib import Path
 
 import pytest
 
+from harness.load._lookup import SIBLING_PATTERNS
 from harness.load.profile import PROFILES_DIR, LoadProfileError, load_profile
 from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.wiring import load_config
@@ -252,21 +254,17 @@ def test_all_shipped_profiles_parse() -> None:
     # broken profile (the failure mode that left matrix row H1 pointing at a nonexistent "steady"
     # profile). connscale*/pooled*/fuse*/batch*.toml are a DIFFERENT schema ([connscale], not [load])
     # consumed by the --connscale CLI (covered by test_connscale_profile.py / test_connscale_fuse.py /
-    # test_connscale_batch.py) — exactly the set that list_connscale_profiles() globs (connscale*,
-    # pooled*, fuse*, batch*) — so they are excluded here. estate*.toml are ANOTHER distinct schema
-    # ([estate], the #216 demo-shape driver, covered by test_estate_profile.py) globbed by
-    # list_estate_profiles(), excluded for the same reason. Keep this in step with
-    # harness.load.connscale.profile.list_connscale_profiles() + harness.load.estate.profile.list_estate_profiles().
+    # test_connscale_batch.py); estate*.toml are ANOTHER distinct schema ([estate], the #216
+    # demo-shape driver, covered by test_estate_profile.py). Both are excluded here.
+    #
+    # The exclusion READS the sibling schemas' own globs rather than rehearsing their prefixes. This
+    # test, list_profiles() and list_connscale_profiles() each carried a copy of that rule and two of
+    # them had already drifted — list_profiles() skipped connscale* alone, so five sibling-schema
+    # files sat on the --list-profiles menu as phantom "(invalid profile)" entries (BACKLOG #1837).
     profiles = [
         p
         for p in sorted(PROFILES_DIR.glob("*.toml"))
-        if not (
-            p.name.startswith("connscale")
-            or p.name.startswith("pooled")
-            or p.name.startswith("fuse")
-            or p.name.startswith("batch")
-            or p.name.startswith("estate")
-        )
+        if not any(fnmatch(p.name, pattern) for pattern in SIBLING_PATTERNS)
     ]
     assert len(profiles) >= 8, "expected the shipped profile set; did the directory move?"
     for path in profiles:

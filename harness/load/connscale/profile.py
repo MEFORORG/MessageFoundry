@@ -24,7 +24,39 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-PROFILES_DIR = Path(__file__).resolve().parents[1] / "profiles"
+from harness.load._lookup import (
+    CONNSCALE_PATTERNS,
+    LOCAL_PROFILES_SUBPATH,
+    PROFILES_DIR,
+    local_profiles_dir,
+    read_profile_toml,
+    resolve_profile,
+    scan_profiles,
+)
+
+#: Re-exported from :mod:`harness.load._lookup`, where the three schemas' shared lookup lives.
+__all__ = [
+    "BATCH_OFF",
+    "BATCH_ON",
+    "CLAIM_MODES",
+    "FIXED_AGGREGATE",
+    "FIXED_PER_CONN",
+    "FUSE_OFF",
+    "FUSE_ON",
+    "LOCAL_PROFILES_SUBPATH",
+    "PER_LANE",
+    "POOLED",
+    "PROFILES_DIR",
+    "SWEEP_MODES",
+    "ConnScaleProfile",
+    "ConnScaleProfileError",
+    "ConnScaleSlo",
+    "get_connscale_profile",
+    "list_connscale_profiles",
+    "load_connscale_profile",
+    "load_connscale_profile_text",
+    "local_profiles_dir",
+]
 
 #: Sweep modes. ``both`` runs ``fixed_aggregate`` then ``fixed_per_conn``.
 FIXED_AGGREGATE = "fixed_aggregate"
@@ -194,71 +226,45 @@ class ConnScaleProfile:
 
 def load_connscale_profile(path: Path | str) -> ConnScaleProfile:
     """Parse a connection-scale profile TOML file. Raises :class:`ConnScaleProfileError` on a problem.
-
-    Tolerant of a leading UTF-8 BOM: PowerShell ``Set-Content -Encoding utf8`` (the natural way to
-    author a profile on Windows) prepends one, which bare ``tomllib`` rejects with an opaque
-    ``Invalid statement (line 1, col 1)``. Decoding via ``utf-8-sig`` strips the BOM if present while
-    still validating UTF-8, so a hand-authored profile loads without a mystifying parse error.
-    """
+    Tolerant of a leading UTF-8 BOM (:func:`~harness.load._lookup.read_profile_toml` explains why)."""
     p = Path(path)
-    try:
-        raw = p.read_bytes()
-    except OSError as exc:
-        raise ConnScaleProfileError(f"cannot read {p.name}: {exc}") from exc
-    try:
-        text = raw.decode("utf-8-sig")  # strips a UTF-8 BOM if present; still enforces UTF-8
-    except UnicodeDecodeError as exc:
-        raise ConnScaleProfileError(f"cannot read {p.name}: not valid UTF-8 ({exc})") from exc
-    try:
-        data = tomllib.loads(text)
-    except tomllib.TOMLDecodeError as exc:
-        raise ConnScaleProfileError(f"cannot read {p.name}: {exc}") from exc
-    return _profile_from_data(data, where=p.name)
+    return _profile_from_data(read_profile_toml(p, error=ConnScaleProfileError), where=p.name)
 
 
 def load_connscale_profile_text(text: str, *, where: str = "<text>") -> ConnScaleProfile:
     """Parse a profile from a TOML string (for tests). Tolerates a leading BOM character."""
     try:
-        data = tomllib.loads(text.removeprefix("\ufeff"))
+        data = tomllib.loads(text.removeprefix("﻿"))
     except tomllib.TOMLDecodeError as exc:
         raise ConnScaleProfileError(f"{where}: {exc}") from exc
     return _profile_from_data(data, where=where)
 
 
 def list_connscale_profiles() -> dict[str, str]:
-    """Built-in profile name → description, read from the connection-scale profile TOMLs
-    (``connscale*.toml`` plus the ``pooled*`` claim-mode A/B, ``fuse*`` fusion A/B, and ``batch*``
-    statement-batching A/B profiles). Keep the glob set in step with
-    ``tests/test_load_config.py::test_all_shipped_profiles_parse`` (which EXCLUDES the same set — a
-    connscale-schema profile is not a [load] profile)."""
-    out: dict[str, str] = {}
-    paths = sorted(
-        {
-            *PROFILES_DIR.glob("connscale*.toml"),
-            *PROFILES_DIR.glob("pooled*.toml"),
-            *PROFILES_DIR.glob("fuse*.toml"),
-            *PROFILES_DIR.glob("batch*.toml"),
-        }
+    """Profile name to description: the shipped connection-scale TOMLs (``connscale*`` plus the
+    ``pooled*`` claim-mode A/B, ``fuse*`` fusion A/B and ``batch*`` statement-batching A/B), plus any
+    operator-local ones, each labelled.
+
+    The glob set is :data:`~harness.load._lookup.CONNSCALE_PATTERNS`, which
+    ``harness.load.profile.list_profiles`` excludes and
+    ``tests/test_load_config.py::test_all_shipped_profiles_parse`` reads — one definition rather than
+    three copies that were already out of step (BACKLOG #1837)."""
+    return scan_profiles(
+        include=CONNSCALE_PATTERNS,
+        load=load_connscale_profile,
+        error=ConnScaleProfileError,
     )
-    for path in paths:
-        try:
-            prof = load_connscale_profile(path)
-            out[prof.name] = prof.description
-        except ConnScaleProfileError:
-            out[path.stem] = "(invalid profile)"
-    return out
 
 
 def get_connscale_profile(name_or_path: str) -> ConnScaleProfile:
-    """Resolve a built-in profile name or a filesystem path to a :class:`ConnScaleProfile`."""
-    candidate = Path(name_or_path)
-    if candidate.exists():
-        return load_connscale_profile(candidate)
-    builtin = PROFILES_DIR / f"{name_or_path}.toml"
-    if builtin.exists():
-        return load_connscale_profile(builtin)
-    choices = ", ".join(sorted(list_connscale_profiles())) or "(none)"
-    raise ConnScaleProfileError(f"unknown connscale profile {name_or_path!r}; built-ins: {choices}")
+    """Resolve a filesystem path, an operator-local profile name, or a built-in name."""
+    return resolve_profile(
+        name_or_path,
+        load=load_connscale_profile,
+        listing=list_connscale_profiles,
+        error=ConnScaleProfileError,
+        label="connscale profile",
+    )
 
 
 def _profile_from_data(data: dict[str, Any], *, where: str) -> ConnScaleProfile:
