@@ -10,7 +10,8 @@ derived domain and no coverage assertion -- the narrow-domain shape that
 `test_connection_factory_redaction_domain.py` documents failing four times over on the connection
 settings surface.
 
-Two failures this file is built to make impossible, both measured at 4633a295:
+Three failures this file is built to make impossible. The first two were measured at 4633a295; the
+third was added at BACKLOG #1547 and has its own measurements below:
 
 1. **A green that a DIFFERENT pattern bought.** The bearer assertion in `tests/test_support_bundle.py`
    passed while `_BEARER` redacted nothing at all: the pattern consumed the word ``Bearer`` as its own
@@ -39,11 +40,21 @@ Two failures this file is built to make impossible, both measured at 4633a295:
    bought for. Only the COST guards read ``secretscrub``; the coverage and fixture guards above stay
    scoped to ``support/redact``, which has its own suite in ``tests/test_logging_credential_scrub.py``.
 
-   A COST GUARD NEEDS A COVERAGE ARM BESIDE IT, and that pairing is the lesson #1547 paid for twice.
-   The first fix bounded the repetition, which made the cost guard green by making the pattern refuse
-   to match a DSN behind a 64-character run -- a credential published in full, in both copies, with
-   every cost assertion passing. ``test_the_dsn_scan_still_reaches_every_scheme_shape_that_matters``
+   A COST GUARD NEEDS A COVERAGE ARM BESIDE IT, and #1547 paid for that lesson TWICE on this one
+   pattern. The first fix bounded the repetition, which made the cost guard green by making the pattern
+   refuse to match a DSN behind a 64-character run -- a credential published in full, in both copies,
+   with every cost assertion passing. ``test_the_dsn_scan_still_reaches_every_scheme_shape_that_matters``
    is the arm that catches a cost bought that way; do not leave a cost guard without one.
+
+   THE SECOND TIME, THAT COVERAGE ARM EXISTED AND STILL MISSED IT, which is the sharper half of the
+   lesson. The anchored fix that replaced the bound kept a ``[a-z]`` head on the scheme, and every
+   entry of ``_DSN_SCHEMES_THAT_MUST_REDACT`` began with a letter -- so a DSN behind a digit-, "+"-,
+   "."- or "-"-headed run lost its match on both surfaces while the table it was supposed to be caught
+   by stayed green. A table of shapes somebody thought of cannot fail for a shape nobody thought of.
+   ``test_the_dsn_head_redacts_everything_both_earlier_heads_did`` is the answer to that one: it is a
+   DIFFERENTIAL against the spellings this pattern replaced, so it fails on any narrowing rather than
+   on the narrowings a fixture author anticipated. Prefer that shape wherever a change claims to widen
+   what a pattern catches.
 
 The sentinel values are invented HERE, never derived from the code under test. They are synthetic and
 carry no real credential, host or site.
@@ -59,6 +70,7 @@ import re
 import re._constants as sre_constants
 import re._parser as sre_parser
 import time
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import partial
@@ -412,23 +424,40 @@ EXCLUDED_FROM_REDACTION: dict[str, str] = {
 }
 
 
-def _applied_pattern_names(module: ModuleType, applier: str) -> set[str]:
-    """Every module-level pattern name USED inside ``module.<applier>``, derived by AST.
+def _applied_names(
+    module: ModuleType, applier: str, select: Callable[[str, object], bool]
+) -> set[str]:
+    """Every module-level name matching ``select`` that is USED inside ``module.<applier>``, by AST.
 
     Reading the function body rather than the module namespace is what makes this a domain rather than
     a list: a pattern defined and never applied cannot silently count as coverage, and a pattern applied
     without a fixture cannot hide. Parameterised by module since BACKLOG #1547, because the cost guard
-    below has to read the write-time copy of this vocabulary as well as this one."""
+    below has to read the write-time copy of this vocabulary as well as this one.
+
+    ONE WALK, TWO SELECTORS. The patterns and the admission gates are the same question asked of two
+    kinds of module-level value, and a second copy of this walk would have to be fixed twice -- a
+    divergence between them would be invisible, since each only ever reports about its own kind."""
     tree = ast.parse(inspect.getsource(module))
     func = named_func(tree, applier)
-    module_patterns = {
-        name for name, value in vars(module).items() if isinstance(value, re.Pattern)
-    }
-    return {
-        node.id
-        for node in ast.walk(func)
-        if isinstance(node, ast.Name) and node.id in module_patterns
-    }
+    wanted = {name for name, value in vars(module).items() if select(name, value)}
+    return {node.id for node in ast.walk(func) if isinstance(node, ast.Name) and node.id in wanted}
+
+
+def _applied_pattern_names(module: ModuleType, applier: str) -> set[str]:
+    """Every module-level compiled pattern applied inside ``module.<applier>``."""
+    return _applied_names(module, applier, lambda _name, value: isinstance(value, re.Pattern))
+
+
+def _applied_gate_names(module: ModuleType, applier: str) -> set[str]:
+    """Every module-level admission-gate tuple read inside ``module.<applier>``.
+
+    A SEVENTH gate added to ``_run`` must widen what reads it, or an assertion over a hand-written
+    list of six keeps passing while covering less than it appears to."""
+    return _applied_names(
+        module,
+        applier,
+        lambda name, value: name.endswith("_HINT") and isinstance(value, tuple),
+    )
 
 
 def test_the_family_table_covers_every_applied_pattern() -> None:
@@ -651,6 +680,12 @@ CREDENTIAL_SURFACES: tuple[tuple[ModuleType, str], ...] = (
 #: guards: an instrument that cannot see this one says nothing about the patterns it passes.
 _SHIPPED_BEFORE_DSN = r"(?i)\b([a-z][a-z0-9+.\-]*://[^\s:/@]+):[^\s/@]+@"
 
+#: #1547's FIRST anchored spelling, which kept a ``[a-z]`` head on the scheme. Contained and linear,
+#: and it silently stopped redacting a DSN whose leading run opens on a digit, "+", "." or "-". Kept as
+#: a named subject rather than described, so the differential arm below can compare against the thing
+#: itself -- a narrowing is only visible against the spelling that did NOT have it.
+_LETTER_HEAD_DSN = r"(?i)(?<![a-z0-9+.\-])([a-z][a-z0-9+.\-]*://[^\s:/@]+):[^\s/@]+@"
+
 #: One WORD character, by the definition ``\b`` itself uses. The structural guard turns on whether a
 #: character class can end a word, so it asks ``re`` rather than hard-coding a set.
 _WORD_CHAR = re.compile(r"\w")
@@ -764,10 +799,18 @@ def _repeat_cannot_restart(body: Any, *, anchored: bool, delimited: frozenset[st
     the repetition admits means a match may not START inside a run of that class: a start is preceded
     by a character outside C, and a walk over C stops at the first character outside C, so the walks
     TILE the line instead of nesting -- O(N) work in total rather than O(N) from each of O(N) offsets.
-    (Fixed-width atoms between the head and the repetition, such as this pattern's ``[a-z]``, shift a
-    walk by at most their own width, which is a constant factor and not a second N.) The repetition is
-    then free to be unbounded -- which matters, because a ``{0,N}`` here bounds the WALK and not the
-    start positions, so it buys linearity by silently refusing to match past N characters.
+    (Fixed-width atoms between the head and the repetition shift a walk by at most their own width,
+    which is a constant factor and not a second N.) The repetition is then free to be unbounded --
+    which matters, because a ``{0,N}`` here bounds the WALK and not the start positions, so it buys
+    linearity by silently refusing to match past N characters.
+
+    CONTAINMENT IS NOT CORRECTNESS AND THIS FUNCTION ONLY SEES THE FIRST. ``_DSN_PASSWORD`` once sat at
+    ``(?<![a-z0-9+.\\-])([a-z]...``, which satisfies the delimiter route exactly -- and the narrower
+    HEAD ATOM meant a start needed the preceding character outside the class and the first character a
+    letter, which together hold only at a run's head, so a run opening on a digit or a delimiter
+    matched nowhere and the password was published. Passing here has never meant a pattern still
+    catches what it used to; ``test_the_dsn_head_redacts_everything_both_earlier_heads_did`` is the arm
+    that answers that, and this one must not be read as covering it.
     """
     items = list(body)
     if len(items) != 1 or items[0][0] != sre_constants.IN:
@@ -891,10 +934,14 @@ def test_every_applied_credential_pattern_has_a_contained_scan_prefix() -> None:
         r"(?i)(?![a-z0-9+.\-])([a-z][a-z0-9+.\-]*://[^\s:/@]+):[^\s/@]+@"
     )
     # NEGATIVE CONTROL: a checker that flags everything is not a checker. Both routes, so neither can
-    # rot into an always-flag without a red -- the bound, and the delimiter head shipped today.
+    # rot into an always-flag without a red -- the bound, and the delimiter head shipped today. The
+    # letter-headed spelling is kept beside it because this guard PASSED it, correctly: it was
+    # contained and linear, and it was still losing credentials. Containment is not correctness, and a
+    # control that only ever shows this checker agreeing with the shipped pattern hides that.
     assert not _unbounded_scan_repeats(r"(?i)\b([a-z][a-z0-9+.\-]{0,63}://[^\s:/@]+):[^\s/@]+@")
+    assert not _unbounded_scan_repeats(_LETTER_HEAD_DSN)
     assert not _unbounded_scan_repeats(
-        r"(?i)(?<![a-z0-9+.\-])([a-z][a-z0-9+.\-]*://[^\s:/@]+):[^\s/@]+@"
+        r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^\s/@]+@"
     )
 
     checked: list[str] = []
@@ -955,9 +1002,18 @@ def test_the_label_prefix_bound_still_reaches_the_labels_it_was_added_for() -> N
 #:
 #: THE FIRST SIX ARE REAL SCHEMES. The next two are long but BROKEN by "." and "-", which end a word
 #: and so offered ``\b`` a later start position -- they survived the ``{0,63}`` bound, and the bound's
-#: own note cited them as evidence that it only cost label text. The LAST TWO are the shapes that note
+#: own note cited them as evidence that it only cost label text. The NEXT TWO are the shapes that note
 #: did not cover: unbroken runs of the class, which took the whole match away and published the
 #: password. Measured leaking on both surfaces while the bound stood.
+#:
+#: THE LAST SIX ARE A SECOND NARROWING THIS TABLE COULD NOT EXPRESS, and the gap is worth naming
+#: because the table looked complete. Every entry above begins with a LETTER, and each one is
+#: interpolated after "store dsn ", so the character in front of the run is always a space. The head
+#: that shipped for #1547 refused a start unless the run's FIRST character was a letter, so a leading
+#: run opening on a digit, "+", "." or "-" lost the match entirely -- and no row here could put one
+#: there. These six do. They are not schemes and are not pretending to be: a request id, a date stamp,
+#: a hex correlation id and three bare punctuation heads are what actually sits glued in front of a DSN
+#: in log text. Measured leaking on both surfaces under the letter head.
 _DSN_SCHEMES_THAT_MUST_REDACT = (
     "postgres",
     "postgresql+asyncpg",
@@ -969,6 +1025,12 @@ _DSN_SCHEMES_THAT_MUST_REDACT = (
     "seg-" * 40 + "postgres",
     "x" * 200,
     "worker" + "0" * 64 + "postgres",
+    "9-postgres",
+    "2024-01-01-postgres",
+    "8f3a-postgres",
+    ".postgres",
+    "-postgres",
+    "+postgres",
 )
 
 
@@ -1004,10 +1066,155 @@ def test_the_dsn_scan_still_reaches_every_scheme_shape_that_matters() -> None:
 
     # AND THE WIDENING THE DELIMITER HEAD BROUGHT WITH IT, pinned so it cannot be given back silently.
     # "_" is a word character, so ``\b`` could not place a match after one and this line never redacted
-    # under EITHER earlier spelling; the lookbehind's class does not hold "_", so it does now.
+    # under the pre-#1547 spelling; the lookbehind's class does not hold "_", so it does now.
     after_underscore = f"store dsn _postgres://svc:{secret}@db.invalid/mefor"
     assert secret not in redact_log_line(after_underscore)
     assert secret not in scrub_credentials(after_underscore)
+
+
+#: Text that can sit glued in front of a DSN in a real log line, paired against the scheme table above
+#: to build the differential corpus. The empty entry is the control, and the claim has to be made about
+#: the PAIR rather than the head alone: a LETTER-headed scheme behind it is a shape every spelling of
+#: this pattern has always matched, because the fixture's own "store dsn " puts a space in front. It is
+#: not true of the empty head by itself -- an empty head in front of ".postgres" is exactly a case the
+#: letter head lost. A literal " " row was tried and removed: the fixture already supplies that space,
+#: so it produced a verdict identical to the empty entry on all 16 schemes rather than a second case.
+_DSN_LEADING_RUNS = (
+    "",
+    "_",
+    "9-",
+    "2024-01-01-",
+    "8f3a-",
+    ".",
+    "-",
+    "+",
+    "x" * 200,
+    "seg." * 40,
+)
+
+
+def _sub_dsn(pattern: re.Pattern[str], line: str) -> str:
+    """``line`` with ``pattern``'s password span replaced, keeping group 1 the way both modules do."""
+    return pattern.sub(lambda m: f"{m.group(1)}:<pw>@", line)
+
+
+def test_both_copies_of_the_dsn_pattern_are_the_same_source() -> None:
+    """The two surfaces carry this regex by hand, and a one-sided edit must red HERE.
+
+    ``secretscrub`` scrubs at WRITE time and ``support/redact`` at READ time, and both keep their own
+    literal copy of ``_DSN_PASSWORD``. That duplication is deliberate -- the modules are neutral leaves
+    and neither imports the other's patterns -- but it has now been edited by hand twice under BACKLOG
+    #1547, and a narrowing shipped in BOTH copies both times.
+
+    NOTHING ELSE IN THIS FILE CATCHES A ONE-SIDED FIX DIRECTLY. The differential arm runs over both
+    modules, so it would red -- but only for corpus rows the earlier head happens to reach, and only
+    while that corpus keeps its shape. An equality on the source is one line, cannot go vacuous, and
+    names the real invariant: these are one pattern stored twice, not two patterns that happen to
+    agree."""
+    assert redact_mod._DSN_PASSWORD.pattern == scrub_mod._DSN_PASSWORD.pattern, (
+        "the read-time and write-time copies of _DSN_PASSWORD have diverged:\n"
+        f"  support/redact: {redact_mod._DSN_PASSWORD.pattern!r}\n"
+        f"  secretscrub   : {scrub_mod._DSN_PASSWORD.pattern!r}\n"
+        "A fix applied to one surface leaves the other leaking. Apply it to both, or state in both "
+        "files why they must differ and widen this guard."
+    )
+    assert redact_mod._DSN_PASSWORD.flags == scrub_mod._DSN_PASSWORD.flags, (
+        "the two copies compile with different flags, so the same source does not mean the same match."
+    )
+
+
+#: The leading runs the letter head could not reach AT ALL, which is the #1547 narrowing stated as
+#: data. Paired with each earlier spelling below so the corpus control can assert BOTH dimensions: a
+#: scheme set alone is blind to the head axis, and the head axis is where this defect lived.
+_LETTER_HEAD_BLIND_RUNS = frozenset({"9-", "2024-01-01-", "8f3a-", ".", "-", "+"})
+
+
+@pytest.mark.parametrize(
+    ("earlier", "blind_runs"),
+    ((_SHIPPED_BEFORE_DSN, frozenset()), (_LETTER_HEAD_DSN, _LETTER_HEAD_BLIND_RUNS)),
+    ids=("pre-1547-word-boundary-head", "first-1547-letter-head"),
+)
+def test_the_dsn_head_redacts_everything_both_earlier_heads_did(
+    earlier: str, blind_runs: frozenset[str]
+) -> None:
+    """No spelling of this head may redact a password the shipped one leaves on the line.
+
+    THIS IS THE ARM THAT WOULD HAVE CAUGHT #1547's SECOND NARROWING, and it is written as a
+    DIFFERENTIAL rather than as more table rows because the table could not state the property. Every
+    entry in ``_DSN_SCHEMES_THAT_MUST_REDACT`` begins with a letter and each is interpolated after a
+    space, so the head that shipped for #1547 -- which refused a start unless the run's first character
+    was a letter -- passed that table while losing every DSN behind a digit-, "+"-, "."- or
+    "-"-headed run. A table of shapes somebody thought of cannot fail for a shape nobody thought of.
+    Comparing against the spellings this one replaced can, because a narrowing is defined relative to
+    them.
+
+    BOTH EARLIER HEADS, NOT JUST THE MOST RECENT. Each lost something the other kept -- ``\\b`` could
+    not start after an underscore, the letter head could not start on a non-letter run -- so a
+    comparison against either one alone has a blind spot exactly where that one was already blind.
+
+    AND THE OUTPUT MUST MATCH, not merely the match/no-match verdict. A head that starts EARLIER
+    captures more into group 1, and group 1 is kept verbatim, so a wider head that redacted the same
+    password could still have rewritten the visible line. It does not, AT ONE MATCH SITE: the extra
+    leading run sat in front of the old match and sits inside group 1 now, and both emit the same
+    characters. THE EQUALITY IS SCOPED TO A ONE-DSN LINE ON PURPOSE, and the precondition is asserted
+    rather than assumed. On a line carrying TWO DSNs the earlier head can miss one of them outright --
+    ``store _postgres://a:S1@h and 9-mysql://c:S2@h`` is redacted once by the ``\\b`` head and twice by
+    the shipped one -- so the outputs differ BECAUSE the shipped head is wider, which is the opposite
+    of what this assertion's message would say. A future editor adding a realistic two-DSN row must
+    widen the arm rather than read its red as a narrowing."""
+    earlier_pattern = re.compile(earlier)
+    secret = "pw-D5n_Pass-55"
+    schemes_seen: set[str] = set()
+    heads_seen: set[str] = set()
+    for module in (redact_mod, scrub_mod):
+        shipped = module._DSN_PASSWORD
+        for head in _DSN_LEADING_RUNS:
+            for scheme in _DSN_SCHEMES_THAT_MUST_REDACT:
+                line = f"store dsn {head}{scheme}://svc:{secret}@db.invalid:5432/mefor"
+                if not earlier_pattern.search(line):
+                    continue
+                schemes_seen.add(scheme)
+                heads_seen.add(head)
+                assert shipped.search(line), (
+                    f"{module.__name__}: {earlier_pattern.pattern!r} redacts {head[:16]!r}+"
+                    f"{scheme[:16]}... and the shipped head does not. That is a credential the "
+                    "previous spelling caught, lost to this one."
+                )
+                assert line.count("://") == 1, (
+                    "the output equality below compares whole lines and holds at ONE match site. "
+                    f"{head[:16]!r}+{scheme[:16]}... carries more than one DSN -- see this test's "
+                    "docstring before widening the corpus."
+                )
+                assert _sub_dsn(earlier_pattern, line) == _sub_dsn(shipped, line), (
+                    f"{module.__name__}: the shipped head rewrites {head[:16]!r}+{scheme[:16]}... "
+                    "differently from the spelling it replaced. Widening the head must not change "
+                    "what an operator reads back."
+                )
+
+    # POSITIVE CONTROL ON THE CORPUS, OVER BOTH OF ITS DIMENSIONS. A differential over lines the
+    # earlier pattern never matched is vacuously green, and the `continue` above is how that happens
+    # silently. Two weaker spellings were tried and rejected, both measured. A floor on the NUMBER of
+    # comparisons tolerates losing most of the corpus. A SCHEME set alone is worse than it looks: the
+    # single leading run "x" * 200 reaches all 16 schemes under both earlier heads, so the corpus can
+    # be pruned down to that one row -- deleting every non-letter run, which is the axis this defect
+    # lived on -- and a scheme-only control still passes both arms. So assert the head axis too.
+    assert schemes_seen == set(_DSN_SCHEMES_THAT_MUST_REDACT), (
+        f"{sorted(s[:20] for s in set(_DSN_SCHEMES_THAT_MUST_REDACT) - schemes_seen)} never reached "
+        f"the comparison -- no leading run puts them within reach of {earlier_pattern.pattern!r}, so "
+        "this arm cannot fail for them. Add a run that does, rather than relaxing this."
+    )
+
+    # THE HEAD AXIS IS ASSERTED AS AN EXACT SET, INCLUDING THE BLIND SPOT, because "which runs this
+    # spelling cannot reach" IS the #1547 narrowing and an inequality would hide it drifting. The
+    # ``\b`` head reaches all 11; the letter head reaches 5 and is blind to the 6 in
+    # ``_LETTER_HEAD_BLIND_RUNS``. If that blind set shrinks, the letter head was not what this file
+    # says it was; if it grows, a run was added that no arm exercises.
+    assert heads_seen == set(_DSN_LEADING_RUNS) - blind_runs, (
+        f"{earlier_pattern.pattern!r} reached the leading runs "
+        f"{sorted(h[:14] for h in heads_seen)}, not the expected "
+        f"{sorted(h[:14] for h in set(_DSN_LEADING_RUNS) - blind_runs)}. Either the corpus lost a run "
+        "or this spelling does not have the reach this file records for it."
+    )
 
 
 #: The length span the growth arm measures across, in characters. 8x rather than one doubling: linear
@@ -1021,16 +1228,141 @@ _GROWTH_LENGTHS = (2048, 16384)
 #: one endpoint more than twofold before this flakes, and a reverted head cannot hide underneath it.
 _MAX_GROWTH = 24.0
 
-#: How far a marked run must outcost an unmarked one on ``scrub_credentials`` before the growth
-#: readings above count as evidence ABOUT THE DSN PASS. The gate is a share-of-cost claim wearing a
-#: ratio: at 4x the DSN pass is at least three quarters of the marked run.
-#:
-#: IT MOVED DOWN FROM 10 WHEN THE PATTERN GOT FASTER, WHICH IS NOT THE SAME AS RELAXING IT. The rest
-#: of the module costs what it costs; as the DSN pass falls toward that floor the achievable ratio
-#: falls with it, so a threshold pinned to the old pass's cost would fail every future improvement.
-#: Measured over six runs at 16 KB: marked 0.201 to 0.208 ms, unmarked 0.023 to 0.024 ms, ratio 8.46x
-#: to 8.83x, the DSN pass 88.2 to 88.7 percent of the marked run. 4 leaves better than 2x of headroom.
-_MIN_MARKER_COST_RATIO = 4.0
+# A SHARE OF WALL-CLOCK COST STOOD HERE, AND IT IS DELETED RATHER THAN RETUNED. ``_MIN_DSN_COST_SHARE``
+# required ``_DSN_PASSWORD.sub`` to be at least 0.5 of ``scrub_credentials``'s cost on the marked run,
+# with the input held constant. It went red on ``test (windows-2025, py3.14)`` at a share of 0.467 --
+# 0.591 ms of 1.266 ms, one failure in 15201 -- and the decomposition condemns it more thoroughly than
+# the miss does. The share is D / (F + D), F being what the call spends outside the pass. On the box
+# this file was written on: D 0.170 ms, F 0.033 ms, share 0.84, across 15 trials spanning 0.817 to
+# 0.874. On that runner: D 0.591 ms, F 0.675 ms. D scaled 3.5x and F scaled 20x, so F/D moved from
+# 0.19 to 1.14 -- a 6x swing in the composition, against the roughly 1.66x of headroom a quantity
+# capped at 1.0 can offer at all. The tight local spread was read as though it said something about
+# another box, and it does not.
+#
+# F IS MEASURED HERE RATHER THAN INFERRED: on that same box the 16 KB casefold costs 0.0033 ms, and
+# the seven ``_admits`` calls one ``scrub_credentials`` makes (one at the entry gate, six inside
+# ``_run``) cost 0.0295 ms. That is F to three decimal places. On this fixture those seven calls walk
+# the folded line 22 times, not once per hint word: ``_admits`` short-circuits, and the entry gate
+# hits on its first word. So the denominator is a substring-sweep cost and the numerator a scan -- two
+# different primitives, timed separately and divided. WHY they scale apart on a shared runner is not
+# established here, and a guess does not belong in a test; THAT they do is the whole finding, since
+# the ratio is then a reading about the box as much as about the code.
+#
+# THE GENERAL SHAPE IS WORTH NAMING, BECAUSE THIS FILE SHIPPED IT TWICE. The deleted arm itself
+# replaced a cross-input ratio (marked run over unmarked, 4x), on the correct finding that varying the
+# input varies the gate work, so the denominator was not the thing the claim named. Holding the input
+# constant fixed that one substitution and kept the shape: A COST SHARE IS A FRAGILE WITNESS WHATEVER
+# YOU HOLD CONSTANT, because the denominator still moves for reasons that have nothing to do with the
+# subject. Lowering the floor would be the same defect in a third costume, a threshold sized from one
+# hosted observation. THIS FILE ALREADY KNEW, twice: both the mitigation guard and the scan-prefix
+# guard are structural "for the reason the narrow version already gave: a timing assertion on a shared
+# runner flakes". That reason was never carried across to this arm.
+#
+# THIS IS NOT A RULE AGAINST STOPWATCHES, AND THE GROWTH ARM ABOVE IS THE CONTRAST THAT SHOWS WHY. It
+# is also a ratio of two timings, and it is sound for a reason the share could never have: it divides
+# THE SAME WORK AT TWO INPUT LENGTHS, so a box that runs everything k times slower multiplies both
+# endpoints by k and k cancels. That holds for the composite subjects too, where each endpoint mixes a
+# scan with the sweeps: while both components stay linear in length, their relative weight drops out
+# of the quotient, so even a component inflated 20x shifts the LEVEL and not the ratio. A slope change
+# would move it, and that is the regression the arm is for.
+#
+# THE RED RUN IS ITSELF THE EVIDENCE FOR THAT, which is why it is worth keeping. On the runner where F
+# came back 20x inflated, all five growth subjects passed and only the share failed. The share divided
+# a regex scan by a substring sweep -- two different primitives at ONE length -- so nothing cancelled
+# and the quotient was never only about the code. Measured over 12 runs here, the growth arm's margins
+# run 2.05x to 3.32x against its threshold, where the share had 1.66x in total. ASK OF ANY TIMING
+# RATIO WHAT CANCELS OUT OF IT. A tight spread on the box you measured it on answers a narrower
+# question, and answers it for that box only.
+#
+# WHAT THE SHARE WAS REACHING FOR IS ALREADY CARRIED ABOVE, which is why removing it costs at least no
+# coverage of #1547. The property #1547 is about is this pattern's own linearity, and the growth loop
+# measures that on the BARE ``.sub`` in two subjects, armed by a positive control on the same bare
+# call. The surface subjects assert that nothing inside ``scrub_credentials`` or ``redact_log_line`` is
+# quadratic, and that stands without attributing the cost to any one pass. What is genuinely gone is a
+# bound on the NON-DSN cost inside the ``scrub_credentials`` subject; no assertion here consumed it.
+#
+# WHAT REPLACES IT IS A COUNT. "Did this pass run, and how often" was always a fact about the code, and
+# the recorder below reads it directly.
+
+
+#: Every ``re.Pattern`` method that APPLIES the pattern to text, whether or not it scans -- ``match``
+#: and ``fullmatch`` anchor at a position and are in the set anyway, because over-reporting an
+#: application is the safe direction and under-reporting one is the failure this set exists to stop. A
+#: recorder watching ``.sub`` alone would miss a future ``_run`` reaching for ``.subn`` or a
+#: ``.finditer`` loop: the same walk, the same cost, and an arm below that stays green while a second
+#: pass runs on every line. That arm checks this set COVERS every public callable of ``re.Pattern``,
+#: because a name dropped or misspelled here narrows the reading and reports nothing.
+_PATTERN_APPLICATIONS = frozenset(
+    {"findall", "finditer", "fullmatch", "match", "scanner", "search", "split", "sub", "subn"}
+)
+
+
+class _RecordingPattern:
+    """A compiled pattern that counts applications of itself and is otherwise the real object.
+
+    NOT a ``re.Pattern`` subclass, because the type refuses subclassing, so ``isinstance(x,
+    re.Pattern)`` is False for the length of a swap. Nothing on the ``scrub_credentials`` path
+    type-checks a pattern today and the swap is undone before anything else looks, but a future
+    ``_run`` spelled ``re.sub(_DSN_PASSWORD, ...)`` rather than ``_DSN_PASSWORD.sub(...)`` would red
+    here with a TypeError from inside ``re``, naming this fixture for a change that is fine.
+    """
+
+    def __init__(self, name: str, pattern: re.Pattern[str], seen: Counter[str]) -> None:
+        self._name = name
+        self._pattern = pattern
+        self._seen = seen
+
+    def __getattr__(self, attr: str) -> Any:
+        # An instance whose __dict__ is empty -- one built by copy, pickle, or a pytest assertion
+        # repr, none of which run __init__ -- would otherwise ask itself for _pattern forever. Raise
+        # AttributeError rather than let the lookup fail some other way: it is what `hasattr`
+        # swallows, and `copy.copy` probes `hasattr(y, "__setstate__")` on exactly such an instance.
+        if "_pattern" not in self.__dict__:
+            raise AttributeError(attr)
+        target = getattr(self._pattern, attr)
+        if attr not in _PATTERN_APPLICATIONS:
+            return target
+        name, seen = self._name, self._seen
+
+        def recorded(*args: Any, **kwargs: Any) -> Any:
+            # Forward verbatim: a bounded `count=` or `pos=` on a future call site must reach the real
+            # method, or this fixture reds with a TypeError naming itself instead of the property.
+            seen[name] += 1
+            return target(*args, **kwargs)
+
+        return recorded
+
+
+def _patterns_applied_during(
+    module: ModuleType, names: set[str], call: Callable[[], object]
+) -> Counter[str]:
+    """How many times each of ``names`` was applied to text during ``call()``.
+
+    Each is swapped for a recorder that delegates everything else to the real object, so this reads
+    what RAN rather than what could have run. ``secretscrub._run`` is straight-line over module
+    globals precisely so a swap here reaches the object it reads -- its own docstring says so, and a
+    dispatch table would hold the pre-swap pattern by value and record nothing.
+
+    Derive ``names`` BEFORE calling this. The derivation selects on ``isinstance(value, re.Pattern)``
+    over the live namespace and a recorder is not one, so a set read during the swap comes back empty
+    rather than wrong.
+
+    The swap is module-global, which is why it is undone immediately. A log record scrubbed from
+    another thread inside the window lands in this count if it opens a gate, and the caller reads that
+    as one pattern applied twice; a record opening no gate applies nothing and leaves the reading
+    alone. The window is one call wide and pytest drives it from one thread, so this is a caveat on
+    the diagnosis rather than a live hazard.
+    """
+    seen: Counter[str] = Counter()
+    originals = {name: getattr(module, name) for name in names}
+    try:
+        for name, pattern in originals.items():
+            setattr(module, name, _RecordingPattern(name, pattern, seen))
+        call()
+    finally:
+        for name, pattern in originals.items():
+            setattr(module, name, pattern)
+    return seen
 
 
 def _adversarial_run(length: int, *, marker: bool) -> str:
@@ -1057,10 +1389,10 @@ def _fastest(call: Callable[[str], object], text: str, rounds: int) -> float:
     return best
 
 
-def _growth(call: Callable[[str], object], *, rounds: int = 5) -> float:
+def _growth(call: Callable[[str], object], *, rounds: int = 5, marker: bool = True) -> float:
     """Time at the long length over time at the short one, both on the adversarial run."""
-    small = _fastest(call, _adversarial_run(_GROWTH_LENGTHS[0], marker=True), rounds)
-    large = _fastest(call, _adversarial_run(_GROWTH_LENGTHS[1], marker=True), rounds)
+    small = _fastest(call, _adversarial_run(_GROWTH_LENGTHS[0], marker=marker), rounds)
+    large = _fastest(call, _adversarial_run(_GROWTH_LENGTHS[1], marker=marker), rounds)
     return large / small
 
 
@@ -1070,7 +1402,7 @@ def test_the_dsn_scan_grows_linearly_in_line_length() -> None:
     The structural guard above proves containment is written down. It cannot prove the containment is
     the one that matters, and a bound or an anchor in the wrong place would pass it while the scan
     stayed quadratic. This arm measures what an unauthenticated sender would actually pay for: at
-    16 KB the shipped-before pattern cost 302 ms against 0.18 ms for the delimiter-headed one, and
+    16 KB the shipped-before pattern cost 302 ms against 0.17 ms for the delimiter-headed one, and
     every extra doubling widened that gap fourfold, so one long delimiter-free run would have hung a
     worker on first deployment.
 
@@ -1079,13 +1411,18 @@ def test_the_dsn_scan_grows_linearly_in_line_length() -> None:
     whatever the patterns do -- which is the "green a different pattern bought" failure of this file's
     own docstring, one layer down and wearing a stopwatch.
 
-    THE NEGATIVE ARM IS THE NO-MARKER RUN, and it answers the other way this could go vacuously green:
-    an input that never reaches the pattern is linear for a reason that has nothing to do with the fix.
-    It works on ``scrub_credentials`` because that surface admission-gates the DSN pass on a literal
-    "://", so dropping the marker skips the pattern outright. It does NOT work on ``redact_log_line``,
-    whose copy is ungated and scans either way -- measured 429 ms with the marker against 516 ms
-    without it, at 16 KB, before the fix. Stated rather than quietly omitted, because a control that
-    cannot discriminate is worse than no control.
+    THE OTHER WAY THIS COULD GO VACUOUSLY GREEN is an input that never reaches the pattern: that is
+    linear for a reason which has nothing to do with the fix. Two arms below close it, and NEITHER
+    CARRIES A STOPWATCH, because "did the pass run" is a fact about the code that a clock can only
+    infer. One reads which admission gates the marked run opens, and that the unmarked run opens none.
+    The other counts which patterns one ``scrub_credentials`` call actually applies. A share of
+    wall-clock cost stood beside them until it went red on a hosted runner; the comment above
+    ``_PATTERN_APPLICATIONS`` is the record of that, and is the one place this file argues it.
+
+    NEITHER ARM IS RUN AGAINST ``redact_log_line``, and that is a property of the surface rather than
+    an omission. Its copy is ungated and scans every line either way, so no input distinguishes
+    "reached the pattern" from "did not" there -- measured before #1547 at 429 ms with the marker
+    against 516 ms without it, at 16 KB. Its linearity is covered by the growth subjects above.
     """
     before = re.compile(_SHIPPED_BEFORE_DSN)
     before_growth = _growth(lambda text: before.sub("x", text), rounds=2)
@@ -1095,14 +1432,24 @@ def test_the_dsn_scan_grows_linearly_in_line_length() -> None:
         "the assertions below cannot fail and prove nothing -- fix the fixture, do not raise the bar."
     )
 
-    subjects: tuple[tuple[str, Callable[[str], object]], ...] = (
-        ("support.redact._DSN_PASSWORD", lambda text: redact_mod._DSN_PASSWORD.sub("x", text)),
-        ("secretscrub._DSN_PASSWORD", lambda text: scrub_mod._DSN_PASSWORD.sub("x", text)),
-        ("secretscrub.scrub_credentials", scrub_credentials),
-        ("support.redact.redact_log_line", redact_log_line),
+    # THE GATE-REJECT PATH IS A SUBJECT IN ITS OWN RIGHT, and it is the one that runs on nearly every
+    # record: a line naming no credential word at all. It reaches `_ANY_HINT`'s 15 substring sweeps and
+    # then returns, so nothing below it is exercised -- which is exactly why it needs its own timed row
+    # rather than being inferred from the marked one. Without it a regression that made that sweep
+    # pathological would have no timed coverage anywhere in this file.
+    subjects: tuple[tuple[str, Callable[[str], object], bool], ...] = (
+        (
+            "support.redact._DSN_PASSWORD",
+            lambda text: redact_mod._DSN_PASSWORD.sub("x", text),
+            True,
+        ),
+        ("secretscrub._DSN_PASSWORD", lambda text: scrub_mod._DSN_PASSWORD.sub("x", text), True),
+        ("secretscrub.scrub_credentials", scrub_credentials, True),
+        ("support.redact.redact_log_line", redact_log_line, True),
+        ("secretscrub.scrub_credentials (gate-reject path)", scrub_credentials, False),
     )
-    for label, call in subjects:
-        ratio = _growth(call)
+    for label, call, marker in subjects:
+        ratio = _growth(call, marker=marker)
         assert ratio <= _MAX_GROWTH, (
             f"{label} grew {ratio:.1f}x for 8x the line length, over the {_MAX_GROWTH}x threshold. "
             f"Linear is {_GROWTH_LENGTHS[1] // _GROWTH_LENGTHS[0]}x and the pattern this replaced "
@@ -1110,14 +1457,113 @@ def test_the_dsn_scan_grows_linearly_in_line_length() -> None:
             "its containment, or a new pattern brought a fresh one."
         )
 
+    # THE GROWTH READINGS ARE ONLY EVIDENCE ABOUT THIS PASS IF THIS PASS IS WHAT RAN, and that splits
+    # into two questions a single cross-input ratio used to answer as one. The first is which gates the
+    # marked run opens, below. The second is which patterns then actually run, further down. Both are
+    # structural; a third arm answered the second question with a stopwatch and is deleted, for the
+    # reasons recorded once above _PATTERN_APPLICATIONS.
     longest = _GROWTH_LENGTHS[1]
-    marked = _fastest(scrub_credentials, _adversarial_run(longest, marker=True), rounds=5)
-    unmarked = _fastest(scrub_credentials, _adversarial_run(longest, marker=False), rounds=5)
-    assert marked > unmarked * _MIN_MARKER_COST_RATIO, (
-        f"the marked run cost {marked * 1000:.3f} ms and the unmarked one {unmarked * 1000:.3f} ms, "
-        f"a ratio of {marked / unmarked:.1f}x against the {_MIN_MARKER_COST_RATIO}x this arm needs, "
-        "so the DSN pass is not what the growth measurement above is measuring. A linear reading off "
-        "an input the pattern never scans is not evidence about the pattern."
+    marked_run = _adversarial_run(longest, marker=True)
+    folded = marked_run.casefold()
+    gates = _applied_gate_names(scrub_mod, "_run")
+    assert "_DSN_HINT" in gates and len(gates) >= 6, (
+        f"the gate derivation found {sorted(gates)} in secretscrub._run, which does not look like the "
+        "per-pass gates. A hardcoded list here would assert less than it reads as asserting."
+    )
+    opened = tuple(
+        sorted(name for name in gates if scrub_mod._admits(folded, getattr(scrub_mod, name)))
+    )
+    assert opened == ("_DSN_HINT",), (
+        f"the marked adversarial run opens {opened} on secretscrub, not the DSN gate alone, so a "
+        "second pass runs on this input and the growth readings above are not about this pattern. "
+        "THE LIKELY CAUSE IS THE FIXTURE, NOT THE GATES: _adversarial_run spells its "
+        "own prose ('upstream error ... host') and a credential word that is a substring of it opens "
+        "a second gate. Change the fixture's wording, and only then look at _run."
+    )
+    assert not scrub_mod._admits(
+        _adversarial_run(longest, marker=False).casefold(), scrub_mod._ANY_HINT
+    ), (
+        "the unmarked run now names a credential word, so it no longer isolates the marker. The "
+        "fixture has drifted -- fix the run, do not drop this assertion."
+    )
+
+    # THE SECOND QUESTION IS WHETHER THE PASS ACTUALLY RAN, AND IT IS A COUNT RATHER THAN A CLOCK. The
+    # arm above reads which gates ADMIT; this one reads which patterns were APPLIED, and how often.
+    # They are not the same reading, and the gap between them is the case the deleted share could only
+    # ever report as an unattributed number: a pattern reached WITHOUT a gate admits nothing and still
+    # walks every line. Asserting both, a disagreement names that case.
+    #
+    # DERIVED OVER THE WHOLE ENTRY PATH, NOT `_run` ALONE. `CREDENTIAL_SURFACES` pairs this module with
+    # `_run` because that is where its patterns are APPLIED, which is the right domain for the
+    # structural guard. This arm asks a different question -- what does one `scrub_credentials` CALL
+    # touch -- so a pattern applied in the entry function above `_run` belongs to it too. Reading
+    # `_run` alone would be this file's own failure 2, a domain narrower than the surface.
+    #
+    # THE ENTRY FUNCTION APPLIES NO PATTERN TODAY, so the union adds no name to the six and is a no-op
+    # on this tree. It is here for the day that stops being true, which is the day reading `_run`
+    # alone would start being wrong with nothing to report it. THE DERIVATION IS ONE LEVEL DEEP either
+    # way -- it walks a function body for module-level names and does not follow calls -- so a pattern
+    # applied inside a NEW helper that `_run` calls is outside this domain. That limit is shared with
+    # the structural guard above, which derives the same way; widening it is one change for both.
+    applied = _applied_pattern_names(scrub_mod, "_run") | _applied_pattern_names(
+        scrub_mod, "scrub_credentials"
+    )
+    assert "_DSN_PASSWORD" in applied, (
+        f"the pattern derivation found {sorted(applied)} across secretscrub.scrub_credentials and "
+        "._run, and _DSN_PASSWORD is not among them. Either the pattern was renamed or it is no "
+        "longer applied on this path; nothing below can be about it until that is resolved."
+    )
+    assert len(applied) >= 6, (
+        f"the pattern derivation found only {sorted(applied)}, which does not look like the per-pass "
+        "patterns. A hardcoded list here would assert less than it reads as asserting."
+    )
+
+    # POSITIVE CONTROL ON THE TWO INSTRUMENTS THIS ARM RUNS ON, because a zero from either is otherwise
+    # indistinguishable from the code having stopped.
+    #
+    # FIRST THE METHOD LIST, AND THE DIRECTION OF THIS CHECK IS THE WHOLE OF IT. The failure that
+    # matters is a name MISSING from the set: the recorder is then blind to that way of applying a
+    # pattern, and the arm below reads a quiet zero it reports as the pass having stopped. So require
+    # every public callable of the real type to be covered. The opposite direction -- a name in the set
+    # that `re.Pattern` does not have -- is harmless, since it simply never fires, and checking it
+    # would red on a stdlib method being removed, for a reason that has nothing to do with this
+    # pattern. A misspelled member fails the check below anyway: the name it should have been is then
+    # uncovered.
+    uncovered = {
+        name
+        for name in dir(re.Pattern)
+        if not name.startswith("_")
+        and callable(getattr(re.Pattern, name, None))
+        and name not in _PATTERN_APPLICATIONS
+    }
+    assert not uncovered, (
+        f"re.Pattern applies a pattern to text through {sorted(uncovered)} and _PATTERN_APPLICATIONS "
+        "does not name it, so the recorder below cannot see it fire. Add it rather than letting the "
+        "reading narrow."
+    )
+
+    # Then the recorder, driven through the module global by a line that MUST match, so a broken swap
+    # reds here rather than being read as "the pass stopped running" thirty lines down.
+    control = _patterns_applied_during(
+        scrub_mod,
+        {"_DSN_PASSWORD"},
+        lambda: scrub_mod._DSN_PASSWORD.sub("x", "postgres://user:pw@host"),
+    )
+    assert control == Counter({"_DSN_PASSWORD": 1}), (
+        f"the recorder read {dict(control)} for one direct application of _DSN_PASSWORD through the "
+        "module global. The swap or the counting is broken, so every reading below is about this "
+        "fixture rather than about secretscrub."
+    )
+
+    ran = _patterns_applied_during(scrub_mod, applied, partial(scrub_credentials, marked_run))
+    assert ran == Counter({"_DSN_PASSWORD": 1}), (
+        f"one scrub_credentials call on the marked adversarial run applied {dict(ran)}, not "
+        "_DSN_PASSWORD exactly once, so the growth readings above are not about this pattern alone. "
+        "Read it this way. AN EMPTY reading means the pass stopped running at all. A COUNT ABOVE ONE "
+        "means one pattern is now walked repeatedly per call. A SECOND NAME, while the gate arm above "
+        f"still sees only {opened} open, means that pattern is reached with no gate in front of it -- "
+        "a cost defect in _run or in scrub_credentials. A second name WITH a red on the gate arm is "
+        "the fixture drifting instead; fix the run's wording, as that assertion says."
     )
 
 

@@ -283,11 +283,14 @@ _KEY_MATERIAL = re.compile(
 # stated ONCE, on ``messagefoundry/secretscrub.py``'s ``_DSN_PASSWORD`` (BACKLOG #1547). Two things are
 # local to this surface and worth saying. This pattern is NOT admission-gated the way the write-time
 # copy is, so it scans every line ``GET /logs/tail`` and the support bundle carry, marker or no marker
-# -- measured on a 16 KB hyphen-and-dot run, ``redact_log_line`` cost 429 ms with a ``://`` and 516 ms
-# without one, which is why a no-marker input is a CONTROL for the gated copy and not for this one. And
+# -- measured on a 16 KB hyphen-and-dot run BEFORE #1547, ``redact_log_line`` cost 429 ms with a
+# ``://`` and 516 ms without one. After it the two are level within the noise of this box, which is the
+# same reading and not a better one: the marker makes no difference to whether this copy scans, because
+# nothing here gates on it. So a no-marker input is a CONTROL for the gated copy and never for this
+# one. And
 # the shared PHI pass beside it is linear on that same input (0.12 ms at 2 KB, 0.99 ms at 16 KB), so
 # the quadratic was this module's own rather than inherited.
-_DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z][a-z0-9+.\-]*://[^\s:/@]+):[^\s/@]+@")
+_DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^\s/@]+@")
 
 # A long base64-ish run (>= 24 chars) that isn't otherwise matched — likely a key/token/encoded body.
 _LONG_B64 = re.compile(r"\b[A-Za-z0-9+/]{24,}={0,2}\b")
