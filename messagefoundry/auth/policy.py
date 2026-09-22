@@ -102,11 +102,16 @@ class BreachCorpusUnavailable(RuntimeError):
     *change* paths screen a password, so this never touches login, never invalidates a session, and
     never stops message flow.
 
-    **A FIRST RUN IS THE EXCEPTION, and it is not narrow.** On an empty store ``AuthService.initialize``
-    mints the bootstrap admin, whose generator screens its own candidate, so this raises out of an
-    unguarded lifespan call and the engine does not start at all. That is fail-closed but arguably
-    disproportionate, because the candidate is a 192-bit random token the breach clause can never match.
-    Tracked separately; do not read the paragraph above as covering a first run.
+    **A FIRST RUN IS NO LONGER A STARTUP FAILURE, AND IT IS STILL NOT THE NARROW CASE ABOVE**
+    (BACKLOG #1447). The bootstrap generator used to raise out of an unguarded lifespan call, so the
+    engine did not start at all; it now suppresses this screen on its own candidate, for the reason
+    given at its call to :meth:`PasswordPolicy.violations`. The engine therefore starts and carries
+    messages. What does NOT follow is the paragraph above: the minted credential is born
+    ``must_change_password=True``, and that forced rotation is an operator-chosen password, which this
+    still refuses. So a first deployment on an unusable corpus would reach a console holding one
+    account that cannot complete its own rotation until the corpus is repaired. That is deliberate --
+    screening an operator's password is what #1438 exists for -- and much narrower than refusing to
+    start, but it is not "never touches login".
     ``AuthService`` also loads the corpus eagerly at startup and logs the same defect as an error, so
     an operator learns about it from the log rather than from a user's failed password change.
     """
@@ -211,7 +216,9 @@ class PasswordPolicy:
             lockout_minutes=settings.lockout_minutes,
         )
 
-    def violations(self, password: str, *, username: str | None = None) -> list[str]:
+    def violations(
+        self, password: str, *, username: str | None = None, suppress_breach_check: bool = False
+    ) -> list[str]:
         """Return clauses completing *"password must …"*; an empty list means the password is
         acceptable. Order: length → opt-in character classes → breach → username → context.
 
@@ -220,7 +227,14 @@ class PasswordPolicy:
 
         Raises :class:`BreachCorpusUnavailable` when ``check_breached`` is on and the bundled corpus is
         unusable (BACKLOG #1438) -- a refusal, not a silent pass. Callers get a list or an exception,
-        never a list that quietly stopped screening."""
+        never a list that quietly stopped screening.
+
+        ``suppress_breach_check=True`` drops the breach clause for ONE call (BACKLOG #1447). It is
+        AND-ed with ``check_breached``, so it can only ever SUPPRESS -- it cannot assert a screen an
+        operator turned off -- and the ``False`` default reproduces the field exactly, so a caller
+        that passes nothing keeps failing closed. WHY a caller may legitimately pass it is stated at
+        the call site, in ``AuthService._generate_policy_password``. Read that before adding a second
+        one; a static arm in ``tests/test_password_corpus_guard.py`` pins how many there are."""
         problems: list[str] = []
         if len(password) < self.min_length:
             problems.append(f"be at least {self.min_length} characters")
@@ -240,8 +254,10 @@ class PasswordPolicy:
         # screen. A large operator export therefore does not excuse it -- the repair is to reinstall the
         # wheel, which is cheap, and the alternative is honouring `check_breached=True` with a screen
         # nobody has validated.
-        if self.check_breached and (
-            lowered in _common_passwords() or self._in_operator_corpus(password)
+        if (
+            self.check_breached
+            and not suppress_breach_check
+            and (lowered in _common_passwords() or self._in_operator_corpus(password))
         ):
             problems.append("not be a common or breached password")
         if (
