@@ -918,9 +918,12 @@ def test_the_webconsole_nesting_arithmetic_in_ci_yml_is_read_and_checks_out() ->
 #: that a test went red -- the move `step_margin_baseline.toml` already makes for the recorded maxima.
 _WEBCONSOLE_XDIST_FLAGS: dict[str, str] = {
     "--dist loadfile": (
-        "`--dist load` scatters one file's tests across workers, which splinters the session-scoped "
-        "`rate_table` aggregation in the console suite's test_authz_audit_rate.py -- the ASVS 16.3.2 "
-        "table then prints in fragments, with nothing reporting that it did"
+        "it keeps a file's tests on ONE worker, so any within-file ordering or shared state still "
+        "holds, and it is the spelling the engine step uses -- two suites, one parallelism model. "
+        "NOTE: an earlier draft justified this by the session-scoped `rate_table` aggregation in the "
+        "console suite's test_authz_audit_rate.py. That reason was WITHDRAWN under measurement: "
+        "under `-q`, the CI spelling, that table is never printed at all. The flag stands on the two "
+        "reasons above, which never depended on it"
     ),
     "--max-worker-restart=0": (
         "without it a worker that dies without `workerfinished` is CLONED, and a clone that never "
@@ -972,8 +975,8 @@ def test_the_web_console_suite_runs_under_xdist_fed_from_the_matrix() -> None:
     indirect = re.fullmatch(r'"?\$\{?(\w+)\}?"?', token)
     assert indirect, (
         f"the step passes `-n {token}` -- a LITERAL worker count rather than a shell variable. It "
-        f"cannot be re-sized per leg that way, and it drifts silently from the engine step's own "
-        f"count on the same runner. Feed it from the matrix through `env:`, as the engine step does."
+        f"cannot be re-sized per leg that way, so a leg with different hardware gets the wrong one. "
+        f"Feed it from the matrix through `env:`, as the engine step does."
     )
     var = indirect.group(1)
     assert var in env, (
@@ -983,7 +986,9 @@ def test_the_web_console_suite_runs_under_xdist_fed_from_the_matrix() -> None:
     knob = re.fullmatch(r"\$\{\{\s*matrix\.(\w+)\s*\}\}", env[var])
     assert knob, (
         f"the step's worker count is {env[var]!r}, not a matrix knob. A literal cannot be re-sized "
-        f"per leg, and it drifts silently from the engine step's own count on the same runner."
+        f"per leg, and it puts the count somewhere the per-leg caps below cannot be reconciled with "
+        f"it. (The `webconsole` job runs on its OWN runner, not the engine job's -- the coupling to "
+        f"worry about is the SHARED matrix knob, not shared hardware.)"
     )
     print(f"[xdist] worker count <- matrix.{knob.group(1)} via ${var}")
 
@@ -995,8 +1000,16 @@ def test_the_web_console_suite_runs_under_xdist_fed_from_the_matrix() -> None:
     assert set(legs) == _EXPECTED_LEGS, f"matrix legs {sorted(legs)} != {sorted(_EXPECTED_LEGS)}"
     for name in sorted(_EXPECTED_LEGS):
         count = legs[name].get(knob.group(1))
-        assert isinstance(count, int) and count > 1, (
-            f"{name} sets {knob.group(1)}={count!r}; `-n` needs an integer above 1 there, or this "
-            f"leg quietly returns to one worker while the flag still reads as parallel"
+        # AT LEAST FOUR, NOT MERELY "MORE THAN ONE". `matrix.pytest_workers` is shared with the engine
+        # step, whose own note in ci.yml offers 2 as "the conservative rung" when engine timing tests
+        # flake. Taking that rung halves THIS step's workers, and every margin figure #1879 recorded
+        # was measured at 4 -- 1.058x and 1.103x are what the two breaching legs need, with no
+        # measurement at all at 2. A `> 1` bound stays green through exactly that change, so it would
+        # let the merge-group ejections come back while still reading as a parallelism guard.
+        assert isinstance(count, int) and count >= 4, (
+            f"{name} sets {knob.group(1)}={count!r}. The web console step's margin arithmetic was "
+            f"measured at 4 workers and there is no measurement below it. This knob is SHARED with "
+            f"the engine step: if you are lowering it for an engine pacing flake, give the console "
+            f"step its own knob or re-derive its caps -- do not let this one go quiet."
         )
         print(f"[xdist] {name}: {knob.group(1)}={count}")

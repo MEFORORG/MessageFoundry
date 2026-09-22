@@ -47,11 +47,17 @@ from messagefoundry_webconsole._auth import BROWSER_HARDENING_OPT_OUT_ENV
 PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 
 
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        port: int = s.getsockname()[1]
-    return port
+def _bound_listener() -> socket.socket:
+    """A bound loopback socket, returned STILL OPEN for uvicorn to serve on directly.
+
+    This replaced a `_free_port() -> int` that bound, read the port, CLOSED, and let uvicorn rebind.
+    Under `-n` (BACKLOG #1879) that gap is a race with any sibling worker doing the same thing, and
+    the loser's bind fails inside uvicorn's own startup. Handing over the bound socket removes the
+    window rather than making it smaller, which is the only fix that does not rest on timing.
+    """
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    return s
 
 
 async def _service(engine: Engine) -> AuthService:
@@ -106,7 +112,8 @@ async def _serving(
         tls_terminated_upstream=api.tls_terminated_upstream if declare_to_app else False,
         trusted_proxies=api.trusted_proxies if declare_to_app else (),
     )
-    port = _free_port()
+    listener = _bound_listener()
+    port = int(listener.getsockname()[1])
     server = uvicorn.Server(
         uvicorn.Config(
             app,
@@ -120,7 +127,7 @@ async def _serving(
             ),
         )
     )
-    task = asyncio.create_task(server.serve())
+    task = asyncio.create_task(server.serve(sockets=[listener]))
     deadline = asyncio.get_running_loop().time() + 20
     while not server.started:
         if asyncio.get_running_loop().time() > deadline:  # pragma: no cover - startup wedge
@@ -133,6 +140,7 @@ async def _serving(
     finally:
         server.should_exit = True
         await asyncio.wait_for(task, timeout=20)
+        listener.close()  # idempotent: uvicorn closes it too when it owned a successful startup
 
 
 def _client_ssl() -> ssl.SSLContext:
