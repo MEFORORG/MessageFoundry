@@ -68,8 +68,11 @@ module runs at all, and ``support/redact.py`` has the identical property on ``GE
 THE CEILING IS A ``_LABEL_PREFIX`` NUMBER AND IT IS THE WHOLE CEILING, which is a claim only since
 BACKLOG #1547: :data:`_DSN_PASSWORD`'s scheme class was reachable from every word boundary in the same
 "." and "-" run, so the same run carrying a ``://`` cost 302 ms at 16 KB rather than 21 ms. That one is
-anchored now -- 0.18 ms on the same input -- and the reasoning and numbers live on the pattern rather
-than here.
+anchored now, and the reasoning and the numbers live on the pattern rather than here. Deliberately no
+figure at this site: it was restated as 0.18 ms and went stale against the pattern's own the first time
+that pattern was touched. No magnitude claim either -- the ratio differs depending on whether you read
+the pattern alone or this module's ceiling, and a summary that picks one silently is how the last
+restatement went wrong.
 It was NOT bought down further: the obvious lever, a bounded lookahead requiring a separator near the
 label, would silently stop scrubbing a credential whose label is longer than the bound. Trading a
 silent security narrowing for time on a synthetic input, against a cost this module does not dominate,
@@ -345,16 +348,44 @@ _KEY_MATERIAL = re.compile(
 # SO THE ANCHOR CARRIES IT INSTEAD, AND NOTHING IS CAPPED. ``(?<![a-z0-9+.\-])`` forbids a match from
 # STARTING inside such a run, which leaves the run one start position rather than O(N); walks from
 # distinct start positions then cannot overlap, because every character the repetition consumes is one
-# the lookbehind excludes. Linear with no ceiling on the scheme -- 0.022 ms at 2 KB and 0.18 ms at
-# 16 KB, 8.0x for 8x the length, and 15x FASTER at 16 KB than the bound it replaces. It also matches
-# strictly MORE than the pre-#1547 pattern: no scheme length is lost, and "_" is not in the class, so
-# ``_postgres://user:pw@host`` redacts here where ``\b`` refused to.
+# the lookbehind excludes. Linear with no ceiling on the scheme -- 0.022 ms at 2 KB and 0.17 ms at
+# 16 KB, 7.8x for 8x the length, and 15x FASTER at 16 KB than the bound it replaces.
 #
-# Pinned three ways in ``tests/test_log_redaction_secret_domain.py``, which guards BOTH copies of this
+# THE FIRST SPELLING OF THAT ANCHOR KEPT A ``[a-z]`` HEAD ON THE SCHEME, AND IT LOST MATCHES. The
+# sentence that stood here -- that it "matches strictly MORE than the pre-#1547 pattern" -- was FALSE,
+# and it was the load-bearing reason a reader would not look again. In
+# ``(?<![a-z0-9+.\-])([a-z]...`` a start needs the preceding character OUTSIDE the class and the first
+# character INSIDE it and a letter. Both hold only at the head of the run, so a run whose head is a
+# digit, "+", "." or "-" had EVERY start position refused and the password went through untouched.
+# Measured on both surfaces, before this correction: ``9-postgres://``, ``2024-01-01-postgres://``,
+# ``8f3a-postgres://``, ``.postgres://``, ``-postgres://`` and ``+postgres://`` each published a
+# synthetic password in full, and the pre-#1547 ``\b`` head matched all six -- "-" and "." are NON-word
+# characters, so ``\b`` placed a start exactly where the letter head refused one. A redaction narrowing
+# shipped in the name of a faster scan, which is the same trade the ``{0,63}`` bound made one paragraph
+# up. That is twice on one pattern, by two different mechanisms.
+#
+# THE HEAD CLASS IS THE LOOKBEHIND'S OWN CLASS NOW, which is what makes the containment argument above
+# read off the pattern instead of having to be derived: the two classes are the same set, so a match
+# starts at the first character of a maximal run of it and nowhere else, and the walks TILE the line.
+# Dropping the ``[a-z]`` changes no redacted OUTPUT at a match site the ``\b`` head reached -- the
+# leading run sat before the old match and sits inside group 1 now, and group 1 is kept verbatim, so
+# both spellings emit the same characters. The differential arm named below rewrites every line of its
+# corpus under each earlier head and under this one and requires the results to be equal: no narrowing,
+# and no output difference. The counts live there rather than here, so they cannot go stale in a file
+# that does not run them. The "strictly more" claim is finally true, of BOTH earlier spellings --
+# AT LEAST every match the ``\b`` head made, plus ``_postgres://user:pw@host``, which ``\b`` could not
+# reach because an underscore is a word character and offers no boundary to anchor on. "At least"
+# rather than an enumeration: the head now admits ANY run head, so ``9postgres://``, ``123://`` and
+# ``...://`` match here and matched under neither earlier spelling. Over-redaction is the safe
+# direction for a credential pass and group 1 is kept, so a reader loses nothing to it.
+#
+# Pinned five ways in ``tests/test_log_redaction_secret_domain.py``, which guards BOTH copies of this
 # vocabulary: the anchor structurally, the growth with a stopwatch against the pre-#1547 pattern as its
-# control, and the shapes that must still redact BY VALUE -- including the glued run above, so the
-# bound cannot come back without a red.
-_DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z][a-z0-9+.\-]*://[^\s:/@]+):[^\s/@]+@")
+# control, the share of that cost the pass actually owns, the shapes that must still redact BY VALUE --
+# including the glued run above and the non-letter leading runs, so neither narrowing can come back
+# without a red -- and a differential arm that fails if either earlier head ever redacts something this
+# one does not.
+_DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^\s/@]+@")
 
 
 def _keep_label(m: re.Match[str], placeholder: str) -> str:

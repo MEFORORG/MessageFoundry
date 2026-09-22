@@ -316,6 +316,14 @@ boundary`, `dependency boundary tray`, `rules file wheel`.
   scheme sits in, so the bound stopped matching a DSN behind a 64-character run and published the
   password in full. The hand-off stands as the record of what this packet decided; it is no longer a
   live finding, and the line numbers above are stale by construction.*
+  *Amended under the same item: the anchored head shipped as `(?<![a-z0-9+.\-])([a-z]...`, and that
+  `[a-z]` cost a SECOND narrowing of the same kind. A start needed the preceding character outside the
+  class and the first character a letter, and both hold only at a run's head, so a DSN behind a run
+  opening on a digit, `+`, `.` or `-` matched nowhere and the password went through -- `9-postgres://`
+  and `2024-01-01-postgres://` among them, all six shapes measured leaking on both surfaces, all six
+  matched by the `\b` head this replaced. The head class is the lookbehind's own class now. Read the
+  original note above as the record of the quadratic and not as evidence the redaction was whole:
+  twice on this pattern, a cost fix narrowed what it caught and the guards of the day went green.*
 - **`dry_run` reporting `filtered` for a `deployed=False` outbound** where the engine records
   `NOT_DEPLOYED`, and `select_inbound`'s empty-registry message, are handed to packet 11 (dry-run).
 - **The package root loading `config` into every importer, including the tray**, is packet 1's P1-03
