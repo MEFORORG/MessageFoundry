@@ -724,10 +724,24 @@ armed PR is queued against the same files, the first question stops predicting t
 | `.venv` (per-worktree, **not** shared) | The remote (`origin`) — all branches/PRs |
 | `.mefor/` dev DB, generated corpus, `ide/node_modules` | — |
 
-**Heads-up — the AI project memory is shared.** `~/.claude/.../memory/` (the `MEMORY.md` index +
-`mf-*.md` files) lives outside the repo and is shared by all sessions. Reads are fine; if two chats
-**write** memory at the same time the last write wins, so coordinate memory updates (or let one chat
-own them).
+**Heads-up — the AI project memory is shared WITHIN a config root and siloed ACROSS roots.** The
+store lives outside the repo at `<config root>/projects/<project slug>/memory/`: a `MEMORY.md` index
+plus one file per fact. Every session on the **same** root shares it with no lock, so if two chats
+**write** at the same time the last write wins — coordinate memory updates, or let one chat own them.
+Reads are fine.
+
+**There is no single store, and the filenames are not `mf-*` everywhere.** Measured 2026-09-18:
+`.claude` holds 192 note files of which 184 are `mf-*`; `.claude-account-4` holds 266 of which 190
+are `mf-*`; `.claude-account-1` holds 110 and **zero** `mf-*`. A note written on one root is
+invisible to sessions on the others: `.claude` and `.claude-account-1` share **one** filename, and so
+do `.claude-account-1` and `.claude-account-4`. **`.claude` and `.claude-account-4` are near-clones**
+— 160 shared filenames, 134 of them byte-identical — which is duplication across roots, not sharing,
+and a repair to one leaves its twin stale. Count notes as `*.md` excluding the index: these
+directories also hold `.bak` files, and a bare `mf-*` glob counts
+`mf-reviewer-seat-suspended.md.bak-console-retired-20260910` as a note.
+
+*This paragraph previously said the store was `~/.claude/.../memory/`, that it held `mf-*.md` files,
+and that it was shared by all sessions. All three are false for a session on `.claude-account-1`.*
 
 **WHERE A COMMAND RUNS IS NOT WHERE THE CALLER IS, and tooling here keeps assuming it is.** Much of
 this repo's coordination machinery resolves "which worktree is this about?" from the **current

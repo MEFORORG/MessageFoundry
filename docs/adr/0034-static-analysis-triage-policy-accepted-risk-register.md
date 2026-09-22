@@ -458,21 +458,69 @@ Adopting zizmor 1.28.0 (from 1.5.2) turned on audits the old pin could not run. 
 findings against the otherwise-unchanged tree were resolved in-tree or as justified non-findings; this
 one is an accepted residual.
 
-* **Finding.** `warning[archived-uses]`, `.github/workflows/cla.yml:44` —
-  `contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08 # v2.6.1`. Upstream is
-  archived (API `archived: true`, `archived_at: null`; last push 2026-03-23) and v2.6.1 is the final
-  release. The pin equals that tag's commit exactly, so there is no later patch to move to.
-* **Compensating control, and its limit.** The full-SHA pin closes tampering: a bundled JS action's SHA
-  fully determines the bytes that run, and a vanished namespace fails the step rather than running
-  someone else's code. It does not close the unpatched-code axis the audit names.
-* **Why not replaced now.** `cla` is a required status context and is the job's own conclusion, so a
-  broken step blocks every PR. `pull_request_target`/`issue_comment` workflows run only from the default
-  branch, so a replacement cannot be exercised on the PR that makes it — it lands on `main` untested,
-  with `required_approving_review_count: 0` and auto-merge armed.
-* **Hard revisit: before Node20 removal.** `action.yml` at the pin — and at the archived HEAD — declares
-  `runs.using: node20`. An archived repo can never re-declare node24, so GitHub's fall-2026 Node20
-  removal, not this lint, forces fork-or-replace. No firm date is published; treat mid-September 2026 as
-  the planning date and re-check before then.
+> **PARTLY SUPERSEDED 2026-09-21 (BACKLOG #1381): THE SHA-PINNED REMOTE REFERENCE THIS AMENDMENT IS
+> ABOUT NO LONGER EXISTS.** `4c8845754` vendored the action into `.github/actions/cla-assistant-lite`,
+> so `cla.yml` now carries `uses: ./.github/actions/cla-assistant-lite` and the `archived-uses` audit
+> has nothing left to fire on. Its suppression in `.github/zizmor.yml` is deleted — the whole rule key,
+> not just the entry. **Of the five bullets below, the first two are retracted and each says so in its
+> own text; the other three stand.** The amendment is kept rather than removed, per this ADR's own rule
+> that a residual made invisible is worse than one stated with its reason.
+>
+> **WHAT THE DELETED SUPPRESSION TOOK WITH IT, stated rather than quietly dropped.** It ended *"Delete
+> this entry when the action is replaced, or if upstream un-archives (the audit re-checks that every
+> run)"* — so upstream's archived status had an automated every-run signal. That signal died when the
+> reference went local, not when the key was deleted: `archived-uses` inspects a remote `uses:` and a
+> local one gives it nothing to read. Either way there is now **no automated watch on this residual at
+> all** — grep for `node20`/`node24` across `tests/`, `scripts/`, `.github/workflows/` and
+> `pyproject.toml` returns prose only. The deadline below rests on a person reading this page. Building
+> that check is unfiled work (the Node20 deadline probe, no number allocated).
+>
+> It also carried one judgment the Contingency bullet does not: on a step holding a write token that
+> any GitHub user can trigger by comment, **trading a frozen vendored bundle for a less-reviewed fork
+> is not self-evidently a security win.** That weighs against the replacement candidate below and is
+> preserved here for the session that acts on it.
+>
+> **THE NODE20 DEADLINE IS NOT PART OF THAT RETRACTION, and must not be read as carried away with it.**
+> Vendoring froze the bytes; it did not change what they declare. Re-verified in-tree 2026-09-21:
+> `.github/actions/cla-assistant-lite/action.yml:45` declares `using: "node20"`. Vendoring makes that
+> the last word rather than the archived upstream's — this workflow holds no reference to that action's
+> upstream at all, so no release could re-declare node24 even in principle. The risk is live and the
+> revisit bullet stands.
+
+* **Finding. RETRACTED 2026-09-21 — the anchor is gone.** As written: `warning[archived-uses]`,
+  `.github/workflows/cla.yml:44` —
+  `contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08 # v2.6.1`. That line
+  no longer holds a `uses:` of any kind, and no reference to the CLA action's upstream survives
+  anywhere in the file. (One remote `uses:` does remain in that workflow — `actions/checkout`,
+  SHA-pinned, not archived, and never what this finding was about.) **The fact the bullet reports is
+  still true and is why the revisit bullet below bites:** upstream is archived (API `archived: true`,
+  `archived_at: null`; last push 2026-03-23), v2.6.1 is the final release, and the vendored
+  `dist/index.js` is that tag's bundle — so there is no later patch to move to.
+* **Compensating control, and its limit. THE CONTROL IS RETRACTED 2026-09-21; ITS LIMIT IS NOT.** As
+  written: the full-SHA pin closes tampering, because a bundled JS action's SHA fully determines the
+  bytes that run and a vanished namespace fails the step rather than running someone else's code.
+  There is no SHA pin now. Tampering is closed by a different mechanism — the action's bytes are
+  committed in this repository, so they are not fetched at run time and no upstream namespace has to
+  survive. That mechanism has its own precondition, which the SHA pin did not need: a local `uses:`
+  resolves against whatever the job checked out, so it holds only while that checkout takes the BASE.
+  `.github/zizmor.yml`'s `dangerous-triggers` entry for this workflow now names that dependency
+  explicitly. **The limit is unchanged and is the half that matters, and vendoring made it permanent
+  rather than merely open:** freezing code does not patch it, and there is no longer an upstream to
+  receive a patch from. A flaw in these bytes is ours to fix or fork away from.
+* **Why not replaced now.** Stands. `cla` is a required status context and is the job's own conclusion,
+  so a broken step blocks every PR. `pull_request_target`/`issue_comment` workflows run only from the
+  default branch, so a replacement cannot be exercised on the PR that makes it — it lands on `main`
+  untested, with `required_approving_review_count: 0` and auto-merge armed. Vendoring did not soften
+  this, it demonstrated it: PR #621 rewrote the `uses:` without adding the checkout a local action
+  needs, every run died in about three seconds, and 7 of 21 open pull requests were blocked at once
+  until an administrator cleared it.
+* **Hard revisit: before Node20 removal. STANDS — this is the live half of this amendment.**
+  `action.yml` declares `runs.using: node20` at the pin, at the archived HEAD, and in the vendored copy
+  (`.github/actions/cla-assistant-lite/action.yml:45`, re-verified 2026-09-21). An archived repo can
+  never re-declare node24, so GitHub's fall-2026 Node20 removal — not this lint — forces fork-or-
+  replace. No firm date is published. **The planning date this bullet set has now passed:** it named
+  mid-September 2026, and this note is dated 2026-09-21. The re-check it asked for is due rather than
+  upcoming, and the contingency below is 2026-08-01 vintage and has not been re-verified since.
 * **Contingency, verified 2026-08-01.** There is no canonical successor — the archived README directs
   users to fork. The best candidate found is `iainmcgin/cla-github-action`, Apache-2.0, not archived,
   last pushed 2026-06-17, 4 stars, single personal maintainer. Note v3.2.0 is an **annotated** tag whose

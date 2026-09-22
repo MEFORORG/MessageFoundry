@@ -297,6 +297,317 @@ def test_a_LEGACY_record_with_no_branch_still_falls_back_to_the_path_alone(
     assert "not allocated to this worktree" in out
 
 
+# ----------------------------------------------------------------- restoring a number the base LOST
+
+
+def lose_adr_0002(repo: Path) -> str:
+    """Put ADR 0002 on the base, then take it away again, and return the bytes the base lost.
+
+    This is the only state in which the restore carve-out (BACKLOG #1468) is reachable: the number is
+    absent from the base's TIP and present in its HISTORY. Nothing in the gate polices an ADR deletion
+    -- check_adrs says so outright, because git already prints one in the diffstat -- so a base can
+    reach this state by a revert, a bad merge resolution, or a plain delete.
+    """
+    body = "# 0002 — Second\n\nThe decision.\n"
+    write(repo, "docs/adr/0002-second.md", body)
+    write(
+        repo,
+        "docs/adr/README.md",
+        README_HEAD
+        + ROW.format(n="0001", slug="first", title="First")
+        + "\n"
+        + ROW.format(n="0002", slug="second", title="Second")
+        + "\n",
+    )
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "add ADR 0002")
+    git(repo, "rm", "-q", "docs/adr/0002-second.md")
+    write(
+        repo,
+        "docs/adr/README.md",
+        README_HEAD + ROW.format(n="0001", slug="first", title="First") + "\n",
+    )
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "revert: drop ADR 0002")
+    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    git(repo, "checkout", "-q", "-b", "restore-0002")
+    # ***ASSERT THE PRECONDITION, BECAUSE git() ABOVE IS THE TOLERANT HELPER.*** Its own docstring
+    # says a broken git is indistinguishable from a command with no output. Without this, a silently
+    # no-op `git rm` leaves a repo where nothing was ever lost -- and the refusal arms below would
+    # still pass, on the ORDINARY refusal, for a reason unrelated to what they claim to test.
+    tip = git_read(repo, "ls-tree", "--name-only", "refs/remotes/origin/main", "docs/adr/")
+    assert "0002-second.md" not in tip, f"0002 should be gone from the base tip, got: {tip}"
+    past = git_read(repo, "rev-list", "refs/remotes/origin/main", "--", "docs/adr/0002-second.md")
+    assert past.strip(), "0002 should still be reachable in the base's history"
+    return body
+
+
+def restore_the_index_row(repo: Path) -> None:
+    write(
+        repo,
+        "docs/adr/README.md",
+        README_HEAD
+        + ROW.format(n="0001", slug="first", title="First")
+        + "\n"
+        + ROW.format(n="0002", slug="second", title="Second")
+        + "\n",
+    )
+
+
+def test_restoring_the_exact_bytes_the_base_lost_is_allowed(repo: Path) -> None:
+    """The row's whole subject: a number the base SPENT and then lost, put back as it was.
+
+    Unowned and unallocated, deliberately -- the commonest restore is of an ADR that landed years
+    before, whose allocating worktree was reaped the same week and whose claim record may never have
+    existed. Requiring ownership here is what has no path: `alloc.ps1` would mint a SECOND number for
+    a document that already has one, renumbering something already cited.
+    """
+    body = lose_adr_0002(repo)
+    write(repo, "docs/adr/0002-second.md", body)
+    restore_the_index_row(repo)
+    git(repo, "add", "-A")
+
+    code, out = run_check(repo)
+    assert code == 0, out
+
+
+def test_restoring_a_lost_number_with_DIFFERENT_bytes_is_refused(repo: Path) -> None:
+    """The first mutation: same number, same path, content the base never carried there.
+
+    ***THE REFUSAL TEXT IS THE ASSERTION, NOT THE EXIT CODE.*** A gate that cannot see refuses
+    everything and scores exactly like a gate that works, so this pins WHICH refusal fired -- and it
+    must be the restore one, not the ownership one, because the remedies differ and the ownership
+    text ("a sibling session may be holding this number") is false of a number the base already spent.
+    """
+    lose_adr_0002(repo)
+    write(repo, "docs/adr/0002-second.md", "# 0002 — Second\n\nA DIFFERENT decision.\n")
+    restore_the_index_row(repo)
+    git(repo, "add", "-A")
+
+    code, out = run_check(repo)
+    assert code == 1
+    assert "is a RESTORE, but not of the bytes" in out
+    assert "restore the file EXACTLY first" in out
+    # It must NOT claim a sibling holds a number the base already spent -- that was the false half of
+    # the old text. It must still offer the recover route, because a claim record can outlive the
+    # commit that landed the number and still name a live tree.
+    assert "a sibling session may be holding" not in out.lower()
+    assert "if a claim record still names a live tree" in out.lower()
+
+
+def test_restoring_lost_bytes_under_a_DIFFERENT_FILENAME_is_refused(repo: Path) -> None:
+    """The second mutation: right bytes, right number, wrong path.
+
+    Differently-NAMED files under one number is the exact signature the gate exists for, so the
+    carve-out is anchored on the path as well as the bytes. Dropping the path anchor would let the
+    collision walk straight through the restore door.
+    """
+    body = lose_adr_0002(repo)
+    write(repo, "docs/adr/0002-second-thing.md", body)
+    write(
+        repo,
+        "docs/adr/README.md",
+        README_HEAD
+        + ROW.format(n="0001", slug="first", title="First")
+        + "\n"
+        + ROW.format(n="0002", slug="second-thing", title="Second thing")
+        + "\n",
+    )
+    git(repo, "add", "-A")
+
+    code, out = run_check(repo)
+    assert code == 1
+    assert "is a RESTORE, but not of the bytes" in out
+
+
+def test_the_refusal_never_builds_a_SHELL_COMMAND_from_the_staged_path(repo: Path) -> None:
+    """A filename is attacker-influenceable, and this gate's deny text is read by an agent that acts.
+
+    ***FOLDING IS NOT ESCAPING, AND AN EARLIER DRAFT CONFLATED THEM.*** `_safe_for_message` exists to
+    stop a value forging a SECOND remedy block (BACKLOG #1040) -- it strips control characters. It does
+    NOT quote, so `$( )`, backticks and `;` survive it intact. The draft printed
+    `git checkout $(git rev-list -1 origin/main -- <path>)^ -- <path>` with the staged path spliced in,
+    and `ADR_FILE` admits `[^/]+` before `.md`, so a crafted filename put a live command substitution
+    inside a block the gate tells a reader to run.
+
+    Pinned as an ABSENCE of the construction rather than a property of one filename: the remedy must
+    not echo the staged path at all.
+    """
+    lose_adr_0002(repo)
+    hostile = "docs/adr/0002-second$(id)`whoami`;echo.md"
+    write(repo, hostile, "# 0002 — Second\n\nDifferent.\n")
+    restore_the_index_row(repo)
+    git(repo, "add", "-A")
+
+    code, out = run_check(repo)
+    assert code == 1
+    # The refusal fired on the number, so the hostile basename must not appear in the remedy at all.
+    assert "$(id)" not in out
+    assert "`whoami`" not in out
+    assert "git checkout $(" not in out
+
+
+def test_a_TRUNCATED_history_refuses_with_its_own_text_rather_than_guessing(repo: Path) -> None:
+    """A shallow clone cannot tell a restore from an invention, and must say so instead of choosing.
+
+    ***AN EMPTY RESULT SET IS TWO DIFFERENT ANSWERS.*** Past a graft boundary `rev-list` reports no
+    commits and exits 0, which is byte-identical to "the base never held this number". Answering the
+    second on evidence for neither is how a genuine restore would have been steered into `alloc.ps1`
+    -- the number-burn this whole carve-out exists to stop, reached through its own blind spot.
+
+    Measured on a managed worktree of this repository: `--is-shallow-repository` is true and only 900
+    commits are reachable from origin/main, so this is the live shape here, not a contrived one.
+    """
+    lose_adr_0002(repo)
+    # Graft the history away: the ADR's commits become unreachable, the tip does not move.
+    tip = git_read(repo, "rev-parse", "HEAD").strip()
+    (repo / ".git" / "shallow").write_text(tip + "\n", encoding="utf-8")
+    write(repo, "docs/adr/0002-second.md", "# 0002 — Second\n\nThe decision.\n")
+    restore_the_index_row(repo)
+    git(repo, "add", "-A")
+
+    code, out = run_check(repo)
+    assert code == 1
+    assert "TRUNCATED" in out
+    assert "--deepen" in out
+    # It must not assert the base never held the number, which it cannot see.
+    assert "is a RESTORE, but not of the bytes" not in out
+
+
+def test_the_history_walk_is_BOUNDED_and_the_bound_is_reported(repo: Path) -> None:
+    """The walk is capped, so past the cap a negative is ignorance -- and must not be worded as fact.
+
+    Without this the bound is unpinned in both directions: lowering RESTORE_HISTORY_DEPTH to 0 leaves
+    every other arm green except the two happy paths, and nothing would notice the refusal text quietly
+    starting to claim "matches no blob its own path held" about revisions it never read.
+    """
+    source = CHECK.read_text(encoding="utf-8")
+    m = re.search(r"^RESTORE_HISTORY_DEPTH = (\d+)$", source, re.M)
+    assert m, "the bound must stay a named constant, not an inline literal"
+    assert int(m.group(1)) > 0, "a bound of 0 silently disables the carve-out"
+
+    # At a bound of 1 the walk saturates on a path with two revisions, so it must report TRUNCATED
+    # rather than deny. Run against a patched copy so the real constant is not the thing under test.
+    lose_adr_0002(repo)
+    write(repo, "docs/adr/0002-second.md", "# 0002 — Second\n\nThe decision.\n")
+    restore_the_index_row(repo)
+    git(repo, "add", "-A")
+    patched = repo / "ledger_check_bounded.py"
+    patched.write_text(
+        re.sub(r"^RESTORE_HISTORY_DEPTH = \d+$", "RESTORE_HISTORY_DEPTH = 1", source, flags=re.M),
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [sys.executable, str(patched)], cwd=repo, capture_output=True, text=True, check=False
+    )
+    assert proc.returncode == 1
+    assert "TRUNCATED" in proc.stdout + proc.stderr
+
+
+def test_a_number_the_base_NEVER_held_is_still_refused_unallocated(repo: Path) -> None:
+    """The third mutation, and the one that proves the carve-out did not widen into the ordinary case.
+
+    0003 was never on the base at all, so no history read can excuse it and the ownership rule must
+    still bite with its ORIGINAL text. This is the arm that fails first if the predicate is ever
+    loosened from "these bytes at this path" to "this number looks historical".
+    """
+    lose_adr_0002(repo)
+    write(repo, "docs/adr/0003-third.md", "# 0003 — Third\n")
+    write(
+        repo,
+        "docs/adr/README.md",
+        README_HEAD
+        + ROW.format(n="0001", slug="first", title="First")
+        + "\n"
+        + ROW.format(n="0003", slug="third", title="Third")
+        + "\n",
+    )
+    git(repo, "add", "-A")
+
+    code, out = run_check(repo)
+    assert code == 1
+    assert "not allocated to this worktree" in out
+    assert "not with the bytes" not in out
+
+
+def test_a_number_still_ON_the_base_is_a_collision_not_a_restore(repo: Path) -> None:
+    """The carve-out is unreachable while the base still carries the number, and must stay so.
+
+    ***IT NEEDS AN INPUT BOTH RULES WOULD ACCEPT, AND TWO EARLIER DRAFTS DID NOT PRODUCE ONE.*** The
+    first staged `0001-first-again.md`, a path with no history, so the carve-out's PATH anchor refused
+    it whatever the order was. The second re-added the base's own declared file, which the collision
+    rule correctly ALLOWS as the file its index row already names -- so neither could detect the
+    reordering it claimed to pin.
+
+    The discriminating input is a SECOND file at a live number, undeclared by its row, whose path and
+    bytes the base's history does carry. The collision rule must refuse it; the carve-out, if it were
+    ever consulted first, would grant it. A restore door that opens on a LIVE number is the original
+    defect with a new name.
+    """
+    alt = "# 0001 — First, alternate take\n"
+    write(repo, "docs/adr/0001-alt.md", alt)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "a second file under 0001")
+    git(repo, "rm", "-q", "docs/adr/0001-alt.md")
+    git(repo, "commit", "-qm", "drop the alternate")
+    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    git(repo, "checkout", "-q", "-b", "readd-0001-alt")
+    write(repo, "docs/adr/0001-alt.md", alt)
+    git(repo, "add", "-A")
+
+    # The number is LIVE on the base, and the staged bytes are ones its own path once carried --
+    # i.e. the carve-out's condition is satisfied and must not be reached.
+    assert "0001-first.md" in git_read(
+        repo, "ls-tree", "--name-only", "refs/remotes/origin/main", "docs/adr/"
+    ), "the base must still carry 0001, or this is not the collision case"
+
+    code, out = run_check(repo)
+    assert code == 1
+    assert "ADR 0001 already exists" in out
+    assert "is a RESTORE" not in out
+
+
+def test_a_revert_of_the_commit_that_dropped_an_adr_is_committable(repo: Path) -> None:
+    """The likeliest real shape, staged by git itself rather than by this test.
+
+    `git revert` re-adds the file with the parent's bytes, which is a restore by construction -- and
+    it is an ADD with no MERGE_HEAD, so the merge-parent carve-out cannot reach it. Built through the
+    real verb because a hand-written equivalent would be testing this file's idea of a revert.
+    """
+    lose_adr_0002(repo)
+    dropped = git_read(repo, "rev-parse", "refs/remotes/origin/main").strip()
+    git(repo, "revert", "--no-commit", dropped)
+    staged = git_read(repo, "diff", "--cached", "--name-status")
+    assert "A\tdocs/adr/0002-second.md" in staged, staged
+
+    code, out = run_check(repo)
+    assert code == 0, out
+
+
+def test_the_restore_carve_out_does_not_run_in_CI(repo: Path) -> None:
+    """CI never reaches it, so a shallow runner cannot be asked a question it has no history for.
+
+    The carve-out sits inside the `not self.ci` ownership arm that CI already skips (a fresh runner
+    has no allocation store, so every ADR would read as unowned). Pinned because the reasoning behind
+    added_files() -- shallow checkouts, `fatal: no merge base` -- would apply to a history walk if one
+    ever ran there, and the reason it does not is a line of code, not a property of git.
+
+    ***IT STAGES THE CASE THE LOCAL GATE REFUSES, AND THAT IS WHAT MAKES IT DISCRIMINATE.*** Asserting
+    that CI accepts a VALID restore proves nothing -- CI accepts that with the carve-out disabled too,
+    which a mutation run confirmed. Restoring with the WRONG bytes separates them: the local gate
+    refuses it (see the DIFFERENT_bytes arm), so a green CI here can only mean CI consulted neither
+    the ownership rule nor the carve-out.
+    """
+    lose_adr_0002(repo)
+    write(repo, "docs/adr/0002-second.md", "# 0002 — Second\n\nA DIFFERENT decision.\n")
+    restore_the_index_row(repo)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "restore ADR 0002")
+
+    code, out = run_check(repo, "--ci")
+    assert code == 0, out
+
+
 # ----------------------------------------------------------------- the dropped-row defect (0077/0079/0080)
 
 
