@@ -72,6 +72,13 @@ class NoLoss:
     backlog: int
     at_least_once_redeliveries: int
     detail: str
+    #: Most of what the run offered was never replied to, so it is a weak MEASUREMENT even when
+    #: nothing it confirmed was lost. It decides no verdict (BACKLOG #1866) — it exists so `render`
+    #: can surface the note on a PASSING run without matching on `detail`'s wording, which would
+    #: also have surfaced the benign per-run stranding note and made an indented line under
+    #: `no-loss: OK` the normal shape of a contended CI log. Defaulted, so every existing positional
+    #: construction is unchanged.
+    heavily_stranded: bool = False
 
 
 @dataclass(frozen=True)
@@ -322,7 +329,15 @@ class RunReport:
             f"engine_written={nl.engine_written} sink_received={nl.sink_received} "
             f"backlog={nl.backlog} at_least_once={nl.at_least_once_redeliveries}"
         )
-        if not nl.ok:
+        # `if not nl.ok` was right while every detail line meant a failure. The heavily-stranded
+        # note now fires precisely on runs that PASS (BACKLOG #1866), so the verdict alone would
+        # keep the one reader-facing signal about a poorly confirmed run out of the console and the
+        # CI log. Widen to that ONE case and no further: testing `detail` against the all-clear
+        # string instead would also print the benign per-run stranding note, which fires on
+        # essentially every contended run, making an indented line under `no-loss: OK` the normal
+        # shape — and any operator or script reading a detail line as a failure signal would then
+        # false-positive on healthy runs.
+        if not nl.ok or nl.heavily_stranded:
             lines.append(f"         {nl.detail}")
         lines.append("")
         lines.append("SLOs:")
@@ -371,9 +386,12 @@ def build_report(
             slos.extend(_phase_slos(rec, profile.slo_for(rec.phase)))
 
     # Unconfirmed-send budget = the run's total client connection count (one pool of pool_size per
-    # target). It is only the small-run FLOOR under `_reconcile`'s half-the-run excusal fraction —
-    # NOT "~one stranded in-flight frame per connection", a model retired because this sender's
-    # in-flight deque is unbounded. `_reconcile` requires `read >= sent // 2` regardless of it.
+    # target). IT NO LONGER BOUNDS ANY VERDICT — it is the small-run floor under a stranding width
+    # that `_reconcile` now only REPORTS (BACKLOG #1866), so changing `pool_size` or the target count
+    # changes when a note prints and nothing else. It is NOT "~one stranded in-flight frame per
+    # connection" either, a model retired because this sender's in-flight deque is unbounded.
+    # Whatever this value is, `_reconcile` still requires that every message the engine replied to
+    # has an ingress row, and still fails a run that offered messages and got no reply at all.
     no_loss = _reconcile(
         final_counters,
         poller,
@@ -429,6 +447,11 @@ def _phase_report(rec: PhaseRecord) -> PhaseReport:
 # blip exceeds any sane rate threshold, so the check would gate on noise rather than behavior.
 _RATE_SLO_MIN_SENT = 200
 
+# The no-loss detail when nothing at all is worth saying. Named so THIS module states it once; the
+# connscale and estate copies still spell the same literal out, and nothing pins the three equal, so
+# do not read this constant as single-sourcing the string across the reconcile copies.
+_NO_LOSS_ALL_CLEAR = "read>=sent, sink_received>=written, backlog drained"
+
 
 def _phase_slos(rec: PhaseRecord, slo: Slo) -> list[SloCheck]:
     p = rec.phase
@@ -472,14 +495,21 @@ def _phase_slos(rec: PhaseRecord, slo: Slo) -> list[SloCheck]:
         # a single transport blip (one reconnect's failed open / stranded in-flights — client-side
         # noise, not loss) is >1%, so any sane threshold flips on one event. Below the floor the check
         # is not emitted at all (no verdict beats a noise-driven one); real load profiles run thousands
-        # of messages per phase and keep the gate. A mass reset/timeout FLOOD is not un-gated by this
-        # floor on the runs that need it: the reconcile fails zero_loss when timeouts exceed its
-        # stranding budget, or when intake drops below its unconditional `read >= sent // 2` floor —
-        # and on a CI smoke the whole run IS that phase. Mind the scope difference, though: the
-        # reconcile is computed ONCE over the run's final counters, so a flood confined to a sub-floor
-        # MEASURED phase inside a large multi-phase run is gated by neither. No shipped profile has
-        # such a phase today (reference's only sub-floor phase is `warmup`, which is unmeasured), so
-        # that is a known scope gap rather than a live hole. (max_nak_rate below deliberately has no
+        # of messages per phase and keep the gate.
+        #
+        # WHAT BACKS THIS SUPPRESSION IS NARROWER THAN IT USED TO BE, AND SAYING SO IS THE POINT.
+        # This comment used to answer "then what catches a mass reset/timeout FLOOD below the floor?"
+        # with "the reconcile fails zero_loss when timeouts exceed its stranding budget". That
+        # sentence is no longer true of this copy (BACKLOG #1866 — `_reconcile` carries the reasoning
+        # and the full list of what it gives up; it is not repeated here). The consequence for THIS
+        # suppression is the part that belongs here: **a PARTIAL flood on a sub-floor phase is now
+        # gated by nothing.** That is a real gap opened deliberately, in exchange for a gate that
+        # does not red on host speed, and it is named rather than left implied.
+        #
+        # Mind the scope difference too: the reconcile is computed ONCE over the run's final
+        # counters, so a flood confined to a sub-floor MEASURED phase inside a large multi-phase run
+        # was already gated by neither. No shipped profile has such a phase today (reference's only
+        # sub-floor phase is `warmup`, which is unmeasured). (max_nak_rate below deliberately has no
         # floor — a NAK is a deterministic engine verdict, not transport noise, so even one is signal.)
         er = errs / sent
         out.append(
@@ -581,82 +611,137 @@ def _reconcile(
     # ANY FURTHER shortfall is a real, confirmed-then-lost message and still fails. With timeouts == 0
     # (every healthy run) this is exactly as strict as read >= sent.
     #
-    # BUT the excusal must never go VACUOUS: with `timeouts == sent` an unbounded excusal degrades the
-    # intake bound to `read >= 0`, and a total ACK-path regression would pass as zero-loss.
+    # THE EXCUSAL IS NOW UNCONDITIONAL, AND A STRANDING COUNT NO LONGER FAILS A RUN. It used to be
+    # cancelled wholesale past a budget of `max(unconfirmed_budget, 3 * sent // 4)`, on the ground
+    # that an unbounded excusal degrades the intake bound to `read >= 0` and a total ACK-path
+    # regression would pass as zero-loss. The ground was right; the instrument was a third fraction
+    # of the OFFERED volume, and it shares the defect that ejected two pull requests from the merge
+    # queue (see `ack_path_dead` below for the runs). Windows-2025 `merge_group` run 35657866239
+    # reported 79 timeouts of 90 sent — 88 percent — against this budget of 67, so retiring only the
+    # intake floor would have left that pull request ejected by the next detector along.
     #
-    # That cap used to be `unconfirmed_budget` alone, modelled as "~one stranded in-flight frame per
-    # connection". That model does not hold for THIS sender: `MllpConnection._inflight` is an UNBOUNDED
-    # deque — an open-loop phase paces sends by the offered rate, not by an ACK slot — so what is
-    # genuinely in flight at a teardown is ~rate x ACK-latency, which is a share of the run and has
-    # nothing to do with the connection count. On a contended runner that mismodelling false-failed a
-    # zero-loss run (14 stranded of 90 against a budget of 4) and red the required windows-2025 leg.
+    # It is not needed for its stated purpose. `sent == acked + nak + timeouts` (every send resolves
+    # exactly once — pinned in tests/test_load_runner.py), so with the excusal unconditional and
+    # clamped, `read_short` is exactly `acked + nak - read`: EVERY MESSAGE THE ENGINE REPLIED TO MUST
+    # HAVE AN INGRESS ROW. That is never vacuous — it is exact — and it is an engine invariant rather
+    # than a tuned number, because both reply paths commit first and build the reply second: an
+    # accept-ACK follows `store.enqueue_ingress`, a NAK follows `store.record_received`
+    # (`messagefoundry/pipeline/wiring_runner.py`). So it fails a confirmed-then-lost message at
+    # magnitude ONE at any host speed, which no budget on `timeouts` ever did.
     #
-    # So bound it as a FRACTION of the run, floored by the caller's connection count for tiny runs:
-    # at most THREE QUARTERS of the sends may be excused.
+    # `timeouts > sent` IS STILL VACUOUS HERE, AND THE CLAMP BELOW DOES NOT FIX IT — do not read it
+    # as doing so. Clamped, `read_short` is `-read`; unclamped it is `sent - timeouts - read`; both
+    # are <= 0 unconditionally, so the clamp only keeps the reported "confirmed sent" figure from
+    # going negative. That state is a COUNTER BUG rather than an engine fault — a send resolves
+    # exactly once — and what actually catches it is the identity `acked + timeouts == sent`
+    # asserted in tests/test_load_runner.py, plus `ack_path_dead` below whenever the flood is total.
     #
-    # THAT FRACTION WAS HALF, AND HALF WAS THE BUG. It was sized when the worst teardown stranding on
-    # record was 14/90 (~16%), making half "~3x the worst seen". windows-2025 has since produced
-    # 46/90 (~51%) on a run that lost NOTHING — 104 written, 104 received at the sink, backlog drained
-    # in 4.7s of a 30s bound — and failed `main` at 9b03057f by ONE message over the budget of 45.
-    # A threshold sitting on top of the healthy distribution's centre is a coin flip, not a detector
-    # (same defect as the ubuntu step cap in #104: 775s against a 780s bound).
+    # The remaining half of the ground, a total ACK-path regression, is caught by `ack_path_dead`
+    # below, on its signature. That is strictly better coverage: the budget could only ever catch a
+    # dead ACK path while the connection-count arm did not dominate, and this file recorded that as a
+    # known open gap ("once `unconfirmed_budget >= sent` the max() forgives even a 100%-dead ACK
+    # path"). `tests/test_harness_reconcile.py` carries the control that closes it.
     #
-    # Three quarters is chosen, not rounded up to: it is ~1.5x the worst healthy value now on record
-    # (51%) while a dead ACK path strands ~100% and still blows it by a wide margin. It also makes
-    # this budget AGREE with the sibling detector in tests/test_load_runner.py, which requires
-    # `acked >= sent // 4` — i.e. tolerates up to 75% stranding. Those two encode the same tolerance
-    # and previously contradicted each other: the test was tuned for "~half is healthy" while this
-    # budget failed at half + 1, so the tuning never applied to the path that actually fired.
-    # Re-check this fraction if observed stranding climbs again; record the observation here.
-    #
-    # A dead ACK path (`timeouts == sent`)
-    # blows that cap and fails loudly — but ONLY while the connection-count floor does not dominate:
-    # once `unconfirmed_budget >= sent` the max() forgives even a 100%-dead ACK path, and the intake
-    # floor below cannot catch that one either, because its signature is a HIGH read with no ACKs.
-    # Closing that half needs the floor ARM of the budget bounded; the floor below closes the INTAKE
-    # half only. Known gap, deliberately not fixed here — it would re-open PR #17's de-flake.
-    #
-    # That cap ALONE does NOT deliver `read >= sent // 2`, and the comment here used to claim it did.
-    # `max()` takes the connection count as a FLOOR, not a ceiling, and every call site passes a
-    # connection count (connscale and estate pass the step's `count` verbatim; this one passes
-    # pool_size x targets). A short, low-rate step sends barely more than one message per connection,
-    # so the count WINS the max() and the bound degrades to `read >= sent - connections` — at
-    # connscale-smoke's N=100 cell (~105 sends, budget max(100, 52) = 100) that is `read >= 5`, the
-    # very vacuity the cap exists to prevent. Nothing clamps `excused` to `sent` either, so
-    # `timeouts > sent` drives it to `read >= 0` outright.
-    #
-    # Hence the guarantee is enforced SEPARATELY below, as an intake floor the excusal cannot lower.
-    unconfirmed = counters.timeouts
+    # The budget survives as REPORTING ONLY. A heavily stranded run is worth saying out loud — it is
+    # a poorly confirmed measurement even when it lost nothing — so the width is still computed and
+    # still named in the detail. It no longer decides `ok`.
+    # `unconfirmed` is the CLAMPED count and is the only one used from here down — for the bound, for
+    # the width test and for both notes. An earlier draft clamped it for the arithmetic and then
+    # tested and printed `counters.timeouts` beside it, so in the `timeouts > sent` counter-bug state
+    # the two notes reported different numbers of "unconfirmed sends" in one report.
+    unconfirmed = min(counters.timeouts, sent)
     budget = max(unconfirmed_budget, 3 * sent // 4)
-    over_budget = unconfirmed > budget
-    # Deliberately all-or-nothing, NOT clamped to the budget: past the budget this is a systemic
-    # fault, and a flood masking a real shortfall must report the whole shortfall rather than excuse
-    # the first `budget` of it (tests/test_harness_reconcile.py pins that — "with the flood masking a
-    # real shortfall, nothing is excused: the loss is reported too"). The cliff that produces is only
-    # reachable once `over_budget` is already true, i.e. once the run has failed anyway.
-    excused = 0 if over_budget else unconfirmed
-    read_short = sent - excused - read
-    # The anti-vacuity guarantee, enforced independently of the excusal AND of `tolerance` — the
-    # tolerance is an operator knob on the SHORTFALL, not a licence to lower the floor that makes
-    # "at least half the run was demonstrably ingested" true at every call site. `sent // 2` is 0 at
-    # sent == 0 (a run that sent nothing clears it trivially) and rounds DOWN on an odd `sent`, so
-    # the floor is never stricter than the documented bound.
-    floor_short = sent // 2 - read
+    heavily_stranded = unconfirmed > budget
+    read_short = sent - unconfirmed - read
+    # THE ANTI-VACUITY GUARD, AND IT IS A SIGNATURE RATHER THAN A FRACTION OF THE OFFERED VOLUME.
+    # (BACKLOG #1866.)
+    #
+    # It was an intake floor, `read >= sent // 2`, and it is the detector that ejected PR 1233 from
+    # the merge queue (windows-2025 `merge_group` run 35656074083: `engine_read 36 < intake floor
+    # 45`, on a run whose every delivery arrived — fan-out 2 over 36 read, 72 received). Its sibling
+    # in tests/test_load_runner.py, `acked >= sent // 4`, ejected PR 1283 twenty minutes later
+    # (run 35657866239: 90 sent / 11 acked / 79 timeouts), and the stranding budget above was the
+    # third of the same family.
+    #
+    # THE TRIGGER IS THE VARIABLE, AND THE MECHANISM BEHIND IT IS NOT ESTABLISHED. Both heads were
+    # green on the same leg as a `pull_request` event. BACKLOG #1866 carries the run split and is
+    # the one place it is recorded; it is a live count that decays, so it is not restated here.
+    # What is known of the difference is only that the queue launches entries in BATCHES — hosted
+    # runners are one VM per job, so a shared-runner story is NOT the explanation and must not be
+    # written down as one. Nothing below depends on a mechanism: these are invariants that hold at
+    # any host speed, which is the whole point of replacing thresholds that did not.
+    #
+    # READ THIS BEFORE TRUSTING A GREEN FROM THIS FUNCTION. `sample_until_reconciled`
+    # (harness/load/enginepoll.py) stops polling on `read >= sent - timeouts` AND
+    # `sink_received >= written` AND an empty pipeline — which is `read_ok` AND `deliver_ok` AND
+    # `drained`, the same three arms rearranged. So ON A RUN WHOSE SAMPLER SETTLED, all three hold
+    # by construction and `ok` is decided by `ack_path_dead` alone; the three only carry information
+    # on a run that exhausted `drain_timeout_s` without settling.
+    #
+    # The coupling is not new — the sampler has always stopped on the reconcile's own condition, and
+    # `read_short` has always been that condition. WHAT IS NEW is that the retired floor was the one
+    # arm the sampler could NOT satisfy, so removing it left `ack_path_dead` as the only independent
+    # bit. The worked case: an engine that ingests 1 of 90 sends, ACKs that 1 and strands 89 settles
+    # immediately (1 >= 90 - 89), reads clean on every arm, and passes. That is the documented
+    # give-up — 89 unconfirmed sends are not provable loss — but it is worth seeing stated as "the
+    # gate went green on a run that moved one message" rather than inferred from three inequalities.
+    #
+    # The failing side IS armed, and it is measured rather than argued: sabotaging the ingress
+    # commit for ONE of 90 accept-ACKed messages makes the poll exhaust its timeout and the run red
+    # with `lost 1 on intake`. The cost is that such a run takes the full `drain_timeout_s` to fail.
+    #
+    # With `nak == 0` the floor reduces to `acked >= sent // 2`: how much of the OFFERED volume this
+    # host confirmed, which is a throughput reading wearing a loss label. It added nothing to the
+    # exact bound `read_short` already carries, and what it GESTURED at — a dead ACK path — it could
+    # not catch, because that signature is a HIGH read with no ACKs, which clears a floor on `read`
+    # by construction. This file recorded that as a known open gap. Close it on the signature
+    # instead, which costs nothing in host-independence: an engine that demonstrably ingested
+    # messages while the sender saw NOT ONE reply has a dead ACK path at any speed. A NAK counts as
+    # a reply — it is itself proof the reply path runs — so the predicate is `acked + nak == 0`, not
+    # `acked == 0`, and an engine rejecting every message is not reported as a dead one.
+    #
+    # It also has margin, which is the property `sent // 2` and `sent // 4` both lacked: teardown
+    # weather never reaches zero replies, and the worst merge-group run on record still confirmed 11
+    # of 90, whereas a dead ACK path lands on exactly zero whatever the host is doing.
+    #
+    # WHAT THIS NO LONGER CATCHES, stated rather than left to be discovered: an UNCONFIRMED send —
+    # one counted at write-buffer time whose reply never arrived before the connection closed — that
+    # never reached the engine at all. It is now excused at every magnitude, where the floor failed
+    # the run once `read` fell under half of `sent`. Nothing here can tell such a send from one whose
+    # frame never left the socket, so the old trip was a coin flip on host speed rather than a
+    # detection. A PARTIAL reply-path regression (the engine replying to some messages it commits and
+    # silently not to others) is the same shape and is given up with it. Both remain visible as a
+    # heavily-stranded note, and the drain and rate SLOs are where a throughput verdict belongs.
+    # No `read > 0` gate, and that omission is deliberate. Gating on it left a TOTAL BLACKOUT green:
+    # a run that offered messages while the engine ingested nothing, replied to nothing and
+    # delivered nothing satisfies `read_short` (everything is excused), `deliver_short` (0 - 0) and
+    # `drained` (an empty pipeline), so `read > 0` was the only thing standing between "the engine
+    # did absolutely nothing" and a clean zero-loss verdict — and it is false in exactly that case.
+    # `sent > 0` alone is the honest guard: a run that offered nothing is not judged on its replies.
+    #
+    # NO SAMPLE FLOOR, WHICH IS A BEHAVIOUR CHANGE ON VERY SMALL RUNS — say it rather than discover
+    # it. At `sent == 1` with the single reply stranded at teardown, the old code passed (the
+    # connection-count budget covered it and `1 // 2 - 0 <= 0` cleared the floor) and this fails.
+    # The margin argument for zero replies is a claim about a ~90-message run and does not carry to
+    # a handful of sends. A floor is deliberately NOT added: it would be one more tuned number in a
+    # function whose defect was tuned numbers, and every profile this copy serves offers two orders
+    # of magnitude more than that. Revisit if a genuinely tiny load profile ever ships.
+    ack_path_dead = sent > 0 and counters.acked + counters.nak == 0
     deliver_short = written - sink_received
     read_ok = read_short <= tolerance
-    floor_ok = floor_short <= 0
     deliver_ok = deliver_short <= tolerance
     drained = backlog == 0
-    ok = read_ok and floor_ok and deliver_ok and drained and not over_budget
+    ok = read_ok and deliver_ok and drained and not ack_path_dead
     parts: list[str] = []
     if not read_ok:
         parts.append(
-            f"engine_read {read} < confirmed sent {sent - excused} (lost {read_short} on intake)"
+            f"engine_read {read} < confirmed sent {sent - unconfirmed} (lost {read_short} on intake)"
         )
-    if not floor_ok:
+    if ack_path_dead:
         parts.append(
-            f"engine_read {read} < intake floor {sent // 2} (half of {sent} sent) — "
-            f"the unconfirmed-send excusal cannot lower this floor"
+            f"{sent} sent and the sender saw no reply at all (acked 0, nak 0, engine_read {read}) "
+            f"— a dead ACK path: no accept-ACK and no NAK came back; no stranding width and no "
+            f"tolerance may excuse this"
         )
     if not deliver_ok:
         parts.append(
@@ -664,11 +749,23 @@ def _reconcile(
         )
     if not drained:
         parts.append(f"backlog {backlog} not drained")
-    if over_budget:
+    if heavily_stranded:
+        # A NOTE, not a verdict: this no longer decides `ok`. It says the run is poorly confirmed —
+        # most of what it offered was never replied to — which makes it a weak MEASUREMENT even
+        # when nothing it confirmed was lost.
+        #
+        # The "everything replied to was accounted for" clause is conditioned on `read_ok`, because
+        # a flood can coexist with a real confirmed loss: printed unconditionally it contradicted
+        # the shortfall clause in the same string, on the same line, for the same run.
+        accounted = (
+            "every message the engine replied to was accounted for"
+            if read_ok
+            else "and a confirmed message is missing besides — see the shortfall above"
+        )
         parts.append(
-            f"{unconfirmed} unconfirmed sends exceed the stranding budget "
-            f"({budget} = max(connections, three quarters of the run)) — systemic no-ACK fault "
-            f"(possible accepted-and-dropped); nothing excused"
+            f"{counters.timeouts} unconfirmed sends exceed the stranding budget "
+            f"({budget} = max(connections, three quarters of the run)) — a poorly confirmed run, "
+            f"not a loss verdict; {accounted}"
         )
     elif unconfirmed > 0 and read < sent:
         # Honest reporting either way: the gap is attributed to unconfirmed sends, not silently absorbed.
@@ -676,8 +773,10 @@ def _reconcile(
             f"{unconfirmed} unconfirmed send(s) (no ACK before connection close) "
             f"not observed at intake — not counted as loss"
         )
-    detail = "; ".join(parts) if parts else "read>=sent, sink_received>=written, backlog drained"
-    return NoLoss(ok, sent, read, written, sink_received, backlog, at_least_once, detail)
+    detail = "; ".join(parts) if parts else _NO_LOSS_ALL_CLEAR
+    return NoLoss(
+        ok, sent, read, written, sink_received, backlog, at_least_once, detail, heavily_stranded
+    )
 
 
 def _engine_summary(
