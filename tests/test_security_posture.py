@@ -1245,12 +1245,26 @@ def test_a_scanner_fault_reds_the_job_and_claims_nothing(tmp_path: Path) -> None
 
 
 def test_a_scan_step_that_dies_early_is_not_reported_clean(tmp_path: Path) -> None:
-    """The sentinel case. Kill the scan step before it writes anything; the reporter must not guess.
+    """Kill the scan step before it writes anything; the reporter must not guess.
 
-    `continue-on-error` rewrites that death to success, so without the sentinel the reporter would
-    see no findings and write a clean result for a scan that never finished.
+    Also the shape the reporter sees when an earlier step failed and the scan never ran at all.
     """
     _, report_code, summary = _scan_then_report(tmp_path, "clean", scan_prelude="set -e\nfalse\n")
     assert report_code != 0
-    assert "stopped before it recorded a result" in summary
+    assert "The scan did not finish" in summary
+    assert "no fixable" not in summary
+
+
+def test_a_scan_step_that_dies_after_recording_status_is_not_reported_clean(tmp_path: Path) -> None:
+    """The case the sentinel exists for, and the one the test above cannot reach.
+
+    The scan step records a status of 0 and THEN dies printing the report. Status alone says clean;
+    only the missing sentinel says the step never finished. Dropping the reporter's sentinel check
+    reds this test and no other.
+    """
+    _, report_code, summary = _scan_then_report(
+        tmp_path, "clean", scan_prelude="cat() { return 1; }\n"
+    )
+    assert report_code != 0
+    assert "The scan did not finish" in summary
     assert "no fixable" not in summary

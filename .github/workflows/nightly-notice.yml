@@ -171,7 +171,9 @@ jobs:
               ;;
             "Security")
               DETAIL="Here that covers the daily dependency audits and the released-line audit, whose
-          subject is a published release that no pull request can change."
+          subject is a published release that no pull request can change. It also covers the
+          container-image scan (\`trivy\`), which reds only when the scan produced no verdict; a
+          vulnerability it finds stays green and is listed in that job's summary."
               ;;
             "DAST")
               DETAIL="Here that covers the entire workflow, which carries no \`pull_request\` trigger

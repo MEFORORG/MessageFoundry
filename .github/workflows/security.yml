@@ -660,15 +660,16 @@ jobs:
             --severity HIGH,CRITICAL --ignore-unfixed --exit-code 5 \
             --output "${report}" \
             messagefoundry:scan || status=$?
+          # Handed on AS SOON AS IT IS KNOWN, before anything else in this step can fail.
+          echo "MEFOR_TRIVY_REPORT=${report}" >> "${GITHUB_ENV}"
+          echo "MEFOR_TRIVY_STATUS=${status}" >> "${GITHUB_ENV}"
           if [ -f "${report}" ]; then
             cat "${report}"
           fi
-          echo "MEFOR_TRIVY_REPORT=${report}" >> "${GITHUB_ENV}"
-          echo "MEFOR_TRIVY_STATUS=${status}" >> "${GITHUB_ENV}"
-          # WRITTEN LAST, AND THE ORDER IS THE POINT. Anything above can die under `set -e`, and this
-          # step's `continue-on-error` would rewrite that death to success. Without the sentinel the
-          # reporter could not tell "scanned, found nothing" from "died before it could say", and
-          # would write a clean result onto the run page for a scan that never finished.
+          # WRITTEN LAST, AND THE ORDER IS THE POINT. The status above is already recorded, so if the
+          # print dies under `set -e` a status of 0 is on record for a step that did not finish, and
+          # this step's `continue-on-error` rewrites that death to success. The reporter claims a
+          # verdict only with this sentinel present, so that case reads as no verdict, not as clean.
           echo "MEFOR_TRIVY_COMPLETE=1" >> "${GITHUB_ENV}"
           # Kept as honest step metadata, NOT as the reporting channel: `continue-on-error` hides it.
           if [ "${status}" -ne 0 ]; then
@@ -682,7 +683,11 @@ jobs:
         #
         # The summary is a PULL channel: it renders on the run page without opening the log. A
         # finding does not red the job, so no issue is opened for one.
-        if: always()
+        #
+        # `!cancelled()` rather than `always()`: it still runs after an earlier step FAILED, so a
+        # broken build or install says so here instead of leaving an empty summary, but a cancelled
+        # run is not reported as a scan fault.
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
           complete="${MEFOR_TRIVY_COMPLETE:-}"
@@ -709,7 +714,8 @@ jobs:
                 echo "## trivy: the scan produced no verdict"
                 echo
                 if [ -z "${complete}" ]; then
-                  echo "The scan step stopped before it recorded a result."
+                  echo "The scan did not finish: it failed part-way, or an earlier step (checkout, image"
+                  echo "build, Trivy install, SBOM) failed and it never ran. See the first red step."
                 else
                   echo "Trivy exited ${status}, which is neither 0 (clean) nor 5 (finding)."
                 fi
@@ -722,6 +728,11 @@ jobs:
               # Bounded: the job summary is capped at 1 MiB per step.
               head -n 400 "${report}"
               echo '```'
+              lines=$(wc -l < "${report}")
+              if [ "${lines}" -gt 400 ]; then
+                echo
+                echo "Truncated: showing 400 of ${lines} lines. The full table is in the scan step's log."
+              fi
             fi
           } >> "${GITHUB_STEP_SUMMARY}"
           case "${verdict}" in
