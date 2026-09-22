@@ -3652,8 +3652,8 @@ jobs:
       # included, and docker-smoke is the one job this sentence would be false for.
       #
       # THE TWO HALVES DESCRIBE DIFFERENT EVENTS, so neither generalises. Path-gating is a
-      # pull_request property; running whatever `changes` emits is a merge_group one. The fact is
-      # stated once, at the `changes`
+      # pull_request property; running whatever `changes` emits is a merge_group one. WHAT THE QUEUE
+      # GATES ON is stated once, at the `changes`
       # job's "Remaining cases" comment; BACKLOG #1830 measured it and carries the fix. Nothing about
       # this roll-up is wrong -- it is `if: always()` and still reports, which is what lets those five
       # be path-gated ON A PULL REQUEST at all. Only the inference "it skipped, so it did not need to
