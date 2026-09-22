@@ -1913,13 +1913,16 @@ jobs:
           # answer. "Names merge_group nowhere" ALONE is true of SIX of this file's 13 jobs -- it also
           # takes in `changes`, which has no `if:` at all, and `ci-gate`, which is `always()` and
           # reads no output of this step. Neither is decided by anything emitted here. Scanned over
-          # all 13 job blocks rather than sampled, and tests/test_ci_merge_group_gate.py pins EVERY
-          # SIDE OF THAT SCAN BY NAME -- the seven, the six and the four above -- and fails outright
-          # if either half of this predicate stops removing anything, which is the state that would
-          # make this paragraph false. That failure cannot be cleared by moving a pin, deliberately.
-          # So do not re-derive these lists by hand after adding a job or a `needs.changes.outputs`
-          # reference: run that module, then move this paragraph and its pins together. How it
-          # checks all that is stated there and not here (SDS-3.5).
+          # all 13 job blocks rather than sampled, and tests/test_ci_merge_group_gate.py pins the
+          # sides of that scan BY MEMBERSHIP, not by count: the SEVEN jobs whose own job-level or
+          # step-level `if:` names merge_group, the SIX of this paragraph, and the FOUR named above.
+          # THE COUNTS IN THIS PARAGRAPH ARE NOT WHAT IS PINNED -- that module held a count until
+          # 2026-09-22 and a count sits at six while a job key is renamed underneath it. It also
+          # fails outright if either half of this predicate stops removing anything, which is the
+          # state that would make this paragraph false, and that failure cannot be cleared by moving
+          # a pin. So do not re-derive these lists by hand after adding a job or a
+          # `needs.changes.outputs` reference: run that module, then move this paragraph and its
+          # pins together. How it checks all that is stated there and not here (SDS-3.5).
           #
           # WHETHER THAT HEAVY TIER SHOULD RUN PER QUEUE ENTRY IS A COVERAGE QUESTION THIS ARM DOES
           # NOT ANSWER. It only stops the answer being an accident. Note while re-opening it that the
