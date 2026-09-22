@@ -36,7 +36,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import pytest
 import yaml
@@ -99,8 +99,12 @@ _DECIDED_BY_THE_ARM_ALONE = {
 }
 
 #: The two jobs that satisfy the SECOND half of that predicate and not the first, which is the whole
-#: of why the wider set is wider: `changes`, which has no `if:` at all, and `ci-gate`, which is
-#: `always()` and reads no output of this step. The arm's comment in ci.yml names both.
+#: of why the wider set is wider. The arm's comment in ci.yml names both.
+#:
+#: What is CHECKED about them is that they are gated on no output of the `changes` step: that is the
+#: two pins below, read together. Why each is not -- `changes` has no `if:` at all today and
+#: `ci-gate` is `always()` -- is colour, and nothing verifies it. Do not promote it to a reason in
+#: prose somewhere else.
 _NOWHERE_AND_DECIDED_HERE_BY_NOTHING = {"changes", "ci-gate"}
 
 #: The control for `_DECIDED_BY_THE_ARM_ALONE`: every job that satisfies only that second half.
@@ -138,9 +142,83 @@ _NAMES_MERGE_GROUP_NOWHERE = {
 #: One quoted bracket index, normalised back to a dot, so `needs['changes'].outputs.code`,
 #: `needs.changes.outputs['code']` and `needs['changes']['outputs']['code']` all collapse to the one
 #: substring test in `_partition_jobs`. An Actions expression may bracket-index ANY segment of a
-#: context, so a list of the spellings to look for is a completeness claim over at least six members
-#: -- exactly what SDS-3.6 says not to maintain. Normalising asks the question once instead.
-_BRACKET_INDEX = re.compile(r"\[\s*['\"]([A-Za-z_][\w-]*)['\"]\s*\]")
+#: context, so a list of the spellings to look for is a completeness claim over an open set -- what
+#: SDS-3.6 says not to maintain. Normalising asks the question once instead.
+#:
+#: KNOWN LIMIT, STATED RATHER THAN IMPLIED, because the first draft of this line bounded the index to
+#: `[A-Za-z_][\w-]*` and so read `needs.changes.outputs['3rd']` and `['a.b']` as NOT gated -- moving
+#: the boundary while the comment above claimed there was none. The quote is captured and
+#: back-referenced so the two must match, and anything but a quote is accepted between them. What is
+#: still not read is an index that is itself an EXPRESSION, `needs[matrix.dep].outputs.code`, which
+#: no amount of string work resolves. A job spelled that way lands outside `decided`.
+_BRACKET_INDEX = re.compile(r"\[\s*(['\"])([^'\"]+)\1\s*\]")
+
+
+class _Partition(NamedTuple):
+    """How each of this file's 13 jobs falls under the two halves of the arm's predicate."""
+
+    #: Gated on an output of the `changes` step AND naming merge_group nowhere -- the arm alone
+    #: settles whether these run in the queue.
+    decided: set[str]
+    #: Naming merge_group nowhere, whatever they are gated on.
+    names_it_nowhere: set[str]
+    #: Naming merge_group in their own job-level or step-level `if:`.
+    self_gated: set[str]
+    #: Self-gated AND gated on an output. This one exists to be NON-EMPTY: it is the whole of what
+    #: the `NOT self_gated` half of the arm's predicate removes, so an empty set means that half has
+    #: stopped doing any work. `decided` versus `names_it_nowhere` measures the other half; without
+    #: this, "BOTH HALVES ARE LOAD-BEARING" was checked in one direction only.
+    self_gated_and_gated: set[str]
+
+
+def _partition_jobs(jobs: dict[str, Any]) -> _Partition:
+    """Sort a workflow's jobs under both halves of the arm's predicate, in one scan.
+
+    ONE scan, four measurements, because every pin in this module reads the same two facts about a
+    job. The pins stay separate literals -- what is shared is the detector, not a pin.
+
+    It takes the JOBS mapping rather than the parsed document so a constructed case needs no
+    workflow-shaped wrapper: a detector that is only ever pinned against the one real file is a
+    detector whose own behaviour nobody has measured.
+    `test_the_detector_reads_an_output_gate_however_it_is_spelled` is those constructed rows.
+
+    `if:` EXPRESSIONS ONLY, at job level and step level. Searching the whole job -- which an early
+    draft of the self-gated pin did -- matches comments and `run:` bodies too, so it reported the
+    `changes` job itself the moment that job gained an arm NAMING the event it gates. A gate that
+    cannot tell "decides on this event" from "mentions this event" is not measuring the thing its
+    failure message claims.
+    """
+    decided: set[str] = set()
+    names_it_nowhere: set[str] = set()
+    self_gated: set[str] = set()
+    self_gated_and_gated: set[str] = set()
+    for name, job in jobs.items():
+        # `str()` and `or []` are both load-bearing on legal YAML this file does not happen to
+        # contain: a bare `if: true` parses to a bool, and `steps:` with nothing under it parses to
+        # None. Either raises TypeError without these, taking the whole module out at collection.
+        conditions = [str(job.get("if", ""))]
+        conditions += [str(step.get("if", "")) for step in job.get("steps", []) or []]
+        # Normalised first, so one substring test reads the reference however it is spelled. ci.yml
+        # uses the dot form throughout (measured 2026-09-22: zero bracket occurrences, and no job's
+        # verdict moves under the normalisation), so this changes nothing on today's file. It is
+        # here because a bracket-spelled gate is what a job the arm DECIDES looks like while falling
+        # outside `decided`, which makes the wider pin report that the job reads no output of this
+        # step -- backwards, and backwards in the direction a reader acts on.
+        gated_on_an_output = any(
+            "needs.changes.outputs." in _BRACKET_INDEX.sub(r".\2", c) for c in conditions
+        )
+        # A substring test, so it is blind to an `if:` that is TRUE on merge_group without naming
+        # it, such as webconsole's job-level `github.event_name != 'push'`. webconsole is caught
+        # today only because its step `if:` lines name the event outright. Known limit, not widened.
+        if any("merge_group" in c for c in conditions):
+            self_gated.add(name)
+            if gated_on_an_output:
+                self_gated_and_gated.add(name)
+        else:
+            names_it_nowhere.add(name)
+            if gated_on_an_output:
+                decided.add(name)
+    return _Partition(decided, names_it_nowhere, self_gated, self_gated_and_gated)
 
 
 def _changes_step_script() -> str:
@@ -312,7 +390,7 @@ def test_the_jobs_that_run_on_a_queue_entry_regardless_are_pinned() -> None:
     failure landing in the OTHER test and pointing at ci.yml rather than at the detector somebody
     edited.
     """
-    _, _, found = _partition_jobs(yaml.safe_load(_CI.read_text(encoding="utf-8"))["jobs"])
+    found = _partition_jobs(yaml.safe_load(_CI.read_text(encoding="utf-8"))["jobs"]).self_gated
     assert found == _SELF_GATED_ON_QUEUE, (
         "the set of jobs that run on a merge_group entry regardless of the path filters has moved.\n"
         f"  added:   {sorted(found - _SELF_GATED_ON_QUEUE)}\n"
@@ -322,83 +400,67 @@ def test_the_jobs_that_run_on_a_queue_entry_regardless_are_pinned() -> None:
     )
 
 
-def _partition_jobs(jobs: dict[str, Any]) -> tuple[set[str], set[str], set[str]]:
-    """(decided by the arm alone, names merge_group nowhere, self-gated on the queue).
-
-    ONE scan, three measurements, because all three pins in this module read the same two facts about
-    a job. Three literals still pin them separately -- what is shared is the detector, not a pin.
-
-    It takes the JOBS mapping rather than the parsed document so a constructed case needs no
-    workflow-shaped wrapper: a detector that is only ever pinned against the one real file is a
-    detector whose own behaviour nobody has measured.
-
-    `if:` EXPRESSIONS ONLY, at job level and step level. Searching the whole job -- which an early
-    draft of the self-gated pin did -- matches comments and `run:` bodies too, so it reported the
-    `changes` job itself the moment that job gained an arm NAMING the event it gates. A gate that
-    cannot tell "decides on this event" from "mentions this event" is not measuring the thing its
-    failure message claims.
-    """
-    decided: set[str] = set()
-    names_it_nowhere: set[str] = set()
-    self_gated_on_the_queue: set[str] = set()
-    for name, job in jobs.items():
-        conditions = [str(job.get("if", ""))]
-        conditions += [str(step.get("if", "")) for step in job.get("steps", []) or []]
-        # Normalised first, so one substring test reads the reference however it is spelled. ci.yml
-        # uses the dot form throughout (measured 2026-09-22: zero bracket occurrences), so this
-        # changes no verdict on today's file. It is here because a bracket-spelled gate is what a job
-        # the arm DECIDES looks like while falling outside `decided`, which would make the wider pin
-        # report that the job reads no output of this step -- backwards, and backwards in the
-        # direction a reader acts on. test_the_detector_reads_a_bracket_spelled_output_gate is the
-        # constructed row.
-        gated_on_an_output = any(
-            "needs.changes.outputs." in _BRACKET_INDEX.sub(r".\1", c) for c in conditions
-        )
-        # A substring test, so it is blind to an `if:` that is TRUE on merge_group without naming
-        # it, such as webconsole's job-level `github.event_name != 'push'`. webconsole is caught
-        # today only because its step `if:` lines name the event outright. Known limit, not widened.
-        if any("merge_group" in c for c in conditions):
-            self_gated_on_the_queue.add(name)
-            continue
-        names_it_nowhere.add(name)
-        if gated_on_an_output:
-            decided.add(name)
-    return decided, names_it_nowhere, self_gated_on_the_queue
-
-
 def test_the_detector_reads_an_output_gate_however_it_is_spelled() -> None:
     """Constructed rows, because ci.yml cannot exercise these: it has no bracket spellings at all.
 
     Without them the normalisation in `_partition_jobs` is a line nothing measures, and a later edit
-    could drop it with every pin below still green. Two controls, and both matter: `unrelated` is a
-    bracket spelling of some OTHER job's outputs, so a detector matching the BRACKET rather than the
-    reference fails on it; `on-the-queue` is gated on an output AND names the event, so a detector
-    that stopped honouring the self-gated half fails on it too.
+    could drop it with every pin below still green. Every row here is a control for something, and a
+    row that only agrees with its neighbours is not worth its lines:
+
+    * `unrelated` brackets some OTHER job's outputs, so a detector matching the BRACKET rather than
+      the reference fails on it.
+    * `expression-index` is a real gate spelled in the one way the normalisation does NOT read, and
+      it is pinned as NOT decided so that limit stays a measured fact rather than a claim.
+    * `on-the-queue` is gated on an output AND names the event, so it lands in `self_gated_and_gated`
+      and nowhere else.
+    * `step-gated` puts the reference in a STEP `if:`, which is where four of ci.yml's real gates
+      live.
+    * `ungated` has no `if:` key, and `null-steps` has `steps:` with nothing under it -- both legal
+      YAML, and both raise TypeError in the scan without the `str()`/`or []` guards it carries.
+    * `bool-if` is `if: true`, which YAML parses to a bool, for the `str()` half of the same guard.
     """
     jobs: dict[str, Any] = {
         "dotted": {"if": "needs.changes.outputs.code == 'true'"},
         "leaf-bracketed": {"if": "needs.changes.outputs['code'] == 'true'"},
         "root-bracketed": {"if": "needs['changes'].outputs.code == 'true'"},
         "fully-bracketed": {"if": "needs['changes']['outputs']['code'] == 'true'"},
+        "odd-key-bracketed": {"if": "needs.changes.outputs['3rd'] == 'true'"},
+        "step-gated": {"steps": [{"if": "needs.changes.outputs.code == 'true'"}]},
         "unrelated": {"if": "needs.other.outputs['code'] == 'true'"},
+        "expression-index": {"if": "needs[matrix.dep].outputs.code == 'true'"},
+        "ungated": {},
+        "null-steps": {"steps": None},
+        "bool-if": {"if": True},
         "on-the-queue": {
             "if": "needs.changes.outputs.code == 'true' || github.event_name == 'merge_group'"
         },
     }
-    spellings = {"dotted", "leaf-bracketed", "root-bracketed", "fully-bracketed"}
-    decided, names_it_nowhere, self_gated = _partition_jobs(jobs)
-    assert decided == spellings, (
-        f"the detector read {sorted(decided)} as decided by the arm alone. Every spelling of the "
-        "same reference must count, a bracket around anything else must not, and a job that names "
-        "the event is decided by its own `if:` rather than by this step"
+    read_as_gated = {
+        "dotted",
+        "leaf-bracketed",
+        "root-bracketed",
+        "fully-bracketed",
+        "odd-key-bracketed",
+        "step-gated",
+    }
+    ungated = {"unrelated", "expression-index", "ungated", "null-steps", "bool-if"}
+    found = _partition_jobs(jobs)
+    assert found.decided == read_as_gated, (
+        f"the detector read {sorted(found.decided)} as decided by the arm alone. Every spelling of "
+        "the same reference must count wherever the `if:` sits, a bracket around anything else must "
+        "not, and a job that names the event is decided by its own `if:` rather than by this step"
     )
-    assert names_it_nowhere == spellings | {"unrelated"}, (
-        f"the wider half of the predicate read {sorted(names_it_nowhere)}. It is every job that does "
-        "NOT name merge_group, whatever it is gated on, so `unrelated` belongs to it and "
-        "`on-the-queue` does not"
+    assert found.names_it_nowhere == read_as_gated | ungated, (
+        f"the wider half of the predicate read {sorted(found.names_it_nowhere)}. It is every job "
+        "that does NOT name merge_group, whatever it is gated on, so all five of the ungated rows "
+        "belong to it and `on-the-queue` does not"
     )
-    assert self_gated == {"on-the-queue"}, (
-        f"the self-gated half read {sorted(self_gated)}; only `on-the-queue` names the event"
+    assert found.self_gated == {"on-the-queue"}, (
+        f"the self-gated half read {sorted(found.self_gated)}; only `on-the-queue` names the event"
+    )
+    assert found.self_gated_and_gated == {"on-the-queue"}, (
+        f"the intersection read {sorted(found.self_gated_and_gated)}; `on-the-queue` is the only row "
+        "that is both, and it is what the `NOT self_gated` half of the arm's predicate removes"
     )
 
 
@@ -422,11 +484,14 @@ def test_the_two_pins_are_a_strict_narrowing() -> None:
     the two-name literal requires those two names to be out of the narrower pin.
     """
     assert _DECIDED_BY_THE_ARM_ALONE < _NAMES_MERGE_GROUP_NOWHERE, (
-        "the two pins in this module are no longer a strict narrowing: the wider one does not "
-        f"properly contain the narrower one.\n  narrower: {sorted(_DECIDED_BY_THE_ARM_ALONE)}\n"
+        "the two PINNED LITERALS in this module are no longer a strict narrowing: the wider one "
+        f"does not properly contain the narrower one.\n"
+        f"  narrower: {sorted(_DECIDED_BY_THE_ARM_ALONE)}\n"
         f"  wider:    {sorted(_NAMES_MERGE_GROUP_NOWHERE)}\n"
-        "If they came out EQUAL, the gated-on-an-output half of the arm's predicate in ci.yml has "
-        "stopped discriminating and that arm's comment is now false. Read it before moving a pin."
+        "Nothing here read ci.yml, so this says the constants are wrong and says nothing about the "
+        "workflow. If they came out EQUAL you were most likely editing both pins to follow a "
+        "failure below, which is the one move that gets there; go back and read what that failure "
+        "actually asked for, and the arm's comment in ci.yml, before editing a literal again."
     )
     extras = _NAMES_MERGE_GROUP_NOWHERE - _DECIDED_BY_THE_ARM_ALONE
     assert extras == _NOWHERE_AND_DECIDED_HERE_BY_NOTHING, (
@@ -453,22 +518,38 @@ def test_the_jobs_the_arm_alone_decides_are_pinned_and_so_is_the_wider_set() -> 
     narrowing legible: it is the decided set plus exactly the two jobs the comment names, so a job
     that crosses between the two predicates is reported by name in whichever pin it left.
 
-    THE STRICTNESS CHECK COMES FIRST, and where it sits is the whole of what it is worth. The same
-    assertion, ``decided < names_it_nowhere``, once sat BEHIND the two pins, where it could not fire:
-    the pins had already fixed both sets at their pinned membership, and the test above makes that
-    membership a strict narrowing, so equality was excluded before a reader reached it. It was then
-    deleted as an assertion that could not fail -- which is true of where it sat and false of the
-    property it asserts. The state that separates the two, measured 2026-09-22: give a step in
-    `changes` an `if:` naming merge_group and a step in `ci-gate` an `if:` reading
-    ``needs.changes.outputs.code``, then follow every failure message that produces. Every pin goes
-    green with the two predicates selecting IDENTICAL jobs, the gated-on-an-output half doing no
-    work, and ci.yml's "BOTH HALVES OF THAT PREDICATE ARE LOAD-BEARING" false. Ahead of the pins,
-    the same assertion fires on exactly that state, and the test above catches the constants an
-    editor would have edited to reach it.
+    BOTH HALVES OF THE ARM'S PREDICATE ARE CHECKED HERE, and each needs its own assertion because
+    each goes vacuous in its own way. ``decided != names_it_nowhere`` says the GATED-ON-AN-OUTPUT
+    half still removes something. ``self_gated_and_gated`` non-empty says the NOT-SELF-GATED half
+    does, and it is the only thing that does: measured 2026-09-22, re-spell the output gates of the
+    four jobs that also name merge_group so that intersection is empty, and every other check in this
+    module stays green while ci.yml's claim that both halves are load-bearing has gone false.
+
+    THE VACUITY CHECKS COME FIRST, and where they sit is the whole of what they are worth. The
+    equality one, spelled ``decided < names_it_nowhere``, once sat BEHIND the two pins, where it
+    could not fire: the pins had already fixed both sets at their pinned membership, and
+    `test_the_two_pins_are_a_strict_narrowing` makes that membership a strict narrowing, so equality
+    was excluded before a reader reached it. It was then deleted as an assertion that could not fail
+    -- which is true of where it sat and false of the property it asserts. It is back here as ``!=``
+    rather than ``<``, because containment is `_partition_jobs`'s to guarantee and inequality is the
+    only part that can go wrong. The state that separates sitting here from sitting there, measured
+    2026-09-22: give a step in `changes` an `if:` naming merge_group and a step in `ci-gate` an `if:`
+    reading ``needs.changes.outputs.code``, then follow every failure message that produces. Every
+    pin goes green with the two predicates selecting IDENTICAL jobs. Ahead of the pins, this fires on
+    exactly that state, and the strict-narrowing test catches the literals an editor would have
+    edited to reach it.
     """
     data = yaml.safe_load(_CI.read_text(encoding="utf-8"))
-    decided, names_it_nowhere, _ = _partition_jobs(data["jobs"])
+    decided, names_it_nowhere, _, self_gated_and_gated = _partition_jobs(data["jobs"])
 
+    assert self_gated_and_gated, (
+        "no job is BOTH gated on an output of the `changes` step and self-gated on merge_group, so "
+        "the `NOT self_gated` half of the arm's predicate now removes nothing and ci.yml's claim "
+        "that BOTH HALVES ARE LOAD-BEARING is false in that direction.\n"
+        f"  gated on an output: {sorted(decided | self_gated_and_gated)}\n"
+        "Either a self-gated job stopped reading an output of this step, or the detector stopped "
+        "reading the spelling it uses. Re-read the arm's comment in ci.yml before moving a pin."
+    )
     assert decided != names_it_nowhere, (
         "the two predicates now select the SAME jobs, so the gated-on-an-output half of the arm's "
         "predicate in ci.yml is doing no work and that arm's comment, which says BOTH HALVES ARE "
