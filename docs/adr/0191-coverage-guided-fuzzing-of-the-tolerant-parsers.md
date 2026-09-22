@@ -299,8 +299,10 @@ atheris 3.1.0, pydicom 3.0.2:
 
 * Atheris logs `INFO: Instrumenting` for **58 pydicom names** -- the package plus 57 submodules,
   among them `filereader`, `filebase`, `fileutil`, `tag`, `datadict`, `encaps`, `charset` and
-  `valuerep`. All four target processes report the same 58, which is what 232 such lines over four
-  targets means.
+  `valuerep`. All four target processes report the same 58, and the warrant for that is a
+  per-name count rather than the total: **each of the 58 names appears exactly 4 times** across the
+  run. The first draft argued it from "232 such lines over four targets", which does not establish
+  it -- 232 is equally consistent with 60/58/58/56, so a total cannot settle a partition.
 * The `dicom_peek` mutator climbs from `cov: 136` at `INITED` to `cov: 341` at its last new unit,
   over 31 readings. Two step changes land immediately after a pydicom parse warning: **+74 at exec
   #4495** (147 to 221, after `filereader.py:487`) and **+69 at #7996** (259 to 328, after
@@ -360,19 +362,35 @@ tested rather than assumed. libFuzzer printed that unit twice, as a hex dump and
 decode to the **same 155 bytes**, and replaying those bytes through
 `TARGETS_BY_NAME["dicom_peek"].run` on **Windows** against the same pydicom 3.0.2 raises the same
 `BytesLengthException` with the same traceback. So the printed form is a complete reproducer across
-platforms, and the artifact would carry identical bytes to a place that is *harder* to reach -- a zip
-behind a download, with its own retention clock.
+platforms.
+
+**That the artifact would have carried the SAME bytes is MEASURED, not inferred, and the control was
+sitting in the log all along.** libFuzzer names a crash file by the SHA-1 of the unit it wrote.
+`sha1` of the 155 decoded bytes is `e407a7c52d06668011f7624709f6f8927cbeb2b1`, which is exactly the
+filename above. The discarded artifact is therefore byte-identical to the printed form, and an upload
+would have moved those same bytes to a place that is *harder* to reach -- a zip behind a download.
+On a change whose first commit is titled "measured now, not reasoned", leaving this leg reasoned
+would have been the odd note.
+
+**The reproducer is now durable in the repository, which is what finishes the argument.** Run
+35761703252 predates the summary step, so its base64 lived only in that run's raw log, under the
+retention clock that would otherwise have been artifact upload's best argument.
+`tests/test_fuzz_targets.py` now commits those 155 bytes as a fixture and runs the reporting step
+against them, so the bytes outlive every clock either option depends on.
 
 **What the incident actually showed is a reporting defect, not a preservation one, and those have
-different fixes.** The reproducer was never lost; it was unread, on line 568,190 of a 568,245-line
+different fixes.** The reproducer was never lost; it was unread, on line 568,193 of a 568,245-line
 log. The job summary added alongside this revisit carries that same base64 to the run page, which is
 strictly closer than an artifact. Uploading as well would also widen the surface the header's PHI
 note fences, for no information the summary does not already hold.
 
-**One caveat, measured the hard way.** Transcribing the base64 by hand is a real hazard: a
-three-character error during this revisit produced a 158-byte unit that parsed cleanly and reported
-**no finding at all** -- a false all-clear from a reproducer that looked right. `fuzz/README.md` says
-so where the recipe is, because the failure is silent. Copy the block, never retype it.
+**One caveat, measured the hard way.** Transcribing the base64 by hand is a real hazard: during this
+revisit a retyped copy decoded to **158 bytes rather than 155**, parsed cleanly, and reported **no
+finding at all** -- a false all-clear from a reproducer that looked right. It was caught only by
+decoding libFuzzer's hex dump as well and comparing the two, which is the control worth keeping: the
+hex dump and the base64 are independent encodings of one unit, so they agree or you mis-copied one.
+`fuzz/README.md` says so where the recipe is, because the failure is silent. Copy the block, never
+retype it.
 
 ## Consequences
 
