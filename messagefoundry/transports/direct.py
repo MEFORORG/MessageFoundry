@@ -325,10 +325,18 @@ class DirectDestination(DestinationConnector):
                     "require a session bound to the host, not merely to the trust anchor"
                 )
         # Built once at construction (fail-fast), reused by every send. None when TLS is off entirely.
-        # DIRECT does not take a RevocationHopGuard even though the hop now verifies: adding it would
-        # make the enumerated count eight and force four "seven verifying hops" docs to change, and the
-        # clinical payload is S/MIME-protected at the message layer so the PHI argument is materially
-        # weaker than EMAIL's (ADR 0085). Recorded rather than silently omitted.
+        # DIRECT does not take a RevocationHopGuard even though the hop now verifies: the clinical
+        # payload is S/MIME-protected at the message layer, so the PHI argument is materially weaker
+        # than EMAIL's (ADR 0085). Recorded rather than silently omitted; the decision is unchanged.
+        #
+        # THE SECOND REASON THIS COMMENT USED TO GIVE IS WITHDRAWN, and it is worth saying why rather
+        # than deleting it. It read: adding the guard "would make the enumerated count eight and force
+        # four 'seven verifying hops' docs to change". That is a documentation cost, not a security
+        # argument, and ADR 0173 §4.3 cited this very sentence as evidence that a hardened count had
+        # started deciding what gets guarded -- which is the SDS-3.6 defect, a completeness claim
+        # reading as coverage. BACKLOG #1498 then moved the count anyway (seven to nine) and rewrote
+        # those docs as "at least", so the cost it named is both paid and no longer chargeable. If
+        # DIRECT is ever reconsidered, weigh the S/MIME reasoning above and nothing about a count.
         self._tls_context: ssl.SSLContext | None = (
             build_smtp_tls_context(
                 host=self.host,

@@ -67,6 +67,7 @@ from messagefoundry.transports.rest import (
     enforce_outbound_length_limits,
     http_family_trust_anchor,
     refuse_cleartext_credential_hop,
+    refuse_unrevoked_verified_hop,
     refuse_url_credentials,
 )
 from messagefoundry.transports.signing import CompactJwtSigner
@@ -123,6 +124,12 @@ class SmartBackendTokenProvider:
         expiry_skew_seconds: float = _DEFAULT_EXPIRY_SKEW,
         timeout_seconds: float = _DEFAULT_TOKEN_TIMEOUT,
         attested: bool = False,
+        # #1498 (ADR 0173 §4.3): the per-connection `tls_revocation_attested`, DISTINCT from `attested`
+        # above (which attests a cleartext/verify-off hop is secure by other means, #200). Read from the
+        # resolved settings by `token_provider_from_settings`, exactly as the delivery cells read it off
+        # their Destination. Like its siblings it has no authoring surface today, so in practice the
+        # blanket MEFOR_TLS_REVOCATION_ATTESTED is the reachable attestation.
+        revocation_attested: bool = False,
         cleartext_accepted: bool = False,
         cleartext_reason: str | None = None,
         connection: str | None = None,
@@ -177,6 +184,33 @@ class SmartBackendTokenProvider:
                 "by the instance security posture (use https, attest the hop as secure via "
                 "tls_hop_attested, or declare cleartext_accepted with a cleartext_reason)"
             ) from exc
+        # #1498 (ADR 0173 §4.3): the revocation twin of the refusal above, and the same one-statement
+        # call its five HTTP-family siblings make. The token hop VERIFIES the authorization server's
+        # certificate but stdlib ssl performs no OCSP/CRL, so a revoked-but-unexpired token-endpoint
+        # certificate was accepted here with no refusal, no warning and no audit entry — on the hop that
+        # carries the signed client_assertion. Keyed on the https scheme, so the cleartext arm above and
+        # this one decide disjoint hops and never double-refuse one.
+        #
+        # ADR 0173 §1.3 / §1.6 / §7 withdrew this hop's row on the ground that `smart.py` contains no
+        # `ssl` usage at all. That ground is true and it does NOT reach the guard: `refuse_unrevoked_
+        # verified_hop` takes a scheme and a url, never a context, precisely because the HTTP family
+        # rides urllib's own context and builds none of its own. The measured absence of `ssl` here
+        # removes this file from the `harden_verify_flags` population; it does not remove the hop.
+        #
+        # The token host is frequently NOT the connection's data host (#1660 resolves this hop's trust
+        # anchor against `token_url` for that reason), so the sibling guard on the REST/FHIR destination
+        # keys on a different host and cannot answer for this one.
+        #
+        # InsecureHopRefused is allowed to propagate rather than being re-wrapped as SmartAuthError: the
+        # guard's own message already names this hop and lists the ways across, which a re-wrap would
+        # discard, and both are ValueError subclasses so the loader surfaces either identically (the
+        # reason the cleartext re-wrap above says it can).
+        refuse_unrevoked_verified_hop(
+            scheme,
+            token_url,
+            connector="SMART token endpoint",
+            revocation_attested=revocation_attested,
+        )
         if not client_id:
             raise SmartAuthError("SMART Backend Services requires a 'smart_client_id' setting")
         if not private_key:
@@ -450,6 +484,9 @@ def token_provider_from_settings(
         # #200: the per-connection insecure-hop attestation keys the posture-keyed cleartext refusal in
         # __init__ (read from settings exactly as _dest_config / the OAuth2 provider do).
         attested=bool(s.get("tls_hop_attested", False)),
+        # #1498 (ADR 0173 §4.3): the revocation attestation, read the same way the runner reads it for a
+        # Destination. A DIFFERENT claim from `attested` above, so it gets its own key.
+        revocation_attested=bool(s.get("tls_revocation_attested", False)),
         cleartext_accepted=accepted[0],
         cleartext_reason=accepted[1],
         connection=accepted[2],

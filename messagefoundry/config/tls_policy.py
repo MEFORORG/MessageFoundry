@@ -1462,6 +1462,15 @@ def revocation_hop_disposition(
     return HopDisposition.WARN
 
 
+#: The remediation sentence for a hop that IS a connection — the seven cells #201 wired. Named so a
+#: non-connection hop can substitute its own via :attr:`RevocationHopGuard.ways_across` rather than
+#: inheriting three levers it cannot use (BACKLOG #1498).
+_CONNECTION_WAYS_ACROSS = (
+    "Configure [tls].crl_file so the engine checks a CRL on this hop, terminate at a "
+    "revocation-checking egress proxy, or set tls_revocation_attested=true on this connection."
+)
+
+
 @dataclass(frozen=True, slots=True)
 class RevocationHopGuard:
     """A captured revocation-refusal decision for one VERIFYING outbound TLS hop (#201, ADR 0078 amend).
@@ -1490,6 +1499,14 @@ class RevocationHopGuard:
     #: Whether this hop's OWN context loads a CRL and sets ``VERIFY_CRL_CHECK_LEAF`` — derived from the
     #: context in :meth:`capture`, never from a global setting.
     crl_checked: bool = False
+    #: This hop's OWN remediation sentence, for a hop the connection-shaped default does not fit
+    #: (BACKLOG #1498). The default names ``[tls].crl_file``, an egress terminator and a connection's
+    #: ``tls_revocation_attested`` — **all three are inapplicable to a hop that is not a connection**:
+    #: ``[tls].crl_file`` reaches a context only through a ``Destination``'s ``TrustAnchorPolicy``, and
+    #: there is no connection to carry the flag. Telling such an operator to set one of them is a
+    #: refusal whose remedy cannot be performed, which is the SDS-3.7 false-premise defect wearing a
+    #: helpful voice. A non-connection hop passes the setting that actually closes its own gate.
+    ways_across: str | None = None
 
     @classmethod
     def capture(
@@ -1501,6 +1518,8 @@ class RevocationHopGuard:
         attested: bool,
         proxy_proven: bool = False,
         context: ssl.SSLContext | None = None,
+        posture: HopPosture | None = None,
+        ways_across: str | None = None,
     ) -> RevocationHopGuard:
         """Snapshot the decision inputs + the active hop posture for a verifying outbound TLS hop.
 
@@ -1514,16 +1533,26 @@ class RevocationHopGuard:
         :func:`context_checks_revocation` reads ``VERIFY_CRL_CHECK_LEAF`` off it, so a hop whose CRL was
         really loaded stops being refused while a sibling hop that never got one keeps its guard. Passing
         the context rather than a ``[tls].crl_file`` boolean is what makes the CRL relaxation per-hop:
-        one instance-wide setting must never silence a hop whose handshake does not consult it."""
+        one instance-wide setting must never silence a hop whose handshake does not consult it.
+
+        ``posture`` is for a hop built **outside** the construction gate, where
+        :func:`current_hop_posture` is ``None`` and the caller holds the derived posture instead — the
+        syslog forwarder and the OIDC IdP legs (BACKLOG #1498), the position ``auth/ldap.py`` and
+        ``store/postgres.py`` are already in. Omitted or ``None`` reads the ambient posture, so every
+        in-gate cell is byte-identical. **This parameter exists so those callers do not have to
+        re-stamp the contextvar themselves:** ``active_hop_posture(None)`` *clears* an ambient posture
+        rather than inheriting it, so the obvious hand-rolled wrapper is a live footgun for any hop
+        that is sometimes in-gate and sometimes not."""
         return cls(
             host=host,
             cell=cell,
             description=description,
             attested=attested,
             proxy_proven=proxy_proven,
-            posture=current_hop_posture(),
+            posture=posture if posture is not None else current_hop_posture(),
             blanket_attested=tls_revocation_attested(),
             crl_checked=context_checks_revocation(context),
+            ways_across=ways_across,
         )
 
     def _disposition(self, posture: HopPosture) -> HopDisposition:
@@ -1540,8 +1569,7 @@ class RevocationHopGuard:
         return (
             f"{self.description} to {self.host}: the peer certificate is verified but NO certificate "
             "revocation checking (OCSP/CRL) is performed — stdlib ssl has none (ASVS 12.1.4, ADR 0078). "
-            "Configure [tls].crl_file so the engine checks a CRL on this hop, terminate at a "
-            "revocation-checking egress proxy, or set tls_revocation_attested=true on this connection. "
+            f"{self.ways_across or _CONNECTION_WAYS_ACROSS} "
             f"Under an enforcing posture a blanket {TLS_REVOCATION_ATTESTED_ENV}=1 no longer suffices "
             "(BACKLOG #299) — it cannot say which hop's PKI was reviewed."
         )
