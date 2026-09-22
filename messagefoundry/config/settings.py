@@ -590,6 +590,17 @@ class StoreSettings(_Section):
     # connections.toml. Empty = use the system trust store (the secure default). Existence is checked at load
     # (a missing file fails loud here, not confusingly at connect).
     ssl_root_cert: str | None = None
+    # BACKLOG #299: optional CRL (PEM, or a CA+CRL bundle) checked against the DB SERVER's certificate.
+    # The store hop builds its own context and resolves no trust anchor, so [tls].crl_file never reaches
+    # it -- this is its own knob rather than a silent inheritance, the per-hop scoping error that item
+    # warns about. POSTGRES ONLY, and only on the `ssl_root_cert` (pinned-CA) branch: that is the one
+    # arm where engine code builds the SSLContext asyncpg will use, so it is the one arm a CRL can be
+    # loaded onto. The DEFAULT store path returns `True` and lets asyncpg build the context, so there is
+    # no engine-side object to load a CRL into (see `_build_ssl`'s stated residual); loopback is that
+    # path's only way across an enforcing posture. SQL Server never sees this (it rides an ODBC keyword
+    # string, not a context). Same fail-closed refusals as every other CRL: absent, unloadable or past
+    # nextUpdate refuses at store open rather than at the first DB handshake.
+    ssl_crl_file: str | None = None
     # SQL SERVER ONLY: emit the ODBC `MultiSubnetFailover=Yes` keyword so a client connecting to an
     # Always On Availability Group *listener* reaches the current PRIMARY promptly across subnets,
     # instead of serially waiting out each replica subnet's DNS/TCP timeout on failover. A no-op for

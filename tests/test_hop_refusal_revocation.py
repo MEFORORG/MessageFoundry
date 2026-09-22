@@ -426,17 +426,80 @@ def test_store_verify_unstamped_is_noop() -> None:
     assert _build_ssl(_pg()) is True
 
 
-def test_store_verify_blanket_env_allows_prod(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_blanket_env_does_not_cross_the_enforcing_store_hop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE DEFECT THIS ARM PINS. ``_refuse_store_revocation`` used to hand-roll the gate and pass
+    ``tls_revocation_attested()`` -- the process-wide env -- into ``revocation_hop_disposition``'s
+    PER-CONNECTION ``attested`` slot. That slot ranks ABOVE the enforcing REFUSE, so the engine-to-store
+    hop crossed on one env var while every guard-routed sibling refused: the #299 clamp was defeated on
+    exactly the hop carrying the PHI store. This test asserted that crossing (``is True``) before the
+    collapse onto ``RevocationHopGuard``, whose ``capture`` reads the env into the separate
+    ``blanket_attested`` field that ranks BELOW the refusal."""
     monkeypatch.setenv(TLS_REVOCATION_ATTESTED_ENV, "1")
-    assert _build_ssl(_pg(), posture=PROD_PHI) is True
+    with pytest.raises(InsecureHopRefused, match="revocation"):
+        _build_ssl(_pg(), posture=PROD_PHI)
+    # NEGATIVE CONTROL, and it is mandatory: without it the refusal above would also pass if the env
+    # were simply never read. On a non-enforcing posture the same env still crosses, byte-identical to
+    # the pre-clamp behaviour, which proves the env IS read and only the enforcing rung moved.
+    assert _build_ssl(_pg(), posture=STAGING_PHI) is True
 
 
-def test_store_pinned_ca_also_refuses_prod_phi_remote(tmp_path: object) -> None:
-    # The ssl_root_cert (pinned-CA) branch is ALSO a verifying hop → refused the same way on prod-PHI.
-    ca = tmp_path / "db-ca.pem"  # type: ignore[operator]
-    ca.write_text("-----BEGIN CERTIFICATE-----\n")
-    with pytest.raises(ValueError, match="revocation"):
-        _build_ssl(_pg(ssl_root_cert=str(ca)), posture=PROD_PHI)
+def test_store_pinned_ca_also_refuses_prod_phi_remote(crl_bundle: str) -> None:
+    """The ssl_root_cert (pinned-CA) branch is ALSO a verifying hop, so it is refused the same way.
+
+    It takes a REAL CA PEM now. The guard moved BELOW the context build on this branch (it has to read
+    the finished object to see a CRL), so a placeholder PEM no longer reaches the refusal -- it dies
+    earlier in ``create_default_context(cafile=...)`` with an SSLError, and the test would pass on a
+    hop that never got built. The `crl_bundle` file doubles as a plain CA anchor: loading it as
+    `cafile=` alone does not set VERIFY_CRL_CHECK_LEAF, so this stays an unrevoked verifying hop."""
+    with pytest.raises(InsecureHopRefused, match="revocation"):
+        _build_ssl(_pg(ssl_root_cert=crl_bundle), posture=PROD_PHI)
+
+
+def test_the_store_crl_closes_its_own_gate_on_the_pinned_ca_branch(crl_bundle: str) -> None:
+    """``[store].ssl_crl_file`` (BACKLOG #299) is the store hop's OWN way across an enforcing posture.
+
+    Closing the clamp above removed this hop's only existing one, and ``StoreSettings`` carries no
+    per-store revocation attestation -- so without a knob a remote Postgres store on an enforcing
+    posture would be refused with no remediation the error text could honestly name. The CRL loads onto
+    the pinned-CA branch, the one arm where engine code builds the context asyncpg uses, and the guard
+    reads ``VERIFY_CRL_CHECK_LEAF`` off that very object rather than off the setting."""
+    ctx = _build_ssl(_pg(ssl_root_cert=crl_bundle, ssl_crl_file=crl_bundle), posture=PROD_PHI)
+    assert isinstance(ctx, ssl.SSLContext)
+    # The line above passed for the RIGHT reason: the CRL really landed on the returned context.
+    assert context_checks_revocation(ctx) is True
+    # NEGATIVE CONTROL: the SAME hop with the SAME CA and no CRL is still refused, so the crossing is
+    # attributable to the CRL rather than to the guard having stopped firing on this branch.
+    with pytest.raises(InsecureHopRefused, match="revocation"):
+        _build_ssl(_pg(ssl_root_cert=crl_bundle), posture=PROD_PHI)
+
+
+def test_the_store_refusal_names_a_lever_that_exists_for_it(crl_bundle: str) -> None:
+    """SDS-3.7 applied to the refusal TEXT. The guard's connection-shaped default names
+    ``[tls].crl_file``, an egress terminator and a connection's ``tls_revocation_attested``; none
+    reaches the store, which resolves no trust anchor and is not a connection. Telling that operator to
+    set one of them is a refusal whose remedy cannot be performed. ``ssl_crl_file`` is named WITH
+    ``ssl_root_cert`` because the CRL only loads on the pinned-CA branch -- from the default path the
+    operator has to set both, and half the instruction is still a remedy that fails."""
+    with pytest.raises(InsecureHopRefused) as exc:
+        _build_ssl(_pg(), posture=PROD_PHI)
+    assert "[store].ssl_crl_file" in str(exc.value)
+    assert "[store].ssl_root_cert" in str(exc.value)
+    assert "tls_revocation_attested=true on this connection" not in str(exc.value)
+
+
+def test_the_default_store_path_has_no_context_for_a_crl_to_reach(crl_bundle: str) -> None:
+    """THE RESIDUAL, pinned so it is not mistaken for a gap in the guard. On the DEFAULT path (no
+    ``ssl_root_cert``) ``_build_ssl`` returns ``True`` and asyncpg builds the context, so there is no
+    engine-side object for a CRL to load into -- ``ssl_crl_file`` alone cannot close this arm, and
+    loopback is its only way across an enforcing posture. Closing it means building the verifying
+    default context here instead, which changes what asyncpg receives: a separate decision."""
+    with pytest.raises(InsecureHopRefused, match="revocation"):
+        _build_ssl(_pg(ssl_crl_file=crl_bundle), posture=PROD_PHI)
+    # ...and the same settings on loopback cross, so the refusal above is the posture gate rather than
+    # the CRL file being rejected.
+    assert _build_ssl(_pg(server=LOOPBACK, ssl_crl_file=crl_bundle), posture=PROD_PHI) is True
 
 
 # --- SMTP-over-TLS email (use_tls verify path; a different construction seam) ------------------------
