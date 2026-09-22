@@ -7,14 +7,24 @@ file the harness would be exercised on exactly one platform by exactly one job t
 fail. That is the shape where a broken detector and a clean run look identical. These tests run on
 every leg, Windows included, because ``fuzz/targets.py`` imports no Atheris.
 
-The load-bearing tests here are the two fault-injection ones. A fuzz harness that has never been
-shown to catch anything measures nothing, so instead of trusting that a raised exception would be
-noticed, they inject one and assert it escapes -- including the case that a narrowed known-finding
-carve-out must **not** swallow.
+The load-bearing tests here are the two fault-injection ones plus the accessor-coverage pin. A fuzz
+harness that has never been shown to catch anything measures nothing, so instead of trusting that a
+raised exception would be noticed, the injection tests raise one and assert it escapes -- including
+the case that a narrowed known-finding carve-out must **not** swallow. Both of those fault
+``Peek.routing``, so between them they pinned ``routing()`` and nothing else;
+``test_the_hl7_target_reads_every_named_routing_property`` covers the eleven named routing accessors
+the sweep drives, which the rest of this file could not see the loss of. A third injection test pins
+the carve-out's exception TYPE, which the first two could not reach.
+
+**"The eleven pre-ACK accessors" was the old wording here and it was wrong** -- seven of the eleven
+are read pre-ACK, three are unique to this sweep, and the pre-ACK path reads several the list does
+not name. ``fuzz/targets.py``'s module docstring carries the measured accounting; this file does not
+restate it.
 """
 
 from __future__ import annotations
 
+import inspect
 import os
 import re
 from collections.abc import Callable
@@ -24,12 +34,14 @@ from typing import Never
 import pytest
 
 from fuzz.targets import (
+    _HL7_ROUTING_PROPERTIES,
     DEFAULT_MAX_LEN,
     KNOWN_FINDINGS,
     TARGETS,
     TARGETS_BY_NAME,
     WORK_DIR_ENV,
     FuzzTarget,
+    HarnessRefusal,
     libfuzzer_argv,
     work_paths,
     work_root,
@@ -40,6 +52,27 @@ from messagefoundry.parsing import Peek
 #: A conformant synthetic message with no blank segment -- the negative control for the carve-out.
 CLEAN_ADT = (
     "MSH|^~\\&|APP|FAC|R|RF|20260101||ADT^A01|MSG1|P|2.5\rPID|1||100001^^^HOSP^MR||DOE^JANE\r"
+)
+
+#: The routing accessors ``_hl7_peek`` must sweep, written out HERE rather than imported.
+#:
+#: **An independent copy is the whole point.** A test that imports the constant its subject iterates
+#: cannot see that constant shrink: behaviour and expectation move together, and emptying it makes
+#: the assertion pass over nothing. Measured -- see
+#: ``test_the_hl7_target_reads_every_named_routing_property``. Changing the accessor tier is now a
+#: deliberate two-file edit, which is the point rather than an inconvenience.
+_EXPECTED_ROUTING_PROPERTIES = (
+    "message_code",
+    "trigger_event",
+    "message_structure",
+    "message_type",
+    "control_id",
+    "version",
+    "sending_app",
+    "sending_facility",
+    "receiving_app",
+    "receiving_facility",
+    "timestamp",
 )
 
 #: Inputs a tolerant parser must survive without breaking its contract. Not a corpus -- just the
@@ -120,6 +153,106 @@ def test_an_index_error_without_a_blank_segment_is_not_suppressed(
     monkeypatch.setattr(Peek, "routing", _boom(IndexError("injected")))
     with pytest.raises(IndexError, match="injected"):
         TARGETS_BY_NAME["hl7_peek"].run(CLEAN_ADT.encode())
+
+
+def test_the_carve_out_does_not_swallow_a_different_type_on_a_blank_segment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The carve-out is gated on the exception TYPE too, and nothing pinned that half.
+
+    Both anti-vacuity tests above drive ``CLEAN_ADT``, which has no blank segment, so both exercise
+    the *structural* arm and neither reaches the type. Measured before this test existed: widening
+    ``except IndexError`` to ``except Exception`` in ``_hl7_peek`` left all fourteen tests green --
+    a suppression the whole carve-out design was supposed to make impossible.
+
+    So drive the discriminator PRESENT and plant a fault of a different type. With ``IndexError`` the
+    fault escapes; with ``Exception`` the carve-out catches it, sees a blank segment, and returns
+    quietly -- which reds here.
+    """
+    findings = [f for f in KNOWN_FINDINGS if f.target == "hl7_peek"]
+    assert findings, "the blank-segment finding is no longer registered"
+    reproducer = findings[0].reproducer
+    assert any(not s for s in Peek.parse(reproducer).segments()), (
+        "reproducer lost its blank segment"
+    )
+
+    # The FIRST property in the sweep, so the planted fault is reached before the natural IndexError
+    # this message provokes on every one of them. From the test's OWN literal, so emptying the
+    # source constant reds this test rather than quietly removing what it patches.
+    monkeypatch.setattr(
+        Peek, _EXPECTED_ROUTING_PROPERTIES[0], property(_boom(TypeError("injected")))
+    )
+    with pytest.raises(TypeError, match="injected"):
+        TARGETS_BY_NAME["hl7_peek"].run(reproducer)
+
+
+def test_the_hl7_target_reads_every_named_routing_property(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The accessor sweep is the harness's whole point, and nothing else pinned it.
+
+    ADR 0191 calls the eleven pre-ACK routing properties the load-bearing tier: a Router reads them
+    before the sender is answered, and the one finding this harness has produced lives entirely
+    there -- fuzzing ``parse`` alone would have measured nothing. Yet deleting the
+    ``for name in _HL7_ROUTING_PROPERTIES`` loop from ``_hl7_peek`` left every other test in this
+    file passing, because the two fault-injection tests both fault ``Peek.routing`` and so pin
+    ``routing()`` and nothing else. The loop could be dropped or shortened in a later edit and the
+    job would go on reporting that every target survived its budget while never touching the tier it
+    was built for.
+
+    WHY THIS TEST CAN SEE THE DIFFERENCE, stated because most of the obvious versions cannot.
+    ``Peek.routing()`` is a second reader of eight of the eleven -- everything except the three
+    MSH-9 components (``message_code``, ``trigger_event``, ``message_structure``). A test that
+    faulted any of those eight would still pass with the loop gone, via ``routing()``. So the
+    assertion is on the SET of properties the target actually read: drop the loop and the three
+    MSH-9 components go unread, the set comes back short, and the failure names them.
+
+    Recording rather than faulting, deliberately. An injected exception would prove one property is
+    read; the recorder proves all eleven are, which is the invariant ADR 0191 states, and it leaves
+    the target's real behaviour untouched while doing so.
+
+    **It iterates its OWN literal, and the first draft's failure is why.** That draft iterated
+    ``_HL7_ROUTING_PROPERTIES`` -- the same constant ``_hl7_peek`` iterates -- so the behaviour and
+    the expectation moved together. Measured: setting that constant to ``()`` at source patched
+    nothing, recorded nothing, computed an empty ``missing`` and passed, reaching the identical end
+    state this test exists to prevent. Dropping ``message_code`` from the constant passed too. The
+    loop-level arms were all red, which is what made the hole invisible: mutating a call site while
+    leaving its data untouched tests half the mechanism.
+    """
+    assert _HL7_ROUTING_PROPERTIES == _EXPECTED_ROUTING_PROPERTIES, (
+        "fuzz/targets.py changed the routing-property list. The target's loop and this test's "
+        "expectation both read it, so shortening it silently shortens what is checked. Update "
+        "_EXPECTED_ROUTING_PROPERTIES only alongside a deliberate change to the accessor tier."
+    )
+    seen: list[str] = []
+    for name in _EXPECTED_ROUTING_PROPERTIES:
+        descriptor = inspect.getattr_static(Peek, name)
+        assert isinstance(descriptor, property), (
+            f"Peek.{name} is no longer a property, so this recorder cannot wrap it. Read that as a "
+            "change in the accessor tier, not as a failure of this test."
+        )
+        fget = descriptor.fget
+        assert fget is not None, f"Peek.{name} is a property with no getter"
+
+        def _record(
+            peek: Peek,
+            _name: str = name,
+            _fget: Callable[[Peek], object] = fget,
+        ) -> object:
+            seen.append(_name)
+            return _fget(peek)
+
+        monkeypatch.setattr(Peek, name, property(_record))
+
+    TARGETS_BY_NAME["hl7_peek"].run(CLEAN_ADT.encode())
+
+    missing = [name for name in _EXPECTED_ROUTING_PROPERTIES if name not in seen]
+    assert not missing, (
+        f"the hl7_peek target never read {missing} off the parsed Peek. Seven of the eleven run on "
+        "the pre-ACK path and the three MSH-9 components are reachable only through this sweep, so "
+        "a target that does not touch them cannot find a contract break there. Restore the accessor "
+        "sweep in `_hl7_peek` -- do not relax this list."
+    )
 
 
 def test_every_known_finding_is_still_recognised_by_its_target() -> None:
@@ -215,11 +348,57 @@ def test_the_work_root_honours_its_override(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv(WORK_DIR_ENV, str(tmp_path / "corpora"))
-    assert work_root() == tmp_path / "corpora"
+    # Compared resolved: ``work_root`` resolves the override now, and a Windows temp directory can
+    # arrive as an 8.3 short name that only resolution normalises.
+    assert work_root() == (tmp_path / "corpora").resolve()
     corpus, artifacts = work_paths(TARGETS_BY_NAME["hl7_peek"])
-    assert corpus.is_relative_to(tmp_path / "corpora")
-    assert artifacts.is_relative_to(tmp_path / "corpora")
+    assert corpus.is_relative_to((tmp_path / "corpora").resolve())
+    assert artifacts.is_relative_to((tmp_path / "corpora").resolve())
     assert corpus != artifacts
+
+
+def test_the_work_root_refuses_an_override_inside_the_repository(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A RELATIVE override lands in the work tree, and no test could see it before this one.
+
+    ``work_root`` returned ``Path(override)`` unexamined, so a relative value resolved against the
+    working directory -- and ``fuzz/README.md`` tells the operator to run the module from the
+    repository root. The corpus is message-shaped by construction, so that put fuzzer-minimised HL7,
+    X12 and DICOM bodies where ``git add -A`` reaches them (CLAUDE.md section 9). No shell quirk is
+    needed for this arm: a plain relative path does it.
+
+    **Why three reviews missed it:** every existing override test passes an absolute ``tmp_path``,
+    which is structurally incapable of showing a relative-path leak. A refusal an operator sees beats
+    a leak nobody notices, so the fence raises rather than silently relocating.
+    """
+    monkeypatch.setenv(WORK_DIR_ENV, "mefor-fuzz-corpus")
+    with pytest.raises(HarnessRefusal, match="inside the repository"):
+        work_root()
+
+
+def test_the_work_root_expands_a_tilde_override_instead_of_writing_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The README's own recipe is the one that carries a tilde, so it gets its own arm.
+
+    ``fuzz/README.md`` hands out ``MEFOR_FUZZ_WORK_DIR=~/mefor-fuzz``. A POSIX shell expands the
+    tilde before Python sees it, so on an interactive bash line the value arrives absolute. **The
+    expansion belongs to the shell, not to the value**, and anything that sets the variable without
+    one passes the tilde through: a quoted assignment, a Dockerfile ``ENV``, a systemd unit, a CI
+    ``env:`` block, or PowerShell. Measured on PowerShell 7, 2026-09-22 -- which is where the
+    non-expansion is easiest to demonstrate, not where the fuzzer runs; Atheris has no Windows
+    wheel. Unexpanded, ``Path("~/mefor-fuzz")`` is *relative* and resolves inside the repository.
+
+    ``expanduser`` makes the recipe mean the same thing however the value arrived. Without it this
+    override hits the fence above -- a refusal rather than a leak, which is safe but turns a
+    documented recipe into an error, so both belong together.
+    """
+    monkeypatch.setenv(WORK_DIR_ENV, "~/mefor-fuzz")
+    root = work_root()
+    assert root == (Path.home() / "mefor-fuzz").resolve()
+    assert not root.is_relative_to(Path(__file__).resolve().parent.parent)
+    assert "~" not in root.parts
 
 
 def test_libfuzzer_argv_supplies_the_defaults_this_harness_needs(tmp_path: Path) -> None:

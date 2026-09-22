@@ -20,14 +20,34 @@ escaping ``IndexError``, ``KeyError``, ``AttributeError`` or ``RecursionError`` 
 parser accepted a body and then broke its own contract on a path a Router already relies on.
 
 **Parse is not the whole surface, and that is the point.** A Router does not stop at ``parse``; it
-reads routing fields off the result. So each target parses *and then* exercises the accessors the
-inbound path actually touches. Fuzzing ``parse`` alone would have missed the one finding this
-harness has already produced (see :data:`KNOWN_FINDINGS`).
+reads routing fields off the result. So each target parses *and then* sweeps the accessor tier.
+Fuzzing ``parse`` alone would have missed the one finding this harness has already produced (see
+:data:`KNOWN_FINDINGS`).
+
+**What that sweep is, stated accurately, because the first draft justified it wrongly.** It claimed
+these are "the accessors the inbound path actually touches". They are not, in both directions, and a
+later reader pruning the list by that reason would prune the wrong entries. Measured 2026-09-22
+against ``pipeline/wiring_runner.py``, ``transports/`` and ``api/``:
+
+* ``Peek.routing()`` and ``Peek.segments()`` are read **nowhere** in the engine -- zero hits across
+  those three packages, against 13 for ``control_id`` on the same instrument. The sweep drives them
+  anyway, and that is defensible: they are public surface on a pure library, so a contract break
+  there is a finding whether or not today's pipeline calls it.
+* The pre-ACK path reads **more** than the eleven named properties: ``control_id``,
+  ``message_type`` and ``summarize(peek)`` at the ingress commit, then ``build_ack``
+  (``transports/mllp.py``) reads eight further accessors before the ACK frame goes out.
+* ``Peek.field()`` is the widest input-dependent surface of all -- ``summarize`` alone calls it up
+  to seven times, for ``PID-3.1``, ``PID-5.1``, ``PID-5.2``, ``ORC-2.1``, ``OBR-2.1``, ``OBR-3.1``
+  and ``ORC-3.1`` -- and **no target calls it directly.** The named properties reach it internally,
+  which is how the known finding surfaced at all; a direct ``field()`` target is the obvious next
+  addition and is deliberately not in this change.
 
 **PHI (CLAUDE.md section 9).** Seeds are the repository's committed synthetic samples plus small
 inline literals -- no new message-shaped files, and never real PHI. No target prints a body, and the
 runner keeps its corpus and crash artifacts **outside the work tree** (see :func:`work_root`), so a
-fuzzer-minimised input cannot be staged even by ``git add -A``.
+fuzzer-minimised input cannot be staged even by ``git add -A``. That last clause is only true because
+:func:`work_root` **refuses** an override resolving inside the repository; it was false for the
+override path until the fence landed, and the docstring there records what went wrong.
 """
 
 from __future__ import annotations
@@ -46,12 +66,37 @@ from messagefoundry.parsing.x12 import X12Error, X12Peek
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SAMPLES = _REPO_ROOT / "samples" / "messages"
 
-#: Override to keep a persistent corpus somewhere of your own choosing.
+#: Override to keep a persistent corpus somewhere of your own choosing. Refused if it resolves inside
+#: the repository -- see :func:`work_root`.
 WORK_DIR_ENV = "MEFOR_FUZZ_WORK_DIR"
 
-#: Inputs longer than this are not interesting here. Every tolerant parser enforces its own size
-#: ceiling well below it and rejects past that with its contract error, so a larger ``max_len`` just
-#: spends the budget re-confirming the ceiling instead of exploring parse branches.
+#: Process exit code for a harness REFUSAL: a misconfiguration that stopped the run before any input
+#: was fuzzed. Distinct from 1 because ``.github/workflows/fuzz.yml`` reads every other non-zero exit
+#: as "this parser broke its exception contract", so a refusal exiting 1 publishes a parser finding
+#: that never happened. It cannot collide with a libFuzzer exit code: every refusal is raised before
+#: ``atheris.Setup``, so libFuzzer has not started and will never choose this process's status.
+REFUSAL_EXIT = 3
+
+
+class HarnessRefusal(ValueError):
+    """The harness refused to run because its configuration would do something unsafe or vacuous.
+
+    A ``ValueError`` because it reports a bad *value* in the environment, and a distinct class so the
+    entrypoint can map it to :data:`REFUSAL_EXIT` without also catching a parser's contract error.
+    """
+
+
+#: Inputs longer than this are not interesting here: a parse bug reachable at all is reachable in a
+#: few kilobytes, and libFuzzer spends its budget on shape rather than on length.
+#:
+#: **The rationale this comment used to give was backwards.** It said each parser enforces a size
+#: ceiling "well below" 8192, making a larger ``max_len`` redundant. Measured 2026-09-22, the
+#: ceilings are 16 MiB -- ``DEFAULT_MAX_MESSAGE_BYTES`` (``parsing/peek.py``),
+#: ``DEFAULT_MAX_INTERCHANGE_BYTES`` (``parsing/x12/delimiters.py``) and, bounding the *inflated*
+#: stream rather than the input, ``DEFAULT_MAX_INFLATED_BYTES`` (``parsing/dicom/_inflate.py``).
+#: That is 2048x **above** this value, not below it, so those guards are **unreachable** at this
+#: ``max_len``, not redundant. The choice stands on the budget argument alone; nothing here fuzzes a
+#: size ceiling, and a run that should exercise one has to raise ``-max_len`` past 16 MiB.
 DEFAULT_MAX_LEN = 8192
 
 
@@ -72,8 +117,16 @@ _MINIMAL_HL7 = b"MSH|^~\\&|APP|FAC|R|RF|20260101||ADT^A01|MSG1|P|2.5\r"
 _TRUNCATED_X12 = b"ISA*00*          *00*"
 _MAGIC_ONLY_DICOM = b"\x00" * 128 + b"DICM"
 
-#: The HL7 routing properties the inbound path reads off a ``Peek``. Every one of these is on the
-#: pre-ACK path, so an exception here is an exception before the sender is answered.
+#: The HL7 routing properties this harness sweeps off a ``Peek``.
+#:
+#: **Not "every one is on the pre-ACK path", which is what this comment used to claim.** Measured
+#: 2026-09-22: six of the eleven are read pre-ACK by ``build_ack`` (``sending_app``,
+#: ``sending_facility``, ``receiving_app``, ``receiving_facility``, ``version``, ``control_id``) and
+#: ``message_type`` is read at the ingress commit. The three MSH-9 components -- ``message_code``,
+#: ``trigger_event``, ``message_structure`` -- are **unique to this sweep**, which is exactly why the
+#: loop earns its place: ``Peek.routing()`` independently reads eight of the eleven, so a fault
+#: injected on any of those eight would still be caught with this loop deleted. See the module
+#: docstring for the full accounting, including what the pre-ACK path reads that is NOT listed here.
 _HL7_ROUTING_PROPERTIES = (
     "message_code",
     "trigger_event",
@@ -158,7 +211,15 @@ def _hl7_has_blank_segment(peek: Peek) -> bool:
 
 
 def _hl7_peek(data: bytes) -> None:
-    """``Peek.parse`` plus the routing accessors the inbound path reads before the ACK."""
+    """``Peek.parse`` plus a sweep of the accessor tier (see the module docstring for which).
+
+    The carve-out below is gated on **both** the exception type and the structural discriminator.
+    Both halves are pinned by ``tests/test_fuzz_targets.py``: widening ``IndexError`` to
+    ``Exception`` reds ``test_the_carve_out_does_not_swallow_a_different_type_on_a_blank_segment``,
+    and dropping the ``_hl7_has_blank_segment`` guard reds its sibling. Before that first test
+    existed the type was unpinned -- widening it left all fourteen tests green, because both
+    anti-vacuity tests drove a message with no blank segment and so exercised the same arm.
+    """
     try:
         peek = Peek.parse(data)
     except HL7PeekError:
@@ -299,19 +360,50 @@ def write_seed_corpus(target: FuzzTarget, directory: Path) -> int:
 def work_root() -> Path:
     """Base directory for seed corpora and crash artifacts, from :data:`WORK_DIR_ENV` or a temp dir.
 
-    **Outside the repository by default, and that is the control rather than a convenience.** Every
-    file the fuzzer writes here is message-shaped -- a minimised HL7, X12 or DICOM body -- and a
-    corpus grows without bound as the fuzzer finds branches, so an overnight run leaves thousands of
-    generated message files. Ignoring them would rely on a pattern staying correct; putting them
-    outside the work tree means ``git add -A`` cannot reach them at all, which is how the PHI rule
-    (CLAUDE.md section 9) holds by construction instead of by a reviewer noticing.
+    **Outside the repository, and that is the control rather than a convenience.** Every file the
+    fuzzer writes here is message-shaped -- a minimised HL7, X12 or DICOM body -- and a corpus grows
+    without bound as the fuzzer finds branches, so an overnight run leaves thousands of generated
+    message files. Ignoring them would rely on a pattern staying correct; keeping them outside the
+    work tree means ``git add -A`` cannot reach them at all, which is how the PHI rule (CLAUDE.md
+    section 9) holds by construction instead of by a reviewer noticing.
+
+    **The override is fenced, and "by construction" was false without the fence.** This function
+    previously returned ``Path(override)`` unexamined, so the guarantee above held for the default
+    and for an absolute path pointing elsewhere -- but a **relative** override resolves against the
+    working directory, and ``fuzz/README.md`` tells the operator to run the module from the
+    repository root. So ``MEFOR_FUZZ_WORK_DIR=corpus`` put fuzzer-minimised message bodies inside
+    the work tree, reachable by ``git add -A``, while this docstring said that could not happen.
+
+    A leading ``~`` is the same fault wearing a disguise, and it is the one the README hands out.
+    ``Path("~/mefor-fuzz")`` is *relative*: measured 2026-09-22, it resolves to
+    ``<repo root>/~/mefor-fuzz``. A POSIX shell expands the tilde before the value is ever set, so
+    the README's recipe is safe on an interactive bash line -- but the expansion belongs to the
+    shell, not to the value, and every mechanism that sets an environment variable **without** a
+    shell passes the tilde through intact: a quoted assignment, a Dockerfile ``ENV``, a systemd
+    unit, a CI ``env:`` block, or a non-POSIX shell such as PowerShell.
+
+    Both halves are fixed: ``expanduser`` first, so the tilde means the same thing however the value
+    arrived, then a refusal if the result still lands inside :data:`_REPO_ROOT`. Refusing loudly
+    beats writing there quietly. Three reviews checked this function and all three passed an
+    absolute path, which is the one shape that cannot show either fault.
 
     That is also why sharing a seed by committing it is the wrong move: a seed belongs in this
     module, as a committed synthetic sample path or a small inline literal.
+
+    :raises HarnessRefusal: if the override resolves to the repository root or anywhere beneath it.
     """
     override = os.environ.get(WORK_DIR_ENV)
     if override:
-        return Path(override)
+        resolved = Path(override).expanduser().resolve()
+        if resolved == _REPO_ROOT or _REPO_ROOT in resolved.parents:
+            raise HarnessRefusal(
+                f"{WORK_DIR_ENV}={override!r} resolves to {resolved}, which is inside the "
+                f"repository at {_REPO_ROOT}. The fuzzer writes minimised message bodies there and "
+                f"`git add -A` would stage them (CLAUDE.md section 9). Point it outside the work "
+                f"tree; note that PowerShell does not expand a leading `~` the way bash does, so "
+                f"give an absolute path or use $HOME/mefor-fuzz."
+            )
+        return resolved
     return Path(tempfile.gettempdir()) / "messagefoundry-fuzz"
 
 

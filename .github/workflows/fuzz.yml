@@ -4,9 +4,18 @@
 # independent: this job's context is not in `.github/required-contexts.txt` (branch-protection
 # membership is the only thing that gates a merge), the fuzz step carries `continue-on-error: true`,
 # and `tests/test_required_contexts.py` lists this context in `_MUST_NOT_BE_REQUIRED` so promoting it
-# reds that test. There is deliberately NO job-level `continue-on-error`: GitHub reports such a job
-# as SUCCESS, which makes a job that cannot fail, and `tests/test_security_posture.py` refuses the
-# idiom outright. The advisory posture belongs on the step.
+# reds that test. There is deliberately NO job-level `continue-on-error`: GitHub rewrites such a
+# job's conclusion to SUCCESS, so the checkout, the install and the version report all stop being
+# able to red it too -- this harness could break before it ran and the job would still report that
+# every target survived its budget. The advisory posture therefore belongs on the ONE step whose
+# result is a function of the time budget and the random seed, and
+# `tests/test_security_posture.py::test_step_advisory_jobs_soften_only_their_named_step` pins three
+# things: no job-level flag, exactly that step carrying one, and the job's `name:` below.
+#
+# THE `name:` IS PINNED BECAUSE THE THIRD GUARD WAS RENAME-FRAGILE. `_MUST_NOT_BE_REQUIRED` holds
+# free text and never resolves it against a real job, so renaming `name:` left that guard protecting
+# a dead string while this job's NEW context was free to be promoted into branch protection. Of ten
+# mutations tried against this workflow, that rename was the only one no test caught.
 #
 # UBUNTU ONLY, BY CONSTRUCTION AND NOT BY CHOICE. Atheris is a libFuzzer binding and publishes
 # manylinux x86-64 wheels only -- 3.1.0 ships cp312/cp313/cp314 manylinux2014_x86_64 and nothing else
@@ -106,6 +115,12 @@ jobs:
         run: |
           set -euo pipefail
           findings=""
+          refusals=""
+          # Exit 3 is `fuzz.targets.REFUSAL_EXIT`: the harness declined to start (no target, unknown
+          # name, missing extra, or a work directory that would write into the repository). Every
+          # OTHER non-zero exit means libFuzzer ran and something escaped a parser's contract.
+          # Collapsing the two was a real misreport: a failed `[dicom]` install published a parser
+          # finding that never happened, and the log said so in those words.
           for target in hl7_peek hl7_tree x12_peek dicom_peek; do
             echo "=== ${target}: ${FUZZ_SECONDS}s ==="
             if MEFOR_FUZZ_TARGET="${target}" python -m fuzz.fuzz_parsers \
@@ -113,12 +128,23 @@ jobs:
                 -print_final_stats=1; then
               echo "${target}: no finding in this budget"
             else
-              echo "::warning title=Fuzz finding::${target} broke its parser's exception contract. Reproduce locally: see fuzz/README.md"
-              findings="${findings} ${target}"
+              status=$?
+              if [ "${status}" -eq 3 ]; then
+                echo "::error title=Fuzz harness refused::${target} did not run: the harness refused to start (exit 3). This is a harness or environment fault, NOT a parser finding. See the message above."
+                refusals="${refusals} ${target}"
+              else
+                echo "::warning title=Fuzz finding::${target} broke its parser's exception contract (exit ${status}). Reproduce locally: see fuzz/README.md"
+                findings="${findings} ${target}"
+              fi
             fi
           done
+          if [ -n "${refusals}" ]; then
+            echo "=== targets that never ran:${refusals} ==="
+          fi
           if [ -n "${findings}" ]; then
             echo "=== targets with findings:${findings} ==="
+          fi
+          if [ -n "${refusals}" ] || [ -n "${findings}" ]; then
             exit 1
           fi
           echo "=== every target survived its budget ==="

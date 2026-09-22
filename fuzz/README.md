@@ -23,6 +23,8 @@ would have missed the finding already registered in `KNOWN_FINDINGS`.
 Atheris ships manylinux x86-64 wheels only, so this needs Linux on x86-64. On any other platform
 install nothing and read the next section instead.
 
+bash:
+
 ```bash
 uv pip install --constraint constraints.lock -e ".[dicom,fuzz]"
 
@@ -30,9 +32,32 @@ uv pip install --constraint constraints.lock -e ".[dicom,fuzz]"
 MEFOR_FUZZ_TARGET=hl7_peek python -m fuzz.fuzz_parsers -max_total_time=60
 
 # Overnight, with a corpus that survives the run and accumulates across runs.
-MEFOR_FUZZ_WORK_DIR=~/mefor-fuzz MEFOR_FUZZ_TARGET=hl7_peek \
+MEFOR_FUZZ_WORK_DIR="$HOME/mefor-fuzz" MEFOR_FUZZ_TARGET=hl7_peek \
   python -m fuzz.fuzz_parsers -max_total_time=28800 -jobs=4
 ```
+
+PowerShell 7, for the same three commands. Note this means **pwsh on Linux x86-64**: Atheris has no
+Windows wheel, so the form is given because it is this project's documented shell, not because the
+fuzzer runs on Windows.
+
+```powershell
+uv pip install --constraint constraints.lock -e ".[dicom,fuzz]"
+
+$env:MEFOR_FUZZ_TARGET = 'hl7_peek'; python -m fuzz.fuzz_parsers -max_total_time=60
+
+$env:MEFOR_FUZZ_WORK_DIR = "$HOME/mefor-fuzz"; $env:MEFOR_FUZZ_TARGET = 'hl7_peek'
+python -m fuzz.fuzz_parsers -max_total_time=28800 -jobs=4
+```
+
+**`$HOME`, never a bare `~`, and this is a containment rule rather than a style note.** Tilde
+expansion is done by the shell, not by the variable, so any mechanism that sets the value without a
+shell -- a quoted assignment, a Dockerfile `ENV`, a systemd unit, a CI `env:` block, PowerShell --
+passes the literal `~` through to Python, where `Path("~/mefor-fuzz")` is a *relative* path that
+resolves to `<repo root>/~/mefor-fuzz`. This recipe used to say `~/mefor-fuzz` and that is exactly
+what it produced off bash. `work_root()` now expands the tilde itself and **refuses** any override
+resolving inside the repository, so the mistake is an error rather than a corpus of message-shaped
+files staged by `git add -A` (CLAUDE.md section 9). The refusal exits **3**, which the advisory
+workflow reports as a harness fault rather than as a parser finding.
 
 Run it as a module from the repository root, so the root is on `sys.path`. Arguments after the
 module name go straight to libFuzzer; `-max_total_time`, `-jobs`, `-runs` and `-dict` are the useful
