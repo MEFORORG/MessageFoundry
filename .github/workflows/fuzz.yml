@@ -12,13 +12,29 @@
 # `tests/test_security_posture.py::test_step_advisory_jobs_soften_only_their_named_step` pins three
 # things: no job-level flag, exactly that step carrying one, and the job's `name:` below.
 #
-# THE SAME ARGUMENT SPLIT THE VERDICT ACROSS TWO STEPS. A FINDING is budget-and-seed dependent, so
+# THE SAME ARGUMENT SPLIT THE VERDICT ACROSS THREE STEPS. A FINDING is budget-and-seed dependent, so
 # it belongs in the softened step. A REFUSAL is not: it means a target never executed, from a
 # missing extra, a renamed target, or a work directory the PHI fence rejected. Inside the softened
 # step that outcome was reported and then thrown away, so "the harness could not run" and "every
-# target survived" produced the same green check. The fuzz step now hands refusals to a second,
+# target survived" produced the same green check. The fuzz step now hands refusals to an
 # UNSOFTENED step that reds the job -- which stays advisory, because the job is not a required
 # context and nothing gates on it.
+#
+# A FINDING WAS BEING THROWN AWAY THE SAME WAY, AND THAT IS WHY THERE IS A THIRD STEP. Measured on
+# run 35761703252: the fuzz step emitted a real contract violation, annotated it, and exited 1 --
+# and `continue-on-error` rewrote that step's CONCLUSION to `success`, leaving only an `outcome`
+# that nothing in this repository reads. The job went green, and PR 1423 merged with the finding
+# unread (run finished 17:39:41Z, merge 18:16:20Z). So the finding now travels the same
+# `$GITHUB_ENV` channel the refusal does, to a step that writes it to the job summary WITH ITS
+# REPRODUCER. That step reds nothing: the posture is unchanged and the reporting is what was
+# missing. A control that finds a real defect and cannot tell anyone is, for practical purposes,
+# not running.
+#
+# THE ADVISORY POSTURE IS UNTOUCHED BY THAT, and the three independent things above still hold:
+# the context stays out of `.github/required-contexts.txt`, the fuzz step keeps its
+# `continue-on-error`, and `_MUST_NOT_BE_REQUIRED` still lists this context. The reporting step
+# carries no `continue-on-error` and needs none -- it cannot fail on a finding, only on its own
+# fault, which is exactly the refusal step's argument applied to reporting.
 #
 # THE `name:` IS PINNED BECAUSE THE THIRD GUARD WAS RENAME-FRAGILE. `_MUST_NOT_BE_REQUIRED` holds
 # free text and never resolves it against a real job, so renaming `name:` left that guard protecting
@@ -124,6 +140,22 @@ jobs:
           set -euo pipefail
           findings=""
           refusals=""
+          # Each target's output is CAPTURED to a file and then printed, rather than streamed
+          # straight out. The reporting step below lifts the reproducer out of that file, and
+          # without it the only copy of a crashing input is one line in the middle of a log half a
+          # million lines long -- which is where run 35761703252's finding sat, on line 568,190 of
+          # 568,245, until the code had already merged.
+          #
+          # `> file 2>&1` is a REDIRECT and not a pipeline, so the status landing in `status` is
+          # still python's own. A `| tee` here would put tee's status there instead on any shell
+          # where pipefail is not set, and a control this load-bearing must not depend on a setting
+          # elsewhere in the file to stay correct.
+          #
+          # RUNNER_TEMP is outside the checkout, which is the same fence `fuzz.targets.work_root`
+          # keeps for the corpus (CLAUDE.md section 9): everything the fuzzer writes is
+          # message-shaped, so `git add -A` must not be able to reach it.
+          log_dir="${RUNNER_TEMP:-/tmp}/fuzz-logs"
+          mkdir -p "${log_dir}"
           # Exit 3 is `fuzz.targets.REFUSAL_EXIT`: the harness declined to start (no target, unknown
           # name, missing extra, or a work directory that would write into the repository). Every
           # OTHER non-zero exit means libFuzzer ran and something escaped a parser's contract.
@@ -131,19 +163,19 @@ jobs:
           # finding that never happened, and the log said so in those words.
           for target in hl7_peek hl7_tree x12_peek dicom_peek; do
             echo "=== ${target}: ${FUZZ_SECONDS}s ==="
-            if MEFOR_FUZZ_TARGET="${target}" python -m fuzz.fuzz_parsers \
-                -max_total_time="${FUZZ_SECONDS}" \
-                -print_final_stats=1; then
+            status=0
+            MEFOR_FUZZ_TARGET="${target}" python -m fuzz.fuzz_parsers \
+              -max_total_time="${FUZZ_SECONDS}" \
+              -print_final_stats=1 > "${log_dir}/${target}.log" 2>&1 || status=$?
+            cat "${log_dir}/${target}.log"
+            if [ "${status}" -eq 0 ]; then
               echo "${target}: no finding in this budget"
+            elif [ "${status}" -eq 3 ]; then
+              echo "::error title=Fuzz harness refused::${target} did not run: the harness refused to start (exit 3). This is a harness or environment fault, NOT a parser finding. See the message above."
+              refusals="${refusals} ${target}"
             else
-              status=$?
-              if [ "${status}" -eq 3 ]; then
-                echo "::error title=Fuzz harness refused::${target} did not run: the harness refused to start (exit 3). This is a harness or environment fault, NOT a parser finding. See the message above."
-                refusals="${refusals} ${target}"
-              else
-                echo "::warning title=Fuzz finding::${target} broke its parser's exception contract (exit ${status}). Reproduce locally: see fuzz/README.md"
-                findings="${findings} ${target}"
-              fi
+              echo "::warning title=Fuzz finding::${target} broke its parser's exception contract (exit ${status}). Reproduce locally: see fuzz/README.md"
+              findings="${findings} ${target}"
             fi
           done
           if [ -n "${refusals}" ]; then
@@ -155,16 +187,112 @@ jobs:
           if [ -z "${refusals}" ] && [ -z "${findings}" ]; then
             echo "=== every target survived its budget ==="
           fi
-          # Handed to the next step rather than decided here. A refusal must be able to RED the job,
-          # and this step cannot red anything -- see that step's comment. Written as an env var the
-          # next step reads straight from the environment, so it needs no GitHub expression
+          # Handed to the next steps rather than decided here. A refusal must be able to RED the job,
+          # and this step cannot red anything -- see that step's comment. Written as env vars the
+          # next steps read straight from the environment, so they need no GitHub expression
           # interpolation and zizmor's template-injection audit has nothing to screen. (Do not write
           # an empty expression literal in a `run:` comment either: actionlint parses the run body
           # for expressions and rejects one, which is how this line first failed the hook.)
+          #
+          # FINDINGS ARE HANDED ON FOR THE SAME REASON REFUSALS ARE, and until run 35761703252 they
+          # were not. A finding was reported into this step's log and then dropped on the floor,
+          # because the only thing carrying it out was the `exit 1` below -- which `continue-on-error`
+          # rewrites to a `success` conclusion, leaving an `outcome` that nothing in this repository
+          # reads. The destination differs from the refusal channel and deliberately so: a refusal
+          # reds the job, a finding is written to the job summary and reds nothing.
           echo "MEFOR_FUZZ_REFUSALS=${refusals}" >> "${GITHUB_ENV}"
+          echo "MEFOR_FUZZ_FINDINGS=${findings}" >> "${GITHUB_ENV}"
+          # One definition of the path, read by the reporting step. Recomputing it there instead
+          # would let the two drift apart silently, and the symptom of that drift is a finding
+          # reported with no reproducer -- which is most of the defect this change exists to fix.
+          echo "MEFOR_FUZZ_LOG_DIR=${log_dir}" >> "${GITHUB_ENV}"
+          # Kept, and it is NOT the reporting channel -- see the comment above. It survives because
+          # `outcome: failure` is honest metadata about what this step saw, and because a reader
+          # scanning the log for the conventional signal should find it where they expect it.
           if [ -n "${findings}" ]; then
             exit 1
           fi
+      - name: Report any finding to the job summary
+        # NOT SOFTENED, AND NOT A GATE EITHER. Those are two different properties and this step needs
+        # both. A finding must never red this job -- ADR 0191 option 6, and the header above -- so
+        # this step exits 0 whatever it finds. But if THIS step breaks, that is a reporting fault and
+        # not a fuzz result, so it is left able to red, which is the same split the step below makes
+        # for refusals.
+        #
+        # WHY IT EXISTS, MEASURED RATHER THAN FEARED. On run 35761703252 the step above emitted a
+        # real contract violation with a `::warning` annotation, the job concluded `success`, and
+        # PR 1423 merged with the finding unread: the run finished at 17:39:41Z and the merge landed
+        # at 18:16:20Z. Nothing carried the finding out of that step's log. A control that finds a
+        # real defect and cannot tell anyone is, for practical purposes, not running.
+        #
+        # THE CONSUMER IS THE JOB SUMMARY, AND IT IS A PULL CHANNEL. Saying so is the point: it
+        # renders on the run page and in the pull request's checks list without anyone opening a log,
+        # and it carries the reproducer, which the log buries -- on that run the crashing input sat
+        # on line 568,190 of 568,245. It does not notify anybody, and no push channel is available
+        # here without either widening this job's permissions or reding it. `failure-signal.yml`
+        # watches CI, Security and backlog-hygiene only, and its label reads "A required check went
+        # red", which is false of this job; `nightly-notice.yml` watches five workflows and this is
+        # not one of them. Both are deliberate: this job is not a required context.
+        run: |
+          set -euo pipefail
+          findings="${MEFOR_FUZZ_FINDINGS:-}"
+          refusals="${MEFOR_FUZZ_REFUSALS:-}"
+          log_dir="${MEFOR_FUZZ_LOG_DIR:-}"
+          if [ -z "${findings}" ]; then
+            # A clean line is written even with nothing to report, so that a reader can tell this
+            # reporter RAN. A reporting step that is silent when healthy is indistinguishable from
+            # one that is broken, which is the failure this harness keeps rediscovering.
+            {
+              echo "## Parser fuzzing"
+              echo
+              if [ -n "${refusals}" ]; then
+                echo "No finding, but the harness refused to start for:${refusals}"
+                echo
+                echo "That is a harness or environment fault, and it reds this job in the next step."
+                echo "A clean result is NOT claimed here, because those targets never ran."
+              else
+                echo "Every target survived its budget. No parser broke its exception contract."
+              fi
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+          # Iterates `found`, not `target`. `tests/test_fuzz_targets.py` locates the target list with
+          # a whole-file regex for `for target in ...; do` and takes the FIRST match, so a second
+          # loop spelled that way here would shadow the real one and quietly pin nothing.
+          {
+            echo "## Parser fuzzing: a parser broke its exception contract"
+            echo
+            echo "This job is advisory and gates nothing, so the check beside it is green. The"
+            echo "finding is real regardless and needs a ledger row."
+            echo
+            for found in ${findings}; do
+              echo "### ${found}"
+              echo
+              log="${log_dir}/${found}.log"
+              if [ ! -r "${log}" ]; then
+                echo "No captured output for this target. Read the fuzz step's log above."
+                echo
+                continue
+              fi
+              exc="$(sed -n '/=== Uncaught Python exception: ===/{n;p;}' "${log}" | head -n 1)"
+              b64="$(sed -n 's/^Base64: //p' "${log}" | tail -n 1)"
+              units="$(sed -n 's/^stat::number_of_executed_units: *//p' "${log}" | tail -n 1)"
+              echo "Escaped after ${units:-an unrecorded number of} executions:"
+              echo
+              echo '```'
+              echo "${exc:-Exception line not captured. Read the fuzz step log above.}"
+              echo '```'
+              echo
+              if [ -n "${b64}" ]; then
+                echo "Reproducer, base64 of the crashing input. See fuzz/README.md for the recipe:"
+                echo
+                echo '```'
+                echo "${b64}"
+                echo '```'
+                echo
+              fi
+            done
+          } >> "${GITHUB_STEP_SUMMARY}"
       - name: Fail if the harness never ran
         # DELIBERATELY NOT SOFTENED, and it is the same argument the header makes against a job-level
         # flag. The step above is advisory because a FINDING is a function of the time budget and the

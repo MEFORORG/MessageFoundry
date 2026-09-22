@@ -50,6 +50,7 @@ from fuzz.targets import (
 )
 from messagefoundry.parsing import Peek
 from messagefoundry.parsing.x12 import X12Peek
+from tests._workflow_contexts import jobs_of
 
 #: A conformant synthetic message with no blank segment -- the negative control for the carve-out.
 CLEAN_ADT = (
@@ -425,6 +426,95 @@ def test_every_target_in_the_fuzz_workflow_exists_in_the_registry() -> None:
     match = re.search(r"for target in ([a-z0-9_ ]+); do", text)
     assert match, f"no target loop found in {workflow.name}; did the job shape change?"
     assert sorted(match.group(1).split()) == sorted(TARGETS_BY_NAME)
+
+
+def _fuzz_job_steps() -> list[dict[str, object]]:
+    """The advisory job's steps, parsed.
+
+    Parsed rather than grepped, because the property under test is *which step* does what, and a
+    whole-file text search cannot tell two steps apart.
+    """
+    jobs = jobs_of("fuzz.yml")
+    assert "parsers" in jobs, f"fuzz.yml declares no job 'parsers' (it has: {sorted(jobs)})"
+    steps = jobs["parsers"].get("steps") or []
+    assert steps, "fuzz.yml:parsers parsed to no steps; read that as a parse failure, not a pass"
+    return [step or {} for step in steps]
+
+
+def test_a_finding_reaches_a_step_that_writes_the_job_summary() -> None:
+    """A finding must leave the softened step through a channel something downstream reads.
+
+    THE DEFECT THIS PINS IS MEASURED, not imagined. On run 35761703252 the fuzz step found a real
+    contract violation, annotated it and exited 1 -- and ``continue-on-error`` rewrote that step's
+    conclusion to ``success``, leaving an ``outcome`` no workflow in this repository reads. The job
+    went green and PR 1423 merged with the finding unread (run finished 17:39:41Z, merge 18:16:20Z).
+
+    So this asserts the three links of the chain separately: the producing step WRITES the findings
+    variable, a DIFFERENT step READS it, and that reader writes the job summary. Producer and
+    consumer being distinct is the load-bearing half -- a step that hands a value to itself is the
+    arrangement that failed, and it satisfies any check that only looks for both strings somewhere
+    in the file.
+    """
+    steps = _fuzz_job_steps()
+    producers = [s for s in steps if "MEFOR_FUZZ_FINDINGS=" in str(s.get("run", ""))]
+    assert len(producers) == 1, (
+        f"expected exactly one step to WRITE MEFOR_FUZZ_FINDINGS, found {len(producers)}. Without "
+        "it a finding leaves the fuzz step only through `exit 1`, which `continue-on-error` "
+        "discards -- the measured defect this channel exists to fix."
+    )
+    assert "GITHUB_ENV" in str(producers[0].get("run", "")), (
+        "the findings variable is written but not into $GITHUB_ENV, so no later step can read it"
+    )
+
+    consumers = [
+        s
+        for s in steps
+        if s is not producers[0]
+        and "MEFOR_FUZZ_FINDINGS" in str(s.get("run", ""))
+        and "GITHUB_STEP_SUMMARY" in str(s.get("run", ""))
+    ]
+    assert len(consumers) == 1, (
+        f"expected exactly one step OTHER THAN the producer to read MEFOR_FUZZ_FINDINGS and write "
+        f"$GITHUB_STEP_SUMMARY, found {len(consumers)}. A finding that is handed from a step to "
+        "itself reaches nobody, which is precisely what happened on run 35761703252."
+    )
+
+
+def test_the_finding_reporter_carries_the_reproducer_and_gates_nothing() -> None:
+    """The reporter must be readable, actionable, and incapable of blocking a merge.
+
+    Three properties, and dropping any one of them re-creates a different half of the defect.
+    Without the reproducer the summary says a defect exists and leaves the reader to re-derive the
+    input from a log line among half a million. With a ``continue-on-error`` of its own the reporter
+    could die silently and report nothing, which is the failure mode the fuzz step already has. With
+    an ``exit 1`` it would red an advisory job on a budget-and-seed-dependent result, which ADR 0191
+    option 6 rejected and which this change does not reopen.
+    """
+    steps = _fuzz_job_steps()
+    reporters = [
+        s
+        for s in steps
+        if "MEFOR_FUZZ_FINDINGS" in str(s.get("run", ""))
+        and "GITHUB_STEP_SUMMARY" in str(s.get("run", ""))
+    ]
+    assert len(reporters) == 1, f"expected one reporting step, found {len(reporters)}"
+    reporter = reporters[0]
+    body = str(reporter.get("run", ""))
+
+    assert "Base64: " in body, (
+        "the reporter does not lift libFuzzer's `Base64:` line out of the captured log, so the "
+        "summary would name a defect without carrying the input that provokes it. Verified against "
+        "run 35761703252: that line decodes to the 155-byte unit, and it reproduces."
+    )
+    assert reporter.get("continue-on-error") in (None, False), (
+        "the reporting step must not be softened. A softened reporter can fail silently, which is "
+        "the same defect one layer up -- and it would also red "
+        "test_step_advisory_jobs_soften_only_their_named_step."
+    )
+    assert not re.search(r"^\s*exit [1-9]", body, re.MULTILINE), (
+        "the reporting step exits non-zero somewhere. A finding must not red this advisory job "
+        "(ADR 0191 option 6); only the refusal step is allowed to."
+    )
 
 
 def test_the_work_root_is_outside_the_repository_by_default(
