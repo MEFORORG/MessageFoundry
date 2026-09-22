@@ -12,12 +12,10 @@
 # operator-pinned, per docs/adr/0024-smart-backend-services-token-provider.md.
 # A search for ".well-known" that lands here has found an unrelated thing.
 #
-# The path is load-bearing and is not a stylistic choice. RFC 9116 section 3
-# requires the file under /.well-known/, and this repository's .gitignore
-# carries a root-anchored /*.txt rule, so a copy placed at the repository root
-# would be silently untracked. Measured 2026-09-22: git check-ignore reports
-# security.txt ignored by .gitignore line 132 and .well-known/security.txt not
-# ignored.
+# EXPIRES IS A COMMITMENT TO RE-CHECK, NOT A FORMALITY. Past the date below a
+# reader should stop trusting this file (RFC 9116 section 2.5.5), so renewing it
+# means confirming both Contact channels still reach a maintainer and only then
+# raising the date. Bumping the date alone discards the field's whole value.
 #
 # NO Canonical FIELD IS PUBLISHED, DELIBERATELY. RFC 9116 section 2.5.2 says a
 # file whose Canonical URI does not match the location it was retrieved from

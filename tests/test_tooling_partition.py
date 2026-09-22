@@ -147,11 +147,12 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # `scripts/**`, `.github/**` and the ledger and does not reach `.well-known/`. Listed as
         # tooling it would be deselected by `-m 'not tooling'` on the engine legs AND unreached by
         # the tooling path gate, so the PR that broke the file would face nothing.
-        # A SECOND REASON APPLIES ONLY TO THIS ENTRY, and it is why the first is not the whole of
-        # it: the module's `test_expires_has_not_passed` arm is a DATED renewal reminder for a
-        # published RFC 9116 field, so it has to fire on UNRELATED pull requests to work at all. A
-        # path-gated job would report an expired disclosure file on precisely the changes that do
-        # not touch it, which is to say never (BACKLOG #277).
+        # A SECOND REASON is stronger than the first and is why widening `tooling=true` to reach
+        # `.well-known/` would not fix it either: ci.yml pins `tooling=false` on the merge_group
+        # arm, and the tooling job's `if:` names merge_group nowhere, so THE TOOLING TIER DOES NOT
+        # RUN IN THE MERGE QUEUE AT ALL. A manifest entry would take this guard off the engine legs
+        # via `-m 'not tooling'` AND out of every queue entry, where `ci-gate` reads a skipped need
+        # as a pass -- the same defect ci.yml already records against `.gitignore` (BACKLOG #277).
         "test_security_txt_rfc9116.py",
         # Engine-subject for the same reason as control_char_check and escape_sequence_check above,
         # and the reason is the one arm that does not use tmp_path: the screen's DEFAULT SCOPE is

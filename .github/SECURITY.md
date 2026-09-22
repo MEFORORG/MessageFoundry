@@ -58,7 +58,8 @@ Install MessageFoundry from source or from PyPI, run it on hardware you control,
 The source in this repository is equally in scope.
 
 There is no hosted service and no production instance to point a scanner at, so do not go looking
-for one. The engine binds `127.0.0.1` and ships as a library and a local service.
+for one. The engine's default network posture is in **Scope notes** below; read it there rather
+than assuming it, because an operator can change it.
 
 Nothing here authorizes you to test a **third party's** installation. A site running this engine
 has not consented to your testing, and their permission is theirs alone to give.
@@ -68,11 +69,12 @@ has not consented to your testing, and their permission is theirs alone to give.
 At least the following. This names the cases with a real chance of arising rather than claiming to
 be a closed list.
 
-1. Report through a channel above, and give us a window to ship a fix before publishing detail.
+1. Report through a channel above, and honor the coordinated-disclosure ask in **Response &
+   remediation timeline** below. That section states the window; this one does not restate it.
 2. Stop at proof. Once you can show the vulnerability exists, stop, rather than pivoting further
    or running the exploit wider than a demonstration needs.
-3. Use synthetic HL7 only. Never send, store, or attach real patient data. The
-   `messagefoundry generate` corpus exists for this.
+3. Use synthetic HL7 only, as **Reporting a vulnerability** above already requires of a report.
+   The same rule governs the testing that produced it.
 4. Leave service intact. No denial-of-service or load testing against anything you do not own,
    and no destructive actions.
 5. Do not access, change, or keep data that is not yours. If you reach such data, stop and tell
