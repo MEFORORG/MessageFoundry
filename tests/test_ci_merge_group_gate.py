@@ -49,20 +49,26 @@ _CI = _ROOT / ".github" / "workflows" / "ci.yml"
 _SOURCE_REPO = "MEFORORG/MessageFoundry"
 
 #: What the queue gates on. Read as a pair with the job `if:` conditions asserted at the bottom of
-#: this file: `serverdb=false` here does NOT mean the server-DB legs are off in the queue, because
-#: those jobs name merge_group themselves. Asserting the outputs without that context would teach a
-#: reader the opposite of what the workflow does.
+#: this file, because these rows DO NOT all mean the same thing:
+#:
+#: * `serverdb` decides nothing. sqlserver-store and postgres-store name merge_group in their own
+#:   job `if:`, so a queue entry runs them whatever this emits.
+#: * `code` is belt-and-braces. `test` and `webconsole` name merge_group in their own STEP `if:`.
+#: * `docker`, `ide`, `tooling` and `packaging` DO decide their jobs -- docker-smoke, ide, tooling
+#:   and packaging-build are each gated on an output of this step AND name merge_group nowhere, so
+#:   false here is that job OFF in the queue. `_DECIDED_BY_THE_ARM_ALONE` below pins that set.
+#:
+#: Asserting the outputs without that context would teach a reader the opposite of what the workflow
+#: does. The same partition is stated at the arm in ci.yml; the two move together.
 _EXPECTED = {
     "serverdb": "false",
     "docker": "false",
     "code": "true",
     "ide": "false",
     "tooling": "false",
-    # `packaging-build` reads ONLY `packaging == 'true'` and names merge_group nowhere, so unlike
-    # `serverdb` above this row does decide the job: false here is the job off in the queue. It is
-    # what the residual arm already computed off the empty diff, so pinning it changes no behaviour
-    # -- it puts the arm's newest output under the same guard as the rest, where a later edit to it
-    # cannot go unread.
+    # Pinned when the arm gained this output. It is what the residual arm already computed off the
+    # empty diff, so emitting it changed no behaviour -- pinning it puts the arm's newest output
+    # under the same guard as the rest, where a later edit to it cannot go unread.
     "packaging": "false",
 }
 
@@ -78,6 +84,23 @@ _SELF_GATED_ON_QUEUE = {
     "load-test-sqlserver",
     "windows-service-smoke",
 }
+
+#: The mirror image, and the one the arm's comment in ci.yml enumerates: jobs GATED ON AN OUTPUT of
+#: the `changes` step that name merge_group nowhere, so the arm alone settles whether they run in the
+#: queue. Pinned because an unchecked enumeration is exactly what went wrong here once -- an earlier
+#: draft of that comment named these four under the predicate "the jobs that name merge_group
+#: nowhere", which is a WIDER set.
+_DECIDED_BY_THE_ARM_ALONE = {
+    "docker-smoke",
+    "ide",
+    "tooling",
+    "packaging-build",
+}
+
+#: The control for the pin above: how many jobs satisfy only the second half of that predicate. The
+#: wider set adds `changes` (no `if:` at all) and `ci-gate` (`always()`, and it reads no output of
+#: this step), neither of which anything emitted here decides.
+_NAMES_MERGE_GROUP_NOWHERE_COUNT = 6
 
 
 def _changes_step_script() -> str:
@@ -261,4 +284,48 @@ def test_the_jobs_that_run_on_a_queue_entry_regardless_are_pinned(workdir: Path)
         f"  removed: {sorted(_SELF_GATED_ON_QUEUE - found)}\n"
         "That is a coverage AND cost change on the merge path. If it is deliberate, move this pin "
         "and the arm's comment together."
+    )
+
+
+def test_the_jobs_the_arm_alone_decides_are_pinned_and_so_is_the_wider_set() -> None:
+    """The four jobs whose queue fate `changes` settles by itself -- with the control for that four.
+
+    The arm's comment in ci.yml enumerates these. An earlier draft enumerated the SAME four under a
+    wider predicate, "the jobs that name merge_group nowhere", which also takes in `changes` itself
+    and `ci-gate`. Neither is decided by anything this step emits, so the enumeration read as checked
+    while being wrong about what it had checked.
+
+    Both halves are asserted, because the wider count is what makes the narrowing legible: if the two
+    sets ever come out the same size, the gated-on-an-output half has stopped discriminating and this
+    test is no longer measuring the thing its name claims.
+    """
+    data = yaml.safe_load(_CI.read_text(encoding="utf-8"))
+    decided: set[str] = set()
+    names_it_nowhere: set[str] = set()
+    for name, job in data["jobs"].items():
+        conditions = [str(job.get("if", ""))]
+        conditions += [str(step.get("if", "")) for step in job.get("steps", []) or []]
+        gated_on_an_output = any("needs.changes.outputs." in c for c in conditions)
+        self_gated = any("merge_group" in c for c in conditions)
+        if not self_gated:
+            names_it_nowhere.add(name)
+        if gated_on_an_output and not self_gated:
+            decided.add(name)
+
+    assert decided == _DECIDED_BY_THE_ARM_ALONE, (
+        "the set of jobs the merge_group arm alone decides has moved.\n"
+        f"  added:   {sorted(decided - _DECIDED_BY_THE_ARM_ALONE)}\n"
+        f"  removed: {sorted(_DECIDED_BY_THE_ARM_ALONE - decided)}\n"
+        "A job entering this set gains the queue as a place it can be switched off by a path filter "
+        "alone. If that is deliberate, move this pin and the arm's comment in ci.yml together."
+    )
+    assert len(names_it_nowhere) == _NAMES_MERGE_GROUP_NOWHERE_COUNT, (
+        f"the CONTROL moved: {len(names_it_nowhere)} jobs name merge_group nowhere "
+        f"({sorted(names_it_nowhere)}), pinned at {_NAMES_MERGE_GROUP_NOWHERE_COUNT}. The assertion "
+        "above only means something while this number is the LARGER one -- it is what the arm's "
+        "comment cites as the reason the predicate carries a gated-on-an-output half at all."
+    )
+    assert decided < names_it_nowhere, (
+        "the two predicates now select the same jobs, so the gated-on-an-output half of the arm's "
+        "comment is no longer doing any work. Re-read that comment before editing this pin"
     )
