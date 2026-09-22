@@ -43,7 +43,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from messagefoundry.config.tls_policy import harden_cipher_suites, harden_crl_check
+from messagefoundry.config.tls_policy import (
+    HopPosture,
+    RevocationHopGuard,
+    harden_cipher_suites,
+    harden_crl_check,
+    harden_verify_flags,
+)
 
 # The escape table and this function were DEFINED here until BACKLOG #1591 and now live in
 # controlchars, which imports nothing and is therefore reachable from ``logging_guard`` too. That
@@ -365,16 +371,26 @@ class JsonFormatter(logging.Formatter):
 
 @dataclass(frozen=True)
 class SyslogForward:
-    """Off-box syslog forwarding target (sec-offbox-log). A primitive value object so this module stays
-    free of a config import (``config.settings`` imports ``LOG_LEVELS`` from here — the dependency must
-    not go the other way). ``protocol`` is ``"udp"`` (RFC 5426; fire-and-forget), ``"tcp"`` (RFC 6587),
+    """Off-box syslog forwarding target (sec-offbox-log). A value object carrying no ``config.settings``
+    import: that module imports ``LOG_LEVELS`` from here, so the dependency must not go the other way.
+    (``config.tls_policy`` is fine and is already imported above — it is a stdlib-only leaf that imports
+    nothing from ``messagefoundry``, so it cannot close that cycle. This docstring used to say
+    "free of a config import", which over-stated the rule and is corrected here rather than worked
+    around.) ``protocol`` is ``"udp"`` (RFC 5426; fire-and-forget), ``"tcp"`` (RFC 6587),
     or ``"tls"`` (RFC 5425; ssl-wrapped TCP — ADR 0080); a down collector is tolerated for the
     connection-oriented protocols (see :func:`configure_logging`). ``fmt`` is ``"json"`` or ``"text"``
     and is independent of the stdout format. The ``tls_*`` fields apply only when ``protocol == "tls"``:
     ``tls_ca_file`` is the PEM trust anchor (only that CA is trusted; system roots are not loaded),
     ``tls_verify`` toggles certificate + hostname verification (default on), ``tls_client_cert`` is
     an optional PEM cert+key chain for mutual TLS, and ``tls_crl_file`` (BACKLOG #299) is an optional
-    CRL that turns on leaf revocation checking against the collector's certificate."""
+    CRL that turns on leaf revocation checking against the collector's certificate.
+
+    ``hop_posture`` (BACKLOG #1498, ADR 0173 §4.3) is the derived instance posture, threaded in by
+    ``serve`` so the revocation guard in :func:`_build_tls_context` can key on it. This handler is built
+    outside the connectors' ``active_hop_posture`` construction scope, so the posture cannot be read
+    ambiently here and must arrive explicitly — the same reason ``auth/ldap.py`` takes one. ``None`` (a
+    direct test construction, or any caller that resolves no posture) leaves the guard a no-op, which is
+    the shipped ``posture is None`` semantics of every other hop guard rather than a new relaxation."""
 
     host: str
     port: int = 514
@@ -384,6 +400,7 @@ class SyslogForward:
     tls_verify: bool = True
     tls_client_cert: str | None = None
     tls_crl_file: str | None = None
+    hop_posture: HopPosture | None = None
 
 
 #: Socket timeout (seconds) pinned on a **TCP** off-box forwarder.
@@ -508,7 +525,11 @@ def _build_tls_context(forward: SyslogForward) -> ssl.SSLContext:
     silently accepting the public CA bundle. ``forward.tls_verify=False`` is the documented insecure
     opt-out (``CERT_NONE`` + no hostname check); ``tls_client_cert`` adds a client chain for mutual
     TLS. The settings validator guarantees a CA file is present when verification is on, so the default
-    path is always CA-anchored + hostname-checked."""
+    path is always CA-anchored + hostname-checked.
+
+    **RAISES on a verifying hop with no revocation** (BACKLOG #1498) — see
+    :func:`_refuse_forward_revocation`. The decision lives here rather than beside its #200 sibling in
+    ``serve`` because it has to read the finished context, and ``serve`` renders the exit code."""
     ctx = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH, cafile=forward.tls_ca_file)
     if not forward.tls_verify:
         # Insecure opt-out: check_hostname must be cleared before verify_mode (ssl rejects the reverse).
@@ -517,18 +538,76 @@ def _build_tls_context(forward: SyslogForward) -> ssl.SSLContext:
     if forward.tls_client_cert is not None:
         # Mutual TLS: a single PEM carrying both the client cert and its key (keyfile defaults to it).
         ctx.load_cert_chain(certfile=forward.tls_client_cert)
-    if forward.tls_verify and forward.tls_crl_file is not None:
-        # BACKLOG #299: revocation checking against the collector's certificate. Guarded on tls_verify
-        # because the opt-out arm above is CERT_NONE -- there is no chain to check a CRL against, and
-        # setting the flag there would refuse every collector while claiming a check. It loads after
-        # the CA and any client chain so harden_crl_check's "the CRL really landed" assertion answers
-        # for the final trust store.
-        harden_crl_check(ctx, forward.tls_crl_file)
-    # Assert forward secrecy LAST, so it sees the final suite list (ASVS 12.1.2). This runs on the
-    # tls_verify=False arm too: that opt-out drops peer AUTHENTICATION, and the log records still cross
-    # the network encrypted, so the suite list still decides whether a recorded session stays private.
+    # Assert forward secrecy LAST of the suite work, so it sees the final suite list (ASVS 12.1.2).
+    # This runs on the tls_verify=False arm too: that opt-out drops peer AUTHENTICATION, and the log
+    # records still cross the network encrypted, so the suite list still decides whether a recorded
+    # session stays private.
     harden_cipher_suites(ctx, connector="syslog TLS forwarder")
+    if forward.tls_verify:
+        # Everything below is VERIFY-path only: the opt-out arm above is CERT_NONE, so there is no
+        # chain to validate, no chain to check a CRL against, and no verified hop to gate. The #200
+        # forward_hop_disposition gate in `serve` owns that arm.
+        if forward.tls_crl_file is not None:
+            # BACKLOG #299: revocation checking against the collector's certificate. Loads after the CA
+            # and any client chain, so harden_crl_check's "the CRL really landed" assertion answers for
+            # the final trust store.
+            harden_crl_check(ctx, forward.tls_crl_file)
+        # #1498: strict RFC 5280 path validation. An ASSERTION here rather than a fix -- this builder
+        # uses create_default_context, which already sets the flag. The reasoning and both measured arms
+        # live at tests/test_hop_refusal_revocation.py::
+        # test_a_default_context_already_carries_the_strict_flag_a_raw_one_does_not.
+        harden_verify_flags(ctx)
+        _refuse_forward_revocation(forward, ctx)
     return ctx
+
+
+#: The syslog forwarder's OWN ways across, replacing the connection-shaped default that names
+#: `[tls].crl_file` and a per-connection flag -- neither of which can reach a hop that is not a
+#: connection. Loopback is the other way and the refusal text already carries it by implication.
+_FORWARD_WAYS_ACROSS = (
+    "Set [logging].forward_tls_crl_file so the engine checks a CRL on this hop, or point the "
+    "forwarder at 127.0.0.1 and let a local agent add TLS (ADR 0080)."
+)
+
+
+def _refuse_forward_revocation(forward: SyslogForward, ctx: ssl.SSLContext) -> None:
+    """Apply the #201 posture-keyed revocation guard to the off-box forwarder (BACKLOG #1498, ADR 0173
+    §4.3). The ``store/postgres.py:_refuse_store_revocation`` shape, for the same reason: a hop built
+    outside the connector-construction gate, so its posture is threaded rather than ambient.
+
+    This hop has **no** revocation signal of any kind in the shipped code. Its #200 sibling
+    (:func:`~messagefoundry.config.settings.forward_hop_disposition`) returns ALLOW for verified TLS --
+    *"an encrypted+authenticated hop, nothing to gate"* -- so on a first deployment a verified
+    collector whose certificate had been revoked **would** keep receiving the audit evidence stream
+    with no refusal, no warning and no audit entry (conditional per CLAUDE.md §0: there are zero
+    deployments, so nothing has received anything). The two gates stay disjoint: that one owns the
+    plaintext and verify-off arms, this one only the verified arm.
+
+    **Known limit, recorded rather than left for the next reader to find.** The WARN arm on a
+    non-enforcing instance logs *after* ``configure_logging`` has set the root level, so it is
+    filtered out at ``[logging].level`` above WARNING -- unlike its #200 sibling, which logs before
+    that and survives on the root ``lastResort`` handler. The REFUSE arm is unaffected (it raises).
+    Measured 2026-09-22 at ``WARNING`` and ``ERROR``.
+
+    Called with the FINISHED context, which is the whole point of ``context=``: a
+    ``forward_tls_crl_file`` that really loaded sets ``VERIFY_CRL_CHECK_LEAF`` on the very context
+    ``wrap_socket`` will use, and the guard reads that flag rather than the setting.
+
+    ``attested=False`` deliberately. ``[logging].forward_hop_attested`` is the #200 claim that an
+    *unprotected* hop is secure by other means; ``config/models.py`` records the two attestations as
+    DISTINCT, and letting one answer the other's question is how a flag silently widens."""
+    RevocationHopGuard.capture(
+        host=forward.host,
+        cell="[logging] syslog TLS forwarder (verified TLS, no revocation check)",
+        description=(
+            "ships the log and audit evidence stream over verified TLS but performs no "
+            "certificate revocation checking"
+        ),
+        attested=False,
+        context=ctx,
+        posture=forward.hop_posture,
+        ways_across=_FORWARD_WAYS_ACROSS,
+    ).enforce_construction()
 
 
 class _TlsSysLogHandler(_TimeoutSysLogHandler):

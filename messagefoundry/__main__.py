@@ -1536,6 +1536,7 @@ def _serve(args: argparse.Namespace) -> int:
     )
     from messagefoundry.config.tls_policy import (
         HopDisposition,
+        InsecureHopRefused,
         in_process_tls_revocation_refused,
         proxy_mtls_declared_but_unverified,
         tls_revocation_attested,
@@ -1919,6 +1920,11 @@ def _serve(args: argparse.Namespace) -> int:
     # Off-box log forwarding (sec-offbox-log): ship a copy of every record to a syslog/SIEM collector
     # so evidence survives a host compromise. PHI redaction + control-char scrubbing apply to the
     # forwarded stream exactly as to stdout (configure_logging installs the same filters on both).
+    # Derived once and used twice below: by the #200 forward_hop_disposition gate, and (BACKLOG #1498,
+    # ADR 0173 §4.3) threaded onto SyslogForward so the forwarder's own revocation guard can key on it.
+    # That handler is built outside the connectors' active_hop_posture scope, so the posture cannot be
+    # read ambiently there and has to travel with the target.
+    _forward_posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
     log_forward = (
         SyslogForward(
             host=settings.logging.forward_host,
@@ -1930,6 +1936,7 @@ def _serve(args: argparse.Namespace) -> int:
             tls_verify=settings.logging.forward_tls_verify,
             tls_client_cert=settings.logging.forward_tls_client_cert,
             tls_crl_file=settings.logging.forward_tls_crl_file,
+            hop_posture=_forward_posture,
         )
         if settings.logging.forward_enabled and settings.logging.forward_host
         else None
@@ -1941,10 +1948,7 @@ def _serve(args: argparse.Namespace) -> int:
     # Loopback (the ADR 0080 local-agent deployment) and a synthetic instance are untouched; the
     # acknowledged opt-out is [logging].forward_hop_attested.
     if log_forward is not None:
-        _forward_hop = forward_hop_disposition(
-            settings.logging,
-            hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement),
-        )
+        _forward_hop = forward_hop_disposition(settings.logging, _forward_posture)
         # Name WHY the hop is unprotected: a plaintext protocol, or tls with verification opted out
         # (encrypted but unauthenticated => MITM-able). Both land on the gradient.
         _forward_why = (
@@ -2006,6 +2010,18 @@ def _serve(args: argparse.Namespace) -> int:
             "the path/permissions, or unset [logging].file to run stdout-only.",
             file=sys.stderr,
         )
+        return 2
+    except InsecureHopRefused as exc:
+        # BACKLOG #1498 (ADR 0173 §4.3): the TLS forwarder's own revocation guard refused, inside
+        # _build_tls_context where the finished context (and hence its CRL flag) exists. Rendered here
+        # as a clean exit 2 rather than a traceback, matching the #200 forward-hop refusal above.
+        #
+        # stderr because that is where every other serve-gate refusal goes and it is unfiltered by the
+        # log level and the PHI/credential filters. NOT because no handler exists: by the time this
+        # raises, configure_logging HAS installed the stdout and file handlers and published the write
+        # guard — only the forwarder is missing. An earlier version of this comment claimed otherwise,
+        # which would have misled anyone reasoning about the guard's WARN arm at the same site.
+        print(f"error: {exc}", file=sys.stderr)
         return 2
     if forwarder_live and log_forward is not None:
         # Only announce forwarding when configure_logging actually installed the handler — a TCP

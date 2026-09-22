@@ -25,9 +25,11 @@ hop — the two gates key on disjoint conditions and never double-refuse one hop
 
 from __future__ import annotations
 
+import ssl
+
 import pytest
 
-from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.models import ConnectorType, Destination, SignatureAlgorithm
 from messagefoundry.config.settings import StoreBackend, StoreSettings
 from messagefoundry.config.tls_policy import (
     TLS_REVOCATION_ATTESTED_ENV,
@@ -43,6 +45,7 @@ from messagefoundry.config.tls_policy import (
     urllib_handler_context,
 )
 from messagefoundry.config.wiring import FHIR, DICOMweb, Rest, Soap
+from messagefoundry.logging_setup import SyslogForward, _build_tls_context
 from messagefoundry.store.postgres import _build_ssl
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.dicom import _client_ssl_context as _dicom_client_ssl_context
@@ -50,6 +53,11 @@ from messagefoundry.transports.email import EmailDestination
 from messagefoundry.transports.mllp import MLLPDestination
 from messagefoundry.transports.remotefile import _ftps_ssl_context
 from messagefoundry.transports.rest import http_family_trust_anchor
+from messagefoundry.transports.smart import (
+    SmartAuthError,
+    SmartBackendTokenProvider,
+    token_provider_from_settings,
+)
 
 # The postures the gradient keys on. `is_phi` went with BACKLOG #1279 -- only the dial is left.
 PROD_PHI = HopPosture(enforcing=True)
@@ -655,3 +663,265 @@ def test_a_loopback_hop_gets_no_crl_and_still_crosses(crl_bundle: str) -> None:
     with active_hop_posture(PROD_PHI):
         dest = MLLPDestination(cfg)
     assert context_checks_revocation(dest._ssl) is False
+
+
+# --- BACKLOG #1498 (ADR 0173 section 4.3, AC-4): parity for two hops #201 left unguarded ----------
+#
+# The cells above carried the guard; three verifying hops did not, and two of those carry
+# authentication material. This section closes two of the three -- the SMART token endpoint and the
+# [logging] syslog TLS forwarder. The OIDC token and JWKS legs are NOT built; the ADR's AC-4 records
+# why and names the change that would close them.
+#
+# The two reach the guard by different seams, so they get separate arms rather than one
+# parametrisation: SMART goes through the https-scheme-keyed refuse_unrevoked_verified_hop wrapper
+# (it rides urllib's shared opener and builds no context of its own), while the forwarder calls
+# capture() directly with its own context, the way EMAIL and MLLP do.
+#
+# THE NOT-REFUSED ARMS ARE THE LOAD-BEARING HALF, for the same reason the #299 arms above are: a
+# guard that refuses everything passes a refusal arm. Each hop pairs its refusal with a loopback arm,
+# and the forwarder adds a real-CRL arm -- the only one that proves the FINISHED context reached the
+# guard rather than a setting being read.
+
+
+@pytest.fixture(scope="module")
+def smart_key() -> str:
+    """An EC P-384 private key PEM for the SMART signer. Synthetic, never leaves the process.
+
+    A real key is needed because the revocation guard sits at the END of ``__init__`` -- below
+    ``self._opener``, since it reads that opener's TLS context -- so every earlier construction check
+    must PASS before the guard is reached, the signer included. That placement is deliberate and is
+    itself under test by `test_a_smart_token_hop_whose_own_context_checks_a_crl_is_not_refused`.
+
+    EC rather than RSA: nothing here verifies a signature, and the two nearest sibling fixtures in this
+    file already use EC because the keygen is orders of magnitude cheaper."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    return (
+        ec.generate_private_key(ec.SECP384R1())
+        .private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+        .decode()
+    )
+
+
+def _smart_provider(token_url: str, key: str, **kw: object) -> None:
+    """Construct the SMART provider through all of its construction gates.
+
+    Returning without raising means the revocation guard ALLOWED this hop, which is what makes the
+    not-refused arms below discriminating: there is no earlier error standing in for the guard's
+    verdict."""
+    SmartBackendTokenProvider(
+        token_url=token_url,
+        client_id="cid",
+        private_key=key,
+        algorithm=SignatureAlgorithm.ES384,
+        **kw,  # type: ignore[arg-type]
+    )
+
+
+def test_the_smart_token_hop_is_refused_when_it_checks_no_revocation(smart_key: str) -> None:
+    # THE CONTROL for this hop. The arms below are rungs of its escape ladder, so it must fail first.
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused, match="revocation"):
+        _smart_provider(f"https://{REMOTE}/token", smart_key)
+
+
+def test_the_smart_token_hop_on_loopback_still_crosses(smart_key: str) -> None:
+    # The on-box carve-out: a token endpoint on this host is not a network exposure.
+    with active_hop_posture(PROD_PHI):
+        _smart_provider(f"https://{LOOPBACK}:8443/token", smart_key)
+
+
+def test_the_smart_token_hop_crosses_on_a_per_connection_revocation_attestation(
+    smart_key: str,
+) -> None:
+    # Distinct from the #200 tls_hop_attested that sits beside it in the same settings mapping.
+    with active_hop_posture(PROD_PHI):
+        _smart_provider(f"https://{REMOTE}/token", smart_key, revocation_attested=True)
+
+
+def test_a_cleartext_smart_token_hop_is_the_200_gates_refusal_not_this_one(smart_key: str) -> None:
+    """DISJOINTNESS, and why no hop is ever double-refused. An ``http`` token endpoint has no TLS, so
+    the cleartext-credential refusal owns it and the revocation gate must stay silent. Asserting the
+    MESSAGE and not merely the type is the point: both are ``ValueError`` subclasses, so a type-only
+    assertion would pass when the wrong gate fired."""
+    with active_hop_posture(PROD_PHI), pytest.raises(SmartAuthError, match="cleartext"):
+        _smart_provider(f"http://{REMOTE}/token", smart_key)
+
+
+def test_the_smart_revocation_attestation_comes_from_its_own_settings_key(smart_key: str) -> None:
+    """The WIRING rather than the guard: ``tls_revocation_attested`` must arrive from the resolved
+    settings the way the runner supplies it for a ``Destination``, and must NOT be satisfied by its
+    #200 twin. A cell that read ``tls_hop_attested`` here would cross on the wrong operator claim --
+    the exact conflation ``config/models.py`` keeps the two fields separate to prevent."""
+    base = {
+        "smart_token_url": f"https://{REMOTE}/token",
+        "smart_client_id": "cid",
+        "smart_private_key": smart_key,
+        "smart_algorithm": "ES384",
+    }
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused, match="revocation"):
+        token_provider_from_settings({**base, "tls_hop_attested": True})
+    # And the right key DOES cross it.
+    with active_hop_posture(PROD_PHI):
+        assert token_provider_from_settings({**base, "tls_revocation_attested": True}) is not None
+
+
+def _forward(host: str, ca: str, **kw: object) -> SyslogForward:
+    """A verifying TLS forwarder target.
+
+    ``ca`` is REQUIRED rather than defaulted to None, because `LoggingSettings` validation refuses
+    ``protocol='tls'`` with verification on and no CA anchor, and `_build_tls_context`'s docstring
+    relies on that ("the default path is always CA-anchored"). A fixture that omitted it would build a
+    context off the OS trust store -- a posture this builder never takes in production -- so the arms
+    would pass while testing a state the engine cannot reach. The `crl_bundle` file doubles as a plain
+    CA anchor: loading it as `cafile=` does not set VERIFY_CRL_CHECK_LEAF, which only
+    `forward_tls_crl_file` does, so a CA-only hop is still an unrevoked hop."""
+    return SyslogForward(host=host, protocol="tls", tls_ca_file=ca, hop_posture=PROD_PHI, **kw)  # type: ignore[arg-type]
+
+
+def test_the_syslog_tls_forwarder_is_refused_when_it_checks_no_revocation(
+    crl_bundle: str,
+) -> None:
+    # It ships the audit evidence stream, and its #200 sibling (forward_hop_disposition) returns ALLOW
+    # for verified TLS -- so before #1498 nothing anywhere decided this hop's revocation posture.
+    with pytest.raises(InsecureHopRefused, match="revocation"):
+        _build_tls_context(_forward(REMOTE, crl_bundle))
+    # ...and for the RIGHT reason: the CA anchor alone leaves the flag off, so this is an unrevoked
+    # verifying hop rather than a hop that failed to build.
+    assert context_checks_revocation(_build_tls_context(_forward(LOOPBACK, crl_bundle))) is False
+
+
+def test_the_syslog_tls_forwarder_on_loopback_still_crosses(crl_bundle: str) -> None:
+    """ADR 0080's documented local-agent topology -- point the forwarder at 127.0.0.1 and let a local
+    rsyslog/Vector add TLS -- stays byte-identical. Refusing it would break a shipped deployment."""
+    _build_tls_context(_forward(LOOPBACK, crl_bundle))
+
+
+def test_a_non_enforcing_syslog_forwarder_warns_instead_of_refusing(crl_bundle: str) -> None:
+    """The WARN rung every sibling cell in this file carries. A `warn`-dialled instance must cross
+    rather than refuse -- and it must not cross silently, which is the whole point of the gate."""
+    ctx = _build_tls_context(
+        SyslogForward(host=REMOTE, protocol="tls", tls_ca_file=crl_bundle, hop_posture=STAGING_PHI)
+    )
+    assert ctx.verify_mode is ssl.CERT_REQUIRED
+
+
+def test_the_blanket_env_does_not_cross_the_enforcing_syslog_forwarder(
+    crl_bundle: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The #299 clamp reaches this hop too, and that is worth pinning separately: the guard folds the
+    blanket env in through `capture`, so it would be easy to assume it crosses. It ranks BELOW the
+    enforcing REFUSE, so an instance-wide env var cannot silence a hop nobody enumerated -- and the
+    forwarder has no per-hop revocation attestation at all, so loopback or a real CRL are the only
+    ways across here."""
+    monkeypatch.setenv(TLS_REVOCATION_ATTESTED_ENV, "1")
+    with pytest.raises(InsecureHopRefused, match="revocation"):
+        _build_tls_context(_forward(REMOTE, crl_bundle))
+    # NEGATIVE CONTROL, or the assertion above would also pass if the env were simply never read: on a
+    # non-enforcing posture the same env DOES cross, byte-identical to the pre-clamp behaviour.
+    _build_tls_context(
+        SyslogForward(host=REMOTE, protocol="tls", tls_ca_file=crl_bundle, hop_posture=STAGING_PHI)
+    )
+
+
+def test_the_blanket_env_does_not_cross_the_enforcing_smart_token_hop(
+    smart_key: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same clamp on the SMART hop. Its per-connection `tls_revocation_attested` crosses (proved
+    above); the process-wide env must not, because it cannot say which hop's PKI was reviewed."""
+    monkeypatch.setenv(TLS_REVOCATION_ATTESTED_ENV, "1")
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused, match="revocation"):
+        _smart_provider(f"https://{REMOTE}/token", smart_key)
+    # NEGATIVE CONTROL: on a non-enforcing posture the same env DOES cross, so the refusal above is
+    # the clamp firing rather than the env never being read.
+    with active_hop_posture(STAGING_PHI):
+        _smart_provider(f"https://{REMOTE}/token", smart_key)
+
+
+def test_a_smart_token_hop_whose_own_context_checks_a_crl_is_not_refused(
+    smart_key: str, crl_bundle: str
+) -> None:
+    """THE FALSE-REFUSAL REGRESSION. The guard was first placed above `self._opener`, so `context=`
+    could not be passed and a token hop whose resolved anchor really carried a CRL was refused anyway
+    -- while being told to configure the CRL it already had. A `[tls].crl_file` matching the token
+    host makes the anchor narrow, which builds a per-provider opener carrying
+    VERIFY_CRL_CHECK_LEAF, and that must cross."""
+    settings = {
+        "smart_token_url": f"https://{REMOTE}/token",
+        "smart_client_id": "cid",
+        "smart_private_key": smart_key,
+        "smart_algorithm": "ES384",
+    }
+    with active_hop_posture(PROD_PHI):
+        assert (
+            token_provider_from_settings(settings, trust_anchor_policy=_crl_policy(crl_bundle))
+            is not None
+        )
+    # NEGATIVE CONTROL: the same hop with no CRL policy is still refused, so the arm above passed
+    # because the CRL reached the context and not because the guard stopped firing.
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused, match="revocation"):
+        token_provider_from_settings(settings)
+
+
+def test_the_syslog_tls_forwarder_crosses_on_a_crl_that_really_loaded(crl_bundle: str) -> None:
+    """The FINISHED context really reaches the guard. ``forward_tls_crl_file`` (#299) shuts the gap
+    this gate refuses on, so the guard must read ``VERIFY_CRL_CHECK_LEAF`` off that context rather
+    than refusing because a setting it cannot see was absent."""
+    ctx = _build_tls_context(_forward(REMOTE, crl_bundle, tls_crl_file=crl_bundle))
+    assert context_checks_revocation(ctx) is True  # the line above passed for the RIGHT reason
+
+
+def test_a_verify_off_syslog_forwarder_takes_no_revocation_guard(crl_bundle: str) -> None:
+    """DISJOINTNESS on this hop. ``forward_tls_verify=false`` is CERT_NONE: no verified chain, so no
+    revocation status could matter, and the #200 forward-hop gate owns that arm. A guard here would be
+    a second gate deciding one hop."""
+    ctx = _build_tls_context(_forward(REMOTE, crl_bundle, tls_verify=False))
+    assert ctx.verify_mode is ssl.CERT_NONE
+
+
+def test_a_syslog_forwarder_with_no_posture_is_unchanged() -> None:
+    """The shipped ``posture is None`` no-op every hop guard has -- the ``build_check`` gate is the
+    authority. This arm is what keeps a direct construction, an embedding and a test working."""
+    _build_tls_context(SyslogForward(host=REMOTE, protocol="tls"))
+
+
+def test_the_forwarder_refusal_names_a_lever_that_exists_for_it(crl_bundle: str) -> None:
+    """SDS-3.7 applied to the refusal TEXT rather than to the gate. The guard's default remediation
+    names ``[tls].crl_file``, an egress terminator and a connection's ``tls_revocation_attested``, and
+    all three are unreachable for a hop that is not a connection -- ``[tls].crl_file`` reaches a
+    context only through a ``Destination``'s trust-anchor policy, and there is no connection to carry
+    the flag. A refusal whose remedy cannot be performed is a control resting on a false premise, so
+    this hop substitutes the setting that actually closes its own gate."""
+    with pytest.raises(InsecureHopRefused) as exc:
+        _build_tls_context(_forward(REMOTE, crl_bundle))
+    assert "[logging].forward_tls_crl_file" in str(exc.value)
+    assert "tls_revocation_attested=true on this connection" not in str(exc.value)
+
+
+def test_a_default_context_already_carries_the_strict_flag_a_raw_one_does_not() -> None:
+    """WHY the ``harden_verify_flags`` half of ADR 0173 section 4.3 is an ASSERTION and not a fix.
+
+    That section measured the call at zero in ``logging_setup.py`` and ``auth/oidc_http.py`` against a
+    positive control of seven files that carry it, and read the absence as a gap. The grep is right;
+    the inference does not follow. Measured 2026-09-22 on CPython 3.14.6 / OpenSSL 3.5.7:
+    ``ssl.create_default_context()`` sets ``VERIFY_X509_STRICT`` **itself**, while a raw
+    ``ssl.SSLContext(...)`` does not. Both hops in question build through the former, so both already
+    had strict path validation; the seven control files build raw contexts, where the call is
+    load-bearing.
+
+    Pinned as two arms so the claim cannot later be re-read as a closed gap. The first version of the
+    test below asserted the opposite and failed, which is how this was found."""
+    assert ssl.create_default_context().verify_flags & ssl.VERIFY_X509_STRICT
+    assert not ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).verify_flags & ssl.VERIFY_X509_STRICT
+
+
+def test_the_verifying_forwarder_context_asserts_strict_path_validation(crl_bundle: str) -> None:
+    """The property that matters, read off the context ``wrap_socket`` will really use. Deliberately
+    NOT paired with a "the CERT_NONE arm lacks it" assertion: per the measurement above the flag
+    arrives with ``create_default_context`` before ``tls_verify`` is consulted, so such an arm would
+    assert a falsehood."""
+    assert _build_tls_context(_forward(LOOPBACK, crl_bundle)).verify_flags & ssl.VERIFY_X509_STRICT

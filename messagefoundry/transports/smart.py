@@ -67,6 +67,7 @@ from messagefoundry.transports.rest import (
     enforce_outbound_length_limits,
     http_family_trust_anchor,
     refuse_cleartext_credential_hop,
+    refuse_unrevoked_verified_hop,
     refuse_url_credentials,
 )
 from messagefoundry.transports.signing import CompactJwtSigner
@@ -123,6 +124,12 @@ class SmartBackendTokenProvider:
         expiry_skew_seconds: float = _DEFAULT_EXPIRY_SKEW,
         timeout_seconds: float = _DEFAULT_TOKEN_TIMEOUT,
         attested: bool = False,
+        # #1498 (ADR 0173 §4.3): the per-connection `tls_revocation_attested`, DISTINCT from `attested`
+        # above (which attests a cleartext/verify-off hop is secure by other means, #200). Read from the
+        # resolved settings by `token_provider_from_settings`, exactly as the delivery cells read it off
+        # their Destination. Like its siblings it has no authoring surface today, so in practice the
+        # blanket MEFOR_TLS_REVOCATION_ATTESTED is the reachable attestation.
+        revocation_attested: bool = False,
         cleartext_accepted: bool = False,
         cleartext_reason: str | None = None,
         connection: str | None = None,
@@ -214,6 +221,43 @@ class SmartBackendTokenProvider:
             )
             if token_proxy is not None or trust_anchor.narrows
             else _NO_REDIRECT_OPENER
+        )
+        # #1498 (ADR 0173 §4.3): the revocation twin of the cleartext refusal above, and the same
+        # one-statement call its HTTP-family siblings make. The token hop VERIFIES the authorization
+        # server's certificate but stdlib ssl performs no OCSP/CRL, so a revoked-but-unexpired
+        # token-endpoint certificate WOULD be accepted on first deployment with no refusal, no warning
+        # and no audit entry -- on the hop carrying the signed client_assertion. Keyed on the https
+        # scheme, so the cleartext arm above and this one decide disjoint hops (that one owns `http`)
+        # and never double-refuse one.
+        #
+        # PLACED HERE, BELOW `self._opener`, AND NOT BESIDE THE CLEARTEXT REFUSAL -- which is where it
+        # was first written, and that was a false-refusal bug. `context=` is what lets a CRL that
+        # really reached THIS hop relax the gate, and the context does not exist until the opener does:
+        # a `[tls].crl_file` resolved against the token host makes `trust_anchor.narrows` true, which
+        # builds a per-provider opener carrying VERIFY_CRL_CHECK_LEAF. Guarding above that line refused
+        # a hop that genuinely checks revocation while telling the operator to configure the CRL they
+        # had already configured -- a refusal whose remedy cannot be performed, which is the SDS-3.7
+        # defect. `urllib_handler_context` reads the context off whichever opener this hop got,
+        # shared or per-provider.
+        #
+        # ADR 0173 §1.3 / §1.6 / §7 withdrew this hop's row because `smart.py` contains no `ssl` usage.
+        # That measurement is true and does NOT reach the guard: the wrapper takes a scheme and a url,
+        # for exactly the hops that ride urllib's own context. It removes this file from the
+        # `harden_verify_flags` population; it does not remove the hop.
+        #
+        # The token host is frequently NOT the connection's data host (#1660 resolves this hop's anchor
+        # against `token_url` for that reason), so the sibling guard on the REST/FHIR destination keys
+        # on a different host and cannot answer for this one.
+        #
+        # InsecureHopRefused propagates rather than being re-wrapped as SmartAuthError: the guard's own
+        # message names this hop and its ways across, which a re-wrap would discard, and both are
+        # ValueError subclasses so the loader surfaces either identically.
+        refuse_unrevoked_verified_hop(
+            scheme,
+            token_url,
+            connector="SMART token endpoint",
+            revocation_attested=revocation_attested,
+            opener=self._opener,
         )
         self._proxy_auth: dict[str, str] = (
             token_proxy.auth_headers() if token_proxy is not None else {}
@@ -450,6 +494,9 @@ def token_provider_from_settings(
         # #200: the per-connection insecure-hop attestation keys the posture-keyed cleartext refusal in
         # __init__ (read from settings exactly as _dest_config / the OAuth2 provider do).
         attested=bool(s.get("tls_hop_attested", False)),
+        # #1498 (ADR 0173 §4.3): the revocation attestation, read the same way the runner reads it for a
+        # Destination. A DIFFERENT claim from `attested` above, so it gets its own key.
+        revocation_attested=bool(s.get("tls_revocation_attested", False)),
         cleartext_accepted=accepted[0],
         cleartext_reason=accepted[1],
         connection=accepted[2],
