@@ -6,7 +6,7 @@ These tests exist because four documents claimed unordered mode buys concurrency
 connection, and it does not. If one of them reds, re-reconcile the docs it guards; do not relax the
 test.
 
-Three facts are pinned here:
+Four facts are pinned here:
 
 * **Unordered never buys intra-lane concurrency.** One outbound connection is one serial sender in
   either claim mode. Parallelism comes from having more lanes, which the positive control shows.
@@ -16,6 +16,11 @@ Three facts are pinned here:
   does not hold the lane.
 * **A FIFO lane under the default claim mode stays on the pooled OUTBOUND dispatcher**, drains at
   ``per_lane_limit`` 1, and blocks its head on failure.
+* **A lane a RELOAD adds gets a consumer, and that consumer drains it.** The partition is decided
+  once per lane and is sticky, so a reload has to decide it before anything can act on the lane. When
+  it did not, an added unordered lane was registered on the dispatcher by the reload's own nudge and
+  then refused a worker as a second consumer, ending up with NO consumer at all. Both sides of the
+  partition are exercised through the same reload, and the refusal's own repair is pinned directly.
 
 THE PARTITION IS THE POINT, so both sides are pinned. A lane is drained by its own worker or by the
 dispatcher, never by both: two consumers on one lane would break per-lane FIFO (ADR 0073). Each
@@ -398,6 +403,162 @@ async def test_one_unordered_lane_sends_one_at_a_time_under_per_lane(
     await _deliver(reg, store, sink, want=6, claim_mode="per_lane")
 
     assert gauge.peak == 1
+
+
+# --- a RELOAD that ADDS an outbound: the lane it adds must end up with a consumer ----------------
+
+_ADDED = "OB_ADDED"
+
+
+def _mixed_registry(inbox: Path, lanes: list[tuple[str, OrderingMode]]) -> Registry:
+    """Like :func:`_registry`, but every lane declares its OWN ordering mode — which is what a reload
+    that adds one unordered outbound beside an existing FIFO one needs. Handler ``i`` sends ``p{i}``
+    to ``lanes[i]``. Lane names are deduped exactly as :func:`_registry` does, so a caller that
+    repeats one (to exercise the ordering flip, say) registers the outbound once."""
+    reg = Registry()
+    for lane, ordering in dict(lanes).items():
+        reg.add_outbound(_dest(lane, ordering))
+    for i, (lane, _ordering) in enumerate(lanes):
+        reg.add_handler(f"h{i}", (lambda ln, pl: lambda m: Send(ln, pl))(lane, f"p{i}"))
+    reg.add_inbound(
+        InboundConnection(
+            "IB",
+            ConnectionSpec(
+                ConnectorType.FILE,
+                {"directory": str(inbox), "pattern": "*.hl7", "poll_seconds": 0.02},
+            ),
+            router="r",
+        )
+    )
+    reg.add_router("r", lambda m: [f"h{i}" for i in range(len(lanes))])
+    return reg
+
+
+async def _reload_then_drain(
+    runner: RegistryRunner,
+    sink: list[tuple[str, str]],
+    inbox: Path,
+    after: Registry,
+    added: str,
+) -> None:
+    """Reload onto ``after``, feed one more message, and wait for ``added`` to deliver. A bare
+    :func:`_wait_until` would report a stalled lane as "condition not met within timeout", which
+    names the wrong problem; this reports which side of the partition the lane actually landed on."""
+    await runner.reload(after)
+    _drop(inbox, "MSG2")
+    try:
+        await _wait_until(lambda: any(lane == added for lane, _ in sink), timeout=5.0)
+    except AssertionError:
+        dispatcher = runner._dispatchers.get(Stage.OUTBOUND)
+        pytest.fail(
+            f"outbound {added!r}, added by a reload, never drained. sink={sink}; "
+            f"own delivery worker={added in runner._workers}; "
+            f"in the pooled OUTBOUND lane set="
+            f"{None if dispatcher is None else added in dispatcher._lane_provider()}"
+        )
+
+
+async def test_pooled_reload_that_adds_an_unordered_outbound_drains_the_new_lane(
+    store: MessageStore, rig: tuple[list[tuple[str, str]], _Gauge], tmp_path: Path
+) -> None:
+    """THE REGRESSION. On a pooled engine, a reload that ADDS a brand-new ``ordering=unordered``
+    outbound must leave that lane with exactly one consumer, and that consumer must drain it.
+
+    The partition is decided once per lane and is sticky, so a reload has to decide it BEFORE
+    anything can act on the lane. When it did not, the reload's dispatcher nudge read the
+    unknown-lane default first and registered the lane on the OUTBOUND dispatcher; reconcile then
+    resolved the lane to its own worker, and the spawn was refused as a second consumer — leaving
+    the lane on NEITHER side. On a deploying site, rows queued to that outbound WOULD sit
+    ``PENDING`` until the process restarted, and no later reload or operator start would recover it.
+
+    Asserting the lane DRAINS is the point. A test that asserted only that the refusal was logged
+    would pin the defect in place."""
+    sink, _ = rig
+    inbox = tmp_path / "in"
+    _drop(inbox, "MSG1")
+    before = _mixed_registry(inbox, [(_LANE, OrderingMode.FIFO)])
+    after = _mixed_registry(inbox, [(_LANE, OrderingMode.FIFO), (_ADDED, OrderingMode.UNORDERED)])
+
+    runner = _runner(before, store, claim_mode=None)
+    await runner.start()
+    try:
+        assert runner._claim_mode == "pooled"  # the mode this test is about
+        await _wait_until(lambda: any(lane == _LANE for lane, _ in sink))  # baseline: it delivers
+        await _reload_then_drain(runner, sink, inbox, after, _ADDED)
+
+        dispatcher = runner._dispatchers.get(Stage.OUTBOUND)
+        assert _ADDED in runner._workers  # the added lane got its OWN delivery worker…
+        assert dispatcher is not None
+        assert _ADDED not in dispatcher._lane_provider()  # …and only that one consumer
+    finally:
+        await runner.stop()
+
+
+async def test_pooled_reload_that_adds_a_fifo_outbound_drains_it_on_the_dispatcher(
+    store: MessageStore, rig: tuple[list[tuple[str, str]], _Gauge], tmp_path: Path
+) -> None:
+    """THE CONTROL, and the other side of the same partition. Same reload, same extra message, same
+    wait — an added FIFO lane drains on the pooled dispatcher and gets no worker of its own.
+
+    This arm passes on the code the test above fails, so a green unordered arm means that lane
+    really drained rather than that the rig happens to deliver nothing at all after a reload."""
+    sink, _ = rig
+    inbox = tmp_path / "in"
+    _drop(inbox, "MSG1")
+    before = _mixed_registry(inbox, [(_LANE, OrderingMode.FIFO)])
+    after = _mixed_registry(inbox, [(_LANE, OrderingMode.FIFO), (_ADDED, OrderingMode.FIFO)])
+
+    runner = _runner(before, store, claim_mode=None)
+    await runner.start()
+    try:
+        await _wait_until(lambda: any(lane == _LANE for lane, _ in sink))
+        await _reload_then_drain(runner, sink, inbox, after, _ADDED)
+
+        dispatcher = runner._dispatchers.get(Stage.OUTBOUND)
+        assert _ADDED not in runner._workers  # no per-lane worker for a FIFO lane
+        assert dispatcher is not None and _ADDED in dispatcher._lane_provider()
+    finally:
+        await runner.stop()
+
+
+# --- the fail-safe itself: refusing a spawn must leave ONE consumer, not zero --------------------
+
+
+async def test_the_two_consumer_refusal_hands_the_lane_back_to_the_dispatcher(
+    store: MessageStore, rig: tuple[list[tuple[str, str]], _Gauge], tmp_path: Path
+) -> None:
+    """``_spawn_worker``'s two-consumer refusal must leave the lane on ONE consumer, not zero.
+
+    The partition is corrupted by hand here because the reload path that used to reach this refusal
+    no longer does, and an unreachable fail-safe is exactly the kind that rots. Refusing used to
+    return with ``_worker_owned`` still True, which drops the lane from the dispatcher's set — the
+    predicate's exact complement — while no worker exists to take it. Its ERROR said the dispatcher
+    kept draining the lane, which was the opposite of what had just happened.
+
+    The assertion BEFORE the call is the control: it shows the True flag really does drop the lane,
+    so the membership assertion after the call is reading a change rather than a constant."""
+    sink, _ = rig
+    inbox = tmp_path / "in"
+    _drop(inbox)
+    reg = _registry(inbox, [_LANE], ordering=OrderingMode.FIFO)
+
+    runner = _runner(reg, store, claim_mode=None)
+    await runner.start()
+    try:
+        await _wait_until(lambda: any(lane == _LANE for lane, _ in sink))
+        dispatcher = runner._dispatchers.get(Stage.OUTBOUND)
+        assert dispatcher is not None
+        assert dispatcher.phase(_LANE) is not None  # the dispatcher holds the lane
+
+        runner._worker_owned[_LANE] = True  # the partition bug this refusal exists to catch
+        assert _LANE not in dispatcher._lane_provider()  # CONTROL: True really does drop the lane
+        runner._spawn_worker(_LANE)
+
+        assert _LANE not in runner._workers  # the spawn was refused…
+        assert runner._worker_owned[_LANE] is False  # …and the lane went back to the dispatcher
+        assert _LANE in dispatcher._lane_provider()
+    finally:
+        await runner.stop()
 
 
 # --- POSITIVE CONTROL: the gauge can read above 1, so the 1 above is real ------------------------
