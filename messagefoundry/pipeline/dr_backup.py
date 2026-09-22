@@ -1099,7 +1099,11 @@ def _verify_archive_blocking(
         return VerifyResult("KEY_MISMATCH", reason=safe_exc(exc))
     except BackupCodecError as exc:
         return VerifyResult("FAIL", reason=f"decrypt failed: {safe_exc(exc)}")
-    except (OSError, tarfile.TarError, json.JSONDecodeError) as exc:
+    except (OSError, tarfile.TarError) as exc:
+        # `json.JSONDecodeError` is no longer named here: `_read_manifest_from_tar` reports a
+        # manifest that will not parse as `TarError`, and nothing else in the block parses JSON
+        # (`read_header` raises `BackupCodecError` for its own). A name for a type that cannot
+        # arrive reads as a guard and guards nothing.
         return VerifyResult("FAIL", reason=safe_exc(exc))
 
 
@@ -1375,22 +1379,51 @@ def _read_manifest_from_tar(tar_path: Path) -> dict[str, object]:
     # store DEK, so reaching this line means the archive was sealed by a holder of the key. The cap
     # is defence in depth — against a locally damaged or tampered archive, and against the
     # `allow_unencrypted` plaintext path, which has no tag to check. It is NOT a pre-auth exposure.
+    #
+    # Every way the manifest can be unusable is reported as ONE type, `tarfile.TarError`, from here.
+    # It used to raise `KeyError` for an absent member and let `json.loads` raise its own
+    # `ValueError` (a `JSONDecodeError`, or a `UnicodeDecodeError` on bytes that are not UTF-8),
+    # and only the restore call site translated those; `_verify_archive_blocking` caught neither,
+    # so `messagefoundry restore-verify` on the identical forged archive -- the command the runbook
+    # says to run FIRST -- raised a traceback where `restore` refused. Both callers already catch
+    # `TarError` for this function's own cap refusals, so normalising here covers both at once.
+    #
+    # A manifest that reads back as something other than an object -- a directory wearing the
+    # member's name (`extractfile` returns None), or valid JSON such as `[]` or `null` -- used to
+    # fold to `{}`, which RESTORED with no manifest check at all while an absent manifest refused.
+    # Those are the same state to an operator (no manifest to verify the store against), so they
+    # refuse the same way.
     with tarfile.open(tar_path, "r:") as tar:
-        info = tar.getmember(_MANIFEST_MEMBER)  # KeyError when absent, as before
+        try:
+            info = tar.getmember(_MANIFEST_MEMBER)
+        except KeyError as exc:
+            raise tarfile.TarError(
+                f"archive has no {_MANIFEST_MEMBER} member, so there is nothing to verify the store "
+                "against"
+            ) from exc
         if info.size > _MAX_MANIFEST_BYTES:
             raise tarfile.TarError(
                 f"archive manifest exceeds the read cap ({_MAX_MANIFEST_BYTES} bytes)"
             )
         member = tar.extractfile(info)
         if member is None:
-            return {}
+            raise tarfile.TarError(f"archive {_MANIFEST_MEMBER} member is not a regular file")
         data = member.read(_MAX_MANIFEST_BYTES + 1)
         if len(data) > _MAX_MANIFEST_BYTES:
             raise tarfile.TarError(
                 f"archive manifest stream exceeds the read cap ({_MAX_MANIFEST_BYTES} bytes)"
             )
-    obj = json.loads(data)
-    return obj if isinstance(obj, dict) else {}
+    try:
+        obj = json.loads(data)
+    except ValueError as exc:
+        # `ValueError` is the common base of both parse-side failures; naming only
+        # `JSONDecodeError` would let the not-UTF-8 case through.
+        raise tarfile.TarError(f"archive {_MANIFEST_MEMBER} could not be parsed: {exc}") from exc
+    if not isinstance(obj, dict):
+        raise tarfile.TarError(
+            f"archive {_MANIFEST_MEMBER} is not a JSON object (got {type(obj).__name__})"
+        )
+    return obj
 
 
 def _extract_member(
@@ -1728,27 +1761,16 @@ def _restore_blocking(
                             )
                         dst.write(buf)
 
-            # `_read_manifest_from_tar` raises three ways -- `tarfile.ReadError` on a compressed or
-            # unreadable tar, `KeyError` when the manifest member is absent, and a `ValueError` from
-            # `json.loads` on a damaged one. None is a bug, all three are what a corrupt or forged
-            # archive looks like, and unguarded they left this path as a CLI traceback from the
-            # last-resort excepthook instead of the refusal every other archive fault here gets.
-            #
-            # `ValueError`, not `json.JSONDecodeError`: `json.loads` on bytes DECODES before it parses,
-            # and bytes that are not UTF-8 raise `UnicodeDecodeError` -- a `ValueError` that is not a
-            # `JSONDecodeError`. A guard naming only the latter reads as complete and lets a
-            # one-byte forgery straight through as a traceback. Both are the same fact about the
-            # member ("this is not a manifest") reported from two layers, so the arm names their
-            # common base.
+            # `_read_manifest_from_tar` reports every way the manifest can be unusable -- absent, a
+            # directory, over the cap, not UTF-8, not JSON, not an object -- as `tarfile.TarError`
+            # (see its comment), so one arm covers the set here and the verify path's existing
+            # `TarError` arm covers it there. Unguarded, a forged archive left this path as a CLI
+            # traceback from the last-resort excepthook instead of the refusal every other archive
+            # fault here gets; translating at this site alone left `restore-verify` with the
+            # traceback.
             try:
                 manifest = _read_manifest_from_tar(tar_path)
-            except KeyError as exc:
-                raise BackupError(
-                    "restore",
-                    f"archive has no {_MANIFEST_MEMBER} member, so there is nothing to verify the "
-                    "store against",
-                ) from exc
-            except (tarfile.TarError, ValueError, OSError) as exc:
+            except (tarfile.TarError, OSError) as exc:
                 raise BackupError(
                     "restore", f"archive manifest could not be read: {safe_exc(exc)}"
                 ) from exc

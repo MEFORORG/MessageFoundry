@@ -892,25 +892,62 @@ def test_restore_refuses_config_only_archive(tmp_path, key_b64, capsys) -> None:
 # --- (5b) a corrupt or forged archive refuses, it does not traceback ----------
 
 
-def _plain_tar(path: Path, members: list[tuple[str, bytes]]) -> Path:
+_DIRECTORY_MEMBER = object()  # a tar member that is a directory wearing the given name
+
+
+def _plain_tar(path: Path, members: list[tuple[str, bytes | object]]) -> Path:
     """An uncompressed tar carrying exactly ``members``, in order -- the plaintext shape
-    ``_restore_blocking`` consumes on a no-key box, and the one a forged archive would have."""
+    ``_restore_blocking`` consumes on a no-key box, and the one a forged archive would have. A body
+    of ``_DIRECTORY_MEMBER`` adds a directory under that name instead of a file."""
     with tarfile.open(path, "w") as tar:
         for name, body in members:
             info = tarfile.TarInfo(name)
+            if body is _DIRECTORY_MEMBER:
+                info.type = tarfile.DIRTYPE
+                tar.addfile(info)
+                continue
+            assert isinstance(body, bytes)
             info.size = len(body)
             tar.addfile(info, io.BytesIO(body))
     return path
 
 
+def _archive_with_manifest(tmp_path: Path, payload: bytes | object | None) -> Path:
+    """A plaintext archive whose manifest is ``payload``: absent when ``None``, a directory member
+    when ``_DIRECTORY_MEMBER``, else exactly those bytes. The store member is always present, so the
+    manifest is the only thing wrong with the archive."""
+    members: list[tuple[str, bytes | object]] = []
+    if payload is not None:
+        members.append((dr_backup._MANIFEST_MEMBER, payload))
+    members.append(("store.db", b"SQLite format 3\x00"))
+    return _plain_tar(tmp_path / "manifest-case.tar", members)
+
+
+# Every shape of manifest that is not one, each labelled by the limb it exercises. Absent is the
+# `KeyError` limb; the next two are the two `ValueError`s `json.loads` raises -- a `JSONDecodeError`
+# on bytes that decode and then fail to parse, and a `UnicodeDecodeError` on bytes that fail to
+# DECODE one step earlier, which is a `ValueError` but NOT a `JSONDecodeError` (so a guard naming
+# only the latter let it through; an all-ASCII body can never reach that limb). The last three are
+# the shapes that used to fold to `{}` and RESTORE with no manifest check at all, while an absent
+# manifest refused: valid JSON that is not an object, and a directory wearing the member's name.
+_UNUSABLE_MANIFESTS = [
+    ("absent", None),
+    ("not json", b"{not json at all"),
+    ("not utf-8", b"{\xff"),
+    ("a list", b"[]"),
+    ("null", b"null"),
+    ("a directory", _DIRECTORY_MEMBER),
+]
+
+
 def test_restore_refuses_an_archive_with_no_manifest(tmp_path, capsys) -> None:
-    # `_read_manifest_from_tar` raises three ways -- ReadError on an unreadable tar, KeyError when the
-    # manifest member is absent, ValueError on a damaged one. At this call site none of them was
-    # caught, so all three escaped the CLI's BackupError handler as a traceback from the last-resort
-    # excepthook, while every other archive fault on this path refuses cleanly. Driven through the
-    # CLI so the observable IS the refusal (rc 1 and a reason on stderr) rather than an exception
-    # type a caller might or might not translate.
-    tar = _plain_tar(tmp_path / "no-manifest.tar", [("store.db", b"SQLite format 3\x00")])
+    # `_read_manifest_from_tar` used to raise KeyError when the manifest member was absent, and at
+    # this call site nothing caught it, so it escaped the CLI's BackupError handler as a traceback
+    # from the last-resort excepthook while every other archive fault on this path refuses cleanly.
+    # Driven through the CLI so the observable IS the refusal (rc 1 and a reason on stderr) rather
+    # than an exception type a caller might or might not translate. The reason names the member, so
+    # an operator reading the line knows what the archive lacks.
+    tar = _archive_with_manifest(tmp_path, None)
     toml = _service_toml(tmp_path, key_b64=None)
     dest = tmp_path / "out" / "msg.db"
     assert main(["restore", str(tar), "--to", str(dest), "--service-config", toml]) == 1
@@ -919,31 +956,36 @@ def test_restore_refuses_an_archive_with_no_manifest(tmp_path, capsys) -> None:
     assert not dest.exists()
 
 
-@pytest.mark.parametrize(
-    ("label", "payload"),
-    [
-        # The JSONDecodeError limb: bytes that decode and then fail to parse.
-        ("not json", b"{not json at all"),
-        # The UnicodeDecodeError limb: bytes that fail to DECODE, one step before the parse.
-        # `json.loads` raises UnicodeDecodeError here, which is a ValueError but NOT a
-        # JSONDecodeError -- so a guard naming only the latter lets this one through as a traceback.
-        # The payload is the whole point of the case: an all-ASCII body can never reach that limb.
-        ("not utf-8", b"{\xff"),
-    ],
-)
-def test_restore_refuses_an_archive_whose_manifest_cannot_be_read(
+@pytest.mark.parametrize(("label", "payload"), _UNUSABLE_MANIFESTS)
+def test_restore_refuses_an_archive_whose_manifest_is_unusable(
     tmp_path, capsys, label, payload
 ) -> None:
-    tar = _plain_tar(
-        tmp_path / "bad-manifest.tar",
-        [("manifest.json", payload), ("store.db", b"SQLite format 3\x00")],
-    )
+    tar = _archive_with_manifest(tmp_path, payload)
     toml = _service_toml(tmp_path, key_b64=None)
     dest = tmp_path / "out" / "msg.db"
     assert main(["restore", str(tar), "--to", str(dest), "--service-config", toml]) == 1, label
     err = _refusal(capsys)
     assert "restore failed (restore)" in err and "manifest could not be read" in err, (label, err)
     assert not dest.exists()
+
+
+@pytest.mark.parametrize(("label", "payload"), _UNUSABLE_MANIFESTS)
+def test_restore_verify_fails_an_archive_whose_manifest_is_unusable(
+    tmp_path, capsys, label, payload
+) -> None:
+    # The SAME archives through `restore-verify`, which is the command the runbook tells an operator
+    # to run FIRST to triage. The translation for these shapes used to live at the restore call site
+    # alone, so `restore` refused a forged manifest-less archive cleanly while `restore-verify` on the
+    # identical file raised a traceback (`_verify_archive_blocking` caught neither the KeyError nor
+    # the ValueError, and the CLI calls it outside any try). Normalised inside
+    # `_read_manifest_from_tar`, both commands now see one `TarError` and both refuse: here as a
+    # FAIL verdict with a reason that names the manifest, on the same stream a good verify reports on.
+    tar = _archive_with_manifest(tmp_path, payload)
+    toml = _service_toml(tmp_path, key_b64=None)
+    assert main(["restore-verify", str(tar), "--service-config", toml, "--json"]) == 1, label
+    verdict = _json_line(capsys.readouterr().out)
+    assert verdict["status"] == "FAIL", (label, verdict)
+    assert "manifest.json" in verdict["reason"], (label, verdict)
 
 
 def test_restore_refuses_a_config_member_landing_on_a_directory(tmp_path) -> None:
