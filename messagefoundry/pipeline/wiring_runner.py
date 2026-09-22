@@ -983,9 +983,11 @@ class RegistryRunner:
         # pooled OUTBOUND StageDispatcher drains (False). The two sets are COMPLEMENTS — that is the
         # single-consumer-per-lane invariant (ADR 0073) in one dict — so every branch that used to ask
         # `self._claim_mode == "pooled"` about an outbound lane asks :meth:`_per_lane_delivery` instead.
-        # Decided ONCE per lane by :meth:`_resolve_lane_consumer` and never flipped while the engine
-        # runs; cleared on teardown so a start()-after-stop() re-decides. Empty in per_lane mode, where
-        # every lane has its own worker by definition.
+        # Decided ONCE per lane by :meth:`_resolve_lane_consumer`; cleared on teardown so a
+        # start()-after-stop() re-decides. Empty in per_lane mode, where every lane has its own worker
+        # by definition. THE ONE FLIP is :meth:`_spawn_worker`'s two-consumer refusal, which hands the
+        # lane back to the dispatcher rather than leave it with no consumer at all — a repair of a
+        # partition that was ALREADY wrong, never a handover of a healthy lane (still refused).
         self._worker_owned: dict[str, bool] = {}
         self._internal_error: dict[str, InternalErrorPolicy] = {}
         self._buildup: dict[str, BuildupThreshold] = {}
@@ -1322,7 +1324,14 @@ class RegistryRunner:
         of the single-consumer guarantee.** Two consumers on one lane would break per-lane FIFO (ADR
         0073), so every outbound branch that used to key off ``self._claim_mode`` — the wake, the
         pause/park/resume gates, the retry wake timer, the reconcile liveness test — keys off THIS
-        instead. A pure read: :meth:`_resolve_lane_consumer` is the only writer."""
+        instead.
+
+        A pure read, and it returns the dispatcher-drained DEFAULT for a lane nothing has resolved
+        yet — so every path that can act on a lane must resolve it first (``_start_outbound``,
+        ``_reconcile_outbounds``, and :meth:`reload`'s hoisted pass over the lanes it ADDS, which is
+        the one that was missing). :meth:`_resolve_lane_consumer` decides it;
+        :meth:`_spawn_worker`'s two-consumer refusal is the one other writer, and that one only ever
+        hands a lane BACK to the dispatcher."""
         if self._claim_mode != "pooled":
             return True
         return self._worker_owned.get(name, False)
@@ -3894,11 +3903,24 @@ class RegistryRunner:
         out = self._dispatchers.get(Stage.OUTBOUND)
         held = None if out is None else out.phase(name)
         if held is not None:
+            # RETURN THE LANE TO THE DISPATCHER BEFORE REFUSING, which is what makes the message below
+            # true of what just happened. Returning with `_worker_owned[name]` still True left the lane
+            # on NEITHER consumer: the flag routes every later `_per_lane_delivery` read away from the
+            # dispatcher, so `_pooled_lane_provider` — its exact complement — DROPS the lane, while no
+            # worker exists to take it. The dispatcher never prunes `_states`, so `phase(name)` stays
+            # non-None and every later respawn, reload and operator `start_outbound` hit this same
+            # refusal; the lane recovered only on a process restart. Writing False rather than popping
+            # keeps the decision sticky: a pop would let the next `_resolve_lane_consumer` decide True
+            # again and arrive straight back here. Unreachable outside pooled (per_lane builds no
+            # dispatchers, so `held` is None there), and a no-op if it were: `_per_lane_delivery`
+            # short-circuits on the mode before it reads this map.
+            self._worker_owned[name] = False
             log.error(
                 "outbound %r would have TWO consumers: a per-lane delivery worker and the pooled "
                 "OUTBOUND dispatcher, which already holds the lane at phase %r. Refusing to spawn "
-                "the worker — the dispatcher keeps draining it (ADR 0066 D4 / ADR 0073 single "
-                "consumer per lane). This is a bug in the lane-consumer partition; report it",
+                "the worker and handing the lane BACK to the dispatcher, which keeps draining it "
+                "(ADR 0066 D4 / ADR 0073 single consumer per lane). This is a bug in the "
+                "lane-consumer partition; report it",
                 name,
                 held,
             )
@@ -4642,6 +4664,9 @@ class RegistryRunner:
 
             old = self.registry
             old_inbound_names = list(self._sources)
+            # (name, its _ordering key already existed) for every lane step 2a below partitions, so the
+            # rollback can drop exactly what this reload wrote and nothing a live lane depends on.
+            partitioned_here: list[tuple[str, bool]] = []
 
             # 1. Quiesce intake: stop every inbound source so no NEW messages are accepted. Any
             #    message already in flight completes under its arrival-time registry (snapshotted in
@@ -4654,6 +4679,34 @@ class RegistryRunner:
             try:
                 # 2. Swap the registry and restart inbound listeners from it (intake back up first).
                 self.registry = new_registry
+                # 2a. ADR 0066 D4: decide the OUTBOUND lane partition for every lane this reload ADDS,
+                # before anything downstream can act on one. :meth:`_per_lane_delivery` returns the
+                # dispatcher-drained DEFAULT for a lane nothing has resolved, and TWO things read it
+                # between here and step 3: the listeners step 2 is about to restart (a transform handoff
+                # reaches `_wake_lane` -> `mark_ready`), and step 2b's `notify_work` broadcast, whose
+                # lane provider is that predicate's complement. Either one REGISTERS an added UNORDERED
+                # lane on the OUTBOUND dispatcher. Step 3 then resolves the lane to its own worker, and
+                # `_spawn_worker` refuses the spawn because the dispatcher already holds the lane — so
+                # the lane ends up on NEITHER consumer, and since the dispatcher never prunes `_states`
+                # no later reload and no operator `start_outbound` undoes it. Only a restart did.
+                #
+                # `_resolve_lane_consumer` reads `_lane_ordering`, so these lanes' ordering has to be
+                # recorded first; step 3 writes both again with the same values, which makes this a
+                # HOIST of two of its lines rather than a second source of truth.
+                #
+                # NARROWED to lanes the partition does not yet know, and to pooled mode. An already-
+                # resolved lane's decision is sticky by design (see `_resolve_lane_consumer`), so
+                # re-running it would be a no-op with a side effect on `_ordering`: writing a RUNNING
+                # lane's new ordering here instead of at step 3 would let its live worker read the new
+                # mode a step early, for no gain. per_lane keeps `_worker_owned` empty by definition.
+                if self._claim_mode == "pooled":
+                    for out_name, out_conn in new_registry.outbound.items():
+                        if out_name in self._worker_owned:
+                            continue
+                        had_ordering = out_name in self._ordering
+                        self._ordering[out_name] = out_conn.ordering or self._ordering_default
+                        self._resolve_lane_consumer(out_name)
+                        partitioned_here.append((out_name, had_ordering))
                 # ADR 0087 (#197): recycle the per-inbound sandbox worker children so the NEW graph
                 # reaches them. Each child holds the registry it load_config'd at spawn, so a stale child
                 # would keep routing/transforming/deciding accepts= against the OLD graph — and a reload
@@ -4733,6 +4786,13 @@ class RegistryRunner:
                 # accepting exactly what it did before (the realistic failure is an inbound bind).
                 log.exception("reload failed; rolling back inbound intake to the previous graph")
                 self.registry = old
+                # …and roll back step 2a, so a lane that never came up carries no sticky consumer
+                # decision into the next reload. Only the entries THIS reload wrote are dropped; a lane
+                # already resolved before it was skipped above and is untouched here.
+                for out_name, had_ordering in partitioned_here:
+                    self._worker_owned.pop(out_name, None)
+                    if not had_ordering:
+                        self._ordering.pop(out_name, None)
                 for name in list(self._sources):
                     await self._stop_inbound_unsafe(name)
                 for name in old_inbound_names:
