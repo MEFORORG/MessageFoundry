@@ -349,7 +349,38 @@ def test_the_installer_manages_post_merge_everywhere_it_manages_post_commit() ->
     # a header that changes once in months, so it reads INSTALLED across an arbitrarily old copy --
     # and the matcher deciding whether this hook publishes lives in the body.
     assert "$durMergeInstalled" in body, "-Status does not look at post-merge at all"
-    assert "$durSrcSha" in body, "-Status reports no content parity for the durability hook"
+
+    # SINCE BACKLOG #1463 THE PARITY LOOP READS A DECLARATION rather than a pair spelled out inside
+    # it, so this pins the declaration and its consumption instead of the old `$durSrcSha` local.
+    # Naming both halves matters: a declaration nothing reads is a second source of truth, and a
+    # loop over a declaration that has lost post-merge is the 2026-09-19 orphan all over again with
+    # every test here still green.
+    #
+    # THE ENTRY IS MATCHED INSIDE THE BLOCK, never loose in the file. An unscoped search would be
+    # satisfied by the same line sitting in any other hashtable in this script, which would pin a
+    # declaration the parity loop never reads.
+    block = re.search(
+        r"(?m)^([ \t]*)\$verbatimHooks\s*=\s*@\{[ \t]*\r?\n(.*?)^\1\}[ \t]*$", body, re.S
+    )
+    assert block, "no $verbatimHooks block is declared"
+    decl = re.search(
+        r"""(?m)^[ \t]*(['"])durability_push\.sh\1\s*=\s*@\(([^)]*)\)""", block.group(2)
+    )
+    assert decl, "the $verbatimHooks block declares no durability_push.sh entry"
+    names = re.findall(r"""(?:['"])([^'"]+)(?:['"])""", decl.group(2))
+    # A FLOOR. Both names must be there; a third one added later is a correct extension and a
+    # reordering means nothing, so neither should red this.
+    assert {"post-commit", "post-merge"} <= set(names), (
+        f"the $verbatimHooks entry for durability_push.sh must name BOTH installed hooks -- naming "
+        f"fewer leaves an entire class of commit compared to nothing: {names}"
+    )
+    # Consumption, matched on the STRUCTURE of the loop rather than on one spelling of a subscript,
+    # so a rename of the loop variable or a switch to .GetEnumerator() does not read as a regression.
+    assert re.search(r"foreach\s*\(\s*\$\w+\s+in\s+\(?\s*\$verbatimHooks\b", body), (
+        "-Status reports no content parity for the durability hook -- nothing iterates the "
+        "$verbatimHooks declaration, so it is a second source of truth rather than the source"
+    )
+    assert "Get-HookPayloadHash" in body, "-Status compares no content hashes at all"
 
 
 # --- the second copy of this matcher ----------------------------------------------------------

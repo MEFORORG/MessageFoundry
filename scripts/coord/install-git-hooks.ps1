@@ -97,6 +97,31 @@ $durabilityMarker = "MessageFoundry durability hook"
 # this script rather than carrying its own copy, so at least the test cannot fall behind it.
 $payloads = @("claim_check.py", "push_guard.py")
 
+# The VERBATIM hooks, and this is the declaration BACKLOG #1463 filed for: a source under
+# scripts\hooks\ that the install path Copy-Items into $hooksDir unchanged, mapped to EVERY installed
+# name it lands under.
+#
+# A LIST of installed names, not one name, because one source already installs twice.
+# durability_push.sh is BOTH post-commit and post-merge, and the 2026-09-19 measurement recorded above
+# is what the unwatched second name cost: an orphan post-merge three weeks older than the post-commit
+# beside it, refusing this clone's private remote while -Status printed INSTALLED and nothing else.
+# A map to a single name would have re-created that blind spot the next time a source gained a name.
+#
+# These differ from $payloads above in shape, not in exposure. A payload is a .py that a generated
+# shim execs; a verbatim hook IS the hook, so nothing regenerates around it and the installed copy is
+# the whole of what runs. Both land in the COMMON git dir, where one stale copy governs every worktree
+# of this clone at once.
+#
+# -Status reads its content parity out of THIS declaration rather than out of a list written a second
+# time inside the loop, and tests\test_installed_coord_hooks.py parses it out of this script rather
+# than carrying its own copy -- so neither consumer can fall behind it.
+#
+# The install path still names its own file per Copy-Item site, exactly as $payloads does and for the
+# same reason: each site carries its own why. A SECOND verbatim hook has to be added in both places.
+$verbatimHooks = @{
+    "durability_push.sh" = @("post-commit", "post-merge")
+}
+
 function Get-HookPayloadHash([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path)) { return $null }
     # A CONTENT hash, not a byte hash, and byte-for-byte the SAME fold as scripts\worktree\
@@ -191,18 +216,50 @@ if ($Status) {
     # getting no parity check at all. Measured 2026-09-19: .git/hooks/post-merge here was three
     # weeks older than the post-commit beside it and carried a matcher that refuses this clone's
     # private remote, while -Status printed INSTALLED for it and nothing else.
+    #
+    # DRIVEN BY $verbatimHooks, never by a pair spelled out here (BACKLOG #1463). This loop used to
+    # carry its own copy of the installed names, so the declaration and the audit were two lists that
+    # had to be kept in step by memory. A source gaining a THIRD installed name would then have been
+    # reported by neither -- and a name no instrument reports is the exact orphan shape measured
+    # 2026-09-19 above, which ran for three weeks while -Status looked straight past it.
+    #
+    # The MARKER lines above still name post-commit and post-merge one at a time on purpose. They
+    # answer a different question -- is a hook of our shape present at all -- and each carries its own
+    # remedy text; this loop is the one that answers "is what RUNS what this checkout committed".
     $shortSha = { param($h) if ($h) { $h.Substring(0, 12).ToLowerInvariant() } else { "(absent)" } }
-    $durSrcSha = Get-HookPayloadHash (Join-Path $RepoRoot "scripts/hooks/durability_push.sh")
-    foreach ($pair in @(@{ n = "post-commit"; p = $postCommit }, @{ n = "post-merge "; p = $postMerge })) {
-        $iSha = Get-HookPayloadHash $pair.p
-        if (-not $iSha) { continue }
-        Write-Host "durability : $($pair.n)  installed $(& $shortSha $iSha) / source $(& $shortSha $durSrcSha)"
-        if ($iSha -ne $durSrcSha) {
-            Write-Host "             ^ STALE. The copy that RUNS is not the one in this checkout, so every" -ForegroundColor Red
-            Write-Host "               rule in it -- including which remotes it refuses to publish to -- is" -ForegroundColor Red
-            Write-Host "               whatever it was when it was installed. Re-run with NO flags to replace it." -ForegroundColor Red
-            Write-Host "               Read the branch you are on first: arming from a checkout that PREDATES" -ForegroundColor Red
-            Write-Host "               the installed copy downgrades it for every worktree of this clone." -ForegroundColor Red
+    # Padded so the digests line up whatever names are declared. Computed with an explicit loop rather
+    # than piping .Values into Measure-Object: the pipeline unrolls a nested array one level, so the
+    # piped spelling's behaviour depends on how many names a source happens to declare.
+    $verbatimWidth = 0
+    foreach ($names in $verbatimHooks.Values) {
+        foreach ($n in $names) { if ($n.Length -gt $verbatimWidth) { $verbatimWidth = $n.Length } }
+    }
+    # AN EMPTY DECLARATION MUST BE LOUD. Driving the loop from a declaration bought a new failure the
+    # hardcoded pair could not have: with $verbatimHooks empty or gone, this whole section prints
+    # NOTHING and says nothing about why, leaving the marker lines above reading INSTALLED over a
+    # copy nobody compared to anything -- the pre-2026-09-19 picture restored, by a deletion, in
+    # silence. The payload loop below cannot reach this state because -Status is not its only reader;
+    # this one has no such backstop, so it reports its own absence.
+    if ($verbatimHooks.Count -eq 0) {
+        Write-Host "durability : NOTHING DECLARED. No verbatim hook was compared to anything." -ForegroundColor Red
+        Write-Host "             `$verbatimHooks above is empty, so this audit is off -- which is NOT" -ForegroundColor Red
+        Write-Host "             the same as the hooks being current. Restore the declaration." -ForegroundColor Red
+    }
+    foreach ($srcName in ($verbatimHooks.Keys | Sort-Object)) {
+        $srcSha = Get-HookPayloadHash (Join-Path $RepoRoot "scripts/hooks/$srcName")
+        foreach ($installedName in $verbatimHooks[$srcName]) {
+            $iSha = Get-HookPayloadHash (Join-Path $hooksDir $installedName)
+            if (-not $iSha) { continue }
+            Write-Host "durability : $($installedName.PadRight($verbatimWidth))  installed $(& $shortSha $iSha) / source $(& $shortSha $srcSha)"
+            if (-not $srcSha) {
+                Write-Host "             ^ no source at scripts/hooks/$srcName -- the installed copy cannot be judged." -ForegroundColor Yellow
+            } elseif ($iSha -ne $srcSha) {
+                Write-Host "             ^ STALE. The copy that RUNS is not the one in this checkout, so every" -ForegroundColor Red
+                Write-Host "               rule in it -- including which remotes it refuses to publish to -- is" -ForegroundColor Red
+                Write-Host "               whatever it was when it was installed. Re-run with NO flags to replace it." -ForegroundColor Red
+                Write-Host "               Read the branch you are on first: arming from a checkout that PREDATES" -ForegroundColor Red
+                Write-Host "               the installed copy downgrades it for every worktree of this clone." -ForegroundColor Red
+            }
         }
     }
 
