@@ -1462,9 +1462,11 @@ def revocation_hop_disposition(
     return HopDisposition.WARN
 
 
-#: The remediation sentence for a hop that IS a connection — the seven cells #201 wired. Named so a
+#: The remediation sentence for a hop that IS a connection, which is most of them. Named so a
 #: non-connection hop can substitute its own via :attr:`RevocationHopGuard.ways_across` rather than
-#: inheriting three levers it cannot use (BACKLOG #1498).
+#: inheriting levers it cannot use (BACKLOG #1498). Deliberately **not** annotated with how many
+#: hops consume it: that is the hardened-count liability SDS-3.6 names, and this very change moved
+#: four documents off such a count. Find the consumers by symbol.
 _CONNECTION_WAYS_ACROSS = (
     "Configure [tls].crl_file so the engine checks a CRL on this hop, terminate at a "
     "revocation-checking egress proxy, or set tls_revocation_attested=true on this connection."
@@ -1569,8 +1571,13 @@ class RevocationHopGuard:
         return (
             f"{self.description} to {self.host}: the peer certificate is verified but NO certificate "
             "revocation checking (OCSP/CRL) is performed — stdlib ssl has none (ASVS 12.1.4, ADR 0078). "
-            f"{self.ways_across or _CONNECTION_WAYS_ACROSS} "
-            f"Under an enforcing posture a blanket {TLS_REVOCATION_ATTESTED_ENV}=1 no longer suffices "
+            # `is not None`, never `or`: a hop with no lever at all passes "" to offer nothing, and a
+            # falsy test would hand it back the connection-shaped advice this field exists to suppress.
+            f"{_CONNECTION_WAYS_ACROSS if self.ways_across is None else self.ways_across} "
+            # The env var is named WITHOUT `=1`. CredentialScrubFilter keys on NAME=VALUE and rewrote
+            # the value to <redacted> here, so the WARN arm rendered its own remediation garbled
+            # (BACKLOG #1498). Naming the setting rather than the value is immune and reads the same.
+            f"Under an enforcing posture a blanket {TLS_REVOCATION_ATTESTED_ENV} no longer suffices "
             "(BACKLOG #299) — it cannot say which hop's PKI was reviewed."
         )
 

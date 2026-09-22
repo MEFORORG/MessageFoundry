@@ -575,12 +575,19 @@ def _refuse_forward_revocation(forward: SyslogForward, ctx: ssl.SSLContext) -> N
     §4.3). The ``store/postgres.py:_refuse_store_revocation`` shape, for the same reason: a hop built
     outside the connector-construction gate, so its posture is threaded rather than ambient.
 
-    This hop had **no** revocation signal of any kind. Its #200 sibling
+    This hop has **no** revocation signal of any kind in the shipped code. Its #200 sibling
     (:func:`~messagefoundry.config.settings.forward_hop_disposition`) returns ALLOW for verified TLS --
-    *"an encrypted+authenticated hop, nothing to gate"* -- so a verified collector whose certificate was
-    revoked this morning kept receiving the audit evidence stream with no refusal, no warning and no
-    audit entry. The two gates stay disjoint: that one owns the plaintext and verify-off arms, this one
-    only the verified arm.
+    *"an encrypted+authenticated hop, nothing to gate"* -- so on a first deployment a verified
+    collector whose certificate had been revoked **would** keep receiving the audit evidence stream
+    with no refusal, no warning and no audit entry (conditional per CLAUDE.md §0: there are zero
+    deployments, so nothing has received anything). The two gates stay disjoint: that one owns the
+    plaintext and verify-off arms, this one only the verified arm.
+
+    **Known limit, recorded rather than left for the next reader to find.** The WARN arm on a
+    non-enforcing instance logs *after* ``configure_logging`` has set the root level, so it is
+    filtered out at ``[logging].level`` above WARNING -- unlike its #200 sibling, which logs before
+    that and survives on the root ``lastResort`` handler. The REFUSE arm is unaffected (it raises).
+    Measured 2026-09-22 at ``WARNING`` and ``ERROR``.
 
     Called with the FINISHED context, which is the whole point of ``context=``: a
     ``forward_tls_crl_file`` that really loaded sets ``VERIFY_CRL_CHECK_LEAF`` on the very context

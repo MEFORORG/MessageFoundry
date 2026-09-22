@@ -2014,9 +2014,13 @@ def _serve(args: argparse.Namespace) -> int:
     except InsecureHopRefused as exc:
         # BACKLOG #1498 (ADR 0173 §4.3): the TLS forwarder's own revocation guard refused, inside
         # _build_tls_context where the finished context (and hence its CRL flag) exists. Rendered here
-        # as a clean exit 2 rather than a traceback, matching the #200 forward-hop refusal above — and
-        # printed to stderr for the same reason that one is: configure_logging did not complete, so
-        # there is no handler to warn on.
+        # as a clean exit 2 rather than a traceback, matching the #200 forward-hop refusal above.
+        #
+        # stderr because that is where every other serve-gate refusal goes and it is unfiltered by the
+        # log level and the PHI/credential filters. NOT because no handler exists: by the time this
+        # raises, configure_logging HAS installed the stdout and file handlers and published the write
+        # guard — only the forwarder is missing. An earlier version of this comment claimed otherwise,
+        # which would have misled anyone reasoning about the guard's WARN arm at the same site.
         print(f"error: {exc}", file=sys.stderr)
         return 2
     if forwarder_live and log_forward is not None:

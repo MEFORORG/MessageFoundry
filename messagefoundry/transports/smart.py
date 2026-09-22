@@ -184,33 +184,6 @@ class SmartBackendTokenProvider:
                 "by the instance security posture (use https, attest the hop as secure via "
                 "tls_hop_attested, or declare cleartext_accepted with a cleartext_reason)"
             ) from exc
-        # #1498 (ADR 0173 §4.3): the revocation twin of the refusal above, and the same one-statement
-        # call its five HTTP-family siblings make. The token hop VERIFIES the authorization server's
-        # certificate but stdlib ssl performs no OCSP/CRL, so a revoked-but-unexpired token-endpoint
-        # certificate was accepted here with no refusal, no warning and no audit entry — on the hop that
-        # carries the signed client_assertion. Keyed on the https scheme, so the cleartext arm above and
-        # this one decide disjoint hops and never double-refuse one.
-        #
-        # ADR 0173 §1.3 / §1.6 / §7 withdrew this hop's row on the ground that `smart.py` contains no
-        # `ssl` usage at all. That ground is true and it does NOT reach the guard: `refuse_unrevoked_
-        # verified_hop` takes a scheme and a url, never a context, precisely because the HTTP family
-        # rides urllib's own context and builds none of its own. The measured absence of `ssl` here
-        # removes this file from the `harden_verify_flags` population; it does not remove the hop.
-        #
-        # The token host is frequently NOT the connection's data host (#1660 resolves this hop's trust
-        # anchor against `token_url` for that reason), so the sibling guard on the REST/FHIR destination
-        # keys on a different host and cannot answer for this one.
-        #
-        # InsecureHopRefused is allowed to propagate rather than being re-wrapped as SmartAuthError: the
-        # guard's own message already names this hop and lists the ways across, which a re-wrap would
-        # discard, and both are ValueError subclasses so the loader surfaces either identically (the
-        # reason the cleartext re-wrap above says it can).
-        refuse_unrevoked_verified_hop(
-            scheme,
-            token_url,
-            connector="SMART token endpoint",
-            revocation_attested=revocation_attested,
-        )
         if not client_id:
             raise SmartAuthError("SMART Backend Services requires a 'smart_client_id' setting")
         if not private_key:
@@ -248,6 +221,43 @@ class SmartBackendTokenProvider:
             )
             if token_proxy is not None or trust_anchor.narrows
             else _NO_REDIRECT_OPENER
+        )
+        # #1498 (ADR 0173 §4.3): the revocation twin of the cleartext refusal above, and the same
+        # one-statement call its HTTP-family siblings make. The token hop VERIFIES the authorization
+        # server's certificate but stdlib ssl performs no OCSP/CRL, so a revoked-but-unexpired
+        # token-endpoint certificate WOULD be accepted on first deployment with no refusal, no warning
+        # and no audit entry -- on the hop carrying the signed client_assertion. Keyed on the https
+        # scheme, so the cleartext arm above and this one decide disjoint hops (that one owns `http`)
+        # and never double-refuse one.
+        #
+        # PLACED HERE, BELOW `self._opener`, AND NOT BESIDE THE CLEARTEXT REFUSAL -- which is where it
+        # was first written, and that was a false-refusal bug. `context=` is what lets a CRL that
+        # really reached THIS hop relax the gate, and the context does not exist until the opener does:
+        # a `[tls].crl_file` resolved against the token host makes `trust_anchor.narrows` true, which
+        # builds a per-provider opener carrying VERIFY_CRL_CHECK_LEAF. Guarding above that line refused
+        # a hop that genuinely checks revocation while telling the operator to configure the CRL they
+        # had already configured -- a refusal whose remedy cannot be performed, which is the SDS-3.7
+        # defect. `urllib_handler_context` reads the context off whichever opener this hop got,
+        # shared or per-provider.
+        #
+        # ADR 0173 §1.3 / §1.6 / §7 withdrew this hop's row because `smart.py` contains no `ssl` usage.
+        # That measurement is true and does NOT reach the guard: the wrapper takes a scheme and a url,
+        # for exactly the hops that ride urllib's own context. It removes this file from the
+        # `harden_verify_flags` population; it does not remove the hop.
+        #
+        # The token host is frequently NOT the connection's data host (#1660 resolves this hop's anchor
+        # against `token_url` for that reason), so the sibling guard on the REST/FHIR destination keys
+        # on a different host and cannot answer for this one.
+        #
+        # InsecureHopRefused propagates rather than being re-wrapped as SmartAuthError: the guard's own
+        # message names this hop and its ways across, which a re-wrap would discard, and both are
+        # ValueError subclasses so the loader surfaces either identically.
+        refuse_unrevoked_verified_hop(
+            scheme,
+            token_url,
+            connector="SMART token endpoint",
+            revocation_attested=revocation_attested,
+            opener=self._opener,
         )
         self._proxy_auth: dict[str, str] = (
             token_proxy.auth_headers() if token_proxy is not None else {}

@@ -61,6 +61,7 @@ from messagefoundry.config.tls_policy import (
     is_loopback_hop_host,
     relax_verify_expiry,
     resolve_trust_anchor,
+    urllib_handler_context,
 )
 from messagefoundry.controlchars import strip_control_chars
 from messagefoundry.transports.base import (
@@ -800,8 +801,32 @@ def refuse_verify_off(
     return InsecureHopGuard(posture=posture, attested=attested, cell=cell, weakened_tls=True)
 
 
+def opener_tls_context(
+    opener: urllib.request.OpenerDirector, *, connector: str
+) -> ssl.SSLContext | None:
+    """The :class:`ssl.SSLContext` ``opener``'s https handler carries, or ``None`` if it has none.
+
+    ``None`` is not a failure: a plain-http opener legitimately has no ``HTTPSHandler``. When one IS
+    present its context is read through
+    :func:`~messagefoundry.config.tls_policy.urllib_handler_context`, which fails closed if CPython
+    ever renames the private attribute — so a missing handler and an unreadable context stay
+    distinguishable instead of both arriving as a quiet ``None`` (BACKLOG #1498)."""
+    # `getattr` because typeshed does not declare `OpenerDirector.handlers`, though CPython has always
+    # populated it in `add_handler`. Defaulting to an empty list keeps a runtime without it on the
+    # "no https handler" arm rather than raising -- the CRL relaxation simply does not apply, which is
+    # the same conservative answer as a caller that passed no opener at all.
+    handlers: list[object] = getattr(opener, "handlers", [])
+    handler = next((h for h in handlers if isinstance(h, urllib.request.HTTPSHandler)), None)
+    return None if handler is None else urllib_handler_context(handler, connector=connector)
+
+
 def refuse_unrevoked_verified_hop(
-    scheme: str, url: str, *, connector: str, revocation_attested: bool = False
+    scheme: str,
+    url: str,
+    *,
+    connector: str,
+    revocation_attested: bool = False,
+    opener: urllib.request.OpenerDirector | None = None,
 ) -> None:
     """Refuse a VERIFYING ``https`` hop that does no certificate revocation checking (#201, ADR 0078 amend).
 
@@ -814,7 +839,15 @@ def refuse_unrevoked_verified_hop(
     attested hops are byte-identical. Only meaningful for ``https`` — an ``http`` url has no TLS (its
     cleartext body is refused by :func:`refuse_cleartext_egress`) and ``verify_tls=false`` is not a
     verifying hop (refused by :func:`refuse_verify_off`), so the revocation gate and the #200 cleartext /
-    verify-off gates key on disjoint conditions and never double-refuse one hop."""
+    verify-off gates key on disjoint conditions and never double-refuse one hop.
+
+    ``opener`` (BACKLOG #1498) is the opener this hop will really dial through, when the caller has
+    already built one. Its https context is then read and handed to the guard, so a ``[tls].crl_file``
+    that resolved against THIS hop's host — making the anchor ``narrow`` and putting
+    ``VERIFY_CRL_CHECK_LEAF`` on a per-hop opener — relaxes the gate instead of being refused with
+    advice to configure the CRL it already has. **Callers that pass it must call this AFTER building
+    the opener**; omitting it keeps the pre-#1498 behaviour, which is correct for a caller whose hop
+    rides the shared import-time opener that can carry no CRL."""
     if scheme != "https":
         return
     host = urllib.parse.urlsplit(url).hostname or ""
@@ -823,6 +856,7 @@ def refuse_unrevoked_verified_hop(
         cell=f"{connector} (verified TLS, no revocation check)",
         description="delivers over verified https but performs no certificate revocation checking",
         attested=revocation_attested,
+        context=None if opener is None else opener_tls_context(opener, connector=connector),
     ).enforce_construction()
 
 
