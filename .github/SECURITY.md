@@ -32,6 +32,57 @@ real PHI — use synthetic HL7 (the `messagefoundry generate` corpus is ideal).
 We aim to acknowledge within a few business days and credit reporters who wish to be named once a
 fix is released.
 
+**Machine-readable contact.** The same two channels are published as
+[`.well-known/security.txt`](../.well-known/security.txt), per
+[RFC 9116](https://www.rfc-editor.org/rfc/rfc9116).
+
+## Authorization and safe harbor for good-faith research
+
+**You are authorized to test.** MessageFoundry adopts the authorization wording recommended by
+CISA, the US Cybersecurity and Infrastructure Security Agency, in its
+[Vulnerability Disclosure Policy template](https://www.cisa.gov/vulnerability-disclosure-policy-template):
+
+> If you make a good faith effort to comply with this policy during your security research, we
+> will consider your research to be authorized, we will work with you to understand and resolve
+> the issue quickly, and MessageFoundry Foundation, LLC will not recommend or pursue legal action
+> related to your research. Should legal action be initiated by a third party against you for
+> activities that were conducted in accordance with this policy, we will make this authorization
+> known.
+
+The wording is CISA's, changed in two ways only: the template's `AGENCY NAME` placeholder is
+filled with this project's legal entity, and the template's bold and italic emphasis is dropped.
+
+### Test your own installation, not somebody else's
+
+Install MessageFoundry from source or from PyPI, run it on hardware you control, and attack that.
+The source in this repository is equally in scope.
+
+There is no hosted service and no production instance to point a scanner at, so do not go looking
+for one. The engine binds `127.0.0.1` and ships as a library and a local service.
+
+Nothing here authorizes you to test a **third party's** installation. A site running this engine
+has not consented to your testing, and their permission is theirs alone to give.
+
+### What a good-faith effort means here
+
+At least the following. This names the cases with a real chance of arising rather than claiming to
+be a closed list.
+
+1. Report through a channel above, and give us a window to ship a fix before publishing detail.
+2. Stop at proof. Once you can show the vulnerability exists, stop, rather than pivoting further
+   or running the exploit wider than a demonstration needs.
+3. Use synthetic HL7 only. Never send, store, or attach real patient data. The
+   `messagefoundry generate` corpus exists for this.
+4. Leave service intact. No denial-of-service or load testing against anything you do not own,
+   and no destructive actions.
+5. Do not access, change, or keep data that is not yours. If you reach such data, stop and tell
+   us what you reached.
+6. Attack the software, not the people or the accounts. No social engineering, no physical
+   attacks, and no attacks on maintainer accounts or project infrastructure.
+
+Ask first through a reporting channel above if you are unsure whether something is in scope.
+Asking never counts against you.
+
 ## Response & remediation timeline
 
 After we acknowledge a report, we triage it by severity and target these remediation windows

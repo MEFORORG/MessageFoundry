@@ -1,0 +1,36 @@
+# Security contact information for MessageFoundry, per RFC 9116.
+# https://www.rfc-editor.org/rfc/rfc9116
+#
+# This file says only WHERE to send a report. The policy itself -- what to
+# include, the coordinated-disclosure ask, the remediation windows, and the
+# authorization and safe-harbor terms for good-faith research -- is the Policy
+# URI below, and is deliberately not restated here. Two copies of a commitment
+# drift, and the drifting copy is the one a researcher reads.
+#
+# THIS IS A STATIC DISCLOSURE FILE, NOT ENDPOINT DISCOVERY. The engine performs
+# no .well-known discovery of any kind: SMART and OIDC endpoints are
+# operator-pinned, per docs/adr/0024-smart-backend-services-token-provider.md.
+# A search for ".well-known" that lands here has found an unrelated thing.
+#
+# The path is load-bearing and is not a stylistic choice. RFC 9116 section 3
+# requires the file under /.well-known/, and this repository's .gitignore
+# carries a root-anchored /*.txt rule, so a copy placed at the repository root
+# would be silently untracked. Measured 2026-09-22: git check-ignore reports
+# security.txt ignored by .gitignore line 132 and .well-known/security.txt not
+# ignored.
+#
+# NO Canonical FIELD IS PUBLISHED, DELIBERATELY. RFC 9116 section 2.5.2 says a
+# file whose Canonical URI does not match the location it was retrieved from
+# should not be trusted, so naming a URI that no host currently serves would
+# instruct parsers to distrust this file. Add Canonical in the same change that
+# starts serving this file over HTTPS, and not before.
+#
+# Contact fields are in decreasing order of preference, which is what RFC 9116
+# section 2.5.3 means by their order. The email address is second and is the
+# fallback that needs no account.
+
+Contact: https://github.com/MEFORORG/MessageFoundry/security/advisories/new
+Contact: mailto:security@messagefoundry.org
+Expires: 2027-09-01T00:00:00.000Z
+Preferred-Languages: en
+Policy: https://github.com/MEFORORG/MessageFoundry/blob/main/.github/SECURITY.md
