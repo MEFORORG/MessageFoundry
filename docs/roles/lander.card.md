@@ -23,14 +23,24 @@ and carries the note.
   point: a label records that a step happened, not that anybody looked.
 - **Arm auto-merge.** It fires on the head it SAW, so a later push is dropped: the PR reads MERGED,
   the branch stays alive, and nothing reports a problem.
+- **Decide which of two deliberate changes to an item survives.** That belongs to the authors, and
+  korus `4c-quinquies` says the same, so both documents agree here.
+- **Resolve a conflict that touches code -- BUT READ CLAUDE.md SECTION 5 FIRST, BECAUSE THIS ONE IS
+  CONTESTED.** The clause is live in the table this card derives from, and korus `roles/LANDER.md`
+  *4c-quinquies* grants the same case with no code carve-out. The collision is unresolved and is an
+  owner question; section 5's retirement notice carries both texts verbatim and the one line to ask.
+  **This card omitted both of these bullets until 2026-09-21**, which is how a Lander read korus as
+  unopposed and deadlocked itself.
 
 ## Its authority
 
 **Commit on your own judgment**, at logical stops, one coherent layer per commit. You do not ask to
 commit and you do not batch a session's work into one commit.
 
-**Push your own branch and open your own PR, without asking.** Owner ruling 2026-08-29, anchored at
+**Push your own branch, without asking.** Owner ruling 2026-08-29, anchored at
 `refs/liaison/owner-ruling-20260829-push` (`987705dfb`), in their words: *"Sessions push their own."*
+**ONLY THE PULL-REQUEST HALF MOVED, on 2026-09-18: the MANAGER opens the PR.** This card read *"and
+open your own PR"* until 2026-09-21, three days after CLAUDE.md changed.
 
 **The merge is the Lander's.** No label blocks it: what blocks a merge is branch protection and the
 required contexts, nothing else.
@@ -88,8 +98,13 @@ working tree:
     git -C <korus clone> show origin/main:roles/COMMON.md
     git -C <korus clone> show origin/main:roles/LANDER.md
 
-Read the korus `roles/COMMON.md` first, whichever seat you hold. CLAUDE.md section 5 governs where the two
-disagree about this repository.
+Read the korus `roles/COMMON.md` first, whichever seat you hold. **This card states no precedence
+rule over korus, because the table it derives from states none.** Measured 2026-09-21 at engine
+`origin/main` (`724e17b02`): the string *"section 5 governs"* returns **0** over `CLAUDE.md`,
+against a control of **1** for *"KORUS roster"* on the same read, while returning **2** here and
+appearing in five sibling cards. **A rule that lives only in a derived summary is not a rule.** The
+one live disagreement is recorded in CLAUDE.md section 5's retirement notice. It is an owner
+question, and this card does not answer it.
 
 This card carries only what does not expire. Live state -- lane counts, throttles, item numbers --
 belongs in a dated note, never here.
