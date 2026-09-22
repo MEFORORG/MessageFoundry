@@ -151,6 +151,9 @@ def test_cli_reports_import_failures_on_the_right_stream(
     else:
         failed_path = out / "IB_WIDTH.py" if failure == "write" else out
         assert repr(str(failed_path)) in error
+        # The filesystem arms must still fail for FILESYSTEM reasons. Without this the compile guard
+        # could start refusing the module first and these two would pass on the wrong error.
+        assert "could not be compiled" not in error
 
 
 def test_unparsable_generated_module_is_refused_instead_of_written(tmp_path: Path) -> None:
@@ -202,10 +205,12 @@ def _compiler_refuses(source: str) -> bool:
     Only the recursion arm needs asking, and its limit is not a knob this test can turn. Measured
     2026-09-21 on CPython 3.14.6 (Windows): a 20,000-term chain raises and a 5,000-term chain does
     not, and that boundary moves for NEITHER ``sys.setrecursionlimit(100)`` NOR a 256 KB thread
-    stack -- so it is a compiled-in C recursion limit, not the interpreter's counter and not a stack
-    this process can size. A build whose limit clears the chain (the reported case is the Linux
-    default 8 MB stack) compiles it cleanly, and the arm would then assert a refusal that never
-    happened.
+    stack -- so it is neither the interpreter's recursion counter nor a stack this process can size.
+    It is the compiler's own C-STACK HEADROOM CHECK, which reports as ``Stack overflow (used 2912 kB)
+    during compilation``. A build with more headroom (the reported case is the Linux default 8 MB
+    stack) compiles the same chain cleanly, and the arm would then assert a refusal that never
+    happened. An earlier revision of this docstring called it a compiled-in recursion limit: the two
+    null results above were real, and that explanation of them was wrong.
 
     Probing keeps the arm a REAL compiler refusal wherever the build produces one, which is the
     property ``_UNCOMPILABLE`` exists to have. The alternatives were worse: monkeypatching
@@ -219,6 +224,17 @@ def _compiler_refuses(source: str) -> bool:
     return False
 
 
+def test_the_refusal_probe_discriminates() -> None:
+    """``_compiler_refuses`` must answer BOTH ways, on every build.
+
+    A probe stuck on True never skips, so the recursion arm asserts a refusal a permissive build
+    never produced. A probe stuck on False always skips, so that arm silently stops testing
+    anything. Neither failure is visible from a green run, so both directions are pinned here rather
+    than left to whoever last ran the helper by hand."""
+    assert _compiler_refuses("def (\n") is True
+    assert _compiler_refuses("x = 1\n") is False
+
+
 @pytest.mark.parametrize("case", sorted(_UNCOMPILABLE))
 def test_every_uncompilable_source_class_is_refused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
@@ -229,7 +245,13 @@ def test_every_uncompilable_source_class_is_refused(
     than simulate it. The surrogate arm is the one that caught a real gap: ``UnicodeEncodeError`` is
     a ``ValueError``, so a tuple naming only the three obvious classes let it escape."""
     source, expected = _UNCOMPILABLE[case]
-    if not _compiler_refuses(source):
+    # ONLY the recursion arm is build-conditional; `syntax` and `surrogate` refuse on every build and
+    # must never be skipped. Gating all three on the probe made a wrongly-False probe EMPTY this
+    # parametrize and report green on three skips -- a guard that cannot fail, which is worse than no
+    # guard because it withdraws the coverage silently. `test_the_refusal_probe_discriminates` below
+    # is the other half: it pins both branches so a probe that stops discriminating fails a test
+    # rather than quietly disabling this one.
+    if case == "recursion" and not _compiler_refuses(source):
         pytest.skip(
             f"this CPython build compiles the {case!r} source, so there is no refusal to convert"
         )

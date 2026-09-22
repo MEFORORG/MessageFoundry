@@ -2,14 +2,19 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Unit tests for the harness no-loss reconcile accounting + the rate-SLO sample floor.
 
-The reconcile invariant under test (both the load runner's and the connscale runner's copies): a
-``timeouts``-counted message (in-flight at a connection close with no ACK seen) is UNCONFIRMED — the
-frame may never have left the closed socket — so ``read >= sent - timeouts`` is the honest intake
-bound, BUT the excusal is BOUNDED: past the bound the timeout count is a systemic no-ACK fault and
-NOTHING is excused. With ``timeouts == 0`` (every healthy run) the check is exactly as strict as
-``read >= sent``.
+**THE THREE COPIES NO LONGER SHARE ONE INVARIANT, SO READ THE HEADING ABOVE EACH SECTION.** Sections
+1, 3 and 4 below cover the connscale and estate copies, which behave as this docstring's first half
+describes. Section 2 covers the LOAD copy, which parted from them (BACKLOG #1866) — the paragraph
+beginning "THE LOAD COPY NO LONGER CARRIES THAT FLOOR" is the one that governs it, and everything
+before it is history for that copy rather than current behaviour.
 
-The systemic-fault threshold is ``max(unconfirmed_budget, 3 * sent // 4)``. It was
+The rig copies' invariant: a ``timeouts``-counted message (in-flight at a connection close with no
+ACK seen) is UNCONFIRMED — the frame may never have left the closed socket — so
+``read >= sent - timeouts`` is the honest intake bound, BUT the excusal is BOUNDED: past the bound
+the timeout count is a systemic no-ACK fault and NOTHING is excused. With ``timeouts == 0`` (every
+healthy run) the check is exactly as strict as ``read >= sent``.
+
+Their systemic-fault threshold is ``max(unconfirmed_budget, 3 * sent // 4)``. It was
 ``unconfirmed_budget`` alone — "~one stranded in-flight frame per connection" — until that model was
 found to be wrong for this sender: ``_inflight`` is an unbounded deque and open-loop sends are paced
 by the offered rate, not by an ACK slot, so genuine teardown stranding scales with rate x
@@ -25,23 +30,45 @@ value on record while a dead ACK path strands ~100% and still blows it, and it a
 detector in ``tests/test_load_runner.py`` (``acked >= sent // 4``, i.e. tolerate up to 75% stranding),
 which previously contradicted this budget.
 
-That ``max()`` does NOT by itself keep ``read >= sent // 2`` required, though it was once documented
-as doing so: the connection count is a FLOOR, not a ceiling, and every call site passes a connection
-count (connscale and estate pass the step's ``count`` verbatim). Whenever the count exceeds half the
-sends — the normal shape of a short, low-rate step, e.g. connscale-smoke's N=100 cell at ~105 sends
-against a budget of ``max(100, 78) = 100`` — the bound degrades to ``read >= sent - connections``,
-i.e. ``read >= 5``; and since nothing clamps the excusal to ``sent``, ``timeouts > sent`` degrades it
-to ``read >= 0`` outright. So the guarantee is enforced SEPARATELY, as an unconditional intake floor
-the excusal cannot lower: ``read >= sent // 2``, in all three copies, at every call site.
+That ``max()`` does NOT by itself bound the excusal: the connection count is a FLOOR, not a ceiling,
+and every call site passes a connection count (connscale and estate pass the step's ``count``
+verbatim). Whenever the count exceeds three quarters of the sends — the normal shape of a short,
+low-rate step, e.g. connscale-smoke's N=100 cell at ~105 sends against a budget of
+``max(100, 78) = 100`` — the bound degrades to ``read >= sent - connections``, i.e. ``read >= 5``;
+and since nothing clamps the excusal to ``sent``, ``timeouts > sent`` degrades it to ``read >= 0``
+outright. The connscale and estate copies answer that with an unconditional intake floor,
+``read >= sent // 2``.
+
+**THE LOAD COPY NO LONGER CARRIES THAT FLOOR, AND THE THREE COPIES NOW DIFFER — this module tests
+them separately and the connscale/estate sections below still pin the floor.** With ``nak == 0``
+every send resolves to acked or timeouts, so ``sent - timeouts == acked`` and the floor reduces to
+``acked >= sent // 2``: a statement about how much of the OFFERED volume this host confirmed, not
+about whether the engine lost anything. ``sent`` is set by the offered rate times the phase wall
+clock, so the quantity moves with the runner's speed while the bound does not. It ejected two
+unrelated pull requests from the MERGE QUEUE inside twenty minutes (windows-2025 ``merge_group`` runs
+35656074083 and 35657866239), on heads that were green on the same leg as ``pull_request``.
+
+What replaced it is not a looser number. ``read_short`` is already the exact intake bound and, with
+``nak == 0``, IS ``acked - read`` — every accept-ACKed message must have an ingress row, an engine
+invariant (``enqueue_ingress`` commits, then the AA is built) that fails at magnitude ONE at any host
+speed. The floor added nothing there. What it gestured at — the budget-dominated vacuity — it could
+not close either, because a dead ACK path's signature is a HIGH read with no ACKs, which clears a
+floor on ``read`` by construction (``test_load_reconcile_dead_ack_path_with_a_high_read_is_caught``
+is the control: those counters passed under the floor and fail now). The load copy closes it on the
+signature instead: ingested messages plus not one reply, neither accept-ACK nor NAK.
 
 These tests pin every edge the tolerance could silently widen through (the harness has caught real
 store bugs with this check — mf-load-test-harness — and that detection must survive the de-flake):
-loss beyond the excusal, an over-budget flood (even with zero actual loss), the floor-binding regime
-(``unconfirmed_budget >= sent``, which no test reached before — every case here used a budget of 2
-against 36 sends, so ``sent // 2`` always won the max() and the floor arm was a surviving mutant),
-and — mutation-tested — that the tolerance applies to INTAKE ONLY: the delivery/backlog cases use
-shortfalls EXACTLY EQUAL to the timeout count, so leaking the subtraction into either check flips the
-expected verdict.
+loss beyond the excusal, the floor-binding regime (``unconfirmed_budget >= sent``, which no test
+reached before — every case here used a budget of 2 against 36 sends, so ``sent // 2`` always won
+the max() and the floor arm was a surviving mutant), and — mutation-tested — that the tolerance
+applies to INTAKE ONLY: the delivery/backlog cases use shortfalls EXACTLY EQUAL to the timeout
+count, so leaking the subtraction into either check flips the expected verdict.
+
+An over-budget flood (even with zero actual loss) is pinned as a FAILURE for the rig copies and as a
+reported-but-passing run for the load copy — the clearest single place the two now diverge, and
+``test_the_load_copy_has_deliberately_parted_from_the_rig_copies`` asserts both halves on one set of
+counters so the split cannot be mistaken for drift.
 """
 
 from __future__ import annotations
@@ -273,13 +300,15 @@ def test_load_reconcile_loss_beyond_unconfirmed_still_fails() -> None:
 
 def test_load_reconcile_timeout_flood_fails_even_without_shortfall() -> None:
     # The degenerate ACK-path regression: acked=0, timeouts=sent, but the engine ingested+delivered
-    # everything. Unbounded excusal would pass this as zero-loss; the budget fails it loudly.
+    # everything. The excusal is unconditional, so `read_short` passes this — and it still fails,
+    # now on the reply-path signature rather than on the stranding count. The budget note rides
+    # along because the run IS heavily stranded; it is the "dead ACK path" clause that sets ok.
     c = Counters(sent=90, acked=0, timeouts=90, sink_received=180)
     result = load_reconcile(
         c, _poller(_sample(read=90, written=180)), 1.0, tolerance=0, unconfirmed_budget=4
     )
     assert not result.ok
-    assert "stranding budget" in result.detail
+    assert "dead ACK path" in result.detail
 
 
 def test_load_reconcile_ci_teardown_stranding_is_not_a_flood() -> None:
@@ -294,27 +323,56 @@ def test_load_reconcile_ci_teardown_stranding_is_not_a_flood() -> None:
     assert result.ok, result.detail
 
 
-def test_load_reconcile_excusal_is_capped_at_three_quarters_of_the_run() -> None:
-    # Mutation pin on the bound. Three quarters of the run is the most the reconcile will ever
-    # forgive, so the separate `read >= sent // 2` floor still holds and the intake bound can never go
-    # vacuous. Exactly at the cap passes; one over flips to a systemic fault with nothing excused.
+def test_load_reconcile_stranding_past_the_budget_is_reported_not_failed() -> None:
+    # THE THIRD OFFERED-VOLUME DETECTOR, RETIRED. `timeouts > max(connections, 3 * sent // 4)` used
+    # to cancel the whole excusal and fail the run as a systemic no-ACK fault. It is the same
+    # mistake as the intake floor at a different threshold — a fraction of what the phase OFFERED —
+    # and it is what would have ejected PR 1283 (79 timeouts of 90, against a budget of 67) on the
+    # next merge-group run even after the floor came out.
     #
-    # WAS half, and half was too tight to be a detector. It was sized when the worst teardown
-    # stranding on record was 14/90 (~16%); windows-2025 then produced 46/90 (~51%) on a run that lost
-    # nothing (104 written, 104 received, backlog drained in 4.7s of a 30s bound) and red `main` at
-    # 9b03057f by ONE message. A threshold sitting on the healthy distribution's centre is a coin
-    # flip. See test_load_reconcile_teardown_stranding_at_the_old_half_bound_passes below, which pins
-    # that exact scenario so it cannot regress.
-    at_cap = Counters(sent=90, acked=23, timeouts=67, sink_received=90)
-    assert load_reconcile(
-        at_cap, _poller(_sample(read=45, written=90)), 1.0, tolerance=0, unconfirmed_budget=4
-    ).ok
+    # Both sides of the old cliff must now reconcile clean, because neither lost anything: every
+    # message the engine replied to has a row. Past the budget the width is still NAMED, so a poorly
+    # confirmed run stays visible to an operator; it just no longer decides the verdict.
+    at_old_cap = Counters(sent=90, acked=23, timeouts=67, sink_received=90)
+    at_cap_result = load_reconcile(
+        at_old_cap, _poller(_sample(read=45, written=90)), 1.0, tolerance=0, unconfirmed_budget=4
+    )
+    assert at_cap_result.ok, at_cap_result.detail
+    # The ABSENCE at 67 is what keeps `3 * sent // 4` a contract now that it decides no verdict.
+    # Without it, mutating the fraction to `sent // 2` (45) passes every other assertion here: both
+    # cases stay ok and the 68 case still carries the note. This is the pin that the retired
+    # cap-boundary mutation test used to provide.
+    assert "exceed the stranding budget" not in at_cap_result.detail
     over = Counters(sent=90, acked=22, timeouts=68, sink_received=90)
     result = load_reconcile(
         over, _poller(_sample(read=45, written=90)), 1.0, tolerance=0, unconfirmed_budget=4
     )
-    assert not result.ok
-    assert "stranding budget" in result.detail
+    assert result.ok, result.detail
+    assert "exceed the stranding budget" in result.detail
+    assert "not a loss verdict" in result.detail
+    # Pin the CLEAN half of the note's conditional clause. Its sibling below pins the other half;
+    # between them, inverting the condition flips both and neither can be a surviving mutant. Left
+    # unpinned, the note would claim everything was accounted for on a run reporting a loss.
+    assert "every message the engine replied to was accounted for" in result.detail
+
+
+def test_load_reconcile_a_flood_still_cannot_mask_a_confirmed_loss() -> None:
+    # THE CONTROL FOR THE TEST ABOVE, and the property the cancel-the-excusal cliff was protecting.
+    # Same 68-timeout flood, one message apart: the engine replied to 22 and has only 21 rows. The
+    # excusal is unconditional now, so this is the case where "nothing is excused" used to do the
+    # work — and it still fails, because `read_short` is `acked + nak - read` and does not depend on
+    # the timeout count at all. Magnitude ONE, under the widest flood the run can produce.
+    c = Counters(sent=90, acked=22, timeouts=68, sink_received=42)
+    result = load_reconcile(
+        c, _poller(_sample(read=21, written=42)), 1.0, tolerance=0, unconfirmed_budget=4
+    )
+    assert not result.ok, result.detail
+    assert "lost 1 on intake" in result.detail
+    # The LOSSY half of the note's conditional clause (see the sibling above). Printed
+    # unconditionally, the note contradicted the shortfall clause in the same string on the same
+    # line: "lost 1 on intake ... every message the engine replied to was accounted for".
+    assert "a confirmed message is missing besides" in result.detail
+    assert "every message the engine replied to was accounted for" not in result.detail
 
 
 def test_load_reconcile_teardown_stranding_at_the_old_half_bound_passes() -> None:
@@ -327,8 +385,10 @@ def test_load_reconcile_teardown_stranding_at_the_old_half_bound_passes() -> Non
         observed, _poller(_sample(read=52, written=104)), 1.0, tolerance=0, unconfirmed_budget=4
     )
     assert result.ok, result.detail
-    # And the anti-vacuity floor was never in question on that run: 52 read >= 45 required.
-    assert result.engine_read >= observed.sent // 2
+    # And the run is clean on the check that replaced the floor: 44 replied to, 52 rows, so every
+    # message the engine answered has one. Asserted here so the pin survives the floor's retirement
+    # rather than resting on the old `read >= sent // 2` reading it used to carry.
+    assert result.engine_read >= observed.acked + observed.nak
 
 
 def test_load_reconcile_loss_beyond_a_large_excusal_still_fails() -> None:
@@ -365,22 +425,136 @@ def test_load_reconcile_tolerance_is_intake_only() -> None:
     assert "not drained" in result2.detail
 
 
-def test_load_reconcile_intake_floor_holds_when_the_budget_stops_bounding() -> None:
-    # The load copy has the same hole: its budget is pool_size x targets, which for a small phase can
-    # exceed half the sends just as the connscale connection count does. 105 sent, budget 100, read 5:
-    # read_short is 0 under the excusal, so only the unconditional floor fails it.
+def test_load_reconcile_budget_dominated_run_is_judged_on_what_it_confirmed() -> None:
+    # The budget-dominated regime, at connscale-smoke's shape: 105 sent, budget 100, 5 acked, 5 read.
+    # The retired `read >= sent // 2` floor failed this as loss. It is NOT loss: the engine ACKed 5
+    # and has 5 rows, so nothing it confirmed is missing, and the other 100 sends are unconfirmed —
+    # frames the harness cannot prove left the socket, since `sent` is counted at write-buffer time.
+    # This is the shape the ejecting merge-group runs produced, and failing it is the flake.
+    # A throughput verdict on such a run belongs to the drain/rate SLOs, not to the loss reconcile.
     c = Counters(sent=_SMOKE_SENT, acked=5, timeouts=100, sink_received=5)
     result = load_reconcile(
         c, _poller(_sample(read=5, written=5)), 1.0, tolerance=0, unconfirmed_budget=_SMOKE_BUDGET
     )
+    assert result.ok, result.detail
+
+
+def test_load_reconcile_one_acked_message_without_a_row_still_fails() -> None:
+    # THE CONTROL FOR THE CASE ABOVE, one message apart from it: the engine ACKed 6 and has only 5
+    # rows. An accept-ACK is built only after `enqueue_ingress` commits, so an AA with no row is a
+    # real defect — and it must fail at magnitude ONE even here, where the excusal is at its widest
+    # (100 timeouts against a budget of 100) and the retired floor was already satisfied by read 5
+    # ... it was not: the floor needed 52. That is the point. The floor could not distinguish these
+    # two runs AT ALL; it failed both. `read_short` separates them on one message.
+    c = Counters(sent=_SMOKE_SENT, acked=6, timeouts=99, sink_received=5)
+    result = load_reconcile(
+        c, _poller(_sample(read=5, written=5)), 1.0, tolerance=0, unconfirmed_budget=_SMOKE_BUDGET
+    )
     assert not result.ok, result.detail
-    assert "intake floor 52" in result.detail
-    assert "stranding budget" not in result.detail
+    assert "lost 1 on intake" in result.detail
+
+
+def test_load_reconcile_dead_ack_path_with_a_high_read_is_caught() -> None:
+    # THE HOLE THE RETIRED FLOOR LEFT OPEN, now closed. A dead ACK path in the budget-dominated
+    # regime: the engine ingested and delivered EVERYTHING (105 read, 105 written, all received) and
+    # returned not one reply. `read_short` is negative and a floor on `read` is cleared twice over
+    # by 105 >= 52 — so the retired `read >= sent // 2` floor passed this run as zero-loss. The
+    # signature fails it, and a NAK would clear it, because a NAK proves the reply path runs.
+    #
+    # The counters obey `sent == acked + nak + timeouts`, which the whole `read_short == acked + nak
+    # - read` derivation rests on; an earlier draft was off by 5 and exercised this branch under a
+    # state the production invariant forbids. `unconfirmed_budget` is set ABOVE the timeout count so
+    # `heavily_stranded` cannot fire, which is what makes the absence assertion below meaningful:
+    # the verdict is the signature's, with no note riding along to confuse the attribution.
+    c = Counters(sent=_SMOKE_SENT, acked=0, timeouts=_SMOKE_SENT, sink_received=105)
+    result = load_reconcile(
+        c,
+        _poller(_sample(read=105, written=105)),
+        1.0,
+        tolerance=0,
+        unconfirmed_budget=200,
+    )
+    assert not result.ok, result.detail
+    assert "dead ACK path" in result.detail
+    assert "exceed the stranding budget" not in result.detail  # the budget is NOT what caught it
+
+
+def test_load_reconcile_a_total_blackout_is_caught() -> None:
+    # THE HOLE THE FIRST DRAFT OF THIS CHANGE OPENED, caught in review and closed here. The engine
+    # ingested NOTHING, replied to nothing and delivered nothing. Every other arm passes it: the
+    # excusal covers the whole run so `read_short` is 0, `deliver_short` is 0 - 0, and an empty
+    # pipeline is a drained one. Gating the signature on `read > 0` — which reads as the natural
+    # guard — is false in exactly this case, so it was the only thing between a total blackout and a
+    # clean zero-loss verdict on the CI smoke gate. `sent > 0` is the correct guard.
+    c = Counters(sent=100, acked=0, timeouts=100, sink_received=0)
+    result = load_reconcile(
+        c, _poller(_sample(read=0, written=0)), 1.0, tolerance=0, unconfirmed_budget=4
+    )
+    assert not result.ok, result.detail
+    assert "dead ACK path" in result.detail
+
+
+def test_load_reconcile_a_run_that_sent_nothing_is_not_a_dead_ack_path() -> None:
+    # The other side of the `sent > 0` guard: a run that offered nothing has no reply to be missing,
+    # so it must not be failed for having none. Pins the guard against a `read >= 0`-style edit.
+    c = Counters(sent=0, acked=0, timeouts=0, sink_received=0)
+    result = load_reconcile(
+        c, _poller(_sample(read=0, written=0)), 1.0, tolerance=0, unconfirmed_budget=4
+    )
+    assert result.ok, result.detail
+
+
+def test_load_reconcile_an_all_nak_run_is_not_a_dead_ack_path() -> None:
+    # The discriminator inside the signature: a NAK IS a reply, so an engine rejecting every message
+    # has a working ACK path and must not be reported as a dead one. (The run fails elsewhere — a
+    # NAK rate SLO, and `max_nak_rate` deliberately has no sample floor — but not here, and not with
+    # this detail.) Pins the `acked + nak == 0` form against a `counters.acked == 0` simplification.
+    c = Counters(sent=90, acked=0, nak=90, sink_received=0)
+    result = load_reconcile(
+        c, _poller(_sample(read=90, written=0)), 1.0, tolerance=0, unconfirmed_budget=4
+    )
+    assert result.ok, result.detail
+    assert "dead ACK path" not in result.detail
+
+
+def test_load_reconcile_merge_queue_ejection_counters_now_reconcile_clean() -> None:
+    # THE TWO REGRESSION PINS for the merge-queue ejections this change repairs. Both are
+    # windows-2025 `merge_group` runs whose pull-request heads were green on the same leg.
+    #
+    # READ THE RECONSTRUCTION RULE BEFORE TRUSTING THESE NUMBERS. Neither run reported a full
+    # counter set, so `acked` (1233) and `read` (1283) are reconstructed. The first draft set
+    # `acked == read` in both, which forces `read_short` to exactly 0 BY CONSTRUCTION — the test
+    # would then assert the invariant on data built to satisfy it and could not fail for the reason
+    # it names. Both are now reconstructed with MARGIN, at the ordinary teardown shape: the engine
+    # commits a row and the ACK for it is stranded at the close, so `read` sits strictly ABOVE
+    # `acked`. A mutation tightening the comparison to `read >= sent` fails these; the equal-valued
+    # version passed it.
+    #
+    # Run 35656074083 (PR 1233): reported `engine_read 36 < intake floor 45`. Everything the engine
+    # read was delivered twice (fan-out 2 over 36 read = 72) and every delivery arrived, so the run
+    # lost nothing; only the offered-volume floor failed it. 30 acked of 36 read leaves 6 of margin.
+    ejected_1233 = Counters(sent=90, acked=30, timeouts=60, sink_received=72)
+    result = load_reconcile(
+        ejected_1233, _poller(_sample(read=36, written=72)), 1.0, tolerance=0, unconfirmed_budget=4
+    )
+    assert result.ok, result.detail
+    assert result.engine_read > ejected_1233.acked  # the margin is real, not an equality artifact
+    # Run 35657866239 (PR 1283): 90 sent, 11 acked, 79 timeouts — it fired the sibling detector in
+    # tests/test_load_runner.py (`acked >= sent // 4`, i.e. 22) before reaching the reconcile, so its
+    # read/written were never reported. Read 15 against 11 acked: 4 of margin. Note this also clears
+    # the retired stranding budget, which 79 timeouts against max(4, 67) would have failed outright.
+    ejected_1283 = Counters(sent=90, acked=11, timeouts=79, sink_received=30)
+    result = load_reconcile(
+        ejected_1283, _poller(_sample(read=15, written=30)), 1.0, tolerance=0, unconfirmed_budget=4
+    )
+    assert result.ok, result.detail
+    assert result.engine_read > ejected_1283.acked
 
 
 def test_load_reconcile_teardown_stranding_still_passes_at_the_smoke_shape() -> None:
     # ~16% teardown stranding at the same budget-dominated shape, fanned out 2x, still reconciles
-    # clean: 88 read >= the 52 floor and every non-stranded send was observed.
+    # clean: every non-stranded send was observed at intake. (The "88 read >= the 52 floor" half of
+    # this note went with the floor; the surviving half is the one that was ever load-bearing.)
     c = Counters(sent=_SMOKE_SENT, acked=88, timeouts=17, sink_received=176)
     result = load_reconcile(
         c,
@@ -392,23 +566,32 @@ def test_load_reconcile_teardown_stranding_still_passes_at_the_smoke_shape() -> 
     assert result.ok, result.detail
 
 
-def test_load_reconcile_tolerance_cannot_lower_the_intake_floor() -> None:
-    # `tolerance` is an operator knob on the SHORTFALL; it is deliberately not applied to the floor,
-    # so no combination of tolerance and excusal can make "at least half the run was ingested" false
-    # while zero_loss reads green. A tolerance wide enough to cover the whole gap changes nothing.
-    c = Counters(sent=_SMOKE_SENT, acked=5, timeouts=100, sink_received=5)
+def test_load_reconcile_tolerance_cannot_excuse_a_dead_ack_path() -> None:
+    # `tolerance` is an operator knob on the intake and delivery SHORTFALLS. It is deliberately not
+    # wired into the reply-path signature, so no tolerance width makes a dead ACK path read green —
+    # the property the retired floor's "the tolerance cannot lower this floor" clause protected,
+    # carried over to the check that replaced it. A tolerance far wider than the whole run changes
+    # nothing here. The counters obey `sent == acked + nak + timeouts` for the same reason the
+    # sibling control does — a draft of this one was off by 5 and exercised the branch under a state
+    # the sender cannot produce.
+    c = Counters(sent=_SMOKE_SENT, acked=0, timeouts=_SMOKE_SENT, sink_received=105)
     result = load_reconcile(
-        c, _poller(_sample(read=5, written=5)), 1.0, tolerance=100, unconfirmed_budget=_SMOKE_BUDGET
+        c,
+        _poller(_sample(read=105, written=105)),
+        1.0,
+        tolerance=1000,
+        unconfirmed_budget=_SMOKE_BUDGET,
     )
     assert not result.ok, result.detail
-    assert "intake floor 52" in result.detail
+    assert "dead ACK path" in result.detail
 
 
 # --- estate _reconcile ---------------------------------------------------------------------------
 
 
 def test_estate_reconcile_intake_floor_holds_when_the_budget_stops_bounding() -> None:
-    # The third copy, kept in step: estate passes `profile.count` as the budget, so a step whose sends
+    # The second RIG copy, still carrying the floor the load copy retired: estate passes
+    # `profile.count` as the budget, so a step whose sends
     # are of the same order as its connection count lands in the same degraded regime. Before the
     # floor this returned ok=True — and (see below) said so in a detail claiming read >= sent.
     c = Counters(sent=_SMOKE_SENT, acked=5, timeouts=100, sink_received=5)
@@ -449,23 +632,48 @@ def test_estate_reconcile_clean_run_still_reports_the_flat_claim() -> None:
     assert result.detail == "read>=sent, sink_received>=written, backlog drained"
 
 
-# --- the three copies, kept in step --------------------------------------------------------------
+# --- the copies, and where they deliberately part ------------------------------------------------
 
 
-def test_the_three_reconcile_copies_emit_the_same_over_budget_detail() -> None:
-    # "The three copies are kept in step" is asserted in three code comments and the changelog, and
-    # nothing enforced it — so it had already drifted: estate's copy omitted the
-    # "(possible accepted-and-dropped); nothing excused" suffix its siblings carry, and the SAME
+def test_the_two_rig_reconcile_copies_emit_the_same_over_budget_detail() -> None:
+    # "The copies are kept in step" is asserted in code comments and the changelog, and nothing
+    # enforced it — so it had already drifted: estate's copy omitted the
+    # "(possible accepted-and-dropped); nothing excused" suffix its sibling carries, and the SAME
     # systemic fault therefore read differently to an operator depending on which runner caught it.
+    #
+    # THIS COVERED THREE COPIES AND NOW COVERS TWO. connscale and estate run on the benchmark rig,
+    # never on the merge queue, and keep the offered-volume detectors unchanged.
     c = Counters(sent=36, acked=6, timeouts=30, sink_received=36)
     full = _sample(read=36, written=36)
     details = {
         connscale_reconcile(c, _BASE, full, unconfirmed_budget=_BUDGET).detail,
         estate_reconcile(c, _BASE, full, unconfirmed_budget=_BUDGET).detail,
-        load_reconcile(c, _poller(full), 1.0, tolerance=0, unconfirmed_budget=_BUDGET).detail,
     }
     assert len(details) == 1, details
     assert "systemic no-ACK fault (possible accepted-and-dropped); nothing excused" in details.pop()
+
+
+def test_the_load_copy_has_deliberately_parted_from_the_rig_copies() -> None:
+    # THE DIVERGENCE, PINNED, so it reads as a decision rather than as drift. On the same counters
+    # the rig copies call a systemic fault, the load copy reports a poorly confirmed run and passes:
+    # 30 unconfirmed of 36, and all 36 messages present and delivered, so nothing the engine replied
+    # to was lost. Only the load copy was ejecting pull requests from the merge queue. Retiring the
+    # rig copies' floor and budget is a separate question and their evidence would have to come
+    # from the rig.
+    #
+    # THE CONNSCALE COPY IS STILL RED ON THE SAME WINDOWS-2025 LEG, VIA
+    # tests/test_connscale_smoke.py::test_no_loss_reconciles_at_every_step, AND NOTHING HERE FIXES
+    # THAT. Its reported failure is `engine_read 15 < confirmed sent 18` — the EXACT-shortfall arm,
+    # which this change leaves alone in every copy — so it is a different defect wearing a similar
+    # sentence: either rows genuinely absent, or an `engine_read` sample that read short, which is
+    # the discrimination harness/load/connscale/intake_audit.py was built to make per message. Do
+    # not read the load copy going green as that sibling being answered.
+    c = Counters(sent=36, acked=6, timeouts=30, sink_received=36)
+    full = _sample(read=36, written=36)
+    assert not connscale_reconcile(c, _BASE, full, unconfirmed_budget=_BUDGET).ok
+    load = load_reconcile(c, _poller(full), 1.0, tolerance=0, unconfirmed_budget=_BUDGET)
+    assert load.ok, load.detail
+    assert "not a loss verdict" in load.detail
 
 
 # --- rate-SLO sample floor -----------------------------------------------------------------------

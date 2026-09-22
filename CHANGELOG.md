@@ -367,6 +367,48 @@ All notable changes to MessageFoundry are documented here. The format follows
   and every such read was already audited. ([BACKLOG #324](docs/BACKLOG.md))
 
 ### Fixed
+- **The load harness's no-loss reconcile failed a run for being SLOW, and ejected pull requests from
+  the merge queue.** Three of its detectors were fractions of the volume the phase OFFERED —
+  `read >= sent // 2` (the intake floor), `timeouts <= max(connections, 3 * sent // 4)` (the
+  stranding budget) and `acked >= sent // 4` in `tests/test_load_runner.py`. An open-loop phase paces
+  sends by the wall clock, so `sent` reaches its nominal count whatever the host serviced, and all
+  three reduce to "this runner confirmed at least X percent of the offered rate": a throughput
+  reading wearing a loss label. Two unrelated pull requests were ejected inside twenty minutes on
+  windows-2025 `merge_group` runs (`engine_read 36 < intake floor 45` with every delivery arriving;
+  and 90 sent / 11 acked / 79 timeouts) while the same heads were green on the same leg as
+  `pull_request` — a filed split of 2 reds in the last 40 `merge_group` runs against 0 in the last
+  40 `pull_request` runs. **Why the trigger matters is not established**: hosted runners are one VM
+  per job, so pull requests do not share one, and all that is known of the difference is that the
+  queue launches entries in batches. The fix deliberately does not rest on a mechanism. Earlier work
+  on this test swept offered rate across three runner SKUs and measured stranding at 0 percent at
+  60/s, 150/s and 300/s alike — it never varied the trigger, which is the discriminator.
+  **The replacements are engine invariants rather than tuned numbers.** `sent == acked + nak +
+  timeouts`, so the existing shortfall check with the excusal made unconditional is exactly
+  `read >= acked + nak`: every message the engine replied to must have an ingress row. Both reply
+  paths commit before they reply (an accept-ACK follows `enqueue_ingress`, a NAK follows
+  `record_received`), so a reply with no row is a real defect, and this fails it at magnitude **one**
+  under any stranding width and at any host speed. A systemic dead ACK path is caught on its
+  signature instead of on a volume fraction: a run that offered messages and got back not one reply,
+  neither accept-ACK nor NAK. **That closes a gap the retired floor recorded as open** — a dead ACK
+  path's signature is a high read with no ACKs, which clears a floor on `read` by construction.
+  **This is a NET RELAXATION, not a tightening, and the ledger of it is exact.** The shortfall check
+  itself is unchanged while the run is inside the stranding budget and *looser* outside it, because
+  cancelling the excusal used to demand `read >= sent` there; what is stricter is only the comparison
+  against the retired floor, which is a different detector. Three things are no longer failed at any
+  magnitude: an unconfirmed send that never reached the engine, a partial reply-path regression, and
+  a partial timeout flood. Nothing in the harness can tell the first from a frame that never left the
+  socket, since `sent` is counted at write-buffer time, and the second is the same shape. They stay
+  visible as a heavily-stranded note on the report; the drain and rate SLOs are where a throughput
+  verdict belongs.
+  **Scope, stated so this is not read as closing the class.** Only the load runner's copy changes —
+  the copy `tests/test_load_runner.py` exercises. The connscale and estate copies keep the
+  offered-volume detectors, and a test now pins that divergence as deliberate rather than as drift.
+  `tests/test_connscale_smoke.py::test_no_loss_reconciles_at_every_step` also reds on the same
+  windows-2025 leg, and **this change does not fix it**: its failure (`engine_read 15 < confirmed
+  sent 18`) is the exact-shortfall arm, which is untouched here, so its cause is a different one —
+  either genuinely absent rows or a short `engine_read` sample, which is the question
+  `harness/load/connscale/intake_audit.py` exists to settle per message.
+  ([BACKLOG #1866](docs/BACKLOG.md))
 - **`audit-verify` accepted a zero-byte database, wrote a schema into it, and reported a clean chain
   of nothing.** The existing guard on `audit-verify`, `audit-anchor` and `rekey-audit` only asked
   whether the `--db` path *existed*. A zero-byte file exists and is a valid, empty SQLite database —
