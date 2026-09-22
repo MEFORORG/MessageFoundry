@@ -358,8 +358,8 @@ Managed at `GET /roles/custom` (`users:read`) and `POST` / `PUT` / `DELETE /role
 [`api/app.py`](../messagefoundry/api/app.py) (70 HTTP + 1 WebSocket) and 38 declared in
 [`api/auth_routes.py`](../messagefoundry/api/auth_routes.py). No other module in `api/` declares routes
 and there is no `include_router` anywhere. `create_app(expose_docs=True)` yields 113 (`/openapi.json`,
-`/docs`, `/docs/oauth2-redirect`, `/redoc`; off by default) and `create_app(serve_ui=True)` yields 216
-(109 + the 106 console routes + the `/ui/static` mount). Of the 109: **91 are permission-gated**, 18 are
+`/docs`, `/docs/oauth2-redirect`, `/redoc`; off by default) and `create_app(serve_ui=True)` yields 218
+(109 + the 108 console routes + the `/ui/static` mount). Of the 109: **91 are permission-gated**, 18 are
 not. Every one is listed below — none is collapsed away.
 
 #### Functions requiring no authorization
@@ -594,13 +594,13 @@ rather than shown a body its permission set does not authorize.
 
 #### The `/ui` console plane (`serve_ui=True`)
 
-When the console is served, the `/ui` plane adds **106 routes + one `/ui/static` mount** (federation off,
+When the console is served, the `/ui` plane adds **108 routes + one `/ui/static` mount** (federation off,
 the default — the two `/ui/oidc/*` routes are registered only when `[auth].oidc_enabled`). They are
 functions too, and they gate on the **same 29-permission catalogue** through parallel wrappers —
 `require_ui`, `require_ui_step_up`, `require_ui_reauth_only`, `require_ui_step_up_action`,
 `require_ui_reauth_only_action` — but authenticate by the `/ui`-confined `SameSite=Strict` **session
 cookie** rather than a bearer token, and refuse cross-site state changes on `Sec-Fetch-Site`/`Origin`.
-**Route → permission map (`/ui` plane).** 96 of the 106 carry a gate; the 10 that do not are the
+**Route → permission map (`/ui` plane).** 98 of the 108 carry a gate; the 10 that do not are the
 sign-in and re-auth entry points, listed after the table. Where the console is served it is the
 *sole* operator UI, so ~20 of these have no JSON counterpart from which their authorization could be
 inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bulk`, the
@@ -669,7 +669,9 @@ inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bu
 | `GET` | `/ui/messages/{message_id}/edit` | `messages:edit`**+**`messages:view_raw` | `require_ui_step_up` |
 | `POST` | `/ui/messages/{message_id}/edit-resend` | `messages:edit`**+**`messages:view_raw` | `require_ui_step_up` |
 | `GET` | `/ui/messages/{message_id}/parse-tree` | `messages:view_raw` | `require_ui` |
+| `GET` | `/ui/messages/{message_id}/resend-confirm` | `messages:resend` | `require_ui` |
 | `POST` | `/ui/messages/{message_id}/replay` | `messages:replay` | `require_ui_step_up` |
+| `POST` | `/ui/messages/{message_id}/resend` | `messages:resend` | `require_ui_step_up` |
 | `GET` | `/ui/monitoring` | `monitoring:read` | `require_ui` |
 | `GET` | `/ui/monitoring/live` | `monitoring:read` | `require_ui` |
 | `GET` | `/ui/nav-status` | `monitoring:read` | `require_ui` |
