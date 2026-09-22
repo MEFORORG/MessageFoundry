@@ -1045,9 +1045,13 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     async def _audit_ui_list(*, service: AuthService, _: Identity, limit: int = 100) -> AuditList:
         # The webconsole /ui/audit page invokes this seam callable DIRECTLY (not through FastAPI), so its
         # defaults MUST be plain values — a route Query(...) sentinel must never reach the store bind
-        # (BACKLOG #170 regression guard: 'type Query is not supported'). The UI shows the full trail;
-        # filter + CSV export are the JSON GET /audit surface. AUDIT_READ is enforced by the webconsole
-        # route's own require_ui dependency, so this wrapper carries no auth dependency of its own.
+        # (BACKLOG #170 regression guard: 'type Query is not supported'). The UI shows the NEWEST
+        # `limit` rows and nothing older, which is not the full trail and must not be described as one
+        # (BACKLOG #1743): this wrapper takes no offset because the store's list_audit has none, so
+        # there is no second page to reach and no total to compare against. Filter + CSV export are the
+        # JSON GET /audit surface, and the export is what produces a complete record. AUDIT_READ is
+        # enforced by the webconsole route's own require_ui dependency, so this wrapper carries no auth
+        # dependency of its own.
         return await _audit_list(service, limit=limit)
 
     @app.get("/audit/export")

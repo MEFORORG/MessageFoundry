@@ -100,7 +100,15 @@ def test_the_dead_letter_replay_forms_encode_a_name_carrying_a_slash() -> None:
     """
     from messagefoundry_webconsole.pages.messages import dead_letters
 
-    html = str(dead_letters(_dead_letters("IB/ACME", "OB/PARTNER")))
+    # The page's two filter arguments are required (BACKLOG #1743) and are passed the same names, so
+    # the assertions below cover the pager's QUERY-side encoding as well as the forms' PATH-side one.
+    html = str(
+        dead_letters(
+            _dead_letters("IB/ACME", "OB/PARTNER"),
+            channel_id="IB/ACME",
+            destination_name="OB/PARTNER",
+        )
+    )
 
     assert "/ui/dead-letters/IB%2FACME/replay" in html
     assert "/ui/dead-letters/IB%2FACME/OB%2FPARTNER/replay" in html
@@ -113,7 +121,13 @@ def test_a_benign_connection_name_still_renders_readably() -> None:
     """NEGATIVE CONTROL for the render path: encoding must not disfigure ordinary names."""
     from messagefoundry_webconsole.pages.messages import dead_letters
 
-    html = str(dead_letters(_dead_letters("IB_ACME_ADT", "OB_PARTNER_ADT")))
+    html = str(
+        dead_letters(
+            _dead_letters("IB_ACME_ADT", "OB_PARTNER_ADT"),
+            channel_id="IB_ACME_ADT",
+            destination_name="OB_PARTNER_ADT",
+        )
+    )
     assert "/ui/dead-letters/IB_ACME_ADT/replay" in html
     assert "%5F" not in html, "an unreserved character was percent-encoded"
 

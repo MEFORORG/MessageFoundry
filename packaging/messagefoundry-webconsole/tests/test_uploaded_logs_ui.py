@@ -210,12 +210,14 @@ async def test_uploaded_logs_list_is_paged(engine: Engine, tmp_path: Path) -> No
         first = await c.get("/ui/uploaded-logs", params={"limit": 2, "offset": 0})
         assert first.status_code == 200
         assert "1-2 of 3 file(s)" in first.text
-        assert "Next" in first.text and "Previous" not in first.text
+        # The RENDERED LINK, not the bare word: "Next" appears in any page that happens to say it,
+        # so a substring match could not tell a link from prose (BACKLOG #1743).
+        assert ">Next<" in first.text and ">Previous<" not in first.text
         assert "/ui/uploaded-logs?limit=2&amp;offset=2" in first.text
 
         last = await c.get("/ui/uploaded-logs", params={"limit": 2, "offset": 2})
         assert "3-3 of 3 file(s)" in last.text
-        assert "Previous" in last.text and "Next" not in last.text
+        assert ">Previous<" in last.text and ">Next<" not in last.text
         # The two pages together are the whole set, and neither shows the other's file.
         shown = [n for n in range(3) if f"page{n}.hl7" in first.text + last.text]
         assert shown == [0, 1, 2]

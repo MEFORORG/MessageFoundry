@@ -10,7 +10,7 @@ markup.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, TypedDict
 from urllib.parse import urlencode
 
 from messagefoundry.api.models import (
@@ -22,7 +22,7 @@ from messagefoundry.api.models import (
 from messagefoundry.parsing.tree import TreeNode
 
 from .._html import Markup, el, page, rows_table, text
-from ._common import _seg
+from ._common import _pager, _seg
 
 __all__ = [
     "dead_letter_pending",
@@ -48,6 +48,23 @@ RESEND_TAIL_WARNING = (
     "A resend is queued at the END of the destination lane. It may therefore be delivered after "
     "newer messages for the same partner that are already queued to that lane."
 )
+
+
+class _MsgFilterValues(TypedDict):
+    """The message log's filters, keyed by their /messages QUERY names.
+
+    A TypedDict rather than a plain dict for the reason ``routes/core.py``'s ``_MsgFilters`` gives
+    one layer up: it is splatted into a named-parameter call, and only a TypedDict makes mypy match
+    each key to its parameter through the ``**``. The same value also feeds the pager, so an
+    untyped dict would turn a mistyped key into one runtime error and one silently dropped filter.
+    """
+
+    channel_id: str
+    status: str
+    message_type: str
+    control_id: str
+    received_from: str
+    received_to: str
 
 
 def _msg_filters(
@@ -103,13 +120,31 @@ def messages(
     """The message log (list of summaries; each summary is view_summary-redacted server-side).
 
     ``deferred`` (or ``data is None``) renders the pre-filled filter form WITHOUT running a query — the
-    "open a connection's messages, adjust, then Search" landing (#4b). Otherwise the results table + pager
-    render as usual.
+    "open a connection's messages, adjust, then Search" landing (#4b). Otherwise the results table
+    renders, followed by the window-of-total counter and its Previous/Next links.
+
+    Before that the page reached only the first window of any result set and said so in a form —
+    ``N of TOTAL (offset 0)`` — that an operator could read as the whole of it, with no way forward
+    from the console at all (BACKLOG #1743). The filter arguments below are the values the listing
+    was actually run under, which is why they are also handed to the pager; ``_common._pager``
+    carries the reason a link must replay them.
 
     ``error`` renders a refusal banner in place of the "click Search" hint, the shape
     ``message_search`` uses: the filters come back carrying what the operator typed, and the route
     answers 400 instead of searching under a bound it dropped (BACKLOG #1744)."""
-    filters = _msg_filters(channel_id, status, message_type, control_id, received_from, received_to)
+    # ONE spelling of them inside this function, feeding both the form and the pager links, so the
+    # two cannot disagree about what the listing was run under. This does NOT collapse the whole
+    # chain — the route still declares them and so does this signature — it removes the one pair
+    # that could have drifted unnoticed.
+    values = _MsgFilterValues(
+        channel_id=channel_id,
+        status=status,
+        message_type=message_type,
+        control_id=control_id,
+        received_from=received_from,
+        received_to=received_to,
+    )
+    filters = _msg_filters(**values)
     if deferred or data is None:
         hint = (
             el("p", error, class_="banner")
@@ -130,10 +165,18 @@ def messages(
         ]
         for m in data.messages
     ]
-    pager = el(
-        "p",
-        text(f"{len(data.messages)} of {data.total} (offset {data.offset})"),
-        class_="pager",
+    pager = _pager(
+        path="/ui/messages",
+        total=data.total,
+        limit=data.limit,
+        offset=data.offset,
+        shown=len(data.messages),
+        noun="message(s)",
+        # ``defer`` is deliberately NOT among them: a pager link must RUN the query, and the
+        # deferred arm returns above this line anyway. Rebuilt as a plain dict because a TypedDict
+        # is a ``Mapping[str, object]`` to mypy however its fields are declared — the ``str`` here
+        # is the type system's artifact, not a conversion; every value already is one.
+        filters={key: str(value) for key, value in values.items()},
     )
     return page(
         "Messages",
@@ -748,13 +791,26 @@ def parse_tree_unavailable(message_id: str, reason: str) -> Markup:
     )
 
 
-def dead_letters(data: DeadLetterList) -> Markup:
+def dead_letters(data: DeadLetterList, *, channel_id: str, destination_name: str) -> Markup:
     """The dead-letter list (newest first) + per-channel bulk replay (M3).
 
     Each row links to the audited message detail (single-message replay lives there, M2b). The bulk
     "Replay all dead" per channel re-queues every dead delivery for that channel (step-up-gated; may be
     held for dual-control approval). Channel names are the ``[TYPE]_[PARTNER]_[MSG]`` URL-safe
     identifiers, carried in the action PATH so the step-up auto-retry re-POST needs no body.
+
+    ``channel_id`` / ``destination_name`` are the route's two query filters, taken here only so the
+    pager can replay them (BACKLOG #1743) — ``_common._pager`` carries the reason. The page draws no
+    filter form, so they render nowhere else. They are REQUIRED rather than defaulted to "": a
+    default would let a second render site omit them, and the page would still render while its
+    links quietly widened the listing, which is the one failure this argument exists to prevent.
+
+    **THE BULK-REPLAY BUTTONS BELOW DO NOT TRACK EITHER ONE, and nothing here makes them.** They are
+    derived from the rows in the CURRENT WINDOW, so paging changes which per-channel and
+    per-destination buttons exist, and "Replay all dead (every channel)" re-queues channels the
+    filter excluded and the operator never saw. Deriving the replay set from the store instead of
+    from the rendered page is the other half of BACKLOG #1743 and is filed separately; this page
+    inherits that behaviour unchanged, which is why it is stated here rather than implied.
     """
     headers = ["Failed", "Channel", "Destination", "Type", "Attempts", "Last error", "Message"]
     body = [
@@ -769,10 +825,14 @@ def dead_letters(data: DeadLetterList) -> Markup:
         ]
         for d in data.dead_letters
     ]
-    pager = el(
-        "p",
-        text(f"{len(data.dead_letters)} of {data.total} (offset {data.offset})"),
-        class_="pager",
+    pager = _pager(
+        path="/ui/dead-letters",
+        total=data.total,
+        limit=data.limit,
+        offset=data.offset,
+        shown=len(data.dead_letters),
+        noun="dead delivery(s)",
+        filters={"channel_id": channel_id, "destination_name": destination_name},
     )
     channels = sorted({d.channel_id for d in data.dead_letters})
     pairs = sorted(

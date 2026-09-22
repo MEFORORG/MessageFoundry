@@ -15,6 +15,7 @@ from urllib.parse import urlencode
 from messagefoundry.api.models import UploadedFileList, UploadedMessagesResult
 
 from .._html import Markup, el, page, register_nav, rows_table, text
+from ._common import _pager
 
 __all__ = [
     "uploaded_log_delete_confirm",
@@ -105,36 +106,18 @@ def uploaded_logs(data: UploadedFileList, *, error: str = "") -> Markup:
 def _list_pager(data: UploadedFileList) -> Markup:
     """The page counter plus Previous/Next links for the uploaded-files listing (BACKLOG #1152).
 
-    ``data.total`` is the whole visible set and ``data.files`` is the window, so the line states
-    both rather than a bare count that would now be ambiguous. The links carry only two integers the
-    engine has already clamped, so nothing operator-supplied reaches the URL — the same reason the
-    refusal codes on this page are fixed tokens."""
-    shown = len(data.files)
-    first = data.offset + 1 if shown else 0
-    parts: list[object] = [text(f"{first}-{data.offset + shown} of {data.total} file(s)")]
-    if data.offset > 0:
-        prev = max(data.offset - data.limit, 0)
-        parts.append(Markup(" "))
-        parts.append(
-            el(
-                "a",
-                "← Previous",
-                href=f"/ui/uploaded-logs?{urlencode({'limit': data.limit, 'offset': prev})}",
-                class_="btn-link",
-            )
-        )
-    if data.offset + shown < data.total:
-        nxt = data.offset + data.limit
-        parts.append(Markup(" "))
-        parts.append(
-            el(
-                "a",
-                "Next →",
-                href=f"/ui/uploaded-logs?{urlencode({'limit': data.limit, 'offset': nxt})}",
-                class_="btn-link",
-            )
-        )
-    return el("p", *parts, class_="pager")
+    This listing has no filters, so the shared builder is called with none: the links carry only two
+    integers the engine has already clamped, and nothing operator-supplied reaches the URL — the same
+    reason the refusal codes on this page are fixed tokens. That is a property of THIS page, not of
+    the builder, which exists to round-trip the filters other callers do have."""
+    return _pager(
+        path="/ui/uploaded-logs",
+        total=data.total,
+        limit=data.limit,
+        offset=data.offset,
+        shown=len(data.files),
+        noun="file(s)",
+    )
 
 
 def uploaded_logs_upload(*, error: str = "") -> Markup:

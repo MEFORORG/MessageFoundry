@@ -595,13 +595,21 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # Form-only landing: pre-filled, NOT run until the operator submits (#4b).
             return HTMLResponse(pages.messages(None, deferred=True, **typed))
 
+        # A BLANK BOX IS NOT A FILTER, and without the calls below it would be. A browser GET form
+        # submits every field it has, so leaving a box empty sends ``status=``, which arrives here
+        # as "" rather than None; the store's filter builder gates on ``is not None`` and emits
+        # ``status = ''``, which no row matches. MEASURED 2026-09-18 on three messages:
+        # ``?channel_id=ch1`` renders all three and ``?channel_id=ch1&status=`` renders none — so
+        # pressing Search on this page's own form with any box left empty returned an empty log.
+        # ``blank_to_none`` is the whole fix, and it belongs here rather than in the store: an empty
+        # string is a legitimate value to a query API, and it is the BROWSER FORM that means "unset"
+        # by it. The two date bounds already went through ``_epoch``, which returns None for a
+        # blank, which is why they were never affected.
         data = await core.list_messages(
             request,
             engine=engine,
             identity=identity,
-            # blank_to_none, or a submitted-but-empty box becomes a literal match on "" and
-            # the log answers 200 with no rows -- which reads as an empty store, not a dropped
-            # filter. A browser sends every box in a GET form, so this is the ordinary path.
+            # ``blank_to_none`` is the fix the paragraph above measured.
             channel_id=blank_to_none(channel_id),
             status=blank_to_none(status_filter),
             message_type=blank_to_none(message_type),
@@ -675,12 +683,23 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             request,
             engine=engine,
             identity=identity,
+            # No blank_to_none here, unlike the message log above: the ConnectionName annotation
+            # refuses a blank with a 422 before this body runs, so "" never reaches this call
+            # (BACKLOG #1740).
             channel_id=channel_id,
             destination_name=destination_name,
             limit=limit,
             offset=offset,
         )
-        return HTMLResponse(pages.dead_letters(data))
+        # The two filters go to the page as well as to the query, because the pager links have to
+        # replay them — see ``pages._common._pager`` for why (BACKLOG #1743).
+        return HTMLResponse(
+            pages.dead_letters(
+                data,
+                channel_id=channel_id or "",
+                destination_name=destination_name or "",
+            )
+        )
 
     # Safe operator actions (M2): inbound connection start/stop/restart. These reuse the JSON
     # control handlers (require CONNECTIONS_CONTROL + the per-channel _control_guard), and add
