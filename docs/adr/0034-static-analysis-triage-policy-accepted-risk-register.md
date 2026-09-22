@@ -2,7 +2,7 @@
 
 - **Status:** Accepted (2026-06-26)
 - **Date:** 2026-06-26
-- **Related:** [0018](0018-per-message-signatures-accepted-risk.md) (accepted-risk precedent) · CI security scanning (PRs #549/#551/#552) · the two fixes (PR #554) · OSSF Scorecard (PR #549) · [CLAUDE.md](../../CLAUDE.md) §8/§9 · [docs/SECURITY.md](../SECURITY.md) · [docs/PHI.md](../PHI.md)
+- **Related:** [0018](0018-per-message-signatures-accepted-risk.md) (accepted-risk precedent) · [0191](0191-coverage-guided-fuzzing-of-the-tolerant-parsers.md) (**withdraws this register's `FuzzingID` accepted risk for the engine half**, 2026-09-22) · CI security scanning (PRs #549/#551/#552) · the two fixes (PR #554) · OSSF Scorecard (PR #549) · [CLAUDE.md](../../CLAUDE.md) §8/§9 · [docs/SECURITY.md](../SECURITY.md) · [docs/PHI.md](../PHI.md)
 
 ---
 
@@ -49,7 +49,7 @@ Scorecard runs on the same mirror and surfaced **48 findings**. These are **repo
 - **`PinnedDependenciesID` — Docker image not digest-pinned (7).** `won't fix`. `dependabot.yml` configures no `docker` ecosystem, so digest-pinning would **freeze a stale, unpatched base**; the floating `python:3.14-slim-bookworm` tag receives patches on rebuild. A *proper* fix would add a docker Dependabot ecosystem **and** digest-pin together (deferred, not warranted for a secondary artifact — primary deploy is the NSSM Windows service).
 - **`TokenPermissionsID` (6).** `won't fix`. The flagged `write` scopes are the documented minimum each workflow needs (CLA writes signatures to the `cla-signatures` branch; release publishes GitHub releases; auto-merge merges PRs); Scorecard flags *any* write. Tightening risks breaking the **required** CLA gate.
 - **`BranchProtectionID` / `CodeReviewID` / `MaintainedID` (3).** `won't fix`. Measured on the read-only mirror (force-pushed snapshots, 0 approved changesets, repo age <90 days); branch protection + required checks + reviewed PRs are enforced on the private upstream.
-- **`FuzzingID` (1).** `won't fix`. No fuzz harness today; a fuzz target for the tolerant HL7/X12 parsers is a reasonable future backlog item, recorded as accepted risk.
+- **`FuzzingID` (1).** ~~`won't fix`. No fuzz harness today; a fuzz target for the tolerant HL7/X12 parsers is a reasonable future backlog item, recorded as accepted risk.~~ **SUPERSEDED 2026-09-22 by [ADR 0191](0191-coverage-guided-fuzzing-of-the-tolerant-parsers.md).** The harness was built -- coverage-guided fuzzing via Atheris against the tolerant HL7 v2, X12 **and** DICOM parsers (wider than the HL7/X12 this row anticipated), behind an advisory ubuntu-only job. The accepted risk is withdrawn for the ENGINE half. It does **not** change any ASVS verdict: that record lives in the vault clone, and nothing in this repository can move it. Amended here rather than left standing, per this ADR's own rule below that a register must be updated whenever findings are re-triaged "or it misleads".
 - **`CIIBestPracticesID` (1).** `won't fix`. An OpenSSF Best Practices badge is a program-enrollment / self-certification effort, not a code change.
 - **`DependencyUpdateToolID` (1).** `false positive`. `.github/dependabot.yml` (uv + github-actions + npm, grouped security updates + auto-merge) is present on `origin/main`; the older mirror snapshot scanned predated it — closes on the next publish.
 
