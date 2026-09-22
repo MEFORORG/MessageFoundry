@@ -414,13 +414,14 @@ class DrCoordinator:
         The refusal is one condition with two wordings: the DR store holds **fewer messages than the
         verified seed declares**, zero included. Fail-closed, recorded as ``dr_activation_aborted``.
 
-        Two limits, stated rather than hidden. A seed taken from a primary that held zero messages
-        restores to a store that also holds zero, so it is refused too — the conservative side of a gate
-        whose whole job is to stop a promotion onto a store with nothing in it, and the error names the
-        condition so an operator running an empty-primary drill sees why. And a store restored from a
-        *different* primary of the same size passes: the count is a load check, not a provenance check.
-        Exact provenance is the ``[dr].restore_token`` vintage floor's job (BACKLOG #223) and extending
-        it to SQLite is unfiled work, not something this gate claims.
+        Two limits, stated rather than hidden. A seed that declares zero messages cannot be told apart
+        from a restore that never happened — both leave the DR store at zero — so that pair is refused
+        too, and the error says which of the two readings it could not separate rather than asserting
+        the restore was skipped. That is the conservative side of a gate whose whole job is to stop a
+        promotion onto a store with nothing in it. And a store restored from a *different* primary of
+        the same size passes: the count is a load check, not a provenance check. Exact provenance is
+        the ``[dr].restore_token`` vintage floor's job (BACKLOG #223) and extending it to SQLite is
+        unfiled work, not something this gate claims.
 
         **Not** ``Store.has_prior_backup_history()``, which the server-DB gate uses and which looks like
         the obvious answer here: the ``dr_backup`` audit row is written AFTER the snapshot it describes
@@ -432,14 +433,35 @@ class DrCoordinator:
         takeover path, paid deliberately: the alternative is promoting onto an unseeded one.
 
         **No-op on a server-DB store**: there the cold seed is config-only and the live DB is DBA-restored,
-        which :meth:`_verify_live_server_seed` already gates (BACKLOG #102). Also a no-op when the verified
-        archive carried no store member, since there is then nothing it could have been loaded from."""
+        which :meth:`_verify_live_server_seed` already gates (BACKLOG #102).
+
+        **An archive that declares no store row counts is a REFUSAL here, not a no-op.** It used to
+        return early, which handed a SQLite box the one gap this gate exists to close: a config-only
+        archive verifies ``PASS`` with empty ``row_counts``, :meth:`_verify_live_server_seed` returns
+        early because the backend is not a server DB, and both gates then passed an unseeded store
+        through — so a deploying site would record a ``dr_seed`` marker and a ``dr.activate`` row
+        against a store nothing was ever restored into, which is exactly the silent success ADR 0048's
+        amendment, ``docs/CONFIGURATION.md`` and ``docs/EARLY-ADOPTER-GUIDE.md`` state is refused
+        unconditionally. It cannot be a false refusal: :func:`~messagefoundry.pipeline.dr_backup.
+        run_restore` refuses a config-only archive outright, so an archive carrying no store is one no
+        SQLite box could have been seeded from in the first place. And a FULL archive always declares
+        counts, because :func:`~messagefoundry.pipeline.dr_backup._count_tables` reports every table in
+        the snapshot's own schema — a real store has dozens — so empty counts on a ``PASS`` mean
+        config-only and nothing else."""
         if self._is_server_db():
             return
         if not verify.row_counts:
-            # A config-only archive (or a verify that reported no counts) gives nothing to compare the
-            # DR store against; leave that path to the server-DB gate rather than guess.
-            return
+            await self._record_aborted(
+                "seed",
+                "the cold-seed archive verified but declares NO store row counts — a config-only "
+                "archive (a --config-only backup, or a server-DB store's DBA-delegated one) carries "
+                "no store.db, so nothing could have been restored from it into this box's store. "
+                "Seed this box from a full archive (messagefoundry restore <archive> --to <store "
+                "path>), then activate. Refusing to promote against a seed that carries no store "
+                "(ADR 0048 fail-closed)",
+                actor,
+                now,
+            )
         seeded = int(verify.row_counts.get("messages", 0))
         try:
             present = await self._store.count_messages()
@@ -448,6 +470,19 @@ class DrCoordinator:
                 "state",
                 f"could not read the DR store's message count to confirm the cold seed was restored "
                 f"into it: {safe_exc(exc)}",
+                actor,
+                now,
+            )
+        if present == 0 and seeded == 0:
+            # Both readings sit on the same number, so name both rather than assert the one that is
+            # usually right: a seed taken from an empty primary restores to an empty store, and so
+            # does a restore that never ran. The gate cannot separate them and says so.
+            await self._record_aborted(
+                "seed",
+                "the DR store holds 0 messages and the verified cold seed declares 0 as well, so the "
+                "restore cannot be told apart from one that never ran. Refusing to promote onto an "
+                "empty store (ADR 0048 fail-closed). If this is an empty-primary drill, seed the box "
+                "from an archive that carries messages",
                 actor,
                 now,
             )
