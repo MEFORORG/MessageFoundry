@@ -44,7 +44,10 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
-from tests._force_include import hatch_build, wheel_force_include
+import pytest
+from packaging.requirements import Requirement
+
+from tests._force_include import hatch_build, version_path, wheel_force_include
 
 _REPO = Path(__file__).resolve().parents[1]
 
@@ -290,8 +293,12 @@ def test_the_harness_force_include_maps_every_source_to_its_own_path() -> None:
 # that branch never runs -- and an extraction whose only new behaviour is never executed is a third
 # definition wearing a shared name. These arms drive it over pyprojects written here.
 #
-# tmp_path rather than the tree, and that is the whole point: the shapes below are the ones this
-# repository does NOT currently use, so there is nothing real to read them off.
+# tmp_path rather than the tree, and for the three force-include arms that is the whole point: those
+# shapes are the ones this repository does NOT currently use, so there is nothing real to read them
+# off. The two `version_path` arms at the end are here for a WEAKER reason -- every distribution does
+# declare `[tool.hatch.version].path`, so a real example exists; what tmp_path buys there is control
+# over WHERE the target sits, which is the only way to tell a project-relative join from a
+# repo-relative one.
 
 
 def _synthetic_pyproject(tmp_path: Path, build_tables: str) -> Path:
@@ -362,6 +369,50 @@ force-include = {}
 """,
     )
     assert wheel_force_include(pyproject) == {}
+
+
+def test_the_version_root_resolves_against_the_project_directory(tmp_path: Path) -> None:
+    """The one rule ``version_path`` adds over a bare TOML descent, driven where it can be wrong.
+
+    Every distribution under ``packaging/`` writes this path climbing back OUT of its own project
+    dir, so a reader that joined to the repo root -- or to the cwd, which is what a plain relative
+    ``Path`` does -- would answer with a file that does not exist and no exception would say so. The
+    fixture puts the target somewhere neither of those reaches.
+
+    Mutation: join to anything but ``pyproject.parent``. Red: the paths differ.
+    """
+    project = tmp_path / "packaging" / "synthetic"
+    project.mkdir(parents=True)
+    target = tmp_path / "engine" / "__init__.py"
+    target.parent.mkdir(parents=True)
+    target.write_text('__version__ = "0"\n', encoding="utf-8")
+
+    pyproject = _synthetic_pyproject(
+        project,
+        """[tool.hatch.version]
+path = "../../engine/__init__.py"
+""",
+    )
+    assert version_path(pyproject) == target.resolve()
+
+
+def test_the_version_root_refuses_a_project_that_declares_none(tmp_path: Path) -> None:
+    """The asymmetry with :func:`hatch_build`, which returns an empty table instead.
+
+    There is no empty answer here -- a caller handed a default would be asserting about a module
+    nothing declared -- so this raises, and it raises NAMING the file, because the bare
+    ``KeyError('version')`` a hand descent produces never says which pyproject was being read.
+    """
+    pyproject = _synthetic_pyproject(tmp_path, "")
+    with pytest.raises(KeyError, match="declares no") as raised:
+        version_path(pyproject)
+    # The FILE, not just the phrasing. Without this arm, deleting `{pyproject}` from the message
+    # leaves this test green while the one property it exists to pin is gone.
+    #
+    # `args[0]`, NOT `str(exc)`: KeyError's __str__ is `repr(args[0])`, so on Windows the path comes
+    # back with every separator doubled and a plain substring test fails against a message that does
+    # carry the path. That is a real trap, not a style preference -- it failed here first.
+    assert str(pyproject) in raised.value.args[0]
 
 
 def test_no_test_module_walks_the_hatch_build_table_for_itself() -> None:
@@ -501,10 +552,161 @@ def test_every_build_system_pins_its_backend_exactly_and_they_agree() -> None:
     )
 
 
+# --- the harness pins the engine it ships with (BACKLOG #1585) --------------------------------------
+
+_HARNESS_PYPROJECT = _REPO / "packaging" / "messagefoundry-harness" / "pyproject.toml"
+
+
+def _version_literal(module: Path) -> str:
+    # Both quote styles. scripts/security/sbom_finalize.py reads this same literal with the looser
+    # pattern, and a check stricter than its sibling misses a version the sibling happily ships.
+    m = re.search(
+        r"""^__version__\s*=\s*["']([^"']+)["']""", module.read_text(encoding="utf-8"), re.M
+    )
+    assert m, f"no `__version__ = ...` literal in {module} - hatchling reads one from it"
+    return m.group(1)
+
+
+def _engine_requirement(dependencies: list[str]) -> Requirement | None:
+    """The parsed requirement on ``messagefoundry``, or ``None`` if the table declares none.
+
+    Returns the REQUIREMENT rather than just its version so the extras check below reads off the same
+    parse instead of re-finding it; the two asked the same question twice and could disagree.
+    """
+    for raw in dependencies:
+        req = Requirement(raw)
+        if _normalise(req.name) == "messagefoundry":
+            return req
+    return None
+
+
+def _engine_pin(dependencies: list[str]) -> str | None:
+    """The exact version the requirement on ``messagefoundry`` pins, or ``None`` if it pins none.
+
+    ``None`` is every loose shape: a bare name, a floor, a compatible release, a wildcard, a range.
+    Each of those lets a resolver pick an engine the harness cannot run against.
+
+    WHY NOT ``_EXACT_PIN`` / ``_unpinned`` ABOVE: that regex answers the same question for
+    ``[build-system].requires`` and CANNOT answer it here. Its name character class has no ``[``, so
+    ``messagefoundry[harness]==0.3.2`` -- a correctly pinned requirement -- does not match it and
+    would read as unpinned. Extras are the difference; ``packaging`` parses them and a regex over a
+    PEP 508 string does not. Two predicates in one file, and this note is which is authoritative
+    where.
+    """
+    req = _engine_requirement(dependencies)
+    if req is None:
+        return None
+    specs = list(req.specifier)
+    if len(specs) == 1 and specs[0].operator == "==" and "*" not in specs[0].version:
+        return specs[0].version
+    return None
+
+
+def test_the_engine_pin_check_refuses_the_shapes_it_exists_to_refuse() -> None:
+    # A check never seen to fire proves nothing by passing. The bare name is what this table carried
+    # before #1585; the rest are the near-misses a later edit reaches for.
+    for loose in (
+        "messagefoundry[harness]",
+        "messagefoundry[harness]>=0.3.2",
+        "messagefoundry[harness]~=0.3.2",
+        "messagefoundry[harness]==0.3.*",
+        "messagefoundry[harness]>=0.3.2,<0.4",
+    ):
+        assert _engine_pin([loose]) is None, loose
+    assert _engine_pin(["messagefoundry[harness]==0.3.2"]) == "0.3.2"
+    # And it must find the requirement among siblings, not only when it stands alone.
+    assert _engine_pin(["pytest>=8", "messagefoundry[harness]==0.3.2"]) == "0.3.2"
+    assert _engine_pin(["pytest>=8"]) is None
+    # The reason this predicate exists rather than reusing _EXACT_PIN: that one cannot see extras.
+    assert _unpinned(["messagefoundry[harness]==0.3.2"]) == ["messagefoundry[harness]==0.3.2"]
+
+
+def test_the_harness_pins_the_engine_at_the_version_it_ships_with() -> None:
+    """``messagefoundry-harness`` is a LOCKSTEP distribution, and its dependency must say so.
+
+    Its ``[tool.hatch.version].path`` is the ENGINE's ``__init__.py``, so the harness wheel and the
+    engine it depends on carry the same version by construction. A bare ``messagefoundry[harness]``
+    did not express "any engine works", it expressed nothing, while the truth available at build time
+    was an exact version. harness/monitor.py and harness/scenarios.py import
+    ``messagefoundry.apiclient`` at module level, so an engine without it installs cleanly and then
+    fails on the operator's first command.
+
+    WHAT THIS DOES NOT ESTABLISH: that a mismatched engine is refused at install time. That needs an
+    index carrying an older release and cannot run here. What is checked is the specifier the build
+    will emit as ``Requires-Dist``.
+    """
+    harness = tomllib.loads(_HARNESS_PYPROJECT.read_text(encoding="utf-8"))
+    # READ FROM `[tool.hatch.version].path`, NOT HARDCODED -- but note what that buys and what it
+    # does not. The assertion below asserts the answer IS the engine's `__init__.py`, so repointing
+    # the version root does not silently move this check, it fails it. That is the intent: the
+    # lockstep pin rests on the root being the engine's, so the premise moving must stop the test
+    # rather than let it carry on asserting about whatever file the config now names.
+    root = version_path(_HARNESS_PYPROJECT)
+    assert root == (_REPO / "messagefoundry" / "__init__.py").resolve(), (
+        f"the harness takes its version from {root}, which is not the engine's __init__.py - the "
+        f"lockstep premise this pin rests on is gone, so re-derive the pin before trusting it"
+    )
+
+    shipped = _version_literal(root)
+    pinned = _engine_pin(harness["project"]["dependencies"])
+    assert pinned == shipped, (
+        f"the harness must pin the engine at the version it ships with (BACKLOG #1585).\n"
+        f"  {root.relative_to(_REPO).as_posix()} says: {shipped}\n"
+        f"  {_HARNESS_PYPROJECT.relative_to(_REPO).as_posix()} pins: {pinned}\n"
+        f"A VERSION BUMP IS TWO EDITS. PEP 621 `dependencies` is static and nothing in this repository "
+        f"generates it, so set that table to `messagefoundry[harness]=={shipped}` in the same commit "
+        f"that moves __version__."
+    )
+
+
+def test_the_harness_pin_keeps_the_extra_the_harness_actually_needs() -> None:
+    """The pin must not quietly drop ``[harness]`` while adding ``==``.
+
+    Dropping it is the easiest way to make this table look stricter and be weaker: the version is
+    nailed down, PySide6 stops being installed, and the GUI fails to start on a fresh install while
+    every version check in the release still passes.
+    """
+    deps = tomllib.loads(_HARNESS_PYPROJECT.read_text(encoding="utf-8"))["project"]["dependencies"]
+    engine = _engine_requirement(deps)
+    assert engine is not None, "the harness declares no requirement on the engine at all"
+    assert engine.extras == {"harness"}, (
+        f"the harness depends on messagefoundry{sorted(engine.extras)}, not [harness] - the extra "
+        f"is what installs PySide6, so the GUI would not start on a fresh install"
+    )
+
+
+def test_the_harness_names_the_engine_once_in_the_table_the_release_counts() -> None:
+    """The release smoke insists on EXACTLY ONE, and this is the only place that can say so in CI.
+
+    release.yml's harness smoke reads the built wheel's ``Requires-Dist`` and exits non-zero on any
+    count but one (BACKLOG #1585). ``_engine_requirement`` above returns the FIRST match and ignores
+    the rest, so a second line naming the engine passes every other assertion in this file and reds
+    the release instead -- in a job with ``needs: release``, after the engine is on PyPI.
+
+    SCOPE, and it is the reason the release check still exists: this reads the pyproject, not the
+    built wheel, so it cannot see what the build backend actually emitted. What it does is move this
+    one shape from tag time to the merge queue.
+
+    ``project.optional-dependencies`` is deliberately NOT read. Those reach ``Requires-Dist`` marked
+    ``extra == "<name>"``, a plain install never pulls them in, and the smoke skips them for that
+    reason (tests/test_release_pipeline.py::test_the_harness_smoke_does_not_count_a_requirement_an
+    _extra_gates). Counting them here would forbid a table the sibling console already ships.
+    """
+    deps = tomllib.loads(_HARNESS_PYPROJECT.read_text(encoding="utf-8"))["project"]["dependencies"]
+    named = [raw for raw in deps if _normalise(Requirement(raw).name) == "messagefoundry"]
+    assert len(named) == 1, (
+        f"the harness base dependency table names the engine {len(named)} times: {named}. The "
+        f"release smoke counts them on the built wheel and accepts only one, so this fails at the "
+        f"tag rather than here. Keep one line in "
+        f"{_HARNESS_PYPROJECT.relative_to(_REPO).as_posix()}."
+    )
+
+
 # --- BACKLOG #1835: .gitignore must not name a path a wheel force-include ships -------------------
 #
-# The section above asks which TRACKED files a map ships. This one asks a question the tracked tree
-# cannot answer at all. git is asked what to TRACK; hatchling's force-include is asked what to SHIP,
+# The BACKLOG #1702 section above asks which TRACKED files a map ships -- named rather than pointed
+# at, because two more sections have since landed between the two. This one asks a question the
+# tracked tree cannot answer at all. git is asked what to TRACK; hatchling's force-include is asked what to SHIP,
 # and `recurse_forced_files` answers it by walking the FILESYSTEM. So a file git is told to ignore,
 # sitting inside a force-included tree, reaches the wheel of whoever holds it -- and `_tracked` above
 # cannot see it, which its own docstring records as this model's residual.

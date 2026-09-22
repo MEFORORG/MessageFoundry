@@ -1,18 +1,32 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""One definition of hatchling's ``[tool.hatch.build]`` table, and of the wheel map inside it.
+"""One definition of hatchling's ``[tool.hatch]`` table, and of the wheel map inside it.
 
-Three guards read that table and each walked the TOML by hand. Two of them want the same
-``force-include`` map, for opposite projections of it:
+At least four guards read the ``build`` sub-table and each walked the TOML by hand. Several want the
+same ``force-include`` map, for different projections of it:
 
 * ``tests/test_packaging.py`` takes the KEYS -- the repo paths a wheel pulls from (BACKLOG #1702) --
   and separately reads the table's ``exclude`` list;
 * ``tests/test_install_instruction_provenance.py`` takes the VALUES -- the import tree each wheel
   lands them at, which is how it derives the code trees its scan must cover (BACKLOG #1193);
+* ``tests/test_packaged_tree_denylist.py`` takes the PAIRS, to walk each shipped tree at the path it
+  lands on, and reads the root project's ``exclude`` list beside them;
 * ``tests/test_release_pipeline.py`` wants the sdist target's ``only-include``, one target over.
 
-So :func:`hatch_build` is the descent all three share and :func:`wheel_force_include` is the one
-resolution rule the first two need on top of it.
+So :func:`hatch_build` is the descent they share and :func:`wheel_force_include` is the one
+resolution rule the force-include readers need on top of it. **"At least" is load-bearing** (SDS-3.6):
+the count was written as three while a fourth reader already existed, so the number is a floor and a
+new caller does not make this paragraph wrong.
+
+**A FOURTH READER WANTED A SIBLING TABLE, NOT THE BUILD ONE, so the scope here is `[tool.hatch]` and
+no longer `[tool.hatch.build]`.** The harness lockstep-pin check (BACKLOG #1585) needs
+``[tool.hatch.version].path`` -- the module a project's version is read out of -- which is one table
+over from everything above. It is here rather than in that test because
+``test_no_test_module_walks_the_hatch_build_table_for_itself`` (BACKLOG #1836) is deliberately wider
+than the defect it was filed for: it refuses a hand descent through ``hatch`` ANYWHERE in a test
+module, on the reasoning that two readings of one table are free to disagree silently whichever key
+they land on. Widening this module is what satisfies that guard; spelling the access differently to
+slip past its regex would defeat it while looking like a pass.
 
 **The two force-include copies already disagreed, and the disagreement was silent.** One read only
 ``[tool.hatch.build.targets.wheel.force-include]``; the other also fell back to the global
@@ -70,14 +84,43 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-__all__ = ["hatch_build", "wheel_force_include"]
+__all__ = ["hatch_build", "version_path", "wheel_force_include"]
+
+
+def _hatch(pyproject: Path) -> dict[str, Any]:
+    """The ``[tool.hatch]`` table of ``pyproject``, or an empty one."""
+    data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    hatch: dict[str, Any] = data.get("tool", {}).get("hatch", {})
+    return hatch
 
 
 def hatch_build(pyproject: Path) -> dict[str, Any]:
     """The ``[tool.hatch.build]`` table of ``pyproject``, or an empty one."""
-    data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
-    build: dict[str, Any] = data.get("tool", {}).get("hatch", {}).get("build", {})
+    build: dict[str, Any] = _hatch(pyproject).get("build", {})
     return build
+
+
+def version_path(pyproject: Path) -> Path:
+    """The module whose ``__version__`` hatchling reads ``pyproject``'s version from.
+
+    RESOLVED against the PROJECT directory, which is what hatchling does and is the whole reason a
+    caller cannot just join it to the repo root: every distribution under ``packaging/`` writes this
+    as a path climbing back out of its own project dir.
+
+    RAISES rather than returning a default, unlike :func:`hatch_build` above, and the asymmetry is
+    deliberate. An absent build table means "this project configures nothing", which is a real answer
+    every caller can use. An absent version root has no such answer -- there is no module to read --
+    so a caller handed one would be asserting about a path nothing declared.
+    """
+    hatch = _hatch(pyproject)
+    try:
+        declared = hatch["version"]["path"]
+    except KeyError as exc:
+        raise KeyError(
+            f"{pyproject} declares no [tool.hatch.version].path, so it names no module for this "
+            f"check to read a version out of"
+        ) from exc
+    return (pyproject.parent / declared).resolve()
 
 
 def wheel_force_include(pyproject: Path) -> dict[str, str]:

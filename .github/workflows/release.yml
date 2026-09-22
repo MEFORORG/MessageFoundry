@@ -731,23 +731,155 @@ jobs:
         id: member-gate
         run: python scripts/release/forbidden_members.py 'webconsole-dist/*.whl'
 
-      - name: Smoke-check the console wheel (version == the console's OWN __version__ == tag)
+      - name: Smoke-check the console wheel (clean venv, install, then the console's OWN __version__ == tag)
         run: |
-          built=$(python -c "import glob,re; print(re.search(r'messagefoundry_webconsole-([^-]+)-', glob.glob('webconsole-dist/*.whl')[0]).group(1))")
+          # THIS STEP USED TO READ THE VERSION OUT OF THE WHEEL FILENAME and never open the file
+          # (BACKLOG #1701): `re.search(r'messagefoundry_webconsole-([^-]+)-', glob(...))`. That proves
+          # the artifact is NAMED right and nothing else — a wheel whose force-include silently produced
+          # no package tree, or whose metadata says one thing and whose payload says another, passed the
+          # step's own promise ("== the console's OWN __version__") while the promise was never checked.
+          # The version now comes out of the INSTALLED distribution, and the installed `__init__.py` is
+          # read back for its `__version__` literal, so the step measures the artifact it is about to
+          # publish rather than the string somebody typed into its name.
+          #
+          # Derived from the lock, exactly as the relsmoke/harnesssmoke jobs do, so one bump moves
+          # every release-path packaging install together instead of drifting apart. Hoisted OUT of the
+          # tag guard for the same reason the engine job hoists its own: an install a dispatch dry-run
+          # never reaches cannot be validated before the tag that depends on it.
+          PKG_PIN="$(sed -n 's/^packaging==\([^ ;]*\).*/\1/p' constraints.lock | head -1)"
+          if [ -z "$PKG_PIN" ]; then
+            echo "::error::no packaging== pin in constraints.lock — refusing an unpinned install on the release path"; exit 1
+          fi
+          echo "packaging pin from constraints.lock: $PKG_PIN"
+          # A THROWAWAY VENV, not this job's interpreter (ADR 0034). This job holds contents: write +
+          # id-token: write, and the steps after this one attach the wheel to a GitHub release and
+          # publish it to PyPI — so anything resolved into the main interpreter here sits inside the
+          # publishing identity. The engine job has always done it this way (/tmp/relsmoke); the console
+          # was the one wheel job still installing into the job interpreter.
+          python -m venv /tmp/webconsolesmoke
+          /tmp/webconsolesmoke/bin/pip install --quiet "packaging==$PKG_PIN"
+          # --no-deps IS LOAD-BEARING, NOT AN OPTIMISATION. `messagefoundry-webconsole` depends on
+          # `messagefoundry`, and this job has no `needs: release`, so a full install would resolve that
+          # engine FROM PYPI inside a job holding id-token: write. Install the built wheel alone.
+          /tmp/webconsolesmoke/bin/pip install --quiet --no-deps webconsole-dist/*.whl
+          # Then INSPECT it rather than import it. messagefoundry_webconsole/__init__.py eagerly imports
+          # .pages, ._auth and .mount, so under --no-deps (no fastapi, no engine) an import would fail on
+          # a perfectly good wheel. find_spec resolves the package WITHOUT executing it, which is exactly
+          # the reach this check needs.
+          #
+          # A FAILURE INSIDE THIS COMMAND SUBSTITUTION FAILS THE STEP. Actions runs the block as
+          # `bash -e {0}`, and for a simple assignment bash takes the substitution's own status, so
+          # errexit fires and nothing after this line runs. Measured, not assumed: under `bash -e`,
+          # `built=$(python -c 'raise SystemExit(3)')` exits 3 without reaching the next command.
+          built=$(/tmp/webconsolesmoke/bin/python -I - <<'PYSMOKE'
+          import re
+          import sys
+          from importlib.metadata import distribution
+          from importlib.util import find_spec
+          from pathlib import Path
+
+          DIST = "messagefoundry-webconsole"
+          PKG = "messagefoundry_webconsole"
+
+          # -I (isolated) is what keeps the CHECKOUT out of sys.path. The repo root carries a
+          # messagefoundry_webconsole/ of its own, and this step runs from that root, so without it the
+          # checkout would answer every question below and the wheel would never be touched. -P or
+          # PYTHONSAFEPATH would do as well; -E alone is a silent no-op here.
+          prefix = Path(sys.prefix).resolve()
+
+          spec = find_spec(PKG)
+          if spec is None or not spec.origin:
+              raise SystemExit(
+                  f"::error::{PKG} is not importable from the smoke venv — the wheel shipped no package tree"
+              )
+          origin = Path(spec.origin).resolve()
+          if not origin.is_relative_to(prefix):
+              raise SystemExit(
+                  f"::error::{PKG} resolved to {origin}, OUTSIDE the smoke venv {prefix} — "
+                  f"the checkout shadowed the wheel and this step inspected the wrong tree"
+              )
+
+          # BIND THE MODULE TO THIS DISTRIBUTION. find_spec above proves SOME module for PKG sits in
+          # the venv; RECORD is what says it came out of THIS wheel. Without the membership test the
+          # two questions are separate, and a venv where another distribution owns the import name
+          # answers the first one happily.
+          dist = distribution(DIST)
+          recorded = [name for f in (dist.files or []) if (name := str(f)).startswith(PKG + "/")]
+          if not recorded:
+              raise SystemExit(
+                  f"::error::{DIST} RECORD lists no {PKG}/ members — the wheel is metadata wrapped around "
+                  f"an empty package tree (a broken force-include builds and installs cleanly)"
+              )
+          if not any(Path(f.locate()).resolve() == origin for f in (dist.files or [])):
+              raise SystemExit(
+                  f"::error::{origin} is not a file {DIST} recorded — the module this step resolved "
+                  f"belongs to something else on sys.path, so the wheel was never inspected"
+              )
+
+          # The step name promises "the console's OWN __version__", so read it — out of the INSTALLED
+          # file, not the checkout. It must agree with the metadata hatchling derived from it; a
+          # disagreement means the version root and the built artifact are not the same thing any more.
+          # Both quote styles: scripts/security/sbom_finalize.py reads this same literal with the looser
+          # pattern, and a check that is stricter than its sibling finds a version the sibling ships.
+          text = origin.read_text(encoding="utf-8")
+          m = re.search(r"""^__version__\s*=\s*["']([^"']+)["']""", text, re.M)
+          if m is None:
+              raise SystemExit(f"::error::no __version__ literal in the installed {origin}")
+          # COMPARED AS PEP 440 VERSIONS, NOT AS STRINGS — the two sides are normalised differently by
+          # construction. `dist.version` comes out of `Version:`, which hatchling canonicalises, while
+          # `__version__` is whatever was typed into the version root, and the hyphen spelling is
+          # SUPPORTED here rather than tolerated (tests/test_version.py::test_version_is_semver admits
+          # it, and the tag trigger above only fires on `...-*`, so a pre-release tag cannot be spelled
+          # any other way). A string compare therefore rejects `0.3.0-rc1` against metadata `0.3.0rc1`
+          # — the same release — and reds every console pre-release at the last gate before the PyPI
+          # upload burns the version. Its sibling tag-vs-built compare below was fixed for exactly this
+          # trap; this is the same trap one comparison over.
+          # tests/test_version.py::test_installed_metadata_matches_dunder_version parses both sides of
+          # the identical question for the engine, and says why in its own comment.
+          #
+          # WHAT THIS GIVES UP, stated rather than left to be discovered: the check is now PEP 440
+          # equality, not a spelling check, so `v0.3.0`, `0.3.0.0` and `0.3` all pass against metadata
+          # `0.3.0` as well. That is the whole equivalence class, not just the hyphen. Nothing else
+          # constrains the console literal's spelling, and its only consumer is the version string
+          # printed at messagefoundry_webconsole/__init__.py. What the check still catches is the
+          # failure it exists for — a wheel whose package tree and metadata came from different trees
+          # — because epochs, post-releases and local segments all still compare unequal.
+          #
+          # `packaging` is installed into this venv above, from the constraints.lock pin. Imported HERE
+          # rather than at the top, matching the harness smoke: everything before this point is
+          # stdlib-only, and that is what lets the guards above report a broken wheel instead of a
+          # missing dependency.
+          from packaging.version import InvalidVersion, Version
+
+          try:
+              source_version, metadata_version = Version(m.group(1)), Version(dist.version)
+          except InvalidVersion as exc:
+              raise SystemExit(
+                  f"::error::unparseable version ({exc}) — installed {PKG}.__version__ "
+                  f"{m.group(1)!r}, wheel metadata {dist.version!r}"
+              )
+          if source_version != metadata_version:
+              raise SystemExit(
+                  f"::error::installed {PKG}.__version__ {m.group(1)} != wheel metadata version "
+                  f"{dist.version} (normalised {source_version} != {metadata_version}) — the console's "
+                  f"version root and its built artifact disagree"
+              )
+
+          print(
+              f"console wheel installed from {origin}: {len(recorded)} {PKG}/ members, "
+              f"__version__ == metadata == {dist.version}",
+              file=sys.stderr,
+          )
+          print(dist.version)
+          PYSMOKE
+          )
           echo "console wheel version: $built"
           # Compared against the CONSOLE's version root, never the engine's — that is the whole point of
-          # the separate tag namespace. PEP 440 comparison because hatchling normalises the filename
+          # the separate tag namespace. PEP 440 comparison because hatchling normalises the version
           # (tag webconsole-v0.3.0-rc1 -> 0.3.0rc1), so a string compare could never match a pre-release.
           if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
             want="${GITHUB_REF_NAME#webconsole-v}"
-            # Derived from the lock, exactly as the relsmoke/harnesssmoke jobs do, so one bump moves
-            # every release-path packaging install together instead of drifting apart.
-            PKG_PIN="$(sed -n 's/^packaging==\([^ ;]*\).*/\1/p' constraints.lock | head -1)"
-            if [ -z "$PKG_PIN" ]; then
-              echo "::error::no packaging== pin in constraints.lock — refusing an unpinned install on the release path"; exit 1
-            fi
-            python -m pip install --quiet "packaging==$PKG_PIN"
-            python - "$built" "$want" <<'PYVER'
+            /tmp/webconsolesmoke/bin/python -I - "$built" "$want" <<'PYVER'
           import sys
           from packaging.version import InvalidVersion, Version
 
@@ -874,26 +1006,28 @@ jobs:
         id: member-gate
         run: python scripts/release/forbidden_members.py 'harness-dist/*.whl'
 
-      - name: Smoke-check the harness wheel (version == engine == tag)
+      - name: Smoke-check the harness wheel (clean venv, install, import, version == engine == tag)
         run: |
-          built=$(python -c "import glob,re; print(re.search(r'messagefoundry_harness-([^-]+)-', glob.glob('harness-dist/*.whl')[0]).group(1))")
-          echo "harness wheel version: $built"
-          # PEP 440 comparison, for a STRONGER reason than the engine's copy of this check: `built` is
-          # read out of the WHEEL FILENAME, which hatchling has already normalised. On tag v0.3.0-rc1
-          # the file is messagefoundry_harness-0.3.0rc1-...whl, so built=0.3.0rc1 while want=0.3.0-rc1
-          # and a string compare could NEVER match — this job failed on every pre-release tag by
-          # construction, whatever __version__ said. With PUBLISH_HARNESS=true it also runs after the
-          # engine has already uploaded, so the failure would land half-published.
-          # Pin DERIVED from constraints.lock + installed outside the tag guard — see the engine job's
-          # wheel smoke above for the full rationale. (`build` already pulls packaging>=24.0 into this
-          # same interpreter, so the install is near-redundant; pinning it beats deleting it, which would
-          # leave the dependency implicit and unpinned via build's own resolve.)
+          # THIS STEP USED TO READ THE VERSION OUT OF THE WHEEL FILENAME and never install the wheel
+          # (BACKLOG #1701): `re.search(r'messagefoundry_harness-([^-]+)-', glob(...))`. harness/ is
+          # force-included from two directories up, which is the one part of this build most likely to
+          # break silently — and a wheel carrying no harness/ at all is named exactly like a good one,
+          # so the old step passed it and the release shipped an empty distribution. The wheel is now
+          # installed into the smoke venv and its entry module imported out of it.
           #
-          # …and into a THROWAWAY VENV, not this job's interpreter, which is the other half of ADR 0034's
-          # recommendation. This job holds contents: write + id-token: write and the steps AFTER this one
-          # attach the wheel to the release and publish it to PyPI, so an install resolved into the main
-          # interpreter here sits inside the publishing identity. The engine job already does it this way
-          # (/tmp/relsmoke); the compare script needs nothing but packaging.version + stdlib.
+          # PEP 440 comparison below, for a STRONGER reason than the engine's copy of this check: `built`
+          # comes from the wheel's own METADATA, which hatchling has already normalised. On tag
+          # v0.3.0-rc1 the metadata says 0.3.0rc1 while want=0.3.0-rc1, so a string compare could NEVER
+          # match — this job failed on every pre-release tag by construction, whatever __version__ said.
+          # With PUBLISH_HARNESS=true it also runs after the engine has already uploaded, so the failure
+          # would land half-published.
+          #
+          # Pin DERIVED from constraints.lock + installed outside the tag guard — see the engine job's
+          # wheel smoke above for the full rationale — and into a THROWAWAY VENV, not this job's
+          # interpreter, which is the other half of ADR 0034's recommendation. This job holds
+          # contents: write + id-token: write and the steps AFTER this one attach the wheel to the
+          # release and publish it to PyPI, so an install resolved into the main interpreter here sits
+          # inside the publishing identity.
           PKG_PIN="$(sed -n 's/^packaging==\([^ ;]*\).*/\1/p' constraints.lock | head -1)"
           if [ -z "$PKG_PIN" ]; then
             echo "::error::no packaging== pin in constraints.lock — refusing an unpinned install on the release path"; exit 1
@@ -901,9 +1035,187 @@ jobs:
           echo "packaging pin from constraints.lock: $PKG_PIN"
           python -m venv /tmp/harnesssmoke
           /tmp/harnesssmoke/bin/pip install --quiet "packaging==$PKG_PIN"
+          # --no-deps IS LOAD-BEARING, NOT AN OPTIMISATION. messagefoundry-harness depends on
+          # messagefoundry[harness], so a full install would resolve the ENGINE AND PySide6 FROM PYPI
+          # inside a job holding id-token: write — and at this moment the engine release above has just
+          # published, so it would also be a live index round-trip on the release path. Install the
+          # built wheel alone; the import below is chosen to need nothing else.
+          /tmp/harnesssmoke/bin/pip install --quiet --no-deps harness-dist/*.whl
+          # A failure inside this command substitution fails the step: Actions runs the block as
+          # `bash -e {0}` and a simple assignment carries the substitution's own status. See the
+          # console job's copy of this note for the measurement.
+          built=$(/tmp/harnesssmoke/bin/python -I - <<'PYSMOKE'
+          import importlib
+          import sys
+          from importlib.metadata import distribution
+          from pathlib import Path
+
+          DIST = "messagefoundry-harness"
+          PKG = "harness"
+
+          # -I (isolated) is what keeps the CHECKOUT out of sys.path. The repo root carries harness/ —
+          # that is where this wheel's contents come from — and this step runs from that root, so
+          # without it the checkout would answer every question below and the wheel would never be
+          # touched. -P or PYTHONSAFEPATH would do as well; -E alone is a silent no-op here.
+          prefix = Path(sys.prefix).resolve()
+
+          # harness/ IS A PEP 420 NAMESPACE PACKAGE (no __init__.py), so `import harness` SUCCEEDS
+          # against an empty directory and its __file__ is None — a top-level import would pass on
+          # exactly the empty wheel this check exists to reject. Import the ENTRY module instead: it
+          # has a real __file__, and its module top level is argparse/sys/datetime only (PySide6 and
+          # the engine are imported lazily inside the subcommands), so it loads under --no-deps.
+          try:
+              entry = importlib.import_module(PKG + ".__main__")
+          except ImportError as exc:
+              raise SystemExit(
+                  f"::error::cannot import {PKG}.__main__ from the smoke venv ({exc}) — the wheel "
+                  f"shipped no package tree, or shipped one this interpreter cannot load"
+              ) from None
+
+          if not getattr(entry, "__file__", None):
+              raise SystemExit(
+                  f"::error::{PKG}.__main__ has no __file__ — the wheel shipped no module there"
+              )
+          origin = Path(entry.__file__).resolve()
+          if not origin.is_relative_to(prefix):
+              raise SystemExit(
+                  f"::error::{PKG}.__main__ resolved to {origin}, OUTSIDE the smoke venv {prefix} — "
+                  f"the checkout shadowed the wheel and this step inspected the wrong tree"
+              )
+
+          # BIND THE MODULE TO THIS DISTRIBUTION. Everything above proves SOME module for PKG sits in
+          # the venv; RECORD is what says it came out of THIS wheel. Without the membership test the
+          # two questions are separate, and a venv where another distribution owns the import name
+          # answers the first one happily.
+          dist = distribution(DIST)
+          recorded = [name for f in (dist.files or []) if (name := str(f)).startswith(PKG + "/")]
+          if not recorded:
+              raise SystemExit(
+                  f"::error::{DIST} RECORD lists no {PKG}/ members — the wheel is metadata wrapped "
+                  f"around an empty package tree (a broken force-include builds and installs cleanly)"
+              )
+          if not any(Path(f.locate()).resolve() == origin for f in (dist.files or [])):
+              raise SystemExit(
+                  f"::error::{origin} is not a file {DIST} recorded — the module this step imported "
+                  f"belongs to something else on sys.path, so the wheel was never inspected"
+              )
+
+          # The declared console_scripts target, resolved. `messagefoundry-harness` on a fresh install
+          # calls harness.__main__:main, and a wheel whose entry point does not resolve is a wheel that
+          # fails on its user's first command.
+          if not callable(getattr(entry, "main", None)):
+              raise SystemExit(
+                  f"::error::{PKG}.__main__ has no callable main() — the messagefoundry-harness "
+                  f"console script would fail on first run"
+              )
+
+          # THE LOCKSTEP PIN, CHECKED ON THE BUILT ARTIFACT (BACKLOG #1585). packaging/
+          # messagefoundry-harness/pyproject.toml pins messagefoundry[harness]==<engine version>, and
+          # PEP 621 `dependencies` is STATIC, so a version bump is two edits. tests/test_packaging.py
+          # catches a drift, but NOTHING in this workflow runs that suite and a tag can be cut from a
+          # commit the merge queue never gated. This is the last place the claim is checkable before
+          # the PyPI upload burns the version forever, and the metadata is already open.
+          # `packaging` is installed above, in this same venv, from the constraints.lock pin. Imported
+          # here rather than at the top because everything before this point is stdlib-only, and that
+          # is what lets the earlier guards report a broken wheel instead of a missing dependency.
+          from packaging.requirements import Requirement
+          from packaging.version import InvalidVersion, Version
+
+          # AN EXTRA'S REQUIREMENT IS NOT ONE OF THESE, and counting it was a defect that could only
+          # surface AFTER the upload. `[project.optional-dependencies]` reaches Requires-Dist as
+          # `<requirement>; extra == "<name>"`, a line a plain `pip install messagefoundry-harness`
+          # never installs. The sibling packaging/messagefoundry-webconsole/pyproject.toml already
+          # carries `dev = ["messagefoundry[dev]"]`, so the first such table added here puts a SECOND
+          # messagefoundry line in this wheel's metadata and the count below reads 2.
+          # tests/test_packaging.py cannot catch it -- that suite reads `project.dependencies`, and an
+          # extra is not in it -- so ci.yml stays GREEN and this step, which carries `needs: release`,
+          # reds with the engine already on PyPI. Half a release, and the version burnt.
+          #
+          # SKIPPED NARROWLY, AND THAT IS THE HALF WORTH NOT LOSING. Dropping every requirement whose
+          # marker is false in this venv reads simpler and would also drop a platform- or
+          # python_version-gated one, so a drifted pin wearing `; sys_platform == "win32"` would sail
+          # past the check BACKLOG #1585 exists to provide, on a step that only ever runs on ubuntu.
+          # A line is skipped only when an extra this wheel DECLARES is what turns its marker true;
+          # a marker false here for any other reason is still counted, and still fails loudly.
+          #
+          # NOT COVERED: `extra == "dev" and sys_platform == "win32"`, where the non-extra half is
+          # false on the runner too. No declared extra turns that marker true, so it is counted
+          # rather than skipped -- erring toward the loud failure, which is the safe side of this.
+          extras = dist.metadata.get_all("Provides-Extra") or []
+
+          def gated_by_an_extra(req: Requirement) -> bool:
+              if req.marker is None or req.marker.evaluate({"extra": ""}):
+                  return False
+              return any(req.marker.evaluate({"extra": extra}) for extra in extras)
+
+          engine = [
+              req
+              for raw in (dist.metadata.get_all("Requires-Dist") or [])
+              if (req := Requirement(raw)).name.replace("_", "-").lower() == "messagefoundry"
+              and not gated_by_an_extra(req)
+          ]
+          if len(engine) != 1:
+              # The surviving requirements are named because this message is read at tag time, with
+              # the engine already published: "2" alone does not say which line to delete.
+              raise SystemExit(
+                  f"::error::{DIST} {dist.version} declares {len(engine)} requirements on the engine, "
+                  f"expected exactly one (BACKLOG #1585): {[str(req) for req in engine]}"
+              )
+          # THE PINNED VERSION IS COMPARED AS A PEP 440 VERSION, NOT AS A SPECIFIER STRING. `packaging`
+          # preserves the raw spelling: str(Requirement("messagefoundry[harness]==0.3.0-rc1").specifier)
+          # is "==0.3.0-rc1", and str(Requirement(...)) round-trips it, so a hyphen typed into the
+          # harness pyproject reaches Requires-Dist intact while `Version:` beside it has been
+          # canonicalised to 0.3.0rc1. An f"=={dist.version}" string compare therefore calls a CORRECT
+          # lockstep pin a drift on every pre-release, and prints two versions that are the same one.
+          #
+          # THE OPERATOR AND THE EXTRA STAY EXACT, and that is the half worth not losing: a range is
+          # not a lockstep pin however it is spelled, and dropping [harness] makes the table look
+          # stricter while it quietly stops installing PySide6
+          # (tests/test_packaging.py::test_the_harness_pin_keeps_the_extra_the_harness_actually_needs).
+          clauses = list(engine[0].specifier)
+          pinned = None
+          if len(clauses) == 1 and clauses[0].operator == "==":
+              try:
+                  pinned = Version(clauses[0].version)
+              except InvalidVersion:
+                  # A WILDCARD PIN IS A DRIFT, NOT A BROKEN ARTIFACT, and it must not escape through
+                  # the metadata branch below. `==0.3.0.*` is a legal specifier that Version() refuses
+                  # — and it matches 0.3.0.1 and 0.3.0.post1, so it is precisely the loose shape this
+                  # check exists to refuse (tests/test_packaging.py::_engine_pin screens the same
+                  # shape). Reported as "unparseable version" it would drop BACKLOG #1585 and the
+                  # instruction to fix the dependencies table, telling the operator the wheel is
+                  # corrupt when the pyproject is merely wrong.
+                  pinned = None
+          try:
+              shipped = Version(dist.version)
+          except InvalidVersion as exc:
+              # The DISTRIBUTION's own version, not the pin: a build that wrote an unparseable
+              # `Version:` is a broken artifact and gets its own message.
+              raise SystemExit(
+                  f"::error::unparseable version ({exc}) — {DIST} metadata {dist.version!r}"
+              )
+          if pinned is None or pinned != shipped or engine[0].extras != {"harness"}:
+              raise SystemExit(
+                  f"::error::{DIST} {dist.version} requires "
+                  f"messagefoundry{sorted(engine[0].extras)}{engine[0].specifier}, not "
+                  f"messagefoundry[harness]=={dist.version} — this is a LOCKSTEP distribution and its "
+                  f"pin drifted from the version it ships at (BACKLOG #1585). Fix the dependencies "
+                  f"table in packaging/messagefoundry-harness/pyproject.toml and re-cut the tag."
+              )
+
+          print(
+              f"harness wheel installed from {origin}: {len(recorded)} {PKG}/ members, "
+              f"entry point {PKG}.__main__:main resolves, requires "
+              f"messagefoundry[harness]{engine[0].specifier}, version {dist.version}",
+              file=sys.stderr,
+          )
+          print(dist.version)
+          PYSMOKE
+          )
+          echo "harness wheel version: $built"
           if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
             want="${GITHUB_REF_NAME#v}"
-            /tmp/harnesssmoke/bin/python - "$built" "$want" <<'PYVER'
+            /tmp/harnesssmoke/bin/python -I - "$built" "$want" <<'PYVER'
           import sys
           from packaging.version import InvalidVersion, Version
 
