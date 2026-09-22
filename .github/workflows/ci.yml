@@ -41,16 +41,27 @@ concurrency:
   # Without it every push to main shares `ci-refs/heads/main`, so each merge cancel-in-progress'd the
   # PREVIOUS merge's validation run. Measured 2026-09-07: of 163 push-event runs since 2026-09-01,
   # 85 concluded `cancelled` -- more than half of all merges. That is not a cosmetic loss. THREE jobs
-  # have NO merge_group arm and no schedule arm and are path-gated on a pull request: `repo harness
-  # tests` (tooling), `ide build` (ide) and `packaging-build`. The push run is the only place any of
-  # the three runs REGARDLESS OF WHAT CHANGED; on a pull request each fires only when its own paths
-  # moved. This line used to name only the first two and say the push run was "the ONLY place they
-  # execute" -- it undercounted by one, and packaging-build is a third job of exactly that shape
-  # rather than a counterexample to it. This file already calls the push arm the SAFETY NET and says
-  # of `tooling`: "Set this false and the tier is effectively unguarded against everything except its
-  # own edits." It calls the same arm's `packaging` half "the more important half of this gate".
-  # Cancelling the push run has the same effect as switching both off, on 52 percent of merges, and a
-  # cancellation reports nothing.
+  # match ALL THREE of: no merge_group arm in any `if:`, job or step; no schedule arm; and path-gated
+  # on a pull request -- `repo harness tests` (tooling), `ide build` (ide) and `packaging-build`.
+  # EVERY CONJUNCT IS LOAD-BEARING. The first two alone select FIVE of this file's 13 jobs, adding
+  # `changes` (no job `if:` at all -- the merge_group arm it does carry is in its run body, which
+  # gates no job) and `ci-gate` (`always()`). Neither of those two is path-gated, so neither belongs
+  # in this sentence.
+  #
+  # TWO EVENTS RUN ALL THREE REGARDLESS OF WHAT CHANGED, and only one of them happens by itself:
+  # push-to-main, and workflow_dispatch, whose arm in `changes` forces every filter true. So the push
+  # run is the only AUTOMATIC pass on which all three run unconditionally. On a pull request each
+  # fires only when its own paths moved, and a queue entry pins all three false at the merge_group
+  # arm. This line used to call the push run "the only place" any of the three runs regardless of
+  # what changed: the dispatch arm falsifies that, and the `schedule` block above already says so in
+  # this same file. An earlier version named only the first two jobs -- it undercounted by one, and
+  # packaging-build is a third job of exactly that shape rather than a counterexample to it.
+  #
+  # This file calls the push arm's `tooling=true` the SAFETY NET and says of it: "Set this false and
+  # the tier is effectively unguarded against everything except its own edits." It calls the same
+  # arm's `packaging=true` "the more important half of this gate". Cancelling the push run has the
+  # same effect as switching those two emissions off, on 52 percent of merges, and a cancellation
+  # reports nothing.
   #
   # Pull requests are deliberately NOT changed: cancelling a superseded PR run is where
   # cancel-in-progress earns its keep, because a new push to the branch supersedes the old answer.
@@ -1891,33 +1902,51 @@ jobs:
           # stated once in the "Remaining cases" comment directly below -- read it there rather than
           # here (SDS-3.5).
           #
-          # THAT REACHED THE RIGHT ANSWER FOR THE WRONG REASON, AND THE WRONG REASON IS ONE EDIT DEEP.
-          # The fail-safe reads "no files changed -> run everything". That is right for an empty PR
-          # diff and right here only by accident. Flip it to `code=false` -- the reading it invites in
-          # isolation, "nothing changed, so there is nothing to test" -- and every queue run skips
-          # install, lint, type-check and the whole of pytest, then reports GREEN, on the one commit
-          # that actually reaches `main`. Nothing downstream would report a problem, because a skipped
-          # required leg reports success. That is the silent-control decay ADR 0158 names, sitting on
-          # the merge path, which is the worst place to put it.
+          # THAT REACHED THE RIGHT ANSWER FOR THE WRONG REASON. The fail-safe reads "no files changed
+          # -> run everything", which is right for an empty PR diff and right here only by accident:
+          # nothing about a queue entry means "run everything", it merely produced an empty diff for
+          # an unrelated reason. This arm is what makes the queue's gating a decision instead of a
+          # by-product, and it takes the queue out of that fail-safe's blast radius entirely.
+          #
+          # THE BLAST RADIUS IS THE PULL REQUEST, NOT THE QUEUE, and an earlier draft of this comment
+          # had it the wrong way round. Flip the fail-safe to `code=false` -- the reading it invites
+          # in isolation, "nothing changed, so there is nothing to test" -- and on a pull request
+          # whose diff comes back empty, `test` skips install, lint, format check, both type-checks
+          # and the whole of pytest, `webconsole` skips install and the console suite, and the run
+          # reports GREEN, because a skipped required leg reports success. That is the silent-control
+          # decay ADR 0158 names.
+          #
+          # IT IS NOT THE MERGE PATH, AND SAYING SO WAS THE DEFECT THIS FILE EXISTS TO AVOID. Measured
+          # at this commit and at `origin/main` alike: 12 steps are gated on `code == 'true'` -- 8 in
+          # `test`, 4 in `webconsole` -- and ALL TWELVE also carry `|| github.event_name ==
+          # 'merge_group'`, so in the QUEUE not one of them would skip however `code` is set. That is
+          # the same fact the next paragraph states as "belt-and-braces"; the earlier draft asserted
+          # its negation eight lines earlier, in the same comment.
           #
           # THE VALUES BELOW ARE THE BEHAVIOUR THAT WAS ALREADY RUNNING, written down rather than
           # inferred. They are deliberately NOT the whole of what a queue entry runs: `test` and
           # `webconsole` name merge_group in their own step `if:` (so `code` here is belt-and-braces
           # for them), and sqlserver-store, postgres-store, load-test, load-test-sqlserver and
-          # windows-service-smoke name it in their JOB `if:`, which is why `serverdb=false` here does
-          # not stop them. THE JOBS GATED ON AN OUTPUT OF THIS STEP THAT NAME merge_group NOWHERE are
-          # decided by that output and by nothing else -- docker-smoke, ide, tooling and
-          # packaging-build, via `docker`, `ide`, `tooling` and `packaging` below.
+          # windows-service-smoke name it in their JOB `if:`, so a queue entry runs them whatever
+          # this step emits. For the first two the merge_group disjunct wins over `serverdb=false`,
+          # which they DO read. For the other three `serverdb` is not overridden but IRRELEVANT --
+          # they reference `needs.changes.outputs` nowhere and do not even `needs: changes`, so it
+          # was never going to stop them. THE JOBS GATED ON AN OUTPUT OF THIS STEP THAT NAME
+          # merge_group NOWHERE are decided by that output and by nothing else -- docker-smoke, ide,
+          # tooling and packaging-build, via `docker`, `ide`, `tooling` and `packaging` below.
           #
           # BOTH HALVES OF THAT PREDICATE ARE LOAD-BEARING, because dropping either changes the
           # answer. "Names merge_group nowhere" ALONE is true of SIX of this file's 13 jobs -- it also
-          # takes in `changes`, which has no `if:` at all, and `ci-gate`, which is `always()` and
-          # reads no output of this step. Neither is decided by anything emitted here. Scanned over
-          # all 13 job blocks rather than sampled, and the six-way scan is the one
-          # tests/test_ci_merge_group_gate.py pins, from the other side: it asserts the SEVEN jobs
-          # whose own job-level or step-level `if:` names merge_group, and the four named above are
-          # what is left once `changes` and `ci-gate` come out. Re-run both halves after adding a job
-          # or a `needs.changes.outputs` reference rather than trusting this list.
+          # takes in `changes`, which has no `if:` at all, and `ci-gate`, which is `always()`. Neither
+          # of those two is DECIDED by anything emitted here. `ci-gate` does READ all of it: both its
+          # failing steps pass `NEEDS_JSON: ${{ toJSON(needs) }}`, which serialises this step's
+          # outputs into the log. Reading an output is not being gated on one, and only the second
+          # settles whether a job runs. Scanned over all 13 job blocks rather than sampled, and
+          # tests/test_ci_merge_group_gate.py pins BOTH sets BY NAME, from the other side: the SEVEN
+          # jobs whose own job-level or step-level `if:` names merge_group, and the SIX that name it
+          # nowhere. The four above are what is left once `changes` and `ci-gate` come out of that
+          # six. Re-run both halves after adding a job or a `needs.changes.outputs` reference rather
+          # than trusting this list.
           #
           # WHETHER THAT HEAVY TIER SHOULD RUN PER QUEUE ENTRY IS A COVERAGE QUESTION THIS ARM DOES
           # NOT ANSWER. It only stops the answer being an accident. Note while re-opening it that the
@@ -3642,22 +3671,35 @@ jobs:
       # `windows-service-smoke` also carries `&& github.repository == '...'`, so on a FORK it skips for
       # a deliberate cost reason that has nothing to do with this defect.
       #
-      # THE FIVE PATH-GATED LEGS LISTED ABOVE GO THE OTHER WAY, ON THIS REPOSITORY. sqlserver-store,
-      # postgres-store, load-test, load-test-sqlserver and windows-service-smoke each name merge_group
-      # in their own job `if:`, so a queue entry runs them whatever `changes` emits -- windows-service-
-      # smoke only where its `github.repository` clause ALSO holds, so on a fork it skips in the queue
-      # for the same cost reason it skips on a pull request. They are ENUMERATED here rather than
-      # called "the heavy legs" because that phrase is not single-valued in this file: the `schedule`
-      # block at the top and the `changes` nightly arm both use it for SIX jobs, docker-smoke
-      # included, and docker-smoke is the one job this sentence would be false for.
+      # THE NEEDS BETWEEN `changes` AND `webconsole` ABOVE GO THE OTHER WAY IN THE QUEUE: each names
+      # merge_group in its own job `if:`, so a queue entry runs it whatever `changes` emits. That set
+      # is pinned BY NAME in tests/test_ci_merge_group_gate.py (`_SELF_GATED_ON_QUEUE`, which also
+      # takes in `test` and `webconsole` through their step `if:`), so it is not re-enumerated here
+      # (SDS-3.5).
+      #
+      # DO NOT CALL THEM "PATH-GATED" AS A GROUP -- it is false for three of them, and naming them
+      # one by one under that label would only make a vague error a checkable one. Only
+      # sqlserver-store and postgres-store carry a `needs.changes.outputs.serverdb` arm. load-test,
+      # load-test-sqlserver and windows-service-smoke reference `needs.changes.outputs` NOWHERE and
+      # do not even `needs: changes`; they are EVENT-gated, and on a pull request they do not run at
+      # all. "The heavy legs" is no better: the `schedule` block at the top of this file uses that
+      # phrase for a SIX-job set including docker-smoke, which is not among these and does not name
+      # merge_group anywhere.
+      #
+      # THE FORK CLAUSE DOES NOT REACH A PULL REQUEST. The note above says a FORK's queue entry skips
+      # windows-service-smoke for a cost reason; that is a merge_group fact. On a pull request the
+      # event disjunct in front of `&& github.repository` is already false, so the job skips on EVERY
+      # pull request -- here and on a fork alike -- for an EVENT reason, and the repository clause is
+      # never reached.
       #
       # THE TWO HALVES DESCRIBE DIFFERENT EVENTS, so neither generalises. Path-gating is a
       # pull_request property; running whatever `changes` emits is a merge_group one. WHAT THE QUEUE
-      # GATES ON is stated once, at the `changes`
-      # job's "Remaining cases" comment; BACKLOG #1830 measured it and carries the fix. Nothing about
-      # this roll-up is wrong -- it is `if: always()` and still reports, which is what lets those five
-      # be path-gated ON A PULL REQUEST at all. Only the inference "it skipped, so it did not need to
-      # run" is.
+      # GATES ON IS THE `changes` JOB'S merge_group ARM -- read it there. The "Remaining cases"
+      # comment just below that arm answers a different question (why the base is empty on a queue
+      # payload and what the diff returns when it is) and is where BACKLOG #1830 is cited. Nothing
+      # about this roll-up is wrong: it is `if: always()` and still reports, which is what lets a
+      # path-gated leg skip on a pull request without wedging the merge. Only the inference "it
+      # skipped, so it did not need to run" is.
       - tooling
       # `packaging-build` rides here on the same terms as the two above (BACKLOG #1840). It is
       # path-gated, so it skips on most pull requests, and a skipped need is not a failure to the
