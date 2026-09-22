@@ -441,8 +441,8 @@ class DrCoordinator:
         early because the backend is not a server DB, and both gates then passed an unseeded store
         through — so a deploying site would record a ``dr_seed`` marker and a ``dr.activate`` row
         against a store nothing was ever restored into, which is exactly the silent success ADR 0048's
-        amendment, ``docs/CONFIGURATION.md`` and ``docs/EARLY-ADOPTER-GUIDE.md`` state is refused
-        unconditionally. It cannot be a false refusal: :func:`~messagefoundry.pipeline.dr_backup.
+        amendment, ``docs/CONFIGURATION.md`` and ``docs/EARLY-ADOPTER-GUIDE.md`` state is refused on
+        a SQLite store. It cannot be a false refusal: :func:`~messagefoundry.pipeline.dr_backup.
         run_restore` refuses a config-only archive outright, so an archive carrying no store is one no
         SQLite box could have been seeded from in the first place. And a FULL archive always declares
         counts, because :func:`~messagefoundry.pipeline.dr_backup._count_tables` reports every table in
