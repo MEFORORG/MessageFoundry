@@ -98,8 +98,10 @@ name: ASVS prove-absences
 # write scopes, and the advisory default.
 
 on:
-  # NO `schedule:`. The scheduled pass lives in the vault (see the decision above). Adding a cron back
-  # here re-creates a job that is red every day for a reason nobody can act on from this repository.
+  # NO `schedule:`. By the decision above the scheduled pass BELONGS in the vault rather than here --
+  # that decision records where it goes, not that it exists there or that it runs, and neither is
+  # visible from here. Adding a cron back here re-creates a job that is red every day for a reason
+  # nobody can act on from this repository.
   workflow_dispatch:
   # The gate must be able to observe changes to ITSELF (the lesson written up at length above
   # asvs-scorecard.yml's own path filter). On these events only the `selftest` job runs -- see its
