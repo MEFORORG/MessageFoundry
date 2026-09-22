@@ -34,8 +34,17 @@ unguarded — the failure mode that would otherwise make this whole module a dec
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess
+from pathlib import Path
 
+from tests._bash_resolver import (
+    CANNOT_RUN_CODES,
+    explain_returncode,
+    probe_env,
+    require_bash,
+)
 from tests._workflow_contexts import (
     WORKFLOWS,
     context_of,
@@ -71,6 +80,8 @@ _BLOCKING_SECURITY_JOBS = frozenset(
 
 # ADVISORY by design: these MUST keep continue-on-error. Both are cron/dispatch-only, so promoting one
 # without also removing its `if:` would wedge every PR (see security.yml's own notes on trivy).
+# WHERE the flag sits differs: `sbom` carries it on the job, `trivy` on its one scan step, and a job
+# listed in _STEP_ADVISORY_JOBS below is graded there instead of by the job-level rule.
 _ADVISORY_SECURITY_JOBS = frozenset({"sbom", "trivy"})
 
 # ADVISORY BY PLACEMENT: hard-failing, but NOT in branch protection. This is a third posture the file
@@ -459,7 +470,14 @@ def test_advisory_by_placement_jobs_cannot_run_on_a_pull_request() -> None:
 def test_advisory_security_jobs_keep_continue_on_error() -> None:
     """The mirror of the blocking assertion: an accidental promotion must also be a deliberate edit."""
     jobs = jobs_of(_SECURITY)
-    for key in sorted(_ADVISORY_SECURITY_JOBS):
+    step_graded = {key for wf, key, _, _ in _STEP_ADVISORY_JOBS if wf == _SECURITY}
+    # Not vacuous by exemption: a step-graded job must still be advisory, and the step test pins
+    # exactly one softened step on it. Only the job-level half of the rule moves.
+    assert step_graded <= _ADVISORY_SECURITY_JOBS, (
+        f"{sorted(step_graded - _ADVISORY_SECURITY_JOBS)} is step-advisory in _STEP_ADVISORY_JOBS "
+        "but not advisory here; classify it in one posture, not two."
+    )
+    for key in sorted(_ADVISORY_SECURITY_JOBS - step_graded):
         assert jobs[key].get("continue-on-error") is True, (
             f"security.yml job {key!r} is advisory by design but no longer declares "
             "`continue-on-error: true`. If this is a deliberate promotion, move it to "
@@ -987,7 +1005,12 @@ def test_the_downgrade_note_points_at_this_guard() -> None:
         )
 
 
-# --- the ONE graded job outside security.yml: advisory posture that must sit on a STEP ------------
+# --- advisory posture that must sit on a STEP, never on the job ----------------------------------
+#
+# `security.yml`'s `trivy` job joined this registry on 2026-09-22 for the same defect one level
+# worse: its JOB-level flag hid a failing scan, and nothing carried the finding out of the raw log.
+# Its entry here replaces the job-level rule `test_advisory_security_jobs_keep_continue_on_error`
+# used to apply to it. The paragraphs below were written for `fuzz.yml` and still hold for both.
 #
 # WHY A JOB IN ANOTHER FILE IS GRADED HERE. Everything above reads `jobs_of(_SECURITY)`, and the one
 # sweep that crosses files -- `test_required_jobs_carry_no_continue_on_error` -- reaches only the jobs
@@ -1020,6 +1043,12 @@ _STEP_ADVISORY_JOBS: tuple[tuple[str, str, str, str], ...] = (
         "parsers",
         "parser fuzzing (advisory)",
         "Fuzz the tolerant parsers (advisory - never gates)",
+    ),
+    (
+        "security.yml",
+        "trivy",
+        "trivy (container image vulnerabilities)",
+        "Scan the image (advisory - fixable HIGH/CRITICAL reported, never gates)",
     ),
 )
 
@@ -1074,3 +1103,154 @@ def test_step_advisory_jobs_soften_only_their_named_step() -> None:
             "an advisory job blocking-shaped, which is the same move in the other direction: both "
             "have to be a deliberate edit to _STEP_ADVISORY_JOBS."
         )
+
+
+# --- trivy: run the scan step and its reporter against each other, verbatim ----------------------
+#
+# The registry entry above pins WHERE `trivy`'s flag sits. These pin what the two steps DO: a
+# substring check over the YAML would pass just as happily against a reporter reading a variable the
+# scan step never writes. Trivy is replaced by a shell function defined ahead of the shipped body, so
+# no scanner, image or network is needed; the function writes a canned table to the `--output` path
+# the shipped command passes and exits with the code each case asks for.
+
+_TRIVY_SCAN_PREFIX = "Scan the image"
+_TRIVY_REPORT_PREFIX = "Report the scan"
+
+_TRIVY_TABLE = (
+    "messagefoundry:scan (debian 13)\nTotal: 1 (HIGH: 1, CRITICAL: 0)\nCVE-2099-0001 libfake\n"
+)
+
+# A stand-in for the real binary. It honours the two flags the hand-off relies on and nothing else:
+# `--output <path>` is where the table goes, and `--exit-code <n>` is what a FINDING exits with, as
+# in real Trivy. A fault exits 1, which is Trivy's own fatal-error code. So reverting the shipped
+# command to `--exit-code 1` makes a finding indistinguishable from a fault, and these tests red.
+_FAKE_TRIVY = r"""
+trivy() {
+  local out="" code="0"
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--output" ]; then out="$2"; shift; fi
+    if [ "$1" = "--exit-code" ]; then code="$2"; shift; fi
+    shift
+  done
+  if [ -n "${out}" ] && [ -n "${FAKE_TRIVY_TABLE:-}" ]; then
+    printf '%s' "${FAKE_TRIVY_TABLE}" > "${out}"
+  fi
+  case "${FAKE_TRIVY_MODE}" in
+    clean) return 0 ;;
+    finding) return "${code}" ;;
+    *) return 1 ;;
+  esac
+}
+"""
+
+
+def _trivy_step_body(prefix: str) -> str:
+    """The shipped ``run:`` body of the one trivy step whose name starts with ``prefix``.
+
+    Refuses a body with an Actions expression in it: Actions substitutes ``${{ }}`` before bash sees
+    it, so running such a body here would no longer be running what CI runs.
+    """
+    steps = jobs_of("security.yml")["trivy"].get("steps") or []
+    named = [s for s in steps if str((s or {}).get("name", "")).startswith(prefix)]
+    assert len(named) == 1, f"expected one trivy step named {prefix!r}, found {len(named)}"
+    body = str(named[0].get("run", ""))
+    assert body, f"trivy step {prefix!r} has an empty run body"
+    assert "${{" not in body, f"trivy step {prefix!r} interpolates an Actions expression"
+    return body
+
+
+def _run_trivy_step(tmp_path: Path, name: str, script: str, env_extra: dict[str, str]) -> int:
+    bash = require_bash(tmp_path)
+    path = tmp_path / f"{name}.sh"
+    path.write_text(script, encoding="utf-8", newline="\n")
+    env = probe_env(Path(bash), dict(os.environ))
+    env.update(env_extra)
+    proc = subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell, test-local paths
+        [bash, path.as_posix()],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+        check=False,
+    )
+    assert proc.returncode not in CANNOT_RUN_CODES, explain_returncode(proc.returncode, name)
+    return proc.returncode
+
+
+def _read_github_env(path: Path) -> dict[str, str]:
+    pairs = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        key, _, value = line.partition("=")
+        pairs[key] = value
+    return pairs
+
+
+def _scan_then_report(
+    tmp_path: Path, mode: str, table: str = _TRIVY_TABLE, scan_prelude: str = ""
+) -> tuple[int, int, str]:
+    """Run the scan step, carry its ``$GITHUB_ENV`` into the reporter, return both exits + summary."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    runner_temp = tmp_path / "runner-temp"
+    runner_temp.mkdir()
+    github_env = tmp_path / "github_env"
+    github_env.write_text("", encoding="utf-8")
+    summary = tmp_path / "summary.md"
+    summary.write_text("", encoding="utf-8")
+
+    scan_code = _run_trivy_step(
+        tmp_path,
+        "scan",
+        _FAKE_TRIVY + scan_prelude + _trivy_step_body(_TRIVY_SCAN_PREFIX),
+        {
+            "RUNNER_TEMP": runner_temp.as_posix(),
+            "GITHUB_ENV": github_env.as_posix(),
+            "FAKE_TRIVY_MODE": mode,
+            "FAKE_TRIVY_TABLE": table,
+        },
+    )
+    handed_on = _read_github_env(github_env)
+    report_code = _run_trivy_step(
+        tmp_path,
+        "report",
+        _trivy_step_body(_TRIVY_REPORT_PREFIX),
+        {**handed_on, "GITHUB_STEP_SUMMARY": summary.as_posix()},
+    )
+    return scan_code, report_code, summary.read_text(encoding="utf-8")
+
+
+def test_a_finding_reaches_the_summary_and_leaves_the_job_green(tmp_path: Path) -> None:
+    scan_code, report_code, summary = _scan_then_report(tmp_path, "finding")
+    # The scan step still fails on its own record; `continue-on-error` is what keeps the job green.
+    assert scan_code != 0
+    assert report_code == 0, "a finding must not red this advisory job"
+    assert "fixable HIGH/CRITICAL vulnerabilities" in summary
+    assert "CVE-2099-0001" in summary, "the summary must carry the finding, not only announce it"
+
+
+def test_a_clean_scan_says_so(tmp_path: Path) -> None:
+    scan_code, report_code, summary = _scan_then_report(
+        tmp_path, "clean", table="Total: 0 (HIGH: 0, CRITICAL: 0)\n"
+    )
+    assert (scan_code, report_code) == (0, 0)
+    assert "no fixable HIGH/CRITICAL vulnerability" in summary
+
+
+def test_a_scanner_fault_reds_the_job_and_claims_nothing(tmp_path: Path) -> None:
+    """Trivy exits 1 on its own fatal errors. That is no verdict, and it must not read as a finding."""
+    _, report_code, summary = _scan_then_report(tmp_path, "fault", table="")
+    assert report_code != 0, "a scan that produced no verdict must red the job"
+    assert "produced no verdict" in summary
+    assert "no fixable" not in summary
+    assert "fixable HIGH/CRITICAL vulnerabilities" not in summary
+
+
+def test_a_scan_step_that_dies_early_is_not_reported_clean(tmp_path: Path) -> None:
+    """The sentinel case. Kill the scan step before it writes anything; the reporter must not guess.
+
+    `continue-on-error` rewrites that death to success, so without the sentinel the reporter would
+    see no findings and write a clean result for a scan that never finished.
+    """
+    _, report_code, summary = _scan_then_report(tmp_path, "clean", scan_prelude="set -e\nfalse\n")
+    assert report_code != 0
+    assert "stopped before it recorded a result" in summary
+    assert "no fixable" not in summary
