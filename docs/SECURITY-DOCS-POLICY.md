@@ -41,7 +41,8 @@ than a project artifact.
 | [`PHI.md`](PHI.md) | Where PHI lives, how it is protected, what is built and what is planned |
 | [`SECURITY-REMEDIATION-LEDGER.md`](SECURITY-REMEDIATION-LEDGER.md) | An audit wave end to end — findings, lanes, and how each was closed |
 | [`SUPPLY-CHAIN.md`](SUPPLY-CHAIN.md) | SBOM, VEX, signing and provenance: what ships per release and how to verify it |
-| [`../.github/SECURITY.md`](../.github/SECURITY.md) | Reporting a vulnerability, and our response and remediation targets |
+| [`../.github/SECURITY.md`](../.github/SECURITY.md) | Reporting a vulnerability, our response and remediation targets, and the authorization and safe-harbor terms for good-faith research |
+| [`../.well-known/security.txt`](../.well-known/security.txt) | The same contact channels in machine-readable form, per RFC 9116 |
 | [Architecture Decision Records](adr/README.md) | Every significant security decision, with its context and consequences |
 
 ## What you can request

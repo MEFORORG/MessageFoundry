@@ -32,6 +32,71 @@ real PHI — use synthetic HL7 (the `messagefoundry generate` corpus is ideal).
 We aim to acknowledge within a few business days and credit reporters who wish to be named once a
 fix is released.
 
+**Machine-readable contact.** The channels above are also published as
+[`.well-known/security.txt`](../.well-known/security.txt), per
+[RFC 9116](https://www.rfc-editor.org/rfc/rfc9116).
+
+## Authorization and safe harbor for good-faith research
+
+**You are authorized to test.** MessageFoundry adopts the authorization wording recommended by
+CISA, the US Cybersecurity and Infrastructure Security Agency, in its
+[Vulnerability Disclosure Policy template](https://www.cisa.gov/vulnerability-disclosure-policy-template):
+
+> If you make a good faith effort to comply with this policy during your security research, we
+> will consider your research to be authorized, we will work with you to understand and resolve
+> the issue quickly, and MessageFoundry Foundation, LLC will not recommend or pursue legal action
+> related to your research. Should legal action be initiated by a third party against you for
+> activities that were conducted in accordance with this policy, we will make this authorization
+> known.
+
+The wording is CISA's, changed in two ways only: the template's `AGENCY NAME` placeholder is
+filled with this project's legal entity, and the template's bold and italic emphasis is dropped.
+
+### What is in scope: the software, and your own installation of it
+
+In scope is **this repository's source** and **an installation you run yourself**. Install
+MessageFoundry from source or from PyPI, run it on hardware you control, and attack that. There is
+no MessageFoundry-operated service hosting the engine, so there is no instance of ours to point a
+scanner at.
+
+The engine's default network posture is in **Scope notes** below. Read it there rather than
+assuming it, because an operator can change it.
+
+**Out of scope, and the authorization above does not reach them:**
+
+- **A third party's installation.** A site running this engine has not consented to your testing,
+  and their permission is theirs alone to give.
+- **The project website and any third-party services we use**, including the website contact form
+  mentioned above and our hosting, email and package-index providers. They are not ours to
+  authorize testing against. If you believe you have found something affecting one of them, report
+  it through a channel above and we will route it.
+
+Ask first if you want something outside this list covered. We would rather widen the scope in
+writing than have you guess.
+
+### What a good-faith effort means here
+
+At least the following. This names the cases with a real chance of arising rather than claiming to
+be a closed list.
+
+1. Report through a channel above, and honor the coordinated-disclosure ask in **Response &
+   remediation timeline** below. That section asks for a reasonable window rather than naming a
+   fixed number of days, and says we will agree the timing with you, so agree it with us there
+   rather than reading a deadline into this list.
+2. Stop at proof. Once you can show the vulnerability exists, stop, rather than pivoting further
+   or running the exploit wider than a demonstration needs.
+3. Use synthetic HL7 only, as **Reporting a vulnerability** above already requires of a report.
+   The same rule governs the testing that produced it.
+4. Leave service intact. No denial-of-service or load testing against anything you do not own,
+   and no destructive actions.
+5. Do not access, change, or keep data that is not yours. If you reach such data, stop and tell
+   us what you reached.
+6. Attack the software, not the people or the accounts. No social engineering, no physical
+   attacks, and no attacks on maintainer accounts or project infrastructure.
+
+Ask first through a reporting channel above if you are unsure whether something is in scope.
+Asking never counts against you.
+
 ## Response & remediation timeline
 
 After we acknowledge a report, we triage it by severity and target these remediation windows

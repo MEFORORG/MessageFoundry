@@ -138,6 +138,22 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         "test_scan_tokens_source.py",
         "test_seam_discovery.py",
         "test_security_static.py",
+        # NOT engine source, so this entry WIDENS the list's stated rule and the claim is spelled
+        # out for review, as test_conftest_name_collision_guard.py and
+        # test_risky_component_designation.py above do. Its subject is `.well-known/security.txt`,
+        # and the gating argument is this file's standard one, checked against ci.yml rather than
+        # assumed. Editing that file sets `code=true` -- it matches none of the docs-only detector's
+        # noncode patterns, so the full suite runs -- but NOT `tooling=true`, whose gate names
+        # `scripts/**`, `.github/**` and the ledger and does not reach `.well-known/`. Listed as
+        # tooling it would be deselected by `-m 'not tooling'` on the engine legs AND unreached by
+        # the tooling path gate, so the PR that broke the file would face nothing.
+        # A SECOND REASON is stronger than the first and is why widening `tooling=true` to reach
+        # `.well-known/` would not fix it either: ci.yml pins `tooling=false` on the merge_group
+        # arm, and the tooling job's `if:` names merge_group nowhere, so THE TOOLING TIER DOES NOT
+        # RUN IN THE MERGE QUEUE AT ALL. A manifest entry would take this guard off the engine legs
+        # via `-m 'not tooling'` AND out of every queue entry, where `ci-gate` reads a skipped need
+        # as a pass -- the same defect ci.yml already records against `.gitignore` (BACKLOG #327).
+        "test_security_txt_rfc9116.py",
         # Engine-subject for the same reason as control_char_check and escape_sequence_check above,
         # and the reason is the one arm that does not use tmp_path: the screen's DEFAULT SCOPE is
         # messagefoundry/api/app.py and auth_routes.py, so test_the_live_api_scope_still_surfaces_the
