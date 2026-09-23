@@ -54,7 +54,7 @@ def rsa_key() -> rsa.RSAPrivateKey:
     """Local rather than imported: ``rsa_key`` is a module-scoped FIXTURE in the sibling suite, and a
     fixture is resolved by name in the module that requests it -- importing the function object does
     not register it here. Same key size, same scope, so the cost is identical."""
-    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return rsa.generate_private_key(public_exponent=65537, key_size=3072)
 
 
 async def _run_race(

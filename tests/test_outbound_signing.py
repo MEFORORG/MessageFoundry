@@ -63,7 +63,7 @@ def _pem(key: object, password: bytes | None = None) -> str:
 
 @pytest.fixture(scope="session")
 def rsa_pem() -> str:
-    return _pem(rsa.generate_private_key(public_exponent=65537, key_size=2048))
+    return _pem(rsa.generate_private_key(public_exponent=65537, key_size=3072))
 
 
 @pytest.fixture(scope="session")
@@ -208,7 +208,7 @@ def test_unloadable_key_fails_loud() -> None:
 
 
 def test_encrypted_key_needs_the_password(rsa_pem: str) -> None:
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    key = rsa.generate_private_key(public_exponent=65537, key_size=3072)
     encrypted = _pem(key, password=b"s3cret")
     # correct password loads + signs
     signer = MessageSigner(
@@ -439,7 +439,7 @@ async def test_with_signing_end_to_end_through_the_connector(ec_pem: str) -> Non
     verify_detached_jws(jws, opener.requests[0].data, dest._signer.public_key)  # type: ignore[union-attr]
 
 
-# --- the RSA signing floor (BACKLOG #1317 sibling; NIST SP 800-131A, ASVS 11.4.1) ---------------
+# --- the RSA signing floor (3072 since BACKLOG #300; ASVS 11.2.3) ----------------------------------
 #
 # Before this floor, _load_private_key was a TYPE check only: measured, it loaded an RSA-1024 key
 # without complaint while rejecting unparseable material in the same run, so the loader was live and
@@ -452,9 +452,21 @@ def test_rsa_1024_signing_key_is_refused() -> None:
         MessageSigner(OutboundSigning(algorithm="RS256", private_key=weak))
 
 
-def test_rsa_2048_signing_key_is_accepted(rsa_pem: str) -> None:
-    """POSITIVE CONTROL. Without it the refusal above is indistinguishable from a loader that rejects
-    every RSA key, which would pass that test for entirely the wrong reason."""
+def test_rsa_2048_signing_key_is_refused() -> None:
+    """BACKLOG #300 raised the floor from 2048 to 3072 (about 128 bits, ASVS 11.2.3). RSA-2048 is the
+    size that floor exists to refuse, so it is the case that shows the raise took effect: the
+    RSA-1024 refusal above passed identically under the old floor."""
+    two_k = _pem(rsa.generate_private_key(public_exponent=65537, key_size=2048))
+    with pytest.raises(SigningError, match="RSA-2048, below the 3072-bit floor"):
+        MessageSigner(OutboundSigning(algorithm="RS256", private_key=two_k))
+
+
+def test_rsa_3072_signing_key_is_accepted(rsa_pem: str) -> None:
+    """POSITIVE CONTROL. Without it the refusals above are indistinguishable from a loader that
+    rejects every RSA key, which would pass them for entirely the wrong reason. ``rsa_pem`` is minted
+    at 3072 bits, exactly the floor, so this also pins the boundary as inclusive."""
+    key = serialization.load_pem_private_key(rsa_pem.encode(), password=None)
+    assert isinstance(key, rsa.RSAPrivateKey) and key.key_size == 3072
     signer = MessageSigner(OutboundSigning(algorithm="RS256", private_key=rsa_pem))
     assert signer is not None
 
@@ -468,9 +480,9 @@ def test_an_ec_key_needs_no_size_floor(ec_pem: str) -> None:
 
 
 def test_the_floor_is_stated_once_and_read_from_the_constant() -> None:
-    """The refusal must derive from _MIN_RSA_BITS rather than a second hardcoded 2048, so raising the
-    floor later cannot leave a stale number in the message an operator actually reads."""
-    assert _MIN_RSA_BITS >= 2048
+    """The refusal must derive from _MIN_RSA_BITS rather than a second hardcoded number, so raising
+    the floor cannot leave a stale number in the message an operator actually reads."""
+    assert _MIN_RSA_BITS == 3072
     weak = _pem(rsa.generate_private_key(public_exponent=65537, key_size=1024))
     with pytest.raises(SigningError) as excinfo:
         MessageSigner(OutboundSigning(algorithm="RS256", private_key=weak))

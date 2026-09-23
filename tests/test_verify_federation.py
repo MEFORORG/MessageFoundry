@@ -31,7 +31,7 @@ NONCE = "n-verify-1"
 
 @pytest.fixture(scope="module")
 def rsa_key() -> rsa.RSAPrivateKey:
-    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return rsa.generate_private_key(public_exponent=65537, key_size=3072)
 
 
 def _b64u_uint(v: int) -> str:

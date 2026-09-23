@@ -74,7 +74,7 @@ def _mint(key: rsa.RSAPrivateKey, kid: str, claims: Mapping[str, Any]) -> str:
 
 @pytest.fixture(scope="module")
 def rsa_key() -> rsa.RSAPrivateKey:
-    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return rsa.generate_private_key(public_exponent=65537, key_size=3072)
 
 
 def _policy(nonce: str = "n-123", **over: Any) -> oidc.OidcClaimPolicy:
@@ -298,7 +298,7 @@ def test_claim_rungs_reject_with_closed_slugs(
 
 def test_bad_signature_is_rejected(rsa_key: rsa.RSAPrivateKey) -> None:
     """A token signed by a different key than the JWKS advertises for that kid."""
-    other = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    other = rsa.generate_private_key(public_exponent=65537, key_size=3072)
     jws = _mint(other, "k1", _good_claims())
     with pytest.raises(oidc.ClaimsError) as exc:
         oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
