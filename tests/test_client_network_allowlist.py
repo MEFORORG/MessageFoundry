@@ -780,7 +780,7 @@ _EXPOSED = (
     # #1279 retired the declaration, so a declared terminator needs both or the start refuses,
     # before these tests reach the allow-list they are about.
     'security.enforcement = "warn"\n'
-    '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n'
+    '[api]\ntls_terminated_upstream = true\nplaintext_upstream_hop_acknowledged = true\ntrusted_proxies = ["10.0.0.1"]\n'
     'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n'
 )
 

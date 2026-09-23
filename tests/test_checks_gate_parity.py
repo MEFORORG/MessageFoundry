@@ -28,7 +28,7 @@ SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
 # Non-security plumbing that pre-clears the OTHER exposure gates so exactly one refusal is under test at
 # a time (a real TLS-terminating proxy + bounded retention + an SMTP alert channel).
 _PROXY = (
-    '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n'
+    '[api]\ntls_terminated_upstream = true\nplaintext_upstream_hop_acknowledged = true\ntrusted_proxies = ["10.0.0.1"]\n'
     'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n'
 )
 _RETENTION_DL = "[retention]\ndead_letter_days = 30\n"

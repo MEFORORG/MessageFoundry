@@ -2290,6 +2290,34 @@ def _serve(args: argparse.Namespace) -> int:
     # refusing exactly as before, so this change is additive — it can only add a warning, never a new
     # refusal.
     if settings.api.tls_terminated_upstream:
+        # BACKLOG #1179: with no operator certificate the engine mints nothing here (ADR 0172 decision
+        # 3 -- serving https would break the proxy's own hop), so the proxy-to-engine hop is PLAINTEXT
+        # by design and securing it is the deploying site's job. The operator must say they have taken
+        # it on. Keyed on api_tls_source, the same branch order that decides what the listener serves:
+        # an operator tls_cert_file wins over the no-mint branch, so with one the hop is TLS and there
+        # is nothing to acknowledge. Unlike the attestations below this refuses in EVERY mode,
+        # enforcing or warn, loopback or not: it asks nothing the engine could check, only who owns a
+        # hop the engine leaves unprotected.
+        from messagefoundry.api.tls import api_tls_source
+
+        serves_plaintext = (
+            api_tls_source(cert_file=settings.api.tls_cert_file, tls_terminated_upstream=True)
+            == "upstream"
+        )
+        if serves_plaintext and not settings.api.plaintext_upstream_hop_acknowledged:
+            print(
+                "error: refusing to serve behind an upstream TLS terminator "
+                "([api].tls_terminated_upstream) without [api].plaintext_upstream_hop_acknowledged. "
+                "The reverse proxy terminates TLS and no [api].tls_cert_file is set, so the engine "
+                "serves the proxy-to-engine hop in PLAINTEXT by design and does nothing to protect "
+                "it. Securing that hop (for example a same-host loopback hop, an isolated network "
+                "segment, or a host firewall) is the deploying site's job. Set "
+                "[api].plaintext_upstream_hop_acknowledged = true to acknowledge that you have taken "
+                "it on, or set [api].tls_cert_file so the engine serves that hop over TLS. See "
+                "docs/SECURITY.md (ADR 0172).",
+                file=sys.stderr,
+            )
+            return 2
         posture_b_missing = []
         if not settings.api.proxy_intra_service_declared:
             posture_b_missing.append(

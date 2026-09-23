@@ -962,6 +962,16 @@ class ApiSettings(_Section):
     # non-loopback bind satisfy the exposed-gate WITHOUT in-process TLS — but only when trusted_proxies
     # is set (so the engine knows a terminator is really in front).
     tls_terminated_upstream: bool = False
+    # The operator's acknowledgement that, with tls_terminated_upstream and no tls_cert_file, the
+    # proxy-to-engine hop is PLAINTEXT by design (ADR 0172 decision 3): the engine mints no
+    # certificate there, so encrypting or isolating that hop is the DEPLOYING SITE's job. `serve`
+    # refuses to start that topology without it, in every mode -- enforcing or warn, loopback or
+    # not -- because only the operator can take on a hop the engine does not protect. With an
+    # operator tls_cert_file the engine serves that hop over TLS, so it is not required there (and
+    # harmless if set). It records who took the hop on; it secures nothing. Meaningful only with
+    # tls_terminated_upstream, so setting it without that is refused at load (a stray
+    # acknowledgement would read as a decision about a hop that does not exist). Default False.
+    plaintext_upstream_hop_acknowledged: bool = False
 
     # --- Posture-B (upstream TLS termination) attestations (#200, ADR 0002) --------
     # In Posture-B the proxy terminates browser TLS and the proxy→engine hop is a plaintext segment on
@@ -1123,6 +1133,14 @@ class ApiSettings(_Section):
         # the proxy in front — otherwise it's an unverifiable claim that XFF could spoof.
         if self.tls_terminated_upstream and not self.trusted_proxies:
             raise ValueError("[api].tls_terminated_upstream requires [api].trusted_proxies")
+        # Refuse rather than ignore a stray acknowledgement, as ad_session_recheck_seconds without
+        # ad_enabled is refused: an operator who set it believes a proxy-to-engine hop exists and
+        # was considered, and without tls_terminated_upstream there is no such hop.
+        if self.plaintext_upstream_hop_acknowledged and not self.tls_terminated_upstream:
+            raise ValueError(
+                "[api].plaintext_upstream_hop_acknowledged requires [api].tls_terminated_upstream "
+                "(it acknowledges the plaintext proxy-to-engine hop that only that topology has)"
+            )
         # Validate the DECLARED Posture-B proxy TLS floor for internal coherence (#200, ASVS 11.6.2) —
         # an attestation, but a *coherent* one (a NIST version floor; forward-secret ciphers if named).
         validate_proxy_tls_posture(self.proxy_tls_min_version, self.proxy_tls_ciphers)
