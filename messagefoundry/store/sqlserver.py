@@ -2691,7 +2691,8 @@ class SqlServerStore:
         # migration carries the payload over VERBATIM, so a legacy plaintext body arrives unencrypted
         # and this pass — which runs after `_ensure_schema` — seals it on the same open.
         #
-        # Every surface now carries the `<> ''` guard. The first three used to omit it on the grounds
+        # Every surface now carries the blank guard (in _seal_surface). The first three used to omit it
+        # on the grounds
         # that raw/payload are never legitimately '' -- but every purge path writes exactly
         # `payload=''` and `raw=''`, so the unguarded loop turned a purged blank into
         # ciphertext-of-empty (BACKLOG #1169). NULL is excluded by NOT LIKE on its own.
@@ -2794,7 +2795,10 @@ class SqlServerStore:
         The state read and the reservation run on their own pooled connections BEFORE the seal's
         transaction opens, because a reservation must commit independently of the seal it covers."""
         keys = key_cols if key_cols is not None else aad_cols
-        pending_where = f"[{column}] NOT LIKE ? AND [{column}] <> ''"
+        # DATALENGTH, not `<> ''`: T-SQL pads trailing spaces before comparing, so `N' ' <> N''` is
+        # FALSE and a whitespace-only value would be skipped here and then refused forever at read,
+        # where the cipher treats only a true '' as blank.
+        pending_where = f"[{column}] NOT LIKE ? AND DATALENGTH([{column}]) > 0"
         row = await self._fetchone(
             f"SELECT COUNT_BIG(*) AS n FROM {table} WHERE {pending_where}", (like,)
         )

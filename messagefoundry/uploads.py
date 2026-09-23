@@ -553,8 +553,8 @@ class UploadStore:
         plain files in a directory, no database write needed). A refusal folded into the same line
         as a routine post-rotation skip is a refusal nobody can see, so the strict read cannot
         honestly be built on top of this handler until the classes are separated. Separating them
-        does not itself refuse anything: an unmarked sidecar is still accepted today by the cipher's
-        read passthrough (``store/crypto.py`` ``decrypt``), which awaits an owner ruling.
+        does not itself refuse anything: an unmarked sidecar is still accepted today, because this store
+        reads with ``allow_unmarked=True`` while the store refuses (#1169); that awaits an owner ruling.
 
         The cipher's own message is safe to log — every ``CipherError`` carries only key ids,
         marker versions and algorithm names, never a decrypted value. The malformed-shape branch

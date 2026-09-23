@@ -348,4 +348,7 @@ async def test_the_one_transaction_seal_never_outruns_its_reservation(
     cipher.encrypt = checked  # type: ignore[method-assign]
     store = await MessageStore.open(db, cipher=cipher)
     await store.close()
+    # Liveness: a wrapper that never ran would make the assertion below vacuous. 30 rows on
+    # messages.raw, 30 ingress payloads on queue.payload.
+    assert cipher.cumulative_invocations() >= 60
     assert not shortfalls, f"the persisted bound trailed the encrypts: {shortfalls[:5]}"

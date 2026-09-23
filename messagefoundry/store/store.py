@@ -2916,7 +2916,7 @@ class MessageStore:
     def _dec(self, value: str | None, *, aad: bytes) -> str | None:
         if value is None:
             return value
-        # '' and legacy plaintext pass through unchanged; a v1 marker decrypts with None AAD (dual-read),
+        # '' passes through; any other unmarked value is refused unless allowed (#1169); a v1 marker decrypts with None AAD (dual-read),
         # a v2 marker with this `aad` — a wrong-cell v2 blob fails the tag → CipherError (fail-closed).
         return self._cipher.decrypt(value, aad=aad)
 
@@ -3561,7 +3561,10 @@ class MessageStore:
 
     async def reencrypt_to_active(self, *, batch: int = 500) -> int:
         """Re-encrypt every cipher-covered value under the **active** key — the key-rotation re-encrypt
-        path (ASVS 11.2.2), run offline via ``messagefoundry rotate-key``. Rewrites values that are
+        path (ASVS 11.2.2), run offline via ``messagefoundry rotate-key``. Since BACKLOG #1169 an unmarked
+        value on a sealed surface is REFUSED here, so a planted row aborts the rotation naming its cell
+        instead of being laundered into ciphertext; the open that precedes it has already sealed every
+        unsealed surface. Rewrites values that are
         plaintext or under a *retired* key; skips values already under the active key (idempotent) and
         NULL/blank ones. A value no configured key can decrypt raises (rotation needs the prior key
         supplied via ``MEFOR_STORE_ENCRYPTION_KEYS_RETIRED``) — it never silently drops PHI. Returns the
