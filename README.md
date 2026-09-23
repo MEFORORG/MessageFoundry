@@ -124,9 +124,9 @@ its own `webconsole-v0.3.0` tag. Pin the pair: `messagefoundry==0.4.0` with
 
 - **No console installed:** the engine serves the JSON API only and prints a warning at startup. If you
   set `[security].serve_web_console = true`, it refuses to start instead.
-- **Console 0.2.15 installed, console on:** the engine refuses to start, because 0.2.15 was built
-  against a different seam. The console is on by default for a loopback bind. Upgrade the console to
-  0.3.0, or set `[security].serve_web_console = false`.
+- **Console 0.2.15 installed, console on:** the engine refuses to start. 0.2.15 was built for an older
+  engine, so startup stops with an import error or a seam mismatch. The console is on by default for a
+  loopback bind. Upgrade the console to 0.3.0, or set `[security].serve_web_console = false`.
 
 **What's in the `messagefoundry` package — and what isn't.** It is the **engine**; the operator UI is
 the browser **web console** served same-origin at `/ui`, which ships as a separate wheel
