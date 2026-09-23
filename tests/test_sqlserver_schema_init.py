@@ -40,8 +40,9 @@ class _FakeCursor:
         self._executed.append((sql, params))
         self._last_sql = sql
 
-    #: What the #305 external-mode options read returns: RCSI on, snapshot isolation on, schema dbo.
-    options_row: tuple[object, ...] = (1, 1, "dbo")
+    #: What the #305 external-mode read returns: RCSI on, snapshot isolation on, default schema dbo,
+    #: and SELECT on the database held.
+    options_row: tuple[object, ...] = (1, 1, "dbo", 1)
 
     async def fetchone(self) -> object:
         if "OBJECT_ID('schema_meta'" in self._last_sql:
@@ -248,7 +249,8 @@ async def test_external_mode_refuses_a_virgin_database_and_runs_no_ddl() -> None
     # The refusal names where THIS login looked, so a provisioning run into another default schema
     # cannot send the operator round a loop of "already current".
     assert info.value.schema == "dbo"
-    assert "(looked in schema 'dbo')" in str(info.value)
+    assert "(this login's default schema is 'dbo')" in str(info.value)
+    assert "default schema and then in dbo" in str(info.value)
     assert any("schema_meta" in sql for sql, _ in executed), "the marker must actually be read"
     assert all(_is_read(sql) for sql, _ in executed), [sql for sql, _ in executed]
     assert conn._conn.timeout == 30  # the B10 DDL exemption never engaged
@@ -332,3 +334,37 @@ async def test_external_mode_warns_with_the_statement_for_the_option_that_is_off
     assert "SET ALLOW_SNAPSHOT_ISOLATION ON" in text
     assert "READ_COMMITTED_SNAPSHOT ON" not in text
     assert all(_is_read(sql) for sql, _ in executed)
+
+
+async def test_external_refusal_names_missing_read_access() -> None:
+    """SQL Server hides an object from a caller that cannot read it, so a login outside db_datareader
+    sees no marker at all. The refusal must name the grant: provision-schema would report "already
+    current" and the operator would loop."""
+    executed: list[tuple[str, object]] = []
+    conn = _FakeConn(executed)
+    conn.cursor_obj.options_row = (1, 1, "dbo", 0)
+    store = _make_store(conn)
+    store._settings = _settings(  # type: ignore[assignment]
+        command_timeout=30, mode=SchemaManagement.EXTERNAL
+    )
+
+    with pytest.raises(SchemaNotProvisionedError) as info:
+        await store._ensure_schema()
+
+    assert "no SELECT on the database" in str(info.value)
+    assert "db_datareader" in str(info.value)
+
+
+async def test_the_external_read_is_not_counted_as_a_write_transaction() -> None:
+    """The A1 committed_txns counter is the write currency; a read snapshot release is not one."""
+    executed: list[tuple[str, object]] = []
+    conn = _FakeConn(executed, marker_current=True)
+    store = _make_store(conn)
+    store._settings = _settings(  # type: ignore[assignment]
+        command_timeout=30, mode=SchemaManagement.EXTERNAL
+    )
+
+    await store._ensure_schema()
+
+    assert conn.committed == 1  # the snapshot WAS released
+    assert store.committed_txns == 0  # and was not counted as a write

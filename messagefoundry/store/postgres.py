@@ -724,12 +724,29 @@ _SCHEMA: list[str] = [
     )""",
 ]
 
+
+def _gated_add_column(table: str, column: str, decl: str) -> str:
+    """An in-place ``ADD COLUMN`` that takes NO lock when the column is already there.
+
+    ``ALTER TABLE ... ADD COLUMN IF NOT EXISTS`` takes an ACCESS EXCLUSIVE lock even when it does
+    nothing, and inside the schema batch that lock is held until the batch commits, after the FIFO
+    index rebuild. On ``leader_lease`` that would stall a live leader's renew into a self-fence. So the
+    catalog is read first, as ``_migrate_lease_columns`` does for the same reason. Literals only: the
+    three arguments are constants of this module, never input."""
+    return (
+        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM information_schema.columns"
+        f" WHERE table_schema = current_schema() AND table_name = '{table}'"
+        f" AND column_name = '{column}') THEN"
+        f" ALTER TABLE {table} ADD COLUMN {column} {decl}; END IF; END $$"
+    )
+
+
 #: The cluster coordinator's own tables (``nodes`` + ``leader_lease``), stated ONCE here and run from
 #: two places: the store's ``_SCHEMA`` batch below, and ``DbCoordinator._ensure_nodes_table`` under
 #: ``auto``. BACKLOG #305 moved them into the batch because under ``[store].schema_management =
 #: external`` the runtime role runs no DDL at all, so a clustered node could not start unless
-#: ``provision-schema`` had created them. The ``ADD COLUMN IF NOT EXISTS`` statements are the in-place
-#: migrations for a pre-existing table; each is a no-op on a fresh one.
+#: ``provision-schema`` had created them. The gated ``ADD COLUMN`` statements are the in-place
+#: migrations for a pre-existing table; each is a lock-free no-op on a fresh one.
 CLUSTER_SCHEMA: tuple[str, ...] = (
     "CREATE TABLE IF NOT EXISTS nodes ("
     " node_id    TEXT PRIMARY KEY,"
@@ -743,10 +760,9 @@ CLUSTER_SCHEMA: tuple[str, ...] = (
     " acquire_delay_seconds DOUBLE PRECISION NOT NULL DEFAULT 0,"
     " promotable BOOLEAN NOT NULL DEFAULT TRUE"
     ")",
-    "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS is_leader BOOLEAN NOT NULL DEFAULT FALSE",
-    "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS acquire_delay_seconds "
-    "DOUBLE PRECISION NOT NULL DEFAULT 0",
-    "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS promotable BOOLEAN NOT NULL DEFAULT TRUE",
+    _gated_add_column("nodes", "is_leader", "BOOLEAN NOT NULL DEFAULT FALSE"),
+    _gated_add_column("nodes", "acquire_delay_seconds", "DOUBLE PRECISION NOT NULL DEFAULT 0"),
+    _gated_add_column("nodes", "promotable", "BOOLEAN NOT NULL DEFAULT TRUE"),
     # The self-fencing leadership lease (Workstream A2): one row per cluster, keyed by the
     # schema-namespaced lease_key, holding the current leader and its DB-clock expiry.
     "CREATE TABLE IF NOT EXISTS leader_lease ("
@@ -756,7 +772,7 @@ CLUSTER_SCHEMA: tuple[str, ...] = (
     " leader_epoch     BIGINT NOT NULL DEFAULT 0"  # H1: monotonic fencing token
     ")",
     # H1: DEFAULT 0 backfills a pre-existing row, so the first fresh acquire bumps it to 1.
-    "ALTER TABLE leader_lease ADD COLUMN IF NOT EXISTS leader_epoch BIGINT NOT NULL DEFAULT 0",
+    _gated_add_column("leader_lease", "leader_epoch", "BIGINT NOT NULL DEFAULT 0"),
 )
 _SCHEMA.extend(CLUSTER_SCHEMA)
 
@@ -1147,9 +1163,10 @@ class PostgresStore:
         provision-schema`` (#305).
 
         A one-connection pool and the identity cipher: this touches no row, so it needs no store key.
-        The batch keeps its advisory lock and marker double-check, so it is safe beside a running
-        engine. The objects it creates are OWNED by this role, which is what lets the runtime role
-        hold row grants only. The result names the schema they landed in."""
+        The batch keeps its advisory lock and marker double-check, so two provisioning runs cannot
+        race, but a batch that has to run takes table locks and rebuilds indexes: run it with the
+        engines stopped. The objects it creates are OWNED by this role, which is what lets the runtime
+        role hold row grants only. The result names the schema they landed in."""
         pool = await cls._create_pool(settings, posture=posture, max_size=1)
         store = cls(pool, settings)
         try:
@@ -1181,11 +1198,13 @@ class PostgresStore:
             and self._settings.resolved_schema_management() is SchemaManagement.EXTERNAL
         )
         async with self._timed_acquire() as conn:
+            if external:
+                # BEFORE the marker read: that read needs SELECT on schema_meta, and without it the
+                # operator would get a raw permission error naming one table instead of the full list.
+                await self._verify_runtime_grants(conn)
             # FAST PATH: two cheap reads, no lock, no transaction. A virgin/pre-marker DB probes as
             # not-current and falls through to the full run.
             if await self._schema_marker_current(conn, expected):
-                if external:
-                    await self._verify_runtime_grants(conn)
                 log.debug("postgres: schema current (%s…) — DDL batch skipped", expected[:12])
                 return False
             if external:
@@ -1258,12 +1277,22 @@ class PostgresStore:
         different owner gets no default grant, and the marker cannot tell. Without this check the first
         pipeline path to touch that table fails mid-flow; with it, the start refuses and names the
         objects. ``has_table_privilege`` is true when ANY listed privilege is held, so each is asked
-        separately. Reads only."""
+        separately.
+
+        SCOPED to the provisioned objects: those owned by ``schema_meta``'s owner, which is the role
+        that ran the batch. A foreign table sharing the schema (an extension's, a DBA's own) is not the
+        store's and must not block its start. ``schema_meta`` itself needs SELECT only, since external
+        mode never writes it. No ``schema_meta`` yet means nothing is provisioned, which the marker read
+        that follows reports. Reads only."""
         rows = await conn.fetch(
             "SELECT c.relname, c.relkind FROM pg_catalog.pg_class c"
-            " WHERE c.relnamespace = (SELECT n.oid FROM pg_catalog.pg_namespace n"
-            "   WHERE n.nspname = current_schema())"
-            " AND ((c.relkind IN ('r', 'p')"
+            " WHERE c.relowner = (SELECT m.relowner FROM pg_catalog.pg_class m"
+            "   WHERE m.oid = pg_catalog.to_regclass('schema_meta'))"
+            " AND c.relnamespace = (SELECT m.relnamespace FROM pg_catalog.pg_class m"
+            "   WHERE m.oid = pg_catalog.to_regclass('schema_meta'))"
+            " AND ((c.relname = 'schema_meta'"
+            "   AND NOT pg_catalog.has_table_privilege(current_user, c.oid, 'SELECT'))"
+            " OR (c.relkind IN ('r', 'p') AND c.relname <> 'schema_meta'"
             "   AND NOT (pg_catalog.has_table_privilege(current_user, c.oid, 'SELECT')"
             "   AND pg_catalog.has_table_privilege(current_user, c.oid, 'INSERT')"
             "   AND pg_catalog.has_table_privilege(current_user, c.oid, 'UPDATE')"

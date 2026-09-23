@@ -94,7 +94,8 @@ must be the gMSA's (`dbo` unless you changed it), because the batch creates ever
 If it also holds `ALTER` on the database, the command turns on `READ_COMMITTED_SNAPSHOT` and
 `ALLOW_SNAPSHOT_ISOLATION` too. That `ALTER` uses `WITH ROLLBACK IMMEDIATE`, which ends other
 sessions' open transactions, hence the stopped engines. If it cannot, the command prints the exact
-statements and **exits 3**, and a DBA runs them by hand (§2). CI provisions as `sa`, so this narrower
+statements for a DBA to run by hand (§2), and **exits 3** when `READ_COMMITTED_SNAPSHOT` is one of
+them, because the pooled claim mode will not start without it. CI provisions as `sa`, so this narrower
 set is the prescription for the same batch, not a measured minimum.
 
 ```powershell
@@ -106,8 +107,10 @@ messagefoundry store provision-schema --service-config <instance dir>\messagefou
 
 Until this step has run, `serve` **refuses to start**. The error names the database and this command.
 It runs no schema DDL of its own, so a refused start leaves the database exactly as it found it.
-The refusal names the schema the gMSA looked in, and `provision-schema` prints the schema it built
-in. If those differ, the two principals have different default schemas.
+The refusal names the gMSA's default schema, and `provision-schema` prints the schema it built in.
+The gMSA resolves unqualified names in its default schema and then in `dbo`, so a built-in schema
+that is neither one means the provisioning principal had another default schema. A gMSA outside
+`db_datareader` cannot see the marker at all, and the refusal says so.
 
 **5. The engine `[store]` block** — integrated auth, encrypted, verifying the DB cert against the
 Windows machine trust store (§5); **no secret in the file or env**:
@@ -282,7 +285,7 @@ SQLite is always `auto`: a local file has no server principal to split.
 2. **Grant the two principals** (§1.1 for SQL Server, §1.2 for PostgreSQL).
 3. **Run `messagefoundry store provision-schema`** as the provisioning principal, with the engines
    stopped. It prints `store schema applied` on a fresh database and `store schema already current`
-   on a re-run, with the schema it built in. It exits 3 if a SQL Server database option is still off.
+   on a re-run, with the schema it built in. It exits 3 if `READ_COMMITTED_SNAPSHOT` is still off.
 4. **Start the engine** as the runtime login.
 5. **On every upgrade, repeat step 3 before the first start of the new build.** If the schema did not
    move, step 3 is a no-op. If it did and step 3 was skipped, `serve` refuses to start and names the

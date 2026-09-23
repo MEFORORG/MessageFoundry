@@ -4788,9 +4788,10 @@ def _store_provision_schema(args: argparse.Namespace) -> int:
     one of the tables it may be creating). Safe to re-run: a current marker is a no-op.
 
     Exit codes: 0 done; 1 could not load settings, wrong backend, or the DDL failed; 3 the schema is
-    applied but a SQL Server database option is still OFF. 3 is not 0 because the shipped pooled claim
-    mode refuses to start while ``READ_COMMITTED_SNAPSHOT`` is off, so a job reading only the exit
-    code must not see a success it would find out about at the next ``serve``.
+    applied but ``READ_COMMITTED_SNAPSHOT`` is still OFF. 3 is not 0 because the shipped pooled claim
+    mode refuses to start while it is off, so a job reading only the exit code must not see a success
+    it would find out about at the next ``serve``. ``ALLOW_SNAPSHOT_ISOLATION`` off is reported with
+    its statement but is not a partial result: nothing in the engine opens a SNAPSHOT transaction.
     """
     import asyncio
 
@@ -4807,6 +4808,15 @@ def _store_provision_schema(args: argparse.Namespace) -> int:
     if settings is None:
         return _emit_error(detail or "could not load the service settings", as_json=args.json)
     store = settings.store
+    if store.backend is StoreBackend.SQLITE:
+        # Checked here rather than caught from the call: a ValueError arm around the driver call would
+        # also swallow the driver's own ValueErrors, unredacted and without the database named.
+        return _emit_error(
+            "the sqlite store builds its own schema when `messagefoundry serve` first opens it; "
+            "`messagefoundry store provision-schema` applies to the sqlserver and postgres "
+            "backends only",
+            as_json=args.json,
+        )
     if (
         args.username is not None
         and store.backend is StoreBackend.SQLSERVER
@@ -4822,8 +4832,6 @@ def _store_provision_schema(args: argparse.Namespace) -> int:
     posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
     try:
         result = asyncio.run(provision_store_schema(store, posture=posture))
-    except ValueError as exc:  # SQLite, which builds its own schema
-        return _emit_error(str(exc), as_json=args.json)
     except Exception as exc:  # noqa: BLE001 - a driver/DDL failure; report it redacted, never a traceback
         return _emit_error(
             f"provision-schema failed on the {store.backend.value} database "
@@ -4831,35 +4839,43 @@ def _store_provision_schema(args: argparse.Namespace) -> int:
             as_json=args.json,
         )
     mode = store.resolved_schema_management().value
+    partial = "READ_COMMITTED_SNAPSHOT" in result.options_off
     if args.json:
         _print_json(
             {
-                "ok": not result.options_off,
+                "ok": not partial,
                 "backend": store.backend.value,
                 "database": store.database,
                 "schema": result.schema,
                 "applied": result.applied,
                 "options_off": list(result.options_off),
+                "remedy": result.remedy,
                 "schema_management": mode,
             },
             compact=True,
         )
     else:
         state = "applied" if result.applied else "already current"
-        print(
+        # _safe_print: a database or schema name outside cp1252 must not turn a committed
+        # provisioning into a crash on a redirected Windows stdout.
+        _safe_print(
             f"store schema {state}: {store.backend.value} database {store.database!r}, schema "
             f"{result.schema!r} ([store].schema_management = {mode!r}). The runtime login must "
-            "resolve unqualified names in that same schema"
+            "resolve unqualified names in that schema"
         )
         if result.options_off:
             print(
-                f"error: {' and '.join(result.options_off)} is still OFF: this principal could not "
-                "ALTER DATABASE. The pooled claim mode refuses to start while "
-                "READ_COMMITTED_SNAPSHOT is off; have a DBA turn it on (docs/DEPLOY-SERVER-DB.md "
-                "section 2)",
+                f"{'error' if partial else 'warning'}: {' and '.join(result.options_off)} is OFF "
+                "after this run: this principal could not ALTER DATABASE. Have a DBA run: "
+                f"{result.remedy}"
+                + (
+                    ". The pooled claim mode refuses to start while READ_COMMITTED_SNAPSHOT is off"
+                    if partial
+                    else ""
+                ),
                 file=sys.stderr,
             )
-    return 3 if result.options_off else 0
+    return 3 if partial else 0
 
 
 def _provision_admin(args: argparse.Namespace) -> int:

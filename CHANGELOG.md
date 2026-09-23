@@ -11,12 +11,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   `messagefoundry store provision-schema` does it instead.** New `[store].schema_management`
   takes `auto` or `external`; **`external` is the server-DB default**, and SQLite is always
   `auto`. Under `external`, `serve` reads the `schema_meta` marker and **refuses to start** when it
-  does not match this build, naming the database, the schema it looked in, and the command. It runs
+  does not match this build, naming the database, the login's default schema, and the command. It runs
   no schema DDL and, on SQL Server, no `ALTER DATABASE`, so a refused start leaves the database as it
   found it. A clustered node's coordinator tables now ride the same batch. A DBA runs
   `provision-schema` as a DDL-capable principal, with the engines stopped, before the first start and
   before the first start of any upgrade whose schema moved. It needs no store key, a re-run on a
-  current schema is a no-op, and it exits 3 when a SQL Server database option is still off. On
+  current schema is a no-op, and it exits 3 when `READ_COMMITTED_SNAPSHOT` is still off. On
   PostgreSQL an external-mode start also refuses when the runtime role lacks row access to a store
   object, instead of failing mid-pipeline. The runtime login then
   needs row access only: `db_datareader` + `db_datawriter` on SQL Server, `USAGE` plus row grants on

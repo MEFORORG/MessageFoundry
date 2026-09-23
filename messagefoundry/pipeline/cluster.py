@@ -654,8 +654,9 @@ _logged_cluster_enabled = False
 class DbCoordinator:
     """Postgres-backed cluster membership + **leader election** (Track B Steps 3-7).
 
-    On :meth:`start` it idempotently creates the ``nodes`` + ``leader_lease`` tables, upserts this
-    node's row, and spawns two cooperatively-cancellable tasks: a **maintenance** task that each tick
+    On :meth:`start` it idempotently creates the ``nodes`` + ``leader_lease`` tables (under
+    ``[store].schema_management = auto`` only; under ``external`` the store batch that
+    ``provision-schema`` ran created them, #305), upserts this node's row, and spawns two cooperatively-cancellable tasks: a **maintenance** task that each tick
     (a) refreshes ``last_seen`` and (b) maintains leadership via a **self-fencing lease** (the single
     ``leader_lease`` row, renewed to ``DB_now + leader_lease_ttl``; a standby acquires only once that
     lease has expired per the DB clock), and a **fence watchdog** task that does NO DB I/O and demotes

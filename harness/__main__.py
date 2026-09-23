@@ -128,6 +128,15 @@ def main(argv: list[str] | None = None) -> int:
     # `multishard` / `shardcert` (+ the WS-C two-box `shardcert-engine`/`shardcert-driver`) are positional
     # subcommands with their own option sets (the flag-based `--connscale`/`--load` style doesn't fit an
     # N-engine sweep or a driver/engine split), so route them before the shared flag parser.
+    # BACKLOG #305: a server-DB store defaults to [store].schema_management = "external", which
+    # refuses to start until `messagefoundry store provision-schema` has run. A harness rig builds and
+    # resets its own schema as its one login, so it takes auto unless the operator chose otherwise.
+    # setdefault, so an explicit choice (including "external", to exercise that path) is honoured,
+    # and the engines this process spawns inherit it.
+    import os
+
+    if os.environ.get("MEFOR_STORE_BACKEND", "").strip().lower() in ("postgres", "sqlserver"):
+        os.environ.setdefault("MEFOR_STORE_SCHEMA_MANAGEMENT", "auto")
     raw = list(sys.argv[1:] if argv is None else argv)
     if raw and raw[0] == "multishard":
         return _run_multishard(raw[1:])

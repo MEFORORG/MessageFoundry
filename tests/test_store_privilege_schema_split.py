@@ -234,6 +234,54 @@ def test_postgres_row_only_role_is_clean_in_external_mode() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("roles", "expected"),
+    [
+        (
+            ("db_datareader", "db_datawriter"),
+            ("CREATE TABLE on database MessageFoundry", "ALTER on schema dbo"),
+        ),
+        (("db_datareader", "db_datawriter", "db_ddladmin"), ("database role db_ddladmin",)),
+    ],
+    ids=["direct-grants", "via-role"],
+)
+def test_sqlserver_direct_ddl_grants_are_excess_under_external(
+    roles: tuple[str, ...], expected: tuple[str, ...]
+) -> None:
+    """A runtime login given CREATE TABLE and ALTER on its schema directly, instead of db_ddladmin,
+    can still change the schema, so under external it is named. When db_ddladmin is held the role is
+    the one finding, not restated as its parts."""
+    assert (
+        sqlserver_excess(
+            server_roles=(),
+            database_roles=roles,
+            control_server=False,
+            control_database=False,
+            database="MessageFoundry",
+            external=True,
+            create_table=True,
+            alter_schema="dbo",
+        )
+        == expected
+    )
+
+
+def test_sqlserver_direct_ddl_grants_are_prescribed_under_auto() -> None:
+    assert (
+        sqlserver_excess(
+            server_roles=(),
+            database_roles=("db_datareader", "db_datawriter"),
+            control_server=False,
+            control_database=False,
+            database="MessageFoundry",
+            external=False,
+            create_table=True,
+            alter_schema="dbo",
+        )
+        == ()
+    )
+
+
 # --- the Postgres probe, through a stubbed read ------------------------------------------------
 
 
@@ -421,6 +469,18 @@ async def test_postgres_external_refuses_a_current_schema_the_role_cannot_use() 
     assert conn.writes == []
 
 
+async def test_postgres_grants_are_checked_before_the_marker_is_read() -> None:
+    """Reading schema_hash needs SELECT on schema_meta. Checked first, a role without it gets the full
+    list of what it cannot use rather than a raw permission error naming one table."""
+    from messagefoundry.store.base import StoreGrantsMissingError
+
+    conn = _FakePgConn(present=True, schema_hash=None, ungranted=("messages", "schema_meta"))
+    store = _postgres_store_over(conn, None)
+    with pytest.raises(StoreGrantsMissingError, match="2 object"):
+        await store._ensure_schema()
+    assert not any("schema_hash" in sql for sql in conn.reads)
+
+
 async def test_postgres_auto_does_not_check_runtime_grants() -> None:
     """Under auto the role owns what it created, so the grants check is external-only."""
     from messagefoundry.store.postgres import _schema_hash
@@ -549,16 +609,16 @@ async def test_sqlserver_provisioning_runs_the_batch_with_provisioning_true(
 
     monkeypatch.setitem(sys.modules, "aioodbc", types.SimpleNamespace(create_pool=_create_pool))
 
-    async def _options(settings: StoreSettings, *, posture: Any = None) -> list[str]:
+    async def _options(settings: StoreSettings, *, posture: Any = None) -> None:
         events.append("options")
-        return ["ALLOW_SNAPSHOT_ISOLATION"]
 
     async def _ensure(self: SqlServerStore, *, provisioning: bool = False) -> bool:
         events.append(f"ensure provisioning={provisioning}")
         return True
 
     async def _fetchone(self: SqlServerStore, sql: str, params: Any = ()) -> dict[str, Any]:
-        return {"schema_name": "dbo"}
+        # The state READ BACK after the run: RCSI on, snapshot isolation still off.
+        return {"rcsi": 1, "si": 0, "schema_name": "dbo"}
 
     monkeypatch.setattr(SqlServerStore, "_ensure_database_options", staticmethod(_options))
     monkeypatch.setattr(SqlServerStore, "_ensure_schema", _ensure)
@@ -568,7 +628,10 @@ async def test_sqlserver_provisioning_runs_the_batch_with_provisioning_true(
     assert settings.resolved_schema_management() is SchemaManagement.EXTERNAL
     result = await SqlServerStore.provision_schema(settings)
     assert result == SchemaProvisionResult(
-        applied=True, schema="dbo", options_off=("ALLOW_SNAPSHOT_ISOLATION",)
+        applied=True,
+        schema="dbo",
+        options_off=("ALLOW_SNAPSHOT_ISOLATION",),
+        remedy="ALTER DATABASE [MessageFoundry] SET ALLOW_SNAPSHOT_ISOLATION ON",
     )
     assert events == [
         "options",
@@ -638,6 +701,7 @@ def test_cli_provisions_as_the_named_principal(
         "schema": "mefor",
         "applied": True,
         "options_off": [],
+        "remedy": None,
         "schema_management": "external",
     }
     assert [s.username for s in seen] == ["mefor_dba"]
@@ -660,18 +724,38 @@ def test_cli_exits_3_when_a_database_option_stayed_off(
     """The schema is built but RCSI is still off, which the pooled default refuses to start on. A job
     reading only the exit code must not see a success."""
     _clear_store_env(monkeypatch)
+    remedy = "ALTER DATABASE [x] SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE"
     result = SchemaProvisionResult(
-        applied=True, schema="dbo", options_off=("READ_COMMITTED_SNAPSHOT",)
+        applied=True, schema="dbo", options_off=("READ_COMMITTED_SNAPSHOT",), remedy=remedy
     )
     _stub_provision(monkeypatch, result, [])
     argv = ["store", "provision-schema", "--service-config", str(_server_toml(tmp_path))]
     assert main(argv) == 3
     captured = capsys.readouterr()
-    assert "READ_COMMITTED_SNAPSHOT is still OFF" in captured.err
+    assert "error: READ_COMMITTED_SNAPSHOT is OFF" in captured.err
+    assert remedy in captured.err
     assert main([*argv, "--json"]) == 3
     payload = json.loads(capsys.readouterr().out)
     assert payload["ok"] is False
     assert payload["options_off"] == ["READ_COMMITTED_SNAPSHOT"]
+
+
+def test_cli_snapshot_isolation_alone_is_a_warning_not_a_partial_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Nothing in the engine opens a SNAPSHOT transaction, so ALLOW_SNAPSHOT_ISOLATION off alone must
+    not fail an exit-code-driven job. It is still reported, with its statement."""
+    _clear_store_env(monkeypatch)
+    remedy = "ALTER DATABASE [x] SET ALLOW_SNAPSHOT_ISOLATION ON"
+    result = SchemaProvisionResult(
+        applied=True, schema="dbo", options_off=("ALLOW_SNAPSHOT_ISOLATION",), remedy=remedy
+    )
+    _stub_provision(monkeypatch, result, [])
+    argv = ["store", "provision-schema", "--service-config", str(_server_toml(tmp_path))]
+    assert main(argv) == 0
+    err = capsys.readouterr().err
+    assert "warning: ALLOW_SNAPSHOT_ISOLATION is OFF" in err
+    assert remedy in err
 
 
 def test_cli_refuses_username_under_integrated_auth(

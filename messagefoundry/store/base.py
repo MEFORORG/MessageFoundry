@@ -2197,8 +2197,9 @@ class SchemaNotProvisionedError(RuntimeError):
 
     External mode never runs schema DDL at open, so a fresh database, or the first start of a build
     whose schema moved, refuses here until a DDL-capable principal runs
-    :data:`PROVISION_SCHEMA_COMMAND`. ``schema`` is where THIS login looked, and ``hint`` names a cause
-    re-running that command would not fix, so a refusal can never send an operator round a loop."""
+    :data:`PROVISION_SCHEMA_COMMAND`. ``schema`` is this login's default schema, and ``hint`` names a
+    cause re-running that command would not fix, so a refusal does not send an operator round a loop
+    of "already current" for the causes the backend can see."""
 
     def __init__(
         self,
@@ -2214,7 +2215,7 @@ class SchemaNotProvisionedError(RuntimeError):
         self.expected = expected
         self.schema = schema
         self.hint = hint
-        where = f" (looked in schema {schema!r})" if schema else ""
+        where = f" (this login's default schema is {schema!r})" if schema else ""
         super().__init__(
             f"the {backend.value} store schema in database {database!r} is not provisioned for this "
             f"build{where}: schema_meta is absent, not visible to this login, or records a different "
@@ -2242,13 +2243,15 @@ class SchemaProvisionResult:
 
     ``applied`` is whether the DDL batch ran (``False``: the marker was already current). ``schema``
     is where the batch's unqualified objects live for the provisioning principal, printed so an
-    operator can match it against the schema a refused runtime login looked in. ``options_off`` names
-    any SQL Server database option the principal could not turn on; non-empty means the run is
-    PARTIAL, because the pooled claim mode refuses to start while ``READ_COMMITTED_SNAPSHOT`` is off."""
+    operator can match it against the schema a refused runtime login names. ``options_off`` names any
+    SQL Server database option that is OFF after the run, read back rather than inferred, with
+    ``remedy`` the statements that turn them on. ``READ_COMMITTED_SNAPSHOT`` among them makes the run
+    PARTIAL, because the pooled claim mode refuses to start while it is off."""
 
     applied: bool
     schema: str | None = None
     options_off: tuple[str, ...] = ()
+    remedy: str | None = None
 
 
 def _absent_sqlite_store(settings: StoreSettings) -> Path | None:

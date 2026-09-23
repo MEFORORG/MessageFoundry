@@ -37,17 +37,22 @@ PostgreSQL**; SQLite is always `auto`, and an explicit `external` there is refus
   options. It opens a one-connection pool with the identity cipher and touches no row, so the DBA
   running it needs no store key. A re-run on a current schema is a no-op, but its RCSI step uses
   `WITH ROLLBACK IMMEDIATE`, so it runs with the engines stopped. It prints the schema it built in,
-  and exits 3 when a database option is still off, because the pooled default refuses to start
-  then. SQLite is refused, so it cannot create a file it was only pointed at (#1780).
+  and exits 3 when `READ_COMMITTED_SNAPSHOT` is still off after the run, read back rather than
+  inferred, because the pooled default refuses to start then. SQLite is refused, so it cannot create a file it was only pointed at (#1780).
 - **The cluster coordinator's tables ride the same batch.** Both coordinators used to create
   `nodes` / `leader_lease` (and on SQL Server `cluster_config`) at every start, as the runtime login.
   The statements are now stated once, as `CLUSTER_SCHEMA` in each store module, and appended to the
   batch; under `external` the coordinator skips its own DDL.
-- **A refusal never sends the operator round a loop.** It names the schema this login looked in,
-  because the batch creates tables unqualified and a provisioning principal with another default
-  schema would build them elsewhere. On PostgreSQL it names a missing `USAGE` grant, which reads
-  exactly like an absent marker. And on PostgreSQL a current marker is followed by a row-grant
-  check, so a table the runtime role cannot use refuses the start instead of failing mid-pipeline.
+- **A refusal does not send the operator round a loop for the causes the store can see.** It names
+  this login's default schema, because the batch creates tables unqualified and a provisioning
+  principal with another default schema would build them elsewhere, and on SQL Server it names a
+  login with no SELECT on the database, which hides the marker. On PostgreSQL it names a missing `USAGE` grant, which reads
+  exactly like an absent marker. And on PostgreSQL a row-grant check over the provisioned objects
+  runs first, so a table the runtime role cannot use refuses the start instead of failing
+  mid-pipeline.
+- **The SQL Server probe also counts directly granted DDL.** Under `external`, `CREATE TABLE` on the
+  database and `ALTER` on the default schema count as excess when no `db_ddladmin` or `db_owner`
+  membership already names them.
 - **The privilege probe follows the mode.** Under `external`, `db_ddladmin` (SQL Server) and
   `CREATE` on, or ownership of objects in, the store's schema (PostgreSQL) count as excess. Under
   `auto` they stay prescribed, which is the #1008 behaviour unchanged.
@@ -104,6 +109,6 @@ login; the new file's live legs exercise `external` against a scratch database.
 minimum.
 
 **Out of scope** — the check-privileges CLI, an AlertSink event on the WARN arm, and the per-hop
-privilege matrix (BACKLOG #305's later half, E2). Direct `GRANT ALTER ON SCHEMA` / `GRANT CREATE
-TABLE` on SQL Server outside `db_ddladmin` is not probed; the probe reads fixed and user-defined role
-membership plus `CONTROL`. The ASVS re-score lives in the vault and is not part of this change.
+privilege matrix (BACKLOG #305's later half, E2). The SQL Server probe reads `CREATE TABLE` and
+`ALTER` on the default schema, and at least those; other object-level DDL grants are not enumerated.
+The ASVS re-score lives in the vault and is not part of this change.

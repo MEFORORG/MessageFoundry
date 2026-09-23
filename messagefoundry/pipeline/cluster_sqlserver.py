@@ -88,7 +88,8 @@ class SqlServerCoordinator:
 
     Mirrors :class:`~messagefoundry.pipeline.cluster.DbCoordinator`.
     On :meth:`start` it idempotently creates the ``nodes`` / ``leader_lease`` / ``cluster_config`` tables
-    (under the store's ``sp_getapplock`` DDL guard), upserts this node, and spawns a **maintenance** task
+    (under the store's ``sp_getapplock`` DDL guard, and under ``[store].schema_management = auto`` only;
+    under ``external`` the store batch created them, #305), upserts this node, and spawns a **maintenance** task
     (heartbeat + lease acquire/renew + config-version refresh each tick) and a DB-free **fence watchdog**
     that demotes this node if it cannot renew within ``leader_fence_timeout`` (< the lease TTL) — so a
     partitioned old leader stops reporting :meth:`is_leader` ``True`` before any standby can acquire the

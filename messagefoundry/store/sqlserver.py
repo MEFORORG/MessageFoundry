@@ -3035,7 +3035,7 @@ class SqlServerStore:
     @staticmethod
     async def _ensure_database_options(
         settings: StoreSettings, *, posture: HopPosture | None = None
-    ) -> list[str]:
+    ) -> None:
         """Enable READ_COMMITTED_SNAPSHOT (RCSI) so the staged claim/finalize paths read on a
         row-version snapshot rather than taking shared locks that deadlock writers under concurrent
         load (concurrency_fixes (a)). Runs on its OWN autocommit connection BEFORE the pool is
@@ -3045,9 +3045,9 @@ class SqlServerStore:
         to a warning (never fails open()) when the principal lacks ALTER DATABASE or the lock cannot
         be taken — emitting the exact statement for a DBA to run out-of-band.
 
-        Returns the options still OFF afterwards (#305), so ``provision-schema`` can report a partial
-        result instead of a success. A connect failure returns nothing: the pool open that follows
-        surfaces the real failure."""
+        ``provision-schema`` (#305) runs this too, then READS the state back on its own connection
+        rather than trusting what happened here: a failed connect or an unreadable row leaves nothing
+        to infer from."""
         import aioodbc
 
         db = settings.database
@@ -3057,8 +3057,7 @@ class SqlServerStore:
             )
         except Exception as exc:  # noqa: BLE001 - the pool open below surfaces a real connect failure
             log.warning("skipping the RCSI check on %r (could not connect): %s", db, exc)
-            return []
-        still_off: list[str] = []
+            return
         try:
             # Standalone one-shot connection (NOT pooled) — `conn.close()` in the finally below frees
             # the cursor with it, so this site is exempt from the EF-6 pool-bleed race that `_cursor`
@@ -3070,16 +3069,16 @@ class SqlServerStore:
             )
             row = await cur.fetchone()
             # If we cannot read the state, do NOT attempt a disruptive ALTER.
-            rcsi_on = bool(row[0]) if row else True
-            snapshot_on = (row[1] in (1, 2)) if row else True
-            if not rcsi_on:
+            # If we cannot read the state, do NOT attempt a disruptive ALTER: _options_off reports
+            # nothing for an unreadable row.
+            off = _options_off(row)
+            if "READ_COMMITTED_SNAPSHOT" in off:
                 try:
                     await cur.execute(
                         "ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE"
                     )
                     log.info("enabled READ_COMMITTED_SNAPSHOT on database %r", db)
                 except Exception as exc:  # noqa: BLE001 - permission/lock: degrade to a DBA pointer
-                    still_off.append("READ_COMMITTED_SNAPSHOT")
                     log.warning(
                         "could not enable READ_COMMITTED_SNAPSHOT on %r (%s); a DBA should run once: "
                         "ALTER DATABASE [%s] SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE — "
@@ -3088,16 +3087,19 @@ class SqlServerStore:
                         exc,
                         db,
                     )
-            if not snapshot_on:
+            if "ALLOW_SNAPSHOT_ISOLATION" in off:
                 try:
                     # ALLOW_SNAPSHOT_ISOLATION is an online change (no exclusivity required).
                     await cur.execute("ALTER DATABASE CURRENT SET ALLOW_SNAPSHOT_ISOLATION ON")
                 except Exception as exc:  # noqa: BLE001 - non-fatal
-                    still_off.append("ALLOW_SNAPSHOT_ISOLATION")
-                    log.warning("could not enable ALLOW_SNAPSHOT_ISOLATION on %r: %s", db, exc)
+                    log.warning(
+                        "could not enable ALLOW_SNAPSHOT_ISOLATION on %r (%s); a DBA should run once: %s",
+                        db,
+                        exc,
+                        _options_remedy(db, ["ALLOW_SNAPSHOT_ISOLATION"]),
+                    )
         finally:
             await conn.close()
-        return still_off
 
     async def require_rcsi_for_pooled(self) -> None:
         """Hard-verify READ_COMMITTED_SNAPSHOT is ON — the pooled claim mode's startup gate (ADR 0066
@@ -3159,7 +3161,12 @@ class SqlServerStore:
         row = await self._fetchone(
             "SELECT SUSER_SNAME() AS login_name, USER_NAME() AS db_user, DB_NAME() AS db_name,"
             " HAS_PERMS_BY_NAME(NULL, NULL, 'CONTROL SERVER') AS control_server,"
-            " HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CONTROL') AS control_db, "
+            " HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CONTROL') AS control_db,"
+            # #305: the schema-DDL rights granted directly rather than by role. Read in both modes and
+            # counted only under external, where the runtime login must hold none.
+            " HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CREATE TABLE') AS create_table,"
+            " SCHEMA_NAME() AS default_schema,"
+            " HAS_PERMS_BY_NAME(SCHEMA_NAME(), 'SCHEMA', 'ALTER') AS alter_schema, "
             + ", ".join(server_cols + db_cols),
             SQLSERVER_FIXED_SERVER_ROLES + SQLSERVER_FIXED_DATABASE_ROLES,
         )
@@ -3193,6 +3200,15 @@ class SqlServerStore:
         control_database = _probed_grant(row["control_db"])
         if control_database is None:
             unread.append(f"CONTROL on database {database}")
+        external = self._settings.resolved_schema_management() is SchemaManagement.EXTERNAL
+        create_table = _probed_grant(row["create_table"])
+        alter_schema = _probed_grant(row["alter_schema"])
+        if external:
+            # Only external reads these as findings, so only external needs them READ.
+            if create_table is None:
+                unread.append(f"CREATE TABLE on database {database}")
+            if alter_schema is None:
+                unread.append("ALTER on the default schema")
         server_roles = tuple(held_server)
         database_roles = tuple(held_database)
         if unread:
@@ -3216,9 +3232,9 @@ class SqlServerStore:
                     f" {', '.join(held_labels) or 'nothing'}"
                 ),
             )
-        # #305: which documented grant the login is measured against. Under external schema management
-        # `provision-schema` runs the DDL as another principal, so db_ddladmin here is excess.
-        external = self._settings.resolved_schema_management() is SchemaManagement.EXTERNAL
+        # #305: `external` (read above) picks which documented grant the login is measured against.
+        # Under external schema management `provision-schema` runs the DDL as another principal, so
+        # db_ddladmin, and the same rights granted directly, are excess here.
         note = (
             "fixed server + database role membership probed BY NAME (authoritative, catalog-visibility"
             " independent); user-defined database roles added best-effort from sys.database_principals"
@@ -3252,6 +3268,8 @@ class SqlServerStore:
                 control_database=bool(control_database),
                 database=database,
                 external=external,
+                create_table=bool(create_table),
+                alter_schema=(str(row["default_schema"] or "") if alter_schema else None),
             ),
             detail=(
                 f"database user {str(row['db_user'] or '')!r}; {note}; measured against the "
@@ -3340,16 +3358,19 @@ class SqlServerStore:
         :class:`SchemaNotProvisionedError`, which names the provisioning command AND the schema this
         login resolves unqualified names in: the batch creates every table unqualified, so a
         provisioning principal with a different default schema puts them where this login never looks,
-        and ``provision-schema`` would then truthfully report the schema current."""
+        and ``provision-schema`` would then truthfully report the schema current. A login with no
+        SELECT on the database is the other cause: ``OBJECT_ID`` hides an object its caller cannot
+        see, so a missing ``db_datareader`` reads exactly like an absent marker."""
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 current = await self._schema_marker_current(cur, expected)
                 await cur.execute(
-                    "SELECT is_read_committed_snapshot_on, snapshot_isolation_state, SCHEMA_NAME()"
+                    "SELECT is_read_committed_snapshot_on, snapshot_isolation_state, SCHEMA_NAME(),"
+                    " HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'SELECT')"
                     " FROM sys.databases WHERE name = DB_NAME()"
                 )
                 row = await cur.fetchone()
-                await self._commit(conn)  # close the probe's read txn (autocommit=False pool)
+                await self._commit_read(conn)  # a read snapshot: not a counted write txn
             except Exception:
                 await conn.rollback()
                 raise
@@ -3367,16 +3388,19 @@ class SqlServerStore:
             )
         if not current:
             schema = str(row[2]) if row and row[2] is not None else None
+            if row and row[3] == 0:
+                hint = (
+                    "this login holds no SELECT on the database, and SQL Server hides objects from a "
+                    "caller that cannot read them; add it to db_datareader and db_datawriter"
+                )
+            else:
+                hint = (
+                    "this login resolves unqualified names in its default schema and then in dbo, so "
+                    "the batch must have been built in one of those; run provision-schema as a "
+                    "principal whose default schema is one of them"
+                )
             exc = SchemaNotProvisionedError(
-                self.backend,
-                database,
-                expected,
-                schema=schema,
-                hint=(
-                    "this login resolves unqualified names in its default schema, so the schema_meta "
-                    "marker must be there; run provision-schema as a principal with the same default "
-                    "schema (dbo by default)"
-                ),
+                self.backend, database, expected, schema=schema, hint=hint
             )
             log.error("sqlserver: %s", exc)
             raise exc
@@ -3427,19 +3451,31 @@ class SqlServerStore:
 
         The result names the schema the batch landed in and any option still OFF, so the caller can
         report a partial result rather than a success."""
-        options_off = await cls._ensure_database_options(settings, posture=posture)
+        await cls._ensure_database_options(settings, posture=posture)
         pool, executor = await cls._create_pool(settings, posture=posture, maxsize=1)
         store = cls(pool, settings, posture=posture)
         store._pool_executor = executor
         try:
             applied = await store._ensure_schema(provisioning=True)
-            row = await store._fetchone("SELECT SCHEMA_NAME() AS schema_name")
+            row = await store._fetchone(
+                "SELECT is_read_committed_snapshot_on AS rcsi, snapshot_isolation_state AS si,"
+                " SCHEMA_NAME() AS schema_name FROM sys.databases WHERE name = DB_NAME()"
+            )
         finally:
             await store.close()
+        # READ BACK, never inferred from the attempt: an unreadable row counts as both OFF, because
+        # a success reported on a state nobody read is the false success exit 3 exists to prevent.
+        off = (
+            _options_off((row["rcsi"], row["si"]))
+            if row is not None
+            else [name for name, _ in _DATABASE_OPTIONS]
+        )
+        schema = row["schema_name"] if row is not None else None
         return SchemaProvisionResult(
             applied=applied,
-            schema=str(row["schema_name"]) if row and row["schema_name"] is not None else None,
-            options_off=tuple(options_off),
+            schema=str(schema) if schema is not None else None,
+            options_off=tuple(off),
+            remedy=_options_remedy(settings.database, off) if off else None,
         )
 
     @staticmethod

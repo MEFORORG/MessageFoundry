@@ -135,12 +135,17 @@ def sqlserver_excess(
     control_database: bool,
     database: str,
     external: bool = False,
+    create_table: bool = False,
+    alter_schema: str | None = None,
 ) -> tuple[str, ...]:
     """What an observed SQL Server principal holds BEYOND the documented least-privilege grant.
 
     ``external`` selects the grant for ``[store].schema_management = external`` (#305), under which
-    the runtime login holds row CRUD only, so ``db_ddladmin`` is reported as excess. ``False`` keeps
-    the auto-mode grant, where the login runs its own schema DDL and ``db_ddladmin`` is prescribed.
+    the runtime login holds row CRUD only, so ``db_ddladmin`` is reported as excess, and so are the
+    same rights granted directly rather than by role: ``create_table`` (``CREATE TABLE`` on the
+    database) and ``alter_schema`` (the name of the default schema, when the login holds ``ALTER`` on
+    it). Both are suppressed when ``db_ddladmin`` or ``db_owner`` is already named, since that role
+    carries them. ``False`` keeps the auto-mode grant, where the login runs its own schema DDL.
 
     Pure — no I/O — so both directions (over-granted and correctly-granted) are unit-testable without
     a database, and the live server legs assert the same function against a real login.
@@ -162,6 +167,12 @@ def sqlserver_excess(
         out.append("CONTROL SERVER")
     if control_database and "db_owner" not in database_roles:
         out.append(f"CONTROL on database {database}")
+    ddl_role_named = bool({"db_ddladmin", "db_owner"} & set(database_roles)) or bool(server_roles)
+    if external and not ddl_role_named and not control_database:
+        if create_table:
+            out.append(f"CREATE TABLE on database {database}")
+        if alter_schema:
+            out.append(f"ALTER on schema {alter_schema}")
     return tuple(out)
 
 

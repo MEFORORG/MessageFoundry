@@ -515,6 +515,10 @@ def _probe_row(
         "db_name": "MessageFoundry",
         "control_server": control_server,
         "control_db": control_db,
+        # #305: the directly-granted schema-DDL rights, read in both modes, counted under external.
+        "create_table": 0,
+        "default_schema": "dbo",
+        "alter_schema": 0,
     }
     for i, name in enumerate(SQLSERVER_FIXED_SERVER_ROLES):
         row[f"srv_{i}"] = None if name in unread else int(name in server_roles)
