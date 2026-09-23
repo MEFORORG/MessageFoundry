@@ -242,6 +242,9 @@ Default-off and degradation-isolated, so the loopback posture is unchanged.
   deployment shape that motivates federating. **This is tested in the lab and allowed to fail** (runbook
   cell L9). If it fails, the fallback (federated users needing admin writes retain a usable AD password,
   or admins use local accounts) is documented, and option 2 above is re-argued.
+  **[SUPERSEDED for an OIDC session by Amendment B (2026-09-23): step-up for a session minted by the
+  federated login goes back to the IdP, not to a password re-bind. A session minted by AD password or
+  Kerberos login is not covered by that amendment.]**
 - **Enabling OIDC changes the ASVS 7.1.3 residual's premise.** The accepted register row reasons that
   "the shipped posture mints no federated session"; that becomes conditional the moment an operator sets
   `oidc_enabled=true`. The row's trigger language is updated in the same PR.
@@ -333,6 +336,11 @@ login, after `resolve_principal` succeeds, the resolved account's bound `(oidc_i
 if it differs from the presented token's, the login is **refused** (`LoginOutcome.reason =
 "federated_subject_conflict"`, audited) **before a session is minted**; a first federated login records the
 binding. AD-password and Kerberos callers pass `None` and stay byte-identical.
+*[The clause "a first federated login records the binding" is SUPERSEDED by the owner rulings recorded in
+[ADR 0184](0184-identify-a-federated-login-by-the-idp-namespaced-subject-not-by-the-username-it-claims.md)
+(2026-09-06 and 2026-09-23): only the administrative binding surface may create a binding, and an unbound
+federated login is refused. ADR 0184's pair-first selection (its AC-1) also bears on the rest of A.2;
+where the two differ, ADR 0184 governs.]*
 
 ### A.3 What this overturns, precisely
 - **"Zero store work" is superseded** by the minimum a continuity guard requires: two **nullable** columns
@@ -398,3 +406,63 @@ window is open.
   and mint no session; WHEN the account is unbound, it SHALL record the binding on that login; WHEN the bound
   tuple matches, the login proceeds unchanged -> the federated-path regression tests (changed-sub / same-username
   refused; same-sub / changed-username resolves to the same account).
+  *[The clause "WHEN the account is unbound, it SHALL record the binding on that login" is SUPERSEDED by ADR
+  0184 AC-4 (accepted 2026-09-23): an unbound federated login is refused and creates no binding. ADR 0184
+  AC-1 (pair-first selection) also bears on the first clause; where the two differ, ADR 0184 governs.]*
+
+---
+
+## Amendment B (2026-09-23) — step-up for an OIDC session goes back to the IdP; back-channel logout stays out of scope (BACKLOG #296, #295)
+
+> **Status: ACCEPTED — owner ruling of 2026-09-23, given to a Manager seat.** The same ruling accepted
+> [ADR 0184](0184-identify-a-federated-login-by-the-idp-namespaced-subject-not-by-the-username-it-claims.md).
+> This amendment does not change the status line at the top of this ADR.
+
+### B.1 Step-up for an OIDC session goes back to the IdP
+
+When a session minted by the federated login needs step-up at `/ui/reauth`, the engine sends the
+browser back to the IdP. The authorization request carries `max_age=0` and `prompt=login`. The engine
+does not re-bind a password for that session.
+
+- **What this records, and what it leaves to the build.** It records the request shape and the
+  owner's choice of leg. It does not specify how the engine verifies what comes back, such as the
+  `auth_time` claim OIDC requires when `max_age` is sent. That is the BACKLOG #296 build's to state,
+  as acceptance criteria added with the code.
+- **What this supersedes.** The *Consequences* bullet "Step-up may be impossible for passwordless
+  accounts", for an OIDC session only. That bullet is marked in place.
+- **What decides which leg runs: the session, not the account.** A hybrid account can also log in by
+  AD password or Kerberos, and those sessions keep their existing step-up. So the session must record
+  how it was minted. That field is the session mechanism item ADR 0184 resolved, and this leg is its
+  only consumer, so the two are built together.
+- **The store change that field needs.** A column on the sessions table narrows the *Out of scope*
+  entry "any store migration" a second time, as A.3 did for its two columns. How AC-1 reads beside
+  that column is the build's to settle, as A.3 settled it for its two.
+- **What this does to lab cell L9.** L9 asks whether step-up survives a passwordless or
+  smartcard-required account. This amendment changes that question for an OIDC session. It does not
+  decide whether L9 is discharged, and the lab cells still stand as written under *To resolve on
+  acceptance*.
+
+### B.2 Back-channel logout stays out of scope
+
+*Out of scope* above already names back-channel logout. This amendment keeps it there, for two
+reasons the owner gave:
+
+1. In the owner's assessment a receiver would move nothing up, and it would add a new
+   unauthenticated POST surface.
+2. Every federated user is also an AD user, because a principal with no on-prem AD object is refused.
+   The directory reconciler, `AuthService.reconcile_directory_sessions` (ADR 0079 mechanism 2, built
+   outside this ADR), already ends those sessions when the directory disables the account. Its pass
+   runs every `[auth].ad_session_recheck_seconds`, 300 seconds by default.
+   *Measured 2026-09-23, beside the owner's reason and not replacing it:* revocation takes
+   `ad_session_recheck_strikes` consecutive absent probes, 2 by default. So at the shipped defaults
+   it takes at least two passes, not one. `ad_session_recheck_max_users` (200 by default) can spread
+   a large estate over more passes, and a value of 0 for the interval turns the loop off. The
+   reconciler sees a directory disable or delete. It does not see a revocation made only at the IdP.
+
+This ruling covers back-channel logout only. The rest of that *Out of scope* list is unchanged. The
+AC-3 forward note on a logout-token ladder keeps its force if this is ever reopened.
+
+### B.3 Related, and recorded in ADR 0184 rather than here
+
+A.4's follow-ons, and the rebind action it recommended, are settled in ADR 0184's *To resolve on
+acceptance* section. Read them there.
