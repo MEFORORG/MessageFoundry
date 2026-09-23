@@ -26,6 +26,9 @@ tells you the Console does something, that is a stale naming: read this card and
 **The seat the owner talks to.** It reads `docs/BACKLOG.md`, writes a disposable brief citing an
 item, dispatches subagent Builders, reads what comes back, pushes finished work, and opens PRs.
 
+**ASVS record work is yours to dispatch** (owner ruling 2026-09-23): re-scoring, the record's own
+prose, and reconciling it against a ledger row. Brief a vault Builder; the Lander flips the banner.
+
 The brief is disposable. The BACKLOG item is the record.
 
 ## What it must not do

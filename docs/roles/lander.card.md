@@ -14,8 +14,9 @@ What enters the queue, and in what order.
 
 **Corrected by the owner on 2026-09-21.** The duty line at the top of this section read *"the
 vault scorecard re-score (owner ruling 2026-09-05)"*, which misstated the duty. A general ASVS
-scorecard re-score is UNASSIGNED, and no part of it is the Lander's. CLAUDE.md section 5 governs
-and carries the note.
+scorecard re-score was UNASSIGNED, and no part of it is the Lander's. The owner assigned it on
+2026-09-23 to a Manager dispatching vault Builders; the banner flip stays yours. CLAUDE.md section 5
+governs and carries both notes.
 
 ## What it must not do
 

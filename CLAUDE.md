@@ -326,7 +326,7 @@ recency.
 
 | Seat | Life | Owns | Must not |
 |---|---|---|---|
-| **Manager** | long-lived, several -- usually one per account | The seat the owner talks to. Reads `docs/BACKLOG.md`, writes a disposable brief citing an item, dispatches subagent Builders in its own process, polls for state, pushes and opens PRs. | Build. Attribute a red -- nobody does that now. Enqueue or merge -- both are the Lander's. Wait on inbound messages; it polls instead. Exit with a worker's work unpushed. |
+| **Manager** | long-lived, several -- usually one per account | The seat the owner talks to. Reads `docs/BACKLOG.md`, writes a disposable brief citing an item, dispatches subagent Builders in its own process, polls for state, pushes and opens PRs. ASVS record work, which it dispatches to vault Builders (owner ruling 2026-09-23; see the note below). | Build. Attribute a red -- nobody does that now. Enqueue or merge -- both are the Lander's. Wait on inbound messages; it polls instead. Exit with a worker's work unpushed. |
 | **Builder** | ephemeral, one per brief | The change, the commit, the push, and the PR carrying the `BACKLOG.md` update. | Guess at something the brief left open, or wait for an answer; it puts the question in its report, comments it on the PR, and stops. Plan and wait for a "go". Spawn another session. |
 | **Watchdog** | as needed | Watching the Lander and keeping it draining. Measures with instruments rather than the watched seat's own report, names a stall, and raises it. Added 2026-09-19. | Take the action it is watching for -- acting destroys the instrument. Drain the queue, take the claim, or drive the lane. Relay an owner grant to the seat it watches. Publish a zero with no control that fired. |
 | **Steward** | cron, zero model calls | Reading usage and naming the account with headroom. | Warn a running session. Nothing can interrupt one. |
@@ -340,6 +340,21 @@ statuses after items merge**, which is what the row now says. **That leaves the 
 re-score UNASSIGNED, and no part of it is the Lander's** -- the owner named no seat for it, so
 neither does this file. Only the re-score half of that wording moved; the separate "Merge when
 ready" ruling of the same date, further down this section, is untouched.
+
+**THE RE-SCORE IS ASSIGNED NOW. OWNER RULING 2026-09-23, GIVEN TO A MANAGER SEAT.** ASVS record
+work belongs to a **Manager dispatching vault Builders**. It covers three acts: re-scoring a cell,
+editing the record's own prose, and reconciling the record against a ledger row when the two
+disagree. **The Lander keeps the banner flip**, which is its 2026-09-21 duty above, unchanged. So
+the paragraph above held for two days and its UNASSIGNED sentence is now superseded. It stays, as
+this file's record of when the gap opened and when it closed.
+
+**What the ruling discharges, and what it does not.** A ledger row may fence record work away from
+a Builder, in words such as *"the closing act is a scorecard re-score and is not a builder's"* or
+*"a scorecard holder's call rather than a build"*. Those rows were written while the record's seat was
+retired, misnamed or empty, so that fence no longer binds: a Manager may brief a vault Builder for the work, and the
+Lander flips the banner once it merges. **The ruling names who does record work, never what the
+record should say.** A row whose remainder waits on a named owner ruling about the requirement
+itself still waits on that ruling.
 
 **THE 2026-09-11 POSITIONAL LEDGER-CONFLICT RULING IS RETIRED. The owner authorised the retirement
 directly on 2026-09-21, in session, after reading an adversarial review of the question.** It is
