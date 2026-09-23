@@ -319,7 +319,10 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    key and decrypts with whichever configured key matches (active + any decrypt-only keys in
    `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`). **Rotation** = set the new active key, keep the prior key in
    `…_RETIRED`, run **`messagefoundry rotate-key`** (offline) to re-encrypt every value under the new
-   key, then drop the retired key. An undecryptable value (corrupt blob / missing key) is contained —
+   key, then drop the retired key. `rotate-key` also opens a new range of the audit chain under the new
+   key and verifies the chain first; do not drop the retired key until it has printed its audit line
+   without an error ([ADR 0193](adr/0193-audit-chain-key-ranges-survive-a-store-key-rotation.md),
+   BACKLOG #1904). An undecryptable value (corrupt blob / missing key) is contained —
    the row is dead-lettered, never crashes a worker.
    **Fail-closed (secure-by-default; H3, OWASP *Fail Securely* / SDS §4.3 PW.9):** `serve` **refuses to
    start with no key on ANY instance** — the refusal is gated on **neither** a data class **nor** the

@@ -1626,6 +1626,14 @@ class AuditStore(Protocol):
         rewrites existing row hashes. Returns ``(ok, message)``."""
         ...
 
+    async def roll_audit_key_epoch(self) -> tuple[bool, str]:
+        """``rotate-key``'s audit step (BACKLOG #1904, ADR 0193): open a range of the audit chain under
+        the ACTIVE key. Verifies the whole chain first and refuses on a break; then appends one range row,
+        MAC'd under the active key, carrying a digest of the range it closes, so that range stays
+        provable after its key is dropped. Rewrites no existing row. A no-op when the current range is
+        already under the active key or the chain is keyless. Run offline. Returns ``(ok, message)``."""
+        ...
+
     def audit_chain_unkeyed(self) -> bool:
         """True when this store holds a keying secret but its audit chain on disk is KEYLESS (#1905).
 

@@ -5253,7 +5253,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
         )
         return 2
 
-    async def run() -> tuple[int, ResealResult]:
+    async def run() -> tuple[int, ResealResult, tuple[bool, str]]:
         import datetime
 
         from messagefoundry.store.store import SecretRotationMetaStore
@@ -5291,12 +5291,18 @@ def _rotate_key(args: argparse.Namespace) -> int:
                         tracked_since=prior.tracked_since if prior is not None else today,
                         last_rotated=today,
                     )
-            return count, uploads
+            # BACKLOG #1904: the audit chain is the third surface the key covers. Its rows are never
+            # re-MAC'd (the off-box tee and every recorded anchor hold those values); instead the chain
+            # gets a range under the NEW key, whose first row commits to a digest of the old range, so
+            # the old range stays provable once the retired key is dropped. Verified first, and last in
+            # this command, so a refusal leaves the data rotation above intact and resumable.
+            rolled = await store.roll_audit_key_epoch()
+            return count, uploads, rolled
         finally:
             await store.close()
 
     try:
-        count, uploads = asyncio.run(run())
+        count, uploads, (rolled_ok, rolled_msg) = asyncio.run(run())
     except CipherError as exc:
         # A value couldn't be decrypted by any supplied key — the prior key is missing. Nothing is
         # corrupted: every pass is all-or-nothing per batch AND idempotent, so re-running with the
@@ -5324,6 +5330,17 @@ def _rotate_key(args: argparse.Namespace) -> int:
             "BEFORE removing MEFOR_STORE_ENCRYPTION_KEYS_RETIRED.",
             file=sys.stderr,
         )
+    if not rolled_ok:
+        # The data is rotated but the audit chain is not: its current range is still under the prior
+        # key, so dropping that key now would leave the newest range unverifiable. Say so, and fail.
+        print(
+            f"error: the audit chain was not rolled to the active key — {rolled_msg}. Do NOT remove "
+            "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED until `messagefoundry rotate-key` completes "
+            "without this error.",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"OK: {rolled_msg}")
     return 0
 
 
