@@ -304,9 +304,10 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    (`store/base.py:1817`, forwarded at `:1826`/`:1836`), which is what closed it. `docs/ASVS-L2-PHASE0-CHANGES.md`
    §"Audit chain" carries the accurate wording — the digest primitive is *"shared verbatim by all three
    backends"*. **What IS unkeyed is the KEYLESS posture, not a backend:** with no store key,
-   `audit_mac_key()` returns `None` (`store/crypto.py:428`) and the chain stays keyless SHA-256 —
-   tamper-evident against a careless edit, not forgery-resistant against anyone who can write the
-   table. At-rest encryption is off by default, so that is the DEFAULT posture.
+   `IdentityCipher.audit_mac_key()` in `store/crypto.py` returns `None` and the chain stays keyless
+   SHA-256 — tamper-evident against a careless edit, not forgery-resistant against anyone who can write
+   the table. That is NOT the default posture: `serve` refuses to start without a store key (item 2
+   below), so a keyless chain needs the audited `[security].allow_unencrypted_phi` opt-out.
 2. **Key management + rotation `[BUILT]`.** The key is a base64 32-byte secret from the **environment**
    (`MEFOR_STORE_ENCRYPTION_KEY`), never the TOML file — reusing the existing secrets convention
    (cf. `MEFOR_STORE_PASSWORD`). Mint one with `messagefoundry gen-key`. On Windows it may instead live
@@ -540,8 +541,8 @@ header row (`content_type`, `total_bytes`, `refcount`, `created_at`) + the `mess
 linkage · `secret_rotation_meta` (all three backends) · `.mfbak` on the server backends.
 
 Deliberately **not** ciphered, so that ids stay indexable and the audit trail stays greppable for
-incident response. Integrity for `audit_log` comes from the **tamper-evident hash chain** — *keyless SHA-256 in the default keyless posture, upgraded to HMAC-SHA256 on an HKDF-derived subkey of the store DEK only when a store key is set (#190), or an isolated-module Transit MAC under `cipher_provider=vault_transit`* — so its strength is **key-custody-dependent**, and the unqualified reading describes the non-default case (the `client`
-address is folded *inside* it), not from a cipher.
+incident response. Integrity for `audit_log` comes from the **tamper-evident hash chain** (the `client`
+address is folded *inside* it), not from a cipher. The chain is *HMAC-SHA256 on an HKDF-derived subkey of the store DEK whenever a store key is set (#190), which is the shipped default because `serve` refuses to start without one; an isolated-module Transit MAC under `cipher_provider=vault_transit`; or keyless SHA-256 only on an instance started without a key through the audited `[security].allow_unencrypted_phi` opt-out* — so its strength is **key-custody-dependent**.
 
 **Access, per tier — several of these ARE returned by an API, under RBAC:**
 

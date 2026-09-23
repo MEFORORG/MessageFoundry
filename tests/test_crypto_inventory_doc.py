@@ -18,8 +18,9 @@ Sibling of ``tests/test_secret_rotation_inventory.py`` (13.1.4) and
 * **The OIDC verification/trust material is documented** (ADR 0142) — the JWKS verifying keys and the
   pinned TLS trust anchor.
 * **The retired false claims cannot reappear** — the "keyless identity (plaintext) by default" cipher
-  claim (false since ADR 0148) and the "no classical-public-key data at rest" PQC claim (false given
-  the WebAuthn COSE + OIDC RP keys).
+  claim (false since ADR 0148), the "no classical-public-key data at rest" PQC claim (false given
+  the WebAuthn COSE + OIDC RP keys), and the "default keyless posture" audit-chain claim (false
+  because ``serve`` refuses to start with no store key).
 * **Every migration row keeps a dated milestone + a named owner** (11.1.4), and the section states a
   review cadence tied to this guard.
 
@@ -59,11 +60,14 @@ _SECTION4_END = "## 5. Communications inventory"
 # The migration subsection (11.1.4) lives at the tail of §4.
 _MIGRATION_START = "### Cryptographic migration & agility"
 
-# The exact false claims 11.1.2 / 11.1.4 deleted. If either literal reappears anywhere in §4 the cell
-# has regressed. (Both are substrings, not tokens — they are whole false sentences.)
+# The exact false claims 11.1.2 / 11.1.4 deleted. If any literal reappears anywhere in §4 the cell
+# has regressed. (All are substrings, not tokens — they are whole false phrases.)
 _RETIRED_CLAIMS = (
     "keyless identity (plaintext) by default",  # the false at-rest cipher default (ADR 0148 refutes it)
     "no classical-public-key data at rest",  # the false PQC posture (WebAuthn COSE + OIDC RP refute it)
+    # The false audit-chain default: `serve` refuses to start with no store key, so the shipped chain
+    # is keyed HMAC, and keyless SHA-256 needs the audited opt-out (BACKLOG #282).
+    "default keyless posture",
 )
 
 
