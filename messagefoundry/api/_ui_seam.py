@@ -168,12 +168,19 @@ from typing import Any
 #: class as the ``UploadedFileList.scope`` entry above, and it forces a bump for the same reason.
 #: Unnumbered: the ``vN`` labels are retired as identifiers (#1220 above); the digest is the identifier.
 #:
+#: ASVS 7.2.4 / BACKLOG #1146: ``AuthService`` gained the public ``supersede_session``, which the
+#: /ui/login and /ui/sso legs call to end the session the browser presented, and ``begin_oidc_login``
+#: gained the optional ``prior_session`` keyword the federated start leg passes. A METHOD the console
+#: calls and a keyword it passes, so a skew is a TypeError or AttributeError at sign-in rather than a
+#: degraded render -- the same class as the ``factor_binding_is_blocked`` entry above. Unnumbered: the
+#: ``vN`` labels are retired as identifiers (#1220 above); the digest is the identifier.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "75c4117d21fd0b98"
+ENGINE_UI_SEAM: str = "2381cc49f716e92e"
 
 
 @dataclass(frozen=True, slots=True)

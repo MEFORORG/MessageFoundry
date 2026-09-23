@@ -52,6 +52,7 @@ from .._auth import (
     assert_same_origin,
     clear_oidc_flow_cookie,
     oidc_flow_cookie_name,
+    session_token,
     set_oidc_flow_cookie,
     set_session_cookie,
 )
@@ -199,8 +200,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             )
             return RedirectResponse("/ui/login?e=oidc_unavailable", status_code=303)
         try:
+            # ASVS 7.2.4: hand over the session this browser holds NOW. The callback cannot read it,
+            # because the IdP's redirect back is cross-site and withholds the Strict cookie; the
+            # engine stages its hash and ends it only once the IdP proof succeeds.
             flow_id, authorization_url = await auth.begin_oidc_login(
-                client=client, public_origin=public_origin
+                client=client, public_origin=public_origin, prior_session=session_token(request)
             )
         except FlowCacheFullError:
             # The bounded flow cache REJECTS rather than evicts (evict-oldest would make a start-leg

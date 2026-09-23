@@ -1628,6 +1628,16 @@ a property of the **page**, not of the API — `DELETE /me/sessions/{id}` checks
 accepts the caller's own current session id and revokes it. The **Users** page has a **Revoke
 sessions** action for admin force-sign-out.
 
+**Signing in again ends the session the browser held (ASVS 7.2.4).** Each console sign-in leg (the
+password form, Windows SSO and federated sign-in) answers with a cookie that replaces the browser's
+session cookie. Once the new sign-in succeeds, the engine revokes the session the browser presented
+and audits `auth.session_revoked` with scope `superseded`. It ends that one session only, never the
+user's others, and a failed sign-in ends nothing. Federated sign-in reads the cookie on its start
+leg, because the identity provider's redirect back is cross-site and the browser withholds the
+Strict cookie there. The two bearer sign-in routes, `POST /auth/login` and `POST /auth/negotiate`,
+revoke nothing: they return a token and replace none, so ending a client's old token is the
+client's own act. The VS Code extension does this when it signs in again.
+
 ### Security-event notifications (WP-L3-05, ASVS 6.3.5 / 6.3.7)
 
 Users are notified of security-relevant changes to their account through **two** channels:

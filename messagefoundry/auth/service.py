@@ -1529,13 +1529,20 @@ class AuthService:
     def _oidc_redirect_uri(self, public_origin: str) -> str:
         return public_origin.rstrip("/") + self._settings.oidc_redirect_path
 
-    async def begin_oidc_login(self, *, client: str | None, public_origin: str) -> tuple[str, str]:
+    async def begin_oidc_login(
+        self, *, client: str | None, public_origin: str, prior_session: str | None = None
+    ) -> tuple[str, str]:
         """Stage a federated flow and return ``(flow_id, authorization_url)``.
 
         The PKCE verifier, ``state`` and ``nonce`` are minted here and stay SERVER-side in the flow
         cache; only the opaque ``flow_id`` goes to the browser. Raises
         :class:`~messagefoundry.auth.oidc.FlowCacheFullError` when the bounded cache is full — the
         caller must treat that as a flood signal, not an error to audit per request.
+
+        ``prior_session`` is the session token the browser presented on this start leg, if any. Only
+        its hash is staged, and nothing is revoked here: :meth:`complete_oidc_login` supersedes it
+        after the IdP proof succeeds (ASVS 7.2.4). The start leg is the only place to read it,
+        because the callback arrives as a cross-site navigation that withholds the Strict cookie.
         """
         if not self.oidc_enabled or self._oidc_flows is None:
             raise oidc.FlowError("federated sign-in is not configured")
@@ -1544,6 +1551,7 @@ class AuthService:
             return_to="/ui",
             client_ip=client or "",
             ttl_seconds=self._settings.oidc_flow_ttl_seconds,
+            prior_session_hash=hash_token(prior_session) if prior_session else None,
         )
         challenge = oidc.pkce_challenge(flow.code_verifier)
         url = oidc.build_authorization_url(
@@ -1589,12 +1597,21 @@ class AuthService:
         if not oidc.state_matches(flow.state, state):
             await self._directory_reject_audit("<oidc>", "oidc", "state_mismatch")
             return LoginOutcome(ok=False, error="federated sign-in failed", reason="state_mismatch")
-        return await self.authenticate_oidc(
+        outcome = await self.authenticate_oidc(
             code,
             flow,
             redirect_uri=self._oidc_redirect_uri(public_origin),
             client=client,
         )
+        # ASVS 7.2.4: the callback's Set-Cookie replaces the browser's session cookie, so end the
+        # session the start leg saw. Strictly after the proof succeeded, as on the other two legs.
+        if outcome.ok and outcome.token is not None and flow.prior_session_hash is not None:
+            await self._supersede_session_hash(
+                flow.prior_session_hash,
+                actor=outcome.identity.username if outcome.identity is not None else None,
+                client=client,
+            )
+        return outcome
 
     async def authenticate_oidc(
         self,
@@ -2948,6 +2965,55 @@ class AuthService:
             # Emit the documented auth.logout event (SECURITY.md, ASVS 16.3.3) — previously the
             # session was revoked silently, contradicting the doc and leaving a gap in the trail.
             await self._audit("auth.logout", actor=actor)
+
+    async def supersede_session(
+        self,
+        prior_token: str | None,
+        *,
+        new_token: str,
+        actor: str | None,
+        client: str | None = None,
+    ) -> bool:
+        """End the session a browser presented at a fresh sign-in (ASVS 7.2.4, login side).
+
+        A console sign-in answers with a ``Set-Cookie`` that REPLACES the browser's session cookie, so
+        the server itself strands the prior session: this browser can never present it again, yet it
+        stays valid until idle or absolute expiry. The verb asks for the current token to be
+        terminated, and overwriting a cookie terminates nothing server-side.
+
+        Call it only AFTER the new credential proof succeeded, so a failed sign-in signs nobody out.
+        It ends exactly the one presented session and never the user's others: a whole-user revoke
+        would turn every sign-in into a forced sign-out of every other device.
+
+        The prior session may belong to a different user, for example on a shared workstation. It is
+        still ended, and the audit row names its owner. Anyone holding that token could already end
+        it with ``POST /auth/logout``, so this grants no new power. Returns True when a live session
+        was revoked; an absent, already-revoked or identical token is a silent no-op with no audit.
+        """
+        if not prior_token or prior_token == new_token:
+            return False
+        return await self._supersede_session_hash(
+            hash_token(prior_token), actor=actor, client=client
+        )
+
+    async def _supersede_session_hash(
+        self, prior_hash: str, *, actor: str | None, client: str | None
+    ) -> bool:
+        """The hash-keyed body of :meth:`supersede_session`. The federated leg stages only the hash
+        in its flow (see :meth:`begin_oidc_login`), so it enters here rather than with a token."""
+        prior = await self._store.get_session(prior_hash)
+        if prior is None or prior.revoked_at is not None:
+            return False
+        await self._store.revoke_session(prior_hash)
+        await self._audit(
+            "auth.session_revoked",
+            actor=actor,
+            detail=_json(
+                {"scope": "superseded", "session": prior_hash[:12], "user_id": prior.user_id}
+            ),
+            client=client,
+        )
+        return True
 
     # --- session inventory + targeted revoke (WP-10, ASVS 7.5.2/7.4.5) -------
 

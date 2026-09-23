@@ -16,6 +16,7 @@ from messagefoundry.api.security import get_auth
 
 from .. import pages
 from .._auth import (
+    session_token,
     set_session_cookie,
 )
 
@@ -83,6 +84,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # no mutual-auth response header (SECURITY.md's "no mutual authentication"; ADR
             # 0068 §9 records this as the current posture).
             return RedirectResponse("/ui/login?e=sso_failed", status_code=303)
+        # ASVS 7.2.4: end the session this browser presented, as /ui/login does. A cross-site link
+        # into this route withholds the Strict cookie, so then there is nothing to read and nothing
+        # is revoked; a same-site navigation, the login page's own link, carries it.
+        await auth.supersede_session(
+            session_token(request),
+            new_token=outcome.token,
+            actor=outcome.identity.username if outcome.identity is not None else None,
+            client=client,
+        )
         resp = RedirectResponse("/ui", status_code=303)
         set_session_cookie(resp, outcome.token, request=request)
         return resp
