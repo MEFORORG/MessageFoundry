@@ -2873,12 +2873,10 @@ class AuthService:
         authenticates once at handshake and its keepalive re-validates the token CAPTURED there, so
         on a first deployment a rotation would make that captured token stop resolving and the server
         would close the socket at the next revalidation tick -- indistinguishable from a revoke,
-        which is the fail-closed direction and the right one. The console does not reconnect it;
-        ``app.js`` wires ``ws.onclose`` to resume the 5-second HTTP poll, and that poll carries the
-        NEW cookie, so the dashboard would keep updating over the fallback until the next full page
-        load re-opened a socket. Completing MFA on the dashboard would therefore cost the live push
-        for the rest of that page's life -- a LIVENESS regression, not a correctness or data-loss
-        one, which is why a bounded reconnect is filed as follow-up rather than built here.
+        which is the fail-closed direction and the right one. ``app.js`` wires ``ws.onclose`` to
+        resume the 5-second HTTP poll and to re-open the socket a bounded number of times, and the
+        new handshake carries the NEW cookie, so the live push survives the rotation. That is a
+        client reconnect, never a server-side grace window for the old token.
         """
         rotated = await self._rotate_session_token(token)
         if rotated is None:

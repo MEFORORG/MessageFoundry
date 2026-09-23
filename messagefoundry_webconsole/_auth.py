@@ -857,8 +857,9 @@ async def authorize_ui_ws(
         # a stolen password-only cookie could probe the socket and leave the chain silent.
         #
         # The rate is bounded by the client, not by a knob: ``static/app.js`` opens ``/ws/stats`` once
-        # per page load and its ``onclose`` resumes the HTTP poll instead of re-opening, so there is no
-        # reconnect loop behind this row. An MFA-pending session cannot load that page anyway
+        # per page load and re-opens it at most WS_RECONNECT_LIMIT (3) times, refilling that budget
+        # only after a socket stayed up, which a refused handshake never does. So at most four rows
+        # per page load stand behind this line. An MFA-pending session cannot load that page anyway
         # (``require_ui`` diverts it to enroll), which leaves the direct handshake — the attacker case
         # this row exists to catch.
         #
