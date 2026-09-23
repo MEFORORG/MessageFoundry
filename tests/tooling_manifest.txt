@@ -55,7 +55,7 @@ tests/test_codex_bridge.py
 tests/test_coord_alloc_floor.py
 tests/test_coord_alloc_reentrancy.py
 tests/test_coord_fleet_fetch_clock.py
-# The three below share one SUBJECT: scripts/hooks/durability_push.sh, copied off disk and run as a
+# The four below share one SUBJECT: scripts/hooks/durability_push.sh, copied off disk and run as a
 # real post-commit hook. They are listed rather than left off because the diff that can break them is
 # a diff to that file, which trips this job's scripts/** path gate -- so the tooling job faces the
 # change that would break them. None of them reads anything under messagefoundry/** or
@@ -64,6 +64,7 @@ tests/test_coord_fleet_fetch_clock.py
 # arrive at a leg where they are deselected. The header's "when ambiguous, leave it off" is not in
 # play, because nothing here is ambiguous about which tier owns the subject.
 tests/test_durability_hook_provenance.py
+tests/test_durability_hook_push_bound.py
 tests/test_durability_hook_remote_guard.py
 tests/test_durability_hook_rewrite_coverage.py
 tests/test_gate_ci_mirror_parity.py

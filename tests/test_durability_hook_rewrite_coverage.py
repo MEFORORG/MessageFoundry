@@ -23,10 +23,15 @@ every single commit would satisfy every positive test in this file.
 so "the orphan ref is absent" is trivially true the instant after ``git commit`` returns. Every
 absence assertion below therefore waits for the MOVING tag to reach its new commit first, and only
 then asks about the orphan -- the push that would have written one has demonstrably finished.
+
+**AND THE REMOTE TAG IS NOT THE HOOK'S LAST WRITE.** The local ``$LAST`` ref lands after it. So a
+test that reads ``$LAST`` next, or commits again on the same branch and so makes the hook read it,
+waits on ``wait_for_landed`` instead, which waits for both.
 """
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import time
@@ -35,7 +40,14 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-HOOK = ROOT / "scripts" / "hooks" / "durability_push.sh"
+#: Overridable, as in the sibling suites, so this file can be run against a MODIFIED copy of the
+#: current hook -- for example one with a delay before its ``update-ref``:
+#:     MEFOR_DURABILITY_HOOK=/tmp/delayed.sh pytest <this file>
+#: NOT a red-first control against a hook older than ``$LAST``: every ``wait_for_landed`` then fails
+#: in setup, the negative control included, before any test reaches the defect it exists for.
+HOOK = Path(
+    os.environ.get("MEFOR_DURABILITY_HOOK") or (ROOT / "scripts" / "hooks" / "durability_push.sh")
+)
 TIMEOUT = 180
 #: The push is detached, so the remote is polled. Generous for the same reason the sibling file
 #: states: a short budget on a saturated box measures load, not behaviour.
@@ -124,6 +136,29 @@ def wait_for_commit(bare: Path, ref: str, sha: str) -> bool:
     return False
 
 
+def wait_for_landed(repo: Path, bare: Path, tag: str, sha: str) -> bool:
+    """Poll until BOTH the remote ``tag`` and the local ``$LAST`` name ``sha``.
+
+    **THE REMOTE TAG ALONE DOES NOT MEAN THE HOOK HAS FINISHED.** The hook writes ``$LAST`` only
+    after the moving push succeeds, so for a moment the bare remote names ``sha`` and the local ref
+    does not. Anything that reads ``$LAST`` in that window reads the old value: an assertion here,
+    or the hook itself on the NEXT commit, which decides from ``$LAST`` whether it is a rewrite.
+    CI showed it as an assertion whose message printed the expected list -- the ref was absent at
+    the comparison and present by the time the message was built. Measured 2026-09-22 with a
+    ``sleep`` before the hook's ``update-ref``: at 80ms, 8 of 15 runs failed, 6 in exactly that
+    shape.
+
+    ``$LAST`` is derived from ``tag`` the way the hook derives it.
+    """
+    last = "refs/mefor/durability/" + tag.removeprefix("refs/tags/rescue/auto/")
+    deadline = time.monotonic() + PUSH_WAIT
+    while time.monotonic() < deadline:
+        if peel(bare, tag) == sha and peel(repo, last) == sha:
+            return True
+        time.sleep(0.25)
+    return False
+
+
 def refs(bare: Path, prefix: str = "") -> list[str]:
     args = ["for-each-ref", "--format=%(refname)"]
     if prefix:
@@ -153,8 +188,11 @@ def _feature_with_two_commits(repo: Path, bare: Path) -> tuple[str, str]:
     commit(repo, "base.txt", "base\n")
     git(repo, "checkout", "-q", "-b", "feature")
     first = commit(repo, "a.txt", "one\n")
+    # Landed before the next commit, so the two detached pushes cannot finish out of order and put
+    # the remote tag or ``$LAST`` back on ``first`` after the wait below has seen both on ``tip``.
+    assert wait_for_landed(repo, bare, MOVING, first), "the first capture never landed"
     tip = commit(repo, "b.txt", "two\n")
-    assert wait_for_commit(bare, MOVING, tip), "the pre-rewrite capture never landed"
+    assert wait_for_landed(repo, bare, MOVING, tip), "the pre-rewrite capture never landed"
     return tip, first
 
 
@@ -200,7 +238,9 @@ def test_an_AMEND_preserves_the_commit_it_replaced(armed: tuple[Path, Path]) -> 
     commit(repo, "base.txt", "base\n")
     git(repo, "checkout", "-q", "-b", "feature")
     replaced = commit(repo, "a.txt", "one\n")
-    assert wait_for_commit(bare, MOVING, replaced)
+    assert wait_for_landed(repo, bare, MOVING, replaced), (
+        "the pre-amend capture never reached both the remote tag and $LAST"
+    )
 
     (repo / "a.txt").write_text("one, corrected\n", encoding="utf-8")
     git(repo, "add", "-A")
@@ -267,7 +307,9 @@ def test_the_orphan_ref_is_SELF_DESCRIBING_and_names_what_displaced_it(
     replaced = commit(repo, "base.txt", "base\n")
     git(repo, "checkout", "-q", "-b", "feature")
     replaced = commit(repo, "a.txt", "one\n")
-    assert wait_for_commit(bare, MOVING, replaced)
+    assert wait_for_landed(repo, bare, MOVING, replaced), (
+        "the pre-amend capture never reached both the remote tag and $LAST"
+    )
     (repo / "a.txt").write_text("one, corrected\n", encoding="utf-8")
     git(repo, "add", "-A")
     git(repo, "commit", "-q", "--amend", "-m", "one, corrected")
@@ -303,9 +345,13 @@ def test_the_bookkeeping_ref_is_outside_refs_tags_so_a_tag_sweep_cannot_publish_
     """
     repo, bare = armed
     sha = commit(repo, "base.txt", "base\n")
-    assert wait_for_commit(bare, "refs/tags/rescue/auto/r/main", sha)
+    assert wait_for_landed(repo, bare, "refs/tags/rescue/auto/r/main", sha), (
+        "the remote tag and the local bookkeeping ref never both reached the commit"
+    )
 
-    assert refs(repo, "refs/mefor") == ["refs/mefor/durability/r/main"], refs(repo, "refs/mefor")
+    # Read ONCE, so the message shows the value that was compared and not a later one.
+    mefor = refs(repo, "refs/mefor")
+    assert mefor == ["refs/mefor/durability/r/main"], mefor
     assert refs(repo, "refs/tags") == [], "a local tag would be swept to a public remote"
 
     elsewhere = tmp_path / "elsewhere.git"
