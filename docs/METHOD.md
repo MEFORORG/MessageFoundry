@@ -127,7 +127,9 @@ checkout reaches nothing else.
 ## At least three things outlive your process
 
 1. **The commits on your branch**, pushed.
-2. **The pull request**. It used to carry your `docs/BACKLOG.md` update in the same PR as the code; the ledger left this repository (BACKLOG #1250), so the banner update happens where the ledger lives and no check here can see it.
+2. **The pull request**, once your Manager opens it. It carries code only. The ledger left this
+   repository (BACKLOG #1250), so the Lander writes the banner in the vault after the merge, from
+   the banner text in your last commit message. No check here can see that update.
 3. **The worktree**, which stays on disk after you exit. That is expected, not a leak.
 
 Three more land without your help. A Stop hook (`scripts/hooks/seat-record.ps1`, wired by
@@ -273,8 +275,12 @@ Two more measured facts about PR state, so you do not re-derive them:
 
 ## At least six actions break the fleet, so never take them
 
-Never rewrite the ledger beyond your own item -- it is no longer in this repository (BACKLOG #1250), so this binds wherever you edit it. Update the item your brief cites, in the same
-PR as the code. Read the ledger from `origin/main`, not from your working tree, and fetch first. A
+Never edit the ledger. It lives in the vault (`MEFORORG/MessageFoundry-vault`) since 2026-09-13
+(BACKLOG #1250), and only the Lander writes a banner, after the merge. Put the banner text you would
+write in your last commit message instead. This read *"Update the item your brief cites, in the same
+PR as the code"* until 2026-09-23.
+
+Read the ledger from the vault's `origin/main`, not from a working tree, and fetch first. A
 working-tree copy 36 commits behind once reported 19 closed items as open.
 
 Never grep for the next free ADR or BACKLOG number. Allocate it:
@@ -318,7 +324,7 @@ You have one turn and no way to ask, so when the brief runs out of road, do this
    puts it in the PR body.
 3. If you need a decision, put it in your report, or mail it to the Manager path from your brief.
    It reaches the reader's next turn, not yours.
-4. Leave the BACKLOG item honest. Do not flip a banner to closed for work you did not finish.
+4. Keep the proposed banner honest. Do not propose closed for work you did not finish.
 
 The full suite can outlast a turn. This repo collects two testpaths under a per-test timeout, so a
 whole `pytest` run is not a safe bet against the clock. Run the tests covering your change, push, and
