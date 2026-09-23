@@ -127,10 +127,10 @@ console on PyPI, 0.2.15, was built against a different seam. So run 0.4.0 withou
 
 **What's in the `messagefoundry` package — and what isn't.** It is the **engine**; the operator UI is
 the browser **web console** served same-origin at `/ui`, which ships as a separate wheel
-(`messagefoundry-webconsole`) with its own version, mounted in-process when it matches the engine's UI
-seam (`[security].serve_web_console` turns it on or off), so a headless server, container, or adopter
-install stays lean. (The former PySide6 desktop console was
-retired in favour of the web console — BACKLOG #103; PySide6 now backs only the opt-in `[harness]` test
+(`messagefoundry-webconsole`) with its own version, so a headless server, container, or adopter
+install stays lean. The engine mounts the console in-process, and the console must match the engine's
+UI seam (see above); `[security].serve_web_console` turns it on or off. (The former PySide6 desktop
+console was retired in favour of the web console — BACKLOG #103; PySide6 now backs only the opt-in `[harness]` test
 tooling.) The **VS Code extension is a separate product, not on PyPI** (a VS Code extension is a
 different ecosystem); see *VS Code extension & test harness* below for where to get it.
 

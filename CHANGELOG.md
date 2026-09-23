@@ -13,8 +13,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   truncated tail.** `audit-anchor` / `audit-verify --expected-anchor`, also new in this release (under
   Changed below), landed first and recorded, accurately at the time, that
   `[integrity].audit_verify_on_start` "is unchanged — it is a bare walk and stays blind to a truncated
-  tail". **With this key set, that sentence no longer describes the engine.** Point the new key at the `COUNT:HEAD` file `messagefoundry audit-anchor` writes and every startup
-  compares against it; leave it empty (the default) and the walk is byte-identical to before.
+  tail". **With this key and `audit_verify_on_start = true` both set, that sentence no longer describes
+  the engine.** Point the new key at the `COUNT:HEAD` file `messagefoundry audit-anchor` writes, and
+  every startup that runs the check compares against it. The key alone arms nothing: with
+  `audit_verify_on_start` left at its default of `false`, startup logs a WARNING that the anchor is
+  never read. Leave the key empty (the default) and the walk is byte-identical to before.
   **It consumes the anchor as a PREFIX, not as the CLI's exact seal, and that is the whole reason a
   startup setting can hold one.** The exact seal compares the *current* head, so it diverges on the
   next appended row — and a running engine writes audit rows, so a startup check built on it would
@@ -194,8 +197,8 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ### Changed
 - **BREAKING — an API request body with an unknown or misspelled key is now refused with HTTP 422
-  instead of being accepted and silently dropped.** Pydantic's default is `extra="ignore"`, and none of the 125
-  models in `messagefoundry/api/models.py` and `messagefoundry/api/auth_models.py` overrode it — so a
+  instead of being accepted and silently dropped.** Pydantic's default is `extra="ignore"`, and
+  none of the 125 models in `messagefoundry/api/models.py` and `messagefoundry/api/auth_models.py` overrode it — so a
   key the engine did not recognise vanished and the route answered success. The sharpest case was
   `PUT /users/{id}/channel-scope`: `channels` is optional and `None` means *all channels*, so
   `{"chanels": ["IB_ACME_ADT"]}` asked for one connection and granted every one of them.
@@ -210,8 +213,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   release. ([BACKLOG #1109](docs/BACKLOG.md))
 
 - **BREAKING — a `fhir_lookup` search value now states its KIND, and a plain string carrying one of
-  FHIR's value-layer separators is refused rather than sent.** Percent-encoding is a URL-layer control: it
-  stops one value becoming two search parameters, and it cannot help at the FHIR value layer, where
+  FHIR's value-layer separators is refused rather than sent.** Percent-encoding is a URL-layer
+  control: it stops one value becoming two search parameters, and it cannot help at the FHIR value layer, where
   `,` `|` and `$` are FHIR's own separators. The FHIR specification is explicit that a server
   percent-decodes a parameter value first and reads FHIR's syntax second (R4 section 3.1.1.4.19, R5
   section 3.2.1.5.7), so `%7C` arrives as a live token separator. A message-derived value carrying one
@@ -437,8 +440,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   `harness/load/connscale/intake_audit.py` exists to settle per message.
   ([BACKLOG #1866](docs/BACKLOG.md))
 - **BREAKING — `audit-verify` accepted a zero-byte database, wrote a schema into it, and reported a
-  clean chain of nothing.** The existing guard on `audit-verify`, `audit-anchor` and `rekey-audit` only asked
-  whether the `--db` path *existed*. A zero-byte file exists and is a valid, empty SQLite database —
+  clean chain of nothing.** The existing guard on `audit-verify`, `audit-anchor` and `rekey-audit`
+  only asked whether the `--db` path *existed*. A zero-byte file exists and is a valid, empty SQLite database —
   what a `touch` in an install script, a failed copy or a log-rotation mistake leaves behind — so it
   walked past the guard, `open_store` migrated 372,736 bytes of schema **into the file that was
   meant to be the evidence**, and the command printed `OK: verified 0 audit row(s)` and exited 0. A
@@ -528,8 +531,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   on the same capped budget, so a dead ACK path that nonetheless delivered everything still passes
   when `connections >= sent`; an intake floor cannot catch a fault whose signature is a high read with
   no ACKs. The load runner's copy now catches it on that signature, under the #1866 entry above.
-- **BREAKING — `messagefoundry adr-analyze` exited 0 over an ADR directory that does not exist.** `Path.glob`
-  yields nothing and raises nothing for a missing directory, so a missing, non-directory, or
+- **BREAKING — `messagefoundry adr-analyze` exited 0 over an ADR directory that does not exist.**
+  `Path.glob` yields nothing and raises nothing for a missing directory, so a missing, non-directory, or
   ADR-less `--adr-dir` produced zero reports and `AnalysisResult.ok = True` — the exact shape of a
   clean run. Withdrawing the ADRs would have silently turned a failing advisory check into a
   passing one. `AnalysisResult` now carries an `error` field, set to a line naming the directory
