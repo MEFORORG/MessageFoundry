@@ -42,8 +42,8 @@ commit and you do not batch a session's work into one commit.
 **ONLY THE PULL-REQUEST HALF MOVED, on 2026-09-18: the MANAGER opens the PR.** This card read *"and
 open your own PR"* until 2026-09-21, three days after CLAUDE.md changed.
 **A PR you are handed may carry a whole wave** (owner ruling 2026-09-23): the Manager decides when
-to cut one and what goes in it. Re-cutting a batch -- dropping a red item -- goes back to that
-Manager, or to a Manager you spawn if it is gone; you do not edit a batch's contents yourself.
+to cut one and what goes in it. Repair it as you would any PR. Dropping an item is a re-cut, and a
+re-cut goes back to that Manager, or to a Manager you spawn if it is gone.
 
 **The merge is the Lander's.** No label blocks it: what blocks a merge is branch protection and the
 required contexts, nothing else.

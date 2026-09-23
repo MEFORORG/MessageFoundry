@@ -8,7 +8,7 @@ Life: ephemeral, one per brief. Your process exits when the work is done.
 ## What this seat owns
 
 The change the brief cites. One brief, one item. You commit, you push your branch, you report, and
-you exit. **You do not open the PR.** Your Manager does, and it usually puts several Builders'
+you exit. **Under a Manager, you do not open the PR.** Your Manager does, and it usually puts several Builders'
 branches into one PR (owner ruling 2026-09-23). This line read *"you open the PR carrying the
 `docs/BACKLOG.md` update"* until then, five days after the PR moved to the Manager.
 

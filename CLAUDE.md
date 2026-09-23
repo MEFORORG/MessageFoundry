@@ -326,8 +326,8 @@ recency.
 
 | Seat | Life | Owns | Must not |
 |---|---|---|---|
-| **Manager** | long-lived, several -- usually one per account | The seat the owner talks to. Reads `docs/BACKLOG.md`, writes a disposable brief citing an item, dispatches subagent Builders in its own process, polls for state, pushes, and **decides when to cut a PR and what goes in it** -- usually one PR per wave (owner ruling 2026-09-23). | Build. Attribute a red -- nobody does that now. Enqueue or merge -- both are the Lander's. Wait on inbound messages; it polls instead. Exit with a worker's work unpushed. |
-| **Builder** | ephemeral, one per brief | The change, the commit, and the push. Its Manager opens the PR, usually carrying several Builders' branches. | Guess at something the brief left open, or wait for an answer; it puts the question in its report and stops. Open the PR -- the Manager's. Plan and wait for a "go". Spawn another session. |
+| **Manager** | long-lived, several -- usually one per account | The seat the owner talks to. Reads `docs/BACKLOG.md`, writes a disposable brief citing an item, dispatches subagent Builders in its own process, polls for state, pushes, and **decides when to cut a PR and what goes in it**, usually one PR per wave (owner ruling 2026-09-23). | Build. Attribute a red -- nobody does that now. Enqueue or merge -- both are the Lander's. Wait on inbound messages; it polls instead. Exit with a worker's work unpushed. |
+| **Builder** | ephemeral, one per brief | The change, the commit, and the push. Under a Manager, the Manager opens the PR, usually carrying several Builders' branches. | Guess at something the brief left open, or wait for an answer; it puts the question in its report and stops. Open the PR when a Manager dispatched it; that is the Manager's. Plan and wait for a "go". Spawn another session. |
 | **Watchdog** | as needed | Watching the Lander and keeping it draining. Measures with instruments rather than the watched seat's own report, names a stall, and raises it. Added 2026-09-19. | Take the action it is watching for -- acting destroys the instrument. Drain the queue, take the claim, or drive the lane. Relay an owner grant to the seat it watches. Publish a zero with no control that fired. |
 | **Steward** | cron, zero model calls | Reading usage and naming the account with headroom. | Warn a running session. Nothing can interrupt one. |
 | **Lander** | as needed | Merging, and flipping row statuses after items merge (owner correction 2026-09-21; see the note below). Standing authority on the engine repo and the vault, with no per-action owner approval. The 2026-09-11 POSITIONAL ledger-conflict ruling is RETIRED -- read the notice below, which also covers the *what an item SAYS* half this row's Must-not column used to carry. | Merge a diff it has not read. Arm auto-merge. Resolve a conflict that touches code, or decide which of two deliberate changes to an item survives. |
@@ -714,11 +714,10 @@ gates a merge**, and no seat has to clear one.
   **WHO may press it changed with the Console's retirement on 2026-09-10: enqueuing and merging are
   BOTH the Lander's now.** A Manager does not enqueue, and that is not a narrowing of an old
   permission -- the seat that held it no longer exists, and korus `MANAGER.md` has never granted it.
-  Hand the PR to the Lander once it is open, and leave the queue to it. (This read *"Talk to the
-  Lander before you open a PR"* until 2026-09-23; korus `MANAGER.md` retired that pre-open check on
-  2026-09-18.) Reading this bullet's earlier
-  wording as *"the dispatching seat enqueues"* is exactly the Console-by-substitution error §5's
-  retirement paragraph names.
+  Hand the PR to the Lander once it is open, and leave the queue to it. Reading this bullet's
+  earlier wording as *"the dispatching seat enqueues"* is exactly the Console-by-substitution error
+  §5's retirement paragraph names. **CORRECTED 2026-09-23:** the sentence before it read *"Talk to
+  the Lander before you open a PR"*. Korus `MANAGER.md` retired that pre-open check on 2026-09-18.
 
   **Dequeue before pushing.** Whether a QUEUED entry drops a later push is unmeasured. The hazard
   this bullet was written against, and why it is kept rather than deleted, is in
@@ -751,16 +750,17 @@ gates a merge**, and no seat has to clear one.
   to push. A Builder's final commit message carries the proposed PR title and ledger banner text, so
   the branch is self-describing if the Manager dies before opening it.
 - **THE MANAGER DECIDES WHEN TO CUT A PR, AND ONE PR USUALLY CARRIES A WHOLE WAVE (owner ruling
-  2026-09-23).** A worktree needs its own branch, not its own PR. Each extra PR costs a full CI run
-  plus a merge-queue run, and a feature-branch push costs almost nothing, so Builders push and stop.
-  The Manager merges the wave's pushed branches onto one fresh branch from `origin/main`, runs the
-  checks once on the combined tree, and opens one PR. It cuts that PR at the first of: every Builder
-  in the wave has reported, the batch holds five items, or the Manager is about to close. An item
-  gets its own PR when it fixes a red `main`, changes a security control, carries a landing-order
-  constraint, or conflicts with another item's code; the Manager does not author that resolution.
-  **No other seat decides this.** A Builder cannot, because it exits first. The Lander owns the PR
-  from the handover on, but re-cutting a batch -- dropping a red item -- goes back to the Manager.
-  Every other seat opens its own PR and may batch its own work the same way. The steps, the PR
+  2026-09-23).** A worktree needs its own branch, not its own PR. Each extra PR runs the required
+  suite on `pull_request` and again on `merge_group`, while a feature-branch push runs one small leak
+  scan. So Builders push and stop. The Manager merges the wave's pushed branches in a throwaway
+  worktree, runs the checks once on the combined tree, and opens one PR. It cuts that PR at the
+  first of: every Builder in the wave has reported, five items are ready, or the Manager is about to
+  close. An item gets its own PR when it fixes a red `main`, changes a security control, supersedes
+  an ADR, or must land in order against another open PR. An item that is red or conflicts goes back
+  to a Builder; the Manager never writes that resolution. **No other seat decides this.** A Builder
+  cannot, because it exits first. The Lander owns the PR from the handover on and repairs it like
+  any other, but dropping an item is a re-cut, and re-cuts go back to the Manager. Every other seat
+  opens its own PR and may batch its own work the same way. The steps, the PR
   body shape and the traps are in korus `roles/MANAGER.md`, *When to cut a pull request*.
 - **The merge is the Lander's, and NO LABEL BLOCKS IT.** What blocks a merge is branch protection and
   the required contexts, nothing else. **Reading a diff before merging it is still the job; no check

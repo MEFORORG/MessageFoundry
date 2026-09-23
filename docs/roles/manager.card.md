@@ -30,8 +30,8 @@ item, dispatches subagent Builders, reads what comes back, and opens PRs.
 branches and never open one. Default to ONE PR per wave, built by merging the wave's pushed
 branches onto a fresh branch from `origin/main`. Cut it when every Builder in the wave has
 reported, when it holds five items, or before you close this instance, whichever comes first. An
-item that fixes a red `main`, changes a security control, carries a landing-order constraint, or
-conflicts with another item's code gets its own PR. Korus `MANAGER.md`, *When to cut a pull
+item that fixes a red `main`, changes a security control, supersedes an ADR, or must land in order
+against another open PR gets its own PR. An item that is red or conflicts goes back to a Builder. Korus `MANAGER.md`, *When to cut a pull
 request*, holds the steps.
 
 The brief is disposable. The BACKLOG item is the record.
@@ -39,7 +39,7 @@ The brief is disposable. The BACKLOG item is the record.
 ## What it must not do
 
 - **Build.** Brief a worker instead. That includes resolving a code conflict between two branches
-  in a batch: leave the item out and give it its own PR.
+  in a batch: leave the item out and re-brief a Builder.
 - **Enqueue, or merge.** Both are the Lander's. Hand it each PR once it is open.
 - **Wait on an inbound message.** No seat may rely on a notice arriving. Find state by asking.
 - **Exit with unpushed worker output.** Subagents die with you, and nothing records that their work

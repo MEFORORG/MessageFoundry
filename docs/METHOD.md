@@ -299,9 +299,9 @@ Never announce a hold, a freeze, or a promise about future state. A 2026-08-01 r
 shape stayed "in force" for hours after its condition had cleared. `main` moved four times underneath
 it.
 
-Never spawn a session. No seat in the roster does: the owner starts each Manager, and a Manager's
-workers are subagents in its own process. Why, and what the retired spawn grant measured, are in
-"The KORUS seats" above.
+Do not spawn a session without permission. Only a Manager and the Lander may spawn freely
+(owner ruling 2026-09-16). This read *"No seat in the roster does"* until 2026-09-23, which
+contradicted "The KORUS seats" above.
 
 ---
 
@@ -311,9 +311,11 @@ Report honestly. A truthful "I got this far and stopped here" is worth more than
 
 You have one turn and no way to ask, so when the brief runs out of road, do this.
 
-1. Push the branch before your turn ends, green or not. Open the PR as a draft if the checks did not
-   finish. An unpushed branch is lost; a red draft PR is recoverable.
-2. Name in the PR body what you ran, what you skipped, and what is therefore unproven.
+1. Push the branch before your turn ends, green or not. An unpushed branch is lost; a red pushed
+   branch is recoverable. Under a Manager you do not open the PR: the Manager does, often one PR for
+   a whole wave. This step read *"Open the PR as a draft"* until 2026-09-23.
+2. Name in your report what you ran, what you skipped, and what is therefore unproven. The Manager
+   puts it in the PR body.
 3. If you need a decision, put it in your report, or mail it to the Manager path from your brief.
    It reaches the reader's next turn, not yours.
 4. Leave the BACKLOG item honest. Do not flip a banner to closed for work you did not finish.
