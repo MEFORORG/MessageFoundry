@@ -94,7 +94,7 @@ pip install -e .                             # core runtime + SQLite store
 For a **deployment**, pin the published wheel instead (and verify its provenance — see [INSTALL-GUIDE.md](INSTALL-GUIDE.md)):
 
 ```powershell
-pip install "messagefoundry==0.3.2"
+pip install "messagefoundry==0.4.0"
 ```
 
 Add only the extras a host actually needs (each is opt-in and lazy-imported):
@@ -111,7 +111,7 @@ pip install -e ".[webauthn]"     # browser WebAuthn passkeys for the /ui console
 pip install -e ".[otel]"         # OpenTelemetry/OTLP export seam (the /metrics endpoint itself needs no extra)
 ```
 
-(For a deployment wheel, the same extras apply: `pip install "messagefoundry[harness]==0.3.2"`, and the web console installs as its own wheel `pip install "messagefoundry-webconsole==0.2.15"`.) SQLite is the zero-dependency default — you need no extra to run the sample config.
+(For a deployment wheel, the same extras apply: `pip install "messagefoundry[harness]==0.4.0"`, and the web console installs as its own wheel on its own version line: `pip install "messagefoundry-webconsole==0.3.0"`, the console built for engine 0.4.0.) SQLite is the zero-dependency default — you need no extra to run the sample config.
 
 ### 3. Run the engine headless (dev)
 

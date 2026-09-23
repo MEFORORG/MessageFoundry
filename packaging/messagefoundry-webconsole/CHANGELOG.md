@@ -8,8 +8,9 @@ here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/
 
 This package is **separately versioned** from the engine and pins itself to the engine's
 `api._ui_seam.ENGINE_UI_SEAM` via `SUPPORTED_ENGINE_SEAMS`; each entry records the supported engine
-seam. Entries from before BACKLOG #1220 quote the integer that shipped at the time; a current one
-points at the constant instead, because nobody picks that value now. See
+seam. Entries from before BACKLOG #1220 quote the integer that shipped at the time. A release since
+then quotes the digest it shipped with. The Unreleased entry points at the constant instead, because
+nobody picks that value and it can move until the release is cut. See
 [`docs/WEBCONSOLE-PACKAGE.md`](../../docs/WEBCONSOLE-PACKAGE.md) for the seam handshake and the
 engine compatibility range.
 
@@ -18,6 +19,13 @@ engine compatibility range.
 **Supported engine UI seam: the single value in `SUPPORTED_ENGINE_SEAMS` -- read it from
 [`messagefoundry_webconsole/__init__.py`](../../messagefoundry_webconsole/__init__.py), not from
 this line.**
+
+## [0.3.0] — 2026-09-23 — Early Access
+
+**Requires engine 0.4.0. Supported engine UI seam: `75c4117d21fd0b98`**, the value engine 0.4.0
+ships as `messagefoundry.api._ui_seam.ENGINE_UI_SEAM`. With the console on, any other engine refuses
+to start with `UiSeamMismatch`, and that includes every 0.3.x engine. Console 0.2.15 does not work
+with engine 0.4.0, so upgrade the two together.
 
 ### Added
 - **High Availability page** (BACKLOG #1495, ADR 0056). `/ui/cluster`, under Monitoring, renders
@@ -95,9 +103,21 @@ this line.**
   budget. **No engine UI seam change:** the charge reuses the existing `enforce_phi_read_pacing` helper
   the reused handlers already call.
 
+### Notes
+- **pip does not stop an unmatched pair.** The package still declares a bare `messagefoundry`
+  dependency with no version range. So an install of console 0.3.0 beside any engine succeeds, and
+  the seam check at engine startup is what refuses the pair. Pin both: `messagefoundry==0.4.0` with
+  `messagefoundry-webconsole==0.3.0`.
+- **This entry is not the full list of changes since 0.2.15.** It holds what was recorded here while
+  0.3.0 was in development. The complete set is the git history of `messagefoundry_webconsole/` and
+  `packaging/messagefoundry-webconsole/` between the `webconsole-v0.2.15` and `webconsole-v0.3.0`
+  tags.
+
 ## [0.2.15] — 2026-07-06 — Early Access
 
-Initial release of the web console as a standalone distribution. **Supported engine UI seam: `1`.**
+Initial release of the web console as a standalone distribution. **Supported engine UI seam: `15`.**
+The wheel published under the `webconsole-v0.2.15` tag on 2026-07-29 accepts seam `15` only. This line
+said `1` until 0.3.0 was cut; `1` was the seam when this entry was written, not the one that shipped.
 
 ### Added
 - **Extracted the `/ui` browser ops console into a separate, same-origin mounted package** (Option B,
@@ -132,5 +152,6 @@ Initial release of the web console as a standalone distribution. **Supported eng
 - Publishing this wheel to PyPI is a separate owner step (re-add the engine `[webconsole]` extra, set the
   compat ranges, re-lock, add the release job) — see [`RELEASE.md`](RELEASE.md). It is not wired yet.
 
-[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.15...HEAD
-[0.2.15]: https://github.com/MEFORORG/MessageFoundry/releases/tag/v0.2.15
+[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/webconsole-v0.3.0...HEAD
+[0.3.0]: https://github.com/MEFORORG/MessageFoundry/releases/tag/webconsole-v0.3.0
+[0.2.15]: https://github.com/MEFORORG/MessageFoundry/releases/tag/webconsole-v0.2.15

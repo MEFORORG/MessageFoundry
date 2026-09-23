@@ -114,16 +114,19 @@ pip install "messagefoundry[dicom]==<version>"       # DICOM codec + C-STORE SCP
 pip install "messagefoundry[harness]==<version>"     # the standalone PySide6 test harness GUI
 ```
 
-**No published web console works with engine 0.4.0.** The browser console (`/ui`) ships as its own
-wheel, `messagefoundry-webconsole`, with its own version numbers. It does not share the engine's
-version, so `messagefoundry-webconsole==0.4.0` does not exist. The engine mounts a console only if
-it was built against this engine's UI seam, the version of the interface between the two. The only
-console on PyPI, 0.2.15, was built against a different seam. So run 0.4.0 without it:
+**Web console 0.3.0 is the one that pairs with engine 0.4.0.** The browser console (`/ui`) ships as
+its own wheel, `messagefoundry-webconsole`, with its own version numbers. It does not share the
+engine's version, so `messagefoundry-webconsole==0.4.0` does not exist. The engine mounts a console
+only if it was built against this engine's UI seam, the version of the interface between the two.
+Console 0.3.0 was built against engine 0.4.0's seam. It is published alongside engine 0.4.0, under
+its own `webconsole-v0.3.0` tag. Pin the pair: `messagefoundry==0.4.0` with
+`messagefoundry-webconsole==0.3.0`. Without that console, engine 0.4.0 behaves like this:
 
 - **No console installed:** the engine serves the JSON API only and prints a warning at startup. If you
   set `[security].serve_web_console = true`, it refuses to start instead.
-- **Console 0.2.15 installed, console on:** the engine refuses to start. The console is on by default
-  for a loopback bind. Set `[security].serve_web_console = false`, or uninstall the console.
+- **Console 0.2.15 installed, console on:** the engine refuses to start, because 0.2.15 was built
+  against a different seam. The console is on by default for a loopback bind. Upgrade the console to
+  0.3.0, or set `[security].serve_web_console = false`.
 
 **What's in the `messagefoundry` package — and what isn't.** It is the **engine**; the operator UI is
 the browser **web console** served same-origin at `/ui`, which ships as a separate wheel
@@ -175,8 +178,9 @@ python -m messagefoundry serve --config samples/config --db messagefoundry.db --
 # API on http://127.0.0.1:8765 — GET /connections, /messages, /stats, WS /ws/stats
 ```
 
-Then open the admin console in a browser (install the web console alongside the engine —
-`pip install -e packaging/messagefoundry-webconsole` — and set `[security].serve_web_console = true`):
+Then open the admin console in a browser (install the web console alongside the engine with
+`pip install -e packaging/messagefoundry-webconsole`; it is on by default for a loopback bind, so
+there is no switch to set):
 
 ```bash
 # browse to http://127.0.0.1:8765/ui and sign in

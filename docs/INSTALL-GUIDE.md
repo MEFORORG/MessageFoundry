@@ -283,7 +283,7 @@ release built for the engine version you pinned. The console is **on by default*
 instance installing it is all you need:
 
 ```powershell
-pip install "messagefoundry-webconsole==0.2.15"   # the /ui web console, into the same venv
+pip install "messagefoundry-webconsole==0.3.0"    # the /ui web console for engine 0.4.0, into the same venv
 # then (re)start the engine — there is no switch to turn on. To turn the console OFF, set
 # [security].serve_web_console = false (the old [api].serve_ui spelling is refused at config load)
 ```

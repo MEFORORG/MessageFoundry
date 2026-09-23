@@ -480,11 +480,13 @@ accepted and committed was ACKed, and a log-write failure neither loses it nor r
 ## Admin console (in a browser)
 
 This service is **headless**. Operators watch and run it from the **browser web console** served
-same-origin at `/ui` (not part of the service runtime — a separate, version-matched wheel the engine
-mounts in-process). It publishes as its **own** distribution, so install it into the engine venv:
+same-origin at `/ui` (not part of the service runtime — a separate wheel the engine mounts
+in-process). It publishes as its **own** distribution on its own version line. With the console on,
+the engine refuses to start beside a console built for a different UI seam, so match the pair:
+console 0.3.0 for engine 0.4.0. Install it into the engine venv:
 
 ```powershell
-pip install messagefoundry-webconsole                # into the engine venv
+pip install "messagefoundry-webconsole==0.3.0"       # into the engine venv (pairs with engine 0.4.0)
 pip install -e packaging/messagefoundry-webconsole   # or, from a source checkout
 ```
 
