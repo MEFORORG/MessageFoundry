@@ -2938,7 +2938,7 @@ def create_app(
     async def test_alert_email(
         request: Request,
         body: AlertTestEmailRequest | None = None,
-        # BACKLOG #287 (ASVS 2.4.2): paced, because each request dials a live outbound SMTP server.
+        # BACKLOG #287 (ASVS 2.4.2): paced, because a configured request dials a live SMTP server.
         identity: Identity = Depends(require_paced(Permission.SERVICE_CONFIGURE)),
     ) -> AlertTestEmailResult:
         """Send a synthetic, **PHI-free** test event through the configured ``[alerts]`` email transport

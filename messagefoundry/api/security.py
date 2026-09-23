@@ -729,7 +729,7 @@ def require_step_up_action(
             # factory SILENTLY STRIPS the pacing floor while reading as a hardening change, because
             # the action binding is visible in the diff and the lost pacing is not. That already
             # happened once: PATCH /users/{user_id} was promoted and lost it, and
-            # docs/SECURITY.md files it under "No limiter of any kind" to this day. Adding it here
+            # docs/SECURITY.md filed it under "No limiter of any kind" until then. Adding it here
             # closes that too rather than only sparing the routes #1148 promotes.
             _enforce_admin_write_pacing(request, auth, identity)
             # NOT redundant with the ASVS 6.3.3 gate in require(), despite covering the same sessions
