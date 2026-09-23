@@ -457,7 +457,7 @@ def test_rsa_2048_signing_key_is_refused() -> None:
     size that floor exists to refuse, so it is the case that shows the raise took effect: the
     RSA-1024 refusal above passed identically under the old floor."""
     two_k = _pem(rsa.generate_private_key(public_exponent=65537, key_size=2048))
-    with pytest.raises(SigningError, match="RSA-2048, below the 3072-bit floor"):
+    with pytest.raises(SigningError, match=f"RSA-2048, below the {_MIN_RSA_BITS}-bit floor"):
         MessageSigner(OutboundSigning(algorithm="RS256", private_key=two_k))
 
 
@@ -482,7 +482,7 @@ def test_an_ec_key_needs_no_size_floor(ec_pem: str) -> None:
 def test_the_floor_is_stated_once_and_read_from_the_constant() -> None:
     """The refusal must derive from _MIN_RSA_BITS rather than a second hardcoded number, so raising
     the floor cannot leave a stale number in the message an operator actually reads."""
-    assert _MIN_RSA_BITS == 3072
+    assert _MIN_RSA_BITS >= 3072  # ASVS 11.2.3's own number; raising it further needs no edit here
     weak = _pem(rsa.generate_private_key(public_exponent=65537, key_size=1024))
     with pytest.raises(SigningError) as excinfo:
         MessageSigner(OutboundSigning(algorithm="RS256", private_key=weak))

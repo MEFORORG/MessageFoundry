@@ -133,7 +133,7 @@ export function clearEngineTrustAnchors(): boolean {
  * refuse a handshake a correctly configured proxy would complete. Two things changed. The engine now
  * serves exactly these suites by default, so pinning them refuses nothing a stock engine speaks. And
  * Node's default still offers the CBC-SHA2 suites the engine's allow-list excludes, so an unpinned
- * client was the one place in the product still offering them. The cost that argument named is real
+ * client kept offering them to the engine. The cost that argument named is real
  * and now paid on purpose: a TLS terminator in front of the engine that speaks only CBC suites will
  * fail the handshake, and the fix is on that terminator. TLS 1.3 is not constrained by this list.
  */

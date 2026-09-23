@@ -280,7 +280,6 @@ def test_the_rest_opener_handshake_is_unchanged_by_the_assertion() -> None:
 
     assert tls13(engine) == tls13(stock)
     assert tls12(engine) == list(tls_policy.APPROVED_TLS12_SUITES)
-    assert set(tls12(stock)) - set(tls12(engine)), "control: urllib's default must offer more"
     assert engine.verify_mode == stock.verify_mode
     assert engine.check_hostname == stock.check_hostname
     assert engine.minimum_version == stock.minimum_version

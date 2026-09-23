@@ -206,9 +206,10 @@ def _load_private_key(setting: str, private_key: str, password: str | None) -> _
 #: #300). ASVS 11.2.3 asks for at least 128 bits and names RSA-3072 as the RSA equivalent; 2048 gives
 #: about 112. The floor was 2048 until #300, which is where NIST SP 800-131A and ASVS 11.4.1 stop.
 #:
-#: Raising it here costs no counterparty anything, which is why this key went first and alone. The
-#: operator generates it and registers only its public half, so nobody else chose it and no
-#: handshake with anybody can break. The CA-issued DIRECT signer key in ``transports/direct.py`` and
+#: This key went first and alone because the operator generates it and registers only its public
+#: half, so nobody else chose it and no TLS handshake depends on it. One cost is possible and was
+#: not measured: an authorization server that caps the RSA size it accepts for a registered SMART or
+#: OAuth2 client-assertion key. ES384 (P-384) is the fallback there, and it needs no floor here. The CA-issued DIRECT signer key in ``transports/direct.py`` and
 #: the IdP keys ``require_public_key_for_alg`` admits are counterparty-facing, and are NOT raised by
 #: this constant (BACKLOG #1166 says not to fold them in).
 #:

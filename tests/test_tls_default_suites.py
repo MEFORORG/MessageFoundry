@@ -71,6 +71,19 @@ _ROOT = Path(__file__).resolve().parent.parent
 CBC_ONLY = "ECDHE-ECDSA-AES128-SHA256"
 AEAD_ONLY = "ECDHE-ECDSA-AES128-GCM-SHA256"
 
+#: Whether this build's interpreter default offers anything beyond the approved list. The controls
+#: below need it to: on a build whose default is ALREADY the approved list, a stock context cannot
+#: talk to a CBC-only peer either, and "the narrowing did it" cannot be shown. They SKIP there rather
+#: than fail, because the product is still correct on such a build; only the control is unavailable.
+_DEFAULT_OFFERS_MORE = bool(
+    {str(c["name"]) for c in ssl.create_default_context().get_ciphers()}
+    - set(APPROVED_TLS12_SUITES)
+    - {"TLS_AES_256_GCM_SHA384", "TLS_CHACHA20_POLY1305_SHA256", "TLS_AES_128_GCM_SHA256"}
+)
+_needs_wider_default = pytest.mark.skipif(
+    not _DEFAULT_OFFERS_MORE, reason="this build's default offers only the approved suites"
+)
+
 _NB = datetime.datetime(2020, 1, 1, tzinfo=datetime.UTC)
 _NA = datetime.datetime(2040, 1, 1, tzinfo=datetime.UTC)
 
@@ -319,6 +332,7 @@ SERVER_HOPS: dict[str, Callable[[_Pki], ssl.SSLContext]] = {
 # --- the controls: the CBC-only peers are real, and a stock context still talks to them ------------
 
 
+@_needs_wider_default
 def test_control_a_stock_client_context_handshakes_with_the_cbc_only_server(pki: _Pki) -> None:
     """CONTROL for every client refusal below. The untouched interpreter default still offers
     ``CBC_ONLY``, so this handshake completes on it. If it failed, every refusal below would be
@@ -327,6 +341,7 @@ def test_control_a_stock_client_context_handshakes_with_the_cbc_only_server(pki:
     assert _handshake(stock, _peer_server(pki, CBC_ONLY)) == CBC_ONLY
 
 
+@_needs_wider_default
 def test_control_a_stock_server_context_handshakes_with_the_cbc_only_client(pki: _Pki) -> None:
     """CONTROL for every server refusal below, the same argument from the other side."""
     stock = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -415,6 +430,7 @@ def test_the_rank_rule_can_reject_a_wrong_order() -> None:
     assert swapped != sorted(swapped, key=_rank)
 
 
+@_needs_wider_default
 def test_narrowing_removes_suites_and_never_reorders_the_ones_it_keeps() -> None:
     """The tuple's comment claims it IS the interpreter default's order with the six CBC-SHA2 suites
     taken out. Measured against the local default rather than restated, because the default list is

@@ -115,6 +115,16 @@ def test_rsa_jwk_round_trips(rsa_key: rsa.RSAPrivateKey) -> None:
     assert isinstance(key, rsa.RSAPublicKey)
 
 
+def test_a_2048_bit_idp_key_is_still_accepted() -> None:
+    """POSITIVE CONTROL at the JWKS floor, which stays 2048 (BACKLOG #1166: an IdP key is a
+    counterparty's). The fixtures above moved to 3072 because they also SIGN through
+    CompactJwtSigner, whose floor BACKLOG #300 raised, so without this nothing here would go red if
+    verification started refusing the 2048-bit keys common IdPs publish."""
+    two_k = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    key = oidc.jwk_to_public_key(_rsa_jwk(two_k, "k2048"))
+    assert isinstance(key, rsa.RSAPublicKey) and key.key_size == 2048
+
+
 def test_undersized_rsa_is_refused() -> None:
     small = rsa.generate_private_key(public_exponent=65537, key_size=1024)
     with pytest.raises(oidc.JwksError, match="1024 bits; the floor is 2048"):

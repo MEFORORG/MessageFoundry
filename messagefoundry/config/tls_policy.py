@@ -625,8 +625,9 @@ def harden_cipher_suites(ctx: ssl.SSLContext, *, connector: str) -> None:
     # remedy available is the one already taken: constrain what an operator may CONFIGURE
     # (`validate_tls_ciphers` refuses CBC-SHA2 outright) and leave the inherited default's six suites
     # in place. BACKLOG #300 has since removed them from every context the engine builds, by default,
-    # so the MAC-then-encrypt exposure this paragraph describes now lives only where a LIBRARY builds
-    # the context (ldap3, hvac, the ODBC driver), which is BACKLOG #1170's terminal-state third.
+    # so the MAC-then-encrypt exposure this paragraph describes is left on the contexts the engine
+    # does not narrow. At least: those a LIBRARY builds (ldap3, hvac, the ODBC driver, asyncpg on the
+    # default store path) and the tray's own health probe. The ADR 0188 amendment's table is the list.
     #
     # THAT RETENTION IS AN IN-CODE DECISION RECORDED ABOVE, AND ITS INTEROP PREMISE IS UNMEASURED.
     # An earlier draft of this comment called it "owner-ratified", which was wrong and is retracted

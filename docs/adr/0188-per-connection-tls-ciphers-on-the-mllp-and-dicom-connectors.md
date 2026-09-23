@@ -2,7 +2,7 @@
 
 - **Status:** Accepted (2026-09-14) — built. **Amended 2026-09-23 (BACKLOG #300):** unset now narrows to the
   approved suites on all four seams, and the approved list is the default on every context the engine
-  builds. See the amendment at the end; it supersedes AC-4, AC-5 and AC-6 below.
+  builds, with recorded exceptions. See the amendment at the end; it supersedes AC-4, AC-5 and AC-6 below.
 - **Date:** 2026-09-14
 - **Related:** [ADR 0002](0002-phase2-transport-security-and-strong-auth.md) (WP-13b MLLP-over-TLS) · [ADR 0025](0025-dicom-codec-store-connectors.md) (DICOM C-STORE connectors) · [ADR 0094](0094-granular-expiry-only-tls-relaxation.md) (the per-connection TLS opt-in this copies) · [ADR 0172](0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md) (the engine always serves TLS) · CLAUDE.md §9 (PHI on the wire)
 
@@ -178,7 +178,7 @@ the peer census.
 ## Amendment (2026-09-23): the approved suites become the default (BACKLOG #300)
 
 **The approved AEAD suites are now the default TLS 1.2 list on every context the engine builds, MLLP
-and DICOM included, with the two recorded exceptions in the table below.** This reverses the boundary the Decision above called hard. Two owner rulings
+and DICOM included, with the exceptions recorded in the table below.** This reverses the boundary the Decision above called hard. Two owner rulings
 allow it, one for each half, and this section is the in-repo record of both.
 
 ### What changed
