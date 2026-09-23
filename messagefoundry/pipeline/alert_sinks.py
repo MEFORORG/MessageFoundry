@@ -923,6 +923,41 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             }
         )
 
+    def approval_stale_requester(self, approval_id: str, *, operation: str, reason: str) -> None:
+        # ASVS 8.3.2: a dual-control release was refused on the requester's standing. The approval id
+        # stands in for "connection", so the throttle and the ADR 0044 instance key per request: two
+        # different stale requests both page, and repeated tries on one request fold into one. The
+        # reason slug lands in the instance's reason column. No username, no params, no PHI.
+        self._emit(
+            {
+                "type": "approval_stale_requester",
+                "connection": approval_id,
+                "operation": operation,
+                "reason": reason,
+            }
+        )
+
+    def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
+        # ADR 0079 mechanism 2: the mass-revoke breaker tripped and the pass applied nothing. The fixed
+        # source label keys the throttle, so a standing misconfiguration that trips every pass pages
+        # once per cooldown rather than once per pass. `detail` is the latched operator explanation,
+        # and it is what the instance's reason column shows (detail wins over reason there).
+        self._emit(
+            {
+                "type": "ad_reconcile_aborted",
+                "connection": name,
+                "reason": reason,
+                "probed": probed,
+                "detail": detail,
+            }
+        )
+
+    def ad_session_revoked(self, name: str, *, reason: str) -> None:
+        # ADR 0079 mechanism 2: a directory principal's sessions were revoked. Keyed on the username so
+        # each revoked principal is its own instance. The username is an operator account name, the same
+        # value the auth.ad_session_revoked audit row carries as its actor; it is not message content.
+        self._emit({"type": "ad_session_revoked", "connection": name, "reason": reason})
+
     def gcm_invocations(self, name: str, *, key_id: str, invocations: int, ceiling: int) -> None:
         # ASVS 11.3.4: the active DEK is approaching its AES-GCM invocation ceiling. The key label
         # stands in for "connection" so the realert throttle + subject keying + rule matching work

@@ -9,6 +9,17 @@ can never approve their own (enforced server-side). On approval the captured ope
 and **both identities** land in the hash-chained audit log. A request older than
 ``[approvals].expiry_hours`` can no longer be approved.
 
+On release the **requester** is re-validated too (ASVS 8.3.2). The request is refused, audited and
+alerted if the requester no longer exists, is disabled, no longer holds the permission the operation
+requires, or has left the channel scope it needs. Authority is read at release rather than remembered
+from the request, because it can be withdrawn inside the ``expiry_hours`` window.
+
+The check reads the ENGINE's copy of the account: the ``users`` row and its stored roles and scope.
+For a directory (AD) requester that copy lags the directory. The reconciler revokes an absent
+principal's sessions without disabling the row, and it re-diffs roles only for principals holding a
+live session. So a directory-side disable, delete or demotion is seen here only once it has reached
+the engine's row. Probing the directory at release is not built.
+
 The registry (op key -> executor) is populated by the API wiring, where the engine is in scope; this
 module owns only the generic hold/approve/reject mechanics over the ``pending_approvals`` store table.
 """
@@ -23,7 +34,10 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
+from messagefoundry.auth.identity import Identity
+from messagefoundry.auth.permissions import Permission
 from messagefoundry.config.settings import ApprovalsSettings
+from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.store.base import Store
 
 log = logging.getLogger(__name__)
@@ -31,12 +45,25 @@ log = logging.getLogger(__name__)
 #: An executor re-runs a captured operation on approval, returning a small JSON-able result summary.
 Executor = Callable[[Mapping[str, Any]], Awaitable[dict[str, Any]]]
 
+#: Resolves a ``users.id`` to its CURRENT :class:`Identity` (roles, custom-role overlay, channel scope),
+#: or ``None`` when it cannot. Injected rather than imported so this module never reaches the auth
+#: service directly. The API wiring late-binds it, because the service is attached after the gate.
+IdentityResolver = Callable[[str], Awaitable[Identity | None]]
+
+#: Whether a re-resolved requester may still act on THESE captured params. This is the channel-scope
+#: half of an operation's authority, which a fixed permission cannot express.
+ScopeCheck = Callable[[Identity, Mapping[str, Any]], bool]
+
 
 @dataclass(frozen=True)
 class _Operation:
     key: str
     label: str  # human description, surfaced in the pending list + audit
     execute: Executor
+    #: The permission the operation's own endpoint demands of the requester. Re-checked at release.
+    permission: Permission
+    #: Optional scope predicate over the captured params, re-checked at release beside ``permission``.
+    in_scope: ScopeCheck | None = None
 
 
 class ApprovalError(Exception):
@@ -53,13 +80,36 @@ class ApprovalGate:
     """Holds the registry of approvable operations and the hold/approve/reject mechanics. One instance
     per app; created with the live store + the resolved ``[approvals]`` settings."""
 
-    def __init__(self, store: Store, settings: ApprovalsSettings) -> None:
+    def __init__(
+        self,
+        store: Store,
+        settings: ApprovalsSettings,
+        *,
+        resolve_identity: IdentityResolver | None = None,
+        alert_sink: AlertSink | None = None,
+    ) -> None:
         self._store = store
         self._settings = settings
         self._ops: dict[str, _Operation] = {}
+        # With no resolver the requester's permissions cannot be re-read, so approve() refuses every
+        # release (fail closed) rather than executing on authority it could not check.
+        self._resolve_identity = resolve_identity
+        self._alert_sink: AlertSink = alert_sink if alert_sink is not None else LoggingAlertSink()
 
-    def register(self, key: str, label: str, execute: Executor) -> None:
-        self._ops[key] = _Operation(key=key, label=label, execute=execute)
+    def register(
+        self,
+        key: str,
+        label: str,
+        execute: Executor,
+        *,
+        permission: Permission,
+        in_scope: ScopeCheck | None = None,
+    ) -> None:
+        """Register an approvable operation. ``permission`` is REQUIRED, so no operation can become
+        approvable without naming the authority its requester must still hold at release."""
+        self._ops[key] = _Operation(
+            key=key, label=label, execute=execute, permission=permission, in_scope=in_scope
+        )
 
     def _gated(self, operation: str) -> bool:
         return self._settings.enabled and operation in self._settings.operations
@@ -134,7 +184,8 @@ class ApprovalGate:
         client: str | None = None,
     ) -> dict[str, Any]:
         """Release a pending request: the captured operation is re-executed and both identities are
-        audited. Refuses self-approval (the requester is not a valid second approver).
+        audited. Refuses self-approval (the requester is not a valid second approver). Also refuses a
+        request whose requester no longer holds the authority it needs (:meth:`_requester_standing`).
 
         **The refusal compares user ids, never usernames (BACKLOG #1540).** The stored ``requester``
         and the live ``approver`` are two snapshots of a directory-writable name, taken up to
@@ -166,12 +217,33 @@ class ApprovalGate:
             op is None
         ):  # registered op was removed between request and approval — refuse, stay pending
             raise ApprovalError(409, f"operation '{operation}' is no longer available")
+        params = json.loads(str(row["params"]))
+        # ASVS 8.3.2: the requester's authority is re-read NOW. It was checked when the request was
+        # made, and it can be withdrawn at any point inside the expiry window: the user deleted or
+        # disabled, a role removed, a channel scope narrowed. It reads the engine's copy of the
+        # account, so a directory-side change counts once it reaches that copy (module docstring). Checked
+        # BEFORE the transition, so a refused request stays pending, like a removed operation above.
+        # It can still be rejected, or released later if the requester's authority is restored.
+        reason = await self._requester_standing(str(requester_user_id), op, params)
+        if reason is not None:
+            await self._refuse_stale_requester(
+                approval_id,
+                operation=op,
+                approver=approver,
+                requester=str(row["requester"]),
+                reason=reason,
+                client=client,
+            )
+            raise ApprovalError(
+                409,
+                "the requester no longer holds the authority this operation requires; reject the "
+                "request, and have an authorized user request it again if it is still needed",
+            )
         # Transition to 'approved' FIRST (atomic, guards a double-approve race); only then execute.
         if not await self._store.decide_pending_approval(
             approval_id, status="approved", approver=approver, decided_at=time.time()
         ):
             raise ApprovalError(409, "request was already decided")
-        params = json.loads(str(row["params"]))
         try:
             result = await op.execute(params)
         except Exception as exc:
@@ -216,6 +288,65 @@ class ApprovalGate:
             "approved_by": approver,
             "result": result,
         }
+
+    async def _requester_standing(
+        self, requester_user_id: str, op: _Operation, params: Mapping[str, Any]
+    ) -> str | None:
+        """``None`` when the requester may still perform ``op`` on ``params``. Otherwise a closed-set
+        reason slug for the audit row and the alert.
+
+        Existence and the disabled flag come from the store row, not from the resolved identity. The
+        resolver deliberately resolves a disabled user too (it also serves the permission inspector),
+        so it cannot say "disabled" on its own."""
+        user = await self._store.get_user(requester_user_id)
+        if user is None:
+            return "requester_missing"
+        if user.disabled:
+            return "requester_disabled"
+        if self._resolve_identity is None:
+            return "requester_unverifiable"
+        identity = await self._resolve_identity(requester_user_id)
+        if identity is None:  # deleted between the two reads, or no auth service is bound
+            return "requester_unverifiable"
+        if not identity.has(op.permission):
+            return "requester_lacks_permission"
+        if op.in_scope is not None and not op.in_scope(identity, params):
+            return "requester_out_of_scope"
+        return None
+
+    async def _refuse_stale_requester(
+        self,
+        approval_id: str,
+        *,
+        operation: _Operation,
+        approver: str,
+        requester: str,
+        reason: str,
+        client: str | None,
+    ) -> None:
+        """Audit and alert a release refused on the requester's standing. The audit row goes first:
+        it is the durable record, and the alert is best-effort by the sink's own contract."""
+        await self._store.record_audit(
+            "approval.stale_requester",
+            actor=approver,
+            detail=json.dumps(
+                {
+                    "approval_id": approval_id,
+                    "operation": operation.key,
+                    "requester": requester,
+                    "reason": reason,
+                    "permission": operation.permission.value,
+                }
+            ),
+            client=client,  # ADR 0150: the approver's address, matching this row's actor
+        )
+        try:
+            self._alert_sink.approval_stale_requester(
+                approval_id, operation=operation.key, reason=reason
+            )
+        except Exception:  # noqa: BLE001 - a sink that breaks its never-raise contract must not
+            # turn the documented 409 into a 500. The audit row above is already written.
+            log.exception("approval %s: the stale-requester alert failed to emit", approval_id)
 
     async def _compensate_failed_execution(
         self,
