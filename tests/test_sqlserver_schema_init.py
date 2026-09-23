@@ -17,6 +17,10 @@ from __future__ import annotations
 
 import types
 
+import pytest
+
+from messagefoundry.config.settings import SchemaManagement
+from messagefoundry.store.base import PROVISION_SCHEMA_COMMAND, SchemaNotProvisionedError
 from messagefoundry.store.pool_metrics import AcquireWaitHistogram
 from messagefoundry.store.sqlserver import _SCHEMA_LOCK, SqlServerStore, _schema_hash
 
@@ -83,12 +87,23 @@ class _FakePool:
         return None
 
 
+def _settings(
+    *, command_timeout: int, mode: SchemaManagement = SchemaManagement.AUTO
+) -> types.SimpleNamespace:
+    """The settings slice _ensure_schema reads. AUTO by default: these contracts are the engine
+    running its OWN DDL; the #305 external-mode cases pass ``mode`` explicitly."""
+    return types.SimpleNamespace(
+        command_timeout=command_timeout,
+        acquire_timeout=30.0,
+        database="MessageFoundry",
+        resolved_schema_management=lambda: mode,
+    )
+
+
 def _make_store(conn: _FakeConn) -> SqlServerStore:
     store = SqlServerStore.__new__(SqlServerStore)
     store._pool = _FakePool(conn)  # type: ignore[assignment]
-    store._settings = types.SimpleNamespace(  # type: ignore[assignment]
-        command_timeout=0, acquire_timeout=30.0
-    )
+    store._settings = _settings(command_timeout=0)  # type: ignore[assignment]
     store._acquire_wait = AcquireWaitHistogram()  # B11: _acquire records acquire-wait into this
     # A1 live cost counters — normally set by __init__ (bypassed here); _commit bumps committed_txns.
     store.committed_txns = 0
@@ -164,9 +179,8 @@ async def test_ensure_schema_exempts_statement_timeout_for_the_ddl_batch() -> No
     executed: list[tuple[str, object]] = []
     conn = _FakeConn(executed)
     store = _make_store(conn)
-    store._settings = types.SimpleNamespace(  # type: ignore[assignment]
-        command_timeout=30, acquire_timeout=30.0
-    )  # non-zero command_timeout, so the DDL override is visible
+    # A non-zero command_timeout, so the DDL override is visible.
+    store._settings = _settings(command_timeout=30)  # type: ignore[assignment]
 
     await store._ensure_schema()
 
@@ -179,9 +193,7 @@ async def test_marker_current_skips_batch_applock_and_timeout_exemption() -> Non
     executed: list[tuple[str, object]] = []
     conn = _FakeConn(executed, marker_current=True)
     store = _make_store(conn)
-    store._settings = types.SimpleNamespace(  # type: ignore[assignment]
-        command_timeout=30, acquire_timeout=30.0
-    )
+    store._settings = _settings(command_timeout=30)  # type: ignore[assignment]
 
     ran = await store._ensure_schema()
 
@@ -193,3 +205,97 @@ async def test_marker_current_skips_batch_applock_and_timeout_exemption() -> Non
     # exemption never engages (a fast-path probe must never hang unbounded).
     assert conn._conn.timeout == 30
     assert conn.committed == 1 and conn.rolledback == 0
+
+
+# --- BACKLOG #305: [store].schema_management = external -----------------------------------------
+
+
+def _is_marker_probe(sql: str) -> bool:
+    return sql.lstrip().upper().startswith("SELECT") and "schema_meta" in sql
+
+
+class _StaleCursor(_FakeCursor):
+    """``schema_meta`` exists but records a different DDL batch: the first start of an upgrade."""
+
+    async def fetchone(self) -> object:
+        if "OBJECT_ID('schema_meta'" in self._last_sql:
+            return (1,)
+        if "schema_hash" in self._last_sql:
+            return ("an-older-build",)
+        return (0,)
+
+
+async def test_external_mode_refuses_a_virgin_database_and_runs_no_ddl() -> None:
+    """The whole point of external mode: open READS the marker and nothing else. No applock, no
+    CREATE, no statement-timeout exemption, and the refusal names the command that clears it."""
+    executed: list[tuple[str, object]] = []
+    conn = _FakeConn(executed)
+    store = _make_store(conn)
+    store._settings = _settings(  # type: ignore[assignment]
+        command_timeout=30, mode=SchemaManagement.EXTERNAL
+    )
+
+    with pytest.raises(SchemaNotProvisionedError) as info:
+        await store._ensure_schema()
+
+    assert PROVISION_SCHEMA_COMMAND in str(info.value)
+    assert executed, "the marker must actually have been read"
+    assert all(_is_marker_probe(sql) for sql, _ in executed), [sql for sql, _ in executed]
+    assert conn._conn.timeout == 30  # the B10 DDL exemption never engaged
+    assert conn.committed == 1 and conn.rolledback == 0  # the probe's read txn is closed
+
+
+async def test_external_mode_refuses_a_stale_marker_without_ddl() -> None:
+    """A schema-moving upgrade: the marker is there but records an older batch. Auto mode would run
+    the batch here; external mode must refuse instead."""
+    executed: list[tuple[str, object]] = []
+    conn = _FakeConn(executed)
+    conn.cursor_obj = _StaleCursor(executed)
+    store = _make_store(conn)
+    store._settings = _settings(  # type: ignore[assignment]
+        command_timeout=30, mode=SchemaManagement.EXTERNAL
+    )
+
+    with pytest.raises(SchemaNotProvisionedError):
+        await store._ensure_schema()
+
+    assert all(_is_marker_probe(sql) for sql, _ in executed)
+
+
+async def test_external_mode_opens_a_provisioned_database() -> None:
+    executed: list[tuple[str, object]] = []
+    conn = _FakeConn(executed, marker_current=True)
+    store = _make_store(conn)
+    store._settings = _settings(  # type: ignore[assignment]
+        command_timeout=30, mode=SchemaManagement.EXTERNAL
+    )
+
+    assert await store._ensure_schema() is False
+    assert all(_is_marker_probe(sql) for sql, _ in executed)
+
+
+async def test_the_same_stale_marker_runs_the_batch_under_auto() -> None:
+    """The control for the stale-marker refusal above: the SAME database state under auto applies the
+    batch, so the refusal is the mode's doing and not the fake's."""
+    executed: list[tuple[str, object]] = []
+    conn = _FakeConn(executed)
+    conn.cursor_obj = _StaleCursor(executed)
+    store = _make_store(conn)
+
+    assert await store._ensure_schema() is True
+    assert any("CREATE TABLE" in sql for sql, _ in executed)
+
+
+async def test_provisioning_applies_the_batch_whatever_the_mode_says() -> None:
+    """``provision-schema`` is the caller external mode routes the DDL to, so it must not refuse."""
+    executed: list[tuple[str, object]] = []
+    conn = _FakeConn(executed)
+    store = _make_store(conn)
+    store._settings = _settings(  # type: ignore[assignment]
+        command_timeout=0, mode=SchemaManagement.EXTERNAL
+    )
+
+    assert await store._ensure_schema(provisioning=True) is True
+    lock_i = _applock_index(executed)
+    first_create = next(i for i, (sql, _) in enumerate(executed) if "CREATE TABLE" in sql)
+    assert first_create > lock_i

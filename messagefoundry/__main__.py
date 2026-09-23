@@ -812,6 +812,36 @@ def main(argv: list[str] | None = None) -> int:
     )
     rotate_key.add_argument("--db", default=None, help="store path (overrides [store].path)")
 
+    # BACKLOG #305 (ASVS 13.2.2): the provisioning half of the server-DB privilege split. Under the
+    # server-DB default [store].schema_management = "external" the engine runs no DDL at open, so a
+    # DBA runs this, as a DDL-capable principal, before the first start and before the first start
+    # of any build whose schema moved.
+    store_cmd = sub.add_parser(
+        "store",
+        help="server-DB store administration: provision-schema runs the schema DDL as a "
+        "provisioning principal, so the engine's runtime login needs no DDL rights (BACKLOG #305)",
+    )
+    store_sub = store_cmd.add_subparsers(dest="store_command", required=True)
+    provision_schema = store_sub.add_parser(
+        "provision-schema",
+        help="create or upgrade the sqlserver/postgres store schema as the CURRENT principal (run "
+        "by a DBA before the first serve and after an upgrade that moves the schema). On SQL "
+        "Server it also enables READ_COMMITTED_SNAPSHOT and ALLOW_SNAPSHOT_ISOLATION",
+    )
+    provision_schema.add_argument(
+        "--service-config",
+        default=None,
+        help="service settings TOML (default: ./messagefoundry.toml if present)",
+    )
+    provision_schema.add_argument(
+        "--username",
+        default=None,
+        help="connect as this provisioning principal instead of [store].username (auth = 'sql' "
+        "or postgres). Its password is read ONLY from MEFOR_STORE_PASSWORD, never an argument. "
+        "Under auth = 'integrated' the command connects as the Windows account running it",
+    )
+    provision_schema.add_argument("--json", action="store_true", help="emit JSON")
+
     backup = sub.add_parser(
         "backup",
         help="take an on-demand DR backup now: snapshot the store + bundle the config, encrypt to a "
@@ -4744,6 +4774,66 @@ def _read_new_password(prompt: str) -> str:
     return first
 
 
+def _store(args: argparse.Namespace) -> int:
+    """`store` command group (BACKLOG #305) — only `provision-schema` today."""
+    return _store_provision_schema(args)
+
+
+def _store_provision_schema(args: argparse.Namespace) -> int:
+    """Run the server-DB schema DDL as a provisioning principal (BACKLOG #305, ASVS 13.2.2).
+
+    Under ``[store].schema_management = external`` — the server-DB default — ``serve`` only reads the
+    ``schema_meta`` marker and refuses on a mismatch, so its login needs row access only. This command
+    is where the DDL went. It does DDL and nothing else: no store key, no rows, no audit row (the
+    audit log is one of the tables it may be creating). Safe to re-run: a current marker is a no-op.
+    """
+    import asyncio
+
+    from pydantic import ValidationError
+
+    from messagefoundry.config.settings import hop_posture_from_ai, load_settings
+    from messagefoundry.store.base import provision_store_schema
+    from messagefoundry.support.redact import redact_log_line
+
+    cli: dict[str, dict[str, object]] = {}
+    if args.username is not None:
+        cli.setdefault("store", {})["username"] = args.username
+    try:
+        settings = load_settings(config_path=args.service_config, cli=cli)
+    except (FileNotFoundError, ValueError, ValidationError) as exc:
+        return _emit_error(str(exc), as_json=args.json)
+    store = settings.store
+    posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
+    try:
+        applied = asyncio.run(provision_store_schema(store, posture=posture))
+    except ValueError as exc:  # SQLite, which builds its own schema
+        return _emit_error(str(exc), as_json=args.json)
+    except Exception as exc:  # noqa: BLE001 - a driver/DDL failure; report it redacted, never a traceback
+        return _emit_error(
+            f"provision-schema failed on the {store.backend.value} database "
+            f"{store.database!r}: {type(exc).__name__}: {redact_log_line(str(exc))[:500]}",
+            as_json=args.json,
+        )
+    state = "applied" if applied else "already current"
+    if args.json:
+        _print_json(
+            {
+                "ok": True,
+                "backend": store.backend.value,
+                "database": store.database,
+                "applied": applied,
+                "schema_management": store.resolved_schema_management().value,
+            },
+            compact=True,
+        )
+    else:
+        print(
+            f"store schema {state}: {store.backend.value} database {store.database!r} "
+            f"([store].schema_management = {store.resolved_schema_management().value!r})"
+        )
+    return 0
+
+
 def _provision_admin(args: argparse.Namespace) -> int:
     """Create the first administrator offline (BACKLOG #1136, ASVS 6.3.2).
 
@@ -6379,6 +6469,7 @@ _DISPATCH = {
     "protect-key": _protect_key,
     "admin-unlock": _admin_unlock,
     "provision-admin": _provision_admin,
+    "store": _store,
     "audit-verify": _audit_verify,
     "audit-anchor": _audit_anchor,
     "rekey-audit": _rekey_audit,

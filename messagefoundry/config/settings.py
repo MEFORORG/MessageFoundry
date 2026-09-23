@@ -213,6 +213,18 @@ class StorePrivilegePosture:
     detail: str = ""
 
 
+class SchemaManagement(str, Enum):  # noqa: UP042
+    """Who runs the store's schema DDL (BACKLOG #305, ASVS 13.2.2).
+
+    ``AUTO``: the engine runs its own DDL batch at open, so its runtime principal needs standing DDL
+    rights. ``EXTERNAL``: a separate provisioning step (``messagefoundry store provision-schema``, run
+    by a DDL-capable principal) owns the DDL, and open only READS the ``schema_meta`` marker and
+    refuses on a mismatch. The runtime principal then needs row access only."""
+
+    AUTO = "auto"
+    EXTERNAL = "external"
+
+
 class SqliteSync(str, Enum):  # noqa: UP042
     NORMAL = "normal"  # crash-safe under WAL, no per-commit fsync (default)
     FULL = "full"
@@ -576,6 +588,14 @@ class StoreSettings(_Section):
     # reads [security].enforcement, NOT the deployment tier, so enforcement='warn' downgrades the
     # refusal to a warning. SQLite is exempt (a local file has no server principal to probe).
     require_least_privilege: bool = False
+    # Who runs the schema DDL (#305, ASVS 13.2.2); see SchemaManagement. None resolves per backend in
+    # resolved_schema_management(): EXTERNAL on SQL Server and Postgres, AUTO on SQLite. External is
+    # the server-DB default because it is the only mode in which the runtime principal can run without
+    # DDL rights; `auto` keeps the engine building and upgrading its own schema at open. Under
+    # external, a fresh database or a build whose schema moved REFUSES to open until a DBA runs
+    # `messagefoundry store provision-schema`. SQLite has no principal to split, so it is always auto
+    # and an explicit `external` there is refused at load (see _schema_management_backend).
+    schema_management: SchemaManagement | None = None
     encrypt: bool = True
     trust_server_certificate: bool = False
     # Optional certificate file to verify the DB server certificate against a PRIVATE / self-signed CA (the
@@ -857,6 +877,28 @@ class StoreSettings(_Section):
                 "Give each install its own database."
             )
         return self
+
+    @model_validator(mode="after")
+    def _schema_management_backend(self) -> StoreSettings:
+        """An explicit ``external`` on SQLite is refused rather than ignored. The file store has no
+        server principal to split, so it always builds its own schema; accepting the setting would let
+        an operator believe the runtime cannot run DDL when it can."""
+        if (
+            self.schema_management is SchemaManagement.EXTERNAL
+            and self.backend is StoreBackend.SQLITE
+        ):
+            raise ValueError(
+                "[store].schema_management = 'external' applies to the sqlserver and postgres "
+                "backends only; the sqlite store always builds its own schema at open"
+            )
+        return self
+
+    def resolved_schema_management(self) -> SchemaManagement:
+        """The mode this store actually runs in (#305): the explicit setting on a server backend,
+        else EXTERNAL there, and always AUTO on SQLite."""
+        if self.backend is StoreBackend.SQLITE:
+            return SchemaManagement.AUTO
+        return self.schema_management or SchemaManagement.EXTERNAL
 
 
 #: The hosts that count as a loopback bind for the OPERATOR API, i.e. not exposed off-box. Both IPv4 and
@@ -5209,8 +5251,8 @@ def security_loosenings(
     ``[auth].ad_session_recheck_seconds``, ``[alerts].email_use_tls``/``email_tls_verify`` (#323
     layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), three per-connection
     deviations — ``cleartext_accepted``, ``tls_allow_expired``, and a generic-ODBC ``DATABASE`` hop
-    with TLS unenforced (#333) -- and the store principal's OBSERVED privilege posture (#1008). It
-    is NOT yet
+    with TLS unenforced (#333) -- the store principal's OBSERVED privilege posture (#1008), and
+    ``[store].schema_management = auto`` on a server backend (#305). It is NOT yet
     an exhaustive registry of every security-relevant switch in every section; ``[store]``/``[auth]``
     carry others (``encrypt``, ``trust_server_certificate``, ``enabled``, ``require_mfa``,
     ``ad_tls_verify``, ``ad_allow_insecure_ldap``, ``oidc_require_mfa_claim``,
@@ -5549,6 +5591,21 @@ def security_loosenings(
                     "its runbook says it must not",
                 )
             )
+    # --- [store].schema_management = auto on a server backend (#305, ASVS 13.2.2). External is the
+    # server-DB default; auto hands the schema DDL back to the runtime principal, which then needs
+    # standing DDL rights. SQLite resolves to auto by construction and is never reported.
+    if (
+        store.backend is not StoreBackend.SQLITE
+        and store.resolved_schema_management() is SchemaManagement.AUTO
+    ):
+        out.append(
+            (
+                "schema_management",
+                "the engine runs its own schema DDL at open ([store].schema_management = 'auto'), so "
+                "its runtime database principal must hold standing DDL rights (db_ddladmin on SQL "
+                "Server, CREATE on the schema on Postgres) that steady-state operation never uses",
+            )
+        )
     return out
 
 

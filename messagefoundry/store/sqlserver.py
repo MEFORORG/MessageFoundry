@@ -57,6 +57,7 @@ from uuid import uuid4
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
+    SchemaManagement,
     SqlAuth,
     StoreBackend,
     StorePrivilegeStatus,
@@ -68,7 +69,9 @@ from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
 from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.base import (
+    PROVISION_SCHEMA_COMMAND,
     UPLOAD_RESERVATION_STALE_AFTER,
+    SchemaNotProvisionedError,
     acquire_pooled,
     warm_pool_connections,
     warm_pool_target,
@@ -2526,7 +2529,13 @@ class SqlServerStore:
         # RCSI must be enabled BEFORE the pool exists: its one-time ALTER ... WITH ROLLBACK IMMEDIATE
         # takes momentary exclusivity, and with no MEFOR pool session open yet it has nothing of ours
         # to terminate (concurrency_fixes (a)).
-        await cls._ensure_database_options(settings, posture=posture)
+        # #305: under external schema management the runtime login runs no DDL at all, so the two
+        # ALTER DATABASE statements move to `provision-schema` and open only reads the state.
+        await cls._ensure_database_options(
+            settings,
+            posture=posture,
+            alter=settings.resolved_schema_management() is SchemaManagement.AUTO,
+        )
         # A DEDICATED EXECUTOR, sized to this pool -- see _build_pool_executor for why sharing the
         # event loop's default one deadlocks rather than merely throttling.
         executor = _build_pool_executor(settings)
@@ -2969,7 +2978,7 @@ class SqlServerStore:
 
     @staticmethod
     async def _ensure_database_options(
-        settings: StoreSettings, *, posture: HopPosture | None = None
+        settings: StoreSettings, *, posture: HopPosture | None = None, alter: bool = True
     ) -> None:
         """Enable READ_COMMITTED_SNAPSHOT (RCSI) so the staged claim/finalize paths read on a
         row-version snapshot rather than taking shared locks that deadlock writers under concurrent
@@ -2978,7 +2987,11 @@ class SqlServerStore:
         session to terminate; IF-guarded on the live state, so the disruptive ALTER fires at most ONCE
         (greenfield first boot) and every later open()/failover is a detect-and-skip no-op. Degrades
         to a warning (never fails open()) when the principal lacks ALTER DATABASE or the lock cannot
-        be taken — emitting the exact statement for a DBA to run out-of-band."""
+        be taken — emitting the exact statement for a DBA to run out-of-band.
+
+        ``alter=False`` (``[store].schema_management = external``, #305) reads the state and issues no
+        ``ALTER``: an OFF option is logged with the provisioning command that sets it, since that
+        command runs this same method with ``alter=True`` as a DDL-capable principal."""
         import aioodbc
 
         db = settings.database
@@ -3002,6 +3015,26 @@ class SqlServerStore:
             # If we cannot read the state, do NOT attempt a disruptive ALTER.
             rcsi_on = bool(row[0]) if row else True
             snapshot_on = (row[1] in (1, 2)) if row else True
+            if not alter:
+                off = [
+                    name
+                    for name, on in (
+                        ("READ_COMMITTED_SNAPSHOT", rcsi_on),
+                        ("ALLOW_SNAPSHOT_ISOLATION", snapshot_on),
+                    )
+                    if not on
+                ]
+                if off:
+                    log.warning(
+                        "%s is OFF on database %r and [store].schema_management is 'external', so the "
+                        "engine will not ALTER DATABASE; run `%s` (it sets both) or have a DBA run "
+                        "ALTER DATABASE [%s] SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE",
+                        " and ".join(off),
+                        db,
+                        PROVISION_SCHEMA_COMMAND,
+                        db,
+                    )
+                return
             if not rcsi_on:
                 try:
                     await cur.execute(
@@ -3051,7 +3084,8 @@ class SqlServerStore:
     async def probe_principal_privileges(self) -> StorePrivilegeReport:
         """Read this login's EFFECTIVE fixed-server-role and database-role membership (#1008,
         ASVS 13.2.2) and report what was observed against the grant ``docs/DEPLOY-SERVER-DB.md`` §1.1
-        prescribes (``db_datareader`` + ``db_datawriter`` + ``db_ddladmin``, and **no** server role).
+        prescribes: ``db_datareader`` + ``db_datawriter``, plus ``db_ddladmin`` only under
+        ``[store].schema_management = auto`` (#305), and **no** server role.
 
         **Both closed role sets are probed BY NAME, not enumerated from the catalog, and that is the
         load-bearing choice.** ``sys.server_principals`` / ``sys.database_principals`` are
@@ -3141,6 +3175,9 @@ class SqlServerStore:
                     f" {', '.join(held_labels) or 'nothing'}"
                 ),
             )
+        # #305: which documented grant the login is measured against. Under external schema management
+        # `provision-schema` runs the DDL as another principal, so db_ddladmin here is excess.
+        external = self._settings.resolved_schema_management() is SchemaManagement.EXTERNAL
         note = (
             "fixed server + database role membership probed BY NAME (authoritative, catalog-visibility"
             " independent); user-defined database roles added best-effort from sys.database_principals"
@@ -3173,14 +3210,29 @@ class SqlServerStore:
                 control_server=bool(control_server),
                 control_database=bool(control_database),
                 database=database,
+                external=external,
             ),
-            detail=f"database user {str(row['db_user'] or '')!r}; {note}",
+            detail=(
+                f"database user {str(row['db_user'] or '')!r}; {note}; measured against the "
+                f"{'runtime (schema_management=external: no db_ddladmin)' if external else 'auto-mode'}"
+                " grant"
+            ),
         )
 
-    async def _ensure_schema(self) -> bool:
+    async def _ensure_schema(self, *, provisioning: bool = False) -> bool:
         """Apply the shipped DDL batch, or skip it entirely when the ``schema_meta`` marker already
-        records this exact batch (ADR 0064). Returns ``True`` iff the batch ran."""
+        records this exact batch (ADR 0064). Returns ``True`` iff the batch ran.
+
+        Under ``[store].schema_management = external`` (#305) an ordinary open only READS the marker and
+        raises :class:`SchemaNotProvisionedError` on a mismatch, running no DDL. ``provisioning=True`` is
+        the ``provision-schema`` caller, which applies the batch whatever the mode says."""
         expected = _schema_hash()
+        if (
+            not provisioning
+            and self._settings.resolved_schema_management() is SchemaManagement.EXTERNAL
+        ):
+            await self._verify_schema_external(expected)
+            return False
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 # FAST PATH (ADR 0064): the marker says this exact DDL batch already ran — skip the
@@ -3237,6 +3289,59 @@ class SqlServerStore:
             except Exception:
                 await conn.rollback()  # roll back the partial DDL batch (M-6)
                 raise
+
+    async def _verify_schema_external(self, expected: str) -> None:
+        """External mode's whole open-time schema step (#305): two reads, no DDL, no applock. A marker
+        that does not record ``expected`` raises :class:`SchemaNotProvisionedError`, which names the
+        provisioning command."""
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                current = await self._schema_marker_current(cur, expected)
+                await self._commit(conn)  # close the probe's read txn (autocommit=False pool)
+            except Exception:
+                await conn.rollback()
+                raise
+        if not current:
+            exc = SchemaNotProvisionedError(self.backend, self._settings.database, expected)
+            log.error("sqlserver: %s", exc)
+            raise exc
+        log.debug("sqlserver: schema verified current (%s…), external management", expected[:12])
+
+    @classmethod
+    async def provision_schema(
+        cls, settings: StoreSettings, *, posture: HopPosture | None = None
+    ) -> bool:
+        """Apply the DDL batch and the two database options as the CURRENT login — the body of
+        ``messagefoundry store provision-schema`` (#305). Returns ``True`` iff the batch ran.
+
+        A one-connection pool and the identity cipher: this touches no row, so it needs no store key.
+        The batch keeps its applock and marker double-check, so it is safe beside a running engine."""
+        try:
+            import aioodbc
+        except ImportError as exc:  # pragma: no cover - exercised only without the extra
+            raise RuntimeError(
+                "SQL Server backend requires the 'sqlserver' extra: "
+                "pip install 'messagefoundry[sqlserver]' (plus the Microsoft ODBC Driver 18)"
+            ) from exc
+        await cls._ensure_database_options(settings, posture=posture, alter=True)
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mefor-provision")
+        try:
+            pool = await aioodbc.create_pool(
+                dsn=connection_string(settings, posture=posture),
+                minsize=1,
+                maxsize=1,
+                autocommit=False,
+                executor=executor,
+            )
+        except Exception:
+            executor.shutdown(wait=False)
+            raise
+        store = cls(pool, settings, posture=posture)
+        store._pool_executor = executor
+        try:
+            return await store._ensure_schema(provisioning=True)
+        finally:
+            await store.close()
 
     @staticmethod
     async def _schema_marker_current(cur: Any, expected: str) -> bool:

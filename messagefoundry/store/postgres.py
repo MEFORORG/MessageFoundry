@@ -66,6 +66,7 @@ from uuid import uuid4
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
+    SchemaManagement,
     StoreBackend,
     StorePrivilegeStatus,
     StoreSettings,
@@ -83,6 +84,7 @@ from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.base import (
     UPLOAD_RESERVATION_STALE_AFTER,
     Row,
+    SchemaNotProvisionedError,
     acquire_pooled,
     warm_pool_connections,
     warm_pool_target,
@@ -1037,32 +1039,7 @@ class PostgresStore:
         message_events: str = "all",
         posture: HopPosture | None = None,
     ) -> PostgresStore:
-        try:
-            import asyncpg
-        except ImportError as exc:  # pragma: no cover - exercised only without the extra
-            raise RuntimeError(
-                "Postgres backend requires the 'postgres' extra: "
-                "pip install 'messagefoundry[postgres]'"
-            ) from exc
-        server_settings = {"application_name": settings.application_name}
-        if settings.db_schema:
-            # Resolve unqualified table names against the configured schema (it must already exist).
-            server_settings["search_path"] = settings.db_schema
-        pool = await asyncpg.create_pool(
-            host=settings.server,
-            port=settings.port,
-            database=settings.database,
-            user=settings.username,
-            password=settings.password,
-            ssl=_build_ssl(settings, posture=posture),
-            min_size=1,
-            max_size=max(1, settings.pool_size),
-            timeout=settings.connect_timeout,  # connection-acquire/connect timeout (seconds)
-            # H-6: a real per-statement timeout (>0) so a hung statement actually times out, unlike
-            # the SQL Server backend's inert per-connection attribute. 0 = no limit (asyncpg: None).
-            command_timeout=(settings.command_timeout or None),
-            server_settings=server_settings,
-        )
+        pool = await cls._create_pool(settings, posture=posture, max_size=settings.pool_size)
         store = cls(
             pool,
             settings,
@@ -1092,21 +1069,84 @@ class PostgresStore:
             raise
         return store
 
-    async def _ensure_schema(self) -> bool:
+    @staticmethod
+    async def _create_pool(
+        settings: StoreSettings, *, posture: HopPosture | None, max_size: int
+    ) -> Any:
+        """The asyncpg pool :meth:`open` and :meth:`provision_schema` both connect through."""
+        try:
+            import asyncpg
+        except ImportError as exc:  # pragma: no cover - exercised only without the extra
+            raise RuntimeError(
+                "Postgres backend requires the 'postgres' extra: "
+                "pip install 'messagefoundry[postgres]'"
+            ) from exc
+        server_settings = {"application_name": settings.application_name}
+        if settings.db_schema:
+            # Resolve unqualified table names against the configured schema (it must already exist).
+            server_settings["search_path"] = settings.db_schema
+        return await asyncpg.create_pool(
+            host=settings.server,
+            port=settings.port,
+            database=settings.database,
+            user=settings.username,
+            password=settings.password,
+            ssl=_build_ssl(settings, posture=posture),
+            min_size=1,
+            max_size=max(1, max_size),
+            timeout=settings.connect_timeout,  # connection-acquire/connect timeout (seconds)
+            # H-6: a real per-statement timeout (>0) so a hung statement actually times out, unlike
+            # the SQL Server backend's inert per-connection attribute. 0 = no limit (asyncpg: None).
+            command_timeout=(settings.command_timeout or None),
+            server_settings=server_settings,
+        )
+
+    @classmethod
+    async def provision_schema(
+        cls, settings: StoreSettings, *, posture: HopPosture | None = None
+    ) -> bool:
+        """Apply the DDL batch as the CURRENT role — the body of ``messagefoundry store
+        provision-schema`` (#305). Returns ``True`` iff the batch ran.
+
+        A one-connection pool and the identity cipher: this touches no row, so it needs no store key.
+        The batch keeps its advisory lock and marker double-check, so it is safe beside a running
+        engine. The objects it creates are OWNED by this role, which is what lets the runtime role
+        hold row grants only."""
+        pool = await cls._create_pool(settings, posture=posture, max_size=1)
+        store = cls(pool, settings)
+        try:
+            return await store._ensure_schema(provisioning=True)
+        finally:
+            await store.close()
+
+    async def _ensure_schema(self, *, provisioning: bool = False) -> bool:
         """Create the schema once, serialized across concurrent opens by a schema advisory lock so
         two processes can't race the DDL (the lock auto-releases at txn end) — or skip the whole
         batch when the ``schema_meta`` marker already records this exact batch (ADR 0064: re-running
         the guarded DDL + migrations under the exclusive lock on EVERY open made N concurrent opens
         convoy, WS-B Finding 2). Returns ``True`` iff the batch ran. Out-of-band drift (an operator
         hand-dropping an object) is no longer healed on every open — the remedy is
-        ``DELETE FROM schema_meta``, which forces one full (idempotent) run."""
+        ``DELETE FROM schema_meta``, which forces one full (idempotent) run.
+
+        Under ``[store].schema_management = external`` (#305) an ordinary open stops after the fast-path
+        read: a marker that does not record this batch raises :class:`SchemaNotProvisionedError` and no
+        DDL runs. ``provisioning=True`` is the ``provision-schema`` caller, which applies the batch
+        whatever the mode says."""
         expected = _schema_hash()
+        external = (
+            not provisioning
+            and self._settings.resolved_schema_management() is SchemaManagement.EXTERNAL
+        )
         async with self._timed_acquire() as conn:
             # FAST PATH: two cheap reads, no lock, no transaction. A virgin/pre-marker DB probes as
             # not-current and falls through to the full run.
             if await self._schema_marker_current(conn, expected):
                 log.debug("postgres: schema current (%s…) — DDL batch skipped", expected[:12])
                 return False
+            if external:
+                exc = SchemaNotProvisionedError(self.backend, self._settings.database, expected)
+                log.error("postgres: %s", exc)
+                raise exc
             async with conn.transaction():
                 # B10/ADR 0060: disable any SERVER-side statement_timeout for this schema txn so a large
                 # first-upgrade FIFO index rebuild (in _migrate_lease_columns) isn't killed by a
@@ -1367,7 +1407,15 @@ class PostgresStore:
         scalar = await self._fetchone(
             "SELECT current_user AS principal, current_catalog AS db_name,"
             " pg_catalog.pg_has_role(current_user, d.datdba, 'MEMBER') AS owns_database,"
-            " pg_catalog.has_database_privilege(current_user, d.oid, 'CREATE') AS create_on_database"
+            " pg_catalog.has_database_privilege(current_user, d.oid, 'CREATE') AS create_on_database,"
+            # #305: the schema-DDL rights, counted as excess only under external schema management.
+            # current_schema() is where the store's unqualified tables live (the pool's search_path).
+            " current_schema() AS store_schema,"
+            " pg_catalog.has_schema_privilege(current_user, current_schema(), 'CREATE')"
+            " AS create_on_schema,"
+            " (SELECT count(*) FROM pg_catalog.pg_class c"
+            "  WHERE c.relnamespace = pg_catalog.to_regnamespace(current_schema())"
+            "  AND pg_catalog.pg_has_role(current_user, c.relowner, 'MEMBER')) AS owned_in_schema"
             " FROM pg_catalog.pg_database d WHERE d.datname = current_catalog"
         )
         if scalar is None:
@@ -1389,6 +1437,22 @@ class PostgresStore:
             for r in rows
         )
         database = str(scalar["db_name"] or self._settings.database or "")
+        external = self._settings.resolved_schema_management() is SchemaManagement.EXTERNAL
+        if external and scalar["create_on_schema"] is None:
+            # No current schema resolved, so the schema-DDL half was NOT READ. Under external mode that
+            # half is the point, so a NULL here is unobserved rather than clean.
+            return StorePrivilegeReport(
+                backend=self.backend,
+                status=StorePrivilegeStatus.UNOBSERVABLE,
+                principal=str(scalar["principal"] or ""),
+                database=database,
+                detail=(
+                    "current_schema() resolved to NULL, so CREATE on the store's schema was NOT READ; "
+                    "[store].schema_management is 'external', which requires the runtime role to hold "
+                    "no schema DDL"
+                ),
+            )
+        schema = str(scalar["store_schema"] or "")
         return StorePrivilegeReport(
             backend=self.backend,
             status=StorePrivilegeStatus.OBSERVED,
@@ -1404,11 +1468,21 @@ class PostgresStore:
                 owns_database=bool(scalar["owns_database"]),
                 create_on_database=bool(scalar["create_on_database"]),
                 database=database,
+                external=external,
+                schema=schema,
+                create_on_schema=bool(scalar["create_on_schema"]),
+                owned_in_schema=int(scalar["owned_in_schema"] or 0),
             ),
             detail=(
                 "roles are every role this principal may assume (pg_has_role MEMBER, so inherited and "
                 "SET ROLE alike); role ATTRIBUTES (SUPERUSER/CREATEROLE/CREATEDB/REPLICATION/BYPASSRLS) "
-                "are Postgres's server-level equivalent and are reported as excess, not as role names"
+                "are Postgres's server-level equivalent and are reported as excess, not as role names; "
+                + (
+                    f"schema_management=external, so CREATE on schema {schema!r} and ownership of its "
+                    "objects are excess"
+                    if external
+                    else "schema_management=auto, so schema DDL rights are expected"
+                )
             ),
         )
 
