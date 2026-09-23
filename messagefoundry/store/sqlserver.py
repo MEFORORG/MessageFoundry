@@ -148,6 +148,7 @@ from messagefoundry.store.store import (
     _qmark_cutoff_case,
     audit_active_key_id,
     audit_append_secret,
+    audit_rekey_when_keyed,
     audit_row_hash,
     build_audit_mac_keys,
     delivery_key,
@@ -1903,6 +1904,8 @@ class SqlServerStore:
         self._audit_first_key_id: str | None = None
         self._audit_range_key_id: str | None = None
         self._audit_range_from: int | None = None
+        self._audit_range_keys: list[str] = []
+        self._audit_ranges_trusted = True
         # #63 message_events verbosity gate ("all"/"errors"/"off"); floor always retained.
         self._message_events = message_events
         self.path = f"{settings.server}/{settings.database}"  # descriptor for db_status
@@ -2639,6 +2642,7 @@ class SqlServerStore:
         self._audit_keyed_from = 1
         self._audit_first_key_id = self._audit_range_key_id = active_id
         self._audit_range_from = 1
+        self._audit_range_keys = [active_id] if active_id is not None else []
 
     def audit_chain_unkeyed(self) -> bool:
         """See :meth:`~messagefoundry.store.store.MessageStore.audit_chain_unkeyed` (#1905)."""
@@ -2669,19 +2673,14 @@ class SqlServerStore:
         self, *, expected_anchor: tuple[int, str] | None = None
     ) -> tuple[bool, str]:
         """Non-silent #190-D migration — enable HMAC keying on an existing keyless chain. Refuses
-        without a DEK, no-op if already keyed, verifies the existing chain first (refusing on any break),
-        then sets the watermark to the next id (never rewrites existing hashes). See the SQLite twin."""
+        without a DEK, verifies the existing chain first (refusing on any break), reports that verify
+        when already keyed (BACKLOG #1904), else sets the watermark to the next id (never rewrites
+        existing hashes). See the SQLite twin."""
         if not self._audit_keyed_capable():
             return False, "no store encryption key/MAC configured; cannot key the audit chain"
         ok, msg = await self.verify_audit_chain(expected_anchor=expected_anchor)
         if self._audit_keyed_from is not None:
-            # BACKLOG #1904: report the verify rather than OK over a keyed chain that does not verify.
-            if not ok:
-                return (
-                    False,
-                    f"audit chain already keyed from id={self._audit_keyed_from}, but {msg}",
-                )
-            return True, f"audit chain already keyed from id={self._audit_keyed_from}; {msg}"
+            return audit_rekey_when_keyed(self._audit_keyed_from, ok, msg)  # BACKLOG #1904
         if not ok:
             return False, f"refusing to key a broken audit chain: {msg}"
         active_id = audit_active_key_id(self._audit_mac_key, self._audit_mac_fn)
@@ -2707,36 +2706,39 @@ class SqlServerStore:
         self._audit_keyed_from = watermark
         self._audit_first_key_id = self._audit_range_key_id = active_id
         self._audit_range_from = watermark
+        self._audit_range_keys = [active_id] if active_id is not None else []
+        self._audit_ranges_trusted = True
         self._audit_chain_unkeyed = False
         return True, f"audit chain keyed from id={watermark}"
 
-    async def _audit_rows(self, from_id: int) -> list[Mapping[str, Any]]:
-        """``AuditRangeHost`` primitive: every audit row with ``id >= from_id``, in id order."""
+    async def _audit_rows(
+        self, from_id: int, *, limit: int | None = None
+    ) -> list[Mapping[str, Any]]:
+        """``AuditRangeHost`` primitive: audit rows with ``id >= from_id``, in id order."""
+        top = "" if limit is None else f"TOP ({int(limit)}) "
         rows: list[Mapping[str, Any]] = list(
             await self._fetchall(
-                "SELECT id, ts, actor, action, channel_id, detail, client, row_hash"
+                f"SELECT {top}id, ts, actor, action, channel_id, detail, client, row_hash"
                 " FROM audit_log WHERE id >= ? ORDER BY id",
                 (from_id,),
             )
         )
         return rows
 
-    async def _audit_latest_range_row(self, from_id: int) -> Mapping[str, Any] | None:
-        """``AuditRangeHost`` primitive: the newest range row at or after ``from_id``."""
-        return await self._fetchone(
-            "SELECT TOP 1 id, detail FROM audit_log WHERE action = ? AND id >= ? ORDER BY id DESC",
-            (AUDIT_KEY_EPOCH_ACTION, from_id),
-        )
+    async def _audit_range_rows(self, from_id: int) -> list[Mapping[str, Any]]:
+        """``AuditRangeHost`` primitive: every range row at or after ``from_id``, in id order.
 
-    async def _persist_audit_first_key(self, key_id: str) -> None:
-        """``AuditRangeHost`` primitive: record the first keyed range's key."""
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute("UPDATE audit_chain_meta SET key_id=? WHERE id=1", (key_id,))
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
+        BIN2 on the predicate: ``audit_log.action`` takes the database's case-insensitive default, and
+        the shared walk matches the action EXACTLY, so a case or trailing-space variant must not be
+        picked here as a range row the walk then treats as an ordinary one."""
+        rows: list[Mapping[str, Any]] = list(
+            await self._fetchall(
+                "SELECT id, detail FROM audit_log"
+                " WHERE action COLLATE Latin1_General_BIN2 = ? AND id >= ? ORDER BY id",
+                (AUDIT_KEY_EPOCH_ACTION, from_id),
+            )
+        )
+        return rows
 
     async def _encrypt_existing_rows(self) -> None:
         """Re-encrypt legacy plaintext bodies in place when encryption is enabled (STORE-1).
@@ -9687,9 +9689,8 @@ class SqlServerStore:
         (:meth:`~messagefoundry.store.store.MessageStore.verify_audit_chain`): every row MAC and the
         anchor head are compared with :func:`hmac.compare_digest` over
         :func:`~messagefoundry.store.store.audit_mac_bytes`, and the walk always completes before the
-        first divergent row id is reported. NOTE this backend counts rows with ``len(rows)`` where the
-        SQLite/Postgres twins carry a ``count`` accumulator — a full walk makes the two equivalent, but
-        do not copy-paste the accumulator form here."""
+        first divergent row id is reported. The walk is the shared
+        :func:`~messagefoundry.store.store.verify_audit_rows` (BACKLOG #1904)."""
         # The walk is `verify_audit_rows`, shared by all three backends (BACKLOG #1904): each keyed row
         # is checked under the key of its OWN range, so a rotation no longer reads as tampering.
         return verify_audit_rows(

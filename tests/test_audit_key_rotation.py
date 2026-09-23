@@ -153,7 +153,7 @@ async def test_rolling_is_idempotent_and_refuses_a_broken_chain(tmp_path: Path) 
         await _seed(store, "a", 2)
         ok, msg = await store.roll_audit_key_epoch()
         assert ok and "already" in msg, msg  # nothing to roll under the same key
-        await store._db.execute("UPDATE audit_log SET actor='mallory' WHERE id=1")
+        await store._db.execute("UPDATE audit_log SET actor='mallory' WHERE id=2")
         await store._db.commit()
     finally:
         await store.close()
@@ -203,6 +203,9 @@ async def test_editing_a_row_of_a_dropped_keys_range_is_caught(tmp_path: Path) -
 
 
 async def test_a_moved_range_boundary_is_caught(tmp_path: Path) -> None:
+    """End to end on a real store. B is held, so the edited range row's own MAC catches this; the
+    closing-record check is pinned on its own, by a key-holder's forgery, in
+    ``test_a_key_holders_range_row_that_misstates_its_range_is_caught``."""
     path, _a, b = await _rotated_and_dropped(tmp_path)
     store = await _open(path, b)
     try:
@@ -244,46 +247,118 @@ async def test_a_forged_range_meta_is_caught(tmp_path: Path) -> None:
     assert not ok
 
 
-async def test_a_leaked_retired_key_cannot_open_a_range_after_the_active_one(
+async def test_rotate_key_refuses_to_reopen_a_key_that_already_keyed_a_range(
     tmp_path: Path,
 ) -> None:
-    """The reason keys are rotated is that one may have leaked. With A leaked and B active, an
-    attacker who can write rows appends an epoch row switching BACK to A, MAC'd under A, then forges
-    freely under A. A key never returns once rotated away from, so the switch-back fails."""
-    path, a, b = await _rotated_and_dropped(tmp_path)
-    leaked = make_cipher(a).audit_mac_key()
-    store = await _open(path, b, (a,))
+    """Rolling A -> B -> back to A would append a range row that can never verify, since a key opens
+    one range only. The roll must refuse and write nothing, not print OK over a permanent break."""
+    path, a, b = tmp_path / "back.db", generate_key(), generate_key()
+    store = await _open(path, a)
     try:
+        await _seed(store, "a", 2)
+    finally:
+        await store.close()
+    await _rotate(path, a, b)
+    store = await _open(path, a, (b,))
+    try:
+        ok, msg = await store.roll_audit_key_epoch()
+        assert not ok and "NEW key" in msg, msg
         cur = await store._db.execute(
-            "SELECT row_hash, detail FROM audit_log WHERE action=? ORDER BY id",
-            (AUDIT_KEY_EPOCH_ACTION,),
+            "SELECT COUNT(*) AS n FROM audit_log WHERE action=?", (AUDIT_KEY_EPOCH_ACTION,)
         )
-        first = await cur.fetchone()
-        assert first is not None
-        a_id = json.loads(first["detail"])["closes"]["key_id"]
+        row = await cur.fetchone()
+        assert row is not None and int(row["n"]) == 1, "a refused roll must write nothing"
+    finally:
+        await store.close()
+
+
+async def test_a_forged_range_row_does_not_route_live_appends(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The open-time answer routes every append, so it is authenticated, not read. A row naming a
+    leaked configured key X that X alone signed must not send new rows to X."""
+    import logging
+
+    from messagefoundry.store.crypto import audit_key_id
+    from messagefoundry.store.store import audit_epoch_detail, audit_handover_tag
+
+    path, a, b = await _rotated_and_dropped(tmp_path)
+    x = generate_key()
+    x_mac = make_cipher(x).audit_mac_key()
+    assert x_mac is not None
+    x_id = audit_key_id(x_mac)
+    store = await _open(path, b, (x,))
+    try:
         cur = await store._db.execute("SELECT row_hash FROM audit_log ORDER BY id DESC LIMIT 1")
         head = await cur.fetchone()
         assert head is not None
-        detail = json.dumps({"key_id": a_id, "closes": {}}, sort_keys=True)
+        closes = {"key_id": "whatever", "from_id": 1, "to_id": 1, "rows": 1, "digest": ""}
+        detail = audit_epoch_detail(x_id, closes, audit_handover_tag(x_id, closes, (x_mac, None)))
         forged = audit_row_hash(
             head["row_hash"],
-            ts=1.0,
+            ts=9.0,
             actor="mallory",
             action=AUDIT_KEY_EPOCH_ACTION,
             channel_id=None,
             detail=detail,
-            key=leaked,
+            key=x_mac,
         )
         await store._db.execute(
             "INSERT INTO audit_log (ts, actor, action, channel_id, detail, client, row_hash)"
             " VALUES (?,?,?,?,?,?,?)",
-            (1.0, "mallory", AUDIT_KEY_EPOCH_ACTION, None, detail, None, forged),
+            (9.0, "mallory", AUDIT_KEY_EPOCH_ACTION, None, detail, None, forged),
         )
         await store._db.commit()
+    finally:
+        await store.close()
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.store.store"):
+        store = await _open(path, b, (x,))
+    try:
+        b_mac = make_cipher(b).audit_mac_key()
+        assert b_mac is not None
+        assert store._audit_range_key_id == audit_key_id(b_mac), (
+            "appends must stay on the active key"
+        )
+        assert any("does not follow" in r.getMessage() for r in caplog.records)
+        ok, msg = await store.roll_audit_key_epoch()
+        assert not ok and "do not authenticate" in msg
         ok, _msg = await store.verify_audit_chain()
         assert not ok
     finally:
         await store.close()
+
+
+def test_a_deeply_nested_range_row_is_a_break_not_an_exception() -> None:
+    """``detail`` is attacker-writable. ``json.loads`` raises RecursionError on deep nesting, which
+    must be reported as a malformed row, never escape and silence the startup tamper alarm."""
+    from messagefoundry.store.store import parse_audit_epoch, verify_audit_rows
+
+    deep = "[" * 100_000
+    assert parse_audit_epoch(deep) is None
+    rows = [
+        {
+            "id": 1,
+            "ts": 1.0,
+            "actor": "u",
+            "action": AUDIT_KEY_EPOCH_ACTION,
+            "channel_id": None,
+            "detail": deep,
+            "client": None,
+            "row_hash": audit_row_hash(
+                "",
+                ts=1.0,
+                actor="u",
+                action=AUDIT_KEY_EPOCH_ACTION,
+                channel_id=None,
+                detail=deep,
+                key=b"k" * 32,
+            ),
+        }
+    ]
+    ok, msg = verify_audit_rows(
+        rows, keyed_from=1, first_key_id="k", mac_keys={"k": b"k" * 32}, mac_fn=None, capable=True
+    )
+    assert not ok and "malformed" in (msg or ""), msg
 
 
 # --- the CLI surface -------------------------------------------------------------------------------
@@ -346,11 +421,26 @@ def test_rekey_audit_does_not_print_ok_over_a_chain_that_does_not_verify(
 # --- the server backends, offline ------------------------------------------------------------------
 
 
-def _rows_across_a_rotation(a_key: bytes, b_key: bytes) -> list[dict[str, object]]:
-    """Three rows under A, a range row under B closing them, two rows under B -- the shape
-    ``rotate-key`` leaves, built here with the shared helpers so both backends read one fixture."""
+def _rows_across_a_rotation(
+    a_key: bytes,
+    b_key: bytes,
+    *,
+    tag_key: bytes | None = None,
+    closes_edit: dict[str, object] | None = None,
+    then: tuple[bytes, bytes] | None = None,
+) -> list[dict[str, object]]:
+    """Three rows under A, a range row opening B, two rows under B -- the shape ``rotate-key`` leaves,
+    built with the shared helpers so every test reads one fixture.
+
+    ``tag_key`` signs the handover (the outgoing key A by default -- pass another to forge it);
+    ``closes_edit`` overrides fields of the ``closes`` record; ``then=(outgoing, incoming)`` appends a
+    SECOND range row opening ``incoming``, handed over under ``outgoing``, and one row under it."""
     from messagefoundry.store.crypto import audit_key_id
-    from messagefoundry.store.store import audit_epoch_detail, audit_range_closing
+    from messagefoundry.store.store import (
+        audit_epoch_detail,
+        audit_handover_tag,
+        audit_range_closing,
+    )
 
     rows: list[dict[str, object]] = []
     prev = ""
@@ -379,13 +469,76 @@ def _rows_across_a_rotation(a_key: bytes, b_key: bytes) -> list[dict[str, object
         row["row_hash"] = prev
         rows.append(row)
 
+    def open_range(outgoing: bytes, incoming: bytes, signer: bytes, from_id: int) -> None:
+        closed = [r for r in rows if int(str(r["id"])) >= from_id]
+        closes = dict(audit_range_closing(closed, key_id=audit_key_id(outgoing), from_id=from_id))
+        closes.update(closes_edit or {})
+        tag = audit_handover_tag(audit_key_id(incoming), closes, (signer, None))
+        add(
+            AUDIT_KEY_EPOCH_ACTION,
+            audit_epoch_detail(audit_key_id(incoming), closes, tag),
+            incoming,
+        )
+
     for i in range(3):
         add("a", json.dumps({"n": i}), a_key)
-    closes = audit_range_closing(rows, key_id=audit_key_id(a_key), from_id=1)
-    add(AUDIT_KEY_EPOCH_ACTION, audit_epoch_detail(audit_key_id(b_key), closes), b_key)
+    open_range(a_key, b_key, tag_key or a_key, 1)
     for i in range(2):
         add("b", json.dumps({"n": i}), b_key)
+    if then is not None:
+        outgoing, incoming = then
+        open_range(outgoing, incoming, outgoing, 4)
+        add("c", json.dumps({"n": 0}), incoming)
     return rows
+
+
+def _verify_rows(
+    rows: list[dict[str, object]], first: bytes, held: tuple[bytes, ...]
+) -> tuple[bool, str | None]:
+    from messagefoundry.store.crypto import audit_key_id
+    from messagefoundry.store.store import verify_audit_rows
+
+    return verify_audit_rows(
+        rows,
+        keyed_from=1,
+        first_key_id=audit_key_id(first),
+        mac_keys={audit_key_id(k): k for k in held},
+        mac_fn=None,
+        capable=True,
+    )
+
+
+_A, _B, _X = b"a" * 32, b"b" * 32, b"x" * 32
+
+
+def test_the_offline_fixture_verifies_so_each_forgery_below_is_the_only_change() -> None:
+    assert _verify_rows(_rows_across_a_rotation(_A, _B), _A, (_A, _B))[0]
+    assert _verify_rows(_rows_across_a_rotation(_A, _B, then=(_B, _X)), _A, (_B, _X))[0]
+
+
+def test_a_configured_key_that_never_keyed_a_range_cannot_open_one() -> None:
+    """The redirect the handover tag exists for. X is configured (retired) and leaked, and never keyed
+    a range. A writer holding X appends a range row naming X, with a CORRECT closing record and a
+    valid MAC under X -- everything but the outgoing key's tag. The tag check alone catches it."""
+    rows = _rows_across_a_rotation(_A, _B, tag_key=_X)
+    ok, msg = _verify_rows(rows, _A, (_A, _B, _X))
+    assert not ok and "not authorised" in (msg or ""), msg
+
+
+def test_a_key_cannot_open_a_second_range_even_when_authorised() -> None:
+    """A -> B -> back to A, handed over correctly under B. Only the one-range-per-key rule catches it,
+    and it is what stops a leaked old key being brought back by anyone who can get one tag signed."""
+    rows = _rows_across_a_rotation(_A, _B, then=(_B, _A))
+    ok, msg = _verify_rows(rows, _A, (_A, _B))
+    assert not ok and "second range" in (msg or ""), msg
+
+
+def test_a_key_holders_range_row_that_misstates_its_range_is_caught() -> None:
+    """A key holder signs a range row whose closing record claims A's range ended a row early. MAC
+    and tag are both valid, so the closing-record check alone catches it."""
+    rows = _rows_across_a_rotation(_A, _B, closes_edit={"to_id": 2})
+    ok, msg = _verify_rows(rows, _A, (_A, _B))
+    assert not ok and "does not match" in (msg or ""), msg
 
 
 @pytest.mark.parametrize("backend", ["postgres", "sqlserver"])

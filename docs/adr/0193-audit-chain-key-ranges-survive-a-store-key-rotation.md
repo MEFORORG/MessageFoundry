@@ -37,23 +37,35 @@ first is opened by a row inside the chain.**
    retired, at construction (`audit_mac_keyring()`), identified by `audit_key_id` -- a one-way digest
    of the DERIVED key under its own label.
 2. **The first range names its key** in the new `audit_chain_meta.key_id` column (all three
-   backends). A pre-existing row has none; the store resolves it once at open by re-MACing the first
-   keyed row under each held key, and records the match.
+   backends), written where the watermark is written. There is no resolution path for a row that
+   lacks one: at zero deployments no such row exists (CLAUDE.md section 0), so a NULL `key_id` under
+   a watermark is reported as a chain that "does not record which key its keyed range is under".
 3. **`rotate-key` opens a new range.** After re-encrypting, it verifies the whole chain (refusing on
    any break) and appends ONE `audit.key_epoch` row, MAC'd under the NEW key. Its detail names the
-   new key and carries a `closes` record for the range it ends: key, first and last id, row count,
-   and a SHA-256 digest over every row's id, chained fields and stored MAC.
+   new key, carries a `closes` record for the range it ends (key, first and last id, row count, and a
+   SHA-256 digest over every row's id, chained fields and stored MAC), and a **handover tag**: a MAC
+   under the OUTGOING key over the new key id and the `closes` record. It refuses, too, when the
+   active key already keyed a range.
 4. **Verify checks each row under its own range's key** (`verify_audit_rows`, one function shared by
    all three backends). A range whose key is no longer held is proved by the digest in the row that
    closes it; that row lies in the next range, so the proof chains forward to the newest range, whose
    key must be held.
 5. **A forged or moved range fails.** The range rows are chain rows, so they are inside every MAC
-   and every anchor. A range row must match the range it closes, and no key may open a second range,
-   so a leaked retired key cannot switch the chain back to itself.
+   and every anchor. A range row must match the range it closes, must carry a handover tag that
+   verifies under the outgoing key whenever that key is held, and must name a key that has not keyed
+   a range before. The tag is what stops a leaked retired key that NEVER keyed a range from opening
+   one: its holder can MAC the row and compute the (unkeyed) digest, but not the outgoing key's tag.
+   The one-range rule stops a key coming back once rotated away from.
 6. **Appends join the CURRENT range**, which is not always the active key's: between a key change
-   and `rotate-key` it is still the retired key's, and the store warns at open not to drop that key.
-   Opening a range is `rotate-key`'s explicit step, never a side effect of an append.
-7. **`rekey-audit` reports the verify** when the chain is already keyed, so it never prints OK over
+   and `rotate-key` it is still the retired key's, and the store warns at open not to drop that key
+   (and says differently, at ERROR, when that key is not configured at all). Opening a range is
+   `rotate-key`'s explicit step, never a side effect of an append.
+7. **The current range is authenticated at open, not read.** It routes every live append, so the
+   open checks, cheaply, that the recorded first key reproduces the first keyed row's MAC and that
+   each range row follows the one before it, is new, and carries a valid handover tag where the
+   outgoing key is held. If any check fails, new rows go under the ACTIVE key, the store logs an
+   ERROR, and `rotate-key` refuses; `audit-verify` reports the break.
+8. **`rekey-audit` reports the verify** when the chain is already keyed, so it never prints OK over
    a chain that does not verify.
 
 ## Acceptance Criteria
@@ -67,10 +79,15 @@ first is opened by a row inside the chain.**
   SYSTEM SHALL report a break rather than verify under the named key.
   → `tests/test_audit_key_rotation.py::test_a_moved_range_boundary_is_caught`
   → `tests/test_audit_key_rotation.py::test_a_forged_range_meta_is_caught`
-- **AC-4** -- IF a range row opens a range under a key that already had one, THEN THE SYSTEM SHALL
-  report a break.
-  → `tests/test_audit_key_rotation.py::test_a_leaked_retired_key_cannot_open_a_range_after_the_active_one`
-- **AC-5** -- IF the chain does not verify, THEN `rotate-key` SHALL write no range row and
+- **AC-4** -- IF a range row opens a range under a key that already had one, or is not authorised
+  by the outgoing key, or misstates the range it closes, THEN THE SYSTEM SHALL report a break.
+  → `tests/test_audit_key_rotation.py::test_a_key_cannot_open_a_second_range_even_when_authorised`
+  → `tests/test_audit_key_rotation.py::test_a_configured_key_that_never_keyed_a_range_cannot_open_one`
+  → `tests/test_audit_key_rotation.py::test_a_key_holders_range_row_that_misstates_its_range_is_caught`
+- **AC-5** -- IF the newest range row does not authenticate at open, THEN THE SYSTEM SHALL key new
+  rows under the active key and refuse to roll.
+  → `tests/test_audit_key_rotation.py::test_a_forged_range_row_does_not_route_live_appends`
+- **AC-6** -- IF the chain does not verify, THEN `rotate-key` SHALL write no range row and
   `rekey-audit` SHALL NOT print OK.
   → `tests/test_audit_key_rotation.py::test_rolling_is_idempotent_and_refuses_a_broken_chain`
   → `tests/test_audit_key_rotation.py::test_rekey_audit_does_not_print_ok_over_a_chain_that_does_not_verify`
@@ -97,6 +114,17 @@ verification at row 1 otherwise; a wholesale rewrite under a leaked key changes 
 out-of-band anchor catches. Between a key change and `rotate-key`, new rows are MAC'd under the
 retired key. Under `vault_transit` the engine sees one range (`vault-transit`); Transit's own key
 versioning is outside this ADR.
+
+Three residuals are recorded rather than solved:
+
+- **`rotate-key` is offline-only, and nothing enforces it.** Another process keeps the range it read
+  at open, so an engine left running would append under the old key after the range row and break
+  the chain. The command's help and PHI.md already say to stop the engine.
+- **A broken chain cannot be rolled.** The roll refuses rather than certify tampered rows with a
+  closing digest, so new rows stay under the old key until the break is dealt with. Whether an
+  operator may roll over a known break (recording it as unverified) is a policy question left open.
+- **Finding the range rows scans `audit_log`** at every open (no index on `action`). Rotations are
+  rare, so the rows are few, but the scan is over every row after the watermark.
 
 **Out of scope** -- vault row #1165's algorithm epoch (digest and KDF label per range); this ADR
 records a KEY per range, and the range row's `detail` is JSON so a later field can be added.

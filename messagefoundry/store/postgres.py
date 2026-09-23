@@ -158,6 +158,7 @@ from messagefoundry.store.store import (
     _opt_float,
     audit_active_key_id,
     audit_append_secret,
+    audit_rekey_when_keyed,
     audit_row_hash,
     build_audit_mac_keys,
     delivery_key,
@@ -996,6 +997,8 @@ class PostgresStore:
         self._audit_first_key_id: str | None = None
         self._audit_range_key_id: str | None = None
         self._audit_range_from: int | None = None
+        self._audit_range_keys: list[str] = []
+        self._audit_ranges_trusted = True
         # #63 message_events verbosity gate ("all"/"errors"/"off"); floor always retained.
         self._message_events = message_events
         self.path = f"{settings.server}/{settings.database}"  # descriptor for db_status
@@ -1809,6 +1812,7 @@ class PostgresStore:
                 self._audit_keyed_from = 1
                 self._audit_first_key_id = self._audit_range_key_id = active_id
                 self._audit_range_from = 1
+                self._audit_range_keys = [active_id] if active_id is not None else []
             else:
                 self._audit_chain_unkeyed = True  # BACKLOG #1905: report, never re-key at open
                 warn_unkeyed_audit_chain(log, rows)
@@ -1842,19 +1846,14 @@ class PostgresStore:
         self, *, expected_anchor: tuple[int, str] | None = None
     ) -> tuple[bool, str]:
         """Non-silent #190-D migration — enable HMAC keying on an existing keyless chain. Refuses
-        without a DEK, no-op if already keyed, verifies the existing chain first (refusing on any break),
-        then sets the watermark to the next id (never rewrites existing hashes). See the SQLite twin."""
+        without a DEK, verifies the existing chain first (refusing on any break), reports that verify
+        when already keyed (BACKLOG #1904), else sets the watermark to the next id (never rewrites
+        existing hashes). See the SQLite twin."""
         if not self._audit_keyed_capable():
             return False, "no store encryption key/MAC configured; cannot key the audit chain"
         ok, msg = await self.verify_audit_chain(expected_anchor=expected_anchor)
         if self._audit_keyed_from is not None:
-            # BACKLOG #1904: report the verify rather than OK over a keyed chain that does not verify.
-            if not ok:
-                return (
-                    False,
-                    f"audit chain already keyed from id={self._audit_keyed_from}, but {msg}",
-                )
-            return True, f"audit chain already keyed from id={self._audit_keyed_from}; {msg}"
+            return audit_rekey_when_keyed(self._audit_keyed_from, ok, msg)  # BACKLOG #1904
         if not ok:
             return False, f"refusing to key a broken audit chain: {msg}"
         active_id = audit_active_key_id(self._audit_mac_key, self._audit_mac_fn)
@@ -1872,31 +1871,33 @@ class PostgresStore:
         self._audit_keyed_from = watermark
         self._audit_first_key_id = self._audit_range_key_id = active_id
         self._audit_range_from = watermark
+        self._audit_range_keys = [active_id] if active_id is not None else []
+        self._audit_ranges_trusted = True
         self._audit_chain_unkeyed = False
         return True, f"audit chain keyed from id={watermark}"
 
-    async def _audit_rows(self, from_id: int) -> list[Mapping[str, Any]]:
-        """``AuditRangeHost`` primitive: every audit row with ``id >= from_id``, in id order."""
-        rows = await self._fetchall(
+    async def _audit_rows(
+        self, from_id: int, *, limit: int | None = None
+    ) -> list[Mapping[str, Any]]:
+        """``AuditRangeHost`` primitive: audit rows with ``id >= from_id``, in id order."""
+        sql = (
             "SELECT id, ts, actor, action, channel_id, detail, client, row_hash"
-            " FROM audit_log WHERE id >= $1 ORDER BY id",
-            from_id,
+            " FROM audit_log WHERE id >= $1 ORDER BY id"
         )
+        if limit is not None:
+            rows: list[Mapping[str, Any]] = await self._fetchall(sql + " LIMIT $2", from_id, limit)
+        else:
+            rows = await self._fetchall(sql, from_id)
         return rows
 
-    async def _audit_latest_range_row(self, from_id: int) -> Mapping[str, Any] | None:
-        """``AuditRangeHost`` primitive: the newest range row at or after ``from_id``."""
-        row: Mapping[str, Any] | None = await self._fetchone(
-            "SELECT id, detail FROM audit_log WHERE action = $1 AND id >= $2 ORDER BY id DESC LIMIT 1",
+    async def _audit_range_rows(self, from_id: int) -> list[Mapping[str, Any]]:
+        """``AuditRangeHost`` primitive: every range row at or after ``from_id``, in id order."""
+        rows: list[Mapping[str, Any]] = await self._fetchall(
+            "SELECT id, detail FROM audit_log WHERE action = $1 AND id >= $2 ORDER BY id",
             AUDIT_KEY_EPOCH_ACTION,
             from_id,
         )
-        return row
-
-    async def _persist_audit_first_key(self, key_id: str) -> None:
-        """``AuditRangeHost`` primitive: record the first keyed range's key."""
-        async with self._timed_acquire() as conn:
-            await conn.execute("UPDATE audit_chain_meta SET key_id = $1 WHERE id = 1", key_id)
+        return rows
 
     async def _encrypt_existing_rows(self) -> None:
         """Encrypt legacy plaintext values in the cipher-covered columns in place when encryption is

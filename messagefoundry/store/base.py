@@ -1621,9 +1621,10 @@ class AuditStore(Protocol):
         self, *, expected_anchor: tuple[int, str] | None = None
     ) -> tuple[bool, str]:
         """Non-silent #190-D migration: enable HMAC keying of the audit chain on an existing keyless
-        store. Refuses without a DEK, is a no-op if already keyed, and verifies the existing keyless
-        chain first (refusing on any break, so a forged chain is never blessed). Sets a watermark; never
-        rewrites existing row hashes. Returns ``(ok, message)``."""
+        store. Refuses without a DEK and verifies the existing chain first (refusing on any break, so a
+        forged chain is never blessed). On an already-keyed chain it changes nothing and reports that
+        verify, so it never answers OK over a chain that does not verify (BACKLOG #1904). Sets a
+        watermark; never rewrites existing row hashes. Returns ``(ok, message)``."""
         ...
 
     async def roll_audit_key_epoch(self) -> tuple[bool, str]:
