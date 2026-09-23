@@ -685,7 +685,12 @@ def test_serve_refuses_a_declared_terminator_without_the_hop_acknowledgement(
     enforcement: str,
 ) -> None:
     _posture_b_toml(
-        tmp_path, intra="mtls", floor="1.2", enforcement=enforcement, loopback=loopback, ack=False
+        tmp_path,
+        intra="network",
+        floor="1.2",
+        enforcement=enforcement,
+        loopback=loopback,
+        ack=False,
     )
     assert _run_posture_b(tmp_path, monkeypatch, env="prod") == 2
     err = capsys.readouterr().err
@@ -693,6 +698,8 @@ def test_serve_refuses_a_declared_terminator_without_the_hop_acknowledgement(
     assert "without [api].plaintext_upstream_hop_acknowledged" in err
     assert "PLAINTEXT by design" in err
     assert "deploying site's job" in err
+    # The certificate remedy must say the proxy has to move to https too, or it breaks the hop.
+    assert "point the proxy at https" in err
 
 
 @_ACK_MODES
@@ -706,7 +713,7 @@ def test_serve_starts_a_declared_terminator_once_the_hop_is_acknowledged(
     # The control arm: the same four cells, acknowledgement set, and every one starts. Without it the
     # refusing arm above could be passing on some other gate's refusal in a cell it does not name.
     _posture_b_toml(
-        tmp_path, intra="mtls", floor="1.2", enforcement=enforcement, loopback=loopback, ack=True
+        tmp_path, intra="network", floor="1.2", enforcement=enforcement, loopback=loopback, ack=True
     )
     assert _run_posture_b(tmp_path, monkeypatch, env="prod") == 0
     assert "plaintext_upstream_hop_acknowledged" not in capsys.readouterr().err
