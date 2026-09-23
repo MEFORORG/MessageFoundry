@@ -196,15 +196,16 @@ calls it when `tls_ciphers` is unset, so those seams still read as the three cal
 | SMTP (EMAIL, DIRECT transport, alert email), syslog forwarder, FTPS, OIDC IdP, Postgres store (pinned-CA and verify-off branches), `verify` smoke | interpreter list | approved list |
 | Postgres store, default verifying branch | asyncpg's own context | **unchanged**: the engine passes `ssl=True` and asyncpg builds the context, the residual `store/postgres.py` already records |
 | Windows tray `/health` probe (`tray/probe.py`) | `truststore` context | **unchanged**: a separate stdlib-plus-httpx package (ADR 0113); it talks only to the local engine, which now serves the approved list |
-| LDAPS (`ldap3`), Vault (`hvac`), SQL Server (ODBC driver) | library's list | **unchanged**: the library builds the context, as BACKLOG #1170's third category records |
+| At least: LDAPS (`ldap3`), Vault (`hvac`), the SQL Server store, the DATABASE connector and `db_lookup` (ODBC drivers) | library's list | **unchanged**: the library builds the context, as BACKLOG #1170's third category records |
 
 A configured `tls_ciphers` or `[api].tls_ciphers` still wins over the default, and still runs the
 same allow-list, which refuses CBC.
 
 **The two properties that could have gone wrong, and were checked.** The narrowing uses the suite
 NAMES, never a preference string, because option 3 below measured that a preference string adds two
-DSS suites. And it writes the context's existing security level back in front of the names, because
-a bare `set_ciphers` string resets the level to the OpenSSL build's default. It neither raises nor
+DSS suites. And it writes the context's existing security level back in front of the names, so the
+level is stated rather than left to the build. On OpenSSL 3.5.7 a bare string was measured to keep
+the level anyway, so this is a guard, not a fix. It neither raises nor
 lowers the level; raising it is a separate, counterparty-facing decision this amendment does not make.
 
 ### Why hops outside MLLP and DICOM could narrow
@@ -252,7 +253,9 @@ And for the engine-wide default, in `tests/test_tls_default_suites.py`:
 - **AC-8** — Every engine-built hop SHALL offer `APPROVED_TLS12_SUITES` in order, and that order SHALL
   follow the stated rule: ECDHE before DHE, then AES-256-GCM, AES-128-GCM, ChaCha20.
   → `test_every_hop_offers_the_approved_list_in_order`, `test_the_approved_order_follows_the_stated_rule`
-- **AC-9** — Every engine module that calls `harden_cipher_suites` SHALL also narrow.
+- **AC-9** — Every engine module other than `tls_policy.py` that calls `harden_cipher_suites` SHALL
+  make at least as many narrowing calls. This is a per-module count: it cannot see a narrowing placed
+  after the assertion or in an unrelated function, which the handshake tests catch for listed hops.
   → `test_every_module_that_asserts_a_suite_list_also_narrows_one`
 
 ### What this amendment does not change

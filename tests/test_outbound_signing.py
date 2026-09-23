@@ -63,7 +63,7 @@ def _pem(key: object, password: bytes | None = None) -> str:
 
 @pytest.fixture(scope="session")
 def rsa_pem() -> str:
-    return _pem(rsa.generate_private_key(public_exponent=65537, key_size=3072))
+    return _pem(rsa.generate_private_key(public_exponent=65537, key_size=_MIN_RSA_BITS))
 
 
 @pytest.fixture(scope="session")
@@ -461,12 +461,12 @@ def test_rsa_2048_signing_key_is_refused() -> None:
         MessageSigner(OutboundSigning(algorithm="RS256", private_key=two_k))
 
 
-def test_rsa_3072_signing_key_is_accepted(rsa_pem: str) -> None:
+def test_an_rsa_key_exactly_at_the_floor_is_accepted(rsa_pem: str) -> None:
     """POSITIVE CONTROL. Without it the refusals above are indistinguishable from a loader that
     rejects every RSA key, which would pass them for entirely the wrong reason. ``rsa_pem`` is minted
-    at 3072 bits, exactly the floor, so this also pins the boundary as inclusive."""
+    at exactly ``_MIN_RSA_BITS``, so this also pins the boundary as inclusive."""
     key = serialization.load_pem_private_key(rsa_pem.encode(), password=None)
-    assert isinstance(key, rsa.RSAPrivateKey) and key.key_size == 3072
+    assert isinstance(key, rsa.RSAPrivateKey) and key.key_size == _MIN_RSA_BITS
     signer = MessageSigner(OutboundSigning(algorithm="RS256", private_key=rsa_pem))
     assert signer is not None
 

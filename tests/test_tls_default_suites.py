@@ -352,6 +352,7 @@ def test_control_a_stock_server_context_handshakes_with_the_cbc_only_client(pki:
 # --- per hop: refuses CBC-only, accepts AEAD, offers the approved list in order --------------------
 
 
+@_needs_wider_default
 @pytest.mark.parametrize("hop", sorted(CLIENT_HOPS))
 def test_client_hop_refuses_a_cbc_only_server(hop: str, pki: _Pki) -> None:
     with pytest.raises(ssl.SSLError):
@@ -364,6 +365,7 @@ def test_client_hop_accepts_an_aead_server(hop: str, pki: _Pki) -> None:
     assert _handshake(CLIENT_HOPS[hop](pki), _peer_server(pki, AEAD_ONLY)) == AEAD_ONLY
 
 
+@_needs_wider_default
 @pytest.mark.parametrize("hop", sorted(SERVER_HOPS))
 def test_server_hop_refuses_a_cbc_only_client(hop: str, pki: _Pki) -> None:
     with pytest.raises(ssl.SSLError):
@@ -446,6 +448,9 @@ def test_narrowing_removes_suites_and_never_reorders_the_ones_it_keeps() -> None
 
 @pytest.mark.parametrize("level", [1, 2, 3])
 def test_narrowing_keeps_the_context_security_level(level: int) -> None:
+    """A regression guard, and on OpenSSL 3.5.7 not a discriminating one: a bare cipher string was
+    measured to keep the level there too, so this passes with or without the ``@SECLEVEL`` prefix.
+    It exists for a build where a bare string resets the level."""
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.set_ciphers(f"@SECLEVEL={level}:ALL")
     assert ctx.security_level == level, "control: the level did not take before narrowing"

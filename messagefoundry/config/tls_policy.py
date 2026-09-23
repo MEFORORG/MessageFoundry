@@ -783,7 +783,13 @@ _APPROVED_TLS13_SUITES = (
 #: OpenSSL offers explicitly named suites in the order given. The order is the interpreter default's
 #: own order with the six CBC-SHA2 suites taken out (measured on CPython 3.14.6 / OpenSSL 3.5.7): ECDHE
 #: before DHE, and within each key exchange AES-256-GCM, then AES-128-GCM, then ChaCha20. So narrowing
-#: removes suites and never reorders the ones that stay. ``tests/test_tls_default_suites.py`` checks
+#: removes suites and never reorders the ones that stay.
+#:
+#: **:data:`_APPROVED_TLS_SUITES` is DERIVED from this tuple, so an edit here moves both at once.**
+#: Adding a suite for a legacy peer widens the DEFAULT on every engine-built hop, not only the knob.
+#: Admitting a suite to the allow-list without making it a default would mean splitting the two,
+#: and it would let a per-connection ``tls_ciphers`` select that suite. Which of those a legacy-peer
+#: change should be is not decided here. ``tests/test_tls_default_suites.py`` checks
 #: that order on every narrowed hop, and the two client copies (``apiclient/client.py`` and
 #: ``ide/src/engineClient.ts``) against this tuple.
 APPROVED_TLS12_SUITES = (
@@ -817,9 +823,11 @@ def narrow_to_approved_suites(ctx: ssl.SSLContext) -> None:
     and is not: measured against the shipped default it also ADDS two DSS suites the default did not
     enable (ADR 0188, option 3). Naming the suites is the one form that cannot admit an unlisted one.
 
-    **The security level is carried over, not raised.** A bare ``set_ciphers`` string resets the
-    level to the OpenSSL build's own default, which need not match the ``@SECLEVEL=2`` Python puts in
-    its default string. So the level ``ctx`` already has is written back in front of the names.
+    **The security level is carried over, not raised.** The level ``ctx`` already has is written
+    back in front of the names, so the level after narrowing is stated in the string rather than
+    left to the OpenSSL build. Measured on OpenSSL 3.5.7, a bare string KEEPS the level (0 through
+    4, both context shapes), so on this build the prefix changes nothing and its test cannot fail
+    here. It is a guard for a build that behaves otherwise, not a fix for one we have seen.
     ``SSLContext.security_level`` is read-only on CPython 3.14, which is why it travels in the string.
 
     This narrows and does not assert. Each seam still calls :func:`harden_cipher_suites` itself,

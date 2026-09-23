@@ -125,6 +125,16 @@ def test_a_2048_bit_idp_key_is_still_accepted() -> None:
     assert isinstance(key, rsa.RSAPublicKey) and key.key_size == 2048
 
 
+def test_a_2048_bit_idp_token_verifies_end_to_end() -> None:
+    """The full verify path, not just the JWK decode above, still accepts a 2048-bit IdP key.
+    ``_mint_with_typ`` signs through the low-level ``_sign``, which has no floor, so it can mint
+    what a real IdP publishes; ``CompactJwtSigner`` now refuses to."""
+    two_k = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    jws = _mint_with_typ(two_k, "k1", _good_claims(), typ="JWT")
+    principal = oidc.validate_id_token(jws, _policy(), _cache_for(two_k), clock=lambda: 1_000_100)
+    assert principal.username == "jdoe"
+
+
 def test_undersized_rsa_is_refused() -> None:
     small = rsa.generate_private_key(public_exponent=65537, key_size=1024)
     with pytest.raises(oidc.JwksError, match="1024 bits; the floor is 2048"):

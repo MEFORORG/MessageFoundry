@@ -391,9 +391,9 @@ def _build_verify_context(
         import truststore
 
         ctx = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    # Both branches, so the suite list does not depend on which trust model was picked. The security
-    # level is written back in front of the names because a bare string resets it to the OpenSSL
-    # build's own default (the engine's narrow_to_approved_suites does the same, for the same reason).
+    # Both branches, so the suite list does not depend on which trust model was picked. The
+    # security level is written back in front of the names, as the engine's
+    # narrow_to_approved_suites does, so it is stated rather than left to the OpenSSL build.
     ctx.set_ciphers(f"@SECLEVEL={ctx.security_level}:" + ":".join(_APPROVED_TLS12_SUITES))
     if client_cert is not None:
         # keyfile=None is valid: the private key may be bundled in the client cert PEM.
