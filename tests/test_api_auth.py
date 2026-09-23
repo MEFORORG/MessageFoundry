@@ -4,7 +4,8 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+import logging
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 
 import httpx
@@ -918,6 +919,67 @@ async def test_connection_test_and_integrity_check_are_paced(engine: Engine) -> 
         assert throttled.headers.get("Retry-After")
         # /status/integrity-check draws from the SAME exhausted per-actor bucket → 429 (also require_paced).
         assert (await c.post("/status/integrity-check", headers=h)).status_code == 429
+
+
+#: BACKLOG #287 (ASVS 2.4.2): the three state-changing routes that stayed on plain require() after the
+#: #193 sweep. Each entry is (method, path, json body, the status an admitted request gets). None of
+#: them needs a live dependency: the preset id names no row, the log level is set to the value the
+#: root logger already holds (filled in at run time), and the test-email request finds no [alerts]
+#: mail transport configured, so it answers without dialling anything.
+_PACED_BY_287: tuple[tuple[str, str, dict[str, object] | None, int], ...] = (
+    ("DELETE", "/search/presets/" + "a" * 32, None, 404),
+    ("PATCH", "/logging/level", None, 200),
+    ("POST", "/alerts/test-email", {}, 200),
+)
+
+
+@pytest.fixture
+def _restore_log_levels() -> Iterator[None]:
+    """PATCH /logging/level calls set_runtime_level, which also sets the uvicorn child loggers even
+    when the root level does not change. Snapshot and restore them so no level leaks to later tests."""
+    names = ("", "uvicorn", "uvicorn.error", "uvicorn.access")
+    saved = {name: logging.getLogger(name).level for name in names}
+    try:
+        yield
+    finally:
+        for name, level in saved.items():
+            logging.getLogger(name).setLevel(level)
+
+
+@pytest.mark.usefixtures("_restore_log_levels")
+@pytest.mark.parametrize(("method", "path", "body", "admitted_status"), _PACED_BY_287)
+async def test_backlog_287_routes_are_paced(
+    engine: Engine,
+    method: str,
+    path: str,
+    body: dict[str, object] | None,
+    admitted_status: int,
+) -> None:
+    # Two requests pass the gate and count toward the floor; the third is refused 429 in the
+    # dependency, BEFORE the route body. On plain require() the third answers exactly like the first
+    # two, which is the control: this test fails against the pre-#287 gates.
+    service = await _service(
+        engine,
+        AuthSettings(
+            require_mfa=False,
+            login_rate_limit_enabled=False,
+            admin_write_rate_limit_per_actor=2,
+            admin_write_rate_limit_window_seconds=60.0,
+        ),
+    )
+    await _add(service, "adm", Role.ADMINISTRATOR)
+    async with _client(engine, service) as c:
+        h = _auth((await _login(c, "adm")).json()["token"])
+        if path == "/logging/level":
+            current = await c.get("/logging/level", headers=h)
+            assert current.status_code == 200
+            body = {"level": current.json()["level"]}
+        for _ in range(2):
+            admitted = await c.request(method, path, json=body, headers=h)
+            assert admitted.status_code == admitted_status, admitted.text
+        throttled = await c.request(method, path, json=body, headers=h)
+        assert throttled.status_code == 429
+        assert throttled.headers.get("Retry-After") == "1"
 
 
 async def test_change_own_password_revokes_sessions(engine: Engine) -> None:
