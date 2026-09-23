@@ -207,26 +207,49 @@ for, not how it is protected before it gets there.
   too (more complete than this bullet used to promise), and a surviving archive is **not** a
   DEK-independent recovery path (less of a safety net than it looks).
 
-### Key management for the other private keys the engine loads
+### Key management for the other keys the engine loads or mints
 
 The bullets above govern exactly **one** key — the store DEK — and they do not generalize. The
 schedule below has always carried the other keys, but it answers a single question about them (how
 often to rotate, and what to replace) and is silent on the rest: who mints them, where they may live,
 how many holders are acceptable, and what retiring one actually means. That is this subsection.
 
-**What the engine mints.** Of the long-lived asymmetric and at-rest key material on this page, the
-engine mints exactly two things; every other key below is minted by the deploying site or by a
-counterparty, and the engine only loads it. (Short-lived CSPRNG secrets the engine also generates —
-session tokens, WebAuthn ceremony challenges, the throwaway scan credential — have their own rows in
-the inventory table above.) The two are the store DEK (`messagefoundry gen-key` — 32 bytes from
-`os.urandom`, base64-encoded, printed to stdout and not persisted by the command; `generate_key` in
-[`store/crypto.py`](../messagefoundry/store/crypto.py)), and a **non-production** self-signed EC P-256
-certificate and key (`messagefoundry cert self-signed`, `make_self_signed` in
-[`pki.py`](../messagefoundry/pki.py) — the key PEM is unencrypted PKCS#8, written `O_EXCL` with mode
-`0o600` and a tightened Windows DACL, refusing to overwrite an existing file; a self-signed
-certificate has no chain of trust and must never front production PHI). `messagefoundry cert import`
-unpacks an operator's PKCS#12 bundle into the PEM files the TLS loaders read — it relocates key
-material, it creates none.
+**Read the two tables below as covering at least the keys they list.** A key they do not name is
+outside this policy. It is not proof that the engine holds no such key. This heading used to read
+"the other private keys the engine loads". That sounded exhaustive while its table held five keys,
+and the engine loads or mints at least twelve. `tests/test_key_lifecycle_coverage.py` holds a floor
+under the list. It sorts every module in `scripts/security/crypto_inventory_check.py`'s `INVENTORY`
+into modules that carry a key and modules that do not. A key-carrying module with no row here fails
+the build, and so does a new module nobody has sorted. **That guard is a floor, not a completeness
+proof.** `INVENTORY` finds a module by what it imports, so the guard sees only the modules the crypto
+gate sees. The SFTP client key shows the limit: `paramiko` is not a crypto-gate trigger, and
+`transports/remotefile.py` is in `INVENTORY` only because it also imports `ssl` and `hashlib`.
+
+**What the engine mints.** This paragraph used to say the engine mints exactly two things. The API
+TLS placeholder key and the TOTP secret made that false. Every other key below is minted by the
+deploying site or by a counterparty, and the engine only loads it. (Short-lived CSPRNG secrets the
+engine also generates — session tokens, WebAuthn ceremony challenges, the throwaway scan credential —
+have their own rows in the inventory table above.) The engine mints at least these:
+
+- The **store DEK**, on request. `messagefoundry gen-key` prints 32 bytes from `os.urandom`,
+  base64-encoded, to stdout and does not persist them (`generate_key` in
+  [`store/crypto.py`](../messagefoundry/store/crypto.py)).
+- A **non-production** self-signed EC P-256 certificate and key, on request (`messagefoundry cert
+  self-signed`, `make_self_signed` in [`pki.py`](../messagefoundry/pki.py)). The key PEM is
+  unencrypted PKCS#8, written `O_EXCL` with mode `0o600` and a tightened Windows DACL, and the command
+  refuses to overwrite an existing file. A self-signed certificate has no chain of trust and must
+  never front production PHI.
+- The **API TLS placeholder key**, unasked, on the first `serve` that has no `[api].tls_cert_file`
+  and no declared upstream TLS terminator
+  ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)).
+  It is the same EC P-256 primitive, written by the same exclusive writer into the engine's state
+  directory (`ensure_api_tls_material` in [`api/tls.py`](../messagefoundry/api/tls.py)).
+- One **TOTP shared secret** for each account that enrols in MFA (second table below).
+
+`messagefoundry cert import` unpacks an operator's PKCS#12 bundle into the PEM files the TLS loaders
+read. It relocates key material and creates none.
+
+**Private keys the engine loads or mints.**
 
 | Key | How it reaches the engine | Who holds it | What losing it costs |
 |---|---|---|---|
@@ -235,24 +258,70 @@ material, it creates none.
 | **DIRECT S/MIME sender signing key** — `signing_key` (+ `signing_key_password`) ([ADR 0085](adr/0085-direct-hisp-smime-connector.md)) | a **file path only** — the engine reads the PEM/DER bytes from disk at construction and checks the key against `signing_cert`, refusing a pair whose public keys differ. `signing_key` names a path, so it is deliberately **not** a secret setting: it is the file, not the setting, that has to be protected | the operator's file system, read by the process account; the recipient holds the sender's certificate | replacing the key and certificate and re-exchanging with partners. This connector **sends** only, so nothing already received depends on it |
 | **SFTP client key** — `private_key` (+ `key_password`) on a remote-file connection | **inline PEM only** — the value is parsed as key text and never opened as a path — and only an **RSA** key loads today, so an Ed25519 or ECDSA client key is not usable with this connector | the operator's secret store and the engine process; the peer holds the matching public key | enrolling a new public key with the SFTP peer |
 | **API TLS server key** — `[api].tls_key_file` (+ `MEFOR_API_TLS_KEY_PASSWORD`) | a PEM file path handed to the TLS stack when the listener's context is built; the key may instead be embedded in the certificate PEM, in which case `tls_key_file` is omitted. A bad PEM, or a wrong or missing passphrase, raises at that construction point — **before** the socket opens — rather than degrading to plaintext | the operator's file system, read by the process account | re-issuing from the site's CA; the listener will not start until a usable key and certificate are present |
+| **API TLS placeholder key** — minted by `serve` when no `[api].tls_cert_file` is set ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)) | minted by the engine, not supplied. An EC P-256 key from `make_self_signed`, written once into the engine's state directory by `_write_private_key` (`O_EXCL`, mode `0o600`, tightened Windows DACL) and reused on every later start | the process account, on the state directory's file system. A client that trusts it holds only the certificate | a fresh mint on the next start, which every client that imported the old certificate must import again. The certificate is self-signed, and nothing re-mints it when it expires after 365 days. The lasting fix is an operator-supplied chain |
+| **Per-connection TLS server key** — `tls_key_file` (+ `tls_key_password`) beside `tls_cert_file` on an MLLP inbound, the inbound HTTP listener, or a DICOM SCP | a PEM file path read when the connection builds its server context (`_mllp_ssl_context` in [`transports/mllp.py`](../messagefoundry/transports/mllp.py), which the HTTP listener reuses, and `_server_ssl_context` in [`transports/dicom.py`](../messagefoundry/transports/dicom.py)). An encrypted key with no passphrase fails when the context is built rather than waiting on a prompt | the operator's file system, read by the process account; a peer holds only the certificate | re-issuing from the site's CA; the connection cannot serve TLS until a usable pair is present |
+| **Outbound mTLS client key** — `tls_key_file` (+ `tls_key_password`) beside `tls_cert_file` on an MLLP outbound, a DICOM SCU or an FTPS remote-file connection; `client_key_file` (+ `client_key_password`) beside `client_cert_file` on a SOAP outbound ([ADR 0015](adr/0015-ws-soap-outbound-mtls-wssecurity.md)) | a PEM file path read when the connection builds its client context. It is optional, and present only when the partner requires mutual TLS | the operator's file system, read by the process account; the partner holds only the certificate | re-issuing the certificate and enrolling it with the partner again |
+| **Off-box log-forward client key** — inside `[logging].forward_tls_client_cert` ([ADR 0080](adr/0080-offbox-forwarding-tls-defaults.md)) | one combined PEM file that holds the certificate **and** its private key, loaded by `load_cert_chain(certfile=...)` in [`logging_setup.py`](../messagefoundry/logging_setup.py). There is no separate key setting and no passphrase setting, so the file's permissions are its only protection | the operator's file system, read by the process account; the collector holds only the certificate | re-issuing from the collector's CA; forwarding with that client identity fails until a usable PEM is present |
+| **Native API client key** — the `tls_client_key` argument of `EngineClient` in [`apiclient/client.py`](../messagefoundry/apiclient/client.py), for mutual TLS to the engine API (today the test harness) | a PEM file path handed to `load_cert_chain` when the client builds its context, or embedded in the certificate PEM. It lives in the **client** process, never the engine | the operator of that client machine; the engine holds no copy of it | re-issuing the client certificate from a CA the engine trusts |
+| **Non-production self-signed key** — from `messagefoundry cert self-signed`, and the per-run pair the load-test harness mints (`harness/load/tlsmat.py`) | minted locally by `make_self_signed` in [`pki.py`](../messagefoundry/pki.py): an EC P-256 key with a SHA-256 self-signed certificate. The CLI writes the key through `_write_private_key`; the harness writes its pair into a per-run temp directory | the account that ran the command. The harness passes the pair's file paths to a child harness process through the environment | nothing: mint another. It has no chain of trust and must never front production PHI |
 
-**Distribution.** For all five the engine needs **one** holder: the process account, reading an
-`env()`-resolved value or a file. It escrows none of them, and none should be escrowed on the DEK's
-reasoning — the DEK is escrowed because losing it strands rows nothing else can recover, whereas
-losing any of these five costs a re-issue and a conversation with a counterparty, never data. The
-right holder count for them is the lowest the site can operate with. The connection settings that
-carry key text or a passphrase are `/metadata`-redacted (`_SECRET_SETTING_KEYS` and
+**Secret keys the engine holds or feeds.** Neither of these is an asymmetric key, and neither fits
+the table above. The TOTP secret is the engine's only true shared secret, and the ASVS two-entity
+clause is written about exactly this kind of key. The anonymizer salt is a keyed-hash key that
+re-identifies data.
+
+| Key | Generation | Storage and holders | Rotation and destruction |
+|---|---|---|---|
+| **TOTP shared secret** — one per enrolled account, in `users.totp_secret` | minted by the engine in `begin_mfa_enrollment`: 160 bits from `secrets.token_bytes(20)`, base32-encoded (`generate_secret` in [`auth/totp.py`](../messagefoundry/auth/totp.py)). It is the HMAC-SHA-256 key for RFC 6238 codes | a ciphered column, sealed by the store cipher and bound to the user id: under the DEK by default, or inside Transit under `vault_transit`. An unkeyed synthetic instance runs the identity cipher, so there it is plaintext. **Two holders by design:** the engine's store and the user's authenticator. The engine returns the secret once, in the enrolment response, and no later route returns it | no calendar cadence. Enrolling again mints a fresh secret, and the engine refuses to re-enrol while MFA is on. Disabling MFA and an administrator reset both set the column to NULL (`disable_totp`). Under the default `aesgcm` cipher, `rotate-key` re-encrypts it under a new DEK, and discarding the DEK erases it, along with every DR archive that holds an older copy |
+| **Anonymizer re-identification salt** — the per-dataset key for the tee `anonymize-captures` export ([ADR 0030](adr/0030-anonymization-test-harness-tee.md) §4) | minted by the operator, not the engine. ADR 0030 requires at least 128 bits from a CSPRNG, and the refusal messages name `secrets.token_urlsafe(24)`. `Keyer` in [`anon/keying.py`](../messagefoundry/anon/keying.py) (vendored byte-identical to `tee/anon/keying.py`) refuses a visibly weak salt. That is a screen against a degenerate value, not proof of 128 bits | supplied through the environment (`MEFOR_ANON_SALT` by default; `--salt-env` names another variable) and held only in the export process's memory. ADR 0030 forbids persisting or logging it. It keys a BLAKE2b hash, so anyone holding it and a guessed real value can recompute that value's surrogate. ADR 0030 classes it as PHI-equivalent. **Target: one holder**, the person running the export | discard it when the run ends; a fresh salt per run is ADR 0030's default. A salt pinned to a dataset, so its fixtures regenerate the same way, must be destroyed once that dataset will not be regenerated. Reusing one salt across datasets links their surrogates, so each new dataset gets a new salt |
+
+**Distribution.** For every key in the first table the engine needs **one** holder: the process
+account, reading an `env()`-resolved value or a file. It escrows none of them, and none should be
+escrowed on the DEK's reasoning. The DEK is escrowed because losing it strands rows nothing else can
+recover. Losing any key in the first table costs a re-issue and a conversation with a counterparty,
+never data. The right holder count for them is the lowest the site can operate with. The connection
+settings that carry key text or a passphrase are `/metadata`-redacted (`_SECRET_SETTING_KEYS` and
 `_is_secret_setting` in [`config/wiring.py`](../messagefoundry/config/wiring.py)), so a console
-operator cannot read a key value back out of a running engine; the **path**-valued connection setting
+operator cannot read a key value back out of a running engine. The **path**-valued connection setting
 `signing_key` is served as the path it is, which is exactly why the file behind it needs file-system
 permissions of its own.
 
-**Destruction and retirement belong to the deploying site.** The engine ships no command that
-destroys, revokes or expires any of these five. It stops using one when the connection's setting
-stops naming it, and the PEM keeps working anywhere it was copied — so retiring a key means revoking
-or de-registering it at the counterparty and deleting the operator-side copies. Only the store DEK
-has the property the Destruction bullet above describes, where discarding the key is itself the
-erasure.
+**Holder bounds, split at the custody line.** ASVS 11.1.1 caps holders at one entity for a private
+key and two for a shared secret. For most keys here the engine cannot count holders, so the bound is
+stated in two parts. Only the first part is a claim about the engine.
+
+- **What the project commits to, which a reader can check in the code.**
+  - The engine reads each private key from the setting or file the site named and keeps it in process
+    memory. The settings that carry key text are redacted as above.
+  - Each private key the engine CLI or `serve` writes goes to one file through `_write_private_key`
+    (`O_EXCL`, mode `0o600`, tightened Windows DACL): the `cert self-signed` output, the `cert import`
+    unpack, and the API TLS placeholder. `gen-key` prints the DEK once and does not persist it.
+  - The TOTP secret has two holders by design. The engine returns it once, at enrolment, and refuses
+    to re-enrol while MFA is on. `test_the_totp_secret_is_returned_once_and_never_again` in
+    `tests/test_mfa.py` pins that half.
+  - The store DEK's escrow is the one second holder this project asks for, for the reason the
+    Distribution bullet above gives.
+  - **The engine does make one further copy, and a site can trigger it by accident.** A DR backup
+    tars every regular file under the config directory (`_add_config_dir` in
+    [`pipeline/dr_backup.py`](../messagefoundry/pipeline/dr_backup.py)). A key file kept there is
+    copied into every archive. It is sealed under the DEK in a `.mfbak`, and left in plaintext in the
+    `.mfbak.plain` a box writes under the audited `[backup].allow_unencrypted` escape. **Keep key files outside the config directory.**
+- **What a deploying site must do, which the engine cannot observe.** Keep each private key with one
+  entity, the engine's process account. Keep each TOTP secret in one authenticator; a cloud-synced
+  authenticator or a copy in a password manager is a third holder. Keep the anonymizer salt with the
+  one person running the export. The engine cannot see copies made outside it, so this document makes
+  **no** claim that these bounds hold on any site.
+
+**Destruction and retirement belong to the deploying site** for every key in the first table. The
+engine ships no command that destroys, revokes or expires any of them. It stops using one when the
+setting stops naming it, and the PEM keeps working anywhere it was copied. So retiring a key means
+revoking or de-registering it at the counterparty and deleting the operator-side copies. Only the
+store DEK has the property the Destruction bullet above describes, where discarding the key is itself
+the erasure. The TOTP secret rides that property, because it is stored under the DEK.
+
+**Named standard.** The NIST SP 800-57 alignment in the heading above is claimed for the store DEK
+alone. Nobody has mapped the keys in this subsection against that standard, and this subsection does
+not claim that it follows one.
 
 ### Rotation schedule (ASVS 13.1.4 / 13.3.4)
 
