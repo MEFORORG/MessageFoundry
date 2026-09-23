@@ -23,6 +23,7 @@ for no factor gain), and the credential algorithm set (:data:`SUPPORTED_COSE_ALG
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 import time
 from collections.abc import Callable, Sequence
@@ -31,6 +32,8 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # the [webauthn] extra is optional — the runtime import is lazy, per-call
     from webauthn.helpers.cose import COSEAlgorithmIdentifier
+
+_log = logging.getLogger(__name__)
 
 CHALLENGE_BYTES = 64
 CHALLENGE_TTL_SECONDS = 120.0
@@ -121,8 +124,9 @@ def _supported_pub_key_algs() -> list[COSEAlgorithmIdentifier]:
 def _invalid_input_errors() -> tuple[type[Exception], ...]:
     """Every exception py_webauthn raises for bad input, which must all reach the audited path.
 
-    ``WebAuthnException`` is the library's own base class. The other three are raw exceptions it
-    lets out when a COSE key is malformed rather than merely wrong: its key decoder indexes an
+    ``WebAuthnException`` is the library's own base class. The other three entries catch four raw
+    exception types (``LookupError`` covers both ``KeyError`` and ``IndexError``) that it lets
+    out when a COSE key is malformed rather than merely wrong: its key decoder indexes an
     untyped CBOR value, so a missing label is a ``KeyError``, a short array an ``IndexError``, a
     bare integer a ``TypeError``, and a point that is not on its stated curve a ``ValueError`` from
     ``cryptography``. Measured at engine ``0076e3cec`` on the pinned ``webauthn==3.0.0`` (BACKLOG
@@ -135,6 +139,27 @@ def _invalid_input_errors() -> tuple[type[Exception], ...]:
     from webauthn.helpers.exceptions import WebAuthnException
 
     return (WebAuthnException, LookupError, TypeError, ValueError)
+
+
+def _refusal(exc: Exception, *, ceremony: str) -> WebAuthnVerificationError:
+    """Turn a caught library exception into the audited refusal, and log the raw ones.
+
+    A ``WebAuthnException`` is the library refusing input on purpose, and the service audits it.
+    A raw exception is the library falling over, which is expected for a malformed key but is
+    ALSO what a defect on our side looks like, for example a store handing back a NULL sign
+    count. Before BACKLOG #1166 that was a loud 500; widening the catch would have made it
+    silent. So the exception TYPE is logged at WARNING. Only the type: the message can quote
+    input, and nothing from a ceremony response belongs in the general log.
+    """
+    from webauthn.helpers.exceptions import WebAuthnException
+
+    if not isinstance(exc, WebAuthnException):
+        _log.warning(
+            "WebAuthn %s refused on a raw %s from the library, treated as invalid input",
+            ceremony,
+            type(exc).__name__,
+        )
+    return WebAuthnVerificationError(str(exc))
 
 
 def _require_usable_public_key(cose_key: bytes) -> None:
@@ -155,9 +180,9 @@ def _require_usable_public_key(cose_key: bytes) -> None:
     try:
         decoded = decode_credential_public_key(cose_key)
         decoded_public_key_to_cryptography(decoded)
+        alg, kty = int(decoded.alg), int(decoded.kty)
     except _invalid_input_errors() as exc:
-        raise WebAuthnVerificationError(f"unusable credential public key: {exc}") from exc
-    alg, kty = int(decoded.alg), int(decoded.kty)
+        raise _refusal(exc, ceremony="registration") from exc
     if _COSE_KTY_FOR_ALG.get(alg) != kty:
         raise WebAuthnVerificationError(
             f"credential public key type {kty} cannot carry COSE algorithm {alg}"
@@ -344,7 +369,7 @@ def verify_registration(
         # ...) — every library-side rejection must land on the audited return-False/400 path,
         # never an unhandled 500. The raw decode errors join it for the same reason (BACKLOG
         # #1166): a malformed COSE key raised them straight out of this call.
-        raise WebAuthnVerificationError(str(exc)) from exc
+        raise _refusal(exc, ceremony="registration") from exc
     _require_usable_public_key(verified.credential_public_key)
     return RegistrationResult(
         credential_id=verified.credential_id,
@@ -412,7 +437,7 @@ def verify_assertion(
         # service's clone-signal classification. The raw decode errors are the backstop for a
         # STORED key registration would now refuse (BACKLOG #1166): one enrolled before that check,
         # or damaged since, decodes here and used to escape as a raw ValueError or KeyError.
-        raise WebAuthnVerificationError(str(exc)) from exc
+        raise _refusal(exc, ceremony="assertion") from exc
     return verified.new_sign_count
 
 

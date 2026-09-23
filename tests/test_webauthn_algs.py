@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import secrets
 import struct
 from collections.abc import Callable
@@ -31,7 +32,7 @@ import pytest
 
 pytest.importorskip("webauthn")
 
-from cryptography.hazmat.primitives.asymmetric import ed25519, rsa  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa  # noqa: E402
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat  # noqa: E402
 from webauthn.helpers import bytes_to_base64url, encode_cbor, parse_cbor  # noqa: E402
 from webauthn.helpers.cose import COSEAlgorithmIdentifier  # noqa: E402
@@ -290,8 +291,8 @@ _UNUSABLE_CREDENTIALS: dict[str, Callable[[], bytes]] = {
     "ES256 identifier on an OKP key": lambda: _okp(ed25519.Ed25519PrivateKey.generate(), alg=-7),
 }
 
-#: COSE structures the pinned library did not refuse cleanly: each raised a raw ``KeyError`` or
-#: ``TypeError`` out of ``verify_registration``, measured at ``0076e3cec`` -- a 500 at enrolment.
+#: COSE structures the pinned library did not refuse cleanly: each raised a raw ``KeyError``,
+#: ``IndexError`` or ``TypeError`` out of ``verify_registration``, measured at ``0076e3cec`` -- a 500 at enrolment.
 _MALFORMED_CREDENTIALS: dict[str, Callable[[], bytes]] = {
     "an empty map": lambda: encode_cbor({}),
     "a key type and nothing else": lambda: encode_cbor({1: 2}),
@@ -340,14 +341,43 @@ def test_the_curve_rows_use_a_well_formed_response() -> None:
     through ``_registration_response`` too, so the OKP arm of the check is shown to admit Ed25519.
     """
     for cose_key in (_p256(), _okp(ed25519.Ed25519PrivateKey.generate())):
-        challenge = secrets.token_bytes(wa.CHALLENGE_BYTES)
-        registered = wa.verify_registration(
-            response_json=_registration_response(challenge, cose_key),
-            challenge=challenge,
-            rp_id=RP,
-            origin=ORIGIN,
+        _assert_registers(cose_key)
+
+
+@pytest.mark.parametrize(
+    ("curve", "crv", "size"),
+    [(ec.SECP384R1(), _P384, 48), (ec.SECP521R1(), 3, 66)],
+    ids=["P-384", "P-521"],
+)
+def test_es256_on_a_larger_curve_still_enrols(curve: ec.EllipticCurve, crv: int, size: int) -> None:
+    """The check refuses keys that cannot verify; it does NOT bind a curve to an identifier.
+
+    ADR 0068 records this: an ES256 credential on P-384 or P-521 verifies and clears the floor,
+    so it enrols. If a later change pins -7 to P-256, this row says so rather than drifting.
+    """
+    nums = ec.generate_private_key(curve).public_key().public_numbers()
+    _assert_registers(
+        encode_cbor(
+            {
+                1: 2,
+                3: -7,
+                -1: crv,
+                -2: nums.x.to_bytes(size, "big"),
+                -3: nums.y.to_bytes(size, "big"),
+            }
         )
-        assert registered.public_key == cose_key
+    )
+
+
+def _assert_registers(cose_key: bytes) -> None:
+    challenge = secrets.token_bytes(wa.CHALLENGE_BYTES)
+    registered = wa.verify_registration(
+        response_json=_registration_response(challenge, cose_key),
+        challenge=challenge,
+        rp_id=RP,
+        origin=ORIGIN,
+    )
+    assert registered.public_key == cose_key
 
 
 @pytest.mark.parametrize(
@@ -355,16 +385,16 @@ def test_the_curve_rows_use_a_well_formed_response() -> None:
     [
         lambda soft: soft.cose_public_key(crv=_P384),
         lambda soft: _relabelled(soft.cose_public_key(), crv=None),
-        lambda soft: soft.cose_public_key(crv=99),
+        lambda soft: encode_cbor([1]),
     ],
-    ids=["labelled P-384 over a P-256 point", "no curve", "unknown curve"],
+    ids=["labelled P-384 over a P-256 point", "no curve", "a short array"],
 )
 def test_an_unusable_stored_key_fails_assertion_as_invalid_input(
     stored: Callable[[SoftAuthenticator], bytes],
 ) -> None:
     """The backstop. Registration now refuses these, but a stored key is data the assertion path
-    must not trust: a raw ``ValueError`` or ``KeyError`` here escapes the service's audited
-    refusal and becomes a 500."""
+    must not trust: a raw ``ValueError``, ``KeyError`` or ``IndexError`` here escapes the
+    service's audited refusal and becomes a 500. Each row raised one of those at ``0076e3cec``."""
     soft = SoftAuthenticator(rp_id=RP, origin=ORIGIN)
     challenge = secrets.token_bytes(wa.CHALLENGE_BYTES)
     with pytest.raises(wa.WebAuthnVerificationError):
@@ -385,3 +415,56 @@ def test_every_pinned_identifier_names_the_key_type_it_arrives_in() -> None:
     is loud; this says why before a user finds out.
     """
     assert set(wa._COSE_KTY_FOR_ALG) == set(wa.SUPPORTED_COSE_ALGS)
+
+
+def test_a_raw_library_failure_is_logged_by_type_and_a_library_refusal_is_not(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Widening the catch must not make a defect silent.
+
+    A raw exception out of the library is what a malformed key produces, and also what a bug on
+    our side produces. It used to be a 500; now it is an audited refusal, so the type is logged.
+    A ``WebAuthnException`` is the library refusing on purpose and is not logged here.
+    """
+    soft = SoftAuthenticator(rp_id=RP, origin=ORIGIN)
+    logger = "messagefoundry.auth.webauthn"
+
+    def assert_with(stored: bytes) -> None:
+        challenge = secrets.token_bytes(wa.CHALLENGE_BYTES)
+        with pytest.raises(wa.WebAuthnVerificationError):
+            wa.verify_assertion(
+                response_json=soft.get_response(challenge),
+                challenge=challenge,
+                rp_id=RP,
+                origin=ORIGIN,
+                public_key=stored,
+                current_sign_count=0,
+            )
+
+    with caplog.at_level(logging.WARNING, logger=logger):
+        assert_with(soft.cose_public_key(crv=99))  # UnsupportedEC2Curve: the library's own
+    assert not [r for r in caplog.records if r.name == logger]
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=logger):
+        assert_with(encode_cbor([1]))  # IndexError: raw
+    warnings = [r for r in caplog.records if r.name == logger]
+    assert [r.levelno for r in warnings] == [logging.WARNING]
+    assert "IndexError" in warnings[0].getMessage()
+    assert "assertion" in warnings[0].getMessage()
+
+    caplog.clear()
+    challenge = secrets.token_bytes(wa.CHALLENGE_BYTES)
+    with (
+        caplog.at_level(logging.WARNING, logger=logger),
+        pytest.raises(wa.WebAuthnVerificationError),
+    ):
+        wa.verify_registration(
+            response_json=_registration_response(challenge, encode_cbor({})),
+            challenge=challenge,
+            rp_id=RP,
+            origin=ORIGIN,
+        )
+    warnings = [r for r in caplog.records if r.name == logger]
+    assert len(warnings) == 1 and "KeyError" in warnings[0].getMessage()
+    assert "registration" in warnings[0].getMessage()
