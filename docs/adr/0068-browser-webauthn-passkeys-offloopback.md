@@ -495,3 +495,16 @@ then fails at first assertion. On the mismatched-curve path the failure arrives 
 `except WebAuthnException` does not catch it and the rejection would not land on the audited
 invalid-input path decision 1 requires. It is self-harm only (the enrolling user is authenticated
 and breaks their own credential) and this pin neither causes nor fixes it.
+
+**Residual closed (2026-09-23, BACKLOG #1166).** Registration now runs the same key decode and key
+construction the assertion path runs, and refuses a credential that fails it. It also refuses a key
+whose type does not match its identifier: EdDSA must arrive as OKP and ES256 as EC2. Measured at
+engine `0076e3cec` before the fix, ten such credentials enrolled and then failed at every
+assertion. They include an unknown curve, a P-256 point labelled P-384, a point on no curve, an OKP
+key of the wrong length, and an EdDSA identifier on an EC2 key. The same run found a second path
+to a 500, at enrolment this time: a malformed COSE key raised a raw `KeyError`, `IndexError` or
+`TypeError` out of `verify_registration`. Both ceremony halves now route those raw exceptions, and
+the raw `ValueError`, to `WebAuthnVerificationError`, so each lands on the audited invalid-input
+path. The assertion-side catch stays as a backstop for a stored key. The check does not bind a
+curve to an identifier: an ES256 credential on P-384 still enrols, because it verifies and clears
+the floor.

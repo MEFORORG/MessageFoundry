@@ -23,6 +23,7 @@ for no factor gain), and the credential algorithm set (:data:`SUPPORTED_COSE_ALG
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 import time
 from collections.abc import Callable, Sequence
@@ -31,6 +32,8 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # the [webauthn] extra is optional — the runtime import is lazy, per-call
     from webauthn.helpers.cose import COSEAlgorithmIdentifier
+
+_log = logging.getLogger(__name__)
 
 CHALLENGE_BYTES = 64
 CHALLENGE_TTL_SECONDS = 120.0
@@ -47,9 +50,10 @@ GLOBAL_PENDING_CAP = 4096
 #:
 #: EdDSA (-8) and ES256 (-7) carry no equivalent hole. The curve rides in the credential rather
 #: than in the identifier, but a credential whose curve is unknown or does not match its key cannot
-#: produce a verifiable assertion — measured: it registers, then every assertion against it is
-#: refused — so no sub-floor EC2 or OKP credential is ever usable. That is the property the RSA
-#: identifier cannot offer, and it is why the floor can be expressed here as a set of identifiers.
+#: produce a verifiable assertion, so no sub-floor EC2 or OKP credential is ever usable. Such a
+#: credential used to register and then fail at every assertion; :func:`_require_usable_public_key`
+#: now refuses it at registration. That is the property the RSA identifier cannot offer, and it is
+#: why the floor can be expressed here as a set of identifiers.
 #:
 #: **Stated rather than hidden: this refuses an authenticator that offers only RS256.** TPM-backed
 #: Windows Hello is the population that registers RSA credentials. Those operators keep TOTP, which
@@ -60,6 +64,13 @@ GLOBAL_PENDING_CAP = 4096
 #: Plain ints so this module still imports without the extra; :func:`_supported_pub_key_algs`
 #: resolves them to the library enum at call time.
 SUPPORTED_COSE_ALGS: tuple[int, ...] = (-8, -7)
+
+#: The COSE key type (IANA COSE Key Types registry) each pinned identifier must arrive in: EdDSA as
+#: OKP (1), ES256 as EC2 (2). The library screens the IDENTIFIER at registration and never checks
+#: that the key beside it is the kind that identifier signs with, so an EdDSA-labelled EC2 key used
+#: to enrol and then fail at every assertion. A test pins that every entry of
+#: :data:`SUPPORTED_COSE_ALGS` has a row here, so widening the set forces a decision about it.
+_COSE_KTY_FOR_ALG: dict[int, int] = {-8: 1, -7: 2}
 
 _INSTALL_HINT = (
     "WebAuthn support requires the [webauthn] extra: pip install messagefoundry[webauthn]"
@@ -108,6 +119,74 @@ def _supported_pub_key_algs() -> list[COSEAlgorithmIdentifier]:
     from webauthn.helpers.cose import COSEAlgorithmIdentifier
 
     return [COSEAlgorithmIdentifier(alg) for alg in SUPPORTED_COSE_ALGS]
+
+
+def _invalid_input_errors() -> tuple[type[Exception], ...]:
+    """Every exception py_webauthn raises for bad input, which must all reach the audited path.
+
+    ``WebAuthnException`` is the library's own base class. The other three entries catch four raw
+    exception types (``LookupError`` covers both ``KeyError`` and ``IndexError``) that it lets
+    out when a COSE key is malformed rather than merely wrong: its key decoder indexes an
+    untyped CBOR value, so a missing label is a ``KeyError``, a short array an ``IndexError``, a
+    bare integer a ``TypeError``, and a point that is not on its stated curve a ``ValueError`` from
+    ``cryptography``. Measured at engine ``0076e3cec`` on the pinned ``webauthn==3.0.0`` (BACKLOG
+    #1166). Each is attacker-shaped input, so each must land on the audited invalid-input path ADR
+    0068 decision 1 requires rather than escape as a 500. Use it only around library calls, never
+    around our own logic, where the same exceptions would mean a bug.
+
+    A function rather than a constant because the library import is lazy (the extra is optional).
+    """
+    from webauthn.helpers.exceptions import WebAuthnException
+
+    return (WebAuthnException, LookupError, TypeError, ValueError)
+
+
+def _refusal(exc: Exception, *, ceremony: str) -> WebAuthnVerificationError:
+    """Turn a caught library exception into the audited refusal, and log the raw ones.
+
+    A ``WebAuthnException`` is the library refusing input on purpose, and the service audits it.
+    A raw exception is the library falling over, which is expected for a malformed key but is
+    ALSO what a defect on our side looks like, for example a store handing back a NULL sign
+    count. Before BACKLOG #1166 that was a loud 500; widening the catch would have made it
+    silent. So the exception TYPE is logged at WARNING. Only the type: the message can quote
+    input, and nothing from a ceremony response belongs in the general log.
+    """
+    from webauthn.helpers.exceptions import WebAuthnException
+
+    if not isinstance(exc, WebAuthnException):
+        _log.warning(
+            "WebAuthn %s refused on a raw %s from the library, treated as invalid input",
+            ceremony,
+            type(exc).__name__,
+        )
+    return WebAuthnVerificationError(str(exc))
+
+
+def _require_usable_public_key(cose_key: bytes) -> None:
+    """Refuse a credential public key that no assertion could ever verify against.
+
+    Runs the SAME decode and key construction the assertion path runs, so a credential that passes
+    here cannot fail there for a reason its key alone decides. Before this check a credential whose
+    curve was unknown, whose point was not on its stated curve, or whose key type did not match its
+    identifier ENROLLED, and was found out only at first use (BACKLOG #1166). No sub-floor key ever
+    became usable, but the refusal came late, and on the mismatched-curve path it came as a raw
+    ``ValueError`` that escaped as a 500.
+
+    This does not pin a curve to an identifier. An ES256 credential on P-384 or P-521 still enrols,
+    because it verifies and clears the 128-bit floor; only a key that cannot verify is refused.
+    """
+    from webauthn.helpers import decode_credential_public_key, decoded_public_key_to_cryptography
+
+    try:
+        decoded = decode_credential_public_key(cose_key)
+        decoded_public_key_to_cryptography(decoded)
+        alg, kty = int(decoded.alg), int(decoded.kty)
+    except _invalid_input_errors() as exc:
+        raise _refusal(exc, ceremony="registration") from exc
+    if _COSE_KTY_FOR_ALG.get(alg) != kty:
+        raise WebAuthnVerificationError(
+            f"credential public key type {kty} cannot carry COSE algorithm {alg}"
+        )
 
 
 def new_challenge() -> bytes:
@@ -266,7 +345,8 @@ def verify_registration(
 
     **This is where :data:`SUPPORTED_COSE_ALGS` is enforced**, not merely advertised: an
     authenticator that answers with an identifier outside the set is refused here, and a refusal
-    lands on the same audited invalid-input path as any other bad response.
+    lands on the same audited invalid-input path as any other bad response. So does a credential
+    whose key no assertion could verify against (:func:`_require_usable_public_key`).
 
     ``transports`` ride ``RegistrationCredential.response.transports`` (struct path verified
     against webauthn 3.0.0 at build time per ADR 0068's open item) — extracted defensively from
@@ -274,7 +354,6 @@ def verify_registration(
     """
     _require_webauthn()
     from webauthn import verify_registration_response
-    from webauthn.helpers.exceptions import WebAuthnException
 
     try:
         verified = verify_registration_response(
@@ -284,12 +363,14 @@ def verify_registration(
             expected_origin=origin,
             supported_pub_key_algs=_supported_pub_key_algs(),
         )
-    except WebAuthnException as exc:
+    except _invalid_input_errors() as exc:
         # The BASE class, deliberately (PR-A review HIGH): structurally-malformed browser input
         # raises siblings of InvalidRegistrationResponse (InvalidJSONStructure, InvalidCBORData,
         # ...) — every library-side rejection must land on the audited return-False/400 path,
-        # never an unhandled 500.
-        raise WebAuthnVerificationError(str(exc)) from exc
+        # never an unhandled 500. The raw decode errors join it for the same reason (BACKLOG
+        # #1166): a malformed COSE key raised them straight out of this call.
+        raise _refusal(exc, ceremony="registration") from exc
+    _require_usable_public_key(verified.credential_public_key)
     return RegistrationResult(
         credential_id=verified.credential_id,
         public_key=verified.credential_public_key,
@@ -339,7 +420,6 @@ def verify_assertion(
     """
     _require_webauthn()
     from webauthn import verify_authentication_response
-    from webauthn.helpers.exceptions import WebAuthnException
 
     try:
         verified = verify_authentication_response(
@@ -350,12 +430,14 @@ def verify_assertion(
             credential_public_key=public_key,
             credential_current_sign_count=current_sign_count,
         )
-    except WebAuthnException as exc:
+    except _invalid_input_errors() as exc:
         # The BASE class, deliberately (PR-A review HIGH): malformed input raises siblings of
         # InvalidAuthenticationResponse — every rejection lands audited, never a 500. The
         # sign-count regression message ("...sign count...") still rides through for the
-        # service's clone-signal classification.
-        raise WebAuthnVerificationError(str(exc)) from exc
+        # service's clone-signal classification. The raw decode errors are the backstop for a
+        # STORED key registration would now refuse (BACKLOG #1166): one enrolled before that check,
+        # or damaged since, decodes here and used to escape as a raw ValueError or KeyError.
+        raise _refusal(exc, ceremony="assertion") from exc
     return verified.new_sign_count
 
 
