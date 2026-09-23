@@ -48,6 +48,7 @@ from messagefoundry.parsing import (
     summarize,
     validate,
 )
+from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 from messagefoundry.pipeline._sandbox_codec import build_payload
 from messagefoundry.pipeline.ingress_guards import (
     IngressGuardError,
@@ -79,9 +80,34 @@ __all__ = [
     "read_messages",
     "read_message_sets",
     "split_messages",
+    "MAX_FIXTURE_FILE_BYTES",
 ]
 
 log = logging.getLogger(__name__)
+
+#: Largest fixture FILE ``dryrun`` and ``check`` will read (ASVS 5.1.1, BACKLOG #1127). The IDE's Test
+#: Bench and Steps view pick a local file and pass its path here, and the owner ruled on 2026-09-23 that
+#: those pickers are upload features, so the read needs a stated maximum. It is the engine's per-message
+#: ceiling, which is also the File source's per-file default: a file the engine's own drop-directory
+#: source would refuse is not one a preview should read whole. A batch file of many small messages
+#: counts as one file against it, exactly as it does at the File source.
+MAX_FIXTURE_FILE_BYTES = DEFAULT_MAX_MESSAGE_BYTES
+
+
+def _read_fixture(path: Path) -> bytes:
+    """``path``'s bytes, or ``ValueError`` when it is over :data:`MAX_FIXTURE_FILE_BYTES`.
+
+    Reads at most one byte past the cap, so an oversized file (or one that grows while it is read)
+    never lands in memory whole. The cap is read from the module at call time."""
+    cap = MAX_FIXTURE_FILE_BYTES
+    with path.open("rb") as fh:
+        data = fh.read(cap + 1)
+    if len(data) > cap:
+        raise ValueError(
+            f"{path} is over the {cap}-byte dry-run file cap (MAX_FIXTURE_FILE_BYTES); "
+            "split it into smaller fixture files"
+        )
+    return data
 
 
 class TraceHook(Protocol):
@@ -971,7 +997,7 @@ def read_messages(paths: list[str]) -> list[tuple[str, str, bytes]]:
 
     Directories contribute their ``*.hl7`` files (sorted); batch files yield one entry per message
     (``"name [i]"``). Raises ``FileNotFoundError`` for a missing path and ``ValueError`` for a
-    directory with no ``*.hl7`` files.
+    directory with no ``*.hl7`` files, or for a file over :data:`MAX_FIXTURE_FILE_BYTES`.
 
     ``content`` is **bytes** — the fixture's own, undecoded (BACKLOG #1689). See
     :func:`split_messages` for why the decode cannot happen here: it belongs to the inbound a fixture
@@ -989,7 +1015,7 @@ def read_messages(paths: list[str]) -> list[tuple[str, str, bytes]]:
         else:
             raise FileNotFoundError(f"no such file or directory: {path}")
         for f in files:
-            messages = split_messages(f.read_bytes())
+            messages = split_messages(_read_fixture(f))
             if len(messages) == 1:
                 out.append((f.name, str(f), messages[0]))
             else:
@@ -1008,7 +1034,8 @@ def read_message_sets(
     names no inbound, is *unmapped* (``None``) and the caller dry-runs it against **every** inbound —
     the all-×-all fallback. Returns ``(label, file_path, content, target_inbound | None)`` per message
     (a batch file yields one entry per message). A single-file ``root`` is one unmapped fixture.
-    Raises ``FileNotFoundError`` for a missing ``root``.
+    Raises ``FileNotFoundError`` for a missing ``root`` and ``ValueError`` for a file over
+    :data:`MAX_FIXTURE_FILE_BYTES`.
 
     ``content`` is **bytes**, for the reason :func:`read_messages` gives — and the cross-product is
     what makes it the only coherent contract here: ONE unmapped fixture is dry-run against EVERY
@@ -1031,7 +1058,7 @@ def read_message_sets(
         raise FileNotFoundError(f"no such file or directory: {root_path}")
     out: list[tuple[str, str, bytes, str | None]] = []
     for f, target in pairs:
-        messages = split_messages(f.read_bytes())
+        messages = split_messages(_read_fixture(f))
         if len(messages) == 1:
             out.append((f.name, str(f), messages[0], target))
         else:

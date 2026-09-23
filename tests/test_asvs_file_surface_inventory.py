@@ -58,7 +58,7 @@ from messagefoundry.parsing import compression
 from messagefoundry.parsing.dicom._inflate import DEFAULT_MAX_INFLATED_BYTES
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 from messagefoundry.parsing.x12.delimiters import DEFAULT_MAX_INTERCHANGE_BYTES
-from messagefoundry.pipeline import dr_backup
+from messagefoundry.pipeline import dr_backup, dryrun
 from messagefoundry.transports.base import _SOURCES, DEFAULT_MAX_ITEMS_PER_POLL
 from messagefoundry.transports.bounded_read import DEFAULT_MAX_RESPONSE_BYTES
 from messagefoundry.transports.dicom import DEFAULT_MAX_OBJECT_BYTES
@@ -106,6 +106,19 @@ CAPTURE_FACTORIES: dict[str, str] = {
     "DICOMweb": "DICOMweb",
     "Database": "database",
 }
+
+#: Where the IDE extension's local file pickers live (owner ruling 2026-09-23: 5.1.1 upload features).
+_IDE_SRC = _ROOT / "ide" / "src"
+
+
+def ide_pickers(src: Path, root: Path) -> set[str]:
+    """Repo-relative paths of the ``.ts`` files that open a file picker (``showOpenDialog(``)."""
+    return {
+        f.relative_to(root).as_posix()
+        for f in sorted(src.rglob("*.ts"))
+        if "showOpenDialog(" in f.read_text(encoding="utf-8")
+    }
+
 
 #: The registered sources the doc excludes as reading nothing from outside. Pinned here so a NEW
 #: source cannot pass by a doc-only edit that adds it to the exclusion bullet.
@@ -286,6 +299,7 @@ def test_no_upload_row_or_source_exclusion_names_a_surface_the_code_lacks() -> N
         | set(api_app._UPLOAD_BODY_PATHS)
         | set(CONTENT_ROUTES)
         | set(HAND_KEPT_UPLOAD_KEYS)
+        | ide_pickers(_IDE_SRC, _ROOT)
     )
     stale = stale_keys(set(_UPLOAD_ROWS), allowed) | stale_keys(_EXCLUDED_SOURCES, _SOURCE_VALUES)
     assert not stale, f"5.1.1 rows or exclusions naming nothing the code registers: {sorted(stale)}"
@@ -311,6 +325,22 @@ def test_every_capturing_outbound_is_named_in_the_reply_row() -> None:
     size_cell = _UPLOAD_ROWS["capture_response"].split("|")[4]
     for word in CAPTURE_FACTORIES.values():
         assert re.search(rf"\b{re.escape(word)}\b", size_cell), f"reply row does not name {word}"
+
+
+def test_every_ide_file_picker_is_named_in_the_picker_row() -> None:
+    pickers = ide_pickers(_IDE_SRC, _ROOT)
+    assert pickers, "instrument found no showOpenDialog call in ide/src at all"
+    first_cells = {
+        token
+        for row in _UPLOAD_ROWS.values()
+        for token in re.findall(r"`([^`]+)`", row.split("|")[1])
+        if token.startswith("ide/")
+    }
+    assert first_cells == pickers, (
+        f"IDE picker row differs from the code: {sorted(first_cells ^ pickers)}"
+    )
+    row = next(r for key, r in _UPLOAD_ROWS.items() if key in pickers)
+    assert has_figure(row, f"MAX_FIXTURE_FILE_BYTES` = {_size(dryrun.MAX_FIXTURE_FILE_BYTES)}")
 
 
 # --- axis 2: upload routes ------------------------------------------------------------------------
@@ -528,6 +558,7 @@ QUOTED_CONSTANTS: dict[str, int] = {
     "_MAX_RESTORE_MEMBER_BYTES": dr_backup._MAX_RESTORE_MEMBER_BYTES,
     "_MAX_CONFIG_MEMBERS": dr_backup._MAX_CONFIG_MEMBERS,
     "_MAX_CONFIG_BYTES": dr_backup._MAX_CONFIG_BYTES,
+    "MAX_FIXTURE_FILE_BYTES": dryrun.MAX_FIXTURE_FILE_BYTES,
 }
 
 _QUOTED = re.compile(r"`([A-Za-z_][A-Za-z0-9_]*)` = (\d+(?:,\d{3})*(?: [KMG]iB)?)")
@@ -669,6 +700,14 @@ def test_self_test_download_routes_follow_callers(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     assert callers([planted], {"emit"}) == {"emit", "route_a"}
+
+
+def test_self_test_a_new_ide_picker_is_found(tmp_path: Path) -> None:
+    src = tmp_path / "ide" / "src"
+    src.mkdir(parents=True)
+    (src / "a.ts").write_text("await vscode.window.showOpenDialog({});", encoding="utf-8")
+    (src / "b.ts").write_text("// showOpenDialog is mentioned, not called", encoding="utf-8")
+    assert ide_pickers(src, tmp_path) == {"ide/src/a.ts"}
 
 
 def test_self_test_duplicate_row_keys_fail_closed() -> None:
