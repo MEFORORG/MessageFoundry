@@ -46,14 +46,19 @@ from tests.test_provision_first_administrator import _tty
 
 _PASSWORD = "a-long-enough-operator-passphrase"
 
-#: Every at-rest variable the loader reads, cleared so a developer's own shell cannot decide a test.
+#: At least the at-rest variables that decide these tests, cleared so a developer's own shell cannot.
 _AT_REST_ENV = (
     "MEFOR_STORE_ENCRYPTION_KEY",
     "MEFOR_STORE_ENCRYPTION_KEY_FILE",
     "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED",
+    "MEFOR_STORE_KEY_PROVIDER",
+    "MEFOR_STORE_CIPHER_PROVIDER",
+    "MEFOR_STORE_ALLOW_UNENCRYPTED_PHI",
+    "MEFOR_STORE_REQUIRE_ENCRYPTION",
     "MEFOR_SECURITY_ALLOW_UNENCRYPTED_PHI",
     "MEFOR_SECURITY_ALLOW_UNENCRYPTED_PHI_UNDER_STRICT_ENFORCEMENT",
-    "MEFOR_STORE_REQUIRE_ENCRYPTION",
+    "MEFOR_SECURITY_ENCRYPT_STORED_DATA",
+    "MEFOR_SECURITY_ENFORCEMENT",
 )
 
 
@@ -251,9 +256,11 @@ async def test_the_posture_route_reports_what_the_open_store_observed(tmp_path: 
         await engine.stop()
 
 
-@pytest.mark.parametrize("backend", ["postgres", "sqlserver"])
+@pytest.mark.parametrize(
+    ("backend", "rows"), [(b, n) for b in ("postgres", "sqlserver") for n in (0, 3)]
+)
 async def test_both_server_backends_report_a_keyless_chain_on_a_keyed_store(
-    backend: str, caplog: pytest.LogCaptureFixture
+    backend: str, rows: int, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The server twins, offline, through the same bare-instance seam the Transit rider uses. The
     live-database legs of these backends run only on a hosted runner."""
@@ -267,7 +274,7 @@ async def test_both_server_backends_report_a_keyless_chain_on_a_keyed_store(
     written: list[str] = []
 
     async def _fetchone(sql: str, *_a: Any, **_kw: Any) -> Any:
-        return {"keyed_from_id": None} if "keyed_from_id" in sql else {"n": 3}
+        return {"keyed_from_id": None} if "keyed_from_id" in sql else {"n": rows}
 
     class _Conn:
         async def fetchrow(self, sql: str, *_a: Any) -> Any:
@@ -280,12 +287,54 @@ async def test_both_server_backends_report_a_keyless_chain_on_a_keyed_store(
     async def _conn() -> Any:
         yield _Conn()
 
+    @contextlib.asynccontextmanager
+    async def _cursor(conn: Any) -> Any:
+        yield conn
+
+    async def _commit(_conn: Any) -> None:
+        return None
+
     store._fetchone = _fetchone
     store._timed_acquire = _conn
     store._acquire = _conn
+    store._cursor = _cursor
+    store._commit = _commit
     with caplog.at_level(logging.WARNING):
         await store._load_audit_chain_meta()
-    assert store._audit_keyed_from is None, f"{backend}: open must not re-key existing rows"
-    assert written == [], f"{backend}: nothing may be written at open"
-    assert store.audit_chain_unkeyed() is True
-    assert any("rekey-audit" in r.getMessage() for r in caplog.records)
+    warned = any("rekey-audit" in r.getMessage() for r in caplog.records)
+    if rows == 0:
+        # The control arm: a fresh keyed store still auto-keys from row 1 and reports nothing.
+        assert store._audit_keyed_from == 1, f"{backend}: a fresh keyed store must key from row 1"
+        assert any("audit_chain_meta" in s for s in written)
+        assert store.audit_chain_unkeyed() is False and not warned
+    else:
+        assert store._audit_keyed_from is None, f"{backend}: open must not re-key existing rows"
+        assert written == [], f"{backend}: nothing may be written at open"
+        assert store.audit_chain_unkeyed() is True and warned
+
+
+def test_provision_admin_refuses_a_configured_key_the_provider_did_not_resolve(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The gate reads settings; the store resolves its key through ``[store].key_provider``. A pinned
+    ``env`` provider ignores a configured key FILE, so the settings say "keyed" while the store opens
+    keyless. The command must refuse before the first audit row, not provision into that chain."""
+    monkeypatch.setenv("MEFOR_STORE_KEY_PROVIDER", "env")
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY_FILE", str(shell / "service.key"))
+    _tty(monkeypatch, _PASSWORD, _PASSWORD)
+    db = shell / "mismatch.db"
+    rc = main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"])
+    out = capsys.readouterr().out
+    assert rc != 0, out
+    assert "resolved no key" in json.loads(out)["error"]
+
+    async def no_audit_rows() -> int:
+        store = await MessageStore.open(db)
+        try:
+            cur = await store._db.execute("SELECT COUNT(*) AS n FROM audit_log")
+            row = await cur.fetchone()
+            return int(row["n"]) if row is not None else -1
+        finally:
+            await store.close()
+
+    assert asyncio.run(no_audit_rows()) == 0

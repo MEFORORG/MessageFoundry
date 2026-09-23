@@ -1747,7 +1747,9 @@ def _serve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
-        if keyless_gate == _GATE_NO_STRICT_ACK:
+        if keyless_gate is not None:
+            # _GATE_NO_STRICT_ACK, and deliberately the catch-all: a refusal value this block does not
+            # name must still refuse, never fall through to the keyless start below.
             # Secure-by-default under STRICT ENFORCEMENT (ADR 0140): keyless PHI under enforcement
             # requires a SECOND acknowledgment beyond [security].allow_unencrypted_phi — the highest-
             # risk posture (real PHI + strict enforcement) is never one flag away from plaintext at
@@ -4757,6 +4759,10 @@ _GATE_NO_OPT_OUT = "[security].allow_unencrypted_phi"
 _GATE_NO_STRICT_ACK = "[security].allow_unencrypted_phi_under_strict_enforcement"
 
 
+class _KeylessProvisionRefused(RuntimeError):
+    """``provision-admin`` found its opened store keyless although a key is configured (#1905)."""
+
+
 def _store_key_configured(settings: ServiceSettings) -> bool:
     """Is a local store key configured? The at-rest gate's one test for "keyed" (a DPAPI key file counts;
     ``open_store`` fails closed later if it is unreadable). It does not consult ``cipher_provider`` --
@@ -4841,17 +4847,17 @@ def _provision_admin(args: argparse.Namespace) -> int:
             "provision-admin opens the store and writes its first audit row, and an audit chain that "
             "starts keyless stays keyless. Set the key the service runs with -- the one in its NSSM "
             "environment -- in this shell and re-run. Do not generate a new key for this command: the "
-            "service would then hold a different key from the one the store was created under. "
-            f"Refused by {keyless_gate}, the same condition that makes `serve` refuse to start.",
+            "service would then hold a different key from the one the store was created under. If "
+            "the service deliberately runs keyless, set the same audited opt-out here that it uses. "
+            f"The deciding setting is {keyless_gate}, the same one that makes `serve` refuse to start.",
             as_json=args.json,
         )
     if not _store_key_configured(settings):
         # An audited opt-out applies, so this proceeds keyless -- and must not do so quietly, because a
         # stale opt-out left in a shell is how a keyed production store would get a keyless first row.
         print(
-            "WARNING: no store key is set in this shell and an audited opt-out "
-            "([security].allow_unencrypted_phi) applies, so the store is opened KEYLESS and its audit "
-            "chain starts as plain SHA-256. It stays keyless if a key is added later. If the service "
+            "WARNING: no store key is set in this shell and the audited at-rest opt-out applies, so "
+            "the store is opened KEYLESS and its audit chain starts as plain SHA-256. It stays keyless if a key is added later. If the service "
             "runs with a key, stop now and set that key in this shell instead.",
             file=sys.stderr,
         )
@@ -4867,6 +4873,15 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # create=True (BACKLOG #1780): this bootstrap runs before the first serve, see the note below.
         store = await open_store(settings.store, create=True)
         try:
+            if _store_key_configured(settings) and not store.cipher_info().encrypts:
+                # BACKLOG #1905: the settings name a key but the key provider resolved none (a pinned
+                # `[store].key_provider` reading a source this shell does not have). Refuse before
+                # the first audit row is written, rather than provision into a keyless chain.
+                raise _KeylessProvisionRefused(
+                    "a store key is configured, but [store].key_provider resolved no key in this "
+                    "shell, so the store opened KEYLESS; refusing to provision. Make the key the "
+                    "service runs with readable here and re-run."
+                )
             outcome = await AuthService(store, settings.auth).provision_first_administrator(
                 username=args.username,
                 password=password,
@@ -4888,7 +4903,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
 
     try:
         outcome, store_path = asyncio.run(run())
-    except FirstAdministratorRefused as exc:
+    except (FirstAdministratorRefused, _KeylessProvisionRefused) as exc:
         return _emit_error(str(exc), as_json=args.json)
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
@@ -6247,7 +6262,8 @@ def _security(args: argparse.Namespace) -> int:
         # observations (#1008 privilege, #1905 audit-chain keying). It passes empty lists and None and
         # declares BOTH gaps
         # in `loosenings_scope` below, instead of reporting a settings-only view as if it were the whole
-        # posture. `messagefoundry check` and GET /security/posture are the complete surfaces.
+        # posture. GET /security/posture is the complete surface; `messagefoundry check` adds the
+        # connection-scoped entries but opens no store either.
         return [
             {"switch": s, "risk": r}
             for s, r in security_loosenings(
