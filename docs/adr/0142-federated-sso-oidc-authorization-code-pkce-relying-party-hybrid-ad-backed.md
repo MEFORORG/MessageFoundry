@@ -339,7 +339,8 @@ binding. AD-password and Kerberos callers pass `None` and stay byte-identical.
 *[The clause "a first federated login records the binding" is SUPERSEDED by the owner rulings recorded in
 [ADR 0184](0184-identify-a-federated-login-by-the-idp-namespaced-subject-not-by-the-username-it-claims.md)
 (2026-09-06 and 2026-09-23): only the administrative binding surface may create a binding, and an unbound
-federated login is refused. The rest of A.2 stands.]*
+federated login is refused. ADR 0184's pair-first selection (its AC-1) also bears on the rest of A.2;
+where the two differ, ADR 0184 governs.]*
 
 ### A.3 What this overturns, precisely
 - **"Zero store work" is superseded** by the minimum a continuity guard requires: two **nullable** columns
@@ -406,8 +407,8 @@ window is open.
   tuple matches, the login proceeds unchanged -> the federated-path regression tests (changed-sub / same-username
   refused; same-sub / changed-username resolves to the same account).
   *[The clause "WHEN the account is unbound, it SHALL record the binding on that login" is SUPERSEDED by ADR
-  0184 AC-4 (accepted 2026-09-23): an unbound federated login is refused and creates no binding. The other
-  two clauses of AC-12 stand.]*
+  0184 AC-4 (accepted 2026-09-23): an unbound federated login is refused and creates no binding. ADR 0184
+  AC-1 (pair-first selection) also bears on the first clause; where the two differ, ADR 0184 governs.]*
 
 ---
 
@@ -434,8 +435,8 @@ does not re-bind a password for that session.
   how it was minted. That field is the session mechanism item ADR 0184 resolved, and this leg is its
   only consumer, so the two are built together.
 - **The store change that field needs.** A column on the sessions table narrows the *Out of scope*
-  entry "any store migration" a second time, as A.3 did for its two columns. Read AC-1 the way A.3
-  reads it: a runtime-behaviour guarantee.
+  entry "any store migration" a second time, as A.3 did for its two columns. How AC-1 reads beside
+  that column is the build's to settle, as A.3 settled it for its two.
 - **What this does to lab cell L9.** L9 asks whether step-up survives a passwordless or
   smartcard-required account. This amendment changes that question for an OIDC session. It does not
   decide whether L9 is discharged, and the lab cells still stand as written under *To resolve on
@@ -446,15 +447,17 @@ does not re-bind a password for that session.
 *Out of scope* above already names back-channel logout. This amendment keeps it there, for two
 reasons the owner gave:
 
-1. A receiver would only make ASVS 10.5.5 apply to this engine. It would raise no cell.
+1. In the owner's assessment a receiver would move nothing up, and it would add a new
+   unauthenticated POST surface.
 2. Every federated user is also an AD user, because a principal with no on-prem AD object is refused.
    The directory reconciler, `AuthService.reconcile_directory_sessions` (ADR 0079 mechanism 2, built
    outside this ADR), already ends those sessions when the directory disables the account. Its pass
    runs every `[auth].ad_session_recheck_seconds`, 300 seconds by default.
    *Measured 2026-09-23, beside the owner's reason and not replacing it:* revocation takes
    `ad_session_recheck_strikes` consecutive absent probes, 2 by default. So at the shipped defaults
-   the bound is about two passes, not one. `ad_session_recheck_max_users` (200 by default) can spread
-   a large estate over more passes, and a value of 0 for the interval turns the loop off.
+   it takes at least two passes, not one. `ad_session_recheck_max_users` (200 by default) can spread
+   a large estate over more passes, and a value of 0 for the interval turns the loop off. The
+   reconciler sees a directory disable or delete. It does not see a revocation made only at the IdP.
 
 This ruling covers back-channel logout only. The rest of that *Out of scope* list is unchanged. The
 AC-3 forward note on a logout-token ladder keeps its force if this is ever reopened.

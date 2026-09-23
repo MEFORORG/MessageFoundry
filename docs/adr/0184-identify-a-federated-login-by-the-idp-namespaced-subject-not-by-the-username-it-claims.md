@@ -5,7 +5,8 @@
   its decision and reason. The build may start. Federation ships off (`oidc_enabled=false`), so this
   work hardens a first deployment that turns it on.
   **Two of the four items were already partly built when the owner ruled, measured on the accepting
-  branch 2026-09-23.** The `objectGUID` re-key shipped under BACKLOG #1471 and #1532. The unbind
+  branch 2026-09-23.** The `objectGUID` re-key shipped under BACKLOG #1471 and #1532, for rows that
+  carry a directory object id. The unbind
   shipped at the store and service layers under #1474, with no route or console caller yet. Each
   item below records what is built and what is left.
   > **SUPERSEDED status text, kept as a record.** Until 2026-09-23 this line read: *"Proposed — **the
@@ -122,8 +123,8 @@ part 4.)*
 
 - **AD simple bind and Kerberos stay byte-identical.** They pass no `federated_subject`, so the new
   branch is unreachable from them. This is the existing design working, not a limit to be argued over.
-  *[Narrowed on acceptance 2026-09-23: the session mechanism field is written on every session,
-  simple-bind and Kerberos included. The pair-keyed branch stays unreachable from them.]*
+  *[Open on acceptance 2026-09-23: whether the session mechanism field is written on simple-bind and
+  Kerberos sessions is the build's to decide. The pair-keyed branch stays unreachable from them.]*
 - **Roles stay LDAP-sourced.** ADR 0142's Decision holds. Nothing here reads a role from a token claim.
 - **The #1256 exclusivity veto and `ux_users_federated_subject` stay.** Pair-keyed resolution makes the
   veto's read redundant on the hit path, not wrong. The index is what makes the check-then-act guard
@@ -335,9 +336,11 @@ to a closed item reads as done.
       > account is refused (*The bootstrap posture*, above). Without unbind, federated login alone
       > cannot be revoked. The store and service halves of unbind had already shipped (see the
       > *Consequences* marker); what is left is a caller for unbind, and the whole of rebind.
-      > **That reason sets an order.** Unbind is safe only once AC-4's refusal ships. Until then,
-      > `_complete_ad_login` still binds on first presentation, so the next login after an unbind
-      > would bind whatever subject presents. No unbind caller lands before the refusal does.
+
+      *Derived on acceptance from the owner's reason, not itself ruled:* that reason sets an order.
+      Unbind is safe only once AC-4's refusal ships. Until then, `_complete_ad_login` still binds on
+      first presentation, so the next login after an unbind would bind whatever subject presents. So
+      no unbind caller should land before the refusal does.
 - [x] Whether the mechanism discriminator belongs on `SessionRecord`, which carries no mechanism field
       today, and which consumer would read it.
       > **RULED 2026-09-23 by the owner: yes. Add the session mechanism field, and build it together
