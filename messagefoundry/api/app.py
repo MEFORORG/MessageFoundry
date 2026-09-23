@@ -626,6 +626,19 @@ def _get_gate(request: Request) -> ApprovalGate | None:
     return getattr(request.app.state, "approval_gate", None)
 
 
+def _replay_in_scope(identity: Identity, channel_id: str | None) -> bool:
+    """Whether ``identity`` may replay dead letters for ``channel_id``. A channel-scoped caller must
+    name one of its own channels, because replay is not channel-filtered at the engine level. Read
+    by the route at request time and by the approval gate at release, so the two cannot diverge."""
+    return identity.can_access_channel(channel_id)
+
+
+def _purge_in_scope(identity: Identity) -> bool:
+    """Whether ``identity`` may purge an outbound. A purge spans every inbound feeding it, so only an
+    unscoped caller may. Read by the route and by the approval gate, like :func:`_replay_in_scope`."""
+    return identity.allowed_channels is None
+
+
 def _requester_identity_resolver(app: FastAPI) -> IdentityResolver:
     """The approval gate's way to re-read a requester's CURRENT identity at release (ASVS 8.3.2).
 
@@ -736,28 +749,23 @@ def _build_approval_gate(
             "failures": [f.step for f in outcome.failures],
         }
 
-    def _replay_in_scope(identity: Identity, p: Mapping[str, Any]) -> bool:
-        # Mirrors replay_dead_letters: a channel-scoped requester must target one of its channels.
+    def _replay_params_in_scope(identity: Identity, p: Mapping[str, Any]) -> bool:
         channel_id = p.get("channel_id")
-        return identity.can_access_channel(channel_id if isinstance(channel_id, str) else None)
-
-    def _purge_in_scope(identity: Identity, _p: Mapping[str, Any]) -> bool:
-        # Mirrors purge_connection: a purge spans every inbound, so only an unscoped requester may.
-        return identity.allowed_channels is None
+        return _replay_in_scope(identity, channel_id if isinstance(channel_id, str) else None)
 
     gate.register(
         "dead_letter_replay",
         "Replay dead-lettered deliveries",
         _replay,
         permission=Permission.MESSAGES_REPLAY,
-        in_scope=_replay_in_scope,
+        in_scope=_replay_params_in_scope,
     )
     gate.register(
         "connection_purge",
         "Purge queued deliveries to an outbound connection",
         _purge,
         permission=Permission.MESSAGES_PURGE,
-        in_scope=_purge_in_scope,
+        in_scope=lambda identity, _p: _purge_in_scope(identity),
     )
     gate.register(
         "config_reload",
@@ -2655,7 +2663,7 @@ def create_app(
         """Soft-cancel queued deliveries to an outbound connection (across all inbounds)."""
         # Purge targets an outbound and spans every inbound feeding it, so it can't be confined to a
         # per-(inbound-)channel scope — a channel-scoped user may not purge a shared outbound.
-        if identity.allowed_channels is not None:
+        if not _purge_in_scope(identity):
             await _audit_channel_denied(engine, identity, name, client_ip(request))
             raise HTTPException(
                 403, "channel-scoped users cannot purge a shared outbound connection"
@@ -3202,9 +3210,7 @@ def create_app(
         alone; each affected message reverts from ``error`` to ``received`` and re-drains."""
         # A channel-scoped user must target one of their channels (replay isn't channel-filtered at
         # the engine level, so an unscoped "replay all" would cross channels).
-        if identity.allowed_channels is not None and not identity.can_access_channel(
-            req.channel_id
-        ):
+        if not _replay_in_scope(identity, req.channel_id):
             await _audit_channel_denied(engine, identity, req.channel_id, client_ip(request))
             raise HTTPException(403, "specify a channel within your scope to replay")
         if (
@@ -6584,11 +6590,11 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
 
     Reads the RETURNED plan, so it sees only a pass that finished. A pass that raised part-way has
     already audited the revocations it applied; those rows stand, and no alert is raised for them."""
-    if plan.aborted == "directory_unavailable":
+    if plan.directory_outage:
         return
     if plan.aborted is not None:
-        # The same split AuthService._abort_reconcile_pass makes: every abort other than the outage
-        # is audited as auth.ad_reconcile_aborted, so every such abort alerts.
+        # Every other abort is audited as auth.ad_reconcile_aborted (ReconcilePlan.directory_outage
+        # is the one predicate both sides read), so every such abort alerts.
         sink.ad_reconcile_aborted(
             "directory-reconciler",
             reason=plan.aborted,
@@ -7052,7 +7058,7 @@ def create_managed_app(
                 approvals_settings or ApprovalsSettings(),
                 # ASVS 8.3.2: late-bound, because the auth service is attached further down.
                 resolve_identity=_requester_identity_resolver(app),
-                alert_sink=notifier or LoggingAlertSink(),
+                alert_sink=notifier,  # None -> the gate's own LoggingAlertSink default
             )
             # ASVS 5.2.4: age-based retention prune for the uploaded-logs surface. Owned by this lifespan
             # (started here, stopped in the finally) — the runner pattern of cert_expiry, but wired where the

@@ -2654,7 +2654,7 @@ class AuthService:
 
     async def _abort_reconcile_pass(self, plan: reconcile.ReconcilePlan) -> None:
         """Record an aborted pass. Applies NOTHING — the point of the abort."""
-        if plan.aborted == "directory_unavailable":
+        if plan.directory_outage:
             # Not a breaker trip: the accounts are fine, the directory is not. Loud but not latched.
             _log.warning(
                 "directory reconcile: ALL %d probes failed — the directory is unreachable. No "

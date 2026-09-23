@@ -31,22 +31,18 @@ from messagefoundry.api.app import (
 )
 from messagefoundry.api.approvals import ApprovalError, ApprovalGate
 from messagefoundry.auth import Permission, Role
-from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.reconcile import ReconcilePlan, SessionRevocation
 from messagefoundry.auth.service import AuthService
-from messagefoundry.config.settings import (
-    _ALERT_EVENT_TYPES,
-    AlertRule,
-    AlertSeverity,
-    ApprovalsSettings,
-    AuthSettings,
-)
+from messagefoundry.config.settings import _ALERT_EVENT_TYPES, AlertRule, AlertSeverity
 from messagefoundry.pipeline import Engine
-from messagefoundry.pipeline.alert_sinks import AlertRuleSet
+from messagefoundry.pipeline.alert_sinks import AlertRuleSet, NotifierAlertSink
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 
-PW = "a-strong-test-passphrase"
-ON = ApprovalsSettings(enabled=True, operations=["dead_letter_replay", "connection_purge"])
+# The provisioning helpers are shared with the gate's own suite rather than copied, so a change to
+# what a provisioned operator is (scope grant, rotation clear) lands once.
+from tests.test_alert_sinks import _drain, _RecordingTransport
+from tests.test_approvals import ON, _add, _service, _token
+
 STALE = "the requester no longer holds the authority"
 
 
@@ -75,37 +71,6 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
     eng = await Engine.create(tmp_path / "recheck.db", poll_interval=0.02)
     yield eng
     await eng.stop()
-
-
-async def _service(engine: Engine) -> AuthService:
-    service = AuthService(engine.store, AuthSettings(require_mfa=False))
-    await service.initialize()
-    return service
-
-
-async def _add(service: AuthService, username: str, *roles: Role) -> str:
-    uid = await service.create_local_user(
-        username=username,
-        password=PW,
-        display_name=None,
-        email=None,
-        roles=[r.value for r in roles],
-        actor="test",
-    )
-    await service.set_channel_scope(uid, [ALL_CHANNELS], actor="test")
-    user = await service.store.get_user(uid)
-    assert user is not None and user.password_hash is not None
-    await service.store.set_password(
-        uid, password_hash=user.password_hash, must_change_password=False
-    )
-    return uid
-
-
-async def _token(c: httpx.AsyncClient, username: str) -> dict[str, str]:
-    r = await c.post(
-        "/auth/login", json={"username": username, "password": PW, "provider": "local"}
-    )
-    return {"Authorization": f"Bearer {r.json()['token']}"}
 
 
 def _client_with_sink(
@@ -363,29 +328,15 @@ def test_the_new_event_types_are_rule_targetable(event_type: str) -> None:
     assert rules.decide({"type": "connection_stopped", "connection": "x"}).severity == "warning"
 
 
-class _Transport:
-    name = "t"
-
-    def __init__(self) -> None:
-        self.events: list[dict[str, Any]] = []
-
-    async def send(self, event: dict[str, Any], **_kw: Any) -> None:
-        self.events.append(event)
-
-
 async def test_the_notifier_carries_each_event_with_no_params_or_secrets() -> None:
-    from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
-
-    t = _Transport()
+    t = _RecordingTransport("t")
     sink = NotifierAlertSink([t])
     sink.approval_stale_requester("a1", operation="dead_letter_replay", reason="requester_disabled")
     sink.ad_reconcile_aborted(
         "directory-reconciler", reason="mass_revoke_breaker", probed=9, detail="breaker TRIPPED"
     )
     sink.ad_session_revoked("alice", reason="directory_absent")
-    sink.start()
-    await asyncio.sleep(0)
-    await sink.aclose()
+    await _drain(sink)
     by_type = {e["type"]: e for e in t.events}
     assert set(by_type) == {
         "approval_stale_requester",

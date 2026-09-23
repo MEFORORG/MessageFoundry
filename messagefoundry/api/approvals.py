@@ -333,7 +333,6 @@ class ApprovalGate:
             ),
             client=client,  # ADR 0150: the approver's address, matching this row's actor
         )
-        log.warning("approval %s (%s) refused at release: %s", approval_id, operation.key, reason)
         self._alert_sink.approval_stale_requester(
             approval_id, operation=operation.key, reason=reason
         )
