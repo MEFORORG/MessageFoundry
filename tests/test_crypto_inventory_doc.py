@@ -66,7 +66,7 @@ _RETIRED_CLAIMS = (
     "keyless identity (plaintext) by default",  # the false at-rest cipher default (ADR 0148 refutes it)
     "no classical-public-key data at rest",  # the false PQC posture (WebAuthn COSE + OIDC RP refute it)
     # The false audit-chain default (BACKLOG #282). The shipped default refuses to `serve` with no
-    # store key; when a chain is keyed is stated once, in the §4 "Audit chain" row.
+    # store key; the §4 "Audit chain" row is the source of record for when a chain is keyed.
     "default keyless posture",
 )
 
@@ -184,12 +184,13 @@ def test_retired_false_claims_are_absent() -> None:
 
 
 def test_default_keyless_claim_is_absent_from_its_other_sites() -> None:
-    # Case-folded, because one site spelled it "DEFAULT keyless posture".
+    # Case-folded, because one site spelled it "DEFAULT keyless posture". Whitespace is collapsed,
+    # because both sites are hard-wrapped prose and a reflow can split the phrase across lines.
     needle = "default keyless posture"
     present = [
         path.relative_to(_ROOT).as_posix()
         for path in _KEYLESS_DEFAULT_SITES
-        if needle in path.read_text(encoding="utf-8").casefold()
+        if needle in " ".join(path.read_text(encoding="utf-8").split()).casefold()
     ]
     assert not present, f"the false 'default keyless posture' wording reappeared in: {present}"
 

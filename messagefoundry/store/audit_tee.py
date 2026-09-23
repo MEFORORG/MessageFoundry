@@ -66,11 +66,12 @@ def emit_audit_tee(
     actually cut, a reader of the log can TEST guesses at the removed span offline, one hash per guess.
     That is narrow (it needs an exact byte-for-byte reconstruction of a redacted exception string, and
     an audit ``detail`` that was not HL7-shaped is forwarded unredacted anyway, so there is nothing left
-    to guess) and it disappears entirely once the chain is keyed, where the digest is an HMAC under a
-    DEK-derived subkey. Keyless is not the shipped default, but a store key does not by itself key a
-    chain whose first row was written keyless; the "Audit chain" row in
-    ``docs/ASVS-L2-PHASE0-CHANGES.md`` says when it is keyed. It is recorded here rather than left for
-    a reader to rediscover.
+    to guess). It does not arise for a row written after the chain is keyed, where the digest is an
+    HMAC under a DEK-derived subkey or a Transit MAC. Keyless is not the shipped default. But a store
+    key does not by itself key a chain whose first row was written keyless, and rows written before
+    the chain was keyed keep their plain SHA-256. The "Audit chain" row in
+    ``docs/ASVS-L2-PHASE0-CHANGES.md`` says when a chain is keyed. It is recorded here rather than
+    left for a reader to rediscover.
 
     **What the anchor fields do and do not buy, stated here so nobody over-reads them.** A within-store
     chain walk cannot see TAIL truncation -- deleting the newest rows leaves a prefix that still
