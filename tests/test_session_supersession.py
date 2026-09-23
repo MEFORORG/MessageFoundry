@@ -86,12 +86,13 @@ async def _live(service: AuthService, token: str) -> bool:
 
 
 async def _superseded(store: MessageStore) -> list[dict[str, object]]:
+    """Each ``superseded`` row as its detail plus the row's ``actor``."""
     out: list[dict[str, object]] = []
     for row in await store.list_audit():
         if row["action"] == "auth.session_revoked" and row["detail"]:
             detail = json.loads(str(row["detail"]))
             if detail.get("scope") == "superseded":
-                out.append(detail)
+                out.append({**detail, "actor": row["actor"]})
     return out
 
 
@@ -104,10 +105,8 @@ async def test_a_sign_in_ends_only_the_presented_session_and_audits_it(
     assert not await _live(service, prior)
     assert await _live(service, elsewhere), "a whole-user revoke, not a supersession"
     assert await _live(service, new)
-    op = await store.get_user_by_username("op")
-    assert op is not None
     assert await _superseded(store) == [
-        {"scope": "superseded", "session": hash_token(prior)[:12], "user_id": op.id}
+        {"scope": "superseded", "session": hash_token(prior)[:12], "actor": "op"}
     ]
 
 
@@ -125,16 +124,46 @@ async def test_superseding_at_the_session_cap_signs_no_other_device_out(
     assert await _live(service, new)
 
 
-async def test_a_prior_session_of_another_user_is_ended_and_named(store: MessageStore) -> None:
+async def test_a_prior_session_of_another_user_is_ended_under_its_owner(
+    store: MessageStore,
+) -> None:
     # A shared workstation: another operator's session was in the browser. It can never be presented
-    # from here again, so it is ended too -- and the row names whose it was, not only who signed in.
+    # from here again, so it is ended too. The row is filed under its OWNER, because
+    # /me/security-events selects by actor: it belongs in their feed, and nothing of theirs belongs
+    # in the feed of whoever signed in.
     service = await _service(store)
     theirs = await _token(service, "other")
     await _token(service, "op", supersedes=theirs)
     assert not await _live(service, theirs)
-    other = await store.get_user_by_username("other")
-    assert other is not None
-    assert [r["user_id"] for r in await _superseded(store)] == [other.id]
+    rows = await _superseded(store)
+    assert [r["actor"] for r in rows] == ["other"]
+    assert all("user_id" not in r for r in rows)
+
+
+async def test_a_lapsed_prior_at_the_cap_is_still_revoked_so_no_device_is_evicted(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Round-2 finding: a prior session over its idle limit but not yet lazily revoked still counts
+    # toward the cap. Skipping it would let the cap evict a LIVE device in its place. The device
+    # must be OLDER than the lapsed session and still live, or the cap would pick the lapsed row
+    # anyway and the test could not fail.
+    service = await _service(store, max_sessions_per_user=3, session_idle_timeout_minutes=30)
+    clock = {"offset": 0.0}
+    real = time.time
+    monkeypatch.setattr(time, "time", lambda: real() + clock["offset"])
+    device = await _token(service)  # oldest, and kept live below
+    browser = await _token(service)  # newer, and about to lapse
+    clock["offset"] = 20 * 60
+    assert await service.identity_for_token(device) is not None  # the device is in use
+    clock["offset"] = 40 * 60  # browser idle 40 min: lapsed; device idle 20 min: live
+    second = await _token(service)  # 3 of 3 unrevoked: device, browser, second
+    await _token(service, supersedes=browser)
+    assert [await _live(service, t) for t in (device, second)] == [True, True], (
+        "the cap evicted a live device"
+    )
+    record = await store.get_session(hash_token(browser))
+    assert record is not None and record.revoked_at is not None
+    assert await _superseded(store) == [], "a lapsed session was recorded as superseded"
 
 
 async def test_a_failed_sign_in_ends_nothing(store: MessageStore) -> None:

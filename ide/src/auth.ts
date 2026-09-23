@@ -228,28 +228,32 @@ export async function withAuth<T>(
   url: string,
   call: (token: string) => Promise<T>,
 ): Promise<T | undefined> {
-  const token = await ensureToken(ctx, url);
-  if (token === undefined) {
+  const first = await ensureToken(ctx, url);
+  if (first === undefined) {
     return undefined; // sign-in cancelled
   }
-  try {
-    return await call(token);
-  } catch (e) {
-    if (e instanceof HttpError && e.status === 401) {
-      // A sign-in elsewhere may have replaced (and revoked) the token this call used. Then the cache
-      // holds a newer, live token: retry with it, and never clear it, or that new session would be
-      // stranded on the engine with no client holding it.
+  let token: string = first;
+  // At most three calls. A 401 is retried once with a NEWER cached token if a sign-in elsewhere
+  // replaced (and revoked) the one this call used -- clearing the cache then would strand that new
+  // session on the engine with no client holding it -- and otherwise by signing in again.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await call(token);
+    } catch (e) {
+      if (!(e instanceof HttpError && e.status === 401) || attempt >= 2) {
+        throw e;
+      }
       const cached = await peekToken(ctx, url);
       if (cached !== undefined && cached !== token) {
-        return await call(cached);
+        token = cached;
+        continue;
       }
       await clearToken(ctx, url);
       const fresh = await signIn(ctx, url);
       if (fresh === undefined) {
         return undefined;
       }
-      return await call(fresh);
+      token = fresh;
     }
-    throw e;
   }
 }

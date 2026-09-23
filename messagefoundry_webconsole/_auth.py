@@ -843,7 +843,9 @@ async def authorize_ui_ws(
     auth = getattr(websocket.app.state, "auth", None)
     if auth is None or not auth.enabled:
         return None, None
-    identity = await auth.identity_for_token(token)
+    # activity=False (ASVS 14.3.1): app.js now re-opens this socket on a TIMER after a drop, and a
+    # timer is not user activity. The page load that opened the first socket already counted.
+    identity = await auth.identity_for_token(token, activity=False)
     if identity is None or identity.must_change_password:
         return None, None
     # ASVS 6.3.3, mirroring authorize_ws on the header path: an MFA-pending session does not stream.

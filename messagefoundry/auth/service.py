@@ -1376,7 +1376,6 @@ class AuthService:
             client,
             mfa_verified=not mfa_required,
             supersedes_hash=hash_token(supersedes) if supersedes else None,
-            actor=user.username,
         )
         await self._audit(
             "auth.login_success",
@@ -1571,8 +1570,7 @@ class AuthService:
 
         ``prior_session`` is the session token the browser presented on this start leg, if any. Only
         its hash is staged, and nothing is revoked here: the callback's mint supersedes it once the
-        IdP proof succeeds (ASVS 7.2.4, :meth:`_issue_session`). The start leg is the only place to read it,
-        because the callback arrives as a cross-site navigation that withholds the Strict cookie.
+        IdP proof succeeds (ASVS 7.2.4). Why the start leg: see ``PendingFlow.prior_session_hash``.
         """
         if not self.oidc_enabled or self._oidc_flows is None:
             raise oidc.FlowError("federated sign-in is not configured")
@@ -1762,8 +1760,7 @@ class AuthService:
             },
             max_expires_at=max_expires_at,
             federated_subject=(principal_claims.issuer, principal_claims.subject),
-            # ASVS 7.2.4: the session the START leg saw, staged in the flow because this callback
-            # arrives cross-site and the browser withholds the Strict cookie here.
+            # ASVS 7.2.4: the session the START leg saw (see PendingFlow.prior_session_hash).
             supersedes_hash=flow.prior_session_hash,
         )
 
@@ -2040,7 +2037,6 @@ class AuthService:
                 # they take no extra read and no extra statement.
                 require_federated_subject=federated_subject,
                 supersedes_hash=supersedes_hash,
-                actor=principal.username,
             )
         except _FederatedBindingWithdrawn:
             await self._directory_reject_audit(
@@ -2781,13 +2777,12 @@ class AuthService:
         max_expires_at: float | None = None,
         require_federated_subject: tuple[str, str] | None = None,
         supersedes_hash: str | None = None,
-        actor: str | None = None,
     ) -> str:
         """Mint a session token and persist the row. Callers passing
         ``require_federated_subject`` must handle :class:`_FederatedBindingWithdrawn`.
 
         ``supersedes_hash`` names the session this sign-in REPLACES in the caller's browser (ASVS
-        7.2.4, login side); ``actor`` is who signed in, for its audit row. It is ended after the new
+        7.2.4, login side). It is ended after the new
         row is safely written and BEFORE the per-user cap runs. That order is the point: ending it
         after the cap would let the cap evict another device's oldest session to make room for a
         session that was about to go anyway.
@@ -2829,8 +2824,8 @@ class AuthService:
             # never blocks it. An MFA-required login leaves it NULL until POST /auth/mfa-verify
             # (WP-14) -- including the Kerberos leg, which asserts nothing and mints at the minimum.
             await self._store.mark_session_mfa_verified(token_hash)
-        if supersedes_hash is not None and supersedes_hash != token_hash:
-            await self._supersede_session_hash(supersedes_hash, actor=actor, client=client)
+        if supersedes_hash is not None:
+            await self._supersede_session_hash(supersedes_hash, client=client)
         cap = self._settings.max_sessions_per_user
         if cap and cap > 0:
             # Evict the oldest sessions beyond the cap (the just-created one is newest, so survives).
@@ -3002,9 +2997,7 @@ class AuthService:
             # session was revoked silently, contradicting the doc and leaving a gap in the trail.
             await self._audit("auth.logout", actor=actor)
 
-    async def _supersede_session_hash(
-        self, prior_hash: str, *, actor: str | None, client: str | None
-    ) -> bool:
+    async def _supersede_session_hash(self, prior_hash: str, *, client: str | None) -> bool:
         """End the session a browser presented at a fresh sign-in (ASVS 7.2.4, login side).
 
         A console sign-in answers with a ``Set-Cookie`` that REPLACES the browser's session cookie, so
@@ -3017,34 +3010,38 @@ class AuthService:
         turn every sign-in into a forced sign-out of every other device.
 
         The prior session may belong to a different user, for example on a shared workstation. It is
-        still ended, and the audit row names its owner. Anyone holding that token could already end
-        it with ``POST /auth/logout``, so this grants no new power.
+        still ended. Anyone holding that token could already end it with ``POST /auth/logout``, so
+        this grants no new power. The audit row's actor is the session's OWNER, not whoever signed
+        in: ``/me/security-events`` selects rows by actor, so the event belongs in the feed of the
+        user whose session ended, and must not put that user's ids in anyone else's.
 
-        Returns True, and audits, only for a session that was LIVE and is now revoked. One already
-        dead by expiry or idle is left to the lazy revoke in :meth:`identity_for_token`, so the trail
-        does not record the ending of something that had already ended. ``revoke_session`` reports no
+        An unrevoked row is ALWAYS revoked, even one already over by expiry or idle: the per-user
+        cap counts every unrevoked row, so leaving a lapsed one would let the cap evict a live
+        device in its place. Only a session that was still LIVE gets an audit row, so the trail does
+        not record the ending of something that had already ended. ``revoke_session`` reports no
         rowcount, so the row is read back: a rotation that re-keyed it between the read and the
         revoke leaves the old hash absent, and then no row claims a revoke that never happened.
+        Returns True when it audited.
         """
         prior = await self._store.get_session(prior_hash)
-        now = time.time()
-        if (
-            prior is None
-            or prior.revoked_at is not None
-            or now > prior.expires_at
-            or now - prior.last_used_at > self._settings.session_idle_timeout_minutes * 60
-        ):
+        if prior is None or prior.revoked_at is not None:
             return False
+        now = time.time()
+        was_live = (
+            now <= prior.expires_at
+            and now - prior.last_used_at <= self._settings.session_idle_timeout_minutes * 60
+        )
         await self._store.revoke_session(prior_hash, now=now)
+        if not was_live:
+            return False
         after = await self._store.get_session(prior_hash)
         if after is None or after.revoked_at is None:
             return False
+        owner = await self._store.get_user(prior.user_id)
         await self._audit(
             "auth.session_revoked",
-            actor=actor,
-            detail=_json(
-                {"scope": "superseded", "session": prior_hash[:12], "user_id": prior.user_id}
-            ),
+            actor=owner.username if owner is not None else None,
+            detail=_json({"scope": "superseded", "session": prior_hash[:12]}),
             client=client,
         )
         return True
