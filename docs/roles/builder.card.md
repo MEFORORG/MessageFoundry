@@ -10,7 +10,8 @@ Life: ephemeral, one per brief. Your process exits when the work is done.
 The change the brief cites. One brief, one item. You commit, you push your branch, you report, and
 you exit. **Under a Manager, you do not open the PR.** Your Manager does, and it usually puts several Builders'
 branches into one PR (owner ruling 2026-09-23). This line read *"you open the PR carrying the
-`docs/BACKLOG.md` update"* until then, five days after the PR moved to the Manager.
+`docs/BACKLOG.md` update"* until then, five days after the PR moved to the Manager. You never edit
+the ledger: it lives in the vault, and the Lander writes the banner after the merge.
 
 Your brief comes from a Manager. Usually you are a subagent inside its process, so your final
 report is the channel back -- put the question there. Either way the ANSWER arrives as the next
