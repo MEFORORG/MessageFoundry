@@ -171,19 +171,30 @@ pip install -e ".[dev]"
 pytest
 ```
 
-Run the engine + localhost API (loads the bundled sample config, which ships only in a checkout):
+Run the engine + localhost API (loads the bundled sample config, which ships only in a checkout).
+It refuses to start until its secure-by-default posture is met, starting with a store encryption
+key (`messagefoundry gen-key`, set as `MEFOR_STORE_ENCRYPTION_KEY`). Each refusal names the setting
+it needs; the [User Guide](https://github.com/MEFORORG/MessageFoundry/blob/main/docs/USER-GUIDE.md)
+covers the key.
 
 ```bash
 python -m messagefoundry serve --config samples/config --db messagefoundry.db --env dev
-# API on http://127.0.0.1:8765 — GET /connections, /messages, /stats, WS /ws/stats
+# API on https://127.0.0.1:8765 — GET /connections, /messages, /stats, WS /ws/stats
 ```
+
+The engine always serves HTTPS. With no `[api].tls_cert_file` set, it mints a self-signed
+certificate on first run and saves it beside the store database as `api-generated-cert.pem`. A
+browser warns about that certificate, and other clients reject it, until you import it into the
+trust store or configure your own. The one exception is a declared TLS-terminating proxy in front
+(`[api].tls_terminated_upstream`): the engine then speaks plain HTTP to the proxy, and you browse to
+the proxy's address.
 
 Then open the admin console in a browser (install the web console alongside the engine with
 `pip install -e packaging/messagefoundry-webconsole`; it is on by default for a loopback bind, so
 there is no switch to set):
 
 ```bash
-# browse to http://127.0.0.1:8765/ui and sign in
+# browse to https://127.0.0.1:8765/ui and sign in
 ```
 
 ### VS Code extension & test harness

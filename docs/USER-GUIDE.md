@@ -158,11 +158,13 @@ Put it under version control with **Set Up Version Control & Checks** in the IDE
 
 ### 5. Open the admin console (in a browser)
 
-The console is the **browser web console** served same-origin by the engine at `/ui` (install the `messagefoundry-webconsole` wheel alongside the engine and set `[security].serve_web_console = true`). With the engine running, browse to:
+The console is the **browser web console** served same-origin by the engine at `/ui` (install the `messagefoundry-webconsole` wheel alongside the engine; it is on by default for a loopback bind, so there is no switch to set). With the engine running, browse to:
 
 ```
-http://127.0.0.1:8765/ui
+https://127.0.0.1:8765/ui
 ```
+
+The engine always serves HTTPS. With no `[api].tls_cert_file`, it mints a self-signed certificate on first run, beside the store database as `api-generated-cert.pem`, so the browser warns until you import that file into the trust store or configure your own certificate.
 
 The web console prompts for sign-in (authentication is on by default). Source: [packaging/messagefoundry-webconsole/](../packaging/messagefoundry-webconsole/). (The former PySide6 desktop console was retired — BACKLOG #103; PySide6 now backs only the standalone test harness.)
 

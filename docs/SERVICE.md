@@ -496,7 +496,10 @@ and `[security].serve_web_console = false` turns it off. (`[api].serve_ui` was t
 is now **refused at config load** — [ADR 0118](adr/0118-secure-by-default-security-configuration-section.md)
 moved the console/bind/origin switches into `[security]`.)
 
-Browse to this service's `/ui` (`http://127.0.0.1:8765/ui`) and sign in. See
+Browse to this service's `/ui` (`https://127.0.0.1:8765/ui`) and sign in. The engine always serves
+HTTPS: with no `[api].tls_cert_file` it mints a self-signed certificate on first run, beside the
+store database as `api-generated-cert.pem`, so the browser warns until you import that file into the
+trust store or configure your own certificate. See
 [INSTALL-GUIDE.md](INSTALL-GUIDE.md) → "Launching the admin console". (The former PySide6 desktop
 console was retired — BACKLOG #103.)
 

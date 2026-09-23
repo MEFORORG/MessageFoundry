@@ -52,14 +52,13 @@ On each host, create a virtual environment and install the engine at a **pinned 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1                 # Linux/macOS: . .venv/bin/activate
-pip install "messagefoundry==0.1.0"          # pin the exact version (core runtime only)
+pip install "messagefoundry==0.4.0"          # pin the exact version (core runtime only)
 ```
 
-> **CAUTION: early access.** `0.1.0` is an **Early Access** release on public PyPI — feature-complete and
+> **CAUTION: early access.** `0.4.0` is an **Early Access** release on public PyPI — feature-complete and
 > test-validated, but the external review + pen test that gate a security-certified **v1.0** land after
-> launch. The exact-pin command above (`==0.1.0`) resolves today; the earlier `0.1.0rc1` pre-release also
-> remains installable (`pip install messagefoundry==0.1.0rc1`). You can equally install from the engine's
-> **GitHub Release assets** or your organization's **private index**.
+> launch. Earlier releases, back to the `0.1.0rc1` pre-release, remain installable. You can equally
+> install from the engine's **GitHub Release assets** or your organization's **private index**.
 
 Add extras only for what a host actually runs — `messagefoundry[postgres]` (PostgreSQL store),
 `messagefoundry[sqlserver]` (SQL Server store + the DATABASE connectors, needs OS-level ODBC Driver 18),
@@ -288,8 +287,11 @@ pip install "messagefoundry-webconsole==0.3.0"    # the /ui web console for engi
 # [security].serve_web_console = false (the old [api].serve_ui spelling is refused at config load)
 ```
 
-Browse to the engine's `/ui` (`http://127.0.0.1:8765/ui` by default — typically the boot-start
-[service](SERVICE.md)) and sign in; nothing else is needed for the local case. Off-loopback the console
+Browse to the engine's `/ui` (`https://127.0.0.1:8765/ui` by default — typically the boot-start
+[service](SERVICE.md)) and sign in. The engine always serves HTTPS: with no `[api].tls_cert_file` it
+mints a self-signed certificate on first run, beside the store database as `api-generated-cert.pem`,
+so the browser warns until you import that file into the trust store or configure your own
+certificate. Nothing else is needed for the local case. Off-loopback the console
 is **opt-in**: an exposed instance serves `/ui` only when `[security].serve_web_console = true` is set
 explicitly — a default-on console on an exposed bind quietly degrades to the JSON API with a warning —
 and it additionally requires TLS, plus `[security].web_console_public_address` behind a declared
