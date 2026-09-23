@@ -42,6 +42,9 @@ DEFAULT_MAX_AGE = 43200
 LADDER_NOW = 1_000_000
 LADDER_CLOCK = LADDER_NOW + 100
 
+#: The least session an accepted auth_time must leave (claims.MIN_RECENCY_REMAINING_SECONDS).
+MIN_LEFT = 60
+
 
 @pytest.fixture(scope="module")
 def rsa_key() -> rsa.RSAPrivateKey:
@@ -164,9 +167,16 @@ def test_a_null_auth_time_is_the_same_fault_as_a_missing_one(rsa_key: rsa.RSAPri
 
 
 def test_a_stale_auth_time_is_refused(rsa_key: rsa.RSAPrivateKey) -> None:
-    # One second past the bound plus the 60 s default skew.
-    stale = LADDER_CLOCK - DEFAULT_MAX_AGE - 60 - 1
+    # 59 s of the bound left: one second under the minimum session the ladder insists on.
+    stale = LADDER_CLOCK - DEFAULT_MAX_AGE + MIN_LEFT - 1
     assert _refusal(rsa_key, ladder._good_claims(auth_time=stale)) == "auth_time_stale"
+
+
+def test_a_stale_auth_time_gets_no_clock_skew_grace(rsa_key: rsa.RSAPrivateKey) -> None:
+    """Unlike exp, the stale side has no skew grace: a token past max_age but inside the 60 s skew
+    would mint a session that is already dead, so the ladder refuses it outright."""
+    inside_skew = LADDER_CLOCK - DEFAULT_MAX_AGE - 30
+    assert _refusal(rsa_key, ladder._good_claims(auth_time=inside_skew)) == "auth_time_stale"
 
 
 def test_the_stale_bound_follows_the_policy_value(rsa_key: rsa.RSAPrivateKey) -> None:
@@ -177,8 +187,8 @@ def test_the_stale_bound_follows_the_policy_value(rsa_key: rsa.RSAPrivateKey) ->
     assert _refusal(rsa_key, claims, max_age_seconds=600) == "auth_time_stale"
 
 
-def test_an_auth_time_inside_the_bound_and_skew_is_accepted(rsa_key: rsa.RSAPrivateKey) -> None:
-    edge = LADDER_CLOCK - DEFAULT_MAX_AGE - 60
+def test_an_auth_time_leaving_the_minimum_session_is_accepted(rsa_key: rsa.RSAPrivateKey) -> None:
+    edge = LADDER_CLOCK - DEFAULT_MAX_AGE + MIN_LEFT
     principal = _validate(rsa_key, ladder._good_claims(auth_time=edge))
     assert principal.auth_time == edge
 
@@ -196,11 +206,14 @@ def test_a_non_numeric_auth_time_is_malformed_not_missing(
     assert _refusal(rsa_key, ladder._good_claims(auth_time=bad)) == "claim_not_numeric"
 
 
+@pytest.mark.parametrize("claim", ["auth_time", "exp", "iat", "nbf"])
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
-def test_a_non_finite_auth_time_is_refused(rsa_key: rsa.RSAPrivateKey, bad: float) -> None:
-    """json.loads accepts NaN and Infinity. NaN compares False against both bounds, so without the
-    finiteness check it would pass the ladder and then vanish inside the service's min()."""
-    assert _refusal(rsa_key, ladder._good_claims(auth_time=bad)) == "claim_not_numeric"
+def test_a_non_finite_time_claim_is_refused(
+    rsa_key: rsa.RSAPrivateKey, claim: str, bad: float
+) -> None:
+    """json.loads accepts NaN and Infinity. NaN compares False against every bound, so a NaN exp
+    used to pass the expiry check and then, inside the service's min(), drop the auth_time cap."""
+    assert _refusal(rsa_key, ladder._good_claims(**{claim: bad})) == "claim_not_numeric"
 
 
 def test_the_policy_refuses_to_be_built_without_a_bound() -> None:
@@ -319,12 +332,11 @@ async def test_the_deadline_is_a_min_so_a_tighter_bound_still_wins(
         await store.close()
 
 
-async def test_an_auth_time_inside_the_skew_grace_never_mints_a_dead_session(
+async def test_an_auth_time_just_past_max_age_never_mints_a_dead_session(
     rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The ladder tolerates clock_skew_seconds, so auth_time can be up to max_age + skew old and
-    pass. Capping at auth_time + max_age would then store a deadline already behind now. The
-    service refuses under the recency slug, not as a generic expiry."""
+    """A deadline already behind now is refused under the recency slug and audited, never minted
+    as a session that dies on its first request."""
     store = await MessageStore.open(":memory:")
     try:
         now = time.time()
@@ -354,6 +366,78 @@ async def test_a_missing_auth_time_refuses_the_federated_login(
         assert out.reason == "auth_time_missing"
         rows = await svc._audit_rows(store, "auth.login_failed")
         assert any('"reason": "auth_time_missing"' in (r["detail"] or "") for r in rows)
+    finally:
+        await store.close()
+
+
+async def test_the_service_backstop_refuses_a_deadline_that_passed_after_the_ladder(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ladder leaves at least a minute; the LDAP round trip after it can eat that. Drive the
+    service branch directly with a principal whose deadline is already behind now."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await svc._service(store, rsa_key)
+        now = time.time()
+        principal = oidc.FederatedPrincipal(
+            username="jdoe",
+            subject="S-1-5-21-federated",
+            issuer="https://idp.example",
+            amr=("mfa",),
+            acr=None,
+            expires_at=now + 3600,
+            auth_time=now - DEFAULT_MAX_AGE - 1,
+        )
+        monkeypatch.setattr(service, "_exchange_and_validate", lambda *_a: principal)
+        out = await service.authenticate_oidc(
+            svc.AUTH_CODE, svc._flow(), redirect_uri="https://ops.example/ui/oidc/callback"
+        )
+        assert not out.ok and out.token is None
+        assert out.reason == "auth_time_stale"
+        rows = await svc._audit_rows(store, "auth.login_failed")
+        assert any('"reason": "auth_time_stale"' in (r["detail"] or "") for r in rows)
+    finally:
+        await store.close()
+
+
+async def test_a_future_auth_time_inside_the_skew_cannot_lengthen_the_session(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ladder accepts an IdP clock up to the skew ahead. The service clamps auth_time to now,
+    so the session still ends max_age from now and not max_age plus the IdP's lead."""
+    store = await MessageStore.open(":memory:")
+    try:
+        now = time.time()
+        out = await _session_for(
+            rsa_key,
+            monkeypatch,
+            store,
+            svc._claims(exp=now + 30 * 86400, auth_time=now + 30),
+            oidc_max_age_seconds=3600,
+        )
+        assert out.ok and out.token is not None
+        session = await store.get_session(hash_token(out.token))
+        assert session is not None
+        assert session.expires_at == pytest.approx(now + 3600, abs=2)
+    finally:
+        await store.close()
+
+
+async def test_a_nan_exp_cannot_drop_the_recency_cap(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end: an 11-hour-old IdP sign-in with exp=NaN used to mint a 12-hour session, because
+    NaN passed the expiry check and then won the min(). It is refused as malformed now."""
+    store = await MessageStore.open(":memory:")
+    try:
+        out = await _session_for(
+            rsa_key,
+            monkeypatch,
+            store,
+            svc._claims(exp=float("nan"), auth_time=time.time() - 11 * 3600),
+        )
+        assert not out.ok and out.token is None
+        assert out.reason == "claim_not_numeric"
     finally:
         await store.close()
 
@@ -400,15 +484,16 @@ def test_a_replayed_token_missing_auth_time_fails_the_claims_rung(
     assert rows["fed.replay.nonce"].status is Status.SKIP
 
 
-def test_a_replayed_token_with_an_old_auth_time_skips_as_a_stale_capture(
+def test_a_replayed_token_with_a_live_exp_and_an_old_auth_time_fails(
     rsa_key: rsa.RSAPrivateKey, tmp_path: Path
 ) -> None:
-    """An old capture's auth_time ages past max_age on disk. Like a past exp, that says nothing
-    about the deployment, so the rung is SKIPPED with a re-capture instruction, never FAILED."""
+    """exp is checked first, so a merely old capture reads as expired and SKIPs. A token whose exp
+    is still live but whose auth_time is past max_age is an IdP that answered a max_age request with
+    an old sign-in instead of re-authenticating: a deployment defect, so FAIL, never SKIP."""
     token = vf._mint(rsa_key, auth_time=time.time() - DEFAULT_MAX_AGE - 3600)
     rows = _replay(rsa_key, tmp_path, token)
-    assert rows["fed.replay.claims"].status is Status.SKIP
-    assert "re-capture" in rows["fed.replay.claims"].detail
+    assert rows["fed.replay.claims"].status is Status.FAIL
+    assert "auth_time_stale" in rows["fed.replay.claims"].detail
     assert rows["fed.replay.nonce"].status is Status.SKIP
 
 

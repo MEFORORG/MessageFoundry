@@ -163,7 +163,9 @@ def _config_rows(settings: ServiceSettings) -> list[CheckResult]:
             Status.MANUAL,
             "every authorization request sends this max_age; a token with no auth_time, or one "
             "older than this, is refused, and the session ends this long after the IdP "
-            "authentication. Confirm the identity provider honours max_age and returns auth_time",
+            "authentication. Confirm the identity provider honours max_age and returns auth_time: "
+            "if it does not, EVERY federated sign-in is refused as auth_time_missing. Replay a "
+            "captured id_token (--fed-id-token / --fed-jwks) to see whether it carries auth_time",
             evidence=f"max_age={auth.oidc_max_age_seconds}s",
         )
     )
@@ -362,20 +364,6 @@ def _replay_rows(
                         Status.SKIP,
                         "no --fed-nonce supplied — the browser flow binding cannot be verified "
                         "offline (it is exercised by the live lab cells)",
-                    )
-                )
-            elif failed_reason == "auth_time_stale":
-                # The same reasoning as a past `exp` below: an old capture's auth_time ages past
-                # max_age while the file sits on disk, which says nothing about the deployment. A
-                # MISSING auth_time is different and FAILs -- that is an IdP ignoring max_age.
-                stopped_because = "the captured token's auth_time is older than max_age"
-                rows.append(
-                    CheckResult(
-                        rid,
-                        title,
-                        Status.SKIP,
-                        "the captured id_token's auth_time is older than [auth].oidc_max_age_seconds "
-                        "— re-capture to exercise this rung",
                     )
                 )
             elif failed_reason == "expired":

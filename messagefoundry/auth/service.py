@@ -1705,15 +1705,20 @@ class AuthService:
         # authenticated AT THE IdP. This is REQUIRED, not belt-and-braces: the ladder only checks
         # recency at login, and /ui/reauth never returns to the IdP, so without this cap the time
         # since the IdP authentication event would grow unbounded for the session's whole life.
-        # Same skew-grace reasoning as above: the ladder tolerates clock_skew_seconds, so a deadline
-        # already behind now is refused under its own slug rather than minted dead.
-        recency_deadline = principal_claims.auth_time + self._settings.oidc_max_age_seconds
+        # auth_time is clamped to now first: the ladder accepts an IdP clock up to clock_skew_seconds
+        # AHEAD, and without the clamp that lead would extend the session past now + max_age. The
+        # ladder already refuses a token leaving under MIN_RECENCY_REMAINING_SECONDS; this branch is
+        # the backstop for time spent between that check and here (the LDAP round trip), so a
+        # deadline already behind now is refused under its own slug rather than minted dead.
+        recency_deadline = (
+            min(principal_claims.auth_time, now) + self._settings.oidc_max_age_seconds
+        )
         if recency_deadline <= now:
             await self._directory_reject_audit(username, "oidc", "auth_time_stale")
             return LoginOutcome(
                 ok=False, error="federated sign-in failed", reason="auth_time_stale"
             )
-        max_expires_at = min(max_expires_at, recency_deadline)
+        max_expires_at = min(recency_deadline, max_expires_at)
 
         self.clear_oidc_unavailable()
         # ASVS 6.3.4, the one directory leg the engine can actually verify. Keyed on the SETTING, not
