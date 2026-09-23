@@ -22,9 +22,9 @@ every single commit would satisfy every positive test in this file.
 **A NEGATIVE ASSERTION HERE IS A RACE UNLESS IT WAITS FOR SOMETHING FIRST.** The push is detached,
 so "the orphan ref is absent" is trivially true the instant after ``git commit`` returns. Every
 absence assertion below therefore waits for the MOVING tag to reach its new commit first, and only
-then asks about the orphan -- the push that would have written one has demonstrably finished. The
-one test whose moving push cannot land waits instead for a ``GIT_TRACE`` line showing it started,
-which the hook reaches only after any orphan push is done.
+then asks about the orphan -- the push that would have written one has demonstrably finished. One
+test's moving push cannot land. It waits instead for a ``GIT_TRACE`` line showing that push
+started, and the hook starts it only after any orphan push is done.
 
 **AND THE REMOTE TAG IS NOT THE HOOK'S LAST WRITE.** The local ``$LAST`` ref lands after it. So a
 test that reads ``$LAST`` next, or commits again on the same branch and so makes the hook read it,
@@ -37,6 +37,7 @@ import os
 import shutil
 import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -128,14 +129,24 @@ def peel(bare: Path, ref: str) -> str:
     return got.stdout.strip() if got.returncode == 0 else ""
 
 
-def wait_for_commit(bare: Path, ref: str, sha: str) -> bool:
-    """Poll until ``ref`` names ``sha``. The detached push is why this is a poll and not a read."""
+def poll(ready: Callable[[], bool]) -> bool:
+    """Poll until ``ready()`` holds, or ``PUSH_WAIT`` runs out. Every wait in this file uses it."""
     deadline = time.monotonic() + PUSH_WAIT
     while time.monotonic() < deadline:
-        if peel(bare, ref) == sha:
+        if ready():
             return True
         time.sleep(0.25)
     return False
+
+
+def last_ref(tag: str) -> str:
+    """The local ``$LAST`` ref for a moving ``tag``, derived the way the hook derives it."""
+    return "refs/mefor/durability/" + tag.removeprefix("refs/tags/rescue/auto/")
+
+
+def wait_for_commit(bare: Path, ref: str, sha: str) -> bool:
+    """Poll until ``ref`` names ``sha``. The detached push is why this is a poll and not a read."""
+    return poll(lambda: peel(bare, ref) == sha)
 
 
 def wait_for_landed(repo: Path, bare: Path, tag: str, sha: str) -> bool:
@@ -149,16 +160,9 @@ def wait_for_landed(repo: Path, bare: Path, tag: str, sha: str) -> bool:
     the comparison and present by the time the message was built. Measured 2026-09-22 with a
     ``sleep`` before the hook's ``update-ref``: at 80ms, 8 of 15 runs failed, 6 in exactly that
     shape.
-
-    ``$LAST`` is derived from ``tag`` the way the hook derives it.
     """
-    last = "refs/mefor/durability/" + tag.removeprefix("refs/tags/rescue/auto/")
-    deadline = time.monotonic() + PUSH_WAIT
-    while time.monotonic() < deadline:
-        if peel(bare, tag) == sha and peel(repo, last) == sha:
-            return True
-        time.sleep(0.25)
-    return False
+    last = last_ref(tag)
+    return poll(lambda: peel(bare, tag) == sha and peel(repo, last) == sha)
 
 
 def refs(bare: Path, prefix: str = "") -> list[str]:
@@ -282,11 +286,12 @@ def test_the_FIRST_commit_on_a_branch_creates_no_orphan(armed: tuple[Path, Path]
     git 2.55.0.windows.5.
 
     **THIS TEST CANNOT CATCH A HOOK THAT READS 128 AS "NOT AN ANCESTOR".** This docstring used to
-    say that collapse would make every first commit preserve a ref, and so imply this test pinned
-    it. It does not. With ``$LAST`` absent, the hook's ``$PREV`` lookup comes back empty as well,
-    and the ``[ -n "$PREV" ]`` guard stops the preserve step on its own. Measured 2026-09-23: with
-    the hook's ``-eq 1`` changed to ``-ne 0``, all six tests this file then held passed. The next
-    test is the one that tells 128 from 1; this one still pins the first-commit behaviour.
+    say that collapse would make every first commit preserve a ref. That implied this test pinned
+    it, and it does not. With ``$LAST`` absent, the hook's ``$PREV`` lookup is empty as well. The
+    ``[ -n "$PREV" ]`` guard then stops the preserve step on its own. Measured 2026-09-23: with the
+    hook's ``-eq 1`` changed to ``-ne 0``, all six tests this file then held passed.
+    ``test_a_128_while_LAST_still_resolves_is_NOT_read_as_a_rewrite`` is the one that tells 128
+    from 1. This one still pins the first-commit behaviour.
     """
     repo, bare = armed
     first = commit(repo, "base.txt", "base\n")
@@ -296,39 +301,42 @@ def test_the_FIRST_commit_on_a_branch_creates_no_orphan(armed: tuple[Path, Path]
 
 
 def wait_for_trace(trace: Path, *needles: str) -> bool:
-    """Poll until one line of a ``GIT_TRACE`` file holds every needle. The file may not exist yet."""
-    deadline = time.monotonic() + PUSH_WAIT
-    while time.monotonic() < deadline:
+    """Poll until one line of a ``GIT_TRACE`` file holds every needle.
+
+    The file may not exist yet, and on Windows a read can collide with git's writer. Both are
+    retried rather than raised, so neither reads as a hook fault.
+    """
+
+    def seen() -> bool:
         try:
-            lines = trace.read_text(encoding="utf-8", errors="replace").splitlines()
-        except FileNotFoundError:
-            lines = []
-        if any(all(n in line for n in needles) for line in lines):
-            return True
-        time.sleep(0.25)
-    return False
+            text = trace.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False
+        return any(all(n in line for n in needles) for line in text.splitlines())
+
+    return poll(seen)
 
 
 def test_a_128_while_LAST_still_resolves_is_NOT_read_as_a_rewrite(
     armed: tuple[Path, Path], tmp_path: Path
 ) -> None:
-    """THE ARM THAT TELLS 128 FROM 1, which the first-commit test above cannot.
+    """THE ARM THAT TELLS 128 FROM 1, which the first-commit test cannot.
 
     The hook runs its preserve step only when merge-base exits 1. A hook that tested ``-ne 0``
-    would also run it on 128, and a first commit cannot show that, because there the ``$PREV``
-    guard stops it anyway. The one state that reaches 128 while ``$LAST`` still resolves is the
-    degraded path the hook's own comment names, where ``$COMMIT`` is empty. So this deletes the
-    branch ref after a landed capture, which leaves HEAD naming a branch with no commit, and runs
-    the hook directly.
+    would also run it on 128. A first commit cannot show that, because the ``$PREV`` guard stops
+    it anyway. So this needs a 128 while ``$LAST`` still resolves. The hook's own comment names
+    one such state: the degraded path where ``$COMMIT`` is empty. It is not claimed to be the only
+    one. A merge-base killed partway might give another, and nobody has measured that. This test
+    deletes the branch ref after a landed capture, so HEAD names a branch with no commit. Then it
+    runs the hook directly.
 
-    Measured 2026-09-23 against a copy with ``-eq 1`` changed to ``-ne 0``: that copy pushed
+    Measured 2026-09-23 against a copy with ``-eq 1`` changed to ``-ne 0``. That copy pushed
     ``refs/tags/rescue/orphan/r/main/<sha>`` for a commit nobody had discarded. The real hook
     pushed no orphan ref.
 
     **THE WAIT IS ON A TRACE LINE, BECAUSE THERE IS NO REMOTE REF TO WAIT FOR.** HEAD does not
     resolve, so the moving push fails. The hook finishes any orphan push before it starts the
-    moving one, so once ``GIT_TRACE`` records the moving push, the absence below is no longer a
-    race.
+    moving one. So once ``GIT_TRACE`` records the moving push, the absence below is not a race.
     """
     repo, bare = armed
     moving = "refs/tags/rescue/auto/r/main"
@@ -341,7 +349,7 @@ def test_a_128_while_LAST_still_resolves_is_NOT_read_as_a_rewrite(
     # The two facts that make this the discriminating state. Without the second, the ``$PREV``
     # guard hides the defect exactly as it does in the first-commit test.
     assert peel(repo, "HEAD") == "", "HEAD still resolves, so the hook's $COMMIT is not empty"
-    assert peel(repo, "refs/mefor/durability/r/main") == sha, "$LAST does not resolve"
+    assert peel(repo, last_ref(moving)) == sha, "$LAST does not resolve"
 
     trace = tmp_path / "trace.txt"
     proc = subprocess.run(
