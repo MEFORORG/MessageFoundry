@@ -320,6 +320,11 @@ automation ≠ running an off the shelf tool"* — so the anchors below are squa
   residuals of record died that way, and two of my own greps did in a single day. **An absence claim
   without a live positive control is void**, regardless of what the pattern returns.
 
+**Residual prose sits outside the anchors.** No gate checks the `file:line` citations inside a
+`residual`; like an anchor's `line`, they are navigation aids. A residual that lists where a gap
+still stands follows [SDS-3.9](Secure_Development_Standards.md): it states how the list was derived,
+or is worded as a floor.
+
 **`reviewed_by` and `reviewed_at`** are recorded on every verdict, so staleness is visible and a
 verdict can be traced to the pass that set it.
 
