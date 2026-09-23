@@ -716,7 +716,14 @@ def test_serve_starts_a_declared_terminator_once_the_hop_is_acknowledged(
         tmp_path, intra="network", floor="1.2", enforcement=enforcement, loopback=loopback, ack=True
     )
     assert _run_posture_b(tmp_path, monkeypatch, env="prod") == 0
-    assert "plaintext_upstream_hop_acknowledged" not in capsys.readouterr().err
+    captured = capsys.readouterr()
+    assert "plaintext_upstream_hop_acknowledged" not in captured.err
+    # The acknowledgement's only runtime record: named in the log at every start. serve's logging
+    # setup installs its own stdout handler, so the record is read from stdout, not caplog.
+    assert (
+        "INFO     messagefoundry.__main__: [api].plaintext_upstream_hop_acknowledged"
+        in captured.out
+    )
 
 
 @_ACK_MODES
