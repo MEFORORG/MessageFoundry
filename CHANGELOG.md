@@ -198,7 +198,8 @@ All notable changes to MessageFoundry are documented here. The format follows
 ### Changed
 - **BREAKING — an API request body with an unknown or misspelled key is now refused with HTTP 422
   instead of being accepted and silently dropped.** Pydantic's default is `extra="ignore"`, and
-  none of the 125 models in `messagefoundry/api/models.py` and `messagefoundry/api/auth_models.py` overrode it — so a
+  none of the 125 models in `messagefoundry/api/models.py` and `messagefoundry/api/auth_models.py`
+  overrode it — so a
   key the engine did not recognise vanished and the route answered success. The sharpest case was
   `PUT /users/{id}/channel-scope`: `channels` is optional and `None` means *all channels*, so
   `{"chanels": ["IB_ACME_ADT"]}` asked for one connection and granted every one of them.
@@ -214,7 +215,8 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 - **BREAKING — a `fhir_lookup` search value now states its KIND, and a plain string carrying one of
   FHIR's value-layer separators is refused rather than sent.** Percent-encoding is a URL-layer
-  control: it stops one value becoming two search parameters, and it cannot help at the FHIR value layer, where
+  control: it stops one value becoming two search parameters, and it cannot help at the FHIR value
+  layer, where
   `,` `|` and `$` are FHIR's own separators. The FHIR specification is explicit that a server
   percent-decodes a parameter value first and reads FHIR's syntax second (R4 section 3.1.1.4.19, R5
   section 3.2.1.5.7), so `%7C` arrives as a live token separator. A message-derived value carrying one
@@ -441,7 +443,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1866](docs/BACKLOG.md))
 - **BREAKING — `audit-verify` accepted a zero-byte database, wrote a schema into it, and reported a
   clean chain of nothing.** The existing guard on `audit-verify`, `audit-anchor` and `rekey-audit`
-  only asked whether the `--db` path *existed*. A zero-byte file exists and is a valid, empty SQLite database —
+  only asked whether the `--db` path *existed*. A zero-byte file exists and is a valid, empty SQLite
+  database —
   what a `touch` in an install script, a failed copy or a log-rotation mistake leaves behind — so it
   walked past the guard, `open_store` migrated 372,736 bytes of schema **into the file that was
   meant to be the evidence**, and the command printed `OK: verified 0 audit row(s)` and exited 0. A
