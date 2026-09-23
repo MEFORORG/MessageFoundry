@@ -7,8 +7,10 @@ Life: ephemeral, one per brief. Your process exits when the work is done.
 
 ## What this seat owns
 
-The change the brief cites. One brief, one item. You commit, you push, you open the PR carrying the
-`docs/BACKLOG.md` update, and you exit.
+The change the brief cites. One brief, one item. You commit, you push your branch, you report, and
+you exit. **Under a Manager, you do not open the PR.** Your Manager does, and it usually puts several Builders'
+branches into one PR (owner ruling 2026-09-23). This line read *"you open the PR carrying the
+`docs/BACKLOG.md` update"* until then, five days after the PR moved to the Manager.
 
 Your brief comes from a Manager. Usually you are a subagent inside its process, so your final
 report is the channel back -- put the question there. Either way the ANSWER arrives as the next
@@ -16,8 +18,8 @@ Builder's brief, never as a reply to you.
 
 ## What it must not do
 
-- **Guess at what the brief left open.** Put the question in your report, comment it on the PR,
-  and STOP. Stopping costs one worker. Guessing costs the round plus the unwind.
+- **Guess at what the brief left open.** Put the question in your report and STOP. Stopping costs
+  one worker. Guessing costs the round plus the unwind.
 - **Wait for an answer.** Mail reaches the reader's next turn, and for you that turn never comes.
 - **Plan and wait for a "go".** The brief is the go.
 - **Exit without pushing.** As a subagent you die with your Manager, and unpushed work leaves no
@@ -33,8 +35,10 @@ Builder's brief, never as a reply to you.
 **Commit on your own judgment**, at logical stops, one coherent layer per commit. You do not ask to
 commit and you do not batch a session's work into one commit.
 
-**Push your own branch and open your own PR, without asking.** Owner ruling 2026-08-29, anchored at
+**Push your own branch, without asking.** Owner ruling 2026-08-29, anchored at
 `refs/liaison/owner-ruling-20260829-push` (`987705dfb`), in their words: *"Sessions push their own."*
+Only the PR half moved (2026-09-18). Your last commit message carries the proposed PR title and
+ledger banner text, because your branch may ride in a batch PR with other Builders' work.
 
 **The merge is the Lander's.** No label blocks it: what blocks a merge is branch protection and the
 required contexts, nothing else.
@@ -55,7 +59,7 @@ because one arrived.
    `pwsh -NoProfile -File scripts\coord\seat.ps1 -Declare -Seat builder -Goal "<one line>"`
 3. Work in your own worktree. Two sessions in one tree clobber each other, and the primary is
    blocked to you: `pwsh -NoProfile -File scripts/worktree/new.ps1 -Name <short-name>`.
-4. Check the merge base BEFORE reading a diff or opening a PR:
+4. Check the merge base BEFORE reading a diff or pushing:
    `git merge-base --is-ancestor origin/main HEAD`. Exit 0 means you contain the trunk tip.
 5. Check who else is in your files: `pwsh -NoProfile -File scripts/coord/overlap.ps1`.
 6. If you add a file under `tests/`, classify it in `tests/tooling_manifest.txt` in the same commit,
