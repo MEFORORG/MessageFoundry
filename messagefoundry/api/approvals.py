@@ -14,6 +14,12 @@ alerted if the requester no longer exists, is disabled, no longer holds the perm
 requires, or has left the channel scope it needs. Authority is read at release rather than remembered
 from the request, because it can be withdrawn inside the ``expiry_hours`` window.
 
+The check reads the ENGINE's copy of the account: the ``users`` row and its stored roles and scope.
+For a directory (AD) requester that copy lags the directory. The reconciler revokes an absent
+principal's sessions without disabling the row, and it re-diffs roles only for principals holding a
+live session. So a directory-side disable, delete or demotion is seen here only once it has reached
+the engine's row. Probing the directory at release is not built.
+
 The registry (op key -> executor) is populated by the API wiring, where the engine is in scope; this
 module owns only the generic hold/approve/reject mechanics over the ``pending_approvals`` store table.
 """
@@ -214,7 +220,8 @@ class ApprovalGate:
         params = json.loads(str(row["params"]))
         # ASVS 8.3.2: the requester's authority is re-read NOW. It was checked when the request was
         # made, and it can be withdrawn at any point inside the expiry window: the user deleted or
-        # disabled, a role removed, a directory group revoked, a channel scope narrowed. Checked
+        # disabled, a role removed, a channel scope narrowed. It reads the engine's copy of the
+        # account, so a directory-side change counts once it reaches that copy (module docstring). Checked
         # BEFORE the transition, so a refused request stays pending, like a removed operation above.
         # It can still be rejected, or released later if the requester's authority is restored.
         reason = await self._requester_standing(str(requester_user_id), op, params)
@@ -333,9 +340,13 @@ class ApprovalGate:
             ),
             client=client,  # ADR 0150: the approver's address, matching this row's actor
         )
-        self._alert_sink.approval_stale_requester(
-            approval_id, operation=operation.key, reason=reason
-        )
+        try:
+            self._alert_sink.approval_stale_requester(
+                approval_id, operation=operation.key, reason=reason
+            )
+        except Exception:  # noqa: BLE001 - a sink that breaks its never-raise contract must not
+            # turn the documented 409 into a 500. The audit row above is already written.
+            log.exception("approval %s: the stale-requester alert failed to emit", approval_id)
 
     async def _compensate_failed_execution(
         self,

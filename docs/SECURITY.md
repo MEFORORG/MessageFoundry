@@ -889,6 +889,13 @@ requester has left the channel scope the operation needs. The refusal writes an
 `approval_stale_requester` alert. The request stays **pending**, so an approver can reject it. If the
 requester's authority comes back inside the expiry window, the request can still be released.
 
+The check reads the **engine's copy** of the account: its user row, stored roles and channel scope. A
+local disable, delete, role change or scope change is seen at once. **A directory (AD) change is seen
+only after it reaches that copy.** The reconciler below revokes an absent principal's sessions but
+does not disable its row. It re-diffs roles only for principals that hold a live session. So an AD
+requester who was disabled, deleted or demoted in the directory after making a request can still pass
+this check. Probing the directory at release is not built.
+
 The gated set is configurable (`[approvals].operations`); the first cut covers the two highest-PHI-impact
 flows — **bulk dead-letter replay** and **connection purge**. (The web console's "are you
 sure?" confirm prompts are **client-side only** and bypassable via the raw API — they are *not* a second approver
@@ -1583,7 +1590,8 @@ every directory principal still holding a live session — via the same password
 lookup the Kerberos path uses — and revokes the sessions of accounts AD has disabled or deleted. Group
 membership is re-diffed on the same pass at no extra directory cost, so a **role demotion** takes effect
 without waiting for a login that may never happen. Revocations audit `auth.ad_session_revoked` and
-raise the `ad_session_revoked` alert, one per revoked principal.
+raise the `ad_session_revoked` alert, one per revoked principal, once the pass completes. A pass that
+fails part-way keeps the audit rows for what it already revoked, but raises no alert for them.
 
 **The probe is keyed on the directory's immutable `objectGUID`**, the same identifier a directory login
 is identified by, and a renamed account's stored username is refreshed from the directory on the same

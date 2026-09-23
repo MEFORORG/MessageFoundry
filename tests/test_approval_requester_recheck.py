@@ -349,3 +349,57 @@ async def test_the_notifier_carries_each_event_with_no_params_or_secrets() -> No
     assert not any(k in stale for k in ("params", "requester", "password", "token"))
     assert by_type["ad_reconcile_aborted"]["probed"] == 9
     assert by_type["ad_session_revoked"]["connection"] == "alice"
+
+
+class _RaisingSink(_Sink):
+    """A sink that breaks its never-raise contract, to prove the callers do not depend on it."""
+
+    def approval_stale_requester(self, approval_id: str, *, operation: str, reason: str) -> None:
+        super().approval_stale_requester(approval_id, operation=operation, reason=reason)
+        raise RuntimeError("sink down")
+
+    def ad_session_revoked(self, name: str, *, reason: str) -> None:
+        super().ad_session_revoked(name, reason=reason)
+        raise RuntimeError("sink down")
+
+
+async def test_a_raising_sink_still_yields_the_409_and_the_audit_row(engine: Engine) -> None:
+    service = await _service(engine)
+    maker = await _add(service, "maker", Role.OPERATOR)
+    sink = _RaisingSink()
+    gate = ApprovalGate(
+        engine.store, ON, resolve_identity=service.identity_for_user_id, alert_sink=sink
+    )
+
+    async def _noop(_p: Mapping[str, Any]) -> dict[str, Any]:
+        return {}
+
+    gate.register("dead_letter_replay", "replay", _noop, permission=Permission.MESSAGES_REPLAY)
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id=maker
+    )
+    assert approval_id is not None
+    await service.delete_user(maker, actor="test")
+    with pytest.raises(ApprovalError) as caught:
+        await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
+    assert caught.value.status == 409  # not a RuntimeError surfacing as a 500
+    assert len(await engine.store.list_audit(action="approval.stale_requester")) == 1
+    assert len(sink.events) == 1
+
+
+async def test_the_reconciler_loop_survives_a_raising_sink() -> None:
+    sink = _RaisingSink()
+    plan = ReconcilePlan(
+        revocations=(SessionRevocation("u1", "alice", reason="directory_absent"),), probed=1
+    )
+    auth = _FakeAuth(plan)
+    task = asyncio.create_task(_directory_reconciler(auth, 0.001, sink))  # type: ignore[arg-type]
+    try:
+        for _ in range(500):
+            if auth.passes >= 3:
+                break
+            await asyncio.sleep(0.005)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert auth.passes >= 3  # the loop kept running after the sink raised on pass one

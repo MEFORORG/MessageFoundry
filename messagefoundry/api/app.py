@@ -6572,12 +6572,12 @@ async def _directory_reconciler(auth: AuthService, interval: float, sink: AlertS
         await asyncio.sleep(interval)
         try:
             plan = await auth.reconcile_directory_sessions()
+            # Inside the try: a sink that breaks its never-raise contract must not kill the loop.
+            _alert_reconcile_plan(plan, auth, sink)
         except asyncio.CancelledError:
             raise
         except Exception:
             _log.exception("directory reconcile: pass failed; will retry next interval")
-            continue
-        _alert_reconcile_plan(plan, auth, sink)
 
 
 def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSink) -> None:
