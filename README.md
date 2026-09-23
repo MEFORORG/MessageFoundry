@@ -107,7 +107,6 @@ deliberate — replace `<version>` with the current release shown at the top of 
 needs (each is opt-in and lazy-imported):
 
 ```bash
-pip install "messagefoundry-webconsole==<version>"   # the browser web console (/ui) — the operator UI; most operators want this
 pip install "messagefoundry[postgres]==<version>"    # PostgreSQL store backend (production server DB)
 pip install "messagefoundry[sqlserver]==<version>"   # SQL Server store backend (+ OS-level ODBC Driver 18)
 pip install "messagefoundry[sftp]==<version>"        # SFTP transport for the REMOTEFILE connector
@@ -115,10 +114,22 @@ pip install "messagefoundry[dicom]==<version>"       # DICOM codec + C-STORE SCP
 pip install "messagefoundry[harness]==<version>"     # the standalone PySide6 test harness GUI
 ```
 
+**No published web console works with engine 0.4.0.** The browser console (`/ui`) ships as its own
+wheel, `messagefoundry-webconsole`, with its own version numbers. It does not share the engine's
+version, so `messagefoundry-webconsole==0.4.0` does not exist. The engine mounts a console only if
+it was built against this engine's UI seam, the version of the interface between the two. The only
+console on PyPI, 0.2.15, was built against a different seam. So run 0.4.0 without it:
+
+- **No console installed:** the engine serves the JSON API only and prints a warning at startup. If you
+  set `[security].serve_web_console = true`, it refuses to start instead.
+- **Console 0.2.15 installed, console on:** the engine refuses to start. The console is on by default
+  for a loopback bind. Set `[security].serve_web_console = false`, or uninstall the console.
+
 **What's in the `messagefoundry` package — and what isn't.** It is the **engine**; the operator UI is
-the browser **web console** served same-origin at `/ui`, which ships as a separate, version-matched
-wheel (`messagefoundry-webconsole`) the engine mounts in-process (turn it on with `[security].serve_web_console`), so
-a headless server, container, or adopter install stays lean. (The former PySide6 desktop console was
+the browser **web console** served same-origin at `/ui`, which ships as a separate wheel
+(`messagefoundry-webconsole`) with its own version, mounted in-process when it matches the engine's UI
+seam (`[security].serve_web_console` turns it on or off), so a headless server, container, or adopter
+install stays lean. (The former PySide6 desktop console was
 retired in favour of the web console — BACKLOG #103; PySide6 now backs only the opt-in `[harness]` test
 tooling.) The **VS Code extension is a separate product, not on PyPI** (a VS Code extension is a
 different ecosystem); see *VS Code extension & test harness* below for where to get it.

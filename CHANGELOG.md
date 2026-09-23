@@ -10,10 +10,10 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ### Added
 - **`[integrity].audit_anchor_file` — the startup audit check can now hold an anchor, so it can see a
-  truncated tail.** A previous release shipped `audit-anchor` / `audit-verify --expected-anchor` and
-  recorded, accurately at the time, that `[integrity].audit_verify_on_start` "is unchanged — it is a
-  bare walk and stays blind to a truncated tail". **That sentence no longer describes the engine.**
-  Point the new key at the `COUNT:HEAD` file `messagefoundry audit-anchor` writes and every startup
+  truncated tail.** `audit-anchor` / `audit-verify --expected-anchor`, also new in this release (under
+  Changed below), landed first and recorded, accurately at the time, that
+  `[integrity].audit_verify_on_start` "is unchanged — it is a bare walk and stays blind to a truncated
+  tail". **With this key set, that sentence no longer describes the engine.** Point the new key at the `COUNT:HEAD` file `messagefoundry audit-anchor` writes and every startup
   compares against it; leave it empty (the default) and the walk is byte-identical to before.
   **It consumes the anchor as a PREFIX, not as the CLI's exact seal, and that is the whole reason a
   startup setting can hold one.** The exact seal compares the *current* head, so it diverges on the
@@ -85,6 +85,16 @@ All notable changes to MessageFoundry are documented here. The format follows
   *narrower* than what they replace. See
   [ADR 0186](docs/adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)
   and BACKLOG #1279.
+- **BREAKING — `[egress].fhir_require_structured_params` is gone, and with it the flat `?`-query form of
+  `fhir_lookup`.** In 0.3.2 the setting defaulted to `false`, so a read query such as
+  `"Patient?identifier=..."` was sent as written unless a site opted out. The flat form appended the
+  author's string unencoded, so it was removed rather than left behind a setting. A query carrying `?`
+  now raises `FhirLookupError` whatever the config says. With nothing left to switch, setting the key
+  now **refuses at load**, under the unknown-key refusal in Changed below.
+  **Migration:** delete the key from `messagefoundry.toml`. Move each flat query to `params=`, so
+  `fhir_lookup("epic", "Patient?identifier=MRN|" + mrn)` becomes
+  `fhir_lookup("epic", "Patient", params={"identifier": FhirToken("MRN", mrn)})`.
+  ([BACKLOG #1243](docs/BACKLOG.md), [ADR 0043](docs/adr/0043-fhir-read-lookup.md))
 
 ### Changed
 - **Setting `[integrity].fail_closed_on_drift` on an editable install now says so at startup, and two
@@ -138,10 +148,13 @@ All notable changes to MessageFoundry are documented here. The format follows
   deliberately** -- an operator able to set it could point a row at a directory account it is not bound
   to, which is the privilege transfer #1471 closes; there is still no setter for
   `directory_object_id`. ([BACKLOG #1532](docs/BACKLOG.md))
-- **Web console engine UI seam `93ba1f10b9dccfc8` -> `b93f38d097f97a45`.** `SecurityPosture` gained the
-  additive `store_privilege` object above, and `StorePrivilegeView` joins the discovered surface.
-  Additive with a default, so an older console ignores it; the seam still moves because the golden seam
-  contract introspects that model's field set.
+- **Web console engine UI seam: this release ships `75c4117d21fd0b98`.** 0.3.2 shipped the integer seam
+  `14`. The seam is now a digest of the surface the console uses (BACKLOG #1220), and it moved several
+  times in this release. One move, `93ba1f10b9dccfc8` -> `b93f38d097f97a45`, came when `SecurityPosture`
+  gained the additive `store_privilege` object above and `StorePrivilegeView` joined the discovered
+  surface. That field is additive with a default, but the seam still moves, because the golden seam
+  contract introspects that model's field set. A console accepts exactly one seam, so with the console
+  on, the engine refuses to start against a console built for any other seam.
 - **`DEPLOY-SERVER-DB.md` §1.2 posture B now states its prerequisite.** "A DBA pre-creates the objects"
   is not sufficient on its own: the engine skips its DDL batch only when the `schema_meta` marker
   records the current batch, and on PostgreSQL `CREATE TABLE IF NOT EXISTS` against an existing table
@@ -164,8 +177,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   maintenance window, a database move, a backup/restore, a hand-off. Anchoring and immediately
   re-verifying compares a value to itself; re-checking a held anchor against a **running** engine alarms
   on every ordinary boot. For continuous coverage of a live engine the off-box log forward / tee remains
-  the control, and `[integrity].audit_verify_on_start` is unchanged — it is a bare walk and stays blind
-  to a truncated tail. ([BACKLOG #328](docs/BACKLOG.md))
+  the control. `[integrity].audit_verify_on_start` on its own is still a bare walk and stays blind to a
+  truncated tail; `[integrity].audit_anchor_file` (under Added above) gives it an anchor.
+  ([BACKLOG #328](docs/BACKLOG.md))
 - **The advisory `raise-fstring` lint in `messagefoundry check` now reads three more spellings of the
   same risk.** It matched only an f-string, so `raise ValueError("bad " + x)`, the `%` form and
   `.format(...)` carried an interpolated message past it — the identical free-text PHI payload, in the
@@ -179,8 +193,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   unflagged. ([BACKLOG #1676](docs/BACKLOG.md))
 
 ### Changed
-- **An API request body with an unknown or misspelled key is now refused with HTTP 422 instead of
-  being accepted and silently dropped.** Pydantic's default is `extra="ignore"`, and none of the 125
+- **BREAKING — an API request body with an unknown or misspelled key is now refused with HTTP 422
+  instead of being accepted and silently dropped.** Pydantic's default is `extra="ignore"`, and none of the 125
   models in `messagefoundry/api/models.py` and `messagefoundry/api/auth_models.py` overrode it — so a
   key the engine did not recognise vanished and the route answered success. The sharpest case was
   `PUT /users/{id}/channel-scope`: `channels` is optional and `None` means *all channels*, so
@@ -195,8 +209,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   RBAC writes is a mis-grant, so adding a field to one of them needs the client bump in the same
   release. ([BACKLOG #1109](docs/BACKLOG.md))
 
-- **A `fhir_lookup` search value now states its KIND, and a plain string carrying one of FHIR's
-  value-layer separators is refused rather than sent.** Percent-encoding is a URL-layer control: it
+- **BREAKING — a `fhir_lookup` search value now states its KIND, and a plain string carrying one of
+  FHIR's value-layer separators is refused rather than sent.** Percent-encoding is a URL-layer control: it
   stops one value becoming two search parameters, and it cannot help at the FHIR value layer, where
   `,` `|` and `$` are FHIR's own separators. The FHIR specification is explicit that a server
   percent-decodes a parameter value first and reads FHIR's syntax second (R4 section 3.1.1.4.19, R5
@@ -209,8 +223,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   **you** wrote — a composite, a quantity, a comma-separated OR or `_sort` list — percent-encoded only.
   **Refusal rather than FHIR's backslash escape, deliberately:** the escape is correct only if the far
   end implements the unescape, and server behaviour there varies, whereas a value that never leaves the
-  process cannot be misread by any server. Escaping stays available as an additive fourth kind for a
-  site that has a real FHIR server and can verify it.
+  process cannot be misread by any server. Escaping is not built; it is left as a possible additive
+  fourth kind for a site that has a real FHIR server and can verify it.
   **Migration:** `{"identifier": "MRN|" + mrn}` becomes `{"identifier": FhirToken("MRN", mrn)}`, which
   puts identical bytes on the wire. Import `FhirToken` / `FhirRaw` from `messagefoundry`. A non-string
   scalar also raises now — it was never in the declared type, but `urlencode` used to coerce it, so
@@ -244,8 +258,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   narrow trail; that is now reported as a loosening at `serve` and on `GET /security/posture`. PHI-view
   grants stay excluded at either value, because the PHI-access audit path already records them.
   ([BACKLOG #1277](docs/BACKLOG.md), [ADR 0118](docs/adr/0118-secure-by-default-security-configuration-section.md) §5 amended)
-- **A PHI instance reached through a declared reverse proxy with `[security].require_mfa` explicitly
-  off would refuse to start on first deployment, where it previously would not have.** The
+- **BREAKING — a PHI instance reached through a declared reverse proxy with `[security].require_mfa`
+  explicitly off would refuse to start on first deployment, where it previously would not have.** The
   MFA-at-exposure gate derived "is this instance exposed?" from `[api].serve_ui`, a field the ADR 0143
   console degrade arms rewrite **in place** earlier in the same startup. On the topology the runbooks
   recommend — a loopback bind behind a declared TLS terminator, with the web console left at its
@@ -342,6 +356,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   its section — a typo, a key copied from newer documentation, or a setting since removed from the
   engine. **Remedy:** correct the spelling; the error names the section and the key. Nothing needs
   migrating, because a key that is refused now was doing nothing before.
+- **BREAKING — `convert_hl7_timestamp(..., from_tz=...)` now raises at the daylight-saving edges
+  instead of guessing.** Twice a year a local wall-clock time happens twice (the fall-back overlap) or
+  never (the spring-forward gap), and a timestamp with no offset cannot say which instant it means.
+  0.3.2 silently picked one, which could be an hour wrong. The function now raises
+  `AmbiguousLocalTimeError` or `NonExistentLocalTimeError`, so a Handler that calls it on those dates
+  fails the message instead of sending a shifted time. Both subclass `DstTransitionError`, a
+  `ValueError`, and they are exported from `messagefoundry` with the `DstEdgePolicy` type. Only a time
+  the sender wrote is refused: a value with no time field keeps its 0.3.2 result, and a timestamp that
+  carries its own offset is unaffected.
+  **Migration:** pass `on_dst_edge="earlier"` to keep the 0.3.2 result exactly, or `"later"` for the
+  other offset. Better, have the sender include its offset. ([BACKLOG #1686](docs/BACKLOG.md))
 
 ### Security
 - **The web console's step-up actions would have refused an MFA-pending session without the audit
@@ -411,8 +436,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   either genuinely absent rows or a short `engine_read` sample, which is the question
   `harness/load/connscale/intake_audit.py` exists to settle per message.
   ([BACKLOG #1866](docs/BACKLOG.md))
-- **`audit-verify` accepted a zero-byte database, wrote a schema into it, and reported a clean chain
-  of nothing.** The existing guard on `audit-verify`, `audit-anchor` and `rekey-audit` only asked
+- **BREAKING — `audit-verify` accepted a zero-byte database, wrote a schema into it, and reported a
+  clean chain of nothing.** The existing guard on `audit-verify`, `audit-anchor` and `rekey-audit` only asked
   whether the `--db` path *existed*. A zero-byte file exists and is a valid, empty SQLite database —
   what a `touch` in an install script, a failed copy or a log-rotation mistake leaves behind — so it
   walked past the guard, `open_store` migrated 372,736 bytes of schema **into the file that was
@@ -428,7 +453,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   no longer read an empty log as detected tamper. `audit-anchor` keeps exit 0 on a real store whose
   log is legitimately empty — sealing a fresh instance as `0:` is a supported workflow — and refuses
   only the non-audit-database paths. ([BACKLOG #1669](docs/BACKLOG.md))
-- **`verify --smoke self` reported PASS on a synthetic message the config would have dropped.**
+- **BREAKING — `verify --smoke self` reported PASS on a synthetic message the config would have
+  dropped.**
   `smoke_self` failed only on `DryRunResult.error`, which `dry_run` sets for a parse failure, a
   strict-validation failure or a Router/Handler raise. `UNROUTED` (the Router selected no handler) and
   `FILTERED` (Handlers ran and sent nothing, including a sole destination that is
@@ -476,30 +502,33 @@ All notable changes to MessageFoundry are documented here. The format follows
   real, so a site running MLLP alongside DICOM cannot read it as licence to delete a working
   allowlist. The same wrong spelling is corrected in the module docstring, the gate comment,
   `config/wiring.py`, `config/settings.py`, `docs/SECURITY.md` and `docs/ASVS-L2-PHASE0-CHANGES.md`.
-  Whether an AE-title list alone should keep satisfying that gate is tracked as **BACKLOG #252** — it
-  is an ADR 0025 §9 contract change and is deliberately **not** decided here.
+  Whether an AE-title list alone should keep satisfying that gate was tracked as **BACKLOG #252** — it
+  is an ADR 0025 §9 contract change and was deliberately **not** decided in this fix. It has since been
+  decided: see the BREAKING DICOM C-STORE SCP entry under Changed (BACKLOG #316).
 - **Two startup gates described themselves against the deployment tier rather than the enforcement
   dial.** Comments on the managed-identity and security-notification gates read "refuse (production) /
   warn (non-production)" over branches that read `enforcing` — and `enforce` is the shipped default on
   `dev` and `staging` as much as on `prod`, so all three refuse. Comment-only, no behaviour change,
   but these are the comments two published documentation defects were copied from.
 - **The load harness's no-loss reconcile did not enforce the `read >= sent // 2` intake guarantee
-  0.3.2 documented.** The unconfirmed-send excusal is capped at `max(connections, half the run)`, but
+  0.3.2 documented.** The unconfirmed-send excusal was capped at `max(connections, half the run)`, but
   that `max()` takes the connection count as a *floor*, and every call site passes a connection count
   — so on a short, low-rate step (connscale-smoke's N=100 cell: ~105 sends, 100 connections) the count
   won the max() and the intake bound degraded to `read >= 5`, the very vacuity the cap exists to
   prevent. Nothing clamped the excusal to `sent` either, so `timeouts > sent` degraded it to
-  `read >= 0`. The half-the-run cap still decides the systemic no-ACK verdict (0.3.2's de-flake is
-  unchanged), and an **unconditional intake floor** the excusal cannot lower now enforces
-  `read >= sent // 2` in all three reconcile copies, at every call site. The estate copy also gained
-  the honest-reporting branch its two siblings had: it previously printed `read>=sent, …` on a
-  bounded-excused run whose read was demonstrably below `sent`, and its over-budget detail string now
-  matches theirs — a test pins the three in step, since nothing enforced the claim that they were.
-  *Known gap, unfixed:* the systemic no-ACK verdict is still gated on the same capped budget, so a
-  dead ACK path that nonetheless delivered everything still passes when `connections >= sent`; an
-  intake floor cannot catch a fault whose signature is a high read with no ACKs. Bounding that arm
-  needs its own change.
-- **`messagefoundry adr-analyze` exited 0 over an ADR directory that does not exist.** `Path.glob`
+  `read >= 0`. In the connscale and estate copies the run-fraction cap still decides the systemic
+  no-ACK verdict (it has since widened from half to three quarters of the run), and an
+  **unconditional intake floor** the excusal cannot lower enforces `read >= sent // 2` at every call
+  site. The load runner's copy had both as well, until the #1866 entry above retired them there. The
+  estate copy also gained the honest-reporting branch its two siblings had: it previously printed
+  `read>=sent, …` on a bounded-excused run whose read was demonstrably below `sent`, and its
+  over-budget detail string now matches connscale's — a test pins those two in step, since nothing
+  enforced the claim that they were.
+  *Known gap, unfixed in the connscale and estate copies:* their systemic no-ACK verdict is still gated
+  on the same capped budget, so a dead ACK path that nonetheless delivered everything still passes
+  when `connections >= sent`; an intake floor cannot catch a fault whose signature is a high read with
+  no ACKs. The load runner's copy now catches it on that signature, under the #1866 entry above.
+- **BREAKING — `messagefoundry adr-analyze` exited 0 over an ADR directory that does not exist.** `Path.glob`
   yields nothing and raises nothing for a missing directory, so a missing, non-directory, or
   ADR-less `--adr-dir` produced zero reports and `AnalysisResult.ok = True` — the exact shape of a
   clean run. Withdrawing the ADRs would have silently turned a failing advisory check into a
@@ -1507,7 +1536,7 @@ tests, but the external code review + penetration test (the bar for a security-c
   `release` workflow.
 
 [Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/v0.4.0...HEAD
-[0.4.0]: https://github.com/MEFORORG/MessageFoundry/releases/tag/v0.4.0
+[0.4.0]: https://github.com/MEFORORG/MessageFoundry/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/MEFORORG/MessageFoundry/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/MEFORORG/MessageFoundry/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.15...v0.3.0
