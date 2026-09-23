@@ -475,7 +475,8 @@ non-breaking fixes rather than listing them all; the git history is the full rec
 - **BREAKING — an HTTP-family reply over 16 MiB now fails.** 0.3.2 read a partner's response with no
   size limit. A REST, SOAP, FHIR or DICOMweb delivery whose reply is larger than 16 MiB now raises
   `ResponseTooLargeError`, which is retried and then dead-lettered. A `fhir_lookup` reply over the cap
-  raises inside the Handler, so that message goes to `ERROR` with no retry. An OAuth2 or SMART token
+  raises inside the Handler, so under the default `internal_error = "continue"` that message goes
+  to `ERROR` with no retry. An OAuth2 or SMART token
   response is capped at 256 KiB. There is no setting to raise either ceiling. **Migration:** none in
   configuration; the partner must send a smaller reply. (ASVS 15.2.2)
 - **BREAKING — `File(sort=)` accepts only `"name"` or `"mtime"`.** In 0.3.2 any other string, such as
@@ -650,8 +651,8 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   - Text-mode error lines now go to stderr, not stdout, for `alert`, `backup`, `codeset`,
     `connection`, `dryrun`, `graph`, `impact`, `import`, `init`, `lens`, `restore-verify` and
     `security`. ([BACKLOG #1673](docs/BACKLOG.md))
-  - `messagefoundry dryrun` prints `NOT_DEPLOYED` where 0.3.2 printed `FILTERED` for a message whose
-    only destinations are not deployed. ([BACKLOG #1690](docs/BACKLOG.md))
+  - `messagefoundry dryrun` prints the disposition `not_deployed` where 0.3.2 printed `filtered` for
+    a message whose only destinations are not deployed. ([BACKLOG #1690](docs/BACKLOG.md))
   - `messagefoundry --version` prints a second line, `package: <path>`.
     ([BACKLOG #1677](docs/BACKLOG.md))
   **Migration:** read each new failure as the real result it is; capture stderr (`2>&1`) or use
@@ -683,19 +684,21 @@ non-breaking fixes rather than listing them all; the git history is the full rec
     drop the hint or quote the name. ([BACKLOG #1574](docs/BACKLOG.md))
   - `anonymize_checked()` and the anonymizer tooling refuse a salt with too little entropy, not just
     a short one. **Migration:** use a random salt; a new salt changes every pseudonym.
-  - Under a pinned `[tls]` trust anchor, the SMART and OAuth2 token requests now use the
-    connection's trust anchor, so a token endpoint on a public CA outside it fails. **Migration:**
-    add that CA to the anchor. ([BACKLOG #1660](docs/BACKLOG.md), [#1794](docs/BACKLOG.md))
+  - Under a pinned `[tls]` trust anchor, every off-loopback HTTP-family hop now uses it: REST,
+    SOAP, FHIR and DICOMweb deliveries, `fhir_lookup`, and the SMART and OAuth2 token requests. In
+    0.3.2 none of them read the anchor, so a partner or token endpoint on a public CA outside it now
+    fails. **Migration:** add that CA to the anchor, or leave `[tls].trust_anchor_mode` at `system`.
+    ([BACKLOG #1180](docs/BACKLOG.md), [#1660](docs/BACKLOG.md), [#1794](docs/BACKLOG.md))
   - The 8 KiB limits on an outbound URL and header value are now checked at send time as well as at
-    build, and a header name over 256 characters is refused. A per-message header, `fhir_lookup`
-    URL or token that grows past them now fails the delivery.
+    build, and a header name over 256 characters is refused. A per-message header or token that
+    grows past them now fails the delivery; a `fhir_lookup` URL that does fails the Handler's
+    message.
   - `messagefoundry codeset rename` validates the old name, so a code set whose file stem carries a
     dot, such as `lab.results`, can no longer be renamed with it. **Migration:** rename the file by
     hand.
-  - DR activation on SQLite refuses a seed that restored nothing: a config-only seed (which the
-    documentation already said was refused, though 0.3.2 activated it) and a drill seeded from an
-    empty primary. **Migration:** seed from a full backup of a primary that holds data.
-    ([BACKLOG #1717](docs/BACKLOG.md))
+  - DR activation on SQLite refuses a seed that restored nothing: a config-only seed, which 0.3.2
+    activated, and a drill seeded from an empty primary. **Migration:** seed from a full backup of
+    a primary that holds data. ([BACKLOG #1717](docs/BACKLOG.md))
 - **BREAKING — the `[vault]` clients no longer follow HTTP redirects.** 0.3.2 let the Vault client
   follow a redirect, carrying its token to the new location. A Vault address that answers with a
   redirect, such as a standby node pointing at the active one, now fails. **Migration:** point the
@@ -787,8 +790,9 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   `tls_check_hostname`, `[alerts].email_tls_verify`). A relay with a self-signed or private-CA
   certificate, or one reached by an address its certificate does not name, now fails: deliveries
   retry and dead-letter, and alert mail stops. Under `enforce`, `[alerts].email_use_tls = false` or
-  `email_tls_verify = false` now refuses to start. On any posture, alert mail with `email_use_tls =
-  false` and an `email_username` now fails at send rather than sending the password in cleartext.
+  `email_tls_verify = false` now refuses to start. On any posture, alert and security-notice mail
+  with `email_use_tls = false` and an `email_username` now fails at send rather than sending the
+  password in cleartext.
   SMTP login now offers only `PLAIN` and `LOGIN`, so a relay that accepts only `CRAM-MD5` refuses
   it. **Migration:** point `tls_ca_file` (per connection), `[alerts].email_tls_ca_file` or
   `[tls].internal_ca_file` at the relay's CA, and reach it by the name on its certificate. For alert
@@ -828,8 +832,8 @@ non-breaking fixes rather than listing them all; the git history is the full rec
 - **BREAKING — directory sessions are now rechecked every 5 minutes by default.** In 0.3.2
   `[auth].ad_session_recheck_seconds` defaulted to `0`, so a signed-in AD user's session was never
   checked against the directory again. The default is now `300`: each pass looks the signed-in AD
-  users up in the directory (up to 200 per pass), and after two passes in which the directory no
-  longer returns an account, its sessions are revoked. **Migration:** set
+  users up in the directory (up to 200 per pass), and after two consecutive passes in which the
+  directory no longer returns an account, its sessions are revoked. **Migration:** set
   `[auth].ad_session_recheck_seconds = 0` to turn it off, which is reported as a loosening.
 - **BREAKING — editing an AD group map signs out every AD session, the caller's included.** In 0.3.2 a
   change to `PUT /ad-group-map` or `PUT /ad-group-scope-map` took effect at each AD user's next
@@ -842,8 +846,9 @@ non-breaking fixes rather than listing them all; the git history is the full rec
 - **BREAKING — an unclaimed bootstrap administrator now expires under
   `[auth].initial_password_expiry_hours` too.** 0.3.2 exempted it from that clock and left it to
   `bootstrap_expiry_hours`, so `bootstrap_expiry_hours = 0` kept it alive indefinitely. It now also
-  dies 72 hours after it was issued, by default. **Migration:** claim the bootstrap account promptly,
-  or provision the first administrator with `messagefoundry provision-admin`.
+  dies 72 hours after it was issued, by default. **Migration:** claim the bootstrap account before
+  the upgrade, or set `[auth].initial_password_expiry_hours = 0`. (`messagefoundry provision-admin`
+  helps only on a fresh store: it refuses once an enabled Administrator exists.)
   ([BACKLOG #1245](docs/BACKLOG.md))
 - **BREAKING — the OIDC id_token is checked more strictly.** A token whose `typ` header is present
   and is not `JWT`, a token without `iat` or `sub`, and a token carrying an `events` claim are now
