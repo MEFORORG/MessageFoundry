@@ -305,8 +305,8 @@ def require(
 def require_paced(*permissions: Permission) -> Callable[[Request], Awaitable[Identity]]:
     """Like :func:`require`, plus per-actor anti-automation PACING on the state-changing admin
     surface (BACKLOG #193, ASVS 2.4.2) — but WITHOUT the MFA / step-up gates. For the mutating admin
-    routes that warrant paced throttling yet not a full step-up re-proof: connection start/stop/
-    restart, DR activate/release, approvals approve/reject, alert ack/resolve, statistics reset. A
+    routes that warrant paced throttling yet not a full step-up re-proof, for example connection
+    start/stop/restart, DR activate/release and statistics reset. docs/SECURITY.md lists the set. A
     non-GET request from an actor over the per-actor rate is refused early with 429 + Retry-After: 1
     (logged, not silent) before the identity is returned. Reuses the SAME #193 limiter as
     :func:`require_step_up` via :func:`_enforce_admin_write_pacing`, so pacing coverage is uniform

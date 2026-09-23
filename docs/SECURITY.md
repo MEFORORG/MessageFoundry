@@ -753,6 +753,7 @@ else would need its own authorization rule stated here.
 2. **The `/ui` write path charges the per-actor admin-write floor in `require_ui` itself**, because
    the console calls the JSON handlers in-process and their pacing `Depends` never runs (see *The
    `/ui` write path is paced* under [Anti-automation](#admin-password-reset-wp-l3-12-asvs-646)).
+   It draws the same bucket, but its 429 carries `Retry-After: 10` where the JSON floor sends `1`.
 3. **The uploaded-logs resend-confirm GET is weaker than its JSON equivalent, and cannot be
    otherwise** (it is not the only weaker uploaded-logs GET — `GET /ui/uploaded-logs` is one too,
    under item 5, and the set of record is `_UI_WEAKER_THAN_JSON_EQUIVALENT`, not this prose).
@@ -1418,8 +1419,9 @@ The honest limits of that model, one sentence each:
   loopback session, because `127.0.0.1` and `::1` are folded into one host.
 - The operator-surface network gate is **inert** behind an undeclared proxy or NAT (see layer 1 of
   [Administrative-interface defense-in-depth](#administrative-interface-defense-in-depth-wp-l3-13-asvs-842)).
-- The per-actor admin-write floor is charged on the **JSON API only** at this release; the `/ui` write
-  path charges none.
+- The per-actor admin-write floor is charged on the JSON API only by routes on `require_paced`,
+  `require_step_up` or `require_step_up_action`. A non-GET route on plain `require` charges none. The
+  `/ui` write path charges it in `require_ui` on every non-GET route.
 
 **Attributes not consumed at this release** — stated so the inventory cannot be read as claiming more
 than it does: time-of-day / hour-of-day, geolocation, device security posture or attestation,
@@ -1913,7 +1915,7 @@ the recovery path. Controls 4–6 are covered in their own rows.
 | `POST /ui/mfa` | per-actor ceremony budget | the ASVS 6.3.3 sign-in gate: it submits the second factor for a session that has already proven its password, so it draws the same budget as `POST /ui/reauth` and carries the same `Retry-After: 30` |
 | `POST /ui/account/mfa/verify` | per-actor ceremony budget | |
 | `POST /ui/account/password` | *(inherits)* | delegates to the JSON handler, which charges once; the 429 is re-raised intact — deliberately not double-charged |
-| **No limiter of any kind** | — | `POST /auth/logout`, `POST /me/mfa/enroll`, `DELETE /me/sessions[/{id}]`, `POST /ai/chat`. BACKLOG #287 moved `DELETE /search/presets/{preset_id}`, `PATCH /logging/level` and `POST /alerts/test-email` onto `require_paced`, so they charge the admin-write floor and are no longer listed here; the third dials a live outbound SMTP server per request, which is why it was paced. **Two routes left this row and the table did not follow them.** `PATCH /users/{user_id}` is the one already narrated: it lost the write pacing when it was promoted to an action-bound step-up gate, and BACKLOG #1148 made `require_step_up_action` charge the floor again. `DELETE /me/mfa` rides that same gate (`require_step_up_action(STEP_UP_ACTION_MFA_DISABLE)`), so #1148 paced it too and it was left listed here regardless. The `reauth_only` action gate (`require_reauth_only_action`) still charges none. `GET /ui/reauth` belongs here because the admin-write floor is non-GET only; the console's WebAuthn **staging** POSTs do **not** — see control 8 |
+| **No limiter of any kind** | — | `POST /auth/logout`, `POST /me/mfa/enroll`, `DELETE /me/sessions[/{id}]`, `POST /ai/chat`. BACKLOG #287 paced three routes that were listed here. They are `DELETE /search/presets/{preset_id}`, `PATCH /logging/level` and `POST /alerts/test-email`, now on `require_paced`. **Two earlier routes left this row and the table did not follow them.** `PATCH /users/{user_id}` is the one already narrated: it lost the write pacing when it was promoted to an action-bound step-up gate, and BACKLOG #1148 made `require_step_up_action` charge the floor again. `DELETE /me/mfa` rides that same gate (`require_step_up_action(STEP_UP_ACTION_MFA_DISABLE)`), so #1148 paced it too and it was left listed here regardless. The `reauth_only` action gate (`require_reauth_only_action`) still charges none. `GET /ui/reauth` belongs here because the admin-write floor is non-GET only; the console's WebAuthn **staging** POSTs do **not** — see control 8 |
 
 The console resolves the ceremony gate through a `getattr` shim because it ships as a separately
 versioned wheel: mounted on an engine that predates the method, it falls back to the **sign-in** budget.
