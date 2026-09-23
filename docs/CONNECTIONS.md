@@ -775,8 +775,8 @@ at the source.
 
 #### File handling & quarantine policy (ASVS 5.1.1)
 
-This block lists every file surface ASVS 5.1.1 asks about, one row each. Two rules decide what
-counts, and both are read off the code rather than kept by hand:
+This block lists the file surfaces ASVS 5.1.1 asks about, one row each. Two rules decide what
+counts:
 
 - An **upload feature** is any shipped surface where a party other than the host operator, working at
   the host, supplies content that the product persists or processes. Content means a file, an object
@@ -784,37 +784,45 @@ counts, and both are read off the code rather than kept by hand:
   field, is a parameter and not content.
 - A **download** is any response the product sends with `Content-Disposition: attachment`.
 
-The receivers are the `register_source(...)` calls in `messagefoundry/transports/`. The upload routes
-are `_UPLOAD_BODY_PATHS` in `api/app.py`, plus one route that takes a message body as a JSON field.
-The downloads are the code sites that write a `Content-Disposition` header.
-`tests/test_asvs_file_surface_inventory.py` derives all three from the code. It fails the build when a
-row is missing, when a row names a surface the code no longer has, or when a figure below stops
-matching the constant named beside it. One limit is disclosed: no code marker tells a content body from
-a parameter body on a JSON route, so the test lists that one route by hand.
+How each part of the list is kept:
+
+- **Receiver rows** follow the `register_source(...)` calls in `messagefoundry/transports/`.
+- **Upload-route rows** follow `_UPLOAD_BODY_PATHS` in `api/app.py`, plus a hand-kept list of JSON
+  routes whose body is a message. No code marker tells a content body from a parameter body on a JSON
+  route, so that list cannot be derived.
+- **Download rows** follow the code sites that write a `Content-Disposition` header or build a
+  `FileResponse`.
+- **Kept by hand:** the reply-capture row, the `/ui` delegates, the two limits after the upload table,
+  and the exclusions. For these the test checks that what they name still exists, not that nothing is
+  missing.
+
+`tests/test_asvs_file_surface_inventory.py` derives the first three parts from the code. It fails the
+build when a derived row is missing, when a row names a surface the code no longer has, or when a
+figure stops matching the constant named beside it.
 
 **Upload features.**
 
 | Surface | Permitted type | Extension | Maximum size | Unpacked size |
 |---|---|---|---|---|
 | `file`: local drop directory, `File(...)` | the inbound's declared `content_type` (default `hl7v2`), content-sniffed against that declaration; see the policy below | chosen by `pattern` (default `*.hl7`); the type check reads content, not the extension | `max_file_bytes`, default `DEFAULT_MAX_FILE_BYTES` = 16 MiB (`transports/file.py`) | no unpacking unless `decompress="gzip"` is set; then `max_decompressed_bytes`, default `DEFAULT_MAX_DECOMPRESSED_BYTES` = 64 MiB |
-| `remotefile`: SFTP or FTP drop directory, `Sftp(...)` / `Ftp(...)` | as for `file` | chosen by `pattern` (default `*.hl7`) | `max_file_bytes`, default `DEFAULT_MAX_FILE_BYTES` = 16 MiB, charged against the listed size and again against the bytes read ([Remote file](#remote-file--sftp--ftp)) | no unpacking on intake; the connector has no `decompress` setting |
-| `dimse`: DICOM C-STORE SCP, an inbound `DICOM(...)` ([ADR 0025](adr/0025-dicom-codec-store-connectors.md)) | DICOM objects in the SCP's accepted presentation contexts | not applicable; objects arrive over DIMSE | `max_object_bytes`, default `DEFAULT_MAX_OBJECT_BYTES` = 128 MiB (`transports/dicom.py`), charged before decode | a Deflated Explicit VR LE object is inflated in bounded memory before decode, capped at `max_object_bytes`; `0` or `None` there tightens the cap to `DEFAULT_MAX_INFLATED_BYTES` = 16 MiB |
-| `http`: web-service listener, `Http(...)` ([HTTP](#http-web-service-listener--http-inbound-only-adr-0023)) | the inbound's declared `content_type` | not applicable; a request body | `max_body_bytes`, default `DEFAULT_MAX_BODY_BYTES` = 16 MiB (`transports/http_listener.py`); headers `DEFAULT_MAX_HEADER_BYTES` = 64 KiB | no unpacking on intake; the listener does not decode `Content-Encoding` and refuses a chunked body |
+| `remotefile`: SFTP or FTP drop directory, `Sftp(...)` / `Ftp(...)` ([Remote file](#remote-file--sftp--ftp)) | as for `file` | chosen by `pattern` (default `*.hl7`) | `max_file_bytes`, default `DEFAULT_MAX_FILE_BYTES` = 16 MiB, charged against the listed size and again against the bytes read | no unpacking on intake; the connector has no `decompress` setting |
+| `dimse`: DICOM C-STORE SCP, an inbound `DICOM(...)`; its size, peer and TLS settings are under [DICOM](#dicom--dicom-inbound-c-store-scp--outbound-c-store-scuc-echo-and-dicomweb-stow-rs-adr-0025) | DICOM objects in the SCP's accepted presentation contexts | not applicable; objects arrive over DIMSE | `max_object_bytes`, default `DEFAULT_MAX_OBJECT_BYTES` = 128 MiB (`transports/dicom.py`), charged before decode | a Deflated Explicit VR LE object is inflated in bounded memory before decode, capped at `max_object_bytes`. Setting `max_object_bytes` to `0` or `None` removes the object cap and drops this inflate cap to `DEFAULT_MAX_INFLATED_BYTES` = 16 MiB |
+| `http`: web-service listener, `Http(...)` ([HTTP](#http-web-service-listener--http-inbound-only-adr-0023)) | the inbound's declared `content_type` | not applicable; a request body | `max_body_bytes`, default `DEFAULT_MAX_BODY_BYTES` = 16 MiB (`transports/http_listener.py`); headers `DEFAULT_MAX_HEADER_BYTES` = 64 KiB | no unpacking on intake. The listener decodes no `Content-Encoding` and no transfer coding. It refuses a body whose `Transfer-Encoding` is exactly `chunked`, and reads any other body as sent, up to the cap |
 | `mllp`: MLLP listener ([MLLP](#mllp--mllp)) | the inbound's declared `content_type` (default `hl7v2`) | not applicable; a framed stream | `max_frame_bytes`, default `DEFAULT_MAX_FRAME_BYTES` = 16 MiB (`transports/mllp.py`) | no unpacking on intake |
 | `tcp`: raw TCP listener ([Raw TCP](#raw-tcp--tcp)) | the inbound's declared `content_type` | not applicable; a framed stream | `max_frame_bytes`, default `DEFAULT_MAX_FRAME_BYTES` = 16 MiB | no unpacking on intake |
 | `x12`: X12 EDI listener ([X12 EDI](#x12-edi--x12)) | X12 interchanges | not applicable; a framed stream | `max_interchange_bytes`, default `DEFAULT_MAX_INTERCHANGE_BYTES` = 16 MiB (`parsing/x12/delimiters.py`) | no unpacking on intake |
 | `database`: database poller, `DatabasePoll(...)` ([Database source](#database-source--databasepoll)) | rows from `poll_statement`, each handed on as one body in the declared `content_type` | not applicable; table rows | no byte cap of its own, so the engine's per-message ceiling below bounds each row; `poll_max_rows`, default `DEFAULT_MAX_ITEMS_PER_POLL` = 500, bounds rows per poll | no unpacking on intake |
-| `/uploads` (POST) and `/ui/uploaded-logs/upload`: uploaded diagnostic logs ([ADR 0134](adr/0134-offline-uploaded-logs-viewer-connection-decoupled-upload-browse-resend-deletion-phi-at-rest-posture-stdlib-multipart.md)) | plain text only, content-sniffed against the extension | `_ALLOWED_UPLOAD_EXTENSIONS`: `.hl7`, `.hl7v2`, `.txt`, `.xml` | `[store].max_upload_bytes`, default 25 MiB (`StoreSettings`) | never unpacked; see the uploaded-logs policy below |
-| `/messages/{message_id}/edit-resend` (POST) and its `/ui` delegate: an operator's edited message body | the origin message's content type; the body re-enters the pipeline as a new message, or goes straight to a chosen outbound when `to` is set | not applicable; the JSON field `raw` | `_MAX_REQUEST_BODY_BYTES` = 1 MiB, the API's request-body cap; `EditResendRequest.raw` also sets `max_length` 16,000,000 characters, which that cap reaches first | no unpacking |
+| `/uploads` (POST) and `/ui/uploaded-logs/upload`: uploaded diagnostic logs ([ADR 0134](adr/0134-offline-uploaded-logs-viewer-connection-decoupled-upload-browse-resend-deletion-phi-at-rest-posture-stdlib-multipart.md)) | plain text only, content-sniffed against the extension. A resend, `/uploads/{file_id}/resend`, puts one message from the file straight onto a chosen inbound's ingress stage, so that inbound's listener checks, including the per-message ceiling below, do not run on it | `_ALLOWED_UPLOAD_EXTENSIONS`: `.hl7`, `.hl7v2`, `.txt`, `.xml` | `[store].max_upload_bytes`, default 25 MiB (`StoreSettings`) | not unpacked; see the uploaded-logs policy below |
+| `/messages/{message_id}/edit-resend` (POST) and its `/ui` delegate: an operator's edited message body | not checked: the edited text is taken as typed. It re-enters the origin channel's pipeline as a new message, or goes straight to a chosen outbound when `to` is set. Either way the listener's checks do not run on it | not applicable; the JSON field `raw` | `_MAX_REQUEST_BODY_BYTES` = 1 MiB, the API's request-body cap; `EditResendRequest.raw` also sets `max_length` 16,000,000 characters, which that cap reaches first | no unpacking |
 | `capture_response` / `reingress_to`: a partner's reply captured from an outbound, and re-ingressed through a `Loopback()` inbound when `reingress_to` is set ([ADR 0013](adr/0013-query-response-orchestration.md)) | whatever the partner returns on that hop | not applicable; a reply on the outbound's own connection | the outbound's own read bound: `DEFAULT_MAX_RESPONSE_BYTES` = 16 MiB (`transports/bounded_read.py`) on REST, SOAP, FHIR and DICOMweb; `max_frame_bytes` on MLLP and TCP; `max_interchange_bytes` on X12; `capture_max_rows`, default 100, plus a fixed byte cap on a database outbound | no unpacking on capture |
 
-Two limits apply to the content of every receiver row above, after intake:
+Two limits apply after intake to the content of every row above that names a connector type:
 
-- **The engine's per-message ceiling.** `DEFAULT_MAX_MESSAGE_BYTES` = 16 MiB (`parsing/peek.py`)
-  bounds each received body, measured in characters once a text body is decoded. A body over it is
-  kept as an `ERROR` message and never processed. An HL7 v2 inbound replaces it with its own
-  `max_message_bytes` when that is set. So a DICOM object between 16 MiB and the SCP's 128 MiB object
-  cap passes the connector and is then recorded as `ERROR` rather than routed.
+- **The engine's per-message ceiling.** The listener applies `DEFAULT_MAX_MESSAGE_BYTES` = 16 MiB
+  (`parsing/peek.py`) to each received body, measured in characters once a text body is decoded. A
+  body over it is kept as an `ERROR` message and never processed. An HL7 v2 inbound replaces it with
+  its own `max_message_bytes` when that is set. So a DICOM object between 16 MiB and the SCP's 128 MiB
+  object cap passes the connector and is then recorded as `ERROR` rather than routed.
 - **Unpacking a payload.** When a Router or Handler parses a Deflated DICOM Part-10 payload,
   `guard_part10_deflate` caps the inflate at `DEFAULT_MAX_INFLATED_BYTES` = 16 MiB, with no setting.
   When a Handler unpacks content itself, it calls `gzip_decompress`, `deflate_decompress` or
@@ -823,7 +831,7 @@ Two limits apply to the content of every receiver row above, after intake:
   choose the ceiling. Passing `None` removes it, and has to be written out. `zip_decompress` also caps
   the member count at `max_entries`, default 1024, and refuses the whole archive when one member's
   name or content fails the checks in `parsing/sniff.py`. This is the unpacked-size limit for any
-  receiver whose content a Handler unpacks.
+  content a Handler unpacks, whichever row it arrived through.
 
 **Downloads.** The "Downloads are made safe at serve (ASVS 1.3.4)" clause below covers the attachment
 row only. The two export rows are made safe as their own row says.
@@ -855,9 +863,10 @@ row only. The two export rows are made safe as their own row says.
   `_MAX_CONFIG_MEMBERS` = 10,000 members and `_MAX_CONFIG_BYTES` = 1 GiB; `import corepoint`;
   `cert import`; `dryrun`; and `support-bundle`, which writes its archive to the local disk and serves
   nothing.
-- The IDE extension's two file pickers (`ide/src/testBench.ts`, `ide/src/stepsView.ts`) are local
-  developer intake. Whether they count is an open owner question on BACKLOG #1127, and this block
-  does not decide it.
+- Developer intake from the IDE extension is not decided here. That covers its two file pickers
+  (`ide/src/testBench.ts`, `ide/src/stepsView.ts`) and the editor text it sends to `/ai/chat` (POST),
+  which `AiChatRequest.prompt` caps at 200,000 characters and the engine relays to the configured AI
+  provider ([AI.md](AI.md)). Whether this intake counts is an open owner question on BACKLOG #1127.
 
 **The embedded-document detach is a STAGE, not a receiver, and its ceilings are stated here
 because the requirement asks for unpacked size wherever content is accepted.** When an inbound sets

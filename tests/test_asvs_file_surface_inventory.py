@@ -1,32 +1,41 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 5.1.1 drift guard: the file-surface inventory in ``docs/CONNECTIONS.md`` must name every
-surface the code ships, and every figure it quotes must match the code constant beside it.
+surface the code ships on its derived axes, and every figure it quotes must match the code constant
+beside it.
 
 For 5.1.1 the documentation IS the control, so a stale table is the defect. The inventory went wrong
 three times while it was hand-kept (BACKLOG #1127): each fix added the one surface the last reviewer
 named and left the rest. ``tests/test_asvs_file_surface_doc_drift.py`` pins TOKENS in the prose and
 says of itself that it guards text, not code. This module derives the surface list from the code, so a
-new surface fails the build until it has a row. Modelled on ``tests/test_communications_inventory.py``.
+new surface on a derived axis fails the build until it has a row. Modelled on
+``tests/test_communications_inventory.py``.
 
-Three derived axes, and one disclosed manual list:
+A row's KEY is the first backticked token in its first cell. Keys are what the axes compare, so a
+passing mention of ``file`` or ``database`` elsewhere in a row cannot stand in for a missing row.
+
+Three derived axes, and the hand-kept parts the doc discloses:
 
 1. **Receivers.** Importing ``messagefoundry.transports`` runs every ``register_source(...)``. Each
-   registered source type's ``.value`` must appear in backticks in the FIRST cell of an upload-table
-   row, or in the exclusions list. A table or exclusion that names a type the registry no longer holds
-   fails too. First-cell matching matters: ``file`` and ``http`` are ordinary words that other cells use.
-2. **Upload routes.** Every path in ``api/app.py``'s ``_UPLOAD_BODY_PATHS`` must head an upload row.
+   registered source type's ``.value`` must key an upload row, or be named in the exclusion bullet
+   that lists registered sources. Every row key must be one of: a registered source value, a path in
+   ``_UPLOAD_BODY_PATHS`` or :data:`CONTENT_ROUTES`, or a hand-kept key in :data:`HAND_KEPT_UPLOAD_KEYS`
+   whose factory parameter still exists. Anything else is a stale row.
+2. **Upload routes.** Every path in ``api/app.py``'s ``_UPLOAD_BODY_PATHS`` must key an upload row.
 3. **Downloads.** An AST walk over ``messagefoundry/`` and ``messagefoundry_webconsole/`` finds every
-   code site that writes a ``Content-Disposition`` header or builds a ``FileResponse``, and names the
-   function it sits in. That set must equal :data:`DOWNLOAD_EMITTERS` exactly, and each emitter's route
-   must head a download row. A new emitter fails until someone maps it and writes its row.
-4. **Manual, disclosed.** No code marker tells a content body from a parameter body on a JSON route,
-   so :data:`CONTENT_ROUTES` lists those routes by hand. Each must still exist in ``create_app()``.
+   code site that writes a ``Content-Disposition`` header (``str`` or ``bytes``) or builds a
+   ``FileResponse``, and names its file and enclosing function. That set must equal
+   :data:`DOWNLOAD_EMITTERS` exactly, and each emitter's route must key a download row.
+
+**Not derived, and disclosed in the doc:** :data:`CONTENT_ROUTES` (no code marker tells a content body
+from a parameter body on a JSON route), the reply-capture row, the ``/ui`` delegates, and the
+exclusions. A ``/ui`` delegate that re-serves an emitter by calling it in-process writes no header of
+its own, so the AST walk cannot see it.
 
 Figures are imported from the code (``DEFAULT_*`` constants, factory signature defaults, pydantic field
-metadata and live route bounds) and asserted on the same line as their symbol, so changing a constant
-reds the doc. The checkers are pure functions with planted-omission self-tests, so the guard cannot
-quietly stop asserting. PHI-free: it reads names, doc prose and constants only.
+metadata and live route bounds) and matched with number boundaries, so ``= 500`` does not pass for a
+code value of ``50``. The checkers are pure functions with planted-omission self-tests, so the guard
+cannot quietly stop asserting. PHI-free: it reads names, doc prose and constants only.
 """
 
 from __future__ import annotations
@@ -41,7 +50,7 @@ import pytest
 
 import messagefoundry.transports  # noqa: F401 - import runs every register_source(...)
 from messagefoundry.api import app as api_app
-from messagefoundry.api.models import EditResendRequest, MessageExportRequest
+from messagefoundry.api.models import AiChatRequest, EditResendRequest, MessageExportRequest
 from messagefoundry.api.validation import MAX_EXPORT_IDS
 from messagefoundry.config import wiring
 from messagefoundry.config.settings import StoreSettings
@@ -67,17 +76,23 @@ _BLOCK_END = "#### Uploaded-logs file policy (ASVS 5.1.1)"
 _UPLOAD_CAPTION = "**Upload features.**"
 _DOWNLOAD_CAPTION = "**Downloads.**"
 _EXCLUDED_CAPTION = "**Excluded, with the reason.**"
+_SOURCE_EXCLUSION_MARKER = "are registered sources"
 
-#: Function that writes a download header -> the route path(s) its download row must name. Keep this
-#: equal to what the AST walk finds; the test says which side is missing.
+#: ``<repo-relative file>::<function>`` that writes a download header -> the route path(s) its
+#: download row must be keyed by. Must equal what the AST walk finds; the test says which side is off.
 DOWNLOAD_EMITTERS: dict[str, tuple[str, ...]] = {
-    "download_attachment": ("/messages/{message_id}/attachments/{attachment_id}",),
-    "export_messages": ("/messages/export",),
-    "export_audit": ("/audit/export",),
+    "messagefoundry/api/app.py::download_attachment": (
+        "/messages/{message_id}/attachments/{attachment_id}",
+    ),
+    "messagefoundry/api/app.py::export_messages": ("/messages/export",),
+    "messagefoundry/api/auth_routes.py::export_audit": ("/audit/export",),
 }
 
-#: JSON routes whose body carries CONTENT (a message body), listed by hand -- see mechanism 4.
+#: JSON routes whose body carries CONTENT (a message body), listed by hand -- no code marker exists.
 CONTENT_ROUTES: tuple[str, ...] = ("/messages/{message_id}/edit-resend",)
+
+#: Hand-kept upload-row keys -> the factory whose parameter of that name must still exist.
+HAND_KEPT_UPLOAD_KEYS: dict[str, object] = {"capture_response": wiring.MLLP}
 
 
 # --- pure helpers ---------------------------------------------------------------------------------
@@ -101,30 +116,34 @@ def _table_after(text: str, caption: str) -> list[str]:
     return rows[2:]
 
 
-def _first_cell_tokens(rows: Iterable[str]) -> dict[str, str]:
-    """Backticked token in a row's first cell -> that whole row."""
-    found: dict[str, str] = {}
+def _keyed_rows(rows: Iterable[str]) -> dict[str, str]:
+    """A row's key (the first backticked token of its first cell) -> that whole row."""
+    keyed: dict[str, str] = {}
     for row in rows:
-        first = row.split("|")[1]
-        for token in re.findall(r"`([^`]+)`", first):
-            found[token] = row
-    return found
+        tokens = re.findall(r"`([^`]+)`", row.split("|")[1])
+        if tokens:
+            keyed[tokens[0]] = row
+    return keyed
 
 
-def _exclusion_tokens(text: str) -> set[str]:
-    start = text.index(_EXCLUDED_CAPTION)
-    rest = text[start:]
-    stop = rest.find("\n\n", rest.index("\n- "))
-    return set(re.findall(r"`([^`]+)`", rest[: stop if stop != -1 else len(rest)]))
+def _source_exclusions(text: str) -> set[str]:
+    """Tokens before ``are registered sources`` in the exclusion bullet that lists sources."""
+    excluded = text[text.index(_EXCLUDED_CAPTION) :]
+    bullet = next(b for b in excluded.split("\n- ") if _SOURCE_EXCLUSION_MARKER in b)
+    return set(re.findall(r"`([^`]+)`", bullet[: bullet.index(_SOURCE_EXCLUSION_MARKER)]))
 
 
-def missing_sources(sources: set[str], table: set[str], excluded: set[str]) -> set[str]:
-    return sources - table - excluded
+def missing_sources(sources: set[str], keys: set[str], excluded: set[str]) -> set[str]:
+    return sources - keys - excluded
 
 
-def stale_sources(sources: set[str], known_types: set[str], named: set[str]) -> set[str]:
-    """Names that ARE connector-type values but are no longer registered sources."""
-    return (named & known_types) - sources
+def stale_keys(keys: set[str], allowed: set[str]) -> set[str]:
+    return keys - allowed
+
+
+def has_figure(text: str, needle: str) -> bool:
+    """``needle`` occurs with no digit or thousands comma running on at either end."""
+    return re.search(r"(?<![\d,])" + re.escape(needle) + r"(?![\d]|,\d)", text) is not None
 
 
 def _size(n: int) -> str:
@@ -135,8 +154,9 @@ def _size(n: int) -> str:
 
 
 def _is_emitter(node: ast.AST) -> bool:
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return node.value.lower() == "content-disposition"
+    if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)):
+        value = node.value.decode("latin-1") if isinstance(node.value, bytes) else node.value
+        return value.lower() == "content-disposition"
     if isinstance(node, ast.Call):
         func = node.func
         name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
@@ -144,32 +164,33 @@ def _is_emitter(node: ast.AST) -> bool:
     return False
 
 
-def _walk(node: ast.AST, stack: list[str], where: str, out: dict[str, set[str]]) -> None:
+def _walk(node: ast.AST, stack: list[str], where: str, out: set[str]) -> None:
     is_fn = isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     if is_fn:
         stack.append(node.name)
     if _is_emitter(node):
-        out.setdefault(stack[-1] if stack else "<module>", set()).add(where)
+        out.add(f"{where}::{stack[-1] if stack else '<module>'}")
     for child in ast.iter_child_nodes(node):
         _walk(child, stack, where, out)
     if is_fn:
         stack.pop()
 
 
-def _emitters(paths: Iterable[Path]) -> dict[str, set[str]]:
-    """Enclosing function name -> files, for every Content-Disposition write or FileResponse call."""
-    out: dict[str, set[str]] = {}
+def emitters(paths: Iterable[Path], root: Path) -> set[str]:
+    """``<file>::<function>`` for every Content-Disposition write or FileResponse call."""
+    out: set[str] = set()
     for path in paths:
-        _walk(ast.parse(path.read_text(encoding="utf-8")), [], path.as_posix(), out)
+        where = path.relative_to(root).as_posix()
+        _walk(ast.parse(path.read_text(encoding="utf-8")), [], where, out)
     return out
 
 
 # --- fixtures -------------------------------------------------------------------------------------
 
 _BLOCK = _block(_DOC)
-_UPLOAD_ROWS = _first_cell_tokens(_table_after(_BLOCK, _UPLOAD_CAPTION))
-_DOWNLOAD_ROWS = _first_cell_tokens(_table_after(_BLOCK, _DOWNLOAD_CAPTION))
-_EXCLUDED = _exclusion_tokens(_BLOCK)
+_UPLOAD_ROWS = _keyed_rows(_table_after(_BLOCK, _UPLOAD_CAPTION))
+_DOWNLOAD_ROWS = _keyed_rows(_table_after(_BLOCK, _DOWNLOAD_CAPTION))
+_EXCLUDED_SOURCES = _source_exclusions(_BLOCK)
 _SOURCE_VALUES = {kind.value for kind in _SOURCES}
 
 
@@ -186,43 +207,55 @@ def app_routes() -> dict[tuple[str, str], object]:
     }
 
 
-# --- axis 1: receivers ----------------------------------------------------------------------------
+# --- axis 1: receivers, and stale keys ------------------------------------------------------------
 
 
-def test_every_registered_source_has_a_row_or_an_exclusion() -> None:
-    missing = missing_sources(_SOURCE_VALUES, set(_UPLOAD_ROWS), _EXCLUDED)
+def test_every_registered_source_keys_a_row_or_is_excluded() -> None:
+    missing = missing_sources(_SOURCE_VALUES, set(_UPLOAD_ROWS), _EXCLUDED_SOURCES)
     assert not missing, f"register_source types with no 5.1.1 row or exclusion: {sorted(missing)}"
 
 
-def test_no_row_names_a_source_type_the_registry_no_longer_holds() -> None:
-    from messagefoundry.config.models import ConnectorType
-
-    known = {kind.value for kind in ConnectorType}
-    stale = stale_sources(_SOURCE_VALUES, known, set(_UPLOAD_ROWS) | _EXCLUDED)
-    assert not stale, f"5.1.1 names connector types that register no source: {sorted(stale)}"
-
-
 def test_a_source_is_either_a_row_or_an_exclusion_not_both() -> None:
-    both = _SOURCE_VALUES & set(_UPLOAD_ROWS) & _EXCLUDED
+    both = set(_UPLOAD_ROWS) & _EXCLUDED_SOURCES
     assert not both, f"listed as an upload feature AND excluded: {sorted(both)}"
 
 
-# --- axis 2 and 4: upload routes ------------------------------------------------------------------
+def test_no_upload_row_or_source_exclusion_names_a_surface_the_code_lacks() -> None:
+    allowed = (
+        _SOURCE_VALUES
+        | set(api_app._UPLOAD_BODY_PATHS)
+        | set(CONTENT_ROUTES)
+        | set(HAND_KEPT_UPLOAD_KEYS)
+    )
+    stale = stale_keys(set(_UPLOAD_ROWS), allowed) | stale_keys(_EXCLUDED_SOURCES, _SOURCE_VALUES)
+    assert not stale, f"5.1.1 rows or exclusions naming nothing the code registers: {sorted(stale)}"
 
 
-def test_every_upload_body_path_heads_an_upload_row() -> None:
-    missing = sorted(p for p in api_app._UPLOAD_BODY_PATHS if p not in _UPLOAD_ROWS)
+def test_hand_kept_keys_still_exist_in_the_factories() -> None:
+    for key, factory in HAND_KEPT_UPLOAD_KEYS.items():
+        assert key in inspect.signature(factory).parameters, f"{key} is gone from its factory"  # type: ignore[arg-type]
+        assert key in _UPLOAD_ROWS, f"{key} has no 5.1.1 upload row"
+    assert "reingress_to" in inspect.signature(wiring.MLLP).parameters
+
+
+# --- axis 2: upload routes ------------------------------------------------------------------------
+
+
+def test_every_upload_body_path_keys_an_upload_row() -> None:
+    # The console delegate shares its row with /uploads, so a path may sit in a row's first cell
+    # without being its key; the key test below covers the API path.
+    first_cells = " ".join(row.split("|")[1] for row in _UPLOAD_ROWS.values())
+    missing = sorted(p for p in api_app._UPLOAD_BODY_PATHS if f"`{p}`" not in first_cells)
     assert not missing, f"_UPLOAD_BODY_PATHS with no 5.1.1 upload row: {missing}"
+    assert "/uploads" in _UPLOAD_ROWS
 
 
-def test_hand_listed_content_routes_exist_and_head_a_row(
+def test_hand_listed_content_routes_exist_and_key_a_row(
     app_routes: dict[tuple[str, str], object],
 ) -> None:
     paths = {path for _, path in app_routes}
     for route in CONTENT_ROUTES:
-        assert route in paths, (
-            f"{route} is listed as a content route but create_app() has no such route"
-        )
+        assert route in paths, f"{route} is listed as a content route but create_app() lacks it"
         assert route in _UPLOAD_ROWS, f"{route} has no 5.1.1 upload row"
 
 
@@ -238,51 +271,60 @@ def _code_paths() -> list[Path]:
 
 
 def test_download_emitters_match_the_code_exactly() -> None:
-    found = _emitters(_code_paths())
-    # multipart.py PARSES an inbound part's Content-Disposition line, it does not write one; its
-    # literal carries a trailing colon, so the exact-equality walk above never matches it.
-    unmapped = set(found) - set(DOWNLOAD_EMITTERS)
-    gone = set(DOWNLOAD_EMITTERS) - set(found)
+    found = emitters(_code_paths(), _ROOT)
+    # multipart.py PARSES an inbound part's Content-Disposition line and writes none; its literal
+    # carries a trailing colon, so the exact-equality walk never matches it.
+    unmapped = found - set(DOWNLOAD_EMITTERS)
+    gone = set(DOWNLOAD_EMITTERS) - found
     assert not unmapped, (
-        f"new Content-Disposition/FileResponse emitter(s) {sorted(unmapped)} in "
-        f"{sorted(f for k in unmapped for f in found[k])}: add a 5.1.1 download row and map it here"
+        f"new Content-Disposition/FileResponse emitter(s) {sorted(unmapped)}: "
+        "add a 5.1.1 download row and map it in DOWNLOAD_EMITTERS"
     )
-    assert not gone, f"DOWNLOAD_EMITTERS names functions that no longer emit: {sorted(gone)}"
+    assert not gone, f"DOWNLOAD_EMITTERS names sites that no longer emit: {sorted(gone)}"
 
 
-def test_every_download_emitter_route_heads_a_download_row(
+def test_every_download_emitter_route_keys_a_download_row(
     app_routes: dict[tuple[str, str], object],
 ) -> None:
     paths = {path for _, path in app_routes}
-    for fn, routes in DOWNLOAD_EMITTERS.items():
+    for site, routes in DOWNLOAD_EMITTERS.items():
         for route in routes:
-            assert route in paths, f"{fn}: route {route} is not in create_app()"
-            assert route in _DOWNLOAD_ROWS, f"{fn}: route {route} has no 5.1.1 download row"
+            assert route in paths, f"{site}: route {route} is not in create_app()"
+            assert route in _DOWNLOAD_ROWS, f"{site}: route {route} has no 5.1.1 download row"
 
 
 def test_download_rows_name_only_emitting_routes() -> None:
     mapped = {r for routes in DOWNLOAD_EMITTERS.values() for r in routes}
-    # `/ui` alone marks a same-handler console delegate, not a route of its own.
-    extra = {t for t in _DOWNLOAD_ROWS if t.startswith("/") and t != "/ui" and t not in mapped}
+    extra = set(_DOWNLOAD_ROWS) - mapped
     assert not extra, f"download rows for routes no emitter serves: {sorted(extra)}"
 
 
 # --- figures, imported from the code --------------------------------------------------------------
 
 
-def _row(token: str, rows: dict[str, str]) -> str:
-    assert token in rows, f"no 5.1.1 row headed by `{token}`"
-    return rows[token]
+def _row(key: str, rows: dict[str, str]) -> str:
+    assert key in rows, f"no 5.1.1 row keyed by `{key}`"
+    return rows[key]
 
 
-def _line_with(symbol: str) -> str:
-    lines = [line for line in _BLOCK.splitlines() if symbol in line]
+def _lines_with(symbol: str, text: str = _BLOCK) -> str:
+    lines = [line for line in text.splitlines() if symbol in line]
     assert lines, f"`{symbol}` is not named in the 5.1.1 block"
     return "\n".join(lines)
 
 
 def _sig_default(fn: object, name: str) -> object:
     return inspect.signature(fn).parameters[name].default  # type: ignore[arg-type]
+
+
+def _max_len(field: object) -> int:
+    return next(m.max_length for m in field.metadata if hasattr(m, "max_length"))  # type: ignore[attr-defined]
+
+
+def _assert_figures(key: str, needles: Iterable[str], rows: dict[str, str]) -> None:
+    row = _row(key, rows)
+    for needle in needles:
+        assert has_figure(row, needle), f"`{key}` row lost or changed `{needle}`"
 
 
 def test_receiver_figures_match_their_constants() -> None:
@@ -295,6 +337,8 @@ def test_receiver_figures_match_their_constants() -> None:
     assert _sig_default(wiring.MLLP, "max_frame_bytes") == DEFAULT_MAX_FRAME_BYTES
     assert _sig_default(wiring.Tcp, "max_frame_bytes") == DEFAULT_MAX_FRAME_BYTES
     assert _sig_default(wiring.X12, "max_interchange_bytes") == DEFAULT_MAX_INTERCHANGE_BYTES
+    assert _sig_default(wiring.DatabasePoll, "poll_max_rows") == DEFAULT_MAX_ITEMS_PER_POLL
+    assert _sig_default(wiring.Sftp, "pattern") == _sig_default(wiring.Ftp, "pattern")
     for factory in (wiring.Sftp, wiring.Ftp):
         assert _sig_default(factory, "max_file_bytes") == DEFAULT_MAX_FILE_BYTES
         assert "decompress" not in inspect.signature(factory).parameters
@@ -322,57 +366,62 @@ def test_receiver_figures_match_their_constants() -> None:
         "x12": [f"DEFAULT_MAX_INTERCHANGE_BYTES` = {_size(DEFAULT_MAX_INTERCHANGE_BYTES)}"],
         "database": [f"DEFAULT_MAX_ITEMS_PER_POLL` = {DEFAULT_MAX_ITEMS_PER_POLL}"],
     }
-    assert _sig_default(wiring.Sftp, "pattern") == _sig_default(wiring.Ftp, "pattern")
-    for token, needles in pins.items():
-        row = _row(token, _UPLOAD_ROWS)
-        for needle in needles:
-            assert needle in row, f"`{token}` row lost or changed `{needle}`"
+    for key, needles in pins.items():
+        _assert_figures(key, needles, _UPLOAD_ROWS)
 
 
 def test_route_and_reply_figures_match_their_constants() -> None:
     uploads = _row("/uploads", _UPLOAD_ROWS)
-    for ext in _ALLOWED_UPLOAD_EXTENSIONS:
-        assert f"`{ext}`" in uploads
-    assert f"default {_size(StoreSettings.model_fields['max_upload_bytes'].default)}" in uploads
-
-    edit = _row(CONTENT_ROUTES[0], _UPLOAD_ROWS)
-    assert f"_MAX_REQUEST_BODY_BYTES` = {_size(api_app._MAX_REQUEST_BODY_BYTES)}" in edit
-    raw_max = next(
-        m.max_length
-        for m in EditResendRequest.model_fields["raw"].metadata
-        if hasattr(m, "max_length")
+    ext_cell = uploads.split("|")[3]
+    assert set(re.findall(r"`(\.[a-z0-9]+)`", ext_cell)) == set(_ALLOWED_UPLOAD_EXTENSIONS)
+    _assert_figures(
+        "/uploads",
+        [f"default {_size(StoreSettings.model_fields['max_upload_bytes'].default)}"],
+        _UPLOAD_ROWS,
     )
-    assert f"{raw_max:,} characters" in edit
+    _assert_figures(
+        CONTENT_ROUTES[0],
+        [
+            f"_MAX_REQUEST_BODY_BYTES` = {_size(api_app._MAX_REQUEST_BODY_BYTES)}",
+            f"{_max_len(EditResendRequest.model_fields['raw']):,} characters",
+        ],
+        _UPLOAD_ROWS,
+    )
+    _assert_figures(
+        "capture_response",
+        [
+            f"DEFAULT_MAX_RESPONSE_BYTES` = {_size(DEFAULT_MAX_RESPONSE_BYTES)}",
+            f"default {_sig_default(wiring.Database, 'capture_max_rows')}",
+        ],
+        _UPLOAD_ROWS,
+    )
 
-    reply = _row("capture_response", _UPLOAD_ROWS)
-    assert f"DEFAULT_MAX_RESPONSE_BYTES` = {_size(DEFAULT_MAX_RESPONSE_BYTES)}" in reply
-    assert f"default {_sig_default(wiring.Database, 'capture_max_rows')}" in reply
 
-
-def _bound(route: object, name: str) -> tuple[object, object]:
+def _bound(route: object, name: str) -> tuple[int, int]:
     param = next(q for q in route.dependant.query_params if q.name == name)  # type: ignore[attr-defined]
     le = next(m.le for m in param.field_info.metadata if hasattr(m, "le"))
     return param.field_info.default, le
 
 
 def test_download_figures_match_the_routes(app_routes: dict[tuple[str, str], object]) -> None:
-    export = _row("/messages/export", _DOWNLOAD_ROWS)
     default, ceiling = _bound(app_routes[("GET", "/messages/export")], "limit")
     body = MessageExportRequest.model_fields["limit"]
     body_le = next(m.le for m in body.metadata if hasattr(m, "le"))
     assert (default, ceiling) == (body.default, body_le), "GET and POST export bounds diverged"
-    assert f"default {default}, ceiling {ceiling:,}" in export
-    assert f"MAX_EXPORT_IDS` = {MAX_EXPORT_IDS:,}" in export
-
-    audit = _row("/audit/export", _DOWNLOAD_ROWS)
+    _assert_figures(
+        "/messages/export",
+        [f"default {default}, ceiling {ceiling:,}", f"MAX_EXPORT_IDS` = {MAX_EXPORT_IDS:,}"],
+        _DOWNLOAD_ROWS,
+    )
     default, ceiling = _bound(app_routes[("GET", "/audit/export")], "limit")
-    assert f"default {default:,}, ceiling {ceiling:,}" in audit
-    assert "_csv_safe" in audit
+    _assert_figures("/audit/export", [f"default {default:,}, ceiling {ceiling:,}"], _DOWNLOAD_ROWS)
+    assert "_csv_safe" in _row("/audit/export", _DOWNLOAD_ROWS)
 
 
 def test_common_limits_and_exclusion_figures_match_their_constants() -> None:
-    assert f"DEFAULT_MAX_MESSAGE_BYTES` = {_size(DEFAULT_MAX_MESSAGE_BYTES)}" in _line_with(
-        "DEFAULT_MAX_MESSAGE_BYTES`"
+    assert has_figure(
+        _lines_with("DEFAULT_MAX_MESSAGE_BYTES`"),
+        f"DEFAULT_MAX_MESSAGE_BYTES` = {_size(DEFAULT_MAX_MESSAGE_BYTES)}",
     )
     # The decompressors' ceiling is a required keyword with NO default; the doc says so.
     for fn in (
@@ -384,18 +433,20 @@ def test_common_limits_and_exclusion_figures_match_their_constants() -> None:
         assert param.kind is inspect.Parameter.KEYWORD_ONLY
         assert param.default is inspect.Parameter.empty, f"{fn.__name__} grew a default"
         assert fn.__name__ in _BLOCK
-    assert (
-        f"`max_entries`, default {_sig_default(compression.zip_decompress, 'max_entries')}"
-        in _BLOCK
-    )
+    entries = _sig_default(compression.zip_decompress, "max_entries")
+    assert has_figure(_BLOCK, f"`max_entries`, default {entries}")
 
-    static = _line_with("ALLOWED_STATIC_EXTENSIONS")
-    for ext in ALLOWED_STATIC_EXTENSIONS:
-        assert f"`{ext}`" in static
+    static = _lines_with("ALLOWED_STATIC_EXTENSIONS")
+    assert set(re.findall(r"`(\.[a-z0-9]+)`", static)) == set(ALLOWED_STATIC_EXTENSIONS)
+
     excluded = _BLOCK[_BLOCK.index(_EXCLUDED_CAPTION) :]
-    assert f"_MAX_RESTORE_MEMBER_BYTES` = {_size(dr_backup._MAX_RESTORE_MEMBER_BYTES)}" in excluded
-    assert f"_MAX_CONFIG_MEMBERS` = {dr_backup._MAX_CONFIG_MEMBERS:,}" in excluded
-    assert f"_MAX_CONFIG_BYTES` = {_size(dr_backup._MAX_CONFIG_BYTES)}" in excluded
+    for needle in (
+        f"_MAX_RESTORE_MEMBER_BYTES` = {_size(dr_backup._MAX_RESTORE_MEMBER_BYTES)}",
+        f"_MAX_CONFIG_MEMBERS` = {dr_backup._MAX_CONFIG_MEMBERS:,}",
+        f"_MAX_CONFIG_BYTES` = {_size(dr_backup._MAX_CONFIG_BYTES)}",
+        f"{_max_len(AiChatRequest.model_fields['prompt']):,} characters",
+    ):
+        assert has_figure(excluded, needle), f"exclusions lost or changed `{needle}`"
 
 
 def test_retired_hedge_stays_gone() -> None:
@@ -414,9 +465,7 @@ def test_the_1_3_4_clause_stays_scoped_to_the_attachment_route() -> None:
 
 def test_in_block_anchors_resolve() -> None:
     def slug(heading: str) -> str:
-        s = heading.strip().lower()
-        s = re.sub(r"[^\w\- ]", "", s)
-        return s.replace(" ", "-")
+        return re.sub(r"[^\w\- ]", "", heading.strip().lower()).replace(" ", "-")
 
     def anchors(text: str) -> set[str]:
         return {slug(m) for m in re.findall(r"^#{1,6} (.+)$", text, flags=re.M)}
@@ -432,27 +481,41 @@ def test_in_block_anchors_resolve() -> None:
 
 
 def test_self_test_a_planted_missing_receiver_is_caught() -> None:
-    table = set(_UPLOAD_ROWS) - {"x12"}
-    assert missing_sources(_SOURCE_VALUES, table, _EXCLUDED) == {"x12"}
+    keys = set(_UPLOAD_ROWS) - {"x12"}
+    assert missing_sources(_SOURCE_VALUES, keys, _EXCLUDED_SOURCES) == {"x12"}
 
 
-def test_self_test_a_planted_stale_row_is_caught() -> None:
-    sources = _SOURCE_VALUES - {"tcp"}
-    assert stale_sources(sources, _SOURCE_VALUES, set(_UPLOAD_ROWS)) == {"tcp"}
+def test_self_test_a_passing_mention_does_not_count_as_a_row() -> None:
+    doc = _BLOCK.replace("| `x12`: X12 EDI listener", "| `X12(...)` EDI listener, see `x12`")
+    keys = set(_keyed_rows(_table_after(doc, _UPLOAD_CAPTION)))
+    assert missing_sources(_SOURCE_VALUES, keys, _source_exclusions(doc)) == {"x12"}
+
+
+def test_self_test_a_row_for_a_deleted_connector_type_is_stale() -> None:
+    # The usual removal deletes the enum member too, so staleness must not depend on ConnectorType.
+    assert stale_keys(set(_UPLOAD_ROWS), _SOURCE_VALUES - {"tcp"} | set(CONTENT_ROUTES)) >= {"tcp"}
 
 
 def test_self_test_a_planted_emitter_is_found(tmp_path: Path) -> None:
     planted = tmp_path / "planted.py"
     planted.write_text(
         "def leak():\n    return {'Content-Disposition': 'attachment'}\n"
+        "def raw():\n    return [(b'content-disposition', b'attachment')]\n"
         "def other():\n    return FileResponse('x', filename='y')\n"
         "def parse(line):\n    return line.startswith('content-disposition:')\n",
         encoding="utf-8",
     )
-    assert set(_emitters([planted])) == {"leak", "other"}
+    assert emitters([planted], tmp_path) == {
+        "planted.py::leak",
+        "planted.py::raw",
+        "planted.py::other",
+    }
 
 
-def test_self_test_a_planted_table_drops_a_row() -> None:
-    doc = _BLOCK.replace("| `x12`:", "| x12:")
-    rows = _first_cell_tokens(_table_after(doc, _UPLOAD_CAPTION))
-    assert missing_sources(_SOURCE_VALUES, set(rows), _exclusion_tokens(doc)) == {"x12"}
+def test_self_test_figure_match_respects_number_boundaries() -> None:
+    row = "| `database` | ... `DEFAULT_MAX_ITEMS_PER_POLL` = 500, bounds rows | 16,000,000 characters |"
+    assert has_figure(row, "DEFAULT_MAX_ITEMS_PER_POLL` = 500")
+    assert not has_figure(row, "DEFAULT_MAX_ITEMS_PER_POLL` = 50")
+    assert not has_figure(row, "6,000,000 characters")
+    assert not has_figure("ceiling 1,000,000", "ceiling 1,000")
+    assert not has_figure("MAX_EXPORT_IDS` = 100,000", "MAX_EXPORT_IDS` = 100")
