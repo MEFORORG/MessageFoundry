@@ -11,6 +11,9 @@ a cookie jar that dropped the old value proves nothing about whether the old tok
 Each leg also has its inverse: a sign-in that FAILS must leave the prior session alive, and a success
 must not touch the user's other sessions. Without those, "revoke the user's sessions on sign-in"
 would pass every positive case here.
+
+The last test covers the sessions page's revoke notice, which must follow the result rather than
+always read "Session revoked." now that a session's id changes at every re-verification.
 """
 
 from __future__ import annotations
@@ -261,3 +264,33 @@ async def test_a_failed_ui_oidc_callback_leaves_the_prior_session_alive(
         assert r.status_code == 303 and r.headers["location"].startswith("/ui/login?e=")
         assert await _live(service, prior), "a FAILED federated sign-in ended the prior session"
     assert await _superseded_rows(engine) == []
+
+
+# --- the sessions page reports the revoke that happened, not the one that was asked for -----------
+
+
+async def test_revoking_an_id_that_no_longer_exists_says_so(engine: Engine) -> None:
+    service = await _service(engine)
+    other = await service.login("op", PW)
+    assert other.token is not None
+    other_id = hash_token(other.token)
+    # The target session re-verifies on its own device, which ROTATES its token (ASVS 7.2.4). The id
+    # a sessions page rendered before that is now dead, while the session itself lives on under a new
+    # one -- the exact case where an unconditional "Session revoked." would be false.
+    identity = await service.identity_for_token(other.token, activity=False)
+    assert identity is not None
+    rotated = await service.reauth(identity, PW, token=other.token)
+    assert rotated.token is not None and await _live(service, rotated.token)
+    async with _client(engine, service) as c:
+        r = await c.post("/ui/login", data={"username": "op", "password": PW}, headers=_SAME)
+        assert r.status_code == 303
+        path = f"/ui/account/sessions/{other_id}/revoke"
+        minted = await c.post("/ui/reauth", data={"next": path, "password": PW}, headers=_SAME)
+        assert minted.status_code in (200, 303), minted.status_code
+        r = await c.post(path, headers=_SAME)
+        assert r.status_code == 303
+        assert r.headers["location"] == "/ui/account/sessions?m=revoke_missed"
+        page = await c.get(r.headers["location"])
+        assert "Nothing was revoked" in page.text
+        assert "Session revoked." not in page.text
+    assert await _live(service, rotated.token), "the notice was right, but the session was touched"

@@ -1638,6 +1638,11 @@ Strict cookie there. The two bearer sign-in routes, `POST /auth/login` and `POST
 revoke nothing: they return a token and replace none, so ending a client's old token is the
 client's own act. The VS Code extension does this when it signs in again.
 
+A session's `id` is its token hash, and that hash changes whenever the session completes MFA or a
+step-up. So an id shown on a sessions page can go stale. The console's revoke says "Nothing was
+revoked" when the id no longer matches, rather than reporting a revoke that did not happen, and
+`DELETE /me/sessions/{id}` answers 404.
+
 ### Security-event notifications (WP-L3-05, ASVS 6.3.5 / 6.3.7)
 
 Users are notified of security-relevant changes to their account through **two** channels:
