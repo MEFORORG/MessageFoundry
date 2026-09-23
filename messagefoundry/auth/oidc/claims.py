@@ -5,7 +5,8 @@
 Given a compact ``id_token``, the pinned config, and a :class:`~messagefoundry.auth.oidc.jwks.JwksCache`,
 this verifies the signature (via ``transports.signing.verify_compact_jws``) and then walks the OIDC
 core claim checks — ``iss``, ``aud``/``azp``, ``exp``/``iat``/``nbf`` within a bounded skew,
-``auth_time`` against the requested ``max_age``, ``nonce`` — and finally the optional MFA-claim gate (``amr``/``acr``), which is BACKLOG #99(g)'s real control.
+``auth_time`` against the requested ``max_age``, ``nonce`` — and finally the optional MFA-claim
+gate (``amr``/``acr``), which is BACKLOG #99(g)'s real control.
 
 Every rejection is a :class:`ClaimsError` carrying a **closed-set reason slug** (:data:`REASONS`) — the
 browser layer maps that slug to an allow-listed error code and audits it, never reflecting IdP text.
@@ -110,7 +111,8 @@ class OidcClaimPolicy:
 @dataclass(frozen=True, slots=True)
 class FederatedPrincipal:
     """The verified outcome of a federated login — the username to resolve against on-prem AD, the
-    evidence folded into the ``auth.login_success`` audit detail, and the verified ``exp``."""
+    evidence folded into the ``auth.login_success`` audit detail, and the verified ``exp`` and
+    ``auth_time``."""
 
     username: str
     subject: str

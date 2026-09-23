@@ -206,11 +206,12 @@ def build_authorization_url(
     """Build the front-channel authorization-code + PKCE (S256) redirect URL (``response_mode=query``).
 
     ``max_age`` is REQUIRED, with no default, so a caller cannot build a URL that forgets it (ASVS
-    6.8.4 / 7.6.1, BACKLOG #1150). OIDC Core's authentication-request rules make the IdP re-authenticate only IF its own
-    authentication is older than ``max_age``, and makes ``auth_time`` REQUIRED in the ``id_token``
-    whenever ``max_age`` was sent. That second half is what the claims ladder then verifies. A value
-    of 0 or less is refused: 0 forces a fresh IdP login every time, which is ``prompt=login`` under
-    another name and throws away the single sign-on federation exists to deliver.
+    6.8.4 / 7.6.1, BACKLOG #1150). OIDC Core's authentication-request rules make the IdP
+    re-authenticate only IF its own authentication is older than ``max_age``, and make
+    ``auth_time`` REQUIRED in the ``id_token`` whenever ``max_age`` was sent. That second half is
+    what the claims ladder then verifies. A value of 0 or less is refused: 0 forces a fresh IdP
+    login every time, which is ``prompt=login`` under another name and throws away the single
+    sign-on federation exists to deliver.
     """
     if max_age <= 0:
         raise ValueError("max_age must be a positive number of seconds")
