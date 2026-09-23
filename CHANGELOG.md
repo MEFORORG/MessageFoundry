@@ -66,6 +66,15 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   there is the filesystem ACL. The PostgreSQL least-privilege grant is now documented
   ([`DEPLOY-SERVER-DB.md`](docs/DEPLOY-SERVER-DB.md) §1.2), which it previously was not.
   ([BACKLOG #1008](docs/BACKLOG.md))
+- **Three new alert events: `approval_stale_requester`, `ad_session_revoked` and
+  `ad_reconcile_aborted`.** The first fires when a dual-control release is refused because the
+  requester no longer holds the authority it needs (under Security below). The other two come from
+  the directory session reconciler. It raises one `ad_session_revoked` per account whose sessions it
+  revoked, and one `ad_reconcile_aborted` when its mass-revoke breaker stops a pass. Each has a
+  matching audit row: `approval.stale_requester`, `auth.ad_session_revoked` and
+  `auth.ad_reconcile_aborted`. A pass that stops because the whole directory is unreachable raises
+  no alert, and neither does a pass that fails part-way. An `[[alerts.rules]]` `event_type` can now
+  name all three, and `any` matches them too. ([BACKLOG #289](docs/BACKLOG.md))
 
 ### Removed
 - **BREAKING: `[security].handles_real_patient_data` is gone, and with it the whole data-class axis.**
@@ -826,9 +835,15 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   - SFTP now offers only SHA-2 ETM MACs with AES-CTR or AES-GCM; 0.3.2 passed no restriction, so
     a server offering only older MACs or CBC ciphers now fails the handshake. (BACKLOG #1170)
   **Migration:** the partner or key owner must offer the stronger option: SHA-256 Digest, a key of
-  2048 bits or more, an ES256 or EdDSA passkey (or TOTP),
+  2048 bits or more, an ES256 passkey on P-256 or an EdDSA passkey (or TOTP),
   `tls_ciphers = "ECDHE+AESGCM:ECDHE+CHACHA20"`, an AES or RSA-3072 Transit key. There is no setting
   that re-admits them.
+- **BREAKING — a new ES256 passkey must use the P-256 curve.** 0.3.2 also registered an ES256
+  passkey on P-384 or P-521. Registration now refuses one. This is not a strength rule: those keys
+  verify and are strong enough. It follows the pairing RFC 9053 recommends, SHA-256 with P-256
+  only, which is also how the WebAuthn specification describes ES256. A passkey already registered
+  on another curve still signs in. **Migration:** register an ES256 passkey on P-256 or an EdDSA
+  passkey, or use TOTP. ([BACKLOG #1166](docs/BACKLOG.md))
 - **BREAKING — directory sessions are now rechecked every 5 minutes by default.** In 0.3.2
   `[auth].ad_session_recheck_seconds` defaulted to `0`, so a signed-in AD user's session was never
   checked against the directory again. The default is now `300`: each pass looks the signed-in AD
@@ -877,6 +892,22 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   custom role; that role would have exceeded its stated scope (HIPAA minimum-necessary) on first
   deployment. No built-in role reaches it — `ADMINISTRATOR` and `OPERATOR` grant both permissions —
   and every such read was already audited. ([BACKLOG #324](docs/BACKLOG.md))
+- **A dual-control release now re-checks the person who asked for it (ASVS 8.3.2).** A held
+  request can wait hours for its second approver, and the requester's authority can be withdrawn in
+  that time. `POST /approvals/{approval_id}/approve` now answers `409` when the requester's account
+  is gone or disabled, no longer holds the operation's permission (`messages:replay`,
+  `messages:purge` or `config:deploy`), or has left the channel scope the operation needs. The
+  refusal writes an `approval.stale_requester` audit row and raises the `approval_stale_requester`
+  alert. The request stays pending, so an approver can reject it. The check reads the engine's own
+  copy of the account, so a change made only in Active Directory counts once it reaches that copy.
+  ([BACKLOG #289](docs/BACKLOG.md))
+- **Three more admin writes now count against the per-account write limit (ASVS 2.4.2).**
+  `PATCH /logging/level`, `DELETE /search/presets/{preset_id}` and `POST /alerts/test-email` were
+  not rate-limited. They now share the budget the other paced admin writes draw on: past 12
+  writes a second from one account, each answers `429` with `Retry-After: 1`. A client that stays
+  under the limit sees no change. `[auth].admin_write_rate_limit_per_actor` and
+  `admin_write_rate_limit_window_seconds` set the limit, and `admin_write_rate_limit_enabled =
+  false` turns it off for every paced write. ([BACKLOG #287](docs/BACKLOG.md))
 
 ### Fixed
 - **The load harness's no-loss reconcile failed a run for being SLOW, and ejected pull requests from
@@ -1030,6 +1061,12 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   matched: both `Path.exists` and `Path.glob` swallow `OSError`, so a directory the process cannot
   read is indistinguishable here from one that is absent, and a message guessing between them would
   send an operator after the wrong cause.
+- **A passkey that could never sign in is now refused when it is registered.** A credential whose
+  curve was unknown, whose point was not on its curve, or whose key type did not match its algorithm
+  used to enrol and then fail at every sign-in. Registration now builds the key the way sign-in
+  does, and refuses it there. A malformed key at either step used to answer `500`; it now lands on
+  the audited invalid-input path. A passkey that can sign in is not affected.
+  ([BACKLOG #1166](docs/BACKLOG.md))
 
 ## [0.3.2] — 2026-07-28 — Early Access
 
