@@ -336,25 +336,27 @@ recency.
 **THE LANDER ROW'S DUTY WAS CORRECTED BY THE OWNER ON 2026-09-21, IN SESSION.** That cell read
 *"Merging, and the vault scorecard re-score (owner ruling 2026-09-05)"*, and the owner has said
 directly that the Lander was never meant to always handle rescoring. The duty is **flipping row
-statuses after items merge**, which is what the row now says. **That leaves the ASVS scorecard
-re-score UNASSIGNED, and no part of it is the Lander's** -- the owner named no seat for it, so
-neither does this file. Only the re-score half of that wording moved; the separate "Merge when
-ready" ruling of the same date, further down this section, is untouched.
+statuses after items merge**, which is what the row now says. **That left the ASVS scorecard
+re-score UNASSIGNED on 2026-09-21, and no part of it is the Lander's** -- the owner named no seat
+for it that day, so neither did this file; **the 2026-09-23 ruling below names one.** Only the
+re-score half of that wording moved; the separate "Merge when ready" ruling of the same date,
+further down this section, is untouched.
 
 **THE RE-SCORE IS ASSIGNED NOW. OWNER RULING 2026-09-23, GIVEN TO A MANAGER SEAT.** ASVS record
 work belongs to a **Manager dispatching vault Builders**. It covers three acts: re-scoring a cell,
 editing the record's own prose, and reconciling the record against a ledger row when the two
-disagree. **The Lander keeps the banner flip**, which is its 2026-09-21 duty above, unchanged. So
-the paragraph above held for two days and its UNASSIGNED sentence is now superseded. It stays, as
-this file's record of when the gap opened and when it closed.
+disagree. **The Lander keeps the row-status flip**, which is its 2026-09-21 duty above, unchanged;
+in the vault ledger that flip is the status banner. The paragraph above is kept as this file's
+record of when the gap opened, and this one records when it closed.
 
-**What the ruling discharges, and what it does not.** A ledger row may fence record work away from
-a Builder, in words such as *"the closing act is a scorecard re-score and is not a builder's"* or
-*"a scorecard holder's call rather than a build"*. Those rows were written while the record's seat was
-retired, misnamed or empty, so that fence no longer binds: a Manager may brief a vault Builder for the work, and the
-Lander flips the banner once it merges. **The ruling names who does record work, never what the
-record should say.** A row whose remainder waits on a named owner ruling about the requirement
-itself still waits on that ruling.
+**What the ruling discharges, and what it does not.** A ledger row or a dated findings document may
+fence record work away from a Builder. It says so in words such as *"the closing act is a scorecard
+re-score and is not a builder's"* or *"a scorecard holder's call rather than a build"*. Each was
+written while the record's seat was retired, misnamed or empty. That fence no longer binds. A
+Manager may brief a vault Builder for the work, and the Lander flips the row status once it merges.
+**The ruling names who does record work, never what the record should say.** A row whose remainder
+waits on a named owner ruling about the requirement itself still waits on that ruling. So does an
+act a document reserves to the owner by name, such as an owner re-signature of an assessment.
 
 **THE 2026-09-11 POSITIONAL LEDGER-CONFLICT RULING IS RETIRED. The owner authorised the retirement
 directly on 2026-09-21, in session, after reading an adversarial review of the question.** It is
