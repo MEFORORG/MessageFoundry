@@ -242,6 +242,9 @@ Default-off and degradation-isolated, so the loopback posture is unchanged.
   deployment shape that motivates federating. **This is tested in the lab and allowed to fail** (runbook
   cell L9). If it fails, the fallback (federated users needing admin writes retain a usable AD password,
   or admins use local accounts) is documented, and option 2 above is re-argued.
+  **[SUPERSEDED for an OIDC session by Amendment B (2026-09-23): step-up for a session minted by the
+  federated login goes back to the IdP, not to a password re-bind. A session minted by AD password or
+  Kerberos login is not covered by that amendment.]**
 - **Enabling OIDC changes the ASVS 7.1.3 residual's premise.** The accepted register row reasons that
   "the shipped posture mints no federated session"; that becomes conditional the moment an operator sets
   `oidc_enabled=true`. The row's trigger language is updated in the same PR.
@@ -398,3 +401,49 @@ window is open.
   and mint no session; WHEN the account is unbound, it SHALL record the binding on that login; WHEN the bound
   tuple matches, the login proceeds unchanged -> the federated-path regression tests (changed-sub / same-username
   refused; same-sub / changed-username resolves to the same account).
+
+---
+
+## Amendment B (2026-09-23) — step-up for an OIDC session goes back to the IdP; back-channel logout stays out of scope (BACKLOG #296, #295)
+
+> **Status: ACCEPTED — owner ruling of 2026-09-23, given to a Manager seat.** The same ruling accepted
+> [ADR 0184](0184-identify-a-federated-login-by-the-idp-namespaced-subject-not-by-the-username-it-claims.md).
+> This amendment does not change the status line at the top of this ADR.
+
+### B.1 Step-up for an OIDC session goes back to the IdP
+
+When a session minted by the federated login needs step-up at `/ui/reauth`, the engine sends the
+browser back to the IdP. The authorization request carries `max_age=0` and `prompt=login`. The engine
+does not re-bind a password for that session.
+
+- **What this supersedes.** The *Consequences* bullet "Step-up may be impossible for passwordless
+  accounts", for an OIDC session only. That bullet is marked in place.
+- **What decides which leg runs: the session, not the account.** A hybrid account can also log in by
+  AD password or Kerberos, and those sessions keep their existing step-up. So the session must record
+  how it was minted. That field is the fourth item ADR 0184 resolved, and this leg is its only
+  consumer, so the two are built together.
+- **What this does to lab cell L9.** L9 asks whether step-up survives a passwordless or
+  smartcard-required account. This amendment changes that question for an OIDC session. It does not
+  decide whether L9 is discharged, and the lab cells still stand as written under *To resolve on
+  acceptance*.
+
+### B.2 Back-channel logout stays out of scope
+
+*Out of scope* above already names back-channel logout. This amendment keeps it there, for two
+reasons the owner gave:
+
+1. A receiver would only make ASVS 10.5.5 apply to this engine. It would raise no cell.
+2. Every federated user is also an AD user, because a principal with no on-prem AD object is refused.
+   The directory reconciler, `AuthService.reconcile_directory_sessions` (ADR 0079 mechanism 2, built
+   outside this ADR), already ends those sessions when the directory disables the account. Its pass
+   runs every `[auth].ad_session_recheck_seconds`, 300 seconds by default.
+
+This ruling covers back-channel logout only. The rest of that *Out of scope* list is unchanged. The
+AC-3 forward note on a logout-token ladder keeps its force if this is ever reopened.
+
+### B.3 Related, and recorded in ADR 0184 rather than here
+
+A.4 left a choice open between refusing an unbound account and an operator pre-binding step. ADR 0184
+took it. On 2026-09-06 the owner ruled that the administrative binding surface is the only path that
+may create a binding. On 2026-09-23 the owner ruled that an unbound federated login is refused, and
+that both unbind and rebind are built. That rebind is the operator action A.4 recommended.

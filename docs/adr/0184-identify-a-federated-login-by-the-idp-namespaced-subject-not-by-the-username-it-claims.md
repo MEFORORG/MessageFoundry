@@ -1,13 +1,19 @@
 # ADR 0184 — Identify a federated login by the IdP-namespaced subject, not by the username it claims
 
-- **Status:** Proposed — **the build must not start yet.** The owner trust decision was TAKEN on
-  2026-09-06 (recorded against the first item under *To resolve on acceptance*), so the sentence that
-  stood here — that the code cannot be written until it is taken — no longer states what blocks this.
-  Four items remain open, and the second follows directly from the ruling: the bootstrap posture.
-  Accepting this ADR is a separate act and has not happened.
-- **Date:** 2026-09-05
+- **Status:** **Accepted — 2026-09-23, by an owner ruling given to a Manager seat.** The owner accepted
+  the design and resolved all four open items under *To resolve on acceptance*, each recorded there with
+  its decision and reason. The build may start. Federation ships off (`oidc_enabled=false`), so this
+  work hardens a first deployment that turns it on. It does not lift 6.8.1 or 10.5.2 above `partial`.
+  > **SUPERSEDED status text, kept as a record.** Until 2026-09-23 this line read: *"Proposed — **the
+  > build must not start yet.** The owner trust decision was TAKEN on 2026-09-06 (recorded against the
+  > first item under To resolve on acceptance), so the sentence that stood here — that the code cannot
+  > be written until it is taken — no longer states what blocks this. Four items remain open, and the
+  > second follows directly from the ruling: the bootstrap posture. Accepting this ADR is a separate act
+  > and has not happened."* The 2026-09-23 ruling is that separate act.
+- **Date:** 2026-09-05 (accepted 2026-09-23)
 - **Related:** [ADR 0142](0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md)
-  and its Amendment A (subject continuity) · [ADR 0136](0136-per-user-saved-and-layered-log-search-filter-presets-extends-the-adr-0046-search-seam.md)
+  and its Amendment A (subject continuity) and Amendment B (the IdP step-up this ADR's session
+  mechanism field serves) · [ADR 0136](0136-per-user-saved-and-layered-log-search-filter-presets-extends-the-adr-0046-search-seam.md)
   (cites the same root cause) · [BACKLOG](../BACKLOG.md) #1143 (the research this records), #1015
   (the continuity guard), #1256 (the exclusivity veto and the filtered unique index) ·
   ASVS 6.8.1 · [CLAUDE.md](../../CLAUDE.md) section 0
@@ -103,7 +109,9 @@ Four parts, and the fourth is gated on the owner decision below.
 
 4. **Delete the unbound short-circuit in the continuity guard, once first contact has an answer.**
    Removing it without a bind path refuses every federated login on a fresh deployment. That is the
-   open decision, not a detail of this one.
+   open decision, not a detail of this one. **[RESOLVED 2026-09-23: first contact is refused. An
+   unbound federated login gets an operator-readable message and no binding; see the second item under
+   *To resolve on acceptance*.]**
 
 ### What it must not break
 
@@ -134,6 +142,10 @@ Four parts, and the fourth is gated on the owner decision below.
 > **No test below is written yet, and that is deliberate.** The build is blocked on the owner decision,
 > and AC-4 cannot even be stated until that decision is taken. Each `→` names the module the test
 > belongs in.
+>
+> **Updated 2026-09-23 on acceptance.** The build is no longer blocked, and AC-4 is now stated below.
+> The unbind and rebind surface and the session mechanism field (items three and four under *To
+> resolve on acceptance*) carry no criterion here yet. The build that adds each one adds its criterion.
 
 - **AC-1** — WHEN a federated login presents an `(issuer, sub)` already bound to an account, THE SYSTEM
   SHALL select that account by the pair before reading any username, and SHALL issue the session for
@@ -145,8 +157,12 @@ Four parts, and the fourth is gated on the owner decision below.
 - **AC-3** — IF the pair-selected account's `auth_provider` is not the AD value, THEN THE SYSTEM SHALL
   refuse the login with an audited `local_account_conflict` and mint no session.
   → `tests/test_auth_oidc_service.py`
-- **AC-4** — (first contact) **Unwritable until the ceremony decision is taken.** It is named here so
-  its absence is visible rather than forgotten.
+- **AC-4** — (first contact) IF a federated login presents an `(issuer, sub)` that is bound to no
+  account, THEN THE SYSTEM SHALL refuse the login with an operator-readable message, SHALL create no
+  binding, and SHALL mint no session.
+  → `tests/test_auth_oidc_service.py`
+  *Until 2026-09-23 this criterion read: "Unwritable until the ceremony decision is taken. It is named
+  here so its absence is visible rather than forgotten."*
 - **AC-5** — WHILE an account carries a federated binding, THE SYSTEM SHALL NOT re-resolve that account
   from its username in `reconcile_directory_sessions`.
   → `tests/test_ad_session_reconcile.py`
@@ -206,7 +222,9 @@ hazard above is a live risk during implementation, not a theoretical one.
 takes `issuer: str, subject: str`. **Both are required, so there is no way to express an unbind.** Any
 administrative surface that needs to *clear* a binding, rather than only re-point it, is a protocol
 change plus three backend implementations, not a route. Whether it needs a clear at all depends on the
-ceremony decision, so this is priced here and decided there.
+ceremony decision, so this is priced here and decided there. **[DECIDED 2026-09-23: it does. The
+owner ruled that both unbind and rebind are built, so this protocol change and its three backend
+implementations are part of the build. See the fourth item under *To resolve on acceptance*.]**
 
 **And the measurement that frames that decision.** `set_user_federated_subject` has exactly **one**
 caller in the engine: the bind-on-first-presentation site in `_complete_ad_login`. Measured 2026-09-05
@@ -266,11 +284,15 @@ to a closed item reads as done.
       > **Bounding the ruling, so it is not read wider than it was given:** it decides what may CREATE
       > a binding. It does not decide the resolution ORDER (the body of this ADR), the reconciler
       > question, or the AD limb, which is BACKLOG #1471 and is not governed by this ADR at all.
-- [ ] **The bootstrap posture that follows from it.** With no bindings and no bind-on-first-
+- [x] **The bootstrap posture that follows from it.** With no bindings and no bind-on-first-
       presentation, a fresh deployment refuses every federated login until an operator binds each
       account. Is that the shipped default? Zero deployments means migration cost is zero, which
       removes a cost from the comparison. It does not choose.
-- [ ] **The reconciler: exclude bound rows, or re-key the probe?** Excluding needs no schema at all,
+      > **RULED 2026-09-23 by the owner: yes. Refuse an unbound federated login, with an
+      > operator-readable message.** Reason: it follows from the 2026-09-06 ruling above. The
+      > administrative binding surface is the only path that may create a binding, so an unbound login
+      > has no other safe outcome. AC-4 now states this.
+- [x] **The reconciler: exclude bound rows, or re-key the probe?** Excluding needs no schema at all,
       since `UserRecord` already carries `oidc_subject`, but it trades away directory disable and role
       reconciliation for bound accounts — a security control given up to fix a security control.
       Re-keying costs one nullable column on three backends with no index (so no SQL Server width
@@ -279,7 +301,20 @@ to a closed item reads as done.
       rename or a move between organizational units. `objectGUID` is the immutable key and is read
       nowhere today. **Re-keying is also the work the four out-of-scope citations above are waiting
       on**, so the two options differ by more than their own price.
-- [ ] **Does the administrative surface need an unbind, or only a rebind?** Decides whether
+      > **RULED 2026-09-23 by the owner: re-key the probe on `objectGUID`.** Reason: excluding bound
+      > rows would give up directory disable and role reconciliation for every bound account. Re-keying
+      > costs one nullable column, and the AD work in BACKLOG #1471 needs that column anyway.
+- [x] **Does the administrative surface need an unbind, or only a rebind?** Decides whether
       `set_user_federated_subject` grows an optional-clear form on the protocol and all three backends.
-- [ ] Whether the mechanism discriminator belongs on `SessionRecord`, which carries no mechanism field
+      > **RULED 2026-09-23 by the owner: build both.** Reason: unbind is safe, because an unbound
+      > account is refused (the second item above). Without unbind, federated login alone cannot be
+      > revoked. So the setter grows its clear form on the protocol and all three backends, as
+      > *Consequences* priced it.
+- [x] Whether the mechanism discriminator belongs on `SessionRecord`, which carries no mechanism field
       today, and which consumer would read it.
+      > **RULED 2026-09-23 by the owner: yes. Add the session mechanism field, and build it together
+      > with the re-auth leg.** Reason: the re-auth leg is the field's only consumer. A hybrid account
+      > can also log in by password or Kerberos, so the account cannot say how to step up; the
+      > session's mechanism must decide. The re-auth leg itself is [ADR 0142](0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md)
+      > Amendment B: step-up for an OIDC session goes back to the IdP. Option 3 above said the field
+      > must name a consumer that can read it, and this is that consumer.
