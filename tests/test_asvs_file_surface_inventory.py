@@ -94,6 +94,23 @@ CONTENT_ROUTES: tuple[str, ...] = ("/messages/{message_id}/edit-resend",)
 #: Hand-kept upload-row keys -> the factory whose parameter of that name must still exist.
 HAND_KEPT_UPLOAD_KEYS: dict[str, object] = {"capture_response": wiring.MLLP}
 
+#: Every ``wiring`` factory taking ``capture_response`` -> the word the reply-capture row must use for
+#: it. Must equal the factories found by signature, so a new capturing outbound fails until named.
+CAPTURE_FACTORIES: dict[str, str] = {
+    "MLLP": "MLLP",
+    "Tcp": "TCP",
+    "X12": "X12",
+    "Rest": "REST",
+    "Soap": "SOAP",
+    "FHIR": "FHIR",
+    "DICOMweb": "DICOMweb",
+    "Database": "database",
+}
+
+#: The registered sources the doc excludes as reading nothing from outside. Pinned here so a NEW
+#: source cannot pass by a doc-only edit that adds it to the exclusion bullet.
+INERT_SOURCES: frozenset[str] = frozenset({"loopback", "passthrough", "timer"})
+
 
 # --- pure helpers ---------------------------------------------------------------------------------
 
@@ -122,6 +139,7 @@ def _keyed_rows(rows: Iterable[str]) -> dict[str, str]:
     for row in rows:
         tokens = re.findall(r"`([^`]+)`", row.split("|")[1])
         if tokens:
+            assert tokens[0] not in keyed, f"two 5.1.1 rows share the key `{tokens[0]}`"
             keyed[tokens[0]] = row
     return keyed
 
@@ -153,25 +171,40 @@ def _size(n: int) -> str:
     return f"{n:,}"
 
 
-def _is_emitter(node: ast.AST) -> bool:
+def _call_name(call: ast.Call) -> str | None:
+    func = call.func
+    return func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+
+
+def _is_emitter(node: ast.AST, file_responses: set[str]) -> bool:
+    """A header write (a ``str``/``bytes`` constant naming the header, or an f-string header line) or
+    a call to ``FileResponse`` under any imported name. A bare ``"content-disposition:"`` constant is a
+    PARSER's prefix test (``api/multipart.py``), not a write, so constants must match exactly."""
     if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)):
         value = node.value.decode("latin-1") if isinstance(node.value, bytes) else node.value
         return value.lower() == "content-disposition"
+    if isinstance(node, ast.JoinedStr) and node.values:
+        head = node.values[0]
+        return (
+            isinstance(head, ast.Constant)
+            and isinstance(head.value, str)
+            and head.value.lower().startswith("content-disposition:")
+        )
     if isinstance(node, ast.Call):
-        func = node.func
-        name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
-        return name == "FileResponse"
+        return _call_name(node) in file_responses
     return False
 
 
-def _walk(node: ast.AST, stack: list[str], where: str, out: set[str]) -> None:
+def _walk(
+    node: ast.AST, stack: list[str], where: str, file_responses: set[str], out: set[str]
+) -> None:
     is_fn = isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     if is_fn:
         stack.append(node.name)
-    if _is_emitter(node):
+    if _is_emitter(node, file_responses):
         out.add(f"{where}::{stack[-1] if stack else '<module>'}")
     for child in ast.iter_child_nodes(node):
-        _walk(child, stack, where, out)
+        _walk(child, stack, where, file_responses, out)
     if is_fn:
         stack.pop()
 
@@ -180,9 +213,29 @@ def emitters(paths: Iterable[Path], root: Path) -> set[str]:
     """``<file>::<function>`` for every Content-Disposition write or FileResponse call."""
     out: set[str] = set()
     for path in paths:
-        where = path.relative_to(root).as_posix()
-        _walk(ast.parse(path.read_text(encoding="utf-8")), [], where, out)
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        file_responses = {"FileResponse"} | {
+            alias.asname
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+            for alias in node.names
+            if alias.name == "FileResponse" and alias.asname
+        }
+        _walk(tree, [], path.relative_to(root).as_posix(), file_responses, out)
     return out
+
+
+def callers(paths: Iterable[Path], names: set[str]) -> set[str]:
+    """``names`` plus every function whose body calls one of them directly (one level)."""
+    found = set(names)
+    for path in paths:
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for call in ast.walk(node):
+                if isinstance(call, ast.Call) and _call_name(call) in names:
+                    found.add(node.name)
+    return found
 
 
 # --- fixtures -------------------------------------------------------------------------------------
@@ -220,6 +273,13 @@ def test_a_source_is_either_a_row_or_an_exclusion_not_both() -> None:
     assert not both, f"listed as an upload feature AND excluded: {sorted(both)}"
 
 
+def test_only_the_pinned_inert_sources_are_excluded() -> None:
+    assert _EXCLUDED_SOURCES == INERT_SOURCES, (
+        "the registered-source exclusion changed; a new exclusion needs a reviewed edit to "
+        f"INERT_SOURCES, not only to the doc: {sorted(_EXCLUDED_SOURCES ^ INERT_SOURCES)}"
+    )
+
+
 def test_no_upload_row_or_source_exclusion_names_a_surface_the_code_lacks() -> None:
     allowed = (
         _SOURCE_VALUES
@@ -236,6 +296,21 @@ def test_hand_kept_keys_still_exist_in_the_factories() -> None:
         assert key in inspect.signature(factory).parameters, f"{key} is gone from its factory"  # type: ignore[arg-type]
         assert key in _UPLOAD_ROWS, f"{key} has no 5.1.1 upload row"
     assert "reingress_to" in inspect.signature(wiring.MLLP).parameters
+
+
+def test_every_capturing_outbound_is_named_in_the_reply_row() -> None:
+    capturing = {
+        name
+        for name, fn in inspect.getmembers(wiring, inspect.isfunction)
+        if fn.__module__ == wiring.__name__
+        and "capture_response" in inspect.signature(fn).parameters
+    }
+    assert capturing == set(CAPTURE_FACTORIES), (
+        f"capture_response factories changed: {sorted(capturing ^ set(CAPTURE_FACTORIES))}"
+    )
+    size_cell = _UPLOAD_ROWS["capture_response"].split("|")[4]
+    for word in CAPTURE_FACTORIES.values():
+        assert re.search(rf"\b{re.escape(word)}\b", size_cell), f"reply row does not name {word}"
 
 
 # --- axis 2: upload routes ------------------------------------------------------------------------
@@ -291,6 +366,21 @@ def test_every_download_emitter_route_keys_a_download_row(
         for route in routes:
             assert route in paths, f"{site}: route {route} is not in create_app()"
             assert route in _DOWNLOAD_ROWS, f"{site}: route {route} has no 5.1.1 download row"
+
+
+def test_download_routes_are_derived_from_the_emitters(
+    app_routes: dict[tuple[str, str], object],
+) -> None:
+    """Every JSON route whose endpoint IS an emitter, or calls one, must be a mapped download route,
+    so a third route onto ``export_messages`` fails until it has a row."""
+    reach = callers(_code_paths(), {site.split("::")[1] for site in DOWNLOAD_EMITTERS})
+    derived = {
+        path
+        for (_, path), route in app_routes.items()
+        if getattr(getattr(route, "endpoint", None), "__name__", None) in reach
+    }
+    mapped = {r for routes in DOWNLOAD_EMITTERS.values() for r in routes}
+    assert derived == mapped, f"download routes differ from the code: {sorted(derived ^ mapped)}"
 
 
 def test_download_rows_name_only_emitting_routes() -> None:
@@ -418,6 +508,47 @@ def test_download_figures_match_the_routes(app_routes: dict[tuple[str, str], obj
     assert "_csv_safe" in _row("/audit/export", _DOWNLOAD_ROWS)
 
 
+#: Every ``SYMBOL`` the block quotes as ``SYMBOL` = figure``, and its code value. The test below
+#: finds EVERY such occurrence in the block; one quoting a symbol missing here fails, so a new quoted
+#: figure must be pinned before it can ship.
+QUOTED_CONSTANTS: dict[str, int] = {
+    "DEFAULT_MAX_FILE_BYTES": DEFAULT_MAX_FILE_BYTES,
+    "DEFAULT_MAX_DECOMPRESSED_BYTES": DEFAULT_MAX_DECOMPRESSED_BYTES,
+    "DEFAULT_MAX_OBJECT_BYTES": DEFAULT_MAX_OBJECT_BYTES,
+    "DEFAULT_MAX_INFLATED_BYTES": DEFAULT_MAX_INFLATED_BYTES,
+    "DEFAULT_MAX_BODY_BYTES": DEFAULT_MAX_BODY_BYTES,
+    "DEFAULT_MAX_HEADER_BYTES": DEFAULT_MAX_HEADER_BYTES,
+    "DEFAULT_MAX_FRAME_BYTES": DEFAULT_MAX_FRAME_BYTES,
+    "DEFAULT_MAX_INTERCHANGE_BYTES": DEFAULT_MAX_INTERCHANGE_BYTES,
+    "DEFAULT_MAX_ITEMS_PER_POLL": DEFAULT_MAX_ITEMS_PER_POLL,
+    "DEFAULT_MAX_MESSAGE_BYTES": DEFAULT_MAX_MESSAGE_BYTES,
+    "DEFAULT_MAX_RESPONSE_BYTES": DEFAULT_MAX_RESPONSE_BYTES,
+    "_MAX_REQUEST_BODY_BYTES": api_app._MAX_REQUEST_BODY_BYTES,
+    "MAX_EXPORT_IDS": MAX_EXPORT_IDS,
+    "_MAX_RESTORE_MEMBER_BYTES": dr_backup._MAX_RESTORE_MEMBER_BYTES,
+    "_MAX_CONFIG_MEMBERS": dr_backup._MAX_CONFIG_MEMBERS,
+    "_MAX_CONFIG_BYTES": dr_backup._MAX_CONFIG_BYTES,
+}
+
+_QUOTED = re.compile(r"`([A-Za-z_][A-Za-z0-9_]*)` = (\d+(?:,\d{3})*(?: [KMG]iB)?)")
+
+
+def misquoted(text: str, constants: dict[str, int]) -> list[str]:
+    """Every ``SYMBOL` = figure`` in ``text`` whose symbol is unpinned or whose figure is wrong."""
+    bad: list[str] = []
+    for symbol, figure in _QUOTED.findall(text):
+        if symbol not in constants:
+            bad.append(f"{symbol} (not pinned)")
+        elif figure not in (_size(constants[symbol]), f"{constants[symbol]:,}"):
+            bad.append(f"{symbol} = {figure}")
+    return bad
+
+
+def test_every_quoted_constant_matches_the_code_everywhere_in_the_block() -> None:
+    assert _QUOTED.findall(_BLOCK), "instrument found no quoted constants at all"
+    assert not misquoted(_BLOCK, QUOTED_CONSTANTS), misquoted(_BLOCK, QUOTED_CONSTANTS)
+
+
 def test_common_limits_and_exclusion_figures_match_their_constants() -> None:
     assert has_figure(
         _lines_with("DEFAULT_MAX_MESSAGE_BYTES`"),
@@ -468,7 +599,9 @@ def test_in_block_anchors_resolve() -> None:
         return re.sub(r"[^\w\- ]", "", heading.strip().lower()).replace(" ", "-")
 
     def anchors(text: str) -> set[str]:
-        return {slug(m) for m in re.findall(r"^#{1,6} (.+)$", text, flags=re.M)}
+        # Skip fenced code: a `# comment` line there is not a heading and renders no anchor.
+        prose = re.sub(r"^```.*?^```", "", text, flags=re.M | re.S)
+        return {slug(m) for m in re.findall(r"^#{1,6} (.+)$", prose, flags=re.M)}
 
     docs = {"": _DOC}
     for target, anchor in re.findall(r"\]\(([A-Z]+\.md)?#([^)]+)\)", _BLOCK):
@@ -502,6 +635,9 @@ def test_self_test_a_planted_emitter_is_found(tmp_path: Path) -> None:
         "def leak():\n    return {'Content-Disposition': 'attachment'}\n"
         "def raw():\n    return [(b'content-disposition', b'attachment')]\n"
         "def other():\n    return FileResponse('x', filename='y')\n"
+        "from starlette.responses import FileResponse as FR\n"
+        "def aliased():\n    return FR('x')\n"
+        "def fstr(n):\n    return f'Content-Disposition: attachment; filename={n}'\n"
         "def parse(line):\n    return line.startswith('content-disposition:')\n",
         encoding="utf-8",
     )
@@ -509,7 +645,35 @@ def test_self_test_a_planted_emitter_is_found(tmp_path: Path) -> None:
         "planted.py::leak",
         "planted.py::raw",
         "planted.py::other",
+        "planted.py::aliased",
+        "planted.py::fstr",
     }
+
+
+def test_self_test_a_misquoted_figure_is_caught() -> None:
+    text = (
+        "`DEFAULT_MAX_RESPONSE_BYTES` = 32 MiB and `NEW_CAP` = 1 MiB and `MAX_EXPORT_IDS` = 100,000"
+    )
+    assert misquoted(text, QUOTED_CONSTANTS) == [
+        "DEFAULT_MAX_RESPONSE_BYTES = 32 MiB",
+        "NEW_CAP (not pinned)",
+    ]
+
+
+def test_self_test_download_routes_follow_callers(tmp_path: Path) -> None:
+    planted = tmp_path / "routes.py"
+    planted.write_text(
+        "def emit():\n    return {'Content-Disposition': 'attachment'}\n"
+        "def route_a():\n    return emit()\n"
+        "def unrelated():\n    return 1\n",
+        encoding="utf-8",
+    )
+    assert callers([planted], {"emit"}) == {"emit", "route_a"}
+
+
+def test_self_test_duplicate_row_keys_fail_closed() -> None:
+    with pytest.raises(AssertionError, match="share the key"):
+        _keyed_rows(["| `file`: a | x |", "| `file`: b | y |"])
 
 
 def test_self_test_figure_match_respects_number_boundaries() -> None:

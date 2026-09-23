@@ -779,8 +779,8 @@ This block lists the file surfaces ASVS 5.1.1 asks about, one row each. Two rule
 counts:
 
 - An **upload feature** is any shipped surface where a party other than the host operator, working at
-  the host, supplies content that the product persists or processes. Content means a file, an object
-  or a message body. A request body that only steers an operation, such as a search needle or a form
+  the host, supplies content that the product persists or processes. Content means a file, a DICOM
+  object or a message body. A request body that only steers an operation, such as a search needle or a form
   field, is a parameter and not content.
 - A **download** is any response the product sends with `Content-Disposition: attachment`.
 
@@ -791,10 +791,11 @@ How each part of the list is kept:
   routes whose body is a message. No code marker tells a content body from a parameter body on a JSON
   route, so that list cannot be derived.
 - **Download rows** follow the code sites that write a `Content-Disposition` header or build a
-  `FileResponse`.
+  `FileResponse`, and the API routes whose handler is such a site or calls one.
 - **Kept by hand:** the reply-capture row, the `/ui` delegates, the two limits after the upload table,
-  and the exclusions. For these the test checks that what they name still exists, not that nothing is
-  missing.
+  and the exclusions. For these the test pins each figure quoted beside a code constant, and checks
+  that the reply-capture setting and the transports that offer it still match. It does not check that
+  nothing is missing.
 
 `tests/test_asvs_file_surface_inventory.py` derives the first three parts from the code. It fails the
 build when a derived row is missing, when a row names a surface the code no longer has, or when a
@@ -811,12 +812,14 @@ figure stops matching the constant named beside it.
 | `mllp`: MLLP listener ([MLLP](#mllp--mllp)) | the inbound's declared `content_type` (default `hl7v2`) | not applicable; a framed stream | `max_frame_bytes`, default `DEFAULT_MAX_FRAME_BYTES` = 16 MiB (`transports/mllp.py`) | no unpacking on intake |
 | `tcp`: raw TCP listener ([Raw TCP](#raw-tcp--tcp)) | the inbound's declared `content_type` | not applicable; a framed stream | `max_frame_bytes`, default `DEFAULT_MAX_FRAME_BYTES` = 16 MiB | no unpacking on intake |
 | `x12`: X12 EDI listener ([X12 EDI](#x12-edi--x12)) | X12 interchanges | not applicable; a framed stream | `max_interchange_bytes`, default `DEFAULT_MAX_INTERCHANGE_BYTES` = 16 MiB (`parsing/x12/delimiters.py`) | no unpacking on intake |
-| `database`: database poller, `DatabasePoll(...)` ([Database source](#database-source--databasepoll)) | rows from `poll_statement`, each handed on as one body in the declared `content_type` | not applicable; table rows | no byte cap of its own, so the engine's per-message ceiling below bounds each row; `poll_max_rows`, default `DEFAULT_MAX_ITEMS_PER_POLL` = 500, bounds rows per poll | no unpacking on intake |
-| `/uploads` (POST) and `/ui/uploaded-logs/upload`: uploaded diagnostic logs ([ADR 0134](adr/0134-offline-uploaded-logs-viewer-connection-decoupled-upload-browse-resend-deletion-phi-at-rest-posture-stdlib-multipart.md)) | plain text only, content-sniffed against the extension. A resend, `/uploads/{file_id}/resend`, puts one message from the file straight onto a chosen inbound's ingress stage, so that inbound's listener checks, including the per-message ceiling below, do not run on it | `_ALLOWED_UPLOAD_EXTENSIONS`: `.hl7`, `.hl7v2`, `.txt`, `.xml` | `[store].max_upload_bytes`, default 25 MiB (`StoreSettings`) | not unpacked; see the uploaded-logs policy below |
+| `database`: database poller, `DatabasePoll(...)` ([Database source](#database-source--databasepoll)) | rows from `poll_statement`, each handed on as one body in the declared `content_type` | not applicable; table rows | no byte cap of its own; the engine's per-message ceiling below rejects an oversized row after it is read; `poll_max_rows`, default `DEFAULT_MAX_ITEMS_PER_POLL` = 500, bounds rows per poll | no unpacking on intake |
+| `/uploads` (POST) and `/ui/uploaded-logs/upload`: uploaded diagnostic logs ([ADR 0134](adr/0134-offline-uploaded-logs-viewer-connection-decoupled-upload-browse-resend-deletion-phi-at-rest-posture-stdlib-multipart.md)) | off unless `[store].uploads_dir` is set. Plain text only, content-sniffed against the extension. A resend, `/uploads/{file_id}/resend`, puts one message from the file straight onto a chosen inbound's ingress stage, so that inbound's listener checks, including the per-message ceiling below, do not run on it | `_ALLOWED_UPLOAD_EXTENSIONS`: `.hl7`, `.hl7v2`, `.txt`, `.xml` | `[store].max_upload_bytes`, default 25 MiB (`StoreSettings`) | not unpacked; see the uploaded-logs policy below |
 | `/messages/{message_id}/edit-resend` (POST) and its `/ui` delegate: an operator's edited message body | not checked: the edited text is taken as typed. It re-enters the origin channel's pipeline as a new message, or goes straight to a chosen outbound when `to` is set. Either way the listener's checks do not run on it | not applicable; the JSON field `raw` | `_MAX_REQUEST_BODY_BYTES` = 1 MiB, the API's request-body cap; `EditResendRequest.raw` also sets `max_length` 16,000,000 characters, which that cap reaches first | no unpacking |
-| `capture_response` / `reingress_to`: a partner's reply captured from an outbound, and re-ingressed through a `Loopback()` inbound when `reingress_to` is set ([ADR 0013](adr/0013-query-response-orchestration.md)) | whatever the partner returns on that hop | not applicable; a reply on the outbound's own connection | the outbound's own read bound: `DEFAULT_MAX_RESPONSE_BYTES` = 16 MiB (`transports/bounded_read.py`) on REST, SOAP, FHIR and DICOMweb; `max_frame_bytes` on MLLP and TCP; `max_interchange_bytes` on X12; `capture_max_rows`, default 100, plus a fixed byte cap on a database outbound | no unpacking on capture |
+| `capture_response` / `reingress_to`: a partner's reply captured from an outbound, and re-ingressed through a `Loopback()` inbound when `reingress_to` is set ([ADR 0013](adr/0013-query-response-orchestration.md)) | whatever the partner returns on that hop. A re-ingressed reply does not pass the `Loopback()` inbound's listener checks, so the read bound in this row is its bound | not applicable; a reply on the outbound's own connection | the outbound's own read bound: `DEFAULT_MAX_RESPONSE_BYTES` = 16 MiB (`transports/bounded_read.py`) on REST, SOAP, FHIR and DICOMweb; `max_frame_bytes` on MLLP and TCP; `max_interchange_bytes` on X12; `capture_max_rows`, default 100, plus a fixed byte cap on a database outbound, both checked only after the whole result set is fetched | no unpacking on capture |
 
-Two limits apply after intake to the content of every row above that names a connector type:
+Two limits apply after intake. The first covers the rows keyed by a connector type, the first eight.
+The last three rows skip the listener, so it does not reach them. The second covers content from any
+row:
 
 - **The engine's per-message ceiling.** The listener applies `DEFAULT_MAX_MESSAGE_BYTES` = 16 MiB
   (`parsing/peek.py`) to each received body, measured in characters once a text body is decoded. A
@@ -825,13 +828,14 @@ Two limits apply after intake to the content of every row above that names a con
   object cap passes the connector and is then recorded as `ERROR` rather than routed.
 - **Unpacking a payload.** When a Router or Handler parses a Deflated DICOM Part-10 payload,
   `guard_part10_deflate` caps the inflate at `DEFAULT_MAX_INFLATED_BYTES` = 16 MiB, with no setting.
-  When a Handler unpacks content itself, it calls `gzip_decompress`, `deflate_decompress` or
-  `zip_decompress` (`parsing/compression.py`, [ADR 0123](adr/0123-compression-codec-gzip-zip-deflate-file-connector-compress-decompress-option.md)).
+  For a Handler that unpacks content itself, the engine offers `gzip_decompress`,
+  `deflate_decompress` and `zip_decompress` (`parsing/compression.py`, [ADR 0123](adr/0123-compression-codec-gzip-zip-deflate-file-connector-compress-decompress-option.md)).
   Each takes `max_output_bytes` as a required keyword with no default, so the Handler author must
   choose the ceiling. Passing `None` removes it, and has to be written out. `zip_decompress` also caps
   the member count at `max_entries`, default 1024, and refuses the whole archive when one member's
-  name or content fails the checks in `parsing/sniff.py`. This is the unpacked-size limit for any
-  content a Handler unpacks, whichever row it arrived through.
+  name or content fails the checks in `parsing/sniff.py`. A Handler is ordinary Python, though, and
+  can unpack with any library instead, such as `gzip` or `zipfile` directly. The engine then sets no
+  bound, and the Handler author owns the unpacked-size limit.
 
 **Downloads.** The "Downloads are made safe at serve (ASVS 1.3.4)" clause below covers the attachment
 row only. The two export rows are made safe as their own row says.
@@ -854,19 +858,23 @@ row only. The two export rows are made safe as their own row says.
   engine sets no row cap, so the Handler's statement is the bound.
 - `/ui/static` serves first-party assets that ship in the package. `AllowlistedStaticFiles` serves
   only `ALLOWED_STATIC_EXTENSIONS` (`.css`, `.js`), and it sends no `Content-Disposition`.
-- Every other API request body is a parameter body, capped by `_MAX_REQUEST_BODY_BYTES` = 1 MiB. That
-  includes the browser CSP report sink, `/ui/csp-report`, which parses a report and logs a bounded
-  summary.
+- The API routes not listed above that take a body are treated as parameter routes, capped by
+  `_MAX_REQUEST_BODY_BYTES` = 1 MiB. That classification is kept by hand. The route closest to the
+  line is the browser CSP report sink, `/ui/csp-report`: it takes an unauthenticated report, parses
+  it, logs a bounded summary and keeps nothing.
 - Local admin CLI commands run as the host operator at the host, which the rule above excludes. The
   ones that read or write a file include: `restore` and `restore-verify` of a `.mfbak` archive,
-  which cap one member at `_MAX_RESTORE_MEMBER_BYTES` = 16 GiB, and a config bundle at
-  `_MAX_CONFIG_MEMBERS` = 10,000 members and `_MAX_CONFIG_BYTES` = 1 GiB; `import corepoint`;
+  which cap the store member at `_MAX_RESTORE_MEMBER_BYTES` = 16 GiB; `restore --config-to`, which
+  also caps the config bundle at `_MAX_CONFIG_MEMBERS` = 10,000 members and
+  `_MAX_CONFIG_BYTES` = 1 GiB; `import corepoint`;
   `cert import`; `dryrun`; and `support-bundle`, which writes its archive to the local disk and serves
   nothing.
-- Developer intake from the IDE extension is not decided here. That covers its two file pickers
-  (`ide/src/testBench.ts`, `ide/src/stepsView.ts`) and the editor text it sends to `/ai/chat` (POST),
+- Developer and test tooling intake is not decided here. That covers the IDE extension's two file
+  pickers
+  (`ide/src/testBench.ts`, `ide/src/stepsView.ts`); the editor text it sends to `/ai/chat` (POST),
   which `AiChatRequest.prompt` caps at 200,000 characters and the engine relays to the configured AI
-  provider ([AI.md](AI.md)). Whether this intake counts is an open owner question on BACKLOG #1127.
+  provider ([AI.md](AI.md)); and the separate test-harness distribution (`harness/`), whose MLLP
+  receiver sets no frame cap. Whether this intake counts is an open owner question on BACKLOG #1127.
 
 **The embedded-document detach is a STAGE, not a receiver, and its ceilings are stated here
 because the requirement asks for unpacked size wherever content is accepted.** When an inbound sets
