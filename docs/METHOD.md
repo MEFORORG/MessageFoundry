@@ -15,8 +15,8 @@ is defined here and nowhere else, so other pages point at this line rather than 
 
 | Seat | Lives how long | What it does |
 |---|---|---|
-| Manager | Long-lived, several at once | The seat the owner talks to. Reads the record and writes a brief citing an item, dispatches subagent workers, then polls. The record is two ledgers, and NEITHER IS IN THIS REPOSITORY any more: the item ledger moved to the maintainer-internal repo (BACKLOG #1250), and the `wshallwshall/claude-multisession` issues track KORUS itself. Nothing pushes to it. |
-| Builder | One brief, then exits | Works, commits, pushes, opens the PR, and stops. That is you, most of the time. |
+| Manager | Long-lived, several at once | The seat the owner talks to. Reads the record and writes a brief citing an item, dispatches subagent workers, then polls. It decides when to cut a PR and what goes in it, usually one PR per wave of workers (owner ruling 2026-09-23). The record is two ledgers, and NEITHER IS IN THIS REPOSITORY any more: the item ledger moved to the maintainer-internal repo (BACKLOG #1250), and the `wshallwshall/claude-multisession` issues track KORUS itself. Nothing pushes to it. |
+| Builder | One brief, then exits | Works, commits, pushes its branch, reports, and stops. The Manager opens the PR (since 2026-09-18). That is you, most of the time. |
 | Watchdog | As needed | Watches the Lander and keeps it draining. Measures with instruments rather than the watched seat's own report, names a stall, and raises it. It never drains, never takes the claim, and never says whose a red is. Added 2026-09-19. |
 | Steward | A cron, no model calls | Reads account usage and names the account with headroom. It cannot interrupt a running session. |
 | Lander | Standing authority | Enqueues and merges. Both, since the Console's retirement. |
