@@ -65,9 +65,15 @@ _MIGRATION_START = "### Cryptographic migration & agility"
 _RETIRED_CLAIMS = (
     "keyless identity (plaintext) by default",  # the false at-rest cipher default (ADR 0148 refutes it)
     "no classical-public-key data at rest",  # the false PQC posture (WebAuthn COSE + OIDC RP refute it)
-    # The false audit-chain default: `serve` refuses to start with no store key, so the shipped chain
-    # is keyed HMAC, and keyless SHA-256 needs the audited opt-out (BACKLOG #282).
+    # The false audit-chain default (BACKLOG #282). The shipped default refuses to `serve` with no
+    # store key; when a chain is keyed is stated once, in the §4 "Audit chain" row.
     "default keyless posture",
+)
+
+# Other files that carried the "default keyless posture" wording before BACKLOG #282 removed it.
+_KEYLESS_DEFAULT_SITES = (
+    _ROOT / "docs" / "PHI.md",
+    _PKG / "store" / "audit_tee.py",
 )
 
 
@@ -170,11 +176,22 @@ def test_oidc_verification_material_is_documented() -> None:
 
 def test_retired_false_claims_are_absent() -> None:
     section = _section4()
-    present = [claim for claim in _RETIRED_CLAIMS if claim in section]
+    present = [claim for claim in _RETIRED_CLAIMS if claim.casefold() in section.casefold()]
     assert not present, (
         "a retired FALSE cryptographic-inventory claim reappeared in §4 of "
         f"docs/ASVS-L2-PHASE0-CHANGES.md: {present}"
     )
+
+
+def test_default_keyless_claim_is_absent_from_its_other_sites() -> None:
+    # Case-folded, because one site spelled it "DEFAULT keyless posture".
+    needle = "default keyless posture"
+    present = [
+        path.relative_to(_ROOT).as_posix()
+        for path in _KEYLESS_DEFAULT_SITES
+        if needle in path.read_text(encoding="utf-8").casefold()
+    ]
+    assert not present, f"the false 'default keyless posture' wording reappeared in: {present}"
 
 
 def _migration_data_rows() -> list[list[str]]:

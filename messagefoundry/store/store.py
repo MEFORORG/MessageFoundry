@@ -1474,8 +1474,8 @@ def audit_row_hash(
     from ``Cipher.audit_mac_fn``) computes the row MAC INSIDE the vault — used by ``vault_transit`` mode
     where the DEK never enters heap, so there is no ``key`` to HMAC with locally yet the chain is still
     keyed (forgery-resistant). ``mac`` takes precedence over ``key``; with neither, the keyless SHA-256
-    default — BYTE-IDENTICAL to pre-#190 — is unchanged (the ``mac is None and key is None`` path is the
-    frozen default cipher's path).
+    path — BYTE-IDENTICAL to pre-#190 — is unchanged (the ``mac is None and key is None`` path is the
+    identity cipher's path, and the path of any chain whose first row was written keyless).
 
     **Client address (ADR 0150).** ``client`` — the caller's network address, when the write had one —
     is folded into the chain as a **CONDITIONAL 7th element**: it is appended ONLY when it is not

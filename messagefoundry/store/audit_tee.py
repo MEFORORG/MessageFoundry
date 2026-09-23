@@ -66,10 +66,11 @@ def emit_audit_tee(
     actually cut, a reader of the log can TEST guesses at the removed span offline, one hash per guess.
     That is narrow (it needs an exact byte-for-byte reconstruction of a redacted exception string, and
     an audit ``detail`` that was not HL7-shaped is forwarded unredacted anyway, so there is nothing left
-    to guess), and it does not arise on the shipped default. There the chain is keyed and the digest
-    is an HMAC under a DEK-derived subkey, because ``serve`` refuses to start with no store key. The
-    keyless posture needs the audited ``[security].allow_unencrypted_phi`` opt-out. It is recorded
-    here rather than left for a reader to rediscover.
+    to guess) and it disappears entirely once the chain is keyed, where the digest is an HMAC under a
+    DEK-derived subkey. Keyless is not the shipped default, but a store key does not by itself key a
+    chain whose first row was written keyless; the "Audit chain" row in
+    ``docs/ASVS-L2-PHASE0-CHANGES.md`` says when it is keyed. It is recorded here rather than left for
+    a reader to rediscover.
 
     **What the anchor fields do and do not buy, stated here so nobody over-reads them.** A within-store
     chain walk cannot see TAIL truncation -- deleting the newest rows leaves a prefix that still
