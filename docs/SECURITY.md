@@ -880,6 +880,15 @@ server-side, not a client confirmation). On release the captured operation is **
 a request older than `[approvals].expiry_hours` can no longer be approved. Approvers see the open queue
 at `GET /approvals`.
 
+**The requester is re-checked at release (ASVS 8.3.2).** A request can wait hours for its second
+approver, and the requester's authority can be withdrawn in that time. So the release reads it again.
+It refuses with **409** if the requester's account is gone or disabled, or no longer holds the
+operation's permission (`messages:replay`, `messages:purge` or `config:deploy`). It also refuses if the
+requester has left the channel scope the operation needs. The refusal writes an
+`approval.stale_requester` audit row against the approver, with a reason slug, and raises the
+`approval_stale_requester` alert. The request stays **pending**, so an approver can reject it. If the
+requester's authority comes back inside the expiry window, the request can still be released.
+
 The gated set is configurable (`[approvals].operations`); the first cut covers the two highest-PHI-impact
 flows — **bulk dead-letter replay** and **connection purge**. (The web console's "are you
 sure?" confirm prompts are **client-side only** and bypassable via the raw API — they are *not* a second approver
@@ -1573,7 +1582,8 @@ attachments, `/dead-letters` — paced at `[auth].phi_read_rate_limit_per_actor`
 every directory principal still holding a live session — via the same password-free service-account
 lookup the Kerberos path uses — and revokes the sessions of accounts AD has disabled or deleted. Group
 membership is re-diffed on the same pass at no extra directory cost, so a **role demotion** takes effect
-without waiting for a login that may never happen. Revocations audit `auth.ad_session_revoked`.
+without waiting for a login that may never happen. Revocations audit `auth.ad_session_revoked` and
+raise the `ad_session_revoked` alert, one per revoked principal.
 
 **The probe is keyed on the directory's immutable `objectGUID`**, the same identifier a directory login
 is identified by, and a renamed account's stored username is refreshed from the directory on the same
@@ -1592,7 +1602,9 @@ Three safety properties, because the lookup still returns one indistinguishable 
   service account that lost read rights answers "not found" for *every* user. A pass whose revocation
   set exceeds **both** `ad_session_revoke_max` (5) **and** `ad_session_revoke_max_fraction` (0.34) of
   the probed population **aborts**: nothing is revoked, nothing is written, the engine logs at ERROR
-  and audits `auth.ad_reconcile_aborted`, and the condition latches until a clean pass. Both thresholds
+  and audits `auth.ad_reconcile_aborted`, raises the `ad_reconcile_aborted` alert, and the condition
+  latches until a clean pass. A whole-directory outage audits `auth.ad_reconcile_skipped` instead and
+  raises no alert. Both thresholds
   must be exceeded — the floor alone would sign out a five-person site, the proportion alone would fire
   on a genuine 3-of-3 offboarding — so it trips only on a change that is simultaneously large and broad.
 

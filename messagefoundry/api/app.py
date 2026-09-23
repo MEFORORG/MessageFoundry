@@ -62,7 +62,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from messagefoundry import __version__
 from messagefoundry.api._ui_seam import ENGINE_UI_SEAM, CoreHandlers, UiDeps
-from messagefoundry.api.approvals import ApprovalError, ApprovalGate
+from messagefoundry.api.approvals import ApprovalError, ApprovalGate, IdentityResolver
 from messagefoundry.api.auth_routes import add_auth_routes
 from messagefoundry.api.client_networks import ClientNetworkMiddleware
 from messagefoundry.api.field_authz import count_exposed, count_masked, redact_unauthorized
@@ -217,6 +217,7 @@ from messagefoundry.api.validation import (
 # behavior is preserved via three seams the console installs: app.state.ui_csp,
 # app.state.ui_ws_authorize, app.state.ui_connections_render (read by the always-on middleware/routes).
 from messagefoundry.auth import Identity, Permission, Role
+from messagefoundry.auth.reconcile import ReconcilePlan
 from messagefoundry.auth.service import AuthService, BootstrapAdmin
 from messagefoundry.auth.trust_anchors import (
     AnchorSpec,
@@ -625,10 +626,39 @@ def _get_gate(request: Request) -> ApprovalGate | None:
     return getattr(request.app.state, "approval_gate", None)
 
 
-def _build_approval_gate(engine: Engine, settings: ApprovalsSettings) -> ApprovalGate:
+def _requester_identity_resolver(app: FastAPI) -> IdentityResolver:
+    """The approval gate's way to re-read a requester's CURRENT identity at release (ASVS 8.3.2).
+
+    Late-bound through ``app.state`` on purpose: the managed lifespan builds the gate before it
+    attaches the auth service, so capturing the service at build time would capture ``None``. With no
+    auth service bound it answers ``None``, and the gate then refuses the release (fail closed)."""
+
+    async def _resolve(user_id: str) -> Identity | None:
+        auth: AuthService | None = getattr(app.state, "auth", None)
+        if auth is None:
+            return None
+        return await auth.identity_for_user_id(user_id)
+
+    return _resolve
+
+
+def _build_approval_gate(
+    engine: Engine,
+    settings: ApprovalsSettings,
+    *,
+    resolve_identity: IdentityResolver | None = None,
+    alert_sink: AlertSink | None = None,
+) -> ApprovalGate:
     """Build the approval gate and register the high-value operations dual-control can hold. Each
-    executor re-runs its captured operation on approval (params are JSON, persisted at request time)."""
-    gate = ApprovalGate(engine.store, settings)
+    executor re-runs its captured operation on approval (params are JSON, persisted at request time).
+
+    Each registration names the permission its endpoint demands, plus the channel-scope check where
+    the endpoint has one, so the gate can re-check the REQUESTER at release (ASVS 8.3.2). Keep each
+    pair in step with the route that raises the request: the route checks at request time, the gate
+    at release, and a divergence would let one of the two pass what the other refuses."""
+    gate = ApprovalGate(
+        engine.store, settings, resolve_identity=resolve_identity, alert_sink=alert_sink
+    )
 
     async def _replay(p: Mapping[str, Any]) -> dict[str, Any]:
         # BACKLOG #1646: write the same dead_letter_replay row the inline route writes, so an
@@ -706,9 +736,35 @@ def _build_approval_gate(engine: Engine, settings: ApprovalsSettings) -> Approva
             "failures": [f.step for f in outcome.failures],
         }
 
-    gate.register("dead_letter_replay", "Replay dead-lettered deliveries", _replay)
-    gate.register("connection_purge", "Purge queued deliveries to an outbound connection", _purge)
-    gate.register("config_reload", "Reload the live config graph (config:deploy)", _config_reload)
+    def _replay_in_scope(identity: Identity, p: Mapping[str, Any]) -> bool:
+        # Mirrors replay_dead_letters: a channel-scoped requester must target one of its channels.
+        channel_id = p.get("channel_id")
+        return identity.can_access_channel(channel_id if isinstance(channel_id, str) else None)
+
+    def _purge_in_scope(identity: Identity, _p: Mapping[str, Any]) -> bool:
+        # Mirrors purge_connection: a purge spans every inbound, so only an unscoped requester may.
+        return identity.allowed_channels is None
+
+    gate.register(
+        "dead_letter_replay",
+        "Replay dead-lettered deliveries",
+        _replay,
+        permission=Permission.MESSAGES_REPLAY,
+        in_scope=_replay_in_scope,
+    )
+    gate.register(
+        "connection_purge",
+        "Purge queued deliveries to an outbound connection",
+        _purge,
+        permission=Permission.MESSAGES_PURGE,
+        in_scope=_purge_in_scope,
+    )
+    gate.register(
+        "config_reload",
+        "Reload the live config graph (config:deploy)",
+        _config_reload,
+        permission=Permission.CONFIG_DEPLOY,
+    )
     return gate
 
 
@@ -1400,7 +1456,12 @@ def create_app(
     )
     if engine is not None:
         app.state.engine = engine
-        app.state.approval_gate = _build_approval_gate(engine, approvals or ApprovalsSettings())
+        # No notifier exists on this direct-construction path, so the gate's alerts log (its default).
+        app.state.approval_gate = _build_approval_gate(
+            engine,
+            approvals or ApprovalsSettings(),
+            resolve_identity=_requester_identity_resolver(app),
+        )
     if auth is not None:
         app.state.auth = auth
     if ai_settings is not None:
@@ -6487,25 +6548,56 @@ async def _session_reaper(store: Store) -> None:
         await asyncio.sleep(_SESSION_REAP_INTERVAL)
 
 
-async def _directory_reconciler(auth: AuthService, interval: float) -> None:
+async def _directory_reconciler(auth: AuthService, interval: float, sink: AlertSink) -> None:
     """Re-resolve directory principals holding live sessions, revoking those AD has disabled or
-    deleted (ADR 0079 mechanism 2). Created only when ``[auth].ad_session_recheck_seconds`` is set
-    AND AD is wired — at the default 0 no task exists and the upgrade is byte-identical.
+    deleted (ADR 0079 mechanism 2). Created only when AD is wired and
+    ``[auth].ad_session_recheck_seconds`` is non-zero (it defaults to 300).
 
     Sleeps FIRST: a pass at startup would probe every session restored from the store before the
     directory connection has been exercised even once, and a boot-time DC hiccup is the least
     informative moment to run a control whose whole job is telling a real disable from a blip.
+
+    Each finished pass is turned into alerts here, by :func:`_alert_reconcile_plan`. The alerting
+    lives in this task and never in ``auth/``, which does not import the pipeline's sinks.
 
     A transient failure must not kill the loop for the process lifetime (that would silently disable
     the control until restart) — log and retry next interval, the session-reaper precedent."""
     while True:
         await asyncio.sleep(interval)
         try:
-            await auth.reconcile_directory_sessions()
+            plan = await auth.reconcile_directory_sessions()
         except asyncio.CancelledError:
             raise
         except Exception:
             _log.exception("directory reconcile: pass failed; will retry next interval")
+            continue
+        _alert_reconcile_plan(plan, auth, sink)
+
+
+def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSink) -> None:
+    """Raise the alert that matches each audit row the pass wrote (ASVS 8.3.2).
+
+    A breaker trip is ``auth.ad_reconcile_aborted`` and becomes one ``ad_reconcile_aborted`` alert.
+    Each applied revocation is ``auth.ad_session_revoked`` and becomes one ``ad_session_revoked``
+    alert. A whole-directory outage aborts too, but it is audited as ``auth.ad_reconcile_skipped``
+    and pages nothing: the accounts are fine, the directory is not, and the pass is fail-open.
+
+    Reads the RETURNED plan, so it sees only a pass that finished. A pass that raised part-way has
+    already audited the revocations it applied; those rows stand, and no alert is raised for them."""
+    if plan.aborted == "directory_unavailable":
+        return
+    if plan.aborted is not None:
+        # The same split AuthService._abort_reconcile_pass makes: every abort other than the outage
+        # is audited as auth.ad_reconcile_aborted, so every such abort alerts.
+        sink.ad_reconcile_aborted(
+            "directory-reconciler",
+            reason=plan.aborted,
+            probed=plan.probed,
+            detail=auth.directory_reconcile_alert or plan.aborted,
+        )
+        return
+    for revocation in plan.revocations:
+        sink.ad_session_revoked(revocation.username, reason=revocation.reason)
 
 
 _BOOTSTRAP_EXPIRY_REMINDER_INTERVAL = 3600.0  # re-check the bootstrap warn window hourly
@@ -6956,7 +7048,11 @@ def create_managed_app(
             app.state.service_settings = service_settings  # back GET /service/status (L6a)
             app.state.log_dir = log_dir  # back GET /status app-log metering (#50)
             app.state.approval_gate = _build_approval_gate(
-                engine, approvals_settings or ApprovalsSettings()
+                engine,
+                approvals_settings or ApprovalsSettings(),
+                # ASVS 8.3.2: late-bound, because the auth service is attached further down.
+                resolve_identity=_requester_identity_resolver(app),
+                alert_sink=notifier or LoggingAlertSink(),
             )
             # ASVS 5.2.4: age-based retention prune for the uploaded-logs surface. Owned by this lifespan
             # (started here, stopped in the finally) — the runner pattern of cert_expiry, but wired where the
@@ -7118,7 +7214,11 @@ def create_managed_app(
                         auth_settings.ad_session_recheck_strikes,
                     )
                     reconciler = asyncio.create_task(
-                        _directory_reconciler(auth, auth_settings.ad_session_recheck_seconds)
+                        _directory_reconciler(
+                            auth,
+                            auth_settings.ad_session_recheck_seconds,
+                            notifier or LoggingAlertSink(),
+                        )
                     )
             yield
         finally:
