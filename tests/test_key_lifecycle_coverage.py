@@ -23,7 +23,8 @@ guarded here only because it ALSO imports ``ssl`` and ``hashlib``. Widening disc
 instrument work, not this module's; do not read a green here as "every key has a lifecycle".
 
 The DEK has no table row: its lifecycle is the ``Store-key management policy`` bullet list, so the
-label :data:`_DEK` resolves to that heading instead.
+label :data:`_DEK` counts as governed only while that heading AND each of its five lifecycle bullets
+(:data:`_DEK_BULLETS`) are present with text after the bullet's lead.
 """
 
 from __future__ import annotations
@@ -37,6 +38,14 @@ _DOC = _ROOT / "docs" / "ASVS-L2-PHASE0-CHANGES.md"
 _CRYPTO_GATE = _ROOT / "scripts" / "security" / "crypto_inventory_check.py"
 
 _DEK_HEADING = "### Store-key management policy"
+#: The bold leads of the DEK's lifecycle bullets. Every one must be present, with text after it.
+_DEK_BULLETS = (
+    "- **Generation**",
+    "- **Storage / access**",
+    "- **Distribution / holders**",
+    "- **Rotation / retirement**",
+    "- **Destruction**",
+)
 _LIFECYCLE_HEADING = "### Key management for the other keys the engine loads or mints"
 _NEXT_HEADING = "### Rotation schedule"
 
@@ -132,8 +141,12 @@ _NO_KEY: dict[str, str] = {
     "messagefoundry/auth/oidc_http.py": _VERIFY_ONLY,
     "messagefoundry/config/fingerprint.py": _KEYLESS,
     "messagefoundry/config/wiring.py": _KEYLESS,
-    "messagefoundry/config/tls_policy.py": _POSTURE_ONLY,
-    "messagefoundry/config/tls_probe.py": _VERIFY_ONLY,
+    "messagefoundry/config/tls_policy.py": "the TLS policy seam itself: it builds verifying contexts, "
+    "floors and suite lists for its callers, and never loads, mints or holds a private key; each "
+    "caller that loads one is sorted under its own row",
+    "messagefoundry/config/tls_probe.py": "an outbound protocol-version probe that builds contexts "
+    "with certificate checks deliberately off; it measures which TLS versions a peer accepts and "
+    "loads no key and no trust anchor",
     "messagefoundry/config/models.py": _POSTURE_ONLY,
     "messagefoundry/config/settings.py": _POSTURE_ONLY,
     "messagefoundry/config/secretprovider_vault.py": "reads connector credentials from Vault KV over "
@@ -155,7 +168,8 @@ _NO_KEY: dict[str, str] = {
     "messagefoundry/pipeline/wiring_runner.py": _POSTURE_ONLY,
     "messagefoundry/api/app.py": _POSTURE_ONLY,
     "messagefoundry/api/security.py": _POSTURE_ONLY,
-    "messagefoundry/transports/base.py": _POSTURE_ONLY,
+    "messagefoundry/transports/base.py": "names the ssl types for a connect helper that receives a "
+    "context built elsewhere and reports handshake failures; it builds no context and loads no key",
     "messagefoundry/transports/ai_broker.py": _POSTURE_ONLY,
     "messagefoundry/transports/database.py": _POSTURE_ONLY,
     "messagefoundry/transports/http_auth.py": _POSTURE_ONLY,
@@ -195,9 +209,15 @@ def lifecycle_labels(doc: str) -> set[str]:
     """
     lines = doc.splitlines()
     labels: set[str] = set()
-    if any(line.startswith(_DEK_HEADING) for line in lines):
-        labels.add(_DEK)
+    dek = next((i for i, line in enumerate(lines) if line.startswith(_DEK_HEADING)), None)
     start = next((i for i, line in enumerate(lines) if line.startswith(_LIFECYCLE_HEADING)), None)
+    if dek is not None:
+        policy = lines[dek + 1 : start if start is not None and start > dek else len(lines)]
+        if all(
+            any(line.startswith(lead) and line[len(lead) :].strip() for line in policy)
+            for lead in _DEK_BULLETS
+        ):
+            labels.add(_DEK)
     if start is None:
         return labels
     end = next(
@@ -296,6 +316,14 @@ def test_deleting_a_row_turns_the_guard_red() -> None:
         )
         assert mutated != doc, f"no row for {label!r} to delete; the row label moved"
         assert f"{culprit} -> {label}" in uncovered(mutated), f"deleting {label!r} stayed green"
+    # The DEK has no row; its policy is a bullet list. Gutting one bullet must also turn it red.
+    gutted = "\n".join(
+        line for line in doc.splitlines() if not line.startswith("- **Destruction**")
+    )
+    assert gutted != doc, "no DEK Destruction bullet to delete; the bullet lead moved"
+    assert f"messagefoundry/store/crypto.py -> {_DEK}" in uncovered(gutted), (
+        "deleting the DEK Destruction bullet stayed green"
+    )
 
 
 def test_a_no_key_reason_is_a_sentence() -> None:

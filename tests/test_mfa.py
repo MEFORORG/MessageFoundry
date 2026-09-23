@@ -811,7 +811,8 @@ async def test_an_account_owing_no_second_factor_still_clears_at_the_password_st
 async def test_the_totp_secret_is_returned_once_and_never_again() -> None:
     """ASVS 11.1.1's two-entity bound on a shared secret, the half the engine controls (BACKLOG #1162).
 
-    The TOTP secret is the engine's only true shared secret. By design it has two holders: the
+    The TOTP secret is the only shared secret the engine mints and uses as key material. By design
+    it has two holders: the
     engine's store and the user's authenticator. The engine cannot see the authenticator side, so
     ``docs/ASVS-L2-PHASE0-CHANGES.md`` states that half as a deployment precondition. What the engine
     CAN promise is that it never hands the secret out a second time, which is what this pins:
@@ -819,8 +820,12 @@ async def test_the_totp_secret_is_returned_once_and_never_again() -> None:
     * staging again mints a FRESH secret rather than re-displaying the staged one;
     * once MFA is on, a new enrolment is refused, so the active secret is never returned again;
     * the status read carries no copy of it; and
-    * the enrolment response is the only API model with a ``secret`` field, so a new route cannot
-      start returning it without failing here.
+    * the enrolment response is the only JSON API model with a field named like a secret, so a new
+      JSON model carrying it fails here. An unrelated ``*secret*`` field fails too, on purpose: it
+      must be looked at.
+
+    What this does NOT cover: HTML pages (the web console renders the staged secret on its own
+    enrolment page) and a route that returns a bare dict. The doc names both enrolment responses.
 
     Mutation: let ``begin_mfa_enrollment`` return the stored secret when MFA is already enabled, or
     add a ``secret`` field to ``MfaStatusResponse``. Red: the matching assertion below.
