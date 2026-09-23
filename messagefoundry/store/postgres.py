@@ -96,13 +96,14 @@ from messagefoundry.store.crypto import (
     CipherError,
     CipherInfo,
     IdentityCipher,
+    allows_unmarked,
     cell_aad,
     cipher_info,
     decrypt_json_cell,
     rotation_fingerprint_key,
 )
 from messagefoundry.store.document_strip import StripResult, cutoff_for
-from messagefoundry.store.gcm_bound import checkpoint_invocations
+from messagefoundry.store.gcm_bound import checkpoint_invocations, reserve_invocations_ahead
 from messagefoundry.store.metadata import (
     decode_response_headers,
     encode_reference_value,
@@ -1078,7 +1079,8 @@ class PostgresStore:
             # since on a store that is having a key enabled for the first time it is itself a large
             # burst. A no-op when the cipher carries no bound (keyless / `vault_transit`).
             await store.checkpoint_cipher_invocations()
-            await store._encrypt_existing_rows()  # one-time PHI-at-rest migration when a key is set
+            # Runs at EVERY keyed open: seals legacy plaintext on still-unsealed surfaces (#1169).
+            await store._encrypt_existing_rows()
             await store._load_audit_chain_meta()  # load/auto-init the #190 keying watermark
             await (
                 store._load_state_cache()
@@ -1833,9 +1835,10 @@ class PostgresStore:
         return True, f"audit chain keyed from id={watermark}"
 
     async def _encrypt_existing_rows(self) -> None:
-        """Encrypt legacy plaintext values in the cipher-covered columns in place when encryption is
-        enabled (STORE-1 / WP-5). Idempotent + batched: skips rows already carrying the ciphertext
-        prefix and NULL / blank values; bounded memory (chunks of 500)."""
+        """Seal legacy plaintext in the cipher-covered columns when encryption is enabled (STORE-1 /
+        WP-5), one (table, column) surface at a time, each in ONE transaction. A surface that already
+        holds ciphertext is SEALED and its unmarked values are refused at read, not sealed (BACKLOG
+        #1169). The SQLite twin documents why; :meth:`_seal_surface` carries the mechanics."""
         if not self._cipher.encrypts:
             return
         # Version-agnostic anchor (M9): `mfenc:%` matches BOTH v1 and v2 ciphertext, so a v2 row is
@@ -1843,132 +1846,126 @@ class PostgresStore:
         like = f"{_ENC_MARKER_PREFIX}%"
         total = 0
         for table, column in self._CIPHER_COLUMNS:
-            while True:
-                rows = await self._fetchall(
-                    f"SELECT id, {column} AS v FROM {table}"
-                    f" WHERE {column} NOT LIKE $1 AND {column} <> '' LIMIT 500",
-                    like,
-                )
-                if not rows:
-                    break
-                async with self._timed_acquire() as conn, conn.transaction():
-                    for r in rows:
-                        await conn.execute(
-                            f"UPDATE {table} SET {column}=$1 WHERE id=$2",
-                            self._cipher.encrypt(r["v"], aad=cell_aad(table, column, r["id"])),
-                            r["id"],
-                        )
-                await self._charge_bound_batch()
-                total += len(rows)
-        total += await self._encrypt_existing_composite(
-            "state", ("namespace", "key"), like, encrypt=True
-        )
-        total += await self._encrypt_existing_composite(
-            "reference", ("name", "version", "key"), like, encrypt=True
+            total += await self._seal_surface(table, column, like, aad_cols=("id",))
+        total += await self._seal_surface("state", "value", like, aad_cols=("namespace", "key"))
+        total += await self._seal_surface(
+            "reference", "value", like, aad_cols=("name", "version", "key")
         )
         # The `response` table (composite PK + cipher columns — ADR 0013; resp_headers added in #154)
         # migrates each column.
         for col in ("body", "detail", "resp_headers"):
-            total += await self._encrypt_existing_composite(
-                "response",
-                ("message_id", "destination_name", "response_seq"),
-                like,
-                encrypt=True,
-                value_col=col,
+            total += await self._seal_surface(
+                "response", col, like, aad_cols=("message_id", "destination_name", "response_seq")
             )
         # The `attachment_chunk` table (#149, ADR 0105) is cipher-covered (`ciphertext`) with the
         # composite PK (attachment_id, seq), so it can't ride the id-keyed loop either. Its ROTATION
         # pass already existed; this ON-OPEN pass did not, so a keyless→keyed transition left legacy
         # plaintext chunks unsealed on this backend while SQLite sealed them (BACKLOG #1169).
         # A SMALL batch, unlike every sibling above: each row is one DETACH_CHUNK_BYTES (1 MiB) slice
-        # rather than a kilobyte-shaped value, so 500 would hold ~650 MiB resident in one transaction
-        # while the store is still opening.
-        total += await self._encrypt_existing_composite(
+        # rather than a kilobyte-shaped value, so 500 would hold ~650 MiB resident at once while the
+        # store is still opening.
+        total += await self._seal_surface(
             "attachment_chunk",
-            ("attachment_id", "seq"),
+            "ciphertext",
             like,
-            encrypt=True,
-            value_col="ciphertext",
-            limit=_ATTACHMENT_CHUNK_BATCH,
+            aad_cols=("attachment_id", "seq"),
+            batch=_ATTACHMENT_CHUNK_BATCH,
         )
-        # BIGSERIAL-id tables bind to insert-time-known natural columns (id_keyed=True; see
-        # _CIPHER_COLUMNS) — their own composite migration passes (ASVS 11.3.3).
-        total += await self._encrypt_existing_composite(
+        # BIGSERIAL-id tables bind to insert-time-known natural columns while the UPDATE targets `id`,
+        # so a natural-column collision can never re-write the wrong row (ASVS 11.3.3).
+        total += await self._seal_surface(
             "message_events",
-            ("message_id", "ts", "event"),
+            "detail",
             like,
-            encrypt=True,
-            value_col="detail",
-            id_keyed=True,
+            aad_cols=("message_id", "ts", "event"),
+            key_cols=("id",),
         )
-        total += await self._encrypt_existing_composite(
+        total += await self._seal_surface(
             "connection_event",
-            ("connection", "ts", "kind"),
+            "reason",
             like,
-            encrypt=True,
-            value_col="reason",
-            id_keyed=True,
+            aad_cols=("connection", "ts", "kind"),
+            key_cols=("id",),
         )
-        total += await self._encrypt_existing_composite(
+        total += await self._seal_surface(
             "alert_instance",
-            ("event_type", "connection"),
+            "reason",
             like,
-            encrypt=True,
-            value_col="reason",
-            id_keyed=True,
+            aad_cols=("event_type", "connection"),
+            key_cols=("id",),
         )
         if total:
             log.info("encrypted %d existing value(s) at rest", total)
 
-    async def _encrypt_existing_composite(
+    async def _seal_surface(
         self,
         table: str,
-        aad_cols: tuple[str, ...],
+        column: str,
         like: str,
         *,
-        encrypt: bool,
-        value_col: str = "value",
-        id_keyed: bool = False,
-        limit: int = 500,
+        aad_cols: tuple[str, ...],
+        key_cols: tuple[str, ...] | None = None,
+        batch: int = 500,
     ) -> int:
-        """Encrypt the ``value_col`` of a non-id-keyed table in place — the migration loop for tables that
-        can't ride the id-keyed loop. Each value binds to ``cell_aad(table, value_col, *aad_cols)`` (ASVS
-        11.3.3). ``encrypt=True`` is the on-open plaintext→active migration (this method's only caller;
-        rotation uses :meth:`_reencrypt_composite`). ``value_col`` defaults to ``value`` (state/reference);
-        ``response`` passes ``body``/``detail``. ``aad_cols`` are the composite PK for state/reference/
-        response; for the BIGSERIAL-id tables (``message_events``/``connection_event``/``alert_instance``)
-        set ``id_keyed=True`` — the AAD then comes from ``aad_cols`` (insert-time-known natural columns)
-        while the UPDATE targets ``id`` (so a natural-column collision can never re-write the wrong row).
+        """Seal one (table, column) surface's legacy plaintext in ONE transaction; return the count.
 
-        ``limit`` is the rows held in memory per batch. 500 suits the KILOBYTE-shaped columns this
-        started with (state/reference/response); ``attachment_chunk`` holds one 1 MiB slice per row,
-        where 500 would be ~650 MiB resident inside a single transaction at store open."""
-        rotated = 0
-        select_cols = ("id", *aad_cols) if id_keyed else aad_cols
-        pk_select = ", ".join(select_cols)
-        where = (
-            "id=$2" if id_keyed else " AND ".join(f"{c}=${i + 2}" for i, c in enumerate(aad_cols))
-        )
-        while True:
-            rows = await self._fetchall(
-                f"SELECT {pk_select}, {value_col} AS v FROM {table}"
-                f" WHERE {value_col} NOT LIKE $1 AND {value_col} <> '' LIMIT {int(limit)}",
-                like,
+        The SQLite twin (``MessageStore._seal_surface``) documents the three steps: derive the
+        surface's state from the data, reserve the whole burst on the AES-GCM bound first (ASVS
+        11.3.4), then seal every batch and commit once. ``aad_cols`` rebuild the cell AAD;
+        ``key_cols`` (default: ``aad_cols``) are what the UPDATE targets. Identifiers are code
+        constants; only the marker pattern is a parameter.
+
+        The state read and the reservation run on their own pooled connections BEFORE the seal's
+        transaction opens. A reservation must commit independently of the seal it covers, and an
+        engine shard's peer only ever adds MARKED values, which cannot turn an unsealed verdict into
+        a wrong seal."""
+        keys = key_cols if key_cols is not None else aad_cols
+        pending_where = f"{column} NOT LIKE $1 AND {column} <> ''"
+        row = await self._fetchone(f"SELECT COUNT(*) AS n FROM {table} WHERE {pending_where}", like)
+        pending = int(row["n"]) if row is not None else 0
+        if not pending:
+            return 0
+        if not allows_unmarked(self._cipher):
+            marked = await self._fetchone(
+                f"SELECT 1 AS x FROM {table} WHERE {column} LIKE $1 LIMIT 1", like
             )
-            if not rows:
-                break
-            async with self._timed_acquire() as conn, conn.transaction():
+            if marked is not None:
+                log.warning(
+                    "cipher column %s.%s holds %d unmarked value(s) beside sealed ones; they were NOT "
+                    "sealed and every read of them is refused (a stripped marker or a planted row). "
+                    "Set [store].allow_unmarked_ciphertext only if they are known to be legitimate",
+                    table,
+                    column,
+                    pending,
+                )
+                return 0
+        await reserve_invocations_ahead(self._cipher, self.add_cipher_invocations, pending)
+        select_cols = ", ".join(dict.fromkeys((*keys, *aad_cols)))
+        where_keys = " AND ".join(f"{c}=${i + 2}" for i, c in enumerate(keys))
+        sealed = 0
+        # One transaction for the whole surface: asyncpg rolls it back on any exception, so a crash
+        # or a failure part-way leaves the surface exactly as unsealed as it was.
+        async with self._timed_acquire() as conn, conn.transaction():
+            while True:
+                rows = await conn.fetch(
+                    f"SELECT {select_cols}, {column} AS v FROM {table}"
+                    f" WHERE {pending_where} LIMIT {int(batch)}",
+                    like,
+                )
+                if not rows:
+                    break
                 for r in rows:
-                    aad = cell_aad(table, value_col, *[r[c] for c in aad_cols])
-                    where_vals = [r["id"]] if id_keyed else [r[c] for c in aad_cols]
                     await conn.execute(
-                        f"UPDATE {table} SET {value_col}=$1 WHERE {where}",
-                        self._cipher.encrypt(r["v"], aad=aad),
-                        *where_vals,
+                        f"UPDATE {table} SET {column}=$1 WHERE {where_keys}",
+                        self._cipher.encrypt(
+                            r["v"], aad=cell_aad(table, column, *(r[c] for c in aad_cols))
+                        ),
+                        *(r[c] for c in keys),
                     )
-            await self._charge_bound_batch()
-            rotated += len(rows)
-        return rotated
+                sealed += len(rows)
+        # Top the reserve back up for whatever follows; the burst itself was reserved above.
+        await self._charge_bound_batch()
+        return sealed
 
     # --- at-rest key rotation (PHI.md §3, ASVS 11.2.2) -----------------------
 
@@ -2104,10 +2101,11 @@ class PostgresStore:
         id_keyed: bool = False,
     ) -> int:
         """Re-encrypt the ``value_col`` of a non-id-keyed table under the active key (the rotation parallel
-        of :meth:`_encrypt_existing_composite`), rebinding the SAME cell AAD (ASVS 11.3.3) so a retired-key
-        v2 value decrypts, and a v1 value upgrades, under the exact AAD its write/read path uses. Decrypt→
-        encrypt up front; a value no key can decrypt raises before any UPDATE. ``aad_cols``/``id_keyed`` as
-        in :meth:`_encrypt_existing_composite`."""
+        of :meth:`_seal_surface`), rebinding the SAME cell AAD (ASVS 11.3.3) so a retired-key v2 value
+        decrypts, and a v1 value upgrades, under the exact AAD its write/read path uses. Decrypt→encrypt
+        up front; a value no key can decrypt raises before any UPDATE. ``aad_cols`` are the cell's AAD
+        columns; ``id_keyed=True`` makes the UPDATE target ``id`` instead of them (the BIGSERIAL
+        tables, whose AAD binds insert-time-known natural columns)."""
         rotated = 0
         select_cols = ("id", *aad_cols) if id_keyed else aad_cols
         pk_select = ", ".join(select_cols)

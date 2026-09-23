@@ -453,6 +453,15 @@ class StoreSettings(_Section):
     # to bind). Setting it false selects the frozen mfenc:v1 writer (byte-identical at rest, CRYPTO-1) and
     # is a LOOSENING — `security_loosenings()` names it, so the opt-out is never silent.
     aad_bind: bool = True
+    # Accept an UNMARKED value in a cipher-covered column of a KEYED store (BACKLOG #1169, ASVS 11.3.3).
+    # **Off by default**: a keyed store writes only `mfenc:` ciphertext there, and the at-open sweep
+    # seals legacy plaintext only on a (table, column) surface that holds no ciphertext yet, so a
+    # non-blank unmarked value beside sealed ones is a stripped marker or a planted row -- the cipher
+    # REFUSES it (`CipherError`, an `integrity_drift` alert with subject `store-cipher`) instead of
+    # returning it as plaintext. A purged '' is never refused. Setting it true restores the old
+    # behaviour: unmarked values read back as plaintext and the sweep seals every unmarked value. It is
+    # a LOOSENING -- `security_loosenings()` names it. No effect without an encryption key.
+    allow_unmarked_ciphertext: bool = False
     # KeyProvider seam (ADR 0019, ASVS 13.3.3): selects HOW the active/retired DEK bytes are *sourced* —
     # never how they are used (the cipher, keyring, and `mfenc:v1` format are unchanged). `auto` (the
     # default) is the env-then-DPAPI ladder, BYTE-IDENTICAL to the pre-seam behavior; `env`/`dpapi` pin a
@@ -5213,6 +5222,7 @@ def security_loosenings(
     ``[security]`` switch — pinned by a completeness floor in ``tests/test_security_posture_defaults.py``
     that iterates ``SecuritySettings.model_fields`` and fails on an unreported, unexempted one — plus an
     ENUMERATED set of deviations that live elsewhere: ``[store].aad_bind``,
+    ``[store].allow_unmarked_ciphertext`` (#1169),
     ``[auth].ad_session_recheck_seconds``, ``[alerts].email_use_tls``/``email_tls_verify`` (#323
     layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), three per-connection
     deviations — ``cleartext_accepted``, ``tls_allow_expired``, and a generic-ODBC ``DATABASE`` hop
@@ -5431,6 +5441,18 @@ def security_loosenings(
                 "aad_bind",
                 "at-rest values are NOT bound to their (table, column, row) cell — a ciphertext moved "
                 "between cells decrypts instead of failing its auth tag (no effect without a store key)",
+            )
+        )
+    # BACKLOG #1169 (ASVS 11.3.3). The substitution limb has a tag to fail; a downgrade to plaintext has
+    # none, and only the refusal this switch turns off protects it.
+    if store.allow_unmarked_ciphertext:
+        out.append(
+            (
+                "allow_unmarked_ciphertext",
+                "an UNMARKED value in an encrypted column reads back as plaintext instead of being "
+                "refused — anyone who can write the store can strip a ciphertext's marker or plant a "
+                "plaintext row and have the engine accept it as that row's content, and the next "
+                "rotate-key seals it as genuine ciphertext (no effect without a store key)",
             )
         )
     # BACKLOG #1004 (ASVS 13.3.4). Stated as what the SITE gives up rather than "a setting is off": the

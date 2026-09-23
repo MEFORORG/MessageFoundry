@@ -2165,7 +2165,12 @@ def build_store_cipher(settings: StoreSettings) -> Cipher:
             "(expected 'aesgcm' or 'vault_transit')"
         )
     retired = [k.strip() for k in settings.encryption_keys_retired.split(",") if k.strip()]
-    return make_cipher(resolve_active_key(settings), retired, write_v2=settings.aad_bind)
+    return make_cipher(
+        resolve_active_key(settings),
+        retired,
+        write_v2=settings.aad_bind,
+        allow_unmarked=settings.allow_unmarked_ciphertext,
+    )
 
 
 class StoreNotFoundError(RuntimeError):

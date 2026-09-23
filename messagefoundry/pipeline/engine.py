@@ -351,6 +351,9 @@ class Engine:
         )
         self._cert_expiry_runner: CertExpiryRunner | None = None
         self._gcm_invocation_runner: GcmInvocationRunner | None = None
+        # The store cipher whose unmarked-value refusals this engine forwards as an alert (BACKLOG
+        # #1169); None until start() arms it, and again after stop() disarms it.
+        self._cipher_refusal_armed: Any = None
         # [secret_rotation] secret-rotation reminder (#195b, ADR 0019 §5) — the secret-side twin of
         # cert_monitor. None (embedding/tests) → no reminder task; a no-op when warn_days=0 or nothing is
         # tracked. The tracked-secret set is derived at scan time from [secret_rotation] so a reload is
@@ -1036,10 +1039,58 @@ class Engine:
             except Exception:  # an alert-sink failure must never break startup
                 log.warning("audit-chain integrity alert could not be delivered")
 
+    def _arm_cipher_refusal_alert(self) -> None:
+        """Forward every unmarked-value refusal by the store cipher to the AlertSink (BACKLOG #1169).
+
+        A keyed store refuses a non-blank unmarked value in a cipher column: a stripped marker or a
+        planted row. The read site contains the ``CipherError`` -- a claim dead-letters the row -- but
+        the store cannot reach the AlertSink, so the refusal would otherwise reach nobody but the log.
+        Reuses the ``integrity_drift`` channel the audit-chain tamper check uses, under its own
+        ``store-cipher`` subject so it throttles and routes independently of that check.
+
+        Tolerant of a store without ``cipher()`` and of a cipher without the hook (keyless, or a test
+        double), exactly like the GCM runner's refill hook. The hook may fire on a worker thread, so it
+        hops back onto the loop before touching the sink."""
+        getter = getattr(self.store, "cipher", None)
+        cipher = getter() if callable(getter) else None
+        setter = getattr(cipher, "set_refusal_hook", None)
+        if not callable(setter):
+            return
+        loop = asyncio.get_running_loop()
+
+        def _refused(table: str, column: str) -> None:
+            loop.call_soon_threadsafe(self._alert_cipher_refusal, table, column)
+
+        setter(_refused)
+        self._cipher_refusal_armed = cipher
+
+    def _disarm_cipher_refusal_alert(self) -> None:
+        cipher = self._cipher_refusal_armed
+        self._cipher_refusal_armed = None
+        setter = getattr(cipher, "set_refusal_hook", None)
+        if callable(setter):
+            setter(None)
+
+    def _alert_cipher_refusal(self, table: str, column: str) -> None:
+        """Raise the ``store-cipher`` integrity alert. Names only the table and column, which the
+        cipher took from the cell AAD: never the row key, never the value, so it carries no PHI."""
+        reason = (
+            f"the keyed store refused an unmarked value in cipher column {table}.{column} "
+            "(a stripped marker or a planted plaintext row)"
+        )
+        if self._alert_sink is None:
+            return  # the cipher already logged the refusal at WARNING
+        try:
+            self._alert_sink.integrity_drift("store-cipher", reason=reason, drift_count=1)
+        except Exception:  # noqa: BLE001 — an alert-sink failure must never break a read path
+            log.warning("store-cipher integrity alert could not be delivered")
+
     async def start(self) -> None:
         """Recover crashed in-flight rows (every stage), dead-letter outbound rows for removed
         outbounds, then start the wired graph."""
         self.started_at = time.time()
+        # Before anything reads the store, so a refusal during recovery alerts too (BACKLOG #1169).
+        self._arm_cipher_refusal_alert()
         # All-stages recovery: returns any row a crash left `inflight` — ingress rows mid-route and
         # outbound rows mid-delivery alike — to `pending` so the staged workers re-claim them
         # (staged pipeline, ADR 0001). The handoff/delivery transactions make the re-run idempotent.
@@ -2191,6 +2242,7 @@ class Engine:
         if self._gcm_invocation_runner is not None:
             await self._gcm_invocation_runner.stop()
             self._gcm_invocation_runner = None
+        self._disarm_cipher_refusal_alert()
         # Deregister cluster membership after the runner has quiesced but before the store closes (the
         # coordinator marks its node left over the same pool). stop() is idempotent and safe even if
         # start() raised (then there's just nothing to cancel). NullCoordinator is a no-op.

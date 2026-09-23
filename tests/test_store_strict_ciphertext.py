@@ -1,0 +1,351 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+"""A keyed store refuses an unmarked value in a cipher column (BACKLOG #1169, ASVS 11.3.3).
+
+**The gap.** The cipher's read seam returned any value without an ``mfenc:`` marker unchanged, as
+"legacy plaintext or a purged blank". So a stripped marker or a planted plaintext row read back as that
+row's content, and the next ``rotate-key`` sealed it into genuine ciphertext. Substitution has a tag to
+fail; a downgrade to plaintext has none, so only a refusal protects it.
+
+**What each test pins.**
+
+* A sealed surface -- one (table, column) that already holds ciphertext -- refuses an unmarked value
+  and raises the ``store-cipher`` alert, which names the table and column and nothing else.
+* An unsealed surface still has its legacy plaintext sealed at a keyed open.
+* NULL and a purged ``''`` are never sealed and never refused.
+* A keyless store is unchanged.
+* ``[store].allow_unmarked_ciphertext`` restores the passthrough and the seal-everything sweep.
+* The uploaded-file store is unchanged: whether it refuses is an open owner question.
+* A crash part-way through a first keyed open leaves the surface all sealed or all unsealed, and the
+  AES-GCM invocation bound (ASVS 11.3.4) still leads every encrypt of the one-transaction seal.
+
+SQLite only. The server-backend runtime twins live in ``tests/test_postgres_store.py`` and
+``tests/test_sqlserver_store.py`` and run only on the hosted ``postgres-store`` / ``sqlserver-store``
+legs.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import sqlite3
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from messagefoundry.config.settings import StoreSettings, security_loosenings
+from messagefoundry.pipeline.engine import Engine
+from messagefoundry.store import MessageStore
+from messagefoundry.store import crypto as crypto_mod
+from messagefoundry.store.base import build_store_cipher
+from messagefoundry.store.crypto import (
+    MARKER_PREFIX,
+    AesGcmCipher,
+    CipherError,
+    aad_cell_name,
+    cell_aad,
+    generate_key,
+    make_cipher,
+)
+from messagefoundry.uploads import UploadStore
+
+_RAW = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG{i}|P|2.5.1\rPID|1||{i}^^^H^MR||DOE^JANE\r"
+_PLANT = "MSH|^~\\&|EVIL|F|R|RF|20260101||ADT^A01|PLANTED|P|2.5.1\rPID|1||666^^^H^MR||ROE^RICH\r"
+
+
+def _keyed(key: str, **kw: Any) -> AesGcmCipher:
+    cipher = make_cipher(key, **kw)
+    assert isinstance(cipher, AesGcmCipher)
+    return cipher
+
+
+async def _seed(db: Path, n: int, cipher: AesGcmCipher | None = None) -> list[str]:
+    """Open the store (keyless unless ``cipher``), write ``n`` ingress messages, return their ids."""
+    store = await MessageStore.open(db, cipher=cipher)
+    try:
+        return [await store.enqueue_ingress(channel_id="c", raw=_RAW.format(i=i)) for i in range(n)]
+    finally:
+        await store.close()
+
+
+def _raw_at_rest(db: Path, mid: str) -> str | None:
+    with sqlite3.connect(db) as conn:
+        row = conn.execute("SELECT raw FROM messages WHERE id=?", (mid,)).fetchone()
+    return None if row is None else row[0]
+
+
+def _set_raw(db: Path, mid: str, value: str) -> None:
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("UPDATE messages SET raw=? WHERE id=?", (value, mid))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class _Sink:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str, int]] = []
+
+    def integrity_drift(self, name: str, *, reason: str, drift_count: int) -> None:
+        self.events.append((name, reason, drift_count))
+
+
+# --- the refusal ---------------------------------------------------------------------------------
+
+
+async def test_unmarked_value_on_a_sealed_surface_is_refused_and_alerts(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    db = tmp_path / "sealed.db"
+    key = generate_key()
+    good, planted = await _seed(db, 2, _keyed(key))
+    assert (_raw_at_rest(db, planted) or "").startswith(MARKER_PREFIX)  # the surface IS sealed
+    _set_raw(db, planted, _PLANT)  # a stripped marker / planted plaintext row
+
+    cipher = _keyed(key)
+    with caplog.at_level(logging.WARNING):
+        store = await MessageStore.open(db, cipher=cipher)
+    try:
+        # The keyed open did NOT seal the plant: sealing would launder it into genuine ciphertext.
+        assert _raw_at_rest(db, planted) == _PLANT
+        assert "messages.raw holds 1 unmarked value(s) beside sealed ones" in caplog.text
+
+        sink = _Sink()
+        engine = Engine(store, alert_sink=sink)  # type: ignore[arg-type]
+        engine._arm_cipher_refusal_alert()
+        try:
+            assert (await store.get_message(good) or {})["raw"] == _RAW.format(i=0)
+            with pytest.raises(CipherError, match=r"messages\.raw"):
+                await store.get_message(planted)
+            await asyncio.sleep(0)  # the hook hops onto the loop with call_soon_threadsafe
+            await asyncio.sleep(0)
+        finally:
+            engine._disarm_cipher_refusal_alert()
+        assert len(sink.events) == 1, sink.events
+        subject, reason, count = sink.events[0]
+        assert (subject, count) == ("store-cipher", 1)
+        assert "messages.raw" in reason
+        # Names the cell, never the row or the value: no row key, no PHI.
+        assert planted not in reason and "ROE" not in reason and "666" not in reason
+        # Disarmed: a later refusal reaches no sink.
+        with pytest.raises(CipherError):
+            await store.get_message(planted)
+        await asyncio.sleep(0)
+        assert len(sink.events) == 1
+    finally:
+        await store.close()
+
+
+def test_the_refusal_hook_gets_the_cell_from_the_aad_and_never_the_row() -> None:
+    cipher = _keyed(generate_key())
+    seen: list[tuple[str, str]] = []
+    cipher.set_refusal_hook(lambda table, column: seen.append((table, column)))
+    with pytest.raises(CipherError, match=r"queue\.payload"):
+        cipher.decrypt("plain", aad=cell_aad("queue", "payload", 42))
+    assert seen == [("queue", "payload")]
+    assert aad_cell_name(cell_aad("state", "value", "ns", "PATIENT-KEY")) == ("state", "value")
+    assert aad_cell_name(None) == ("?", "?")
+    assert aad_cell_name(b"garbage") == ("?", "?")
+
+
+# --- sealing an unsealed surface -----------------------------------------------------------------
+
+
+async def test_legacy_plaintext_on_an_unsealed_surface_is_sealed(tmp_path: Path) -> None:
+    db = tmp_path / "legacy.db"
+    ids = await _seed(db, 3)
+    assert all(not (_raw_at_rest(db, m) or "").startswith(MARKER_PREFIX) for m in ids)
+
+    store = await MessageStore.open(db, cipher=_keyed(generate_key()))
+    try:
+        for i, mid in enumerate(ids):
+            at_rest = _raw_at_rest(db, mid) or ""
+            assert at_rest.startswith(MARKER_PREFIX) and "DOE" not in at_rest
+            assert (await store.get_message(mid) or {})["raw"] == _RAW.format(i=i)
+    finally:
+        await store.close()
+
+
+async def test_blank_and_null_values_are_untouched(tmp_path: Path) -> None:
+    db = tmp_path / "blank.db"
+    purged, _other = await _seed(db, 2)
+    _set_raw(db, purged, "")  # what every purge path writes
+    key = generate_key()
+
+    store = await MessageStore.open(db, cipher=_keyed(key))
+    try:
+        assert _raw_at_rest(db, purged) == ""  # not sealed into ciphertext-of-empty
+        record = await store.get_message(purged) or {}
+        assert record["raw"] == "" and record["summary"] is None  # neither refused
+    finally:
+        await store.close()
+    # And on a surface that is now SEALED, a blank still reads without a refusal.
+    store = await MessageStore.open(db, cipher=_keyed(key))
+    try:
+        assert (await store.get_message(purged) or {})["raw"] == ""
+    finally:
+        await store.close()
+
+
+async def test_a_keyless_store_is_unchanged(tmp_path: Path) -> None:
+    db = tmp_path / "keyless.db"
+    (mid,) = await _seed(db, 1)
+    _set_raw(db, mid, _PLANT)
+    store = await MessageStore.open(db)
+    try:
+        assert (await store.get_message(mid) or {})["raw"] == _PLANT
+        assert _raw_at_rest(db, mid) == _PLANT
+    finally:
+        await store.close()
+
+
+# --- the opt-out ---------------------------------------------------------------------------------
+
+
+async def test_the_opt_out_restores_passthrough_and_the_seal_everything_sweep(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "optout.db"
+    key = generate_key()
+    _good, planted = await _seed(db, 2, _keyed(key))
+    _set_raw(db, planted, _PLANT)
+
+    cipher = build_store_cipher(StoreSettings(encryption_key=key, allow_unmarked_ciphertext=True))
+    assert isinstance(cipher, AesGcmCipher) and cipher.allow_unmarked
+    assert cipher.decrypt("unmarked") == "unmarked"
+    store = await MessageStore.open(db, cipher=cipher)
+    try:
+        # The old sweep: every unmarked value is sealed, even beside ciphertext.
+        assert (_raw_at_rest(db, planted) or "").startswith(MARKER_PREFIX)
+        assert (await store.get_message(planted) or {})["raw"] == _PLANT
+    finally:
+        await store.close()
+
+
+def test_the_setting_ships_off_and_on_is_a_named_loosening() -> None:
+    from messagefoundry.config.settings import (
+        AlertsSettings,
+        AuthSettings,
+        SecretRotationSettings,
+        SecuritySettings,
+    )
+
+    assert StoreSettings().allow_unmarked_ciphertext is False
+    shipped = build_store_cipher(StoreSettings(encryption_key=generate_key()))
+    assert isinstance(shipped, AesGcmCipher) and not shipped.allow_unmarked
+
+    def names(store: StoreSettings) -> dict[str, str]:
+        return dict(
+            security_loosenings(
+                SecuritySettings(),
+                store,
+                AuthSettings(),
+                AlertsSettings(),
+                SecretRotationSettings(),
+                (),
+                (),
+                (),
+                None,
+            )
+        )
+
+    assert "allow_unmarked_ciphertext" not in names(StoreSettings())
+    risk = names(StoreSettings(allow_unmarked_ciphertext=True))["allow_unmarked_ciphertext"]
+    assert "no effect without a store key" in risk
+
+
+# --- uploads are out of scope, and must not change -----------------------------------------------
+
+
+async def test_the_uploaded_file_store_is_unchanged(tmp_path: Path) -> None:
+    root = tmp_path / "uploads"
+    data = _RAW.format(i=1).encode()
+    plain = UploadStore(root, make_cipher(None), max_bytes=4096)
+    meta = await plain.save(data=data, filename="x.hl7", uploader="op", uploader_id="u-op")
+
+    # The live store cipher is shared with the upload store, strict policy and all.
+    keyed = UploadStore(root, _keyed(generate_key()), max_bytes=4096)
+    assert [m.file_id for m in await keyed.list_files()] == [meta.file_id]
+    assert await keyed.read_bytes(meta.file_id) == data
+    # And a first key-enable still seals a legacy plaintext upload.
+    await keyed.reseal_to_active()
+    blob = (root / f"{meta.file_id}.blob").read_text(encoding="utf-8")
+    assert blob.startswith(MARKER_PREFIX)
+    assert await keyed.read_bytes(meta.file_id) == data
+
+
+# --- crash safety and the 11.3.4 bound -----------------------------------------------------------
+
+
+async def test_a_crash_mid_seal_leaves_the_surface_all_unsealed(tmp_path: Path) -> None:
+    """600 legacy rows span two of the sweep's 500-row batches, and the simulated crash lands in the
+    second. Committing per batch -- the pre-#1169 sweep -- leaves 500 sealed and 100 not, and option A
+    would then refuse those 100 legitimate rows forever."""
+    db = tmp_path / "crash.db"
+    ids = await _seed(db, 600)
+    key = generate_key()
+
+    cipher = _keyed(key)
+    real_encrypt = cipher.encrypt
+    calls = 0
+
+    def dies_part_way(plaintext: str, *, aad: bytes | None = None) -> str:
+        nonlocal calls
+        calls += 1
+        if calls > 550:
+            raise RuntimeError("simulated crash mid-seal")
+        return real_encrypt(plaintext, aad=aad)
+
+    cipher.encrypt = dies_part_way  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        await MessageStore.open(db, cipher=cipher)
+    with sqlite3.connect(db) as conn:
+        (marked,) = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE raw LIKE ?", (f"{MARKER_PREFIX}%",)
+        ).fetchone()
+    assert marked == 0, f"{marked} of 600 rows committed sealed: the surface is half-sealed"
+
+    healthy = _keyed(key)
+    store = await MessageStore.open(db, cipher=healthy)
+    try:
+        assert all((_raw_at_rest(db, m) or "").startswith(MARKER_PREFIX) for m in ids)
+        assert (await store.get_message(ids[0]) or {})["raw"] == _RAW.format(i=0)
+        assert (await store.get_message(ids[-1]) or {})["raw"] == _RAW.format(i=599)
+    finally:
+        await store.close()
+
+
+async def test_the_one_transaction_seal_never_outruns_its_reservation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ASVS 11.3.4. The seal commits a surface once, so it cannot top the reserve up part-way. At every
+    encrypt, the COMMITTED persisted total must already cover what the cipher has spent, or a kill at
+    that instant under-counts the key. A small block makes a 30-row surface outrun one block."""
+    monkeypatch.setattr(crypto_mod, "_GCM_RESERVE_BLOCK", 8)
+    monkeypatch.setattr(crypto_mod, "_GCM_RESERVE_REFILL_AT", 4)
+    db = tmp_path / "bound.db"
+    await _seed(db, 30)
+
+    cipher = _keyed(generate_key())
+    real_encrypt = cipher.encrypt
+    shortfalls: list[tuple[int, int]] = []
+
+    def checked(plaintext: str, *, aad: bytes | None = None) -> str:
+        out = real_encrypt(plaintext, aad=aad)
+        # A separate connection sees only what is COMMITTED -- what a crash would leave behind.
+        with sqlite3.connect(db) as conn:
+            row = conn.execute(
+                "SELECT invocations FROM cipher_meta WHERE key_id=?", (cipher.active_key_id,)
+            ).fetchone()
+        persisted = int(row[0]) if row else 0
+        spent = cipher.cumulative_invocations()
+        if persisted < spent:
+            shortfalls.append((persisted, spent))
+        return out
+
+    cipher.encrypt = checked  # type: ignore[method-assign]
+    store = await MessageStore.open(db, cipher=cipher)
+    await store.close()
+    assert not shortfalls, f"the persisted bound trailed the encrypts: {shortfalls[:5]}"

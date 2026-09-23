@@ -488,7 +488,11 @@ class UploadStore:
         return self._cipher.encrypt(b64, aad=cell_aad("uploaded_file", "body", file_id))
 
     def _decrypt_blob(self, stored: str, file_id: str) -> bytes:
-        b64 = self._cipher.decrypt(stored, aad=cell_aad("uploaded_file", "body", file_id))
+        # allow_unmarked=True keeps this surface exactly as it was: whether the uploaded-file store
+        # refuses an unmarked file is an open owner question (BACKLOG #1169), not decided here.
+        b64 = self._cipher.decrypt(
+            stored, aad=cell_aad("uploaded_file", "body", file_id), allow_unmarked=True
+        )
         return base64.b64decode(b64)
 
     def _encrypt_meta(self, meta: UploadedFileMeta) -> str:
@@ -497,7 +501,9 @@ class UploadStore:
         )
 
     def _decrypt_meta(self, stored: str, file_id: str) -> UploadedFileMeta:
-        raw = self._cipher.decrypt(stored, aad=cell_aad("uploaded_file", "meta", file_id))
+        raw = self._cipher.decrypt(  # allow_unmarked: see _decrypt_blob (BACKLOG #1169)
+            stored, aad=cell_aad("uploaded_file", "meta", file_id), allow_unmarked=True
+        )
         d = json.loads(raw)
         return UploadedFileMeta(
             file_id=str(d["file_id"]),
@@ -1142,7 +1148,9 @@ def _reencrypt_value(cipher: AesGcmCipher, stored: str, aad: bytes) -> str:
     on store classes this LEAF module may not import (see the module docstring), so the shared name
     is what keeps a grep for ``_reencrypt_value`` from missing this one. Pairing a decrypt and an
     encrypt with different AADs is the mistake the single-expression form exists to prevent."""
-    return cipher.encrypt(cipher.decrypt(stored, aad=aad), aad=aad)
+    # allow_unmarked=True: the uploaded-file store's reseal keeps its pre-#1169 behaviour (see
+    # UploadStore._decrypt_blob), so a first key-enable still seals a legacy plaintext upload.
+    return cipher.encrypt(cipher.decrypt(stored, aad=aad, allow_unmarked=True), aad=aad)
 
 
 def _atomic_write_text(root: Path, path: Path, text: str) -> None:
