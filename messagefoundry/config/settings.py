@@ -5205,6 +5205,7 @@ def security_loosenings(
     expiry_relaxed_hops: Sequence[str],
     unverified_db_hops: Sequence[str],
     store_privilege: StorePrivilegePosture | None,
+    audit_chain_unkeyed: bool | None,
 ) -> list[tuple[str, str]]:
     """The ``[security]`` switches at their INSECURE value, plus the enumerated deviations outside that
     section, as ``(switch, plain-language risk)``.
@@ -5250,6 +5251,12 @@ def security_loosenings(
     a clean result and this registry never renders it as one. Note the switch that acts on the finding
     — ``[store].require_least_privilege`` — is a HARDENING, so it is not itself reported here; the
     DEVIATION is what the observation found, exactly as with the three connection-scoped entries.
+
+    ``audit_chain_unkeyed`` is the second store OBSERVATION (BACKLOG #1905), from the open store's
+    ``audit_chain_unkeyed()``: the store holds a key, yet its audit chain is keyless SHA-256 because
+    rows were written before any key was in hand, and a keyed open never re-keys existing rows.
+    ``None`` has the same meaning as for ``store_privilege`` -- no store is open at this call site, so
+    nothing was observed -- and is never read as a clean result.
 
     The three sequence parameters are the CONNECTION-scoped deviations, each a list of connection NAMES:
     ``cleartext_hops`` declares ``cleartext_accepted`` (ADR 0153), ``expiry_relaxed_hops`` declares
@@ -5556,6 +5563,20 @@ def security_loosenings(
                     "its runbook says it must not",
                 )
             )
+    # --- the AUDIT CHAIN's observed keying (BACKLOG #1905). An observation, like the entry above: no
+    # switch declares it. A store that holds a key but opened onto a keyless chain with rows carries
+    # tamper-evidence an attacker with write access can forge, and nothing else in this registry
+    # would say so -- the at-rest entries report a MISSING key, and here the key is present.
+    if audit_chain_unkeyed:
+        out.append(
+            (
+                "audit_chain_unkeyed",
+                "the audit chain is KEYLESS SHA-256 although a store key is configured -- its rows "
+                "were written before the key was in hand, and opening with a key does not re-key "
+                "existing rows, so anyone who can write audit_log can forge a row that verifies "
+                "clean; run `messagefoundry rekey-audit` to verify the chain and key every row after it",
+            )
+        )
     return out
 
 

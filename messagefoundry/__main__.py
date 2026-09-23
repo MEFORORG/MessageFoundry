@@ -1721,45 +1721,9 @@ def _serve(args: argparse.Namespace) -> int:
     # file (Windows) counts as a configured key; if it's set but unreadable here, open_store fails closed
     # at startup with the DPAPI error.
     if not (settings.store.encryption_key or settings.store.encryption_key_file):
-        if settings.store.require_encryption:
-            print(
-                "error: [store].require_encryption is set but no MEFOR_STORE_ENCRYPTION_KEY (or "
-                "[store].encryption_key_file) is configured; refusing to start (PHI would be stored "
-                "unencrypted at rest)",
-                file=sys.stderr,
-            )
-            return 2
-        if not settings.store.allow_unencrypted_phi:
-            # Secure-by-default: any instance, in any environment, refuses to run keyless. This is
-            # the H3 tightening — previously prod refused and non-prod only warned (fail-open), but
-            # dev/staging routinely hold near-real PHI.
-            print(
-                f"error: no MEFOR_STORE_ENCRYPTION_KEY (or [store].encryption_key_file) set on a "
-                f"PHI instance (environment {env_name!r}); refusing to start "
-                "— PHI bodies and the summary/metadata (MRN + patient name) and "
-                "error/last_error/detail columns would be stored UNENCRYPTED at rest. Generate a "
-                "key with `messagefoundry gen-key` (or protect one to a file with `messagefoundry "
-                "protect-key`) and configure it; or, to deliberately run without at-rest "
-                "encryption, set [security].allow_unencrypted_phi=true (audited).",
-                file=sys.stderr,
-            )
-            return 2
-        if enforcing and not settings.security.allow_unencrypted_phi_under_strict_enforcement:
-            # Secure-by-default under STRICT ENFORCEMENT (ADR 0140): keyless PHI under enforcement
-            # requires a SECOND acknowledgment beyond [security].allow_unencrypted_phi — the highest-
-            # risk posture (real PHI + strict enforcement) is never one flag away from plaintext at
-            # rest. Under warn enforcement PHI keeps the single-flag audited override below.
-            print(
-                "error: [security].allow_unencrypted_phi=true on a PHI instance under strict "
-                f"enforcement (environment {env_name!r}), but "
-                "[security].allow_unencrypted_phi_under_strict_enforcement is not set; refusing to "
-                "start — PHI bodies and the summary/metadata (MRN + patient name) and "
-                "error/last_error/detail columns would be stored UNENCRYPTED at rest. Configure a "
-                "key (MEFOR_STORE_ENCRYPTION_KEY), or set "
-                "[security].allow_unencrypted_phi_under_strict_enforcement=true to deliberately run "
-                "keyless under strict enforcement (audited).",
-                file=sys.stderr,
-            )
+        keyless_refusal = _keyless_store_refusal(settings, env_name=env_name, enforcing=enforcing)
+        if keyless_refusal is not None:
+            print(f"error: {keyless_refusal}", file=sys.stderr)
             return 2
         # Explicit, audited override: start keyless on a PHI instance. Emit a loud warning AND a
         # WARNING-level audit record (captured by NSSM stdout/SIEM) so the deliberate weakening is
@@ -2075,7 +2039,9 @@ def _serve(args: argparse.Namespace) -> int:
     # The store is NOT open yet either, so the #1008 store-principal privilege OBSERVATION is passed as
     # None for the same reason and with the same discipline: it is reported moments later by the
     # preflight's own log line + audit row once the lifespan opens the store, and completely by
-    # GET /security/posture. None here is "not yet observed", never "observed and clean".
+    # GET /security/posture. None here is "not yet observed", never "observed and clean". The same
+    # holds for the #1905 audit-chain keying observation: the store logs its own WARNING when it opens
+    # onto a keyless chain, and GET /security/posture reports it off the live store.
     _loosenings = security_loosenings(
         settings.security,
         settings.store,
@@ -2085,6 +2051,7 @@ def _serve(args: argparse.Namespace) -> int:
         (),
         (),
         (),
+        None,
         None,
     )
     if _loosenings:
@@ -4744,6 +4711,62 @@ def _read_new_password(prompt: str) -> str:
     return first
 
 
+def _keyless_store_refusal(
+    settings: ServiceSettings, *, env_name: str | None, enforcing: bool
+) -> str | None:
+    """Why a store with NO key configured may not be opened, or ``None`` when it may.
+
+    The at-rest gate's decision, stated once and read by every command that opens a store for WRITING
+    on a fresh install: ``serve``, and ``provision-admin`` since BACKLOG #1905. Before that item it
+    lived inline in ``serve`` alone, so the documented install order -- ``provision-admin`` before the
+    first ``serve``, with the key in the service environment rather than the operator's shell --
+    opened the store keyless, wrote the first audit row as keyless SHA-256, and left a chain that a
+    later keyed open never keys (``_load_audit_chain_meta`` auto-keys only an EMPTY ``audit_log``).
+
+    Call it only when no key is configured. ``None`` means one of the two audited opt-outs applies
+    and the caller proceeds keyless; ``serve`` then logs its AUDIT line. The returned text carries no
+    ``error:`` prefix, so ``serve`` prints it byte-identically to its pre-#1905 message and a caller
+    reporting through ``_emit_error`` does not double it. ``env_name`` is ``None`` for a command
+    that takes no ``--env`` (``provision-admin``), and the message then omits the clause rather than
+    printing ``environment None``; ``serve`` always has one, so its text is unchanged."""
+    where = f" (environment {env_name!r})" if env_name is not None else ""
+    if settings.store.require_encryption:
+        return (
+            "[store].require_encryption is set but no MEFOR_STORE_ENCRYPTION_KEY (or "
+            "[store].encryption_key_file) is configured; refusing to start (PHI would be stored "
+            "unencrypted at rest)"
+        )
+    if not settings.store.allow_unencrypted_phi:
+        # Secure-by-default: any instance, in any environment, refuses to run keyless. This is the
+        # H3 tightening -- previously prod refused and non-prod only warned (fail-open), but
+        # dev/staging routinely hold near-real PHI.
+        return (
+            f"no MEFOR_STORE_ENCRYPTION_KEY (or [store].encryption_key_file) set on a "
+            f"PHI instance{where}; refusing to start "
+            "— PHI bodies and the summary/metadata (MRN + patient name) and "
+            "error/last_error/detail columns would be stored UNENCRYPTED at rest. Generate a "
+            "key with `messagefoundry gen-key` (or protect one to a file with `messagefoundry "
+            "protect-key`) and configure it; or, to deliberately run without at-rest "
+            "encryption, set [security].allow_unencrypted_phi=true (audited)."
+        )
+    if enforcing and not settings.security.allow_unencrypted_phi_under_strict_enforcement:
+        # Secure-by-default under STRICT ENFORCEMENT (ADR 0140): keyless PHI under enforcement
+        # requires a SECOND acknowledgment beyond [security].allow_unencrypted_phi -- the highest-risk
+        # posture (real PHI + strict enforcement) is never one flag away from plaintext at rest. Under
+        # warn enforcement PHI keeps the single-flag audited override.
+        return (
+            "[security].allow_unencrypted_phi=true on a PHI instance under strict "
+            f"enforcement{where}, but "
+            "[security].allow_unencrypted_phi_under_strict_enforcement is not set; refusing to "
+            "start — PHI bodies and the summary/metadata (MRN + patient name) and "
+            "error/last_error/detail columns would be stored UNENCRYPTED at rest. Configure a "
+            "key (MEFOR_STORE_ENCRYPTION_KEY), or set "
+            "[security].allow_unencrypted_phi_under_strict_enforcement=true to deliberately run "
+            "keyless under strict enforcement (audited)."
+        )
+    return None
+
+
 def _provision_admin(args: argparse.Namespace) -> int:
     """Create the first administrator offline (BACKLOG #1136, ASVS 6.3.2).
 
@@ -4777,6 +4800,29 @@ def _provision_admin(args: argparse.Namespace) -> int:
         settings = load_settings(config_path=args.service_config, cli=cli)
     except (FileNotFoundError, ValueError, ValidationError) as exc:
         return _emit_error(str(exc), as_json=args.json)
+
+    # BACKLOG #1905: the same no-key refusal `serve` applies, and BEFORE the password prompt and the
+    # store open, so a refusal leaves no keyless store behind. This command writes the store's FIRST
+    # audit row, and a chain that starts keyless stays keyless: a later keyed open never re-keys rows
+    # that already exist. The key has to be in the environment of the shell running THIS command --
+    # the service's NSSM environment is not visible here, which is how the documented order used to
+    # go wrong.
+    if not (settings.store.encryption_key or settings.store.encryption_key_file):
+        from messagefoundry.config.ai_policy import SecurityEnforcement
+
+        keyless_refusal = _keyless_store_refusal(
+            settings,
+            env_name=settings.ai.environment,
+            enforcing=settings.security.enforcement is SecurityEnforcement.ENFORCE,
+        )
+        if keyless_refusal is not None:
+            return _emit_error(
+                "provision-admin opens the store and writes its first audit row, so the store key "
+                "must be set in THIS shell (MEFOR_STORE_ENCRYPTION_KEY, or "
+                "[store].encryption_key_file in the service config), not only in the service's "
+                "environment: a chain that starts keyless stays keyless. " + keyless_refusal,
+                as_json=args.json,
+            )
 
     try:
         password = _read_new_password("New administrator password: ")
@@ -6165,14 +6211,15 @@ def _security(args: argparse.Namespace) -> int:
 
     def _loosenings(sec: SecuritySettings) -> list[dict[str, str]]:
         # This CLI reads a SETTINGS file and never loads the connection graph — nor does it open the
-        # store — so it can see NEITHER the three per-connection declarations NOR the #1008
-        # store-principal privilege observation. It passes empty lists and None and declares BOTH gaps
+        # store — so it can see NEITHER the three per-connection declarations NOR the two store
+        # observations (#1008 privilege, #1905 audit-chain keying). It passes empty lists and None and
+        # declares BOTH gaps
         # in `loosenings_scope` below, instead of reporting a settings-only view as if it were the whole
         # posture. `messagefoundry check` and GET /security/posture are the complete surfaces.
         return [
             {"switch": s, "risk": r}
             for s, r in security_loosenings(
-                sec, _store, _auth, _alerts, _rotation, (), (), (), None
+                sec, _store, _auth, _alerts, _rotation, (), (), (), None, None
             )
         ]
 
@@ -6193,8 +6240,8 @@ def _security(args: argparse.Namespace) -> int:
         "loosenings_scope": (
             "settings only ([security]/[store]/[auth]/[alerts]); the per-connection "
             "cleartext_accepted, tls_allow_expired and generic-ODBC DATABASE TLS declarations are NOT "
-            "included, and neither is the store-principal privilege observation (#1008 — this command "
-            "opens no store). These are the AUTHORED values, so a `serve --host` bind override on a "
+            "included, and neither are the store-principal privilege and audit-chain keying "
+            "observations (#1008, #1905 — this command opens no store). These are the AUTHORED values, so a `serve --host` bind override on a "
             "running engine is not reflected here either — see `messagefoundry check` or "
             "GET /security/posture"
         ),

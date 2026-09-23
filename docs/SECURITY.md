@@ -79,6 +79,14 @@ operator-named administrator pre-empts it and the account named `admin` never ex
 BACKLOG #1136). **The shipped default is unchanged:** skip this and you still get the bootstrap
 account described above.
 
+**Set the store key in the shell you run it from.** `provision-admin` opens the store and writes its
+first audit row, so it needs `MEFOR_STORE_ENCRYPTION_KEY` (or `[store].encryption_key_file`) in its
+own environment. The key in the service's NSSM environment is not visible to your shell. With no key,
+the command refuses exactly as `serve` does (BACKLOG #1905). The refusal matters because an audit
+chain that starts keyless stays keyless: opening the store with a key later does not re-key rows that
+already exist. If a store is already in that state, it logs a WARNING at every open and
+`GET /security/posture` reports `audit_chain_unkeyed`; `messagefoundry rekey-audit` clears it.
+
 Four properties are load-bearing rather than incidental:
 
 - **The gate is host access**, the same one `messagefoundry admin-unlock` ships on

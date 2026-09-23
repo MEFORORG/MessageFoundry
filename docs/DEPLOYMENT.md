@@ -577,7 +577,8 @@ On an instance under `[security].enforcement = enforce` with security notices sw
 Administrator has a notification address** — so a configured SMTP transport does not by itself mean
 any notice is deliverable. Set an address on at least one enabled Administrator (on a new install,
 `messagefoundry provision-admin --username <name> --email <address>` before the first `serve` avoids
-the state entirely), or record the pull-only `/me/security-events` feed as accepted in writing with
+the state entirely; set the store key in that shell first, because the command refuses a keyless
+open as `serve` does, see [`SECURITY.md`](SECURITY.md)), or record the pull-only `/me/security-events` feed as accepted in writing with
 `[alerts].security_notifications_required = false`.
 
 **Why the number differs, since it will look like an inconsistency.** The check needs the user

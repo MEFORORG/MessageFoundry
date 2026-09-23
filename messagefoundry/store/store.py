@@ -1501,6 +1501,24 @@ def audit_row_hash(
     return hmac.new(key, data, hashlib.sha256).hexdigest()
 
 
+def warn_unkeyed_audit_chain(logger: logging.Logger, rows: int) -> None:
+    """Log that a keyed-capable store opened onto a KEYLESS audit chain (BACKLOG #1905).
+
+    Shared verbatim by all three backends. A store that has a key but no keying watermark and at least
+    one audit row carries a chain anyone who can write ``audit_log`` can forge: every row is plain
+    SHA-256, and ``_load_audit_chain_meta`` auto-keys only an EMPTY log. Keying the existing rows at
+    open is forbidden -- it would bless a forged row into a keyed chain -- so the remedy is the
+    explicit, chain-verifying ``rekey-audit``, and this line names it. The same state is reported by
+    ``security_loosenings()`` as ``audit_chain_unkeyed``, so it is not only a log line."""
+    logger.warning(
+        "audit chain is KEYLESS (%d existing row(s), no keying watermark) although a store encryption "
+        "key or isolated-module MAC is configured: its rows are plain SHA-256 and can be forged by "
+        "anyone who can write audit_log. Opening with a key does not re-key existing rows. Run "
+        "`messagefoundry rekey-audit` to verify the chain and key every row after it.",
+        rows,
+    )
+
+
 #: The phrase :func:`audit_prefix_verdict` puts in its failure message, exported so a CALLER can tell a
 #: TRUNCATED/REWRITTEN TAIL from a BROKEN CHAIN without walking the log twice (BACKLOG #328).
 #:
@@ -2848,6 +2866,9 @@ class MessageStore:
         # Audit-chain keying watermark (#190): the first audit_log.id hashed with the key. None = the
         # whole chain is keyless. Loaded (and, for a fresh encrypted store, auto-set) by open().
         self._audit_keyed_from: int | None = None
+        # BACKLOG #1905: a keyed-capable store that opened onto a keyless chain with rows. Set only by
+        # `_load_audit_chain_meta`, cleared only by a successful `rekey_audit_chain`.
+        self._audit_chain_unkeyed = False
         # `message_events` verbosity gate (#63): "all"/"errors"/"off". Governs how many rows reach the
         # message_events disposition log; the compliance floor is always retained (see should_record_event).
         self._message_events = message_events
@@ -3289,13 +3310,22 @@ class MessageStore:
             return  # keyless store — the chain stays byte-identical to pre-#190
         cur = await self._db.execute("SELECT COUNT(*) AS n FROM audit_log")
         cnt = await cur.fetchone()
-        if cnt is not None and int(cnt["n"]) == 0:
+        rows = int(cnt["n"]) if cnt is not None else 0
+        if rows == 0:
             async with self._lock:
                 await self._db.execute(
                     "INSERT OR REPLACE INTO audit_chain_meta (id, keyed_from_id) VALUES (1, 1)"
                 )
                 await self._commit()
             self._audit_keyed_from = 1
+        else:
+            # BACKLOG #1905: never silent. Report it; do not re-key it (see the docstring above).
+            self._audit_chain_unkeyed = True
+            warn_unkeyed_audit_chain(log, rows)
+
+    def audit_chain_unkeyed(self) -> bool:
+        """True when this store can key its audit chain but the chain on disk is keyless (#1905)."""
+        return self._audit_chain_unkeyed
 
     def _audit_keyed_capable(self) -> bool:
         """Is a keying secret available? — an in-heap HMAC key (``aesgcm`` mode) OR an isolated-module MAC
@@ -3349,6 +3379,7 @@ class MessageStore:
             )
             await self._commit()
         self._audit_keyed_from = watermark
+        self._audit_chain_unkeyed = False
         return True, f"audit chain keyed from id={watermark}"
 
     #: Every (table, column) the store cipher covers — raw bodies plus the PHI-bearing nullable text

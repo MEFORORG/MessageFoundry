@@ -157,6 +157,7 @@ from messagefoundry.store.store import (
     require_notify_email,
     seed_notify_email,
     should_record_event,
+    warn_unkeyed_audit_chain,
 )
 
 log = logging.getLogger(__name__)
@@ -1886,6 +1887,7 @@ class SqlServerStore:
         # isolated one (ASVS 13.3.3).
         self._audit_mac_fn = audit_mac_fn
         self._audit_keyed_from: int | None = None
+        self._audit_chain_unkeyed = False  # BACKLOG #1905 -- see the SQLite twin
         # #63 message_events verbosity gate ("all"/"errors"/"off"); floor always retained.
         self._message_events = message_events
         self.path = f"{settings.server}/{settings.database}"  # descriptor for db_status
@@ -2600,17 +2602,23 @@ class SqlServerStore:
         if not self._audit_keyed_capable():
             return  # keyless store — the chain stays byte-identical to pre-#190
         cnt = await self._fetchone("SELECT COUNT(*) AS n FROM audit_log")
-        if cnt is not None and int(cnt["n"]) == 0:
-            async with self._acquire() as conn, self._cursor(conn) as cur:
-                try:
-                    await cur.execute(
-                        "INSERT INTO audit_chain_meta (id, keyed_from_id) VALUES (1, 1)"
-                    )
-                    await self._commit(conn)
-                except Exception:
-                    await conn.rollback()
-                    raise
-            self._audit_keyed_from = 1
+        rows = int(cnt["n"]) if cnt is not None else 0
+        if rows > 0:
+            self._audit_chain_unkeyed = True  # BACKLOG #1905: report, never re-key at open
+            warn_unkeyed_audit_chain(log, rows)
+            return
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute("INSERT INTO audit_chain_meta (id, keyed_from_id) VALUES (1, 1)")
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        self._audit_keyed_from = 1
+
+    def audit_chain_unkeyed(self) -> bool:
+        """See :meth:`~messagefoundry.store.store.MessageStore.audit_chain_unkeyed` (#1905)."""
+        return self._audit_chain_unkeyed
 
     def _audit_append_mac(self) -> tuple[bytes | None, AuditMacFn | None]:
         """The ``(key, mac)`` a NEW ``audit_log`` row is hashed with (#190 / ADR 0138) — see the SQLite
@@ -2668,6 +2676,7 @@ class SqlServerStore:
                 await conn.rollback()
                 raise
         self._audit_keyed_from = watermark
+        self._audit_chain_unkeyed = False
         return True, f"audit chain keyed from id={watermark}"
 
     async def _encrypt_existing_rows(self) -> None:

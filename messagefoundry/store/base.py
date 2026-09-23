@@ -1626,6 +1626,17 @@ class AuditStore(Protocol):
         rewrites existing row hashes. Returns ``(ok, message)``."""
         ...
 
+    def audit_chain_unkeyed(self) -> bool:
+        """True when this store holds a keying secret but its audit chain on disk is KEYLESS (#1905).
+
+        Observed once, at open, by ``_load_audit_chain_meta``: a key or isolated-module MAC is in hand,
+        no keying watermark is recorded, and ``audit_log`` already has rows. Those rows are plain
+        SHA-256, so anyone who can write the table can forge them. The open does not re-key them --
+        that would bless a forged row -- so the state persists until ``rekey-audit`` succeeds, which
+        clears it. A store with no key at all returns False: that chain is keyless by the audited
+        at-rest opt-out, which ``security_loosenings()`` already reports."""
+        ...
+
     async def has_prior_backup_history(self) -> bool:
         """True iff the audit log carries at least one ``dr_backup`` row — the #102 server-DB DR-seed
         gate's "restored, not freshly-bootstrapped" signal. A ``dr_backup`` row is written on every

@@ -36,6 +36,7 @@ from messagefoundry.auth.service import (
     FirstAdministratorRefused,
 )
 from messagefoundry.config.settings import AuthSettings
+from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
 
 # The directory-sign-in precondition, imported rather than re-derived: that module is where it is
@@ -377,6 +378,18 @@ def _tty(monkeypatch: pytest.MonkeyPatch, *entries: str) -> None:
     monkeypatch.setattr("getpass.getpass", lambda *_a, **_k: queued.pop(0))
 
 
+def _key_in_this_shell(monkeypatch: pytest.MonkeyPatch) -> str:
+    """Put a store key in the environment the command runs in, and return it.
+
+    Since BACKLOG #1905 the command refuses a keyless open exactly as ``serve`` does, so a test about
+    anything else has to supply the key the documented order now requires. The keyless refusal
+    itself is pinned in ``tests/test_audit_keyless_chain_flagged.py``.
+    """
+    key = generate_key()
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key)
+    return key
+
+
 def test_cli_refuses_without_a_terminal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -387,6 +400,7 @@ def test_cli_refuses_without_a_terminal(
     ``serve`` see a non-empty directory and read as if something happened.
     """
     monkeypatch.chdir(tmp_path)
+    _key_in_this_shell(monkeypatch)
     db = tmp_path / "provision.db"
     assert main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"]) == 1
     assert "no --password" in json.loads(capsys.readouterr().out)["error"]
@@ -407,6 +421,7 @@ def test_cli_refuses_a_mismatched_confirmation(
 ) -> None:
     """A typo in a credential nobody can read back is exactly how an install gets stranded."""
     monkeypatch.chdir(tmp_path)
+    _key_in_this_shell(monkeypatch)
     _tty(monkeypatch, _PASSWORD, _PASSWORD + "typo")
     db = tmp_path / "provision.db"
     assert main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"]) == 1
@@ -424,6 +439,7 @@ def test_cli_provisions_and_names_the_store_it_wrote_to(
     default account anyway -- with the command having reported success.
     """
     monkeypatch.chdir(tmp_path)
+    key = _key_in_this_shell(monkeypatch)
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
     db = tmp_path / "provision.db"
     assert (
@@ -445,7 +461,8 @@ def test_cli_provisions_and_names_the_store_it_wrote_to(
     assert "WARNING" not in out, "an address was supplied, so the PHI warning must not fire"
 
     async def check() -> None:
-        store = await MessageStore.open(db)
+        cipher = make_cipher(key)
+        store = await MessageStore.open(db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
         try:
             row = await store.get_user_by_username("site-admin")
             assert row is not None
@@ -468,6 +485,7 @@ def test_cli_warns_when_no_notification_address_is_given(
     command warns and names the flag instead of inventing its own refusal.
     """
     monkeypatch.chdir(tmp_path)
+    _key_in_this_shell(monkeypatch)
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
     assert (
         main(["provision-admin", "--username", "site-admin", "--db", str(tmp_path / "p.db")]) == 0
