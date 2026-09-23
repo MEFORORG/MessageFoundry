@@ -1,6 +1,8 @@
 # 0188 — Per-connection `tls_ciphers` on the MLLP and DICOM connectors
 
-- **Status:** Accepted (2026-09-14) — built
+- **Status:** Accepted (2026-09-14) — built. **Amended 2026-09-23 (BACKLOG #300):** unset now narrows to the
+  approved suites on all four seams, and the approved list is the default on every context the engine
+  builds. See the amendment at the end; it supersedes AC-4, AC-5 and AC-6 below.
 - **Date:** 2026-09-14
 - **Related:** [ADR 0002](0002-phase2-transport-security-and-strong-auth.md) (WP-13b MLLP-over-TLS) · [ADR 0025](0025-dicom-codec-store-connectors.md) (DICOM C-STORE connectors) · [ADR 0094](0094-granular-expiry-only-tls-relaxation.md) (the per-connection TLS opt-in this copies) · [ADR 0172](0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md) (the engine always serves TLS) · CLAUDE.md §9 (PHI on the wire)
 
@@ -170,3 +172,93 @@ the peer census.
 - [x] Confirm the opt-in path runs the same validator as `[api].tls_ciphers`, allow-list included (AC-3).
 - [x] Confirm the ASVS 12.1.2 call-site guard still sees the assertion at all four seams.
       It did not, on the first draft, and that is why the assertion is not folded into the helper.
+
+---
+
+## Amendment (2026-09-23): the approved suites become the default (BACKLOG #300)
+
+**The approved AEAD suites are now the default TLS 1.2 list on every context the engine builds, MLLP
+and DICOM included, with the two recorded exceptions in the table below.** This reverses the boundary the Decision above called hard. Two owner rulings
+allow it, one for each half, and this section is the in-repo record of both.
+
+### What changed
+
+A new function, `tls_policy.narrow_to_approved_suites(ctx)`, calls `set_ciphers` with the eight
+TLS 1.2 names in `APPROVED_TLS12_SUITES`, in order. Every engine-built seam calls it before its
+`harden_cipher_suites` assertion. On the four seams this ADR covers, `apply_connection_tls_ciphers`
+calls it when `tls_ciphers` is unset, so those seams still read as the three calls shown above.
+
+| Hop | Default before | Default now |
+|---|---|---|
+| MLLP listener and destination, DICOM SCP and SCU, the HTTP listener (it reuses the MLLP builder) | interpreter list, 6 CBC-SHA2 suites included | approved list |
+| API / UI listener, apiclient, IDE extension client | interpreter list | approved list |
+| REST, FHIR, DICOMweb, SOAP, SMART and OAuth2 token endpoints, `fhir_lookup`, alert webhook | interpreter list | approved list |
+| SMTP (EMAIL, DIRECT transport, alert email), syslog forwarder, FTPS, OIDC IdP, Postgres store (pinned-CA and verify-off branches), `verify` smoke | interpreter list | approved list |
+| Postgres store, default verifying branch | asyncpg's own context | **unchanged**: the engine passes `ssl=True` and asyncpg builds the context, the residual `store/postgres.py` already records |
+| Windows tray `/health` probe (`tray/probe.py`) | `truststore` context | **unchanged**: a separate stdlib-plus-httpx package (ADR 0113); it talks only to the local engine, which now serves the approved list |
+| LDAPS (`ldap3`), Vault (`hvac`), SQL Server (ODBC driver) | library's list | **unchanged**: the library builds the context, as BACKLOG #1170's third category records |
+
+A configured `tls_ciphers` or `[api].tls_ciphers` still wins over the default, and still runs the
+same allow-list, which refuses CBC.
+
+**The two properties that could have gone wrong, and were checked.** The narrowing uses the suite
+NAMES, never a preference string, because option 3 below measured that a preference string adds two
+DSS suites. And it writes the context's existing security level back in front of the names, because
+a bare `set_ciphers` string resets the level to the OpenSSL build's default. It neither raises nor
+lowers the level; raising it is a separate, counterparty-facing decision this amendment does not make.
+
+### Why hops outside MLLP and DICOM could narrow
+
+**Owner ruling 2026-08-22, recorded in BACKLOG #1170:** the interop rationale reaches only TLS on
+MLLP and DICOM. The Context above and option 2 argued from hospital peers, and that ruling scopes the
+argument to those two connectors. No other hop has a named peer class that needs CBC. So option 3's
+rejection never reached the other hops, and narrowing them contradicts nothing this ADR decided.
+
+### Why MLLP and DICOM narrowed too
+
+**Owner ruling 2026-09-23, relayed on BACKLOG #300:** remove the six CBC-SHA2 suites from the MLLP
+and DICOM TLS 1.2 defaults. State the risk plainly, because this ADR said the opposite:
+
+- **No peer census was run.** The Context above gated retirement on one. The owner decided not to
+  wait for it and accepted the interop risk. The premise that hospital peers still need CBC is still
+  unmeasured in either direction.
+- **A legacy CBC-only peer is served only by a reviewed code change to `_APPROVED_TLS_SUITES`.**
+  There is no per-connection CBC override and no new loosening setting. `tls_ciphers` cannot reopen
+  CBC, because the allow-list it runs refuses it (AC-3). This keeps the 2026-08-22 strict-allow-list
+  ruling (BACKLOG #1317) intact.
+- A peer that offers only CBC-SHA2 suites now fails the TLS 1.2 handshake at that one connection.
+
+### Superseded acceptance criteria
+
+AC-4, AC-5 and AC-6 asserted that unset changed nothing. Each keeps its instrument and flips its
+claim, in `tests/test_connection_tls_ciphers.py`:
+
+- **AC-4 (amended)** — WHERE `tls_ciphers` is unset, THE SYSTEM SHALL offer exactly
+  `APPROVED_TLS12_SUITES` at TLS 1.2, in order.
+  → `test_unset_resolves_the_approved_suite_list_in_order`
+- **AC-5 (amended)** — WHERE `tls_ciphers` is unset, THE SYSTEM SHALL call `set_ciphers` exactly once,
+  naming the approved list.
+  → `test_unset_narrows_through_one_set_ciphers_call`
+- **AC-6 (amended)** — WHERE `tls_ciphers` is unset, THE SYSTEM SHALL offer none of the six CBC-SHA2
+  suites. → `test_unset_offers_none_of_the_six_cbc_sha2_suites`
+
+And for the engine-wide default, in `tests/test_tls_default_suites.py`:
+
+- **AC-7** — WHEN any engine-built hop meets a TLS 1.2 peer offering only a CBC-SHA2 suite, THE
+  SYSTEM SHALL fail the handshake; WHEN the peer offers an AEAD suite, it SHALL complete. A stock
+  context of the same shape completes against the same CBC-only peer, as the control.
+  → `test_client_hop_refuses_a_cbc_only_server`, `test_server_hop_refuses_a_cbc_only_client` and
+  their `accepts` pairs
+- **AC-8** — Every engine-built hop SHALL offer `APPROVED_TLS12_SUITES` in order, and that order SHALL
+  follow the stated rule: ECDHE before DHE, then AES-256-GCM, AES-128-GCM, ChaCha20.
+  → `test_every_hop_offers_the_approved_list_in_order`, `test_the_approved_order_follows_the_stated_rule`
+- **AC-9** — Every engine module that calls `harden_cipher_suites` SHALL also narrow.
+  → `test_every_module_that_asserts_a_suite_list_also_narrows_one`
+
+### What this amendment does not change
+
+The separation above stands: `harden_cipher_suites` asserts and never narrows, and the ASVS 12.1.2
+call-site guard still sees it by name at every seam. It also asserts on library-built contexts that
+the engine cannot narrow, which is why it must not apply the list itself. Key-exchange groups are not
+touched: Python 3.14 cannot set them, so every hop still inherits OpenSSL's group list, which accepts
+`ffdhe2048` (see `harden_kex_groups`). Counterparty key floors and the OpenSSL security level are out of scope.

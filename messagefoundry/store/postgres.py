@@ -76,6 +76,7 @@ from messagefoundry.config.tls_policy import (
     RevocationHopGuard,
     harden_cipher_suites,
     harden_crl_check,
+    narrow_to_approved_suites,
 )
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
@@ -788,6 +789,7 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
         ctx.verify_mode = ssl.CERT_NONE
         # Verification is off but the store hop is still encrypted, so the suite list still decides
         # whether recorded PHI traffic survives a future key compromise (ASVS 12.1.2).
+        narrow_to_approved_suites(ctx)  # approved AEAD default (BACKLOG #300)
         harden_cipher_suites(ctx, connector="Postgres store (TLS verification disabled)")
         return ctx
     # #201 (ADR 0078 amendment): the engine->store hop below VERIFIES the peer cert (a pinned CA or the
@@ -804,6 +806,7 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
         # (+ hostname) against this PEM bundle. create_default_context() already sets CERT_REQUIRED +
         # check_hostname=True, so this stays a fully-verifying posture (a bad path raises at connect).
         ctx = ssl.create_default_context(cafile=settings.ssl_root_cert)
+        narrow_to_approved_suites(ctx)  # approved AEAD default (BACKLOG #300)
         harden_cipher_suites(ctx, connector="Postgres store (pinned CA)")
         if settings.ssl_crl_file is not None:
             # BACKLOG #299: revocation checking against the DB server's certificate. Loads AFTER the CA,

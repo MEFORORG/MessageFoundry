@@ -336,6 +336,25 @@ def _assert_safe_transport(base_url: str, *, allow_insecure: bool) -> bool:
     )
 
 
+#: The TLS 1.2 suites this client offers, in preference order (BACKLOG #300).
+#:
+#: A COPY of ``messagefoundry.config.tls_policy.APPROVED_TLS12_SUITES``, and a copy on purpose: a
+#: client must not import ``config/`` (CLAUDE.md section 4), so it cannot read the engine's tuple.
+#: ``tests/test_tls_default_suites.py`` pins the two equal, order included, so they cannot drift.
+#: The engine's API listener offers exactly these by default, so pinning them here refuses nothing a
+#: stock engine speaks; it stops the client offering the six CBC-SHA2 suites the interpreter enables.
+_APPROVED_TLS12_SUITES = (
+    "ECDHE-ECDSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-AES256-GCM-SHA384",
+    "ECDHE-ECDSA-AES128-GCM-SHA256",
+    "ECDHE-RSA-AES128-GCM-SHA256",
+    "ECDHE-ECDSA-CHACHA20-POLY1305",
+    "ECDHE-RSA-CHACHA20-POLY1305",
+    "DHE-RSA-AES256-GCM-SHA384",
+    "DHE-RSA-AES128-GCM-SHA256",
+)
+
+
 def _build_verify_context(
     cacert: str | None,
     client_cert: str | None,
@@ -355,6 +374,9 @@ def _build_verify_context(
       ``load_verify_locations`` cert as a trust anchor (verified on Windows), so we build a stdlib
       context whose only anchors are the supplied file.
 
+    **The TLS 1.2 suites are pinned** to :data:`_APPROVED_TLS12_SUITES` on either branch (BACKLOG
+    #300), so this client offers the AEAD suites the engine listener defaults to and nothing wider.
+
     An opt-in **client** certificate (mTLS, ASVS 12.3.5) is loaded onto whichever context is built — this
     is also what replaces httpx 0.28's deprecated ``cert=`` keyword. Plaintext ``http`` never reaches
     this context (the ``_assert_safe_transport`` gate runs first and httpx ignores TLS settings for http).
@@ -369,6 +391,10 @@ def _build_verify_context(
         import truststore
 
         ctx = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    # Both branches, so the suite list does not depend on which trust model was picked. The security
+    # level is written back in front of the names because a bare string resets it to the OpenSSL
+    # build's own default (the engine's narrow_to_approved_suites does the same, for the same reason).
+    ctx.set_ciphers(f"@SECLEVEL={ctx.security_level}:" + ":".join(_APPROVED_TLS12_SUITES))
     if client_cert is not None:
         # keyfile=None is valid: the private key may be bundled in the client cert PEM.
         ctx.load_cert_chain(client_cert, client_key)

@@ -251,7 +251,8 @@ def test_rest_shared_opener_context_is_the_one_that_was_asserted(
 
 
 def test_the_rest_opener_handshake_is_unchanged_by_the_assertion() -> None:
-    """The assertion must change NOTHING about the connection, and this is what proves it.
+    """The assertion must change nothing about the connection beyond the suite list, and this is
+    what proves it. The suite list is narrowed on purpose since BACKLOG #300.
 
     A first version of this change substituted a hand-built ``ssl.create_default_context()`` for
     urllib's. Measured on CPython 3.14.6 / OpenSSL 3.5.7, those are NOT the same context: urllib's
@@ -267,7 +268,19 @@ def test_the_rest_opener_handshake_is_unchanged_by_the_assertion() -> None:
         "the engine's HTTP-family context no longer matches urllib's default on post-handshake auth "
         "- the assertion has started substituting a context instead of checking urllib's"
     )
-    assert [c["name"] for c in engine.get_ciphers()] == [c["name"] for c in stock.get_ciphers()]
+
+    # The ONE deliberate difference (BACKLOG #300): the TLS 1.2 list is the approved names, in order,
+    # where urllib's default also carries the six CBC-SHA2 suites. TLS 1.3 is out of set_ciphers'
+    # reach, so it must still match urllib's exactly.
+    def tls13(ctx: ssl.SSLContext) -> list[str]:
+        return [c["name"] for c in ctx.get_ciphers() if c["protocol"] == "TLSv1.3"]
+
+    def tls12(ctx: ssl.SSLContext) -> list[str]:
+        return [c["name"] for c in ctx.get_ciphers() if c["protocol"] != "TLSv1.3"]
+
+    assert tls13(engine) == tls13(stock)
+    assert tls12(engine) == list(tls_policy.APPROVED_TLS12_SUITES)
+    assert set(tls12(stock)) - set(tls12(engine)), "control: urllib's default must offer more"
     assert engine.verify_mode == stock.verify_mode
     assert engine.check_hostname == stock.check_hostname
     assert engine.minimum_version == stock.minimum_version

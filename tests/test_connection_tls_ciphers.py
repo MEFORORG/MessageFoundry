@@ -6,23 +6,19 @@ Four seams carry it: the MLLP listener, the MLLP destination, the DICOM SCP list
 SCU destination. Every test below runs against all four, because a setting wired into three of four
 is the failure this shape invites and a spot check on one cannot see it.
 
-**The hard boundary is the point of this file, not a side note.** The feature is opt-in and a
-connection that leaves ``tls_ciphers`` unset must build the context it built before ADR 0188 existed
--- the interpreter's inherited suite list, **the six CBC-SHA2 suites included**. The allow-list
-governs what an operator may CONFIGURE and never what an inherited default may contain (the ruling
-recorded in ``harden_cipher_suites``), and retiring those six is gated on a peer census that does not
-exist. So the unset path is proven three ways rather than asserted once:
+**The unset boundary is the point of this file, and BACKLOG #300 moved it.** Until then a connection
+that left ``tls_ciphers`` unset built the interpreter's inherited suite list, **six CBC-SHA2 suites
+included**, pending a peer census. On 2026-09-23 the owner ruled to remove those six from the MLLP and
+DICOM defaults without the census, and the ADR 0188 amendment records it. So unset now narrows to the
+approved list, and that is proven three ways rather than asserted once:
 
-* ``test_unset_leaves_the_inherited_suite_list_untouched`` compares each seam against a REFERENCE
-  construction of the same context shape -- a bare ``ssl`` call that runs none of this code;
-* ``test_unset_never_calls_set_ciphers`` watches the method itself and requires zero calls, with the
-  opt-in arm as the positive control that the watcher is wired up at all;
-* ``test_unset_still_offers_the_suites_the_allow_list_excludes`` names the six CBC-SHA2 suites and
-  requires them still negotiable, which is the boundary stated in the sharpest form available.
+* ``test_unset_resolves_the_approved_suite_list_in_order`` compares each seam's TLS 1.2 list, in
+  order, to ``APPROVED_TLS12_SUITES``, with a bare-``ssl`` REFERENCE construction as the control;
+* ``test_unset_narrows_through_one_set_ciphers_call`` watches the method itself and requires exactly
+  one call naming the approved list, with the opt-in arm as the positive control for the watcher;
+* ``test_unset_offers_none_of_the_six_cbc_sha2_suites`` names the six and requires them gone.
 
-The first two would both pass on a context nobody built, so each asserts a non-empty suite list
-first. The third is the one that would go red if a future change applied the allow-list to the
-inherited default, which is precisely the overshoot ADR 0188 forbids.
+Each would go red if a future change put the inherited list back on an unset seam.
 """
 
 from __future__ import annotations
@@ -42,6 +38,7 @@ from cryptography.x509.oid import NameOID
 from messagefoundry.config import tls_policy
 from messagefoundry.config.connections_file import load_connections_file
 from messagefoundry.config.tls_policy import (
+    APPROVED_TLS12_SUITES,
     CONNECTION_TLS_CIPHERS_SETTING,
     apply_connection_tls_ciphers,
 )
@@ -140,6 +137,12 @@ SEAMS = ["MLLP listener", "MLLP destination", "DICOM listener", "DICOM destinati
 
 def _suites(ctx: ssl.SSLContext) -> set[str]:
     return {str(c.get("name", "?")) for c in ctx.get_ciphers()}
+
+
+def _tls12_order(ctx: ssl.SSLContext) -> list[str]:
+    """The TLS 1.2 suites ``ctx`` offers, in its own preference order (``set_ciphers`` cannot reach
+    TLS 1.3, so those three are left out of every order claim)."""
+    return [str(c.get("name", "?")) for c in ctx.get_ciphers() if c.get("protocol") != "TLSv1.3"]
 
 
 @pytest.fixture
@@ -241,39 +244,49 @@ def test_the_refusal_is_the_shared_validator_and_not_a_second_copy(
     assert calls == [NARROW], "the seam did not run the shared validator on the operator string"
 
 
-# --- AC-4 / AC-5 / AC-6: THE BOUNDARY. Unset must change nothing. --------------------------------
+# --- AC-4 / AC-5 / AC-6: THE BOUNDARY, as amended by BACKLOG #300. Unset narrows. ---------------
+#
+# Until BACKLOG #300 these three proved the opposite: that unset changed NOTHING and the six CBC-SHA2
+# suites stayed negotiable. The owner ruled on 2026-09-23 to remove those six from the MLLP and DICOM
+# defaults with no peer census, and the ADR 0188 amendment records it. Each test keeps its old
+# instrument and flips its claim, so a regression back to the inherited list reds all three.
 
 
 @pytest.mark.parametrize("seam", SEAMS)
-def test_unset_leaves_the_inherited_suite_list_untouched(seam: str, tmp_path: Path) -> None:
-    """AC-4, and the regression that protects ADR 0188's hard boundary.
+def test_unset_resolves_the_approved_suite_list_in_order(seam: str, tmp_path: Path) -> None:
+    """AC-4 (amended). An unset connection offers exactly the approved TLS 1.2 suites, in order.
 
-    An unset connection must resolve the SAME suite list as a reference construction of that context
-    shape. Sets, not lists: ``harden_kex_groups`` and the verify flags run on the seam and not on the
-    reference, and neither is a suite-list change, but pinning ORDER here would couple this test to
-    facts it is not making a claim about.
+    A LIST, not a set, because ``narrow_to_approved_suites`` hands OpenSSL an ordered list of names
+    and the order is part of the default (BACKLOG #300 asked for an order check). The reference
+    construction is kept as the CONTROL: it must still offer a TLS 1.2 suite the seam does not, or
+    the equality below could pass on a build whose default had already become the approved list.
     """
-    got, reference = _suites(_build(seam, tmp_path, None)), _suites(_reference(seam))
-    assert got, f"{seam}: resolved to NO suites — the comparison is vacuous"
-    assert got == reference, (
-        f"{seam}: leaving tls_ciphers unset changed the negotiated suite list. "
-        f"ADR 0188 is opt-in: only-here {sorted(got - reference)}, "
-        f"only-in-reference {sorted(reference - got)}."
+    got = _tls12_order(_build(seam, tmp_path, None))
+    assert got == list(APPROVED_TLS12_SUITES), (
+        f"{seam}: leaving tls_ciphers unset did not produce the approved default, in order. "
+        f"Got {got}."
+    )
+    assert set(_tls12_order(_reference(seam))) - set(got), (
+        f"{seam}: the untouched reference offers nothing the seam does not, so this build cannot "
+        f"show the narrowing -- the equality above is not evidence of it here"
     )
 
 
 @pytest.mark.parametrize("seam", SEAMS)
-def test_unset_never_calls_set_ciphers(
+def test_unset_narrows_through_one_set_ciphers_call(
     seam: str, tmp_path: Path, set_ciphers_calls: list[str]
 ) -> None:
-    """AC-5. Not merely "the list came out the same" — the narrowing call is never made at all.
+    """AC-5 (amended). Unset makes exactly ONE ``set_ciphers`` call, and it names the approved list.
 
-    A seam that called ``set_ciphers`` with a string resolving back to the default would pass AC-4
-    and still be a behaviour change: it would freeze the suite list against a future interpreter
-    whose default moved. This is the stronger statement, and the two are worth having separately.
+    It was "no call at all" until BACKLOG #300. One call, spelled by ``narrow_to_approved_suites``,
+    is the new claim: a second call would mean something else re-narrowed the context, and a call
+    with any other string would mean the default is no longer the approved list.
     """
     _build(seam, tmp_path, None)
-    assert set_ciphers_calls == [], f"{seam}: unset path called set_ciphers{set_ciphers_calls}"
+    assert len(set_ciphers_calls) == 1, f"{seam}: unset path called set_ciphers{set_ciphers_calls}"
+    assert set_ciphers_calls[0].endswith(":" + ":".join(APPROVED_TLS12_SUITES)), (
+        f"{seam}: the unset path narrowed to {set_ciphers_calls[0]!r}, not the approved names"
+    )
 
 
 def test_the_set_ciphers_watcher_can_see_a_call(
@@ -287,27 +300,24 @@ def test_the_set_ciphers_watcher_can_see_a_call(
 
 
 @pytest.mark.parametrize("seam", SEAMS)
-def test_unset_still_offers_the_suites_the_allow_list_excludes(seam: str, tmp_path: Path) -> None:
-    """AC-6, and the boundary in its sharpest form: the six CBC-SHA2 suites stay negotiable.
+def test_unset_offers_none_of_the_six_cbc_sha2_suites(seam: str, tmp_path: Path) -> None:
+    """AC-6 (amended), the boundary in its sharpest form: the six CBC-SHA2 suites are GONE.
 
-    This is the test that goes red if someone applies ``_APPROVED_TLS_SUITES`` to an inherited
-    context -- the one overshoot ADR 0188 names and refuses. Retiring these six is an owner call
-    gated on a peer census nobody has run; it is not a side effect of adding an operator knob.
+    Until BACKLOG #300 this test required them to stay negotiable, on the ground that retiring them
+    was an owner call gated on a peer census. The owner made that call on 2026-09-23 without the
+    census, accepting the interop risk. A legacy CBC-only peer is now served only by a reviewed code
+    change to ``_APPROVED_TLS_SUITES``; ``tls_ciphers`` cannot reopen CBC (AC-3 refuses it).
 
-    Skips rather than passes where the local OpenSSL enables none of them, because a build that
-    offers no CBC-SHA2 suite to begin with cannot show one being retained.
+    The control is the reference construction, which must still carry at least one of the six on
+    this build, or "none offered" would be true of the seam for a reason that is not the narrowing.
     """
     present = _suites(_reference(seam)) & CBC_SHA2_SUITES
     if not present:  # pragma: no cover - build-dependent
         pytest.skip(f"this OpenSSL ({ssl.OPENSSL_VERSION}) enables no CBC-SHA2 suite by default")
-    # Bound once and reused in the message. Building a SECOND context to describe the failure would
-    # report a different object than the one that failed, which is how a message misleads the reader
-    # it exists for.
     got = _suites(_build(seam, tmp_path, None))
-    assert got >= present, (
-        f"{seam}: leaving tls_ciphers unset RETIRED CBC-SHA2 suite(s) {sorted(present - got)}. "
-        f"ADR 0188 forbids this: the allow-list governs what an operator may configure, never what "
-        f"a default may contain."
+    assert not (got & CBC_SHA2_SUITES), (
+        f"{seam}: leaving tls_ciphers unset still offers CBC-SHA2 suite(s) "
+        f"{sorted(got & CBC_SHA2_SUITES)}; BACKLOG #300 removed them from every default."
     )
 
 

@@ -171,8 +171,8 @@ def _server_ssl_context(s: dict[str, Any]) -> ssl.SSLContext | None:
             harden_crl_check(ctx, str(crl))
     harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
     # Narrow first, assert last, both spelled here -- do NOT fold them into one call; see
-    # apply_connection_tls_ciphers. Unset (the default) narrows nothing, leaving the line below the
-    # assertion this seam has always made on the inherited suite list.
+    # apply_connection_tls_ciphers. Unset (the default) narrows to the approved AEAD suites
+    # (BACKLOG #300, the ADR 0188 amendment); set, to the operator's validated string.
     apply_connection_tls_ciphers(ctx, s, connector="DICOM listener")  # opt-in per-hop suite list
     harden_cipher_suites(ctx, connector="DICOM listener")  # assert forward secrecy (ASVS 12.1.2)
     harden_verify_flags(ctx)  # strict RFC 5280 validation of any mTLS client cert (ASVS 12.1.4)
