@@ -22,7 +22,9 @@ every single commit would satisfy every positive test in this file.
 **A NEGATIVE ASSERTION HERE IS A RACE UNLESS IT WAITS FOR SOMETHING FIRST.** The push is detached,
 so "the orphan ref is absent" is trivially true the instant after ``git commit`` returns. Every
 absence assertion below therefore waits for the MOVING tag to reach its new commit first, and only
-then asks about the orphan -- the push that would have written one has demonstrably finished.
+then asks about the orphan -- the push that would have written one has demonstrably finished. The
+one test whose moving push cannot land waits instead for a ``GIT_TRACE`` line showing it started,
+which the hook reaches only after any orphan push is done.
 
 **AND THE REMOTE TAG IS NOT THE HOOK'S LAST WRITE.** The local ``$LAST`` ref lands after it. So a
 test that reads ``$LAST`` next, or commits again on the same branch and so makes the hook read it,
@@ -277,14 +279,86 @@ def test_the_FIRST_commit_on_a_branch_creates_no_orphan(armed: tuple[Path, Path]
     """The arm where there is nothing to compare against, which must not read as a rewrite.
 
     ``git merge-base --is-ancestor`` exits 128, not 1, when a name does not resolve -- measured on
-    git 2.55.0.windows.5. Collapsing 128 into "not an ancestor" would make every branch's first
-    commit try to preserve a ref that does not exist.
+    git 2.55.0.windows.5.
+
+    **THIS TEST CANNOT CATCH A HOOK THAT READS 128 AS "NOT AN ANCESTOR".** This docstring used to
+    say that collapse would make every first commit preserve a ref, and so imply this test pinned
+    it. It does not. With ``$LAST`` absent, the hook's ``$PREV`` lookup comes back empty as well,
+    and the ``[ -n "$PREV" ]`` guard stops the preserve step on its own. Measured 2026-09-23: with
+    the hook's ``-eq 1`` changed to ``-ne 0``, all six tests this file then held passed. The next
+    test is the one that tells 128 from 1; this one still pins the first-commit behaviour.
     """
     repo, bare = armed
     first = commit(repo, "base.txt", "base\n")
 
     assert wait_for_commit(bare, "refs/tags/rescue/auto/r/main", first)
     assert refs(bare, ORPHANS) == []
+
+
+def wait_for_trace(trace: Path, *needles: str) -> bool:
+    """Poll until one line of a ``GIT_TRACE`` file holds every needle. The file may not exist yet."""
+    deadline = time.monotonic() + PUSH_WAIT
+    while time.monotonic() < deadline:
+        try:
+            lines = trace.read_text(encoding="utf-8", errors="replace").splitlines()
+        except FileNotFoundError:
+            lines = []
+        if any(all(n in line for n in needles) for line in lines):
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def test_a_128_while_LAST_still_resolves_is_NOT_read_as_a_rewrite(
+    armed: tuple[Path, Path], tmp_path: Path
+) -> None:
+    """THE ARM THAT TELLS 128 FROM 1, which the first-commit test above cannot.
+
+    The hook runs its preserve step only when merge-base exits 1. A hook that tested ``-ne 0``
+    would also run it on 128, and a first commit cannot show that, because there the ``$PREV``
+    guard stops it anyway. The one state that reaches 128 while ``$LAST`` still resolves is the
+    degraded path the hook's own comment names, where ``$COMMIT`` is empty. So this deletes the
+    branch ref after a landed capture, which leaves HEAD naming a branch with no commit, and runs
+    the hook directly.
+
+    Measured 2026-09-23 against a copy with ``-eq 1`` changed to ``-ne 0``: that copy pushed
+    ``refs/tags/rescue/orphan/r/main/<sha>`` for a commit nobody had discarded. The real hook
+    pushed no orphan ref.
+
+    **THE WAIT IS ON A TRACE LINE, BECAUSE THERE IS NO REMOTE REF TO WAIT FOR.** HEAD does not
+    resolve, so the moving push fails. The hook finishes any orphan push before it starts the
+    moving one, so once ``GIT_TRACE`` records the moving push, the absence below is no longer a
+    race.
+    """
+    repo, bare = armed
+    moving = "refs/tags/rescue/auto/r/main"
+    sha = commit(repo, "base.txt", "base\n")
+    assert wait_for_landed(repo, bare, moving, sha), (
+        "the capture never reached both the remote tag and $LAST"
+    )
+
+    git(repo, "update-ref", "-d", "refs/heads/main")
+    # The two facts that make this the discriminating state. Without the second, the ``$PREV``
+    # guard hides the defect exactly as it does in the first-commit test.
+    assert peel(repo, "HEAD") == "", "HEAD still resolves, so the hook's $COMMIT is not empty"
+    assert peel(repo, "refs/mefor/durability/r/main") == sha, "$LAST does not resolve"
+
+    trace = tmp_path / "trace.txt"
+    proc = subprocess.run(
+        ["sh", str(repo / ".git" / "hooks" / "post-commit")],
+        cwd=str(repo),
+        env=dict(os.environ, GIT_TRACE=str(trace)),
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+    )
+    assert proc.returncode == 0, "a post-commit hook that exits non-zero is a broken commit"
+
+    assert wait_for_trace(trace, "built-in: git push", "--force", f"HEAD:{moving}"), (
+        "the moving push never started, so an absent orphan ref proves nothing"
+    )
+    orphans = refs(bare, ORPHANS)
+    assert orphans == [], f"merge-base exit 128 was read as a rewrite: {orphans}"
 
 
 def test_the_orphan_ref_is_SELF_DESCRIBING_and_names_what_displaced_it(
