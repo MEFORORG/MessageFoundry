@@ -85,6 +85,8 @@ from messagefoundry.store.base import (
     UPLOAD_RESERVATION_STALE_AFTER,
     Row,
     SchemaNotProvisionedError,
+    SchemaProvisionResult,
+    StoreGrantsMissingError,
     acquire_pooled,
     warm_pool_connections,
     warm_pool_target,
@@ -722,6 +724,42 @@ _SCHEMA: list[str] = [
     )""",
 ]
 
+#: The cluster coordinator's own tables (``nodes`` + ``leader_lease``), stated ONCE here and run from
+#: two places: the store's ``_SCHEMA`` batch below, and ``DbCoordinator._ensure_nodes_table`` under
+#: ``auto``. BACKLOG #305 moved them into the batch because under ``[store].schema_management =
+#: external`` the runtime role runs no DDL at all, so a clustered node could not start unless
+#: ``provision-schema`` had created them. The ``ADD COLUMN IF NOT EXISTS`` statements are the in-place
+#: migrations for a pre-existing table; each is a no-op on a fresh one.
+CLUSTER_SCHEMA: tuple[str, ...] = (
+    "CREATE TABLE IF NOT EXISTS nodes ("
+    " node_id    TEXT PRIMARY KEY,"
+    " host       TEXT,"
+    " pid        INTEGER,"
+    " started_at DOUBLE PRECISION,"
+    " last_seen  DOUBLE PRECISION,"
+    " status     TEXT,"
+    " is_leader  BOOLEAN NOT NULL DEFAULT FALSE,"  # Step 7: derived-leader observability
+    # ADR 0096 leader-preference config, mirrored per-node for the /cluster/nodes API.
+    " acquire_delay_seconds DOUBLE PRECISION NOT NULL DEFAULT 0,"
+    " promotable BOOLEAN NOT NULL DEFAULT TRUE"
+    ")",
+    "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS is_leader BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS acquire_delay_seconds "
+    "DOUBLE PRECISION NOT NULL DEFAULT 0",
+    "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS promotable BOOLEAN NOT NULL DEFAULT TRUE",
+    # The self-fencing leadership lease (Workstream A2): one row per cluster, keyed by the
+    # schema-namespaced lease_key, holding the current leader and its DB-clock expiry.
+    "CREATE TABLE IF NOT EXISTS leader_lease ("
+    " lease_key        TEXT PRIMARY KEY,"
+    " owner            TEXT,"
+    " lease_expires_at DOUBLE PRECISION NOT NULL,"
+    " leader_epoch     BIGINT NOT NULL DEFAULT 0"  # H1: monotonic fencing token
+    ")",
+    # H1: DEFAULT 0 backfills a pre-existing row, so the first fresh acquire bumps it to 1.
+    "ALTER TABLE leader_lease ADD COLUMN IF NOT EXISTS leader_epoch BIGINT NOT NULL DEFAULT 0",
+)
+_SCHEMA.extend(CLUSTER_SCHEMA)
+
 # Bump when _migrate_lease_columns (the open-path migration code OUTSIDE _SCHEMA) changes behavior:
 # unlike _SCHEMA edits — which change _schema_hash automatically — the migration function's Python
 # body is invisible to the content hash, so this constant is its stand-in in the hash input.
@@ -1104,20 +1142,25 @@ class PostgresStore:
     @classmethod
     async def provision_schema(
         cls, settings: StoreSettings, *, posture: HopPosture | None = None
-    ) -> bool:
+    ) -> SchemaProvisionResult:
         """Apply the DDL batch as the CURRENT role — the body of ``messagefoundry store
-        provision-schema`` (#305). Returns ``True`` iff the batch ran.
+        provision-schema`` (#305).
 
         A one-connection pool and the identity cipher: this touches no row, so it needs no store key.
         The batch keeps its advisory lock and marker double-check, so it is safe beside a running
         engine. The objects it creates are OWNED by this role, which is what lets the runtime role
-        hold row grants only."""
+        hold row grants only. The result names the schema they landed in."""
         pool = await cls._create_pool(settings, posture=posture, max_size=1)
         store = cls(pool, settings)
         try:
-            return await store._ensure_schema(provisioning=True)
+            applied = await store._ensure_schema(provisioning=True)
+            row = await store._fetchone("SELECT current_schema() AS schema_name")
         finally:
             await store.close()
+        return SchemaProvisionResult(
+            applied=applied,
+            schema=str(row["schema_name"]) if row and row["schema_name"] is not None else None,
+        )
 
     async def _ensure_schema(self, *, provisioning: bool = False) -> bool:
         """Create the schema once, serialized across concurrent opens by a schema advisory lock so
@@ -1141,10 +1184,12 @@ class PostgresStore:
             # FAST PATH: two cheap reads, no lock, no transaction. A virgin/pre-marker DB probes as
             # not-current and falls through to the full run.
             if await self._schema_marker_current(conn, expected):
+                if external:
+                    await self._verify_runtime_grants(conn)
                 log.debug("postgres: schema current (%s…) — DDL batch skipped", expected[:12])
                 return False
             if external:
-                exc = SchemaNotProvisionedError(self.backend, self._settings.database, expected)
+                exc = await self._not_provisioned(conn, expected)
                 log.error("postgres: %s", exc)
                 raise exc
             async with conn.transaction():
@@ -1173,6 +1218,73 @@ class PostgresStore:
                 )
         log.info("postgres: schema DDL batch applied (%s…)", expected[:12])
         return True
+
+    async def _not_provisioned(self, conn: Any, expected: str) -> SchemaNotProvisionedError:
+        """The external-mode refusal, with the one cause ``provision-schema`` cannot fix named (#305).
+
+        ``to_regclass`` silently skips a ``search_path`` schema the role has no ``USAGE`` on, so a
+        missing ``GRANT USAGE`` reads exactly like an absent marker. Re-running the provisioning command
+        would then report "already current" and the refusal would repeat, so the grant is checked and
+        named here. Reads only."""
+        schema = self._settings.db_schema
+        hint: str | None = None
+        if schema:
+            row = await conn.fetchrow(
+                "SELECT pg_catalog.has_schema_privilege(current_user, n.oid, 'USAGE') AS usage"
+                " FROM pg_catalog.pg_namespace n WHERE n.nspname = $1",
+                schema,
+            )
+            if row is not None and not row["usage"]:
+                hint = (
+                    f"this role has no USAGE on schema {schema!r}, so it cannot see the marker; "
+                    f"GRANT USAGE ON SCHEMA {schema} TO the runtime role"
+                )
+        else:
+            row = await conn.fetchrow("SELECT current_schema() AS schema_name")
+            schema = row["schema_name"] if row is not None else None
+            hint = (
+                "[store].db_schema is unset, so each role resolves tables through its own "
+                "search_path; set db_schema so both roles use the same schema"
+            )
+        return SchemaNotProvisionedError(
+            self.backend, self._settings.database, expected, schema=schema, hint=hint
+        )
+
+    async def _verify_runtime_grants(self, conn: Any) -> None:
+        """External mode: the marker is current, so check THIS role can use what it marks (#305).
+
+        ``provision-schema`` creates objects OWNED by the provisioning role, and the runtime role reaches
+        them only through grants (``ALTER DEFAULT PRIVILEGES`` in the runbook). A table created under a
+        different owner gets no default grant, and the marker cannot tell. Without this check the first
+        pipeline path to touch that table fails mid-flow; with it, the start refuses and names the
+        objects. ``has_table_privilege`` is true when ANY listed privilege is held, so each is asked
+        separately. Reads only."""
+        rows = await conn.fetch(
+            "SELECT c.relname, c.relkind FROM pg_catalog.pg_class c"
+            " WHERE c.relnamespace = (SELECT n.oid FROM pg_catalog.pg_namespace n"
+            "   WHERE n.nspname = current_schema())"
+            " AND ((c.relkind IN ('r', 'p')"
+            "   AND NOT (pg_catalog.has_table_privilege(current_user, c.oid, 'SELECT')"
+            "   AND pg_catalog.has_table_privilege(current_user, c.oid, 'INSERT')"
+            "   AND pg_catalog.has_table_privilege(current_user, c.oid, 'UPDATE')"
+            "   AND pg_catalog.has_table_privilege(current_user, c.oid, 'DELETE')))"
+            " OR (c.relkind = 'S'"
+            "   AND NOT pg_catalog.has_sequence_privilege(current_user, c.oid, 'USAGE')))"
+            " ORDER BY c.relname"
+        )
+        if not rows:
+            return
+        names = ", ".join(str(r["relname"]) for r in rows[:10])
+        more = f" (and {len(rows) - 10} more)" if len(rows) > 10 else ""
+        exc = StoreGrantsMissingError(
+            f"the postgres store schema in database {self._settings.database!r} is provisioned and "
+            f"current, but this role lacks row access to {len(rows)} object(s): {names}{more}. "
+            "Refusing to start rather than fail mid-pipeline. Grant SELECT, INSERT, UPDATE, DELETE on "
+            "the tables and USAGE on the sequences to the runtime role (docs/DEPLOY-SERVER-DB.md "
+            "section 1.2); provision-schema cannot grant them"
+        )
+        log.error("postgres: %s", exc)
+        raise exc
 
     @staticmethod
     async def _schema_marker_current(conn: Any, expected: str) -> bool:
@@ -1414,7 +1526,11 @@ class PostgresStore:
             " pg_catalog.has_schema_privilege(current_user, current_schema(), 'CREATE')"
             " AS create_on_schema,"
             " (SELECT count(*) FROM pg_catalog.pg_class c"
-            "  WHERE c.relnamespace = pg_catalog.to_regnamespace(current_schema())"
+            # pg_namespace by name, NOT to_regnamespace(): that re-parses the name as an identifier
+            # (case-folding it, and raising on invalid syntax before PG16), while current_schema()
+            # returns the stored name verbatim, as has_schema_privilege above consumes it.
+            "  WHERE c.relnamespace = (SELECT n.oid FROM pg_catalog.pg_namespace n"
+            "    WHERE n.nspname = current_schema())"
             "  AND pg_catalog.pg_has_role(current_user, c.relowner, 'MEMBER')) AS owned_in_schema"
             " FROM pg_catalog.pg_database d WHERE d.datname = current_catalog"
         )

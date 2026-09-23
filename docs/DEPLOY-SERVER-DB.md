@@ -84,11 +84,18 @@ ALTER ROLE db_datawriter  ADD MEMBER [CORP\mefor-svc$];
 ```
 
 **4. Provision the schema as a separate, DDL-capable principal** (DBA). Run this before the first
-start, and again before the first start of any upgrade whose schema moved. It is safe to re-run: a
-schema that is already current is a no-op. The provisioning principal is a DBA login in `db_ddladmin`
-on the MessageFoundry database, never the gMSA. If it also holds `ALTER` on the database, the command
-turns on `READ_COMMITTED_SNAPSHOT` and `ALLOW_SNAPSHOT_ISOLATION` too; if it does not, it warns and a
-DBA runs those two statements by hand (§2).
+start, and again before the first start of any upgrade whose schema moved. Run it with the engines
+stopped. A schema that is already current is a no-op.
+
+The provisioning principal is a DBA login, never the gMSA. It needs `db_ddladmin` **plus**
+`db_datareader` and `db_datawriter` on the MessageFoundry database: the batch writes the
+`schema_meta` marker and runs data migrations, which `db_ddladmin` alone cannot do. Its default schema
+must be the gMSA's (`dbo` unless you changed it), because the batch creates every table unqualified.
+If it also holds `ALTER` on the database, the command turns on `READ_COMMITTED_SNAPSHOT` and
+`ALLOW_SNAPSHOT_ISOLATION` too. That `ALTER` uses `WITH ROLLBACK IMMEDIATE`, which ends other
+sessions' open transactions, hence the stopped engines. If it cannot, the command prints the exact
+statements and **exits 3**, and a DBA runs them by hand (§2). CI provisions as `sa`, so this narrower
+set is the prescription for the same batch, not a measured minimum.
 
 ```powershell
 # As the DBA's own Windows account: auth = "integrated" connects as whoever runs the command.
@@ -98,7 +105,9 @@ messagefoundry store provision-schema --service-config <instance dir>\messagefou
 ```
 
 Until this step has run, `serve` **refuses to start**. The error names the database and this command.
-It runs no DDL of its own, so a refused start leaves the database exactly as it found it.
+It runs no schema DDL of its own, so a refused start leaves the database exactly as it found it.
+The refusal names the schema the gMSA looked in, and `provision-schema` prints the schema it built
+in. If those differ, the two principals have different default schemas.
 
 **5. The engine `[store]` block** — integrated auth, encrypted, verifying the DB cert against the
 Windows machine trust store (§5); **no secret in the file or env**:
@@ -119,16 +128,16 @@ require_managed_identity = true    # refuse a static SQL login on production PHI
 > trailing `$` (`CORP\mefor-svc$`) — the same name NSSM's `ObjectName` uses.
 >
 > **Why two principals, and never `db_owner` / `sysadmin` for either.** The schema batch issues
-> `CREATE TABLE` / `CREATE INDEX` / `ALTER TABLE ... ADD` / `DROP INDEX` / `DROP TABLE`, which is
-> `db_ddladmin`. Steady state issues only `SELECT` (`db_datareader`) and `INSERT` / `UPDATE` /
-> `DELETE` / `MERGE` (`db_datawriter`). Splitting them means the login that serves traffic every day
-> cannot change the schema. The engine never creates the database, never `TRUNCATE`s, and calls no
-> DMV and no extended procedure.
+> at least `CREATE TABLE` / `CREATE INDEX` / `ALTER TABLE ... ADD` / `DROP INDEX` / `DROP TABLE`,
+> which is `db_ddladmin`. Steady state needs row access: `SELECT` (`db_datareader`) and `INSERT` /
+> `UPDATE` / `DELETE` / `MERGE` (`db_datawriter`). It also creates `#temp` tables, which any login may.
+> Splitting them means the login that serves traffic every day cannot change the store's schema. The
+> cluster coordinator's tables ride the same batch, so a clustered node needs no DDL either.
 >
 > | Principal | Grant | When it is used |
 > |---|---|---|
 > | Runtime (the gMSA) | `db_datareader` + `db_datawriter` | every start, all day |
-> | Provisioning (a DBA login) | `db_ddladmin`, plus `ALTER` on the database for the two options | step 4 only |
+> | Provisioning (a DBA login) | `db_ddladmin` + `db_datareader` + `db_datawriter`, plus `ALTER` on the database for the two options | step 4 only |
 >
 > **`[store].schema_management = "auto"` puts the DDL back on the runtime login.** The engine then
 > builds and upgrades its own schema at open, and the gMSA also needs `db_ddladmin` as a standing
@@ -264,15 +273,16 @@ Who runs the schema DDL is `[store].schema_management` (BACKLOG #305). The two m
 
 | Mode | Who runs the DDL | What `serve` does at open |
 |---|---|---|
-| `external` — the **server-DB default** | a DBA, as a DDL-capable principal, with `messagefoundry store provision-schema` | reads the `schema_meta` marker and **refuses to start** if it does not match this build. It runs no DDL. |
+| `external` — the **server-DB default** | a DBA, as a DDL-capable principal, with `messagefoundry store provision-schema` | reads the `schema_meta` marker and **refuses to start** if it does not match this build. It runs no schema DDL. |
 | `auto` | the engine's own runtime login | builds or upgrades the schema itself, so that login needs standing DDL rights |
 
 SQLite is always `auto`: a local file has no server principal to split.
 
 1. **Create the database.** The engine never runs `CREATE DATABASE`.
 2. **Grant the two principals** (§1.1 for SQL Server, §1.2 for PostgreSQL).
-3. **Run `messagefoundry store provision-schema`** as the provisioning principal. It prints
-   `store schema applied` on a fresh database and `store schema already current` on a re-run.
+3. **Run `messagefoundry store provision-schema`** as the provisioning principal, with the engines
+   stopped. It prints `store schema applied` on a fresh database and `store schema already current`
+   on a re-run, with the schema it built in. It exits 3 if a SQL Server database option is still off.
 4. **Start the engine** as the runtime login.
 5. **On every upgrade, repeat step 3 before the first start of the new build.** If the schema did not
    move, step 3 is a no-op. If it did and step 3 was skipped, `serve` refuses to start and names the

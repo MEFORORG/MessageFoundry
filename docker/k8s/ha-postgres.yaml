@@ -195,7 +195,7 @@ spec:
             - { name: MEFOR_STORE_PORT, value: "5432" }
             - { name: MEFOR_STORE_DATABASE, value: "messagefoundry" }
             # A ROW-ONLY role (BACKLOG #305). [store].schema_management defaults to "external" on a
-            # server DB, so these pods run no DDL and refuse to start until the schema is provisioned.
+            # server DB, so these pods run no schema DDL and refuse to start until the schema is provisioned.
             # Run `messagefoundry store provision-schema` once, and before each upgrade whose schema
             # moved, as a DDL-capable role: for example a one-off Job with that role's credentials.
             # Never put the provisioning credentials in this pod's Secret (docs/DEPLOY-SERVER-DB.md §2).

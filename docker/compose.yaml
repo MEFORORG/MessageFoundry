@@ -174,7 +174,7 @@ services:
     restart: unless-stopped
 
   # One-shot schema provisioning (BACKLOG #305). On a server DB [store].schema_management defaults to
-  # "external": `serve` runs no DDL and refuses to start until `messagefoundry store provision-schema`
+  # "external": `serve` runs no schema DDL and refuses to start until `messagefoundry store provision-schema`
   # has built the schema. This service runs it once and exits; both engines wait for it to finish.
   # It is safe to re-run. LOCAL DEV SHORTCUT: here the one dev role does both jobs. A real deployment
   # runs this as a separate DDL-capable role and gives the engines a row-only role

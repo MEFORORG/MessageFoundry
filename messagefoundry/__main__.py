@@ -4784,28 +4784,44 @@ def _store_provision_schema(args: argparse.Namespace) -> int:
 
     Under ``[store].schema_management = external`` — the server-DB default — ``serve`` only reads the
     ``schema_meta`` marker and refuses on a mismatch, so its login needs row access only. This command
-    is where the DDL went. It does DDL and nothing else: no store key, no rows, no audit row (the
-    audit log is one of the tables it may be creating). Safe to re-run: a current marker is a no-op.
+    is where the DDL went. It does DDL and nothing else: no store key, no audit row (the audit log is
+    one of the tables it may be creating). Safe to re-run: a current marker is a no-op.
+
+    Exit codes: 0 done; 1 could not load settings, wrong backend, or the DDL failed; 3 the schema is
+    applied but a SQL Server database option is still OFF. 3 is not 0 because the shipped pooled claim
+    mode refuses to start while ``READ_COMMITTED_SNAPSHOT`` is off, so a job reading only the exit
+    code must not see a success it would find out about at the next ``serve``.
     """
     import asyncio
 
-    from pydantic import ValidationError
-
-    from messagefoundry.config.settings import hop_posture_from_ai, load_settings
+    from messagefoundry.config.settings import SqlAuth, StoreBackend, hop_posture_from_ai
     from messagefoundry.store.base import provision_store_schema
     from messagefoundry.support.redact import redact_log_line
 
     cli: dict[str, dict[str, object]] = {}
     if args.username is not None:
         cli.setdefault("store", {})["username"] = args.username
-    try:
-        settings = load_settings(config_path=args.service_config, cli=cli)
-    except (FileNotFoundError, ValueError, ValidationError) as exc:
-        return _emit_error(str(exc), as_json=args.json)
+    # Rendered, never stringified: str(ValidationError) carries the section's input values, and the
+    # DBA running this has the provisioning password in MEFOR_STORE_PASSWORD. See the helper's note.
+    settings, detail = _load_service_settings(args.service_config, cli=cli)
+    if settings is None:
+        return _emit_error(detail or "could not load the service settings", as_json=args.json)
     store = settings.store
+    if (
+        args.username is not None
+        and store.backend is StoreBackend.SQLSERVER
+        and store.auth is not SqlAuth.SQL
+    ):
+        # The ODBC string carries no UID under integrated/entra, so the name would be silently dropped
+        # and the DDL would run, and its objects land, as whatever identity runs this process.
+        return _emit_error(
+            f"--username applies to [store].auth = 'sql' only, and this store uses "
+            f"{store.auth.value!r}: run the command as the provisioning identity instead",
+            as_json=args.json,
+        )
     posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
     try:
-        applied = asyncio.run(provision_store_schema(store, posture=posture))
+        result = asyncio.run(provision_store_schema(store, posture=posture))
     except ValueError as exc:  # SQLite, which builds its own schema
         return _emit_error(str(exc), as_json=args.json)
     except Exception as exc:  # noqa: BLE001 - a driver/DDL failure; report it redacted, never a traceback
@@ -4814,24 +4830,36 @@ def _store_provision_schema(args: argparse.Namespace) -> int:
             f"{store.database!r}: {type(exc).__name__}: {redact_log_line(str(exc))[:500]}",
             as_json=args.json,
         )
-    state = "applied" if applied else "already current"
+    mode = store.resolved_schema_management().value
     if args.json:
         _print_json(
             {
-                "ok": True,
+                "ok": not result.options_off,
                 "backend": store.backend.value,
                 "database": store.database,
-                "applied": applied,
-                "schema_management": store.resolved_schema_management().value,
+                "schema": result.schema,
+                "applied": result.applied,
+                "options_off": list(result.options_off),
+                "schema_management": mode,
             },
             compact=True,
         )
     else:
+        state = "applied" if result.applied else "already current"
         print(
-            f"store schema {state}: {store.backend.value} database {store.database!r} "
-            f"([store].schema_management = {store.resolved_schema_management().value!r})"
+            f"store schema {state}: {store.backend.value} database {store.database!r}, schema "
+            f"{result.schema!r} ([store].schema_management = {mode!r}). The runtime login must "
+            "resolve unqualified names in that same schema"
         )
-    return 0
+        if result.options_off:
+            print(
+                f"error: {' and '.join(result.options_off)} is still OFF: this principal could not "
+                "ALTER DATABASE. The pooled claim mode refuses to start while "
+                "READ_COMMITTED_SNAPSHOT is off; have a DBA turn it on (docs/DEPLOY-SERVER-DB.md "
+                "section 2)",
+                file=sys.stderr,
+            )
+    return 3 if result.options_off else 0
 
 
 def _provision_admin(args: argparse.Namespace) -> int:

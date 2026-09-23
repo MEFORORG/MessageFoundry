@@ -309,7 +309,7 @@ exist already. Stand the database up in this order:
    the secondaries through the AG. Repeat this before the first start of any upgrade whose schema
    moved ([`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §2).
 6. **First engine start**, as the runtime login. Under the default
-   `[store].schema_management = "external"` it runs no DDL, and it refuses to start if step 5 has
+   `[store].schema_management = "external"` it runs no schema DDL, and it refuses to start if step 5 has
    not run.
 
 The checklist behind those steps:
@@ -344,7 +344,8 @@ The checklist behind those steps:
 - [ ] **Login grants — least privilege, never `db_owner`.** Two principals, and **no
       server-level role** for either. The engine's runtime database user needs `db_datareader` +
       `db_datawriter` on `mefor`. The provisioning principal that runs
-      `messagefoundry store provision-schema` needs `db_ddladmin` on `mefor`.
+      `messagefoundry store provision-schema` needs `db_ddladmin` + `db_datareader` +
+      `db_datawriter` on `mefor`, and the same default schema as the engine's user.
       [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §1.1 carries the T-SQL and §2 the provisioning
       steps. Only `[store].schema_management = "auto"` puts `db_ddladmin` on the runtime login, and
       then it is a **schema-change-window** grant: the store skips its whole DDL batch whenever the

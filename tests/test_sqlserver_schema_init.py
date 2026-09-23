@@ -40,11 +40,16 @@ class _FakeCursor:
         self._executed.append((sql, params))
         self._last_sql = sql
 
+    #: What the #305 external-mode options read returns: RCSI on, snapshot isolation on, schema dbo.
+    options_row: tuple[object, ...] = (1, 1, "dbo")
+
     async def fetchone(self) -> object:
         if "OBJECT_ID('schema_meta'" in self._last_sql:
             return (1,) if self._marker_current else (None,)
         if "schema_hash" in self._last_sql:
             return (_schema_hash(),) if self._marker_current else (None,)
+        if "sys.databases" in self._last_sql:
+            return self.options_row
         return (0,)  # sp_getapplock return code >= 0 (lock granted)
 
     async def fetchall(self) -> list[object]:
@@ -210,8 +215,9 @@ async def test_marker_current_skips_batch_applock_and_timeout_exemption() -> Non
 # --- BACKLOG #305: [store].schema_management = external -----------------------------------------
 
 
-def _is_marker_probe(sql: str) -> bool:
-    return sql.lstrip().upper().startswith("SELECT") and "schema_meta" in sql
+def _is_read(sql: str) -> bool:
+    """External mode issues SELECTs only: the marker probe and the database-options read."""
+    return sql.lstrip().upper().startswith("SELECT")
 
 
 class _StaleCursor(_FakeCursor):
@@ -222,7 +228,7 @@ class _StaleCursor(_FakeCursor):
             return (1,)
         if "schema_hash" in self._last_sql:
             return ("an-older-build",)
-        return (0,)
+        return await super().fetchone()
 
 
 async def test_external_mode_refuses_a_virgin_database_and_runs_no_ddl() -> None:
@@ -239,8 +245,12 @@ async def test_external_mode_refuses_a_virgin_database_and_runs_no_ddl() -> None
         await store._ensure_schema()
 
     assert PROVISION_SCHEMA_COMMAND in str(info.value)
-    assert executed, "the marker must actually have been read"
-    assert all(_is_marker_probe(sql) for sql, _ in executed), [sql for sql, _ in executed]
+    # The refusal names where THIS login looked, so a provisioning run into another default schema
+    # cannot send the operator round a loop of "already current".
+    assert info.value.schema == "dbo"
+    assert "(looked in schema 'dbo')" in str(info.value)
+    assert any("schema_meta" in sql for sql, _ in executed), "the marker must actually be read"
+    assert all(_is_read(sql) for sql, _ in executed), [sql for sql, _ in executed]
     assert conn._conn.timeout == 30  # the B10 DDL exemption never engaged
     assert conn.committed == 1 and conn.rolledback == 0  # the probe's read txn is closed
 
@@ -259,7 +269,7 @@ async def test_external_mode_refuses_a_stale_marker_without_ddl() -> None:
     with pytest.raises(SchemaNotProvisionedError):
         await store._ensure_schema()
 
-    assert all(_is_marker_probe(sql) for sql, _ in executed)
+    assert all(_is_read(sql) for sql, _ in executed)
 
 
 async def test_external_mode_opens_a_provisioned_database() -> None:
@@ -271,7 +281,7 @@ async def test_external_mode_opens_a_provisioned_database() -> None:
     )
 
     assert await store._ensure_schema() is False
-    assert all(_is_marker_probe(sql) for sql, _ in executed)
+    assert all(_is_read(sql) for sql, _ in executed)
 
 
 async def test_the_same_stale_marker_runs_the_batch_under_auto() -> None:
@@ -299,3 +309,26 @@ async def test_provisioning_applies_the_batch_whatever_the_mode_says() -> None:
     lock_i = _applock_index(executed)
     first_create = next(i for i, (sql, _) in enumerate(executed) if "CREATE TABLE" in sql)
     assert first_create > lock_i
+
+
+async def test_external_mode_warns_with_the_statement_for_the_option_that_is_off(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Only ALLOW_SNAPSHOT_ISOLATION is off: the warning must give THAT statement, not RCSI's
+    disruptive WITH ROLLBACK IMMEDIATE one, and the open must still issue no ALTER."""
+    executed: list[tuple[str, object]] = []
+    conn = _FakeConn(executed, marker_current=True)
+    conn.cursor_obj.options_row = (1, 0, "dbo")
+    store = _make_store(conn)
+    store._settings = _settings(  # type: ignore[assignment]
+        command_timeout=30, mode=SchemaManagement.EXTERNAL
+    )
+
+    with caplog.at_level("WARNING"):
+        assert await store._ensure_schema() is False
+
+    text = caplog.text
+    assert "ALLOW_SNAPSHOT_ISOLATION is OFF" in text
+    assert "SET ALLOW_SNAPSHOT_ISOLATION ON" in text
+    assert "READ_COMMITTED_SNAPSHOT ON" not in text
+    assert all(_is_read(sql) for sql, _ in executed)

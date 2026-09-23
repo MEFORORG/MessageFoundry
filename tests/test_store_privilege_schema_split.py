@@ -50,6 +50,7 @@ from messagefoundry.config.settings import (
 from messagefoundry.store.base import (
     PROVISION_SCHEMA_COMMAND,
     SchemaNotProvisionedError,
+    SchemaProvisionResult,
     provision_store_schema,
 )
 from messagefoundry.store.privilege import (
@@ -304,11 +305,23 @@ async def test_postgres_probe_with_no_current_schema_is_unobserved_under_externa
 
 
 class _FakePgConn:
-    """Answers the two ADR 0064 marker reads and records anything that would write."""
+    """Answers the external-mode reads and records anything that would write.
 
-    def __init__(self, *, present: bool, schema_hash: str | None) -> None:
+    ``usage`` is whether the role holds USAGE on ``db_schema``; ``ungranted`` names objects the role
+    cannot use, as the runtime-grants check would find them."""
+
+    def __init__(
+        self,
+        *,
+        present: bool,
+        schema_hash: str | None,
+        usage: bool = True,
+        ungranted: tuple[str, ...] = (),
+    ) -> None:
         self._present = present
         self._hash = schema_hash
+        self._usage = usage
+        self._ungranted = ungranted
         self.reads: list[str] = []
         self.writes: list[str] = []
 
@@ -316,7 +329,15 @@ class _FakePgConn:
         self.reads.append(sql)
         if "to_regclass" in sql:
             return {"present": self._present}
+        if "has_schema_privilege" in sql:
+            return {"usage": self._usage}
+        if "current_schema()" in sql:
+            return {"schema_name": "public"}
         return None if self._hash is None else {"schema_hash": self._hash}
+
+    async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
+        self.reads.append(sql)
+        return [{"relname": name, "relkind": "r"} for name in self._ungranted]
 
     async def execute(self, sql: str, *args: Any, **kwargs: Any) -> None:
         self.writes.append(sql)
@@ -325,10 +346,14 @@ class _FakePgConn:
         raise AssertionError("external mode must never open a DDL transaction")
 
 
-def _postgres_store_over(conn: _FakePgConn, mode: SchemaManagement | None) -> Any:
+def _postgres_store_over(
+    conn: _FakePgConn, mode: SchemaManagement | None, *, db_schema: str | None = None
+) -> Any:
     from messagefoundry.store.postgres import PostgresStore
 
-    store = PostgresStore(None, _server(StoreBackend.POSTGRES, schema_management=mode))
+    store = PostgresStore(
+        None, _server(StoreBackend.POSTGRES, schema_management=mode, db_schema=db_schema)
+    )
 
     @contextlib.asynccontextmanager
     async def _timed_acquire(*, record: bool = True) -> AsyncIterator[Any]:
@@ -353,6 +378,27 @@ async def test_postgres_external_refuses_without_ddl(
     assert conn.writes == []
 
 
+async def test_postgres_refusal_names_a_missing_usage_grant() -> None:
+    """``to_regclass`` skips a schema the role cannot use, so a missing USAGE reads as an absent marker.
+    The refusal must name the grant, because re-running provision-schema would say "already current"."""
+    conn = _FakePgConn(present=False, schema_hash=None, usage=False)
+    store = _postgres_store_over(conn, None, db_schema="mefor")
+    with pytest.raises(SchemaNotProvisionedError) as info:
+        await store._ensure_schema()
+    assert "no USAGE on schema 'mefor'" in str(info.value)
+    assert "GRANT USAGE ON SCHEMA mefor" in str(info.value)
+    assert conn.writes == []
+
+
+async def test_postgres_refusal_with_usage_does_not_blame_the_grant() -> None:
+    """The control for the case above: with USAGE held, the hint must not name a grant."""
+    conn = _FakePgConn(present=False, schema_hash=None, usage=True)
+    store = _postgres_store_over(conn, None, db_schema="mefor")
+    with pytest.raises(SchemaNotProvisionedError) as info:
+        await store._ensure_schema()
+    assert "USAGE" not in str(info.value)
+
+
 async def test_postgres_external_opens_a_provisioned_schema() -> None:
     from messagefoundry.store.postgres import _schema_hash
 
@@ -362,6 +408,28 @@ async def test_postgres_external_opens_a_provisioned_schema() -> None:
     assert conn.writes == []
 
 
+async def test_postgres_external_refuses_a_current_schema_the_role_cannot_use() -> None:
+    """A table owned by a role the default privileges do not cover has no runtime grant. The marker
+    cannot tell, so the start must refuse and name it, rather than fail the first pipeline path."""
+    from messagefoundry.store.base import StoreGrantsMissingError
+    from messagefoundry.store.postgres import _schema_hash
+
+    conn = _FakePgConn(present=True, schema_hash=_schema_hash(), ungranted=("messages",))
+    store = _postgres_store_over(conn, None)
+    with pytest.raises(StoreGrantsMissingError, match="lacks row access to 1 object"):
+        await store._ensure_schema()
+    assert conn.writes == []
+
+
+async def test_postgres_auto_does_not_check_runtime_grants() -> None:
+    """Under auto the role owns what it created, so the grants check is external-only."""
+    from messagefoundry.store.postgres import _schema_hash
+
+    conn = _FakePgConn(present=True, schema_hash=_schema_hash(), ungranted=("messages",))
+    store = _postgres_store_over(conn, SchemaManagement.AUTO)
+    assert await store._ensure_schema() is False
+
+
 async def test_postgres_auto_on_the_same_stale_marker_reaches_the_ddl_transaction() -> None:
     """The control: the refusal above is the mode's doing. Auto on the same state goes on to open the
     DDL transaction (the fake refuses it, which is how this test sees it was reached)."""
@@ -369,6 +437,62 @@ async def test_postgres_auto_on_the_same_stale_marker_reaches_the_ddl_transactio
     store = _postgres_store_over(conn, SchemaManagement.AUTO)
     with pytest.raises(AssertionError, match="DDL transaction"):
         await store._ensure_schema()
+
+
+# --- the cluster coordinator's tables ride the batch ---------------------------------------------
+
+
+def test_both_batches_carry_the_cluster_tables() -> None:
+    """Under external the runtime login runs no DDL, so the coordinator's tables must be created by
+    the batch provision-schema runs. Stated once, and appended to the batch, on both backends."""
+    from messagefoundry.store import postgres, sqlserver
+
+    for module in (postgres, sqlserver):
+        batch = module._SCHEMA
+        cluster = list(module.CLUSTER_SCHEMA)
+        assert cluster, module.__name__
+        start = batch.index(cluster[0])
+        assert batch[start : start + len(cluster)] == cluster, module.__name__
+        joined = "\n".join(module.CLUSTER_SCHEMA)
+        assert "nodes" in joined and "leader_lease" in joined, module.__name__
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"), [(None, False), (SchemaManagement.AUTO, True)], ids=["external", "auto"]
+)
+@pytest.mark.parametrize("backend", [StoreBackend.SQLSERVER, StoreBackend.POSTGRES])
+def test_the_coordinator_runs_its_ddl_under_auto_only(
+    backend: StoreBackend, mode: SchemaManagement | None, expected: bool
+) -> None:
+    from messagefoundry.pipeline.cluster import build_coordinator
+
+    store = types.SimpleNamespace(
+        _pool=object(), _owner="node-1", _settings=_server(backend, schema_management=mode)
+    )
+    coordinator = build_coordinator(store, types.SimpleNamespace(enabled=True))
+    assert coordinator._run_schema_ddl is expected  # type: ignore[union-attr]
+
+
+async def test_an_external_coordinator_start_issues_no_ddl(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The coordinator's own DDL is skipped outright under external, not merely made idempotent."""
+    from messagefoundry.pipeline.cluster import DbCoordinator
+
+    called: list[str] = []
+
+    async def _ensure(self: DbCoordinator) -> None:
+        called.append("ddl")
+
+    async def _register(self: DbCoordinator) -> None:
+        called.append("register")
+
+    monkeypatch.setattr(DbCoordinator, "_ensure_nodes_table", _ensure)
+    monkeypatch.setattr(DbCoordinator, "_register", _register)
+    coordinator = DbCoordinator(object(), "node-1", run_schema_ddl=False)
+    await coordinator.start()
+    try:
+        assert called == ["register"]
+    finally:
+        await coordinator.stop()
 
 
 # --- the provisioning seam --------------------------------------------------------------------
@@ -390,14 +514,15 @@ async def test_provisioning_dispatches_to_the_backend(
 
     cls = SqlServerStore if backend is StoreBackend.SQLSERVER else PostgresStore
     seen: list[StoreSettings] = []
+    result = SchemaProvisionResult(applied=True, schema="dbo")
 
-    async def _provision(settings: StoreSettings, *, posture: Any = None) -> bool:
+    async def _provision(settings: StoreSettings, *, posture: Any = None) -> SchemaProvisionResult:
         seen.append(settings)
-        return True
+        return result
 
     monkeypatch.setattr(cls, "provision_schema", _provision)
     settings = _server(backend)
-    assert await provision_store_schema(settings) is True
+    assert await provision_store_schema(settings) is result
     assert seen == [settings]
 
 
@@ -405,7 +530,8 @@ async def test_sqlserver_provisioning_runs_the_batch_with_provisioning_true(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``provision_schema`` must reach ``_ensure_schema(provisioning=True)`` even though the settings
-    resolve to external, enable the database options with ALTER, and release its pool."""
+    resolve to external, run the database options first, report what stayed OFF and where the batch
+    landed, and release its pool."""
     from messagefoundry.store.sqlserver import SqlServerStore
 
     events: list[str] = []
@@ -423,21 +549,29 @@ async def test_sqlserver_provisioning_runs_the_batch_with_provisioning_true(
 
     monkeypatch.setitem(sys.modules, "aioodbc", types.SimpleNamespace(create_pool=_create_pool))
 
-    async def _options(settings: StoreSettings, *, posture: Any = None, alter: bool = True) -> None:
-        events.append(f"options alter={alter}")
+    async def _options(settings: StoreSettings, *, posture: Any = None) -> list[str]:
+        events.append("options")
+        return ["ALLOW_SNAPSHOT_ISOLATION"]
 
     async def _ensure(self: SqlServerStore, *, provisioning: bool = False) -> bool:
         events.append(f"ensure provisioning={provisioning}")
         return True
 
+    async def _fetchone(self: SqlServerStore, sql: str, params: Any = ()) -> dict[str, Any]:
+        return {"schema_name": "dbo"}
+
     monkeypatch.setattr(SqlServerStore, "_ensure_database_options", staticmethod(_options))
     monkeypatch.setattr(SqlServerStore, "_ensure_schema", _ensure)
+    monkeypatch.setattr(SqlServerStore, "_fetchone", _fetchone)
 
     settings = _server(StoreBackend.SQLSERVER)
     assert settings.resolved_schema_management() is SchemaManagement.EXTERNAL
-    assert await SqlServerStore.provision_schema(settings) is True
+    result = await SqlServerStore.provision_schema(settings)
+    assert result == SchemaProvisionResult(
+        applied=True, schema="dbo", options_off=("ALLOW_SNAPSHOT_ISOLATION",)
+    )
     assert events == [
-        "options alter=True",
+        "options",
         "create_pool maxsize=1",
         "ensure provisioning=True",
         "pool.close",
@@ -465,14 +599,25 @@ def test_cli_refuses_a_sqlite_store_and_creates_nothing(
     assert not target.exists()
 
 
-def _server_toml(tmp_path: Path) -> Path:
+def _server_toml(tmp_path: Path, body: str | None = None) -> Path:
     toml = tmp_path / "svc.toml"
     toml.write_text(
-        '[store]\nbackend = "postgres"\nserver = "db.invalid"\ndatabase = "messagefoundry"\n'
+        body
+        or '[store]\nbackend = "postgres"\nserver = "db.invalid"\ndatabase = "messagefoundry"\n'
         'username = "mefor_runtime"\n',
         encoding="utf-8",
     )
     return toml
+
+
+def _stub_provision(
+    monkeypatch: pytest.MonkeyPatch, result: SchemaProvisionResult, seen: list[StoreSettings]
+) -> None:
+    async def _provision(settings: StoreSettings, *, posture: Any = None) -> SchemaProvisionResult:
+        seen.append(settings)
+        return result
+
+    monkeypatch.setattr("messagefoundry.store.base.provision_store_schema", _provision)
 
 
 def test_cli_provisions_as_the_named_principal(
@@ -481,12 +626,7 @@ def test_cli_provisions_as_the_named_principal(
     """``--username`` swaps in the provisioning principal; the runtime one stays in the file."""
     _clear_store_env(monkeypatch)
     seen: list[StoreSettings] = []
-
-    async def _provision(settings: StoreSettings, *, posture: Any = None) -> bool:
-        seen.append(settings)
-        return True
-
-    monkeypatch.setattr("messagefoundry.store.base.provision_store_schema", _provision)
+    _stub_provision(monkeypatch, SchemaProvisionResult(applied=True, schema="mefor"), seen)
     toml = _server_toml(tmp_path)
     argv = ["store", "provision-schema", "--service-config", str(toml), "--username", "mefor_dba"]
     assert main([*argv, "--json"]) == 0
@@ -495,23 +635,78 @@ def test_cli_provisions_as_the_named_principal(
         "ok": True,
         "backend": "postgres",
         "database": "messagefoundry",
+        "schema": "mefor",
         "applied": True,
+        "options_off": [],
         "schema_management": "external",
     }
     assert [s.username for s in seen] == ["mefor_dba"]
 
 
-def test_cli_reports_an_already_current_schema(
+def test_cli_reports_an_already_current_schema_and_where_it_is(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _clear_store_env(monkeypatch)
-
-    async def _provision(settings: StoreSettings, *, posture: Any = None) -> bool:
-        return False
-
-    monkeypatch.setattr("messagefoundry.store.base.provision_store_schema", _provision)
+    _stub_provision(monkeypatch, SchemaProvisionResult(applied=False, schema="mefor"), [])
     assert main(["store", "provision-schema", "--service-config", str(_server_toml(tmp_path))]) == 0
-    assert "already current" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "already current" in out
+    assert "schema 'mefor'" in out
+
+
+def test_cli_exits_3_when_a_database_option_stayed_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The schema is built but RCSI is still off, which the pooled default refuses to start on. A job
+    reading only the exit code must not see a success."""
+    _clear_store_env(monkeypatch)
+    result = SchemaProvisionResult(
+        applied=True, schema="dbo", options_off=("READ_COMMITTED_SNAPSHOT",)
+    )
+    _stub_provision(monkeypatch, result, [])
+    argv = ["store", "provision-schema", "--service-config", str(_server_toml(tmp_path))]
+    assert main(argv) == 3
+    captured = capsys.readouterr()
+    assert "READ_COMMITTED_SNAPSHOT is still OFF" in captured.err
+    assert main([*argv, "--json"]) == 3
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["options_off"] == ["READ_COMMITTED_SNAPSHOT"]
+
+
+def test_cli_refuses_username_under_integrated_auth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Under integrated auth the ODBC string carries no UID, so a --username would be silently dropped
+    and the DDL would run as whoever runs the command."""
+    _clear_store_env(monkeypatch)
+    seen: list[StoreSettings] = []
+    _stub_provision(monkeypatch, SchemaProvisionResult(applied=True), seen)
+    toml = _server_toml(
+        tmp_path,
+        '[store]\nbackend = "sqlserver"\nserver = "db.invalid"\ndatabase = "MessageFoundry"\n'
+        'auth = "integrated"\n',
+    )
+    argv = ["store", "provision-schema", "--service-config", str(toml), "--username", "mefor_dba"]
+    assert main(argv) == 1
+    assert "--username applies to [store].auth = 'sql' only" in capsys.readouterr().err
+    assert seen == []
+
+
+def test_cli_settings_failure_never_prints_the_password(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The DBA has the provisioning password in MEFOR_STORE_PASSWORD. A [store] that fails validation
+    must be rendered, not stringified, or the section's input values reach the terminal."""
+    _clear_store_env(monkeypatch)
+    secret = "Px9_" + secrets.token_urlsafe(18)
+    monkeypatch.setenv("MEFOR_STORE_PASSWORD", secret)
+    toml = _server_toml(tmp_path, '[store]\nbackend = "postgres"\ndatabase = "messagefoundry"\n')
+    for extra in ([], ["--json"]):
+        code = main(["store", "provision-schema", "--service-config", str(toml), *extra])
+        captured = capsys.readouterr()
+        assert code == 1
+        assert secret not in captured.out + captured.err
 
 
 def test_cli_reports_a_driver_failure_as_one_line(
@@ -519,7 +714,7 @@ def test_cli_reports_a_driver_failure_as_one_line(
 ) -> None:
     _clear_store_env(monkeypatch)
 
-    async def _provision(settings: StoreSettings, *, posture: Any = None) -> bool:
+    async def _provision(settings: StoreSettings, *, posture: Any = None) -> SchemaProvisionResult:
         raise PermissionError("permission denied for schema mefor")
 
     monkeypatch.setattr("messagefoundry.store.base.provision_store_schema", _provision)
@@ -604,9 +799,9 @@ async def test_live_sqlserver_external_refuses_then_provisions_then_runs_row_onl
             await SqlServerStore.open(external)
         assert await scalar(f"SELECT COUNT(*) FROM [{db}].sys.objects WHERE is_ms_shipped = 0") == 0
 
-        assert await provision_store_schema(external) is True
+        assert (await provision_store_schema(external)).applied is True
         assert await scalar(f"SELECT COUNT(*) FROM [{db}].sys.tables") > 0
-        assert await provision_store_schema(external) is False
+        assert (await provision_store_schema(external)).applied is False
 
         await run(
             f"IF SUSER_ID('{login}') IS NULL CREATE LOGIN {login} WITH PASSWORD='{password}',"
@@ -679,9 +874,9 @@ async def test_live_postgres_external_refuses_then_provisions_then_runs_row_only
             await PostgresStore.open(external)
         assert await tables() == 0
 
-        assert await provision_store_schema(external) is True
+        assert (await provision_store_schema(external)).applied is True
         assert await tables() > 0
-        assert await provision_store_schema(external) is False
+        assert (await provision_store_schema(external)).applied is False
 
         await admin._execute(f"CREATE ROLE {role} LOGIN PASSWORD '{password}'")
         for stmt in (

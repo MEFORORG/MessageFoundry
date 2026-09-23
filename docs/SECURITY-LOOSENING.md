@@ -574,7 +574,7 @@ This section is kept rather than deleted, because the claim it used to make is t
   `CREATE` on the store's schema on PostgreSQL) that steady-state operation never uses. Any code path
   that reaches the store can then create, alter or drop the engine's own tables, not only read and
   write their rows.
-- **What the default does instead:** `serve` runs no DDL. A DBA runs
+- **What the default does instead:** `serve` runs no schema DDL. A DBA runs
   `messagefoundry store provision-schema` as a separate, DDL-capable principal, before the first start
   and before the first start of any upgrade whose schema moved. Until then `serve` refuses to start and
   names that command ([`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §2).

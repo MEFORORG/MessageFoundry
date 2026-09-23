@@ -1,4 +1,4 @@
-# 0192 — Server-DB schema is provisioned externally by default; the runtime login runs no DDL
+# 0192 — Server-DB schema is provisioned externally by default; the runtime login runs no schema DDL
 
 - **Status:** Accepted (2026-09-23) — built with this ADR.
 - **Date:** 2026-09-23
@@ -28,15 +28,26 @@ nothing today, and nobody needs a migration window.
 `[store].schema_management` takes `auto` or `external`. **`external` is the default on SQL Server and
 PostgreSQL**; SQLite is always `auto`, and an explicit `external` there is refused at load.
 
-- **Under `external`, open runs no DDL.** It reads the marker through the existing
+- **Under `external`, open runs no schema DDL.** It reads the marker through the existing
   `_schema_marker_current` and raises `SchemaNotProvisionedError` when it does not match. The error
   names the database and the fix. On SQL Server it also stops issuing the two `ALTER DATABASE`
   options (`READ_COMMITTED_SNAPSHOT`, `ALLOW_SNAPSHOT_ISOLATION`) and warns instead.
 - **`messagefoundry store provision-schema` runs the DDL** as whoever runs the command: the same
   batch, applock or advisory lock, and marker write that `auto` uses, plus the two SQL Server
   options. It opens a one-connection pool with the identity cipher and touches no row, so the DBA
-  running it needs no store key. It is safe to re-run. SQLite is refused, so it cannot create a file
-  it was only pointed at (#1780).
+  running it needs no store key. A re-run on a current schema is a no-op, but its RCSI step uses
+  `WITH ROLLBACK IMMEDIATE`, so it runs with the engines stopped. It prints the schema it built in,
+  and exits 3 when a database option is still off, because the pooled default refuses to start
+  then. SQLite is refused, so it cannot create a file it was only pointed at (#1780).
+- **The cluster coordinator's tables ride the same batch.** Both coordinators used to create
+  `nodes` / `leader_lease` (and on SQL Server `cluster_config`) at every start, as the runtime login.
+  The statements are now stated once, as `CLUSTER_SCHEMA` in each store module, and appended to the
+  batch; under `external` the coordinator skips its own DDL.
+- **A refusal never sends the operator round a loop.** It names the schema this login looked in,
+  because the batch creates tables unqualified and a provisioning principal with another default
+  schema would build them elsewhere. On PostgreSQL it names a missing `USAGE` grant, which reads
+  exactly like an absent marker. And on PostgreSQL a current marker is followed by a row-grant
+  check, so a table the runtime role cannot use refuses the start instead of failing mid-pipeline.
 - **The privilege probe follows the mode.** Under `external`, `db_ddladmin` (SQL Server) and
   `CREATE` on, or ownership of objects in, the store's schema (PostgreSQL) count as excess. Under
   `auto` they stay prescribed, which is the #1008 behaviour unchanged.
@@ -46,7 +57,7 @@ PostgreSQL**; SQLite is always `auto`, and an explicit `external` there is refus
 ## Acceptance Criteria
 
 - **AC-1** — WHILE `schema_management` resolves to `external`, WHEN the marker is absent or records
-  another batch, THE SYSTEM SHALL refuse the open, name `provision-schema`, and run no DDL.
+  another batch, THE SYSTEM SHALL refuse the open, name `provision-schema`, and run no schema DDL.
   → `tests/test_sqlserver_schema_init.py::test_external_mode_refuses_a_virgin_database_and_runs_no_ddl`
   → `tests/test_store_privilege_schema_split.py::test_postgres_external_refuses_without_ddl`
 - **AC-2** — WHILE `schema_management` resolves to `auto`, THE SYSTEM SHALL apply the batch exactly as
@@ -87,6 +98,10 @@ fails `serve` until someone runs `provision-schema`. This is the accepted cost. 
 comes at start before any listener binds, and names the command. CI server-DB legs and the dev scripts
 set `MEFOR_STORE_SCHEMA_MANAGEMENT=auto`, because their suites drop and rebuild tables as the test
 login; the new file's live legs exercise `external` against a scratch database.
+
+**Measured, and not** — CI provisions as `sa`. The runbook's narrower provisioning grant
+(`db_ddladmin` + `db_datareader` + `db_datawriter`) is the prescription for the batch, not a measured
+minimum.
 
 **Out of scope** — the check-privileges CLI, an AlertSink event on the WARN arm, and the per-hop
 privilege matrix (BACKLOG #305's later half, E2). Direct `GRANT ALTER ON SCHEMA` / `GRANT CREATE
