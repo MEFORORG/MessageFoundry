@@ -111,30 +111,6 @@ export async function peekToken(
 }
 
 /**
- * Best-effort revoke of the token cached for `url`, which a fresh sign-in is about to replace.
- *
- * Only that one token: never the user's other sessions, which may be other tools or machines. A
- * failure is swallowed, because the old session times out on its own and a sign-in must not fail
- * over it. `withAuth` clears the cache before it re-signs in after a 401, so the case this covers is
- * the status bar's explicit "Sign in" over a token that is still cached and still live.
- */
-async function revokeSuperseded(
-  ctx: vscode.ExtensionContext,
-  url: string,
-  replacement: string,
-): Promise<void> {
-  const prior = await peekToken(ctx, url);
-  if (!prior || prior === replacement) {
-    return;
-  }
-  try {
-    await postJson<unknown>(url, "/auth/logout", {}, prior);
-  } catch {
-    // Unreachable engine or an already-dead token: nothing more this client can do.
-  }
-}
-
-/**
  * Prompt for credentials and sign in to `url`; stores + returns the token, or undefined if cancelled.
  *
  * EXPORTED (it used to be private, reachable only as a side-effect of promote) so the engine status bar
@@ -198,9 +174,12 @@ export async function signIn(ctx: vscode.ExtensionContext, url: string): Promise
       throw e;
     }
     // ASVS 7.2.4: the store below REPLACES any token cached for this engine, so end that session on
-    // the engine first. Otherwise it stays valid, unreachable from here, until it idles out. Only now,
-    // after the new sign-in succeeded, so a failed sign-in signs nobody out.
-    await revokeSuperseded(ctx, url, res.token);
+    // the engine first, or it stays valid, unreachable from here, until it idles out. Only now, after
+    // the new sign-in succeeded, so a failed sign-in signs nobody out. signOut revokes that one token
+    // and never the user's other sessions, and it is best-effort: a sign-in must not fail over it.
+    // `withAuth` clears the cache before it re-signs in after a 401, so the case this covers is the
+    // status bar's explicit "Sign in" over a token that is still cached and still live.
+    await signOut(ctx, url);
     await ctx.secrets.store(secretKey(url), res.token);
     // Both of these produce a token that LOOKS fine and then 403s later, so say so now, at the moment
     // the user can act on it, rather than letting them discover it as an opaque failure mid-promote.

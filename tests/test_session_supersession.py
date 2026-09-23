@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
+from urllib.parse import parse_qsl, urlsplit
 
 import pytest
 
@@ -178,7 +179,7 @@ async def test_the_callback_supersedes_only_after_the_proof_succeeds(
     flow_id, url = await service.begin_oidc_login(
         client=None, public_origin="https://ops.example", prior_session=prior
     )
-    state = dict(p.split("=", 1) for p in url.split("?", 1)[1].split("&"))["state"]
+    state = dict(parse_qsl(urlsplit(url).query))["state"]
     outcome = await service.complete_oidc_login(
         flow_id=flow_id,
         state=state,

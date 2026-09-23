@@ -23,18 +23,16 @@ from urllib.parse import parse_qsl, urlsplit
 
 import httpx
 import pytest
+from _ui_clients import PW, provision
+from _ui_clients import SAME_ORIGIN as _SAME
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
-from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.service import AuthService, LoginOutcome
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
-
-PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms -- satisfies the ASVS policy (WP-3)
-_SAME = {"Sec-Fetch-Site": "same-origin"}
 
 _PRINCIPAL = AdPrincipal(
     username="jdoe",
@@ -82,20 +80,7 @@ async def _service(engine: Engine) -> AuthService:
     service = AuthService(engine.store, _directory_settings(), ldap=_FakeLdap())  # type: ignore[arg-type]
     await service.initialize()
     await service.set_ad_group_map([("cn=mf-admins,dc=x", "administrator")], actor="admin")
-    user_id = await service.create_local_user(
-        username="op",
-        password=PW,
-        display_name=None,
-        email=None,
-        roles=[Role.OPERATOR.value],
-        actor="test",
-    )
-    await service.set_channel_scope(user_id, [ALL_CHANNELS], actor="test")
-    user = await service.store.get_user(user_id)
-    assert user is not None and user.password_hash is not None
-    await service.store.set_password(
-        user_id, password_hash=user.password_hash, must_change_password=False
-    )
+    await provision(service, "op", [Role.OPERATOR.value])
     return service
 
 
