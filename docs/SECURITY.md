@@ -154,6 +154,11 @@ pre-auth `[security].allowed_client_networks` gate — the full set is inventori
 so N engine shards multiply every budget by N): an off-loopback deployment must additionally front the
 API with a proxy/WAF limiter. Disable with `[auth].admin_write_rate_limit_enabled = false`.
 
+**A second 2.4.2 control is a time floor, not a rate.** A held dual-control request cannot be approved
+until it is `[approvals].min_dwell_seconds` old (default 2 s). It is described, with where its default
+comes from, under [Dual-control approval for high-value
+actions](#dual-control-approval-for-high-value-actions-wp-l3-04-asvs-235).
+
 **Authorization-decision audit (ASVS 16.3.2).** **Every** authorization grant is audited
 (`auth.permission_granted`), the twin of the existing `auth.permission_denied` (BACKLOG #195a). PHI-view
 grants are the one standing exclusion, because the PHI-access audit path already records those accesses
@@ -880,6 +885,42 @@ server-side, not a client confirmation). On release the captured operation is **
 a request older than `[approvals].expiry_hours` can no longer be approved. Approvers see the open queue
 at `GET /approvals`.
 
+**A request must also be old enough before it can be approved (ASVS 2.4.2).** The expiry is a
+ceiling. `[approvals].min_dwell_seconds` is the floor, default **2 s**. An approve that arrives sooner
+gets **409** and writes an `approval.too_early` audit row against the approver, with the request's age
+and the floor. The request stays **pending**, and nothing retries it: the approver approves again. The
+check is inside the approval gate itself, so every release path meets it. Setting the floor to `0`
+removes it. When requests expire, a floor as long as the expiry window is refused at startup, because
+no request could ever be approved.
+
+**Where the default comes from.** It is **provisional**, and it comes from published human-timing
+research, not from a timed session. The keystroke-level model (Card, Moran and Newell, "The
+keystroke-level model for user performance time with interactive systems", *Communications of the ACM*
+23(7), 1980, pp. 396-410) gives these operator times:
+
+| Operator | What the person does | Time |
+|---|---|---|
+| M | prepare mentally: see the request and decide | 1.35 s |
+| P | point at a target | 1.10 s |
+| K | press a key or button (the fastest typist the model lists) | 0.08 s |
+
+To release a request a person must at least see it and decide (M), pick out that one request (P), and
+submit (K). That is about **2.53 s**, even with the request on screen the instant it exists. There is no
+Approve button today: the only release path is `POST /approvals/{id}/approve` from an HTTP tool. There
+the person must carry the request's 32-character id into the command. Pointing at it costs P, and typing
+it costs 32 K, about 2.56 s, so the bound holds either way. The default sits about 20% below 2.53 s,
+because M and P are averages and some people are faster. The margin is a judgment, not a measurement:
+nothing here shows that no person is ever faster than 2.0 s. The aim is that no genuine reviewer is
+refused.
+
+**What the floor does not do.** It refuses a release faster than the published figure above allows
+for. It does not detect automation. `GET /approvals` publishes each request's `requested_at`, so a
+script that waits out the floor is not refused. The floor also compares two wall-clock readings. A
+clock that jumps forward between request and approve lets a release through early, by the size of
+the jump. That happens on one host after a clock step or a VM resume. It also happens across hosts
+that share a store, when the approver's clock runs ahead. A clock that runs behind refuses for
+longer, and the 409 states the real wait.
+
 **The requester is re-checked at release (ASVS 8.3.2).** A request can wait hours for its second
 approver, and the requester's authority can be withdrawn in that time. So the release reads it again.
 It refuses with **409** if the requester's account is gone or disabled, or no longer holds the
@@ -1356,7 +1397,7 @@ slack.
 | Pending federated-login flows, per client IP | the `client_ip` recorded on each staged flow | ≥ **16** pending flows from this address (`DEFAULT_PER_IP_CAP`, no knob), or ≥ `oidc_flow_cache_max` (**512**) engine-wide; 300 s TTL; **reject-when-full, never evict** (evict-oldest would turn a start-leg flood into a login DoS) | **DENY** the start leg — `FlowCacheFullError` → **303** to `/ui/login?e=rate_limited`, WARNING-logged, deliberately **never** audited so a flood cannot amplify into `audit_log` growth | 16 / 512 / 300 s | `[auth].oidc_flow_cache_max`, `oidc_flow_ttl_seconds` |
 | `Sec-Fetch-Mode` on the federated sign-in legs | the browser fetch-metadata header on `GET /ui/sso`, `POST /ui/oidc/start`, `GET /ui/oidc/callback` | header **present** and not `navigate` (absent = allowed, for non-browser clients). Distinct from the `Sec-Fetch-Site` row below: a different header, a different surface, and `assert_same_origin` deliberately does **not** run on the callback leg, whose `Sec-Fetch-Site` is legitimately cross-site | **DENY** — 303 → `/ui/login?e=sso_failed`\|`oidc_failed`, plus an **audited** `auth.login_failed` row carrying the closed-set slug `non_navigation_fetch`. Evaluated **after** the login limiter, so the audit write is itself rate-bounded | on | (no knob) |
 | Instance environment posture × claimed AI data scope | `[ai].derived_posture()` (from `[ai].environment` and `[security].production_instance`; an unresolved posture defaults to the **strictest** ceiling) re-resolved server-side through `resolve_effective_policy` on every `POST /ai/chat` | the effective mode is not `managed_endpoint`, or the request's `data_scope` exceeds the server-enforced ceiling (the engine-broker MVP enforces `code_only` regardless of what the caller claims) | **DENY** — **409** on the mode mismatch, **403** on scope excess; each audited `ai.assist` with PHI-safe metadata only | `mode = byo`, `data_scope = code_only` | `[ai].mode`, `[ai].data_scope`, `[ai].environment`, `[security].production_instance` |
-| Gated operation × requester-vs-approver identity × hold age | the pending-approval record: the operation name, the requesting identity, and the hold's creation time | `[approvals].enabled` **and** the operation is in `[approvals].operations` and has no approved unexpired release; the approver is the requester; the hold is older than `expiry_hours` | **DENY** the immediate execution — **202** hold + `approval.requested` audit; **403** on self-approval; **409** once expired or already decided | off; `['connection_purge','dead_letter_replay']`; 72 h | `[approvals].enabled`, `operations`, `expiry_hours` |
+| Gated operation × requester-vs-approver identity × hold age | the pending-approval record: the operation name, the requesting identity, and the hold's creation time | `[approvals].enabled` **and** the operation is in `[approvals].operations` and has no approved unexpired release; the approver is the requester; the hold is older than `expiry_hours`; the hold is younger than `min_dwell_seconds` | **DENY** the immediate execution — **202** hold + `approval.requested` audit; **403** on self-approval; **409** once expired or already decided; **409** + `approval.too_early` audit while younger than the floor (the hold stays pending) | off; `['connection_purge','dead_letter_replay']`; 72 h; 2 s | `[approvals].enabled`, `operations`, `expiry_hours`, `min_dwell_seconds` |
 | mTLS client-certificate subject | the qualified subject-RDN / SAN names of a **verified** peer certificate | exact match against a deny-by-default map (empty map = feature off) | **ALLOW** — resolve to that principal's Identity (RBAC then authorizes); a disabled account grants none | `{}` = off | `[api].tls_client_cert_identities` (requires `tls_client_ca_file`) |
 | Operator-listener peer client certificate | the TLS peer certificate presented at the API / `/ui` handshake | `[api].tls_client_ca_file` set (requires `tls_cert_file`) → `ssl.CERT_REQUIRED` plus strict RFC 5280 verify flags (`api/tls.py:47-50`); no client certificate, or one not issued by that CA | **DENY** — the TLS handshake fails, so the request never reaches the ASGI stack at all: no middleware runs, no route matches, no identity is resolved, and no 403 body is produced | unset = off (server-only TLS, no peer-certificate decision on the control plane) | `[api].tls_client_ca_file` |
 | Declared token class of a federated assertion | the `typ` JOSE header, and the presence of an `events` claim, on a **signature-verified** JWS | `typ` present and — normalised `.strip().lower()` then `application/`-stripped — not `jwt`, so `at+jwt` (RFC 9068 access token), `logout+jwt` and `secevent+jwt` are refused while an **absent** `typ` is allowed (RFC 7519 §5.1 makes the header advisory); or the claim set carries `events`, i.e. an RFC 8417 security event token. Every such token is minted by the **same issuer under the same key**, so no signature or key rung distinguishes it | **DENY** the sign-in — `ClaimsError("wrong_token_type")` at the key-selection rung, `ClaimsError("unexpected_events_claim")` ahead of the nonce compare (a logout token carries no nonce, so a later check would misreport it as a browser-binding failure) | on | (no knob) |
