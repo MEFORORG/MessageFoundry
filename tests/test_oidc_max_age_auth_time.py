@@ -42,9 +42,6 @@ DEFAULT_MAX_AGE = 43200
 LADDER_NOW = 1_000_000
 LADDER_CLOCK = LADDER_NOW + 100
 
-#: The least session an accepted auth_time must leave (claims.MIN_RECENCY_REMAINING_SECONDS).
-MIN_LEFT = 60
-
 
 @pytest.fixture(scope="module")
 def rsa_key() -> rsa.RSAPrivateKey:
@@ -167,8 +164,8 @@ def test_a_null_auth_time_is_the_same_fault_as_a_missing_one(rsa_key: rsa.RSAPri
 
 
 def test_a_stale_auth_time_is_refused(rsa_key: rsa.RSAPrivateKey) -> None:
-    # 59 s of the bound left: one second under the minimum session the ladder insists on.
-    stale = LADDER_CLOCK - DEFAULT_MAX_AGE + MIN_LEFT - 1
+    # Exactly at the bound: auth_time + max_age == now, so the session would already be over.
+    stale = LADDER_CLOCK - DEFAULT_MAX_AGE
     assert _refusal(rsa_key, ladder._good_claims(auth_time=stale)) == "auth_time_stale"
 
 
@@ -187,8 +184,10 @@ def test_the_stale_bound_follows_the_policy_value(rsa_key: rsa.RSAPrivateKey) ->
     assert _refusal(rsa_key, claims, max_age_seconds=600) == "auth_time_stale"
 
 
-def test_an_auth_time_leaving_the_minimum_session_is_accepted(rsa_key: rsa.RSAPrivateKey) -> None:
-    edge = LADDER_CLOCK - DEFAULT_MAX_AGE + MIN_LEFT
+def test_an_auth_time_one_second_inside_the_bound_is_accepted(rsa_key: rsa.RSAPrivateKey) -> None:
+    """No margin tighter than max_age: the IdP keeps single sign-on right up to max_age, so any
+    margin here would refuse every retry in a window the IdP will not re-authenticate in."""
+    edge = LADDER_CLOCK - DEFAULT_MAX_AGE + 1
     principal = _validate(rsa_key, ladder._good_claims(auth_time=edge))
     assert principal.auth_time == edge
 
@@ -207,12 +206,17 @@ def test_a_non_numeric_auth_time_is_malformed_not_missing(
 
 
 @pytest.mark.parametrize("claim", ["auth_time", "exp", "iat", "nbf"])
-@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize(
+    "bad",
+    [float("nan"), float("inf"), float("-inf"), 10**400],
+    ids=["nan", "inf", "-inf", "huge-int"],
+)
 def test_a_non_finite_time_claim_is_refused(
     rsa_key: rsa.RSAPrivateKey, claim: str, bad: float
 ) -> None:
-    """json.loads accepts NaN and Infinity. NaN compares False against every bound, so a NaN exp
-    used to pass the expiry check and then, inside the service's min(), drop the auth_time cap."""
+    """json.loads accepts NaN, Infinity and ints of any size. NaN compares False against every
+    bound, so a NaN exp used to pass the expiry check and then, inside the service's min(), drop the
+    auth_time cap. An int too big for a float raised OverflowError, an unmapped 500."""
     assert _refusal(rsa_key, ladder._good_claims(**{claim: bad})) == "claim_not_numeric"
 
 
@@ -484,16 +488,17 @@ def test_a_replayed_token_missing_auth_time_fails_the_claims_rung(
     assert rows["fed.replay.nonce"].status is Status.SKIP
 
 
-def test_a_replayed_token_with_a_live_exp_and_an_old_auth_time_fails(
+def test_a_replayed_token_with_an_old_auth_time_skips_naming_both_causes(
     rsa_key: rsa.RSAPrivateKey, tmp_path: Path
 ) -> None:
-    """exp is checked first, so a merely old capture reads as expired and SKIPs. A token whose exp
-    is still live but whose auth_time is past max_age is an IdP that answered a max_age request with
-    an old sign-in instead of re-authenticating: a deployment defect, so FAIL, never SKIP."""
+    """Staleness is measured against the replay's clock and the ladder reports only the slug, so
+    the verifier cannot tell an aged capture from an IdP that ignored max_age. FAIL would blame a
+    correct IdP for a capture that sat on disk; PASS would claim a check that did not happen."""
     token = vf._mint(rsa_key, auth_time=time.time() - DEFAULT_MAX_AGE - 3600)
     rows = _replay(rsa_key, tmp_path, token)
-    assert rows["fed.replay.claims"].status is Status.FAIL
-    assert "auth_time_stale" in rows["fed.replay.claims"].detail
+    assert rows["fed.replay.claims"].status is Status.SKIP
+    detail = rows["fed.replay.claims"].detail
+    assert "capture has aged" in detail and "ignored max_age" in detail
     assert rows["fed.replay.nonce"].status is Status.SKIP
 
 

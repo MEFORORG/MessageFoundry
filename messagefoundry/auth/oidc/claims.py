@@ -138,12 +138,6 @@ class FederatedPrincipal:
     auth_time: float
 
 
-#: The least session an accepted ``auth_time`` must leave under ``max_age``, in seconds (BACKLOG
-#: #1150). A JUDGMENT, not a measurement: long enough to survive the callback redirect and the first
-#: page load, far below any configurable ``max_age`` (the settings floor is 300).
-MIN_RECENCY_REMAINING_SECONDS = 60
-
-
 #: The ``typ`` values an ``id_token`` may declare, after normalisation. RFC 7519 §5.1 makes the header
 #: advisory and OIDC Core does not mandate it, so an ABSENT ``typ`` is accepted — refusing it would
 #: lock out conforming IdPs that omit it.
@@ -314,10 +308,10 @@ def _check_auth_time(claims: Mapping[str, object], policy: OidcClaimPolicy, now:
     """Require and bound ``auth_time``; return it (ASVS 6.8.4 / 7.6.1, BACKLOG #1150).
 
     The engine ALWAYS sends ``max_age``, and OIDC Core 2 makes ``auth_time`` REQUIRED whenever
-    ``max_age`` was requested. So an absent claim is never "the IdP chose not to say"; it is an IdP
-    that ignored the request, and the engine cannot tell how long ago the human authenticated. Refuse
-    rather than fall back to a minimum-strength assumption: that fallback applies only where
-    ``max_age`` was NOT requested, and here it always is.
+    ``max_age`` was requested. An absent claim therefore means the IdP ignored the request, and the
+    engine cannot tell how long ago the human authenticated. Refuse rather than fall back to a
+    minimum-strength assumption: that fallback applies only where ``max_age`` was NOT requested, and
+    here it always is.
 
     Sending ``max_age`` without this check would be a request with no control behind it. This is the
     half that turns the request into a control.
@@ -331,21 +325,22 @@ def _check_auth_time(claims: Mapping[str, object], policy: OidcClaimPolicy, now:
             "auth_time_missing",
             "id_token carries no auth_time although max_age was requested",
         )
-    auth_time = _require_number(claims, "auth_time", "auth_time_missing")
+    auth_time = _require_number(claims, "auth_time", "claim_not_numeric")
     if auth_time > now + policy.clock_skew_seconds:
         # An authentication in the future is a malformed or hostile assertion. Inside the skew it is
         # accepted, and the service clamps it to `now` before adding max_age.
         raise ClaimsError("issued_in_future", "id_token auth_time is in the future")
-    # NO skew grace on this side, unlike `exp`. The session ends at auth_time + max_age, so a token
-    # accepted here with less than MIN_RECENCY_REMAINING_SECONDS left would mint a session that dies
-    # before the browser's next request, and the user would be signed out with no audited reason.
-    # Refusing instead sends them back to the IdP, which by then sees its own sign-in as older than
-    # max_age and re-authenticates. One threshold, here, so the offline verifier and a live login
-    # agree about which tokens pass.
-    if auth_time + policy.max_age_seconds - now < MIN_RECENCY_REMAINING_SECONDS:
+    # NO skew grace on this side, unlike `exp`: the session ends at auth_time + max_age, so a token
+    # past that point would mint a session that is already dead. The boundary is exactly max_age and
+    # no tighter. The IdP re-authenticates only once its sign-in is OLDER than max_age, so any margin
+    # here opens a window in which the IdP keeps single sign-on and the engine refuses, and every
+    # retry fails the same way until the window passes (BACKLOG #1150 review, round two). A user
+    # whose IdP sign-in is a few seconds short of max_age gets a short session instead, and the next
+    # sign-in finds the IdP sign-in past max_age and re-authenticates.
+    if auth_time + policy.max_age_seconds <= now:
         raise ClaimsError(
             "auth_time_stale",
-            "id_token auth_time leaves less than the minimum session under the requested max_age",
+            "id_token auth_time is older than the max_age the engine requested",
         )
     return auth_time
 
@@ -361,12 +356,18 @@ def _require_number(claims: Mapping[str, object], field_name: str, _reason: str)
     value = claims.get(field_name)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ClaimsError("claim_not_numeric", f"{field_name} is missing or non-numeric")
-    # json.loads accepts NaN and Infinity. NaN compares False against everything, so a NaN `exp`
-    # passed the expiry check and then, inside the service's min(), silently dropped every session
-    # cap that came after it (BACKLOG #1150 review). Infinity is no real epoch time either.
-    if not math.isfinite(value):
+    # json.loads accepts NaN and Infinity, and ints of any size. NaN compares False against
+    # everything, so a NaN `exp` passed the expiry check and then, inside the service's min(),
+    # dropped every session cap after it (BACKLOG #1150 review). An int too big for a float raises
+    # OverflowError, which no caller maps, so it escaped as a 500 with no audit row. All three are
+    # the same fault: not a usable epoch time.
+    try:
+        number = float(value)
+    except OverflowError:
+        raise ClaimsError("claim_not_numeric", f"{field_name} is out of range") from None
+    if not math.isfinite(number):
         raise ClaimsError("claim_not_numeric", f"{field_name} is not a finite number")
-    return float(value)
+    return number
 
 
 def _check_mfa_gate(

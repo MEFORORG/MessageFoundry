@@ -1702,14 +1702,14 @@ class AuthService:
             await self._directory_reject_audit(username, "oidc", "expired")
             return LoginOutcome(ok=False, error="federated sign-in failed", reason="expired")
         # BACKLOG #1150 (ASVS 6.8.4 / 7.6.1): the session also ends max_age after the user last
-        # authenticated AT THE IdP. This is REQUIRED, not belt-and-braces: the ladder only checks
-        # recency at login, and /ui/reauth never returns to the IdP, so without this cap the time
-        # since the IdP authentication event would grow unbounded for the session's whole life.
+        # authenticated AT THE IdP. The ladder checks recency only at login, and /ui/reauth never
+        # returns to the IdP, so without this cap the time since the IdP authentication event would
+        # grow unbounded for the session's whole life.
         # auth_time is clamped to now first: the ladder accepts an IdP clock up to clock_skew_seconds
         # AHEAD, and without the clamp that lead would extend the session past now + max_age. The
-        # ladder already refuses a token leaving under MIN_RECENCY_REMAINING_SECONDS; this branch is
-        # the backstop for time spent between that check and here (the LDAP round trip), so a
-        # deadline already behind now is refused under its own slug rather than minted dead.
+        # ladder already refuses a deadline behind its own clock; this branch is the backstop for
+        # time spent between that check and here (the LDAP round trip), so a deadline already
+        # behind now is refused under its own slug rather than minted dead.
         recency_deadline = (
             min(principal_claims.auth_time, now) + self._settings.oidc_max_age_seconds
         )

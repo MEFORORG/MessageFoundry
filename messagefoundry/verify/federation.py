@@ -164,8 +164,9 @@ def _config_rows(settings: ServiceSettings) -> list[CheckResult]:
             "every authorization request sends this max_age; a token with no auth_time, or one "
             "older than this, is refused, and the session ends this long after the IdP "
             "authentication. Confirm the identity provider honours max_age and returns auth_time: "
-            "if it does not, EVERY federated sign-in is refused as auth_time_missing. Replay a "
-            "captured id_token (--fed-id-token / --fed-jwks) to see whether it carries auth_time",
+            "if it does not, EVERY federated sign-in is refused as auth_time_missing. A replayed "
+            "id_token (--fed-id-token / --fed-jwks) answers this only if it was captured from a "
+            "request that sent max_age; many IdPs omit auth_time when it was not asked for",
             evidence=f"max_age={auth.oidc_max_age_seconds}s",
         )
     )
@@ -364,6 +365,23 @@ def _replay_rows(
                         Status.SKIP,
                         "no --fed-nonce supplied — the browser flow binding cannot be verified "
                         "offline (it is exercised by the live lab cells)",
+                    )
+                )
+            elif failed_reason == "auth_time_stale":
+                # Staleness is measured against THIS run's clock, not the token's iat, and the
+                # ladder reports only the slug. So the verifier cannot tell an aged capture (a
+                # correct IdP, replayed late) from an IdP that answered max_age with an old sign-in.
+                # SKIP says "not verified" without blaming either; a FAIL would blame the IdP for a
+                # capture that merely sat on disk. A MISSING auth_time is different and FAILs.
+                stopped_because = "the captured token's auth_time is past max_age at replay time"
+                rows.append(
+                    CheckResult(
+                        rid,
+                        title,
+                        Status.SKIP,
+                        "auth_time is older than [auth].oidc_max_age_seconds at replay time: either "
+                        "the capture has aged, or the IdP ignored max_age. Re-capture and replay "
+                        "promptly to tell the two apart",
                     )
                 )
             elif failed_reason == "expired":
