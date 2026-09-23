@@ -24,9 +24,9 @@ this line.**
 
 **Requires engine 0.4.0. Supported engine UI seam: `75c4117d21fd0b98`**, the value engine 0.4.0
 ships as `messagefoundry.api._ui_seam.ENGINE_UI_SEAM`. With the console on, any other engine refuses
-to start, and that includes every 0.3.x engine. The error is not always `UiSeamMismatch`: engine
-0.3.2 fails while importing this console and reports the console as not installed. Console 0.2.15
-does not work with engine 0.4.0 either, so upgrade the two together.
+to start, and that includes every 0.3.x engine. A 0.3.x engine never reaches `UiSeamMismatch`: it
+fails while importing this console and reports the console as not installed. Console 0.2.15 does
+not work with engine 0.4.0 either, so upgrade the two together.
 
 ### Added
 - **High Availability page** (BACKLOG #1495, ADR 0056). `/ui/cluster`, under Monitoring, renders
@@ -146,8 +146,9 @@ two items sat under Unreleased.
   defaults its DTOs carry (BACKLOG #279).
 
 ### Unchanged (by design)
-- A plain `pip install messagefoundry` stays **byte-identical**: with `serve_ui` default-off and the
-  console absent, the JSON API is unchanged; `serve_ui=true` without the console fails loud at startup.
+- A plain `pip install messagefoundry` stays **byte-identical**: with the console absent, the JSON API
+  is unchanged; `serve_ui=true` without the console fails loud at startup. This line said `serve_ui`
+  was default-off until 0.3.0 was cut; the engine at the `webconsole-v0.2.15` tag already had it on.
 - The same-origin security model is **unchanged** — the `/ui`-confined `SameSite=Strict` cookie, the
   `Origin`/`Sec-Fetch-Site` CSRF check, step-up re-auth, the CSWSH `Origin == Host` WS check, and
   dual-control all moved verbatim.
