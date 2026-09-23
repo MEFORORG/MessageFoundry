@@ -410,18 +410,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             form.get("password", ""),
             provider=AuthProvider.AD if provider_value == "ad" else AuthProvider.LOCAL,
             client=client,
+            # ASVS 7.2.4: the Set-Cookie below REPLACES whatever session cookie this browser sent,
+            # so the engine ends that one session as part of a SUCCESSFUL mint, rather than leave
+            # it valid and unreachable until it expires. A failed sign-in ends nothing.
+            supersedes=session_token(request),
         )
         if not outcome.ok or outcome.token is None:
             return RedirectResponse("/ui/login?e=bad", status_code=303)
-        # ASVS 7.2.4: the Set-Cookie below REPLACES whatever session cookie this browser sent, so end
-        # that session server-side rather than leave it valid and unreachable until it expires. Only
-        # here, after the proof succeeded, and only the presented session (see supersede_session).
-        await auth.supersede_session(
-            session_token(request),
-            new_token=outcome.token,
-            actor=outcome.identity.username if outcome.identity is not None else None,
-            client=client,
-        )
         # A must-change account goes straight to the browser rotation page (L4b) — every other
         # /ui route would bounce it there anyway (require_ui). An MFA-pending session lands on the
         # second-factor page for the same reason (ASVS 6.3.3). Order matches the server-side gates:

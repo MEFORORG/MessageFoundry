@@ -1192,8 +1192,13 @@ class AuthService:
         *,
         provider: AuthProvider = AuthProvider.LOCAL,
         client: str | None = None,
+        supersedes: str | None = None,
     ) -> LoginOutcome:
         """The credential sign-in seam, with every failed outcome held to a fixed deadline.
+
+        ``supersedes`` is the session token the caller's browser presented, if any. On success it is
+        ended as part of the new session's mint (see :meth:`_issue_session`). Only a caller whose
+        response REPLACES that token passes it: the console legs do, the bearer routes never do.
 
         A wrapper rather than a pad threaded through the dispatch's returns, so that a failure branch
         added there later inherits the equaliser instead of quietly escaping it (BACKLOG #1140).
@@ -1207,7 +1212,9 @@ class AuthService:
         keeps ``_login*`` meaning exactly what it meant.
         """
         started = time.monotonic()
-        outcome = await self._dispatch_login(username, password, provider=provider, client=client)
+        outcome = await self._dispatch_login(
+            username, password, provider=provider, client=client, supersedes=supersedes
+        )
         return await self._equalize_failure(outcome, started, seam="login")
 
     async def _dispatch_login(
@@ -1217,6 +1224,7 @@ class AuthService:
         *,
         provider: AuthProvider = AuthProvider.LOCAL,
         client: str | None = None,
+        supersedes: str | None = None,
     ) -> LoginOutcome:
         if provider is AuthProvider.AD:
             # RETIRED (BACKLOG #1137, owner ruling 2026-08-22). The engine no longer accepts a
@@ -1239,10 +1247,10 @@ class AuthService:
                 ok=False,
                 error="Directory password sign-in has been retired; use Windows SSO or OIDC",
             )
-        return await self._login_local(username, password, client=client)
+        return await self._login_local(username, password, client=client, supersedes=supersedes)
 
     async def _login_local(
-        self, username: str, password: str, *, client: str | None
+        self, username: str, password: str, *, client: str | None, supersedes: str | None = None
     ) -> LoginOutcome:
         # Enforce bootstrap expiry/supersession before the credential check: an unclaimed bootstrap
         # that lapsed (or was superseded) is disabled here, so the disabled-account path below refuses
@@ -1363,7 +1371,13 @@ class AuthService:
             # account. It is the MFA leg (``verify_mfa`` / ``finish_webauthn_assertion``) that clears
             # it when a factor is owed; this branch covers the accounts that owe none.
             await self._store.record_login_success(user.id, now=now)
-        token = await self._issue_session(user.id, client, mfa_verified=not mfa_required)
+        token = await self._issue_session(
+            user.id,
+            client,
+            mfa_verified=not mfa_required,
+            supersedes_hash=hash_token(supersedes) if supersedes else None,
+            actor=user.username,
+        )
         await self._audit(
             "auth.login_success",
             actor=user.username,
@@ -1413,7 +1427,12 @@ class AuthService:
         )
 
     async def authenticate_kerberos(
-        self, token: bytes, *, client: str | None = None, seed_reauth: bool = True
+        self,
+        token: bytes,
+        *,
+        client: str | None = None,
+        seed_reauth: bool = True,
+        supersedes: str | None = None,
     ) -> LoginOutcome:
         """The browser/API Windows-SSO seam, with every failed outcome held to a fixed deadline.
 
@@ -1437,11 +1456,18 @@ class AuthService:
         identical for every principal and already disclosed in the redirect.
         """
         started = time.monotonic()
-        outcome = await self._authenticate_kerberos(token, client=client, seed_reauth=seed_reauth)
+        outcome = await self._authenticate_kerberos(
+            token, client=client, seed_reauth=seed_reauth, supersedes=supersedes
+        )
         return await self._equalize_failure(outcome, started, seam="kerberos")
 
     async def _authenticate_kerberos(
-        self, token: bytes, *, client: str | None = None, seed_reauth: bool = True
+        self,
+        token: bytes,
+        *,
+        client: str | None = None,
+        seed_reauth: bool = True,
+        supersedes: str | None = None,
     ) -> LoginOutcome:
         # Audit every reject path so blocked/failed Windows-SSO attempts are not invisible to a
         # defender (AUTH-K-AUDIT). A sentinel actor is used until the principal is known.
@@ -1478,7 +1504,11 @@ class AuthService:
         # MFA-exempt set, so without an enrollment ceremony that accepts a directory account it is a
         # lockout rather than a control.
         return await self._complete_ad_login(
-            principal, client, mfa_verified=False, seed_reauth=seed_reauth
+            principal,
+            client,
+            mfa_verified=False,
+            seed_reauth=seed_reauth,
+            supersedes_hash=hash_token(supersedes) if supersedes else None,
         )
 
     def _oidc_policy(self, nonce: str) -> oidc.OidcClaimPolicy:
@@ -1540,8 +1570,8 @@ class AuthService:
         caller must treat that as a flood signal, not an error to audit per request.
 
         ``prior_session`` is the session token the browser presented on this start leg, if any. Only
-        its hash is staged, and nothing is revoked here: :meth:`complete_oidc_login` supersedes it
-        after the IdP proof succeeds (ASVS 7.2.4). The start leg is the only place to read it,
+        its hash is staged, and nothing is revoked here: the callback's mint supersedes it once the
+        IdP proof succeeds (ASVS 7.2.4, :meth:`_issue_session`). The start leg is the only place to read it,
         because the callback arrives as a cross-site navigation that withholds the Strict cookie.
         """
         if not self.oidc_enabled or self._oidc_flows is None:
@@ -1597,21 +1627,12 @@ class AuthService:
         if not oidc.state_matches(flow.state, state):
             await self._directory_reject_audit("<oidc>", "oidc", "state_mismatch")
             return LoginOutcome(ok=False, error="federated sign-in failed", reason="state_mismatch")
-        outcome = await self.authenticate_oidc(
+        return await self.authenticate_oidc(
             code,
             flow,
             redirect_uri=self._oidc_redirect_uri(public_origin),
             client=client,
         )
-        # ASVS 7.2.4: the callback's Set-Cookie replaces the browser's session cookie, so end the
-        # session the start leg saw. Strictly after the proof succeeded, as on the other two legs.
-        if outcome.ok and outcome.token is not None and flow.prior_session_hash is not None:
-            await self._supersede_session_hash(
-                flow.prior_session_hash,
-                actor=outcome.identity.username if outcome.identity is not None else None,
-                client=client,
-            )
-        return outcome
 
     async def authenticate_oidc(
         self,
@@ -1741,6 +1762,9 @@ class AuthService:
             },
             max_expires_at=max_expires_at,
             federated_subject=(principal_claims.issuer, principal_claims.subject),
+            # ASVS 7.2.4: the session the START leg saw, staged in the flow because this callback
+            # arrives cross-site and the browser withholds the Strict cookie here.
+            supersedes_hash=flow.prior_session_hash,
         )
 
     async def _refuse_directory_row(
@@ -1785,6 +1809,7 @@ class AuthService:
         evidence: Mapping[str, object] | None = None,
         max_expires_at: float | None = None,
         federated_subject: tuple[str, str] | None = None,
+        supersedes_hash: str | None = None,
     ) -> LoginOutcome:
         # ``federated_subject`` is the verified OIDC ``(issuer, sub)`` and is passed ONLY by the
         # federated path (BACKLOG #1015). It defaults to None, so the Kerberos caller stays
@@ -2014,6 +2039,8 @@ class AuthService:
                 # INSERT lands just after it. The Kerberos and password legs pass nothing here, so
                 # they take no extra read and no extra statement.
                 require_federated_subject=federated_subject,
+                supersedes_hash=supersedes_hash,
+                actor=principal.username,
             )
         except _FederatedBindingWithdrawn:
             await self._directory_reject_audit(
@@ -2753,9 +2780,18 @@ class AuthService:
         seed_reauth: bool | None = None,
         max_expires_at: float | None = None,
         require_federated_subject: tuple[str, str] | None = None,
+        supersedes_hash: str | None = None,
+        actor: str | None = None,
     ) -> str:
         """Mint a session token and persist the row. Callers passing
-        ``require_federated_subject`` must handle :class:`_FederatedBindingWithdrawn`."""
+        ``require_federated_subject`` must handle :class:`_FederatedBindingWithdrawn`.
+
+        ``supersedes_hash`` names the session this sign-in REPLACES in the caller's browser (ASVS
+        7.2.4, login side); ``actor`` is who signed in, for its audit row. It is ended after the new
+        row is safely written and BEFORE the per-user cap runs. That order is the point: ending it
+        after the cap would let the cap evict another device's oldest session to make room for a
+        session that was about to go anyway.
+        """
         token = mint_token()
         token_hash = hash_token(token)
         expires_at = time.time() + self._settings.session_absolute_hours * 3600
@@ -2793,6 +2829,8 @@ class AuthService:
             # never blocks it. An MFA-required login leaves it NULL until POST /auth/mfa-verify
             # (WP-14) -- including the Kerberos leg, which asserts nothing and mints at the minimum.
             await self._store.mark_session_mfa_verified(token_hash)
+        if supersedes_hash is not None and supersedes_hash != token_hash:
+            await self._supersede_session_hash(supersedes_hash, actor=actor, client=client)
         cap = self._settings.max_sessions_per_user
         if cap and cap > 0:
             # Evict the oldest sessions beyond the cap (the just-created one is newest, so survives).
@@ -2964,13 +3002,8 @@ class AuthService:
             # session was revoked silently, contradicting the doc and leaving a gap in the trail.
             await self._audit("auth.logout", actor=actor)
 
-    async def supersede_session(
-        self,
-        prior_token: str | None,
-        *,
-        new_token: str,
-        actor: str | None,
-        client: str | None = None,
+    async def _supersede_session_hash(
+        self, prior_hash: str, *, actor: str | None, client: str | None
     ) -> bool:
         """End the session a browser presented at a fresh sign-in (ASVS 7.2.4, login side).
 
@@ -2979,30 +3012,33 @@ class AuthService:
         stays valid until idle or absolute expiry. The verb asks for the current token to be
         terminated, and overwriting a cookie terminates nothing server-side.
 
-        Call it only AFTER the new credential proof succeeded, so a failed sign-in signs nobody out.
-        It ends exactly the one presented session and never the user's others: a whole-user revoke
-        would turn every sign-in into a forced sign-out of every other device.
+        Reached only from :meth:`_issue_session`, so only after a credential proof succeeded. It ends
+        exactly the one presented session and never the user's others: a whole-user revoke would
+        turn every sign-in into a forced sign-out of every other device.
 
         The prior session may belong to a different user, for example on a shared workstation. It is
         still ended, and the audit row names its owner. Anyone holding that token could already end
-        it with ``POST /auth/logout``, so this grants no new power. Returns True when a live session
-        was revoked; an absent, already-revoked or identical token is a silent no-op with no audit.
-        """
-        if not prior_token or prior_token == new_token:
-            return False
-        return await self._supersede_session_hash(
-            hash_token(prior_token), actor=actor, client=client
-        )
+        it with ``POST /auth/logout``, so this grants no new power.
 
-    async def _supersede_session_hash(
-        self, prior_hash: str, *, actor: str | None, client: str | None
-    ) -> bool:
-        """The hash-keyed body of :meth:`supersede_session`. The federated leg stages only the hash
-        in its flow (see :meth:`begin_oidc_login`), so it enters here rather than with a token."""
+        Returns True, and audits, only for a session that was LIVE and is now revoked. One already
+        dead by expiry or idle is left to the lazy revoke in :meth:`identity_for_token`, so the trail
+        does not record the ending of something that had already ended. ``revoke_session`` reports no
+        rowcount, so the row is read back: a rotation that re-keyed it between the read and the
+        revoke leaves the old hash absent, and then no row claims a revoke that never happened.
+        """
         prior = await self._store.get_session(prior_hash)
-        if prior is None or prior.revoked_at is not None:
+        now = time.time()
+        if (
+            prior is None
+            or prior.revoked_at is not None
+            or now > prior.expires_at
+            or now - prior.last_used_at > self._settings.session_idle_timeout_minutes * 60
+        ):
             return False
-        await self._store.revoke_session(prior_hash)
+        await self._store.revoke_session(prior_hash, now=now)
+        after = await self._store.get_session(prior_hash)
+        if after is None or after.revoked_at is None:
+            return False
         await self._audit(
             "auth.session_revoked",
             actor=actor,

@@ -19,6 +19,7 @@ always read "Session revoked." now that a session's id changes at every re-verif
 from __future__ import annotations
 
 import json
+import time
 from urllib.parse import parse_qsl, urlsplit
 
 import httpx
@@ -29,7 +30,8 @@ from _ui_clients import SAME_ORIGIN as _SAME
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
 from messagefoundry.auth.ldap import AdPrincipal
-from messagefoundry.auth.service import AuthService, LoginOutcome
+from messagefoundry.auth.oidc import FederatedPrincipal
+from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
@@ -203,12 +205,20 @@ async def _oidc_round_trip(
     if the engine only looked for the prior session at the callback.
     """
 
-    async def _authenticated(*_a: object, **_k: object) -> LoginOutcome:
-        if not ok:
-            return LoginOutcome(ok=False, error="federated sign-in failed", reason="claim_aud")
-        return await service.login("op", PW)
+    # The IdP exchange is replaced at the one seam the service calls; the directory resolve, the
+    # AD mirror row and the mint all run for real. A name the directory cannot resolve is the
+    # failing proof.
+    def _exchange(*_a: object, **_k: object) -> FederatedPrincipal:
+        return FederatedPrincipal(
+            username="jdoe" if ok else "stranger",
+            subject="S-1-5-21-fed",
+            issuer="https://idp.example",
+            amr=("pwd", "mfa"),
+            acr=None,
+            expires_at=time.time() + 600,
+        )
 
-    monkeypatch.setattr(service, "authenticate_oidc", _authenticated)
+    monkeypatch.setattr(service, "_exchange_and_validate", _exchange)
     start = await c.post("/ui/oidc/start", headers=_SAME, follow_redirects=False)
     assert start.status_code == 303, start.headers
     state = dict(parse_qsl(urlsplit(start.headers["location"]).query))["state"]

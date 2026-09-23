@@ -173,14 +173,18 @@ export async function signIn(ctx: vscode.ExtensionContext, url: string): Promise
       }
       throw e;
     }
-    // ASVS 7.2.4: the store below REPLACES any token cached for this engine, so end that session on
-    // the engine first, or it stays valid, unreachable from here, until it idles out. Only now, after
-    // the new sign-in succeeded, so a failed sign-in signs nobody out. signOut revokes that one token
-    // and never the user's other sessions, and it is best-effort: a sign-in must not fail over it.
+    // ASVS 7.2.4: this store REPLACES any token cached for this engine, so that session is then
+    // ended on the engine, or it would stay valid, unreachable from here, until it idles out. Only
+    // after the new sign-in succeeded, so a failed sign-in signs nobody out, and only that one token,
+    // never the user's other sessions. The new token is stored FIRST and the revoke is not awaited:
+    // postJson has no timeout, and a slow engine must not hold a sign-in that already succeeded.
     // `withAuth` clears the cache before it re-signs in after a 401, so the case this covers is the
     // status bar's explicit "Sign in" over a token that is still cached and still live.
-    await signOut(ctx, url);
+    const prior = await peekToken(ctx, url);
     await ctx.secrets.store(secretKey(url), res.token);
+    if (prior && prior !== res.token) {
+      void postJson<unknown>(url, "/auth/logout", {}, prior).catch(() => undefined);
+    }
     // Both of these produce a token that LOOKS fine and then 403s later, so say so now, at the moment
     // the user can act on it, rather than letting them discover it as an opaque failure mid-promote.
     if (res.must_change_password) {
@@ -232,6 +236,13 @@ export async function withAuth<T>(
     return await call(token);
   } catch (e) {
     if (e instanceof HttpError && e.status === 401) {
+      // A sign-in elsewhere may have replaced (and revoked) the token this call used. Then the cache
+      // holds a newer, live token: retry with it, and never clear it, or that new session would be
+      // stranded on the engine with no client holding it.
+      const cached = await peekToken(ctx, url);
+      if (cached !== undefined && cached !== token) {
+        return await call(cached);
+      }
       await clearToken(ctx, url);
       const fresh = await signIn(ctx, url);
       if (fresh === undefined) {

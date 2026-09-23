@@ -75,7 +75,17 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # be born with a free step-up window; the first sensitive action forces the
         # directory-password step-up at /ui/reauth. ONE session per navigation into this
         # route (the resync side effect fires here, never per page).
-        outcome = await auth.authenticate_kerberos(token_bytes, client=client, seed_reauth=False)
+        #
+        # ASVS 7.2.4: ``supersedes`` ends the session this browser presented, as /ui/login does, once
+        # the ticket is accepted. RESIDUAL: a cross-site link into this route (an intranet portal)
+        # withholds the Strict cookie, so there is nothing to read and nothing is ended -- yet the
+        # Set-Cookie below still replaces that cookie, leaving the prior session valid until it
+        # expires. Only a same-site hop in front of this leg could close that, as the federated
+        # leg's start page does for OIDC. A same-site navigation, such as the login page's own link,
+        # carries the cookie and is covered.
+        outcome = await auth.authenticate_kerberos(
+            token_bytes, client=client, seed_reauth=False, supersedes=session_token(request)
+        )
         if not outcome.ok or outcome.token is None:
             # authenticate_kerberos audited the reject. NEVER a second 401 — no challenge
             # loops (Kerberos-only single-leg is a hard line; an NTLM NegTokenInit from an
@@ -84,15 +94,6 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # no mutual-auth response header (SECURITY.md's "no mutual authentication"; ADR
             # 0068 §9 records this as the current posture).
             return RedirectResponse("/ui/login?e=sso_failed", status_code=303)
-        # ASVS 7.2.4: end the session this browser presented, as /ui/login does. A cross-site link
-        # into this route withholds the Strict cookie, so then there is nothing to read and nothing
-        # is revoked; a same-site navigation, the login page's own link, carries it.
-        await auth.supersede_session(
-            session_token(request),
-            new_token=outcome.token,
-            actor=outcome.identity.username if outcome.identity is not None else None,
-            client=client,
-        )
         resp = RedirectResponse("/ui", status_code=303)
         set_session_cookie(resp, outcome.token, request=request)
         return resp
