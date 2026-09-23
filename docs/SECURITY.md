@@ -121,7 +121,8 @@ actor** (`allow_admin_write`, keyed on the acting user, `_enforce_admin_write_pa
 - **`require_paced`** — state-changing routes that warrant pacing but **not** a step-up re-proof:
   connection start/stop/restart/flag/test/test-credential, `POST /statistics/reset`, the four
   `/alerts/{id}/*` writes, approvals approve/reject, `POST /dr/activate|release`,
-  `POST /status/integrity-check`.
+  `POST /status/integrity-check`, and since BACKLOG #287 `PATCH /logging/level`,
+  `DELETE /search/presets/{preset_id}` and `POST /alerts/test-email`.
 
 Both charge **non-GET requests only**, so the step-up **GET**s are exempt from *that* limiter by design
 — they are reads, not writes — but they are not unpaced: the **four** that select PHI in bulk
@@ -242,8 +243,8 @@ apply. What each **adds** over plain `require()`:
 
 | Gate wrapper | Routes | What it adds over `require()` |
 |---|---|---|
-| `require` | 43 | nothing — the ladder itself |
-| `require_paced` | 16 | per-actor anti-automation pacing on **non-GET** requests (`allow_admin_write`), 429 + `Retry-After: 1` |
+| `require` | 40 | nothing — the ladder itself |
+| `require_paced` | 19 | per-actor anti-automation pacing on **non-GET** requests (`allow_admin_write`), 429 + `Retry-After: 1` |
 | `require_phi_read` | 7 | the ADR 0092 PHI-read hop refusal (`enforce_phi_read_hop`) **before** any identity work, then the per-actor PHI-read budget, 429 + `Retry-After: 10` |
 | `require_step_up` | 28 | the same non-GET pacing, then the **MFA gate** (403 + `X-MFA-Required: 1`), the **new-client-IP** signal, and the credential-recency window (403 + `X-Step-Up-Required: 1`) |
 | `require_step_up_action` | 4 | the same non-GET pacing (BACKLOG #1148), the **MFA gate**, then a **single-use, action-bound** step-up grant minted only by `POST /me/reauth` (403 + `X-Step-Up-Action: <action>`). Promoting a route here no longer drops the pacing floor |
@@ -449,7 +450,7 @@ tuple: they act only on the caller's own account.
 | `GET` | `/dr/status` | `monitoring:read` | `require` |
 | `GET` | `/service/status` | `monitoring:read` | `require` |
 | `GET` | `/logging/level` | `monitoring:diagnose` | `require` |
-| `PATCH` | `/logging/level` | `monitoring:diagnose` | `require` — **not** paced (see the gap note under [Brute-force & abuse protection](#brute-force--abuse-protection)) |
+| `PATCH` | `/logging/level` | `monitoring:diagnose` | `require_paced` (BACKLOG #287) |
 | `POST` | `/statistics/reset` | `monitoring:diagnose` | `require_paced` |
 | `POST` | `/status/integrity-check` | `monitoring:diagnose` | `require_paced` |
 | `GET` | `/alerts/active` | `monitoring:diagnose` | `require` |
@@ -457,7 +458,7 @@ tuple: they act only on the caller's own account.
 | `POST` | `/alerts/{alert_id}/resolve` | `monitoring:diagnose` | `require_paced` |
 | `POST` | `/alerts/{alert_id}/suspend` | `monitoring:diagnose` | `require_paced` |
 | `POST` | `/alerts/{alert_id}/resume` | `monitoring:diagnose` | `require_paced` |
-| `POST` | `/alerts/test-email` | `service:configure` | `require` — operator test-send through the configured `[alerts]` email transport (BACKLOG #118); fires a live outbound SMTP dial, so it is admin-gated rather than `monitoring:diagnose`; sends a synthetic PHI-free event and returns no addresses; audited `alert_test_email` |
+| `POST` | `/alerts/test-email` | `service:configure` | `require_paced` (BACKLOG #287) — operator test-send through the configured `[alerts]` email transport (BACKLOG #118); fires a live outbound SMTP dial, so it is admin-gated rather than `monitoring:diagnose`; sends a synthetic PHI-free event and returns no addresses; audited `alert_test_email` |
 | `WS` | `/ws/stats` | `monitoring:read` | `authorize_ws` — `Origin` validated against `[api].ws_allowed_origins` **before** `accept()`; Authorization header only, no `?token=` fallback |
 | `GET` | `/service/identity` | `monitoring:read` | `require_service_cert` — **mTLS client certificate only**; PHI-fenced at app construction; writes a `service_cert_auth` audit row |
 
@@ -505,7 +506,7 @@ tuple: they act only on the caller's own account.
 |---|---|---|---|---|
 | `GET` | `/search/presets` | `messages:read` | `require` | **owner-scoped**: a caller sees only their OWN presets. Enforced on the identity's `user_id`, not on any client-supplied field, so the permission grants the FUNCTION and the row's owner grants the DATA (ASVS 8.1.1) |
 | `POST` | `/search/presets` | `messages:read` | `require_step_up` | **owner-scoped**: a caller sees only their OWN presets. Enforced on the identity's `user_id`, not on any client-supplied field, so the permission grants the FUNCTION and the row's owner grants the DATA (ASVS 8.1.1) |
-| `DELETE` | `/search/presets/{preset_id}` | `messages:read` | `require` | **not** paced; **owner-scoped**: a caller sees only their OWN presets. Enforced on the identity's `user_id`, not on any client-supplied field, so the permission grants the FUNCTION and the row's owner grants the DATA (ASVS 8.1.1). A preset id belonging to another user is a miss, not a 403 -- ownership is part of the lookup |
+| `DELETE` | `/search/presets/{preset_id}` | `messages:read` | `require_paced` | paced since BACKLOG #287; **owner-scoped**: a caller sees only their OWN presets. Enforced on the identity's `user_id`, not on any client-supplied field, so the permission grants the FUNCTION and the row's owner grants the DATA (ASVS 8.1.1). A preset id belonging to another user is a miss, not a 403 -- ownership is part of the lookup |
 | `GET` | `/search/layered` | `messages:read` | `require_step_up` | explicit `enforce_phi_read_hop` + `enforce_phi_read_pacing` |
 
 #### Uploaded files (PHI at rest)
@@ -749,8 +750,9 @@ else would need its own authorization rule stated here.
 
 1. `require_ui_step_up` answers a stale session with a **303 to `/ui/reauth`** instead of a 403 the
    browser cannot act on.
-2. **No `/ui` route charges the per-actor admin-write pacing floor** (see the interim note under
-   [Anti-automation](#admin-password-reset-wp-l3-12-asvs-646)).
+2. **The `/ui` write path charges the per-actor admin-write floor in `require_ui` itself**, because
+   the console calls the JSON handlers in-process and their pacing `Depends` never runs (see *The
+   `/ui` write path is paced* under [Anti-automation](#admin-password-reset-wp-l3-12-asvs-646)).
 3. **The uploaded-logs resend-confirm GET is weaker than its JSON equivalent, and cannot be
    otherwise** (it is not the only weaker uploaded-logs GET — `GET /ui/uploaded-logs` is one too,
    under item 5, and the set of record is `_UI_WEAKER_THAN_JSON_EQUIVALENT`, not this prose).
@@ -814,7 +816,8 @@ else would need its own authorization rule stated here.
    `POST /ui/connections/{name}/flag` mirrors `POST /connections/{name}/flag` (`require_paced` — a
    deploy-flag toggle, not `POST /config/reload`'s step-up'd deploy); and
    `POST /ui/messages/search/presets/{preset_id}/delete` mirrors
-   `DELETE /search/presets/{preset_id}` (also plain `require`), deleting a saved query, not PHI.
+   `DELETE /search/presets/{preset_id}` (`require_paced` since BACKLOG #287, a floor `require_ui`
+   charges too), deleting a saved query, not PHI.
 
 Differences 3–5 are derived and pinned: a `/ui` route that is weaker than **any** JSON route holding
 the same permission set on the same method reds CI until it is listed here.
@@ -1910,7 +1913,7 @@ the recovery path. Controls 4–6 are covered in their own rows.
 | `POST /ui/mfa` | per-actor ceremony budget | the ASVS 6.3.3 sign-in gate: it submits the second factor for a session that has already proven its password, so it draws the same budget as `POST /ui/reauth` and carries the same `Retry-After: 30` |
 | `POST /ui/account/mfa/verify` | per-actor ceremony budget | |
 | `POST /ui/account/password` | *(inherits)* | delegates to the JSON handler, which charges once; the 429 is re-raised intact — deliberately not double-charged |
-| **No limiter of any kind** | — | `POST /auth/logout`, `POST /me/mfa/enroll`, `DELETE /me/sessions[/{id}]`, `POST /ai/chat`, `DELETE /search/presets/{preset_id}`, `PATCH /logging/level`, `POST /alerts/test-email` — the last of which dials a live outbound SMTP server per request behind a plain `service:configure` check. **Two routes left this row and the table did not follow them.** `PATCH /users/{user_id}` is the one already narrated: it lost the write pacing when it was promoted to an action-bound step-up gate, and BACKLOG #1148 made `require_step_up_action` charge the floor again. `DELETE /me/mfa` rides that same gate (`require_step_up_action(STEP_UP_ACTION_MFA_DISABLE)`), so #1148 paced it too and it was left listed here regardless. The `reauth_only` action gate (`require_reauth_only_action`) still charges none. `GET /ui/reauth` belongs here because the admin-write floor is non-GET only; the console's WebAuthn **staging** POSTs do **not** — see control 8 |
+| **No limiter of any kind** | — | `POST /auth/logout`, `POST /me/mfa/enroll`, `DELETE /me/sessions[/{id}]`, `POST /ai/chat`. BACKLOG #287 moved `DELETE /search/presets/{preset_id}`, `PATCH /logging/level` and `POST /alerts/test-email` onto `require_paced`, so they charge the admin-write floor and are no longer listed here; the third dials a live outbound SMTP server per request, which is why it was paced. **Two routes left this row and the table did not follow them.** `PATCH /users/{user_id}` is the one already narrated: it lost the write pacing when it was promoted to an action-bound step-up gate, and BACKLOG #1148 made `require_step_up_action` charge the floor again. `DELETE /me/mfa` rides that same gate (`require_step_up_action(STEP_UP_ACTION_MFA_DISABLE)`), so #1148 paced it too and it was left listed here regardless. The `reauth_only` action gate (`require_reauth_only_action`) still charges none. `GET /ui/reauth` belongs here because the admin-write floor is non-GET only; the console's WebAuthn **staging** POSTs do **not** — see control 8 |
 
 The console resolves the ceremony gate through a `getattr` shim because it ships as a separately
 versioned wheel: mounted on an engine that predates the method, it falls back to the **sign-in** budget.
