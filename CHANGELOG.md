@@ -6,6 +6,8 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-09-23 — Early Access
+
 ### Added
 - **`[integrity].audit_anchor_file` — the startup audit check can now hold an anchor, so it can see a
   truncated tail.** A previous release shipped `audit-anchor` / `audit-verify --expected-anchor` and
@@ -1504,7 +1506,8 @@ tests, but the external code review + penetration test (the bar for a security-c
 - Releases are built, SBOM'd (CycloneDX), and signed with [Sigstore](https://www.sigstore.dev/) — see the
   `release` workflow.
 
-[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/MEFORORG/MessageFoundry/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/MEFORORG/MessageFoundry/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/MEFORORG/MessageFoundry/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.15...v0.3.0
