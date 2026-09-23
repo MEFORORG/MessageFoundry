@@ -15,8 +15,8 @@ is defined here and nowhere else, so other pages point at this line rather than 
 
 | Seat | Lives how long | What it does |
 |---|---|---|
-| Manager | Long-lived, several at once | The seat the owner talks to. Reads the record and writes a brief citing an item, dispatches subagent workers, then polls. The record is two ledgers, and NEITHER IS IN THIS REPOSITORY any more: the item ledger moved to the maintainer-internal repo (BACKLOG #1250), and the `wshallwshall/claude-multisession` issues track KORUS itself. Nothing pushes to it. |
-| Builder | One brief, then exits | Works, commits, pushes, opens the PR, and stops. That is you, most of the time. |
+| Manager | Long-lived, several at once | The seat the owner talks to. Reads the record and writes a brief citing an item, dispatches subagent workers, then polls. It decides when to cut a PR and what goes in it, usually one PR per wave of workers (owner ruling 2026-09-23). The record is two ledgers, and NEITHER IS IN THIS REPOSITORY any more: the item ledger moved to the maintainer-internal repo (BACKLOG #1250), and the `wshallwshall/claude-multisession` issues track KORUS itself. Nothing pushes to it. |
+| Builder | One brief, then exits | Works, commits, pushes its branch, reports, and stops. The Manager opens the PR (since 2026-09-18). That is you, most of the time. |
 | Watchdog | As needed | Watches the Lander and keeps it draining. Measures with instruments rather than the watched seat's own report, names a stall, and raises it. It never drains, never takes the claim, and never says whose a red is. Added 2026-09-19. |
 | Steward | A cron, no model calls | Reads account usage and names the account with headroom. It cannot interrupt a running session. |
 | Lander | Standing authority | Enqueues and merges. Both, since the Console's retirement. |
@@ -299,9 +299,9 @@ Never announce a hold, a freeze, or a promise about future state. A 2026-08-01 r
 shape stayed "in force" for hours after its condition had cleared. `main` moved four times underneath
 it.
 
-Never spawn a session. No seat in the roster does: the owner starts each Manager, and a Manager's
-workers are subagents in its own process. Why, and what the retired spawn grant measured, are in
-"The KORUS seats" above.
+Do not spawn a session without permission. Only a Manager and the Lander may spawn freely
+(owner ruling 2026-09-16). This read *"No seat in the roster does"* until 2026-09-23, which
+contradicted "The KORUS seats" above.
 
 ---
 
@@ -311,9 +311,11 @@ Report honestly. A truthful "I got this far and stopped here" is worth more than
 
 You have one turn and no way to ask, so when the brief runs out of road, do this.
 
-1. Push the branch before your turn ends, green or not. Open the PR as a draft if the checks did not
-   finish. An unpushed branch is lost; a red draft PR is recoverable.
-2. Name in the PR body what you ran, what you skipped, and what is therefore unproven.
+1. Push the branch before your turn ends, green or not. An unpushed branch is lost; a red pushed
+   branch is recoverable. Under a Manager you do not open the PR: the Manager does, often one PR for
+   a whole wave. This step read *"Open the PR as a draft"* until 2026-09-23.
+2. Name in your report what you ran, what you skipped, and what is therefore unproven. The Manager
+   puts it in the PR body.
 3. If you need a decision, put it in your report, or mail it to the Manager path from your brief.
    It reaches the reader's next turn, not yours.
 4. Leave the BACKLOG item honest. Do not flip a banner to closed for work you did not finish.

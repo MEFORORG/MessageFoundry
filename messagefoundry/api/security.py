@@ -305,8 +305,8 @@ def require(
 def require_paced(*permissions: Permission) -> Callable[[Request], Awaitable[Identity]]:
     """Like :func:`require`, plus per-actor anti-automation PACING on the state-changing admin
     surface (BACKLOG #193, ASVS 2.4.2) — but WITHOUT the MFA / step-up gates. For the mutating admin
-    routes that warrant paced throttling yet not a full step-up re-proof: connection start/stop/
-    restart, DR activate/release, approvals approve/reject, alert ack/resolve, statistics reset. A
+    routes that warrant paced throttling yet not a full step-up re-proof, for example connection
+    start/stop/restart, DR activate/release and statistics reset. docs/SECURITY.md lists the set. A
     non-GET request from an actor over the per-actor rate is refused early with 429 + Retry-After: 1
     (logged, not silent) before the identity is returned. Reuses the SAME #193 limiter as
     :func:`require_step_up` via :func:`_enforce_admin_write_pacing`, so pacing coverage is uniform
@@ -729,7 +729,7 @@ def require_step_up_action(
             # factory SILENTLY STRIPS the pacing floor while reading as a hardening change, because
             # the action binding is visible in the diff and the lost pacing is not. That already
             # happened once: PATCH /users/{user_id} was promoted and lost it, and
-            # docs/SECURITY.md files it under "No limiter of any kind" to this day. Adding it here
+            # docs/SECURITY.md filed it under "No limiter of any kind" until then. Adding it here
             # closes that too rather than only sparing the routes #1148 promotes.
             _enforce_admin_write_pacing(request, auth, identity)
             # NOT redundant with the ASVS 6.3.3 gate in require(), despite covering the same sessions

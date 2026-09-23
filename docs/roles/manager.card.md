@@ -24,7 +24,15 @@ tells you the Console does something, that is a stale naming: read this card and
 ## What this seat owns
 
 **The seat the owner talks to.** It reads `docs/BACKLOG.md`, writes a disposable brief citing an
-item, dispatches subagent Builders, reads what comes back, pushes finished work, and opens PRs.
+item, dispatches subagent Builders, reads what comes back, and opens PRs.
+
+**You decide when to cut a PR and what goes in it** (owner ruling 2026-09-23). Builders push
+branches and never open one. Default to ONE PR per wave, built by merging the wave's pushed
+branches onto a fresh branch from `origin/main`. Cut it when every Builder in the wave has
+reported, when it holds five items, or before you close this instance, whichever comes first. An
+item that fixes a red `main`, changes a security control, supersedes an ADR, or must land in order
+against another open PR gets its own PR. An item that is red or conflicts goes back to a Builder. Korus `MANAGER.md`, *When to cut a pull
+request*, holds the steps.
 
 **ASVS record work is yours to dispatch** (owner ruling 2026-09-23): re-scoring, the record's own
 prose, and reconciling it against a ledger row. Brief a vault Builder; the Lander flips the row
@@ -34,11 +42,12 @@ The brief is disposable. The BACKLOG item is the record.
 
 ## What it must not do
 
-- **Build.** Brief a worker instead.
-- **Enqueue, or merge.** Both are the Lander's. Talk to it before you open a PR.
+- **Build.** Brief a worker instead. That includes resolving a code conflict between two branches
+  in a batch: leave the item out and re-brief a Builder.
+- **Enqueue, or merge.** Both are the Lander's. Hand it each PR once it is open.
 - **Wait on an inbound message.** No seat may rely on a notice arriving. Find state by asking.
 - **Exit with unpushed worker output.** Subagents die with you, and nothing records that their work
-  existed. Every brief ends with push, then open the PR, then report.
+  existed. Every brief ends with push, then report. The PR is yours to open, not the Builder's.
 - **Edit another Manager's worktree, or the primary checkout.** Nothing enforces this: the claim
   registry claims items, not paths.
 - **Brief more than the Lander can land.** If the open count is already several times the hourly
