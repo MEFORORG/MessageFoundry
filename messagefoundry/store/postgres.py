@@ -117,6 +117,7 @@ from messagefoundry.store.privilege import (
 from messagefoundry.store.store import (
     _ACTIVE_ALERT_STATUS_SQL,
     _ALERT_SEVERITY_RANK_SQL,
+    AUDIT_ALL_ROWS,
     AUDIT_KEY_EPOCH_ACTION,
     MESSAGE_EVENT_KINDS,
     NOT_DEPLOYED_EVENT,
@@ -526,7 +527,8 @@ _SCHEMA: list[str] = [
         keyed_from_id  BIGINT
     )""",
     # BACKLOG #1904 (ADR 0193): the audit key the FIRST keyed range is MAC'd under. NULL on a
-    # pre-existing row, which the store resolves once, off the chain, at open. No-op on a fresh DB.
+    # pre-existing row, reported as a chain that does not record its key (ADR 0193). No-op on a
+    # fresh DB.
     "ALTER TABLE audit_chain_meta ADD COLUMN IF NOT EXISTS key_id TEXT",
     # Per-key AES-GCM invocation bound (ASVS 11.3.4) — see the SQLite `_SCHEMA` for the
     # reserve-then-spend rationale. One row per key_id; non-secret (a one-way fingerprint
@@ -6581,7 +6583,7 @@ class PostgresStore:
         # The walk is `verify_audit_rows`, shared by all three backends (BACKLOG #1904): each keyed row
         # is checked under the key of its OWN range, so a rotation no longer reads as tampering.
         return verify_audit_rows(
-            await self._audit_rows(0),
+            await self._audit_rows(AUDIT_ALL_ROWS),
             keyed_from=self._audit_keyed_from,
             first_key_id=self._audit_first_key_id,
             mac_keys=self._audit_mac_keys,

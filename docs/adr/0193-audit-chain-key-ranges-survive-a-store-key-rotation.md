@@ -115,7 +115,7 @@ out-of-band anchor catches. Between a key change and `rotate-key`, new rows are 
 retired key. Under `vault_transit` the engine sees one range (`vault-transit`); Transit's own key
 versioning is outside this ADR.
 
-Three residuals are recorded rather than solved:
+Five residuals are recorded rather than solved:
 
 - **`rotate-key` is offline-only, and nothing enforces it.** Another process keeps the range it read
   at open, so an engine left running would append under the old key after the range row and break
@@ -125,6 +125,17 @@ Three residuals are recorded rather than solved:
   operator may roll over a known break (recording it as unverified) is a policy question left open.
 - **Finding the range rows scans `audit_log`** at every open (no index on `action`). Rotations are
   rare, so the rows are few, but the scan is over every row after the watermark.
+- **The newest handover cannot be authenticated once its outgoing key is dropped.** The tag needs
+  the outgoing key. Once A is dropped after A -> B, a writer holding a configured retired key X that
+  never keyed a range can rewrite the A -> B row and every row after it under X, and the chain
+  verifies; the open then routes appends to X. Only a recorded anchor catches it. An EARLIER handover
+  is safe, because the next one's digest (under a held key) covers it. Keeping the previous key
+  configured until the NEXT rotation closes it operationally; closing it in code needs a choice this
+  ADR does not make (for example, requiring the newest range to be under the active key whenever its
+  opening handover cannot be checked, which misreads the pending window of a second rotation).
+- **`rotate-key` verifies without an anchor**, so a tail truncated before the roll is sealed into
+  the closing digest; only a separately recorded `[integrity].audit_anchor_file` prefix still shows
+  it once the old key is gone.
 
 **Out of scope** -- vault row #1165's algorithm epoch (digest and KDF label per range); this ADR
 records a KEY per range, and the range row's `detail` is JSON so a later field can be added.

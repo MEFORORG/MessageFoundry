@@ -104,6 +104,7 @@ from messagefoundry.store.privilege import (
 from messagefoundry.store.store import (
     _ACTIVE_ALERT_STATUS_SQL,
     _ALERT_SEVERITY_RANK_SQL,
+    AUDIT_ALL_ROWS,
     AUDIT_KEY_EPOCH_ACTION,
     MESSAGE_EVENT_KINDS,
     NOT_DEPLOYED_EVENT,
@@ -1413,7 +1414,7 @@ _SCHEMA: list[str] = [
     """IF OBJECT_ID('audit_chain_meta','U') IS NULL CREATE TABLE audit_chain_meta (
         id INT NOT NULL PRIMARY KEY CHECK (id = 1), keyed_from_id BIGINT NULL)""",
     # BACKLOG #1904 (ADR 0193): the audit key the FIRST keyed range is MAC'd under. NULL on a
-    # pre-existing row, which the store resolves once, off the chain, at open. BIN2 like the other
+    # pre-existing row, reported as a chain that does not record its key (ADR 0193). BIN2 like the other
     # fingerprint-keyed columns.
     """IF COL_LENGTH('audit_chain_meta','key_id') IS NULL
         ALTER TABLE audit_chain_meta ADD key_id VARCHAR(64) COLLATE Latin1_General_BIN2 NULL""",
@@ -2728,17 +2729,17 @@ class SqlServerStore:
     async def _audit_range_rows(self, from_id: int) -> list[Mapping[str, Any]]:
         """``AuditRangeHost`` primitive: every range row at or after ``from_id``, in id order.
 
-        BIN2 on the predicate: ``audit_log.action`` takes the database's case-insensitive default, and
-        the shared walk matches the action EXACTLY, so a case or trailing-space variant must not be
-        picked here as a range row the walk then treats as an ordinary one."""
-        rows: list[Mapping[str, Any]] = list(
-            await self._fetchall(
-                "SELECT id, detail FROM audit_log"
-                " WHERE action COLLATE Latin1_General_BIN2 = ? AND id >= ? ORDER BY id",
-                (AUDIT_KEY_EPOCH_ACTION, from_id),
-            )
+        The shared walk matches the action EXACTLY. ``audit_log.action`` takes the database's
+        case-insensitive default, so the predicate is BIN2; and SQL Server pads trailing spaces for
+        ``=`` under EVERY collation, BIN2 included, so the exact match is re-applied here in Python --
+        otherwise ``'audit.key_epoch '`` would be read as a range row the walk treats as ordinary."""
+        rows = await self._fetchall(
+            "SELECT id, action, detail FROM audit_log"
+            " WHERE action COLLATE Latin1_General_BIN2 = ? AND id >= ? ORDER BY id",
+            (AUDIT_KEY_EPOCH_ACTION, from_id),
         )
-        return rows
+        exact: list[Mapping[str, Any]] = [r for r in rows if r["action"] == AUDIT_KEY_EPOCH_ACTION]
+        return exact
 
     async def _encrypt_existing_rows(self) -> None:
         """Re-encrypt legacy plaintext bodies in place when encryption is enabled (STORE-1).
@@ -9694,7 +9695,7 @@ class SqlServerStore:
         # The walk is `verify_audit_rows`, shared by all three backends (BACKLOG #1904): each keyed row
         # is checked under the key of its OWN range, so a rotation no longer reads as tampering.
         return verify_audit_rows(
-            await self._audit_rows(0),
+            await self._audit_rows(AUDIT_ALL_ROWS),
             keyed_from=self._audit_keyed_from,
             first_key_id=self._audit_first_key_id,
             mac_keys=self._audit_mac_keys,

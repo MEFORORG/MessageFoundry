@@ -570,3 +570,129 @@ async def test_both_server_backends_verify_across_a_rotation_with_the_old_key_dr
     assert not ok and "id=4" in (msg or ""), (
         f"{backend}: the closing range row must catch it: {msg}"
     )
+
+
+# --- review round 2 --------------------------------------------------------------------------------
+
+
+async def test_a_row_with_a_negative_id_is_still_walked(tmp_path: Path) -> None:
+    """The walk reads every row. A lower bound of 0 silently dropped a row a writer inserted with an
+    explicit negative id, which the unfiltered pre-#1904 walk reported."""
+    path, a = tmp_path / "neg.db", generate_key()
+    store = await _open(path, a)
+    try:
+        await _seed(store, "a", 2)
+        await store._db.execute(
+            "INSERT INTO audit_log (id, ts, actor, action, channel_id, detail, client, row_hash)"
+            " VALUES (-5, 1.0, 'admin', 'auth.login', NULL, NULL, NULL, 'deadbeef')"
+        )
+        await store._db.commit()
+        ok, msg = await store.verify_audit_chain()
+        assert not ok and "id=-5" in (msg or ""), msg
+    finally:
+        await store.close()
+
+
+async def test_a_nested_closing_record_neither_raises_at_open_nor_in_verify(tmp_path: Path) -> None:
+    """The tag check re-serialises ``closes``; nested values would raise RecursionError there. A
+    closing record takes scalars only, so the row is simply malformed."""
+    from messagefoundry.store.crypto import audit_key_id
+
+    path, a = tmp_path / "nest.db", generate_key()
+    a_mac = make_cipher(a).audit_mac_key()
+    assert a_mac is not None
+    a_id = audit_key_id(a_mac)  # names the CURRENT range, so the open reaches the tag check
+    store = await _open(path, a)
+    try:
+        await _seed(store, "a", 2)
+        nested = (
+            '{"key_id":"feedfacefeedface","handover":"00","closes":{"key_id":'
+            + json.dumps(a_id)
+            + ',"z":'
+            # Deep enough that json.dumps raises and shallow enough that json.loads does not, on
+            # CPython 3.14 -- the gap the tag check's re-serialisation fell into.
+            + '{"a":' * 10000
+            + "1"
+            + "}" * 10000
+            + "}}"
+        )
+        await store._db.execute(
+            "INSERT INTO audit_log (ts, actor, action, channel_id, detail, client, row_hash)"
+            " VALUES (9.0, 'mallory', ?, NULL, ?, NULL, 'deadbeef')",
+            (AUDIT_KEY_EPOCH_ACTION, nested),
+        )
+        await store._db.commit()
+    finally:
+        await store.close()
+    store = await _open(path, a)  # must not raise
+    try:
+        ok, _msg = await store.verify_audit_chain()
+        assert not ok
+    finally:
+        await store.close()
+
+
+async def test_an_empty_first_range_is_not_read_as_a_forged_first_key(tmp_path: Path) -> None:
+    """A fresh keyed store rolled before any row is written has an EMPTY first range, so its first
+    keyed row is the next range's own row. That is not a check of the first key."""
+    path, a, b, c = tmp_path / "empty.db", generate_key(), generate_key(), generate_key()
+    store = await _open(path, a)
+    await store.close()
+    await _rotate(path, a, b)
+    store = await _open(path, b, (a,))
+    try:
+        assert store._audit_ranges_trusted, "a legitimate empty first range must authenticate"
+    finally:
+        await store.close()
+    await _rotate(path, b, c)
+    assert (await _verify(path, c))[0]
+
+
+async def test_a_lost_range_key_keeps_the_audit_trail_writing(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Refusing every append while the current range's key is missing would stop every audited action,
+    sign-in included. The rows go under the active key instead, loudly, and verify reports the break."""
+    import logging
+
+    path, a, b = tmp_path / "lost.db", generate_key(), generate_key()
+    store = await _open(path, a)
+    try:
+        await _seed(store, "a", 2)
+    finally:
+        await store.close()
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.store.store"):
+        store = await _open(path, b)  # A lost before rotate-key ran
+    try:
+        await store.record_audit("auth.login", actor="u")  # must not raise
+        assert any("NOT configured" in r.getMessage() for r in caplog.records)
+        ok, _msg = await store.verify_audit_chain()
+        assert not ok
+    finally:
+        await store.close()
+
+
+def test_rotate_key_does_not_print_ok_when_the_audit_roll_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    for name in _AT_REST_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.chdir(tmp_path)
+    db, a, b = tmp_path / "partial.db", generate_key(), generate_key()
+
+    async def seed_and_tamper() -> None:
+        store = await _open(db, a)
+        try:
+            await _seed(store, "a", 3)
+            await store._db.execute("UPDATE audit_log SET actor='mallory' WHERE id=2")
+            await store._db.commit()
+        finally:
+            await store.close()
+
+    asyncio.run(seed_and_tamper())
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", b)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEYS_RETIRED", a)
+    assert main(["rotate-key", "--db", str(db)]) == 1
+    captured = capsys.readouterr()
+    assert "OK:" not in captured.out and "PARTIAL:" in captured.out, captured.out
+    assert "Do NOT remove" in captured.err

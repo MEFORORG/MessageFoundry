@@ -1803,6 +1803,11 @@ def audit_mac_bytes(value: str | None) -> bytes:
 #   the MAC'd chain (and so inside the out-of-band anchor), a range row must match the range it closes,
 #   and no key may open a second range -- so a leaked retired key cannot switch the chain back to itself.
 
+#: The lowest ``audit_log.id`` a verify walk reads from -- the BIGINT floor, so a row a writer inserted
+#: with an explicit NEGATIVE id is still walked (and reported), exactly as the unfiltered pre-#1904
+#: ``SELECT ... ORDER BY id`` walked it. ``0`` here silently dropped such rows from the tamper check.
+AUDIT_ALL_ROWS: Final = -(2**63)
+
 #: The action of the row that opens a new keyed range of the audit chain.
 AUDIT_KEY_EPOCH_ACTION: Final = "audit.key_epoch"
 
@@ -1913,6 +1918,7 @@ def audit_range_closing(
 
 
 _AUDIT_HANDOVER_INFO: Final = b"mefor/audit-handover/v1\x00"
+_AUDIT_CLOSES_FIELDS: Final = frozenset({"key_id", "from_id", "to_id", "rows", "digest"})
 
 
 def audit_handover_tag(
@@ -1957,6 +1963,13 @@ def parse_audit_epoch(detail: str | None) -> tuple[str, dict[str, Any], str] | N
         return None
     key_id, closes, handover = obj.get("key_id"), obj.get("closes"), obj.get("handover")
     if not isinstance(key_id, str) or not key_id or not isinstance(closes, dict):
+        return None
+    # Scalars only, and only the fields a closing record has. The tag check RE-SERIALISES `closes`, and
+    # json.dumps recurses deeper than json.loads tolerates, so a nested value would raise
+    # RecursionError there -- at open, and in the startup verify -- rather than read as a break.
+    if not set(closes) <= _AUDIT_CLOSES_FIELDS or not all(
+        v is None or isinstance(v, (int, str)) for v in closes.values()
+    ):
         return None
     if not isinstance(handover, str):
         return None
@@ -2232,7 +2245,10 @@ async def settle_audit_ranges(host: AuditRangeHost, recorded_key_id: str | None)
             before = [r for r in head if int(r["id"]) < keyed_from]
             first = next((r for r in head if int(r["id"]) >= keyed_from), None)
             determinable = keyed_from == 1 or bool(before)
-            if first is not None and determinable:
+            # An EMPTY first range (a fresh store, or rekey-audit then rotate-key with no row between)
+            # makes the first keyed row the next range's own row, MAC'd under THAT key -- not a check
+            # of the first key at all.
+            if first is not None and determinable and first["action"] != AUDIT_KEY_EPOCH_ACTION:
                 prev = before[-1]["row_hash"] if before else ""
                 expected = audit_row_hash(
                     prev,
@@ -2275,11 +2291,20 @@ async def settle_audit_ranges(host: AuditRangeHost, recorded_key_id: str | None)
             current, current_from = new_key, rid
     host._audit_range_keys = seen
     if problem is not None:
+        # Stay on the last range that DID authenticate when its key is held, so rows written after a
+        # junk range row still verify; fall back to the active key only when it is not. Never the key
+        # the unauthenticated row names.
+        last_good = (
+            current
+            if current is not None
+            and _audit_secret_for(current, keys, host._audit_mac_fn) is not None
+            else active_id
+        )
         host._audit_ranges_trusted = False
-        host._audit_range_key_id, host._audit_range_from = active_id, None
+        host._audit_range_key_id, host._audit_range_from = last_good, None
         log.error(
-            "%s. New audit rows are keyed under the ACTIVE store key rather than a key this record "
-            "names, and `rotate-key` will refuse; run `messagefoundry audit-verify` to see the break.",
+            "%s. New audit rows stay under the last range that authenticated (or the active key), never "
+            "a key that row names, and `rotate-key` will refuse; run `messagefoundry audit-verify`.",
             problem,
         )
         return
@@ -2287,11 +2312,15 @@ async def settle_audit_ranges(host: AuditRangeHost, recorded_key_id: str | None)
     if active_id is None or current == active_id:
         return
     if _audit_secret_for(current, keys, host._audit_mac_fn) is None:
+        # Refusing every append would stop every audited action, sign-in included, for as long as the
+        # key is missing. New rows go under the active key instead, which verify will report as a break
+        # inside this range: the loss is recorded rather than turned into an outage.
+        host._audit_range_key_id = active_id
         log.error(
             "the audit chain's current range (from id=%d) is keyed under a store key that is NOT "
-            "configured, so every audit append will be refused. Restore that key to "
-            "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED, then stop the engine and run "
-            "`messagefoundry rotate-key` to open a range under the active key.",
+            "configured. New audit rows are keyed under the active key and will not verify inside "
+            "that range. Restore the key to MEFOR_STORE_ENCRYPTION_KEYS_RETIRED, then stop the engine "
+            "and run `messagefoundry rotate-key`.",
             current_from,
         )
     else:
@@ -3154,7 +3183,7 @@ CREATE INDEX IF NOT EXISTS ix_audit_ts ON audit_log(ts);
 -- (never rewrites existing row_hashes), so enabling keying can never re-bless a forged row.
 -- `key_id` (BACKLOG #1904, ADR 0193) names the audit key the FIRST keyed range is MAC'd under; every
 -- later range is opened by an `audit.key_epoch` row inside the chain. NULL on a pre-#1904 row, which
--- the store resolves once, off the chain, at open.
+-- the store reports as a chain that does not record its key (there is no resolver: ADR 0193).
 CREATE TABLE IF NOT EXISTS audit_chain_meta (
     id             INTEGER PRIMARY KEY CHECK (id = 1),
     keyed_from_id  INTEGER,
@@ -4781,7 +4810,7 @@ class MessageStore:
         # valid — audit_row_hash omits the 7th element entirely when client is None.
         if "client" not in audit_cols:
             await db.execute("ALTER TABLE audit_log ADD COLUMN client TEXT")
-        # BACKLOG #1904: the first keyed range's key. NULL on an existing row is resolved at open.
+        # BACKLOG #1904: the first keyed range's key. NULL is reported, never guessed (ADR 0193).
         cur = await db.execute("PRAGMA table_info(audit_chain_meta)")
         if "key_id" not in {row["name"] for row in await cur.fetchall()}:
             await db.execute("ALTER TABLE audit_chain_meta ADD COLUMN key_id TEXT")
@@ -9596,7 +9625,7 @@ class MessageStore:
         # The walk itself is `verify_audit_rows`, shared by all three backends (BACKLOG #1904): each
         # keyed row is checked under the key of its OWN range, so a rotation no longer reads as tampering.
         return verify_audit_rows(
-            await self._audit_rows(0),
+            await self._audit_rows(AUDIT_ALL_ROWS),
             keyed_from=self._audit_keyed_from,
             first_key_id=self._audit_first_key_id,
             mac_keys=self._audit_mac_keys,

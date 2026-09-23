@@ -5317,10 +5317,13 @@ def _rotate_key(args: argparse.Namespace) -> int:
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path)
-    print(
-        f"OK: re-encrypted {count} value(s) under the active key"
+    done = (
+        f"re-encrypted {count} value(s) under the active key"
         f" (+{uploads.resealed} uploaded-file value(s) re-sealed)"
     )
+    # "OK:" only when the whole rotation, audit chain included, is done: a wrapper reading stdout must
+    # not see OK and drop the retired key while the audit roll failed (BACKLOG #1904).
+    print(f"OK: {done}" if rolled_ok else f"PARTIAL: {done}")
     if uploads.skipped:
         # Say it plainly and on stderr: a skipped file is STILL under the old key, so retiring that
         # key now destroys it. This is the one outcome where "OK" alone would mislead.
