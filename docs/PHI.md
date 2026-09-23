@@ -306,8 +306,9 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    table that can legally empty out (`queue.payload`, `state`, `alert_instance`) and any column that
    has not been written yet (`users.totp_secret` before the first MFA enrolment, for example). A planted
    row read before that open is still refused. Also note that a planted `state` or `reference` value
-   on a sealed surface stops the store from opening, since the open reads those tables eagerly; that
-   refusal is logged but raises no alert, because the engine arms the alert only after the open.
+   on a sealed surface stops the store from opening, since the open reads those tables eagerly. `serve`
+   arms the alert before the open, so that refusal alerts too, and so does a planted row the open
+   finds and leaves in place. The retention document-strip pass skips a refused row and carries on.
    **A third at-rest tier ships — `[store].cipher_provider = "vault_transit"` (`mfenc:v3`, ADR 0138).**
    This does not merely source the key: it **replaces the cipher object**
    ([store/crypto_transit.py](../messagefoundry/store/crypto_transit.py)), so every encrypt/decrypt runs

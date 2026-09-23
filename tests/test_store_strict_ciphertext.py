@@ -352,3 +352,150 @@ async def test_the_one_transaction_seal_never_outruns_its_reservation(
     # messages.raw, 30 ingress payloads on queue.payload.
     assert cipher.cumulative_invocations() >= 60
     assert not shortfalls, f"the persisted bound trailed the encrypts: {shortfalls[:5]}"
+
+
+# --- repair round 2: alerts reach the operator even where no read path runs ----------------------
+
+
+def _plant_state(db: Path, key: str) -> None:
+    """Seal the ``state`` surface with one genuine value, then plant a plaintext one beside it."""
+    cipher = _keyed(key)
+    sealed = cipher.encrypt('{"a": 1}', aad=cell_aad("state", "value", "ns", "sealed"))
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(
+            "INSERT INTO state (namespace, key, value, set_at, message_id) VALUES (?,?,?,?,?)",
+            ("ns", "sealed", sealed, 0.0, "m1"),
+        )
+        conn.execute(
+            "INSERT INTO state (namespace, key, value, set_at, message_id) VALUES (?,?,?,?,?)",
+            ("ns", "row-key-9", '{"mrn": "666"}', 0.0, "m2"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+async def test_open_store_arms_the_refusal_hook_before_the_open(tmp_path: Path) -> None:
+    """A planted ``state`` value on a sealed surface stops the store from opening, because the open
+    reads that table eagerly. The refusal must still reach a hook, so it can alert."""
+    from messagefoundry.store.base import open_store
+
+    db = tmp_path / "state.db"
+    key = generate_key()
+    await _seed(db, 1, _keyed(key))
+    _plant_state(db, key)
+    seen: list[tuple[str, str]] = []
+    with pytest.raises(CipherError, match=r"state\.value"):
+        await open_store(
+            StoreSettings(path=str(db), encryption_key=key),
+            refusal_hook=lambda table, column: seen.append((table, column)),
+        )
+    assert ("state", "value") in seen
+
+
+class _LifecycleSink:
+    """A stand-in notifier: records alerts and whether its queue was drained."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str, int]] = []
+        self.started = False
+        self.drained = False
+
+    def integrity_drift(self, name: str, *, reason: str, drift_count: int) -> None:
+        self.events.append((name, reason, drift_count))
+
+    def set_store(self, store: object) -> None:
+        pass
+
+    def start(self) -> None:
+        self.started = True
+
+    async def aclose(self) -> None:
+        self.drained = True
+
+    async def prime_suspensions(self) -> None:
+        pass
+
+
+def test_serve_alerts_when_a_planted_state_value_blocks_the_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pytest.importorskip("psutil")
+    import importlib
+
+    from fastapi.testclient import TestClient
+
+    from messagefoundry.api import create_managed_app
+    from messagefoundry.config.settings import AlertsSettings
+
+    app_mod = importlib.import_module("messagefoundry.api.app")
+    sink = _LifecycleSink()
+    monkeypatch.setattr(app_mod, "notifier_from_settings", lambda *a, **k: sink)
+    db = tmp_path / "serve.db"
+    key = generate_key()
+    asyncio.run(_seed(db, 1, _keyed(key)))
+    _plant_state(db, key)
+
+    app = create_managed_app(
+        store_settings=StoreSettings(path=str(db), encryption_key=key),
+        alerts_settings=AlertsSettings(),
+        poll_interval=0.05,
+    )
+    with pytest.raises(CipherError), TestClient(app):
+        pass
+    # Two findings, both expected: the sweep finds the planted row and leaves it, then the eager
+    # cache load reads it and the refusal aborts the open. The sink's subject throttle folds repeats.
+    assert sink.events and {e[0] for e in sink.events} == {"store-cipher"}, sink.events
+    for _subject, reason, _count in sink.events:
+        assert "state.value" in reason and "666" not in reason and "row-key-9" not in reason
+    # The open failed before the notifier would normally start, so it must be started and drained
+    # here, or the one alert that explains the refusal is queued and never sent.
+    assert sink.started and sink.drained
+
+
+async def test_a_planted_row_the_open_finds_alerts_without_being_read(tmp_path: Path) -> None:
+    db = tmp_path / "found.db"
+    key = generate_key()
+    _good, planted = await _seed(db, 2, _keyed(key))
+    _set_raw(db, planted, _PLANT)
+    cipher = _keyed(key)
+    seen: list[tuple[str, str]] = []
+    cipher.set_refusal_hook(lambda table, column: seen.append((table, column)))
+    store = await MessageStore.open(db, cipher=cipher)
+    await store.close()
+    assert seen == [("messages", "raw")]  # nothing read it; the sweep found it
+
+
+async def test_the_document_strip_pass_contains_a_refused_row(tmp_path: Path) -> None:
+    from messagefoundry.parsing import binary
+
+    db = tmp_path / "strip.db"
+    body = binary.encode(b"SYNTHETIC-DOCUMENT-BYTES " * 200)
+    store = await MessageStore.open(db, cipher=_keyed(generate_key()))
+    try:
+        ids: list[str] = []
+        for i in range(2):
+            mid = await store.enqueue_message(
+                channel_id="IB", raw=body, deliveries=[("OB", "x")], control_id=f"C{i}", now=0.0
+            )
+            [row] = await store.outbox_for(mid)
+            await store.claim_ready(now=0.0)
+            await store.mark_done(row["id"], now=0.0)
+            ids.append(mid)
+        _set_raw(db, ids[0], body)  # planted: an unmarked body the pass will be refused on
+        result = await store.strip_embedded_documents(older_than=10.0, now=20.0)
+        assert result.messages_stripped == 1  # the other row was still stripped
+        assert _raw_at_rest(db, ids[0]) == body  # the refused row is left exactly as found
+    finally:
+        await store.close()
+
+
+def test_the_logging_sink_does_not_call_a_store_cipher_alert_an_engine_module(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from messagefoundry.pipeline.alerts import LoggingAlertSink
+
+    with caplog.at_level(logging.WARNING):
+        LoggingAlertSink().integrity_drift("store-cipher", reason="messages.raw", drift_count=1)
+    assert "store-cipher" in caplog.text and "engine module" not in caplog.text

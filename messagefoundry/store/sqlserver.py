@@ -86,6 +86,7 @@ from messagefoundry.store.crypto import (
     cell_aad,
     cipher_info,
     decrypt_json_cell,
+    report_unmarked,
     rotation_fingerprint_key,
 )
 from messagefoundry.store.document_strip import StripResult, cutoff_for
@@ -2818,6 +2819,9 @@ class SqlServerStore:
                     column,
                     pending,
                 )
+                # Alert now, not only on a read: a planted row nobody reads would otherwise stay
+                # invisible except in the log. Names the cell only (BACKLOG #1169).
+                report_unmarked(self._cipher, table, column)
                 return 0
         await reserve_invocations_ahead(self._cipher, self.add_cipher_invocations, pending)
         select_cols = ", ".join(f"[{c}]" for c in dict.fromkeys((*keys, *aad_cols)))
@@ -6446,7 +6450,18 @@ class SqlServerStore:
             cutoff = cutoff_for(row["channel_id"], older_than, connection_cutoffs)
             if row["received_at"] >= cutoff:
                 continue
-            raw = self._cipher.decrypt(row["raw"], aad=cell_aad("messages", "raw", row["id"]))
+            try:
+                raw = self._cipher.decrypt(row["raw"], aad=cell_aad("messages", "raw", row["id"]))
+            except CipherError as exc:
+                # Contain ONE row, as the claim sites do: a refused (unmarked) or undecryptable body
+                # must not abort the whole retention pass. The row is left exactly as found; the
+                # message names only the cell and the message id, never the body (BACKLOG #1169).
+                log.warning(
+                    "document strip skipped message %s: its body could not be read: %s",
+                    row["id"],
+                    exc,
+                )
+                continue
             new_raw, n_docs, n_bytes = _strip_documents(
                 raw,
                 pruned_at=now,

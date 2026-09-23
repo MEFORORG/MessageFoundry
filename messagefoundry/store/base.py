@@ -41,7 +41,7 @@ from messagefoundry.store.content_search import (
     SearchTarget,
     make_spec,
 )
-from messagefoundry.store.crypto import Cipher, CipherInfo, make_cipher
+from messagefoundry.store.crypto import Cipher, CipherInfo, UnmarkedRefusalHook, make_cipher
 from messagefoundry.store.document_strip import StripResult
 from messagefoundry.store.keyprovider import resolve_key_provider
 from messagefoundry.store.pool_metrics import PoolStatus
@@ -2211,6 +2211,7 @@ async def open_store(
     create: bool = False,
     message_events: str = "all",
     posture: HopPosture | None = None,
+    refusal_hook: UnmarkedRefusalHook | None = None,
 ) -> Store:
     """Open the store for the configured backend — the single backend-selection seam.
 
@@ -2234,6 +2235,11 @@ async def open_store(
     server-DB backends so the engine<->store weakened-TLS refusal (``connection_string`` / ``_build_ssl``)
     clamps the ``MEFOR_ALLOW_INSECURE_TLS`` escape on a production-PHI hop (decision 2). ``None`` (SQLite —
     no TLS — or a backup/restore utility / test) leaves it unclamped, byte-identical to pre-#200.
+
+    ``refusal_hook`` (BACKLOG #1169) is set on the cipher BEFORE the backend opens. The open itself can
+    refuse an unmarked value -- the sweep finds a planted row, or the eager ``state``/``reference``
+    cache load reads one and aborts the open -- and only a hook armed this early can alert on those.
+    ``None`` leaves the refusal to the log, as a CLI utility's open does.
     """
     # Before the cipher, so a refusal never waits on a key provider (a Vault round trip).
     if not create and (absent := _absent_sqlite_store(settings)) is not None:
@@ -2244,6 +2250,9 @@ async def open_store(
     # aad_bind=false selects the frozen v1 writer, byte-identical at rest). `vault_transit` runs the bulk
     # crypto inside Vault/OpenBao Transit so the DEK never enters heap (ASVS 13.3.3). No key → identity.
     cipher = build_store_cipher(settings)
+    setter = getattr(cipher, "set_refusal_hook", None)
+    if refusal_hook is not None and callable(setter):
+        setter(refusal_hook)
     # #190: HKDF-derived HMAC key for the tamper-evident audit chain; None for the identity cipher (the
     # chain then stays the keyless SHA-256 chain, byte-identical to a pre-#190 store).
     audit_mac_key = cipher.audit_mac_key()

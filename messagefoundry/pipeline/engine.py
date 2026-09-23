@@ -50,7 +50,11 @@ from messagefoundry.config.wiring import (
     connector_secret_env_values,
     load_config,
 )
-from messagefoundry.pipeline.alerts import AlertSink
+from messagefoundry.pipeline.alerts import (
+    AlertSink,
+    LoggingAlertSink,
+    store_cipher_refusal_forwarder,
+)
 from messagefoundry.pipeline.cert_expiry import CertExpiryRunner, MonitoredCert, certs_from_registry
 from messagefoundry.pipeline.cluster import (
     ClusterCoordinator,
@@ -1049,19 +1053,17 @@ class Engine:
         ``store-cipher`` subject so it throttles and routes independently of that check.
 
         Tolerant of a store without ``cipher()`` and of a cipher without the hook (keyless, or a test
-        double), exactly like the GCM runner's refill hook. The hook may fire on a worker thread, so it
-        hops back onto the loop before touching the sink."""
+        double), exactly like the GCM runner's refill hook. With no configured sink it falls back to
+        the logging sink, as that runner does. The serve path also arms a hook BEFORE the store opens
+        (``api/app.py``), so a refusal that blocks the open alerts too; this one replaces it for the
+        engine's lifetime. The forwarder hops onto the loop when a decrypt ran on another thread."""
         getter = getattr(self.store, "cipher", None)
         cipher = getter() if callable(getter) else None
         setter = getattr(cipher, "set_refusal_hook", None)
         if not callable(setter):
             return
-        loop = asyncio.get_running_loop()
-
-        def _refused(table: str, column: str) -> None:
-            loop.call_soon_threadsafe(self._alert_cipher_refusal, table, column)
-
-        setter(_refused)
+        sink = self._alert_sink if self._alert_sink is not None else LoggingAlertSink()
+        setter(store_cipher_refusal_forwarder(sink, asyncio.get_running_loop()))
         self._cipher_refusal_armed = cipher
 
     def _disarm_cipher_refusal_alert(self) -> None:
@@ -1070,20 +1072,6 @@ class Engine:
         setter = getattr(cipher, "set_refusal_hook", None)
         if callable(setter):
             setter(None)
-
-    def _alert_cipher_refusal(self, table: str, column: str) -> None:
-        """Raise the ``store-cipher`` integrity alert. Names only the table and column, which the
-        cipher took from the cell AAD: never the row key, never the value, so it carries no PHI."""
-        reason = (
-            f"the keyed store refused an unmarked value in cipher column {table}.{column} "
-            "(a stripped marker or a planted plaintext row)"
-        )
-        if self._alert_sink is None:
-            return  # the cipher already logged the refusal at WARNING
-        try:
-            self._alert_sink.integrity_drift("store-cipher", reason=reason, drift_count=1)
-        except Exception:  # noqa: BLE001 — an alert-sink failure must never break a read path
-            log.warning("store-cipher integrity alert could not be delivered")
 
     async def start(self) -> None:
         """Recover crashed in-flight rows (every stage), dead-letter outbound rows for removed

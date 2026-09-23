@@ -268,6 +268,20 @@ class _UnmarkedPolicy:
         is swallowed -- an alert must never change what the read does."""
         self._refusal_hook = hook
 
+    def report_unmarked(self, table: str, column: str) -> None:
+        """Fire the refusal hook for an unmarked value in ``table.column`` without reading it.
+
+        The read seam calls this on every refusal. The at-open sweep calls it too when it finds a
+        planted row it leaves in place, so a row nobody reads still reaches an alert. Anything the
+        hook raises is swallowed: an alert must never change what the caller does."""
+        hook = self._refusal_hook
+        if hook is None:
+            return
+        try:
+            hook(table, column)
+        except Exception:  # noqa: BLE001 — an alert failure must never change the read's outcome
+            _log.debug("cipher refusal hook raised; the refusal itself still stands")
+
     def _pass_unmarked(self, stored: str, aad: bytes | None, allow_unmarked: bool) -> str:
         """Return an unmarked ``stored`` when policy permits it, else raise :class:`CipherError`."""
         if not stored or allow_unmarked or self._allow_unmarked:
@@ -279,12 +293,7 @@ class _UnmarkedPolicy:
             table,
             column,
         )
-        hook = self._refusal_hook
-        if hook is not None:
-            try:
-                hook(table, column)
-            except Exception:  # noqa: BLE001 — an alert failure must never change the read's outcome
-                _log.debug("cipher refusal hook raised; the refusal itself still stands")
+        self.report_unmarked(table, column)
         raise CipherError(
             f"refused an unmarked value in cipher column {table}.{column} (a stripped marker or a "
             "planted row); set [store].allow_unmarked_ciphertext to accept unmarked values"
@@ -298,6 +307,15 @@ def allows_unmarked(cipher: Cipher) -> bool:
     have its unmarked values sealed (only under the opt-out). Duck-typed so a test double or embedder
     cipher without the policy keeps the old seal-everything sweep."""
     return bool(getattr(cipher, "allow_unmarked", True))
+
+
+def report_unmarked(cipher: Cipher, table: str, column: str) -> None:
+    """Report an unmarked value the at-open sweep found and left in place (BACKLOG #1169).
+
+    Duck-typed like :func:`allows_unmarked`: a cipher without the policy has no hook to fire."""
+    report = getattr(cipher, "report_unmarked", None)
+    if callable(report):
+        report(table, column)
 
 
 # --- in-use memory hygiene (ASVS 13.3.3 / 11.7.2) — all best-effort, see the module docstring -------
