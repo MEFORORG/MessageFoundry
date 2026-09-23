@@ -49,6 +49,9 @@ _DEK_BULLETS = (
 _LIFECYCLE_HEADING = "### Key management for the other keys the engine loads or mints"
 _NEXT_HEADING = "### Rotation schedule"
 
+#: A cell or bullet counts as written only if it holds a letter or digit, not just a dash.
+_WORD = re.compile(r"\w")
+
 #: The pseudo-label for the store DEK, whose lifecycle is a bullet list rather than a table row.
 _DEK = "Store DEK"
 
@@ -214,7 +217,7 @@ def lifecycle_labels(doc: str) -> set[str]:
     if dek is not None:
         policy = lines[dek + 1 : start if start is not None and start > dek else len(lines)]
         if all(
-            any(line.startswith(lead) and line[len(lead) :].strip() for line in policy)
+            any(line.startswith(lead) and _WORD.search(line[len(lead) :]) for line in policy)
             for lead in _DEK_BULLETS
         ):
             labels.add(_DEK)
@@ -233,7 +236,7 @@ def lifecycle_labels(doc: str) -> set[str]:
         if not match:
             continue
         cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
-        if len(cells) >= 4 and all(cells):
+        if len(cells) >= 4 and all(_WORD.search(cell) for cell in cells):
             labels.add(match.group(1))
     return labels
 
@@ -317,6 +320,14 @@ def test_deleting_a_row_turns_the_guard_red() -> None:
         assert mutated != doc, f"no row for {label!r} to delete; the row label moved"
         assert f"{culprit} -> {label}" in uncovered(mutated), f"deleting {label!r} stayed green"
     # The DEK has no row; its policy is a bullet list. Gutting one bullet must also turn it red.
+    # Gutting a bullet down to its lead and dash must be red too, not just deleting it.
+    emptied = "\n".join(
+        "- **Destruction** \u2014" if line.startswith("- **Destruction**") else line
+        for line in doc.splitlines()
+    )
+    assert f"messagefoundry/store/crypto.py -> {_DEK}" in uncovered(emptied), (
+        "a DEK bullet emptied to its lead stayed green"
+    )
     gutted = "\n".join(
         line for line in doc.splitlines() if not line.startswith("- **Destruction**")
     )

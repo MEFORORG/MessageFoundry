@@ -820,8 +820,9 @@ async def test_the_totp_secret_is_returned_once_and_never_again() -> None:
     * staging again mints a FRESH secret rather than re-displaying the staged one;
     * once MFA is on, a new enrolment is refused, so the active secret is never returned again;
     * the status read carries no copy of it; and
-    * the enrolment response is the only JSON API model with a field named like a secret, so a new
-      JSON model carrying it fails here. An unrelated ``*secret*`` field fails too, on purpose: it
+    * the enrolment response is the only JSON API model with a field NAMED like a secret, so a new
+      JSON model with such a field fails here. A field under another name does not; the
+      enrolment response already carries the secret a second time, inside ``otpauth_uri``. An unrelated ``*secret*`` field fails too, on purpose: it
       must be looked at.
 
     What this does NOT cover: HTML pages (the web console renders the staged secret on its own

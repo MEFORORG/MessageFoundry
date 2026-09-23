@@ -258,8 +258,8 @@ have their own rows in the inventory table above.) The engine mints at least the
 - One **TOTP shared secret** for each account that enrols in MFA (second table below).
 
 `messagefoundry cert import` unpacks an operator's PKCS#12 bundle into the PEM files the TLS loaders
-read. It creates no new key, but it does copy one: the key leaves the passphrase-protected `.pfx` as
-an **unencrypted** `key.pem` (`pki.key_to_pem`), and the `.pfx` stays where it was.
+read. It creates no new key, but it does copy one: the key leaves the `.pfx`, and any passphrase protection
+it had there, as an **unencrypted** `key.pem` (`pki.key_to_pem`), and the `.pfx` stays where it was.
 
 **Private keys the engine loads or mints.**
 
@@ -294,7 +294,8 @@ the process account, reading an `env()`-resolved value or a file. The native API
 exception, because its one holder is the client machine's account, not the engine's. The engine
 escrows none of the keys in the first table, and none should be escrowed on the DEK's reasoning.
 The DEK is escrowed because losing it strands rows nothing else can recover. Losing a key in the
-first table costs a re-issue, often with a counterparty, and never data. The right holder count for them is the lowest the site can operate with. The connection
+first table costs a re-issue, often with a counterparty, and never data. The right holder count
+for them is the lowest the site can operate with. The connection
 settings that carry key text or a passphrase are `/metadata`-redacted (`_SECRET_SETTING_KEYS` and
 `_is_secret_setting` in [`config/wiring.py`](../messagefoundry/config/wiring.py)), so a console
 operator cannot read a key value back out of a running engine. The **path**-valued connection setting
@@ -322,18 +323,20 @@ stated in two parts. Only the first part is a claim about the engine.
     place, so delete whichever copy the site does not need. And a DR backup tars every regular file
     under the config directory (`_add_config_dir` in
     [`pipeline/dr_backup.py`](../messagefoundry/pipeline/dr_backup.py)). A key file kept there is
-    copied into every archive. It is sealed under the DEK in a `.mfbak`. A box with no store key that sets the audited
-    `[backup].allow_unencrypted` escape writes a `.mfbak.plain` instead, and there the copy is
+    copied into every archive. It is sealed under the DEK in a `.mfbak`. A box with no store key that sets
+    the audited     `[backup].allow_unencrypted` escape writes a `.mfbak.plain` instead, and there the copy is
     plaintext. **Keep key files outside the config directory.**
-- **What a deploying site must do, which the engine cannot observe.** Keep each private key with one
-  entity, the engine's process account. Keep each TOTP secret in one authenticator; a cloud-synced
+- **What a deploying site must do, which the engine cannot observe.** Keep each engine-side private key
+  with one entity, the engine's process account, and the native API client key with the client
+  machine's account. Keep each TOTP secret in one authenticator; a cloud-synced
   authenticator or a copy in a password manager is a third holder. Keep the anonymizer salt with the
   one person running the export. The engine cannot see copies made outside it, so this document makes
   **no** claim that these bounds hold on any site.
 
 **Destruction and retirement belong to the deploying site** for every operator-supplied key in the
 first table. The engine ships no command that destroys, revokes or expires any of them. It stops
-using one when the setting stops naming it, and the PEM keeps working anywhere it was copied. So retiring a key means
+using one when the setting stops naming it, and the PEM keeps working anywhere it was copied.
+So retiring a key means
 revoking or de-registering it at the counterparty and deleting the operator-side copies. Only the
 store DEK has the property the Destruction bullet above describes, where discarding the key is itself
 the erasure. Under the default `aesgcm` cipher the TOTP secret rides that property, because it is
