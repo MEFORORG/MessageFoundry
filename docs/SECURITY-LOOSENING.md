@@ -566,6 +566,28 @@ This section is kept rather than deleted, because the claim it used to make is t
   principal may assume rather than on the principal itself (`CREATEROLE via role site_ops`) — reachable
   by `SET ROLE`, so held in practice. Both are real deviations from the prescribed grant, not noise.
 
+### `schema_management` — the engine's runtime login runs its own schema DDL
+
+> **A switch at a non-default value.** `[store].schema_management = "auto"` on a SQL Server or
+> PostgreSQL store. BACKLOG #305, ASVS 13.2.2. The server-DB default is `"external"`.
+- **What you lose:** the runtime login needs standing DDL rights (`db_ddladmin` on SQL Server,
+  `CREATE` on the store's schema on PostgreSQL) that steady-state operation never uses. Any code path
+  that reaches the store can then create, alter or drop the engine's own tables, not only read and
+  write their rows.
+- **What the default does instead:** `serve` runs no DDL. A DBA runs
+  `messagefoundry store provision-schema` as a separate, DDL-capable principal, before the first start
+  and before the first start of any upgrade whose schema moved. Until then `serve` refuses to start and
+  names that command ([`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §2).
+- **When acceptable:** a lab or a single-operator install where the DBA and the engine are the same
+  person, and the provisioning step buys nothing.
+- **It is never silent:** an entry here and in `GET /security/posture` on every server-DB start in
+  `auto`. The startup privilege probe also changes what it expects: under `auto` it treats the DDL
+  grant as prescribed, under `external` it names it as excess (`store_principal_over_granted`).
+- **On SQLite this entry never fires.** A local file has no server principal to split, so SQLite is
+  always `auto` by construction.
+- **How to turn it off:** remove the setting, or set `[store].schema_management = "external"`, then run
+  `provision-schema` and drop the DDL grant from the runtime login.
+
 ### `store_principal_privileges_unobserved` — the privilege posture could not be read
 
 > The complement of the entry above, and it is reported **separately** on purpose: an over-grant and an

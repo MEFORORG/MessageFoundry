@@ -7,6 +7,20 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **On SQL Server and PostgreSQL the engine's runtime login no longer runs schema DDL, and
+  `messagefoundry store provision-schema` does it instead.** New `[store].schema_management`
+  takes `auto` or `external`; **`external` is the server-DB default**, and SQLite is always
+  `auto`. Under `external`, `serve` reads the `schema_meta` marker and **refuses to start** when it
+  does not match this build, naming the database and the command. It runs no DDL and, on SQL
+  Server, no `ALTER DATABASE`, so a refused start leaves the database as it found it. A DBA runs
+  `provision-schema` as a DDL-capable principal before the first start and before the first start of
+  any upgrade whose schema moved; it is safe to re-run and needs no store key. The runtime login then
+  needs row access only: `db_datareader` + `db_datawriter` on SQL Server, `USAGE` plus row grants on
+  PostgreSQL ([`DEPLOY-SERVER-DB.md`](docs/DEPLOY-SERVER-DB.md) §1.1, §1.2, §2). The startup
+  privilege probe follows the mode: under `external` it names `db_ddladmin`, or `CREATE` on the store
+  schema, as excess. Set `schema_management = "auto"` to keep the engine building its own schema;
+  on a server DB that is reported by `security_loosenings()` as `schema_management`.
+  ([BACKLOG #305](docs/BACKLOG.md), [ADR 0192](docs/adr/0192-server-db-schema-is-provisioned-externally-by-default-the-runtime-login-runs-no-ddl.md))
 - **`[integrity].audit_anchor_file` — the startup audit check can now hold an anchor, so it can see a
   truncated tail.** A previous release shipped `audit-anchor` / `audit-verify --expected-anchor` and
   recorded, accurately at the time, that `[integrity].audit_verify_on_start` "is unchanged — it is a

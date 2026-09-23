@@ -70,21 +70,37 @@ password**:
   -ServiceAccount "CORP\mefor-svc$"          # gMSA — passwordless; preflight + SeServiceLogonRight auto
 ```
 
-**3. Grant the gMSA a SQL login** (DBA, on the SQL Server) — the Windows account, mapped to a
-least-privilege database user; the engine bootstraps its own schema on first open (§2), so the user
-needs table create/CRUD on the MessageFoundry database only:
+**3. Grant the gMSA a runtime login: row access only** (DBA, on the SQL Server). The engine runs no
+schema DDL under `[store].schema_management = "external"`, the server-DB default, so the gMSA needs
+row read and write on the MessageFoundry database and nothing else:
 
 ```sql
 CREATE LOGIN [CORP\mefor-svc$] FROM WINDOWS;               -- the gMSA's Windows identity ($ suffix)
 USE [MessageFoundry];
 CREATE USER [CORP\mefor-svc$] FOR LOGIN [CORP\mefor-svc$];
--- Least privilege: schema bootstrap (§2) + row CRUD; NOT sysadmin/db_owner.
+-- Runtime least privilege: row CRUD only. NOT db_ddladmin, and never sysadmin/db_owner.
 ALTER ROLE db_datareader  ADD MEMBER [CORP\mefor-svc$];
 ALTER ROLE db_datawriter  ADD MEMBER [CORP\mefor-svc$];
-ALTER ROLE db_ddladmin    ADD MEMBER [CORP\mefor-svc$];    -- schema DDL: first open + upgrades
 ```
 
-**4. The engine `[store]` block** — integrated auth, encrypted, verifying the DB cert against the
+**4. Provision the schema as a separate, DDL-capable principal** (DBA). Run this before the first
+start, and again before the first start of any upgrade whose schema moved. It is safe to re-run: a
+schema that is already current is a no-op. The provisioning principal is a DBA login in `db_ddladmin`
+on the MessageFoundry database, never the gMSA. If it also holds `ALTER` on the database, the command
+turns on `READ_COMMITTED_SNAPSHOT` and `ALLOW_SNAPSHOT_ISOLATION` too; if it does not, it warns and a
+DBA runs those two statements by hand (§2).
+
+```powershell
+# As the DBA's own Windows account: auth = "integrated" connects as whoever runs the command.
+messagefoundry store provision-schema --service-config <instance dir>\messagefoundry.toml
+# With a SQL login instead: put its password in MEFOR_STORE_PASSWORD first, then add
+#   --username <provisioning login>
+```
+
+Until this step has run, `serve` **refuses to start**. The error names the database and this command.
+It runs no DDL of its own, so a refused start leaves the database exactly as it found it.
+
+**5. The engine `[store]` block** — integrated auth, encrypted, verifying the DB cert against the
 Windows machine trust store (§5); **no secret in the file or env**:
 
 ```toml
@@ -96,49 +112,90 @@ auth = "integrated"                # Trusted_Connection=yes — the gMSA's ident
 encrypt = true                     # default; TLS to the DB
 trust_server_certificate = false   # default; verify the DB cert (import its CA into LocalMachine\Root, §5.2)
 require_managed_identity = true    # refuse a static SQL login on production PHI (ASVS 13.2.1)
+# schema_management = "external"   # the server-DB default; step 4 owns the DDL (BACKLOG #305)
 ```
 
 > **Why the `$`:** a gMSA authenticates as a *computer-class* principal, so its SQL login name carries the
 > trailing `$` (`CORP\mefor-svc$`) — the same name NSSM's `ObjectName` uses.
 >
-> **Why exactly these three, and never `db_owner` / `sysadmin`:** the store issues `CREATE TABLE` /
-> `CREATE INDEX` / `ALTER TABLE ... ADD` / `DROP INDEX` / `DROP TABLE` (`db_ddladmin`), then only
-> `SELECT` (`db_datareader`) and `INSERT` / `UPDATE` / `DELETE` / `MERGE` (`db_datawriter`). It never
-> creates the database, never `TRUNCATE`s, calls no DMV and no extended procedure, and its two
-> `ALTER DATABASE ... SET` statements (`READ_COMMITTED_SNAPSHOT` and `ALLOW_SNAPSHOT_ISOLATION`) each
-> degrade to a warning — §2.
+> **Why two principals, and never `db_owner` / `sysadmin` for either.** The schema batch issues
+> `CREATE TABLE` / `CREATE INDEX` / `ALTER TABLE ... ADD` / `DROP INDEX` / `DROP TABLE`, which is
+> `db_ddladmin`. Steady state issues only `SELECT` (`db_datareader`) and `INSERT` / `UPDATE` /
+> `DELETE` / `MERGE` (`db_datawriter`). Splitting them means the login that serves traffic every day
+> cannot change the schema. The engine never creates the database, never `TRUNCATE`s, and calls no
+> DMV and no extended procedure.
 >
-> **The one thing a higher role would unlock — and why §2's RCSI pre-enable is a prerequisite, never a
-> tuning knob.** `db_owner` holds `ALTER` on the database, so it would let the engine turn RCSI on
-> itself at open; this login cannot, and the shipped default (`[pipeline].claim_mode = "pooled"` with
-> `require_rcsi_for_pooled = true`) **refuses to start** while RCSI is off. Have a DBA run the RCSI and
-> `ALLOW_SNAPSHOT_ISOLATION` statements once, before first start. That is the price of the reduced
-> role, and it is the only one — it is never a reason to grant a higher role.
+> | Principal | Grant | When it is used |
+> |---|---|---|
+> | Runtime (the gMSA) | `db_datareader` + `db_datawriter` | every start, all day |
+> | Provisioning (a DBA login) | `db_ddladmin`, plus `ALTER` on the database for the two options | step 4 only |
 >
-> **`EXECUTE` is not in the set.** The only **user** stored procedures the engine calls are the two
-> lane-family claim procs, and only when `[store].fifo_claim_proc = true` — SQL Server only, default
-> `false` ([`CONFIGURATION.md`](CONFIGURATION.md) `[store]`). (`sp_getapplock`, used on every finalize
-> and at schema init, is a **system** procedure `public` can already execute — no grant.) Their
-> *creation* rides the schema batch either way, but it is permission-guarded and self-no-ops when the
-> principal cannot take it, so a login without `CREATE PROCEDURE` still opens cleanly. If you do enable
-> the flag with a split bootstrap/runtime principal, the runtime one also needs `VIEW DEFINITION` on
-> both procs — without it the startup gate cannot read the bodies it verifies and degrades to the
-> shipped batch.
+> **`[store].schema_management = "auto"` puts the DDL back on the runtime login.** The engine then
+> builds and upgrades its own schema at open, and the gMSA also needs `db_ddladmin` as a standing
+> grant. That is the one supported reason to grant it to the runtime login. The startup probe (§1.3)
+> reports `db_ddladmin` as excess under `external` and expects it under `auto`, and
+> `security_loosenings()` names `auto` on a server database as a deviation.
 >
-> **`db_ddladmin` is a schema-change grant, not a first-run-only one** (§2). Dropping it after the
-> first open is supported *only* if you re-grant it for the first start of any upgrade whose schema
-> moved: that start issues the DDL batch and **fails outright** without it. Pre-creating the schema
-> and never granting it is the other supported posture, and it takes the same upgrade discipline.
+> **Why §2's RCSI pre-enable is a prerequisite, never a tuning knob.** Neither the runtime login nor
+> a `db_ddladmin`-only provisioning login can `ALTER DATABASE`. The shipped default
+> (`[pipeline].claim_mode = "pooled"` with `require_rcsi_for_pooled = true`) **refuses to start**
+> while RCSI is off. So either give the provisioning principal `ALTER` on the database, or have a DBA
+> run the RCSI and `ALLOW_SNAPSHOT_ISOLATION` statements once. That is the price of the reduced role,
+> and it is never a reason to grant a higher one.
+>
+> **`EXECUTE` is not in the runtime set by default.** The only **user** stored procedures the engine
+> calls are the two lane-family claim procs, and only when `[store].fifo_claim_proc = true` — SQL
+> Server only, default `false` ([`CONFIGURATION.md`](CONFIGURATION.md) `[store]`). (`sp_getapplock`,
+> used on every finalize and at schema init, is a **system** procedure `public` can already execute —
+> no grant.) Their *creation* rides the schema batch, so step 4 deploys them. It is
+> permission-guarded and self-no-ops when the provisioning principal cannot take it. If you enable the
+> flag, grant the runtime login `EXECUTE` and `VIEW DEFINITION` on both procs. Without
+> `VIEW DEFINITION` the startup gate cannot read the bodies it verifies and degrades to the shipped
+> batch.
 
 ### 1.2 PostgreSQL — the least-privilege role
 
 The SQL Server set in §1.1 does **not** transfer: Postgres has no fixed **database** roles, the schema
 uses `BIGSERIAL` sequences rather than `IDENTITY`, and there is no stored-procedure path
 (`fifo_claim_proc` is SQL Server only). The Postgres equivalent is a role with **no attributes**, plus
-object grants. Two supported postures — pick one:
+object grants. The two supported postures follow `[store].schema_management`:
 
-**Posture A — the engine role owns its own schema** (simplest; the engine bootstraps and upgrades
-itself, §2):
+**Posture B — `external`, the server-DB default: a provisioning role owns the schema, and the engine
+role holds only row CRUD** (the analogue of §1.1's two principals):
+
+```sql
+-- The provisioning role. It owns the schema and every object provision-schema creates in it.
+CREATE ROLE mefor_owner LOGIN PASSWORD :'owner_pw';  -- NOSUPERUSER NOCREATEDB NOCREATEROLE are the defaults
+GRANT CONNECT ON DATABASE messagefoundry TO mefor_owner;
+CREATE SCHEMA mefor AUTHORIZATION mefor_owner;
+-- The runtime role: USAGE on the schema and row grants, never CREATE.
+CREATE ROLE mefor LOGIN PASSWORD :'pw';
+GRANT CONNECT ON DATABASE messagefoundry TO mefor;
+GRANT USAGE ON SCHEMA mefor TO mefor;                                  -- USAGE, not CREATE
+-- Objects the provisioning role creates later carry the runtime grants automatically.
+ALTER DEFAULT PRIVILEGES FOR ROLE mefor_owner IN SCHEMA mefor
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO mefor;
+ALTER DEFAULT PRIVILEGES FOR ROLE mefor_owner IN SCHEMA mefor
+  GRANT USAGE, SELECT ON SEQUENCES TO mefor;                           -- the BIGSERIAL sequences
+-- then set [store].db_schema = "mefor" so the pool's search_path lands there
+```
+
+Then provision the schema as `mefor_owner`, before the first start and again before the first start
+of any upgrade whose schema moved. Put that role's password in `MEFOR_STORE_PASSWORD` first:
+
+```powershell
+messagefoundry store provision-schema --service-config <instance dir>\messagefoundry.toml --username mefor_owner
+```
+
+> **`provision-schema` is what makes posture B work.** It writes the `schema_meta` marker, and the
+> engine role only ever reads it. Hand-creating the tables is not enough: without a current marker
+> the engine refuses to start, by design, and names this command. If the tables already existed
+> before the default privileges above, also run `GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES
+> IN SCHEMA mefor TO mefor;` and `GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA mefor TO mefor;`.
+
+**Posture A — `auto`: the engine role owns its own schema** and bootstraps and upgrades it at open
+(§2). Set `[store].schema_management = "auto"`. It is simpler, and it leaves the runtime role with
+standing DDL rights, so the startup probe expects them and `security_loosenings()` names the choice:
 
 ```sql
 CREATE ROLE mefor LOGIN PASSWORD :'pw';          -- NOSUPERUSER NOCREATEDB NOCREATEROLE are the defaults
@@ -147,35 +204,13 @@ CREATE SCHEMA mefor AUTHORIZATION mefor;         -- run by a DBA; the role owns 
 -- then set [store].db_schema = "mefor" so the pool's search_path lands there
 ```
 
-**Posture B — a DBA pre-creates the objects; the engine role holds only row CRUD** (the analogue of
-"pre-create the schema and never grant `db_ddladmin`"; it carries the same upgrade discipline — the
-first start of any build whose schema moved must be run by a principal that may issue DDL):
-
-```sql
-CREATE ROLE mefor LOGIN PASSWORD :'pw';
-GRANT CONNECT ON DATABASE messagefoundry TO mefor;
-GRANT USAGE ON SCHEMA mefor TO mefor;                                  -- USAGE, not CREATE
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA mefor TO mefor;
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA mefor TO mefor;         -- the BIGSERIAL sequences
-```
-
-> **Posture B has a prerequisite that "pre-create the objects" does not spell out: the `schema_meta`
-> marker must already record the current DDL batch.** The engine skips its batch only on that marker
-> (§2); with the marker absent or stale it runs `CREATE TABLE IF NOT EXISTS`, and on PostgreSQL that
-> is **refused for a role holding only `USAGE`** — measured on 16.14, `CREATE TABLE IF NOT EXISTS`
-> against an already-existing table fails with *permission denied for schema*, because the schema ACL
-> is checked **before** the existence skip. `IF NOT EXISTS` does not rescue it. So hand-creating the
-> tables is not enough: bootstrap by running the engine once as a DDL-capable principal (which writes
-> the marker), then hand over to the `USAGE`-only role — and re-grant for the first start of any build
-> whose schema moved, exactly as §2 says. If that sequencing is awkward, use posture A.
-
 > **Why nothing wider, derived from the store rather than asserted.** The Postgres store issues
 > `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS` inside its own schema, then only
 > `SELECT` / `INSERT` / `UPDATE` / `DELETE`. Its concurrency primitives are `pg_advisory_xact_lock`
 > and `SET LOCAL statement_timeout`, both available to any role. It installs no extension, creates no
 > function, and never uses `LISTEN`/`NOTIFY` or `COPY`.
 >
-> **Never `SUPERUSER`**, and never `CREATEROLE` / `CREATEDB` / `REPLICATION` / `BYPASSRLS`. Do **not**
+> **Never `SUPERUSER`** for either role, and never `CREATEROLE` / `CREATEDB` / `REPLICATION` / `BYPASSRLS`. Do **not**
 > make the engine role the **owner of the database** — ownership carries `CREATE` on the database and
 > the right to drop it, neither of which the engine uses. Do not grant `pg_read_all_data`,
 > `pg_write_all_data`, `pg_read_server_files`, `pg_write_server_files`, `pg_execute_server_program`,
@@ -195,8 +230,8 @@ The grants in §1.1 and §1.2 used to be prescriptions the engine could not chec
 
 | Backend | What the probe reads | On SQLite |
 |---|---|---|
-| SQL Server | fixed **server**-role and **database**-role membership by name (`IS_SRVROLEMEMBER` / `IS_ROLEMEMBER` — authoritative and independent of catalog visibility), plus `CONTROL SERVER` / database `CONTROL`, plus any user-defined database role the catalog exposes | n/a |
-| PostgreSQL | every role the principal may assume and the **attributes** each carries (`SUPERUSER`, `CREATEROLE`, `CREATEDB`, `REPLICATION`, `BYPASSRLS`), plus database ownership and `CREATE` on the database | n/a |
+| SQL Server | fixed **server**-role and **database**-role membership by name (`IS_SRVROLEMEMBER` / `IS_ROLEMEMBER` — authoritative and independent of catalog visibility), plus `CONTROL SERVER` / database `CONTROL`, plus any user-defined database role the catalog exposes. Under `schema_management = "external"` (the default) `db_ddladmin` counts as excess; under `auto` it is prescribed | n/a |
+| PostgreSQL | every role the principal may assume and the **attributes** each carries (`SUPERUSER`, `CREATEROLE`, `CREATEDB`, `REPLICATION`, `BYPASSRLS`), plus database ownership and `CREATE` on the database. Under `external` it also counts `CREATE` on the store's schema, and ownership of objects in it, as excess; under `auto` both are prescribed | n/a |
 | SQLite | — | reported **not applicable**: a local file has no server principal; access is the filesystem ACL on the `.db` and its `-wal`/`-shm` sidecars |
 
 - **The WARN arm ships on and cannot block an install.** Every start logs what was observed, writes a
@@ -211,9 +246,9 @@ The grants in §1.1 and §1.2 used to be prescriptions the engine could not chec
   because a declared refusal that passed a principal it could not read would be a control in name only.
 
 > **Two things it reports that a site may not expect, both by construction.** On SQL Server, a
-> **user-defined database role** is named as excess even when it wraps exactly the three prescribed
+> **user-defined database role** is named as excess even when it wraps exactly the prescribed
 > ones: the probe reads *membership*, not a role's contents, and it cannot expand a site role without
-> catalog permission it deliberately does not depend on. Grant the three fixed roles directly, or
+> catalog permission it deliberately does not depend on. Grant the fixed roles directly, or
 > accept the entry. On PostgreSQL, a role **attribute** is reported when it sits on any role the
 > principal may assume, not only on the principal itself — attributes are never inherited, but a
 > member may `SET ROLE` to the holder and exercise them, so the wrapper is named alongside the
@@ -224,27 +259,44 @@ The grants in §1.1 and §1.2 used to be prescriptions the engine could not chec
 
 ## 2. Schema bootstrap & evolution
 
-- **Bootstrap on open:** the store creates its tables on `open()` if absent — no separate migration
-  step to run. Point the engine at an empty database (and a login that may create objects on first run,
-  or pre-create the schema from the documented DDL).
-- **Schema-evolution policy:** schema changes are **idempotent additive DDL applied on open** (new
-  columns/indexes added if missing; nothing destructive). An engine upgrade that adds a column brings it
-  in on the next start. Because v0.1 is greenfield-only, there is no cross-version data backfill to plan.
-- **Steady state issues no DDL at all.** Both server backends stamp a content hash of the shipped DDL
-  batch into a one-row `schema_meta` table; when it matches at open, the batch and its serializing lock
-  are skipped entirely ([ADR 0064](adr/0064-schema-init-fastpath.md)). So the batch runs only against a
-  virgin database and on the **first start of a build whose schema moved** — and on that start a login
-  without DDL rights **fails the open**; it does not degrade. Plan the DDL grant as an upgrade-window
-  privilege, not a one-time bootstrap one.
-- **SQL Server specifics:** RCSI (`READ_COMMITTED_SNAPSHOT`) is enabled at open (with a DBA-fallback
-  warning if the login can't `ALTER DATABASE`); pre-enable it if your security policy forbids that grant.
-  With the §1.1 least-privilege login this is **not conditional** — that login cannot `ALTER DATABASE`,
-  and pooled claim mode (the shipped default) fails closed when RCSI is off.
-  The engine login's grants are §1.1 — `db_datareader` + `db_datawriter` + `db_ddladmin`, and never
+Who runs the schema DDL is `[store].schema_management` (BACKLOG #305). The two modes differ only in
+**which principal** runs the same DDL batch:
+
+| Mode | Who runs the DDL | What `serve` does at open |
+|---|---|---|
+| `external` — the **server-DB default** | a DBA, as a DDL-capable principal, with `messagefoundry store provision-schema` | reads the `schema_meta` marker and **refuses to start** if it does not match this build. It runs no DDL. |
+| `auto` | the engine's own runtime login | builds or upgrades the schema itself, so that login needs standing DDL rights |
+
+SQLite is always `auto`: a local file has no server principal to split.
+
+1. **Create the database.** The engine never runs `CREATE DATABASE`.
+2. **Grant the two principals** (§1.1 for SQL Server, §1.2 for PostgreSQL).
+3. **Run `messagefoundry store provision-schema`** as the provisioning principal. It prints
+   `store schema applied` on a fresh database and `store schema already current` on a re-run.
+4. **Start the engine** as the runtime login.
+5. **On every upgrade, repeat step 3 before the first start of the new build.** If the schema did not
+   move, step 3 is a no-op. If it did and step 3 was skipped, `serve` refuses to start and names the
+   command.
+
+- **Schema-evolution policy:** schema changes are **idempotent additive DDL** (new columns/indexes
+  added if missing; nothing destructive). Because v0.1 is greenfield-only, there is no cross-version
+  data backfill to plan.
+- **Steady state issues no DDL at all, in either mode.** Both server backends stamp a content hash of
+  the shipped DDL batch into a one-row `schema_meta` table; when it matches at open, the batch and its
+  serializing lock are skipped entirely ([ADR 0064](adr/0064-schema-init-fastpath.md)). So the batch
+  runs only against a virgin database and on the **first start of a build whose schema moved**. Under
+  `auto` a login without DDL rights **fails that open**; under `external` the open never tries.
+- **SQL Server specifics:** `provision-schema` turns on RCSI (`READ_COMMITTED_SNAPSHOT`) and
+  `ALLOW_SNAPSHOT_ISOLATION` when its principal holds `ALTER` on the database, and warns with the
+  exact statement when it does not. Under `external`, `serve` never issues either `ALTER DATABASE`: it
+  reads the state and warns if one is off. Under `auto` it tries at open and warns on failure. Either
+  way, pre-enable RCSI if your policy keeps `ALTER` on the database from both logins, because pooled
+  claim mode (the shipped default) fails closed when RCSI is off. The runtime login's grants are
+  §1.1: `db_datareader` + `db_datawriter`, plus `db_ddladmin` only under `auto`, and never
   `db_owner` or `sysadmin`.
 
 > **The PostgreSQL role grants are now answered in §1.2** — the two supported postures, why nothing
-> wider, and posture B's marker prerequisite. The SQL Server set (§1.1) never transferred and does not
+> wider, and why posture B needs `provision-schema`. The SQL Server set (§1.1) never transferred and does not
 > now: Postgres has no equivalent of SQL Server's fixed **database** roles
 > (`db_datareader`/`db_datawriter`/`db_ddladmin`), the schema uses `BIGSERIAL` sequences rather than
 > `IDENTITY`, and there is no stored-procedure path (`fifo_claim_proc` is SQL Server only), which is
@@ -401,8 +453,10 @@ update the pin in lockstep — pin the **CA**, not the leaf, to keep rotations m
       machine-store import; SQL Server **machine store only** (§5). Never `TrustServerCertificate=true`.
 - [ ] `[store].pool_size` sized (default **40**, server-DB only; ≥ 2 hard-required in cluster mode) **and**
       the connection budget checked: engines × `pool_size` (+ standby warm) well under the DB `max_connections` (§3).
-- [ ] Bootstrap login can create the schema on first open, **or** the schema is pre-created.
-- [ ] SQL Server: RCSI enabled (auto, or pre-enabled by a DBA).
+- [ ] `messagefoundry store provision-schema` has run as the provisioning principal (§2), and the
+      runtime login holds row access only (§1.1/§1.2). **Or** `[store].schema_management = "auto"` is
+      set on purpose and the runtime login holds the DDL grant.
+- [ ] SQL Server: RCSI enabled (by `provision-schema`, or pre-enabled by a DBA).
 - [ ] Source store drained (`in_pipeline → 0`) before cutover — greenfield, no in-place migration.
 - [ ] (HA) `[cluster].enabled`; DB-tier replication/Always On configured by DBAs; VIP/LB in front.
 - [ ] Off-loopback exposure reviewed against [`DEPLOYMENT.md`](DEPLOYMENT.md) (TLS on every channel).

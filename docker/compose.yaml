@@ -16,6 +16,8 @@ x-ha-engine: &ha-engine
   depends_on:
     postgres:
       condition: service_healthy
+    schema-provision:
+      condition: service_completed_successfully
   command: ["serve", "--config", "/config", "--env", "prod"]
   env_file:
     - path: ./secrets.env
@@ -170,6 +172,22 @@ services:
       timeout: 3s
       retries: 10
     restart: unless-stopped
+
+  # One-shot schema provisioning (BACKLOG #305). On a server DB [store].schema_management defaults to
+  # "external": `serve` runs no DDL and refuses to start until `messagefoundry store provision-schema`
+  # has built the schema. This service runs it once and exits; both engines wait for it to finish.
+  # It is safe to re-run. LOCAL DEV SHORTCUT: here the one dev role does both jobs. A real deployment
+  # runs this as a separate DDL-capable role and gives the engines a row-only role
+  # (docs/DEPLOY-SERVER-DB.md §1.2, posture B).
+  schema-provision:
+    <<: *ha-engine
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["store", "provision-schema"]
+    environment:
+      <<: *ha-engine-env
+    restart: "no"
 
   # TWO clustered engines that BOTH join the shared Postgres and share ONE leader lease — this is the real
   # active-passive PAIR. The engine GRAPH SUPERVISOR runs the listeners/workers on whichever one currently

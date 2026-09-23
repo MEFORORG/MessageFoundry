@@ -127,8 +127,9 @@ The box "has all three databases", so validate each the way a real user would â€
 
 ```powershell
 $env:MEFOR_STORE_BACKEND = "sqlserver"   # then the sqlserver connection env
+messagefoundry store provision-schema    # once per server DB, as a DDL-capable login (BACKLOG #305)
 messagefoundry verify --section store,smoke --smoke live
-# repeat for postgres, and for sqlite
+# repeat for postgres, and for sqlite (sqlite needs no provision-schema)
 ```
 
 Secrets (DB creds) come from `MEFOR_*` env only â€” never a file or the report.
