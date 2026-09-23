@@ -12,10 +12,13 @@ engine's MFA gates on an assertion the engine never receives.
 from __future__ import annotations
 
 import asyncio
+import inspect
 
 import pytest
 from _totp_clock import fresh_totp, pin_totp_clock
+from pydantic import BaseModel
 
+from messagefoundry.api import auth_models, models
 from messagefoundry.auth import totp
 from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.ldap import AdPrincipal
@@ -803,3 +806,63 @@ async def test_an_account_owing_no_second_factor_still_clears_at_the_password_st
         )
     finally:
         await store.close()
+
+
+async def test_the_totp_secret_is_returned_once_and_never_again() -> None:
+    """ASVS 11.1.1's two-entity bound on a shared secret, the half the engine controls (BACKLOG #1162).
+
+    The TOTP secret is the only shared secret the engine mints and uses as key material. By design
+    it has two holders: the
+    engine's store and the user's authenticator. The engine cannot see the authenticator side, so
+    ``docs/ASVS-L2-PHASE0-CHANGES.md`` states that half as a deployment precondition. What the engine
+    CAN promise is that it never hands the secret out a second time, which is what this pins:
+
+    * staging again mints a FRESH secret rather than re-displaying the staged one;
+    * once MFA is on, a new enrolment is refused, so the active secret is never returned again;
+    * the status read carries no copy of it; and
+    * the enrolment response is the only JSON API model with a field NAMED like a secret, so a new
+      JSON model with such a field fails here. A field under another name does not; the
+      enrolment response already carries the secret a second time, inside ``otpauth_uri``. An unrelated ``*secret*`` field fails too, on purpose: it
+      must be looked at.
+
+    What this does NOT cover: HTML pages (the web console renders the staged secret on its own
+    enrolment page) and a route that returns a bare dict. The doc names both enrolment responses.
+
+    Mutation: let ``begin_mfa_enrollment`` return the stored secret when MFA is already enabled, or
+    add a ``secret`` field to ``MfaStatusResponse``. Red: the matching assertion below.
+    """
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings())
+        identity, token, _ = await _bootstrap_login(service)
+
+        staged = await service.begin_mfa_enrollment(identity)
+        restaged = await service.begin_mfa_enrollment(identity)
+        assert restaged.secret != staged.secret, "re-staging re-displayed the staged secret"
+
+        confirmed = await service.confirm_mfa_enrollment(
+            identity, fresh_totp(restaged.secret), token=token
+        )
+        assert confirmed.ok
+
+        with pytest.raises(ValueError, match="already enabled"):
+            await service.begin_mfa_enrollment(identity)
+
+        status = await service.mfa_status(identity)
+        assert restaged.secret not in repr(status)
+    finally:
+        await store.close()
+
+    carriers = sorted(
+        f"{module.__name__}.{name}"
+        for module in (auth_models, models)
+        for name, obj in vars(module).items()
+        if inspect.isclass(obj)
+        and issubclass(obj, BaseModel)
+        and obj.__module__ == module.__name__
+        and any("secret" in field for field in obj.model_fields)
+    )
+    assert carriers == ["messagefoundry.api.auth_models.MfaEnrollResponse"], (
+        f"API models with a field named like a secret: {carriers}. The TOTP secret may leave the "
+        f"engine only in the enrolment response; a second carrier breaks the two-holder bound."
+    )
