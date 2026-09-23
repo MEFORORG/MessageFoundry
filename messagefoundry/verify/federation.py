@@ -53,7 +53,7 @@ _RUNGS: tuple[tuple[str, str, frozenset[str]], ...] = (
     ),
     (
         "fed.replay.claims",
-        "token class (events) / iss / aud / azp / exp / iat / nbf / sub",
+        "token class (events) / iss / aud / azp / exp / iat / nbf / auth_time / sub",
         frozenset(
             {
                 # An ``events`` claim means an RFC 8417 SET, not an id_token. Checked at the TOP of
@@ -68,6 +68,10 @@ _RUNGS: tuple[tuple[str, str, frozenset[str]], ...] = (
                 "claim_sub_missing",
                 "not_yet_valid",
                 "issued_in_future",
+                # BACKLOG #1150: auth_time is checked inside this rung, after nbf and before the
+                # nonce compare, so both recency slugs indict THIS rung and no other.
+                "auth_time_missing",
+                "auth_time_stale",
             }
         ),
     ),
@@ -148,6 +152,21 @@ def _config_rows(settings: ServiceSettings) -> list[CheckResult]:
                 "no MFA assertion at all. This gives up the control BACKLOG #99(g) exists for",
             )
         )
+
+    # BACKLOG #1150. MANUAL for the same reason as the rows above: the validator already bounds the
+    # value, and there is no off switch to report. What an operator must confirm is the IdP side,
+    # which nothing offline can see: that the IdP honours `max_age` and returns `auth_time`.
+    rows.append(
+        CheckResult(
+            "fed.max_age",
+            "IdP authentication recency bound (max_age / auth_time)",
+            Status.MANUAL,
+            "every authorization request sends this max_age; a token with no auth_time, or one "
+            "older than this, is refused, and the session ends this long after the IdP "
+            "authentication. Confirm the identity provider honours max_age and returns auth_time",
+            evidence=f"max_age={auth.oidc_max_age_seconds}s",
+        )
+    )
 
     # AC-11. Also MANUAL (the validator refuses an empty source when stripping), but the effective
     # list is exactly what an operator needs to eyeball: it is what stops a federated principal
@@ -294,6 +313,7 @@ def _replay_rows(
         client_id=auth.oidc_client_id or "",
         signing_algorithms=[SignatureAlgorithm(a) for a in auth.oidc_signing_algorithms],
         nonce=nonce or _SENTINEL_NONCE,
+        max_age_seconds=auth.oidc_max_age_seconds,
         username_claim=auth.oidc_username_claim,
         username_strip_domain=auth.oidc_username_strip_domain,
         allowed_username_domains=frozenset(auth.effective_oidc_username_domains),
@@ -344,6 +364,20 @@ def _replay_rows(
                         "offline (it is exercised by the live lab cells)",
                     )
                 )
+            elif failed_reason == "auth_time_stale":
+                # The same reasoning as a past `exp` below: an old capture's auth_time ages past
+                # max_age while the file sits on disk, which says nothing about the deployment. A
+                # MISSING auth_time is different and FAILs -- that is an IdP ignoring max_age.
+                stopped_because = "the captured token's auth_time is older than max_age"
+                rows.append(
+                    CheckResult(
+                        rid,
+                        title,
+                        Status.SKIP,
+                        "the captured id_token's auth_time is older than [auth].oidc_max_age_seconds "
+                        "— re-capture to exercise this rung",
+                    )
+                )
             elif failed_reason == "expired":
                 # A stale capture is not a deployment defect. NOTE this is now reachable ONLY for a
                 # genuinely past `exp` -- a missing or non-numeric one raises `claim_not_numeric`
@@ -386,7 +420,8 @@ def _replay_rows(
                 "from AD, never from the token)",
                 evidence=(
                     f"username={principal.username}; sub={principal.subject}; "
-                    f"amr={list(principal.amr)}; acr={principal.acr}"
+                    f"amr={list(principal.amr)}; acr={principal.acr}; "
+                    f"auth_time={principal.auth_time:.0f}"
                 ),
             )
         )

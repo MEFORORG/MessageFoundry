@@ -4,19 +4,21 @@
 
 Given a compact ``id_token``, the pinned config, and a :class:`~messagefoundry.auth.oidc.jwks.JwksCache`,
 this verifies the signature (via ``transports.signing.verify_compact_jws``) and then walks the OIDC
-core claim checks — ``iss``, ``aud``/``azp``, ``exp``/``iat``/``nbf`` within a bounded skew, ``nonce``
-— and finally the optional MFA-claim gate (``amr``/``acr``), which is BACKLOG #99(g)'s real control.
+core claim checks — ``iss``, ``aud``/``azp``, ``exp``/``iat``/``nbf`` within a bounded skew,
+``auth_time`` against the requested ``max_age``, ``nonce`` — and finally the optional MFA-claim gate (``amr``/``acr``), which is BACKLOG #99(g)'s real control.
 
 Every rejection is a :class:`ClaimsError` carrying a **closed-set reason slug** (:data:`REASONS`) — the
 browser layer maps that slug to an allow-listed error code and audits it, never reflecting IdP text.
 The engine verifies what the IdP **asserts**, cryptographically; it does not and cannot prove the IdP
 *enforced* MFA. The success value is a :class:`FederatedPrincipal` carrying the resolved username,
-``sub``, the evidence recorded in the audit, and the verified ``exp`` the engine session is capped at.
+``sub``, the evidence recorded in the audit, and the verified ``exp`` and ``auth_time`` the engine
+session is capped by.
 """
 
 from __future__ import annotations
 
 import hmac
+import math
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -50,6 +52,12 @@ REASONS: frozenset[str] = frozenset(
         "expired",
         "not_yet_valid",
         "issued_in_future",
+        # BACKLOG #1150 (ASVS 6.8.4 / 7.6.1): the IdP authentication-recency bound. Two slugs, not
+        # one, because they indict different parties: a MISSING auth_time says the IdP ignored the
+        # max_age the engine sent (a deployment defect), a STALE one says the IdP answered with an
+        # authentication older than the bound it was asked to honour.
+        "auth_time_missing",
+        "auth_time_stale",
         "nonce_mismatch",
         "mfa_claim_missing",
         "username_claim_missing",
@@ -76,6 +84,10 @@ class OidcClaimPolicy:
     client_id: str
     signing_algorithms: Sequence[SignatureAlgorithm]
     nonce: str
+    #: The ``max_age`` sent on the authorization request, in seconds (BACKLOG #1150). REQUIRED, with no
+    #: default, so a caller that forgets it fails at construction rather than skipping the check. It
+    #: is always positive: there is no "max_age not requested" state to fall back from.
+    max_age_seconds: int
     username_claim: str = "preferred_username"
     username_strip_domain: bool = True
     #: Lower-cased UPN suffixes the username claim may carry when ``username_strip_domain`` is on.
@@ -86,6 +98,13 @@ class OidcClaimPolicy:
     mfa_amr_values: Sequence[str] = field(default_factory=lambda: ("mfa",))
     required_acr_values: Sequence[str] = field(default_factory=tuple)
     clock_skew_seconds: int = 60
+
+    def __post_init__(self) -> None:
+        # The settings validator already bounds the knob. This guard is for the other constructors
+        # (the offline verifier, tests, a future caller): a non-positive bound would either refuse
+        # every login or, worse, read as "recency not checked".
+        if self.max_age_seconds <= 0:
+            raise ValueError("max_age_seconds must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +129,11 @@ class FederatedPrincipal:
     # a federated session can never outlive the assertion it was minted from. Carried as a typed field
     # precisely so no caller re-parses the raw token to recover it.
     expires_at: float
+    # The signature-verified ``auth_time`` (epoch seconds): when the user last authenticated AT THE IdP,
+    # as the IdP asserts it (BACKLOG #1150). Typed and carried for the same reason as ``expires_at``:
+    # the service caps the session at ``auth_time + max_age`` from this value, never from a re-parse.
+    # It is IdP wall clock, so the bound is only as good as the IdP's clock.
+    auth_time: float
 
 
 #: The ``typ`` values an ``id_token`` may declare, after normalisation. RFC 7519 §5.1 makes the header
@@ -206,12 +230,14 @@ def _nonce_matches(received: str, expected: str) -> bool:
 
 def _check_core_claims(
     claims: Mapping[str, object], policy: OidcClaimPolicy, now: float
-) -> tuple[float, str]:
-    """Walk the core OIDC claim checks and **return the verified ``(exp, sub)``** (ADR 0142 AC-6).
+) -> tuple[float, str, float]:
+    """Walk the core OIDC claim checks and **return the verified ``(exp, sub, auth_time)``** (ADR
+    0142 AC-6, BACKLOG #1150).
 
-    Both are returned rather than discarded so the session cap and the audit subject have operands
-    that came from the *signature-verified* claims. A caller must never re-parse the token to recover
-    either — that is the second-read bug class ``verify_compact_jws`` exists to foreclose.
+    All three are returned rather than discarded so the session cap and the audit subject have
+    operands that came from the *signature-verified* claims. A caller must never re-parse the token
+    to recover any of them — that is the second-read bug class ``verify_compact_jws`` exists to
+    foreclose.
     """
     # ASVS 9.2.2, ahead of every other claim check. A claim set carrying ``events`` is a Security
     # Event Token (RFC 8417) — a back-channel logout token or similar — not an ``id_token``, and the
@@ -259,6 +285,8 @@ def _check_core_claims(
         if now + skew < nbf:
             raise ClaimsError("not_yet_valid", "id_token nbf is in the future")
 
+    auth_time = _check_auth_time(claims, policy, now)
+
     token_nonce = claims.get("nonce")
     if not isinstance(token_nonce, str) or not _nonce_matches(token_nonce, policy.nonce):
         raise ClaimsError("nonce_mismatch", "id_token nonce does not match the flow nonce")
@@ -271,7 +299,46 @@ def _check_core_claims(
     if not isinstance(subject, str) or subject == "":
         raise ClaimsError("claim_sub_missing", "id_token carries no usable sub claim")
 
-    return exp, subject
+    return exp, subject, auth_time
+
+
+def _check_auth_time(claims: Mapping[str, object], policy: OidcClaimPolicy, now: float) -> float:
+    """Require and bound ``auth_time``; return it (ASVS 6.8.4 / 7.6.1, BACKLOG #1150).
+
+    The engine ALWAYS sends ``max_age``, and OIDC Core 2 makes ``auth_time`` REQUIRED whenever
+    ``max_age`` was requested. So an absent claim is never "the IdP chose not to say"; it is an IdP
+    that ignored the request, and the engine cannot tell how long ago the human authenticated. Refuse
+    rather than fall back to a minimum-strength assumption: that fallback applies only where
+    ``max_age`` was NOT requested, and here it always is.
+
+    Sending ``max_age`` without this check would be a request with no control behind it. This is the
+    half that turns the request into a control.
+
+    Checked inside the claims rung, before the nonce compare, so ``verify --section federation``
+    attributes both slugs to the claims rung and to no other.
+    """
+    # Absent and JSON null are the same fault: the IdP returned no authentication time.
+    if claims.get("auth_time") is None:
+        raise ClaimsError(
+            "auth_time_missing",
+            "id_token carries no auth_time although max_age was requested",
+        )
+    auth_time = _require_number(claims, "auth_time", "auth_time_missing")
+    # json.loads accepts NaN and Infinity. A NaN compares False against everything, so it would pass
+    # both bounds below and then vanish inside the service's min(). Refuse it as malformed.
+    if not math.isfinite(auth_time):
+        raise ClaimsError("claim_not_numeric", "auth_time is not a finite number")
+    skew = policy.clock_skew_seconds
+    if auth_time > now + skew:
+        # An authentication in the future is a malformed or hostile assertion, and it would push the
+        # auth_time + max_age deadline later than any real authentication could.
+        raise ClaimsError("issued_in_future", "id_token auth_time is in the future")
+    if now - auth_time > policy.max_age_seconds + skew:
+        raise ClaimsError(
+            "auth_time_stale",
+            "id_token auth_time is older than the max_age the engine requested",
+        )
+    return auth_time
 
 
 def _require_number(claims: Mapping[str, object], field_name: str, _reason: str) -> float:
@@ -362,7 +429,7 @@ def validate_id_token(
     """
     key, _alg = _select_key_and_alg(id_token, policy, jwks)
     claims = _verify_signature(id_token, key, policy)
-    expires_at, subject = _check_core_claims(claims, policy, clock())
+    expires_at, subject, auth_time = _check_core_claims(claims, policy, clock())
     amr, acr = _check_mfa_gate(claims, policy)
     username = _resolve_username(claims, policy)
 
@@ -373,4 +440,5 @@ def validate_id_token(
         amr=amr,
         acr=acr,
         expires_at=expires_at,
+        auth_time=auth_time,
     )
