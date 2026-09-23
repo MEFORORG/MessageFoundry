@@ -505,6 +505,17 @@ key of the wrong length, and an EdDSA identifier on an EC2 key. The same run fou
 to a 500, at enrolment this time: a malformed COSE key raised a raw `KeyError`, `IndexError` or
 `TypeError` out of `verify_registration`. Both ceremony halves now route those raw exceptions, and
 the raw `ValueError`, to `WebAuthnVerificationError`, so each lands on the audited invalid-input
-path. The assertion-side catch stays as a backstop for a stored key. The check does not bind a
-curve to an identifier: an ES256 credential on P-384 still enrols, because it verifies and clears
-the floor.
+path. The assertion-side catch stays as a backstop for a stored key.
+
+**ES256 is bound to P-256 (owner ruling 2026-09-23, BACKLOG #1166).** The first cut of the
+check above did not bind a curve to an identifier, so an ES256 credential on P-384 or P-521
+enrolled. Registration now refuses one. EdDSA is likewise bound to Ed25519, which the library
+already required. This is not a strength control: those keys verify and clear the 128-bit
+floor. It follows the pairing RFC 9053 section 2.1 recommends for interoperability, SHA-256
+with P-256 only, which is also how the WebAuthn specification describes -7. The refusal is
+deliberate, so it reaches the audited path without the WARNING a raw library failure logs.
+
+**The pin is registration-only, by design.** `verify_assertion` does not re-screen a stored
+key's curve. A credential enrolled before the pin may be ES256 on P-384 or P-521; it still
+verifies and still clears the floor, so refusing it at assertion would lock its owner out for
+no security gain. A test pins that such a stored key still asserts.

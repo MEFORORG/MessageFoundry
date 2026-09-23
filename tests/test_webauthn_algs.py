@@ -344,28 +344,70 @@ def test_the_curve_rows_use_a_well_formed_response() -> None:
         _assert_registers(cose_key)
 
 
-@pytest.mark.parametrize(
+_LARGER_CURVES = pytest.mark.parametrize(
     ("curve", "crv", "size"),
     [(ec.SECP384R1(), _P384, 48), (ec.SECP521R1(), 3, 66)],
     ids=["P-384", "P-521"],
 )
-def test_es256_on_a_larger_curve_still_enrols(curve: ec.EllipticCurve, crv: int, size: int) -> None:
-    """The check refuses keys that cannot verify; it does NOT bind a curve to an identifier.
 
-    ADR 0068 records this: an ES256 credential on P-384 or P-521 verifies and clears the floor,
-    so it enrols. If a later change pins -7 to P-256, this row says so rather than drifting.
+
+def _cose_es256(key: ec.EllipticCurvePrivateKey, crv: int, size: int) -> bytes:
+    nums = key.public_key().public_numbers()
+    return encode_cbor(
+        {
+            1: 2,
+            3: -7,
+            -1: crv,
+            -2: nums.x.to_bytes(size, "big"),
+            -3: nums.y.to_bytes(size, "big"),
+        }
+    )
+
+
+@_LARGER_CURVES
+def test_es256_on_a_curve_other_than_p256_is_refused_at_registration(
+    curve: ec.EllipticCurve, crv: int, size: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Owner ruling 2026-09-23: ES256 is bound to P-256, the pairing RFC 9053 section 2.1 recommends.
+
+    These keys are real and would verify, so this is a deliberate refusal and not a raw failure:
+    it reaches the audited path as ``WebAuthnVerificationError`` and logs no WARNING.
     """
-    nums = ec.generate_private_key(curve).public_key().public_numbers()
-    _assert_registers(
-        encode_cbor(
-            {
-                1: 2,
-                3: -7,
-                -1: crv,
-                -2: nums.x.to_bytes(size, "big"),
-                -3: nums.y.to_bytes(size, "big"),
-            }
+    challenge = secrets.token_bytes(wa.CHALLENGE_BYTES)
+    response = _registration_response(
+        challenge, _cose_es256(ec.generate_private_key(curve), crv, size)
+    )
+    logger = "messagefoundry.auth.webauthn"
+    with (
+        caplog.at_level(logging.WARNING, logger=logger),
+        pytest.raises(wa.WebAuthnVerificationError) as caught,
+    ):
+        wa.verify_registration(response_json=response, challenge=challenge, rp_id=RP, origin=ORIGIN)
+    assert "-7" in str(caught.value)
+    assert not [r for r in caplog.records if r.name == logger]
+
+
+@_LARGER_CURVES
+def test_a_stored_es256_key_on_a_larger_curve_still_asserts(
+    curve: ec.EllipticCurve, crv: int, size: int
+) -> None:
+    """The pin is registration-only, on purpose: a key enrolled before it must not lock anyone out.
+
+    It verifies and clears the floor, so ``verify_assertion`` does not re-screen its curve.
+    """
+    key = ec.generate_private_key(curve)
+    soft = SoftAuthenticator(rp_id=RP, origin=ORIGIN, _key=key)  # signs ECDSA over SHA-256
+    challenge = secrets.token_bytes(wa.CHALLENGE_BYTES)
+    assert (
+        wa.verify_assertion(
+            response_json=soft.get_response(challenge),
+            challenge=challenge,
+            rp_id=RP,
+            origin=ORIGIN,
+            public_key=_cose_es256(key, crv, size),
+            current_sign_count=0,
         )
+        == 0
     )
 
 
@@ -414,7 +456,7 @@ def test_every_pinned_identifier_names_the_key_type_it_arrives_in() -> None:
     Without a row, an added identifier would be refused at registration for every credential, which
     is loud; this says why before a user finds out.
     """
-    assert set(wa._COSE_KTY_FOR_ALG) == set(wa.SUPPORTED_COSE_ALGS)
+    assert set(wa._COSE_KEY_SHAPE_FOR_ALG) == set(wa.SUPPORTED_COSE_ALGS)
 
 
 def test_a_raw_library_failure_is_logged_by_type_and_a_library_refusal_is_not(
