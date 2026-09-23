@@ -5217,8 +5217,8 @@ def security_loosenings(
     ``[auth].ad_session_recheck_seconds``, ``[alerts].email_use_tls``/``email_tls_verify`` (#323
     layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), three per-connection
     deviations — ``cleartext_accepted``, ``tls_allow_expired``, and a generic-ODBC ``DATABASE`` hop
-    with TLS unenforced (#333) -- and the store principal's OBSERVED privilege posture (#1008). It
-    is NOT yet
+    with TLS unenforced (#333) -- the store principal's OBSERVED privilege posture (#1008), and the
+    OBSERVED keying of the audit chain (#1905). It is NOT yet
     an exhaustive registry of every security-relevant switch in every section; ``[store]``/``[auth]``
     carry others (``encrypt``, ``trust_server_certificate``, ``enabled``, ``require_mfa``,
     ``ad_tls_verify``, ``ad_allow_insecure_ldap``, ``oidc_require_mfa_claim``,
@@ -5574,7 +5574,8 @@ def security_loosenings(
                 "the audit chain is KEYLESS SHA-256 although a store key is configured -- its rows "
                 "were written before the key was in hand, and opening with a key does not re-key "
                 "existing rows, so anyone who can write audit_log can forge a row that verifies "
-                "clean; run `messagefoundry rekey-audit` to verify the chain and key every row after it",
+                "clean; stop the engine and run `messagefoundry rekey-audit` to verify the chain and "
+                "key every row after it",
             )
         )
     return out

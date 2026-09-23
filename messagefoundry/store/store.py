@@ -1513,8 +1513,8 @@ def warn_unkeyed_audit_chain(logger: logging.Logger, rows: int) -> None:
     logger.warning(
         "audit chain is KEYLESS (%d existing row(s), no keying watermark) although a store encryption "
         "key or isolated-module MAC is configured: its rows are plain SHA-256 and can be forged by "
-        "anyone who can write audit_log. Opening with a key does not re-key existing rows. Run "
-        "`messagefoundry rekey-audit` to verify the chain and key every row after it.",
+        "anyone who can write audit_log. Opening with a key does not re-key existing rows. Stop the "
+        "engine, then run `messagefoundry rekey-audit` to verify the chain and key every row after it.",
         rows,
     )
 
@@ -3310,7 +3310,9 @@ class MessageStore:
             return  # keyless store — the chain stays byte-identical to pre-#190
         cur = await self._db.execute("SELECT COUNT(*) AS n FROM audit_log")
         cnt = await cur.fetchone()
-        rows = int(cnt["n"]) if cnt is not None else 0
+        if cnt is None:
+            return  # no count read: never key over rows that may exist
+        rows = int(cnt["n"])
         if rows == 0:
             async with self._lock:
                 await self._db.execute(

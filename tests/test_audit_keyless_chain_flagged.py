@@ -27,8 +27,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import sys
-import types
 from pathlib import Path
 
 import pytest
@@ -44,6 +42,7 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore, audit_row_hash
+from tests.test_provision_first_administrator import _tty
 
 _PASSWORD = "a-long-enough-operator-passphrase"
 
@@ -56,12 +55,6 @@ _AT_REST_ENV = (
     "MEFOR_SECURITY_ALLOW_UNENCRYPTED_PHI_UNDER_STRICT_ENFORCEMENT",
     "MEFOR_STORE_REQUIRE_ENCRYPTION",
 )
-
-
-def _tty(monkeypatch: pytest.MonkeyPatch, *entries: str) -> None:
-    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
-    queued = list(entries)
-    monkeypatch.setattr("getpass.getpass", lambda *_a, **_k: queued.pop(0))
 
 
 @pytest.fixture
@@ -87,19 +80,21 @@ def test_provision_admin_refuses_with_no_key_in_the_shell(
     error = json.loads(capsys.readouterr().out)["error"]
     assert "MEFOR_STORE_ENCRYPTION_KEY" in error
     assert "shell" in error, "the refusal must say where the key has to be"
+    assert "gen-key" not in error, "the service already holds a key; a new one would not match it"
     assert not db.exists(), "a refused provision must not leave a keyless store behind"
 
 
 def test_provision_admin_honours_the_same_audited_opt_out_serve_does(
-    shell: Path, monkeypatch: pytest.MonkeyPatch
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Same gate, same override. An operator who deliberately runs keyless under both acks gets the
-    same answer from ``provision-admin`` as from ``serve``: allowed, and audited there."""
+    """Same gate, same override -- but never quietly. A stale opt-out left in a shell is exactly how a
+    keyed store would get a keyless first row, so proceeding keyless says so."""
     monkeypatch.setenv("MEFOR_SECURITY_ALLOW_UNENCRYPTED_PHI", "true")
     monkeypatch.setenv("MEFOR_SECURITY_ALLOW_UNENCRYPTED_PHI_UNDER_STRICT_ENFORCEMENT", "true")
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
     db = shell / "optout.db"
     assert main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"]) == 0
+    assert "KEYLESS" in capsys.readouterr().err
 
 
 def test_the_documented_order_with_the_key_in_the_shell_keys_the_chain_from_row_1(

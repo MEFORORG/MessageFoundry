@@ -1632,9 +1632,11 @@ class AuditStore(Protocol):
         Observed once, at open, by ``_load_audit_chain_meta``: a key or isolated-module MAC is in hand,
         no keying watermark is recorded, and ``audit_log`` already has rows. Those rows are plain
         SHA-256, so anyone who can write the table can forge them. The open does not re-key them --
-        that would bless a forged row -- so the state persists until ``rekey-audit`` succeeds, which
-        clears it. A store with no key at all returns False: that chain is keyless by the audited
-        at-rest opt-out, which ``security_loosenings()`` already reports."""
+        that would bless a forged row. A successful :meth:`rekey_audit_chain` on THIS handle clears
+        it; a rekey by another process (the ``rekey-audit`` CLI) is seen at the next open, which is
+        one reason that command is run with the engine stopped. A store with no key at all returns
+        False: that chain is keyless by the audited at-rest opt-out, which ``security_loosenings()``
+        already reports."""
         ...
 
     async def has_prior_backup_history(self) -> bool:

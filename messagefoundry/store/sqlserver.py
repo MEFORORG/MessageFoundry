@@ -2602,7 +2602,9 @@ class SqlServerStore:
         if not self._audit_keyed_capable():
             return  # keyless store — the chain stays byte-identical to pre-#190
         cnt = await self._fetchone("SELECT COUNT(*) AS n FROM audit_log")
-        rows = int(cnt["n"]) if cnt is not None else 0
+        if cnt is None:
+            return  # no count read: never key over rows that may exist
+        rows = int(cnt["n"])
         if rows > 0:
             self._audit_chain_unkeyed = True  # BACKLOG #1905: report, never re-key at open
             warn_unkeyed_audit_chain(log, rows)

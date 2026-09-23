@@ -1778,7 +1778,9 @@ class PostgresStore:
             if not self._audit_keyed_capable():
                 return  # keyless store — the chain stays byte-identical to pre-#190
             cnt = await conn.fetchrow("SELECT COUNT(*) AS n FROM audit_log")
-            rows = int(cnt["n"]) if cnt is not None else 0
+            if cnt is None:
+                return  # no count read: never key over rows that may exist
+            rows = int(cnt["n"])
             if rows == 0:
                 await conn.execute(
                     "INSERT INTO audit_chain_meta (id, keyed_from_id) VALUES (1, 1) "

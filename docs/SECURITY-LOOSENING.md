@@ -593,11 +593,13 @@ This section is kept rather than deleted, because the claim it used to make is t
   a key keys a store only when its `audit_log` is empty, and never re-keys rows that already exist,
   because that would bless a forged row. The documented install order used to produce this: run
   `provision-admin` with the key only in the service's environment, and the first audit row is
-  keyless. `provision-admin` now refuses a keyless open exactly as `serve` does.
+  keyless. `provision-admin` now refuses under the same condition `serve` refuses to start.
 - **It is never silent:** a WARNING each time the store opens, naming `messagefoundry rekey-audit`,
   and an `audit_chain_unkeyed` entry in `GET /security/posture`. It is not in the serve-time
   settings warning or `messagefoundry security show`, because neither opens the store.
-- **How to clear it:** run `messagefoundry rekey-audit` with the key configured. It verifies the
+- **How to clear it:** stop the engine, then run `messagefoundry rekey-audit` with the key
+  configured. A running engine keeps the watermark it read at open, so it would go on appending
+  keyless rows above the new one and the next verify would report a break. `rekey-audit` verifies the
   existing chain first, refuses a broken one, and keys every row after it. The existing rows keep
   their SHA-256 hashes, but the first keyed row folds in the last keyless hash, so a later edit to
   any earlier row breaks the keyed suffix.
