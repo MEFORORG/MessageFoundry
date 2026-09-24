@@ -31,6 +31,10 @@ the bundled breach corpus holds four of the twelve (``bootstrap`` is not in it),
 set. Pinning a number this module did not derive would be a second hand-kept copy, which is the
 defect it exists to remove. Only the total is pinned.
 
+**What is NOT covered.** The prose paragraph after the list in ``docs/SECURITY.md`` also spells the
+total ("four of the twelve" at the time of writing). This module does not read that paragraph, for
+the reason below, so a change in the count would leave that phrase stale with this gate green.
+
 **The parser reads the list paragraph and nothing else.** The paragraph after the list also names
 some members in backticks, and it is prose that other changes rewrite. Reading it would let a stray
 backticked word pass as a member. ``test_the_parser_stops_at_the_list`` holds that boundary, and the
@@ -59,6 +63,9 @@ _HEADING = "**The context-word deny-list, in full.**"
 _LIST_NAME = "context-word deny-list"
 #: The ``docs/CONFIGURATION.md`` row that republishes the count.
 _CONFIG_ROW_PREFIX = "| `password_check_context` |"
+
+#: The field types ``PasswordPolicy`` may carry. A term list would need a collection type.
+_SCALAR_FIELD_TYPES = frozenset({"bool", "int", "str | None"})
 
 _TERM = re.compile(r"`([^`\s]+)`")
 _NUMBER_WORDS = {
@@ -115,6 +122,12 @@ def _heading_and_list(text: str) -> tuple[str, str]:
     while i < len(lines) and lines[i].strip():
         listed.append(lines[i].strip())
         i += 1
+    # A blank line inside the list would end the parse early and blame the doc for terms a reader
+    # can see. Name that cause instead.
+    following = next((line.strip() for line in lines[i:] if line.strip()), "")
+    assert not following.startswith("`"), (
+        f"the published list continues after a blank line ({following!r}); keep it one paragraph"
+    )
     return " ".join(intro), " ".join(listed)
 
 
@@ -158,10 +171,12 @@ def _published_terms() -> list[str]:
 def _refusal_clause() -> str:
     """The clause ``PasswordPolicy`` emits for a context word, read from the code, not retyped."""
     # Any member will do; taking one from the constant keeps this from breaking when a term leaves.
-    term = min(CONTEXT_WORDS)
-    clauses = PasswordPolicy(check_breached=False).violations(f"zqzqzqzqzqzqzqzq-{term}")
-    assert len(clauses) == 1, f"expected only the context-word clause, got {clauses}"
-    return clauses[0]
+    # The clause is what adding the term ADDS, so another screen firing on the filler does not hide it.
+    policy = PasswordPolicy(check_breached=False)
+    base = "zqzqzqzqzqzqzqzq-"
+    added = set(policy.violations(base + min(CONTEXT_WORDS))) - set(policy.violations(base))
+    assert len(added) == 1, f"expected adding a term to add one clause, got {sorted(added)}"
+    return added.pop()
 
 
 # ---------------------------------------------------------------------------------------------
@@ -182,14 +197,16 @@ def test_every_published_term_is_refused_by_the_policy() -> None:
     match."""
     policy = PasswordPolicy(check_breached=False)
     clause = _refusal_clause()
+    template = "zq-{}-vy-long-passphrase"
+    # Control on the loop's own template with the term left out: if the filler ever held a member,
+    # every iteration would pass and the loop would prove nothing.
+    assert clause not in policy.violations(template.format("")), template
     not_refused = [
         term
         for term in _published_terms()
-        if clause not in policy.violations(f"zq-{term.upper()}-vy-long-passphrase")
+        if clause not in policy.violations(template.format(term.upper()))
     ]
     assert not not_refused, f"published terms the policy does not refuse: {not_refused}"
-    # Control: a passphrase holding no term must not draw the clause, or the loop above proves nothing.
-    assert clause not in policy.violations("a-strong-test-passphrase")
 
 
 def test_security_doc_spells_the_count() -> None:
@@ -215,8 +232,13 @@ def test_configuration_row_spells_the_count() -> None:
     assert f"**{word}** terms" in row, f"the row should say '**{word}** terms': {row!r}"
     # "of the <N>" names the total too ("five of the twelve"). Only the total is checked here; the
     # sub-count is not derivable from code, see the module docstring.
-    totals = re.findall(r"\bof the (\w+)\b", row)
-    stale = [t for t in totals if t in _NUMBER_WORDS.values() and t != word]
+    totals = [t.lower() for t in re.findall(r"\bof the (\w+)\b", row, flags=re.IGNORECASE)]
+    stale = [
+        t
+        for t in totals
+        if (t in _NUMBER_WORDS.values() and t != word)
+        or (t.isdigit() and int(t) != len(CONTEXT_WORDS))
+    ]
     assert not stale, f"the row states a total of {stale}, but CONTEXT_WORDS holds {word}"
     assert "CONTEXT_WORDS" in row, "the row should name CONTEXT_WORDS as where the list lives"
 
@@ -235,9 +257,18 @@ def test_no_setting_adds_or_removes_a_term() -> None:
     docs."""
     marker = re.compile(r"context|deny|term")
     settings_fields = {f for f in AuthSettings.model_fields if marker.search(f)}
-    policy_fields = {f.name for f in dataclasses.fields(PasswordPolicy) if marker.search(f.name)}
     assert settings_fields == {"password_check_context"}, settings_fields
-    assert policy_fields == {"check_context"}, policy_fields
+    # A name filter alone misses a setting called, say, `password_blocklist`. Every setting reaches
+    # the screen through PasswordPolicy.from_settings, so pin that dataclass's fields and require
+    # each to be a scalar: a term list would have to arrive as a collection-typed field.
+    policy_fields = {f.name: f.type for f in dataclasses.fields(PasswordPolicy)}
+    non_scalar = {n: t for n, t in policy_fields.items() if t not in _SCALAR_FIELD_TYPES}
+    assert not non_scalar, (
+        f"PasswordPolicy gained a non-scalar field {non_scalar}. If it feeds terms into the "
+        "context-word screen, docs/SECURITY.md and docs/CONFIGURATION.md both say no setting adds a "
+        "term, and both must change"
+    )
+    assert {n for n in policy_fields if marker.search(n)} == {"check_context"}, policy_fields
 
 
 # ---------------------------------------------------------------------------------------------
@@ -273,6 +304,7 @@ def test_the_parser_stops_at_the_list() -> None:
         pytest.param(f"{_HEADING} intro.\n", id="heading-with-no-list"),
         pytest.param(f"{_HEADING} intro.\n\nno backticks here\n", id="list-with-no-terms"),
         pytest.param(f"{_HEADING} intro.\n\n`alpha`, and beta\n", id="bare-word-member"),
+        pytest.param(f"{_HEADING} intro.\n\n`alpha`,\n\n`beta`\n", id="list-split-by-blank"),
         pytest.param("no heading at all\n\n`alpha`\n", id="heading-missing"),
         pytest.param(f"{_HEADING} a.\n\n`alpha`\n\n{_HEADING} b.\n\n`beta`\n", id="heading-twice"),
     ],
