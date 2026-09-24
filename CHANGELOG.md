@@ -11,24 +11,26 @@ All notable changes to MessageFoundry are documented here. The format follows
   `POST /auth/login` returns it in `LoginResponse` when `must_change_password` is set. `POST /users`
   returns it in `UserSummary` for the account it creates. It is a Unix timestamp, read from the same
   stored stamp the login gate checks. It is `null` when no change is owed, or when
-  `[auth].initial_password_expiry_hours` is `0`. `GET /users` always returns `null` here. That route
-  needs only `users:read`, and a list of live temporary passwords is a target list. The
+  `[auth].initial_password_expiry_hours` is `0` or less. `GET /users` always returns `null` here.
+  That route needs only `users:read`, and a list of live temporary passwords is a target list. The
   never-claimed bootstrap account also gets `null`, because `bootstrap-admin.txt` already states its
   earlier deadline. The web console's create-user form now states how many hours the password
   lasts. Its user page and forced change-password page state the time, and so does the IDE's
   must-change warning. (`BACKLOG #1141`)
 
 ### Changed
-- **BREAKING — web console engine UI seam: the engine now provides `65ee7bd5234eb01b`.** Engine
-  0.4.0 shipped `75c4117d21fd0b98`. The seam moved because the console now imports three deadline
-  helpers from `messagefoundry.api.security`, and `UserSummary` gained `credential_expires_at`
-  (under Added). A console accepts exactly one seam. The web console 0.3.0 release, tagged
-  `webconsole-v0.3.0` beside engine 0.4.0, accepts only `75c4117d21fd0b98`. So with the console on,
-  this engine refuses to start with that release installed (`UiSeamMismatch`). The version number
-  alone does not tell a matching console apart, so check the constant. **Migration:** upgrade the
-  web console together with the engine, to a release whose
-  `messagefoundry_webconsole.SUPPORTED_ENGINE_SEAMS` holds `65ee7bd5234eb01b`. Or set
-  `[security].serve_web_console = false` to run the JSON API alone. (`BACKLOG #1141`)
+- **BREAKING — the web console engine UI seam moved, so this engine no longer pairs with web
+  console 0.3.0.** Engine 0.4.0 shipped `75c4117d21fd0b98`. The seam moved because the console now
+  imports three deadline helpers from `messagefoundry.api.security`, and `UserSummary` gained
+  `credential_expires_at` (under Added). A console accepts exactly one seam. The web console 0.3.0
+  release, tagged `webconsole-v0.3.0` beside engine 0.4.0, accepts only `75c4117d21fd0b98`. So
+  with the console on, this engine refuses to start with that release installed
+  (`UiSeamMismatch`). The version number alone does not tell a matching console apart, so check
+  the constant. This entry does not quote the new value, because it can move again before the
+  release. **Migration:** upgrade the web console together with the engine, to a release whose
+  `messagefoundry_webconsole.SUPPORTED_ENGINE_SEAMS` holds this engine's
+  `messagefoundry.api._ui_seam.ENGINE_UI_SEAM`. Or set `[security].serve_web_console = false` to
+  run the JSON API alone. (`BACKLOG #1141`)
 - **BREAKING — the `403` for a session that must change its password is no longer always the exact
   string `password change required`.** When the engine can state the temporary password's
   deadline, the detail now reads `password change required; the temporary password stops working at
@@ -57,27 +59,20 @@ All notable changes to MessageFoundry are documented here. The format follows
   - When the engine mints its own pair, the tray now finds `api-generated-cert.pem` through the
     service entry and pins it as its only trust anchor. It looks beside `--db`, else
     `[store].path`, else `messagefoundry.db` under the service's `AppDirectory`. It finds nothing
-    when a relative store path would sit under `--project-root` or `[environments].base_dir`.
-    `messagefoundry.tray.poller.StatusPoller` applies the pin unless the caller passes its own
-    `client_factory`. A tray started before the engine's first run picks the file up once it
-    loads, with no restart.
+    when a relative store path has no `AppDirectory` to sit under, or would sit under
+    `--project-root` or `[environments].base_dir`. `messagefoundry.tray.poller.StatusPoller`
+    applies the pin unless the caller passes its own `client_factory`. A tray started before the
+    engine's first run picks the file up once it loads, with no restart.
   - A new `tray.toml` key, `engine_cacert`, names the file to pin. It must be an absolute path; a
     relative one is ignored. An explicit `engine_url` drops the file the tray found. A pin that
     will not load falls back to the OS trust store, never to no verification.
-  - On Windows, when the engine mints a pair, it now grants local users (`BUILTIN\Users`) read on
-    the certificate file. The certificate is public, since every TLS client receives it. The key
-    stays readable only by its owner. The grant is best-effort: a failure is logged, and the
-    engine still starts.
   - **Migration:** to reach a stock engine, give `EngineClient` a `cacert=` that names
     `api-generated-cert.pem`. For an engine behind `[api].tls_terminated_upstream`, which speaks
     plain http, pass `base_url="http://127.0.0.1:8765"`. A tray that does not take its address
     from the service entry now tries https. Set `engine_url` in `tray.toml` to reach a plain-http
-    engine. With no service entry at all, set `engine_cacert` to reach a stock engine. The engine
-    reuses a pair it already has, and engine 0.4.0 minted its pairs without the grant.
-    `scripts\service\install-service.ps1` locks the data directory to SYSTEM, Administrators and
-    the service account, and the tray runs as the signed-in user. On such a host, grant local
-    users read on `api-generated-cert.pem` alone, never the key. Or delete both generated files so
-    the engine mints a new pair, then re-pin every client that pinned the old one.
+    engine. Set `engine_cacert` wherever the tray cannot find a stock engine's certificate: with
+    no service entry, or in the cases above. The tray must also be able to read that file; the
+    entry under Security covers that.
 
 ### Security
 - **BREAKING — OIDC sign-in now bounds how old the IdP's authentication may be.** A new setting,
@@ -121,16 +116,19 @@ All notable changes to MessageFoundry are documented here. The format follows
     `Content-Length: 0` is still accepted.
   - Methods are now case-sensitive. A lowercase `post` is no longer ingested, and a lowercase `get`
     or `head` is no longer answered as a health probe.
-  - At least these also get `400`: a `Content-Length` with a leading `+`, an underscore or more than
-    18 significant digits; whitespace before a header colon; a folded header line; a bare CR or LF
-    in the head; a control character in a header value; a method or header name that is not a
-    token; and an HTTP version other than 1.x.
+  - At least these also get `400`:
+    - a `Content-Length` with a leading `+`, an underscore or more than 18 significant digits;
+    - whitespace before a header colon, or a folded header line;
+    - a bare CR or LF in the head, or a control character in a header value;
+    - a method or header name that is not a token;
+    - an HTTP version other than 1.x.
   - **Migration:** a sending partner puts a `Content-Length` on every `POST`, `PUT` or `PATCH`,
     sends no `Transfer-Encoding`, and writes the method in capitals. A health checker sends `GET`
     or `HEAD` in capitals, with no body.
 - **BREAKING — an MFA-pending session on an account that has a second factor can no longer end
-  sessions.** `DELETE /me/sessions` and `DELETE /me/sessions/{session_id}` skip the MFA gate, so an
-  account with no factor can still end its own sessions. In 0.4.0 that also let a caller holding
+  sessions through the `/me/sessions` routes.** `DELETE /me/sessions` and
+  `DELETE /me/sessions/{session_id}` skip the MFA gate, so an account with no factor can still end
+  its own sessions. In 0.4.0 that also let a caller holding
   only the password sign out a user who has a factor. Now, for an account with a TOTP factor or a
   passkey, a pending session gets `403` with `X-MFA-Required: 1` from both routes. `POST /me/reauth`
   with `purpose` `session_terminate` still answers `200` and returns a new token, but it mints no
@@ -138,19 +136,19 @@ All notable changes to MessageFoundry are documented here. The format follows
   now answer with `X-MFA-Required` instead of `X-Step-Up-Required` and `X-Step-Up-Action`. Each
   refusal on those four routes writes an `auth.mfa_denied` audit row. Every `auth.reauth` audit row
   now carries a `grant_refused` field. An account with no factor is unaffected. The web console
-  applies the same rule and sends the browser to `/ui/reauth`, which asks for the code first.
-  `POST /me/password` still revokes every session from a pending session; this change does not
-  cover it. **Migration:** on a `403` with `X-MFA-Required` from those four routes, prove the
+  applies the same rule and sends the browser to `/ui/reauth`, which asks for the second factor
+  as well as the password. `POST /me/password` still revokes every session from a pending session;
+  this change does not cover it. **Migration:** on a `403` with `X-MFA-Required` from those four routes, prove the
   existing factor on that same session first. A JSON client sends a TOTP or recovery code to
   `POST /auth/mfa-verify` and adopts the `token` it returns. Then it sends `POST /me/reauth` with
   the route's `purpose` (`session_terminate`, `mfa_enroll` or `mfa_confirm`), adopts that `token`,
   and retries. The JSON API has no passkey step, so a passkey-only account ends its sessions from the
-  web console, where `/ui/reauth` asks for the passkey first. (`BACKLOG #1951`)
+  web console, where `/ui/reauth` asks for the passkey. (`BACKLOG #1951`)
 - **A lockout, and a sign-in that succeeds after failures, now write their own audit rows, so they
   reach the user's security-events feed.** Engine 0.4.0 wrote no row of its own for either event.
-  Each lived only in the out-of-band notice. So an account with no notification address never saw
-  it in `GET /me/security-events`, and neither did any account on an engine with no mail relay.
-  Two new audit actions carry them. `auth.account_locked` is written when a wrong password, or a
+  Each lived only in the out-of-band notice, so no account saw either event in
+  `GET /me/security-events`. An account with no notification address, or on an engine with no
+  mail relay, got no notice of it at all. Two new audit actions carry them. `auth.account_locked` is written when a wrong password, or a
   wrong TOTP or recovery code, crosses the lockout threshold. `auth.login_after_failures` is written
   when a local password sign-in succeeds after three or more failures. Each row names the account
   as its actor and carries no more detail than the attempt's own row. The failure count stays in
@@ -168,8 +166,10 @@ All notable changes to MessageFoundry are documented here. The format follows
   HSTS. It covers at least uvicorn's `400` for a request it cannot parse, and its `500` when the
   app fails without starting a response. It also covers uvicorn's WebSocket `500` and the legacy
   websockets server's own handshake answers. Each step it adds fails open. On an error it logs a
-  WARNING, once per response family and step, and leaves uvicorn's own response as it was.
-  (`BACKLOG #1120`)
+  WARNING, once per response family and step, and leaves uvicorn's own response as it was. Those
+  steps rely on uvicorn and websockets internals, measured at uvicorn 0.49.0 and websockets 16.0,
+  the versions `requirements.lock` pins. `pyproject.toml` admits other versions, and on one of
+  them a step may fail open and leave its headers off. (`BACKLOG #1120`)
 - **Passkey registration now requires real CBOR integers where the COSE key needs them.** Engine
   0.4.0's P-256 pin for ES256 let `true`, `1.0` and some other non-integer CBOR values stand in for
   an integer. So an ES256 key whose curve read `true` or `1.0` could enrol past the pin.
@@ -177,6 +177,18 @@ All notable changes to MessageFoundry are documented here. The format follows
   whose `crv` is not one. It also refuses a label that is neither an integer nor a text string (RFC
   9052 section 7), and a key sent as a CBOR array. Each refusal is audited as
   `auth.webauthn_failed`. Passkeys already registered are not re-checked. (`BACKLOG #1953`)
+- **On Windows, the engine now lets local users read the API certificate it mints, and never the
+  key.** When it mints its self-signed pair, it grants `BUILTIN\Users` read on
+  `api-generated-cert.pem` alone. `scripts\service\install-service.ps1` locks the data directory
+  to SYSTEM, Administrators and the service account. The tray runs as the signed-in user, so on
+  such a host it may not be able to read the file it pins (under Changed). The certificate is
+  public, since every TLS client receives it in the handshake. The key stays readable only by its
+  owner. The grant adds one entry for this one file and leaves the directory as it was. It is
+  best-effort: a failure is logged, and the engine still starts. **Migration:** the engine reuses
+  a pair it already has, and engine 0.4.0 minted its pairs without the grant. On such a host,
+  grant local users read on `api-generated-cert.pem` alone, never the key. Or delete both
+  generated files so the engine mints a new pair, then re-pin every client that pinned the old
+  one. (`BACKLOG #1276`)
 
 ## [0.4.0] — 2026-09-23 — Early Access
 
