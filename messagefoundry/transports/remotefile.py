@@ -106,6 +106,16 @@ logger = logging.getLogger(__name__)
 
 _PROTOCOLS = ("sftp", "ftp", "ftps")
 
+
+def remote_file_protocol(settings: Mapping[str, Any]) -> str:
+    """The wire protocol a REMOTEFILE connection speaks: ``protocol`` lowercased, SFTP when unset.
+
+    The ONE normalisation: the client factory, both construction guards and the static-credential
+    inventory (BACKLOG #1182) all read it here, so a classifier cannot call an upper-case or missing
+    ``protocol`` FTP while the transport dials SFTP. It does not validate; ``_validate_common`` does."""
+    return str(settings.get("protocol", "sftp")).lower()
+
+
 _T = TypeVar("_T")
 
 #: Bytes pulled per chunk while retrieving a remote file. Only the granularity of the budget check —
@@ -862,7 +872,7 @@ def _make_client(
     real server/SSH is needed; both connectors call it per operation-batch. ``trust_anchor_policy``
     (#190, ADR 0093) is the outbound FTPS verify-path internal-CA fallback; the source passes ``None``
     (byte-identical) and SFTP/plain-FTP ignore it (no server-cert verify)."""
-    protocol = str(settings.get("protocol", "sftp")).lower()
+    protocol = remote_file_protocol(settings)
     if protocol == "sftp":
         return _SftpClient(settings)
     if protocol == "ftp":
@@ -891,7 +901,7 @@ def _anon_ftp_guard(
     The acceptance pair arrives as arguments rather than out of ``s``: it is a top-level OUTBOUND key,
     not a transport setting, and it is **Destination-only** (ADR 0153 decision 2), so the inbound
     ``RemoteFileSource`` path leaves it at its default."""
-    if str(s.get("protocol", "sftp")).lower() != "ftp":
+    if remote_file_protocol(s) != "ftp":
         return None
     if s.get("username") or s.get("password"):
         return None  # credentialed ftp — covered by _validate_common's cleartext-credential refusal
@@ -926,7 +936,7 @@ def _validate_common(
     for req in ("host", "remote_dir"):
         if not s.get(req):
             raise ValueError(f"REMOTEFILE connector requires a {req!r} setting")
-    protocol = str(s.get("protocol", "sftp")).lower()
+    protocol = remote_file_protocol(s)
     if protocol not in _PROTOCOLS:
         raise ValueError(f"REMOTEFILE protocol must be one of {_PROTOCOLS}, got {protocol!r}")
     if protocol == "ftp" and (s.get("username") or s.get("password")):

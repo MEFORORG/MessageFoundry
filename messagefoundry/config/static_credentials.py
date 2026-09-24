@@ -69,6 +69,7 @@ names the SETTING that holds it, never the value."""
 from __future__ import annotations
 
 import logging
+import urllib.parse
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -193,6 +194,21 @@ def _http_hop(
     return StaticCredentialHop(name, "none", f"presents no credential ({peer})", compliant_kind)
 
 
+def _url_userinfo(url: object) -> bool:
+    """Does a proxy URL carry ``user@`` or ``user:password@`` in its authority?
+
+    urllib's ``ProxyHandler`` turns URL userinfo into a pre-emptive ``Proxy-authorization: Basic``
+    header, so userinfo is a credential on the wire even with ``proxy_user`` unset. Read after
+    unquoting, the way ``transports.rest.refuse_url_credentials`` reads an endpoint URL, because
+    ``urlsplit`` misses an ``@`` hidden behind percent-encoding. Any userinfo counts, including a
+    user with no password: that sends nothing today, but it is a credential written to be sent, and
+    the gate fails closed on it. An unresolved ``env()`` reference cannot be read, so it counts as no
+    userinfo; the proxy it names is still reported when ``proxy_user`` or ``proxy_password`` is set."""
+    if not isinstance(url, str):
+        return False
+    return "@" in urllib.parse.unquote(urllib.parse.urlsplit(url.strip()).netloc)
+
+
 def _proxy_hop(
     name: str, settings: Mapping[str, Any], site_proxy: str | None
 ) -> StaticCredentialHop | None:
@@ -203,14 +219,20 @@ def _proxy_hop(
     So no compliant kind exists for it. The proxy is the connection's own ``proxy_url``, else the
     inherited ``[egress].proxy_url``. ``site_proxy`` is that inherited value, or ``None`` when the
     caller has no settings to read; the hop is then reported, because a credential written on a
-    connection is written to be used. A proxy with no credential has nothing presented to it."""
-    if not (settings.get("proxy_user") or settings.get("proxy_password")):
-        return None
+    connection is written to be used. A proxy with no credential has nothing presented to it.
+
+    The credential is either the ``proxy_user``/``proxy_password`` pair or userinfo in the proxy URL
+    itself (:func:`_url_userinfo`); the label is built from parsed parts, so the userinfo never
+    reaches it."""
     proxy_url = settings.get("proxy_url") or site_proxy
+    keyed = bool(settings.get("proxy_user") or settings.get("proxy_password"))
+    if not keyed and not _url_userinfo(proxy_url):
+        return None
     if site_proxy is not None and not proxy_url:
         return None  # no proxy at all: the credential is never sent
-    # From a closed set, not echoed: only a known scheme name reaches the detail.
-    kind = str(settings.get("proxy_auth_type") or "basic")
+    # From a closed set, not echoed: only a known scheme name reaches the detail. URL userinfo is
+    # always Basic: urllib's ProxyHandler sends it pre-emptively, whatever proxy_auth_type says.
+    kind = str(settings.get("proxy_auth_type") or "basic") if keyed else "basic"
     if kind not in ("basic", "digest"):
         kind = "static"
     return StaticCredentialHop(
@@ -225,8 +247,14 @@ def _remote_file_hop(
     name: str, settings: Mapping[str, Any], peer: str
 ) -> StaticCredentialHop | None:
     """SFTP can present an SSH private key, which is compliant. FTP and FTPS cannot: the FTPS client
-    certificate exists in the transport, but ``Ftp()`` exposes no setting that selects it."""
-    if settings.get("protocol") == "sftp":
+    certificate exists in the transport, but ``Ftp()`` exposes no setting that selects it.
+
+    The protocol is read through the transport's own normalisation (lowercased, SFTP when unset), so
+    the classifier cannot call a hop FTP that the transport dials as SFTP."""
+    # Lazy, for the one-way rule ``_smart`` states.
+    from messagefoundry.transports.remotefile import remote_file_protocol
+
+    if remote_file_protocol(settings) == "sftp":
         if settings.get("password"):
             return StaticCredentialHop(name, "static", f"SFTP password ({peer})", True)
         if settings.get("private_key"):

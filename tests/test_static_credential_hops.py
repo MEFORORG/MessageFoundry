@@ -519,3 +519,97 @@ def test_http_digest_is_read_from_the_mode_the_connector_reads() -> None:
     assert "HTTP Digest" not in _http_static(ConnectorType.REST, keys, False)
     digest = {**keys, "http_auth": "digest"}
     assert "HTTP Digest" in _http_static(ConnectorType.REST, digest, False)
+
+
+# --- review round 2: a proxy URL's userinfo, and the remote-file protocol ---------------------------
+
+#: A proxy password that must never reach a detail.
+_PROXY_PW = "PROXY-userinfo-SECRET"
+
+
+def test_a_proxy_url_carrying_userinfo_is_a_static_credential_hop(tmp_path: Path) -> None:
+    """urllib's ``ProxyHandler`` turns ``user:password@`` in the proxy URL into a pre-emptive
+    ``Proxy-authorization: Basic`` header, so the hop presents a static credential with no
+    ``proxy_user`` set. The label still carries scheme, host and port only."""
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "feed.py").write_text(
+        "from messagefoundry import Rest, outbound\n"
+        "outbound('OB_P', Rest(url='https://a.example.invalid/x',\n"
+        f"    proxy='https://puser:{_PROXY_PW}@proxy.example.invalid:3128'))\n",
+        encoding="utf-8",
+    )
+    hops = {
+        h.name: h
+        for h in static_credential_hops(
+            registry=load_config(cfg, allow_empty=True), settings=ServiceSettings()
+        )
+    }
+    hop = hops["proxy:OB_P"]
+    assert hop.credential == "static" and hop.compliant_kind is False
+    assert "(https://proxy.example.invalid:3128)" in hop.detail
+    assert _PROXY_PW not in hop.detail and "puser" not in hop.detail
+
+
+def test_a_site_proxy_carrying_userinfo_is_a_hop_for_every_http_connection(tmp_path: Path) -> None:
+    """The inherited ``[egress].proxy_url`` is sent by every HTTP-family connection with no proxy of
+    its own, so its userinfo is presented on each of those hops."""
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "feed.py").write_text(
+        "from messagefoundry import Rest, outbound\n"
+        "outbound('OB_S', Rest(url='https://a.example.invalid/x'))\n",
+        encoding="utf-8",
+    )
+    registry = load_config(cfg, allow_empty=True)
+    site = _settings(
+        egress={
+            "proxy_url": f"http://suser:{_PROXY_PW}@site.example.invalid:3128",
+            "allowed_proxy": ["site.example.invalid"],
+        }
+    )
+    hops = {h.name: h for h in static_credential_hops(registry=registry, settings=site)}
+    hop = hops["proxy:OB_S"]
+    assert hop.credential == "static"
+    assert "(http://site.example.invalid:3128)" in hop.detail
+    assert _PROXY_PW not in hop.detail and "suser" not in hop.detail
+    # The control: the same site proxy without userinfo presents nothing to the proxy.
+    bare = _settings(
+        egress={
+            "proxy_url": "http://site.example.invalid:3128",
+            "allowed_proxy": ["site.example.invalid"],
+        }
+    )
+    assert "proxy:OB_S" not in {
+        h.name for h in static_credential_hops(registry=registry, settings=bare)
+    }
+
+
+@pytest.mark.parametrize("protocol", ["SFTP", "Sftp", None])
+def test_sftp_is_classified_with_the_transports_normalisation_and_default(
+    protocol: str | None,
+) -> None:
+    """The transport lowercases ``protocol`` and defaults it to ``sftp``. A key on an upper-case or
+    missing protocol is an SSH key, not an FTP password."""
+    from messagefoundry.config.models import ConnectorType
+    from messagefoundry.config.static_credentials import _connection_hop
+
+    base: dict[str, object] = {"host": "sftp.example.invalid", "remote_dir": "/in"}
+    if protocol is not None:
+        base["protocol"] = protocol
+    key = {**base, "username": "u", "private_key": "k.pem"}
+    assert _connection_hop("OB_K", ConnectorType.REMOTEFILE, key) is None
+    pw = _connection_hop(
+        "OB_P", ConnectorType.REMOTEFILE, {**base, "username": "u", "password": "x"}
+    )
+    assert pw is not None and pw.detail.startswith("SFTP password") and pw.compliant_kind is True
+
+
+def test_an_upper_case_ftp_protocol_is_still_ftp() -> None:
+    """The control for the case above: normalising must not turn FTP into SFTP."""
+    from messagefoundry.config.models import ConnectorType
+    from messagefoundry.config.static_credentials import _connection_hop
+
+    s = {"host": "ftp.example.invalid", "protocol": "FTPS", "username": "u", "password": "x"}
+    hop = _connection_hop("OB_F", ConnectorType.REMOTEFILE, s)
+    assert hop is not None and hop.detail.startswith("FTP password") and hop.compliant_kind is False

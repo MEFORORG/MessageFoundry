@@ -1398,7 +1398,7 @@ opt-out. That is expected, and the table says which they are.
 | `FhirLookup(...)` | `fhir_lookup:<name>` | yes: SMART Backend Services |
 | `Soap(...)` | `<name>` | yes: client certificate, or OAuth2 |
 | `DICOMweb(...)` | `<name>` | **no** (static bearer or Basic only) |
-| forward-proxy credential on any HTTP connection | `proxy:<name>` | **no** (Basic or Digest only) |
+| forward-proxy credential on any HTTP connection (`proxy_user`/`proxy_password`, or `user:password@` in the proxy URL, its own or `[egress].proxy_url`) | `proxy:<name>` | **no** (Basic or Digest only) |
 | `MLLP(...)`, `DICOM(...)` outbound | `<name>` | yes: `tls=True` with `tls_cert_file` |
 | `Tcp(...)`, `X12(...)` outbound | `<name>` | **no** (no credential of any kind) |
 | `Email(...)`, `Direct(...)` SMTP AUTH | `<name>` | **no** |

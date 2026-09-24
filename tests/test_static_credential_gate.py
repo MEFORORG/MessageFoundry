@@ -503,3 +503,26 @@ async def test_the_probes_do_not_reach_the_posture_response(tmp_path: Path) -> N
         await eng.stop()
     _assert_probe_free(resp.text)
     assert resp.headers.get("cache-control") == "no-store"
+
+
+def test_the_check_reports_the_settings_half_on_an_empty_graph(tmp_path: Path) -> None:
+    """Under ``--allow-empty-config`` a connection-less graph still has a settings half. The check
+    must report it rather than skip with "config did not load" about a config that loaded."""
+    from messagefoundry.checks import run_checks
+
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (tmp_path / "messagefoundry.toml").write_text(
+        '[store]\nbackend = "sqlserver"\nserver = "db.example.invalid"\ndatabase = "mf"\n'
+        f'username = "svc"\npassword = "{_SECRET}"\n\n[ai]\nenvironment = "dev"\n',
+        encoding="utf-8",
+    )
+    result = next(
+        r
+        for r in run_checks(cfg, run_lint=False, allow_empty_config=True).results
+        if r.name == "static-credentials"
+    )
+    assert not result.skipped, result.detail
+    detail = str(result.detail)
+    assert "settings:store" in detail
+    assert _SECRET not in detail

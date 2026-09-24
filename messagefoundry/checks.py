@@ -2119,7 +2119,11 @@ def _check_static_credentials(
 
     name = "static-credentials"
     try:
-        registry = load_config(config_dir)
+        # allow_empty: same reason as dead-config (BACKLOG #1648). A connection-less graph still has a
+        # settings half -- [store], [secrets], [alerts] and the rest dial out whether or not a
+        # connection is declared -- so under `--allow-empty-config` this leg must report it, not skip
+        # with "config did not load" about a config that loaded.
+        registry = load_config(config_dir, allow_empty=True)
     except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
         return CheckResult(
             name, ok=True, required=False, skipped=True, detail=f"config did not load: {exc}"
