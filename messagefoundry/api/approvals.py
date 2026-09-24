@@ -9,6 +9,12 @@ can never approve their own (enforced server-side). On approval the captured ope
 and **both identities** land in the hash-chained audit log. A request older than
 ``[approvals].expiry_hours`` can no longer be approved.
 
+A request YOUNGER than ``[approvals].min_dwell_seconds`` cannot be approved yet (ASVS 2.4.2). The expiry
+is a ceiling; this is the floor. The refusal is a 409 with an ``approval.too_early`` audit row, and the
+request stays pending. Nothing retries it: the approver must approve again. Where the default comes
+from, and what the floor does not do, is stated once in docs/SECURITY.md under "Dual-control approval
+for high-value actions".
+
 On release the **requester** is re-validated too (ASVS 8.3.2). The request is refused, audited and
 alerted if the requester no longer exists, is disabled, no longer holds the permission the operation
 requires, or has left the channel scope it needs. Authority is read at release rather than remembered
@@ -28,6 +34,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -87,10 +94,13 @@ class ApprovalGate:
         *,
         resolve_identity: IdentityResolver | None = None,
         alert_sink: AlertSink | None = None,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         self._store = store
         self._settings = settings
         self._ops: dict[str, _Operation] = {}
+        # Wall-clock seconds, injectable so a test can drive the expiry ceiling and the dwell floor.
+        self._clock = clock
         # With no resolver the requester's permissions cannot be re-read, so approve() refuses every
         # release (fail closed) rather than executing on authority it could not check.
         self._resolve_identity = resolve_identity
@@ -139,7 +149,7 @@ class ApprovalGate:
             raise ValueError(
                 "requester_user_id is required (a request with no owner id is unapprovable)"
             )
-        now = time.time()
+        now = self._clock()
         approval_id = uuid4().hex
         expires_at = (
             None if self._settings.expiry_hours == 0 else now + self._settings.expiry_hours * 3600.0
@@ -162,7 +172,7 @@ class ApprovalGate:
         return approval_id
 
     async def list_pending(self) -> list[dict[str, Any]]:
-        rows = await self._store.list_pending_approvals(now=time.time())
+        rows = await self._store.list_pending_approvals(now=self._clock())
         return [
             {
                 "id": str(r["id"]),
@@ -185,7 +195,8 @@ class ApprovalGate:
     ) -> dict[str, Any]:
         """Release a pending request: the captured operation is re-executed and both identities are
         audited. Refuses self-approval (the requester is not a valid second approver). Also refuses a
-        request whose requester no longer holds the authority it needs (:meth:`_requester_standing`).
+        request whose requester no longer holds the authority it needs (:meth:`_requester_standing`),
+        and one younger than ``[approvals].min_dwell_seconds`` (409, ``approval.too_early``).
 
         **The refusal compares user ids, never usernames (BACKLOG #1540).** The stored ``requester``
         and the live ``approver`` are two snapshots of a directory-writable name, taken up to
@@ -217,6 +228,44 @@ class ApprovalGate:
             op is None
         ):  # registered op was removed between request and approval — refuse, stay pending
             raise ApprovalError(409, f"operation '{operation}' is no longer available")
+        # ASVS 2.4.2: the FLOOR on the request's age, beside the expiry CEILING in _require_pending.
+        # Here, inside approve(), because every release path calls this method, so no caller can skip
+        # it. Checked BEFORE the transition, so the row stays pending and the approver can simply
+        # approve again.
+        #
+        # The age compares two WALL-CLOCK readings, and they can come from two engine processes that
+        # share one store. Skew cuts both ways. A clock BEHIND the requester's reads as too young and
+        # fails closed until it catches up. A clock AHEAD reads as older than it is and fails OPEN by
+        # the size of the skew, and so does a forward clock step. Stamping both ends from the store's
+        # own clock would close that; it is not built.
+        #
+        # `min_dwell > 0` first, so a floor of 0 really is "no floor". Without it a clock reading even
+        # 1 ms behind requested_at gives a negative age, and `age < 0.0` would refuse the approve.
+        min_dwell = self._settings.min_dwell_seconds
+        age = self._clock() - float(row["requested_at"])
+        if min_dwell > 0 and age < min_dwell:
+            await self._store.record_audit(
+                "approval.too_early",
+                actor=approver,
+                detail=json.dumps(
+                    {
+                        "approval_id": approval_id,
+                        "operation": operation,
+                        "requester": str(row["requester"]),
+                        "age_seconds": round(age, 3),
+                        "min_dwell_seconds": min_dwell,
+                    }
+                ),
+                client=client,  # ADR 0150: the approver's address, matching this row's actor
+            )
+            # The real remaining wait, not the floor: when this clock is behind the requester's, the
+            # wait is longer than the floor, and saying "less than 2 seconds old" would mislead.
+            wait = math.ceil(min_dwell - age)
+            raise ApprovalError(
+                409,
+                f"this request is too new to approve (the minimum is {min_dwell} seconds); "
+                f"review it and approve it again in {wait} second(s)",
+            )
         params = json.loads(str(row["params"]))
         # ASVS 8.3.2: the requester's authority is re-read NOW. It was checked when the request was
         # made, and it can be withdrawn at any point inside the expiry window: the user deleted or
@@ -241,7 +290,7 @@ class ApprovalGate:
             )
         # Transition to 'approved' FIRST (atomic, guards a double-approve race); only then execute.
         if not await self._store.decide_pending_approval(
-            approval_id, status="approved", approver=approver, decided_at=time.time()
+            approval_id, status="approved", approver=approver, decided_at=self._clock()
         ):
             raise ApprovalError(409, "request was already decided")
         try:
@@ -370,7 +419,7 @@ class ApprovalGate:
                 approval_id,
                 status="failed",
                 approver=approver,
-                decided_at=time.time(),
+                decided_at=self._clock(),
                 from_status="approved",
             )
             await self._store.record_audit(
@@ -403,7 +452,7 @@ class ApprovalGate:
         may reject — including the requester cancelling their own."""
         row = await self._require_pending(approval_id)
         if not await self._store.decide_pending_approval(
-            approval_id, status="rejected", approver=approver, decided_at=time.time()
+            approval_id, status="rejected", approver=approver, decided_at=self._clock()
         ):
             raise ApprovalError(409, "request was already decided")
         operation = str(row["operation"])
@@ -432,7 +481,7 @@ class ApprovalGate:
         if str(row["status"]) != "pending":
             raise ApprovalError(409, f"request is already {row['status']}")
         expires_at = row["expires_at"]
-        if expires_at is not None and float(expires_at) <= time.time():
+        if expires_at is not None and float(expires_at) <= self._clock():
             raise ApprovalError(409, "request has expired")
         return row
 

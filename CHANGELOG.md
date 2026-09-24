@@ -57,6 +57,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   the SCP's limit; the outbound SCU's use of the key, and the SCP's pre-decode inflate bound for a
   deflated object, are unchanged. (`BACKLOG #1910`)
 ### Security
+- **An approval can no longer be granted faster than a person could read it.** A new setting,
+  `[approvals].min_dwell_seconds`, sets the youngest age at which a pending request may be
+  approved. It defaults to 2.0 seconds, which is provisional and derived from the keystroke-level
+  model; `docs/SECURITY.md` states the derivation. `ApprovalGate.approve()` refuses a younger
+  request with `409`, stating the remaining wait, and writes an `approval.too_early` audit row. The
+  request stays pending, and nothing retries it. The check sits inside `approve()`, so every release
+  path meets it. `0` means no floor. `[approvals].expiry_hours` now also refuses NaN, infinity and
+  overflow, and with dual control on, startup refuses a floor at or past the expiry. Dual control
+  (`[approvals].enabled`) still ships off. ([BACKLOG #287](docs/BACKLOG.md))
 - **BREAKING: the `Http()` inbound listener now refuses any `Transfer-Encoding`, not only
   `chunked`.** The listener decodes no transfer coding. In 0.4.0 it refused the header only when its
   whole value was `chunked`. A coding list such as `gzip, chunked` got through, and so did `chunked,`
