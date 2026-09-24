@@ -538,9 +538,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         limit: int = Query(100, ge=1, le=1000),
     ) -> SecurityEventsList:
         """The caller's own security-event history (WP-L3-05, ASVS 6.3.5/6.3.7): the audited ``auth.*``
-        actions on their account (sign-ins, lockouts, password changes), most-recent-first. The
-        out-of-band email push complements this for events the user should learn of without logging in
-        (and for admin-initiated changes, whose audit actor is the admin)."""
+        actions on their account (sign-ins, lockouts, password changes), most-recent-first; which
+        events that includes is stated once, in ``auth/notifications.py``. The out-of-band email push
+        complements this for events the user should learn of without logging in (and for
+        admin-initiated changes, whose audit actor is the admin)."""
         rows = await service.security_events_for(identity.username, limit=limit)
         return SecurityEventsList(events=[SecurityEventInfo(**r) for r in rows])
 
