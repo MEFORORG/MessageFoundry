@@ -159,7 +159,7 @@ async def test_the_startup_error_names_the_rotation_a_first_serve_cannot_finish(
     changed in different pull requests, so this arm pins them together on ONE service. Drop the
     sentence and the wording asserts fail. Change the behaviour -- the mint starts raising again, or
     the rotation stops being refused -- and the behaviour asserts fail, which is the prompt to reword.
-    Why the wording names `serve` is stated on `_error_if_bundled_corpus_unusable`.
+    Why the wording is conditional is stated on `_error_if_bundled_corpus_unusable`.
 
     SCOPE: this drives `AuthService` directly. It does not reach the must-change gate in
     `api/security.py` or the `serve` lifespan in `api/app.py`, so a change there cannot fail it.
@@ -171,12 +171,11 @@ async def test_the_startup_error_names_the_rotation_a_first_serve_cannot_finish(
     assert len(errors) == 1, errors
     message = errors[0]
     for phrase in (
-        "first `serve`",
-        "bootstrap admin",
-        "must change its password",
+        "`serve` against a store with no users still creates the bootstrap admin",
         "cannot finish that change",
-        "before that credential expires",
-        "and restart",
+        "`provision-admin` fails",
+        "deadline in bootstrap-admin.txt",
+        "password_check_breached = false and restart",
     ):
         assert phrase in message, f"{phrase!r} missing from the startup ERROR: {message}"
 
