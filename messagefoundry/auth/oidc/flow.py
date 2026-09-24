@@ -301,9 +301,14 @@ def exchange_code(
         method="POST",
     )
     # BACKLOG #1125 (ASVS 4.2.1): a reply whose length framing is ambiguous is refused before its
-    # body is read, by the rule read_bounded applies to connector replies. Imported here to match the
-    # length helper's import above; FlowError keeps it on the audited login-failure path.
+    # body is read, by the rule read_bounded applies to connector replies. BACKLOG #1979: the body is
+    # read through the same strict reader, so a malformed chunk-size line cannot get past the bound.
+    # Imported here to match the length helper's import above; FlowError keeps both on the audited
+    # login-failure path.
     from messagefoundry.transports.bounded_read import (  # noqa: PLC0415  (matches the import above)
+        AmbiguousFramingError,
+        EgressReplyError,
+        read_reply_body,
         reply_framing_fault,
     )
 
@@ -314,13 +319,20 @@ def exchange_code(
     http_status: int | None = None
     unreachable: str | None = None
     misframed = False
+    cut_short = False
     body = b""
     try:
         with opener.open(req, timeout=timeout) as resp:  # noqa: S310 — see above
             if reply_framing_fault(resp) is not None:
                 misframed = True
             else:
-                body = resp.read(_MAX_TOKEN_RESPONSE_BYTES + 1)
+                try:
+                    body = read_reply_body(
+                        resp, _MAX_TOKEN_RESPONSE_BYTES + 1, connector="OIDC token endpoint"
+                    )
+                except EgressReplyError as refused:
+                    misframed = isinstance(refused, AmbiguousFramingError)
+                    cut_short = not misframed
     except urllib.error.HTTPError as exc:
         # Read the RFC 6749 error code only; never the body verbatim (may echo request params).
         http_status = exc.code
@@ -332,6 +344,8 @@ def exchange_code(
         raise FlowError(f"token endpoint unreachable: {unreachable}")
     if misframed:
         raise FlowError("token endpoint response framed its body length ambiguously")
+    if cut_short:
+        raise FlowError("token endpoint closed the connection part-way through its response")
     if len(body) > _MAX_TOKEN_RESPONSE_BYTES:
         raise FlowError("token endpoint response exceeds the size bound")
     try:
