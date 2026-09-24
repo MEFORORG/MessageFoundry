@@ -1219,6 +1219,34 @@ def proxy_auth_handler_from_settings(
     )
 
 
+def proxy_url_sends_userinfo(proxy_url: object) -> bool:
+    """Does this ``proxy_url`` put a credential of its own on the wire (BACKLOG #1182)?
+
+    ``ProxyHandler`` turns a user AND a password in the proxy URL into a pre-emptive
+    ``Proxy-authorization: Basic`` header, whether or not ``proxy_user`` is set. So this answers what
+    the engine sends, in the order :func:`proxy_config_from_settings` builds it: ``"default"`` hands
+    the proxy to the operating system and carries nothing from this URL; a scheme other than http or
+    https is refused before any request; and the userinfo is then read by ``_parse_proxy``, the
+    parser the handler runs. ``urlsplit`` would be the wrong reader: with an unencoded ``/``, ``?`` or
+    ``#`` in the password it ends the authority early and sees no ``@``, while the handler still
+    sends the password. A user with no password sends nothing. Never raises: a URL the transport
+    cannot parse is refused at build, so it sends nothing either. Not an ``env()`` reference: the
+    caller passes a value, and anything that is not a string answers ``False``."""
+    if not isinstance(proxy_url, str):
+        return False
+    proxy = proxy_url.strip()
+    if proxy.lower() == PROXY_DEFAULT:
+        return False
+    try:
+        if urllib.parse.urlsplit(proxy).scheme.lower() not in ("http", "https"):
+            return False
+        # Private, but it is exactly what ProxyHandler.proxy_open calls; a test pins the pairing.
+        _, user, password, _ = urllib.request._parse_proxy(proxy)  # type: ignore[attr-defined]
+    except ValueError:
+        return False
+    return bool(user and password)
+
+
 def proxy_config_from_settings(
     s: Mapping[str, Any],
     *,

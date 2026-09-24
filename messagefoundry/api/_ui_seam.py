@@ -182,12 +182,20 @@ from typing import Any
 #: goes. A METHOD the console calls, so it forces a bump for the reason the
 #: ``factor_binding_is_blocked`` entry above gives. Unnumbered, as above.
 #:
+#: ASVS 13.2.1 / BACKLOG #1182: ``SecurityPosture`` gained the additive ``static_credential_hops`` (a
+#: list of the new ``StaticCredentialHopView``) and ``static_credential_hops_scope``, the inventory
+#: of backend hops that present an unchanging credential or none. The two new fields change the
+#: snapshot's ``SecurityPosture`` line, and the nested model joins the discovered DTO surface; each
+#: alone moves the digest. The fields carry defaults, but the console pins exactly one seam
+#: (BACKLOG #279), so an older console refuses this engine at startup rather than ignoring them.
+#: Unnumbered: the ``vN`` labels are retired as identifiers (#1220 above).
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "37e84a155b662187"
+ENGINE_UI_SEAM: str = "ab2e10f1b28a610f"
 
 
 @dataclass(frozen=True, slots=True)
