@@ -150,10 +150,11 @@ def jwks_fetcher(
         )
         with opener.open(req, timeout=timeout) as resp:  # noqa: S310 — see above
             # BACKLOG #1125 (ASVS 4.2.1): refuse ambiguous length framing before reading, by the
-            # rule every egress connector applies. An HTTPException, the type http.client raises for
-            # its own protocol faults, so the login path records an unavailable IdP. A JwksError
-            # would be retyped by claims.py as ClaimsError('unknown_kid'), a token-verification
-            # reject, which misnames a transport fault.
+            # rule read_bounded applies to connector replies. An HTTPException, the type
+            # http.client raises for its own protocol faults, so the login that triggered the fetch
+            # records an unavailable IdP. A JwksError would be retyped by claims.py as
+            # ClaimsError('unknown_kid'), a token-verification reject. Logins inside the refetch
+            # floor after this see the cache's throttle, as after any failed fetch.
             if reply_framing_fault(resp) is not None:
                 raise http.client.HTTPException("JWKS response framed its body length ambiguously")
             return bytes(resp.read(_MAX_JWKS_BYTES + 1))

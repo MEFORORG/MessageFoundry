@@ -63,10 +63,11 @@ refuses nothing about the reply's shape.
 **Framing comes before length, and** ``http.client`` **does not check it** (BACKLOG #1125, ASVS
 4.2.1). ``http.client`` reads the FIRST ``Transfer-Encoding`` field and treats the reply as chunked
 only when that one value, compared case-insensitively, is ``chunked``; otherwise it frames by the
-FIRST ``Content-Length``, parsed with :func:`int`. So ``Transfer-Encoding: gzip, chunked`` beside ``Content-Length: 3`` reads
-three bytes of raw chunk framing, two ``Content-Length`` fields of 3 and 5 read whichever came
-first, and ``Content-Length: 1_0`` reads ten bytes. Every one of those would hand a wrong body to
-the caller as the peer's answer, with no truncation for the checks above to see.
+FIRST ``Content-Length``, parsed with :func:`int`. So ``Transfer-Encoding: gzip, chunked`` beside
+``Content-Length: 3`` reads three bytes of raw chunk framing, two ``Content-Length`` fields of 3
+and 5 read whichever came first, and ``Content-Length: 1_0`` reads ten bytes. Each of those would
+hand a wrong body to the caller as the peer's answer, with no truncation for the checks above to
+see.
 :func:`reply_framing_fault` refuses them before any body byte is read, under RFC 9112 section 6.
 See its docstring for the shapes and for why each one is refused.
 """
@@ -259,9 +260,7 @@ def drain_bounded(
         return
 
 
-#: Statuses whose reply has no body whatever its headers say (RFC 9112 section 6.3, rule 1).
-#: ``http.client`` sets ``length = 0`` for these before any read, so their framing headers frame
-#: nothing. A ``304`` routinely carries the ``Content-Length`` of the representation it stands for.
+#: Statuses whose reply has no body (RFC 9112 section 6.3, rule 1). See reply_framing_fault.
 _BODYLESS_STATUSES = frozenset({204, 304})
 
 
@@ -291,9 +290,15 @@ def reply_framing_fault(reader: object) -> str | None:
     * A ``Content-Length`` that is all digits but that ``http.client`` could not parse, so it left
       the length unset and would read to close. Past 4300 digits :func:`int` refuses the string.
 
-    A ``204``, a ``304``, any ``1xx`` and any reply to ``HEAD`` have no body, so their headers are
-    not checked. A reader with no parsed headers, such as a binary file handle, has no framing to
-    refuse and returns ``None``.
+    A reply to ``HEAD`` is not checked: ``http.client`` returns no body for it whatever the headers
+    say. A ``204``, a ``304`` and any ``1xx`` have no body either, and ``http.client`` sets
+    ``length = 0`` for them, so a ``Content-Length`` there frames nothing; a ``304`` routinely
+    carries its representation's length. But ``http.client`` tests ``chunked`` before ``length``,
+    so ``Transfer-Encoding`` on one of those statuses would still make it read a chunked body that
+    section 6.3 says does not exist. That one header is refused there, and nothing else is checked.
+
+    A reader with no parsed headers, such as a binary file handle, has no framing to refuse and
+    returns ``None``.
 
     The reason strings are fixed text and never echo a header value.
     """
@@ -301,15 +306,15 @@ def reply_framing_fault(reader: object) -> str | None:
     get_all = getattr(headers, "get_all", None)
     if not callable(get_all):
         return None
-    status = getattr(reader, "status", None)
-    if isinstance(status, int) and (status in _BODYLESS_STATUSES or 100 <= status < 200):
-        return None
     # A private attribute, read defensively: HTTPResponse keeps the request method only there, and
     # HTTPError delegates attribute reads to the response it wraps.
     if getattr(reader, "_method", None) == "HEAD":
         return None
     te_fields: list[str] = [str(v) for v in (get_all("Transfer-Encoding") or [])]
     cl_fields: list[str] = [str(v).strip(" \t") for v in (get_all("Content-Length") or [])]
+    status = getattr(reader, "status", None)
+    if isinstance(status, int) and (status in _BODYLESS_STATUSES or 100 <= status < 200):
+        return "Transfer-Encoding on a response that has no body" if te_fields else None
     if te_fields:
         if getattr(reader, "version", None) == 10:
             return "Transfer-Encoding on an HTTP/1.0 response"

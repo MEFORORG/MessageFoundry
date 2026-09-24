@@ -253,7 +253,7 @@ def exchange_code(
 
     ``opener`` is injected (production supplies a hardened, CA-pinned, no-redirect opener). A
     confidential client sends ``client_secret_post``; a public client omits it and relies on PKCE.
-    Raises :class:`FlowError` on any non-2xx, misframed, oversized, or non-JSON response — PHI/secret-safe: the
+    Raises :class:`FlowError` on a non-2xx, misframed, oversized or non-JSON response — PHI/secret-safe: the
     secret, the ``code``, and the tokens never enter an exception message.
 
     The request line and header block are **measured before the POST** (ASVS 4.2.5, BACKLOG #1048).
@@ -301,7 +301,7 @@ def exchange_code(
         method="POST",
     )
     # BACKLOG #1125 (ASVS 4.2.1): a reply whose length framing is ambiguous is refused before its
-    # body is read, by the same rule every egress connector applies. Imported here to match the
+    # body is read, by the rule read_bounded applies to connector replies. Imported here to match the
     # length helper's import above; FlowError keeps it on the audited login-failure path.
     from messagefoundry.transports.bounded_read import (  # noqa: PLC0415  (matches the import above)
         reply_framing_fault,

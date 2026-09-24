@@ -33,6 +33,7 @@ from messagefoundry.config.wiring import Rest, Soap
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.bounded_read import (
+    AmbiguousFramingError,
     EgressReplyError,
     drain_bounded,
     read_bounded,
@@ -79,6 +80,10 @@ _AMBIGUOUS: dict[str, bytes] = {
     "length-list-5-5": _OK + b"Content-Length: 5, 5\r\n\r\nhello",
     # read b"hello": Transfer-Encoding on HTTP/1.0
     "http10-chunked": b"HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" + _CHUNKS,
+    # read b"hello" as the body of a 204, a status with no body; and the TE+CL shape refused on a 200
+    "no-content-chunked": b"HTTP/1.1 204 No Content\r\n"
+    + b"Transfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\n"
+    + _CHUNKS,
     # read b"hello": chunked applied twice, which RFC 9112 section 6.1 forbids
     "chunked-twice": _OK
     + b"Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n"
@@ -173,9 +178,7 @@ def _rest(url: str) -> RestDestination:
 
 
 def _assert_framing_refusal(exc: BaseException) -> None:
-    # By name as well as by family, so this reads the same whether or not the class is importable.
-    assert isinstance(exc, EgressReplyError)
-    assert type(exc).__name__ == "AmbiguousFramingError"
+    assert isinstance(exc, AmbiguousFramingError)
     assert "framed its response body ambiguously" in str(exc)
 
 
@@ -269,14 +272,29 @@ def _wire(raw: bytes, method: str = "GET") -> http.client.HTTPResponse:
     return resp
 
 
-def test_a_bodyless_reply_is_not_checked() -> None:
-    """A 304 routinely carries its representation's Content-Length, and neither a 204 nor a reply
-    to HEAD has a body to misframe."""
-    both = b"Transfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\n"
-    assert reply_framing_fault(_wire(b"HTTP/1.1 304 Not Modified\r\n" + both)) is None
-    assert reply_framing_fault(_wire(b"HTTP/1.1 204 No Content\r\n" + both)) is None
-    assert reply_framing_fault(_wire(_OK + both, method="HEAD")) is None
-    assert reply_framing_fault(_wire(_OK + both)) is not None  # the control
+def test_a_bodyless_reply_is_read_as_empty_whatever_its_length_says() -> None:
+    """A 304 routinely carries its representation's Content-Length, and http.client reads no body
+    for it. Measured by reading, not by the guard's return value alone."""
+    raw = b"HTTP/1.1 304 Not Modified\r\nContent-Length: 3\r\nContent-Length: 5\r\n\r\nhello"
+    assert read_bounded(_wire(raw), connector="c") == b""
+    raw = b"HTTP/1.1 204 No Content\r\nContent-Length: 1_0\r\n\r\nhello"
+    assert read_bounded(_wire(raw), connector="c") == b""
+
+
+def test_a_304_carrying_a_chunked_body_is_refused() -> None:
+    """A 304 is non-2xx, so urllib raises it as HTTPError and no connector captures it. The reader
+    still sees it on the fault-body path, where http.client would read b"hello" before the fix."""
+    raw = b"HTTP/1.1 304 Not Modified\r\nTransfer-Encoding: chunked\r\n\r\n" + _CHUNKS
+    with pytest.raises(AmbiguousFramingError):
+        read_bounded(_wire(raw), connector="c")
+
+
+def test_a_reply_to_head_is_read_as_empty_whatever_its_framing_says() -> None:
+    both = b"Transfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\n" + _CHUNKS
+    resp = _wire(_OK + both, method="HEAD")
+    assert reply_framing_fault(resp) is None
+    assert read_bounded(resp, connector="c") == b""
+    assert reply_framing_fault(_wire(_OK + both)) is not None  # the control: the same bytes to GET
 
 
 def test_a_length_http_client_cannot_parse_is_refused() -> None:
@@ -312,8 +330,6 @@ def test_drain_bounded_does_not_refuse_framing() -> None:
 
 
 def test_the_refusal_is_transient_and_in_the_reply_family() -> None:
-    from messagefoundry.transports.bounded_read import AmbiguousFramingError
-
     assert issubclass(AmbiguousFramingError, EgressReplyError)
     assert issubclass(AmbiguousFramingError, DeliveryError)
     assert not issubclass(AmbiguousFramingError, NegativeAckError)
