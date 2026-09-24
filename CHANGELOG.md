@@ -34,11 +34,12 @@ number cites the project's private planning ledger, so it has no public page.
   truncated tail; `[integrity].audit_anchor_file`, also in Added, gives it an anchor.
   (BACKLOG #328)
 - **`[integrity].audit_anchor_file` — the startup audit check can now hold an anchor, so it can see a
-  truncated tail.** `audit-anchor` / `audit-verify --expected-anchor`, also in Added, landed first.
-  It left `[integrity].audit_verify_on_start` a bare walk, blind to a truncated tail. **With this key
-  and `audit_verify_on_start = true` both set, that is no longer true.** Point the new key at the
-  `COUNT:HEAD` file `messagefoundry audit-anchor` writes, and every startup that runs the check
-  compares against it. The key alone arms nothing: with
+  truncated tail.** `audit-anchor` / `audit-verify --expected-anchor`, also in Added, check an anchor
+  on demand. On its own, `[integrity].audit_verify_on_start` is a bare walk, blind to a truncated
+  tail. **With this key and `audit_verify_on_start = true` both set, the startup check can see one.**
+  Save the `COUNT:HEAD` line `messagefoundry audit-anchor` prints to a UTF-8 file, and point the new
+  key at it; every startup that runs the check compares against it. (PowerShell 5.1's `>` writes
+  UTF-16, which the engine cannot read.) The key alone arms nothing: with
   `audit_verify_on_start` left at its default of `false`, startup logs a WARNING that the anchor is
   never read. Leave the key empty (the default) and the walk is byte-identical to before.
   **It consumes the anchor as a PREFIX, not as the CLI's exact seal, and that is the whole reason a
@@ -183,9 +184,9 @@ number cites the project's private planning ledger, so it has no public page.
   **Who this bites:** every AD account row that 0.3.2 created has no stored id. Its first 0.4.0
   sign-in through a directory that returns `objectGUID` is therefore refused as
   `directory_identity_conflict`. **Migration:** an administrator deletes each such MessageFoundry
-  user row (`DELETE /users/{user_id}`; on a store created by 0.3.2, first apply the migration in the
-  BREAKING saved-search entry below, which runs before the first 0.4.0 start), and the person's next
-  directory sign-in creates a new row bound to the id. Uploaded files, saved search presets and a
+  user row (`DELETE /users/{user_id}`; on a store created by 0.3.2, the operator must first apply the
+  migration in the BREAKING saved-search entry below, before the first 0.4.0 start), and the person's
+  next directory sign-in creates a new row bound to the id. Uploaded files, saved search presets and a
   per-user channel scope keyed to the old row do not carry over. (BACKLOG #1471)
 - **The directory session reconciler is keyed on that same immutable id, and the stored username is
   now a cache the directory refreshes.** Identifying a login by `objectGUID` while
@@ -248,7 +249,7 @@ number cites the project's private planning ledger, so it has no public page.
   `ChannelScope`) travel in both directions; they carry the request rule because a dropped key on the
   RBAC writes is a mis-grant, so adding a field to one of them needs the client bump in the same
   release. **Migration:** send only the keys each route defines. The `422` lists every refused key
-  as its own `detail` entry, of type `extra_forbidden`. The key sits in `loc`, as in
+  as its own `detail` entry, of type `extra_forbidden`. The key is the last element of `loc`, as in
   `["body", "limt"]`. Fix its spelling or drop it. (BACKLOG #1109)
 - **BREAKING — a `fhir_lookup` search value now states its KIND, and a plain string carrying one of
   FHIR's value-layer separators is refused rather than sent.** Percent-encoding is a URL-layer
@@ -967,8 +968,9 @@ number cites the project's private planning ledger, so it has no public page.
   log is legitimately empty — sealing a fresh instance as `0:` is a supported workflow — and refuses
   only the non-audit-database paths.
   **Migration:** on an empty log, a scheduled `audit-verify` job now gets exit 3 where 0.3.2 gave
-  it 0. If an empty log is expected, as on a new instance, pass `--allow-empty` or
-  `--expected-anchor 0:`. Anywhere else, treat 3 as a finding. `audit-verify` and `rekey-audit` now
+  it 0. If an empty log is expected, as on a new instance, pass `--allow-empty`. Not
+  `--expected-anchor 0:`, which is an exact seal and fails once the log gains a row. Anywhere else,
+  treat 3 as a finding. `audit-verify` and `rekey-audit` now
   exit 2 on a SQLite `--db` with no `audit_log` table, a zero-byte file included. A file that is not
   a database also gets exit 2. Check that each job names the live store. (BACKLOG #1669)
 - **BREAKING — `verify --smoke self` reported PASS on a synthetic message the config would have
