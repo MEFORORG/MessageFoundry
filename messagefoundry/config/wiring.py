@@ -709,6 +709,11 @@ def FhirLookup(
     # to name — a deviation the registry cannot see is a second posture by the back door.
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
+    # ADR 0173: the per-connection revocation attestation for this lookup's SMART token hop, the one
+    # verifying hop on a lookup that carries the revocation refusal. That refusal names this lever, so
+    # it must be authorable here too.
+    tls_revocation_attested: bool = False,
+    tls_revocation_attested_reason: str | None = None,
 ) -> FhirLookupSpec:
     """Declare a named live-lookup FHIR connection (ADR 0043). A Handler reads it at run time with
     ``fhir_lookup(name, query, params)`` — a **read-only** read-by-id (``fhir_lookup(name,
@@ -743,12 +748,18 @@ def FhirLookup(
     plus an audit record at every construction, and an entry in ``security_loosenings()`` /
     ``GET /security/posture`` naming this connection. Same flag/reason coherence rules as an
     ``outbound()``: the flag without a reason, a blank reason, or a reason without the flag all fail
-    loud at load."""
+    loud at load.
+
+    ``tls_revocation_attested`` / ``tls_revocation_attested_reason`` (ADR 0173) attest that a
+    revocation-checking PKI covers the SMART token endpoint this lookup signs in to, so an enforcing
+    instance does not refuse that verifying hop. Same coherence rules, and the reason is recorded in
+    the WARNING logged when the attestation suppresses the refusal."""
     _reject_envref_headers("FhirLookup", headers)
     # ADR 0153: coherence-checked at the ONE authoring surface, exactly as build_outbound_connection
     # does for an outbound, so the declaration cannot reach the read executor unvalidated.
     try:
         _check_cleartext_acceptance(cleartext_accepted, cleartext_reason)
+        _check_revocation_attestation(tls_revocation_attested, tls_revocation_attested_reason)
     except ValueError as exc:
         raise WiringError(f"fhir lookup {name!r}: {exc}") from exc
     settings: dict[str, Any] = {
@@ -768,6 +779,10 @@ def FhirLookup(
         settings["cleartext_accepted"] = True
         settings["cleartext_reason"] = cleartext_reason
         settings["cleartext_connection"] = name
+    if tls_revocation_attested:
+        # The same keys _dest_config mirrors for an outbound, read by token_provider_from_settings.
+        settings["tls_revocation_attested"] = True
+        settings["tls_revocation_attested_reason"] = tls_revocation_attested_reason
     spec = FhirLookupSpec(name, settings)
     _active_registry().add_fhir_lookup(spec)
     return spec

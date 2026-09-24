@@ -724,8 +724,9 @@ ungated, never covered by an "every verifying hop" sentence; a weakening with no
 on it — **reported is not gated**, and the two must never be written as if either implied the other;
 and a field with no factory parameter and no `connections.toml`
 key (`tls_hop_attested`) must never be offered as an operator lever. (`tls_revocation_attested` left
-this list when it gained both, under ADR 0173; `tests/test_hop_refusal_revocation.py` and
-`tests/test_hop_refusal_wiring.py` pin that every lever the revocation refusals name is settable.)
+this list when it gained both, under ADR 0173. `tests/test_hop_refusal_revocation.py` and
+`tests/test_hop_refusal_wiring.py` pin that this one lever is settable wherever the connection
+refusals name it; they do not check the other levers those refusals name.)
 Two more rules of thumb: state a control **with its default and its off-switch** (`require_sign_in`,
 `enforcement`), and never describe `[egress]` as bounding a *transform* —
 it bounds declared **destinations**.

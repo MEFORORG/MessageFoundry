@@ -182,6 +182,47 @@ def test_the_same_inbound_unattested_is_still_refused(tmp_path: Path) -> None:
         check_inbound_revocation(src, "IB", posture=_ENFORCING)
 
 
+def test_dest_config_mirrors_the_pair_for_the_smart_token_hop(tmp_path: Path) -> None:
+    # The SMART token-endpoint provider reads a settings MAPPING, not the Destination, so the runner
+    # mirrors the declaration into the resolved settings. Without the mirror an attested REST/FHIR
+    # outbound with SMART auth would cross its data hop and be refused at its token hop.
+    attested = _dest_config(_toml(tmp_path, ob_extra=_TOML_ATTEST).outbound["OB"], {})
+    assert attested.settings["tls_revocation_attested"] is True
+    assert attested.settings["tls_revocation_attested_reason"] == _REASON
+    # CONTROL: an undeclared outbound gains no keys, so the two above are the mirror firing.
+    assert (
+        "tls_revocation_attested" not in _dest_config(_toml(tmp_path).outbound["OB"], {}).settings
+    )
+
+
+def test_fhir_lookup_can_author_the_attestation_its_smart_refusal_names(tmp_path: Path) -> None:
+    # A lookup's SMART token hop carries the revocation refusal, and that refusal names this lever,
+    # so FhirLookup() must be able to set it: it writes the keys the token provider reads.
+    (tmp_path / "lookup.py").write_text(
+        f"""
+from messagefoundry import FhirLookup
+
+FhirLookup("epic", url="https://ehr.example.org/fhir"{_ATTEST})
+FhirLookup("plain", url="https://ehr.example.org/fhir")
+""",
+        encoding="utf-8",
+    )
+    lookups = load_config(tmp_path, allow_empty=True).fhir_lookups
+    assert lookups["epic"].settings["tls_revocation_attested"] is True
+    assert lookups["epic"].settings["tls_revocation_attested_reason"] == _REASON
+    assert "tls_revocation_attested" not in lookups["plain"].settings  # control
+
+
+def test_fhir_lookup_flag_without_reason_is_refused(tmp_path: Path) -> None:
+    (tmp_path / "lookup.py").write_text(
+        "from messagefoundry import FhirLookup\n"
+        'FhirLookup("epic", url="https://ehr.example.org/fhir", tls_revocation_attested=True)\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(WiringError, match="requires tls_revocation_attested_reason"):
+        load_config(tmp_path, allow_empty=True)
+
+
 def test_the_outbound_audit_line_carries_the_reason(caplog: pytest.LogCaptureFixture) -> None:
     guard = RevocationHopGuard.capture(
         host="collector.example.org",
