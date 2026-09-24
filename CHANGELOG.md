@@ -296,11 +296,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   `[auth].oidc_tls_crl_file` now stops `serve`. The refusal comes when the API is built, after the
   engine has started its listeners and workers. Neither `messagefoundry check` nor
   `messagefoundry verify` reports it ahead of time. ADR 0173 section 4.3 called for this guard,
-  and its AC-4 records these limits. **Migration:** with OIDC on, set `[auth].oidc_tls_crl_file`
-  to a PEM file holding a CRL from each CA that issues the token and JWKS endpoint certificates.
-  Put only CRLs in it, because a certificate in that file becomes a trusted root for this hop.
-  `[security].enforcement = "warn"` also lets `serve` start, but it turns every enforce-only
-  refusal in the instance into a warning, not this one alone. (`BACKLOG #1887`)
+  and ADR 0173 AC-4 records these limits. **Migration:** with OIDC on, set
+  `[auth].oidc_tls_crl_file` to a PEM file holding a CRL from each CA that issues the token and
+  JWKS endpoint certificates. Put only CRLs in it, because a certificate in that file becomes a
+  trusted root for this hop. `[security].enforcement = "warn"` also lets `serve` start, but it
+  turns every enforce-only refusal in the instance into a warning, not this one alone.
+  (`BACKLOG #1887`)
 - **BREAKING — the `Direct()` S/MIME envelope now encrypts its content with AES-256-CBC.** Engine
   0.4.0 set no content cipher, so the `cryptography` library chose its default, AES-128-CBC. The
   mode is still CBC, and the content key is still wrapped with RSAES-PKCS1-v1_5. Signing is
