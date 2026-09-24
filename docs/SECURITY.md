@@ -1393,6 +1393,7 @@ listen source. The refusal action differs materially per listener, so each has i
 | **HTTP** | peer socket address | not in `source_ip_allowlist` | **DENY** — a real `403 {"error":"forbidden"}` is written to the peer, then close; WARNING log + `peer_not_allowlisted` event |
 | **DICOM C-STORE SCP** | `event.assoc.requestor.address` | not in `source_ip_allowlist` | **DENY** — DIMSE status **`0x0124` (Not Authorized)** returned **before any durable commit**; WARNING log naming the peer IP and calling AE; **no connection event** |
 | **MLLP / HTTP / DICOM** — peer client certificate | the TLS peer certificate presented at handshake | `tls = true` **and** `tls_ca_file` set → `ssl.CERT_REQUIRED` plus strict RFC 5280 verify flags; no client certificate, or one not issued by that CA | **DENY** — the TLS handshake fails and the connection **never reaches the accept path**, so there is **no** connection event and no allow-list evaluation. `tls_ca_file` unset → server-only TLS and no peer-certificate decision. TCP and X12 have no inbound TLS at this release |
+| **HTTP** — intake authentication (`intake_auth`, ADR 0154 D6) | the credential a peer presents: the `intake_api_key_header` header (default `x-api-key`) under `api_key`, `Authorization: Bearer` under `bearer`, or the verified client certificate's `CN:` / `SAN:` names under `mtls_subject` | `intake_auth` is not `none` and the credential is missing or wrong, or the certificate's names are not in `intake_client_subjects`. **The default is `intake_auth = "none"`, which checks no credential: a default HTTP inbound admits any peer the rows above admit.** `GET`/`HEAD` probes are inside the check unless `intake_auth_health = "allow"` | **DENY** — `401` for a missing or wrong credential (read before any body byte), `403` for a verified certificate with an unlisted subject, `429` + `Retry-After: 60` once the peer's failed-attempt budget (`intake_auth_rate_limit`, 10/min) or the global one (`intake_auth_rate_limit_global`, 60/min) is spent; nothing is committed. Audited `intake.auth_failed` / `intake.auth_subject_denied` / `intake.auth_rate_limited`, plus a connection event. Off loopback, a listener with no effective peer control — no `intake_auth`, and no `source_ip_allowlist` whose every entry is at least a /8 (IPv4) or a /32 (IPv6) — is refused at start under `[security].enforcement = enforce` and only warned otherwise |
 | **DICOM** — calling AE | the requesting AE's Calling AE Title, at **association negotiation** | `calling_ae_allowlist` set and the title is not in it | **DENY** — the association is rejected by pynetdicom before any C-STORE callback runs (`ae.require_calling_aet`). `None` = any AE the peer-IP allow-list admits |
 | **DICOM** — called AE | the AE Title the peer addressed the association to | not this engine's own `ae_title` | **DENY** at negotiation (`ae.require_called_aet`); **default `require_called_ae_title = true`** |
 | **DICOM** — peer-control construction gate | the SCP's bind host × the presence of a **verifiable** peer control | non-loopback bind with **neither** `source_ip_allowlist` (an `inbound(...)` keyword — for a DICOM SCP the ONLY surface, since `DICOM()` is not authorable in `connections.toml`) **nor** mTLS (`tls` + `tls_ca_file` → `CERT_REQUIRED`). **NOTE:** `calling_ae_allowlist` does **not** satisfy this gate alone (BACKLOG #316): an AE Title is caller-asserted with no cryptographic binding, so it is still enforced as a filter but must be **paired** with one of the two above | **DENY at construction** (ValueError). The connection degrades per ADR 0031 startup fault isolation and the fault surfaces under `messagefoundry check` / dry-run. Loopback hosts are exempt |
@@ -1695,7 +1696,10 @@ twelve as examples. That description was wrong in a way a reader could act on: f
 connection to this application, to a vendor, or to HL7, so a passphrase chosen on the strength of the
 old sentence could still be refused with no indication of which rule fired. The list above is the
 whole of it, mirrored from `CONTEXT_WORDS` in
-[`auth/policy.py`](../messagefoundry/auth/policy.py); the code is the authority if the two diverge.
+[`auth/policy.py`](../messagefoundry/auth/policy.py).
+`tests/test_security_doc_context_words.py` pins this
+list to `CONTEXT_WORDS`, so a term added to or dropped from either one without the other fails the
+build rather than leaving the two to diverge.
 
 **What a deploying site can and cannot tune here.** `password_check_context` is a whole-list on/off
 switch, on by default. There is **no** setting that adds a site's own terms — its hospital
@@ -1718,9 +1722,15 @@ Two further screens (ASVS 6.2.11 / 6.2.12), both on by default and fully offline
 
 ### Authentication pathways — comparative strength
 
-**Five** authentication pathways ship: **three** interactive sign-ins (Local, Kerberos/SPNEGO,
+**Six** authentication pathways ship: **three** interactive sign-ins (Local, Kerberos/SPNEGO,
 OIDC), the **AD directory bind** — retained for step-up re-authentication after its sign-in was
-retired — and the non-interactive mTLS service-identity plane.
+retired — and **two** non-interactive planes: the mTLS service-identity plane on the engine API, and
+**HTTP intake authentication** (`intake_auth`) on the ingest plane. The first five authenticate a
+caller to the engine API. The sixth authenticates a partner submitting messages to one inbound HTTP
+connection; it mints no identity, opens no session and grants no read. It counts as a pathway by owner
+ruling (2026-09-23). **Its default is `intake_auth = "none"`: a default HTTP inbound checks no
+credential and admits any peer the network rules let through** (see its row below and
+[Table B](#table-b--data-plane-ingest-listeners)).
 
 | Pathway | Factor | Brute-force defense | Notes |
 |---|---|---|---|
@@ -1729,6 +1739,7 @@ retired — and the non-interactive mTLS service-identity plane.
 | **Kerberos / SPNEGO** | domain ticket **plus an engine second factor**. No `amr`-equivalent evidence reaches the engine, so the ticket proves nothing about directory-side factor strength and the session is issued **MFA-pending** (BACKLOG #1144). It used to be issued **MFA-satisfied** under a delegated-directory relaxation, which cleared every engine MFA gate on zero engine-readable evidence; that grant is retired. While `[security].require_mfa` is on, an un-satisfied directory session reaches only the MFA-pending-exempt routes, and its holder enrols a TOTP or a passkey on the same routes a local account uses. Set `require_mfa = false` for the earlier single-factor posture | the **domain's** controls; engine-side, the sign-in window on the token-bearing leg (`[auth].login_rate_limit_enabled`, default on — **off leaves this pathway with no engine-side control at all**; the RFC 4559 challenge leg is deliberately unthrottled either way) | experimental, off by default, **single-leg — no mutual authentication**, channel binding deliberately un-enforced. The browser leg (`GET /ui/sso`) mints with no step-up window, so the first sensitive action forces a step-up; the JSON `POST /auth/negotiate` seeds it |
 | **OIDC federation** (browser only, hybrid AD-backed) | IdP-asserted, gated on a **signature-verified** `amr`/`acr` claim (`[auth].oidc_require_mfa_claim` defaults **on**) — an assertion, not a proof | no engine credential to guess, so no per-account lockout; both legs (`/ui/oidc/start`, `/ui/oidc/callback`) charge the sign-in window (`[auth].login_rate_limit_enabled`, default on — **off leaves this pathway with no engine-side control at all**, though the bounded pending-flow cache still caps concurrent start legs), plus the IdP's own lockout | hybrid-only: a federated principal with no on-prem AD object is refused. Roles come from LDAP, never from a token claim. When `[auth].oidc_username_strip_domain` is on (default), the claim's UPN suffix must match `oidc_allowed_username_domains` (or `[auth].ad_domain`); with stripping **off** the claim is used verbatim and no suffix check applies. The session's absolute lifetime is capped at the verified `id_token.exp`; minted with no step-up window |
 | **mTLS service identity** (non-interactive, ADR 0083) | a **verified** client certificate mapped through a deny-by-default, name-space-qualified allow-list (`CN:` / `SAN:<type>:`) | **not applicable** — no guessable secret and no lockout; admission requires a chain verifying to the pinned client CA plus a listed qualified name | no session, no MFA, no step-up — which is why it is **PHI-fenced**: `require_service_cert` raises at **app construction** if asked to gate a PHI-view permission. One route only (`GET /service/identity`); every success is audited `service_cert_auth` |
+| **HTTP intake authentication** (non-interactive, ingest plane, ADR 0154 D6) | per inbound `Http()` connection, `intake_auth` picks one of `none`, `api_key`, `bearer` or `mtls_subject`. **The default is `none`: no credential is checked, so any peer the network rules admit may submit.** `api_key` and `bearer` compare a shared secret (`intake_api_key`, `env()` only, with an `intake_api_key_next` rotation slot) in constant time; `mtls_subject` maps a client certificate already verified against `tls_ca_file` through the qualified `intake_client_subjects` allow-list | **per-peer and global failed-attempt budgets** (`intake_auth_rate_limit` 10/min, `intake_auth_rate_limit_global` 60/min, `429` + `Retry-After: 60` when spent); a successful attempt never spends budget. **No per-account lockout** — there is no account | authorises *submitting* only: no session, no MFA, no step-up, no read. A missing or wrong credential gets `401` before any body byte is read; a verified certificate with an unlisted subject gets `403`. Each refusal is audited `intake.auth_failed` / `intake.auth_subject_denied` / `intake.auth_rate_limited`. Off loopback, a listener with no effective peer control — no `intake_auth` and no narrow `source_ip_allowlist` — is refused at start under `[security].enforcement = enforce` and only warned otherwise |
 
 Comparative properties on the dimensions the table's four columns cannot carry:
 
@@ -1739,13 +1750,17 @@ Comparative properties on the dimensions the table's four columns cannot carry:
 | **Kerberos** | none (single-leg, no channel binding) | ticket lifetime is the domain's | **none** — the acceptor keytab/SPN is OS-owned | an **engine** factor (TOTP or passkey), enrolled and satisfied at the engine — the ticket asserts nothing the engine can read, so nothing is delegated (BACKLOG #1144) | as AD |
 | **OIDC** | the IdP's, not the engine's | strongest of the four: server-side PKCE verifier + `state` (constant-time compare) + `nonce`, single-use flow, a `__Host-`-prefixed browser-binding cookie the callback requires, and a `typ`/kid/alg/signature/`events`/`iss`/`aud`/`exp`/`iat`/`nbf`/`nonce`/`sub` ladder under a bounded clock skew — `typ` and `events` assert the token **class** (an access token or a logout token carries the same issuer and key), and `sub`/`iat` are required rather than optional | **none** — only the confidential-client secret (env-only or a `[secrets]` reference, resolved eagerly at startup) | asserted via `amr`/`acr` **and enforced** — with `[auth].oidc_require_mfa_claim` on (default) a token carrying no configured `amr`/`acr` is refused at claims validation, and only then is the session minted MFA-verified; switch it off and the federated session is minted **un**verified, which `mfa_satisfied` refuses. This is the one directory leg whose factor the engine actually verifies | as AD, plus the `id_token.exp` cap; no refresh tokens and no RP-initiated logout |
 | **mTLS** | n/a (no interactive ceremony) | n/a | **none** — the engine holds only the pinned client CA and the name map | none, structurally | **no revocation checking** — `VERIFY_X509_STRICT` is strict path validation, not OCSP/CRL; live revocation is the org's PKI. Engine-side: remove the allow-list entry (config change → restart) or disable the mapped account |
+| **HTTP intake** | `api_key` / `bearer`: none, the shared secret is phishable like any password; `mtls_subject`: the client certificate's | `api_key` / `bearer`: none beyond TLS, and a listener without `tls` sends the secret in cleartext; `mtls_subject`: the TLS handshake | **none** in the store — `intake_api_key` / `intake_api_key_next` must be `env()` references, never inline; for `mtls_subject` the engine holds only `tls_ca_file` and the subject list | none, structurally | change the `env()` secret (the `intake_api_key_next` slot avoids an outage) or drop the subject from `intake_client_subjects`; `tls_crl_file` adds opt-in CRL checking for `mtls_subject` |
 
 **Where each pathway is enforced, and what turns it on:** Local → `POST /auth/login` + `POST /ui/login`
-(always available); AD → the same two routes with `provider=ad` (`[auth].ad_enabled`); Kerberos →
+(always available); AD → the step-up re-bind at `POST /me/reauth` + `POST /ui/reauth`
+(`[auth].ad_enabled`), while `provider=ad` on the two sign-in routes is refused and audited; Kerberos →
 `POST /auth/negotiate` + `GET /ui/sso` (`[auth].kerberos_enabled`, default off); OIDC →
 `GET`/`POST /ui/oidc/start` + `GET /ui/oidc/callback`, registered **only** when `[auth].oidc_enabled` (default
 off, and it additionally requires `ad_enabled`); mTLS → `GET /service/identity`, active only when
-`[api].tls_client_cert_identities` **and** `[api].tls_client_ca_file` are both set (default `{}` = off).
+`[api].tls_client_cert_identities` **and** `[api].tls_client_ca_file` are both set (default `{}` = off);
+HTTP intake → the inbound `Http()` listener's own socket, per connection, active only when that
+connection sets `intake_auth` to something other than its default `none`.
 
 **A second gate applies to the three browser legs.** `POST /ui/login`, `GET /ui/sso` and the two
 `GET /ui/oidc/*` routes are registered by the separately versioned web-console wheel, which is mounted
@@ -1788,9 +1803,16 @@ all**, while Local keeps its per-account lockout and the AD step-up bind keeps i
 dedicated off switch*. That one flag therefore **widens** the strength gap between the local and the
 delegated pathways rather than narrowing it, and an operator turning it off must have the directory's
 lockout policy carrying the whole load. OIDC has no engine credential to lock out; the mTLS plane has
-no guessable secret at all, so no rate limit or lockout applies to it. **A genuine second factor is built
-for local accounts only** — TOTP (WP-14) *and* WebAuthn passkeys (WP-14b), the latter being the only
-phishing-resistant factor shipped; `[security].require_mfa` defaults **on** and its shipped scope is
+no guessable secret at all, so no rate limit or lockout applies to it. HTTP intake authentication
+(`intake_auth`) has no account to lock, so its `api_key` / `bearer` secret is bounded only by its own
+per-peer and global failed-attempt budgets. Those are set per connection, not under `[auth]`, and
+`0` or `None` turns either one off. It also ships as `none`, so a default HTTP inbound authenticates no
+one. **An engine second factor
+is built for every account, directory ones included** (BACKLOG #1144) — TOTP (WP-14) *and* WebAuthn
+passkeys (WP-14b), the latter being the only phishing-resistant factor shipped. A directory
+account (Kerberos or OIDC) enrolls on the same routes a local account uses. An earlier revision said
+the factor was built "for local accounts only", which stopped being true when the enrollment ceremonies
+began accepting a directory account. `[security].require_mfa` defaults **on** and its shipped scope is
 **`every_local_account`** rather than the Administrator role, and it is enforced as an **access gate, not
 only at the step-up boundary** — an MFA-pending session is refused on every authorized route. An earlier
 revision of this sentence asserted the opposite on both counts and named the `[auth]` keys the loader
@@ -1899,10 +1921,14 @@ deny re-authentication — and therefore every step-up action — to every signe
 holding a credential.
 
 **What a tripped control looks like (6.1.1's "consequences of these defenses being triggered").**
-Control 1 refuses before any verify and audits the refusal — but the event name differs per leg:
-`auth.login_locked` on the local password path (`messagefoundry/auth/service.py:808`), `auth.mfa_failed` with
-`reason=locked` on the TOTP/recovery leg (`:2390-2394`), and `auth.webauthn_failed` with
-`reason=locked` on the assertion leg (`:2797-2801`). Controls 2 and 3
+Control 1 refuses before checking the presented credential and audits the refusal. (The password
+path still hashes against a dummy value first, so a locked account answers in about the time a real
+check takes.) The event name differs per leg:
+`auth.login_locked` on the local password path (`AuthService._login_local` in
+`messagefoundry/auth/service.py`), `auth.mfa_failed` with `reason=locked` on the TOTP/recovery leg
+(`AuthService.verify_mfa`), and `auth.webauthn_failed` with `reason=locked` on the assertion leg
+(`AuthService.finish_webauthn_assertion`). They are cited by method rather than line because the line
+numbers drifted. Controls 2 and 3
 return **429**. `Retry-After: 30` is carried by `POST /ui/login` (control 2) and by `POST /ui/reauth`,
 `POST /ui/reauth/webauthn` and `POST /ui/mfa` (control 3); the three JSON sign-in routes, the three JSON ceremony
 routes (`POST /me/password`, `POST /me/reauth`, `POST /me/mfa/confirm`, all via

@@ -17,8 +17,11 @@ from __future__ import annotations
 
 import ast
 import inspect
+import typing
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from _mfa_grant import mfa_grant_values
@@ -30,6 +33,7 @@ from messagefoundry.auth.permissions import Permission, Role
 from messagefoundry.auth.policy import PasswordPolicy
 from messagefoundry.auth.service import AuthProvider, AuthService
 from messagefoundry.config.settings import ApiSettings, AuthSettings
+from messagefoundry.config.wiring import Http
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DOC = _ROOT / "docs" / "SECURITY.md"
@@ -41,18 +45,25 @@ _LOGIN_ENTRY_POINTS = frozenset(
     {"login", "authenticate_kerberos", "complete_oidc_login", "authenticate_oidc"}
 )
 
-#: Row token -> the settings field whose existence proves the pathway still ships. ``None`` = always
-#: available (Local needs no switch). ``mTLS`` is the fifth, non-interactive pathway.
-_PATHWAY_ANCHORS: dict[str, tuple[type[BaseModel], str] | None] = {
+#: Row token -> the setting whose existence proves the pathway still ships: a settings-model field, or
+#: a parameter of a connector factory. ``None`` = always available (Local needs no switch). ``mTLS`` is
+#: the fifth pathway and the first non-interactive one; HTTP intake authentication is the sixth, on the
+#: ingest plane (owner ruling 2026-09-23: ``intake_auth`` IS an authentication pathway).
+_PATHWAY_ANCHORS: dict[str, tuple[type[BaseModel], str] | tuple[Callable[..., Any], str] | None] = {
     "**Local**": None,
     "**AD**": (AuthSettings, "ad_enabled"),
     "**Kerberos / SPNEGO**": (AuthSettings, "kerberos_enabled"),
     "**OIDC federation**": (AuthSettings, "oidc_enabled"),
     "**mTLS service identity**": (ApiSettings, "tls_client_cert_identities"),
+    "**HTTP intake authentication**": (Http, "intake_auth"),
 }
 
+#: Pathways that live on the INGEST plane rather than the engine API. Neither the ``AuthService``
+#: derivation nor the ``api.security`` factory derivation can see them, so they are counted here.
+_INGEST_PLANE_PATHWAYS = frozenset({"**HTTP intake authentication**"})
+
 #: Tokens the numbered-6.1.3 paragraph must enumerate — it is the artefact that cites the requirement.
-_PARAGRAPH_TOKENS = ("Local", "AD", "Kerberos", "OIDC", "mTLS")
+_PARAGRAPH_TOKENS = ("Local", "AD", "Kerberos", "OIDC", "mTLS", "intake_auth")
 
 #: Every public dependency factory in ``messagefoundry.api.security``. The interactive derivation
 #: above covers ``AuthService``; this covers the NON-interactive plane, which is where a new
@@ -154,8 +165,9 @@ def test_row_count_tracks_the_login_entry_points_in_code() -> None:
         "table and update this guard in the same change (ASVS 6.1.3)."
     )
     # complete_oidc_login + authenticate_oidc are two legs of ONE pathway, so 4 entry points collapse
-    # to 3 interactive pathways beyond Local; +Local +mTLS = 5 rows.
-    assert len(_PATHWAY_ANCHORS) == 5
+    # to 3 interactive pathways beyond Local; +Local +mTLS = 5 API-plane rows, +HTTP intake on the
+    # ingest plane = 6 (owner ruling 2026-09-23).
+    assert len(_PATHWAY_ANCHORS) == 6
     # BLIND SPOT CLOSED. The public-coroutine derivation above cannot see a sixth pathway added
     # through the EXISTING public entry point: ``login()`` dispatches on ``AuthProvider`` into a
     # PRIVATE ``_login_<provider>`` coroutine, so a new enum member + ``_login_saml`` would change
@@ -188,16 +200,20 @@ def test_every_pathway_row_is_anchored_to_a_live_code_artefact() -> None:
         assert token in block, f"the comparative-strength table has no {token} row"
         if anchor is None:
             continue
-        model, field = anchor
-        assert field in model.model_fields, (
-            f"{model.__name__}.{field} no longer exists, but docs/SECURITY.md still tabulates the "
+        owner, field = anchor
+        if isinstance(owner, type) and issubclass(owner, BaseModel):
+            present = field in owner.model_fields
+        else:
+            present = field in inspect.signature(owner).parameters
+        assert present, (
+            f"{owner.__name__}.{field} no longer exists, but docs/SECURITY.md still tabulates the "
             f"{token} pathway. Remove the row or fix the anchor."
         )
 
 
 def test_companion_table_covers_the_remaining_strength_dimensions() -> None:
     """The four primary columns cannot carry phishing/replay/storage/MFA/revocation, so a companion
-    table does — with the same five rows, in the same order."""
+    table does — with the same rows, in the same order."""
     tables = _tables(_section())
     companion = [
         t for t in tables if t[0][:2] == ["Pathway", "Phishing resistance"] and "Revocation" in t[0]
@@ -279,7 +295,7 @@ def test_mtls_row_states_the_phi_fence_that_the_code_enforces() -> None:
         assert claim in notes, f"the mTLS row must state {claim!r}"
 
 
-def test_the_numbered_paragraph_enumerates_all_five_pathways() -> None:
+def test_the_numbered_paragraph_enumerates_every_pathway() -> None:
     """The paragraph citing ASVS 6.1.3 by number is the scored artefact, so it must be complete."""
     block = _section()
     marker = "ASVS 6.1.3"
@@ -288,7 +304,49 @@ def test_the_numbered_paragraph_enumerates_all_five_pathways() -> None:
     missing = [t for t in _PARAGRAPH_TOKENS if t not in paragraph]
     assert not missing, (
         f"the ASVS 6.1.3 paragraph does not enumerate {missing}; it must state which controls do and "
-        "do not cover every one of the five pathways."
+        f"do not cover every one of the {len(_PATHWAY_ANCHORS)} pathways."
+    )
+
+
+def test_the_pathway_count_sentence_matches_the_row_set() -> None:
+    """The sentence that makes the count is what a reader quotes, so it must equal the rows.
+
+    It said **Five** while HTTP intake authentication shipped outside it; the owner ruled on
+    2026-09-23 that ``intake_auth`` is a sixth pathway, so a count that drifts from the row set again
+    reds here rather than going unnoticed.
+    """
+    words = {5: "Five", 6: "Six", 7: "Seven", 8: "Eight"}
+    expected = f"**{words[len(_PATHWAY_ANCHORS)]}** authentication pathways ship"
+    assert expected in _section(), (
+        f"the section must open with {expected!r}: the row set has {len(_PATHWAY_ANCHORS)} pathways."
+    )
+
+
+def test_the_intake_row_states_the_modes_and_the_unauthenticated_default() -> None:
+    """The HTTP intake row is derived from ``Http()``'s signature, not typed from memory.
+
+    RULE: the modes it names are exactly the ``intake_auth`` Literal, and it states the shipped
+    default plainly, because that default admits an unauthenticated peer.
+    """
+    param = inspect.signature(Http).parameters["intake_auth"]
+    # ``wiring.py`` uses postponed annotations, so the raw annotation is a string; resolve it.
+    modes = typing.get_args(typing.get_type_hints(Http)["intake_auth"])
+    assert param.default == "none" and "none" in modes, (
+        f"Http(intake_auth=...) now defaults to {param.default!r}; restate the intake rows and the "
+        "count sentence in docs/SECURITY.md."
+    )
+    row = next(r for r in _primary_table()[1:] if r[0].startswith("**HTTP intake"))
+    joined = " ".join(row)
+    missing = [m for m in modes if f"`{m}`" not in joined]
+    assert not missing, f"the HTTP intake row does not name the intake_auth mode(s) {missing}"
+    assert "The default is `none`" in row[1], (
+        "the HTTP intake Factor cell must state the unauthenticated default in so many words"
+    )
+    for claim in ("no session", "no mfa", "no step-up"):
+        assert claim in row[3].lower(), f"the HTTP intake row must state {claim!r}"
+    lead = _section().split("| Pathway |", 1)[0]
+    assert 'intake_auth = "none"' in lead, (
+        "the count sentence above the table must state the intake default, not leave it to a cell"
     )
 
 
@@ -504,8 +562,9 @@ def test_non_interactive_authentication_planes_are_enumerated_too() -> None:
         "to _NON_BEARER_FACTORIES."
     )
     assert factories >= _NON_BEARER_FACTORIES
-    assert len(_NON_BEARER_FACTORIES) + 4 == len(_PATHWAY_ANCHORS), (
-        "the four interactive pathways plus every non-bearer plane must equal the documented row set"
+    assert len(_NON_BEARER_FACTORIES) + 4 + len(_INGEST_PLANE_PATHWAYS) == len(_PATHWAY_ANCHORS), (
+        "the four interactive pathways plus every non-bearer plane plus the ingest-plane pathways "
+        "must equal the documented row set"
     )
 
 
