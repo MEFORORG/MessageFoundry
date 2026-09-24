@@ -16,8 +16,8 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -324,20 +324,84 @@ def test_the_check_does_not_claim_the_gate_is_off_when_it_read_no_settings(
     assert "graph only" in detail
 
 
-def test_the_posture_does_not_mark_an_inert_opt_out_as_accepted() -> None:
-    """With the refusal off an opt-out does nothing, and security_loosenings() says so; the posture
-    view's ``accepted`` must agree."""
-    from messagefoundry.api.models import StaticCredentialHopView
+async def _get_posture(
+    tmp_path: Path,
+    *,
+    graph: bool = True,
+    settings: ServiceSettings | None = None,
+    filtered: bool = False,
+) -> dict[str, Any]:
+    """GET /security/posture over the basic-auth graph, with the stashes a test chooses."""
+    import httpx
 
-    # The model carries the flag; the route decides it. Pin the rule the route applies.
-    settings = _settings(gate=False, accepted={"settings:store": "r"})
-    sec = settings.security
-    opt_outs = sec.static_credential_accepted if sec.require_nonstatic_credentials else {}
-    views = [
-        StaticCredentialHopView(**asdict(hop), accepted=hop.name in opt_outs)
-        for hop in static_credential_hops(registry=None, settings=settings)
-    ]
-    assert [(v.name, v.accepted) for v in views] == [("settings:store", False)]
+    from messagefoundry.api.app import create_app
+
+    cfg = tmp_path / "cfg"
+    _write_graph(cfg, basic=True)
+    registry_filter: Callable[[Registry], Registry] | None = (lambda r: r) if filtered else None
+    eng = await Engine.create(
+        tmp_path / "e.db", poll_interval=0.02, registry_filter=registry_filter
+    )
+    if graph:
+        eng.add_registry(load_config(cfg))
+    app = create_app(eng, allow_no_auth=True)
+    if settings is not None:
+        app.state.static_credential_settings = settings
+        app.state.security = settings.security
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            body: dict[str, Any] = (await client.get("/security/posture")).json()
+    finally:
+        await eng.stop()
+    return body
+
+
+async def test_the_posture_does_not_mark_an_inert_opt_out_as_accepted(tmp_path: Path) -> None:
+    """With the refusal off an opt-out does nothing, and security_loosenings() says so; the posture
+    view's ``accepted`` must agree. Driven through the route, so the route's own rule is under test."""
+    body = await _get_posture(
+        tmp_path, settings=_settings(gate=False, accepted={"OB_REST": "r", "settings:store": "r"})
+    )
+    hops = {h["name"]: h for h in body["static_credential_hops"]}
+    assert hops["OB_REST"]["accepted"] is False
+    assert hops["settings:store"]["accepted"] is False
+
+
+async def test_an_engine_shard_does_not_call_its_inventory_complete(tmp_path: Path) -> None:
+    """An engine shard's registry holds only its own connections (ADR 0037)."""
+    body = await _get_posture(tmp_path, settings=_settings(gate=False), filtered=True)
+    scope = str(body["static_credential_hops_scope"])
+    assert scope.startswith("partial") and "engine shards" in scope
+
+
+async def test_a_posture_that_read_neither_half_says_not_read(tmp_path: Path) -> None:
+    from messagefoundry.api.models import STATIC_CREDENTIAL_HOPS_NOT_READ
+
+    body = await _get_posture(tmp_path, graph=False)
+    assert body["static_credential_hops_scope"] == STATIC_CREDENTIAL_HOPS_NOT_READ
+    assert body["static_credential_hops"] == []
+
+
+def test_the_check_never_prints_a_configured_value_it_could_not_load(tmp_path: Path) -> None:
+    """A pydantic error prints ``input_value=<the value>``. An unquoted numeric password is a type
+    error, and its value must not reach check output or a CI log."""
+    from messagefoundry.checks import run_checks
+
+    cfg = tmp_path / "config"
+    _write_graph(cfg, basic=True)
+    (tmp_path / "messagefoundry.toml").write_text(
+        '[store]\nbackend = "sqlserver"\nserver = "db.example.invalid"\ndatabase = "mf"\n'
+        'username = "svc"\npassword = 918273645\n',
+        encoding="utf-8",
+    )
+    result = next(
+        r for r in run_checks(cfg, run_lint=False).results if r.name == "static-credentials"
+    )
+    detail = str(result.detail)
+    assert not result.ok and "settings did not load" in detail
+    assert "store.password" in detail  # the control: the failure is the password's own
+    assert "918273645" not in detail
 
 
 async def test_a_first_load_refusal_closes_the_store(tmp_path: Path) -> None:
@@ -350,7 +414,7 @@ async def test_a_first_load_refusal_closes_the_store(tmp_path: Path) -> None:
 
     cfg = tmp_path / "cfg"
     _write_graph(cfg, basic=True)
-    before = {t.ident for t in threading.enumerate()}
+    before = set(threading.enumerate())
     app = create_managed_app(
         db_path=tmp_path / "m.db",
         config_dir=cfg,
@@ -359,10 +423,13 @@ async def test_a_first_load_refusal_closes_the_store(tmp_path: Path) -> None:
     with pytest.raises(WiringError, match="OB_REST"):
         async with app.router.lifespan_context(app):
             pass
-    leaked = [
-        t for t in threading.enumerate() if t.ident not in before and not t.daemon and t.is_alive()
-    ]
-    assert leaked == []
+    # A closed worker resolves its stop future just before it leaves its loop, so give each new
+    # non-daemon thread a moment to finish rather than reading is_alive() mid-exit. Compared by
+    # object, not ident: an ident can be reused.
+    new = [t for t in threading.enumerate() if t not in before and not t.daemon]
+    for thread in new:
+        thread.join(timeout=5)
+    assert [t for t in new if t.is_alive()] == []
 
 
 # --- the probes, on every surface a detail reaches ------------------------------------------------

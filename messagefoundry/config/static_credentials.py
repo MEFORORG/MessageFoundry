@@ -157,7 +157,9 @@ def _http_static(ctype: ConnectorType, settings: Mapping[str, Any], token: bool)
             out.append("static bearer token")
         if settings.get("basic_user") and settings.get("basic_password"):
             out.append("HTTP Basic")
-    if settings.get("http_auth_user") or settings.get("http_auth_password"):
+    # The connector answers a Digest challenge only in http_auth='digest' mode, and refuses to build
+    # in that mode with either half missing, so the mode is the predicate, not the credential keys.
+    if str(settings.get("http_auth") or "").lower() == "digest":
         out.append("HTTP Digest")
     if ctype is ConnectorType.SOAP:
         ws_user = settings.get("ws_username") or settings.get("basic_user")

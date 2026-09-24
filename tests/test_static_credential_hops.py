@@ -464,6 +464,12 @@ def test_an_at_outside_the_authority_names_no_host(
         ({"server": "db.example.invalid"}, "db.example.invalid"),
         ({"server": "tcp:db.example.invalid,1433"}, "db.example.invalid,1433"),
         ({"server": r"db.example.invalid\INST"}, r"db.example.invalid\INST"),
+        # A port setting joins the SQL Server form with its own separator, as a host's joins with ":".
+        ({"server": "tcp:db.example.invalid", "port": 1433}, "db.example.invalid,1433"),
+        ({"server": "db.example.invalid", "port": 1433}, "db.example.invalid:1433"),
+        # A bare IPv6 host is what a socket takes; the label brackets it so the port stays readable.
+        ({"host": "2001:db8::1", "port": 2575}, "[2001:db8::1]:2575"),
+        ({"host": "::1"}, "[::1]"),
         ({}, "(unknown peer)"),
     ],
 )
@@ -479,9 +485,26 @@ def test_the_label_keeps_scheme_host_and_port(settings: dict[str, object], label
         "https://user%3AS3CRET%40host.example.invalid/",  # an encoded userinfo in the host
         "https://host.example.invalid:S3CRET/",  # a non-numeric port
         "not a url at all S3CRET",
+        # urlsplit deletes tab, CR and LF, which would fold the text after them into the host.
+        "https://host.example.invalid\tS3CRET/",
+        "https://host.example.invalid\nS3CRET/",
+        # No scheme means a bare authority; a path on one is a mistyped URL, not a host to name.
+        "http:/S3CRET.example.invalid/x",
     ],
 )
 def test_an_unparseable_address_is_withheld_not_echoed(value: str) -> None:
     label = _peer_label({"url": value})
-    assert "S3CRET" not in label and "sk_live" not in label and "12" not in label
+    assert "s3cret" not in label.lower() and "sk_live" not in label and "12" not in label
     assert "withheld" in label
+
+
+def test_http_digest_is_read_from_the_mode_the_connector_reads() -> None:
+    """The connector answers a Digest challenge only with ``http_auth='digest'``; the credential
+    keys alone send nothing."""
+    from messagefoundry.config.models import ConnectorType
+    from messagefoundry.config.static_credentials import _http_static
+
+    keys = {"http_auth_user": "u", "http_auth_password": "p"}
+    assert "HTTP Digest" not in _http_static(ConnectorType.REST, keys, False)
+    digest = {**keys, "http_auth": "digest"}
+    assert "HTTP Digest" in _http_static(ConnectorType.REST, digest, False)

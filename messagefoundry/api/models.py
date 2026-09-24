@@ -1211,7 +1211,7 @@ class StorePrivilegeView(BaseModel):
 
 
 #: ``SecurityPosture.static_credential_hops_scope`` when the inventory was not read at all.
-STATIC_CREDENTIAL_HOPS_NOT_READ = "not read: this posture was built without the inventory"
+STATIC_CREDENTIAL_HOPS_NOT_READ = "not read: neither the connection graph nor the service settings"
 #: The same field when both halves of the inventory were read.
 STATIC_CREDENTIAL_HOPS_COMPLETE = (
     "complete: the connection graph and the service settings were read"

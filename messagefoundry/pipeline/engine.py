@@ -818,6 +818,12 @@ class Engine:
         return self._registry_runner
 
     @property
+    def registry_filtered(self) -> bool:
+        """True when this engine runs a filtered graph, as an engine shard does (ADR 0037). Its registry
+        is then a subset of the config dir, so a report read off it must not call itself complete."""
+        return self._registry_filter is not None
+
+    @property
     def update_check_result(self) -> UpdateCheckResult | None:
         """The latest no-network version-diff result (#30, ADR 0026), or ``None`` when [update_check]
         is disabled / no pass has run yet. Read by the ``/status`` endpoint to surface the additive

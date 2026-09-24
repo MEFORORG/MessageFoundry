@@ -1532,6 +1532,25 @@ def _resolve_service_toml(
     return _find_service_toml(config_dir)
 
 
+def _settings_error_without_values(exc: Exception) -> str:
+    """A settings-load failure, rendered without any configured value (BACKLOG #1182).
+
+    A pydantic ``ValidationError`` prints ``input_value=<the value>``, so an unquoted numeric password
+    in ``[store]`` would land in check output and any CI log. It is rendered as each field's location
+    and error type only. Any other failure goes through :func:`~messagefoundry.redaction.safe_exc`."""
+    from pydantic import ValidationError
+
+    from messagefoundry.redaction import safe_exc
+
+    if isinstance(exc, ValidationError):
+        fields = "; ".join(
+            f"{'.'.join(str(part) for part in err['loc'])} ({err['type']})"
+            for err in exc.errors(include_input=False, include_url=False, include_context=False)
+        )
+        return f"{exc.error_count()} invalid setting(s): {fields}"
+    return safe_exc(exc)
+
+
 def _find_service_toml(config_dir: str | Path) -> Path | None:
     """Best-effort locate this instance's ``messagefoundry.toml`` for the posture check.
 
@@ -2118,7 +2137,10 @@ def _check_static_credentials(
         except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
             # Present-but-refused is a failure, not a skip (BACKLOG #1318, the alert-smtp-tls rule).
             return CheckResult(
-                name, ok=False, required=False, detail=f"settings did not load: {exc}"
+                name,
+                ok=False,
+                required=False,
+                detail=f"settings did not load: {_settings_error_without_values(exc)}",
             )
     hops = static_credential_hops(registry=registry, settings=settings)
     sec = settings.security if settings is not None else None

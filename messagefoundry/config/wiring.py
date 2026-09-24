@@ -4483,19 +4483,37 @@ def _split_address(text: str) -> tuple[str, str, str] | None:
     authority, which is what a scheme-less ``user:password@proxy:3128`` is. The userinfo is dropped,
     and so are the path, query and fragment. An ``@`` after the authority returns ``None``: that is
     either an ``@`` in a query or a credential holding an unencoded ``/``, ``?`` or ``#``, and in the
-    second case the "host" a parser finds is the head of the credential."""
+    second case the "host" a parser finds is the head of the credential. A value with no scheme must
+    be a bare authority, so any path, query or fragment on it returns ``None`` too.
+
+    Whitespace or a control character anywhere returns ``None`` before parsing, because ``urlsplit``
+    silently deletes tab, CR and LF: ``host\\tSECRET`` would otherwise parse as one host name."""
     text = text.strip()
+    if any(c.isspace() or not c.isprintable() for c in text):
+        return None
+    has_scheme = "://" in text
     try:
-        parts = urllib.parse.urlsplit(text if "://" in text else "//" + text)
+        parts = urllib.parse.urlsplit(text if has_scheme else "//" + text)
         port = parts.port
     except ValueError:  # a malformed IPv6 literal, or a port that is not a number in range
         return None
     host = parts.hostname or ""
     if ":" in host:
         host = f"[{host}]"
-    if "@" in parts.path + parts.query + parts.fragment or not _HOST.fullmatch(host):
+    tail = parts.path + parts.query + parts.fragment
+    if "@" in tail or (tail and not has_scheme) or not _HOST.fullmatch(host):
         return None
     return parts.scheme, host, "" if port is None else str(port)
+
+
+def _bare_ipv6(text: str) -> str | None:
+    """``[addr]`` for a bare IPv6 literal, which a ``host`` setting may hold and a socket accepts, but
+    which no authority parse can read (its colons look like a port)."""
+    try:
+        addr = ipaddress.ip_address(text.strip())
+    except ValueError:
+        return None
+    return f"[{addr}]" if addr.version == 6 else None
 
 
 def _peer_label(settings: Mapping[str, Any]) -> str:
@@ -4525,10 +4543,14 @@ def _peer_label(settings: Mapping[str, Any]) -> str:
             continue
         if isinstance(raw, EnvRef):
             scheme, host, port = "", f"env({raw.key})", ""
+        elif key != "url" and (v6 := _bare_ipv6(str(raw))):
+            scheme, host, port = "", v6, ""
         elif parsed := _split_address(str(raw)):
             scheme, host, port = parsed
         elif key == "server" and (sql := _SQL_SERVER.fullmatch(str(raw).strip())):
-            return f"{sql.group(1)},{sql.group(2)}" if sql.group(2) else sql.group(1)
+            # SQL Server's own form keeps its ``,port`` separator, including for a port setting.
+            port = sql.group(2) or port_setting
+            return f"{sql.group(1)},{port}" if port else sql.group(1)
         else:
             return _WITHHELD_PEER
         if key != "url" and not port:

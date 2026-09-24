@@ -84,6 +84,7 @@ from messagefoundry.api.metrics import (
 )
 from messagefoundry.api.models import (
     STATIC_CREDENTIAL_HOPS_COMPLETE,
+    STATIC_CREDENTIAL_HOPS_NOT_READ,
     STATIC_CREDENTIAL_HOPS_PARTIAL,
     STORE_PRIVILEGE_NOT_PROBED,
     AiChatRequest,
@@ -2023,14 +2024,19 @@ def create_app(
             for half, missing in (
                 ("the connection graph (none is loaded)", runner is None),
                 ("the service settings (none were stashed by serve)", cred_settings is None),
+                (
+                    "connections other engine shards own (messagefoundry check reads them all)",
+                    runner is not None and engine.registry_filtered,
+                ),
             )
             if missing
         ]
-        static_hops_scope = (
-            STATIC_CREDENTIAL_HOPS_PARTIAL + "; ".join(unseen)
-            if unseen
-            else STATIC_CREDENTIAL_HOPS_COMPLETE
-        )
+        if runner is None and cred_settings is None:
+            static_hops_scope = STATIC_CREDENTIAL_HOPS_NOT_READ
+        elif unseen:
+            static_hops_scope = STATIC_CREDENTIAL_HOPS_PARTIAL + "; ".join(unseen)
+        else:
+            static_hops_scope = STATIC_CREDENTIAL_HOPS_COMPLETE
         store_privilege_view = (
             StorePrivilegeView(status=STORE_PRIVILEGE_NOT_PROBED)
             if store_privilege is None
