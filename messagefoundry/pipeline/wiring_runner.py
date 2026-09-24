@@ -2684,11 +2684,13 @@ class RegistryRunner:
         await source.validate_startup()
         # Bind BEFORE registering: a failed bind (e.g. port in use) must not leave a dead source in
         # _sources, where inbound_running() would report True and a retry would no-op (review M-9).
-        # The HTTP listen source (ADR 0023) gets a receipt handler returning the committed message_id for
-        # its 202; every other source gets the standard handler whose str return is a wire reply/ACK.
-        make_handler = (
-            self._make_http_handler if ic.spec.type is ConnectorType.HTTP else self._make_handler
-        )
+        # A source that answers the sender with its own protocol status declares wants_receipt, and gets
+        # the receipt handler: the committed message_id, or None when the body was refused and recorded
+        # ERROR. The HTTP listener (ADR 0023) maps that to its 202; the DICOM C-STORE SCP maps None to a
+        # DIMSE failure (BACKLOG #1910). Every other source gets the standard handler, whose str return is
+        # a wire reply/ACK and whose None means both "committed" and "refused". The transport declares the
+        # contract rather than the runner keying on a connector type (CLAUDE.md sec. 4).
+        make_handler = self._make_http_handler if source.wants_receipt else self._make_handler
         try:
             await source.start(make_handler(ic), leader_gate=self._coordinator.is_leader)
         except OSError as exc:
@@ -4868,6 +4870,8 @@ class RegistryRunner:
         # the body was NOT committed: a recorded ERROR from a decode/size guard). The receipt semantics
         # (which the source maps to 202/4xx) are HTTP's own response logic, exactly as the HL7 ACK is
         # MLLP's — the ingress commit + count-and-log + disposition machine are the SAME as _handle_inbound.
+        # Every source declaring wants_receipt binds this handler, the DICOM SCP included (BACKLOG #1910),
+        # so None here must keep meaning "not committed": the SCP answers a DIMSE failure on it.
         async def on_request(raw: bytes) -> str | None:
             return await self._handle_inbound_http(ic, raw)
 
@@ -4923,7 +4927,11 @@ class RegistryRunner:
 
         Shares the SAME store calls, size ceiling, decode handling, and disposition machine as
         :meth:`_handle_inbound`; it differs only in returning the id instead of a wire ACK and in not
-        building an HL7 ACK frame (HTTP is the carrier, the 202 is the receipt)."""
+        building an HL7 ACK frame (HTTP is the carrier, the 202 is the receipt).
+
+        It is the receipt handler for EVERY source that declares ``wants_receipt``, not only HTTP. The
+        DICOM C-STORE SCP answers a DIMSE failure on ``None`` (BACKLOG #1910), so no path here may return
+        ``None`` after ``enqueue_ingress`` has committed, or an accepted object reads as refused."""
         src = ic.spec.type.value
         hl7v2 = ic.content_type is ContentType.HL7V2
 
@@ -4941,7 +4949,7 @@ class RegistryRunner:
                 )
                 return None
             if await self._declared_content_mismatch(ic, raw):
-                return None  # ERROR recorded; HTTP owns its own 202/4xx receipt (no HL7 ACK)
+                return None  # ERROR recorded; the receipt source owns its reply (no HL7 ACK)
             mid = await self.store.enqueue_ingress(
                 channel_id=ic.name,
                 raw=RawMessage.from_bytes(raw, ic.content_type.value).raw,
@@ -4999,7 +5007,7 @@ class RegistryRunner:
                 )
                 return None
             if await self._declared_content_mismatch(ic, raw, text=text):
-                return None  # ERROR recorded; HTTP owns its own 202/4xx receipt (no HL7 ACK)
+                return None  # ERROR recorded; the receipt source owns its reply (no HL7 ACK)
             mid = await self.store.enqueue_ingress(
                 channel_id=ic.name,
                 raw=text,

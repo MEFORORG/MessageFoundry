@@ -45,7 +45,13 @@ from messagefoundry.parsing.peek import HL7PeekError, Peek
 from messagefoundry.parsing.sniff import _looks_like_hl7, _lstrip_bom_ws
 from messagefoundry.parsing.split import split_batch
 from messagefoundry.store.content_search import SearchSpec, row_matches
-from messagefoundry.store.crypto import AesGcmCipher, Cipher, CipherError, cell_aad
+from messagefoundry.store.crypto import (
+    MARKER_PREFIX,
+    AesGcmCipher,
+    Cipher,
+    CipherError,
+    cell_aad,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -174,6 +180,16 @@ class UploadQuotaError(UploadError):
 
     Still open, and out of scope here: the ledger is checked and paid back around the write, not in
     the same transaction as it, because the body lives on the filesystem rather than in the store."""
+
+
+class UploadUnreadableError(UploadError, CipherError):
+    """The store cipher refused an uploaded file on a by-id read (BACKLOG #1169).
+
+    On a keyed store that is usually a plaintext upload stored before the key was enabled, which a
+    keyed store refuses until ``rotate-key`` seals it (owner ruling 2026-09-23). It can also be a file
+    under a key that is no longer configured. It is a :class:`CipherError` too, so any caller that
+    already catches the cipher's error still does. The API maps it to HTTP 423 without importing the
+    cipher module. The message is the cipher's own, which names only the surface and the fix."""
 
 
 class UploadNotFoundError(UploadError):
@@ -362,6 +378,11 @@ class ResealResult:
 
     resealed: int = 0
     skipped: int = 0
+    #: How many UPLOADS had a plaintext half that this pass sealed (BACKLOG #1169). It counts files,
+    #: not values, so it matches the count ``serve`` logs at startup (:meth:`UploadStore.warn_if_unsealed`).
+    #: A keyed store refuses those uploads until this pass seals them, so this is how many it turned
+    #: from refused into readable.
+    sealed_plaintext: int = 0
 
 
 @dataclass(frozen=True)
@@ -487,8 +508,26 @@ class UploadStore:
         b64 = base64.b64encode(data).decode("ascii")
         return self._cipher.encrypt(b64, aad=cell_aad("uploaded_file", "body", file_id))
 
+    @property
+    def _passes_unmarked(self) -> bool:
+        """True when this surface reads an unmarked file back as plaintext (BACKLOG #1169).
+
+        **Owner ruling 2026-09-23: on a keyed store, an unmarked upload is REFUSED until an operator
+        runs ``rotate-key``,** which reseals it. So the refusal applies exactly where that command can
+        reseal, which is an :class:`AesGcmCipher`. There the cipher's own policy decides, and
+        ``[store].allow_unmarked_ciphertext`` restores the passthrough for this surface too.
+
+        Every other cipher keeps the passthrough. The identity cipher has no key, so nothing is
+        refused anyway. ``vault_transit`` is a named residual, and ``docs/PHI.md`` §3 is where it and
+        its reason are stated."""
+        return not isinstance(self._cipher, AesGcmCipher)
+
     def _decrypt_blob(self, stored: str, file_id: str) -> bytes:
-        b64 = self._cipher.decrypt(stored, aad=cell_aad("uploaded_file", "body", file_id))
+        b64 = self._cipher.decrypt(
+            stored,
+            aad=cell_aad("uploaded_file", "body", file_id),
+            allow_unmarked=self._passes_unmarked,
+        )
         return base64.b64decode(b64)
 
     def _encrypt_meta(self, meta: UploadedFileMeta) -> str:
@@ -497,7 +536,11 @@ class UploadStore:
         )
 
     def _decrypt_meta(self, stored: str, file_id: str) -> UploadedFileMeta:
-        raw = self._cipher.decrypt(stored, aad=cell_aad("uploaded_file", "meta", file_id))
+        raw = self._cipher.decrypt(
+            stored,
+            aad=cell_aad("uploaded_file", "meta", file_id),
+            allow_unmarked=self._passes_unmarked,
+        )
         d = json.loads(raw)
         return UploadedFileMeta(
             file_id=str(d["file_id"]),
@@ -546,9 +589,19 @@ class UploadStore:
         read would raise in, on exactly the surface where planting a file is easiest (a pair of
         plain files in a directory, no database write needed). A refusal folded into the same line
         as a routine post-rotation skip is a refusal nobody can see, so the strict read cannot
-        honestly be built on top of this handler until the classes are separated. Separating them
-        does not itself refuse anything: an unmarked sidecar is still accepted today by the cipher's
-        read passthrough (``store/crypto.py`` ``decrypt``), which awaits an owner ruling.
+        honestly be built on top of this handler until the classes are separated. It now is built:
+        on a keyed AES-GCM store an unmarked sidecar is refused (:attr:`_passes_unmarked`), lands in
+        the cipher branch below, and is left out of the listing, the quota and the retention prune
+        until ``rotate-key`` reseals it.
+
+        **The quota and the prune deliberately do NOT read a refused sidecar either.** A plaintext
+        sidecar is not bound to its path, so its JSON can name ANOTHER upload's ``file_id`` for the
+        prune to delete, carry a negative ``size`` that lifts an uploader's byte quota, write
+        attacker-chosen names into the ``upload.prune`` audit, or hold a number that overflows the
+        coercion and fails every save. Trusting it to keep retention working would trade a bounded
+        residual for all of that. The residual is named in ``docs/PHI.md`` §3: a refused upload is
+        outside retention and the quota until ``rotate-key`` seals it, and ``serve`` logs the count
+        at startup so the operator knows to run it.
 
         The cipher's own message is safe to log — every ``CipherError`` carries only key ids,
         marker versions and algorithm names, never a decrypted value. The malformed-shape branch
@@ -559,10 +612,9 @@ class UploadStore:
             try:
                 out.append(self._decrypt_meta(entry.read_text(encoding="utf-8"), fid))
             except CipherError as exc:
-                # The cipher declined the value. Today that is a wrong/rotated-away key or a blob
-                # relocated into another cell; once a strict-ciphertext read ships it is ALSO the
-                # refusal of an unmarked (planted or downgraded) sidecar. Named on its own so the
-                # two can be told apart in a log.
+                # The cipher declined the value: a wrong/rotated-away key, a blob relocated into
+                # another cell, or the refusal of an unmarked (legacy, planted or downgraded)
+                # sidecar. Named on its own so these can be told apart from a damaged file.
                 _log.warning("uploaded-file sidecar %s: cipher declined it: %s", fid, exc)
             except (OSError, UnicodeDecodeError) as exc:
                 # The bytes never reached the cipher — unreadable file, or not valid UTF-8.
@@ -805,6 +857,8 @@ class UploadStore:
                 return self._decrypt_meta(meta_path.read_text(encoding="utf-8"), file_id)
             except FileNotFoundError as exc:
                 raise UploadNotFoundError(file_id) from exc
+            except CipherError as exc:
+                raise UploadUnreadableError(str(exc)) from exc
 
         return await asyncio.to_thread(_read)
 
@@ -818,6 +872,8 @@ class UploadStore:
                 return self._decrypt_blob(blob_path.read_text(encoding="utf-8"), file_id)
             except FileNotFoundError as exc:
                 raise UploadNotFoundError(file_id) from exc
+            except CipherError as exc:
+                raise UploadUnreadableError(str(exc)) from exc
 
         return await asyncio.to_thread(_read)
 
@@ -831,6 +887,8 @@ class UploadStore:
                 meta = self._decrypt_meta(meta_path.read_text(encoding="utf-8"), file_id)
             except FileNotFoundError as exc:
                 raise UploadNotFoundError(file_id) from exc
+            except CipherError as exc:
+                raise UploadUnreadableError(str(exc)) from exc
             # Remove the body first, then the sidecar (best-effort on the body — the sidecar is the
             # listing key, so once it is gone the file is invisible even if the blob lingers).
             blob_path.unlink(missing_ok=True)
@@ -853,10 +911,12 @@ class UploadStore:
         **The two transitions are not closed the same way, and the difference is deliberate.** The
         store seals legacy plaintext AUTOMATICALLY, in ``_encrypt_existing_rows`` at every keyed open.
         This pass has one caller, ``rotate-key``, so it closes the rotation half automatically and
-        the first-key-enable half only when an operator runs that command. Wiring a whole-directory
-        crypto sweep into API startup is unbounded boot-time work over a directory with no batching
-        seam, which is a different risk and a separate decision — so it is named here rather than
-        quietly assumed.
+        the first-key-enable half only when an operator runs that command. **Owner ruling
+        2026-09-23:** until then a keyed store REFUSES each plaintext upload on read (fail-closed, like
+        ``[backup].allow_unencrypted``), and ``serve`` logs how many are waiting
+        (:meth:`warn_if_unsealed`). The engine does not seal them at startup, because a
+        whole-directory crypto sweep is unbounded boot-time work over a directory with no batching
+        seam.
 
         Same contract as the store's pass: rewrites values that are plaintext **or** under a retired
         key, skips values already under the active key (so it is idempotent), and lets a
@@ -873,14 +933,13 @@ class UploadStore:
         25 MiB upload transiently costs a few hundred MiB. A file already under the active key is
         detected from its first bytes and never read whole.
 
-        **This pass LAUNDERS an unmarked value, and that is not an oversight to overlook.** Handed a
-        plaintext file, the cipher's read passthrough returns it unchanged and this method then seals
-        it into a genuine, AAD-bound ciphertext — after which nothing distinguishes it from a file
-        the engine wrote itself. The store's rotation has the identical property. That is precisely
-        why #1169 wants a strict-ciphertext read, and this method does not substitute for one: it is
-        a **precondition** for it. A refusal built before this pass existed would fire on legitimate
-        pre-rotation uploads, because until now nothing could ever seal them. The refusal itself
-        awaits an owner ruling and is deliberately not built here.
+        **This pass LAUNDERS an unmarked value, and that is the ruled trade, not an oversight.** It
+        seals every plaintext file it finds, legacy or planted, into a genuine AAD-bound ciphertext,
+        after which nothing distinguishes it from a file the engine wrote itself. Unlike the store,
+        this surface has no "already sealed" evidence to tell the two apart: new sealed uploads land
+        beside legacy plaintext ones for as long as the operator has not run ``rotate-key``. So the
+        control is the refusal BEFORE this pass, with its alert and the startup count, plus
+        ``sealed_plaintext`` in the result, which the operator can check against that count.
 
         Runs entirely off the event loop."""
         return await asyncio.to_thread(self._reseal_to_active_sync)
@@ -894,7 +953,7 @@ class UploadStore:
         if not root.is_dir():
             return ResealResult()
         active = cipher.active_marker_prefix
-        resealed = skipped = 0
+        resealed = skipped = sealed_plaintext = 0
         for fid, _sidecar in self._iter_sidecars():
             try:
                 blob_path, meta_path = self._paths(fid)
@@ -905,9 +964,13 @@ class UploadStore:
                 skipped += 1
                 _log.warning("uploaded file %s: skipped, its id fails the path guard", fid)
                 continue
+            had_plaintext = False
             # The sidecar carries the AAD kind "meta"; the body carries "body" (see _encrypt_meta /
             # _encrypt_blob). Re-binding the SAME cell AAD is what keeps a re-sealed value readable.
-            for path, kind in ((meta_path, "meta"), (blob_path, "body")):
+            # Body FIRST, as save() writes it: the sidecar is the listing key, and a keyed store
+            # refuses a plaintext value (BACKLOG #1169). Sealing the sidecar first would let an
+            # interrupted pass list an upload whose body is still refused.
+            for path, kind in ((blob_path, "body"), (meta_path, "meta")):
                 try:
                     # Read the MARKER first, not the file. The idempotency test is a prefix compare,
                     # and a sealed 25 MiB upload is ~44 MiB on disk — reading it whole only to skip
@@ -918,6 +981,7 @@ class UploadStore:
                         if handle.read(len(active)) == active:
                             continue  # already under the active key in the active format
                     stored = path.read_text(encoding="utf-8")
+                    had_plaintext |= bool(stored) and not stored.startswith(MARKER_PREFIX)
                 except (OSError, UnicodeDecodeError) as exc:
                     # A half-deleted pair or an unreadable file. Counted and named, never silent:
                     # this file is still under the OLD key and the operator must not retire it yet.
@@ -933,13 +997,75 @@ class UploadStore:
                 # one is read, roughly doubling peak memory for no reason.
                 del stored
                 resealed += 1
+            sealed_plaintext += had_plaintext
         if resealed or skipped:
             _log.info(
-                "re-sealed %d uploaded-file value(s) under the active key (%d skipped)",
+                "re-sealed %d uploaded-file value(s) under the active key, sealing %d plaintext "
+                "upload(s) (%d skipped)",
                 resealed,
+                sealed_plaintext,
                 skipped,
             )
-        return ResealResult(resealed=resealed, skipped=skipped)
+        return ResealResult(resealed=resealed, skipped=skipped, sealed_plaintext=sealed_plaintext)
+
+    async def warn_if_unsealed(self) -> int:
+        """Log, once at ``serve`` startup, how many uploads a keyed store holds as plaintext.
+
+        Owner ruling 2026-09-23 (BACKLOG #1169): each one is refused on read until an operator runs
+        ``rotate-key``, and nothing else would tell the operator they exist, because a refused file
+        simply drops out of the listing. So this logs the COUNT at WARNING with that instruction, and
+        never names a file: the filename inside a sidecar can carry PHI, and the count is all the
+        operator needs. Returns the count. Returns 0 without logging where the refusal does not apply
+        (see :attr:`_passes_unmarked`).
+
+        The cost is one directory walk and a read of at most a marker's length from each file. The
+        hourly retention scan already decrypts every sidecar, so this adds nothing of a new order. Runs
+        off the event loop."""
+        cipher = self._cipher
+        if not isinstance(cipher, AesGcmCipher):  # the same test as _passes_unmarked
+            return 0
+        try:
+            count = await asyncio.to_thread(self._count_unsealed_sync)
+        except OSError as exc:
+            # The directory itself could not be walked. A startup notice must never stop serve; the
+            # listing scan will hit and name the same fault.
+            _log.warning("uploaded-logs: could not count plaintext uploads at startup: %s", exc)
+            return 0
+        if count:
+            what = (
+                "served as plaintext, because [store].allow_unmarked_ciphertext is on"
+                if cipher.allow_unmarked
+                else "refused on every read"
+            )
+            _log.warning(
+                "uploaded-logs: %d uploaded file(s) are stored as plaintext on this keyed store and "
+                "are %s. Run 'messagefoundry rotate-key' with the engine stopped to seal them "
+                "(BACKLOG #1169)",
+                count,
+                what,
+            )
+        return count
+
+    def _count_unsealed_sync(self) -> int:
+        """How many uploads have a non-blank half with no ``mfenc:`` marker. Reads only the first
+        ``len(MARKER_PREFIX)`` characters of each file. A file that cannot be read is not counted here;
+        the listing scan names it on its own."""
+        count = 0
+        for fid, _sidecar in self._iter_sidecars():
+            try:
+                paths = self._paths(fid)
+            except UploadPathError:
+                continue
+            for path in paths:
+                try:
+                    with path.open(encoding="utf-8") as handle:
+                        head = handle.read(len(MARKER_PREFIX))
+                except (OSError, UnicodeDecodeError):
+                    continue
+                if head and head != MARKER_PREFIX:
+                    count += 1
+                    break  # count the upload once, whichever half is plaintext
+        return count
 
     async def prune_expired(
         self, *, now: float | None = None, retention_days: int | None = None
@@ -1142,7 +1268,10 @@ def _reencrypt_value(cipher: AesGcmCipher, stored: str, aad: bytes) -> str:
     on store classes this LEAF module may not import (see the module docstring), so the shared name
     is what keeps a grep for ``_reencrypt_value`` from missing this one. Pairing a decrypt and an
     encrypt with different AADs is the mistake the single-expression form exists to prevent."""
-    return cipher.encrypt(cipher.decrypt(stored, aad=aad), aad=aad)
+    # allow_unmarked=True: the one pass that reads a plaintext upload, because sealing it is the
+    # whole point. Owner ruling 2026-09-23 (BACKLOG #1169): a keyed store refuses a plaintext
+    # upload on every read path until `rotate-key` runs this pass.
+    return cipher.encrypt(cipher.decrypt(stored, aad=aad, allow_unmarked=True), aad=aad)
 
 
 def _atomic_write_text(root: Path, path: Path, text: str) -> None:

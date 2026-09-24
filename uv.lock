@@ -1325,7 +1325,7 @@ requires-dist = [
     { name = "prometheus-client", specifier = ">=0.20" },
     { name = "psutil", specifier = ">=6.0" },
     { name = "pydantic", specifier = ">=2.6" },
-    { name = "pydicom", marker = "extra == 'dicom'", specifier = ">=3.0.2,<4" },
+    { name = "pydicom", marker = "extra == 'dicom'", specifier = ">=3.0.2,<3.1" },
     { name = "pynetdicom", marker = "extra == 'dicom'", specifier = ">=3.0.4,<4" },
     { name = "pyside6", marker = "extra == 'harness'", specifier = ">=6.6" },
     { name = "pyspnego", specifier = ">=0.10" },

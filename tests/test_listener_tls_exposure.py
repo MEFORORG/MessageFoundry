@@ -163,7 +163,7 @@ def test_serve_proxy_terminated_offloopback_starts(
         "alerts.security_notifications_required = false\n"  # GIVEN 1 (ADR 0148): dev derives PHI now
         'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
         'security.enforcement = "warn"\n'
-        '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.7"]\n'
+        '[api]\ntls_terminated_upstream = true\nplaintext_upstream_hop_acknowledged = true\ntrusted_proxies = ["10.0.0.7"]\n'
         'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n',
         encoding="utf-8",
     )

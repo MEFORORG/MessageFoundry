@@ -453,6 +453,17 @@ class StoreSettings(_Section):
     # to bind). Setting it false selects the frozen mfenc:v1 writer (byte-identical at rest, CRYPTO-1) and
     # is a LOOSENING — `security_loosenings()` names it, so the opt-out is never silent.
     aad_bind: bool = True
+    # Accept an UNMARKED value in a cipher-covered column of a KEYED store (BACKLOG #1169, ASVS 11.3.3).
+    # **Off by default**: a keyed store writes only `mfenc:` ciphertext there, and the at-open sweep
+    # seals legacy plaintext only on a (table, column) surface that holds no ciphertext yet, so a
+    # non-blank unmarked value beside sealed ones is a stripped marker or a planted row -- the cipher
+    # REFUSES it (`CipherError`, an `integrity_drift` alert with subject `store-cipher`) instead of
+    # returning it as plaintext. A purged '' is never refused. Setting it true restores the old
+    # behaviour: unmarked values read back as plaintext and the sweep seals every unmarked value. It is
+    # a LOOSENING -- `security_loosenings()` names it. No effect without an encryption key. It also
+    # restores the passthrough for a plaintext UPLOADED FILE, which a keyed store otherwise refuses
+    # until `rotate-key` seals it, alerting under `upload-cipher` (owner ruling 2026-09-23).
+    allow_unmarked_ciphertext: bool = False
     # KeyProvider seam (ADR 0019, ASVS 13.3.3): selects HOW the active/retired DEK bytes are *sourced* —
     # never how they are used (the cipher, keyring, and `mfenc:v1` format are unchanged). `auto` (the
     # default) is the env-then-DPAPI ladder, BYTE-IDENTICAL to the pre-seam behavior; `env`/`dpapi` pin a
@@ -962,6 +973,16 @@ class ApiSettings(_Section):
     # non-loopback bind satisfy the exposed-gate WITHOUT in-process TLS — but only when trusted_proxies
     # is set (so the engine knows a terminator is really in front).
     tls_terminated_upstream: bool = False
+    # The operator's acknowledgement that, with tls_terminated_upstream and no tls_cert_file, the
+    # proxy-to-engine hop is PLAINTEXT by design (ADR 0172 decision 3): the engine mints no
+    # certificate there, so encrypting or isolating that hop is the DEPLOYING SITE's job. `serve`
+    # refuses to start that topology without it, in every mode -- enforcing or warn, loopback or
+    # not -- because only the operator can take on a hop the engine does not protect. With an
+    # operator tls_cert_file the engine serves that hop over TLS, so it is not required there (and
+    # harmless if set). It records who took the hop on; it secures nothing. Meaningful only with
+    # tls_terminated_upstream, so setting it without that is refused at load (a stray
+    # acknowledgement would read as a decision about a hop that does not exist). Default False.
+    plaintext_upstream_hop_acknowledged: bool = False
 
     # --- Posture-B (upstream TLS termination) attestations (#200, ADR 0002) --------
     # In Posture-B the proxy terminates browser TLS and the proxy→engine hop is a plaintext segment on
@@ -1123,6 +1144,14 @@ class ApiSettings(_Section):
         # the proxy in front — otherwise it's an unverifiable claim that XFF could spoof.
         if self.tls_terminated_upstream and not self.trusted_proxies:
             raise ValueError("[api].tls_terminated_upstream requires [api].trusted_proxies")
+        # Refuse rather than ignore a stray acknowledgement, as ad_session_recheck_seconds without
+        # ad_enabled is refused: an operator who set it believes a proxy-to-engine hop exists and
+        # was considered, and without tls_terminated_upstream there is no such hop.
+        if self.plaintext_upstream_hop_acknowledged and not self.tls_terminated_upstream:
+            raise ValueError(
+                "[api].plaintext_upstream_hop_acknowledged requires [api].tls_terminated_upstream "
+                "(it acknowledges the plaintext proxy-to-engine hop that only that topology has)"
+            )
         # Validate the DECLARED Posture-B proxy TLS floor for internal coherence (#200, ASVS 11.6.2) —
         # an attestation, but a *coherent* one (a NIST version floor; forward-secret ciphers if named).
         validate_proxy_tls_posture(self.proxy_tls_min_version, self.proxy_tls_ciphers)
@@ -2198,7 +2227,7 @@ class AuthSettings(_Section):
     password_require_digit: bool = False
     password_require_symbol: bool = False
     password_check_breached: bool = True  # reject known common/breached passwords (offline corpus)
-    password_check_context: bool = True  # reject passwords containing app/vendor/HL7 terms
+    password_check_context: bool = True  # reject passwords containing a CONTEXT_WORDS term
     password_check_username: bool = (
         True  # reject passwords containing the user's own username (6.2.11)
     )
@@ -5243,6 +5272,7 @@ def security_loosenings(
     ``[security]`` switch — pinned by a completeness floor in ``tests/test_security_posture_defaults.py``
     that iterates ``SecuritySettings.model_fields`` and fails on an unreported, unexempted one — plus an
     ENUMERATED set of deviations that live elsewhere: ``[store].aad_bind``,
+    ``[store].allow_unmarked_ciphertext`` (#1169),
     ``[auth].ad_session_recheck_seconds``, ``[alerts].email_use_tls``/``email_tls_verify`` (#323
     layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), three per-connection
     deviations — ``cleartext_accepted``, ``tls_allow_expired``, and a generic-ODBC ``DATABASE`` hop
@@ -5467,6 +5497,21 @@ def security_loosenings(
                 "aad_bind",
                 "at-rest values are NOT bound to their (table, column, row) cell — a ciphertext moved "
                 "between cells decrypts instead of failing its auth tag (no effect without a store key)",
+            )
+        )
+    # BACKLOG #1169 (ASVS 11.3.3). The substitution limb has a tag to fail; a downgrade to plaintext has
+    # none, and only the refusal this switch turns off protects it.
+    if store.allow_unmarked_ciphertext:
+        out.append(
+            (
+                "allow_unmarked_ciphertext",
+                "an UNMARKED value in an encrypted column reads back as plaintext instead of being "
+                "refused — anyone who can write the store can strip a ciphertext's marker or plant a "
+                "plaintext row and have the engine accept it as that row's content, and the next "
+                "rotate-key seals it as genuine ciphertext. It also serves a plaintext uploaded file: "
+                "anyone who can write [store].uploads_dir, with no store access at all, can drop a "
+                "sidecar with a chosen uploader and have it listed, browsed and resent "
+                "(no effect without a store key)",
             )
         )
     # BACKLOG #1004 (ASVS 13.3.4). Stated as what the SITE gives up rather than "a setting is off": the
