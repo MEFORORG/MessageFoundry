@@ -529,22 +529,91 @@ async def test_read_body_rejects_incomplete_declared_body() -> None:  # BACKLOG 
     assert excinfo.value.status == 400 and excinfo.value.kind == "framing_error"
 
 
-async def test_read_body_keeps_the_get_before_chunked_ordering() -> None:
-    # Pins a quirk the split could silently "fix": the GET/HEAD short-circuit runs BEFORE the chunked
-    # refusal, so a GET carrying Transfer-Encoding: chunked is accepted with an empty body. Hoisting
-    # the refusal into the head phase would look like hardening and would change shipped behaviour.
+async def test_framing_is_decided_for_every_method_in_the_head_phase() -> None:
+    """THE ORDERING THIS ONCE PINNED WAS DELIBERATELY REVERSED (BACKLOG #1125, ASVS 4.2.1).
+
+    This test used to assert the opposite, and its comment warned that hoisting the refusal "would
+    look like hardening and would change shipped behaviour". That was a fair warning and it worked:
+    it turned an edit into a decision. The decision went to adversarial review, which measured that
+    a GET carrying framing headers left its declared bytes unread on the socket, and that the
+    authoring commit (`f2ef0ea92`, the ADR 0154 intake-auth increment) names no ruling and no
+    incident -- it was change-control caution, not a requirement.
+
+    RFC 9112 makes framing a property of the MESSAGE, not of the method, so it is now settled in
+    `_read_head` for every method before dispatch. Rewritten rather than deleted, so the reversal is
+    recorded where the next reader will look for it.
+    """
+    # A bodyless method carrying Transfer-Encoding is now REFUSED, in the head phase.
     reader = await _reader_from(
         b"GET /health HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"
     )
+    with pytest.raises(HttpRequestError) as excinfo:
+        await _read_head(reader, max_header_bytes=8192)
+    assert excinfo.value.status == 400
+
+    # ... and so is a POST carrying it, now also in the head phase rather than the body phase.
+    reader = await _reader_from(b"POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n")
+    with pytest.raises(HttpRequestError) as excinfo:
+        await _read_head(reader, max_header_bytes=8192)
+    assert excinfo.value.status == 400
+
+    # REFUSE, NEVER CONSUME -- and this is the carve-out that keeps a health checker green.
+    # `Content-Length: 0` on a bodyless method declares no body, desyncs nothing, and is the one
+    # shape this tree actually exercises (test_read_request_allows_single_content_length_get).
+    reader = await _reader_from(b"GET /health HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n\r\n")
     head = await _read_head(reader, max_header_bytes=8192)
     assert await _read_body(reader, head, max_body_bytes=DEFAULT_MAX_BODY_BYTES) == b""
 
-    # ... while a POST carrying it is still refused, in the body phase.
-    reader = await _reader_from(b"POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n")
-    head = await _read_head(reader, max_header_bytes=8192)
+    # ... while a NON-ZERO length on the same method is refused: those are the declared bytes that
+    # would otherwise sit on the wire for a pooling front end to read as a second request.
+    reader = await _reader_from(
+        b"GET /health HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nHELLO"
+    )
     with pytest.raises(HttpRequestError) as excinfo:
-        await _read_body(reader, head, max_body_bytes=DEFAULT_MAX_BODY_BYTES)
+        await _read_head(reader, max_header_bytes=8192)
     assert excinfo.value.status == 400
+
+
+@pytest.mark.parametrize(
+    ("label", "raw"),
+    [
+        # Transfer-Encoding is refused by PRESENCE. Exact equality on "chunked" measurably missed
+        # all three of these, and they reached the POST path and were ingested as clinical payload.
+        (
+            "te gzip,chunked",
+            b"POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
+        ),
+        ("te trailing comma", b"POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked,\r\n\r\n"),
+        ("te identity", b"POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: identity\r\n\r\n"),
+        # Content-Length is 1*DIGIT, not int(). int() takes a leading plus and PEP 515 underscores,
+        # so "1_0" framed TEN bytes against a proxy that would have read one.
+        ("cl leading plus", b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: +3\r\n\r\nabc"),
+        ("cl underscore", b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 1_0\r\n\r\n0123456789"),
+        # Whitespace before the colon is a MUST-reject: strip() turned this into valid framing,
+        # which is the shape a strict proxy drops and a lenient origin honours.
+        ("space before colon", b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length : 3\r\n\r\nabc"),
+        # A bare LF fused two headers into one and the Content-Length VANISHED from the dict, so
+        # both framing guards inspected a request whose framing header they could no longer see.
+        ("bare lf in head", b"POST / HTTP/1.1\r\nHost: h\nContent-Length: 3\r\n\r\nabc"),
+        # ... and a bare LF in the request line left the header dict EMPTY while the body was read.
+        ("bare lf request line", b"POST /x HTTP/1.1\nHost: h\r\n\r\n"),
+        # HTTP-version is DIGIT "." DIGIT; a startswith("HTTP/") test accepted this.
+        ("non-token version", b"POST / HTTP/1.1x\r\nHost: h\r\n\r\n"),
+    ],
+)
+async def test_the_head_parse_refuses_the_rfc_9112_desync_grammar(label: str, raw: bytes) -> None:
+    """Nine shapes both library parsers reject and this one accepted (BACKLOG #1125).
+
+    Every one is a desync primitive: it parses one way here and another way in a fronting proxy.
+    The accept-controls live in the tests around this one -- a plain GET, a plain POST carrying a
+    Content-Length, and GET + `Content-Length: 0` -- so a parser that had gone refuse-everything
+    would redden those rather than pass here.
+    """
+    reader = await _reader_from(raw)
+    with pytest.raises(HttpRequestError) as excinfo:
+        await _read_head(reader, max_header_bytes=8192)
+    assert excinfo.value.status == 400, label
+    assert excinfo.value.kind == "framing_error", label
 
 
 def test_build_response_shape() -> None:
