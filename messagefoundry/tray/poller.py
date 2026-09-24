@@ -27,6 +27,7 @@ without a real service or network.
 
 from __future__ import annotations
 
+import functools
 import logging
 import threading
 import time
@@ -36,7 +37,7 @@ from dataclasses import dataclass
 import httpx
 
 from messagefoundry.tray.config import TrayConfig
-from messagefoundry.tray.probe import make_probe_client, probe_health, probe_ui
+from messagefoundry.tray.probe import make_probe_client, pin_loads, probe_health, probe_ui
 from messagefoundry.tray.state import (
     HealthProbe,
     ProbeInputs,
@@ -220,7 +221,7 @@ class StatusPoller:
         scm_reader: Callable[[str], ScmReading] = query_scm_state,
         health_probe: Callable[[httpx.Client], HealthProbe] = probe_health,
         ui_probe: Callable[[httpx.Client], UiProbe] = probe_ui,
-        client_factory: Callable[[str], httpx.Client] = make_probe_client,
+        client_factory: Callable[[str], httpx.Client] | None = None,
         clock: Callable[[], float] = time.monotonic,
         toast_min_interval_s: float = TOAST_MIN_INTERVAL_S,
     ) -> None:
@@ -229,7 +230,15 @@ class StatusPoller:
         self._scm_reader = scm_reader
         self._health_probe = health_probe
         self._ui_probe = ui_probe
+        # The default factory carries the config's certificate pin, so a caller that injects its
+        # own factory owns the trust decision too.
+        #: The pin the default factory uses. See :meth:`_rebuild_once_the_pin_loads`.
+        self._pin: str | None = None
+        if client_factory is None:
+            self._pin = config.engine_cacert
+            client_factory = functools.partial(make_probe_client, cacert=config.engine_cacert)
         self._client_factory = client_factory
+        self._pin_pending = False
         self._clock = clock
         self._toast_min_interval_s = toast_min_interval_s
         self._client: httpx.Client | None = None
@@ -242,7 +251,7 @@ class StatusPoller:
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
-        self._client = self._client_factory(self._config.engine_url)
+        self._open_client()
         self._thread = threading.Thread(target=self._run, name="mefor-tray-poller", daemon=True)
         self._thread.start()
 
@@ -317,12 +326,40 @@ class StatusPoller:
 
     def poll_once(self, now: float) -> PollResult:
         """Read all probes once and produce a :class:`PollResult`. Does I/O via the injected deps."""
+        self._rebuild_once_the_pin_loads()
         reading = self._scm_reader(self._config.service_name)
         client = self._client
         health = self._health_probe(client) if client is not None else HealthProbe.DOWN
         ui = self._ui_probe(client) if client is not None else UiProbe.UNKNOWN
         self._tracking, inputs = advance(self._tracking, reading, health, ui, now)
         return self._build_result(inputs, reading, now)
+
+    def _open_client(self) -> None:
+        # Checked BEFORE the build, so a pin that appears in between costs one spare rebuild
+        # rather than leaving the client unpinned.
+        self._pin_pending = self._pin is not None and not pin_loads(self._pin)
+        self._client = self._client_factory(self._config.engine_url)
+
+    def _rebuild_once_the_pin_loads(self) -> None:
+        """Pick up the engine's certificate once it loads, without a tray restart.
+
+        The engine mints its pair on its first run, so a tray started before then builds its client
+        with no pin, and the probe falls back to the OS trust store and reads the engine as down.
+        The client is otherwise built once, so this retries the load on each tick and rebuilds the
+        client once it succeeds. It keys on LOADING, not on the file existing: the engine writes
+        the file non-atomically, so an empty or half-written file exists too. The pending flag
+        clears only after the rebuild, so a factory that raises is retried on the next tick.
+        """
+        if not self._pin_pending or self._pin is None or self._stop.is_set():
+            return
+        if not pin_loads(self._pin):
+            return
+        log.info("engine certificate %s now loads; rebuilding the probe client", self._pin)
+        old = self._client
+        self._client = self._client_factory(self._config.engine_url)
+        self._pin_pending = False
+        if old is not None:
+            old.close()
 
     def _unknown_result(self) -> PollResult:
         """The stand-in :class:`PollResult` for a tick that raised.

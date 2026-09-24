@@ -187,8 +187,8 @@ def test_build_verify_never_returns_false() -> None:
 
 def test_probe_module_has_no_verify_false_escape_hatch() -> None:
     """Frozen (AST, so prose about the rule doesn't trip it): a future 'just make the self-signed
-    cert work' edit must not slip an insecure default into the tray's probe client. The OS trust
-    store — into which an operator can install a self-signed engine root — is the only path."""
+    cert work' edit must not slip an insecure default into the tray's probe client. A pinned PEM
+    or the OS trust store are the only two trust paths, and both verify."""
     tree = ast.parse(Path(inspect.getfile(probe_module)).read_text(encoding="utf-8"))
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
@@ -761,3 +761,98 @@ def test_the_guard_permits_classify_healths_own_signature_reading_the_status_val
     assert not _flags_the_plant(
         'return body.get("status")', "status_code: int | None, body: object"
     )
+
+
+# --- The minted-certificate pin (ADR 0172) --------------------------------------------------------
+
+
+@pytest.fixture
+def minted_tls_engine(tmp_path: Path) -> Iterator[tuple[str, str]]:
+    """A loopback https server presenting a freshly minted self-signed pair, like a stock engine.
+
+    Yields ``(base_url, cert_pem_path)``. It answers ``GET /health`` with the stock body, so a
+    probe that completes the handshake classifies it as the engine.
+    """
+    import http.server
+    import threading
+
+    from messagefoundry import pki
+
+    cert_pem, key_pem = pki.make_self_signed("127.0.0.1", ["127.0.0.1"], 1)
+    cert = tmp_path / "api-generated-cert.pem"
+    key = tmp_path / "api-generated-key.pem"
+    cert.write_bytes(cert_pem)
+    key.write_bytes(key_pem)
+
+    body = json.dumps(STOCK_HEALTH_BODY).encode()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(str(cert), str(key))
+    server.socket = ctx.wrap_socket(server.socket, server_side=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"https://127.0.0.1:{server.server_address[1]}", str(cert)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_a_pinned_probe_reaches_an_engine_serving_its_minted_pair(
+    minted_tls_engine: tuple[str, str],
+) -> None:
+    """The fix, over a real handshake: pinned to the minted PEM, the probe reads the engine as up."""
+    url, cert = minted_tls_engine
+    with make_probe_client(url, cacert=cert) as client:
+        assert probe_health(client) is HealthProbe.OK
+
+
+def test_an_unpinned_probe_cannot_verify_the_minted_pair(
+    minted_tls_engine: tuple[str, str],
+) -> None:
+    """The control for the test above: the same server, the OS trust store, and the engine is DOWN.
+
+    Without this arm the pinned test would pass equally if verification had been switched off.
+    """
+    url, _cert = minted_tls_engine
+    with make_probe_client(url) as client:
+        assert probe_health(client) is HealthProbe.DOWN
+
+
+def test_build_verify_pins_exactly_the_given_pem(minted_tls_engine: tuple[str, str]) -> None:
+    _url, cert = minted_tls_engine
+    ctx = build_verify("https://127.0.0.1:8765", cert)
+    assert isinstance(ctx, ssl.SSLContext)
+    assert "truststore" not in type(ctx).__module__
+    assert ctx.verify_mode is ssl.CERT_REQUIRED
+    assert ctx.check_hostname is True
+    assert ctx.cert_store_stats()["x509"] == 1  # the pin alone: no OS roots were loaded
+
+
+def test_build_verify_ignores_a_pin_for_plain_http() -> None:
+    assert build_verify("http://127.0.0.1:8765", "whatever.pem") is True
+
+
+def test_build_verify_an_unloadable_pin_still_verifies(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A pin not minted yet falls back to the OS trust store, loudly, and never to no verification."""
+    missing = tmp_path / "api-generated-cert.pem"
+    with caplog.at_level("WARNING", logger="messagefoundry.tray.probe"):
+        ctx = build_verify("https://127.0.0.1:8765", str(missing))
+    assert isinstance(ctx, ssl.SSLContext)
+    assert ctx.verify_mode is ssl.CERT_REQUIRED
+    assert "truststore" in type(ctx).__module__
+    assert str(missing) in caplog.text

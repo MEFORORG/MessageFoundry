@@ -314,6 +314,9 @@ _CONTEXTUAL_TOKENS = frozenset(
         "session_absolute_hours",
         "max_session_hours",
         "oidc_session_max_hours",
+        # BACKLOG #1150: time since the IdP authentication event. A hard DENY at the claims ladder
+        # (missing / stale auth_time) and a cap on the minted session's deadline.
+        "oidc_max_age_seconds",
         "max_sessions_per_user",
         "phi_read_rate_limit_enabled",
         "phi_read_rate_limit_per_actor",
@@ -417,6 +420,7 @@ _PINNED_THRESHOLDS: tuple[tuple[str, str, object, str], ...] = (
     ("auth", "phi_read_rate_limit_window_seconds", 60.0, "60 s"),
     ("auth", "oidc_flow_cache_max", 512, "**512**"),
     ("auth", "oidc_flow_ttl_seconds", 300, "300 s"),
+    ("auth", "oidc_max_age_seconds", 43200, "43200 s"),
 )
 
 #: Settings-name fragments that make a field a candidate contextual/environmental input. Every field
@@ -507,7 +511,7 @@ _CONTEXTUAL_PROSE_ONLY = frozenset(
 #: Body-row counts of the two decision tables. Row-scoping alone cannot catch the deletion of a row
 #: whose tokens are shared with a sibling row (Sec-Fetch, bind/exposure, the DICOM construction
 #: gate), so the counts are pinned too: removing ANY row reds CI.
-_CONTEXT_TABLE_A_ROWS = 37
+_CONTEXT_TABLE_A_ROWS = 38
 _CONTEXT_TABLE_B_ROWS = 13
 
 #: The closed action vocabulary the section declares. Every Action cell in BOTH tables must OPEN with

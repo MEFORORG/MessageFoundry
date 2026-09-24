@@ -327,7 +327,7 @@ recency.
 | Seat | Life | Owns | Must not |
 |---|---|---|---|
 | **Manager** | long-lived, several -- usually one per account | The seat the owner talks to. Reads the backlog ledger (in the vault since 2026-09-13; `docs/BACKLOG.md` here is a stub), writes a disposable brief citing an item, dispatches subagent Builders in its own process, polls for state, pushes, and **decides when to cut a PR and what goes in it**, usually one PR per wave (owner ruling 2026-09-23). ASVS record work, which it dispatches to vault Builders (owner ruling 2026-09-23; see the note below). | Build. Attribute a red -- nobody does that now. Enqueue or merge -- both are the Lander's. Wait on inbound messages; it polls instead. Exit with a worker's work unpushed. |
-| **Builder** | ephemeral, one per brief | The change, the commit, and the push. Under a Manager, the Manager opens the PR, usually carrying several Builders' branches. | Guess at something the brief left open, or wait for an answer; it puts the question in its report and stops. Open the PR when a Manager dispatched it; that is the Manager's. Plan and wait for a "go". Spawn another session. |
+| **Builder** | ephemeral, one per brief | The change, the commit, and the push. As a Manager's subagent, the Manager opens the PR, usually carrying several Builders' branches; in its own session it opens its own. | Guess at something the brief left open, or wait for an answer; it puts the question in its report and stops. Open the PR as a Manager's subagent; that is the Manager's. Plan and wait for a "go". Spawn another session. |
 | **Watchdog** | as needed | Watching the Lander and keeping it draining. Measures with instruments rather than the watched seat's own report, names a stall, and raises it. Added 2026-09-19. | Take the action it is watching for -- acting destroys the instrument. Drain the queue, take the claim, or drive the lane. Relay an owner grant to the seat it watches. Publish a zero with no control that fired. |
 | **Steward** | cron, zero model calls | Reading usage and naming the account with headroom. | Warn a running session. Nothing can interrupt one. |
 | **Lander** | as needed | Merging, and flipping row statuses after items merge (owner correction 2026-09-21; see the note below). Standing authority on the engine repo and the vault, with no per-action owner approval. The 2026-09-11 POSITIONAL ledger-conflict ruling is RETIRED -- read the notice below, which also covers the *what an item SAYS* half this row's Must-not column used to carry. | Merge a diff it has not read. Arm auto-merge. Resolve a conflict that touches code, or decide which of two deliberate changes to an item survives. |
@@ -592,7 +592,9 @@ gates a merge**, and no seat has to clear one.
    Bash call itself. CI arrives later, when the process is gone.
 3. It runs the checks below **before** it commits, because nobody downstream can ask it to.
 4. Its process exits when it has pushed and reported. The Manager opens the PR, often one PR for
-   several Builders' branches. The worktree stays behind.
+   several Builders' branches. The worktree stays behind. **A Builder in its own session -- started
+   from a chip, or spawned -- is not the Manager's subagent and opens its own PR** (korus
+   `roles/MANAGER.md`, *A Builder in its own session opens its own pull request*).
 5. **It CAN declare its own seat, through the Bash tool.** Measured 2026-09-02: a headless `-p`
    Builder ran `seat.ps1 -Declare` and its record carries `seatSource: declared` with a real goal,
    which no hook can write. **Quote the Windows path.** Unquoted, the SHELL eats the backslashes:
@@ -761,8 +763,9 @@ gates a merge**, and no seat has to clear one.
   measured 2026-09-03, BACKLOG #1440. Same rule for any file whose content is later fed to a command.
 - **Every seat pushes its own branch, without asking.** Owner ruling 2026-08-29, anchored at
   `refs/liaison/owner-ruling-20260829-push` (`987705dfb`), in their words: *"Sessions push their
-  own."* **ONLY THE PULL-REQUEST HALF MOVED, on 2026-09-18: the MANAGER opens the PR**, verifying
-  the branch with `git ls-remote --heads origin` rather than trusting the Builder's report. The push
+  own."* **ONLY THE PULL-REQUEST HALF MOVED, on 2026-09-18: the MANAGER opens the PR** for a
+  Builder that is its subagent, verifying the branch with `git ls-remote --heads origin` rather
+  than trusting the Builder's report. The push
   half of the 2026-08-29 ruling is untouched, so do not read this as a return to asking permission
   to push. A Builder's final commit message carries the proposed PR title and ledger banner text, so
   the branch is self-describing if the Manager dies before opening it.
@@ -777,7 +780,10 @@ gates a merge**, and no seat has to clear one.
   to a Builder; the Manager never writes that resolution. **No other seat decides this.** A Builder
   cannot, because it exits first. The Lander owns the PR from the handover on and repairs it like
   any other, but dropping an item is a re-cut, and re-cuts go back to the Manager. Every other seat
-  opens its own PR and may batch its own work the same way. The steps, the PR
+  opens its own PR and may batch its own work the same way. **"Dispatched by a Manager" means running
+  as its SUBAGENT (owner ruling 2026-09-24).** A Builder in its own session, started from a chip or
+  spawned, has a report that reaches nobody, so it opens its own PR even though a Manager wrote its
+  brief. The steps, the PR
   body shape and the traps are in korus `roles/MANAGER.md`, *When to cut a pull request*.
 - **The merge is the Lander's, and NO LABEL BLOCKS IT.** What blocks a merge is branch protection and
   the required contexts, nothing else. **Reading a diff before merging it is still the job; no check

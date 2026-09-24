@@ -10,6 +10,7 @@ import errno
 import json
 import logging
 import ssl
+import sys
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -226,13 +227,16 @@ def test_serve_mtls_with_cert_map_swaps_in_shim_protocol(
     http_cls = captured.get("http")
     assert http_cls is not None
     assert "connection_made" in vars(http_cls)  # the shim's per-connection cert-stashing override
+    # BACKLOG #1120: the shim is stacked ON the header-floored protocol, never instead of it.
+    assert "send_400_response" in vars(http_cls.__mro__[1])
 
 
-def test_serve_mtls_without_cert_map_keeps_stock_protocol(
+def test_serve_mtls_without_cert_map_gets_no_shim(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Mutual-auth-only (client CA but NO cert-identity map, e.g. console mTLS) keeps the stock protocol:
-    # no behaviour change without a client CA + map. So uvicorn gets no `http` override.
+    # Mutual-auth-only (client CA but NO cert-identity map, e.g. console mTLS) never gets the mTLS
+    # shim: no behaviour change without a client CA + map. Since BACKLOG #1120 uvicorn always gets
+    # the header-floored protocol, so this asserts the shim is absent rather than that `http` is.
     from messagefoundry.store.crypto import generate_key
 
     cert, key = _self_signed(tmp_path)
@@ -253,7 +257,18 @@ def test_serve_mtls_without_cert_map_keeps_stock_protocol(
         encoding="utf-8",
     )
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
-    assert "http" not in captured  # stock protocol — the shim is never wired without a map
+    http_cls = captured["http"]
+    assert "connection_made" not in vars(http_cls)  # the shim is never wired without a map
+    assert "send_400_response" in vars(http_cls)  # the header-floored protocol (BACKLOG #1120)
+    # The ws class overrides the WebSocket 500, and on the legacy server the handshake writer too.
+    from uvicorn.protocols.websockets.auto import AutoWebSocketsProtocol
+
+    ws_base: Any = AutoWebSocketsProtocol
+    ws_cls = captured["ws"]
+    assert issubclass(ws_cls, ws_base)
+    assert ws_cls.send_500_response is not ws_base.send_500_response
+    if hasattr(ws_base, "write_http_response"):
+        assert ws_cls.write_http_response is not ws_base.write_http_response
 
 
 def test_serve_loopback_without_a_certificate_now_mints_and_serves_tls(
@@ -2290,3 +2305,41 @@ def test_the_upstream_terminator_topology_keeps_the_host_prefix_without_minting(
     # on an operator remembering to set both keys.
     with pytest.raises(ValidationError, match="requires .api..trusted_proxies"):
         ApiSettings(tls_terminated_upstream=True)
+
+
+def _sddl(path: str, out_dir: Path) -> str:
+    """The file's DACL as SDDL, via ``icacls /save``: SIDs as aliases, so no display language."""
+    import subprocess
+
+    out = out_dir / (Path(path).name + ".acl")
+    subprocess.run(["icacls", path, "/save", str(out)], check=True, capture_output=True)
+    return out.read_bytes().decode("utf-16")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the grant is Windows-only, as the tray is")
+def test_local_users_can_read_the_minted_certificate_but_not_the_key(tmp_path: Path) -> None:
+    """The tray runs as the logged-on user and must pin this certificate, while the installer locks
+    the data directory to SYSTEM, Administrators and the service account. The cert is public (every
+    handshake hands it out); the key must stay owner-only. BU is the SDDL alias for BUILTIN\\Users.
+    """
+    state = tmp_path / "state"
+    cert, key = ensure_api_tls_material(ApiSettings(), state_dir=state)
+    cert_acl = _sddl(cert, tmp_path)
+    key_acl = _sddl(key, tmp_path)
+    assert ";;;BU)" in cert_acl, cert_acl
+    assert ";;;BU)" not in key_acl, key_acl
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the grant is Windows-only, as the tray is")
+def test_a_failed_read_grant_never_stops_the_mint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Best-effort, like ``store._secure_file``: the engine still gets its pair, and the log says why
+    the tray will not be able to pin it."""
+    monkeypatch.setattr(
+        "messagefoundry.store.store._system_exe", lambda *_p: str(tmp_path / "no-icacls.exe")
+    )
+    with caplog.at_level(logging.WARNING):
+        cert, key = ensure_api_tls_material(ApiSettings(), state_dir=tmp_path / "state")
+    assert Path(cert).exists() and Path(key).exists()
+    assert "could not grant read on" in caplog.text

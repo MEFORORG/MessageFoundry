@@ -17,6 +17,7 @@ from messagefoundry.tray.config import (
     build_engine_url,
     compose_config,
     engine_serves_https,
+    generated_cert_path,
     is_local_engine,
     is_tls_url,
     load_config,
@@ -217,7 +218,8 @@ def test_compose_registry_hints() -> None:
         app_stdout="C:\\ProgramData\\MessageFoundry\\logs\\service.out.log",
     )
     cfg = compose_config(None, reg)
-    assert cfg.engine_url == "http://127.0.0.1:9100"
+    # https: with no engine settings to say otherwise, the engine runs on its defaults, which mint.
+    assert cfg.engine_url == "https://127.0.0.1:9100"
     assert cfg.repo_path == "C:\\Users\\me\\Code\\MessageFoundry"
     assert cfg.log_path is not None and cfg.log_path.endswith("service.out.log")
 
@@ -537,3 +539,124 @@ def test_ensure_tray_toml_writes_template_then_is_idempotent(tmp_path: Path) -> 
     path.write_text("engine_url = 'http://x:9'\n", encoding="utf-8")
     ensure_tray_toml(tmp_path)
     assert path.read_text(encoding="utf-8") == "engine_url = 'http://x:9'\n"
+
+
+# --- The minted-certificate pin (ADR 0172) --------------------------------------------------------
+
+
+def test_default_engine_url_is_https() -> None:
+    """A stock engine serves TLS (ADR 0172), so a plaintext default probes a socket that hangs up."""
+    assert DEFAULT_ENGINE_URL == "https://127.0.0.1:8765"
+
+
+# The AppParameters shape scripts/service/install-service.ps1 writes, which always has an absolute
+# --db. Built from a real absolute path so Path.is_absolute() agrees on every OS the suite runs on.
+def _installed(db: Path) -> str:
+    return (
+        f'serve --config "C:\\MF\\config" --db "{db}" '
+        "--host 127.0.0.1 --port 8765 --log-level INFO --env prod"
+    )
+
+
+def _reg(params: str, app_directory: str | None) -> ServiceRegistryInfo:
+    return ServiceRegistryInfo(app_directory=app_directory, app_parameters=params)
+
+
+def test_generated_cert_path_follows_an_absolute_db(tmp_path: Path) -> None:
+    db = tmp_path / "data" / "messagefoundry.db"
+    got = generated_cert_path(None, _reg(_installed(db), str(tmp_path / "elsewhere")))
+    assert got == str(tmp_path / "data" / "api-generated-cert.pem")
+
+
+def test_generated_cert_path_resolves_a_relative_db_against_app_directory(tmp_path: Path) -> None:
+    got = generated_cert_path(None, _reg("serve --db data/mf.db", str(tmp_path)))
+    assert got == str(tmp_path / "data" / "api-generated-cert.pem")
+
+
+def test_generated_cert_path_falls_back_to_store_path_then_the_default(tmp_path: Path) -> None:
+    toml: dict[str, object] = {"store": {"path": "state/mf.db"}}
+    assert generated_cert_path(toml, _reg("serve --port 8765", str(tmp_path))) == str(
+        tmp_path / "state" / "api-generated-cert.pem"
+    )
+    # No --db and no [store].path: the engine's own default, messagefoundry.db, under AppDirectory.
+    assert generated_cert_path(None, _reg("serve --port 8765", str(tmp_path))) == str(
+        tmp_path / "api-generated-cert.pem"
+    )
+
+
+@pytest.mark.parametrize(
+    "toml",
+    [
+        {"api": {"tls_cert_file": "C:\\certs\\engine.pem"}},  # operator chain: OS trust store
+        {"api": {"tls_terminated_upstream": True}},  # plaintext to a proxy: nothing to pin
+    ],
+)
+def test_generated_cert_path_is_none_when_the_engine_serves_no_minted_pair(
+    toml: dict[str, object], tmp_path: Path
+) -> None:
+    assert generated_cert_path(toml, _reg(_installed(tmp_path / "mf.db"), str(tmp_path))) is None
+
+
+def test_generated_cert_path_does_not_guess(tmp_path: Path) -> None:
+    """No service entry, no working directory, or a project root the tray does not resolve."""
+    base = str(tmp_path)
+    assert generated_cert_path(None, None) is None
+    assert generated_cert_path(None, _reg("serve --db mf.db", None)) is None
+    assert generated_cert_path(None, _reg("serve --project-root estate --db mf.db", base)) is None
+    rooted: dict[str, object] = {"environments": {"base_dir": "estate"}}
+    assert generated_cert_path(rooted, _reg("serve --db mf.db", base)) is None
+    # An ABSOLUTE --db is honoured as-is even under a root, exactly as serve honours it.
+    db = tmp_path / "d" / "mf.db"
+    assert generated_cert_path(None, _reg(f'serve --project-root estate --db "{db}"', base)) == str(
+        tmp_path / "d" / "api-generated-cert.pem"
+    )
+
+
+def test_compose_an_explicit_engine_url_drops_the_derived_pin() -> None:
+    """The derived pin belongs to the local service; an explicit URL may name another engine."""
+    reg = _reg("serve --host 127.0.0.1 --port 8765", None)
+    derived = compose_config(None, reg, engine_cacert="derived.pem")
+    assert derived.engine_url == "https://127.0.0.1:8765"
+    assert derived.engine_cacert == "derived.pem"
+    explicit = compose_config({"engine_url": "https://127.0.0.1:9999"}, reg, engine_cacert="d.pem")
+    assert explicit.engine_cacert is None
+
+
+def test_compose_an_explicit_engine_cacert_wins(tmp_path: Path) -> None:
+    mine = str(tmp_path / "mine.pem")
+    toml: dict[str, object] = {"engine_cacert": mine}
+    assert compose_config(toml, None, engine_cacert="derived.pem").engine_cacert == mine
+
+
+def test_compose_a_relative_engine_cacert_is_ignored() -> None:
+    """A relative pin would resolve against whatever directory the tray started in."""
+    toml: dict[str, object] = {"engine_cacert": "mine.pem"}
+    assert compose_config(toml, None, engine_cacert="derived.pem").engine_cacert == "derived.pem"
+
+
+def test_a_blank_cert_path_is_classified_as_the_engine_classifies_it(tmp_path: Path) -> None:
+    """The tray passes tls_cert_file raw, as the engine does, so a blank one reads as an operator
+    chain on both sides and the tray derives no pin for a pair the engine would never mint."""
+    toml: dict[str, object] = {"api": {"tls_cert_file": " "}}
+    assert engine_serves_https(toml) is True
+    assert generated_cert_path(toml, _reg(_installed(tmp_path / "mf.db"), str(tmp_path))) is None
+
+
+def test_load_config_pins_the_minted_cert_of_an_installed_service(tmp_path: Path) -> None:
+    """End to end over the shipped install shape: the scheme AND the trust anchor, both derived."""
+    data = tmp_path / "data"
+    reader = _FakeReader(_reg(_installed(data / "messagefoundry.db"), str(tmp_path)))
+    cfg = load_config(tmp_path, reader)
+    assert cfg.engine_url == "https://127.0.0.1:8765"
+    assert cfg.engine_cacert == str(data / "api-generated-cert.pem")
+
+
+def test_load_config_an_operator_chain_pins_nothing(tmp_path: Path) -> None:
+    """The NEGATIVE control: https, but trusted through the OS store rather than a pin."""
+    (tmp_path / "messagefoundry.toml").write_text(
+        '[api]\ntls_cert_file = "engine.pem"\n', encoding="utf-8"
+    )
+    reader = _FakeReader(_reg(_installed(tmp_path / "messagefoundry.db"), str(tmp_path)))
+    cfg = load_config(tmp_path, reader)
+    assert cfg.engine_url == "https://127.0.0.1:8765"
+    assert cfg.engine_cacert is None
