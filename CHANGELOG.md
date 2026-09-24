@@ -43,6 +43,41 @@ All notable changes to MessageFoundry are documented here. The format follows
   monitor sockets, gets `503`. Without the extension the route still sends the bare close it sent
   before. **Migration:** a client that reads the handshake status should treat `503` as "try again
   later", not as a sign-in failure. (`BACKLOG #1120`)
+- **BREAKING — `EngineClient()` and the Windows tray now default to `https://127.0.0.1:8765`, and
+  the tray pins the certificate a stock engine mints.** Engine 0.4.0 serves https by default. Yet
+  `EngineClient()` still aimed at `http://127.0.0.1:8765`, which a stock engine does not answer.
+  So did the tray, unless its service entry named both `--host` and `--port`. A tray that took its
+  address from the service entry already chose https. It then reported the engine down, because
+  no trust store holds the minted certificate. (`BACKLOG #1276`)
+  - `messagefoundry.apiclient.EngineClient` now defaults `base_url` to https. Its trust is
+    unchanged. Without `cacert=`, it verifies against the OS trust store, so a stock engine's
+    certificate fails verification. The client never turns verification off.
+  - The tray's `DEFAULT_ENGINE_URL` is now https. `messagefoundry.tray.config.compose_config()` now
+    defaults `engine_tls` to `True`, because an engine on its own defaults mints a pair.
+  - When the engine mints its own pair, the tray now finds `api-generated-cert.pem` through the
+    service entry and pins it as its only trust anchor. It looks beside `--db`, else
+    `[store].path`, else `messagefoundry.db` under the service's `AppDirectory`. It finds nothing
+    when a relative store path would sit under `--project-root` or `[environments].base_dir`.
+    `messagefoundry.tray.poller.StatusPoller` applies the pin unless the caller passes its own
+    `client_factory`. A tray started before the engine's first run picks the file up once it
+    loads, with no restart.
+  - A new `tray.toml` key, `engine_cacert`, names the file to pin. It must be an absolute path; a
+    relative one is ignored. An explicit `engine_url` drops the file the tray found. A pin that
+    will not load falls back to the OS trust store, never to no verification.
+  - On Windows, when the engine mints a pair, it now grants local users (`BUILTIN\Users`) read on
+    the certificate file. The certificate is public, since every TLS client receives it. The key
+    stays readable only by its owner. The grant is best-effort: a failure is logged, and the
+    engine still starts.
+  - **Migration:** to reach a stock engine, give `EngineClient` a `cacert=` that names
+    `api-generated-cert.pem`. For an engine behind `[api].tls_terminated_upstream`, which speaks
+    plain http, pass `base_url="http://127.0.0.1:8765"`. A tray that does not take its address
+    from the service entry now tries https. Set `engine_url` in `tray.toml` to reach a plain-http
+    engine. With no service entry at all, set `engine_cacert` to reach a stock engine. The engine
+    reuses a pair it already has, and engine 0.4.0 minted its pairs without the grant.
+    `scripts\service\install-service.ps1` locks the data directory to SYSTEM, Administrators and
+    the service account, and the tray runs as the signed-in user. On such a host, grant local
+    users read on `api-generated-cert.pem` alone, never the key. Or delete both generated files so
+    the engine mints a new pair, then re-pin every client that pinned the old one.
 
 ### Security
 - **BREAKING — OIDC sign-in now bounds how old the IdP's authentication may be.** A new setting,
