@@ -91,6 +91,31 @@ All notable changes to MessageFoundry are documented here. The format follows
   - any HTTP version other than 1.x.
 
   **A deploying sender relying on any of these would be refused.** ([BACKLOG #1125](docs/BACKLOG.md))
+- **BREAKING: an HTTP-family reply is now refused when its header block or its chunked body breaks
+  the HTTP/1.1 grammar.** 0.4.0 read most of these as the partner's answer. A REST, SOAP, FHIR or DICOMweb delivery,
+  and an OAuth2 or SMART token request, now raises `AmbiguousFramingError`, a transient delivery
+  error that is retried and then dead-lettered. A `fhir_lookup` reply raises inside the Handler. The
+  OIDC token and JWKS reads refuse the same replies, and that sign-in fails as an unavailable IdP.
+  The OIDC token read now also refuses a body shorter than its `Content-Length`, as the connectors
+  already did. Newly refused, at least:
+  - a header line that is not a field line, such as a line with no colon or a space before the
+    colon. 0.4.0 dropped every header after that line, then framed the body without them. It could
+    read three bytes of raw chunk framing as the answer, or read to close and take a second
+    response as part of the body;
+  - a header line with no name, a first line that is a continuation, a `From ` line, or a field
+    name that is not an RFC 9110 token;
+  - a chunk-size line that is not plain hex digits, such as `-5`, `1_0`, `+5`, `0x5` or ` 5`.
+    0.4.0 parsed these with `int()`. On a negative size it read to the end of the stream, past
+    the reply's byte bound, and only then failed;
+  - a chunk line ended by a bare LF, or holding a bare CR, and chunk data not followed by CRLF;
+  - a trailer line that is not a field line, or more than 100 trailer fields;
+  - a chunked body that stops before its final CRLF. This is a truncation, and 0.4.0 accepted it.
+
+  Chunk extensions, trailer fields, upper-case hex and leading zeros still read. Connection probes
+  and the alert webhook discard the body and are not refused. They stop reading at the first bad
+  chunk line and log a WARNING. **Migration:** none in configuration. The partner or its proxy must
+  send well-formed HTTP/1.1. (ASVS 4.2.1, ASVS 15.2.2, [BACKLOG #1125](docs/BACKLOG.md),
+  [BACKLOG #1979](docs/BACKLOG.md))
 ### Fixed
 - **The startup ERROR for an unusable bundled breach corpus now says a first `serve` still creates
   the bootstrap admin, whose forced password change that corpus would refuse.** It also says
