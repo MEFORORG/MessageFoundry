@@ -1692,13 +1692,11 @@ At least one shipped path makes an account must-change **and** leaves it a facto
 administrator password reset, which keeps the account's factors. That account proves its factor
 first, then rotates. The must-change confinement lets `POST /auth/mfa-verify` through for it, and the
 console sends it to `/ui/mfa` before the password page. A passkey-only account has to do this on the
-console, through `POST /ui/reauth/webauthn`, because the JSON plane has no passkey leg. Before this
-change a JSON-only client could rotate such an account's password and could then do nothing else,
-since its next sign-in is pending with no way to prove a passkey there; now it cannot rotate
-either. A directory account is not refused here: `POST /me/password` answers it with the usual 400
-and changes nothing. This change was made without an owner ruling, by
-a Manager decision of 2026-09-24, because the research found no account it leaves without a way
-forward.
+console, through `POST /ui/reauth/webauthn`, because the JSON plane has no passkey leg. So a
+JSON-only client cannot rotate it. Before this change such a client could rotate it and then do
+nothing else. Its next sign-in was pending, with no way to prove a passkey there. A directory
+account is not refused here: `POST /me/password` answers it with the usual 400 and changes nothing.
+The owner ruled on 2026-09-24 to keep this behaviour as built.
 
 Every targeted revoke is audited (`auth.session_revoked`, with scope + actor). The **web console** surfaces
 this: an **Active sessions…** view in the account menu lists your sessions and offers per-session

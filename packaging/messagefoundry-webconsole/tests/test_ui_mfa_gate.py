@@ -700,7 +700,7 @@ async def test_a_satisfied_session_changes_the_password_as_before(
 
 @pytest.mark.parametrize("enrolled", (False, True), ids=("no-factor", "with-a-factor"))
 async def test_a_directory_account_still_gets_the_directory_refusal(
-    engine: Engine, enrolled: bool
+    engine: Engine, enrolled: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """RED when: the refusal pre-empts the directory 400.
 
@@ -714,6 +714,7 @@ async def test_a_directory_account_still_gets_the_directory_refusal(
         username="aduser", display_name=None, email=None, dn="CN=aduser,DC=x", groups=frozenset()
     )
     if enrolled:
+        _pin_totp_clock(monkeypatch, 1_000_000.0)  # no step boundary between code and check
         setup = await service._complete_ad_login(principal, None, mfa_verified=False)
         assert setup.identity is not None and setup.token is not None
         enrollment = await service.begin_mfa_enrollment(setup.identity)

@@ -3198,7 +3198,9 @@ class AuthService:
         """Whether the session is MFA-pending on an account that already HAS a second factor.
 
         Fails closed (True) when the session or its user cannot be found. ``local_only`` answers
-        False for any account whose password the engine does not hold."""
+        False for a directory account, whose password the engine does not hold. It names AD rather
+        than excluding everything that is not LOCAL: ``_build_identity`` maps an unrecognized
+        provider back to LOCAL, so the password handler treats that row as local and changes it."""
         if not token:
             return True  # no session to act on, so fail closed (as below)
         if await self.mfa_satisfied(token):
@@ -3209,7 +3211,7 @@ class AuthService:
         user = await self._store.get_user(session.user_id)
         if user is None:
             return True
-        if local_only and user.auth_provider != AuthProvider.LOCAL.value:
+        if local_only and user.auth_provider == AuthProvider.AD.value:
             return False
         return await self._second_factor_enrolled(user)
 

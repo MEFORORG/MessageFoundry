@@ -775,6 +775,41 @@ async def test_a_directory_account_is_still_told_its_password_lives_in_the_direc
         assert "Active Directory" in r.json()["detail"]
 
 
+async def test_an_unrecognized_provider_row_still_owes_its_factor(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the #1954 check exempts every provider that is not exactly LOCAL.
+
+    ``_build_identity`` maps an unrecognized provider back to LOCAL, so the password handler treats
+    such a row as local and changes it. Only AD may skip the factor here; anything else fails closed.
+    """
+    import dataclasses
+
+    service = await _service(engine)
+    await _add(service, "vic", Role.VIEWER)
+    t0 = 1_000_000.0
+    pin_totp_clock(monkeypatch, t0)
+    await _enroll_totp_out_of_band(service, "vic", now=t0)
+    async with _client(engine, service) as c:
+        tok = await _login(c, "vic")
+        # POSITIVE CONTROL: the real local row owes its factor before any tampering.
+        assert await service.password_change_owes_factor(tok) is True
+        real_get_user = engine.store.get_user
+
+        async def rogue_get_user(user_id: str) -> object:
+            user = await real_get_user(user_id)
+            if user is None:
+                return None
+            return dataclasses.replace(user, auth_provider="saml-from-the-future")
+
+        monkeypatch.setattr(engine.store, "get_user", rogue_get_user)
+        assert await service.password_change_owes_factor(tok) is True
+        r = await _change_password(c, tok)
+        assert r.status_code == 403 and r.headers.get("X-MFA-Required") == "1"
+    monkeypatch.undo()
+    assert (await service.login("vic", PW)).ok  # nothing changed
+
+
 # --- 6.3.4: per-mechanism directory strength --------------------------------
 
 

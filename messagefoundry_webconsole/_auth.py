@@ -288,7 +288,8 @@ def require_ui(
 
     A ``must_change_password`` account is 303'd to the browser change-password page (L4b) from every
     /ui route — ``allow_must_change=True`` is set ONLY by that page's own GET/POST (so the rotation
-    can actually happen; anything else would loop).
+    can actually happen; anything else would loop). While it still owes a factor it has enrolled,
+    it goes to ``/ui/mfa`` instead (``must_change_target``, BACKLOG #1954).
 
     ``activity=False`` (ASVS 14.3.1) validates the session WITHOUT refreshing its idle clock — the
     same contract the engine's /ws/stats keepalive uses. Set it on the console's **timer-driven
