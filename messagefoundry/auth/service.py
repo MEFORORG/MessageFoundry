@@ -22,7 +22,8 @@ import secrets
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, TypeVar
+from types import MappingProxyType
+from typing import Any, Final, TypeVar
 from uuid import uuid4
 
 from messagefoundry.auth import oidc, reconcile, totp, webauthn
@@ -465,6 +466,17 @@ def _json(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True)
 
 
+# BACKLOG #1138, ASVS 6.3.5: the audit action each suspicious-sign-in event is recorded under. A fixed
+# map, not ``f"auth.{event_type}"``, so the action names stay greppable and no other notice kind can
+# be passed in and double-audit an event its own call site already audits.
+_SUSPICIOUS_LOGIN_ACTIONS: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        ACCOUNT_LOCKED: "auth.account_locked",
+        LOGIN_AFTER_FAILURES: "auth.login_after_failures",
+    }
+)
+
+
 def _allowed_channels(user: UserRecord, roles: frozenset[Role]) -> frozenset[str] | None:
     """Resolve a user's stored per-channel RBAC scope to a frozenset, or ``None`` for all channels.
 
@@ -517,7 +529,8 @@ class AuthService:
         # dial cannot be read off settings here; it must be passed. Defaults enforce (fail-closed).
         self._trust_anchors_enforcing = enforcing
         # Out-of-band security-event push (ASVS 6.3.5/6.3.7), injected by the API lifespan. None = no
-        # email push (the audited /me/security-events feed still records everything). Best-effort.
+        # email push. What the /me/security-events pull feed still shows is stated once, in
+        # auth/notifications.py. Best-effort.
         self._security_notifier = security_notifier
         self._policy = PasswordPolicy.from_settings(settings)
         _warn_if_corpus_unreadable(settings.password_breach_corpus_file)
@@ -1295,12 +1308,12 @@ class AuthService:
                 client=client,
             )
             if just_locked:
-                await self._notify_security(
+                await self._record_suspicious_login(
                     ACCOUNT_LOCKED,
-                    username=user.username,
-                    email=user.notify_email,
+                    user,
                     client=client,
-                    detail={"failed_attempts": attempts},
+                    audit_detail={"provider": "local"},
+                    notice_detail={"failed_attempts": attempts},
                 )
             return LoginOutcome(ok=False, error="invalid credentials")
         # ASVS 6.4.1: an admin-issued initial/reset credential that was never claimed EXPIRES — the
@@ -1373,12 +1386,12 @@ class AuthService:
         if prior_failures >= SUSPICIOUS_LOGIN_FAILURE_THRESHOLD:
             # A successful login right after a run of failures is the classic compromised/attacked
             # signal (ASVS 6.3.5) — notify the owner out-of-band so they can react if it wasn't them.
-            await self._notify_security(
+            await self._record_suspicious_login(
                 LOGIN_AFTER_FAILURES,
-                username=user.username,
-                email=user.notify_email,
+                user,
                 client=client,
-                detail={"failed_attempts": prior_failures},
+                audit_detail={"provider": "local"},
+                notice_detail={"failed_attempts": prior_failures},
             )
         return LoginOutcome(
             ok=True,
@@ -1488,6 +1501,7 @@ class AuthService:
             client_id=s.oidc_client_id or "",
             signing_algorithms=[SignatureAlgorithm(a) for a in s.oidc_signing_algorithms],
             nonce=nonce,
+            max_age_seconds=s.oidc_max_age_seconds,
             username_claim=s.oidc_username_claim,
             username_strip_domain=s.oidc_username_strip_domain,
             allowed_username_domains=frozenset(s.effective_oidc_username_domains),
@@ -1554,6 +1568,7 @@ class AuthService:
             nonce=flow.nonce,
             code_challenge=challenge,
             scopes=self._settings.oidc_scopes,
+            max_age=self._settings.oidc_max_age_seconds,
             acr_values=self._settings.oidc_acr_values,
             prompt=self._settings.oidc_prompt,
         )
@@ -1689,17 +1704,34 @@ class AuthService:
                 ok=False, error="federated sign-in failed", reason="federated_subject_conflict"
             )
 
+        now = time.time()
         max_expires_at = principal_claims.expires_at
         if self._settings.oidc_session_max_hours:
-            max_expires_at = min(
-                max_expires_at, time.time() + self._settings.oidc_session_max_hours * 3600
-            )
-        if max_expires_at <= time.time():
+            max_expires_at = min(max_expires_at, now + self._settings.oidc_session_max_hours * 3600)
+        if max_expires_at <= now:
             # The ladder accepts an exp up to clock_skew_seconds in the PAST, so a token inside the
             # grace window would otherwise mint an already-dead session: the user "logs in" and is
             # revoked on their first request, with no audited reason. Refuse loudly instead.
             await self._directory_reject_audit(username, "oidc", "expired")
             return LoginOutcome(ok=False, error="federated sign-in failed", reason="expired")
+        # BACKLOG #1150 (ASVS 6.8.4 / 7.6.1): the session also ends max_age after the user last
+        # authenticated AT THE IdP. The ladder checks recency only at login, and /ui/reauth never
+        # returns to the IdP, so without this cap the time since the IdP authentication event would
+        # grow unbounded for the session's whole life.
+        # auth_time is clamped to now first: the ladder accepts an IdP clock up to clock_skew_seconds
+        # AHEAD, and without the clamp that lead would extend the session past now + max_age. The
+        # ladder already refuses a deadline behind its own clock; this branch is the backstop for
+        # time spent between that check and here (the LDAP round trip), so a deadline already
+        # behind now is refused under its own slug rather than minted dead.
+        recency_deadline = (
+            min(principal_claims.auth_time, now) + self._settings.oidc_max_age_seconds
+        )
+        if recency_deadline <= now:
+            await self._directory_reject_audit(username, "oidc", "auth_time_stale")
+            return LoginOutcome(
+                ok=False, error="federated sign-in failed", reason="auth_time_stale"
+            )
+        max_expires_at = min(recency_deadline, max_expires_at)
 
         self.clear_oidc_unavailable()
         # ASVS 6.3.4, the one directory leg the engine can actually verify. Keyed on the SETTING, not
@@ -3071,6 +3103,7 @@ class AuthService:
         else:
             ok = await self.verify_current_password(identity, password)
         elevation = Elevation()
+        grant_refused = False
         if ok:
             # (1) Every stamp for this elevation, against the OLD hash. The rotation carries these
             # columns forward; a stamp issued after it would silently write nothing.
@@ -3079,15 +3112,16 @@ class AuthService:
             await self._store.mark_session_reauthed(hash_token(token), client=client)
             # `_factor_binding_is_blocked` resolves the session BY THE OLD TOKEN and fails closed when
             # it cannot find it, so it is decided here, BEFORE the rotation retires that token --
-            # asking after would refuse every factor-binding grant on a session that is perfectly fine.
-            binding_blocked = purpose is not None and await self._factor_binding_is_blocked(
+            # asking after would refuse every such grant on a session that is perfectly fine. It
+            # covers every action in _PENDING_REFUSED_ACTIONS, session_terminate too (#1951).
+            grant_refused = purpose is not None and await self._factor_binding_is_blocked(
                 token, purpose
             )
             # (2) Rotate. Past this line `token` no longer authenticates.
             elevation = await self._elevated(
                 token, ceremony="reauth", actor=identity.username, client=client
             )
-            if purpose is not None and not binding_blocked and elevation.token is not None:
+            if purpose is not None and not grant_refused and elevation.token is not None:
                 # (3) Purpose-bound grants are minted AFTER, against the NEW hash -- minted against the
                 # old one they would be stranded on a hash nothing resolves any more.
                 # Bind THIS fresh proof to the single action named by `purpose` (single-use), so a broad
@@ -3104,47 +3138,65 @@ class AuthService:
                     # A good password on a session that vanished mid-ceremony is neither a success nor
                     # a credential failure; without this the audit row would read as a clean re-auth.
                     "session_lost": elevation.session_lost,
+                    # A good password whose purpose grant was refused (a pending session on an
+                    # account with a factor). Without it the row reads as a granted re-proof.
+                    "grant_refused": grant_refused,
                 }
             ),
             client=client,
         )
         return elevation
 
-    #: The step-up actions that BIND A NEW SECOND FACTOR. Reaching one from an MFA-pending session is
-    #: legitimate only while the account has no factor at all — that is the bootstrap escape the MFA
-    #: gate's carve-out exists for. For an account that already HAS a factor it is a promotion path,
-    #: because both ceremonies mark the session MFA-satisfied on success.
-    _FACTOR_BINDING_ACTIONS = frozenset(
-        {STEP_UP_ACTION_MFA_ENROLL, STEP_UP_ACTION_MFA_CONFIRM, STEP_UP_ACTION_WEBAUTHN_ENROLL}
+    #: The step-up actions a pending session may NOT be granted once its account HAS a factor. Every
+    #: one of them rides a ``*_reauth_only_action`` gate (``mfa_gate=False``), which exists so an
+    #: account with no factor is not locked out of it. For an account that already has one:
+    #:
+    #: - binding a new factor (``mfa_enroll``, ``mfa_confirm``, ``webauthn_enroll``) is a promotion
+    #:   path, because both ceremonies mark the session MFA-satisfied on success;
+    #: - ending sessions (``session_terminate``, BACKLOG #1951, ASVS 7.5.2) through the terminate
+    #:   routes would let a password holder sign the real user out without the second factor. That
+    #:   is these routes only: ``POST /me/password`` still revokes every session from a pending one.
+    #:
+    #: A new action on either reauth-only action gate belongs here too. A test in
+    #: ``tests/test_mfa_access_gate.py`` catches at least a missing one wired in the engine or
+    #: console packages. The action-less ``require_ui_reauth_only`` gate never consults it.
+    _PENDING_REFUSED_ACTIONS = frozenset(
+        {
+            STEP_UP_ACTION_MFA_ENROLL,
+            STEP_UP_ACTION_MFA_CONFIRM,
+            STEP_UP_ACTION_WEBAUTHN_ENROLL,
+            STEP_UP_ACTION_SESSION_TERMINATE,
+        }
     )
 
     async def _factor_binding_is_blocked(self, token: str | None, purpose: str) -> bool:
-        """Whether a factor-binding step-up grant must be REFUSED for this session (ASVS 6.3.3).
+        """Whether a step-up grant for ``purpose`` must be REFUSED for this session (ASVS 6.3.3).
 
+        Named for its first case, binding a factor; :data:`_PENDING_REFUSED_ACTIONS` lists them all.
         Closes a bypass the 6.3.3 access gate would otherwise leave open. The gate's carve-out
         (``mfa_gate=False`` on the ``*_reauth_only*`` factories, plus ``POST /me/reauth`` being
         MFA-exempt) is justified solely by "an un-enrolled user cannot satisfy a gate standing in
-        front of the only route that enrolls them" — a condition that is FALSE for an account that
-        already has a factor. Without this check, an attacker holding only the password could take a
-        pending session, re-auth with the password alone, enrol a NEW authenticator, and be promoted
-        to MFA-satisfied by ``confirm_mfa_enrollment`` / ``finish_webauthn_registration`` — defeating
+        front of the route it needs" — a condition that is FALSE for an account that already has a
+        factor. Without this check, an attacker holding only the password could take a pending
+        session, re-auth with the password alone, enrol a NEW authenticator, and be promoted to
+        MFA-satisfied by ``confirm_mfa_enrollment`` / ``finish_webauthn_registration`` — defeating
         the second factor entirely and durably binding an attacker-controlled authenticator.
 
         So: if the session has not satisfied its second factor and the account already has one, the
         existing factor must be proven first (``POST /auth/mfa-verify``). Bootstrap is untouched — an
-        account with NO factor still enrols freely from a password-only session, which is exactly the
-        deadlock carve-out. Disable/delete actions are NOT listed: they run behind
-        ``require_step_up_action``, which keeps its own ``mfa_satisfied`` check.
+        account with NO factor still enrols, and still ends sessions, from a password-only session,
+        which is exactly the deadlock carve-out. Disable/delete actions are NOT listed: they run
+        behind ``require_step_up_action``, which keeps its own ``mfa_satisfied`` check.
         """
-        if purpose not in self._FACTOR_BINDING_ACTIONS:
+        if purpose not in self._PENDING_REFUSED_ACTIONS:
             return False
         if not token:
-            return True  # no session to bind a factor to — fail closed, as below
+            return True  # no session to act on, so fail closed (as below)
         if await self.mfa_satisfied(token):
             return False
         session = await self._store.get_session(hash_token(token))
         if session is None:
-            return True  # no session to bind a factor to — fail closed
+            return True  # no session to act on, so fail closed
         user = await self._store.get_user(session.user_id)
         if user is None:
             return True
@@ -3161,7 +3213,7 @@ class AuthService:
 
         ``action`` is the route's step-up action, which is the same vocabulary ``POST /me/reauth``
         spells ``purpose``, so it passes straight through rather than being fixed per call site --
-        which would mean exporting :data:`_FACTOR_BINDING_ACTIONS` or shutting the non-factor lanes
+        which would mean exporting :data:`_PENDING_REFUSED_ACTIONS` or shutting the other lanes
         with it."""
         return await self._factor_binding_is_blocked(token, action)
 
@@ -3342,9 +3394,9 @@ class AuthService:
         """Whether ``user`` must satisfy a second factor. An enrolled user (either factor — the caller
         pre-resolves ``second_factor_enrolled`` via :meth:`_second_factor_enrolled`, keeping this hot
         boolean logic sync and the store round-trip visible at each call site) always must; an
-        un-enrolled user must when ``[auth].require_mfa`` is on and ``[auth].require_mfa_scope``
-        covers them — ``every_local_account`` (default, ASVS 6.3.3) or, under ``administrators``,
-        only the Administrator role.
+        un-enrolled user must when ``[security].require_mfa`` is on and
+        ``[security].require_mfa_scope`` covers them — ``every_local_account`` (default, ASVS
+        6.3.3) or, under ``administrators``, only the Administrator role.
 
         **THE RULE READS NO PROVIDER (BACKLOG #1144, ASVS 6.8.4),** which is what keeps it closed
         against an unrecognized value — :meth:`_identity_for_user` maps one back to ``LOCAL`` when it
@@ -3535,12 +3587,12 @@ class AuthService:
         attempts, just_locked = await self._register_failure(user, now)
         await self._audit("auth.mfa_failed", actor=user.username, client=client)
         if just_locked:
-            await self._notify_security(
+            await self._record_suspicious_login(
                 ACCOUNT_LOCKED,
-                username=user.username,
-                email=user.notify_email,
+                user,
                 client=client,
-                detail={"failed_attempts": attempts},
+                audit_detail=None,
+                notice_detail={"failed_attempts": attempts},
             )
         return Elevation()
 
@@ -4600,6 +4652,50 @@ class AuthService:
         (token-only or engine-internal) leave it NULL rather than inheriting an unrelated one."""
         await self._store.record_audit(action, actor=actor, detail=detail, client=client)
 
+    async def _record_suspicious_login(
+        self,
+        event_type: str,
+        user: UserRecord,
+        *,
+        client: str | None,
+        audit_detail: dict[str, Any] | None,
+        notice_detail: dict[str, Any],
+    ) -> None:
+        """Audit one ASVS 6.3.5 event under its own action name, then send the out-of-band notice.
+
+        The rows are ``auth.account_locked`` and ``auth.login_after_failures``, from the fixed
+        :data:`_SUSPICIOUS_LOGIN_ACTIONS` map. Each is written with the account's stored username as
+        actor, so the event reaches the user's own feed (``auth/notifications.py`` states the rule).
+
+        **WHY THE AUDIT ROW EXISTS (BACKLOG #1138).** Before it, neither event wrote a row of its own:
+        the crossing attempt left an ordinary ``auth.login_failed`` and the flagged success an ordinary
+        ``auth.login_success``. The label lived only inside the notice, which the notifier drops for an
+        account with no address and which does not exist at all without a mail relay. The feed is the
+        one channel that reaches both of those accounts, so the label has to be written where it reads.
+
+        The row is written whether or not a notifier is wired, for that reason. It is written BEFORE
+        the notice, and the action is resolved before either, so the notifier's "the event is still in
+        the audit log" is true when it says it and an unknown kind fails before any side effect.
+
+        **``audit_detail`` MIRRORS THE ATTEMPT'S OWN ROW, never ``notice_detail``.** The failure count
+        goes in the notice only. The audit row carries no more than the ``auth.login_failed``,
+        ``auth.mfa_failed`` or ``auth.login_success`` row beside it. The attempt itself stays audited
+        once, by that row; this adds the event the attempt caused."""
+        action = _SUSPICIOUS_LOGIN_ACTIONS[event_type]
+        await self._audit(
+            action,
+            actor=user.username,
+            detail=_json(audit_detail) if audit_detail is not None else None,
+            client=client,
+        )
+        await self._notify_security(
+            event_type,
+            username=user.username,
+            email=user.notify_email,
+            client=client,
+            detail=notice_detail,
+        )
+
     async def _notify_security(
         self,
         event_type: str,
@@ -4611,7 +4707,8 @@ class AuthService:
     ) -> None:
         """Best-effort out-of-band security-event push (ASVS 6.3.5/6.3.7). A missing notifier or a
         notifier failure is swallowed (logged) — a notification must never break a login or an admin
-        action. The event is also already in the audit log (the /me/security-events feed)."""
+        action. The caller writes the audit row, not this method: see
+        :meth:`_record_suspicious_login` for the two 6.3.5 events."""
         if self._security_notifier is None:
             return
         try:

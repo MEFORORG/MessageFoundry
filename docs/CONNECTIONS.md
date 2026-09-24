@@ -594,7 +594,7 @@ routes a `Message`; `json`/`xml`/`text`/`fhir` route a `RawMessage` the Handler 
 | `encoding` | `utf-8` | charset the POSTed body is decoded with (non-binary content types) |
 | `max_connections` | `256` | cap on concurrent clients (connection-flood guard). `None`/`0` = unlimited. |
 | `receive_timeout` | `60.0` | bound the **whole-request** read — request line + headers + body (slowloris guard); over budget answers a synchronous `408`. `None`/`0` = no timeout. |
-| `max_body_bytes` | `16 MiB` | the MLLP frame cap's HTTP twin — an over-declared `Content-Length` (or a read past the cap) is refused `413` **before the body is buffered whole** (OOM guard). `None`/`0` = unlimited. |
+| `max_body_bytes` | `16 MiB` | the MLLP frame cap's HTTP twin — an over-declared `Content-Length` is refused `413` **before a body byte is read** (OOM guard). `None`/`0` = unlimited. |
 | `max_header_bytes` | `64 KiB` | cap the request line + headers (header-flood guard). A falsy value falls back to the 64 KiB default — this one cap can't be switched off. |
 | `max_messages_per_second` | **off** | sustained message-rate ceiling for the **whole listener** (ASVS 2.4.1 / 15.2.2, BACKLOG #1114 — the MLLP pacer, ported). Over budget the connector **waits before reading the request**, so the partner is back-pressured and then served in full — **nothing is dropped, refused or answered differently**, and the wait sits outside `receive_timeout` so a paced partner is never handed a `408` for a delay the engine imposed. **Listener-wide, not per-connection**, unlike MLLP/TCP/X12: this connector answers one request per connection, so a per-connection bucket would be charged once and thrown away, bounding nothing. A `GET`/`HEAD` probe and a refused request wait behind an outstanding debt but **charge nothing** — only a committed message spends budget, so a peer that submits nothing cannot starve one that does. Unset = no bound, deliberately: a guessed rate throttles real traffic, so the number has to come from your own feed profile. |
 | `message_burst` | = the rate | tokens the bucket holds, i.e. how large a burst passes unpaced before the sustained rate applies. Only meaningful with `max_messages_per_second` set. Floor of 1 so the listener can always make progress. |
@@ -641,9 +641,9 @@ HTTP twin of MLLP's AA-on-receipt. A post-ingress routing/transform/delivery fai
 disposition + the AlertSink, exactly as a post-ACK MLLP failure does. A **pre-ingress** refusal answers
 synchronously and emits an ADR 0021 `connection_event`: `403` (not in `source_ip_allowlist`), `408` (the
 request didn't fully arrive within `receive_timeout`), `413` (over `max_body_bytes` **or**
-`max_header_bytes`), `400` (malformed request line / header, a bad or duplicated framing header), `503` (at
+`max_header_bytes`), `400` (a malformed request line or header, or framing this listener will not guess at -- including at least any `Transfer-Encoding`, a duplicated or non-digit `Content-Length`, whitespace before a header colon, a folded header line, a bare CR or LF, a control character in a header value, an HTTP version other than 1.x, and a non-zero body declared on a method other than `POST`/`PUT`/`PATCH`), `411` (a `POST`/`PUT`/`PATCH` with no `Content-Length`; the body is never read to EOF), `503` (at
 `max_connections` — the connection is accepted, then refused and closed at the application layer).
-`GET`/`HEAD` are static, non-PHI health probes and write **no** ingress row; any other method is `405`.
+`GET`/`HEAD` are static, non-PHI health probes and write **no** ingress row; any other method is `405`. Methods are case-sensitive (RFC 9110), so a lowercase `get` or `post` is not a probe or an intake request.
 
 **Synchronous captured-downstream reply (`reply_from`, ADR 0154 increment B).** Naming `reply_from` makes
 the HTTP turn **block** until the named outbound's reply has been captured **and committed to the store**,
@@ -1696,6 +1696,11 @@ it with the sender's key + cert (authenticity + integrity), **ENCRYPTs** the sig
 the S/MIME message to `host:port` over STARTTLS SMTP. PHI is therefore protected **end-to-end**, independent
 of the transport TLS. Crypto is core `cryptography` (`serialization.pkcs7`) and SMTP is stdlib `smtplib` —
 **no new dependency, no extra**.
+
+The envelope encrypts the content under **AES-256-CBC**. That is fixed in code, not a setting
+(BACKLOG #1168). The content key is wrapped to the recipient's RSA key with RSAES-PKCS1-v1_5, which the
+library offers no way to change. A partner whose S/MIME stack cannot decrypt AES-256-CBC cannot read
+these messages, and the SMTP relay accepts them before anyone tries.
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
