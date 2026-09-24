@@ -208,11 +208,13 @@ does resolve for `icacls`; the lockout is the design working as written, not a f
 **Decision: in a hardened data directory the trio gets the directory's principals, explicitly.**
 `_secure_store_file` (`messagefoundry/store/store.py`), called from the open path and from restore,
 reads the directory's owner and DACL as SDDL. The directory counts as HARDENED when all of these hold:
-inheritance is removed; every entry is an ALLOW naming SYSTEM, `BUILTIN\Administrators` or ONE
-per-service virtual account (`S-1-5-80-` plus five sub-authorities, which excludes `ALL SERVICES`), so
-each with the installer's own inheritance (`OICI`) and rights (`FA` for SYSTEM and
-Administrators, `0x1301bf` for the service), so any other right, inheritance or deny entry is refused; the owner is SYSTEM, Administrators or that service
-account; and no component of the path is a reparse point (junction, symlink, mount point). There every
+inheritance is removed; every entry is an ALLOW with exactly the shape `install-service.ps1` writes --
+inheritance `OICI`, full control (`FA`) for SYSTEM and for `BUILTIN\Administrators`, both present, and
+Modify (`0x1301bf`) for at most ONE per-service virtual account (`S-1-5-80-` plus five
+sub-authorities, which excludes `ALL SERVICES`) -- so any other principal, right, inheritance or deny
+entry is refused, with a WARNING naming the entry when the principals match but the shape does not;
+the owner is SYSTEM, Administrators or that service account; and no component of the path is a
+reparse point (junction, symlink, mount point). There every
 open writes the same explicit, protected DACL on each file in one `SetNamedSecurityInfoW` call, naming
 only the principals the directory allows: full control for SYSTEM and Administrators, Modify for the
 service account, as `install-service.ps1` grants them on the directory. A file owner outside that set
@@ -246,19 +248,25 @@ right or inheritance shape is not hardened (the parser pins `OICI` with `FA` and
   network logon, which is not UAC-filtered. No capability is new: each of them could already take
   ownership, and holds Full Control on the data directory and on its logs, a PHI sink of the same class.
 - **The audit difference, plainly.** Before, a non-owner administrator reaching a store the service
-  secured first had to take ownership, which raises event 4674 only where "Audit Sensitive Privilege
-  Use" is enabled. A read through the explicit entry now raises nothing. The backup-privilege route
-  (`SeBackupPrivilege`) was always silent, before and after.
-- **Decision: accepted,** at medium-high confidence on an independent adversarial pass, which found no
-  new capability and the narrowing above. **The one measurement that would reopen it:** a UAC-filtered
-  token successfully reading a file whose only matching entry is the Administrators allow. That would
-  mean the deny-only reading is wrong, and the change widens non-elevated sessions after all.
+  secured first had two routes. Taking ownership raises event 4674 only where "Audit Sensitive
+  Privilege Use" is enabled. A backup-privilege read (`SeBackupPrivilege`, `robocopy /B` say) is
+  recorded only where "Audit: Audit the use of Backup and Restore privilege" is ALSO on, so it was
+  silent by default, before and after. A read through the explicit entry now raises nothing unless
+  the file carries an object-access audit SACL, which nothing sets today.
+- **Decision: accepted, not an owner question.** The batch 121 Manager ruled this on 2026-09-24, on
+  an independent adversarial pass that returned ACCEPT WITH CHANGES at medium-high confidence: it
+  found no new capability and the narrowing above. **The measurement the pass named as reopening it:**
+  a UAC-filtered token successfully reading a file whose only matching entry is the Administrators
+  allow. That would mean the deny-only reading is wrong, and the change widens non-elevated sessions
+  after all.
 - **Optional follow-up, not built:** an inheritable audit SACL on the data directory, set by
   `install-service.ps1`, would restore a record of administrator reads.
 - **Pre-existing follow-up, not built:** restore staging in `messagefoundry/pipeline/dr_backup.py` (the
   `TemporaryDirectory` with prefix `mefor-restore-` under `dest_store_path.parent`) still calls
-  `_secure_file`, which grants the operator's user SID. The published store is restricted by this
-  change; its staging copies are not.
+  `_secure_file`, which grants the operator's user SID. That leaves `archive.tar` so granted, and the
+  staged `store.db` too until it is placed. Placement hard-links it where it can, and a hard link shares
+  one security descriptor, so once the published store is restricted the staged link carries the same
+  DACL (measured); on the copy fallback it does not.
 
 Because the trio's DACL is protected, a later edit to the directory does not reach the store.
 

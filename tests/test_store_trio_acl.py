@@ -69,15 +69,22 @@ def test_a_localsystem_install_grants_system_and_administrators_only() -> None:
 @pytest.mark.parametrize(
     ("label", "sddl"),
     [
-        ("inheritance still on", f"O:BAD:AI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{_TI})"),
+        (
+            "inheritance still on",
+            f"O:BAD:AI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;{_TI})",
+        ),
         ("BUILTIN\\Users by alias", "O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;0x1200a9;;;BU)"),
         ("BUILTIN\\Users by SID", "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;0x1200a9;;;S-1-5-32-545)"),
         ("Everyone", "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FR;;;WD)"),
         ("Authenticated Users", "O:BAD:P(A;OICI;FA;;;BA)(A;OICI;FR;;;AU)"),
-        ("NT SERVICE\\ALL SERVICES", "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;S-1-5-80-0)"),
+        (
+            "NT SERVICE\\ALL SERVICES",
+            "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;S-1-5-80-0)",
+        ),
         (
             "a second service account",
-            f"O:BAD:P(A;;FA;;;SY)(A;;FA;;;{_TI})(A;;FA;;;{_OTHER_SERVICE})",
+            f"O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;{_TI})"
+            f"(A;OICI;0x1301bf;;;{_OTHER_SERVICE})",
         ),
         ("a named user or group", "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;S-1-5-21-1-2-3-1001)"),
         ("CREATOR OWNER", "O:BAD:P(A;OICI;FA;;;SY)(A;OICIIO;FA;;;CO)"),
@@ -85,7 +92,7 @@ def test_a_localsystem_install_grants_system_and_administrators_only() -> None:
         ("owned by a standard user", "O:S-1-5-21-1-2-3-1001D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"),
         (
             "owned by an unnamed service",
-            f"O:{_OTHER_SERVICE}D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;{_TI})",
+            f"O:{_OTHER_SERVICE}D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;{_TI})",
         ),
         ("no owner read", "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"),
         ("deny entries only", "O:BAD:P(D;OICI;FA;;;WD)"),
@@ -103,6 +110,18 @@ def test_a_localsystem_install_grants_system_and_administrators_only() -> None:
         (
             "Administrators container-inherit-only",
             f"O:BAD:PAI(A;OICI;FA;;;SY)(A;CIIO;FA;;;BA)(A;OICI;0x1301bf;;;{_TI})",
+        ),
+        (
+            "Administrators read-only, installer inheritance",
+            f"O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FR;;;BA)(A;OICI;0x1301bf;;;{_TI})",
+        ),
+        (
+            "the service holding full control",
+            f"O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{_TI})",
+        ),
+        (
+            "Administrators left out",
+            f"O:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;0x1301bf;;;{_TI})",
         ),
         (
             "LocalSystem install granting a different service read-only",
@@ -123,11 +142,6 @@ def test_a_directory_with_a_deny_entry_is_not_hardened() -> None:
     assert _grants(_INSTALLER_DIR + "(D;OICI;FA;;;BG)") is None
 
 
-def test_the_grants_name_only_what_the_directory_allows() -> None:
-    # A directory that leaves Administrators out must not get them added on the store.
-    assert _grants(f"O:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;0x1301bf;;;{_TI})") == (_SY, _TI)
-
-
 def test_an_exact_trio_dacl_is_recognised_and_nothing_else_is() -> None:
     grants = (_SY, _BA, _TI)
     exact = store_mod._parse_sddl_dacl(f"D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1301bf;;;{_TI})")
@@ -144,6 +158,11 @@ def test_an_exact_trio_dacl_is_recognised_and_nothing_else_is() -> None:
         f"O:S-1-5-21-1-2-3-1001D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1301bf;;;{_TI})"
     )
     assert user_owned is not None and not store_mod._trio_dacl_is_exact(user_owned, grants)
+    # An explicit entry carrying inheritance flags is not the flag-less entry the trio writes.
+    flagged = store_mod._parse_sddl_dacl(
+        f"O:BAD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;OICI;0x1301bf;;;{_TI})"
+    )
+    assert flagged is not None and not store_mod._trio_dacl_is_exact(flagged, grants)
     # C1: a broadened right is rewritten, not accepted as exact.
     broadened = store_mod._parse_sddl_dacl(f"O:BAD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{_TI})")
     assert broadened is not None and not store_mod._trio_dacl_is_exact(broadened, grants)
@@ -278,19 +297,49 @@ def _read_back(path: Path) -> store_mod._SddlDacl:
     return dacl
 
 
-def _harden(directory: Path) -> None:
-    """Lock ``directory`` the way install-service.ps1 locks the data directory."""
-    _run(
-        [
-            _icacls(),
-            str(directory),
-            "/inheritance:r",
-            "/grant:r",
-            "*S-1-5-18:(OI)(CI)F",
-            "*S-1-5-32-544:(OI)(CI)F",
-            f"*{_TI}:(OI)(CI)M",
-        ]
+def _my_sids() -> set[str]:
+    """The current user as SDDL may spell it: its SID, or the alias ``LA`` when it IS the built-in
+    Administrator (RID 500), which is what the hosted runners run as (CI run 36039014999)."""
+    me = _my_sid()
+    return {me, "LA"} if me.endswith("-500") else {me}
+
+
+def _build_dir_dacl(directory: Path, *grants: str, owner_ba: bool = False) -> None:
+    """Give ``directory`` exactly ``grants`` and nothing else, EXPLICITLY, instead of trusting what it
+    inherits from the runner's temp directory. Python 3.13+ ``mkdtemp`` writes SYSTEM, Administrators
+    and OWNER RIGHTS entries there (measured), and CI run 36039014999 showed they can survive onto a
+    file as explicit entries. So: remove inherited entries, grant, drop any explicit OWNER RIGHTS or
+    CREATOR OWNER, and optionally set the owner to Administrators (elevated only)."""
+    _run([_icacls(), str(directory), "/inheritance:r", "/grant:r", *grants])
+    _run([_icacls(), str(directory), "/remove:g", "*S-1-3-4", "*S-1-3-0"])
+    if owner_ba:
+        _run([_icacls(), str(directory), "/setowner", "*S-1-5-32-544"])
+
+
+def _harden(directory: Path, *, owner_ba: bool = False) -> None:
+    """Lock ``directory`` exactly the way install-service.ps1's Set-SecureDataDirAcl does, then verify
+    the fixture produced that shape, so a fixture that did not is reported as one rather than as a
+    product failure."""
+    _build_dir_dacl(
+        directory,
+        "*S-1-5-18:(OI)(CI)F",
+        "*S-1-5-32-544:(OI)(CI)F",
+        f"*{_TI}:(OI)(CI)M",
+        owner_ba=owner_ba,
     )
+    dacl = store_mod._parse_sddl_dacl(store_mod._read_dacl_sddl(directory, owner=True) or "")
+    assert dacl is not None and dacl.protected, f"fixture: {directory} is not protected: {dacl}"
+    shape = {
+        (t, frozenset(f[i : i + 2] for i in range(0, len(f), 2)), r, s) for t, f, r, s in dacl.aces
+    }
+    oici = frozenset({"OI", "CI"})
+    assert shape == {
+        ("A", oici, "FA", _SY),
+        ("A", oici, "FA", _BA),
+        ("A", oici, "0X1301BF", _TI),
+    }, f"fixture: {directory} is not the installer's shape: {dacl}"
+    if owner_ba:
+        assert dacl.owner == _BA, f"fixture: {directory} is not owned by Administrators: {dacl}"
 
 
 def _release(directory: Path, sid: str) -> None:
@@ -327,6 +376,11 @@ def test_a_store_file_gets_exactly_the_hardened_principals(tmp_path: Path) -> No
         assert dacl.protected, dacl
         assert all(t == "A" and not f for t, f, _r, _s in dacl.aces), dacl
         assert {sid for _t, _f, _r, sid in dacl.aces} == {_SY, _BA, _TI}, dacl
+        # The rights as Windows renders what _write_trio_dacl wrote: if they drifted from
+        # _trio_right, every start would rewrite and warn.
+        assert {sid: r for _t, _f, r, sid in dacl.aces} == {
+            sid: store_mod._trio_right(sid) for sid in (_SY, _BA, _TI)
+        }, dacl
         # The owner: an elevated token moves it to Administrators; a non-elevated one cannot, so the
         # file keeps its user owner and the step logs the refusal instead of passing as exact.
         if _elevated():
@@ -378,15 +432,26 @@ def test_a_store_directory_reached_through_a_junction_is_not_hardened(tmp_path: 
 
 @_windows_only
 def test_a_store_outside_a_hardened_directory_stays_owner_only(tmp_path: Path) -> None:
-    # A developer checkout or a temp directory: the half of ADR 0163's property the fix keeps.
+    # A developer checkout or a temp directory: the half of ADR 0163's property the fix keeps. The
+    # directory is BUILT broad (the user plus BUILTIN\Users), not inherited from the runner's temp,
+    # and the file is reset to inherit it, so it starts with no explicit entry of any kind: the old
+    # owner-only rewrite leaves other principals' explicit entries in place (measured), which is a
+    # separate, pre-existing gap and not what this test is about.
     me = _my_sid()
-    db = tmp_path / "messagefoundry.db"
+    data = tmp_path / "data"
+    data.mkdir()
+    _build_dir_dacl(data, f"*{me}:(OI)(CI)F", "*S-1-5-32-545:(OI)(CI)RX")
+    db = data / "messagefoundry.db"
     db.write_bytes(b"")
-    grants = store_mod._store_dir_grants(tmp_path)
+    _run([_icacls(), str(db), "/reset"])
+    start = _read_back(db)
+    assert all("ID" in f for _t, f, _r, _s in start.aces), f"fixture: {start}"
+    grants = store_mod._store_dir_grants(data)
     assert grants is None
     store_mod._secure_store_file(db, dir_grants=grants)
     dacl = _read_back(db)
-    assert dacl.protected and {sid for _t, _f, _r, sid in dacl.aces} == {me}, dacl
+    sids = {sid for _t, _f, _r, sid in dacl.aces}
+    assert dacl.protected and sids and sids <= _my_sids(), dacl
 
 
 @_windows_only
@@ -423,7 +488,10 @@ async def test_open_in_a_hardened_directory_grants_the_directorys_principals(
     me = _my_sid()
     data = tmp_path / "data"
     data.mkdir()
-    _harden(data)
+    # Owner set explicitly: the hosted runner's user is the built-in Administrator, whose new objects
+    # it owns itself (CI run 36039014999), while the installer's data directory on the same runner is
+    # owned by Administrators (Wave 0, run 36026471545). The fixture states the installer's owner.
+    _harden(data, owner_ba=True)
     try:
         assert store_mod._store_dir_grants(data) == (_SY, _BA, _TI)
         store = await store_mod.MessageStore.open(data / "messagefoundry.db")

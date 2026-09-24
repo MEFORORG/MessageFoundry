@@ -208,14 +208,12 @@ path** (no separate at-rest tier):
 `-wal`/`-shm` siblings on every open — POSIX `chmod 0600`; on Windows, SQLite store owner-only DACL via
 `icacls` (inheritance off) through `_secure_file()`
 ([store/store.py](../messagefoundry/store/store.py)), **except** in a data directory hardened the way
-`install-service.ps1` leaves it (inheritance removed; every entry an allow naming SYSTEM,
-`BUILTIN\Administrators` or one per-service account with the installer's own rights; owned by one
-of those; no link on the path).
+`install-service.ps1` leaves it (the exact test is stated once, in the ADR 0163 note linked below).
 There each file gets an explicit, protected DACL naming only the principals the directory allows, so
 the service account and the operator running `provision-admin` can both open the store in either
 order. That reaches every member of Administrators whose token carries the group ENABLED, not only
 the one who provisioned; a UAC-filtered session, which carries it deny-only, loses the access the old
-rewrite granted the operator's own user SID. Accepted on an adversarial pass ([ADR 0163](adr/0163-first-run-provisioning-without-a-default-account-the-not-present-arm-via-an-engine-consumed-request.md),
+rewrite granted the operator's own user SID. Accepted by the batch 121 Manager on an adversarial pass ([ADR 0163](adr/0163-first-run-provisioning-without-a-default-account-the-not-present-arm-via-an-engine-consumed-request.md),
 note of 2026-09-24). It is best-effort and non-fatal: a skipped or
 failed restriction is **logged** (STORE-2), with directory-level ACLs ([SERVICE.md](SERVICE.md)) as
 the backstop. **This is the SQLite tier only.** On SQL Server / Postgres the engine creates no database

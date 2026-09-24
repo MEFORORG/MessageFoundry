@@ -2796,12 +2796,18 @@ _TRIO_RIGHTS: Mapping[str, str] = MappingProxyType({"S-1-5-18": "FA", "S-1-5-32-
 _SERVICE_RIGHTS = "0x1301bf"
 
 
+def _trio_right(sid: str) -> str:
+    """The one SDDL right the trio carries for ``sid``, upper-cased as the parser keeps rights. The
+    writer and both checks use this, so they cannot drift apart."""
+    return _TRIO_RIGHTS.get(sid, _SERVICE_RIGHTS).upper()
+
+
 @dataclass(frozen=True)
 class _SddlDacl:
     """A security descriptor read from SDDL: its owner (when requested), whether the DACL blocks
     inheritance, and each ACE as (type, flags, rights, sid) with SYSTEM/Administrators aliases
-    resolved. Rights are kept as SDDL writes them (``FA``, ``0x1301bf``), because the hardening test
-    and the exactness test both compare them."""
+    resolved. Rights are kept upper-cased (``FA``, ``0X1301BF``), because the hardening test and the
+    exactness test both compare them against :func:`_trio_right`."""
 
     protected: bool
     aces: tuple[tuple[str, str, str, str], ...]
@@ -2849,10 +2855,10 @@ def _hardened_trio_grants(directory: _SddlDacl) -> tuple[str, ...] | None:
 
     Hardened means the directory is exactly what install-service.ps1's Set-SecureDataDirAcl writes:
     inheritance blocked; every ACE an allow with the installer's own inheritance (``OICI``) and
-    rights -- full control (``FA``) for SYSTEM and Administrators, Modify (``0x1301bf``) for ONE
-    per-service account -- and nothing else; no deny ACE, because the trio's DACL does not carry
-    denies over; an owner of SYSTEM, Administrators or that service account, because an owner keeps
-    WRITE_DAC over the directory; and at least one ACE.
+    rights -- full control (``FA``) for SYSTEM and Administrators, both present, and Modify
+    (``0x1301bf``) for at most ONE per-service account -- and nothing else; no deny ACE, because the
+    trio's DACL does not carry denies over; and an owner of SYSTEM, Administrators or that service
+    account, because an owner keeps WRITE_DAC over the directory.
 
     The RIGHTS and FLAGS are part of the test, not only the principals, because the trio is always
     written with FA/Modify: a directory granting Administrators read, or a service container-only,
@@ -2864,23 +2870,33 @@ def _hardened_trio_grants(directory: _SddlDacl) -> tuple[str, ...] | None:
     named: set[str] = set()
     services: set[str] = set()
     for ace_type, flags, rights, sid in directory.aces:
-        if ace_type != "A" or _sddl_flag_set(flags) != {"OI", "CI"}:
+        trusted = sid in _STORE_DIR_TRUSTED_SIDS
+        service = not trusted and bool(_SERVICE_SID.fullmatch(sid))
+        if ace_type != "A" or not (trusted or service):
             return None
-        if sid in _STORE_DIR_TRUSTED_SIDS:
-            if rights != _TRIO_RIGHTS[sid]:
-                return None
-            named.add(sid)
-            continue
-        if not _SERVICE_SID.fullmatch(sid) or rights != _SERVICE_RIGHTS.upper():
+        if _sddl_flag_set(flags) != {"OI", "CI"} or rights != _trio_right(sid):
+            # The principals are the installer's but the shape is not. Say so: the fallback is the
+            # owner-only rewrite, which brings back the Wave 0 lockout with no other symptom.
+            log.warning(
+                "the store directory grants %s (%s;%s), not the installer's shape (OICI;%s), so the "
+                "store there is restricted owner-only (ADR 0163 note of 2026-09-24)",
+                sid,
+                flags,
+                rights,
+                _trio_right(sid),
+            )
             return None
-        services.add(sid)
-    if len(services) > 1:
+        (named if trusted else services).add(sid)
+    # Both built-in principals are required, as the installer always writes them: without
+    # Administrators among the grants, a file it owns could never be made exact, and would be
+    # rewritten -- and warned about -- on every start.
+    if named != set(_STORE_DIR_TRUSTED_SIDS) or len(services) > 1:
         return None
     if directory.owner is None or (
         directory.owner not in _STORE_DIR_TRUSTED_SIDS and directory.owner not in services
     ):
         return None
-    return (*(sid for sid in _STORE_DIR_TRUSTED_SIDS if sid in named), *sorted(services))
+    return (*_STORE_DIR_TRUSTED_SIDS, *sorted(services))
 
 
 def _sddl_flag_set(flags: str) -> set[str]:
@@ -2902,7 +2918,7 @@ def _trio_dacl_is_exact(dacl: _SddlDacl, grants: Sequence[str]) -> bool:
     for ace_type, flags, rights, sid in dacl.aces:
         if ace_type != "A" or flags:
             return False
-        if rights != _TRIO_RIGHTS.get(sid, _SERVICE_RIGHTS).upper():
+        if rights != _trio_right(sid):
             return False
     return {sid for _t, _f, _r, sid in dacl.aces} == set(grants)
 
@@ -3026,7 +3042,7 @@ def _write_trio_dacl(path: Path, grants: Sequence[str], *, owner: str | None = N
     import ctypes
     from ctypes import wintypes
 
-    aces = "".join(f"(A;;{_TRIO_RIGHTS.get(sid, _SERVICE_RIGHTS)};;;{sid})" for sid in grants)
+    aces = "".join(f"(A;;{_trio_right(sid)};;;{sid})" for sid in grants)
     sddl = (f"O:{owner}" if owner else "") + f"D:P{aces}"
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
