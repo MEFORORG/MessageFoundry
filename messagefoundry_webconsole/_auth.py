@@ -249,16 +249,30 @@ async def rotation_comes_first(auth: AuthService, must_change: bool, token: str 
     owes a factor it has enrolled proves it first, since the password page refuses it until then
     (``AuthService.password_change_owes_factor``, BACKLOG #1954); an administrator reset is at least
     one shipped way in, because it keeps factors. Where the routing is a redirect,
-    :func:`must_change_target` asks the same question."""
-    return must_change and not await auth.password_change_owes_factor(token)
+    :func:`must_change_target` asks the same question.
+
+    Fails closed on an unknown state (BACKLOG #1974): see :func:`_owes_known_factor`."""
+    return must_change and not await _owes_known_factor(auth, token)
+
+
+async def _owes_known_factor(auth: AuthService, token: str | None) -> bool:
+    """Whether the session owes a factor it has enrolled, and still EXISTS to prove it.
+
+    ``password_change_owes_factor`` answers True for a missing session or user too (its own
+    docstring). Read as "owes a factor", that unknown state would release a must-change session
+    from the confinement, so a True counts only while the token still resolves to an identity
+    (BACKLOG #1974). Session and user rows are never restored once gone, so a token that resolves
+    after the check resolved during it. ``activity=False``: this probe is not user activity."""
+    if not await auth.password_change_owes_factor(token):
+        return False
+    return await auth.identity_for_token(token, activity=False) is not None
 
 
 async def must_change_target(auth: AuthService, token: str | None) -> str:
     """Where a must-change session is sent: the factor page while it owes an enrolled factor,
-    otherwise the password page (see :func:`rotation_comes_first`)."""
-    if await auth.password_change_owes_factor(token):
-        return "/ui/mfa"
-    return "/ui/account/password"
+    otherwise the password page. It asks what :func:`rotation_comes_first` asks, so an unknown
+    state is confined on both paths and never audited as an MFA refusal."""
+    return "/ui/mfa" if await _owes_known_factor(auth, token) else "/ui/account/password"
 
 
 def require_ui(

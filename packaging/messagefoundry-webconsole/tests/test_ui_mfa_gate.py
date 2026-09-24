@@ -19,6 +19,7 @@ from _ui_clients import SAME_ORIGIN
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role, totp
 from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 
@@ -387,7 +388,6 @@ async def test_a_pending_session_cannot_end_an_enrolled_accounts_sessions(
     single-use grant; ``opted-out`` stamps the window, which is that branch's whole gate.
     """
     from messagefoundry.auth.service import STEP_UP_ACTION_SESSION_TERMINATE
-    from messagefoundry.auth.tokens import hash_token
 
     service = await _service(engine, require_action_step_up=action_step_up)
     await _add(service, "op", Role.OPERATOR)
@@ -677,6 +677,84 @@ async def test_a_must_change_account_with_no_factor_still_rotates_first(engine: 
             assert r.status_code == 403 and r.json()["error"] == "password change required"
             r = await _change_password(c, current=password)
             assert r.headers.get("location") == "/ui/login?e=pwchanged", username
+
+
+_VANISH_ROUTES = ("login", "gated-page", "get-mfa", "post-mfa", "reauth-webauthn")
+
+
+@pytest.mark.parametrize("vanish", ("session", "user"))
+@pytest.mark.parametrize("route", _VANISH_ROUTES)
+async def test_a_row_that_vanishes_mid_request_does_not_lift_the_confinement(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, vanish: str, route: str
+) -> None:
+    """RED when: ``rotation_comes_first`` negates ``password_change_owes_factor`` unguarded.
+
+    BACKLOG #1974. An unknown state must confine a must-change session, never release it. The
+    wrapper removes the row once, after the route has resolved the identity and before the check
+    runs: the race this guards. The account has no factor, so the only wrong answers are the ones
+    that release it: the factor page, the enroll bounce, the page itself, or a ceremony run. The
+    password page or a sign-in redirect both hold. ``gated-page`` is the ``require_ui`` path through
+    ``must_change_target``, which must also write no ``auth.mfa_denied`` row for an account with
+    nothing to deny. ``user`` hides only the user row: ``delete_user`` would take the sessions with
+    it, and this case would then test a missing session twice.
+    """
+    service = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False))
+    await service.initialize()
+    await service.create_local_user(
+        username="newbie",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=[Role.OPERATOR.value],
+        actor="test",
+    )
+    real_check = service.password_change_owes_factor
+    vanished: list[bool] = []
+
+    async def no_user(user_id: str) -> None:
+        return None
+
+    async def vanishing_check(token: str | None) -> bool:
+        assert token is not None
+        if not vanished:
+            vanished.append(True)
+            if vanish == "session":
+                # DELETE the row, as the expiry purge does. Revoking would not do: it only stamps
+                # ``revoked_at``, and the row still answers the lookup this test is about.
+                session = await service.store.get_session(hash_token(token))
+                assert session is not None
+                await service.store.purge_expired_sessions(now=session.expires_at + 1)
+                assert await service.store.get_session(hash_token(token)) is None
+            else:
+                monkeypatch.setattr(service.store, "get_user", no_user)
+        return await real_check(token)
+
+    async with _client(engine, service) as c:
+        if route != "login":
+            # The sign-in runs the real check, so it lands on the password page as it should.
+            r = await c.post("/ui/login", data={"username": "newbie", "password": PW})
+            assert r.status_code == 303 and r.headers["location"] == _PASSWORD
+        monkeypatch.setattr(service, "password_change_owes_factor", vanishing_check)
+        if route == "login":
+            r = await c.post("/ui/login", data={"username": "newbie", "password": PW})
+        elif route == "gated-page":
+            r = await c.get("/ui/messages")
+        elif route == "get-mfa":
+            r = await c.get("/ui/mfa")
+        elif route == "post-mfa":
+            r = await c.post("/ui/mfa", data={"code": "000000"}, headers=SAME_ORIGIN)
+        else:
+            r = await c.post("/ui/reauth/webauthn", json={"response": {}}, headers=SAME_ORIGIN)
+        assert vanished, "the route never asked the check, so nothing vanished"
+        if route == "reauth-webauthn":
+            assert r.status_code in (401, 403), r.text  # refused before any ceremony ran
+            return
+        assert r.status_code == 303, r.text
+        location = r.headers["location"]
+        assert location == _PASSWORD or location.startswith("/ui/login"), location
+    if route == "gated-page":
+        denied = [a for a in await engine.store.list_audit() if a["action"] == "auth.mfa_denied"]
+        assert not denied, "an account with no factor was audited as refused one"
 
 
 async def test_a_satisfied_session_changes_the_password_as_before(
