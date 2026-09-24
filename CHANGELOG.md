@@ -10,7 +10,7 @@ All notable changes to MessageFoundry are documented here. The format follows
 - **`credential_expires_at` tells a client when an admin-issued temporary password stops working.**
   `POST /auth/login` returns it in `LoginResponse` when `must_change_password` is set. `POST /users`
   returns it in `UserSummary` for the account it creates. It is a Unix timestamp, read from the same
-  stored stamp the login gate checks. It is `null` when no change is owed, or when
+  stored stamp the login gate checks. It is `null` in at least these cases: no change is owed, or
   `[auth].initial_password_expiry_hours` is `0` or less. `GET /users` always returns `null` here.
   That route needs only `users:read`, and a list of live temporary passwords is a target list. The
   never-claimed bootstrap account also gets `null`, because `bootstrap-admin.txt` already states its
@@ -59,10 +59,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   - When the engine mints its own pair, the tray now finds `api-generated-cert.pem` through the
     service entry and pins it as its only trust anchor. It looks beside `--db`, else
     `[store].path`, else `messagefoundry.db` under the service's `AppDirectory`. It finds nothing
-    when a relative store path has no `AppDirectory` to sit under, or would sit under
-    `--project-root` or `[environments].base_dir`. `messagefoundry.tray.poller.StatusPoller`
-    applies the pin unless the caller passes its own `client_factory`. A tray started before the
-    engine's first run picks the file up once it loads, with no restart.
+    in at least these cases: a relative store path with no `AppDirectory` to sit under, or one
+    under `--project-root` or `[environments].base_dir`. It can also name the wrong file, for
+    example when `MEFOR_STORE_PATH` in the service's environment moves the store.
+    `messagefoundry.tray.poller.StatusPoller` applies the pin unless the caller passes its own
+    `client_factory`. A tray started before the engine's first run picks the file up once it
+    loads, with no restart.
   - A new `tray.toml` key, `engine_cacert`, names the file to pin. It must be an absolute path; a
     relative one is ignored. An explicit `engine_url` drops the file the tray found. A pin that
     will not load falls back to the OS trust store, never to no verification.
@@ -70,9 +72,10 @@ All notable changes to MessageFoundry are documented here. The format follows
     `api-generated-cert.pem`. For an engine behind `[api].tls_terminated_upstream`, which speaks
     plain http, pass `base_url="http://127.0.0.1:8765"`. A tray that does not take its address
     from the service entry now tries https. Set `engine_url` in `tray.toml` to reach a plain-http
-    engine. Set `engine_cacert` wherever the tray cannot find a stock engine's certificate: with
-    no service entry, or in the cases above. The tray must also be able to read that file; the
-    entry under Security covers that.
+    engine. Set `engine_cacert` wherever the tray cannot find a stock engine's certificate on its
+    own, as with no service entry or in the cases above. The tray must also be able to read that
+    file; the entry under Security covers that. The standalone test harness is not part of this
+    change, and its default engine URL is still `http://127.0.0.1:8765`.
 
 ### Security
 - **BREAKING — OIDC sign-in now bounds how old the IdP's authentication may be.** A new setting,
@@ -98,7 +101,7 @@ All notable changes to MessageFoundry are documented here. The format follows
   strength. A partner whose S/MIME stack cannot decrypt AES-256-CBC cannot read these messages.
   The engine cannot see that failure. The SMTP relay accepts each message before the partner tries
   to decrypt it, so the engine records a successful delivery. **Migration:** before upgrading,
-  confirm that each Direct partner's HISP decrypts AES-256-CBC. RFC 5751 requires S/MIME agents to
+  confirm that each Direct partner's health information service provider decrypts AES-256-CBC. RFC 5751 requires S/MIME agents to
   support AES-128-CBC (MUST) and only recommends AES-256-CBC (SHOULD+). No setting restores
   AES-128-CBC. (`BACKLOG #1168`)
 - **BREAKING — the inbound `Http()` listener now settles a request's framing before it reads the
@@ -187,8 +190,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   best-effort: a failure is logged, and the engine still starts. **Migration:** the engine reuses
   a pair it already has, and engine 0.4.0 minted its pairs without the grant. On such a host,
   grant local users read on `api-generated-cert.pem` alone, never the key. Or delete both
-  generated files so the engine mints a new pair, then re-pin every client that pinned the old
-  one. (`BACKLOG #1276`)
+  generated files so the engine mints a new pair. Then restart the tray, which does not reload a
+  pin that already loaded, and re-pin every other client that pinned the old certificate.
+  (`BACKLOG #1276`)
 
 ## [0.4.0] — 2026-09-23 — Early Access
 

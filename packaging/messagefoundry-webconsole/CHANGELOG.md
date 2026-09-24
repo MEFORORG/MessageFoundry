@@ -21,8 +21,8 @@ engine compatibility range.
 this line.**
 
 **Requires an engine newer than 0.4.0**, one whose `messagefoundry.api._ui_seam.ENGINE_UI_SEAM` is
-that value. Engine 0.4.0 does not work with this console, and console 0.3.0 does not work with that
-newer engine, so upgrade the two together.
+that value. Console 0.3.0 does not work with that engine, so upgrade the two together. The entry
+under Changed says why engine 0.4.0 does not work with this console.
 
 ### Added
 - **Pages that issue or enforce an admin-set temporary password now say when it stops working**
