@@ -3614,7 +3614,7 @@ def _serve(args: argparse.Namespace) -> int:
         # ADR 0083 activation: only when in-process mTLS (client CA) AND a cert-identity map are BOTH
         # configured, swap in the scope-populating HTTP protocol so a verified peer cert reaches
         # resolve_client_cert_identity. Gated on both so a mutual-auth-only bind (console mTLS, no map)
-        # and every non-mTLS bind keep the stock protocol — no behaviour change without a client CA + map.
+        # and every non-mTLS bind keep the header-floored protocol without the shim.
         if settings.api.tls_client_ca_file and settings.api.tls_client_cert_identities:
             from messagefoundry.api.tls_client_cert import client_cert_http_protocol_class
 

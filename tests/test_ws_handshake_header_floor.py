@@ -183,10 +183,13 @@ async def test_without_the_extension_every_refusal_is_still_a_bare_close(engine:
     )
     capped = create_app(engine, allow_no_auth=True)
     capped.state.ws_count = 10_000
+    engineless = create_app(engine, allow_no_auth=True)
+    engineless.state.engine = None
     for app, client, code in (
         (create_app(engine), ("127.0.0.1", 1), 1008),
         (netapp, ("192.168.9.9", 2), 1008),
         (capped, ("127.0.0.1", 3), 1013),
+        (engineless, ("127.0.0.1", 4), 1011),
     ):
         sent = await _drive(app, _scope(client=client, extension=False))
         assert [m["type"] for m in sent] == ["websocket.close"]

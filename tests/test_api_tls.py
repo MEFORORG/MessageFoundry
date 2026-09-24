@@ -230,7 +230,7 @@ def test_serve_mtls_with_cert_map_swaps_in_shim_protocol(
     assert "send_400_response" in vars(http_cls.__mro__[1])
 
 
-def test_serve_mtls_without_cert_map_keeps_stock_protocol(
+def test_serve_mtls_without_cert_map_gets_no_shim(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Mutual-auth-only (client CA but NO cert-identity map, e.g. console mTLS) never gets the mTLS
@@ -259,7 +259,7 @@ def test_serve_mtls_without_cert_map_keeps_stock_protocol(
     http_cls = captured["http"]
     assert "connection_made" not in vars(http_cls)  # the shim is never wired without a map
     assert "send_400_response" in vars(http_cls)  # the header-floored protocol (BACKLOG #1120)
-    assert "send_500_response" in vars(captured["ws"])
+    assert captured["ws"].__module__ == "messagefoundry.api.protocol_headers"
 
 
 def test_serve_loopback_without_a_certificate_now_mints_and_serves_tls(

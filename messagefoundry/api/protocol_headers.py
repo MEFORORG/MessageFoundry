@@ -22,8 +22,9 @@ of the floor.
 
 **Adding, not rewriting.** Each override calls uvicorn's own method and adds the headers on the way
 out, so the status, body and framing stay uvicorn's. The ``400`` and the WebSocket ``500`` are written
-straight to the transport, synchronously, in one ``write`` whose first line is the status line, so a
-transport proxy adds the header lines after it for the length of that one call. The HTTP ``500``
+straight to the transport, synchronously, and the FIRST ``write`` of each carries the status line (for
+httptools and the WebSocket writers it is the only write; h11 writes head, body and end separately).
+So a transport proxy adds the header lines after that status line, for the length of that one call. The HTTP ``500``
 goes through the cycle's ``send``, which prepends the cycle's ``default_headers``, so the override
 extends those for that one response.
 
@@ -35,6 +36,7 @@ family on the wire, so an upgrade that moves either goes red there rather than s
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable
 from functools import partial
 from typing import Any
@@ -63,6 +65,12 @@ PROTOCOL_SECURITY_HEADERS: tuple[tuple[str, str], ...] = (
 _HEADER_LINES = b"".join(
     f"{name}: {value}\r\n".encode("latin-1") for name, value in PROTOCOL_SECURITY_HEADERS
 )
+_log = logging.getLogger(__name__)
+#: One-shot latch for the warning in _floor_the_cycle_500.
+_SWAP_FAILED: list[bool] = []
+#: One floored subclass per uvicorn cycle class, built on first use.
+_FLOORED_CYCLES: dict[type[Any], type[Any]] = {}
+
 _HEADER_PAIRS = [
     (name.lower().encode("latin-1"), value.encode("latin-1"))
     for name, value in PROTOCOL_SECURITY_HEADERS
@@ -91,6 +99,9 @@ class _HeaderInjectingTransport:
             data = _after_status_line(bytes(data))
         self._inner.write(data)
 
+    def writelines(self, chunks: Any) -> None:
+        self.write(b"".join(bytes(chunk) for chunk in chunks))
+
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
 
@@ -105,19 +116,46 @@ def _write_with_headers(protocol: Any, emit: Callable[[], None]) -> None:
         protocol.transport = inner
 
 
+def _floored_cycle_class(cls: type[Any]) -> type[Any]:
+    """A subclass of uvicorn's request cycle whose own ``500`` carries the headers, and nothing else.
+
+    uvicorn prepends ``default_headers`` to every response start a cycle sends. Extending it only
+    once the ``500`` is underway puts the headers on that response alone. REBIND, never mutate: the
+    list uvicorn passed in is the server-wide ``server_state.default_headers``. A class, built once
+    per cycle class, rather than a per-request closure: a closure stored on the cycle would hold the
+    cycle, and a reference cycle keeps each request's scope and body alive until a GC pass."""
+
+    floored = _FLOORED_CYCLES.get(cls)
+    if floored is None:
+
+        class _FlooredCycle(cls):  # type: ignore[misc]
+            _mf_floored = True
+
+            async def send_500_response(self) -> None:
+                cycle: Any = self
+                cycle.default_headers = [*cycle.default_headers, *_HEADER_PAIRS]
+                await super().send_500_response()
+
+        floored = _FLOORED_CYCLES[cls] = _FlooredCycle
+    return floored
+
+
 def _floor_the_cycle_500(cycle: Any) -> None:
-    """Make this request cycle's own ``500`` carry the headers, and nothing else of the cycle's.
-
-    uvicorn prepends ``cycle.default_headers`` to every response start the cycle sends. Extending it
-    only once the ``500`` is underway puts the headers on that response alone. REBIND, never mutate:
-    the list uvicorn passed in is the server-wide ``server_state.default_headers``."""
-    original = cycle.send_500_response
-
-    async def send_500_response() -> None:
-        cycle.default_headers = [*cycle.default_headers, *_HEADER_PAIRS]
-        await original()
-
-    cycle.send_500_response = send_500_response
+    """Swap this cycle onto :func:`_floored_cycle_class`. If a future uvicorn makes that impossible,
+    log once and serve the request anyway: a missing header on a 500 is not worth an outage."""
+    cls = type(cycle)
+    if getattr(cls, "_mf_floored", False):
+        return
+    try:
+        cycle.__class__ = _floored_cycle_class(cls)
+    except TypeError:
+        if not _SWAP_FAILED:
+            _SWAP_FAILED.append(True)
+            _log.warning(
+                "uvicorn's %s cannot be subclassed per request; its own 500 will not carry the "
+                "security headers (BACKLOG #1120). Re-measure uvicorn's protocol layer.",
+                cls.__name__,
+            )
 
 
 def floored_http_protocol_class(base: type[Any] | None = None) -> type[asyncio.Protocol]:
@@ -151,7 +189,11 @@ def floored_http_protocol_class(base: type[Any] | None = None) -> type[asyncio.P
 
 
 def floored_ws_protocol_class(base: type[Any] | None = None) -> type[asyncio.Protocol] | None:
-    """uvicorn's WebSocket protocol with the headers on its pre-handshake ``500``.
+    """uvicorn's WebSocket protocol with the headers on its pre-handshake ``500``, and, on the
+    legacy websockets server, on the handshake rejections that library writes itself.
+
+    NOT covered: the sans-I/O protocol's own handshake rejections, which it builds through
+    ``ServerProtocol.reject``. It is not what ``ws="auto"`` resolves to at the locked versions.
 
     ``base`` defaults to uvicorn's resolved ``AutoWebSocketsProtocol``. That is ``None`` when no
     WebSocket library is installed, and then this returns ``None`` too, which uvicorn reads exactly
@@ -168,4 +210,18 @@ def floored_ws_protocol_class(base: type[Any] | None = None) -> type[asyncio.Pro
         def send_500_response(self) -> None:
             _write_with_headers(self, super().send_500_response)
 
+    if hasattr(base, "write_http_response"):
+        # The legacy websockets server writes every handshake answer through this one method: the
+        # 101, the app's denial, and its OWN rejections of a bad handshake (400 for a missing key or
+        # version, 426, 503 on shutdown, 500). Add the headers where absent, so the 101 and the
+        # denial, which the floor already covered, are not stamped twice.
+
+        class _FlooredLegacyWebSocketProtocol(_FlooredWebSocketProtocol):
+            def write_http_response(self, status: Any, headers: Any, body: Any = None) -> None:
+                for name, value in PROTOCOL_SECURITY_HEADERS:
+                    if name not in headers:
+                        headers[name] = value
+                super().write_http_response(status, headers, body)
+
+        return _FlooredLegacyWebSocketProtocol
     return _FlooredWebSocketProtocol

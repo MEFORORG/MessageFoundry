@@ -24,7 +24,8 @@ site does not bypass the floor, or what covers it instead.
 | ``protocol-override`` | A ``send_400_response`` or ``send_500_response``: uvicorn's own responses. |
 
 **Its bound, stated so it is not read as more.** This pins the FIRST-PARTY emitter population, and
-only emitters of a shape listed above. "Emits an HTTP response" has no total syntactic trigger, so a
+only emitters of a shape listed above, in the literal spelling the table gives: an aliased import
+(``import uvicorn as uv``) or a WebSocket bound to another name evades it. "Emits an HTTP response" has no total syntactic trigger, so a
 new emitter of a shape nobody has named yet can still land. And it cannot pin uvicorn's own
 population at all: the responses uvicorn writes below the app change with its version, and no scan
 of this repository can see them. That is ``tests/test_header_floor_wire.py``'s job, which drives a
@@ -211,7 +212,7 @@ _REGISTERED: dict[Site, tuple[int, str]] = {
         1,
         "Registered before the floor, so inside it: the floor setdefaults the baseline onto it.",
     ),
-    Site(_PROTOCOL, "_floor_the_cycle_500", "protocol-override"): (
+    Site(_PROTOCOL, "_floored_cycle_class._FlooredCycle", "protocol-override"): (
         1,
         "Adds the headers to uvicorn's own HTTP 500; tests/test_header_floor_wire.py.",
     ),

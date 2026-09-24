@@ -36,6 +36,7 @@ from typing import Any
 
 import pytest
 import uvicorn
+import websockets
 from starlette.types import Receive, Scope, Send
 from uvicorn.protocols.http.h11_impl import H11Protocol
 from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol
@@ -58,6 +59,8 @@ from messagefoundry.pipeline import Engine
 
 #: The uvicorn this suite was measured against. See the module docstring before moving it.
 _MEASURED_UVICORN = "0.49.0"
+#: The websockets library writes the legacy protocol's own handshake rejections, so it is pinned too.
+_MEASURED_WEBSOCKETS = "16.0"
 
 _HANDSHAKE = (
     "GET {path} HTTP/1.1\r\n"
@@ -156,6 +159,10 @@ async def _bare_ws_refusal(scope: Scope, receive: Receive, send: Send) -> None:
 
 
 def test_the_suite_is_measuring_the_uvicorn_it_was_written_against() -> None:
+    assert websockets.__version__ == _MEASURED_WEBSOCKETS, (
+        f"websockets is {websockets.__version__}, and this suite measured {_MEASURED_WEBSOCKETS}. "
+        "Re-read the handshake responses it writes itself, then move the pin."
+    )
     assert uvicorn.__version__ == _MEASURED_UVICORN, (
         f"uvicorn is {uvicorn.__version__}, and this suite measured {_MEASURED_UVICORN}. The set of "
         "responses uvicorn writes itself may have changed: re-read its protocol modules for every "
@@ -257,3 +264,17 @@ async def test_the_websocket_500_carries_nosniff(base: type[Any]) -> None:
 def test_no_websocket_library_means_no_websocket_protocol(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("uvicorn.protocols.websockets.auto.AutoWebSocketsProtocol", None)
     assert floored_ws_protocol_class() is None
+
+
+async def test_the_legacy_websocket_handshake_rejection_carries_nosniff() -> None:
+    """The legacy websockets server answers a malformed handshake itself (here, no
+    Sec-WebSocket-Key) before the app runs. The sans-I/O protocol's equivalent is NOT covered and
+    is not what ``ws="auto"`` resolves to at the locked versions; see protocol_headers."""
+    request = _HANDSHAKE.format(path="/ws/stats").replace(
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n", ""
+    )
+    async with _served(_raises, ws=WebSocketProtocol) as port:
+        control = await _exchange(port, request.encode())
+    async with _served(_raises, ws=floored_ws_protocol_class(base=WebSocketProtocol)) as port:
+        shipped = await _exchange(port, request.encode())
+    _assert_protocol_family(control, shipped, 400)
