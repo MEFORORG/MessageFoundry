@@ -71,6 +71,46 @@ All notable changes to MessageFoundry are documented here. The format follows
   #1887, ADR 0173 section 4.3).** Each leg is guarded on its own host. An enforcing instance whose
   off-box identity provider has no `[auth].oidc_tls_crl_file` would refuse to start on first
   deployment.
+- **BREAKING — an HTTP-family reply with ambiguous length framing now fails before its body is
+  read.** 0.4.0 let `http.client` pick one reading, which could hand back raw chunk framing or the
+  shorter of two lengths as the partner's answer. Refused now, under RFC 9112 section 6, at least:
+  `Transfer-Encoding` beside `Content-Length`; a `Content-Length` that is not plain digits, such as
+  `+5` or `5, 5`, or two that differ; `Transfer-Encoding` on an HTTP/1.0 reply; a codings list whose
+  final coding is not a single `chunked`, including `gzip, chunked`; and `Transfer-Encoding` on a
+  204, 304 or 1xx reply. A REST, SOAP, FHIR or DICOMweb delivery, and an OAuth2 or SMART token
+  request, raises `AmbiguousFramingError`, a transient delivery error that is retried and then
+  dead-lettered. A `fhir_lookup` reply raises inside the Handler. The OIDC token and JWKS reads
+  refuse the same replies, and the sign-in that made the read fails as an unavailable IdP.
+  Connection probes and the alert webhook discard the body and are not checked. **Migration:** none
+  in configuration; the partner or its proxy must frame the reply by one rule. (ASVS 4.2.1,
+  [BACKLOG #1125](docs/BACKLOG.md))
+- **BREAKING — an AD or OIDC sign-in that matches no scope-mapped group now withdraws the user's
+  channel scope, unless an administrator set it.** In 0.4.0 such a sign-in left the stored scope as
+  it was. So a user removed from their last scope-mapped group would have kept those channels
+  indefinitely. The engine now withdraws that scope to NULL, which denies. It also revokes the
+  user's other sessions and writes an `auth.ad_scope_resynced` audit row. That row's `channels` is
+  now null on a withdrawal, and a new `withdrawn` key holds the removed scope. The withdrawal is a
+  compare-and-set, so a scope written during the sign-in survives. A matching group still
+  overwrites any scope, an administrator's included. The scope it writes counts as the directory's
+  from then on, even when the value did not change.
+  **How the engine tells the two apart:** every scope write records its writer in a new column,
+  `users.channel_scope_source` (`'ad'` or `'manual'`), on all three store backends. The column is
+  added with no backfill. A scope with no recorded writer counts as the directory's, so it is
+  withdrawn too, which fails closed.
+  **Who this bites:** every AD account whose scope was set before the upgrade has a NULL source.
+  So an administrator's scope on such an account would be withdrawn at the user's next unmatched
+  sign-in. A site with no `/ad-group-scope-map` rows is hit hardest: no sign-in ever matches. So
+  every `["*"]` or hand-set grant on an AD account would drop to deny at that user's next sign-in.
+  **Migration:**
+  - Stop every node, upgrade them all, then start. A 0.4.0 node writes a scope without its source,
+    so on a shared store it would leave the source stale.
+  - The first start on PostgreSQL or SQL Server needs DDL rights, as it did for 0.4.0. The
+    PostgreSQL migration revision moves from 3 to 4, and the schema hash moves on both.
+  - Before AD users sign in, set again each scope an administrator chose, with
+    `PUT /users/{id}/channel-scope`. That records it as `'manual'`, and it revokes that user's
+    sessions. Do not re-set a scope the directory granted. It would then survive the user leaving
+    the group. If a sign-in withdraws a scope first, the audit row's `withdrawn` key holds it.
+  ([BACKLOG #1927](docs/BACKLOG.md))
 - **BREAKING: `deflate_decompress` now refuses any bytes after the end of the stream, and no longer
   hangs on them.** Its bounded loop never checked for the end of the stream. Take a stream whose
   output needs more than one 64 KiB round, and add one byte after it. The loop spun forever and the
@@ -138,6 +178,19 @@ All notable changes to MessageFoundry are documented here. The format follows
   direct path (`to` set) writes an outbound row, so only the NUL rule applies there in practice; its
   body is already held below 16 MiB by the 1 MiB request cap. The web console shows an uploaded-log
   resend refused this way as its own notice. ([BACKLOG #1911](docs/BACKLOG.md))
+- **BREAKING — a session that has not proved its second factor can no longer change the password of
+  an account that has one.** In 0.4.0 `POST /me/password` accepted an MFA-pending session on the
+  password alone, and a change ends every session, so a caller holding only the password could lock
+  the real user out. It now answers `403` with an `X-MFA-Required` header, and audits
+  `auth.mfa_denied`, when the account has confirmed TOTP or a registered passkey. That covers every
+  provider except a directory account, which still gets its `400`. The web console's password page
+  sends the same session to `/ui/mfa` instead. `POST /auth/mfa-verify` is now reachable while a
+  password change is required, so a must-change account with a factor, such as one an administrator
+  reset, proves the factor first and then rotates. An account with no factor rotates as before.
+  **Migration:** on that `403`, send `POST /auth/mfa-verify` with a TOTP code, adopt the token it
+  returns, and retry. The JSON API has no passkey leg, so a passkey-only account proves its factor on
+  the web console.
+  ([BACKLOG #1954](docs/BACKLOG.md))
 - **A keyed store now refuses an unmarked value in an encrypted column instead of reading it back
   as plaintext.** Once a store key is set, every covered column holds only `mfenc:` ciphertext, so
   a non-blank value without the marker is a stripped marker or a planted row. The cipher raises

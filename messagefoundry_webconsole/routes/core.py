@@ -45,9 +45,11 @@ from .._auth import (
     is_unlock_action,
     login_redirect_response,
     lookup_ui_action,
+    must_change_target,
     register_ui_action,
     require_ui,
     require_ui_step_up,
+    rotation_comes_first,
     session_token,
     set_session_cookie,
     webauthn_rp,
@@ -415,12 +417,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return RedirectResponse("/ui/login?e=bad", status_code=303)
         # A must-change account goes straight to the browser rotation page (L4b) — every other
         # /ui route would bounce it there anyway (require_ui). An MFA-pending session lands on the
-        # second-factor page for the same reason (ASVS 6.3.3). Order matches the server-side gates:
-        # must_change first, since a fresh account is BOTH and can only rotate.
+        # second-factor page for the same reason (ASVS 6.3.3). must_change comes first for an
+        # account with NO factor (a new user, the bootstrap admin): it is BOTH and can only rotate.
+        # An account that HAS a factor (an admin reset keeps them) proves it first, because the
+        # rotation page refuses it until then (BACKLOG #1954), and the factor page sends it on to
+        # the rotation page afterwards.
         #
-        # UX only — require_ui is what actually enforces, and it covers the other two cookie-minting
-        # legs (Kerberos SSO, the OIDC callback) without either needing this branch.
-        if outcome.must_change_password:
+        # UX only — require_ui and the rotation page are what actually enforce, and they cover the
+        # other two cookie-minting legs (Kerberos SSO, the OIDC callback) without this branch.
+        if await rotation_comes_first(auth, outcome.must_change_password, outcome.token):
             target = "/ui/account/password"
         elif outcome.mfa_required:
             target = "/ui/mfa"
@@ -1015,9 +1020,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         identity = await auth.identity_for_token(token) if auth is not None else None
         if auth is None or identity is None:
             return login_redirect_response()
-        if identity.must_change_password:
-            # must_change outranks MFA, mirroring require()/require_ui: a fresh account is both, and
-            # only rotation is reachable until it happens.
+        if await rotation_comes_first(auth, identity.must_change_password, token):
+            # must_change outranks MFA for an account with no factor, mirroring require()/require_ui:
+            # a fresh account is both, and only rotation is reachable until it happens. One that
+            # still owes an enrolled factor stays here to answer it (BACKLOG #1954).
             return RedirectResponse("/ui/account/password", status_code=303)
         if await auth.mfa_satisfied(token):
             return RedirectResponse("/ui", status_code=303)  # idempotent: nothing owed
@@ -1044,7 +1050,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         identity = await auth.identity_for_token(token) if auth is not None else None
         if auth is None or not token or identity is None:
             return login_redirect_response()
-        if identity.must_change_password:
+        if await rotation_comes_first(auth, identity.must_change_password, token):
             return RedirectResponse("/ui/account/password", status_code=303)
         client = request.client.host if request.client else None
         if not allow_reauth_attempt(auth, identity, client):
@@ -1057,8 +1063,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         elevation = await auth.verify_mfa(token, form.get("code", ""), client=client)
         if elevation.token is not None:
             # The session was re-keyed (ASVS 7.2.4), so the cookie this browser holds is now dead.
-            # Re-set it on the redirect or the operator is signed out by their own correct code.
-            resp = RedirectResponse("/ui", status_code=303)
+            # Re-set it on the redirect or the operator is signed out by their own correct code. A
+            # must-change session proved its factor first and rotates next (BACKLOG #1954).
+            target = "/ui/account/password" if identity.must_change_password else "/ui"
+            resp = RedirectResponse(target, status_code=303)
             set_session_cookie(resp, elevation.token, request=request)
             return resp
         if elevation.session_lost:
@@ -1099,8 +1107,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # like any other, so it carries Clear-Site-Data + the explanatory code (14.3.1).
             return login_redirect_response()
         if identity.must_change_password:
-            # Mirror require_ui's confinement: a must-change session can only rotate (L4b).
-            return RedirectResponse("/ui/account/password", status_code=303)
+            # Mirror require_ui's confinement (L4b): rotate, or first prove an owed factor (#1954).
+            return RedirectResponse(await must_change_target(auth, token), status_code=303)
         mfa = await auth.mfa_status(identity)
         if mfa.required and not (mfa.enabled or mfa.webauthn_enrolled) and action.step_up:
             # A full-step-up action a required-but-UNENROLLED session (no factor of EITHER
@@ -1134,8 +1142,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if auth is None or not token or identity is None:
             return login_redirect_response()  # session ended mid-ceremony — see ui_reauth_form
         if identity.must_change_password:
-            # Mirror require_ui's confinement: a must-change session can only rotate (L4b).
-            return RedirectResponse("/ui/account/password", status_code=303)
+            # Mirror require_ui's confinement (L4b): rotate, or first prove an owed factor (#1954).
+            return RedirectResponse(await must_change_target(auth, token), status_code=303)
         form = dict(parse_qsl((await request.body()).decode("utf-8", "replace")))
         next_ = form.get("next", "")
         action = lookup_ui_action(next_)
@@ -1265,7 +1273,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     # the operator still submits POST /ui/reauth (password) for reauth_at + the WP-L3-13
     # client re-anchor. NOT registered as a continuation (body-carrying JSON — part of the
     # step-up mechanism itself). MFA-pending sessions pass (the assertion IS the proof);
-    # must-change confinement is mirrored manually like both /ui/reauth handlers.
+    # must-change confinement is mirrored manually like /ui/mfa's, NOT like both /ui/reauth
+    # handlers: a must-change session that still owes its factor must pass. For a passkey-only
+    # account this is the only way to prove it (BACKLOG #1954).
     @app.post("/ui/reauth/webauthn")
     async def ui_reauth_webauthn(request: Request) -> Response:
         assert_same_origin(request)
@@ -1274,8 +1284,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         identity = await auth.identity_for_token(token) if auth is not None else None
         if auth is None or not token or identity is None:
             return JSONResponse({"ok": False, "error": "session expired"}, status_code=401)
-        if identity.must_change_password:
-            # Mirror require_ui's confinement: a must-change session can only rotate (L4b).
+        if await rotation_comes_first(auth, identity.must_change_password, token):
+            # Mirror /ui/mfa's confinement (L4b).
             return JSONResponse({"ok": False, "error": "password change required"}, status_code=403)
         rp = webauthn_rp(request)
         if rp is None:
