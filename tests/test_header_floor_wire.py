@@ -437,3 +437,27 @@ def test_a_hooked_cycle_is_still_freed_by_refcount(cycle_module: str) -> None:
     finally:
         if enabled:
             gc.enable()
+
+
+def test_a_changed_handshake_writer_signature_reaches_the_server_unchanged(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Fail open on a signature change: a writer called with one argument, where 16.0 passes
+    (status, headers, body), must still write, not raise inside the override."""
+    written: list[tuple[Any, ...]] = []
+
+    class _Stub(asyncio.Protocol):
+        def send_500_response(self) -> None:
+            pass
+
+        def write_http_response(self, response: Any) -> None:
+            written.append((response,))
+
+    monkeypatch.setattr(protocol_headers, "_WARNED", set())
+    caplog.set_level(logging.WARNING, logger=protocol_headers.__name__)
+    floored = floored_ws_protocol_class(base=_Stub)
+    assert floored is not None
+    floored().write_http_response("a single response object")  # type: ignore[attr-defined]
+    assert written == [("a single response object",)]
+    hits = [r.getMessage() for r in caplog.records if r.name == protocol_headers.__name__]
+    assert len(hits) == 1 and "ws-handshake: header addition" in hits[0], hits

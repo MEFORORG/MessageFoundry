@@ -34,9 +34,12 @@ separately). So a transport proxy adds the header lines after that status line, 
 that one call. The HTTP ``500`` goes through the cycle's ``send``, which prepends the cycle's
 ``default_headers``, so the override extends those for that one response.
 
-**Fail open, always.** A header is worth less than the response it rides on. Every step on the
-header path catches ``Exception``, logs its type once at WARNING, and falls through to the server's
-own behaviour, so no failure here can change a status or break a request.
+**Fail open.** A header is worth less than the response it rides on. The steps this module adds
+to a response (at least the transport swap and restore, the status-line injection, the 500 hook and
+its header extension, the handshake header addition, and the class build at startup) catch
+``Exception``, log the type once per family and step at WARNING, and fall through to the server's
+own behaviour. The overrides take ``*args, **kwargs`` so a changed server signature reaches the
+server's method unchanged. ``tests/test_header_floor_wire.py`` injects failures into those steps.
 
 **This leans on uvicorn and websockets INTERNALS**: the protocol's ``cycle`` attribute, the cycle's
 ``default_headers`` and ``send_500_response``, the protocols' ``transport``, and the legacy server's
@@ -98,8 +101,9 @@ def _fell_open(family: str, step: str, exc: BaseException) -> None:
         return
     _WARNED.add((family, step))
     _log.warning(
-        "%s: %s failed (%s); serving the server's own response without the protocol-level security "
-        "headers (BACKLOG #1120). Re-measure the uvicorn/websockets protocol layer.",
+        "%s: %s failed (%s); falling back to the server's own behaviour, so responses of this "
+        "family may lack the protocol-level security headers (BACKLOG #1120). Re-measure the "
+        "uvicorn/websockets protocol layer.",
         family,
         step,
         type(exc).__name__,
@@ -133,11 +137,16 @@ class _HeaderInjectingTransport:
         self._inner.write(data)
 
     def writelines(self, chunks: Any) -> None:
-        chunks = list(chunks)
+        if not self._pending:
+            self._inner.writelines(chunks)
+            return
         try:
-            joined = b"".join(bytes(chunk) for chunk in chunks)
+            chunks = list(chunks)
+            joined: bytes | None = b"".join(bytes(chunk) for chunk in chunks)
         except Exception as exc:
             _fell_open(self._family, "writelines join", exc)
+            joined = None
+        if joined is None:
             self._pending = False
             self._inner.writelines(chunks)
             return
@@ -179,8 +188,12 @@ async def _send_floored_500(cycle_ref: weakref.ref[Any], *args: Any, **kwargs: A
     response start the cycle sends, so extending it only now puts the headers on this response
     alone. REBIND, never mutate: the list uvicorn passed in is the server-wide
     ``server_state.default_headers``."""
-    # uvicorn calls this through the cycle it is about to answer for, so the referent is alive.
+    # uvicorn calls this through the cycle it is about to answer for, so the referent is alive. If
+    # it ever is not, there is no cycle left to send through, with or without this module.
     cycle: Any = cycle_ref()
+    if cycle is None:
+        _fell_open("http-500", "cycle reference", ReferenceError("cycle already freed"))
+        return
     try:
         cycle.default_headers = [*cycle.default_headers, *_HEADER_PAIRS]
     except Exception as exc:
@@ -276,16 +289,17 @@ def _build_floored_ws(base: type[Any]) -> type[asyncio.Protocol]:
         # absent, so the 101 and the denial, which the floor already covered, are not stamped twice.
 
         class _FlooredLegacyWebSocketProtocol(_FlooredWebSocketProtocol):
-            def write_http_response(
-                self, status: Any, headers: Any, *args: Any, **kwargs: Any
-            ) -> None:
+            def write_http_response(self, *args: Any, **kwargs: Any) -> None:
+                # No named parameters, so a changed signature reaches the server's own method
+                # unchanged instead of raising here. At 16.0 it is (status, headers, body=None).
                 try:
+                    headers = kwargs["headers"] if "headers" in kwargs else args[1]
                     for name, value in PROTOCOL_SECURITY_HEADERS:
                         if name not in headers:
                             headers[name] = value
                 except Exception as exc:
                     _fell_open("ws-handshake", "header addition", exc)
-                super().write_http_response(status, headers, *args, **kwargs)
+                super().write_http_response(*args, **kwargs)
 
         return _FlooredLegacyWebSocketProtocol
     return _FlooredWebSocketProtocol
