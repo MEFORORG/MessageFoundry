@@ -814,8 +814,8 @@ Full model: **[SECURITY.md](SECURITY.md)**. PHI-relevant facts only here:
   absolute (12 h) timeouts; a password change or a local disable revokes sessions at once. Some
   paths lag a revocation. A running bulk export keeps going. A change made in Active Directory, or
   to the AD group maps, can wait for the reconciler, the next login or the session cap. A user
-  dropped from their last scope-mapped AD group would keep the old channel scope, and with it any
-  PHI view permission they hold on those channels. See
+  dropped from their last scope-mapped AD group would keep the old channel scope in live sessions,
+  and any PHI view it carries. That would last until their next login, within the session cap. See
   [SECURITY.md](SECURITY.md#a-revoked-privilege-reaches-the-next-request-with-exceptions-asvs-832).
 - **Local passwords** are argon2id; lockout after 5 failed attempts. AD users bind over LDAPS.
 

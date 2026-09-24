@@ -850,8 +850,12 @@ the same permission set on the same method reds CI until it is listed here.
 > **cannot purge** a shared outbound (purge spans every inbound feeding it). **AD users** inherit
 > their scope from the `ad_group_scope_map` (`GET/PUT /ad-group-scope-map`; channel `*` = all): on
 > login the group-derived scope is persisted — a wildcard row persists the explicit `["*"]` grant —
-> and stale sessions revoked. It's opt-in: with no matching mapped group the user's existing scope
-> is left untouched, which for a never-granted account means it stays denied.
+> and stale sessions revoked. When no mapped group matches, the AD login sync withdraws the stored
+> scope to NULL, which denies, and revokes the user's other sessions (BACKLOG #1927). It keeps a
+> scope an administrator set, and a scope that already denies. A matching group still overwrites
+> any scope, an administrator's included, and that scope then counts as the directory's. A scope
+> with no recorded writer counts as the directory's too. So on a database older than #1927, an
+> administrator's scope on an AD account would be withdrawn at that user's next unmatched login.
 >
 > **The monitoring plane is narrowed too, and this used to say the opposite.** For a channel-scoped
 > caller `GET /channels`, `GET /connections`, `GET /events`, `GET /graph/edges` and `GET /alerts/active`
@@ -1618,7 +1622,7 @@ roles.
 At least these changes reach the next request, and each one also revokes the affected sessions:
 
 - a user's roles set, or a custom role edited or deleted;
-- a local user's channel scope set;
+- a user's channel scope set by an administrator;
 - a user disabled, deleted, or given a new password.
 
 The dual-control release re-checks the requester's standing too.
@@ -1633,13 +1637,14 @@ On a first deployment, each would let a caller keep acting on a withdrawn grant 
 | The `/ws/stats` live feed | The engine re-checks the session and `monitoring:read` every 3 s, while it sends a frame each second. Each frame's connections table uses the identity from the last re-check. The engine checks second-factor status at the handshake only. | Up to three more frames after a revocation or a narrowed scope. A change that newly requires a second factor, but revokes no session, would not reach an open socket. Under the shipped `require_mfa` defaults every open socket already holds a verified session. So this arises only where an operator has turned `require_mfa` off or narrowed `require_mfa_scope`. |
 | The bulk message export (`GET` or `POST /messages/export`, streamed as newline-delimited JSON) | The engine resolves the identity once, when the export starts. It tests each row's channel against that copy. | To the end of that export, up to 100,000 message bodies. |
 | The IDE extension's AI policy, in `byo` mode | The IDE asks the engine when it holds a live session. Withdrawing `ai:assist` revokes that session. The engine then answers with the grant unknown, and `byo` mode treats unknown as allowed. When the engine is unreachable, the extension reuses its last cached answer, with no age limit. | Until the IDE signs in again, or for as long as the engine stays unreachable. In `managed_endpoint` mode the engine checks `ai:assist` on each chat request. |
-| An engine-side edit that narrows an AD account's grant | An edit to the AD group-to-role or group-to-scope map revokes every live directory session. At the next login the engine re-derives roles from the groups. It re-derives scope only when a scope-mapped group matches, and then it overwrites any per-user scope an admin set. | A per-user scope an admin narrowed on a user in a scope-mapped group: the next login restores the group scope. A scope-map row removed so that no mapped group matches: the old scope stays, with no time bound. A service-certificate identity mapped to an AD account: it has no session to revoke and no pass re-derives its roles, so with no time bound. |
-| A change made in Active Directory rather than in the engine | The [directory reconciler](#directory-session-reconciliation--propagating-an-ad-disable-adr-0079-mechanism-2) runs every `[auth].ad_session_recheck_seconds` (300 s by default), for principals that hold a session. It revokes a changed role set after one pass. It revokes a disabled or deleted account after `ad_session_recheck_strikes` passes that each find it absent. It fails open when the domain controller is unreachable. A pass that trips the mass-revoke breaker revokes nothing. It re-checks roles, not channel scope. | A role change: about one interval. A disable or delete: about the interval times the strikes, and an engine restart starts the count again. Both run longer on an estate larger than one pass's probe budget. While the domain controller is down or the breaker keeps tripping, both last until the absolute session cap, 12 hours by default. A scope change: until the next login, within that cap. A user dropped from their last scope-mapped group would keep the old scope with no time bound, because login leaves an unmatched scope untouched. |
+| An engine-side edit that narrows an AD account's grant | An edit to the AD group-to-role or group-to-scope map revokes every live directory session. At the next login the engine re-derives roles from the groups. It re-derives scope by the rule under *Per-channel scoping* above. | A per-user scope an admin narrowed on a user in a scope-mapped group: the next login restores the group scope. A scope-map row removed so that no mapped group matches: the map edit revokes the session, and the next login applies that rule. A service-certificate identity mapped to an AD account: it has no session to revoke, and no pass re-derives its roles or its scope, so with no time bound. |
+| A change made in Active Directory rather than in the engine | The [directory reconciler](#directory-session-reconciliation--propagating-an-ad-disable-adr-0079-mechanism-2) runs every `[auth].ad_session_recheck_seconds` (300 s by default), for principals that hold a session. It revokes a changed role set after one pass. It revokes a disabled or deleted account after `ad_session_recheck_strikes` passes that each find it absent. It fails open when the domain controller is unreachable. A pass that trips the mass-revoke breaker revokes nothing. It re-checks roles, not channel scope. | A role change: about one interval. A disable or delete: about the interval times the strikes, and an engine restart starts the count again. Both run longer on an estate larger than one pass's probe budget. While the domain controller is down or the breaker keeps tripping, both last until the absolute session cap, 12 hours by default. A scope change: until the next login, within that cap, because the reconciler does not re-check scope. So a user dropped from their last scope-mapped group would keep the old scope in live sessions until then. |
 
 No alert fires when a caller acts inside one of these windows, and the engine reverts nothing done
 there. The reconciler's `ad_session_revoked` alert reports a revocation, not an action taken after one.
 The dual-control release refuses a stale requester and raises an alert, and the approval gate ships
-off. BACKLOG #1154 tracks the lag, and BACKLOG #1927 tracks the scope that never narrows.
+off. BACKLOG #1154 tracks the lag. Since BACKLOG #1927, login withdraws a directory scope that no
+mapped group matches. No item yet tracks the reconciler's missing scope re-check.
 
 ### Directory session reconciliation — propagating an AD disable (ADR 0079 mechanism 2)
 
