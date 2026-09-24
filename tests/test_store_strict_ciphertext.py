@@ -15,7 +15,8 @@ fail; a downgrade to plaintext has none, so only a refusal protects it.
 * NULL and a purged ``''`` are never sealed and never refused.
 * A keyless store is unchanged.
 * ``[store].allow_unmarked_ciphertext`` restores the passthrough and the seal-everything sweep.
-* The uploaded-file store is unchanged: whether it refuses is an open owner question.
+* The uploaded-file store's own refusal (owner ruling 2026-09-23) is pinned in
+  ``tests/test_uploads_strict_ciphertext.py``.
 * A crash part-way through a first keyed open leaves the surface all sealed or all unsealed, and the
   AES-GCM invocation bound (ASVS 11.3.4) still leads every encrypt of the one-transaction seal.
 
@@ -48,7 +49,6 @@ from messagefoundry.store.crypto import (
     generate_key,
     make_cipher,
 )
-from messagefoundry.uploads import UploadStore
 
 _RAW = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG{i}|P|2.5.1\rPID|1||{i}^^^H^MR||DOE^JANE\r"
 _PLANT = "MSH|^~\\&|EVIL|F|R|RF|20260101||ADT^A01|PLANTED|P|2.5.1\rPID|1||666^^^H^MR||ROE^RICH\r"
@@ -255,26 +255,6 @@ def test_the_setting_ships_off_and_on_is_a_named_loosening() -> None:
     assert "allow_unmarked_ciphertext" not in names(StoreSettings())
     risk = names(StoreSettings(allow_unmarked_ciphertext=True))["allow_unmarked_ciphertext"]
     assert "no effect without a store key" in risk
-
-
-# --- uploads are out of scope, and must not change -----------------------------------------------
-
-
-async def test_the_uploaded_file_store_is_unchanged(tmp_path: Path) -> None:
-    root = tmp_path / "uploads"
-    data = _RAW.format(i=1).encode()
-    plain = UploadStore(root, make_cipher(None), max_bytes=4096)
-    meta = await plain.save(data=data, filename="x.hl7", uploader="op", uploader_id="u-op")
-
-    # The live store cipher is shared with the upload store, strict policy and all.
-    keyed = UploadStore(root, _keyed(generate_key()), max_bytes=4096)
-    assert [m.file_id for m in await keyed.list_files()] == [meta.file_id]
-    assert await keyed.read_bytes(meta.file_id) == data
-    # And a first key-enable still seals a legacy plaintext upload.
-    await keyed.reseal_to_active()
-    blob = (root / f"{meta.file_id}.blob").read_text(encoding="utf-8")
-    assert blob.startswith(MARKER_PREFIX)
-    assert await keyed.read_bytes(meta.file_id) == data
 
 
 # --- crash safety and the 11.3.4 bound -----------------------------------------------------------

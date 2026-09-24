@@ -700,10 +700,25 @@ async def test_edit_resend_reject_path_charges_the_phi_read_budget(engine: Engin
         assert r.headers["Retry-After"]
 
 
-async def test_edit_resend_reroute_redirects_to_child(engine: Engine) -> None:
+async def test_edit_resend_reroute_redirects_to_child(engine: Engine, tmp_path: Path) -> None:
     # Re-route re-ingresses the EDITED body as a fresh correlated child on the origin channel; the /ui
     # route lands the operator on the NEW child's detail. Store-level reingress needs no started
-    # pipeline.
+    # pipeline, but the origin inbound must be registered: its ingress guards run on the edited body,
+    # and with no inbound to guard with the re-route refuses (BACKLOG #1911).
+    (tmp_path / "in").mkdir(exist_ok=True)
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection(
+            "ch1",
+            ConnectionSpec(
+                ConnectorType.FILE,
+                {"directory": str(tmp_path / "in"), "pattern": "*.hl7", "poll_seconds": 0.05},
+            ),
+            router="r",
+        )
+    )
+    reg.add_router("r", lambda m: [])
+    engine.add_registry(reg)
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     mid = await _seed(engine)

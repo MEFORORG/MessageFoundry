@@ -68,7 +68,14 @@ _SYSTEM_IDENTITY = Identity.build(
 )
 
 # While an account is flagged to rotate its password, only these self-service routes stay reachable.
-_MUST_CHANGE_EXEMPT_PATHS = frozenset({"/auth/logout", "/auth/me", "/me/password"})
+# /auth/mfa-verify is here for an account that is must-change AND has a factor (admin_reset_password
+# keeps factors): /me/password refuses its pending session until the factor is proven (BACKLOG
+# #1954), so the factor step has to be reachable or the account can do neither. What it adds for
+# every must-change session is that one ceremony: a call draws the sign-in rate budget and, on an
+# account with TOTP, a wrong code counts toward the lockout, exactly as it would unconfined.
+_MUST_CHANGE_EXEMPT_PATHS = frozenset(
+    {"/auth/logout", "/auth/me", "/auth/mfa-verify", "/me/password"}
+)
 
 # ASVS 6.3.3: while a session's second factor is PENDING, only these self-service routes stay
 # reachable. Keyed on (METHOD, path), NOT on path alone like the must-change set above: /me/mfa is
@@ -77,9 +84,10 @@ _MUST_CHANGE_EXEMPT_PATHS = frozenset({"/auth/logout", "/auth/me", "/me/password
 #
 # /auth/mfa-verify is HOW a session becomes satisfied, so it must gate itself out; /me/password and
 # /me/reauth are the binding deadlock carve-outs (a fresh account can be must_change AND mfa_pending
-# in the same instant). Enrollment (POST /me/mfa/enroll, /confirm) is NOT listed because it rides
-# require_reauth_only_action, which opts out via mfa_gate=False — an un-enrolled user could never
-# satisfy a gate that stands in front of the only route that enrolls them.
+# in the same instant). /me/password is exempt only for an account with NO factor: see
+# _PASSWORD_CHANGE_ROUTE below. Enrollment (POST /me/mfa/enroll, /confirm) is NOT listed
+# because it rides require_reauth_only_action, which opts out via mfa_gate=False — an un-enrolled
+# user could never satisfy a gate that stands in front of the only route that enrolls them.
 #
 # Deliberately NOT exempt: GET /me/sessions and GET /me/security-events. A pending session has proven
 # ONE factor, which is exactly the attacker-holds-the-password case; handing it the victim's session
@@ -89,8 +97,7 @@ _MUST_CHANGE_EXEMPT_PATHS = frozenset({"/auth/logout", "/auth/me", "/me/password
 #
 # That revocation path serves an account with NO factor, which has nothing to prove at
 # /auth/mfa-verify. An account that HAS one proves it first before that path works (BACKLOG #1951;
-# see AuthService._PENDING_REFUSED_ACTIONS). /me/password is NOT so limited: it revokes every
-# session when it changes the password, from a pending session too.
+# see AuthService._PENDING_REFUSED_ACTIONS). /me/password is limited the same way (#1954).
 _MFA_EXEMPT_ROUTES: frozenset[tuple[str, str]] = frozenset(
     {
         ("POST", "/auth/logout"),
@@ -101,6 +108,13 @@ _MFA_EXEMPT_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("GET", "/me/mfa"),
     }
 )
+
+# The one exempt route above whose exemption serves an account with NO factor only. A pending
+# session on a non-directory account that HAS one is refused here like anywhere else: a password change
+# revokes every session, so without this a caller holding only the password could lock the real
+# user out and sign them out everywhere (BACKLOG #1954, ASVS 6.3.3).
+# AuthService.password_change_owes_factor decides it; the console's password page asks it too.
+_PASSWORD_CHANGE_ROUTE = ("POST", "/me/password")
 
 # BACKLOG #195a (ASVS 16.3.2): the permissions whose authorization GRANT is worth an audit row when the
 # trail is NARROWED — the sensitive / state-changing / config / user-mgmt surface.
@@ -340,16 +354,22 @@ def require(
                 ),
             )
         # ASVS 6.3.3 — MFA is an ACCESS gate, not only a step-up gate. Ordering is load-bearing in
-        # BOTH directions. must_change stays FIRST: a fresh account is must_change AND mfa_pending at
-        # the same instant, and GET /me/mfa is MFA-exempt but NOT must-change-exempt, so leading with
-        # MFA would point that account at /auth/mfa-verify, which it cannot satisfy until it has
-        # rotated — the brick. And this stays ABOVE the permission loop: refusing below it would tell
-        # an unverified caller whether it holds the permission, a free authorization oracle.
-        if (
-            mfa_gate
-            and (request.method, request.url.path) not in _MFA_EXEMPT_ROUTES
-            and not await auth.mfa_satisfied(bearer_token(request))
-        ):
+        # BOTH directions. must_change stays FIRST: a fresh account (new user, bootstrap admin) is
+        # must_change AND mfa_pending with NO factor, so leading with MFA would point it at
+        # /auth/mfa-verify with nothing to prove there — the brick. It rotates first instead, and
+        # /me/password lets it, because the factor refusal below skips an account with no factor.
+        # A must-change account that HAS a factor (an admin reset) is sent the other way: /me/password
+        # refuses it with X-MFA-Required, and /auth/mfa-verify is must-change-exempt so it can answer
+        # (BACKLOG #1954). And this stays ABOVE the permission loop: refusing below it would tell an
+        # unverified caller whether it holds the permission, a free authorization oracle.
+        route = (request.method, request.url.path)
+        if mfa_gate and route not in _MFA_EXEMPT_ROUTES:
+            pending = not await auth.mfa_satisfied(bearer_token(request))
+        elif mfa_gate and route == _PASSWORD_CHANGE_ROUTE:
+            pending = await auth.password_change_owes_factor(bearer_token(request))
+        else:
+            pending = False
+        if pending:
             await auth.audit_mfa_denied(identity, request.url.path, client=client_ip(request))
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN,

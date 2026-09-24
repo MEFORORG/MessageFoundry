@@ -61,6 +61,7 @@ __all__ = [
     "SecretStamp",
     "StoreKeyRotationOverdueError",
     "enforce_store_key_expiry",
+    "fingerprints_equal",
     "reconcile_rotation_meta",
     "secrets_from_settings",
     "secrets_from_settings_and_stamps",
@@ -162,6 +163,13 @@ def _fingerprint_bytes(value: str) -> bytes:
     surrogate encodes rather than raising and two distinct strings can never collide onto the same bytes.
     """
     return value.encode("utf-8", "surrogatepass")
+
+
+def fingerprints_equal(a: str, b: str) -> bool:
+    """Compare two stored rotation fingerprints the way the watcher does: constant-time, over their
+    byte form (ASVS 11.2.4, BACKLOG #1167). For a caller outside this module, so it need not
+    re-derive the rule; ``messagefoundry rotate-key`` uses it (BACKLOG #1169)."""
+    return hmac.compare_digest(_fingerprint_bytes(a), _fingerprint_bytes(b))
 
 
 def _keyed_fingerprint(key: bytes, value: str) -> str:
