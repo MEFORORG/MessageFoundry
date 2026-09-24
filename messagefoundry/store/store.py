@@ -1898,11 +1898,18 @@ def _audit_digest_line(r: Mapping[str, Any]) -> bytes:
 
 
 def audit_range_closing(
-    rows: Sequence[Mapping[str, Any]], *, key_id: str, from_id: int
+    rows: Sequence[Mapping[str, Any]], *, key_id: str, from_id: int, prev_hash: str
 ) -> dict[str, Any]:
     """The ``closes`` record a range row carries for the range it ends: the range's key, its first and
-    last id, its row count and a SHA-256 digest over every row. ``rows`` are the range's rows, in id
-    order -- everything from ``from_id`` up to (not including) the new range row."""
+    last id, its row count, a SHA-256 digest over every row, and ``prev_hash`` -- the stored
+    ``row_hash`` of the row just BEFORE the range (``""``, the chain's genesis, when there is none).
+    ``rows`` are the range's rows, in id order -- everything from ``from_id`` up to (not including) the
+    new range row.
+
+    ``prev_hash`` is the range's link to everything before it. While the range's key is held, the MAC
+    on its first row carries that link; once the key is dropped, only this record does. Without it the
+    rows below a dropped range -- the keyless prefix under a ``rekey-audit`` watermark, above all --
+    could be rewritten and re-hashed and the chain would still verify (PR 1446, Lander blocker)."""
     digest = hashlib.sha256()
     last = from_id - 1
     for r in rows:
@@ -1914,11 +1921,14 @@ def audit_range_closing(
         "to_id": last,
         "rows": len(rows),
         "digest": digest.hexdigest(),
+        "prev_hash": prev_hash,
     }
 
 
 _AUDIT_HANDOVER_INFO: Final = b"mefor/audit-handover/v1\x00"
-_AUDIT_CLOSES_FIELDS: Final = frozenset({"key_id", "from_id", "to_id", "rows", "digest"})
+_AUDIT_CLOSES_FIELDS: Final = frozenset(
+    {"key_id", "from_id", "to_id", "rows", "digest", "prev_hash"}
+)
 
 
 def audit_handover_tag(
@@ -2031,6 +2041,8 @@ def verify_audit_rows(
     range_digest = hashlib.sha256()
     range_rows = 0
     range_last = 0
+    #: Stored ``row_hash`` of the row just before the range being walked: its link to the chain below.
+    range_prev = ""
     seen_keys: set[str] = set()
     #: (range row id, outgoing key, new key, claimed closes, handover tag, what the walk saw)
     closings: list[tuple[int, str | None, str, dict[str, Any], str, dict[str, Any]]] = []
@@ -2041,6 +2053,7 @@ def verify_audit_rows(
             assert keyed_from is not None  # for the type checker: `keyed` implies it
             range_key, range_from = first_key_id, keyed_from
             range_last = keyed_from - 1
+            range_prev = prev  # the last keyless row's stored hash, or "" (genesis) when none
             if range_key is not None:
                 seen_keys.add(range_key)
         if keyed and r["action"] == AUDIT_KEY_EPOCH_ACTION:
@@ -2065,12 +2078,14 @@ def verify_audit_rows(
                             "to_id": range_last,
                             "rows": range_rows,
                             "digest": range_digest.hexdigest(),
+                            "prev_hash": range_prev,
                         },
                     )
                 )
                 seen_keys.add(new_key)
                 range_key, range_from = new_key, rid
                 range_digest, range_rows, range_last = hashlib.sha256(), 0, rid - 1
+                range_prev = prev  # the stored hash of the row before this range row
         key: bytes | None = None
         mac: AuditMacFn | None = None
         held = True
@@ -2127,7 +2142,11 @@ def verify_audit_rows(
         digest_ok = hmac.compare_digest(
             audit_mac_bytes(str(claimed.get("digest", ""))), audit_mac_bytes(actual["digest"])
         )
-        if not (fields_ok and digest_ok):
+        # The range's link to the chain below it, which must hold with the range's key gone.
+        link_ok = hmac.compare_digest(
+            audit_mac_bytes(str(claimed.get("prev_hash"))), audit_mac_bytes(actual["prev_hash"])
+        )
+        if not (fields_ok and digest_ok and link_ok):
             breaks.append((rid, "audit key-range row does not match the range it closes"))
         out_secret = _audit_secret_for(outgoing, mac_keys, mac_fn)
         if out_secret is not None and not _audit_tag_ok(new_key, claimed, handover, out_secret):
@@ -2374,11 +2393,25 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
             f"the audit chain's current range is keyed under audit key {current!r}, which is not "
             "configured; restore it to MEFOR_STORE_ENCRYPTION_KEYS_RETIRED and re-run"
         )
-    ok, msg = await host.verify_audit_chain()
+    # ONE read, verified and sealed from the same rows, so the closing record cannot describe a
+    # different chain from the one the verify passed.
+    rows = await host._audit_rows(AUDIT_ALL_ROWS)
+    ok, msg = verify_audit_rows(
+        rows,
+        keyed_from=host._audit_keyed_from,
+        first_key_id=host._audit_first_key_id,
+        mac_keys=host._audit_mac_keys,
+        mac_fn=host._audit_mac_fn,
+        capable=True,  # active_id is not None, so a keying secret is in hand
+    )
     if not ok:
         return False, f"refusing to roll a broken audit chain: {msg}"
+    before = [r for r in rows if int(r["id"]) < current_from]
     closes = audit_range_closing(
-        await host._audit_rows(current_from), key_id=current, from_id=current_from
+        [r for r in rows if int(r["id"]) >= current_from],
+        key_id=current,
+        from_id=current_from,
+        prev_hash=(before[-1]["row_hash"] or "") if before else "",
     )
     handover = audit_handover_tag(active_id, closes, out_secret)
     host._audit_range_key_id = active_id  # the range row is the first row of the new range

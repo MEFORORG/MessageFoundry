@@ -471,7 +471,15 @@ def _rows_across_a_rotation(
 
     def open_range(outgoing: bytes, incoming: bytes, signer: bytes, from_id: int) -> None:
         closed = [r for r in rows if int(str(r["id"])) >= from_id]
-        closes = dict(audit_range_closing(closed, key_id=audit_key_id(outgoing), from_id=from_id))
+        before = [r for r in rows if int(str(r["id"])) < from_id]
+        closes = dict(
+            audit_range_closing(
+                closed,
+                key_id=audit_key_id(outgoing),
+                from_id=from_id,
+                prev_hash=str(before[-1]["row_hash"]) if before else "",
+            )
+        )
         closes.update(closes_edit or {})
         tag = audit_handover_tag(audit_key_id(incoming), closes, (signer, None))
         add(
@@ -696,3 +704,77 @@ def test_rotate_key_does_not_print_ok_when_the_audit_roll_fails(
     captured = capsys.readouterr()
     assert "OK:" not in captured.out and "PARTIAL:" in captured.out, captured.out
     assert "Do NOT remove" in captured.err
+
+
+# --- Lander blocker on PR 1446: the keyless prefix below a dropped first range ----------------------
+
+
+async def _keyless_then_rekeyed_then_rotated(tmp_path: Path) -> tuple[Path, str]:
+    """The Lander's reproduction, the path #1905 points operators down: keyless rows, `rekey-audit`
+    under A (watermark id=4), two A rows, `rotate-key` to B, one B row. Returns (path, B)."""
+    path, a, b = tmp_path / "prefix.db", generate_key(), generate_key()
+    store = await MessageStore.open(path)
+    try:
+        await _seed(store, "keyless", 3)
+    finally:
+        await store.close()
+    store = await _open(path, a)
+    try:
+        ok, msg = await store.rekey_audit_chain()
+        assert ok and "keyed from id=4" in msg, msg
+        await _seed(store, "a", 2)
+    finally:
+        await store.close()
+    await _rotate(path, a, b)
+    store = await _open(path, b, (a,))
+    try:
+        await _seed(store, "b", 1)
+    finally:
+        await store.close()
+    return path, b
+
+
+async def test_an_untampered_keyless_prefix_verifies_after_the_first_key_is_dropped(
+    tmp_path: Path,
+) -> None:
+    """The control: without it, a red below could be the drop itself, not the forgery."""
+    path, b = await _keyless_then_rekeyed_then_rotated(tmp_path)
+    ok, msg = await _verify(path, b)
+    assert ok, msg
+
+
+async def test_a_forged_keyless_prefix_is_caught_after_the_first_key_is_dropped(
+    tmp_path: Path,
+) -> None:
+    """Edit keyless row 2 and recompute SHA-256 for rows 2 and 3. Only A's MAC on row 4 tied the
+    keyless prefix in; with A dropped, the B-keyed range row must still pin it."""
+    path, b = await _keyless_then_rekeyed_then_rotated(tmp_path)
+    store = await _open(path, b)
+    try:
+        cur = await store._db.execute(
+            "SELECT id, ts, actor, action, channel_id, detail, client, row_hash"
+            " FROM audit_log WHERE id <= 3 ORDER BY id"
+        )
+        rows = [dict(r) for r in await cur.fetchall()]
+        rows[1]["actor"] = "mallory"
+        prev = rows[0]["row_hash"]
+        for r in rows[1:]:
+            r["row_hash"] = audit_row_hash(
+                prev,
+                ts=r["ts"],
+                actor=r["actor"],
+                action=r["action"],
+                channel_id=r["channel_id"],
+                detail=r["detail"],
+                client=r["client"],
+            )
+            prev = r["row_hash"]
+            await store._db.execute(
+                "UPDATE audit_log SET actor=?, row_hash=? WHERE id=?",
+                (r["actor"], r["row_hash"], r["id"]),
+            )
+        await store._db.commit()
+        ok, msg = await store.verify_audit_chain()
+        assert not ok, f"a forged keyless prefix verified with the first key dropped: {msg}"
+    finally:
+        await store.close()

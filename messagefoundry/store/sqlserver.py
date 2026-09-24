@@ -2717,11 +2717,13 @@ class SqlServerStore:
     ) -> list[Mapping[str, Any]]:
         """``AuditRangeHost`` primitive: audit rows with ``id >= from_id``, in id order."""
         top = "" if limit is None else f"TOP ({int(limit)}) "
+        # audit_log.id is INT here: clamp the "every row" floor to INT's own minimum, which selects
+        # the same rows and keeps the parameter inside the column's type.
         rows: list[Mapping[str, Any]] = list(
             await self._fetchall(
                 f"SELECT {top}id, ts, actor, action, channel_id, detail, client, row_hash"
                 " FROM audit_log WHERE id >= ? ORDER BY id",
-                (from_id,),
+                (max(from_id, -(2**31)),),
             )
         )
         return rows

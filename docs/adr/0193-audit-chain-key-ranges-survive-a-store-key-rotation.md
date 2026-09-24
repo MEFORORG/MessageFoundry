@@ -43,13 +43,17 @@ first is opened by a row inside the chain.**
 3. **`rotate-key` opens a new range.** After re-encrypting, it verifies the whole chain (refusing on
    any break) and appends ONE `audit.key_epoch` row, MAC'd under the NEW key. Its detail names the
    new key, carries a `closes` record for the range it ends (key, first and last id, row count, and a
-   SHA-256 digest over every row's id, chained fields and stored MAC), and a **handover tag**: a MAC
+   SHA-256 digest over every row's id, chained fields and stored MAC, and `prev_hash`, the stored
+   hash of the row just before the range, or `""` when there is none), and a **handover tag**: a MAC
    under the OUTGOING key over the new key id and the `closes` record. It refuses, too, when the
    active key already keyed a range.
 4. **Verify checks each row under its own range's key** (`verify_audit_rows`, one function shared by
    all three backends). A range whose key is no longer held is proved by the digest in the row that
    closes it; that row lies in the next range, so the proof chains forward to the newest range, whose
-   key must be held.
+   key must be held. The closing record's `prev_hash` must equal the stored hash of the row before
+   the range. While the range's key is held, the MAC on its first row carries that link; once the key
+   is dropped, only `prev_hash` does. Without it, the keyless rows below a `rekey-audit` watermark
+   could be rewritten and re-hashed once the first range's key was dropped (PR 1446, Lander blocker).
 5. **A forged or moved range fails.** The range rows are chain rows, so they are inside every MAC
    and every anchor. A range row must match the range it closes, must carry a handover tag that
    verifies under the outgoing key whenever that key is held, and must name a key that has not keyed
@@ -75,6 +79,7 @@ first is opened by a row inside the chain.**
   → `tests/test_audit_key_rotation.py::test_the_documented_rotation_verifies_at_every_step`
 - **AC-2** -- WHEN a row of a dropped key's range is edited, THE SYSTEM SHALL report a break.
   → `tests/test_audit_key_rotation.py::test_editing_a_row_of_a_dropped_keys_range_is_caught`
+  → `tests/test_audit_key_rotation.py::test_a_forged_keyless_prefix_is_caught_after_the_first_key_is_dropped`
 - **AC-3** -- IF a range row's `closes` record, or `audit_chain_meta.key_id`, is altered, THEN THE
   SYSTEM SHALL report a break rather than verify under the named key.
   → `tests/test_audit_key_rotation.py::test_a_moved_range_boundary_is_caught`
