@@ -6,6 +6,15 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- **BREAKING — the config loader refuses a connection name that does not match
+  `^[A-Za-z][A-Za-z0-9_-]{0,255}$`.** In 0.4.0 such a name still loaded and ran, and only the API
+  refused it. Now a code-first `inbound()` or `outbound()` call, or a `connections.toml` entry,
+  carrying one fails the whole load with a `WiringError` that names it. The `connections.toml`
+  editor and the rename planner refuse it before writing, and the Corepoint importer folds a
+  generated connection name that would fail it. **Migration:** rename such connections to fit the pattern;
+  stored history stays under the old name. ([BACKLOG #1107](docs/BACKLOG.md))
+
 ## [0.4.0] — 2026-09-23 — Early Access
 
 This section lists every breaking change since 0.3.2, each marked BREAKING, and summarizes the
