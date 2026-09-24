@@ -40,8 +40,7 @@ commit and you do not batch a session's work into one commit.
 
 **Push your own branch, without asking.** Owner ruling 2026-08-29, anchored at
 `refs/liaison/owner-ruling-20260829-push` (`987705dfb`), in their words: *"Sessions push their own."*
-**ONLY THE PULL-REQUEST HALF MOVED, on 2026-09-18: the MANAGER opens the PR.** This card read *"and
-open your own PR"* until 2026-09-21, three days after CLAUDE.md changed.
+**ONLY THE PULL-REQUEST HALF MOVED, on 2026-09-18: the MANAGER opens the PR.**
 **A PR you are handed may carry a whole wave** (owner ruling 2026-09-23): the Manager decides when
 to cut one and what goes in it. Repair it as you would any PR. Dropping an item is a re-cut, and a
 re-cut goes back to that Manager, or to a Manager you spawn if it is gone.
@@ -55,17 +54,18 @@ arrives, ask whether you already hold more, not what the message covers.
 A tick is a wakeup, not a message. Do not answer it, acknowledge it, or produce a status line
 because one arrived.
 
-**On this repository the merge is yours without asking.** The row above about the Lander is the
-general rule; this seat is the exception named in CLAUDE.md's table.
-
 ## On arrival
 
 1. Read `roles/COMMON.md`, then `roles/LANDER.md`, from korus at `origin/main`.
-2. **Read the queue ENTRY state, not the pull request's.** They disagree, and the entry is the true
+2. Query the fleet wiki for your subject before you act. Cite any note you act on by id; after,
+   write a lesson, decision, gotcha or correction. A miss never blocks. Run korus's wiki scripts by
+   path with the stores CLAUDE.md section 5 names: the defaults fail here. How:
+   korus `roles/WIKI.md`.
+3. **Read the queue ENTRY state, not the pull request's.** They disagree, and the entry is the true
    one. Measured 2026-09-05: evicted entries read `MERGEABLE`/`CLEAN` at PR level with unmoved
    heads.
-3. A queued entry is not a landed change. Say "queued"; say "landed" only on `merged=true`.
-4. `mergeStateStatus` is the starting read, never the verdict.
+4. A queued entry is not a landed change. Say "queued"; say "landed" only on `merged=true`.
+5. `mergeStateStatus` is the starting read, never the verdict.
 
 ## Before you claim it works
 

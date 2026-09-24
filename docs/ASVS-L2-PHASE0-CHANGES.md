@@ -116,14 +116,51 @@ for, not how it is protected before it gets there.
 > records what a file USES, while a seam entry is what makes that file's IMPORTERS visible, so a
 > module can be inventoried while everything reaching crypto through it stays invisible.
 >
+> **An OPERATION arm reads the same Python at a finer grain** (BACKLOG #1164). The import walk
+> cannot see a new operation inside a file it already lists. The operation arm resolves every call
+> and classifies it: encrypt or decrypt, hash, MAC, constant-time compare, sign or verify, key
+> derivation, CSPRNG draw, TLS context or posture, and key or certificate handling. It follows
+> first-party helpers without a seam list, so `pipeline/alert_sinks.py` is found through
+> `build_smtp_tls_context`. It diffs against the script's `OPERATION_INVENTORY` both ways. Each token
+> carries the algorithm when the call names one, so `hashlib.md5` planted beside an existing
+> `hashlib.sha256` reds. It prints what it read before its verdict and runs a planted positive control
+> on every invocation. **Its green still means "at least".** The list of what no arm sees lives once,
+> under THE RESIDUAL in `scripts/security/crypto_operations.py`. One entry is worth naming here:
+> `transports/database.py` builds `Encrypt=` and `TrustServerCertificate=` into a connection string,
+> and the script's `IMPORT_ONLY` table records that as an instrument limit.
+>
+> **Twelve files the import walk never saw** are crypto sites by operation. Each reaches crypto through
+> a first-party helper and imports no trigger of its own:
+>
+> - `api/auth_routes.py`, and the web console's `routes/account.py` and `routes/core.py`, hash a
+>   presented session token (`auth/tokens.hash_token`) to look it up or revoke it.
+> - `verify/federation.py` builds the IdP opener, parses the JWKS and validates an ID token.
+> - `verify/runner.py` builds the live smoke's client TLS context.
+> - Five `harness/load/` modules mint a per-run loopback certificate pair through
+>   `harness/load/tlsmat.py`. Four of them also build the pinned client TLS context there;
+>   `enginepoll.py` does not.
+> - `scripts/security/dast_auth_sweep.py` runs the DAST target, which draws a throwaway password.
+> - `tray/poller.py` builds the tray's probe client through `tray/probe.py`, and decides when the
+>   pinned engine certificate replaces the OS trust store.
+>
 > **A SECOND ARM covers the non-Python tree** (BACKLOG #1172, ASVS 11.5.1) and rides the same required
 > context. The walk above is an `import ast` pass over `*.py` and is Python-only by construction, so
 > `check_non_python_randomness` scans `ide/` and `messagefoundry_webconsole/` for randomness sources
 > by pattern and diffs them against `NON_PYTHON_INVENTORY` the same bidirectional way. A weak source
 > (`Math.random()`) fails with no inventory row to hide behind, and an empty walk is a violation
-> rather than a clean result. **Randomness is the whole claim that arm supports** — the TLS floor
-> `ide/src/engineClient.ts` applies to every https request is first-party crypto in a shipped
-> artifact and is discoverable from neither arm.
+> rather than a clean result. **Randomness is the whole claim that arm supports.** A third arm
+> (BACKLOG #1164) reads the same roots for every operation class. It finds the TLS floor
+> `ide/src/engineClient.ts` applies to every https request, and the console's WebAuthn ceremony in
+> `static/app.js`. A fourth arm reads the PowerShell under `scripts/`. That includes
+> `scripts/service/import-db-ca.ps1`, which installs a trust anchor into the machine root store. It
+> also includes `scripts/service/install-service.ps1`, which checks the service wrapper against a
+> pinned SHA-256. That script ADDS TLS 1.2 to the enabled protocols with `-bor`, which is not a floor,
+> so the pinned hash is the control that holds. Both arms run as `--non-python-operations` in their
+> own `crypto-operations` CI job (owner decision 2026-09-24). It has no path gate, so it reports on
+> every pull request. **It blocks a merge only once branch protection requires its context.**
+> [`.github/required-contexts.txt`](../.github/required-contexts.txt) is the checked-in record of
+> that set. Until protection names it, the required green still says nothing about non-Python
+> crypto beyond randomness.
 
 | Asset | Algorithm / detail | Source / storage | Lifecycle |
 |---|---|---|---|
