@@ -195,18 +195,53 @@ _WRITE_RIGHTS: frozenset[str] = frozenset(
 )
 
 
+def _is_broad_sid(token: str) -> bool:
+    """Whether a lowercased token is a broad SID, matched whole, with or without a leading ``*``."""
+    sid = token.lstrip("*")
+    if sid in _BROAD_PRINCIPAL_SIDS:
+        return True
+    return sid.startswith("s-1-5-21-") and sid.rsplit("-", 1)[-1] in _BROAD_DOMAIN_RIDS
+
+
 def _is_broad_principal(principal: str) -> bool:
     """Whether an already-lowercased icacls principal token names an identity broader than the file's
     owner. Every match is whole: the SID after any leading ``*``, the display name as a whole token,
     or a group name as the part after the last ``\\``."""
-    sid = principal.lstrip("*")
-    if sid in _BROAD_PRINCIPAL_SIDS:
-        return True
-    if sid.startswith("s-1-5-21-") and sid.rsplit("-", 1)[-1] in _BROAD_DOMAIN_RIDS:
-        return True
-    if principal in _BROAD_PRINCIPAL_NAMES:
+    if _is_broad_sid(principal) or principal in _BROAD_PRINCIPAL_NAMES:
         return True
     return principal.rsplit("\\", 1)[-1] in _BROAD_GROUP_LEAF_NAMES
+
+
+def _ends_in_broad_principal(text: str) -> bool:
+    """Whether lowercased line-1 text that still carries the path echo ENDS in a broad principal.
+
+    The parser uses this only when it could not find where the echoed path ends, so it cannot cut
+    the principal out whole. The principal always comes last, after whitespace, so a broad one is a
+    whole-word suffix: a SID as the last word, a display name after a space, a group leaf after the
+    last ``\\``. This keeps a line-1 broad grant visible whatever the echo looked like."""
+    flat = " ".join(text.split())
+    if flat and _is_broad_sid(flat.rsplit(" ", 1)[-1]):
+        return True
+    if any(flat == name or flat.endswith(" " + name) for name in _BROAD_PRINCIPAL_NAMES):
+        return True
+    return flat.rsplit("\\", 1)[-1] in _BROAD_GROUP_LEAF_NAMES
+
+
+def _echoed_path_pattern(anchor_path: str) -> re.Pattern[str]:
+    """A pattern for the path as ``icacls`` echoes it at the start of line 1.
+
+    icacls writes the OEM code page, so a character outside it does not come back as itself.
+    Measured on Windows 11 (OEM 437): two CJK characters echoed as ``??``, an emoji as ``??``, and
+    ``l-stroke`` as a best-fit ``l``. So an ASCII character must match itself, ignoring case, and any
+    other character matches one character of any kind (one or two outside the BMP, which icacls
+    counts as two UTF-16 units). Each character has a fixed width, save that one-or-two, so the
+    match cannot land on a split far from the real one. Whitespace or the end of the line must
+    follow the path, and a principal never starts with whitespace."""
+    parts = [
+        re.escape(ch) if ch.isascii() else (".{1,2}" if ord(ch) > 0xFFFF else ".")
+        for ch in anchor_path
+    ]
+    return re.compile("".join(parts) + r"(?:\s+|$)", re.IGNORECASE)
 
 
 #: Bare (unqualified) principal names that are the owner, or that grant nobody anything, so a write
@@ -242,8 +277,11 @@ def owner_only_from_icacls(text: str, *, anchor_path: str) -> bool | None:
     * ``None`` — the DACL could **not be determined**.
 
     **Determined means exactly this: at least one line parsed as an ACE, i.e. a non-empty principal
-    token followed by a ``:(rights)`` blob.** Empty output, a truncated read, a banner or trailer with
-    no ACE under it, and text that is not icacls output at all therefore all answer ``None``. Before
+    token followed by a ``:(rights)`` blob.** Empty output, a read cut off before its first ACE, a
+    banner or trailer with no ACE under it, and text that is not icacls output at all therefore all
+    answer ``None``. A read cut off AFTER an ACE is not detected: the only end marker is the success
+    trailer, which is localized, and :func:`dacl_is_owner_only` already answers ``None`` on the
+    non-zero exit a killed ``icacls`` returns. Before
     BACKLOG #1142 this returned ``bool`` and fell through to ``True``, so "no broad principal has
     write" and "I parsed nothing" were the same answer — and the second is an affirmative assertion of
     owner-only storage the parser has no basis for. ``None`` is the caller's cue to degrade.
@@ -258,33 +296,53 @@ def owner_only_from_icacls(text: str, *, anchor_path: str) -> bool | None:
     ``True`` from a non-English host remains weaker than one from an English host. Closing that needs
     a SID-form read (the in-process DACL walk ``config/wiring.py`` already ships) and is not done here.
 
-    The known ``anchor_path`` is stripped from the leading line so a path that legitimately contains
-    ``\\Users`` (e.g. ``C:\\Users\\svc\\anchor.pem``) is never mistaken for a ``BUILTIN\\Users`` ACE."""
+    The known ``anchor_path`` is stripped from line 1, and from line 1 only, so a path that
+    legitimately contains ``\\Users`` (e.g. ``C:\\Users\\svc\\anchor.pem``) is never mistaken for a
+    ``BUILTIN\\Users`` ACE. icacls echoes that path in the OEM code page, so it is matched leniently
+    (:func:`_echoed_path_pattern`). Where even that fails, line 1's principal is unknown: a broad
+    principal at its end still answers ``False``, and any other write grant there answers ``None``.
+    An unmatched echo never yields ``True`` for a line-1 write."""
+    path_echo = _echoed_path_pattern(anchor_path)
     saw_ace = False
     unattributed_write = False
+    first_line = True
     for raw in text.splitlines():
         line = raw.strip()
         if not line:
             continue
+        is_first, first_line = first_line, False
         low = line.lower()
         if low.startswith("successfully processed") or low.startswith("failed processing"):
             continue
-        # Line 1 carries the path prefix; strip the exact path we passed so its characters can't be
-        # read as a principal.
-        if low.startswith(anchor_path.lower()):
-            line = line[len(anchor_path) :].strip()
+        # Line 1 carries the path prefix; strip it so its characters can't be read as a principal.
+        # Only line 1: a short relative path such as "NT" would cut the front off "NT AUTHORITY\..."
+        # on a later line.
+        path_left_on = False
+        if is_first:
+            echo = path_echo.match(line)
+            if echo:
+                line = line[echo.end() :]
+            else:
+                path_left_on = True
         idx = line.find(":(")
         if idx == -1:
             continue
         principal = line[:idx].strip().lower()
         if not principal:
             continue  # a rights blob with nothing in front of it is attributable to nobody
-        saw_ace = True
         rights_blob = line[idx:]
-        if "(deny)" in rights_blob.lower():
-            continue  # a DENY reduces access; it never grants write
         tokens = {t.strip().upper() for t in re.split(r"[(),]", rights_blob) if t.strip()}
-        if not tokens & _WRITE_RIGHTS:
+        # A DENY reduces access; it never grants write.
+        grants_write = "(deny)" not in rights_blob.lower() and bool(tokens & _WRITE_RIGHTS)
+        if path_left_on:
+            # The path echo is still on the front, and nobody knows where it ends. This ACE counts
+            # toward nothing determined; a write in it is either visibly broad or unattributable.
+            if grants_write and _ends_in_broad_principal(principal):
+                return False
+            unattributed_write = unattributed_write or grants_write
+            continue
+        saw_ace = True
+        if not grants_write:
             continue
         if _is_broad_principal(principal):
             return False  # a broad write settles it; the rest of the DACL cannot take it back
@@ -303,8 +361,9 @@ def dacl_is_owner_only(path: str | os.PathLike[str]) -> bool | None:
 
     These make it undeterminable on Windows, and all answer ``None``: ``icacls`` could not be run,
     it exited non-zero, it returned no output, or (BACKLOG #1142) the parser answered ``None``. That
-    last covers two causes the warning names together: no ACE it could attribute to a principal, or
-    a write grant to a bare principal name it does not recognise.
+    last covers three causes the warning names together: no ACE it could attribute to a principal,
+    a write grant to a bare principal name it does not recognise, or a write grant on line 1 whose
+    principal could not be split from the echoed path.
 
     * POSIX: no group- or other-WRITE bit (``mode & 0o022 == 0``).
     * Windows: read the DACL with ``icacls <path>`` (no modifying flags) and flag any broad-group ACE
@@ -347,8 +406,9 @@ def dacl_is_owner_only(path: str | os.PathLike[str]) -> bool | None:
         parsed = owner_only_from_icacls(result.stdout, anchor_path=os.fspath(path))
         if parsed is None:
             log.warning(
-                "icacls exited 0 for %s but its output carried no readable ACE, or granted write "
-                "to a bare principal name it does not recognise; the DACL could not be determined",
+                "icacls exited 0 for %s but its output carried no readable ACE, granted write to a "
+                "bare principal name it does not recognise, or granted write on a first line whose "
+                "path echo did not match; the DACL could not be determined",
                 path,
             )
         return parsed

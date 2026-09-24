@@ -397,6 +397,88 @@ def test_dacl_read_of_a_non_ascii_path_does_not_crash(tmp_path: Path) -> None:
     assert dacl_is_owner_only(p) == dacl_is_owner_only(ascii_twin)
 
 
+# --- line 1: the path echo icacls prints is not always the path we passed (BACKLOG #1142) --------
+# icacls echoes the path in the OEM code page. A character outside it comes back as "?" (two for a
+# character outside the BMP) or as a best-fit look-alike, so the exact path cannot be stripped from
+# line 1. Measured on Windows 11 (OEM 437): "icprobe_<CJK x2>" echoed "icprobe_??", an emoji "??",
+# and "<l-stroke><A-macron>" "lA". Continuation lines are padded to the ECHOED width.
+
+_CJK_PATH = "C:\\Users\\svc\\\u65e5\u672c\\anchor.pem"
+_CJK_ECHO = "C:\\Users\\svc\\??\\anchor.pem"
+
+
+def _icacls_echo(echo: str, *aces: str) -> str:
+    pad = " " * (len(echo) + 1)
+    body = "\n".join([f"{echo} {aces[0]}", *(pad + a for a in aces[1:])])
+    return body + "\n\nSuccessfully processed 1 files; Failed processing 0 files\n"
+
+
+@pytest.mark.parametrize(
+    "principal",
+    ["Everyone", r"NT AUTHORITY\INTERACTIVE", "*S-1-1-0", "S-1-1-0", r"BUILTIN\Users"],
+)
+def test_icacls_line1_broad_write_behind_an_unmatched_path_echo_is_not_owner_only(
+    principal: str,
+) -> None:
+    # The regression this slice's first cut introduced: the echo did not match the path passed, so
+    # nothing was stripped, the principal read as "<path> everyone", and whole-token matching missed
+    # it. The head before this fix answered True for Everyone; the base 8d08d420c answered False.
+    text = _icacls_echo(_CJK_ECHO, f"{principal}:(M)", r"DESKTOP-A\svc:(F)")
+    assert owner_only_from_icacls(text, anchor_path=_CJK_PATH) is False
+
+
+@pytest.mark.parametrize(
+    ("path", "echo"),
+    [
+        (_CJK_PATH, _CJK_ECHO),
+        ("C:\\Users\\svc\\\U0001f600\\anchor.pem", "C:\\Users\\svc\\??\\anchor.pem"),
+        ("C:\\Users\\svc\\\u0142\u0100\\anchor.pem", "C:\\Users\\svc\\lA\\anchor.pem"),
+    ],
+)
+def test_icacls_line1_owner_behind_an_oem_echo_is_still_read(path: str, echo: str) -> None:
+    # The control for the test above: the echo is matched leniently, so the owner's line-1 ACE is
+    # still attributed and a clean DACL is a determined True, not an indeterminate one.
+    text = _icacls_echo(echo, r"DESKTOP-A\svc:(F)", r"NT AUTHORITY\SYSTEM:(I)(F)")
+    assert owner_only_from_icacls(text, anchor_path=path) is True
+    # And the lenient match is real: a broad write on line 1 is still seen through it.
+    text = _icacls_echo(echo, r"CORP\Domain Users:(M)", r"DESKTOP-A\svc:(F)")
+    assert owner_only_from_icacls(text, anchor_path=path) is False
+
+
+def test_icacls_line1_write_that_cannot_be_attributed_is_indeterminate() -> None:
+    # An echo that matches nothing leaves line 1's principal unknown. A write grant there must never
+    # read as owner-only, even when the principal it ends in is not a broad one.
+    text = _icacls_echo(r"C:\Other\place.pem", r"DESKTOP-A\svc:(F)", r"NT AUTHORITY\SYSTEM:(I)(F)")
+    assert owner_only_from_icacls(text, anchor_path=_PATH) is None
+    # A line-1 ACE with no write right cannot grant write, whoever holds it.
+    text = _icacls_echo(r"C:\Other\place.pem", r"DESKTOP-A\svc:(RX)", r"NT AUTHORITY\SYSTEM:(I)(F)")
+    assert owner_only_from_icacls(text, anchor_path=_PATH) is True
+
+
+def test_icacls_path_is_stripped_from_line_1_only() -> None:
+    # A short relative path must not cut the front off a principal on a later line: "NT" stripped
+    # from "NT AUTHORITY\INTERACTIVE" left "AUTHORITY\INTERACTIVE", which no set knows.
+    text = _icacls_echo("NT", r"DESKTOP-A\svc:(F)", r"NT AUTHORITY\INTERACTIVE:(I)(M)")
+    assert owner_only_from_icacls(text, anchor_path="NT") is False
+
+
+@_windows_only
+def test_dacl_read_sees_a_line1_broad_write_on_a_path_outside_the_oem_code_page(
+    tmp_path: Path,
+) -> None:
+    # The end-to-end form of the test above, on a real icacls read. An explicit ACE lists before the
+    # inherited ones, so the Everyone grant lands on line 1, behind a path echo of "??" wherever the
+    # OEM code page lacks these characters. Asserted as "not True" so a host that localizes Everyone
+    # (an indeterminate None) still passes, and an owner-only reading fails.
+    d = tmp_path / "\u65e5\u672c"
+    d.mkdir()
+    p = _pem(d, b"x")
+    import subprocess
+
+    subprocess.run(["icacls", str(p), "/grant", "*S-1-1-0:(M)"], check=True, capture_output=True)
+    assert dacl_is_owner_only(p) is not True
+
+
 @_posix_only
 def test_posix_mode_owner_only(tmp_path: Path) -> None:
     p = _pem(tmp_path, b"x")
