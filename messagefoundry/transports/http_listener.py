@@ -82,7 +82,6 @@ DEFAULT_MAX_BODY_BYTES = (
 DEFAULT_MAX_HEADER_BYTES = (
     64 * 1024
 )  # cap the request line + headers (a header-flood / slow-loris guard)
-_READ_CHUNK = 65536  # body read granularity
 
 # On stop()/reload, established clients are closed and their handlers given this long to finish an
 # in-flight commit before the connection tasks are cancelled (mirrors MLLPSource; bounds shutdown).
@@ -179,6 +178,10 @@ _CONTENT_LENGTH_RE = re.compile(r"[0-9]+")
 #: NON-ZERO length is refused, because those are the declared bytes a bodyless handler would leave
 #: unread on a connection.
 _BODYLESS_METHODS = frozenset({"GET", "HEAD"})
+
+#: Methods this listener ingests a body for. Each must declare a ``Content-Length``; with none the
+#: request is refused 411 in the head parse rather than read to EOF (BACKLOG #1125).
+_BODY_METHODS = frozenset({"POST", "PUT", "PATCH"})
 
 #: ``HTTP-version = "HTTP/" DIGIT "." DIGIT`` (RFC 9112 section 2.3). A ``startswith("HTTP/")`` test
 #: accepted ``HTTP/1.1x``; a fronting proxy that parses the version strictly and an origin that does
@@ -297,9 +300,8 @@ async def _read_head(
     **The split is a security boundary, not tidying** (ADR 0154 D6). It is what lets intake
     authentication examine a request's credentials *before* its body is buffered. Authenticating
     after a combined read would let an anonymous peer command up to
-    ``max_connections × max_body_bytes`` of resident heap — transiently about twice that on the
-    no-``Content-Length`` path, where :func:`_read_to_eof` accumulates a chunk list and then joins it
-    — before a single credential byte was examined. The connection cap cannot shed that load either,
+    ``max_connections × max_body_bytes`` of resident heap before a single credential byte was
+    examined. The connection cap cannot shed that load either,
     because it is consulted earlier still, in ``_on_client``. Keep any new pre-body refusal here.
 
     Raises :class:`HttpRequestError` (carrying the status + connection-event kind) on an unbounded
@@ -329,8 +331,16 @@ async def _read_head(
     # the request line was worse -- the header dict came out EMPTY while the body was still read.
     # A fronting proxy that accepts bare LF as a terminator and an origin that does not is the
     # textbook desync pair, so this is refused rather than normalised.
-    if "\n" in text.replace("\r\n", ""):
+    #
+    # A BARE CR is the same primitive from the other side. RFC 9112 section 2.2 lets a recipient
+    # treat it as a line break, so `Host: h\rContent-Length: 3` is a Host header here and a
+    # Content-Length to a proxy that splits on CR. That shape measurably reached the POST path with
+    # the Content-Length hidden inside the Host value.
+    bare = text.replace("\r\n", "")
+    if "\n" in bare:
         raise HttpRequestError(400, "bare LF in request head", kind="framing_error")
+    if "\r" in bare:
+        raise HttpRequestError(400, "bare CR in request head", kind="framing_error")
 
     try:
         lines = text.split("\r\n")
@@ -338,7 +348,9 @@ async def _read_head(
         method, target, version = request_line.split(" ", 2)
     except ValueError as exc:
         raise HttpRequestError(400, "malformed request line", kind="framing_error") from exc
-    if not _HTTP_VERSION_RE.fullmatch(version):
+    # `method = token` (RFC 9110 section 9.1). Checked here because the method now selects the
+    # framing rule below, so a method this parser and a proxy disagree on is a framing decision.
+    if not _HEADER_NAME_RE.fullmatch(method) or not _HTTP_VERSION_RE.fullmatch(version):
         raise HttpRequestError(400, "malformed request line", kind="framing_error")
 
     headers: dict[str, str] = {}
@@ -346,6 +358,12 @@ async def _read_head(
     for line in lines[1:]:
         if not line:
             continue
+        # A LINE THAT STARTS WITH SPACE OR TAB IS AN obs-fold CONTINUATION (RFC 9112 section 5.2),
+        # and a server must refuse it or unfold it. Before this check `.strip()` read
+        # ` Content-Length: 3` as a real framing header, while a proxy that unfolds reads it as
+        # more of the previous header's value. Refused, like every other shape the two could split on.
+        if line[0] in " \t":
+            raise HttpRequestError(400, "obsolete line folding in header", kind="framing_error")
         name, sep, value = line.partition(":")
         if not sep:
             raise HttpRequestError(400, "malformed header line", kind="framing_error")
@@ -354,7 +372,10 @@ async def _read_head(
         # precisely the shape a strict proxy drops and a lenient origin honours.
         if name != name.rstrip():
             raise HttpRequestError(400, "whitespace before header colon", kind="framing_error")
-        key = name.strip().lower()
+        # `field-name = token`. Anything else is a name a proxy may read differently.
+        if not _HEADER_NAME_RE.fullmatch(name):
+            raise HttpRequestError(400, "malformed header line", kind="framing_error")
+        key = name.lower()
         header_counts[key] = header_counts.get(key, 0) + 1
         headers[key] = value.strip()
 
@@ -405,6 +426,13 @@ async def _read_head(
         # would be left on the wire.
         if method in _BODYLESS_METHODS and cl_raw != "0":
             raise HttpRequestError(400, f"{method} must not declare a body", kind="framing_error")
+    elif method in _BODY_METHODS:
+        # A BODY METHOD WITH NO FRAMING IS REFUSED, NOT READ TO EOF. RFC 9112 section 6.3 says such
+        # a request has a ZERO-length body, so a proxy forwards the head and treats any bytes after
+        # it as the next request, while the old read-to-EOF path ingested those same bytes as this
+        # request's clinical payload. 411 Length Required is the RFC 9110 answer, and the engine API
+        # already gives it for a request with no Content-Length.
+        raise HttpRequestError(411, "Content-Length is required", kind="framing_error")
 
     return HttpRequest(method, target, headers, b"")
 
@@ -430,8 +458,8 @@ async def _read_body(
 
     Framing is now settled in :func:`_read_head` for EVERY method before dispatch, so by the time
     this runs a ``Transfer-Encoding`` has already been refused and a ``Content-Length`` is already
-    known to be ``1*DIGIT`` and to be absent-or-zero on a bodyless method. What remains here is the
-    read itself."""
+    known to be ``1*DIGIT``, to be absent-or-zero on a bodyless method, and to be present on a body
+    method. What remains here is the read itself."""
     # Only methods that carry a body read one. A bodyless method reaching this point has already
     # been proven to declare no body, so this discards nothing that was ever on the wire.
     if head.method in _BODYLESS_METHODS:
@@ -446,9 +474,6 @@ async def _read_body(
             # Refuse on the DECLARED size before reading a single body byte (don't buffer to find out).
             raise HttpRequestError(413, "body exceeds cap", kind="frame_oversize")
         body = await _read_exactly(reader, content_length)
-    elif head.method in ("POST", "PUT", "PATCH"):
-        # No Content-Length and not chunked: read to EOF (Connection: close), still bounded by the cap.
-        body = await _read_to_eof(reader, max_body_bytes)
     return body
 
 
@@ -481,22 +506,6 @@ async def _read_exactly(reader: asyncio.StreamReader, n: int) -> bytes:
         return await reader.readexactly(n)
     except asyncio.IncompleteReadError as exc:
         raise HttpRequestError(400, "incomplete request body", kind="framing_error") from exc
-
-
-async def _read_to_eof(reader: asyncio.StreamReader, cap: int | None) -> bytes:
-    """Read body bytes to EOF, enforcing ``cap`` (None disables it). Refuses past the cap rather than
-    buffering an unbounded body (the OOM guard the MLLPDecoder cap provides for framed transports)."""
-    chunks: list[bytes] = []
-    total = 0
-    while True:
-        chunk = await reader.read(_READ_CHUNK)
-        if not chunk:
-            break
-        total += len(chunk)
-        if cap is not None and total > cap:
-            raise HttpRequestError(413, "body exceeds cap", kind="frame_oversize")
-        chunks.append(chunk)
-    return b"".join(chunks)
 
 
 # The runner injects an HTTP receipt handler that commits the body to ingress and returns the engine
@@ -943,7 +952,7 @@ class HttpSource(SourceConnector):
             body = "" if request.method == "HEAD" else '{"status":"ok"}'
             await self._respond(writer, build_response(200, body))
             return False
-        if request.method not in ("POST", "PUT", "PATCH"):
+        if request.method not in _BODY_METHODS:
             await self._write_safely(writer, build_response(405, '{"error":"method not allowed"}'))
             return False
 

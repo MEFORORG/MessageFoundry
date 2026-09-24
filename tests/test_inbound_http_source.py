@@ -599,6 +599,22 @@ async def test_framing_is_decided_for_every_method_in_the_head_phase() -> None:
         ("bare lf request line", b"POST /x HTTP/1.1\nHost: h\r\n\r\n"),
         # HTTP-version is DIGIT "." DIGIT; a startswith("HTTP/") test accepted this.
         ("non-token version", b"POST / HTTP/1.1x\r\nHost: h\r\n\r\n"),
+        # An obs-fold continuation line. `.strip()` read it as a real Content-Length, while a proxy
+        # that unfolds reads it as more of the Host value (RFC 9112 section 5.2).
+        (
+            "obs-fold framing header",
+            b"POST / HTTP/1.1\r\nHost: h\r\n Content-Length: 3\r\n\r\nabc",
+        ),
+        ("obs-fold with tab", b"POST / HTTP/1.1\r\nHost: h\r\n\tContent-Length: 3\r\n\r\nabc"),
+        # A bare CR hid the Content-Length inside the Host value here; a proxy that splits on CR
+        # sees it as its own header.
+        ("bare cr in head", b"POST / HTTP/1.1\r\nHost: h\rContent-Length: 3\r\n\r\nabc"),
+        # The method now selects the framing rule, so it must be a token.
+        ("non-token method", b"PO(ST / HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nabc"),
+        ("non-token header name", b"POST / HTTP/1.1\r\nHost: h\r\nContent(Length: 3\r\n\r\nabc"),
+        # HEAD is bodyless like GET, so the same framing refusals apply to it.
+        ("head te", b"HEAD / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"),
+        ("head cl", b"HEAD / HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nHELLO"),
     ],
 )
 async def test_the_head_parse_refuses_the_rfc_9112_desync_grammar(label: str, raw: bytes) -> None:
@@ -614,6 +630,65 @@ async def test_the_head_parse_refuses_the_rfc_9112_desync_grammar(label: str, ra
         await _read_head(reader, max_header_bytes=8192)
     assert excinfo.value.status == 400, label
     assert excinfo.value.kind == "framing_error", label
+
+
+@pytest.mark.parametrize("method", ["POST", "PUT", "PATCH"])
+async def test_a_body_method_with_no_framing_is_refused_411_not_read_to_eof(method: str) -> None:
+    """BACKLOG #1125. A body method with neither Content-Length nor Transfer-Encoding used to be
+    read to EOF, so the bytes after the head were ingested as this request's body. RFC 9112
+    section 6.3 gives such a request a ZERO-length body, so a proxy reads those same bytes as the
+    next request. It is refused in the head phase with 411, the RFC 9110 answer.
+    """
+    reader = await _reader_from(f"{method} / HTTP/1.1\r\nHost: h\r\n\r\nabc".encode("ascii"))
+    with pytest.raises(HttpRequestError) as excinfo:
+        await _read_head(reader, max_header_bytes=8192)
+    assert excinfo.value.status == 411
+    assert excinfo.value.kind == "framing_error"
+
+
+async def test_a_bodyless_method_needs_no_framing() -> None:
+    # Accept-control for the 411 above: GET and DELETE carry no body, so no framing is required.
+    for method in ("GET", "DELETE"):
+        reader = await _reader_from(f"{method} / HTTP/1.1\r\nHost: h\r\n\r\n".encode("ascii"))
+        head = await _read_head(reader, max_header_bytes=8192)
+        assert await _read_body(reader, head, max_body_bytes=DEFAULT_MAX_BODY_BYTES) == b""
+
+
+@pytest.mark.parametrize(
+    ("raw", "status"),
+    [
+        (b"POST /ingest HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: gzip, chunked\r\n\r\nabc", 400),
+        (b"POST /ingest HTTP/1.1\r\nHost: h\r\n\r\nabc", 411),
+        (b"POST /ingest HTTP/1.1\r\nHost: h\r\n Content-Length: 3\r\n\r\nabc", 400),
+        (b"GET /health HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nHELLO", 400),
+    ],
+)
+async def test_a_framing_refusal_is_answered_logged_and_never_ingested(
+    store: MessageStore, raw: bytes, status: int
+) -> None:
+    """End to end over a socket (BACKLOG #1125): the refusal is a clean 4xx, the connection is
+    closed, a `framing_error` connection_event records it, and no ingress row is written. This is
+    the same record every other pre-ingress refusal on this listener leaves.
+    """
+    events: list[tuple] = []
+    ic = build_inbound_connection(
+        "IB_HTTP",
+        Http(port=0),
+        router="r",
+        content_type=ContentType.TEXT,
+        capture_connection_errors=True,
+    )
+    src = await _start_source(store, ic, events=events)
+    try:
+        # half_close so the old read-to-EOF path would have finished and ingested "abc".
+        resp = await _http(src.sockport, raw_override=raw, half_close=True)
+    finally:
+        await src.stop()
+    assert resp.status == status
+    assert resp.headers.get("connection") == "close"
+    assert any(kind == "framing_error" for kind, *_ in events)
+    cur = await store._db.execute("SELECT COUNT(*) AS n FROM messages")
+    assert (await cur.fetchone())["n"] == 0
 
 
 def test_build_response_shape() -> None:
@@ -900,8 +975,9 @@ async def test_max_connections_flood_refused_and_event(store: MessageStore) -> N
 
 
 async def test_body_flood_no_content_length_refused(store: MessageStore) -> None:
-    """A POST with NO Content-Length streams its body to EOF; a body past ``max_body_bytes`` is refused
-    with 413 + ``frame_oversize`` on the read-to-EOF path (complements the declared-CL socket test)."""
+    """A POST with NO Content-Length flooding past ``max_body_bytes`` is refused before one body byte
+    is read. It used to stream to EOF and trip the cap with 413; since BACKLOG #1125 the read-to-EOF
+    path is gone and the head parse refuses the missing framing with 411."""
     events: list[tuple] = []
     ic = build_inbound_connection(
         "IB_HTTP",
@@ -912,18 +988,18 @@ async def test_body_flood_no_content_length_refused(store: MessageStore) -> None
     )
     src = await _start_source(store, ic, events=events)
     try:
-        # No Content-Length header -> the read-to-EOF path; body 64 bytes trips the 16-byte cap.
+        # No Content-Length header -> refused in the head phase; the 64 flood bytes are never read.
         resp = await _http(
             src.sockport,
             raw_override=b"POST /ingest HTTP/1.1\r\nHost: localhost\r\n\r\n" + b"x" * 64,
         )
         assert resp.status in (
-            413,
+            411,
             0,
-        )  # 413 when flushed; 0 = reset before flush (Windows Proactor)
-        assert await _wait_for(lambda: any(k == "frame_oversize" for k, *_ in events))
+        )  # 411 when flushed; 0 = reset before flush (Windows Proactor)
+        assert await _wait_for(lambda: any(k == "framing_error" for k, *_ in events))
         cur = await store._db.execute("SELECT COUNT(*) AS n FROM messages")
-        assert (await cur.fetchone())["n"] == 0  # oversize body refused before any ingress row
+        assert (await cur.fetchone())["n"] == 0  # refused before any ingress row
     finally:
         await asyncio.wait_for(src.stop(), timeout=8.0)
 
