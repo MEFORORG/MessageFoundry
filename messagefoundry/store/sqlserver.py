@@ -111,6 +111,7 @@ from messagefoundry.store.store import (
     REINGRESS_TARGET_PREFIX,
     AlertInstance,
     AlertSummary,
+    AuditHeadMovedError,
     CapturedResponse,
     ClaimAbortPhase,
     ClaimedHeads,
@@ -9418,6 +9419,7 @@ class SqlServerStore:
         detail: str | None = None,
         client: str | None = None,
         now: float | None = None,
+        expect_prev: str | None = None,
     ) -> None:
         """Append a row to the audit hash chain. Takes the audit-append applock first, so concurrent
         writers — including writers in OTHER engine-shard processes — serialize on the read-tail +
@@ -9454,6 +9456,8 @@ class SqlServerStore:
                     await cur.execute("SELECT TOP (1) row_hash FROM audit_log ORDER BY id DESC")
                     last = await cur.fetchone()
                     prev = last[0] if last and last[0] else ""
+                    if expect_prev is not None and prev != expect_prev:
+                        raise AuditHeadMovedError(prev)  # BACKLOG #1904: roll sealed another head
                     # Keyed (in-heap HMAC key or isolated-module Transit MAC) once the #190
                     # watermark is set, else keyless.
                     _key, _mac = self._audit_append_mac()
