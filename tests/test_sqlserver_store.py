@@ -766,6 +766,31 @@ async def test_channel_scope_source_roundtrip_and_upgrade(store) -> None:
     assert (await store.get_user("scope-src")).channel_scope_source is None
 
 
+async def test_withdraw_ad_channel_scope_matches_a_scope_over_4000_characters(store) -> None:
+    """The compare-and-set must match a scope longer than 4000 characters (BACKLOG #1927).
+
+    ``channel_scope`` is NVARCHAR(MAX) and the withdrawal compares it with a bound parameter. A
+    string over 4000 characters is past the NVARCHAR(n) limit, so the driver binds it as a long
+    type. If it arrived as ``ntext``, SQL Server would refuse ``nvarchar(max) = ntext`` and the
+    withdrawal would raise instead of returning True. Nobody has measured which happens; this test
+    decides it on the ``sqlserver-store`` leg."""
+    import json
+
+    from messagefoundry.store.store import SCOPE_SOURCE_AD
+
+    scope = json.dumps(sorted(f"IB_LONG_SCOPE_{n:04d}" for n in range(300)))
+    assert len(scope) > 4000  # positive control: really past the NVARCHAR(n) limit
+    await store.create_user(
+        user_id="long-scope", username="long-scope", auth_provider="ad", now=1.0
+    )
+    await store.set_user_channel_scope("long-scope", scope, source=SCOPE_SOURCE_AD)
+    assert (await store.get_user("long-scope")).channel_scope == scope  # stored whole
+
+    assert await store.withdraw_ad_channel_scope("long-scope", scope) is True
+    got = await store.get_user("long-scope")
+    assert (got.channel_scope, got.channel_scope_source) == (None, SCOPE_SOURCE_AD)
+
+
 async def test_directory_object_id_column_upgrade_is_idempotent(store) -> None:
     """The COL_LENGTH-gated ADD for ``users.directory_object_id`` (BACKLOG #1471) on a pre-#1471
     database.
