@@ -2129,6 +2129,57 @@ async def test_legacy_plaintext_error_detail_migrated_on_open(store) -> None:
         await keyed.close()
 
 
+async def test_unmarked_value_on_a_sealed_surface_is_refused_not_sealed(store) -> None:
+    """BACKLOG #1169 (ASVS 11.3.3), the ``sqlserver-store`` twin of
+    ``tests/test_store_strict_ciphertext.py``. Once ``messages.raw`` holds ciphertext, a keyed reopen
+    must NOT seal a planted plaintext row (that launders it), and a read of it must be REFUSED with the
+    cell named to the refusal hook -- never returned as the row's content. Also pins the purged-blank
+    guard the first id-keyed loop used to lack: a ``raw=''`` stays blank through a keyed open."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.crypto import AesGcmCipher, CipherError
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    settings = load_settings(environ=os.environ).store
+    plant = "MSH|^~\\&|EVIL|F|R|RF|20260101||ADT^A01|PLANTED|P|2.5.1\r"
+    keyed = await SqlServerStore.open(settings, cipher=AesGcmCipher(bytearray(b"k" * 32)))
+    try:
+        good = await keyed.enqueue_message(
+            channel_id="IB", raw=RAW, deliveries=[("OB", "p")], now=100.0
+        )
+        planted = await keyed.enqueue_message(
+            channel_id="IB", raw=RAW, deliveries=[("OB", "p")], now=101.0
+        )
+        blank = await keyed.enqueue_message(
+            channel_id="IB", raw=RAW, deliveries=[("OB", "p")], now=102.0
+        )
+        row = (await keyed._fetchall("SELECT raw FROM messages WHERE id=?", (planted,)))[0]
+        assert row["raw"].startswith(MARKER_PREFIX)  # the surface IS sealed
+        await keyed._execute("UPDATE messages SET raw=? WHERE id=?", (plant, planted))
+        await keyed._execute("UPDATE messages SET raw='' WHERE id=?", (blank,))
+    finally:
+        await keyed.close()
+
+    cipher = AesGcmCipher(bytearray(b"k" * 32))
+    refused: list[tuple[str, str]] = []
+    cipher.set_refusal_hook(lambda t, c: refused.append((t, c)))
+    reopened = await SqlServerStore.open(settings, cipher=cipher)
+    try:
+        # The open's sweep visits the surface once and reports the planted row once (#1169 round 2);
+        # the read below adds one more report for its refusal. Two events, by design.
+        assert refused == [("messages", "raw")], "the open must report the surface exactly once"
+        row = (await reopened._fetchall("SELECT raw FROM messages WHERE id=?", (planted,)))[0]
+        assert row["raw"] == plant, "the keyed reopen sealed a planted row on a sealed surface"
+        row = (await reopened._fetchall("SELECT raw FROM messages WHERE id=?", (blank,)))[0]
+        assert row["raw"] == "", "a purged blank was sealed into ciphertext-of-empty"
+        assert (await reopened.get_message(good))["raw"] == RAW
+        assert (await reopened.get_message(blank))["raw"] == ""
+        with pytest.raises(CipherError, match=r"messages\.raw"):
+            await reopened.get_message(planted)
+        assert refused == [("messages", "raw")] * 2  # the open's finding, then this refusal
+    finally:
+        await reopened.close()
+
+
 async def test_state_plaintext_migrated_on_keyed_reopen(store) -> None:
     """BACKLOG #1723: the no-key -> key open must seal ``state.value`` on THIS backend too.
 

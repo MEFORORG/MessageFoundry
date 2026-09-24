@@ -20,6 +20,8 @@ import logging
 import os
 import secrets
 import time
+import urllib.parse
+import urllib.request
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -69,7 +71,7 @@ from messagefoundry.auth.tokens import hash_bytes, hash_token, mint_token
 from messagefoundry.config.models import SignatureAlgorithm
 from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
 from messagefoundry.config.settings import AuthSettings
-from messagefoundry.config.tls_policy import HopPosture
+from messagefoundry.config.tls_policy import HopPosture, RevocationHopGuard
 from messagefoundry.store.base import AdminStore
 from messagefoundry.store.store import (
     SCOPE_SOURCE_AD,
@@ -78,6 +80,7 @@ from messagefoundry.store.store import (
     UserRecord,
     WebAuthnCredential,
 )
+from messagefoundry.transports.rest import opener_tls_context
 
 _log = logging.getLogger(__name__)
 
@@ -510,6 +513,69 @@ def _allowed_channels(user: UserRecord, roles: frozenset[Role]) -> frozenset[str
     return frozenset(str(n) for n in names)
 
 
+#: The IdP legs' OWN way across. The connection-shaped default cannot reach this opener, which
+#: resolves no trust anchor; see :attr:`~messagefoundry.config.tls_policy.RevocationHopGuard.ways_across`.
+_IDP_WAYS_ACROSS = (
+    "Set [auth].oidc_tls_crl_file to a PEM file holding a CRL from each CA that issues the token "
+    "and JWKS endpoint certificates, so the engine checks revocation on both legs. Put only CRLs "
+    "in it: a certificate in that file becomes a trusted root for this hop."
+)
+
+#: Stands in for a URL with no host. NOT the empty string: `is_loopback_hop_host("")` is True, so an
+#: empty host would take the on-box carve-out and a guard that cannot name its host would ALLOW.
+_NO_HOST = "(no host)"
+
+
+def _refuse_idp_revocation(
+    settings: AuthSettings, opener: urllib.request.OpenerDirector, posture: HopPosture | None
+) -> None:
+    """Apply the #201 posture-keyed revocation guard to BOTH OIDC legs (BACKLOG #1887, ADR 0173 §4.3).
+
+    **Two guards, never one.** The token endpoint and the JWKS URI are validated one URL at a time
+    and nothing requires them to share a host (#1158), so they may differ in loopback status. A single
+    guard keyed on the token host would let an off-box JWKS cross unguarded. Each leg derives its own
+    ``host=`` from its own URL; both read the ONE context the shared opener carries.
+
+    Called with the FINISHED opener, which is the point of ``context=``: an ``oidc_tls_crl_file`` that
+    really loaded sets ``VERIFY_CRL_CHECK_LEAF`` on that context, and the guard reads the flag rather
+    than the setting. Guarding before the opener exists would refuse an operator who had already
+    closed the gap, while telling them to set the CRL they had set.
+
+    ``posture`` is PASSED, never read ambiently: ``AuthService`` is built in the API lifespan, outside
+    every ``active_hop_posture`` scope, which is the position ``auth/ldap.py`` is already in. ``None``
+    leaves both guards the shipped no-op.
+
+    ``attested=False`` because no per-hop revocation attestation exists for these legs. There is no
+    ``[auth]`` key for one, and borrowing another hop's claim is how a flag silently widens.
+
+    Known limits of this placement (it fires after ``engine.start()``, and ``check``/``verify`` do
+    not reach it) are recorded once, in ADR 0173 AC-4. Two more are recorded only here: when both
+    legs refuse, only the token leg is named, because it is checked first; and the WARN arm logs with
+    no audit sink after ``configure_logging`` has set the root level, so a level above WARNING would
+    likely filter it, as ``logging_setup._refuse_forward_revocation`` measured for its hop."""
+    context = opener_tls_context(opener, connector="OIDC identity provider (token + JWKS)")
+    for url, leg, carries in (
+        (
+            settings.oidc_token_endpoint,
+            "token endpoint",
+            "the client secret and authorization code",
+        ),
+        (settings.oidc_jwks_uri, "JWKS endpoint", "the identity provider's signing keys"),
+    ):
+        # _NO_HOST is reached only by unvalidated settings: the validator refuses a missing URL.
+        RevocationHopGuard.capture(
+            host=urllib.parse.urlsplit(url or "").hostname or _NO_HOST,
+            cell=f"[auth] OIDC {leg} (verified TLS, no revocation check)",
+            description=(
+                f"carries {carries} over verified TLS but performs no certificate revocation checking"
+            ),
+            attested=False,
+            context=context,
+            posture=posture,
+            ways_across=_IDP_WAYS_ACROSS,
+        ).enforce_construction()
+
+
 class AuthService:
     """Authentication + RBAC orchestration over an :class:`AuthStore` and the configured directory."""
 
@@ -663,6 +729,8 @@ class AuthService:
                 # trust anchor, so it carries its own CRL setting rather than inheriting [tls].crl_file.
                 crl_file=settings.oidc_tls_crl_file,
             )
+            # BACKLOG #1887: must follow the opener, whose finished context it reads.
+            _refuse_idp_revocation(settings, self._oidc_opener, hop_posture)
             self._oidc_jwks = oidc.JwksCache(
                 jwks_fetcher(settings.oidc_jwks_uri or "", self._oidc_opener),
                 ttl_seconds=settings.oidc_jwks_ttl_seconds,
