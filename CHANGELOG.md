@@ -76,6 +76,27 @@ All notable changes to MessageFoundry are documented here. The format follows
     own, as with no service entry or in the cases above. The tray must also be able to read that
     file; the entry under Security covers that. The standalone test harness is not part of this
     change, and its default engine URL is still `http://127.0.0.1:8765`.
+- **`messagefoundry dryrun` and `messagefoundry check` now refuse an oversized fixture file.** The
+  cap is `MAX_FIXTURE_FILE_BYTES`, which defaults to `DEFAULT_MAX_MESSAGE_BYTES` (16 MiB) and rises
+  to the largest `max_message_bytes` any inbound in the graph sets. The file's size is checked
+  before it is read, so an oversized fixture is never read whole. A fixture over the cap that
+  0.4.0 read would now fail the run. [`docs/CONNECTIONS.md`](docs/CONNECTIONS.md) also carries a
+  code-derived ASVS 5.1.1 file-surface inventory, with upload and download tables and stated
+  exclusions, and a test fails when the code and the tables drift apart.
+  ([BACKLOG #1127](docs/BACKLOG.md))
+- **BREAKING — `[api].tls_terminated_upstream` without `[api].tls_cert_file` now requires
+  `[api].plaintext_upstream_hop_acknowledged = true`.** 0.4.0 asked for no such acknowledgement. In
+  that topology the engine mints no certificate (ADR 0172 decision 3). So the
+  proxy-to-engine hop is plaintext by design, and securing it is the deploying site's job. `serve`
+  refuses that topology (exit 2) until the operator sets the acknowledgement. It refuses in every
+  mode: `enforce` or `warn`, loopback bind or not. With an operator `tls_cert_file` the engine serves
+  that hop over TLS, so nothing needs acknowledging. The existing proxy attestations keep their own
+  behaviour. Setting the acknowledgement without `tls_terminated_upstream` is refused at load. See
+  `docs/CONFIGURATION.md` and `docs/SECURITY.md`. **Migration:** after you upgrade, set
+  `[api].plaintext_upstream_hop_acknowledged = true`. 0.4.0 refuses the key as unrecognized, so do
+  not add it first. Or set `[api].tls_cert_file` and `[api].tls_key_file` so the engine serves that
+  hop over TLS. The proxy must then speak https to the engine and trust that certificate, or every
+  request through it fails. ([BACKLOG #1179](docs/BACKLOG.md))
 
 ### Security
 - **BREAKING — OIDC sign-in now bounds how old the IdP's authentication may be.** A new setting,
@@ -193,6 +214,20 @@ All notable changes to MessageFoundry are documented here. The format follows
   generated files so the engine mints a new pair. Then restart the tray, which does not reload a
   pin that already loaded, and re-pin every other client that pinned the old certificate.
   (`BACKLOG #1276`)
+- **The OIDC token endpoint and JWKS legs now carry the posture-keyed revocation guard (BACKLOG
+  #1887, ADR 0173 section 4.3).** Each leg is guarded on its own host. An enforcing instance whose
+  off-box identity provider has no `[auth].oidc_tls_crl_file` would refuse to start on first
+  deployment.
+- **A keyed store now refuses an unmarked value in an encrypted column instead of reading it back
+  as plaintext.** Once a store key is set, every covered column holds only `mfenc:` ciphertext, so
+  a non-blank value without the marker is a stripped marker or a planted row. The cipher raises
+  `CipherError` on it. A purged `''` is never refused. The sweep that runs at each keyed open now
+  seals legacy plaintext only on a surface that holds no sealed value yet; on any other surface it
+  leaves the unmarked value in place and reports it. Each refusal raises an `integrity_drift` alert
+  under the subject `store-cipher`, naming the table and column but never the row or the value.
+  **A planted `state` or `reference` value would stop the engine from starting**, because both
+  caches load at open. The opt-out, `[store].allow_unmarked_ciphertext`, ships off and is reported
+  as a loosening when on. ([BACKLOG #1169](docs/BACKLOG.md))
 
 ## [0.4.0] — 2026-09-23 — Early Access
 

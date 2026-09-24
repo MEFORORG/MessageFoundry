@@ -76,7 +76,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.parsing.binary import BinaryCarriageError
 from messagefoundry.parsing.binary import decode as _carriage_decode
-from messagefoundry.parsing.dicom._deps import load_dcmread
+from messagefoundry.parsing.dicom._deps import load_dcmread, load_header_readers
 from messagefoundry.parsing.dicom._inflate import (
     DEFAULT_MAX_INFLATED_BYTES,
     DEFLATED_EXPLICIT_VR_LE,
@@ -748,18 +748,22 @@ class DicomScuDestination(DestinationConnector):
         negotiated transfer syntax in ``_on_c_store``.) A deflate bomb is a permanent dead-letter (a retry
         re-sends the identical bad object)."""
         dcmread = load_dcmread()
+        # Also outside the try, for the same reason: a pydicom without the readers the guard replays is
+        # a deploy error, and the broad except below must not turn it into a per-message bad-object.
+        load_header_readers()
         try:
-            guard_part10_deflate(
-                object_bytes,
-                max_bytes=self._max_object_bytes
-                if self._max_object_bytes is not None
-                else DEFAULT_MAX_INFLATED_BYTES,
-            )
+            guard_part10_deflate(object_bytes, force=False, max_bytes=self._max_object_bytes)
         except DicomBombError as exc:
             raise NegativeAckError(
                 "DICOM C-STORE SCU: outgoing deflated object inflates past the max-object cap "
                 "(no retry)",
                 code="deflate-bomb",
+                permanent=True,
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 - the guard replays dcmread's header read; same verdict
+            raise NegativeAckError(
+                "DICOM C-STORE SCU: outgoing object is not a parseable DICOM Part-10 object (no retry)",
+                code="bad-object",
                 permanent=True,
             ) from exc
         try:

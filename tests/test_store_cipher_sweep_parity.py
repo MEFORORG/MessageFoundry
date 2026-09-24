@@ -169,7 +169,7 @@ def _sweep_strings(tree: ast.AST, entry: str) -> set[str]:
     DIRECTLY, and the module/class-level declarations it names.
 
     All three matter. ``_encrypt_existing_rows`` delegates most tables to helpers
-    (``_encrypt_existing_composite``, ``_encrypt_message_events``), and the id-keyed tables are not
+    (``_seal_surface``, since BACKLOG #1169), and the id-keyed tables are not
     literals in any function at all — they live in the ``_CIPHER_COLUMNS`` class attribute the loop
     iterates. Reading only a function body reports four tables missing on every backend, which is
     how a guard ends up crying wolf and getting switched off.
