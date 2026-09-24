@@ -124,6 +124,7 @@ from messagefoundry.store.store import (
     REINGRESS_TARGET_PREFIX,
     AlertInstance,
     AlertSummary,
+    AuditHeadMovedError,
     CapturedResponse,
     ClaimedHeads,
     ClaimProcStatus,
@@ -6284,6 +6285,7 @@ class PostgresStore:
         detail: str | None = None,
         client: str | None = None,
         now: float | None = None,
+        expect_prev: str | None = None,
     ) -> None:
         """Append a row to the audit hash chain. H-7: takes the audit-chain advisory lock first, so
         concurrent writers serialize on the read-tail + insert and can't fork the chain.
@@ -6299,6 +6301,8 @@ class PostgresStore:
             await self._advisory_lock(conn, _LOCK_CLASS_AUDIT, _AUDIT_LOCK)
             last = await conn.fetchrow("SELECT row_hash FROM audit_log ORDER BY id DESC LIMIT 1")
             prev = last["row_hash"] if last and last["row_hash"] else ""
+            if expect_prev is not None and prev != expect_prev:
+                raise AuditHeadMovedError(prev)  # BACKLOG #1904: the roll sealed a different head
             # Keyed (in-heap HMAC key or isolated-module Transit MAC) once the #190
             # watermark is set, else keyless.
             _key, _mac = self._audit_append_mac()
