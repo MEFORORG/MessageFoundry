@@ -42,6 +42,7 @@ from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.ingress_guards import (
     IngressGuardError,
+    admit_resubmission,
     admit_resubmitted_body,
 )
 from messagefoundry.store.store import Stage
@@ -537,6 +538,23 @@ async def test_edit_resend_reroute_into_a_strict_inbound_refuses_a_strictly_inva
     mid, r = await _edit_resend(engine, {"raw": STRICT_INVALID_EDIT, "idempotency_key": "k1"})
     assert r.status_code == 422, r.text
     await _assert_nothing_committed(engine, mid, r)
+    rejected = await _actions(engine, "message_edit_resend_reject")
+    assert '"phase": "strict"' in str(rejected[0]["detail"])  # not a parse or decode refusal
+
+
+async def test_a_strict_refusal_echoes_no_value_hl7apy_quotes(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # hl7apy echoes an unsupported MSH-12 verbatim ("The version <value> is not supported"), and
+    # safe_text leaves a bare token alone. The reason is returned and audited, and an auditor may read
+    # the audit row without message access, so the reason must not carry that text at all.
+    engine.add_registry(_registry(tmp_path, _inbound(tmp_path, strict=True)))
+    leaky = STRICT_EDITED.replace("|P|2.5.1\r", f"|P|{PHI_MARKER}\r")
+    mid, r = await _edit_resend(engine, {"raw": leaky, "idempotency_key": "k1"})
+    assert r.status_code == 422, r.text
+    await _assert_nothing_committed(engine, mid, r)
+    rejected = await _actions(engine, "message_edit_resend_reject")
+    assert '"phase": "strict"' in str(rejected[0]["detail"])
 
 
 async def test_edit_resend_reroute_into_a_strict_inbound_admits_a_conformant_body(
@@ -555,47 +573,82 @@ async def test_edit_resend_direct_is_not_strict_validated(engine: Engine, tmp_pa
     assert r.status_code == 200, r.text
 
 
-def test_guard_runs_strict_validation_where_the_inbound_sets_it() -> None:
-    admit_resubmitted_body(STRICT_ADT, _strict_ic())
-    admit_resubmitted_body(ADT, _ic(ContentType.HL7V2))  # tolerant: Peek.parse is the whole check
+async def test_guard_runs_strict_validation_where_the_inbound_sets_it() -> None:
+    await admit_resubmission(STRICT_ADT, _strict_ic())
+    await admit_resubmission(ADT, _ic(ContentType.HL7V2))  # tolerant: Peek.parse is the whole check
+    admit_resubmitted_body(ADT, _strict_ic())  # the synchronous guards alone never run strict
     with pytest.raises(IngressGuardError) as exc:
-        admit_resubmitted_body(ADT, _strict_ic())
+        await admit_resubmission(ADT, _strict_ic())
     assert exc.value.phase == "strict"
-    assert exc.value.reason.startswith("strict-validation failed: ")
+    assert exc.value.reason.startswith("strict-validation failed (1 error)")
 
 
-def test_guard_strict_refusal_scrubs_what_hl7apy_quotes(monkeypatch: pytest.MonkeyPatch) -> None:
-    # hl7apy's error text can quote a field VALUE. The reason is returned and audited, so it carries
-    # the listener's persisted, safe_text-scrubbed form, not the raw error.
-    from messagefoundry.parsing.validate import ValidationResult
-    from messagefoundry.pipeline import ingress_guards
-
-    quoted = f"MSH|^~\\&|X\rPID|1||{PHI_MARKER}^^^H^MR||DOE^JANE"
-    monkeypatch.setattr(
-        ingress_guards,
-        "validate",
-        lambda raw, *, expected_version=None: ValidationResult(False, None, [quoted]),
-    )
+async def test_guard_checks_the_inbounds_declared_version() -> None:
     with pytest.raises(IngressGuardError) as exc:
-        admit_resubmitted_body(STRICT_ADT, _strict_ic())
-    assert PHI_MARKER not in exc.value.reason
-
-
-def test_guard_checks_the_inbounds_declared_version() -> None:
-    with pytest.raises(IngressGuardError) as exc:
-        admit_resubmitted_body(
+        await admit_resubmission(
             STRICT_ADT,
             dataclasses.replace(
                 _ic(ContentType.HL7V2), validation=Validation(strict=True, hl7_version="2.3")
             ),
         )
-    assert exc.value.phase == "strict" and "version mismatch" in exc.value.reason
+    assert exc.value.phase == "strict"
 
 
-def test_guard_downgrades_strict_over_the_streaming_threshold() -> None:
+async def test_guard_downgrades_strict_over_the_streaming_threshold() -> None:
     # The listener validates only the header of a streaming inbound's body at or over its threshold
     # (#149, ADR 0105), so a body it would admit there must stay resendable. Below it, strict holds.
-    admit_resubmitted_body(ADT, _strict_ic(stream_threshold_bytes=len(ADT)))
+    await admit_resubmission(ADT, _strict_ic(stream_threshold_bytes=len(ADT)))
     with pytest.raises(IngressGuardError) as exc:
-        admit_resubmitted_body(ADT, _strict_ic(stream_threshold_bytes=len(ADT) + 1))
+        await admit_resubmission(ADT, _strict_ic(stream_threshold_bytes=len(ADT) + 1))
     assert exc.value.phase == "strict"
+
+
+@pytest.mark.parametrize("timeout", [float("inf"), 0.0, -1.0])
+async def test_guard_accepts_every_timeout_the_listener_accepts(timeout: float) -> None:
+    # An unbounded wait (inf) and a disabled backstop (<= 0) both validate un-timed, as on the listener.
+    ic = dataclasses.replace(
+        _ic(ContentType.HL7V2), validation=Validation(strict=True, strict_timeout_s=timeout)
+    )
+    await admit_resubmission(STRICT_ADT, ic)
+    with pytest.raises(IngressGuardError) as exc:
+        await admit_resubmission(ADT, ic)
+    assert exc.value.phase == "strict"
+
+
+def test_the_listener_and_the_resend_share_the_strict_rules() -> None:
+    # One rule, two readers: the listener's names are the shared functions, not copies of them.
+    from messagefoundry.pipeline import ingress_guards, wiring_runner
+
+    assert wiring_runner._strict_validate_timeout is ingress_guards.strict_validate_timeout
+    assert (
+        wiring_runner._STRICT_VALIDATE_TIMEOUT_SECONDS
+        == ingress_guards.STRICT_VALIDATE_TIMEOUT_SECONDS
+    )
+    ic = _strict_ic(stream_threshold_bytes=len(ADT))
+    for body in (ADT, ADT[:-1]):
+        assert wiring_runner.RegistryRunner._streaming_over_threshold(
+            None,  # type: ignore[arg-type]
+            ic,
+            body,
+        ) is ingress_guards.streaming_over_threshold(ic, body)
+
+
+@pytest.mark.parametrize(
+    ("body", "refused"),
+    [(STRICT_ADT, False), (ADT, True), (STRICT_INVALID_EDIT, True)],
+)
+async def test_the_resend_and_the_dry_run_agree_on_strict(body: str, refused: bool) -> None:
+    # The dry run is the other pure reader of validation.strict; a body one refuses the other must too.
+    from messagefoundry.pipeline.dryrun import dry_run
+    from messagefoundry.store import MessageStatus
+
+    ic = _strict_ic()
+    reg = Registry()
+    reg.add_inbound(ic)
+    reg.add_router("r", lambda m: [])
+    assert (dry_run(reg, body, inbound="in1").disposition is MessageStatus.ERROR) is refused
+    if refused:
+        with pytest.raises(IngressGuardError):
+            await admit_resubmission(body, ic)
+    else:
+        await admit_resubmission(body, ic)

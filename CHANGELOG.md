@@ -207,8 +207,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   re-route now run the listener's strict `hl7apy` validation before anything is written. It runs
   under the same `validation.strict_timeout_s` backstop, and a failure or a timeout is refused with
   422. The refusal writes the same `upload.resend_reject` or `message_edit_resend_reject` audit row
-  as the other guards, with phase `strict` and the listener's scrubbed error text, and writes no
-  message. **A resend that 0.4.0 accepted can now be refused**: an HL7 body that passes `Peek.parse`
+  as the other guards, with phase `strict`, and writes no message. Its reason counts the
+  validation errors and quotes none, because `hl7apy` can echo a field value; a dry run against
+  the inbound lists them. **A resend that 0.4.0 accepted can now be refused**: an HL7 body that passes `Peek.parse`
   but not the inbound's strict validation. As on the listener, a streaming inbound's body at or over
   `stream_threshold_bytes` gets header-only checking. The edit-resend direct path meets no inbound,
   so strict validation does not apply to it. ([BACKLOG #1911](docs/BACKLOG.md))

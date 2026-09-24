@@ -315,7 +315,7 @@ from messagefoundry.pipeline.cluster import (
 )
 from messagefoundry.pipeline.connscale_shim import maybe_install_executor_shim
 from messagefoundry.pipeline.dr import DrActivationError
-from messagefoundry.pipeline.ingress_guards import IngressGuardError, admit_resubmitted_body
+from messagefoundry.pipeline.ingress_guards import IngressGuardError, admit_resubmission
 from messagefoundry.pipeline.security_notify import security_notifier_from_settings
 from messagefoundry.pipeline.wiring_runner import (
     NotDeployedError,
@@ -1232,17 +1232,17 @@ async def _guard_resubmission(
 
     The upload resend and the edit-resend paths write the stage row directly, so the listener's size
     ceiling, declared-type checks and strict validation never ran on them. This runs the same guards
-    (:func:`~messagefoundry.pipeline.ingress_guards.admit_resubmitted_body`) before anything is written
+    (:func:`~messagefoundry.pipeline.ingress_guards.admit_resubmission`) before anything is written
     and returns the form to commit, which the caller writes instead of the body it was handed. A
     refusal is an HTTP 4xx, an ``action`` audit row and a log line, and no message row is written, so
     count-and-log holds: no body is accepted and then dropped. Off the event loop, because the body can
     be as large as an upload.
 
     The audit row carries ids, the guard's phase and its reason. The reason is written to carry no byte
-    of the body, so neither the row nor the 4xx detail echoes PHI. A strict refusal's reason quotes
-    hl7apy's error text, scrubbed by ``safe_text`` as the listener scrubs the ``ERROR`` row it writes."""
+    of the body, so neither the row nor the 4xx detail echoes PHI. A strict refusal counts hl7apy's
+    errors rather than quoting them, since that text can echo a field value."""
     try:
-        return await asyncio.to_thread(admit_resubmitted_body, raw, inbound)
+        return await admit_resubmission(raw, inbound)
     except IngressGuardError as exc:
         await engine.store.record_audit(
             action,

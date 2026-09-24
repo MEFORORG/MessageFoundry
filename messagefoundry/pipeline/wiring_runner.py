@@ -126,6 +126,7 @@ from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.pipeline.dryrun import TransformOutcome, route_only, transform_one
 from messagefoundry.pipeline.ingress_guards import (
     STRICT_VALIDATE_TIMEOUT_SECONDS,
+    streaming_over_threshold,
     strict_validate_timeout,
 )
 from messagefoundry.pipeline.phase_timing import (
@@ -5090,9 +5091,9 @@ class RegistryRunner:
     def _streaming_over_threshold(self, ic: InboundConnection, text: str) -> bool:
         """Whether ``ic`` is a streaming inbound (``stream_threshold_bytes`` set) and ``text`` is at/above
         that threshold — the gate for the over-threshold detach path (#149, ADR 0105 Phase 1a). Below
-        threshold or unset ⇒ False ⇒ the byte-identical no-detach fast path (and no strict downgrade)."""
-        threshold = ic.stream_threshold_bytes
-        return threshold is not None and len(text) >= threshold
+        threshold or unset ⇒ False ⇒ the byte-identical no-detach fast path (and no strict downgrade).
+        The rule lives in ``ingress_guards`` so the operator resend reads it the same way (#1911)."""
+        return streaming_over_threshold(ic, text)
 
     async def _detach_documents(self, ic: InboundConnection, text: str) -> tuple[str, list[str]]:
         """Detach every oversized OBX-5 ED base64 document from an over-threshold HL7 body into the
