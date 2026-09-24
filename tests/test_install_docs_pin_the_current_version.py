@@ -6,8 +6,9 @@
 ``$V = "<version>"``, and the guides carry ``pip install "messagefoundry==<version>"`` commands. The
 0.4.0 release bumped ``messagefoundry.__version__`` and left the verify blocks and the early-adopter
 install command at ``0.1.0``, so a pasted block verified and installed a release three versions old.
-Pinning every such literal to ``__version__`` makes the release commit that bumps the version fail
-until the guides move with it.
+Pinning those literals to ``__version__`` makes the release commit that bumps the version fail until
+the guides move with it. INSTALL-GUIDE's engine pins are left out on purpose: it also shows an
+illustrative upgrade to another version (``messagefoundry==0.2.0``), which is not a stale pin.
 """
 
 from __future__ import annotations

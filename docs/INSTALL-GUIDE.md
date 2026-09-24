@@ -170,7 +170,7 @@ my-config-repo/
 ├─ environments/prod.toml
 ├─ messages/sets/example_adt.hl7   # a synthetic fixture (NO real PHI) that gates `check`
 ├─ messagefoundry.toml             # THIS instance's settings (environment + posture + store + API + egress)
-├─ requirements.txt                # pins the engine:  messagefoundry==0.1.0
+├─ requirements.txt                # pins the engine:  messagefoundry==0.4.0
 ├─ .github/workflows/check.yml     # CI: install the pinned engine + run `messagefoundry check` on every PR
 ├─ .vscode/settings.json           # points the VS Code extension at config/ + messages/
 ├─ .gitignore  .gitattributes      # excludes stores, secrets, captures, venvs, caches

@@ -889,3 +889,16 @@ def test_the_default_base_url_is_https() -> None:
     ``http://`` default failed with "Server disconnected without sending a response"."""
     with EngineClient() as client:
         assert client.base_url == "https://127.0.0.1:8765"
+
+
+def test_an_unloadable_cacert_is_an_api_error(tmp_path: pathlib.Path) -> None:
+    """A pinned PEM is operator input (the harness --cacert flag, the Monitor tab's Cert field). A
+    missing file or a non-PEM one must surface as the ApiError every caller handles, not as the raw
+    OSError / ssl.SSLError the stdlib raises, which escaped a GUI slot and a CLI run as a traceback."""
+    not_pem = tmp_path / "not-a-cert.pem"
+    not_pem.write_text("not a certificate", encoding="utf-8")
+    for bad in (tmp_path / "missing.pem", not_pem):
+        with pytest.raises(ApiError, match="cannot load TLS material"):
+            EngineClient("https://127.0.0.1:8765", cacert=str(bad))
+    # CONTROL: over http no context is built, so the same bad path is never read.
+    EngineClient("http://127.0.0.1:8765", cacert=str(tmp_path / "missing.pem")).close()

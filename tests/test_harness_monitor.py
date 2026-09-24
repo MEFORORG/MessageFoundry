@@ -212,6 +212,19 @@ def test_monitor_panel_builds_disconnected(qapp: Any) -> None:
     panel.shutdown()  # safe to call when never connected
 
 
+def test_a_mistyped_cert_path_is_reported_not_raised(qapp: Any, tmp_path: Path) -> None:
+    # The Cert field is free text. A path that does not load must land in the status label; it used
+    # to escape the Connect slot as a raw FileNotFoundError, so the tab silently did nothing.
+    panel = MonitorPanel()
+    panel._cacert.setText(str(tmp_path / "missing.pem"))
+    panel._connect_btn.click()
+    try:
+        assert panel._client is None
+        assert "cannot load TLS material" in panel._status.text()
+    finally:
+        panel.shutdown()
+
+
 @pytest.mark.timeout(120)
 def test_monitor_reaches_a_tls_engine_only_with_its_minted_cert_pinned(
     qapp: Any, tls_server: tuple[str, Path, str]

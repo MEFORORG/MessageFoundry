@@ -237,13 +237,18 @@ class MonitorPanel(QWidget):
 
     def _connect(self) -> None:
         url = self._url.text().strip()
-        cacert = self._cacert_path()
         try:
             client = EngineClient(
-                url, timeout=4.0, allow_insecure=self._allow_insecure, cacert=cacert
+                url, timeout=4.0, allow_insecure=self._allow_insecure, cacert=self._cacert_path()
             )
+        except ApiError as exc:
+            self._set_status(str(exc), error=True)
+            return
+        try:
             client.health()  # reachable?
         except ApiError as exc:
+            # An unverified minted cert fails here on a first connect, so close the pool it opened.
+            client.close()
             self._set_status(str(exc), error=True)
             return
         if not self._ensure_auth(client):

@@ -375,6 +375,8 @@ memory **hygiene** is not memory **encryption**.
 curl.exe --cacert <DataDir>\api-generated-cert.pem https://127.0.0.1:8765/health   # -> {"status":"ok", ...}
 ```
 
+`--cacert` names the certificate the engine minted on first start. If you set `[api].tls_cert_file`, pass your own certificate or CA bundle instead.
+
 Send a test message and confirm it flows through:
 
 ```powershell
