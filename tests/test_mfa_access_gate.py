@@ -108,6 +108,30 @@ async def _login(c: httpx.AsyncClient, username: str) -> str:
     return str(r.json()["token"])
 
 
+async def _add_passkey(service: AuthService, username: str) -> None:
+    """Give ``username`` one stored passkey and no TOTP secret, so a passkey is its only factor."""
+    user = await service.store.get_user_by_username(username)
+    assert user is not None and not user.totp_enabled
+    await service.store.add_webauthn_credential(
+        WebAuthnCredential(
+            credential_id_hash=f"{username}-passkey-hash",
+            credential_id=f"{username}-passkey-id-b64url",
+            user_id=user.id,
+            rp_id="t",
+            public_key="cose-public-key-b64url",
+            sign_count=0,
+            transports=None,
+            device_type="multi_device",
+            backed_up=True,
+            label="yubikey",
+            aaguid="aaguid-0000",
+            created_at=1000.0,
+            last_used_at=None,
+        )
+    )
+    assert await service.store.has_webauthn_credentials(user.id) is True
+
+
 def _principal(username: str = "aduser") -> AdPrincipal:
     return AdPrincipal(
         username=username,
@@ -359,26 +383,9 @@ async def test_the_existing_factor_is_required_whatever_the_step_up_knob_says(
     await _add(service, "vic", Role.VIEWER)
 
     # The victim really holds a factor, so the enrollment deadlock carve-out does not cover them.
+    await _add_passkey(service, "vic")
     victim = await service.store.get_user_by_username("vic")
     assert victim is not None
-    await engine.store.add_webauthn_credential(
-        WebAuthnCredential(
-            credential_id_hash="vic-passkey-hash",
-            credential_id="vic-passkey-id-b64url",
-            user_id=victim.id,
-            rp_id="t",
-            public_key="cose-public-key-b64url",
-            sign_count=0,
-            transports=None,
-            device_type="multi_device",
-            backed_up=True,
-            label="yubikey",
-            aaguid="aaguid-0000",
-            created_at=1000.0,
-            last_used_at=None,
-        )
-    )
-    assert await service.store.has_webauthn_credentials(victim.id) is True
 
     async with _client(engine, service) as c:
         tok = await _login(c, "vic")  # the attacker knows the password and nothing else
@@ -643,6 +650,36 @@ async def test_a_pending_session_cannot_change_an_enrolled_accounts_password(
     denied = [a for a in await engine.store.list_audit() if a["action"] == "auth.mfa_denied"]
     assert any("/me/password" in (a["detail"] or "") for a in denied)
     assert denied[-1]["client"] == "192.0.2.54"
+
+
+async def test_a_pending_session_cannot_change_a_passkey_only_accounts_password(
+    engine: Engine,
+) -> None:
+    """RED when: the #1954 refusal counts only TOTP as a factor, or leaves the route entirely.
+
+    The test above enrolls TOTP, so a check narrowed to ``totp_enabled`` would still pass it. This
+    account holds a passkey and no TOTP secret, and the owner's #1954 ruling covers it the same
+    way: a caller holding only the password must prove the passkey before rotating.
+    """
+    service = await _service(engine)
+    await _add(service, "vic", Role.VIEWER)
+    await _add_passkey(service, "vic")
+    other = await service.login("vic", PW)  # a session the change would revoke
+    assert other.ok and other.token is not None
+
+    async with _client(engine, service) as c:
+        tok = await _login(c, "vic")  # the attacker knows the password and nothing else
+        assert await service.mfa_satisfied(tok) is False
+        r = await _change_password(c, tok)
+        assert r.status_code == 403, "a pending session changed a passkey-only account's password"
+        assert r.headers.get("X-MFA-Required") == "1"
+        assert "X-Step-Up-Required" not in r.headers
+
+    # Nothing changed: the other session survives, and the old password still works.
+    assert await service.identity_for_token(other.token) is not None
+    assert (await service.login("vic", PW)).ok
+    denied = [a for a in await engine.store.list_audit() if a["action"] == "auth.mfa_denied"]
+    assert any("/me/password" in (a["detail"] or "") for a in denied)
 
 
 async def test_a_reset_account_with_a_factor_proves_it_and_then_rotates(
