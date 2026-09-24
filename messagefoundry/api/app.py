@@ -1238,7 +1238,7 @@ async def _guard_resubmission(
             client=client_ip(request),
         )
         _log.warning("%s: refused by the ingress guards (phase=%s)", action, exc.phase)
-        raise HTTPException(_INGRESS_GUARD_STATUS.get(exc.phase, 422), exc.reason) from None
+        raise HTTPException(_INGRESS_GUARD_STATUS[exc.phase], exc.reason) from None
 
 
 async def _audit_channel_denied(

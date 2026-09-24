@@ -1992,8 +1992,8 @@ class Engine:
         """Edit-and-resubmit RE-ROUTE (ADR 0090 §9, BACKLOG #153): re-ingress an EDITED body as a fresh
         correlated ``RECEIVED`` message on the ORIGIN's channel, then wake the workers so the router
         drains the new ingress row promptly. The store (:meth:`QueueStore.reingress`) does the idempotent,
-        original-immutable, correlated insert; RBAC + step-up are the API's job. The original message row
-        is never written."""
+        original-immutable, correlated insert; RBAC + step-up are the API's job, and so are the origin
+        inbound's ingress guards (BACKLOG #1911). The original message row is never written."""
         outcome = await self.store.reingress(
             origin_message_id=message_id, raw=raw, idempotency_key=idempotency_key
         )
@@ -2021,7 +2021,8 @@ class Engine:
         This is deliberately **not** :meth:`edit_resend_reroute`/``reingress``: that presupposes an
         origin ``messages`` row (for its channel + correlation), which an uploaded, never-ingested file
         has none of. ``enqueue_ingress`` takes the target inbound channel **directly**. Target
-        validation (registered/running) + RBAC + audit are the API's job. Returns the new message id."""
+        validation (registered/running) + RBAC + audit are the API's job, and so are the target inbound's
+        ingress guards (BACKLOG #1911). Returns the new message id."""
         mid = await self.store.enqueue_ingress(
             channel_id=channel_id, raw=raw, source_type=source_type, metadata=metadata
         )
@@ -2034,8 +2035,9 @@ class Engine:
     ) -> ResendOutcome:
         """Edit-and-resubmit DIRECT power-path (ADR 0090 §9, BACKLOG #153): deliver an EDITED body
         straight to a chosen alternate outbound ``to`` (reusing #123's :meth:`QueueStore.resend_to` with
-        a ``body_override``), then wake the alternate lane. Target validation + RBAC are the API's job;
-        the origin row is only read, never written."""
+        a ``body_override``), then wake the alternate lane. Target validation + RBAC are the API's job,
+        and so are the engine-wide ingress guards (BACKLOG #1911); the origin row is only read, never
+        written."""
         outcome = await self.store.resend_to(
             message_id=message_id, to=to, idempotency_key=idempotency_key, body_override=raw
         )

@@ -345,3 +345,14 @@ def test_guard_without_an_inbound_keeps_the_engine_wide_rules() -> None:
     with pytest.raises(IngressGuardError) as exc:
         check_resubmitted_body("A" * (DEFAULT_MAX_MESSAGE_BYTES + 1), None)
     assert exc.value.phase == "size"
+
+
+def test_guard_applies_the_hl7_segment_cap_peek_parse_applies() -> None:
+    from messagefoundry.parsing.peek import DEFAULT_MAX_SEGMENTS
+
+    too_many = (
+        "MSH|^~\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\r" + "NTE|1\r" * DEFAULT_MAX_SEGMENTS
+    )
+    with pytest.raises(IngressGuardError) as exc:
+        check_resubmitted_body(too_many, _ic(ContentType.HL7V2))
+    assert exc.value.phase == "size" and "max segments" in exc.value.reason
