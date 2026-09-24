@@ -86,6 +86,7 @@ from xml.etree.ElementTree import (  # nosec B405 — exception type only; every
 from defusedxml.common import DefusedXmlException
 from defusedxml.ElementTree import fromstring as _xml_fromstring
 
+from messagefoundry.connection_names import CONNECTION_NAME_MAX_LENGTH, is_connection_name
 from messagefoundry.controlchars import strip_control_chars
 
 if TYPE_CHECKING:  # runtime never needs the class — only the annotations do
@@ -456,7 +457,7 @@ def _parse_channel(ch: dict[str, Any], index: int) -> Channel:
     # collides with another channel's stem is already de-duplicated and reported by the writer's
     # ``assigned`` set. Sanitize at the source, not at the filename, so the stem and the connection
     # name it registers cannot desync.
-    module_name = _sanitize(_opt_str(inbound, "name") or f"IB_{ident.upper()}")
+    module_name = _connection_name(_sanitize(_opt_str(inbound, "name") or f"IB_{ident.upper()}"))
 
     dests_raw = ch.get("destinations", [])
     if not isinstance(dests_raw, list):
@@ -466,7 +467,9 @@ def _parse_channel(ch: dict[str, Any], index: int) -> Channel:
         if not isinstance(d, dict):
             raise CorepointImportError(f"channel {name!r} destination #{j} must be an object")
         d_connector, d_call = _render_connector(d, name, inbound=False)
-        d_name = _opt_str(d, "name") or f"OB_{ident.upper()}_{j + 1}"
+        # Folded like the inbound name above, so the export cannot emit an ``outbound()`` the
+        # loader refuses (BACKLOG #1107); handler ``destinations`` fold the same way to stay matched.
+        d_name = _connection_name(_opt_str(d, "name") or _default_outbound(ident, j))
         destinations.append(Destination(d_name, d_connector, d_call))
 
     handlers_raw = ch.get("handlers")
@@ -483,6 +486,12 @@ def _parse_channel(ch: dict[str, Any], index: int) -> Channel:
     return Channel(
         module_name, in_connector, in_call, router_name, tuple(destinations), tuple(handlers)
     )
+
+
+def _default_outbound(ident: str, index: int) -> str:
+    # Trim the stem, not the result, so a cap can never cut off the ``_<n>`` that keeps two unnamed
+    # destinations of one channel apart.
+    return f"OB_{ident.upper()[: _CONNECTION_NAME_BUDGET - 16]}_{index + 1}"
 
 
 def _parse_handler(
@@ -507,7 +516,7 @@ def _parse_handler(
     if dests_raw is None:
         dests = all_dests
     elif isinstance(dests_raw, list) and all(isinstance(x, str) for x in dests_raw):
-        dests = tuple(dests_raw)
+        dests = tuple(_connection_name(x) for x in dests_raw)
     else:
         raise CorepointImportError(
             f"channel {channel!r} handler {raw_name!r} 'destinations' must be an array of names"
@@ -1243,7 +1252,7 @@ def _role_send_args(operands: tuple[Operand, ...]) -> tuple[str, ...]:
     generated wiring as a traversal path."""
     for operand in operands:
         if operand.kind == "literal" and operand.text.strip():
-            return (_lit(_sanitize(operand.text)),)
+            return (_lit(_connection_name(_sanitize(operand.text))),)
     return ()
 
 
@@ -1494,7 +1503,7 @@ def _send_args(operands: list[str]) -> tuple[str, ...]:
     for token in operands:
         name = _option(token) or _string_literal(token)
         if name:
-            return (_lit(_sanitize(name)),)
+            return (_lit(_connection_name(_sanitize(name))),)
     return ()
 
 
@@ -1547,7 +1556,7 @@ def parse_package(text: str, *, source_name: str = "package") -> tuple[Channel, 
 
     package = _attr(root, "Name") or source_name
     ident = _sanitize(package)
-    module_name = f"IB_{ident.upper()}"
+    module_name = _connection_name(f"IB_{ident.upper()}")
 
     # ElementTree carries no parent link, so build one pass of child→parent up front: an <ActionList>
     # is switched off by @Disabled on ITSELF or on any element enclosing it (typically <Package>).
@@ -2363,3 +2372,24 @@ def _sanitize(name: str) -> str:
     if keyword.iskeyword(ident):
         ident = f"{ident}_"
     return ident
+
+
+# A generated CONNECTION name must also pass the loader's rule (BACKLOG #1107), which is stricter than
+# a Python identifier: ASCII only, and bounded. So a connection name gets this second fold, and only a
+# connection name does -- handler, router and ``def`` names keep ``_sanitize`` alone. A name that
+# already passes the rule is returned unchanged, so a legal hyphenated name is never renamed.
+_NON_CONNECTION = re.compile(r"[^A-Za-z0-9_-]+")
+# Headroom under the rule's ceiling for the writer's ``_<n>`` de-duplication suffix, and, where the
+# name is also a file stem, for ``.py`` inside a 255-character filename.
+_CONNECTION_NAME_BUDGET = CONNECTION_NAME_MAX_LENGTH - 16
+
+
+def _connection_name(name: str) -> str:
+    if is_connection_name(name) and len(name) <= _CONNECTION_NAME_BUDGET:
+        return name
+    folded = _NON_CONNECTION.sub("_", name).strip("_-")
+    if not folded:
+        folded = "channel"
+    if not ("A" <= folded[0].upper() <= "Z"):
+        folded = f"c_{folded}"
+    return folded[:_CONNECTION_NAME_BUDGET]

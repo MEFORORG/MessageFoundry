@@ -44,6 +44,7 @@ from messagefoundry.config.reachability import (
     build_reference_index,
 )
 from messagefoundry.config.wiring import Registry, WiringError
+from messagefoundry.connection_names import CONNECTION_NAME_PATTERN, is_connection_name
 from messagefoundry.controlchars import has_control_char
 
 __all__ = [
@@ -633,6 +634,12 @@ def _validate_new_name(config_dir: Path, target_kind: str, new: str) -> None:
         raise WiringError(f"the new name {new!r} must not contain control characters")
     if any(ch in new for ch in ("'", '"', "\\")):
         raise WiringError(f"the new name {new!r} must not contain a quote or backslash")
+    # A renamed connection must still load (BACKLOG #1107): refuse here, before any file is rewritten.
+    if target_kind in ("inbound", "outbound") and not is_connection_name(new):
+        raise WiringError(
+            f"the new name {new!r} is not a valid connection name: it must match "
+            f"{CONNECTION_NAME_PATTERN}"
+        )
     if target_kind in _FILE_BACKED_KINDS:
         # Reuse the exact traversal/drive/containment rules the codeset writer enforces on a file stem.
         from messagefoundry.config.code_sets import CODESETS_DIR_NAME
