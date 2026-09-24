@@ -57,7 +57,7 @@ dependencies = [
     # for one string is not worth it), so nothing derives this for you. `tests/test_packaging.py`
     # ::test_the_harness_pins_the_engine_at_the_version_it_ships_with is the gate, and it names both
     # files in its failure.
-    "messagefoundry[harness]==0.3.2",
+    "messagefoundry[harness]==0.4.0",
 ]
 
 [project.scripts]

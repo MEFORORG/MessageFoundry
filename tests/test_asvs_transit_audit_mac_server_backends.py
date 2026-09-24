@@ -29,7 +29,7 @@ import pytest
 
 from messagefoundry.config.settings import StoreBackend, StoreSettings
 from messagefoundry.store.base import open_store
-from messagefoundry.store.store import audit_row_hash
+from messagefoundry.store.store import audit_active_key_id, audit_row_hash, build_audit_mac_keys
 
 BACKENDS: list[str] = ["postgres", "sqlserver"]
 
@@ -52,6 +52,10 @@ def _bare(backend: str, *, mac_fn: Any = None, mac_key: bytes | None = None) -> 
     store._audit_mac_key = mac_key
     store._audit_mac_fn = mac_fn
     store._audit_keyed_from = None
+    # BACKLOG #1904: the audit keyring and the key ranges `__init__` / open would have set.
+    store._audit_mac_keys = build_audit_mac_keys(None, mac_key)
+    store._audit_first_key_id = store._audit_range_key_id = audit_active_key_id(mac_key, mac_fn)
+    store._audit_range_from = None
     return store
 
 
@@ -274,6 +278,11 @@ async def test_rekey_is_available_on_the_transit_mac_alone(backend: str) -> None
     # configured" — the operator had no route to key an existing chain at all.
     store = _bare(backend, mac_fn=stub_transit_mac)
     store._audit_keyed_from = 7
+
+    async def _fetchall(_sql: str, *_a: Any, **_kw: Any) -> list[dict[str, Any]]:
+        return []  # BACKLOG #1904: "already keyed" now reports the verify, so it reads the chain
+
+    store._fetchall = _fetchall
     ok, message = await store.rekey_audit_chain()
     assert ok and "already keyed" in message  # got past the capability gate
 

@@ -10,20 +10,21 @@ line; the extra-free store parity contract lives in ``tests/_webauthn_store_cont
 
 from __future__ import annotations
 
+import dataclasses
 import json
 
 import pytest
 
 pytest.importorskip("webauthn")
 
-from webauthn.helpers import base64url_to_bytes  # noqa: E402
+from webauthn.helpers import base64url_to_bytes, bytes_to_base64url  # noqa: E402
 
 from messagefoundry.auth import webauthn as wa  # noqa: E402
 from messagefoundry.auth.identity import Identity  # noqa: E402
 from messagefoundry.auth.notifications import MFA_DISABLED, SecurityEvent  # noqa: E402
 from messagefoundry.auth.service import AuthService  # noqa: E402
 from messagefoundry.config.settings import AuthSettings  # noqa: E402
-from messagefoundry.store.store import MessageStore  # noqa: E402
+from messagefoundry.store.store import MessageStore, WebAuthnCredential  # noqa: E402
 from tests._soft_webauthn import SoftAuthenticator  # noqa: E402
 
 RP = "t"
@@ -218,6 +219,66 @@ async def test_registration_rejects_wrong_origin() -> None:
         assert elevation.ok is False  # origin binding — the phishing-resistance property
         assert "auth.webauthn_failed" in await _events(service, identity.username)
         assert (await service.mfa_status(identity)).webauthn_enrolled is False
+    finally:
+        await store.close()
+
+
+async def test_a_credential_whose_curve_does_not_match_its_key_is_refused_and_audited() -> None:
+    """BACKLOG #1166. It used to ENROL and then fail at first assertion with a raw ``ValueError``
+    from ``cryptography`` -- a 500. The refusal now happens at enrolment, on the audited path."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, _ = await _bootstrap_login(service)
+        opts = json.loads(
+            await service.begin_webauthn_registration(
+                identity, token=token, rp_id=RP, rp_name="MessageFoundry"
+            )
+        )
+        challenge = base64url_to_bytes(opts["challenge"])
+        mislabelled = SoftAuthenticator(rp_id=RP, origin=ORIGIN, crv=2)  # a P-256 key called P-384
+        elevation = await service.finish_webauthn_registration(
+            identity,
+            mislabelled.create_response(challenge),
+            label="mislabelled",
+            token=token,
+            rp_id=RP,
+            origin=ORIGIN,
+        )
+        assert elevation.ok is False
+        assert "auth.webauthn_failed" in await _events(service, identity.username)
+        assert (await service.mfa_status(identity)).webauthn_enrolled is False
+    finally:
+        await store.close()
+
+
+async def test_an_unusable_stored_key_fails_the_assertion_audited_not_raised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The backstop for a key that is already stored. Enrolment now refuses this shape, so the
+    stored row is substituted to stand in for one enrolled before that check or damaged since. The
+    assertion must come back refused and audited, never as an exception out of the service."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, _ = await _bootstrap_login(service)
+        auth, token = await _enroll(service, identity, token)
+
+        real_get = store.get_webauthn_credential
+
+        async def mislabelled(credential_id_hash: str) -> WebAuthnCredential | None:
+            cred = await real_get(credential_id_hash)
+            if cred is None:
+                return None
+            wrong_curve = bytes_to_base64url(auth.cose_public_key(crv=2))
+            return dataclasses.replace(cred, public_key=wrong_curve)
+
+        monkeypatch.setattr(store, "get_webauthn_credential", mislabelled)
+        before = (await _events(service, identity.username)).count("auth.webauthn_failed")
+        ok, _ = await _assert_once(service, token, auth)
+        assert ok is False
+        after = (await _events(service, identity.username)).count("auth.webauthn_failed")
+        assert after == before + 1
     finally:
         await store.close()
 

@@ -60,7 +60,16 @@ from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Final, NoReturn, NotRequired, Protocol, TypedDict, runtime_checkable
+from typing import (
+    Any,
+    Final,
+    NoReturn,
+    NotRequired,
+    Protocol,
+    TypedDict,
+    cast,
+    runtime_checkable,
+)
 from uuid import uuid4
 
 import aiosqlite
@@ -84,10 +93,12 @@ from messagefoundry.store.content_search import SearchSpec, row_matches
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
 from messagefoundry.store.crypto import (
     AesGcmCipher,
+    AuditMacFn,
     Cipher,
     CipherError,
     CipherInfo,
     IdentityCipher,
+    audit_key_id,
     cell_aad,
     cipher_info,
     decrypt_json_cell,
@@ -1474,8 +1485,8 @@ def audit_row_hash(
     from ``Cipher.audit_mac_fn``) computes the row MAC INSIDE the vault — used by ``vault_transit`` mode
     where the DEK never enters heap, so there is no ``key`` to HMAC with locally yet the chain is still
     keyed (forgery-resistant). ``mac`` takes precedence over ``key``; with neither, the keyless SHA-256
-    default — BYTE-IDENTICAL to pre-#190 — is unchanged (the ``mac is None and key is None`` path is the
-    frozen default cipher's path).
+    path — BYTE-IDENTICAL to pre-#190 — is unchanged (the ``mac is None and key is None`` path is the
+    identity cipher's path, and the path of every row below the #190 keying watermark).
 
     **Client address (ADR 0150).** ``client`` — the caller's network address, when the write had one —
     is folded into the chain as a **CONDITIONAL 7th element**: it is appended ONLY when it is not
@@ -1499,6 +1510,24 @@ def audit_row_hash(
     if key is None:
         return hashlib.sha256(data).hexdigest()
     return hmac.new(key, data, hashlib.sha256).hexdigest()
+
+
+def warn_unkeyed_audit_chain(logger: logging.Logger, rows: int) -> None:
+    """Log that a keyed-capable store opened onto a KEYLESS audit chain (BACKLOG #1905).
+
+    Shared verbatim by all three backends. A store that has a key but no keying watermark and at least
+    one audit row carries a chain anyone who can write ``audit_log`` can forge: every row is plain
+    SHA-256, and ``_load_audit_chain_meta`` auto-keys only an EMPTY log. Keying the existing rows at
+    open is forbidden -- it would bless a forged row into a keyed chain -- so the remedy is the
+    explicit, chain-verifying ``rekey-audit``, and this line names it. The same state is reported by
+    ``security_loosenings()`` as ``audit_chain_unkeyed``, so it is not only a log line."""
+    logger.warning(
+        "audit chain is KEYLESS (%d existing row(s), no keying watermark) although a store encryption "
+        "key or isolated-module MAC is configured: its rows are plain SHA-256 and can be forged by "
+        "anyone who can write audit_log. Opening with a key does not re-key existing rows. Stop the "
+        "engine, then run `messagefoundry rekey-audit` to verify the chain and key every row after it.",
+        rows,
+    )
 
 
 #: The phrase :func:`audit_prefix_verdict` puts in its failure message, exported so a CALLER can tell a
@@ -1756,6 +1785,652 @@ def audit_mac_bytes(value: str | None) -> bytes:
     surrogate smuggled into the column encodes rather than raising, and two distinct strings can never
     collide onto the same bytes."""
     return (value or "").encode("utf-8", "surrogatepass")
+
+
+# --- audit-chain key ranges (BACKLOG #1904, ADR 0193) ------------------------------------------------
+#
+# A keyed audit chain is a sequence of RANGES, each MAC'd under one audit key. The first range starts at
+# the #190 watermark and names its key in ``audit_chain_meta.key_id``. Every later range starts at a row
+# whose action is ``AUDIT_KEY_EPOCH_ACTION``: ``rotate-key`` appends it, MAC'd under the NEW key, and its
+# detail names that key and carries a digest of the range it closes. Three properties follow, and the
+# functions below are where each is enforced -- once, for all three backends:
+#
+# * A rotation no longer reads as tampering: each row is checked under the key of its own range.
+# * A range stays provable after its key is dropped: the closing row's digest covers the range's
+#   content and stored MACs, and that row is itself covered by the next range, so the proof chains
+#   forward to the newest range, whose key must be held.
+# * A forged or moved range FAILS instead of redirecting verification: the range record lives inside
+#   the MAC'd chain (and so inside the out-of-band anchor), a range row must match the range it closes,
+#   and no key may open a second range -- so a leaked retired key cannot switch the chain back to itself.
+
+#: The lowest ``audit_log.id`` a verify walk reads from -- the BIGINT floor, so a row a writer inserted
+#: with an explicit NEGATIVE id is still walked (and reported), exactly as the unfiltered pre-#1904
+#: ``SELECT ... ORDER BY id`` walked it. ``0`` here silently dropped such rows from the tamper check.
+AUDIT_ALL_ROWS: Final = -(2**63)
+
+#: The action of the row that opens a new keyed range of the audit chain.
+AUDIT_KEY_EPOCH_ACTION: Final = "audit.key_epoch"
+
+#: The key id a range keyed inside Vault/OpenBao Transit names (ADR 0138). Transit versions its own key,
+#: so from the engine's side a Transit-keyed chain is one range.
+AUDIT_TRANSIT_KEY_ID: Final = "vault-transit"
+
+
+def build_audit_mac_keys(cipher: Cipher | None, audit_mac_key: bytes | None) -> dict[str, bytes]:
+    """Every audit key a store can verify with, by :func:`~messagefoundry.store.crypto.audit_key_id`:
+    the cipher's whole audit keyring (active and retired), plus the ``audit_mac_key`` the caller passed
+    in, which is the active one."""
+    keys: dict[str, bytes] = dict(cipher.audit_mac_keyring()) if cipher is not None else {}
+    if audit_mac_key is not None:
+        keys.setdefault(audit_key_id(audit_mac_key), audit_mac_key)
+    return keys
+
+
+def audit_active_key_id(audit_mac_key: bytes | None, audit_mac_fn: AuditMacFn | None) -> str | None:
+    """The key id a NEW range opens under, or ``None`` when the store holds no keying secret. The
+    isolated-module MAC wins over an in-heap key, matching the append path's precedence."""
+    if audit_mac_fn is not None:
+        return AUDIT_TRANSIT_KEY_ID
+    if audit_mac_key is not None:
+        return audit_key_id(audit_mac_key)
+    return None
+
+
+def _audit_secret_for(
+    key_id: str | None, mac_keys: Mapping[str, bytes], mac_fn: AuditMacFn | None
+) -> tuple[bytes | None, AuditMacFn | None] | None:
+    """``(key, mac)`` for a range keyed under ``key_id``, or ``None`` when this store does not hold it."""
+    if key_id == AUDIT_TRANSIT_KEY_ID:
+        return (None, mac_fn) if mac_fn is not None else None
+    key = mac_keys.get(key_id) if key_id is not None else None
+    return (key, None) if key is not None else None
+
+
+def audit_append_secret(
+    *,
+    keyed_from: int | None,
+    range_key_id: str | None,
+    mac_keys: Mapping[str, bytes],
+    mac_key: bytes | None,
+    mac_fn: AuditMacFn | None,
+) -> tuple[bytes | None, AuditMacFn | None]:
+    """The ``(key, mac)`` a NEW ``audit_log`` row is hashed with -- shared by all three backends.
+
+    Keyless below the #190 watermark (``(None, None)``). Keyed, a new row joins the CURRENT range, so it
+    is MAC'd under that range's key, which is not always the active one: between a key change and
+    ``rotate-key`` the current range is still the retired key's. Opening a range under the active key is
+    ``rotate-key``'s explicit step, never a side effect of an append, because a range that opens with no
+    range row would read as tampering (BACKLOG #1904). Fail-closed both ways: no secret at all, or the
+    current range's key not held -- an append that could not verify must not be written."""
+    if keyed_from is None:
+        return None, None  # keyless chain -- byte-identical to pre-#190
+    if mac_key is None and mac_fn is None:
+        raise RuntimeError(
+            f"audit chain is keyed (from id={keyed_from}) but no store encryption key or "
+            "isolated-module MAC is configured; refusing to append a keyless audit row above the watermark"
+        )
+    key_id = range_key_id or audit_active_key_id(mac_key, mac_fn)
+    secret = _audit_secret_for(key_id, mac_keys, mac_fn)
+    if secret is None:
+        raise RuntimeError(
+            f"the audit chain's current range is keyed under audit key {key_id!r}, which is not "
+            "configured; refusing to append a row that could not verify. Restore that store key to "
+            "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED and run `messagefoundry rotate-key` with the engine "
+            "stopped"
+        )
+    return secret
+
+
+def _audit_digest_line(r: Mapping[str, Any]) -> bytes:
+    """One row's contribution to a range digest: its id, every chained field and its STORED MAC, so a
+    digest over a range pins both what the rows say and the MACs a key-holder could still check."""
+    fields = [
+        int(r["id"]),
+        r["ts"],
+        r["actor"],
+        r["action"],
+        r["channel_id"],
+        r["detail"],
+        r["client"],
+        r["row_hash"],
+    ]
+    return json.dumps(fields, default=str).encode("utf-8") + b"\n"
+
+
+def audit_range_closing(
+    rows: Sequence[Mapping[str, Any]], *, key_id: str, from_id: int, prev_hash: str
+) -> dict[str, Any]:
+    """The ``closes`` record a range row carries for the range it ends: the range's key, its first and
+    last id, its row count, a SHA-256 digest over every row, and ``prev_hash`` -- the stored
+    ``row_hash`` of the row just BEFORE the range (``""``, the chain's genesis, when there is none).
+    ``rows`` are the range's rows, in id order -- everything from ``from_id`` up to (not including) the
+    new range row.
+
+    ``prev_hash`` is the range's link to everything before it. While the range's key is held, the MAC
+    on its first row carries that link; once the key is dropped, only this record does. Without it the
+    rows below a dropped range -- the keyless prefix under a ``rekey-audit`` watermark, above all --
+    could be rewritten and re-hashed and the chain would still verify (PR 1446, Lander blocker)."""
+    digest = hashlib.sha256()
+    last = from_id - 1
+    for r in rows:
+        digest.update(_audit_digest_line(r))
+        last = int(r["id"])
+    return {
+        "key_id": key_id,
+        "from_id": from_id,
+        "to_id": last,
+        "rows": len(rows),
+        "digest": digest.hexdigest(),
+        "prev_hash": prev_hash,
+    }
+
+
+_AUDIT_HANDOVER_INFO: Final = b"mefor/audit-handover/v1\x00"
+_AUDIT_CLOSES_FIELDS: Final = frozenset(
+    {"key_id", "from_id", "to_id", "rows", "digest", "prev_hash"}
+)
+
+
+def audit_handover_tag(
+    key_id: str, closes: Mapping[str, Any], secret: tuple[bytes | None, AuditMacFn | None]
+) -> str:
+    """The OUTGOING key's authorisation of a range handover (review round 1 of BACKLOG #1904).
+
+    A range row is MAC'd under the INCOMING key, which on its own lets anyone holding ANY configured
+    key -- a leaked retired key that never keyed a range included -- open a range under it. So the
+    range row also carries this tag: a MAC, under the key of the range being CLOSED, over the new key id
+    and the ``closes`` record. A handover therefore needs the key the chain is currently under, which is
+    the active key, or the retired key during the window before ``rotate-key``."""
+    data = _AUDIT_HANDOVER_INFO + json.dumps(
+        {"key_id": key_id, "closes": dict(closes)}, sort_keys=True, default=str
+    ).encode("utf-8")
+    key, mac = secret
+    if mac is not None:
+        return mac(data)
+    assert key is not None  # a secret is (key, None) or (None, mac)
+    return hmac.new(key, data, hashlib.sha256).hexdigest()
+
+
+def audit_epoch_detail(key_id: str, closes: Mapping[str, Any], handover: str) -> str:
+    """The ``detail`` of a range row: the key the new range is MAC'd under, what it closes, and the
+    outgoing key's :func:`audit_handover_tag`."""
+    return json.dumps(
+        {"key_id": key_id, "closes": dict(closes), "handover": handover}, sort_keys=True
+    )
+
+
+def parse_audit_epoch(detail: str | None) -> tuple[str, dict[str, Any], str] | None:
+    """``(key_id, closes, handover)`` from a range row's detail, or ``None`` when it is not one.
+
+    Total over attacker-written input: ``detail`` is a writable column, and a deeply nested value makes
+    ``json.loads`` raise ``RecursionError``, which must surface as a malformed row -- a reported break --
+    and never as an exception that turns a tamper alarm into a "could not run" log line."""
+    try:
+        obj = json.loads(detail or "")
+    except (ValueError, TypeError, RecursionError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    key_id, closes, handover = obj.get("key_id"), obj.get("closes"), obj.get("handover")
+    if not isinstance(key_id, str) or not key_id or not isinstance(closes, dict):
+        return None
+    # Scalars only, and only the fields a closing record has. The tag check RE-SERIALISES `closes`, and
+    # json.dumps recurses deeper than json.loads tolerates, so a nested value would raise
+    # RecursionError there -- at open, and in the startup verify -- rather than read as a break.
+    if not set(closes) <= _AUDIT_CLOSES_FIELDS or not all(
+        v is None or isinstance(v, (int, str)) for v in closes.values()
+    ):
+        return None
+    if not isinstance(handover, str):
+        return None
+    return key_id, closes, handover
+
+
+def _audit_tag_ok(
+    new_key: str,
+    closes: Mapping[str, Any],
+    handover: str,
+    secret: tuple[bytes | None, AuditMacFn | None],
+) -> bool:
+    """Constant-time check of a range row's handover tag under the outgoing key's ``secret``."""
+    expected = audit_handover_tag(new_key, closes, secret)
+    return hmac.compare_digest(audit_mac_bytes(handover), audit_mac_bytes(expected))
+
+
+def verify_audit_rows(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    keyed_from: int | None,
+    first_key_id: str | None,
+    mac_keys: Mapping[str, bytes],
+    mac_fn: AuditMacFn | None,
+    capable: bool,
+    expected_anchor: tuple[int, str] | None = None,
+    expected_prefix: tuple[int, str] | None = None,
+) -> tuple[bool, str | None]:
+    """Recompute the audit chain over ``rows`` (all of ``audit_log``, id order) -- the ONE walk all
+    three backends' ``verify_audit_chain`` run, so the rule cannot drift between them.
+
+    Keyless below the #190 watermark; at and above it, each row is checked under the key of its own
+    range (BACKLOG #1904, ADR 0193). A range whose key is no longer held is proved instead by the digest
+    in the range row that closes it; the NEWEST range's key must be held, since nothing later vouches
+    for it. A range row must match the range it closes, carry the outgoing key's handover tag whenever
+    that key is held, and name a key that has not keyed a range before.
+
+    **Constant-time, full-walk (ASVS 11.2.4)**, as before: every row MAC is compared with
+    :func:`hmac.compare_digest` over :func:`audit_mac_bytes`, the walk always runs to completion, and
+    the first divergent row id is reported after it. A structural break is reported at its own row id,
+    with the reason."""
+    if keyed_from is not None and not capable:
+        # A watermark set but no key/MAC in hand: the keyed suffix is unverifiable (opened without the
+        # DEK or the vault). Report honestly rather than mis-flag every keyed row as tampered.
+        return (
+            False,
+            "audit chain is keyed (from id="
+            f"{keyed_from}) but no store encryption key/MAC is configured to verify it",
+        )
+    breaks: list[tuple[int, str | None]] = []
+    prev = ""
+    count = 0
+    #: Head as it stood AT ``expected_prefix[0]`` rows. Stays None when the walk never gets there,
+    #: which is the truncation case and must FAIL rather than pass vacuously (BACKLOG #328).
+    prefix_head: str | None = None
+    # The range being walked: its key, its first id, its digest and row count so far, its last id.
+    range_key: str | None = None
+    range_from: int | None = None
+    range_digest = hashlib.sha256()
+    range_rows = 0
+    range_last = 0
+    #: Stored ``row_hash`` of the row just before the range being walked: its link to the chain below.
+    range_prev = ""
+    seen_keys: set[str] = set()
+    #: (range row id, outgoing key, new key, claimed closes, handover tag, what the walk saw)
+    closings: list[tuple[int, str | None, str, dict[str, Any], str, dict[str, Any]]] = []
+    for r in rows:
+        rid = int(r["id"])
+        keyed = keyed_from is not None and rid >= keyed_from
+        if keyed and range_from is None:
+            assert keyed_from is not None  # for the type checker: `keyed` implies it
+            range_key, range_from = first_key_id, keyed_from
+            range_last = keyed_from - 1
+            range_prev = prev  # the last keyless row's stored hash, or "" (genesis) when none
+            if range_key is not None:
+                seen_keys.add(range_key)
+        if keyed and r["action"] == AUDIT_KEY_EPOCH_ACTION:
+            parsed = parse_audit_epoch(r["detail"])
+            if parsed is None:
+                breaks.append((rid, "malformed audit key-range row"))
+            else:
+                new_key, claimed, handover = parsed
+                if new_key in seen_keys:
+                    breaks.append((rid, f"audit key {new_key!r} opens a second range"))
+                assert range_from is not None
+                closings.append(
+                    (
+                        rid,
+                        range_key,
+                        new_key,
+                        claimed,
+                        handover,
+                        {
+                            "key_id": range_key,
+                            "from_id": range_from,
+                            "to_id": range_last,
+                            "rows": range_rows,
+                            "digest": range_digest.hexdigest(),
+                            "prev_hash": range_prev,
+                        },
+                    )
+                )
+                seen_keys.add(new_key)
+                range_key, range_from = new_key, rid
+                range_digest, range_rows, range_last = hashlib.sha256(), 0, rid - 1
+                range_prev = prev  # the stored hash of the row before this range row
+        key: bytes | None = None
+        mac: AuditMacFn | None = None
+        held = True
+        if keyed:
+            secret = _audit_secret_for(range_key, mac_keys, mac_fn)
+            if secret is None:
+                held = False  # proved by the closing range row's digest instead (checked below)
+            else:
+                key, mac = secret
+        expected = (
+            audit_row_hash(
+                prev,
+                ts=r["ts"],
+                actor=r["actor"],
+                action=r["action"],
+                channel_id=r["channel_id"],
+                detail=r["detail"],
+                # NULL on every pre-ADR-0150 row -> the 7th element is omitted and the legacy digest
+                # reproduces exactly, so a mixed old/new chain verifies end to end.
+                client=r["client"],
+                key=key,
+                mac=mac,
+            )
+            if held
+            else r["row_hash"]
+        )
+        # Bind the compare first so it is ALWAYS evaluated: folding it behind a known-break test
+        # would short-circuit the comparator once a break is known.
+        row_ok = hmac.compare_digest(audit_mac_bytes(r["row_hash"]), audit_mac_bytes(expected))
+        if not row_ok:
+            breaks.append((rid, None))
+        if keyed:
+            range_digest.update(_audit_digest_line(r))
+            range_rows += 1
+            range_last = rid
+        # Chain from the STORED hash (not `expected`) so a divergence is reported once, at its own
+        # row, instead of cascading a false break onto every successor.
+        prev = r["row_hash"] or ""
+        count += 1
+        # BACKLOG #328: remember the head AT the recorded prefix position, in this same pass. A
+        # POSITION test, not a data-dependent branch, so it does not reintroduce the early-return
+        # the walk deliberately avoids (ASVS 11.2.4) and costs one comparison per row.
+        if expected_prefix is not None and count == expected_prefix[0]:
+            prefix_head = prev
+    if range_from is not None and _audit_secret_for(range_key, mac_keys, mac_fn) is None:
+        unheld = (
+            f"the newest audit range is keyed under audit key {range_key!r}, which is not configured"
+            if range_key is not None
+            else "the audit chain does not record which key its keyed range is under"
+        )
+        breaks.append((range_from, unheld))
+    for rid, outgoing, new_key, claimed, handover, actual in closings:
+        fields_ok = all(claimed.get(f) == actual[f] for f in ("key_id", "from_id", "to_id", "rows"))
+        digest_ok = hmac.compare_digest(
+            audit_mac_bytes(str(claimed.get("digest", ""))), audit_mac_bytes(actual["digest"])
+        )
+        # The range's link to the chain below it, which must hold with the range's key gone.
+        link_ok = hmac.compare_digest(
+            audit_mac_bytes(str(claimed.get("prev_hash"))), audit_mac_bytes(actual["prev_hash"])
+        )
+        if not (fields_ok and digest_ok and link_ok):
+            breaks.append((rid, "audit key-range row does not match the range it closes"))
+        out_secret = _audit_secret_for(outgoing, mac_keys, mac_fn)
+        if out_secret is not None and not _audit_tag_ok(new_key, claimed, handover, out_secret):
+            breaks.append(
+                (rid, "audit key-range row is not authorised by the key of the range it closes")
+            )
+    if breaks:
+        first_id, reason = min(breaks, key=lambda b: (b[0], b[1] is not None))
+        return False, f"audit chain broken at row id={first_id}" + (
+            f" ({reason})" if reason else ""
+        )
+    if expected_anchor is not None:
+        exp_count, exp_head = expected_anchor
+        # Evaluate the head compare UNCONDITIONALLY (not behind `or`): the anchor head is a MAC too,
+        # so it gets the same constant-time treatment, and the comparator count stays independent of
+        # the row count.
+        head_ok = hmac.compare_digest(audit_mac_bytes(prev), audit_mac_bytes(exp_head))
+        if count < exp_count or not head_ok:
+            return (
+                False,
+                f"audit log diverges from recorded anchor (have {count} row(s) head {prev[:12]!r}, "
+                f"expected {exp_count} head {exp_head[:12]!r}) — truncated or rewritten",
+            )
+    if expected_prefix is not None:
+        ok, msg = audit_prefix_verdict(expected_prefix, prefix_head, count)
+        if not ok:
+            return False, msg
+    return True, f"verified {count} audit row(s)"
+
+
+def audit_rekey_when_keyed(keyed_from: int, ok: bool, msg: str | None) -> tuple[bool, str]:
+    """``rekey_audit_chain``'s answer on a chain that is ALREADY keyed, shared by all three backends.
+
+    BACKLOG #1904: this used to return OK without looking, so ``rekey-audit`` printed OK over a keyed
+    chain that did not verify. It now reports the verify the caller just ran."""
+    if not ok:
+        return False, f"audit chain already keyed from id={keyed_from}, but {msg}"
+    return True, f"audit chain already keyed from id={keyed_from}; {msg}"
+
+
+class AuditRangeHost(Protocol):
+    """What :func:`settle_audit_ranges` and :func:`roll_audit_key_range` need from a store backend.
+
+    Each backend supplies two small SQL primitives; the range logic itself lives once, here."""
+
+    _audit_keyed_from: int | None
+    _audit_mac_key: bytes | None
+    _audit_mac_fn: AuditMacFn | None
+    _audit_mac_keys: dict[str, bytes]
+    _audit_first_key_id: str | None
+    _audit_range_key_id: str | None
+    _audit_range_from: int | None
+    _audit_range_keys: list[str]
+    _audit_ranges_trusted: bool
+
+    async def _audit_rows(
+        self, from_id: int, *, limit: int | None = None
+    ) -> list[Mapping[str, Any]]:
+        """``audit_log`` rows with ``id >= from_id``, id order, with the chained columns; at most
+        ``limit`` of them when given."""
+        ...
+
+    async def _audit_range_rows(self, from_id: int) -> list[Mapping[str, Any]]:
+        """Every ``AUDIT_KEY_EPOCH_ACTION`` row with ``id >= from_id`` (``id``, ``detail``), id order,
+        matched EXACTLY on the action (a case-insensitive collation must not widen it)."""
+        ...
+
+    async def verify_audit_chain(
+        self,
+        *,
+        expected_anchor: tuple[int, str] | None = None,
+        expected_prefix: tuple[int, str] | None = None,
+    ) -> tuple[bool, str | None]: ...
+
+    async def record_audit(
+        self,
+        action: str,
+        *,
+        actor: str | None = None,
+        channel_id: str | None = None,
+        detail: str | None = None,
+        client: str | None = None,
+        now: float | None = None,
+    ) -> None: ...
+
+
+async def settle_audit_ranges(host: AuditRangeHost, recorded_key_id: str | None) -> None:
+    """At open, after the watermark is loaded: find the CURRENT range -- the one new rows join.
+
+    Cheaply AUTHENTICATED rather than trusted, because the answer routes every live append: the
+    recorded first key must reproduce the first keyed row's MAC when one exists, and each range row
+    must close the range before it, name a key no range has used, and carry a handover tag that
+    verifies under the outgoing key whenever that key is held. If any of that fails, new rows go under
+    the ACTIVE key (a key an attacker who can only write rows does not hold), the store logs an ERROR,
+    and ``rotate-key`` refuses until ``audit-verify`` has been read. A full verify is not run here; it
+    is the startup check's and ``audit-verify``'s job, and they report the break this finds.
+
+    Between a key change and ``rotate-key`` the current range is legitimately a RETIRED key's; the
+    store says so, and says differently when that key is not configured at all."""
+    host._audit_range_keys = []
+    host._audit_ranges_trusted = True
+    host._audit_first_key_id = recorded_key_id
+    if host._audit_keyed_from is None:
+        return
+    keyed_from = host._audit_keyed_from
+    active_id = audit_active_key_id(host._audit_mac_key, host._audit_mac_fn)
+    keys = host._audit_mac_keys
+    problem: str | None = None
+    if recorded_key_id is None:
+        problem = "the audit chain records no key for its first keyed range"
+    else:
+        first_secret = _audit_secret_for(recorded_key_id, keys, host._audit_mac_fn)
+        if first_secret is not None:
+            head = await host._audit_rows(max(keyed_from - 1, 1), limit=2)
+            before = [r for r in head if int(r["id"]) < keyed_from]
+            first = next((r for r in head if int(r["id"]) >= keyed_from), None)
+            determinable = keyed_from == 1 or bool(before)
+            # An EMPTY first range (a fresh store, or rekey-audit then rotate-key with no row between)
+            # makes the first keyed row the next range's own row, MAC'd under THAT key -- not a check
+            # of the first key at all.
+            if first is not None and determinable and first["action"] != AUDIT_KEY_EPOCH_ACTION:
+                prev = before[-1]["row_hash"] if before else ""
+                expected = audit_row_hash(
+                    prev,
+                    ts=first["ts"],
+                    actor=first["actor"],
+                    action=first["action"],
+                    channel_id=first["channel_id"],
+                    detail=first["detail"],
+                    client=first["client"],
+                    key=first_secret[0],
+                    mac=first_secret[1],
+                )
+                if not hmac.compare_digest(
+                    audit_mac_bytes(first["row_hash"]), audit_mac_bytes(expected)
+                ):
+                    problem = (
+                        f"the first keyed audit row (id={int(first['id'])}) does not verify under "
+                        "the key audit_chain_meta names for it"
+                    )
+    current, current_from = recorded_key_id, keyed_from
+    seen: list[str] = [recorded_key_id] if recorded_key_id is not None else []
+    if problem is None:
+        for e in await host._audit_range_rows(keyed_from):
+            rid = int(e["id"])
+            parsed = parse_audit_epoch(e["detail"])
+            if parsed is None:
+                problem = f"the audit key-range row at id={rid} is malformed"
+                break
+            new_key, closes, handover = parsed
+            if new_key in seen or closes.get("key_id") != current:
+                problem = f"the audit key-range row at id={rid} does not follow the range before it"
+                break
+            out_secret = _audit_secret_for(current, keys, host._audit_mac_fn)
+            if out_secret is not None and not _audit_tag_ok(new_key, closes, handover, out_secret):
+                problem = (
+                    f"the audit key-range row at id={rid} is not authorised by the key it closes"
+                )
+                break
+            seen.append(new_key)
+            current, current_from = new_key, rid
+    host._audit_range_keys = seen
+    if problem is not None:
+        # Stay on the last range that DID authenticate when its key is held, so rows written after a
+        # junk range row still verify; fall back to the active key only when it is not. Never the key
+        # the unauthenticated row names.
+        last_good = (
+            current
+            if current is not None
+            and _audit_secret_for(current, keys, host._audit_mac_fn) is not None
+            else active_id
+        )
+        host._audit_ranges_trusted = False
+        host._audit_range_key_id, host._audit_range_from = last_good, None
+        log.error(
+            "%s. New audit rows stay under the last range that authenticated (or the active key), never "
+            "a key that row names, and `rotate-key` will refuse; run `messagefoundry audit-verify`.",
+            problem,
+        )
+        return
+    host._audit_range_key_id, host._audit_range_from = current, current_from
+    if active_id is None or current == active_id:
+        return
+    if _audit_secret_for(current, keys, host._audit_mac_fn) is None:
+        # Refusing every append would stop every audited action, sign-in included, for as long as the
+        # key is missing. New rows go under the active key instead, which verify will report as a break
+        # inside this range: the loss is recorded rather than turned into an outage.
+        host._audit_range_key_id = active_id
+        log.error(
+            "the audit chain's current range (from id=%d) is keyed under a store key that is NOT "
+            "configured. New audit rows are keyed under the active key and will not verify inside "
+            "that range. Restore the key to MEFOR_STORE_ENCRYPTION_KEYS_RETIRED, then stop the engine "
+            "and run `messagefoundry rotate-key`.",
+            current_from,
+        )
+    else:
+        log.warning(
+            "the audit chain's current range (from id=%d) is keyed under a retired store key, so new "
+            "audit rows stay under that key. Do NOT drop the retired key yet: stop the engine and run "
+            "`messagefoundry rotate-key`, which verifies the chain and opens a range under the active key.",
+            current_from,
+        )
+
+
+async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
+    """``rotate-key``'s audit step (BACKLOG #1904): open a range under the ACTIVE key.
+
+    Verifies the whole chain first and refuses on any break, so a range is never closed over tampered
+    rows -- once its key is dropped, the closing digest is the only proof of that range, and it must not
+    certify a forgery. Refuses, too, when the active key already keyed a range: a key opens one range
+    only, and a row that broke that rule would never verify. Then appends ONE range row, MAC'd under
+    the active key, carrying the closed range's digest and the outgoing key's handover tag. It rewrites
+    no existing row, so the off-box tee and every recorded anchor stay valid. A no-op when the current
+    range is already under the active key.
+
+    OFFLINE ONLY, like ``rekey-audit``: another process keeps the range it read at open, so an engine
+    left running would go on appending under the old key after the range row and break the chain."""
+    if host._audit_keyed_from is None:
+        return (
+            True,
+            "audit chain is keyless; no keyed range to roll (see `messagefoundry rekey-audit`)",
+        )
+    active_id = audit_active_key_id(host._audit_mac_key, host._audit_mac_fn)
+    if active_id is None:
+        return False, "no store encryption key/MAC configured; cannot roll the audit chain"
+    if not host._audit_ranges_trusted:
+        return (
+            False,
+            "the audit chain's key ranges do not authenticate; run `messagefoundry audit-verify`",
+        )
+    current, current_from = host._audit_range_key_id, host._audit_range_from
+    if current is None or current_from is None:
+        return False, "the audit chain does not record which key its current range is under"
+    if current == active_id:
+        return True, f"audit chain already under the active key (range from id={current_from})"
+    if active_id in host._audit_range_keys:
+        return False, (
+            "the active store key already keyed an earlier audit range, and a key opens one range "
+            "only; rotate to a NEW key rather than back to a previous one"
+        )
+    out_secret = _audit_secret_for(current, host._audit_mac_keys, host._audit_mac_fn)
+    if out_secret is None:
+        return False, (
+            f"the audit chain's current range is keyed under audit key {current!r}, which is not "
+            "configured; restore it to MEFOR_STORE_ENCRYPTION_KEYS_RETIRED and re-run"
+        )
+    # ONE read, verified and sealed from the same rows, so the closing record cannot describe a
+    # different chain from the one the verify passed.
+    rows = await host._audit_rows(AUDIT_ALL_ROWS)
+    ok, msg = verify_audit_rows(
+        rows,
+        keyed_from=host._audit_keyed_from,
+        first_key_id=host._audit_first_key_id,
+        mac_keys=host._audit_mac_keys,
+        mac_fn=host._audit_mac_fn,
+        capable=True,  # active_id is not None, so a keying secret is in hand
+    )
+    if not ok:
+        return False, f"refusing to roll a broken audit chain: {msg}"
+    before = [r for r in rows if int(r["id"]) < current_from]
+    closes = audit_range_closing(
+        [r for r in rows if int(r["id"]) >= current_from],
+        key_id=current,
+        from_id=current_from,
+        prev_hash=(before[-1]["row_hash"] or "") if before else "",
+    )
+    handover = audit_handover_tag(active_id, closes, out_secret)
+    host._audit_range_key_id = active_id  # the range row is the first row of the new range
+    try:
+        await host.record_audit(
+            AUDIT_KEY_EPOCH_ACTION,
+            actor="system:rotate-key",
+            detail=audit_epoch_detail(active_id, closes, handover),
+        )
+    except BaseException:
+        host._audit_range_key_id = current
+        raise
+    ranges = await host._audit_range_rows(current_from)
+    host._audit_range_from = int(ranges[-1]["id"]) if ranges else current_from
+    host._audit_range_keys.append(active_id)
+    return True, (
+        f"audit chain range from id={current_from} closed ({closes['rows']} row(s)); a new range "
+        f"under the active key opens at id={host._audit_range_from}"
+    )
 
 
 # #233 (ADR 0111): the event name for a Send declined because its target outbound is present-but-NOT-
@@ -2539,9 +3214,13 @@ CREATE INDEX IF NOT EXISTS ix_audit_ts ON audit_log(ts);
 -- SHA-256 chain, so verify walks a keyless prefix + a keyed suffix and BOTH verify. NULL / no row =
 -- the whole chain is keyless (byte-identical to a pre-#190 store). The watermark is only ever SET
 -- (never rewrites existing row_hashes), so enabling keying can never re-bless a forged row.
+-- `key_id` (BACKLOG #1904, ADR 0193) names the audit key the FIRST keyed range is MAC'd under; every
+-- later range is opened by an `audit.key_epoch` row inside the chain. NULL on a pre-#1904 row, which
+-- the store reports as a chain that does not record its key (there is no resolver: ADR 0193).
 CREATE TABLE IF NOT EXISTS audit_chain_meta (
     id             INTEGER PRIMARY KEY CHECK (id = 1),
-    keyed_from_id  INTEGER
+    keyed_from_id  INTEGER,
+    key_id         TEXT
 );
 
 -- Per-key AES-GCM invocation bound (ASVS 11.3.4). One row per `key_id` (the one-way SHA-256 DEK
@@ -2848,6 +3527,18 @@ class MessageStore:
         # Audit-chain keying watermark (#190): the first audit_log.id hashed with the key. None = the
         # whole chain is keyless. Loaded (and, for a fresh encrypted store, auto-set) by open().
         self._audit_keyed_from: int | None = None
+        # BACKLOG #1905: a keyed-capable store that opened onto a keyless chain with rows. Set only by
+        # `_load_audit_chain_meta`, cleared only by a successful `rekey_audit_chain`.
+        self._audit_chain_unkeyed = False
+        # BACKLOG #1904 (ADR 0193): every audit key this store can verify with (active AND retired), the
+        # first keyed range's key, and the CURRENT range -- the one new rows join. See
+        # `settle_audit_ranges` for how the last two are read at open.
+        self._audit_mac_keys: dict[str, bytes] = build_audit_mac_keys(cipher, audit_mac_key)
+        self._audit_first_key_id: str | None = None
+        self._audit_range_key_id: str | None = None
+        self._audit_range_from: int | None = None
+        self._audit_range_keys: list[str] = []
+        self._audit_ranges_trusted = True
         # `message_events` verbosity gate (#63): "all"/"errors"/"off". Governs how many rows reach the
         # message_events disposition log; the compliance floor is always retained (see should_record_event).
         self._message_events = message_events
@@ -3280,22 +3971,42 @@ class MessageStore:
         are no existing rows to re-bless, so this is safe and is NOT the forbidden 'silently re-key on
         open' (which concerns EXISTING rows). An EXISTING keyless chain is left keyless — enabling keying
         there requires the explicit, chain-verifying :meth:`rekey_audit_chain` migration (never silent)."""
-        cur = await self._db.execute("SELECT keyed_from_id FROM audit_chain_meta WHERE id=1")
+        cur = await self._db.execute(
+            "SELECT keyed_from_id, key_id FROM audit_chain_meta WHERE id=1"
+        )
         row = await cur.fetchone()
         if row is not None and row["keyed_from_id"] is not None:
             self._audit_keyed_from = int(row["keyed_from_id"])
+            await settle_audit_ranges(self, row["key_id"])  # BACKLOG #1904
             return
         if not self._audit_keyed_capable():
             return  # keyless store — the chain stays byte-identical to pre-#190
         cur = await self._db.execute("SELECT COUNT(*) AS n FROM audit_log")
         cnt = await cur.fetchone()
-        if cnt is not None and int(cnt["n"]) == 0:
+        if cnt is None:
+            return  # no count read: never key over rows that may exist
+        rows = int(cnt["n"])
+        if rows == 0:
+            active_id = audit_active_key_id(self._audit_mac_key, self._audit_mac_fn)
             async with self._lock:
                 await self._db.execute(
-                    "INSERT OR REPLACE INTO audit_chain_meta (id, keyed_from_id) VALUES (1, 1)"
+                    "INSERT OR REPLACE INTO audit_chain_meta (id, keyed_from_id, key_id)"
+                    " VALUES (1, 1, ?)",
+                    (active_id,),
                 )
                 await self._commit()
             self._audit_keyed_from = 1
+            self._audit_first_key_id = self._audit_range_key_id = active_id
+            self._audit_range_from = 1
+            self._audit_range_keys = [active_id] if active_id is not None else []
+        else:
+            # BACKLOG #1905: never silent. Report it; do not re-key it (see the docstring above).
+            self._audit_chain_unkeyed = True
+            warn_unkeyed_audit_chain(log, rows)
+
+    def audit_chain_unkeyed(self) -> bool:
+        """True when this store can key its audit chain but the chain on disk is keyless (#1905)."""
+        return self._audit_chain_unkeyed
 
     def _audit_keyed_capable(self) -> bool:
         """Is a keying secret available? — an in-heap HMAC key (``aesgcm`` mode) OR an isolated-module MAC
@@ -3303,24 +4014,44 @@ class MessageStore:
         return self._audit_mac_key is not None or self._audit_mac_fn is not None
 
     def _audit_append_mac(self) -> tuple[bytes | None, Callable[[bytes], str] | None]:
-        """The ``(key, mac)`` a NEW ``audit_log`` row is hashed with (#190 / ADR 0138). Keyed once the
-        watermark is set (a new row always lands at an id ≥ the watermark), else keyless ``(None, None)``.
-
-        Prefers the isolated-module MAC (Transit) when present; else the in-heap key. Fail-closed when the
-        chain is keyed but NEITHER secret is in hand (a keyed store opened writable without its key/vault):
-        appending a keyless row above the watermark would make a legitimately-written row read as tampered
-        under a later keyed verify — a FALSE break defeating the #190 guarantee. Refuse (raise) rather than
-        silently corrupt the chain; this mirrors the symmetric guard in :meth:`verify_audit_chain`."""
-        if self._audit_keyed_from is None:
-            return None, None  # keyless chain — byte-identical to pre-#190
-        if self._audit_mac_fn is not None:
-            return None, self._audit_mac_fn  # keyed inside the isolated module (Transit)
-        if self._audit_mac_key is not None:
-            return self._audit_mac_key, None  # keyed with the in-heap HMAC key
-        raise RuntimeError(
-            f"audit chain is keyed (from id={self._audit_keyed_from}) but no store encryption key or "
-            "isolated-module MAC is configured; refusing to append a keyless audit row above the watermark"
+        """The ``(key, mac)`` a NEW ``audit_log`` row is hashed with -- see :func:`audit_append_secret`,
+        shared by all three backends: keyless below the #190 watermark, else the CURRENT range's key
+        (BACKLOG #1904), failing closed when that key is not held."""
+        return audit_append_secret(
+            keyed_from=self._audit_keyed_from,
+            range_key_id=self._audit_range_key_id,
+            mac_keys=self._audit_mac_keys,
+            mac_key=self._audit_mac_key,
+            mac_fn=self._audit_mac_fn,
         )
+
+    async def _audit_rows(
+        self, from_id: int, *, limit: int | None = None
+    ) -> list[Mapping[str, Any]]:
+        """``AuditRangeHost`` primitive: audit rows with ``id >= from_id``, in id order."""
+        # A LIMIT of -1 is SQLite's "no limit", which keeps this ONE literal statement: the
+        # writer-transaction guard reads every execute() argument as text, and a built string is a
+        # blind spot to it.
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT id, ts, actor, action, channel_id, detail, client, row_hash"
+                " FROM audit_log WHERE id >= ? ORDER BY id LIMIT ?",
+                (from_id, -1 if limit is None else limit),
+            )
+            return cast("list[Mapping[str, Any]]", list(await cur.fetchall()))
+
+    async def _audit_range_rows(self, from_id: int) -> list[Mapping[str, Any]]:
+        """``AuditRangeHost`` primitive: every range row at or after ``from_id``, in id order."""
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT id, detail FROM audit_log WHERE action = ? AND id >= ? ORDER BY id",
+                (AUDIT_KEY_EPOCH_ACTION, from_id),
+            )
+            return cast("list[Mapping[str, Any]]", list(await cur.fetchall()))
+
+    async def roll_audit_key_epoch(self) -> tuple[bool, str]:
+        """``rotate-key``'s audit step -- see :func:`roll_audit_key_range` (BACKLOG #1904)."""
+        return await roll_audit_key_range(self)
 
     async def rekey_audit_chain(
         self, *, expected_anchor: tuple[int, str] | None = None
@@ -3328,27 +4059,33 @@ class MessageStore:
         """Operator migration (#190-D): enable HMAC keying of the audit chain on an EXISTING keyless
         store — a **non-silent, fail-safe** step, never something ``open()`` does implicitly.
 
-        Refuses unless a DEK is configured; a no-op if already keyed; and FIRST re-verifies the existing
-        keyless chain — refusing on any break so a forged/tampered chain can never be blessed into a
-        keyed one. On success it sets the keying watermark to the NEXT id (it never rewrites an existing
+        Refuses unless a DEK is configured, and FIRST re-verifies the existing chain — refusing on any
+        break so a forged/tampered chain can never be blessed into a keyed one. On an already-keyed chain
+        it changes nothing and reports that verify (BACKLOG #1904), never a bare OK. On success it sets the keying watermark to the NEXT id (it never rewrites an existing
         ``row_hash``), so every existing keyless row keeps verifying and every future row is keyed."""
         if not self._audit_keyed_capable():
             return False, "no store encryption key configured; cannot key the audit chain"
-        if self._audit_keyed_from is not None:
-            return True, f"audit chain already keyed from id={self._audit_keyed_from}"
         ok, msg = await self.verify_audit_chain(expected_anchor=expected_anchor)
+        if self._audit_keyed_from is not None:
+            return audit_rekey_when_keyed(self._audit_keyed_from, ok, msg)  # BACKLOG #1904
         if not ok:
             return False, f"refusing to key a broken audit chain: {msg}"
+        active_id = audit_active_key_id(self._audit_mac_key, self._audit_mac_fn)
         async with self._lock:
             cur = await self._db.execute("SELECT COALESCE(MAX(id), 0) AS m FROM audit_log")
             row = await cur.fetchone()
             watermark = (int(row["m"]) if row is not None else 0) + 1
             await self._db.execute(
-                "INSERT OR REPLACE INTO audit_chain_meta (id, keyed_from_id) VALUES (1, ?)",
-                (watermark,),
+                "INSERT OR REPLACE INTO audit_chain_meta (id, keyed_from_id, key_id) VALUES (1, ?, ?)",
+                (watermark, active_id),
             )
             await self._commit()
         self._audit_keyed_from = watermark
+        self._audit_first_key_id = self._audit_range_key_id = active_id
+        self._audit_range_from = watermark
+        self._audit_range_keys = [active_id] if active_id is not None else []
+        self._audit_ranges_trusted = True
+        self._audit_chain_unkeyed = False
         return True, f"audit chain keyed from id={watermark}"
 
     #: Every (table, column) the store cipher covers — raw bodies plus the PHI-bearing nullable text
@@ -4106,6 +4843,10 @@ class MessageStore:
         # valid — audit_row_hash omits the 7th element entirely when client is None.
         if "client" not in audit_cols:
             await db.execute("ALTER TABLE audit_log ADD COLUMN client TEXT")
+        # BACKLOG #1904: the first keyed range's key. NULL is reported, never guessed (ADR 0193).
+        cur = await db.execute("PRAGMA table_info(audit_chain_meta)")
+        if "key_id" not in {row["name"] for row in await cur.fetchall()}:
+            await db.execute("ALTER TABLE audit_chain_meta ADD COLUMN key_id TEXT")
         cur = await db.execute("PRAGMA table_info(users)")
         user_cols = {row["name"] for row in await cur.fetchall()}
         if "channel_scope" not in user_cols:
@@ -8914,81 +9655,18 @@ class MessageStore:
         broken chain now pays the same N round trips a healthy one already pays — accepted: the
         healthy-verify cost is the bound, and a tamper alarm must not be cheaper to provoke than a
         clean pass.)"""
-        # A watermark set but no key/MAC in hand → the keyed suffix is unverifiable (opened without the
-        # DEK or the vault). Report honestly rather than mis-flag every keyed row as tampered.
-        if self._audit_keyed_from is not None and not self._audit_keyed_capable():
-            return (
-                False,
-                "audit chain is keyed (from id="
-                f"{self._audit_keyed_from}) but no store encryption key/MAC is configured to verify it",
-            )
-        async with self._read() as db:
-            cur = await db.execute(
-                "SELECT id, ts, actor, action, channel_id, detail, client, row_hash"
-                " FROM audit_log ORDER BY id"
-            )
-            rows = await cur.fetchall()
-        prev = ""
-        count = 0
-        first_break: int | None = None
-        #: Head as it stood AT ``expected_prefix[0]`` rows. Stays None when the walk never gets there,
-        #: which is the truncation case and must FAIL rather than pass vacuously (BACKLOG #328).
-        prefix_head: str | None = None
-        for r in rows:
-            # Per-row secret: keyless below the #190 watermark, keyed at/above it (in-heap HMAC key OR
-            # isolated-module Transit MAC) — so a keyless prefix and a keyed suffix both verify across an
-            # enabled-keying migration.
-            keyed_row = (
-                self._audit_keyed_from is not None and int(r["id"]) >= self._audit_keyed_from
-            )
-            key = self._audit_mac_key if (keyed_row and self._audit_mac_fn is None) else None
-            mac = self._audit_mac_fn if keyed_row else None
-            expected = audit_row_hash(
-                prev,
-                ts=r["ts"],
-                actor=r["actor"],
-                action=r["action"],
-                channel_id=r["channel_id"],
-                detail=r["detail"],
-                # NULL on every pre-ADR-0150 row → the 7th element is omitted and the legacy digest
-                # reproduces exactly, so a mixed old/new chain verifies end to end.
-                client=r["client"],
-                key=key,
-                mac=mac,
-            )
-            # Bind the compare first so it is ALWAYS evaluated: folding it behind the
-            # `first_break is None` test would short-circuit the comparator once a break is known.
-            row_ok = hmac.compare_digest(audit_mac_bytes(r["row_hash"]), audit_mac_bytes(expected))
-            if not row_ok and first_break is None:
-                first_break = int(r["id"])
-            # Chain from the STORED hash (not `expected`) so a divergence is reported once, at its own
-            # row, instead of cascading a false break onto every successor.
-            prev = r["row_hash"] or ""
-            count += 1
-            # BACKLOG #328: remember the head AT the recorded prefix position, in this same pass. A
-            # POSITION test, not a data-dependent branch, so it does not reintroduce the early-return
-            # the walk deliberately avoids (ASVS 11.2.4) and costs one comparison per row.
-            if expected_prefix is not None and count == expected_prefix[0]:
-                prefix_head = prev
-        if first_break is not None:
-            return False, f"audit chain broken at row id={first_break}"
-        if expected_anchor is not None:
-            exp_count, exp_head = expected_anchor
-            # Evaluate the head compare UNCONDITIONALLY (not behind `or`): the anchor head is a MAC too,
-            # so it gets the same constant-time treatment, and the comparator count stays independent of
-            # the row count.
-            head_ok = hmac.compare_digest(audit_mac_bytes(prev), audit_mac_bytes(exp_head))
-            if count < exp_count or not head_ok:
-                return (
-                    False,
-                    f"audit log diverges from recorded anchor (have {count} row(s) head {prev[:12]!r}, "
-                    f"expected {exp_count} head {exp_head[:12]!r}) — truncated or rewritten",
-                )
-        if expected_prefix is not None:
-            ok, msg = audit_prefix_verdict(expected_prefix, prefix_head, count)
-            if not ok:
-                return False, msg
-        return True, f"verified {count} audit row(s)"
+        # The walk itself is `verify_audit_rows`, shared by all three backends (BACKLOG #1904): each
+        # keyed row is checked under the key of its OWN range, so a rotation no longer reads as tampering.
+        return verify_audit_rows(
+            await self._audit_rows(AUDIT_ALL_ROWS),
+            keyed_from=self._audit_keyed_from,
+            first_key_id=self._audit_first_key_id,
+            mac_keys=self._audit_mac_keys,
+            mac_fn=self._audit_mac_fn,
+            capable=self._audit_keyed_capable(),
+            expected_anchor=expected_anchor,
+            expected_prefix=expected_prefix,
+        )
 
     async def has_prior_backup_history(self) -> bool:
         """See :meth:`AuditStore.has_prior_backup_history` — ≥1 ``dr_backup`` audit row (the #102 server-DB
