@@ -20,6 +20,18 @@ engine compatibility range.
 [`messagefoundry_webconsole/__init__.py`](../../messagefoundry_webconsole/__init__.py), not from
 this line.**
 
+### Fixed
+- **The uploaded-file browse, resend and delete pages now explain a file the engine refuses under
+  the store key** (`BACKLOG #1169`). Engine PR 1500 made the engine answer `423 Locked` for an
+  uploaded file its store cipher cannot read. These three routes did not handle that status, so the
+  console showed the engine's raw JSON error. Each now returns to the uploaded-files list with a
+  plain notice. The notice says the engine cannot read the file under the store's encryption key.
+  It adds that a file stored as plaintext before the key was turned on stays refused until an
+  administrator runs `messagefoundry rotate-key` with the engine stopped. It never points at the
+  `[store].allow_unmarked_ciphertext` opt-out. Each refusal logs a WARNING with the file id and
+  status only, never the filename. The `404` answers are unchanged, so a refused owner check still
+  reads as a missing file.
+
 ## [0.3.0] — 2026-09-23 — Early Access
 
 **Requires engine 0.4.0. Supported engine UI seam: `75c4117d21fd0b98`**, the value engine 0.4.0
