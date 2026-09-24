@@ -27,6 +27,7 @@ without a real service or network.
 
 from __future__ import annotations
 
+import functools
 import logging
 import threading
 import time
@@ -220,7 +221,7 @@ class StatusPoller:
         scm_reader: Callable[[str], ScmReading] = query_scm_state,
         health_probe: Callable[[httpx.Client], HealthProbe] = probe_health,
         ui_probe: Callable[[httpx.Client], UiProbe] = probe_ui,
-        client_factory: Callable[[str], httpx.Client] = make_probe_client,
+        client_factory: Callable[[str], httpx.Client] | None = None,
         clock: Callable[[], float] = time.monotonic,
         toast_min_interval_s: float = TOAST_MIN_INTERVAL_S,
     ) -> None:
@@ -229,7 +230,11 @@ class StatusPoller:
         self._scm_reader = scm_reader
         self._health_probe = health_probe
         self._ui_probe = ui_probe
-        self._client_factory = client_factory
+        # The default factory carries the config's certificate pin, so a caller that injects its
+        # own factory owns the trust decision too.
+        self._client_factory = client_factory or functools.partial(
+            make_probe_client, cacert=config.engine_cacert
+        )
         self._clock = clock
         self._toast_min_interval_s = toast_min_interval_s
         self._client: httpx.Client | None = None

@@ -16,13 +16,19 @@ No bearer token is ever sent (that would defeat the engine's idle-timeout — CW
 not-a-console boundary). Uses ``httpx`` directly (a base dependency, shared with the apiclient),
 never the authenticating apiclient session.
 
-**TLS.** An engine with ``[api].tls_cert_file`` set serves https on the same loopback bind, so the
-probe client must be able to *verify* that server certificate. It does so against the **OS trust
-store** (``truststore``, a base dependency), mirroring the engine client's default posture in
-:mod:`messagefoundry.apiclient.client` — on a domain-joined box an internal-CA/AD-CS engine cert
-then verifies with no per-machine wrangling, and a self-signed one verifies once the operator
-installs it in the machine's Trusted Root store (the tray is Windows-only, so that store *is* the
-supported pin). Verification is **never** disabled: there is no ``verify=False`` path here, by
+**TLS.** The engine serves https by default (ADR 0172), so the probe client must be able to
+*verify* that server certificate. It trusts one of two things, and never neither:
+
+- **A pinned PEM** (``cacert``) when the config carries one. That is the certificate the engine
+  minted for itself, which no trust store holds, found by
+  :func:`messagefoundry.tray.config.generated_cert_path` or set as ``engine_cacert`` in
+  ``tray.toml``. It becomes the context's ONLY trust anchor, the same way ``cacert`` works in
+  :mod:`messagefoundry.apiclient.client`.
+- **The OS trust store** (``truststore``, a base dependency) otherwise, mirroring the engine
+  client's default posture. On a domain-joined box an internal-CA/AD-CS operator chain then
+  verifies with no per-machine wrangling.
+
+Verification is **never** disabled: there is no ``verify=False`` path here, by
 design, because a probe that trusts anything cannot distinguish the real engine from a
 man-in-the-middle and the tray's whole job is to report which one answered.
 
@@ -43,12 +49,15 @@ which on Windows also reads the machine CA/ROOT stores; see ``auth/oidc_http``).
 from __future__ import annotations
 
 import json
+import logging
 import ssl
 
 import httpx
 
 from messagefoundry.tray.config import is_tls_url
 from messagefoundry.tray.state import HealthProbe, UiProbe
+
+log = logging.getLogger("messagefoundry.tray.probe")
 
 DEFAULT_TIMEOUT_S = 2.0
 
@@ -211,15 +220,30 @@ def probe_ui(client: httpx.Client) -> UiProbe:
     return classify_ui(status_code)
 
 
-def build_verify(engine_url: str) -> ssl.SSLContext | bool:
-    """The ``verify=`` httpx should use for ``engine_url`` — OS-trust-store TLS, or ``True``.
+def build_verify(engine_url: str, cacert: str | None = None) -> ssl.SSLContext | bool:
+    """The ``verify=`` httpx should use for ``engine_url`` — pinned TLS, OS-trust-store TLS, or ``True``.
 
     Only an https URL gets a context: httpx ignores ``verify`` for plaintext http, and building
     one there would make an http-only tray import ``truststore`` for nothing. The ``True`` returned
     for http is httpx's own default, not a relaxation — there is no code path that yields ``False``.
+
+    ``cacert`` pins trust to exactly that PEM. **A pin that cannot be loaded falls back to the OS
+    trust store, which still verifies.** The common cause is a tray started before the engine's
+    first run, when the pair is not minted yet. The client is built once, so that tray reads the
+    engine as down until it is restarted; the warning names the path so the cause is findable.
     """
     if not is_tls_url(engine_url):
         return True
+    if cacert is not None:
+        try:
+            return ssl.create_default_context(cafile=cacert)
+        except (OSError, ssl.SSLError) as exc:
+            log.warning(
+                "cannot load the engine certificate %s (%s); verifying against the OS trust store "
+                "instead. Restart the tray once the engine has minted it.",
+                cacert,
+                exc,
+            )
     # Lazily imported so the http path never pays for it, matching apiclient's convention.
     import truststore
 
@@ -229,7 +253,9 @@ def build_verify(engine_url: str) -> ssl.SSLContext | bool:
     return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 
 
-def make_probe_client(engine_url: str, timeout: float = DEFAULT_TIMEOUT_S) -> httpx.Client:
+def make_probe_client(
+    engine_url: str, timeout: float = DEFAULT_TIMEOUT_S, *, cacert: str | None = None
+) -> httpx.Client:
     """A tokenless httpx client for probing: short timeout, no redirect-follow by default.
 
     Never carries an ``Authorization`` header — the whole point of the tray's boundary. An https
@@ -250,5 +276,5 @@ def make_probe_client(engine_url: str, timeout: float = DEFAULT_TIMEOUT_S) -> ht
         base_url=engine_url.rstrip("/"),
         timeout=timeout,
         follow_redirects=False,
-        verify=build_verify(engine_url),
+        verify=build_verify(engine_url, cacert),
     )

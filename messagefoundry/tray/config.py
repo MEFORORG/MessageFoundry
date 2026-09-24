@@ -19,6 +19,13 @@ engine serve ``https`` on the *same* loopback bind, so "is this engine reachable
 — it accepts ``http`` **and** ``https`` — because that is what actually gates service control and
 Open-Repo (both are local-box operations). Keying monitor-only on the scheme instead made a
 TLS-hardened loopback engine render as unmanageable, punishing the safer configuration.
+
+**Trust is the other half of the scheme, and the tray has to find it.** Since ADR 0172 an engine
+with no ``[api].tls_cert_file`` mints a self-signed pair beside its store database and serves https
+with it. No trust store holds that certificate, so an https URL alone still fails verification and
+renders a running engine as ``DOWN``. :func:`generated_cert_path` finds the minted certificate from
+the same registry hints and settings TOML the scheme comes from, and :class:`TrayConfig` carries it
+as ``engine_cacert`` for :mod:`messagefoundry.tray.probe` to pin.
 """
 
 from __future__ import annotations
@@ -34,7 +41,9 @@ from urllib.parse import urlsplit
 
 from messagefoundry.service_status import is_safe_service_name
 
-DEFAULT_ENGINE_URL = "http://127.0.0.1:8765"
+# https because the engine serves TLS by default (ADR 0172). Plain http is right only behind a
+# declared upstream terminator, and the tray learns that from the engine's settings, not by default.
+DEFAULT_ENGINE_URL = "https://127.0.0.1:8765"
 DEFAULT_SERVICE_NAME = "MessageFoundry"
 DEFAULT_POLL_SECONDS = 5.0
 _POLL_MIN_S = 1.0
@@ -47,6 +56,12 @@ _MAX_PATH_LEN = 4096
 # The engine's own default when `serve --service-config` is absent (see messagefoundry/__main__.py),
 # resolved against the service's working directory — which NSSM records as AppDirectory.
 _DEFAULT_SERVICE_TOML = "messagefoundry.toml"
+# The engine's default [store].path, resolved the same way. The minted pair sits beside it.
+_DEFAULT_STORE_PATH = "messagefoundry.db"
+#: The filename the engine mints its self-signed API certificate to, beside the store database.
+#: A COPY of ``messagefoundry.api.tls._GENERATED_CERT_NAME``: the tray must not import ``api/``
+#: (ADR 0113 keeps it stdlib + httpx). ``tests/test_tray_config.py`` pins the two equal.
+GENERATED_CERT_NAME = "api-generated-cert.pem"
 
 
 @dataclass(frozen=True)
@@ -58,6 +73,8 @@ class TrayConfig:
     repo_path: str | None = None
     poll_seconds: float = DEFAULT_POLL_SECONDS
     log_path: str | None = None
+    #: A PEM the probe pins as its ONLY trust anchor, or ``None`` for the OS trust store.
+    engine_cacert: str | None = None
 
     @property
     def monitor_only(self) -> bool:
@@ -215,6 +232,8 @@ def _iter_options(app_parameters: str, wanted: frozenset[str]) -> Iterator[tuple
 
 _SERVE_BIND_FLAGS = frozenset({"--host", "--port"})
 _SERVE_CONFIG_FLAGS = frozenset({"--service-config"})
+_SERVE_DB_FLAGS = frozenset({"--db"})
+_SERVE_ROOT_FLAGS = frozenset({"--project-root"})
 
 
 def parse_serve_args(app_parameters: str) -> tuple[str | None, int | None]:
@@ -314,18 +333,84 @@ def engine_serves_https(service_toml: dict[str, object] | None) -> bool:
     return api.get("tls_terminated_upstream") is not True
 
 
+def engine_serves_generated_cert(service_toml: dict[str, object] | None) -> bool:
+    """True when the engine's API bind presents the certificate it minted for itself.
+
+    The narrower sibling of :func:`engine_serves_https`: of its two https arms, only the one with
+    no operator chain serves the minted pair. An operator chain is trusted through the OS store,
+    which is where an enterprise or public CA already lives, so the tray pins nothing for it.
+    """
+    api = (service_toml or {}).get("api")
+    if not isinstance(api, dict):
+        return True
+    cert = api.get("tls_cert_file")
+    if isinstance(cert, str) and cert.strip():
+        return False
+    return api.get("tls_terminated_upstream") is not True
+
+
+def generated_cert_path(
+    service_toml: dict[str, object] | None, reg: ServiceRegistryInfo | None
+) -> str | None:
+    """Where the engine keeps its minted API certificate, or ``None`` when the tray cannot tell.
+
+    Mirrors ``serve``: the pair sits in the directory holding the store database, and the store
+    path is ``--db``, else ``[store].path``, else ``messagefoundry.db``. A relative path resolves
+    against the service's working directory, which NSSM records as ``AppDirectory``.
+    ``scripts/service/install-service.ps1`` spells the same rule when it prints its health check.
+
+    **It answers ``None`` rather than guess** when the engine serves an operator chain or speaks
+    plaintext to a proxy, when there is no service entry, and when a relative store path would be
+    anchored under a project root (``--project-root`` or ``[environments].base_dir``), whose own
+    resolution this module does not repeat. ``None`` leaves the probe on the OS trust store, and
+    ``engine_cacert`` in ``tray.toml`` covers any posture this cannot see.
+
+    The inputs are untrusted hints, validated by :func:`_clean_path_hint`. The result is only a
+    path to a trust anchor for a loopback probe; nothing here reads or resolves the file.
+    """
+    if reg is None or not engine_serves_generated_cert(service_toml):
+        return None
+    params = reg.app_parameters or ""
+    store: str | None = None
+    for _key, val in _iter_options(params, _SERVE_DB_FLAGS):
+        store = _clean_path_hint(val) or store
+    if store is None:
+        section = (service_toml or {}).get("store")
+        raw = section.get("path") if isinstance(section, dict) else None
+        store = _clean_path_hint(raw) or _DEFAULT_STORE_PATH
+    path = Path(store)
+    if not path.is_absolute():
+        envs = (service_toml or {}).get("environments")
+        rooted = any(True for _ in _iter_options(params, _SERVE_ROOT_FLAGS)) or (
+            isinstance(envs, dict) and bool(envs.get("base_dir"))
+        )
+        base = _clean_path_hint(reg.app_directory)
+        if rooted or base is None:
+            return None
+        path = Path(base) / path
+    return str(path.parent / GENERATED_CERT_NAME)
+
+
 def compose_config(
     toml_data: dict[str, object] | None,
     reg: ServiceRegistryInfo | None,
     *,
-    engine_tls: bool = False,
+    engine_tls: bool = True,
+    engine_cacert: str | None = None,
 ) -> TrayConfig:
     """Merge built-in defaults ← registry hints ← TOML (TOML wins). Pure.
 
     ``engine_tls`` scheme-corrects the *registry-derived* URL only; an explicit ``engine_url`` in
-    ``tray.toml`` already carries its own scheme and always wins.
+    ``tray.toml`` already carries its own scheme and always wins. It defaults to True for the same
+    reason :func:`engine_serves_https` answers True on no settings: an engine on its defaults mints.
+
+    ``engine_cacert`` is the DERIVED pin (see :func:`generated_cert_path`), and it travels with the
+    derived URL. An explicit ``engine_url`` drops it, because that URL may name a different engine
+    whose certificate the local service's minted PEM would refuse. An explicit ``engine_cacert`` in
+    ``tray.toml`` always wins.
     """
     engine_url = DEFAULT_ENGINE_URL
+    cacert = engine_cacert
     service_name = DEFAULT_SERVICE_NAME
     repo_path: str | None = None
     poll_seconds = DEFAULT_POLL_SECONDS
@@ -345,6 +430,8 @@ def compose_config(
         raw_url = toml_data.get("engine_url")
         if isinstance(raw_url, str) and raw_url:
             engine_url = raw_url
+            cacert = None
+        cacert = _clean_path_hint(toml_data.get("engine_cacert")) or cacert
         raw_name = toml_data.get("service_name")
         if isinstance(raw_name, str) and is_safe_service_name(raw_name):
             service_name = raw_name
@@ -360,6 +447,7 @@ def compose_config(
         repo_path=repo_path,
         poll_seconds=poll_seconds,
         log_path=log_path,
+        engine_cacert=cacert,
     )
 
 
@@ -417,9 +505,14 @@ def load_config(config_dir: Path, reader: RegistryReader | None = None) -> TrayC
         reg = reader.read_service_params(_resolve_service_name(toml_data))
 
     svc_path = service_toml_path(reg)
-    engine_tls = engine_serves_https(_read_toml(svc_path) if svc_path is not None else None)
+    service_toml = _read_toml(svc_path) if svc_path is not None else None
 
-    return compose_config(toml_data, reg, engine_tls=engine_tls)
+    return compose_config(
+        toml_data,
+        reg,
+        engine_tls=engine_serves_https(service_toml),
+        engine_cacert=generated_cert_path(service_toml, reg),
+    )
 
 
 def default_config_dir() -> Path:
@@ -443,9 +536,14 @@ TRAY_TOML_TEMPLATE = """\
 # self-signed pair and serves TLS unless [api].tls_terminated_upstream declares a reverse proxy in
 # front of it. Only a REMOTE host puts the tray in monitor-only mode (service control + Open-Repo
 # disabled — they need the local box).
-# An https engine's certificate is verified against the Windows trust store, so a self-signed
-# engine cert must be installed under Trusted Root Certification Authorities on this machine.
-# engine_url = "http://127.0.0.1:8765"
+# engine_url = "https://127.0.0.1:8765"
+
+# The PEM to trust for an https engine, as its ONLY trust anchor. When unset, the tray finds the
+# certificate the engine minted beside its store database (api-generated-cert.pem) through the
+# service entry. An engine serving your own [api].tls_cert_file is verified against the Windows
+# trust store instead. Set this when the tray cannot find the minted file, or when engine_url above
+# names an engine other than the local service.
+# engine_cacert = 'C:\\ProgramData\\MessageFoundry\\data\\api-generated-cert.pem'
 
 # The NSSM Windows service name the tray shows and controls.
 # service_name = "MessageFoundry"
