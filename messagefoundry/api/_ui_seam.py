@@ -178,9 +178,11 @@ from typing import Any
 #:
 #: ASVS 13.2.1 / BACKLOG #1182: ``SecurityPosture`` gained the additive ``static_credential_hops`` (a
 #: list of the new ``StaticCredentialHopView``) and ``static_credential_hops_scope``, the inventory
-#: of backend hops that present an unchanging credential or none. The nested model joins the
-#: discovered DTO surface, which is what moves the digest. Additive with defaults, so an older
-#: console ignores them. Unnumbered: the ``vN`` labels are retired as identifiers (#1220 above).
+#: of backend hops that present an unchanging credential or none. The two new fields change the
+#: snapshot's ``SecurityPosture`` line, and the nested model joins the discovered DTO surface; each
+#: alone moves the digest. The fields carry defaults, but the console pins exactly one seam
+#: (BACKLOG #279), so an older console refuses this engine at startup rather than ignoring them.
+#: Unnumbered: the ``vN`` labels are retired as identifiers (#1220 above).
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the

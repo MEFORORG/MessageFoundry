@@ -161,6 +161,11 @@ _RESPONSE_FIELD_COLUMN: dict[tuple[str, str], str | None] = {
     # through redact_log_line and cut to 300 characters. Its PERSISTED twin is audit_log.detail
     # (PL-4), not either of the PL-2 `detail` columns this field NAME collides with.
     ("StorePrivilegeView", "detail"): None,
+    # The static-credential inventory (BACKLOG #1182). app.py builds it from the loaded graph and
+    # the service settings, so the route reads no store row. None rates that provenance only. It is
+    # NOT a claim the string is secret-free: for a hop it can carry a peer label built from a
+    # configured URL, and that label does not yet strip every credential a URL can hold.
+    ("StaticCredentialHopView", "detail"): None,
     ("AiPolicy", "reason"): None,  # why the AI policy clamped, derived from config
     ("ConnectionMetadata", "metadata"): None,  # the operator's own connections.toml label table
     # OPEN QUESTION, recorded on BACKLOG #1185 and deliberately NOT ruled here. These two carry a
