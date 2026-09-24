@@ -16,14 +16,16 @@ What this module holds, and why each part is here:
 * **Every published term is refused, by behaviour.** The parsed list is fed through
   ``PasswordPolicy`` rather than compared only to the constant, so "the documented list is used" is
   measured, not inferred.
-* **The spelled count at each publishing site.** ``docs/SECURITY.md`` says "twelve terms" and
-  ``docs/CONFIGURATION.md`` says "The **twelve** terms" and "of the twelve". A thirteenth term would
-  leave those words stale, so they are derived from ``len(CONTEXT_WORDS)``.
+* **The spelled count, where the gate reads it.** The ``docs/SECURITY.md`` lead-in says "twelve
+  terms" and ``docs/CONFIGURATION.md`` says "The **twelve** terms" and "five of the twelve are". A
+  thirteenth term would leave those words stale, so they are derived from ``len(CONTEXT_WORDS)``.
+  One further site is not read; see "What is NOT covered" below.
 * **The refusal names the list.** The message a user sees used to say "application or vendor terms",
   which mis-described the list: several members are generic credential words. It must now name the
   deny-list by the heading a reader can search for.
-* **No setting adds a term.** Both documents say the list is fixed. A tripwire on the settings and
-  policy fields turns that claim red the moment a setting appears.
+* **No setting adds a term.** Both documents say the list is fixed. Every setting reaches the
+  screen through ``PasswordPolicy``, so its field set is pinned: any new field reds here and sends
+  the author to check that claim.
 
 **What is deliberately NOT pinned.** ``docs/CONFIGURATION.md`` also says "five of the twelve are
 generic credential words". Nothing in code classifies the members, so that five cannot be derived:
@@ -64,8 +66,27 @@ _LIST_NAME = "context-word deny-list"
 #: The ``docs/CONFIGURATION.md`` row that republishes the count.
 _CONFIG_ROW_PREFIX = "| `password_check_context` |"
 
-#: The field types ``PasswordPolicy`` may carry. A term list would need a collection type.
-_SCALAR_FIELD_TYPES = frozenset({"bool", "int", "str | None"})
+#: ``PasswordPolicy``'s fields, pinned whole. A name or type filter cannot tell a new term source
+#: apart: ``breach_corpus_file`` is a ``str | None`` path to a word list, so a second one shaped like
+#: it would pass both. A new field must be added here on purpose, after checking the docs' claim.
+_POLICY_FIELDS = frozenset(
+    {
+        "min_length",
+        "require_uppercase",
+        "require_lowercase",
+        "require_digit",
+        "require_symbol",
+        "check_breached",
+        "check_context",
+        "check_username",
+        "breach_corpus_file",
+        "lockout_threshold",
+        "lockout_minutes",
+    }
+)
+#: The row's sub-count sentence, "five of the twelve are ...". Anchored on "are" so an unrelated
+#: "either of the two" is not read as the total, and bold-tolerant because the row bolds numbers.
+_SUBCOUNT_TOTAL = re.compile(r"\b\w+ of the \**(\w+)\**\s+are\b", re.IGNORECASE)
 
 _TERM = re.compile(r"`([^`\s]+)`")
 _NUMBER_WORDS = {
@@ -100,6 +121,12 @@ def _count_word(n: int) -> str:
     return _NUMBER_WORDS[n]
 
 
+def _stale_totals(text: str, n: int) -> list[str]:
+    """Totals in "<k> of the <N> are" phrases that disagree with ``n``, as a word or as digits."""
+    totals = [t.lower() for t in _SUBCOUNT_TOTAL.findall(text)]
+    return [t for t in totals if t != _count_word(n) and t != str(n)]
+
+
 def _heading_and_list(text: str) -> tuple[str, str]:
     """Return ``(intro, list_paragraph)``: the paragraph the heading opens, then the one after it.
 
@@ -123,10 +150,18 @@ def _heading_and_list(text: str) -> tuple[str, str]:
         listed.append(lines[i].strip())
         i += 1
     # A blank line inside the list would end the parse early and blame the doc for terms a reader
-    # can see. Name that cause instead.
-    following = next((line.strip() for line in lines[i:] if line.strip()), "")
-    assert not following.startswith("`"), (
-        f"the published list continues after a blank line ({following!r}); keep it one paragraph"
+    # can see. Name that cause instead. The next paragraph is a continuation only when it is terms
+    # and separators alone; prose that happens to open with a backticked word is not.
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    following: list[str] = []
+    while i < len(lines) and lines[i].strip():
+        following.append(lines[i].strip())
+        i += 1
+    after = " ".join(following)
+    leftover = _TERM.sub("", after).replace(",", " ").split()
+    assert not (_TERM.search(after) and set(leftover) <= {"and"}), (
+        f"the published list continues after a blank line ({after!r}); keep it one paragraph"
     )
     return " ".join(intro), " ".join(listed)
 
@@ -230,15 +265,9 @@ def test_configuration_row_spells_the_count() -> None:
     row = rows[0]
     word = _count_word(len(CONTEXT_WORDS))
     assert f"**{word}** terms" in row, f"the row should say '**{word}** terms': {row!r}"
-    # "of the <N>" names the total too ("five of the twelve"). Only the total is checked here; the
-    # sub-count is not derivable from code, see the module docstring.
-    totals = [t.lower() for t in re.findall(r"\bof the (\w+)\b", row, flags=re.IGNORECASE)]
-    stale = [
-        t
-        for t in totals
-        if (t in _NUMBER_WORDS.values() and t != word)
-        or (t.isdigit() and int(t) != len(CONTEXT_WORDS))
-    ]
+    # "five of the twelve are" names the total too. Only the total is checked; the sub-count is not
+    # derivable from code, see the module docstring.
+    stale = _stale_totals(row, len(CONTEXT_WORDS))
     assert not stale, f"the row states a total of {stale}, but CONTEXT_WORDS holds {word}"
     assert "CONTEXT_WORDS" in row, "the row should name CONTEXT_WORDS as where the list lives"
 
@@ -258,17 +287,15 @@ def test_no_setting_adds_or_removes_a_term() -> None:
     marker = re.compile(r"context|deny|term")
     settings_fields = {f for f in AuthSettings.model_fields if marker.search(f)}
     assert settings_fields == {"password_check_context"}, settings_fields
-    # A name filter alone misses a setting called, say, `password_blocklist`. Every setting reaches
-    # the screen through PasswordPolicy.from_settings, so pin that dataclass's fields and require
-    # each to be a scalar: a term list would have to arrive as a collection-typed field.
-    policy_fields = {f.name: f.type for f in dataclasses.fields(PasswordPolicy)}
-    non_scalar = {n: t for n, t in policy_fields.items() if t not in _SCALAR_FIELD_TYPES}
-    assert not non_scalar, (
-        f"PasswordPolicy gained a non-scalar field {non_scalar}. If it feeds terms into the "
-        "context-word screen, docs/SECURITY.md and docs/CONFIGURATION.md both say no setting adds a "
-        "term, and both must change"
+    # The name filter above misses a setting called, say, `password_blocklist_file`. Every setting
+    # reaches the screen through PasswordPolicy.from_settings, so pin that dataclass's fields whole.
+    policy_fields = {f.name for f in dataclasses.fields(PasswordPolicy)}
+    assert policy_fields == _POLICY_FIELDS, (
+        f"PasswordPolicy fields changed: added {sorted(policy_fields - _POLICY_FIELDS)}, removed "
+        f"{sorted(_POLICY_FIELDS - policy_fields)}. docs/SECURITY.md and docs/CONFIGURATION.md both "
+        "say no setting adds a term to the context-word screen. If a new field does, change both "
+        "documents; either way, update _POLICY_FIELDS"
     )
-    assert {n for n in policy_fields if marker.search(n)} == {"check_context"}, policy_fields
 
 
 # ---------------------------------------------------------------------------------------------
@@ -305,6 +332,7 @@ def test_the_parser_stops_at_the_list() -> None:
         pytest.param(f"{_HEADING} intro.\n\nno backticks here\n", id="list-with-no-terms"),
         pytest.param(f"{_HEADING} intro.\n\n`alpha`, and beta\n", id="bare-word-member"),
         pytest.param(f"{_HEADING} intro.\n\n`alpha`,\n\n`beta`\n", id="list-split-by-blank"),
+        pytest.param(f"{_HEADING} intro.\n\n`alpha`,\n\nand `beta`\n", id="split-with-and"),
         pytest.param("no heading at all\n\n`alpha`\n", id="heading-missing"),
         pytest.param(f"{_HEADING} a.\n\n`alpha`\n\n{_HEADING} b.\n\n`beta`\n", id="heading-twice"),
     ],
@@ -324,3 +352,16 @@ def test_parity_reds_on_a_planted_extra_or_missing_term() -> None:
     missing = _parity_problems(real - {dropped}, CONTEXT_WORDS)
     assert len(missing) == 1 and dropped in missing[0] and "6.1.2" in missing[0]
     assert _parity_problems(set(), CONTEXT_WORDS), "an empty published set must not pass"
+
+
+def test_the_parser_accepts_prose_that_opens_with_a_term() -> None:
+    doc = f"{_HEADING} intro.\n\n`alpha`, `beta`\n\n`alpha` is described in prose here.\n"
+    _, listed = _heading_and_list(doc)
+    assert _parse_terms(listed) == ["alpha", "beta"]
+
+
+def test_the_total_check_can_fire() -> None:
+    assert _stale_totals("five of the twelve are generic", 12) == []
+    assert _stale_totals("five of the **twelve** are generic", 13) == ["twelve"]
+    assert _stale_totals("Five Of The 12 are generic", 13) == ["12"]
+    assert _stale_totals("either of the two screens", 13) == []
