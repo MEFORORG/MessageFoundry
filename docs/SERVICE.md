@@ -480,11 +480,13 @@ accepted and committed was ACKed, and a log-write failure neither loses it nor r
 ## Admin console (in a browser)
 
 This service is **headless**. Operators watch and run it from the **browser web console** served
-same-origin at `/ui` (not part of the service runtime — a separate, version-matched wheel the engine
-mounts in-process). It publishes as its **own** distribution, so install it into the engine venv:
+same-origin at `/ui` (not part of the service runtime — a separate wheel the engine mounts
+in-process). It publishes as its **own** distribution on its own version line. With the console on,
+the engine refuses to start beside a console built for a different UI seam, so match the pair:
+console 0.3.0 for engine 0.4.0. Install it into the engine venv:
 
 ```powershell
-pip install messagefoundry-webconsole                # into the engine venv
+pip install "messagefoundry-webconsole==0.3.0"       # into the engine venv (pairs with engine 0.4.0)
 pip install -e packaging/messagefoundry-webconsole   # or, from a source checkout
 ```
 
@@ -494,7 +496,10 @@ and `[security].serve_web_console = false` turns it off. (`[api].serve_ui` was t
 is now **refused at config load** — [ADR 0118](adr/0118-secure-by-default-security-configuration-section.md)
 moved the console/bind/origin switches into `[security]`.)
 
-Browse to this service's `/ui` (`http://127.0.0.1:8765/ui`) and sign in. See
+Browse to this service's `/ui` (`https://127.0.0.1:8765/ui`) and sign in. The engine always serves
+HTTPS: with no `[api].tls_cert_file` it mints a self-signed certificate on first run, beside the
+store database as `api-generated-cert.pem`, so the browser warns until you import that file into the
+trust store or configure your own certificate. See
 [INSTALL-GUIDE.md](INSTALL-GUIDE.md) → "Launching the admin console". (The former PySide6 desktop
 console was retired — BACKLOG #103.)
 

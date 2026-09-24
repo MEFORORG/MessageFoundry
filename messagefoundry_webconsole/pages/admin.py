@@ -13,7 +13,6 @@ password ``<input>`` — and is never echoed back into a re-rendered form.
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from datetime import UTC, datetime
 
 from messagefoundry.api.auth_models import (
     AdGroupMapEntry,
@@ -26,7 +25,7 @@ from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.permissions import Role
 
 from .._html import Markup, el, page, register_nav, rows_table
-from ._common import _seg
+from ._common import _deadline_stamp, _seg
 
 __all__ = [
     "ad_groups_page",
@@ -43,9 +42,10 @@ def _banner(error: str | None) -> Markup:
     return el("p", error, class_="banner") if error else Markup("")
 
 
-def _deadline_text(ts: float) -> str:
-    """A Unix instant as the console's usual UTC stamp (``audit``/``connections`` use this shape)."""
-    return datetime.fromtimestamp(ts, UTC).strftime("%Y-%m-%d %H:%M:%SZ")
+def _hours_text(hours: float) -> str:
+    """A credential window in words: ``72 hours``, ``1 hour``, ``1,000,000 hours``."""
+    shown = f"{hours:,.0f}" if float(hours).is_integer() else f"{hours:,.2f}".rstrip("0")
+    return f"{shown} hour" if shown == "1" else f"{shown} hours"
 
 
 def _admin_links(active_page: str) -> Markup:
@@ -147,12 +147,24 @@ def user_new_page(
     display_name: str = "",
     email: str = "",
     checked: Iterable[str] = (),
+    credential_window_hours: float | None = None,
 ) -> Markup:
     """The create-user form (an ``unlock`` page: it always opens inside a fresh step-up window).
 
     On a rejected submit the form is re-rendered with the non-secret fields preserved — the password
     field is always empty (a password is never echoed back into markup).
+
+    BACKLOG #1141 (ASVS 6.4.5): the initial password is a must-change credential the login gate
+    expires. This form renders before the account exists, so it can state only the WINDOW, from
+    ``[auth].initial_password_expiry_hours``. The instant itself is on the user's page the submit
+    lands on. ``None`` means the setting is 0 and the credential never expires.
     """
+    hint = "Convey the initial password out-of-band; the user must change it at first sign-in."
+    if credential_window_hours is not None:
+        hint += (
+            f" It stops working {_hours_text(credential_window_hours)} after you create the "
+            "account; the exact time is shown on the next page."
+        )
     form = el(
         "form",
         el("label", "Username", el("input", name="username", value=username, autofocus=True)),
@@ -161,11 +173,7 @@ def user_new_page(
             "Initial password",
             el("input", name="password", type="password", autocomplete="new-password"),
         ),
-        el(
-            "p",
-            "Convey the initial password out-of-band; the user must change it at first sign-in.",
-            class_="muted",
-        ),
+        el("p", hint, class_="muted"),
         el("label", "Display name", el("input", name="display_name", value=display_name)),
         el("label", "Email", el("input", name="email", value=email)),
         el("fieldset", el("legend", "Roles"), *_role_checkboxes(roles, checked)),
@@ -319,6 +327,7 @@ def user_detail_page(
             f"Provider: {user.auth_provider} — {'disabled' if user.disabled else 'active'}",
             class_="muted",
         ),
+        *_pending_credential(user),
         _banner(error),
         el("div", el("h2", "Profile"), profile, class_="card"),
         el("div", el("h2", "Roles"), roles_section, class_="card"),
@@ -327,6 +336,28 @@ def user_detail_page(
         el("p", el("a", "← Users", href="/ui/users")),
         active="users",
     )
+
+
+def _pending_credential(user: UserSummary) -> list[object]:
+    """BACKLOG #1141 (ASVS 6.4.5): the deadline of an admin-issued credential nobody has replaced yet.
+
+    A new account lands here straight from the create form, so this is where the issuing
+    administrator reads when the initial password dies. ``credential_expires_at`` is the engine's
+    enforced instant; nothing renders when it is ``None``, because then no deadline exists.
+    """
+    expires = user.credential_expires_at
+    when = None if expires is None else _deadline_stamp(expires)
+    if when is None:
+        return []
+    return [
+        el(
+            "p",
+            f"The password {user.username} was issued stops working at {when}. Tell "
+            f"{user.username} to sign in and set a password before then, or reset it to issue a "
+            "new one.",
+            class_="muted",
+        )
+    ]
 
 
 def temp_password_page(
@@ -344,11 +375,12 @@ def temp_password_page(
     the sentence is then omitted rather than softened, because a vague one would be worse than none.
     """
     deadline: list[object] = []
-    if expires_at is not None:
+    when = None if expires_at is None else _deadline_stamp(expires_at)
+    if when is not None:
         deadline = [
             el(
                 "p",
-                f"It stops working at {_deadline_text(expires_at)}. Tell {username} to sign in and "
+                f"It stops working at {when}. Tell {username} to sign in and "
                 "set a password before then, or the credential has to be reissued.",
                 class_="muted",
             )

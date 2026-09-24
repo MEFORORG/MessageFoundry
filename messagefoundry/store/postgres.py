@@ -49,7 +49,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import hmac
 import json
 import logging
 import os
@@ -118,11 +117,14 @@ from messagefoundry.store.privilege import (
 from messagefoundry.store.store import (
     _ACTIVE_ALERT_STATUS_SQL,
     _ALERT_SEVERITY_RANK_SQL,
+    AUDIT_ALL_ROWS,
+    AUDIT_KEY_EPOCH_ACTION,
     MESSAGE_EVENT_KINDS,
     NOT_DEPLOYED_EVENT,
     REINGRESS_TARGET_PREFIX,
     AlertInstance,
     AlertSummary,
+    AuditHeadMovedError,
     CapturedResponse,
     ClaimedHeads,
     ClaimProcStatus,
@@ -156,17 +158,23 @@ from messagefoundry.store.store import (
     _alert_summary,
     _finite_cutoff,  # backlog #106: keep-forever cutoff clamp
     _opt_float,
-    audit_mac_bytes,
-    audit_prefix_verdict,
+    audit_active_key_id,
+    audit_append_secret,
+    audit_rekey_when_keyed,
     audit_row_hash,
+    build_audit_mac_keys,
     delivery_key,
     next_lockout_state,
     not_deployed_detail,
     owned_lane_scope,
     password_claim_set,
     require_notify_email,
+    roll_audit_key_range,
     seed_notify_email,
+    settle_audit_ranges,
     should_record_event,
+    verify_audit_rows,
+    warn_unkeyed_audit_chain,
 )
 
 log = logging.getLogger(__name__)
@@ -519,6 +527,10 @@ _SCHEMA: list[str] = [
         id             INTEGER PRIMARY KEY CHECK (id = 1),
         keyed_from_id  BIGINT
     )""",
+    # BACKLOG #1904 (ADR 0193): the audit key the FIRST keyed range is MAC'd under. NULL on a
+    # pre-existing row, reported as a chain that does not record its key (ADR 0193). No-op on a
+    # fresh DB.
+    "ALTER TABLE audit_chain_meta ADD COLUMN IF NOT EXISTS key_id TEXT",
     # Per-key AES-GCM invocation bound (ASVS 11.3.4) — see the SQLite `_SCHEMA` for the
     # reserve-then-spend rationale. One row per key_id; non-secret (a one-way fingerprint
     # plus a counter).
@@ -981,6 +993,15 @@ class PostgresStore:
         # isolated one (ASVS 13.3.3).
         self._audit_mac_fn = audit_mac_fn
         self._audit_keyed_from: int | None = None
+        self._audit_chain_unkeyed = False  # BACKLOG #1905 -- see the SQLite twin
+        # BACKLOG #1904 (ADR 0193): the audit keyring (active AND retired), the first keyed range's key and
+        # the CURRENT range -- see the SQLite twin and `settle_audit_ranges`.
+        self._audit_mac_keys: dict[str, bytes] = build_audit_mac_keys(cipher, audit_mac_key)
+        self._audit_first_key_id: str | None = None
+        self._audit_range_key_id: str | None = None
+        self._audit_range_from: int | None = None
+        self._audit_range_keys: list[str] = []
+        self._audit_ranges_trusted = True
         # #63 message_events verbosity gate ("all"/"errors"/"off"); floor always retained.
         self._message_events = message_events
         self.path = f"{settings.server}/{settings.database}"  # descriptor for db_status
@@ -1769,38 +1790,55 @@ class PostgresStore:
         encrypted store (nothing to re-bless). An existing keyless chain stays keyless until the
         explicit :meth:`rekey_audit_chain` migration — never silent (see the SQLite twin)."""
         async with self._timed_acquire() as conn:
-            row = await conn.fetchrow("SELECT keyed_from_id FROM audit_chain_meta WHERE id=1")
-            if row is not None and row["keyed_from_id"] is not None:
-                self._audit_keyed_from = int(row["keyed_from_id"])
-                return
+            row = await conn.fetchrow(
+                "SELECT keyed_from_id, key_id FROM audit_chain_meta WHERE id=1"
+            )
+        if row is not None and row["keyed_from_id"] is not None:
+            self._audit_keyed_from = int(row["keyed_from_id"])
+            await settle_audit_ranges(self, row["key_id"])  # BACKLOG #1904
+            return
+        async with self._timed_acquire() as conn:
             if not self._audit_keyed_capable():
                 return  # keyless store — the chain stays byte-identical to pre-#190
             cnt = await conn.fetchrow("SELECT COUNT(*) AS n FROM audit_log")
-            if cnt is not None and int(cnt["n"]) == 0:
+            if cnt is None:
+                return  # no count read: never key over rows that may exist
+            rows = int(cnt["n"])
+            if rows == 0:
+                active_id = audit_active_key_id(self._audit_mac_key, self._audit_mac_fn)
                 await conn.execute(
-                    "INSERT INTO audit_chain_meta (id, keyed_from_id) VALUES (1, 1) "
-                    "ON CONFLICT (id) DO UPDATE SET keyed_from_id = EXCLUDED.keyed_from_id"
+                    "INSERT INTO audit_chain_meta (id, keyed_from_id, key_id) VALUES (1, 1, $1) "
+                    "ON CONFLICT (id) DO UPDATE SET keyed_from_id = EXCLUDED.keyed_from_id, "
+                    "key_id = EXCLUDED.key_id",
+                    active_id,
                 )
                 self._audit_keyed_from = 1
+                self._audit_first_key_id = self._audit_range_key_id = active_id
+                self._audit_range_from = 1
+                self._audit_range_keys = [active_id] if active_id is not None else []
+            else:
+                self._audit_chain_unkeyed = True  # BACKLOG #1905: report, never re-key at open
+                warn_unkeyed_audit_chain(log, rows)
+
+    def audit_chain_unkeyed(self) -> bool:
+        """See :meth:`~messagefoundry.store.store.MessageStore.audit_chain_unkeyed` (#1905)."""
+        return self._audit_chain_unkeyed
 
     def _audit_append_mac(self) -> tuple[bytes | None, AuditMacFn | None]:
-        """The ``(key, mac)`` a NEW ``audit_log`` row is hashed with (#190 / ADR 0138) — see the SQLite
-        twin :meth:`~messagefoundry.store.store.MessageStore._audit_append_mac`.
-
-        Prefers the isolated-module MAC (Vault/OpenBao Transit) when present, else the in-heap HMAC key.
-        Fail-closed when the chain is keyed but NEITHER secret is in hand: appending a keyless row above
-        the watermark would make a legitimately-written row read as tampered under a later keyed
-        verify — a FALSE break defeating the #190 guarantee (review major-1; see the SQLite twin)."""
-        if self._audit_keyed_from is None:
-            return None, None  # keyless chain — byte-identical to pre-#190
-        if self._audit_mac_fn is not None:
-            return None, self._audit_mac_fn  # keyed inside the isolated module (Transit)
-        if self._audit_mac_key is not None:
-            return self._audit_mac_key, None  # keyed with the in-heap HMAC key
-        raise RuntimeError(
-            f"audit chain is keyed (from id={self._audit_keyed_from}) but no store encryption key or "
-            "isolated-module MAC is configured; refusing to append a keyless audit row above the watermark"
+        """The ``(key, mac)`` a NEW ``audit_log`` row is hashed with -- :func:`audit_append_secret`,
+        shared by all three backends: keyless below the #190 watermark, else the CURRENT range's key
+        (BACKLOG #1904), failing closed when that key is not held. See the SQLite twin."""
+        return audit_append_secret(
+            keyed_from=self._audit_keyed_from,
+            range_key_id=self._audit_range_key_id,
+            mac_keys=self._audit_mac_keys,
+            mac_key=self._audit_mac_key,
+            mac_fn=self._audit_mac_fn,
         )
+
+    async def roll_audit_key_epoch(self) -> tuple[bool, str]:
+        """``rotate-key``'s audit step -- see :func:`roll_audit_key_range` (BACKLOG #1904)."""
+        return await roll_audit_key_range(self)
 
     def _audit_keyed_capable(self) -> bool:
         """Is a keying secret available? — an in-heap HMAC key (``aesgcm`` mode) OR an isolated-module MAC
@@ -1811,26 +1849,58 @@ class PostgresStore:
         self, *, expected_anchor: tuple[int, str] | None = None
     ) -> tuple[bool, str]:
         """Non-silent #190-D migration — enable HMAC keying on an existing keyless chain. Refuses
-        without a DEK, no-op if already keyed, verifies the existing chain first (refusing on any break),
-        then sets the watermark to the next id (never rewrites existing hashes). See the SQLite twin."""
+        without a DEK, verifies the existing chain first (refusing on any break), reports that verify
+        when already keyed (BACKLOG #1904), else sets the watermark to the next id (never rewrites
+        existing hashes). See the SQLite twin."""
         if not self._audit_keyed_capable():
             return False, "no store encryption key/MAC configured; cannot key the audit chain"
-        if self._audit_keyed_from is not None:
-            return True, f"audit chain already keyed from id={self._audit_keyed_from}"
         ok, msg = await self.verify_audit_chain(expected_anchor=expected_anchor)
+        if self._audit_keyed_from is not None:
+            return audit_rekey_when_keyed(self._audit_keyed_from, ok, msg)  # BACKLOG #1904
         if not ok:
             return False, f"refusing to key a broken audit chain: {msg}"
+        active_id = audit_active_key_id(self._audit_mac_key, self._audit_mac_fn)
         async with self._timed_acquire() as conn, conn.transaction():
             await self._advisory_lock(conn, _LOCK_CLASS_AUDIT, _AUDIT_LOCK)
             row = await conn.fetchrow("SELECT COALESCE(MAX(id), 0) AS m FROM audit_log")
             watermark = (int(row["m"]) if row is not None else 0) + 1
             await conn.execute(
-                "INSERT INTO audit_chain_meta (id, keyed_from_id) VALUES (1, $1) "
-                "ON CONFLICT (id) DO UPDATE SET keyed_from_id = EXCLUDED.keyed_from_id",
+                "INSERT INTO audit_chain_meta (id, keyed_from_id, key_id) VALUES (1, $1, $2) "
+                "ON CONFLICT (id) DO UPDATE SET keyed_from_id = EXCLUDED.keyed_from_id, "
+                "key_id = EXCLUDED.key_id",
                 watermark,
+                active_id,
             )
         self._audit_keyed_from = watermark
+        self._audit_first_key_id = self._audit_range_key_id = active_id
+        self._audit_range_from = watermark
+        self._audit_range_keys = [active_id] if active_id is not None else []
+        self._audit_ranges_trusted = True
+        self._audit_chain_unkeyed = False
         return True, f"audit chain keyed from id={watermark}"
+
+    async def _audit_rows(
+        self, from_id: int, *, limit: int | None = None
+    ) -> list[Mapping[str, Any]]:
+        """``AuditRangeHost`` primitive: audit rows with ``id >= from_id``, in id order."""
+        sql = (
+            "SELECT id, ts, actor, action, channel_id, detail, client, row_hash"
+            " FROM audit_log WHERE id >= $1 ORDER BY id"
+        )
+        if limit is not None:
+            rows: list[Mapping[str, Any]] = await self._fetchall(sql + " LIMIT $2", from_id, limit)
+        else:
+            rows = await self._fetchall(sql, from_id)
+        return rows
+
+    async def _audit_range_rows(self, from_id: int) -> list[Mapping[str, Any]]:
+        """``AuditRangeHost`` primitive: every range row at or after ``from_id``, in id order."""
+        rows: list[Mapping[str, Any]] = await self._fetchall(
+            "SELECT id, detail FROM audit_log WHERE action = $1 AND id >= $2 ORDER BY id",
+            AUDIT_KEY_EPOCH_ACTION,
+            from_id,
+        )
+        return rows
 
     async def _encrypt_existing_rows(self) -> None:
         """Encrypt legacy plaintext values in the cipher-covered columns in place when encryption is
@@ -6215,6 +6285,7 @@ class PostgresStore:
         detail: str | None = None,
         client: str | None = None,
         now: float | None = None,
+        expect_prev: str | None = None,
     ) -> None:
         """Append a row to the audit hash chain. H-7: takes the audit-chain advisory lock first, so
         concurrent writers serialize on the read-tail + insert and can't fork the chain.
@@ -6230,6 +6301,8 @@ class PostgresStore:
             await self._advisory_lock(conn, _LOCK_CLASS_AUDIT, _AUDIT_LOCK)
             last = await conn.fetchrow("SELECT row_hash FROM audit_log ORDER BY id DESC LIMIT 1")
             prev = last["row_hash"] if last and last["row_hash"] else ""
+            if expect_prev is not None and prev != expect_prev:
+                raise AuditHeadMovedError(prev)  # BACKLOG #1904: the roll sealed a different head
             # Keyed (in-heap HMAC key or isolated-module Transit MAC) once the #190
             # watermark is set, else keyless.
             _key, _mac = self._audit_append_mac()
@@ -6511,74 +6584,18 @@ class PostgresStore:
         anchor head are compared with :func:`hmac.compare_digest` over
         :func:`~messagefoundry.store.store.audit_mac_bytes`, and the walk always completes before the
         first divergent row id is reported."""
-        if self._audit_keyed_from is not None and not self._audit_keyed_capable():
-            return (
-                False,
-                "audit chain is keyed (from id="
-                f"{self._audit_keyed_from}) but no store encryption key/MAC is configured to verify it",
-            )
-        rows = await self._fetchall(
-            "SELECT id, ts, actor, action, channel_id, detail, client, row_hash"
-            " FROM audit_log ORDER BY id"
+        # The walk is `verify_audit_rows`, shared by all three backends (BACKLOG #1904): each keyed row
+        # is checked under the key of its OWN range, so a rotation no longer reads as tampering.
+        return verify_audit_rows(
+            await self._audit_rows(AUDIT_ALL_ROWS),
+            keyed_from=self._audit_keyed_from,
+            first_key_id=self._audit_first_key_id,
+            mac_keys=self._audit_mac_keys,
+            mac_fn=self._audit_mac_fn,
+            capable=self._audit_keyed_capable(),
+            expected_anchor=expected_anchor,
+            expected_prefix=expected_prefix,
         )
-        prev = ""
-        count = 0
-        first_break: int | None = None
-        #: Head as it stood AT ``expected_prefix[0]`` rows; None when the walk never reached that
-        #: position, which IS the truncation case (BACKLOG #328). See the SQLite twin.
-        prefix_head: str | None = None
-        for r in rows:
-            # Per-row secret: keyless below the #190 watermark, keyed at/above it — in-heap HMAC key OR
-            # isolated-module Transit MAC (ADR 0138), mirroring the SQLite twin so a keyless prefix and a
-            # keyed suffix both verify across an enabled-keying migration.
-            keyed_row = (
-                self._audit_keyed_from is not None and int(r["id"]) >= self._audit_keyed_from
-            )
-            key = self._audit_mac_key if (keyed_row and self._audit_mac_fn is None) else None
-            mac = self._audit_mac_fn if keyed_row else None
-            expected = audit_row_hash(
-                prev,
-                ts=r["ts"],
-                actor=r["actor"],
-                action=r["action"],
-                channel_id=r["channel_id"],
-                detail=r["detail"],
-                # NULL on every pre-ADR-0150 row → the conditional 7th element is omitted and the
-                # legacy digest reproduces exactly, so a mixed old/new chain verifies end to end.
-                client=r["client"],
-                key=key,
-                mac=mac,
-            )
-            # ASVS 11.2.4: constant-time compare, no data-dependent early return — record the first
-            # divergent row and report it AFTER the full walk (see the SQLite twin).
-            # Bind the compare first so it is ALWAYS evaluated: folding it behind the
-            # `first_break is None` test would short-circuit the comparator once a break is known.
-            row_ok = hmac.compare_digest(audit_mac_bytes(r["row_hash"]), audit_mac_bytes(expected))
-            if not row_ok and first_break is None:
-                first_break = int(r["id"])
-            prev = r["row_hash"] or ""
-            count += 1
-            # BACKLOG #328: capture the head AT the recorded prefix position in this same pass. A
-            # POSITION test, not a data-dependent branch, so it does not reintroduce the early return
-            # this walk deliberately avoids.
-            if expected_prefix is not None and count == expected_prefix[0]:
-                prefix_head = prev
-        if first_break is not None:
-            return False, f"audit chain broken at row id={first_break}"
-        if expected_anchor is not None:
-            exp_count, exp_head = expected_anchor
-            head_ok = hmac.compare_digest(audit_mac_bytes(prev), audit_mac_bytes(exp_head))
-            if count < exp_count or not head_ok:
-                return (
-                    False,
-                    f"audit log diverges from recorded anchor (have {count} row(s) head {prev[:12]!r}, "
-                    f"expected {exp_count} head {exp_head[:12]!r}) — truncated or rewritten",
-                )
-        if expected_prefix is not None:
-            ok, msg = audit_prefix_verdict(expected_prefix, prefix_head, count)
-            if not ok:
-                return False, msg
-        return True, f"verified {count} audit row(s)"
 
     # --- auth: users / roles / sessions --------------------------------------
 
