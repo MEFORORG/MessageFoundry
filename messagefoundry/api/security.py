@@ -14,6 +14,7 @@ raising, so the caller can close the socket cleanly).
 
 from __future__ import annotations
 
+import datetime
 import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -23,7 +24,7 @@ from fastapi import HTTPException, Request, WebSocket, status
 
 from messagefoundry.api.tls_client_cert import MF_CLIENT_PEERCERT_STATE_KEY
 from messagefoundry.auth import AuthProvider, Identity, Permission, Role
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import BOOTSTRAP_USERNAME, AuthService
 from messagefoundry.config.tls_policy import HopDisposition
 
 # Re-imported, not redefined. The cert->principal mapping now lives in the neutral package-root leaf
@@ -34,6 +35,7 @@ from messagefoundry.config.tls_policy import HopDisposition
 from messagefoundry.credential import client_cert_principal
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cert_expiry import peer_cert_expiry
+from messagefoundry.store.store import UserRecord
 
 log = logging.getLogger(__name__)
 
@@ -176,6 +178,62 @@ def get_auth(request: Request) -> AuthService | None:
     return auth
 
 
+def pending_credential_deadline(auth: AuthService, user: UserRecord | None) -> float | None:
+    """The instant this account's admin-issued must-change credential stops working, or ``None``.
+
+    BACKLOG #1141 (ASVS 6.4.5). Every route-layer surface that states the deadline of an unclaimed
+    credential reads it HERE, so each one states the instant the login gate refuses on. The gate
+    refuses when ``must_change_password`` is set and ``now`` is past
+    :meth:`AuthService.initial_credential_deadline` of the STORED ``password_changed_at``. This
+    mirrors both halves of that test and reads no clock of its own. ``None`` means the gate never
+    refuses this credential on time: no such user, a password the holder chose, or
+    ``[auth].initial_password_expiry_hours`` set to 0.
+
+    **The never-claimed first-run bootstrap account gets ``None`` here, on purpose.** WP-3 can retire
+    that ACCOUNT earlier than this CREDENTIAL bound (``bootstrap_expiry_hours`` set shorter), and it
+    is retired outright once a second administrator exists. ``bootstrap-admin.txt`` and the lifespan
+    reminder already state the earlier of the two. Stating the credential bound alone would name a
+    later instant than the real one. The recorded ``password_claimed_at`` stamp is the test, so an
+    ``admin`` account claimed long ago and then reset by another administrator still gets its
+    deadline. The complete answer, one service method that the gate itself calls and that takes the
+    earlier bound, belongs in ``AuthService``.
+    """
+    if user is None or not user.must_change_password:
+        return None
+    if user.username == BOOTSTRAP_USERNAME and user.password_claimed_at is None:
+        return None
+    return auth.initial_credential_deadline(user.password_changed_at)
+
+
+async def pending_credential_deadline_for(auth: AuthService, user_id: str) -> float | None:
+    """:func:`pending_credential_deadline` for an account named by id (one store read)."""
+    return pending_credential_deadline(auth, await auth.store.get_user(user_id))
+
+
+def initial_credential_window_hours(auth: AuthService) -> float | None:
+    """How long a newly issued must-change credential lives, in hours, or ``None`` for no expiry.
+
+    For text shown BEFORE the credential exists (the create-user form), when there is no stored stamp
+    to anchor an instant to yet. It asks :meth:`AuthService.initial_credential_deadline` for the
+    deadline of a credential stamped at the epoch, so the window comes from the same arithmetic the
+    gate uses rather than from a second read of the setting.
+    """
+    deadline = auth.initial_credential_deadline(0.0)
+    return None if deadline is None else deadline / 3600.0
+
+
+def deadline_utc(ts: float) -> str | None:
+    """A deadline instant as a UTC ISO-8601 stamp, for text a client shows to a person.
+
+    ``None`` when the instant cannot be rendered. The expiry setting has no upper bound, and
+    ``fromtimestamp`` raises past year 9999, or past year 3000 on Windows. A deadline that far out
+    is not worth a 500 on the refusal that states it, so the caller drops the sentence instead."""
+    try:
+        return datetime.datetime.fromtimestamp(ts, datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 def _allow_no_auth(app_state: object) -> bool:
     """Whether this app explicitly opted out of auth (embedding/dev). Default: fail-closed."""
     return bool(getattr(app_state, "allow_no_auth", False))
@@ -235,6 +293,14 @@ def client_ip(conn: Request | WebSocket) -> str | None:
     return conn.client.host if conn.client else None
 
 
+def _password_change_required(deadline: float | None) -> str:
+    """The 403 detail for a must-change session, naming the credential's deadline when it has one."""
+    when = None if deadline is None else deadline_utc(deadline)
+    if when is None:
+        return "password change required"
+    return f"password change required; the temporary password stops working at {when}"
+
+
 def require(
     *permissions: Permission, mfa_gate: bool = True
 ) -> Callable[[Request], Awaitable[Identity]]:
@@ -263,7 +329,16 @@ def require(
         if identity is None:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "not authenticated")
         if identity.must_change_password and request.url.path not in _MUST_CHANGE_EXEMPT_PATHS:
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "password change required")
+            # BACKLOG #1141 (ASVS 6.4.5): this refusal is the renewal instruction every non-browser
+            # caller receives, so it states when the credential dies. The detail stays a string that
+            # STARTS with the old text, because clients match on it as a substring
+            # (``ide/src/engineStatusModel.ts`` ``classifyForbidden``).
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                _password_change_required(
+                    await pending_credential_deadline_for(auth, identity.user_id)
+                ),
+            )
         # ASVS 6.3.3 — MFA is an ACCESS gate, not only a step-up gate. Ordering is load-bearing in
         # BOTH directions. must_change stays FIRST: a fresh account is must_change AND mfa_pending at
         # the same instant, and GET /me/mfa is MFA-exempt but NOT must-change-exempt, so leading with
