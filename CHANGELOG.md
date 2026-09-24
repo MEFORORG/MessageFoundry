@@ -6,7 +6,54 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- **BREAKING — the config loader refuses a connection name that does not match
+  `^[A-Za-z][A-Za-z0-9_-]{0,255}$`.** In 0.4.0 such a name still loaded and ran, and only the API
+  refused it. Now a code-first `inbound()` or `outbound()` call, or a `connections.toml` entry,
+  carrying one fails the whole load with a `WiringError` that names it. The `connections.toml`
+  editor and the rename planner refuse it before writing, and the Corepoint importer folds a
+  generated connection name that would fail it. **Migration:** rename such connections to fit the pattern;
+  stored history stays under the old name. ([BACKLOG #1107](docs/BACKLOG.md))
+### Fixed
+- **The DICOM C-STORE SCP no longer answers Success for an object the engine does not accept.**
+  The SCP's `max_object_bytes` defaults to 128 MiB, but the engine's binary ingress records any
+  object over 16 MiB as `ERROR` and never processes it. So an object between 16 and 128 MiB was
+  answered Success and dropped: the modality believed it delivered and would not re-send it. Two
+  changes close this. The SCP now caps objects at the smaller of `max_object_bytes` and the 16 MiB
+  ingress ceiling, including when `max_object_bytes` is `0`/`None`, and refuses a larger one with
+  Out of Resources (`0xA700`) before any commit. Like the SCP's other pre-commit refusals, that
+  object is logged and not recorded as a message; it used to leave an `ERROR` row. And whenever the engine's ingress refuses an object
+  the SCP passed, the SCP now answers Cannot Understand (`0xC000`) instead of Success; the `ERROR`
+  record is kept. **Behaviour change for a sending modality:** an object over 16 MiB now gets a
+  failure status where it used to get Success. A `max_object_bytes` above 16 MiB no longer raises
+  the SCP's limit; the outbound SCU's use of the key, and the SCP's pre-decode inflate bound for a
+  deflated object, are unchanged. (`BACKLOG #1910`)
 ### Security
+- **BREAKING: the `Http()` inbound listener now refuses any `Transfer-Encoding`, not only
+  `chunked`.** The listener decodes no transfer coding. In 0.4.0 it refused the header only when its
+  whole value was `chunked`. A coding list such as `gzip, chunked` got through, and so did `chunked,`
+  and `identity`. The listener then read the body raw. If the sender closed its side, that body was
+  stored as the message. A `GET` or `HEAD` carrying `Transfer-Encoding` was also accepted. Now the
+  listener refuses any `Transfer-Encoding` with `400`, on every method. It refuses before it reads a
+  body byte. It also refuses a header named `Transfer_Encoding` or `Content_Length`. A front end that
+  swaps `_` for `-` would read either one as real framing. A request with both `Transfer-Encoding`
+  and `Content-Length` was already refused and still is. Each refusal is logged as a `framing_error`
+  connection event and writes no ingress row. **A deploying sender that sets `Transfer-Encoding`
+  would be refused**, and must send a `Content-Length` instead.
+  ([BACKLOG #1125](docs/BACKLOG.md), [BACKLOG #1913](docs/BACKLOG.md))
+- **BREAKING: the `Http()` inbound listener reads request framing more strictly.** A `POST`, `PUT`
+  or `PATCH` with no `Content-Length` is now refused with `411`. In 0.4.0 the listener read such a
+  request to the end of the connection and stored what it got. A non-zero `Content-Length` is now
+  refused with `400` on every method other than `POST`, `PUT` and `PATCH`. A lowercase method such
+  as `post` is no longer treated as `POST`. The header grammar is stricter too. It refuses with `400`
+  at least these shapes:
+  - a bare LF or CR;
+  - a folded header line;
+  - space before the colon;
+  - a `Content-Length` such as `+3` or `1_0`;
+  - any HTTP version other than 1.x.
+
+  **A deploying sender relying on any of these would be refused.** ([BACKLOG #1125](docs/BACKLOG.md))
 - **OIDC sign-in now bounds how old the IdP's authentication may be.** A new setting,
   `[auth].oidc_max_age_seconds`, is sent as `max_age` on every authorization request. It defaults
   to 43200 seconds (12 hours), accepts 300 to 86400, and has no off switch. The engine now requires
@@ -15,10 +62,25 @@ All notable changes to MessageFoundry are documented here. The format follows
   the `id_token` `exp`, and the configured session caps. **A deploying site whose IdP does not return
   `auth_time` would have every federated sign-in refused**; that is spec-correct and deliberate.
   Federation still ships off (`oidc_enabled = false`). ([BACKLOG #296](docs/BACKLOG.md))
+### Fixed
+- **The startup ERROR for an unusable bundled breach corpus now says a first `serve` still creates
+  the bootstrap admin, whose forced password change that corpus would refuse.** It also says
+  `provision-admin` fails for the same reason, where the deadline is, and that changing
+  `password_check_breached` needs a restart (BACKLOG #1886).
 - **The OIDC token endpoint and JWKS legs now carry the posture-keyed revocation guard (BACKLOG
   #1887, ADR 0173 section 4.3).** Each leg is guarded on its own host. An enforcing instance whose
   off-box identity provider has no `[auth].oidc_tls_crl_file` would refuse to start on first
   deployment.
+- **BREAKING: `deflate_decompress` now refuses any bytes after the end of the stream, and no longer
+  hangs on them.** Its bounded loop never checked for the end of the stream. Take a stream whose
+  output needs more than one 64 KiB round, and add one byte after it. The loop spun forever and the
+  ceiling never fired. On first deployment, a Handler inflating an untrusted body would hang its
+  transform worker. A shorter stream returned its output and dropped the extra bytes without a
+  word. Both now raise `CompressionError`. Stdlib `zlib.decompress` ignores such bytes, so a Handler
+  that expects a trailer should strip it first. The loop now feeds its input one 64 KiB window at a
+  time, so it runs in linear time, not quadratic. A bomb now stops at the ceiling, not up to one
+  window past it. `gzip_decompress` and `zip_decompress` do not use this loop and are unchanged.
+  ([BACKLOG #1964](docs/BACKLOG.md))
 ### Changed
 - **`messagefoundry dryrun` and `messagefoundry check` now refuse an oversized fixture file.** The
   cap is `MAX_FIXTURE_FILE_BYTES`, which defaults to `DEFAULT_MAX_MESSAGE_BYTES` (16 MiB) and rises
@@ -56,6 +118,24 @@ All notable changes to MessageFoundry are documented here. The format follows
   hop's detail names its peer as scheme, host and port only. **BREAKING for anything that parses
   `check` output:** the `static-db-credentials` check line is renamed `static-credentials`, because it
   now covers every backend hop and not only database hops. ([BACKLOG #1182](docs/BACKLOG.md))
+- **BREAKING — an operator resend now meets the target inbound's ingress guards.** `POST
+  /uploads/{file_id}/resend` and `POST /messages/{message_id}/edit-resend` wrote the stage row
+  directly, so the inbound's size ceiling and declared-type checks never ran on them. An uploaded file
+  may be 25 MiB by default, so a single message larger than the 16 MiB ingress ceiling could be
+  injected into any inbound, and an HL7 message could be injected into a JSON one. Both routes now
+  run the listener's checks first, at least: the size ceiling (an HL7 inbound's own lower
+  `max_message_bytes`, never above 16 MiB), `Peek.parse` for HL7 or the declared-type sniff for
+  another type, the NUL rule, and a check that the inbound's charset can hold the text. A refusal
+  answers 413, 415 or 422, writes an `upload.resend_reject` or `message_edit_resend_reject` audit
+  row, and writes no message. **A resend that 0.4.0 accepted can now be refused**: an oversize body,
+  a body that does not match the inbound's declared type, or an HL7 body `Peek.parse` rejects.
+  An admitted body is committed in the listener's form: HL7 with `\r` line endings, and a binary
+  inbound's body as `mfb64:v1:` carriage. Strict `hl7apy` validation is still not run on a
+  resubmission. A re-route whose origin inbound this engine does not hold (removed, or owned by
+  another engine shard) is now refused with 409 rather than written unchecked. The edit-resend
+  direct path (`to` set) writes an outbound row, so only the NUL rule applies there in practice; its
+  body is already held below 16 MiB by the 1 MiB request cap. The web console shows an uploaded-log
+  resend refused this way as its own notice. ([BACKLOG #1911](docs/BACKLOG.md))
 - **A keyed store now refuses an unmarked value in an encrypted column instead of reading it back
   as plaintext.** Once a store key is set, every covered column holds only `mfenc:` ciphertext, so
   a non-blank value without the marker is a stripped marker or a planted row. The cipher raises

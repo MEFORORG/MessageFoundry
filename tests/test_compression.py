@@ -12,11 +12,17 @@ from __future__ import annotations
 import gzip
 import io
 import os
+import random
+import threading
 import time
 import zipfile
+import zlib
+from collections.abc import Callable
+from types import SimpleNamespace
 
 import pytest
 
+from messagefoundry.parsing import compression
 from messagefoundry.parsing.compression import (
     CompressionError,
     deflate_compress,
@@ -427,3 +433,218 @@ def test_zip_directory_entries_still_count_toward_member_cap() -> None:
         zf.writestr("d/a.txt", b"payload")
     with pytest.raises(CompressionError, match="3 members, over the 2-member cap"):
         zip_decompress(archive.getvalue(), max_output_bytes=None, max_entries=2)
+
+
+# --- #1964: the bounded inflate stops at the end of the stream -----------------
+
+# The Lander's reproduction: an all-zero body whose output needs more than one output round.
+_MULTI_ROUND = b"\x00" * (3 * compression._CHUNK)
+_CAP = 16 * 1024 * 1024
+
+
+def _returns_within[T](fn: Callable[[], T], seconds: float = 10.0) -> T:
+    """Run ``fn`` on a worker thread and fail, rather than hang, if it has not returned in time.
+
+    The defect is an endless loop, so the test must not rely on the call returning. A daemon thread
+    lets the assertion fire while a regressed loop keeps spinning in the background until exit.
+    """
+    outcome: list[T | BaseException] = []
+
+    def target() -> None:
+        try:
+            outcome.append(fn())
+        except BaseException as exc:  # handed back to the test thread below, never swallowed
+            outcome.append(exc)
+
+    worker = threading.Thread(target=target, daemon=True)
+    worker.start()
+    worker.join(seconds)
+    assert outcome, f"did not return within {seconds}s: the inflate loop never ended (#1964)"
+    result = outcome[0]
+    if isinstance(result, BaseException):
+        raise result
+    return result
+
+
+@pytest.mark.timeout(30)
+def test_deflate_multi_round_stream_with_a_trailing_byte_is_refused() -> None:  # #1964
+    stream = zlib.compress(_MULTI_ROUND) + b"X"
+    with pytest.raises(CompressionError, match="trailing data after the end of the deflate stream"):
+        _returns_within(lambda: deflate_decompress(stream, max_output_bytes=_CAP))
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize(
+    "trailing",
+    [b"X", b"\x00", zlib.compress(b"second stream")],
+    ids=["byte", "nul-pad", "second-stream"],
+)
+@pytest.mark.parametrize("body", [b"\x00" * 100, _MULTI_ROUND], ids=["one-round", "multi-round"])
+def test_deflate_refuses_any_bytes_after_the_end_of_the_stream(
+    body: bytes, trailing: bytes
+) -> None:  # #1964
+    # One rule for every shape. The one-round case used to return the body and drop the trailing
+    # bytes without a word, which is accept-and-drop; the multi-round case used to hang.
+    stream = zlib.compress(body) + trailing
+    with pytest.raises(CompressionError, match="trailing data"):
+        _returns_within(lambda: deflate_decompress(stream, max_output_bytes=None))
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize("cap", [1024, len(_MULTI_ROUND) - 1], ids=["early", "on-the-last-round"])
+def test_deflate_ceiling_still_fires_before_the_trailing_check(cap: int) -> None:  # #1964
+    # Over the ceiling with junk after it is refused as over the ceiling. "on-the-last-round" crosses
+    # the cap in the same round that reaches the end of the stream, so it pins the order of the two
+    # checks, not only that the ceiling fires early on a bomb.
+    stream = zlib.compress(_MULTI_ROUND) + b"X"
+    with pytest.raises(CompressionError, match="ceiling"):
+        _returns_within(lambda: deflate_decompress(stream, max_output_bytes=cap))
+
+
+def _stored_stream_of_exact_length(length: int) -> bytes:
+    # Level 0 stores the payload, so the stream length moves one byte per payload byte.
+    rng = random.Random(length)
+    for size in range(length - 64, length):
+        stream = zlib.compress(rng.randbytes(size), 0)
+        if len(stream) == length:
+            return stream
+    raise AssertionError(f"no stored stream of exactly {length} bytes")
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize("windows", [1, 2])
+def test_deflate_trailing_data_on_a_window_boundary(windows: int) -> None:  # #1964
+    # A stream that ends exactly on an input window leaves nothing in that window, so only the
+    # "a later window exists" half of the trailing check can see the extra byte.
+    stream = _stored_stream_of_exact_length(windows * compression._CHUNK)
+    assert len(_returns_within(lambda: deflate_decompress(stream, max_output_bytes=None))) > 0
+    with pytest.raises(CompressionError, match="trailing data"):
+        _returns_within(lambda: deflate_decompress(stream + b"Z", max_output_bytes=None))
+
+
+@pytest.mark.parametrize(
+    "data, cap",
+    [
+        (zlib.compress(b"\x00" * 300_000), 1000),
+        (b"\xff\xff\xff\xff not deflate", None),
+        (zlib.compress(b"hello") + b"X", None),
+    ],
+    ids=["ceiling", "corrupt", "trailing"],
+)
+def test_deflate_error_leaves_a_bytearray_resizable(data: bytes, cap: int | None) -> None:  # #1964
+    # A caller that keeps the error must still be able to grow its own buffer. A memoryview window
+    # held by the raising frame would pin the buffer and make extend() raise BufferError. The
+    # signature says bytes, but nothing stops a Handler passing a bytearray at run time.
+    buf = bytearray(data)
+    with pytest.raises(CompressionError) as caught:
+        deflate_decompress(buf, max_output_bytes=cap)  # type: ignore[arg-type]
+    assert caught.value.__traceback__ is not None  # the raising frame is still reachable here
+    buf.extend(b"more")
+
+
+def test_deflate_bomb_stops_at_the_ceiling_not_a_window_past_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # #1964
+    # The module promises a bomb is refused after producing at most the ceiling. Asking zlib for a
+    # whole window each round would overshoot a small ceiling by up to one window.
+    produced: list[int] = []
+    real = zlib.decompressobj
+
+    class _Counting:
+        def __init__(self, *, wbits: int) -> None:
+            self._inner = real(wbits=wbits)
+
+        def decompress(self, data: bytes, max_length: int = 0) -> bytes:
+            piece = self._inner.decompress(data, max_length)
+            produced.append(len(piece))
+            return piece
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._inner, name)
+
+    monkeypatch.setattr(
+        compression, "zlib", SimpleNamespace(decompressobj=_Counting, error=zlib.error)
+    )
+    with pytest.raises(CompressionError, match="ceiling"):
+        deflate_decompress(zlib.compress(_MULTI_ROUND), max_output_bytes=1024)
+    assert sum(produced) == 1025
+
+
+def test_deflate_stream_spanning_many_input_windows() -> None:  # #1964
+    # Level 0 does not compress, so the stream is many 64 KiB input windows long. The exact size
+    # passes and one byte less is refused, so the windowed loop neither loses nor double-counts.
+    payload = random.Random(1964).randbytes(1024 * 1024 + 7)
+    stream = zlib.compress(payload, 0)
+    assert deflate_decompress(stream, max_output_bytes=len(payload)) == payload
+    with pytest.raises(CompressionError, match="ceiling"):
+        deflate_decompress(stream, max_output_bytes=len(payload) - 1)
+
+
+def test_deflate_feeds_each_input_byte_a_bounded_number_of_times(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # #1964
+    # Handing zlib the whole remaining input every round copies it every round, which is quadratic
+    # in the compressed size. Count the bytes fed rather than time the call, so the test is exact.
+    fed: list[int] = []
+
+    class _Recording:
+        def __init__(self, *, wbits: int) -> None:
+            self._inner = zlib.decompressobj(wbits=wbits)
+
+        def decompress(self, data: bytes, max_length: int = 0) -> bytes:
+            fed.append(len(data))
+            return self._inner.decompress(data, max_length)
+
+        def flush(self) -> bytes:
+            return self._inner.flush()
+
+        @property
+        def eof(self) -> bool:
+            return self._inner.eof
+
+        @property
+        def unconsumed_tail(self) -> bytes:
+            return self._inner.unconsumed_tail
+
+        @property
+        def unused_data(self) -> bytes:
+            return self._inner.unused_data
+
+    monkeypatch.setattr(
+        compression, "zlib", SimpleNamespace(decompressobj=_Recording, error=zlib.error)
+    )
+    payload = random.Random(1964).randbytes(4 * 1024 * 1024)
+    stream = zlib.compress(payload, 0)
+    assert deflate_decompress(stream, max_output_bytes=None) == payload
+    # Quadratic feeding hands zlib about len(stream) ** 2 / (2 * 64 KiB) bytes, about 128 MiB here.
+    assert sum(fed) <= 3 * len(stream), f"fed {sum(fed)} bytes for a {len(stream)}-byte stream"
+
+
+@pytest.mark.timeout(30)
+def test_gzip_multi_round_member_with_trailing_bytes_ends() -> None:  # #1964
+    # GzipFile runs its own loop. Pin that it ends on the same shape: a non-NUL byte is refused as
+    # a bad next member, and NUL padding is accepted, which is the stdlib gzip rule.
+    member = gzip_compress(_MULTI_ROUND)
+    with pytest.raises(CompressionError, match="corrupt"):
+        _returns_within(lambda: gzip_decompress(member + b"X", max_output_bytes=_CAP))
+    assert (
+        _returns_within(lambda: gzip_decompress(member + b"\x00" * 8, max_output_bytes=_CAP))
+        == _MULTI_ROUND
+    )
+
+
+@pytest.mark.timeout(30)
+def test_zip_multi_round_member_with_trailing_bytes_ends() -> None:  # #1964
+    # zipfile runs its own loop, bounded by each member's compressed size. Pin only that it ends.
+    # Whether bytes after the archive should be refused, as deflate now does, is a separate question
+    # and deliberately not pinned here.
+    archive = zip_compress({"a.bin": _MULTI_ROUND}) + b"X"
+
+    def call() -> object:
+        # Returned, not raised, so a prompt refusal also counts as ending.
+        try:
+            return zip_decompress(archive, max_output_bytes=_CAP)
+        except CompressionError:
+            return "refused"
+
+    _returns_within(call)

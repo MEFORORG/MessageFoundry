@@ -107,7 +107,7 @@ def _warn_if_corpus_unreadable(path: str | None) -> None:
 
 def _error_if_bundled_corpus_unusable(check_breached: bool) -> None:
     """Eagerly load (and cache) the BUNDLED breach corpus at startup, so a truncated or missing file
-    surfaces in the log at boot rather than as a 500 on somebody's first password change (BACKLOG
+    surfaces in the log at boot, before anyone meets it as a 500 on a password change (BACKLOG
     #1438). The twin of ``_warn_if_corpus_unreadable`` above, at a higher level for a reason.
 
     The OPERATOR corpus degrades to a warning because it is optional and the bundled list still screens
@@ -121,6 +121,12 @@ def _error_if_bundled_corpus_unusable(check_breached: bool) -> None:
     on its own candidate -- see that call for why. Stated as that ONE path rather than as "nothing
     anywhere": the ``provision-first-administrator`` CLI still halts on this, and uncaught.
 
+    BACKLOG #1886: the message names the forced rotation a first ``serve`` now cannot finish. The
+    chain behind that is stated once, on :class:`BreachCorpusUnavailable`. This runs from
+    ``__init__``, before ``initialize`` decides whether to mint, so the claim is conditional. A
+    repaired file is read without a restart, since ``lru_cache`` does not cache an exception. The
+    setting is read once into ``PasswordPolicy``, so changing it needs a restart.
+
     Skipped when the operator has turned screening off: a corpus nobody consults is not a defect.
     """
     if not check_breached:
@@ -129,9 +135,16 @@ def _error_if_bundled_corpus_unusable(check_breached: bool) -> None:
         entries = _common_passwords()
     except BreachCorpusUnavailable as exc:
         _log.error(
-            "%s; local password creation and change will be REFUSED until it is repaired "
-            "(ASVS 6.2.4). Reinstall the messagefoundry wheel, or set [auth].password_check_breached "
-            "= false to accept unscreened passwords deliberately",
+            "%s; creating or changing a local password by hand will be REFUSED until it is "
+            "repaired (ASVS 6.2.4). An account that must change its password therefore cannot "
+            "finish that change, and the attempt fails with a server error. A `serve` against a "
+            "store with no users still creates the bootstrap admin, and that account must change "
+            "its password. An administrator's password reset leaves its user stuck the same way, "
+            "and `provision-admin` fails for this reason too. Repair the corpus before the deadline "
+            "in bootstrap-admin.txt, and keep that file until the change succeeds. To repair it, "
+            "reinstall the messagefoundry wheel; a repaired file is read without a restart. Or set "
+            "[auth].password_check_breached = false and restart, to accept unscreened passwords "
+            "deliberately",
             exc,
         )
         return

@@ -127,10 +127,7 @@ def gzip_decompress(data: bytes, *, max_output_bytes: int | None) -> bytes:
             # only decompresses enough to satisfy n, so the bomb is never fully expanded in memory.
             out = gz.read(max_output_bytes + 1)
             if len(out) > max_output_bytes:
-                raise CompressionError(
-                    f"gzip stream decompresses beyond the {max_output_bytes}-byte ceiling "
-                    "(possible decompression bomb)"
-                )
+                raise _over_ceiling("gzip", max_output_bytes)
             return out
     except (OSError, EOFError, zlib.error) as exc:
         # EOFError = truncated; OSError/BadGzipFile = corrupt header/trailer; zlib.error = bad DEFLATE.
@@ -151,31 +148,56 @@ def deflate_decompress(data: bytes, *, max_output_bytes: int | None) -> bytes:
     ``max_output_bytes`` is **required** (BACKLOG #1237) — pass an explicit ``None`` to mean "no
     ceiling". See the module docstring for why it has no default.
 
-    Enforced incrementally with a :func:`zlib.decompressobj` ``max_length`` loop. A corrupt / truncated
-    stream or an over-ceiling size raises :class:`CompressionError`."""
+    Enforced incrementally with a :func:`zlib.decompressobj` ``max_length`` loop. It stops at the end
+    of the stream, and its time is linear in the input plus the output. A corrupt or truncated
+    stream, an over-ceiling size, or any bytes after the end of the stream raise
+    :class:`CompressionError` (BACKLOG #1964). Stdlib :func:`zlib.decompress` ignores such bytes. This
+    refuses them, so no part of the input is dropped without a word."""
     _check_ceiling(max_output_bytes)
-    return _bounded_inflate(data, _ZLIB_WBITS, max_output_bytes, label="deflate")
+    return _bounded_inflate(data, max_output_bytes, label="deflate")
 
 
-def _bounded_inflate(data: bytes, wbits: int, max_output_bytes: int | None, *, label: str) -> bytes:
-    d = zlib.decompressobj(wbits=wbits)
+def _over_ceiling(label: str, max_output_bytes: int) -> CompressionError:
+    return CompressionError(
+        f"{label} stream decompresses beyond the {max_output_bytes}-byte ceiling "
+        "(possible decompression bomb)"
+    )
+
+
+def _bounded_inflate(data: bytes, max_output_bytes: int | None, *, label: str) -> bytes:
+    # zlib-wrapped only. The tail rule below is wrong for gzip, which has members and NUL padding.
+    d = zlib.decompressobj(wbits=_ZLIB_WBITS)
     out = bytearray()
-    pending = data
     try:
-        while pending:
-            piece = d.decompress(pending, _CHUNK)
-            # unconsumed_tail is the *compressed* input held back because the output hit _CHUNK — feed
-            # it again next loop. When it is empty, all input was consumed and all output produced.
-            pending = d.unconsumed_tail
-            out += piece
-            if max_output_bytes is not None and len(out) > max_output_bytes:
-                raise CompressionError(
-                    f"{label} stream decompresses beyond the {max_output_bytes}-byte ceiling "
-                    "(possible decompression bomb)"
-                )
+        # Feed the input one window at a time. unconsumed_tail is a copy of the input not yet used,
+        # so handing zlib the whole remainder copies it on every round, which is quadratic in the
+        # compressed size (BACKLOG #1964). Slicing copies each window once, and unlike a memoryview
+        # it leaves no export on a caller's bytearray behind a raised error.
+        for offset in range(0, len(data), _CHUNK):
+            pending = data[offset : offset + _CHUNK]
+            # Stop at the end of the stream too. After it, zlib can keep trailing input in
+            # unconsumed_tail and never use it, so a loop that watches only pending spins forever
+            # without growing the output, and the ceiling never fires (BACKLOG #1964).
+            while pending and not d.eof:
+                # Ask for at most one byte past the ceiling, so a bomb stops at the ceiling itself.
+                room = _CHUNK if max_output_bytes is None else max_output_bytes - len(out) + 1
+                out += d.decompress(pending, min(_CHUNK, room))
+                if max_output_bytes is not None and len(out) > max_output_bytes:
+                    raise _over_ceiling(label, max_output_bytes)
+                pending = d.unconsumed_tail
+            if d.eof:
+                if pending or d.unused_data or offset + _CHUNK < len(data):
+                    # Refused rather than ignored: returning the first stream would drop the rest
+                    # of the input without a word, which is accept-and-drop. A zlib stream has no
+                    # multi-member form and no padding convention, so there is no tail to accept.
+                    raise CompressionError(f"trailing data after the end of the {label} stream")
+                return bytes(out)
+        # The input ran out first. zlib may still hold output for input it has already taken.
         out += d.flush()
     except zlib.error as exc:
         raise CompressionError(f"corrupt or truncated {label} stream: {exc}") from exc
+    if max_output_bytes is not None and len(out) > max_output_bytes:
+        raise _over_ceiling(label, max_output_bytes)
     if not d.eof:
         raise CompressionError(f"truncated {label} stream (input ended mid-stream)")
     return bytes(out)
