@@ -105,7 +105,7 @@ switch, a merge), just **restart** it (elevated):
 
 ```powershell
 & C:\ProgramData\MessageFoundry\bin\nssm.exe restart MessageFoundry
-curl http://127.0.0.1:8765/health
+curl.exe --cacert C:\ProgramData\MessageFoundry\api-generated-cert.pem https://127.0.0.1:8765/health
 ```
 
 Because the install is editable, a restart runs **whatever branch is checked out** in the repo.
@@ -372,7 +372,7 @@ memory **hygiene** is not memory **encryption**.
 ## Verify it's running
 
 ```powershell
-curl http://127.0.0.1:8765/health        # -> {"status":"ok", ...}
+curl.exe --cacert <DataDir>\api-generated-cert.pem https://127.0.0.1:8765/health   # -> {"status":"ok", ...}
 ```
 
 Send a test message and confirm it flows through:

@@ -134,7 +134,7 @@ When the engine runs from somewhere other than the repo root (e.g. under the ser
 Confirm it's up:
 
 ```powershell
-curl http://127.0.0.1:8765/health
+curl.exe --cacert .\api-generated-cert.pem https://127.0.0.1:8765/health
 ```
 
 ### 4. Scaffold your own config repo
@@ -500,7 +500,7 @@ python -m messagefoundry serve --config samples/config --db ./messagefoundry.db 
 Then open the web console in a browser (the engine serves it at `/ui` when `[api].serve_ui` is on):
 
 ```
-http://127.0.0.1:8765/ui
+https://127.0.0.1:8765/ui
 ```
 
 When the engine requires authentication (the default), a **Sign in** form appears first:

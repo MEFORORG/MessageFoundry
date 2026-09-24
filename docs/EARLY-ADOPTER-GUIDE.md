@@ -170,7 +170,7 @@ provenance** and a **Sigstore signature**; check both with the **GitHub CLI** (`
 optionally `sigstore` (`pip install sigstore`). Install **only** the file that passes:
 
 ```powershell
-$V = "0.1.0"   # the exact version you intend to install
+$V = "0.4.0"   # the exact version you intend to install
 
 # Download the wheel + its Sigstore bundle from that release's assets
 gh release download "v$V" --repo MEFORORG/MessageFoundry `
@@ -327,7 +327,7 @@ creation.
 ### 4.6 Verify it runs
 
 ```powershell
-curl http://127.0.0.1:8765/health           # -> {"status":"ok"}
+curl.exe --cacert <DataDir>\api-generated-cert.pem https://127.0.0.1:8765/health   # -> {"status":"ok"}
 # tail <DataDir>\logs\service.out.log for the "wiring started" banner
 ```
 
