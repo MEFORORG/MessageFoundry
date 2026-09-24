@@ -32,17 +32,21 @@ how to develop and test it, and its **honest scope** (what the extraction does a
   [`packaging/messagefoundry-webconsole/pyproject.toml`](../packaging/messagefoundry-webconsole/pyproject.toml)
   (hatchling), which force-includes the tree into a wheel. The **engine wheel does not contain it** — the
   same mechanic that keeps `harness/` out of the engine wheel — so a plain `pip install messagefoundry`
-  stays byte-identical and, with `serve_ui` default-off, the JSON API is unchanged.
+  stays byte-identical. The console is on by default for a loopback bind (ADR 0143); with it absent,
+  the engine serves the JSON API only and prints a warning at startup.
 - **Independent version root.** Unlike `messagefoundry-harness` (deliberately lockstep — it reads the
   engine's `__version__`), the console has its **own** `__version__`, tag, changelog, and PyPI cadence.
-  It depends on the engine through a PEP 508 **compat range** (`messagefoundry>=X,<Y`), not lockstep.
+  It is meant to depend on the engine through a PEP 508 **compat range** (`messagefoundry>=X,<Y`), not
+  lockstep. **That range is not set:** the package declares a bare `messagefoundry` dependency, so pip
+  installs any pair and the startup seam check is what refuses a mismatch. Setting it is step 2 of
+  [`RELEASE.md`](../packaging/messagefoundry-webconsole/RELEASE.md).
 - **Mounted same-origin, in-process.** `create_app` grafts the console onto its FastAPI app with a single
   call from the `serve_ui` tail: `mount_ui(app, deps)`. Because `create_managed_app` delegates to
   `create_app` and the tests call `create_app` directly, that one call site covers the CLI/service path
   and the test path. The `/ui` routes are **clients of the reused JSON handlers by reference** (not over
   HTTP) — the single audited PHI path, per-channel RBAC, and summary redaction are reused verbatim.
 - **Narrow, one-way imports.** The package imports only `fastapi`, the leaf-safe engine surface
-  (`messagefoundry.api.security` / `.models` / `.auth_models` / `._ui_seam`), `messagefoundry.auth`, and
+  (`messagefoundry.api.security` / `.models` / `.auth_models` / `.validation` / `._ui_seam`), `messagefoundry.auth`, and
   the pure `messagefoundry.parsing` library — **never** `pipeline` / `store` / `transports` / `config`
   (CLAUDE.md §4). The direction package → engine-api-leaf is the only allowed one.
 
@@ -65,10 +69,11 @@ prose goes stale silently (this line said "currently 1" back when the seam was a
 integer). The console declares `messagefoundry_webconsole.SUPPORTED_ENGINE_SEAMS: frozenset[str]`
 and refuses a skew
 at startup via `assert_engine_seam(engine_seam)`, which raises `UiSeamMismatch` with a clear message
-rather than a raw `TypeError`. The handshake is **three-layered** and fails loud at every layer:
+rather than a raw `TypeError`. The handshake is designed in **three layers**; the two that are wired
+fail loud:
 
-1. **Install-time** — the PEP 508 range on the engine dependency fails an out-of-range pair at
-   `pip`/`uv` resolve (wired at publish; see the RELEASE checklist).
+1. **Install-time** — the PEP 508 range on the engine dependency would fail an out-of-range pair at
+   `pip`/`uv` resolve. **Not wired:** the range is unset (see §1), so this layer does not fire today.
 2. **Startup-time** — `create_app`'s `serve_ui` tail calls `assert_engine_seam(ENGINE_UI_SEAM)`
    **before** it builds the deps bundle, so a package that changed the bundle *shape* for a new seam
    surfaces as `UiSeamMismatch`, not a kwargs `TypeError`. A second identical assert at the top of
