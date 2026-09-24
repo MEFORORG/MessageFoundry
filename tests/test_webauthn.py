@@ -25,6 +25,7 @@ from messagefoundry.auth.notifications import MFA_DISABLED, SecurityEvent  # noq
 from messagefoundry.auth.service import AuthService  # noqa: E402
 from messagefoundry.config.settings import AuthSettings  # noqa: E402
 from messagefoundry.store.store import MessageStore, WebAuthnCredential  # noqa: E402
+from tests._admin_account import ADMIN_USERNAME, login_admin  # noqa: E402
 from tests._soft_webauthn import SoftAuthenticator  # noqa: E402
 
 RP = "t"
@@ -44,19 +45,11 @@ async def _service(
 ) -> AuthService:
     # These WebAuthn tests assume single-factor unless a test opts in (a few pass require_mfa=True
     # explicitly). BACKLOG #187 flipped the require_mfa default ON, so default it back OFF here unless
-    # the caller set it — otherwise the bootstrap admin's mfa_status/last-factor-delete assertions,
+    # the caller set it — otherwise the test admin's mfa_status/last-factor-delete assertions,
     # written for require_mfa off, would flip.
     settings.setdefault("require_mfa", False)
     service = AuthService(store, AuthSettings(**settings), security_notifier=notifier)
     return service
-
-
-async def _bootstrap_login(service: AuthService) -> tuple[Identity, str, str]:
-    boot = await service.initialize()
-    assert boot is not None
-    out = await service.login("admin", boot.password)
-    assert out.ok and out.identity is not None and out.token is not None
-    return out.identity, out.token, boot.password
 
 
 async def _enroll(
@@ -120,7 +113,7 @@ async def test_register_then_assert_e2e() -> None:
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store)
-        identity, token, _ = await _bootstrap_login(service)
+        identity, token, _ = await login_admin(service)
 
         status = await service.mfa_status(identity)
         assert status.webauthn_enrolled is False and status.required is False
@@ -155,10 +148,10 @@ async def test_fresh_session_is_mfa_pending_until_assertion() -> None:
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store)
-        identity, token, password = await _bootstrap_login(service)
+        identity, token, password = await login_admin(service)
         auth, token = await _enroll(service, identity, token)
 
-        out = await service.login("admin", password)
+        out = await service.login(ADMIN_USERNAME, password)
         assert out.ok and out.token is not None
         fresh = out.token
         assert await service.mfa_satisfied(fresh) is False  # webauthn-enrolled ⇒ required
@@ -177,10 +170,10 @@ async def test_assertion_stamps_mfa_only_never_reauth() -> None:
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store)
-        identity, token, password = await _bootstrap_login(service)
+        identity, token, password = await login_admin(service)
         auth, token = await _enroll(service, identity, token)
 
-        out = await service.login("admin", password)
+        out = await service.login(ADMIN_USERNAME, password)
         fresh = out.token
         assert fresh is not None
         before = await store.get_session(hash_token(fresh))
@@ -200,7 +193,7 @@ async def test_registration_rejects_wrong_origin() -> None:
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store)
-        identity, token, _ = await _bootstrap_login(service)
+        identity, token, _ = await login_admin(service)
         opts = json.loads(
             await service.begin_webauthn_registration(
                 identity, token=token, rp_id=RP, rp_name="MessageFoundry"
@@ -237,7 +230,7 @@ async def test_a_p256_key_whose_curve_is_not_the_integer_1_is_refused_and_audite
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store)
-        identity, token, _ = await _bootstrap_login(service)
+        identity, token, _ = await login_admin(service)
         opts = json.loads(
             await service.begin_webauthn_registration(
                 identity, token=token, rp_id=RP, rp_name="MessageFoundry"
@@ -269,7 +262,7 @@ async def test_an_unusable_stored_key_fails_the_assertion_audited_not_raised(
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store)
-        identity, token, _ = await _bootstrap_login(service)
+        identity, token, _ = await login_admin(service)
         auth, token = await _enroll(service, identity, token)
 
         real_get = store.get_webauthn_credential
@@ -298,7 +291,7 @@ async def test_sign_count_cas_clone_detection_nonzero() -> None:
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store)
-        identity, token, _ = await _bootstrap_login(service)
+        identity, token, _ = await login_admin(service)
         auth = SoftAuthenticator(rp_id=RP, origin=ORIGIN, sign_count=5)
         _, token = await _enroll(service, identity, token, auth=auth)
 
@@ -324,7 +317,7 @@ async def test_sign_count_zero_synced_passkey_accepted_repeatedly() -> None:
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store)
-        identity, token, _ = await _bootstrap_login(service)
+        identity, token, _ = await login_admin(service)
         auth, token = await _enroll(service, identity, token)  # sign_count 0 (synced passkey)
         for _ in range(3):
             ok, token = await _assert_once(service, token, auth, sign_count=0)
@@ -342,7 +335,7 @@ async def test_challenge_single_use_ttl_and_per_user_bound() -> None:
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store)
-        identity, token, _ = await _bootstrap_login(service)
+        identity, token, _ = await login_admin(service)
         auth, token = await _enroll(service, identity, token)
 
         # Single-use: the replay of an already-consumed challenge fails (covered E2E above); an
@@ -408,7 +401,7 @@ async def test_a_directory_account_can_enroll_a_passkey() -> None:
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store)
-        await _bootstrap_login(service)
+        await login_admin(service)
         principal = AdPrincipal(
             username="aduser",
             display_name="AD User",
@@ -431,7 +424,7 @@ async def test_duplicate_label_and_duplicate_credential_rejected() -> None:
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store)
-        identity, token, _ = await _bootstrap_login(service)
+        identity, token, _ = await login_admin(service)
         auth, token = await _enroll(service, identity, token, label="mykey")
 
         # Same label again (different authenticator) → legible refusal via the integrity path.
@@ -474,9 +467,9 @@ async def test_last_factor_delete_refused_while_required() -> None:
     store = await MessageStore.open(":memory:")
     try:
         notifier = _FakeNotifier()
-        # require_mfa targets local Administrators — the bootstrap admin qualifies.
+        # require_mfa targets local Administrators — the test admin qualifies.
         service = await _service(store, notifier=notifier, require_mfa=True)
-        identity, token, _ = await _bootstrap_login(service)
+        identity, token, _ = await login_admin(service)
         _, token = await _enroll(service, identity, token)
         creds = await store.list_webauthn_credentials(identity.user_id)
         with pytest.raises(ValueError, match="enroll another factor first"):
@@ -491,7 +484,7 @@ async def test_last_factor_delete_notifies_when_not_required() -> None:
     try:
         notifier = _FakeNotifier()
         service = await _service(store, notifier=notifier)  # require_mfa off
-        identity, token, _ = await _bootstrap_login(service)
+        identity, token, _ = await login_admin(service)
         _, token = await _enroll(service, identity, token)
         creds = await store.list_webauthn_credentials(identity.user_id)
 
@@ -512,7 +505,7 @@ async def test_admin_reset_mfa_clears_webauthn_credentials() -> None:
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store)
-        identity, token, _ = await _bootstrap_login(service)
+        identity, token, _ = await login_admin(service)
         _, token = await _enroll(service, identity, token)
         await service.admin_reset_mfa(identity.user_id, actor="boss")
         assert await store.has_webauthn_credentials(identity.user_id) is False
@@ -528,7 +521,7 @@ async def test_assertion_failures_never_lock_the_account() -> None:
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store)
-        identity, token, _ = await _bootstrap_login(service)
+        identity, token, _ = await login_admin(service)
         _, token = await _enroll(service, identity, token)
         for _ in range(10):
             garbage = await service.finish_webauthn_assertion(
@@ -559,15 +552,15 @@ async def test_a_successful_assertion_clears_the_failure_counter() -> None:
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store)
-        identity, token, password = await _bootstrap_login(service)
+        identity, token, password = await login_admin(service)
         auth, token = await _enroll(service, identity, token)
 
         for _ in range(3):
-            assert (await service.login("admin", "wrong-passphrase-entirely")).ok is False
+            assert (await service.login(ADMIN_USERNAME, "wrong-passphrase-entirely")).ok is False
         user = await store.get_user(identity.user_id)
         assert user is not None and user.failed_attempts == 3, "the failures were not counted"
 
-        out = await service.login("admin", password)
+        out = await service.login(ADMIN_USERNAME, password)
         assert out.ok and out.token is not None
         assert out.mfa_required, "the passkey account was not held at the second factor"
         user = await store.get_user(identity.user_id)
@@ -594,7 +587,7 @@ async def test_verify_mfa_stays_totp_specific() -> None:
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store)
-        identity, token, _ = await _bootstrap_login(service)
+        identity, token, _ = await login_admin(service)
         _, token = await _enroll(service, identity, token)
         assert (await service.verify_mfa(token, "123456")).ok is False
         user = await store.get_user(identity.user_id)
@@ -609,7 +602,7 @@ async def test_rp_mismatch_makes_credentials_unusable() -> None:
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store)
-        identity, token, _ = await _bootstrap_login(service)
+        identity, token, _ = await login_admin(service)
         _, token = await _enroll(service, identity, token)
         assert await service.begin_webauthn_assertion(token, rp_id="other.example") is None
     finally:

@@ -26,6 +26,7 @@ from messagefoundry.auth.notifications import (
 from messagefoundry.auth.service import AuthService, IssuedCredential
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
+from tests._admin_account import ADMIN_USERNAME, create_admin
 
 GOOD_PASSWORD = "Sup3rSecret!!"
 NEW_PASSWORD = "An0ther-Str0ng-Pass!!"
@@ -308,11 +309,13 @@ async def test_the_claim_stamp_is_write_once_across_a_second_rotation() -> None:
     store = await _store()
     try:
         service = AuthService(store, AuthSettings())
-        boot = await service.initialize()
-        assert boot is not None
-        await _claim_bootstrap(service, boot.password)
+        await service.initialize()
+        admin = await create_admin(service)  # unclaimed until the holder rotates it below
+        out = await service.login(admin.username, admin.password)
+        assert out.ok and out.identity is not None
+        assert await service.change_password(out.identity, NEW_PASSWORD) == []
 
-        first = await store.get_user_by_username("admin")
+        first = await store.get_user_by_username(ADMIN_USERNAME)
         assert first is not None
         assert first.password_claimed_at is not None and first.password_changed_at is not None
         # The claiming write stamped its OWN instant (one ``now`` per UPDATE feeds both columns).
@@ -322,12 +325,12 @@ async def test_the_claim_stamp_is_write_once_across_a_second_rotation() -> None:
         original_stamp = first.password_claimed_at
 
         # Rotate a SECOND time, through the real service path, as the holder.
-        out = await service.login("admin", NEW_PASSWORD)
+        out = await service.login(ADMIN_USERNAME, NEW_PASSWORD)
         assert out.ok and out.identity is not None
         third_password = "A-third-Str0ng-Passphrase!!"
         assert await service.change_password(out.identity, third_password) == []
 
-        again = await store.get_user_by_username("admin")
+        again = await store.get_user_by_username(ADMIN_USERNAME)
         assert again is not None and again.password_claimed_at is not None
 
         # POSITIVE CONTROLS: the second rotation really happened and really wrote THIS row. Without
@@ -335,8 +338,8 @@ async def test_the_claim_stamp_is_write_once_across_a_second_rotation() -> None:
         # failure mode most likely to make this test lie. The credential check is clock-independent;
         # the timestamp check proves the UPDATE carrying the claim term ran with a fresh ``now``, so
         # a stamp that stayed put did so because of the COALESCE and not because nothing was written.
-        assert (await service.login("admin", third_password)).ok
-        assert not (await service.login("admin", NEW_PASSWORD)).ok
+        assert (await service.login(ADMIN_USERNAME, third_password)).ok
+        assert not (await service.login(ADMIN_USERNAME, NEW_PASSWORD)).ok
         assert again.password_changed_at is not None
         assert again.password_changed_at > first.password_changed_at
 
@@ -354,7 +357,7 @@ async def test_the_upgrade_backfill_restores_a_claim_a_pre_column_database_canno
     # ``:memory:``, which creates ``users`` WITH the column from _SCHEMA, so the guarded migration
     # branch is never entered and deleting the backfill outright reds no test at all.
     #
-    # This drives the real path: claim the bootstrap, drop the column to manufacture a pre-#1245
+    # This drives the real path: claim an account, drop the column to manufacture a pre-#1245
     # database, reopen, and assert the claim came back. Without the backfill the reopened row reads
     # NULL, which the gate reads as "never claimed", and the next trigger disables an account whose
     # holder claimed it long ago -- the defect, re-introduced by its own fix.
@@ -362,10 +365,12 @@ async def test_the_upgrade_backfill_restores_a_claim_a_pre_column_database_canno
     store = await MessageStore.open(str(db))
     try:
         service = AuthService(store, AuthSettings(bootstrap_expiry_hours=72))
-        boot = await service.initialize()
-        assert boot is not None
-        await _claim_bootstrap(service, boot.password)
-        claimed = await store.get_user_by_username("admin")
+        await service.initialize()
+        admin = await create_admin(service)  # unclaimed until the holder rotates it below
+        out = await service.login(admin.username, admin.password)
+        assert out.ok and out.identity is not None
+        assert await service.change_password(out.identity, NEW_PASSWORD) == []
+        claimed = await store.get_user_by_username(ADMIN_USERNAME)
         assert claimed is not None and claimed.password_claimed_at is not None
     finally:
         await store.close()
@@ -400,7 +405,7 @@ async def test_the_upgrade_backfill_restores_a_claim_a_pre_column_database_canno
 
     reopened = await MessageStore.open(str(db))
     try:
-        healed = await reopened.get_user_by_username("admin")
+        healed = await reopened.get_user_by_username(ADMIN_USERNAME)
         assert healed is not None
         assert healed.password_claimed_at is not None  # the backfill ran on open
         # And it restored the ORIGINAL claim instant, not "now" -- the stamp is evidence about when
@@ -1449,9 +1454,8 @@ async def test_the_deliverability_gate_reads_the_notification_address() -> None:
     store = await _store()
     try:
         service = AuthService(store, AuthSettings())
-        boot = await service.initialize()
-        assert boot is not None
-        admin = await store.get_user_by_username("admin")
+        await service.initialize()
+        admin = await store.get_user((await create_admin(service)).user_id)
         assert admin is not None
         assert not await service.has_notifiable_admin()  # minted with no address at all
 
