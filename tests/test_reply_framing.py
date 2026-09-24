@@ -323,3 +323,69 @@ def test_a_repeated_chunked_coding_is_named_as_such() -> None:
     """The reason lands on the delivery row, so it must name the fault the peer made."""
     resp = _wire(_AMBIGUOUS["chunked-twice"])
     assert reply_framing_fault(resp) == "the chunked transfer coding applied more than once"
+
+
+# --- the engine's own OIDC relying party reads the same way ---------------------------------------
+#
+# Not an outbound connection, but the same stdlib reader on a reply the engine asked for. The token
+# leg raises FlowError (a ValueError) and the JWKS leg an http.client.HTTPException. Both reach the
+# (OSError, ValueError, HTTPException) arm in auth/service.py's authenticate_oidc, which records an
+# unavailable IdP. The JWKS leg must NOT raise JwksError: claims.py retypes that as
+# ClaimsError("unknown_kid"), a token-verification reject. These tests pin the types, not the
+# service mapping.
+
+_TOKEN_JSON = b'{"id_token": "x.y.z"}'
+
+
+def _json_reply(headers: bytes) -> bytes:
+    return _OK + headers + b"\r\n" + _TOKEN_JSON
+
+
+def _exchange(url: str) -> object:
+    from messagefoundry.auth import oidc
+
+    return oidc.exchange_code(
+        token_endpoint=url,
+        client_id="c",
+        client_secret=None,
+        code="x",
+        redirect_uri="http://localhost/cb",
+        code_verifier="v",
+        opener=urllib.request.build_opener(),
+    )
+
+
+def test_oidc_token_exchange_refuses_ambiguous_framing() -> None:
+    from messagefoundry.auth import oidc
+
+    raw = _json_reply(b"Content-Length: 3\r\nContent-Length: %d\r\n" % len(_TOKEN_JSON))
+    with _serve(raw) as url, pytest.raises(oidc.FlowError, match="ambiguously"):
+        _exchange(url)
+
+
+def test_oidc_token_exchange_reads_unambiguous_framing() -> None:
+    raw = _json_reply(b"Content-Length: %d\r\n" % len(_TOKEN_JSON))
+    with _serve(raw) as url:
+        payload = _exchange(url)
+    assert payload == {"id_token": "x.y.z"}
+
+
+def test_oidc_jwks_fetch_refuses_ambiguous_framing() -> None:
+    from messagefoundry.auth.oidc.jwks import JwksError
+    from messagefoundry.auth.oidc_http import jwks_fetcher
+
+    raw = _json_reply(b"Transfer-Encoding: gzip\r\nContent-Length: 3\r\n")
+    with (
+        _serve(raw) as url,
+        pytest.raises(http.client.HTTPException, match="ambiguously") as raised,
+    ):
+        jwks_fetcher(url, urllib.request.build_opener())()
+    assert not isinstance(raised.value, (JwksError, ValueError))
+
+
+def test_oidc_jwks_fetch_reads_unambiguous_framing() -> None:
+    from messagefoundry.auth.oidc_http import jwks_fetcher
+
+    raw = _json_reply(b"Content-Length: %d\r\n" % len(_TOKEN_JSON))
+    with _serve(raw) as url:
+        assert jwks_fetcher(url, urllib.request.build_opener())() == _TOKEN_JSON

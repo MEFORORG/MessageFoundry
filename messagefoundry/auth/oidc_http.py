@@ -34,6 +34,7 @@ let an IdP-adjacent attacker relocate a request carrying the client secret and t
 
 from __future__ import annotations
 
+import http.client
 import ssl
 import urllib.request
 from collections.abc import Callable
@@ -42,6 +43,7 @@ from typing import Any
 from messagefoundry.auth.oidc.jwks import _MAX_JWKS_BYTES
 from messagefoundry.auth.trust_anchors import AnchorSpec, enforce_anchor
 from messagefoundry.config.tls_policy import harden_cipher_suites, harden_crl_check
+from messagefoundry.transports.bounded_read import reply_framing_fault
 
 __all__ = ["build_idp_opener", "jwks_fetcher"]
 
@@ -136,8 +138,9 @@ def jwks_fetcher(
     cannot make the engine buffer an unbounded body before the cache's own check runs. ``JwksCache``
     re-checks the same bound — deliberate defence in depth, since ``fetch`` is injectable.
 
-    Errors are left as raw ``urllib``/``OSError`` exceptions: the caller (``auth/service.py``) maps any
-    IdP-reachability failure onto a degraded login plus an audited ``auth.login_error``. Nothing here
+    Errors are left as raw ``urllib``/``OSError``/``http.client.HTTPException`` exceptions: the caller
+    (``auth/service.py``) maps any IdP-reachability failure onto a degraded login plus an audited
+    ``auth.login_error``. Nothing here
     logs the URI's response body.
     """
 
@@ -146,6 +149,13 @@ def jwks_fetcher(
             jwks_uri, headers={"Accept": "application/json"}, method="GET"
         )
         with opener.open(req, timeout=timeout) as resp:  # noqa: S310 — see above
+            # BACKLOG #1125 (ASVS 4.2.1): refuse ambiguous length framing before reading, by the
+            # rule every egress connector applies. An HTTPException, the type http.client raises for
+            # its own protocol faults, so the login path records an unavailable IdP. A JwksError
+            # would be retyped by claims.py as ClaimsError('unknown_kid'), a token-verification
+            # reject, which misnames a transport fault.
+            if reply_framing_fault(resp) is not None:
+                raise http.client.HTTPException("JWKS response framed its body length ambiguously")
             return bytes(resp.read(_MAX_JWKS_BYTES + 1))
 
     return fetch
