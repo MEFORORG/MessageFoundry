@@ -92,7 +92,7 @@ two-tier split:
 - **`hl7_map`** — pure helpers a code-first Handler composes to build HL7 v2 (header → ORM/ORU fields; each SR
   measurement → an `OBX`), HL7-escaped and CR/LF-guarded.
 
-Backed by the optional **`[dicom]` extra** (`pydicom>=3.0.2,<4` + `pynetdicom>=3.0.4,<4`, pure-Python, **no
+Backed by the optional **`[dicom]` extra** (`pydicom>=3.0.2,<3.1` + `pynetdicom>=3.0.4,<4`, pure-Python, **no
 numpy**), lazily imported so a SQLite-only install and a console peek-import stay driverless.
 
 ---

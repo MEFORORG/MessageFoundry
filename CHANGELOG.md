@@ -15,12 +15,20 @@ All notable changes to MessageFoundry are documented here. The format follows
   the `id_token` `exp`, and the configured session caps. **A deploying site whose IdP does not return
   `auth_time` would have every federated sign-in refused**; that is spec-correct and deliberate.
   Federation still ships off (`oidc_enabled = false`). ([BACKLOG #296](docs/BACKLOG.md))
-- **The DIRECT S/MIME connector now encrypts message content with AES-256-CBC.** The library default
-  it used before was AES-128-CBC. Every DIRECT message's content cipher changes on the wire; nothing
-  else about the envelope does. **A deploying site whose partner stack cannot decrypt AES-256-CBC
-  would see that partner fail to open the message after its relay has already accepted it**, so the
-  failure would surface on the partner's side, not as a send error here.
-  ([BACKLOG #1168](docs/BACKLOG.md))
+- **The OIDC token endpoint and JWKS legs now carry the posture-keyed revocation guard (BACKLOG
+  #1887, ADR 0173 section 4.3).** Each leg is guarded on its own host. An enforcing instance whose
+  off-box identity provider has no `[auth].oidc_tls_crl_file` would refuse to start on first
+  deployment.
+- **BREAKING: `deflate_decompress` now refuses any bytes after the end of the stream, and no longer
+  hangs on them.** Its bounded loop never checked for the end of the stream. Take a stream whose
+  output needs more than one 64 KiB round, and add one byte after it. The loop spun forever and the
+  ceiling never fired. On first deployment, a Handler inflating an untrusted body would hang its
+  transform worker. A shorter stream returned its output and dropped the extra bytes without a
+  word. Both now raise `CompressionError`. Stdlib `zlib.decompress` ignores such bytes, so a Handler
+  that expects a trailer should strip it first. The loop now feeds its input one 64 KiB window at a
+  time, so it runs in linear time, not quadratic. A bomb now stops at the ceiling, not up to one
+  window past it. `gzip_decompress` and `zip_decompress` do not use this loop and are unchanged.
+  ([BACKLOG #1964](docs/BACKLOG.md))
 - **BREAKING — sign-in now checks a stored passkey with the same rule as registration.** This
   reverses two promises in the 0.4.0 notes: "Passkeys registered on 0.3.2 still work" and "A
   passkey already registered on another curve still signs in". Neither holds any more. A stored
@@ -30,6 +38,44 @@ All notable changes to MessageFoundry are documented here. The format follows
   owner refused at every passkey sign-in; a passkey-only user would stay refused until an admin
   runs `admin_reset_mfa`.** **Migration:** register an ES256 passkey on P-256 or an EdDSA
   passkey, or use TOTP. ([BACKLOG #1166](docs/BACKLOG.md))
+### Changed
+- **`messagefoundry dryrun` and `messagefoundry check` now refuse an oversized fixture file.** The
+  cap is `MAX_FIXTURE_FILE_BYTES`, which defaults to `DEFAULT_MAX_MESSAGE_BYTES` (16 MiB) and rises
+  to the largest `max_message_bytes` any inbound in the graph sets. The file's size is checked
+  before it is read, so an oversized fixture is never read whole. A fixture over the cap that
+  0.4.0 read would now fail the run. [`docs/CONNECTIONS.md`](docs/CONNECTIONS.md) also carries a
+  code-derived ASVS 5.1.1 file-surface inventory, with upload and download tables and stated
+  exclusions, and a test fails when the code and the tables drift apart.
+  ([BACKLOG #1127](docs/BACKLOG.md))
+- **BREAKING — `[api].tls_terminated_upstream` without `[api].tls_cert_file` now requires
+  `[api].plaintext_upstream_hop_acknowledged = true`.** 0.4.0 asked for no such acknowledgement. In
+  that topology the engine mints no certificate (ADR 0172 decision 3). So the
+  proxy-to-engine hop is plaintext by design, and securing it is the deploying site's job. `serve`
+  refuses that topology (exit 2) until the operator sets the acknowledgement. It refuses in every
+  mode: `enforce` or `warn`, loopback bind or not. With an operator `tls_cert_file` the engine serves
+  that hop over TLS, so nothing needs acknowledging. The existing proxy attestations keep their own
+  behaviour. Setting the acknowledgement without `tls_terminated_upstream` is refused at load. See
+  `docs/CONFIGURATION.md` and `docs/SECURITY.md`. **Migration:** after you upgrade, set
+  `[api].plaintext_upstream_hop_acknowledged = true`. 0.4.0 refuses the key as unrecognized, so do
+  not add it first. Or set `[api].tls_cert_file` and `[api].tls_key_file` so the engine serves that
+  hop over TLS. The proxy must then speak https to the engine and trust that certificate, or every
+  request through it fails. ([BACKLOG #1179](docs/BACKLOG.md))
+- **The DIRECT S/MIME connector now encrypts message content with AES-256-CBC.** The library default
+  it used before was AES-128-CBC. Every DIRECT message's content cipher changes on the wire; nothing
+  else about the envelope does. **A deploying site whose partner stack cannot decrypt AES-256-CBC
+  would see that partner fail to open the message after its relay has already accepted it**, so the
+  failure would surface on the partner's side, not as a send error here.
+  ([BACKLOG #1168](docs/BACKLOG.md))
+- **A keyed store now refuses an unmarked value in an encrypted column instead of reading it back
+  as plaintext.** Once a store key is set, every covered column holds only `mfenc:` ciphertext, so
+  a non-blank value without the marker is a stripped marker or a planted row. The cipher raises
+  `CipherError` on it. A purged `''` is never refused. The sweep that runs at each keyed open now
+  seals legacy plaintext only on a surface that holds no sealed value yet; on any other surface it
+  leaves the unmarked value in place and reports it. Each refusal raises an `integrity_drift` alert
+  under the subject `store-cipher`, naming the table and column but never the row or the value.
+  **A planted `state` or `reference` value would stop the engine from starting**, because both
+  caches load at open. The opt-out, `[store].allow_unmarked_ciphertext`, ships off and is reported
+  as a loosening when on. ([BACKLOG #1169](docs/BACKLOG.md))
 
 ## [0.4.0] — 2026-09-23 — Early Access
 
