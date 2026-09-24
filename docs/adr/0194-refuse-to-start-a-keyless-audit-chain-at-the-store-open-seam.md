@@ -42,16 +42,21 @@ Zero deployments (CLAUDE.md section 0): this is what a first deployment would ha
    `enforcement = enforce`, no `allow_unencrypted_phi_under_strict_enforcement` refuses. It does not
    ask whether a key is configured. `_keyless_store_gate` in `__main__.py` now calls it.
 2. `open_store` takes `keyless_chain_refusal: str | None`. When the opened store holds **no keying
-   secret** (no in-heap HMAC key and no isolated-module MAC) **and `audit_log` is empty**, a
-   non-`None` value closes the store and raises `KeylessAuditChainRefused`, naming the deciding
-   setting. **The default is the refusal** (`[security].allow_unencrypted_phi`), so a caller that
-   does not decide is refused rather than waved through.
+   secret** (no in-heap HMAC key and no isolated-module MAC), **`audit_log` is empty, and no keying
+   watermark is recorded** -- so the next append would be a keyless row 1 -- a non-`None` value
+   closes the store and raises `KeylessAuditChainRefused`, naming the deciding setting. A SQLite file
+   the same call created is removed again. **The default is the refusal**
+   (`[security].allow_unencrypted_phi`), so a caller that does not decide is refused rather than
+   waved through.
 3. Every CLI command that opens the store passes `keyless_opt_out_refusal(...)` and turns the
    refusal into exit 2 with the message. `rotate-key` needs a key before it opens anything and keeps
    the refusing default. `serve`'s lifespan passes the verdict whenever `security_settings` is given,
    which `serve` always does.
 4. A store method, `audit_append_refusal()`, answers "would an audit append be refused now" without
-   appending. `provision-admin` and `admin-unlock` call it before their first write.
+   appending. `provision-admin`, `admin-unlock` and `backup` call it before their first write. It
+   also covers the case step 2 deliberately leaves alone: an EMPTY chain that is already keyed,
+   opened with no key. That is not a keyless start, since its appends refuse on their own, so the
+   seam's message would give the wrong remedy.
 5. `open_store(warn_unkeyed_chain=False)` silences the #1905 keyless-chain WARNING for one open.
    Only `rekey-audit` passes it, since the warning names `rekey-audit` as its fix.
 
@@ -87,9 +92,14 @@ a store that turned out keyless covers it for every command. The message names t
 is configured.
 
 **Why refuse before writing, not a transaction.** Making `provision-admin`'s account rows and audit
-row one transaction would mean a store-protocol change across three backends for two commands. The
-state that makes the append refuse is known at open and does not change within an offline command, so
-asking first is equivalent and small.
+row one transaction would mean a store-protocol change across three backends for three commands. The
+state that makes the append refuse is read at open, so asking first covers every case where it does
+not change during the command. **One case it does not cover:** `admin-unlock` may run while `serve`
+starts for the first time. With the opt-out in the admin's shell and a key in the service's, the
+admin's open can read an empty, unkeyed chain, and `serve` can write its keying watermark before the
+admin's append lands. That append is then a keyless row above the watermark, which `audit-verify`
+reports as a break. It needs a misconfigured shell and a race of one short command, and it fails
+loud rather than silent, so it is recorded here rather than closed.
 
 ## Rejected
 
@@ -103,7 +113,9 @@ asking first is equivalent and small.
 
 - A command run on a fresh store with no key and no opt-out now exits 2 where it used to succeed:
   `backup`, `admin-unlock`, `audit-anchor`, `audit-verify`, `rekey-audit`. Anchoring a fresh instance
-  as `0:` (BACKLOG #328) still works with a key or under the opt-out.
+  as `0:` (BACKLOG #328) still works with a key or under the opt-out. `serve` with a key named that
+  the provider did not resolve now fails at startup inside the lifespan, which uvicorn reports as its
+  own startup failure, where it used to start keyless.
 - `create_managed_app` without `security_settings` (the embedding and test convenience) opens as
   before. That path is not how a service opens its store; the guard records the exemption.
 - The backend `.open` classmethods decide nothing. They are library primitives, and the tests use

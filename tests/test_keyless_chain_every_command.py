@@ -314,6 +314,8 @@ _MAY_PASS_NONE = {
 
 #: Direct backend ``.open`` calls outside the seam, and why each is not a bypass.
 _BACKEND_OPEN_OUTSIDE_THE_SEAM = {
+    # the seam itself: open_store's backend dispatch
+    ("messagefoundry/store/base.py", "_open_backend"),
     # Engine.create(db_path): the documented tests/embedding convenience, never the service path
     ("messagefoundry/pipeline/engine.py", "Engine.create"),
     # the load harness resetting a synthetic server store between runs
@@ -339,7 +341,7 @@ _BACKENDS = {"MessageStore", "SqlServerStore", "PostgresStore"}
 
 def _calls(rel: str) -> list[tuple[str, ast.Call]]:
     """``(qualified enclosing scope, call)`` for every call in one source file."""
-    tree = ast.parse((_REPO / rel).read_text(encoding="utf-8"))
+    tree = ast.parse((_REPO / rel).read_bytes())
     found: list[tuple[str, ast.Call]] = []
 
     def walk(node: ast.AST, scope: str) -> None:
@@ -355,11 +357,21 @@ def _calls(rel: str) -> list[tuple[str, ast.Call]]:
     return found
 
 
+def _callee(call: ast.Call) -> str | None:
+    """The called name, whether spelled bare (``open_store``) or through a module (``base.open_store``)."""
+    if isinstance(call.func, ast.Name):
+        return call.func.id
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr
+    return None
+
+
 def _is_verdict(value: ast.expr) -> bool:
+    """A call to the shared rule with its two arguments -- a store section and a security section."""
     return (
         isinstance(value, ast.Call)
-        and isinstance(value.func, ast.Name)
-        and value.func.id == "keyless_opt_out_refusal"
+        and _callee(value) == "keyless_opt_out_refusal"
+        and (len(value.args) == 2 and not value.keywords)
     )
 
 
@@ -367,52 +379,70 @@ def _is_none(value: ast.expr) -> bool:
     return isinstance(value, ast.Constant) and value.value is None
 
 
+def _product_files() -> list[str]:
+    roots = (
+        "messagefoundry",
+        "messagefoundry_webconsole",
+        "packaging",
+        "harness",
+        "scripts",
+        "tee",
+    )
+    return sorted(
+        p.relative_to(_REPO).as_posix()
+        for root in roots
+        if (_REPO / root).is_dir()
+        for p in (_REPO / root).rglob("*.py")
+        if "tests" not in p.relative_to(_REPO).parts
+    )
+
+
+def _classify_open_store(call: ast.Call) -> str:
+    """``default`` / ``verdict`` / ``none`` / ``conditional-none`` / ``other`` for one open_store call."""
+    if any(kw.arg is None for kw in call.keywords):
+        return "other"  # a **kwargs spread could carry anything, so it is never read as decided
+    verdict = next((kw.value for kw in call.keywords if kw.arg == "keyless_chain_refusal"), None)
+    if verdict is None:
+        return "default"
+    if _is_verdict(verdict):
+        return "verdict"
+    if _is_none(verdict):
+        return "none"
+    if isinstance(verdict, ast.IfExp) and _is_verdict(verdict.body) and _is_none(verdict.orelse):
+        return "conditional-none"
+    return "other"
+
+
 def test_every_product_store_open_goes_through_the_seam_and_decides() -> None:
     """Enumerates every ``open_store`` call in product code and every direct backend ``.open``.
 
     An ``open_store`` call must leave ``keyless_chain_refusal`` at its refusing default, pass the
-    shared verdict (a call to ``keyless_opt_out_refusal``), or pass ``None`` -- bare or as the other
-    arm of a conditional verdict -- from a caller on the allow-list above, with its reason. A direct
-    backend ``.open`` skips the decision entirely, so each one outside ``store/`` must be named. A new
-    command that opens the store therefore cannot start a keyless chain without deciding, or without
-    appearing in this file's diff."""
+    shared verdict (a call to ``keyless_opt_out_refusal`` with its two arguments), or pass ``None`` --
+    bare or as the other arm of a conditional verdict -- from a caller on the allow-list above, with
+    its reason. A ``**kwargs`` spread counts as undecided. A direct backend ``.open`` skips the decision
+    entirely, so each one must be named. A new command that opens the store therefore cannot start a
+    keyless chain without deciding, or without appearing in this file's diff."""
     unreviewed_none: list[str] = []
     not_the_shared_rule: list[str] = []
     backend_opens: list[str] = []
-    cli: dict[str, str] = {}
-    roots = [_REPO / "messagefoundry", _REPO / "harness", _REPO / "scripts"]
-    files = sorted(p.relative_to(_REPO).as_posix() for root in roots for p in root.rglob("*.py"))
+    cli: list[tuple[str, str]] = []
+    files = _product_files()
     for rel in files:
-        if rel.startswith("messagefoundry/store/"):
-            continue
         for scope, call in _calls(rel):
-            target = call.func
-            if isinstance(target, ast.Name) and target.id == "open_store":
-                verdict = next(
-                    (kw.value for kw in call.keywords if kw.arg == "keyless_chain_refusal"), None
-                )
+            name = _callee(call)
+            if name == "open_store":
+                how = _classify_open_store(call)
                 if rel == "messagefoundry/__main__.py":
-                    if verdict is None:
-                        cli[scope] = "default"
-                    else:
-                        cli[scope] = "verdict" if _is_verdict(verdict) else "other"
-                if verdict is None or _is_verdict(verdict):
-                    continue
-                allowed = (rel, scope) in _MAY_PASS_NONE
-                if _is_none(verdict) or (
-                    isinstance(verdict, ast.IfExp)
-                    and _is_verdict(verdict.body)
-                    and _is_none(verdict.orelse)
-                ):
-                    if not allowed:
-                        unreviewed_none.append(f"{rel}:{scope}")
-                else:
+                    cli.append((scope, how))
+                if how in ("none", "conditional-none") and (rel, scope) not in _MAY_PASS_NONE:
+                    unreviewed_none.append(f"{rel}:{scope}")
+                elif how == "other":
                     not_the_shared_rule.append(f"{rel}:{scope}")
             if (
-                isinstance(target, ast.Attribute)
-                and target.attr == "open"
-                and isinstance(target.value, ast.Name)
-                and target.value.id in _BACKENDS
+                name == "open"
+                and isinstance(call.func, ast.Attribute)
+                and isinstance(call.func.value, ast.Name)
+                and call.func.value.id in _BACKENDS
                 and (rel, scope) not in _BACKEND_OPEN_OUTSIDE_THE_SEAM
             ):
                 backend_opens.append(f"{rel}:{scope}")
@@ -424,7 +454,62 @@ def test_every_product_store_open_goes_through_the_seam_and_decides() -> None:
     )
     assert not backend_opens, f"a store backend opened outside open_store: {backend_opens}"
     # Positive control and completeness in one: the instrument must find exactly the CLI openers the
-    # behavioural tests above exercise, or its silence proves nothing. A new CLI opener fails here.
-    assert set(cli) == _CLI_OPENERS | _CLI_DEFAULT, sorted(cli)
-    assert {s for s, how in cli.items() if how == "verdict"} == _CLI_OPENERS
-    assert {s for s, how in cli.items() if how == "default"} == _CLI_DEFAULT
+    # behavioural tests above exercise, or its silence proves nothing. A new CLI opener fails here, and
+    # so does a second open inside one of them.
+    assert sorted(s for s, _ in cli) == sorted(_CLI_OPENERS | _CLI_DEFAULT), sorted(cli)
+    assert {s for s, how in cli if how == "verdict"} == _CLI_OPENERS
+    assert {s for s, how in cli if how == "default"} == _CLI_DEFAULT
+    # And it must have scanned the seam itself: the backend dispatch is the one allowed backend open.
+    assert "messagefoundry/store/base.py" in files
+
+
+# --- the round-1 review cases -------------------------------------------------------------------------
+
+
+def test_an_empty_KEYED_chain_opened_without_a_key_is_refused_before_any_write(
+    shell: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The service keyed the store (a watermark, no rows yet); a shell with no key and no opt-out runs
+    ``admin-unlock``. That is not a keyless START, so the seam does not claim it is. The append would
+    refuse, so the command must refuse before clearing the lockout rather than after."""
+    db = shell / "keyed-empty.db"
+    _fresh_store(db, user="ops", key=generate_key())
+    rc = main(_argv("admin-unlock", db, shell))
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert rc == 2
+    assert "would be refused" in error and "would start a KEYLESS" not in error
+    with sqlite3.connect(db) as conn:
+        locked = conn.execute("SELECT locked_until FROM users WHERE id='u1'").fetchone()[0]
+    assert locked is not None, "the lockout was cleared although its audit row could not be written"
+    assert _audit_rows(db) == 0
+
+
+def test_backup_refuses_before_running_when_its_audit_row_would_be_refused(
+    shell: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A keyed store and a shell with no key but a leftover opt-out: before, the archive was written
+    and kept (and older ones pruned), then the audit append raised."""
+    db = shell / "keyed.db"
+    _fresh_store(db, key=generate_key())
+    _opt_out(monkeypatch)
+    monkeypatch.setenv("MEFOR_BACKUP_ALLOW_UNENCRYPTED", "true")
+    assert main(_argv("backup", db, shell)) == 2
+    assert not (shell / "dest").exists() or not any((shell / "dest").iterdir())
+    assert _audit_rows(db) == 0
+
+
+def test_a_refused_create_leaves_no_store_behind(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``provision-admin`` creates the store. A key named in the settings that the key provider does
+    not resolve passes the CLI gate and is refused at the seam; the file that open created is removed,
+    so the next ``serve`` does not find a store someone half-made."""
+    monkeypatch.setenv("MEFOR_STORE_KEY_PROVIDER", "env")
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY_FILE", str(shell / "service.key"))
+    _tty(monkeypatch, _PASSWORD, _PASSWORD)
+    db = shell / "unresolved.db"
+    rc = main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"])
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert rc == 2
+    assert "resolved no key" in error
+    assert not db.exists()

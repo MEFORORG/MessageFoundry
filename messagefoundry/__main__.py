@@ -4937,9 +4937,10 @@ def _provision_admin(args: argparse.Namespace) -> int:
 
     try:
         outcome, store_path = asyncio.run(run())
-    except (FirstAdministratorRefused, _KeylessProvisionRefused) as exc:
+    except FirstAdministratorRefused as exc:
         return _emit_error(str(exc), as_json=args.json)
-    except (KeylessAuditChainRefused, _UnauditableWrite) as exc:  # #1916: could not start
+    except (_KeylessProvisionRefused, KeylessAuditChainRefused, _UnauditableWrite) as exc:
+        # #1905, #1916: could not start -- exit 2 whichever of the three keyless checks caught it
         _emit_error(str(exc), as_json=args.json)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
@@ -5149,7 +5150,8 @@ def _audit_anchor(args: argparse.Namespace) -> int:
     # migrates it, so a typo'd path or a zero-byte file would mint a fresh empty DB and print `0:` —
     # an anchor OF NOTHING, which a later verify against the wrong database would happily confirm.
     # Unlike the verify twin this keeps exit 0 on a REAL store whose log is legitimately empty:
-    # anchoring a fresh instance as `0:` is a supported workflow (#328), not a defect to refuse.
+    # anchoring a fresh instance as `0:` is a supported workflow (#328), not a defect to refuse. On a
+    # store with no key it needs the audited at-rest opt-out, as every command does (#1916).
     refused = _refuse_a_store_that_is_not_an_audit_log(
         is_sqlite=settings.store.backend == StoreBackend.SQLITE,
         path=settings.store.path,
@@ -5452,6 +5454,7 @@ def _backup(args: argparse.Namespace) -> int:
             keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
         )
         try:
+            _refuse_an_unauditable_write(store)  # its audit row is written even on failure
             runner = _BackupRunner(
                 store,
                 backup_settings,
@@ -5468,7 +5471,8 @@ def _backup(args: argparse.Namespace) -> int:
         result = asyncio.run(run())
     except BackupError as exc:
         return _emit_error(f"backup failed ({exc.kind}): {exc}", as_json=args.json)
-    except (StoreNotFoundError, KeylessAuditChainRefused) as exc:  # #1780, #1916: could not start
+    except (StoreNotFoundError, KeylessAuditChainRefused, _UnauditableWrite) as exc:
+        # #1780, #1916: could not start, so exit 2 like #1670 below
         _emit_error(str(exc), as_json=args.json)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database

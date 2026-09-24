@@ -2297,19 +2297,23 @@ async def open_store(
     ``keyless_chain_refusal`` (BACKLOG #1916) is the at-rest opt-out's verdict for this caller: the
     setting that refuses running keyless, or ``None`` when the audited opt-out applies. A service
     command passes :func:`~messagefoundry.config.settings.keyless_opt_out_refusal` of its settings. It
-    is consulted in exactly one state -- no keying secret in hand and an EMPTY ``audit_log`` -- because
-    that is the only open whose first audit row starts a chain, and a chain that starts keyless stays
-    keyless. There a non-``None`` value raises :class:`KeylessAuditChainRefused` with the handle
-    closed. **The default is the refusal**, so a caller that does not decide is refused rather than
-    waved through; that is what makes this the gate for every command, where #1905's gate covered only
-    the two commands that called it. A server backend has built its schema by then, which starts no
-    chain: a later keyed open still keys the empty log from row 1.
+    is consulted in exactly one state -- no keying secret in hand, an EMPTY ``audit_log``, and no
+    keying watermark, so the next append would be a keyless row 1 -- because that is the only open
+    whose first audit row starts a chain, and a chain that starts keyless stays keyless. There a
+    non-``None`` value raises :class:`KeylessAuditChainRefused` with the handle closed. **The default
+    is the refusal**, so a caller that does not decide is refused rather than waved through; that is
+    what makes this the gate for every command, where #1905's gate covered only the two commands that
+    called it. A SQLite file this call created is removed again on refusal. A server backend has built
+    its schema by then, which starts no chain: a later keyed open still keys the empty log from row 1.
+    An empty chain that is already KEYED is not refused here: its appends refuse on their own, and a
+    writer asks :meth:`Store.audit_append_refusal` before its first write.
 
     ``warn_unkeyed_chain=False`` silences the #1905 keyless-chain WARNING for this open only. Only
     ``rekey-audit`` passes it, because that command is the remedy the warning names.
     """
     # Before the cipher, so a refusal never waits on a key provider (a Vault round trip).
-    if not create and (absent := _absent_sqlite_store(settings)) is not None:
+    absent = _absent_sqlite_store(settings)
+    if not create and absent is not None:
         raise StoreNotFoundError(absent)
     # The at-rest cipher via the single build_store_cipher seam: ADR 0019 key sourcing + the ADR 0138
     # cipher_provider dispatch. Default `aesgcm` is the in-process AES-256-GCM keyring (active + retired
@@ -2346,22 +2350,39 @@ async def open_store(
             store,
             keyless_chain_refusal,
             key_named=bool(settings.encryption_key or settings.encryption_key_file),
+            created=absent,
         )
     return store
 
 
 async def _refuse_to_start_a_keyless_chain(
-    store: Store, refused_by: str, *, key_named: bool
+    store: Store, refused_by: str, *, key_named: bool, created: Path | None
 ) -> None:
-    """Close ``store`` and raise :class:`KeylessAuditChainRefused` when its audit log is empty."""
+    """Close ``store`` and raise :class:`KeylessAuditChainRefused` when its next audit row would be a
+    keyless row 1. ``created`` is the SQLite file this open created, removed again on refusal so a
+    refused command leaves nothing behind for the next ``serve`` to find."""
     try:
         count, _head = await store.audit_anchor()
+        # An EMPTY chain that is already keyed (a watermark, no key here) is not a keyless start: its
+        # appends refuse on their own, so this message would give the wrong remedy.
+        starts_keyless = count == 0 and store.audit_append_refusal() is None
     except BaseException:
-        await store.close()
+        await _close_quietly(store)
         raise
-    if count == 0:
+    if starts_keyless:
         await store.close()
+        if created is not None:
+            for suffix in ("", "-wal", "-shm", "-journal"):
+                Path(f"{created}{suffix}").unlink(missing_ok=True)
         raise KeylessAuditChainRefused(store.path, refused_by, key_named=key_named)
+
+
+async def _close_quietly(store: Store) -> None:
+    """Close ``store`` on an error path without letting a close failure replace the real error."""
+    try:
+        await store.close()
+    except Exception:
+        log.warning("closing the store after a failed open also failed", exc_info=True)
 
 
 async def _open_backend(

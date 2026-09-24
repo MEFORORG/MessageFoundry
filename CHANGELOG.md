@@ -23,11 +23,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   command shares. **A command that opens a store with no key and an empty audit log now exits 2**
   unless the audited opt-out applies (`[security].allow_unencrypted_phi`, plus
   `allow_unencrypted_phi_under_strict_enforcement` under `enforcement = enforce`). That covers
-  `backup`, `admin-unlock`, `audit-anchor`, `audit-verify` and `rekey-audit`, and `serve` when a key is
-  named that `[store].key_provider` did not resolve. A store whose chain already has rows opens as
-  before. Two smaller fixes ride along. `provision-admin` and `admin-unlock` now refuse before their
-  first write when the store would refuse their audit row. Before, a keyed store opened from a shell
-  with no key and a leftover opt-out got the account written and then a traceback, with no audit row.
+  `backup`, `admin-unlock`, `audit-anchor`, `audit-verify` and `rekey-audit`. `serve` now also
+  refuses to start when a key is named that `[store].key_provider` did not resolve; before, it started
+  keyless. A store whose chain already has rows opens as before. Two smaller fixes ride along.
+  `provision-admin`, `admin-unlock` and `backup` now refuse before their first write when the store
+  would refuse their audit row, and exit 2. Before, a keyed store opened from a shell with no key and
+  a leftover opt-out got the account written and then a traceback, with no audit row.
   And `rekey-audit` no longer prints the keyless-chain warning that names `rekey-audit` as its fix.
   ([BACKLOG #1916](docs/BACKLOG.md))
 
