@@ -2455,30 +2455,54 @@ def test_a_stale_exception_entry_is_reported_and_not_fatal(cells: list[Cell], wh
     assert f"1.1.1: [[reviewer_exception]] entry is stale ({why})" in findings.advisories[0]
 
 
+_EXC = '[[reviewer_exception]]\nid = "1.1.1"\nprovenance = "graded at seed commit abc"\n'
+
+
 def test_the_exception_list_is_read_from_the_record(tmp_path: Path) -> None:
-    sc = _scorecard_file(
-        tmp_path,
-        _REVIEWER_CELL
-        + '[[reviewer_exception]]\nid = "1.1.1"\nprovenance = "graded at seed commit abc"\n',
-    )
+    sc = _scorecard_file(tmp_path, _EXC + _REVIEWER_CELL)
     assert load_reviewer_exceptions(sc) == {"1.1.1": "graded at seed commit abc"}
     assert load_reviewer_exceptions(_scorecard_file(tmp_path, _REVIEWER_CELL)) == {}
 
 
 @pytest.mark.parametrize(
-    "entries",
+    ("entries", "match"),
     [
-        '[[reviewer_exception]]\nid = "1.1.1"\n',
-        '[[reviewer_exception]]\nid = "1.1.1"\nprovenance = "  "\n',
-        '[[reviewer_exception]]\nprovenance = "graded at abc"\n',
-        '[[reviewer_exception]]\nid = "1.1.1"\nprovenance = "a"\n'
-        '[[reviewer_exception]]\nid = "1.1.1"\nprovenance = "b"\n',
+        ('[[reviewer_exception]]\nid = "1.1.1"\n', "non-blank `provenance`"),
+        ('[[reviewer_exception]]\nid = "1.1.1"\nprovenance = "  "\n', "non-blank `provenance`"),
+        ('[[reviewer_exception]]\nprovenance = "graded at abc"\n', "`id` must be a bare"),
+        ('[[reviewer_exception]]\nid = "V1.1.1"\nprovenance = "a"\n', "`id` must be a bare"),
+        ('[[reviewer_exception]]\nid = "1.1.1 "\nprovenance = "a"\n', "`id` must be a bare"),
+        (
+            '[[reviewer_exception]]\nid = "1.1.1"\nprovenance = "a"\n'
+            '[[reviewer_exception]]\nid = "1.1.1"\nprovenance = "b"\n',
+            "listed more than once",
+        ),
+        ('[reviewer_exception]\nid = "1.1.1"\nprovenance = "a"\n', "array of tables"),
+        ('reviewer_exception = ["1.1.1"]\n', "array of tables"),
     ],
 )
-def test_a_malformed_exception_entry_fails_closed(tmp_path: Path, entries: str) -> None:
-    """An entry that names no cell, or says nothing about who graded it, must not waive a refusal."""
-    with pytest.raises(ScorecardError, match="reviewer_exception"):
-        load_reviewer_exceptions(_scorecard_file(tmp_path, _REVIEWER_CELL + entries))
+def test_a_malformed_exception_entry_fails_closed(tmp_path: Path, entries: str, match: str) -> None:
+    """A malformed entry must not waive a refusal, and must raise ScorecardError (exit 2, could not
+    measure), never a traceback. Each arm is placed BEFORE the cell so placement is not what fires."""
+    with pytest.raises(ScorecardError, match=match):
+        load_reviewer_exceptions(_scorecard_file(tmp_path, entries + _REVIEWER_CELL))
+
+
+def test_an_exception_table_after_the_first_cell_is_refused(tmp_path: Path) -> None:
+    """apply.py reads a table sitting after a [[cell]] as part of that cell, and a rewrite drops it."""
+    with pytest.raises(ScorecardError, match="must come before the first"):
+        load_reviewer_exceptions(_scorecard_file(tmp_path, _REVIEWER_CELL + _EXC))
+
+
+@pytest.mark.parametrize("value", ["false", "0", "[]"])
+def test_a_non_string_decision_closed_by_is_refused_at_load(tmp_path: Path, value: str) -> None:
+    """`str(false)` would read as a name and waive the reviewer gate through the closure arm."""
+    body = (
+        _REVIEWER_CELL + 'decision_closed = true\ndecision_closed_verdict = "pass"\n'
+        f"decision_closed_by = {value}\n"
+    )
+    with pytest.raises(ScorecardError, match="`decision_closed_by` must be a string"):
+        load_scorecard(_scorecard_file(tmp_path, body))
 
 
 _ANCHOR = (
@@ -2504,10 +2528,7 @@ def test_verify_passes_a_cell_the_record_lists_as_an_exception(
 ) -> None:
     """The same record plus one `[[reviewer_exception]]` entry: verify reads it and goes green."""
     sc, corpus, engine = _sibling_fixture(
-        tmp_path,
-        "SIZE = 64\n",
-        _ANCHOR + '[[reviewer_exception]]\nid = "1.1.1"\nprovenance = "graded at seed abc"\n',
-        reviewer="",
+        tmp_path, "SIZE = 64\n", _ANCHOR, reviewer="", preamble=_EXC
     )
     rc = main(["--scorecard", str(sc), "--corpus", str(corpus), "--root", str(engine)])
     assert rc == 0, capsys.readouterr().err
@@ -3234,12 +3255,19 @@ def test_overdue_is_computed_not_asserted(tmp_path: Path) -> None:
 
 
 def _sibling_fixture(
-    tmp_path: Path, module_body: str, cell_body: str, *, reviewer: str = _FIXTURE_REVIEWER
+    tmp_path: Path,
+    module_body: str,
+    cell_body: str,
+    *,
+    reviewer: str = _FIXTURE_REVIEWER,
+    preamble: str = "",
 ) -> tuple[Path, Path, Path]:
     """Record and engine tree as SIBLINGS, which is the production topology.
 
     The record lives in the vault; ``--root`` names a separate engine checkout. Returns
-    (scorecard, corpus, engine). ``reviewer=""`` leaves the cell's ``reviewed_by`` key out.
+    (scorecard, corpus, engine). ``reviewer=""`` leaves the cell's ``reviewed_by`` key OUT (absent,
+    not blank). ``preamble`` goes between the ``[scorecard]`` header and the cell, which is where a
+    ``[[reviewer_exception]]`` table must sit.
     """
     corpus = _corpus_file(tmp_path, {"1.1.1": 1})
     engine = tmp_path / "engine"
@@ -3248,7 +3276,10 @@ def _sibling_fixture(
     sc = _scorecard_file(
         tmp_path,
         f'[scorecard]\nasvs_version = "5.0.0"\ncorpus_sha256 = "{corpus_digest(corpus)}"\n'
-        '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "pass"\n' + reviewer + cell_body,
+        + preamble
+        + '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "pass"\n'
+        + reviewer
+        + cell_body,
     )
     return sc, corpus, engine
 

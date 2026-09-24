@@ -498,16 +498,17 @@ def load_corpus(path: Path) -> dict[str, int]:
     return {str(r["req_id"]).lstrip("V"): int(r["L"]) for r in reqs}
 
 
-def _reviewed_by(raw: dict[str, Any]) -> str | None:
+def _name_field(raw: dict[str, Any], key: str) -> str | None:
     """``None`` for an absent key, else the string. A non-string is refused, because ``str(false)``
-    or ``str([])`` would read as a named reviewer and pass the reviewer gate (BACKLOG #1889)."""
-    if "reviewed_by" not in raw:
+    or ``str([])`` would read as a name and pass the reviewer gate (BACKLOG #1889). Used for the two
+    fields that gate reads as naming a person or pass: ``reviewed_by`` and ``decision_closed_by``."""
+    if key not in raw:
         return None
-    value = raw["reviewed_by"]
+    value = raw[key]
     if not isinstance(value, str):
         raise ScorecardError(
-            f"cell {raw.get('id')!r}: `reviewed_by` must be a string naming who graded the cell, "
-            f"got {type(value).__name__} {value!r}"
+            f"cell {raw.get('id')!r}: `{key}` must be a string naming who graded or settled the "
+            f"cell, got {type(value).__name__} {value!r}"
         )
     return value
 
@@ -642,12 +643,12 @@ def load_scorecard(path: Path) -> list[Cell]:
                 posture=str(raw.get("posture", "single")),
                 decision_closed=raw.get("decision_closed") is True,
                 decision_closed_on=str(raw.get("decision_closed_on", "")),
-                decision_closed_by=str(raw.get("decision_closed_by", "")),
+                decision_closed_by=_name_field(raw, "decision_closed_by") or "",
                 last_verified=str(raw.get("last_verified", "")),
                 verified_at=str(raw.get("verified_at", "")),
                 # Membership, not `.get(..., "")`: TOML has no null, so `in` is the only way to keep
                 # an absent key distinguishable from a blank one (BACKLOG #1889).
-                reviewed_by=_reviewed_by(raw),
+                reviewed_by=_name_field(raw, "reviewed_by"),
                 evidence=tuple(
                     Anchor(
                         path=str(e["path"]),
@@ -785,18 +786,38 @@ def load_reviewer_exceptions(path: Path) -> dict[str, str]:
     re-score; :func:`check_reviewers` reports an entry the record no longer needs. **Never copy a
     provenance string into ``reviewed_by``.** It is what history shows, not a record of a review.
 
-    An entry missing either field, or naming a cell twice, fails closed: a malformed exception must
-    not quietly waive a refusal.
+    A malformed entry fails closed, because it must not quietly waive a refusal. That covers a
+    missing field, an id that is not a bare requirement id, a cell named twice, and a table placed
+    after the first ``[[cell]]``. ``apply.py`` treats everything from a ``[[cell]]`` header to the
+    next one as that cell's block, so rewriting the cell would silently delete a table sitting there.
     """
-    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    text = path.read_text(encoding="utf-8")
+    data = tomllib.loads(text)
+    entries = data.get("reviewer_exception", [])
+    if not isinstance(entries, list) or not all(isinstance(e, dict) for e in entries):
+        raise ScorecardError(
+            "reviewer_exception must be an array of tables, written `[[reviewer_exception]]`"
+        )
+    first_cell = re.search(r"^\[\[cell\]\]", text, re.M)
+    first_exc = re.search(r"^\[\[reviewer_exception\]\]", text, re.M)
+    if first_cell and first_exc and first_exc.start() > first_cell.start():
+        raise ScorecardError(
+            "[[reviewer_exception]] must come before the first [[cell]]: after it, apply.py reads "
+            "the table as part of the cell above and a rewrite of that cell deletes it"
+        )
     out: dict[str, str] = {}
-    for e in data.get("reviewer_exception", []):
+    for e in entries:
         cid = e.get("id")
         why = e.get("provenance")
-        if not (isinstance(cid, str) and cid.strip() and isinstance(why, str) and why.strip()):
+        if not (isinstance(cid, str) and re.fullmatch(r"\d+(\.\d+)+", cid)):
             raise ScorecardError(
-                f"reviewer_exception {e!r}: needs a non-blank string `id` and `provenance`. An "
-                "entry that says nothing about who graded the cell is a waiver, not an exception"
+                f"reviewer_exception {e!r}: `id` must be a bare requirement id, like 1.2.3, with no "
+                "V prefix and no spaces, or it can never match a cell"
+            )
+        if not (isinstance(why, str) and why.strip()):
+            raise ScorecardError(
+                f"reviewer_exception {cid!r}: needs a non-blank `provenance`. An entry that says "
+                "nothing about who graded the cell is a waiver, not an exception"
             )
         if cid in out:
             raise ScorecardError(f"reviewer_exception {cid!r} is listed more than once")
