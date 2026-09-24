@@ -5355,7 +5355,8 @@ def _rotate_key(args: argparse.Namespace) -> int:
     try:
         count, uploads, (rolled_ok, rolled_msg) = asyncio.run(run())
     except CipherError as exc:
-        # A value couldn't be decrypted by any supplied key — the prior key is missing. Nothing is
+        # A value couldn't be decrypted by any supplied key — the prior key is missing — or it was an
+        # unmarked value the cipher refuses (#1169); the message names which, and the cell. Nothing is
         # corrupted: every pass is all-or-nothing per batch AND idempotent, so re-running with the
         # key supplied finishes the job. Note the command now spans TWO surfaces (the store, then
         # the uploaded-file store), so a failure in the second leaves the FIRST already committed

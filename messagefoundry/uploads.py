@@ -488,7 +488,11 @@ class UploadStore:
         return self._cipher.encrypt(b64, aad=cell_aad("uploaded_file", "body", file_id))
 
     def _decrypt_blob(self, stored: str, file_id: str) -> bytes:
-        b64 = self._cipher.decrypt(stored, aad=cell_aad("uploaded_file", "body", file_id))
+        # allow_unmarked=True keeps this surface exactly as it was: whether the uploaded-file store
+        # refuses an unmarked file is an open owner question (BACKLOG #1169), not decided here.
+        b64 = self._cipher.decrypt(
+            stored, aad=cell_aad("uploaded_file", "body", file_id), allow_unmarked=True
+        )
         return base64.b64decode(b64)
 
     def _encrypt_meta(self, meta: UploadedFileMeta) -> str:
@@ -497,7 +501,9 @@ class UploadStore:
         )
 
     def _decrypt_meta(self, stored: str, file_id: str) -> UploadedFileMeta:
-        raw = self._cipher.decrypt(stored, aad=cell_aad("uploaded_file", "meta", file_id))
+        raw = self._cipher.decrypt(  # allow_unmarked: see _decrypt_blob (BACKLOG #1169)
+            stored, aad=cell_aad("uploaded_file", "meta", file_id), allow_unmarked=True
+        )
         d = json.loads(raw)
         return UploadedFileMeta(
             file_id=str(d["file_id"]),
@@ -547,8 +553,8 @@ class UploadStore:
         plain files in a directory, no database write needed). A refusal folded into the same line
         as a routine post-rotation skip is a refusal nobody can see, so the strict read cannot
         honestly be built on top of this handler until the classes are separated. Separating them
-        does not itself refuse anything: an unmarked sidecar is still accepted today by the cipher's
-        read passthrough (``store/crypto.py`` ``decrypt``), which awaits an owner ruling.
+        does not itself refuse anything: an unmarked sidecar is still accepted today, because this store
+        reads with ``allow_unmarked=True`` while the store refuses (#1169); that awaits an owner ruling.
 
         The cipher's own message is safe to log — every ``CipherError`` carries only key ids,
         marker versions and algorithm names, never a decrypted value. The malformed-shape branch
@@ -1142,7 +1148,9 @@ def _reencrypt_value(cipher: AesGcmCipher, stored: str, aad: bytes) -> str:
     on store classes this LEAF module may not import (see the module docstring), so the shared name
     is what keeps a grep for ``_reencrypt_value`` from missing this one. Pairing a decrypt and an
     encrypt with different AADs is the mistake the single-expression form exists to prevent."""
-    return cipher.encrypt(cipher.decrypt(stored, aad=aad), aad=aad)
+    # allow_unmarked=True: the uploaded-file store's reseal keeps its pre-#1169 behaviour (see
+    # UploadStore._decrypt_blob), so a first key-enable still seals a legacy plaintext upload.
+    return cipher.encrypt(cipher.decrypt(stored, aad=aad, allow_unmarked=True), aad=aad)
 
 
 def _atomic_write_text(root: Path, path: Path, text: str) -> None:

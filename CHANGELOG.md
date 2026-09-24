@@ -15,6 +15,16 @@ All notable changes to MessageFoundry are documented here. The format follows
   the `id_token` `exp`, and the configured session caps. **A deploying site whose IdP does not return
   `auth_time` would have every federated sign-in refused**; that is spec-correct and deliberate.
   Federation still ships off (`oidc_enabled = false`). ([BACKLOG #296](docs/BACKLOG.md))
+- **A keyed store now refuses an unmarked value in an encrypted column instead of reading it back
+  as plaintext.** Once a store key is set, every covered column holds only `mfenc:` ciphertext, so
+  a non-blank value without the marker is a stripped marker or a planted row. The cipher raises
+  `CipherError` on it. A purged `''` is never refused. The sweep that runs at each keyed open now
+  seals legacy plaintext only on a surface that holds no sealed value yet; on any other surface it
+  leaves the unmarked value in place and reports it. Each refusal raises an `integrity_drift` alert
+  under the subject `store-cipher`, naming the table and column but never the row or the value.
+  **A planted `state` or `reference` value would stop the engine from starting**, because both
+  caches load at open. The opt-out, `[store].allow_unmarked_ciphertext`, ships off and is reported
+  as a loosening when on. ([BACKLOG #1169](docs/BACKLOG.md))
 - **The DIRECT S/MIME connector now encrypts message content with AES-256-CBC.** The library default
   it used before was AES-128-CBC. Every DIRECT message's content cipher changes on the wire; nothing
   else about the envelope does. **A deploying site whose partner stack cannot decrypt AES-256-CBC

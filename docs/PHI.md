@@ -289,6 +289,26 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    and **`messagefoundry rotate-key` upgrades them v1→v2**, so the default is safe on an existing store
    and reversible. `aad_bind` has no effect without an encryption key (the identity cipher has nothing
    to bind).
+   **An unmarked value is refused — `[store].allow_unmarked_ciphertext`, default OFF (ASVS 11.3.3,
+   BACKLOG #1169).** A keyed store reads a cipher column only as `mfenc:` ciphertext. A non-blank value
+   with no marker is refused with a `CipherError` and raises an `integrity_drift` alert under the
+   `store-cipher` subject, which names the table and column and never the row or the value. It is a
+   stripped marker or a planted row: cell binding catches a moved ciphertext because it has a tag to
+   fail, and a downgrade to plaintext has no tag, so only this refusal protects it. A purged `''` is
+   never refused. The keyed open still seals legacy plaintext, one `(table, column)` surface at a time,
+   but only while that surface holds no ciphertext yet; each surface seals in one transaction, so a
+   crash leaves it all sealed or all unsealed. Setting the switch `true` restores the old behaviour
+   (unmarked values read back as plaintext, and the open seals every one) and is a declared loosening.
+   **At least these limits remain.** The uploaded-file store is not covered: it still accepts an
+   unmarked file, pending an owner ruling. The DIRECT S/MIME enveloped body is not covered. And the
+   "sealed" evidence is the surface's own ciphertext, so a surface that holds none at the moment of a
+   keyed open is treated as unsealed and a row planted into it is sealed as legacy data. That covers a
+   table that can legally empty out (`queue.payload`, `state`, `alert_instance`) and any column that
+   has not been written yet (`users.totp_secret` before the first MFA enrolment, for example). A planted
+   row read before that open is still refused. Also note that a planted `state` or `reference` value
+   on a sealed surface stops the store from opening, since the open reads those tables eagerly. `serve`
+   arms the alert before the open, so that refusal alerts too, and so does a planted row the open
+   finds and leaves in place. The retention document-strip pass skips a refused row and carries on.
    **A third at-rest tier ships — `[store].cipher_provider = "vault_transit"` (`mfenc:v3`, ADR 0138).**
    This does not merely source the key: it **replaces the cipher object**
    ([store/crypto_transit.py](../messagefoundry/store/crypto_transit.py)), so every encrypt/decrypt runs
