@@ -46,11 +46,11 @@
     output shows an open failure; otherwise it is tagged [NOT SHOWN TO BE STORE ACCESS], because a
     refused start gate or a held port also stops the engine from serving.
 
-    A GREEN CAN BE CONDITIONAL, and says so. store.py's _secure_file only logs when icacls fails,
-    so if it could not restrict the trio under some identity (for example, a %USERNAME% icacls
-    cannot resolve), both identities open the store because nothing was re-secured. That result is
-    true of this host and not of every host, so it prints GREEN (CONDITIONAL) with a warning
-    annotation naming what was not restricted, rather than a plain GREEN.
+    CONFINEMENT IS CHECKED AFTER EVERY OPEN. Opening is half of the question; the other half is the
+    property ADR 0163's restriction exists for. After each identity's open, every trio file may grant
+    only SYSTEM, BUILTIN\Administrators, the service account and the operator, or the arm goes RED.
+    A GREEN CAN BE CONDITIONAL, and says so: store.py only logs when icacls fails, so a restriction
+    warning in the service log or the CLI output prints GREEN (CONDITIONAL) with a warning annotation.
 
     The start gates are satisfied with synthetic values: a store key minted by `gen-key`, an SMTP
     relay on loopback that nothing listens on (the start gates read configuration only; nothing
@@ -270,12 +270,6 @@ function Get-Attribution {
     return "$kind $files $log Trio: $($trio.Text).$out"
 }
 
-function Get-DbSddl {
-    # The .db's DACL as SDDL, or a marker when this caller cannot read it (restricted to another).
-    if (-not (Test-Path -LiteralPath $DbPath)) { return "absent" }
-    try { return (Get-Acl -LiteralPath $DbPath).Sddl } catch { return "unreadable" }
-}
-
 function Show-Trio([string]$Label) {
     Write-Host "===== trio DACL after: $Label ====="
     foreach ($suffix in "", "-wal", "-shm") {
@@ -286,24 +280,40 @@ function Show-Trio([string]$Label) {
 
 function Test-Resecured {
     <#
-      Did this identity's open re-secure the store? Three readings, any one of which says it did not:
-      the .db still inherits (store.py strips inheritance when icacls succeeds); the .db's DACL is
-      byte-identical to what it was before this open, which catches a SECOND opener whose restriction
-      silently did nothing; or a restriction warning. -FromServiceLog reads the service's current
-      logs for that warning, and is passed only for the service's own opens, so an earlier service
-      warning is never charged to the operator. An unreadable DACL on both sides tells nothing.
+      After an identity's open, is the store still CONFINED -- the property ADR 0163's restriction
+      exists for? Every present trio file may grant only SYSTEM, BUILTIN\Administrators, the service
+      account and the operator. Any other allow entry is a RED: the store has become readable by a
+      principal outside that set.
+
+      This replaced a check on the MECHANISM ("the .db still inherits", "the DACL did not change"),
+      which encoded the pre-0b rewrite-to-the-opener design. Under Wave 0b a store in a hardened
+      directory inherits that directory on purpose, so the old check would have flagged the correct
+      state. A restriction warning is still a CONDITION: the open did not do what it tried to.
+      -FromServiceLog reads the service's current logs for that warning, and is passed only for the
+      service's own opens, so an earlier service warning is never charged to the operator.
     #>
-    param([string]$Identity, [string]$Output, [string]$SddlBefore, [switch]$FromServiceLog)
-    $notes = @()
-    $after = Get-DbSddl
-    if ($after -ne "absent" -and $after -ne "unreadable") {
-        if (-not (Get-Acl -LiteralPath $DbPath).AreAccessRulesProtected) {
-            $notes += "the .db still inherits its directory's entries"
+    param([string]$Identity, [string]$Output, [switch]$FromServiceLog)
+    $allowed = @("S-1-5-18", "S-1-5-32-544") + @(Get-Sid $ServiceIdentity) + @(
+        [Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
+    foreach ($suffix in "", "-wal", "-shm") {
+        $f = "$DbPath$suffix"
+        if (-not (Test-Path -LiteralPath $f)) { continue }
+        try { $acl = Get-Acl -LiteralPath $f } catch {
+            Add-Condition "after $Identity's open, $Operator could not read the DACL of $(Split-Path -Leaf $f), so its confinement is unmeasured"
+            continue
         }
-        if ($SddlBefore -and $SddlBefore -eq $after) {
-            $notes += "the .db's DACL is unchanged by this open ($after)"
+        foreach ($rule in $acl.Access) {
+            if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
+            $sid = "$($rule.IdentityReference)"
+            try { $sid = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { }
+            if ($allowed -notcontains $sid) {
+                Add-Failure ("after $Identity's open, $(Split-Path -Leaf $f) grants $($rule.IdentityReference) " +
+                    "($($rule.FileSystemRights)), a principal outside SYSTEM, Administrators, " +
+                    "$ServiceIdentity and $Operator, so the store is no longer confined")
+            }
         }
     }
+    $notes = @()
     if ($FromServiceLog) {
         foreach ($m in (Get-LogMatches -Pattern $RestrictFailPattern | Select-Object -First 2)) {
             $notes += "service log: $(Get-Excerpt $m.Line 200)"
@@ -311,7 +321,7 @@ function Test-Resecured {
     }
     if ($Output -and $Output -match $RestrictFailPattern) { $notes += "CLI: $(Get-Excerpt $Output 200)" }
     if ($notes.Count -gt 0) {
-        Add-Condition "$Identity's open did not re-secure the store: $($notes -join '; ')"
+        Add-Condition "$Identity's open reported a failed restriction: $($notes -join '; ')"
     }
 }
 
@@ -700,16 +710,15 @@ try {
             Add-Failure ("$Operator could not provision the fresh store $DbPath through provision-admin " +
                 "(exit $($r.Code)). " + (Get-Attribution $Operator (Get-OperatorSids) $r.Text))
         } else {
-            Test-Resecured -Identity $Operator -Output $r.Text -SddlBefore "absent"
+            Test-Resecured -Identity $Operator -Output $r.Text
             # 2 and 3. The service starts on the store the operator created and secured, and serves.
-            $before = Get-DbSddl
             Start-TheService "start"
             $failed = $Failures.Count
             Test-ServiceServes "the start" "$Operator provisioned"
             Stop-TheService
             Show-Trio "service started"
             if ($Failures.Count -eq $failed) {
-                Test-Resecured -Identity $ServiceIdentity -SddlBefore $before -FromServiceLog
+                Test-Resecured -Identity $ServiceIdentity -FromServiceLog
             }
         }
     } else {
@@ -726,10 +735,9 @@ try {
             Show-LogTail
         } else {
             Add-Reading "$ServiceIdentity created and opened $DbPath, then the ADR 0167 gate refused it (expected)"
-            Test-Resecured -Identity $ServiceIdentity -SddlBefore "absent" -FromServiceLog
+            Test-Resecured -Identity $ServiceIdentity -FromServiceLog
             # 2. The operator opens that store through the CLI's path.
             $CurrentPhase = "operator open"
-            $before = Get-DbSddl
             $r = Invoke-OperatorCli -Arguments $provisionArgs -Secrets $cliSecrets
             Show-Trio "operator open"
             $provisioned = ($r.Code -eq 0)
@@ -756,9 +764,8 @@ try {
                 $how = if ($provisioned) { "and provisioned it (no bootstrap account existed)" }
                        else { "and provision-admin declined on the bootstrap Administrator (expected)" }
                 Add-Reading "$Operator opened $DbPath $how"
-                Test-Resecured -Identity $Operator -Output $r.Text -SddlBefore $before
+                Test-Resecured -Identity $Operator -Output $r.Text
                 # 3. The service starts again on the store the operator's open re-secured.
-                $before = Get-DbSddl
                 Start-TheService "restart"
                 if ($provisioned) {
                     # An addressed Administrator now exists, so the gate passes: prove the open by serving.
@@ -766,7 +773,7 @@ try {
                     Test-ServiceServes "the restart" "$Operator's open re-secured"
                     Stop-TheService
                     if ($Failures.Count -eq $failed) {
-                        Test-Resecured -Identity $ServiceIdentity -SddlBefore $before -FromServiceLog
+                        Test-Resecured -Identity $ServiceIdentity -FromServiceLog
                     }
                 } else {
                     $reopened = Wait-ForGateRefusal "the restart"
@@ -778,7 +785,7 @@ try {
                         Show-LogTail
                     } else {
                         Add-Reading "$ServiceIdentity reopened $DbPath after $Operator's open"
-                        Test-Resecured -Identity $ServiceIdentity -SddlBefore $before -FromServiceLog
+                        Test-Resecured -Identity $ServiceIdentity -FromServiceLog
                     }
                 }
                 Show-Trio "service restart"
@@ -813,11 +820,11 @@ if ($Failures.Count -gt 0) {
     throw "RED [$Order]: $($Failures.Count) failure(s); the first: $($Failures[0])"
 }
 if ($Conditions.Count -gt 0) {
-    $why = "both identities opened the store, but at least one open did not re-secure it, so this order did not test ADR 0163's reading on this host: $($Conditions -join ' / ')"
+    $why = "both identities opened the store, but at least one open reported a failed restriction or an unreadable DACL: $($Conditions -join ' / ')"
     Write-Host "::warning title=ADR 0183 Wave 0 ($Order) GREEN (CONDITIONAL)::$(Format-Annotation $why)"
     Write-Host "GREEN (CONDITIONAL) [$Order]: $why"
 } else {
-    Write-Host "GREEN [$Order]: both identities opened the store in this order, and each open re-secured it."
+    Write-Host "GREEN [$Order]: both identities opened the store in this order, and it stayed confined after each open."
 }
 # The Actions wrapper exits with $LASTEXITCODE, which the last native command (nssm, icacls) set.
 exit 0

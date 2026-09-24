@@ -42,9 +42,11 @@ import hmac
 import json
 import logging
 import os
+import re
 import shutil
 import stat
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import (
@@ -2760,6 +2762,204 @@ async def _secure_file_async(path: Path, *, extra_read_grants: Sequence[str] | N
     await asyncio.to_thread(_secure_file, path, extra_read_grants=extra_read_grants)
 
 
+# --- the store trio in a HARDENED data directory (ADR 0183 Wave 0b, ADR 0163 consequences 1-2) ------
+#
+# `_secure_file` rewrites a file to its opener ALONE. For the store trio that made whichever identity
+# opened a fresh store first its only principal, measured on hosted windows-2022 and windows-2025 (CI
+# run 36026471545): an operator's `provision-admin` locked the NSSM service account out, and the
+# service locked the operator out. Neither process can know the other's identity -- the CLI cannot
+# see the service's account, the service cannot know which administrator comes later -- so no grant
+# NAMED by the opener fixes both orders.
+#
+# The data directory already names the right set. install-service.ps1 removes its inheritance and
+# grants SYSTEM, BUILTIN\Administrators and the run-as account, inherited by files. So where the
+# store's directory is HARDENED like that, the trio INHERITS the directory instead of being rewritten
+# to its opener. Everywhere else -- a developer checkout, a temp directory, any directory that admits
+# a principal outside that set -- the owner-only rewrite applies exactly as before. The test is an
+# ALLOW-list, so a directory granting anyone else, or one this code cannot parse, falls back to it.
+
+#: SDDL aliases the confinement test resolves. Any other alias names a principal outside the set.
+_SDDL_SID_ALIASES: Mapping[str, str] = MappingProxyType({"SY": "S-1-5-18", "BA": "S-1-5-32-544"})
+#: NT AUTHORITY\SYSTEM and BUILTIN\Administrators.
+_STORE_DIR_TRUSTED_SIDS = frozenset({"S-1-5-18", "S-1-5-32-544"})
+#: One per-service virtual account, NT SERVICE\<name>: S-1-5-80 plus exactly five sub-authorities.
+#: NT SERVICE\ALL SERVICES is S-1-5-80-0 and does NOT match, because it admits every service.
+_SERVICE_SID = re.compile(r"S-1-5-80-\d+-\d+-\d+-\d+-\d+")
+_SDDL_DENY_TYPES = frozenset({"D", "OD", "XD"})
+_SDDL_ACE = re.compile(r"\(([^()]*)\)")
+
+
+@dataclass(frozen=True)
+class _SddlDacl:
+    """A DACL read from SDDL: whether inheritance is blocked, and each ACE as (type, flags, sid)."""
+
+    protected: bool
+    aces: tuple[tuple[str, str, str], ...]
+
+
+def _parse_sddl_dacl(sddl: str) -> _SddlDacl | None:
+    """The ``D:`` section of an SDDL string, or ``None`` when it is absent or not plainly parseable.
+
+    ``None`` is the fail-closed answer: every caller treats it as "not confined", so a shape this does
+    not understand (a callback ACE, a resource attribute, a null DACL) gets the owner-only rewrite."""
+    start = sddl.find("D:")
+    if start < 0:
+        return None
+    body = sddl[start + 2 :]
+    end = body.find("S:")  # a SACL section, if one was included, follows the DACL
+    if end >= 0:
+        body = body[:end]
+    first = body.find("(")
+    flags = body if first < 0 else body[:first]
+    if "NO_ACCESS_CONTROL" in flags:
+        return None
+    aces: list[tuple[str, str, str]] = []
+    rest = body[first:] if first >= 0 else ""
+    for match in _SDDL_ACE.finditer(rest):
+        parts = match.group(1).split(";")
+        if len(parts) != 6:
+            return None
+        aces.append((parts[0], parts[1], parts[5]))
+    # Anything left over once the ACEs are removed is a shape this parser does not model.
+    if _SDDL_ACE.sub("", rest).strip():
+        return None
+    return _SddlDacl(protected="P" in flags, aces=tuple(aces))
+
+
+def _dacl_confines_store(dacl: _SddlDacl) -> bool:
+    """Does this directory DACL confine a store to SYSTEM, Administrators and per-service accounts?
+
+    It must block inheritance, and every non-deny ACE must name one of those principals. A deny entry
+    only narrows access, so it cannot let anyone else in."""
+    if not dacl.protected or not dacl.aces:
+        return False
+    for ace_type, _flags, sid in dacl.aces:
+        if ace_type in _SDDL_DENY_TYPES:
+            continue
+        if ace_type != "A":
+            return False
+        resolved = _SDDL_SID_ALIASES.get(sid, sid)
+        if resolved not in _STORE_DIR_TRUSTED_SIDS and not _SERVICE_SID.fullmatch(resolved):
+            return False
+    return True
+
+
+def _dacl_inherits_only(dacl: _SddlDacl) -> bool:
+    """Is this file DACL purely inherited (not protected, and every ACE carries the ``ID`` flag)?"""
+    return (not dacl.protected) and bool(dacl.aces) and all("ID" in f for _t, f, _s in dacl.aces)
+
+
+def _read_dacl_sddl(path: Path) -> str | None:
+    """The DACL of ``path`` as SDDL, or ``None`` when it cannot be read. Windows only.
+
+    GetNamedSecurityInfoW asks for DACL_SECURITY_INFORMATION alone, so it needs only READ_CONTROL,
+    and SDDL names principals by SID, so the answer does not depend on the display language."""
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32.GetNamedSecurityInfoW.argtypes = [
+        wintypes.LPCWSTR,
+        ctypes.c_int,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi32.GetNamedSecurityInfoW.restype = wintypes.DWORD
+    advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW.argtypes = [
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.LPWSTR),
+        ctypes.c_void_p,
+    ]
+    advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    se_file_object = 1
+    dacl_security_information = 0x4
+    sddl_revision_1 = 1
+    descriptor = ctypes.c_void_p()
+    status = advapi32.GetNamedSecurityInfoW(
+        str(path),
+        se_file_object,
+        dacl_security_information,
+        None,
+        None,
+        None,
+        None,
+        ctypes.byref(descriptor),
+    )
+    if status != 0:
+        return None
+    try:
+        text = wintypes.LPWSTR()
+        if not advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor, sddl_revision_1, dacl_security_information, ctypes.byref(text), None
+        ):
+            return None
+        try:
+            return text.value
+        finally:
+            kernel32.LocalFree(ctypes.cast(text, ctypes.c_void_p))
+    finally:
+        kernel32.LocalFree(descriptor)
+
+
+def _store_dir_confines(directory: Path) -> bool:
+    """Is the store's directory hardened (see :func:`_dacl_confines_store`)? ``False`` off Windows,
+    and whenever the DACL cannot be read or parsed -- both fall back to the owner-only rewrite."""
+    if os.name != "nt":
+        return False
+    sddl = _read_dacl_sddl(directory)
+    if sddl is None:
+        return False
+    dacl = _parse_sddl_dacl(sddl)
+    return dacl is not None and _dacl_confines_store(dacl)
+
+
+def _secure_store_file(path: Path, *, dir_confines: bool) -> None:
+    """Restrict one file of the SQLite store trio.
+
+    Outside a hardened directory, or off Windows, this is :func:`_secure_file`: owner-only, exactly as
+    before. Inside one, the file is left to INHERIT the directory -- SYSTEM, Administrators and the
+    per-service account the installer granted -- so the service and the operator who provisions the
+    store can both open it, in either order. A file already purely inheriting is left untouched: the
+    service account holds Modify, not WRITE_DAC, so rewriting a correct DACL would fail and warn on
+    every start. Otherwise ``icacls /reset`` drops explicit entries and restores inheritance. Like
+    :func:`_secure_file` it is best-effort and logs rather than raises."""
+    if os.name != "nt" or not dir_confines:
+        _secure_file(path)
+        return
+    current = _read_dacl_sddl(path)
+    parsed = _parse_sddl_dacl(current) if current is not None else None
+    if parsed is not None and _dacl_inherits_only(parsed):
+        return
+    try:
+        result = subprocess.run(  # nosec B603 B607
+            [_system_exe("icacls.exe"), str(path), "/reset"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        log.warning("could not restore inheritance on %s: %s", path, exc)
+        return
+    if result.returncode != 0:
+        log.warning(
+            "icacls could not restrict %s to its hardened directory (exit %s): %s",
+            path,
+            result.returncode,
+            (result.stderr or result.stdout or "").strip(),
+        )
+
+
 def _opt_float(value: Any) -> float | None:
     """Coerce a possibly-NULL epoch column to ``float | None`` (a backend may return int/Decimal)."""
     return None if value is None else float(value)
@@ -3743,13 +3943,17 @@ class MessageStore:
             # completes before anything is serving, so this one is consistency rather than a fix.
             if str(path) != ":memory:":
                 main = Path(path)
+                # ADR 0183 Wave 0b: in a HARDENED data directory the trio inherits the directory, so
+                # the service account and the provisioning operator can both open it in either order;
+                # elsewhere it is rewritten owner-only as before. See _secure_store_file.
+                confines = await asyncio.to_thread(_store_dir_confines, main.parent)
                 for f in (
                     main,
                     main.with_name(main.name + "-wal"),
                     main.with_name(main.name + "-shm"),
                 ):
                     if f.exists():
-                        await _secure_file_async(f)
+                        await asyncio.to_thread(_secure_store_file, f, dir_confines=confines)
             store = cls(
                 db,
                 path=path,

@@ -195,6 +195,44 @@ neither introduces nor fixes it; a design must not *worsen* it.
   into a standing one.
 - **A standalone provisioning CLI.** See §"Why a standalone CLI is not viable".
 
+## Note (2026-09-24): consequences 1 and 2 measured, and a fix for the SQLite trio (ADR 0183 Wave 0b)
+
+**Consequences 1 and 2 held exactly, on hosted runners.** [ADR 0183](0183-provision-the-first-administrator-offline-no-default-account-at-first-run.md)
+Amendment A Wave 0 measured them under a real NSSM service on the default virtual account, CI run
+36026471545, on windows-2022 and windows-2025. Provision first: the store `runneradmin` provisioned
+carried one entry, `runneradmin:(F)`, and `NT SERVICE\MessageFoundry` never answered `/health`.
+Start first: the store the service created carried one entry, `NT SERVICE\MessageFoundry:(F)`, and the
+operator's `provision-admin` failed with `unable to open database file`. So the service's `%USERNAME%`
+does resolve for `icacls`; the lockout is the design working as written, not a failed call.
+
+**Decision: in a hardened data directory the trio inherits the directory.** `_secure_store_file`
+(`messagefoundry/store/store.py`), called from the open path, reads the directory's DACL as SDDL. The
+directory counts as hardened when inheritance is removed and every allow entry names SYSTEM,
+`BUILTIN\Administrators` or one per-service virtual account (`S-1-5-80-` plus five sub-authorities,
+which excludes `ALL SERVICES`). That is the shape `install-service.ps1` writes. There the files keep or
+regain inheritance (`icacls /reset`) instead of being rewritten to their opener; a file already purely
+inheriting is left alone, because the service holds Modify and not WRITE_DAC. Anywhere else, including
+any directory this code cannot read or parse, the owner-only rewrite applies exactly as before.
+
+**Why this and not a named grant.** Neither process can name the other. The CLI cannot see the
+service's account (the trap BACKLOG #1905 fixed for the key), and the service cannot know which
+administrator will provision. Granting the service account from the CLI fixes only provision first.
+Granting Administrators alone fixes neither order, because the virtual account is not an
+Administrator. The installer already names the right set on the data directory, so the trio uses it.
+
+**What it widens, stated plainly.** Before, a store file granted its last opener alone. Now, in a
+hardened directory, it grants SYSTEM, every elevated member of `BUILTIN\Administrators`, and the
+service account -- the principals that already hold Full Control or Modify on the data directory and
+its logs, which are a PHI sink of the same class. An Administrator gains no capability it lacked
+(it could already take ownership), but the DACL now says so. The store also tracks the directory: if an
+operator later adds a broad entry to the directory, the files inherit it until the next open, which
+falls back to the owner-only rewrite because the directory no longer counts as hardened.
+
+**What it does not cover.** A service installed with `-ServiceAccount` naming a gMSA or a dedicated
+user holds a SID outside the allow-list, so that directory is not "hardened" and the old lockout
+remains for that configuration. POSIX is unchanged (`chmod 0600`). Consequences 3 and 4 are not
+touched here: the key half was answered by BACKLOG #1905.
+
 ## How this was reached
 
 Two multi-agent research passes with adversarial verification. Round one selected a standalone CLI;
