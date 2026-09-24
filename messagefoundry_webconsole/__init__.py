@@ -22,7 +22,7 @@ from pathlib import Path
 
 #: Independent version root (NOT lockstep with the engine — that is the departure from
 #: ``messagefoundry-harness``); its own tag / changelog / PyPI cadence. Starts matched to the engine.
-__version__ = "0.2.15"
+__version__ = "0.3.0"
 
 #: The engine seam this console build supports (``api._ui_seam.ENGINE_UI_SEAM``). Any other engine is
 #: refused at startup — the runtime backstop behind the PEP 508 compat range.

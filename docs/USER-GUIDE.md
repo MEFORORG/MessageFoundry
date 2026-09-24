@@ -94,7 +94,7 @@ pip install -e .                             # core runtime + SQLite store
 For a **deployment**, pin the published wheel instead (and verify its provenance — see [INSTALL-GUIDE.md](INSTALL-GUIDE.md)):
 
 ```powershell
-pip install "messagefoundry==0.3.2"
+pip install "messagefoundry==0.4.0"
 ```
 
 Add only the extras a host actually needs (each is opt-in and lazy-imported):
@@ -111,7 +111,7 @@ pip install -e ".[webauthn]"     # browser WebAuthn passkeys for the /ui console
 pip install -e ".[otel]"         # OpenTelemetry/OTLP export seam (the /metrics endpoint itself needs no extra)
 ```
 
-(For a deployment wheel, the same extras apply: `pip install "messagefoundry[harness]==0.3.2"`, and the web console installs as its own wheel `pip install "messagefoundry-webconsole==0.2.15"`.) SQLite is the zero-dependency default — you need no extra to run the sample config.
+(For a deployment wheel, the same extras apply: `pip install "messagefoundry[harness]==0.4.0"`, and the web console installs as its own wheel on its own version line: `pip install "messagefoundry-webconsole==0.3.0"`, the console built for engine 0.4.0.) SQLite is the zero-dependency default — you need no extra to run the sample config.
 
 ### 3. Run the engine headless (dev)
 
@@ -158,11 +158,13 @@ Put it under version control with **Set Up Version Control & Checks** in the IDE
 
 ### 5. Open the admin console (in a browser)
 
-The console is the **browser web console** served same-origin by the engine at `/ui` (install the `messagefoundry-webconsole` wheel alongside the engine and set `[security].serve_web_console = true`). With the engine running, browse to:
+The console is the **browser web console** served same-origin by the engine at `/ui` (install the `messagefoundry-webconsole` wheel alongside the engine; it is on by default for a loopback bind, so there is no switch to set). With the engine running, browse to:
 
 ```
-http://127.0.0.1:8765/ui
+https://127.0.0.1:8765/ui
 ```
+
+The engine always serves HTTPS. With no `[api].tls_cert_file`, it mints a self-signed certificate on first run, beside the store database as `api-generated-cert.pem`, so the browser warns until you import that file into the trust store or configure your own certificate.
 
 The web console prompts for sign-in (authentication is on by default). Source: [packaging/messagefoundry-webconsole/](../packaging/messagefoundry-webconsole/). (The former PySide6 desktop console was retired — BACKLOG #103; PySide6 now backs only the standalone test harness.)
 

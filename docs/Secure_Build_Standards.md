@@ -10,8 +10,8 @@
 | **Applies to** | Any project developed under the SDS. Each project records its graded result in its own scorecard; MessageFoundry (MEFOR) is the reference implementation ([Secure Build Scorecard](Secure_Build_Scorecard_MEFOR.md)). |
 | **Maintained by** | Project maintainers (open-source). Each deploying organization assigns its own local security owner. |
 | **Status** | Draft for review |
-| **Version** | 0.5 |
-| **Date** | July 14, 2026 |
+| **Version** | 0.6 |
+| **Date** | September 23, 2026 |
 | **License** | Publishable under the project's open-source license; intended to be shared with adopters and reused across projects. |
 | **Review cadence** | At least annually, and on any material change to the evidence base behind the rubric (new metric studies, a new framework version, a change to the enforcement model). |
 | **Aligns to** | NIST SP 800-218 (SSDF) producer practices · SP 800-115 (technical security testing) · SP 800-66 Rev. 2 (HIPAA Security Rule) · OWASP ASVS 5.0 Level 3. Companion to the SDS, the [AI-build companion](Secure_AI_Development_Standards.md), and [Code Quality](Code_Quality_Standards.md). Confers no certification — NIST and OWASP issue no certificate, and a self-assessment is not one. |
@@ -112,7 +112,7 @@ The signals fall into two layers, and the split is the whole point.
 | # | Signal | What "good" looks like | Gate type | Owner |
 |---|---|---|---|---|
 | 9 | **Vulnerability response & disclosure** (RV.1–3) | Defined private intake channel; triaged remediation SLA windows (Crit/High/Med) clocked from upstream-fix; RCA process; coordinated disclosure; the SLA machinery exercised end-to-end (tabletop/dry-run), not just written. | Process | SDS §4.4/§8 |
-| 10 | **Independent external verification** (SDS §6.3 / ASVS L3) | Third-party source review + penetration test + DAST before production or off-loopback. Where deferred, a dated, signed risk acceptance is in force with a re-score trigger. | Process | SDS §6.3 |
+| 10 | **Independent external verification** (SDS §6.3 / ASVS L3) | **Desired, not required.** The desired state is a third-party source review + penetration test + DAST. An internal or self-run pass does not meet it. ASVS 5.0 L3 does not require an independent review, and neither does this rubric. Until one runs, a dated, signed risk acceptance records the gap, with a re-score trigger. *(Changed 2026-09-23 by owner ruling. This row required "Third-party source review + penetration test + DAST before production or off-loopback". It is now a desired state.)* | Process | SDS §6.3 |
 | 11 | **Evidence & attestation honesty** (SDS §9) | A claims register with a Built / designed-but-deferred / aspirational taxonomy; documented ASVS exclusions; a single canonical verdict-of-record with no conflicting in-tree scorecards; no "certified" phrasing; stale findings reconciled to current code. | Advisory | SDS §9 / [AI companion §8](Secure_AI_Development_Standards.md) |
 | 12 | **Release-gate integrity** (SDS §6.4) | Codified pass/fail gate: no unresolved high/critical, current independent-review status or a signed risk acceptance, updated evidence and a signed/SBOM'd tag; the gate does not lean on an unsigned acceptance. | Deterministic + advisory | SDS §6.4 |
 
@@ -168,7 +168,7 @@ A scorecard built from this rubric does not restate a single per-requirement ver
 | 7 | Interface & transport authentication | SDS §7.4 | V6, V9, V10, V12 | — | Owned by SDS §7.4; checked here |
 | 8 | Audit & tamper-evident logging | PW.5 | V16 | — | Owned there; checked here |
 | 9 | Vulnerability response & disclosure | RV.1–RV.3 (§4.4/§8) | (process — no ASVS row) | — | Owned by SDS; checked here |
-| 10 | Independent external verification | SDS §6.3 | ASVS L3 verification mandate | — | Owned by SDS §6.3; surfaced here as the capping gap |
+| 10 | Independent external verification | SDS §6.3 | Not an ASVS requirement: ASVS 5.0 L3 does not require independent review. *(Corrected 2026-09-23. This cell said "ASVS L3 verification mandate", which was false.)* | — | Owned by SDS §6.3; surfaced here as the capping gap |
 | 11 | Evidence & attestation honesty | SDS §9 | (ASVS exclusions V3/V17) | §8 / §9 (tooling-honesty register) | New — this rubric (the anti-scoreboard layer) |
 | 12 | Release-gate integrity | SDS §6.4 | — | §9 | Owned there; checked here |
 | — | The composite letter grade + anti-metric rule (§4.1) | — | — | Analogue of AI companion §5 and [Code Quality §4.1](Code_Quality_Standards.md) | New — this rubric |
@@ -218,5 +218,6 @@ Two things are new here. Signal 11 is the claims-register and single-verdict-of-
 
 | Version | Date | Notes |
 | --- | --- | --- |
+| 0.6 | September 23, 2026 | **Signal 10 is a desired state, not a requirement (owner ruling 2026-09-23).** The row required an independent review + penetration test + DAST "before production or off-loopback". It now names that engagement as the desired state and says an internal or self-run pass does not meet it. The §6 mapping called signal 10 an "ASVS L3 verification mandate"; ASVS 5.0 L3 does not require independent review, so that cell was false and is corrected. The grading model is unchanged. |
 | 0.5 | July 14, 2026 | **Split into a reusable standard + a per-project scorecard.** This document is now the project-agnostic rubric; MEFOR's graded result moved to the separate [Secure Build Scorecard](Secure_Build_Scorecard_MEFOR.md). All MEFOR-specific content (the placement table, evidence citations, verdict, ranked gaps, grade history) lives there. No change to the twelve signals, the anti-metric rule, or the companion mapping. |
 | 0.1–0.4 | July 14, 2026 | Developed as a single combined document (rubric + MEFOR scorecard). Full history is retained in the [Secure Build Scorecard](Secure_Build_Scorecard_MEFOR.md) version table, which carried the B+ → A- grade progression. |

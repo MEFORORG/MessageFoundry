@@ -215,14 +215,19 @@ def test_the_notice_has_exactly_two_copies() -> None:
 @pytest.mark.parametrize(
     "row",
     [
-        "Third-party source review + penetration test + DAST before production or off-loopback",
+        "The desired state is a third-party source review + penetration test + DAST. An internal or "
+        "self-run pass does not meet it.",
         'An internal "L3 verified" / self-assessment pass',
     ],
 )
 def test_signal_10_rows_are_unchanged(row: str) -> None:
     """Signal 10 and its theater-table twin are the rows this change is most likely to be mistaken for
     satisfying. Row 6 of the theater table names an internal self-assessment pass as the gameable proxy
-    — which is precisely the shape of a self-run DAST tier — so neither may be softened."""
+    — which is precisely the shape of a self-run DAST tier — so neither may be softened.
+
+    Owner ruling 2026-09-23 made signal 10 a desired state rather than a requirement, so this pin moved
+    from the old "before production or off-loopback" bar to the new row. What it guards did not move: the
+    row must still say a self-run pass does not meet it."""
     assert row in _read(_BUILD_STANDARDS), (
         f"docs/Secure_Build_Standards.md no longer contains {row!r} verbatim. A self-run DAST tier does "
         "not satisfy signal 10, and this row must not be edited to suggest otherwise."

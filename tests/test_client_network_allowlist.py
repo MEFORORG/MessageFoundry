@@ -62,6 +62,7 @@ def _loosenings(sec: SecuritySettings) -> list[tuple[str, str]]:
         (),
         (),
         None,
+        None,
     )
 
 

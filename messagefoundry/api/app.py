@@ -1984,6 +1984,8 @@ def create_app(
                 expired_hops,
                 db_hops,
                 store_privilege,
+                # BACKLOG #1905: read off the LIVE store -- settings cannot know what audit_log holds.
+                engine.store.audit_chain_unkeyed(),
             )
         ]
         store_privilege_view = (
