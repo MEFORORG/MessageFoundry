@@ -973,6 +973,16 @@ class ApiSettings(_Section):
     # non-loopback bind satisfy the exposed-gate WITHOUT in-process TLS — but only when trusted_proxies
     # is set (so the engine knows a terminator is really in front).
     tls_terminated_upstream: bool = False
+    # The operator's acknowledgement that, with tls_terminated_upstream and no tls_cert_file, the
+    # proxy-to-engine hop is PLAINTEXT by design (ADR 0172 decision 3): the engine mints no
+    # certificate there, so encrypting or isolating that hop is the DEPLOYING SITE's job. `serve`
+    # refuses to start that topology without it, in every mode -- enforcing or warn, loopback or
+    # not -- because only the operator can take on a hop the engine does not protect. With an
+    # operator tls_cert_file the engine serves that hop over TLS, so it is not required there (and
+    # harmless if set). It records who took the hop on; it secures nothing. Meaningful only with
+    # tls_terminated_upstream, so setting it without that is refused at load (a stray
+    # acknowledgement would read as a decision about a hop that does not exist). Default False.
+    plaintext_upstream_hop_acknowledged: bool = False
 
     # --- Posture-B (upstream TLS termination) attestations (#200, ADR 0002) --------
     # In Posture-B the proxy terminates browser TLS and the proxy→engine hop is a plaintext segment on
@@ -1134,6 +1144,14 @@ class ApiSettings(_Section):
         # the proxy in front — otherwise it's an unverifiable claim that XFF could spoof.
         if self.tls_terminated_upstream and not self.trusted_proxies:
             raise ValueError("[api].tls_terminated_upstream requires [api].trusted_proxies")
+        # Refuse rather than ignore a stray acknowledgement, as ad_session_recheck_seconds without
+        # ad_enabled is refused: an operator who set it believes a proxy-to-engine hop exists and
+        # was considered, and without tls_terminated_upstream there is no such hop.
+        if self.plaintext_upstream_hop_acknowledged and not self.tls_terminated_upstream:
+            raise ValueError(
+                "[api].plaintext_upstream_hop_acknowledged requires [api].tls_terminated_upstream "
+                "(it acknowledges the plaintext proxy-to-engine hop that only that topology has)"
+            )
         # Validate the DECLARED Posture-B proxy TLS floor for internal coherence (#200, ASVS 11.6.2) —
         # an attestation, but a *coherent* one (a NIST version floor; forward-secret ciphers if named).
         validate_proxy_tls_posture(self.proxy_tls_min_version, self.proxy_tls_ciphers)
@@ -2209,7 +2227,7 @@ class AuthSettings(_Section):
     password_require_digit: bool = False
     password_require_symbol: bool = False
     password_check_breached: bool = True  # reject known common/breached passwords (offline corpus)
-    password_check_context: bool = True  # reject passwords containing app/vendor/HL7 terms
+    password_check_context: bool = True  # reject passwords containing a CONTEXT_WORDS term
     password_check_username: bool = (
         True  # reject passwords containing the user's own username (6.2.11)
     )
@@ -2398,6 +2416,16 @@ class AuthSettings(_Section):
     oidc_flow_ttl_seconds: int = 300  # single-use flow window; validator-capped 30..1800
     oidc_flow_cache_max: int = 512  # reject-when-full (never evict — that is a login DoS)
     oidc_session_max_hours: int | None = None  # G2: cap below id_token.exp if tighter is wanted
+    # ASVS 6.8.4 / 7.6.1, BACKLOG #296 / #1150: the most time, in seconds, that may pass between the
+    # user's authentication AT THE IdP and the end of the engine session it mints. Sent as `max_age` on
+    # every authorization request, so a conforming IdP re-authenticates only when its own SSO session
+    # is older than this (single sign-on survives for everyone inside the window) and MUST return
+    # `auth_time`. The ladder refuses a token with no `auth_time` or a stale one, and the session is
+    # capped at `auth_time + max_age`. There is deliberately NO off switch: None and 0 are refused
+    # (0 is `prompt=login` under another name, which throws away single sign-on). The default matches
+    # the shipped 12-hour absolute session cap, so a fresh IdP login changes nothing and an old one
+    # cannot buy a session reaching past 12 hours from the moment the human actually authenticated.
+    oidc_max_age_seconds: int = 43200
 
     # Login rate limiting (AUTH-RATE) — in-process sliding window in front of the per-account
     # lockout: bounds password-spray + argon2 CPU-burn. In-process only; an exposed/multi-host
@@ -2432,8 +2460,9 @@ class AuthSettings(_Section):
 
     # Out-of-band user notification of security events (ASVS 6.3.5/6.3.7): email the affected user on
     # lockout / first-success-after-failures / password/email/role/disable changes. Email requires the
-    # [alerts] SMTP transport to be configured (no SMTP → email is skipped); the audited
-    # /me/security-events feed records these regardless of this toggle.
+    # [alerts] SMTP transport to be configured (no SMTP means email is skipped). This toggle does not
+    # touch the audit log; which events the /me/security-events feed shows is stated once, in
+    # auth/notifications.py.
     notify_security_events: bool = True
 
     @field_validator("mfa_recovery_code_count")
@@ -2483,6 +2512,21 @@ class AuthSettings(_Section):
         # an unbounded value is wrong in both directions.
         if not 30 <= value <= 1800:
             raise ValueError("oidc_flow_ttl_seconds must be between 30 and 1800")
+        return value
+
+    @field_validator("oidc_max_age_seconds")
+    @classmethod
+    def _check_oidc_max_age(cls, value: int) -> int:
+        # Bounded at both ends, and the floor is what makes "no off switch" true. At 0 the IdP must
+        # re-authenticate on every sign-in, which is `prompt=login` and destroys single sign-on; a
+        # few seconds is that in practice. The 5-minute floor and the 24-hour ceiling are a JUDGMENT
+        # with no measured anchor, like the flow-TTL bounds above. The ceiling keeps the knob from
+        # quietly becoming "unbounded"; the 12-hour absolute session cap sits below it anyway.
+        if not 300 <= value <= 86400:
+            raise ValueError(
+                "oidc_max_age_seconds must be between 300 and 86400 (there is no off switch: the "
+                "IdP authentication recency bound is always enforced when oidc_enabled is set)"
+            )
         return value
 
     @field_validator("totp_skew_steps")
@@ -5216,6 +5260,7 @@ def security_loosenings(
     expiry_relaxed_hops: Sequence[str],
     unverified_db_hops: Sequence[str],
     store_privilege: StorePrivilegePosture | None,
+    audit_chain_unkeyed: bool | None,
 ) -> list[tuple[str, str]]:
     """The ``[security]`` switches at their INSECURE value, plus the enumerated deviations outside that
     section, as ``(switch, plain-language risk)``.
@@ -5228,8 +5273,8 @@ def security_loosenings(
     ``[auth].ad_session_recheck_seconds``, ``[alerts].email_use_tls``/``email_tls_verify`` (#323
     layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), three per-connection
     deviations — ``cleartext_accepted``, ``tls_allow_expired``, and a generic-ODBC ``DATABASE`` hop
-    with TLS unenforced (#333) -- and the store principal's OBSERVED privilege posture (#1008). It
-    is NOT yet
+    with TLS unenforced (#333) -- the store principal's OBSERVED privilege posture (#1008), and the
+    OBSERVED keying of the audit chain (#1905). It is NOT yet
     an exhaustive registry of every security-relevant switch in every section; ``[store]``/``[auth]``
     carry others (``encrypt``, ``trust_server_certificate``, ``enabled``, ``require_mfa``,
     ``ad_tls_verify``, ``ad_allow_insecure_ldap``, ``oidc_require_mfa_claim``,
@@ -5262,6 +5307,12 @@ def security_loosenings(
     a clean result and this registry never renders it as one. Note the switch that acts on the finding
     — ``[store].require_least_privilege`` — is a HARDENING, so it is not itself reported here; the
     DEVIATION is what the observation found, exactly as with the three connection-scoped entries.
+
+    ``audit_chain_unkeyed`` is the second store OBSERVATION (BACKLOG #1905), from the open store's
+    ``audit_chain_unkeyed()``: the store holds a key, yet its audit chain is keyless SHA-256 because
+    rows were written before any key was in hand, and a keyed open never re-keys existing rows.
+    ``None`` has the same meaning as for ``store_privilege`` -- no store is open at this call site, so
+    nothing was observed -- and is never read as a clean result.
 
     The three sequence parameters are the CONNECTION-scoped deviations, each a list of connection NAMES:
     ``cleartext_hops`` declares ``cleartext_accepted`` (ADR 0153), ``expiry_relaxed_hops`` declares
@@ -5583,6 +5634,21 @@ def security_loosenings(
                     "its runbook says it must not",
                 )
             )
+    # --- the AUDIT CHAIN's observed keying (BACKLOG #1905). An observation, like the entry above: no
+    # switch declares it. A store that holds a key but opened onto a keyless chain with rows carries
+    # tamper-evidence an attacker with write access can forge, and nothing else in this registry
+    # would say so -- the at-rest entries report a MISSING key, and here the key is present.
+    if audit_chain_unkeyed:
+        out.append(
+            (
+                "audit_chain_unkeyed",
+                "the audit chain is KEYLESS SHA-256 although a store key is configured -- its rows "
+                "were written before the key was in hand, and opening with a key does not re-key "
+                "existing rows, so anyone who can write audit_log can forge a row that verifies "
+                "clean; stop the engine and run `messagefoundry rekey-audit` to verify the chain and "
+                "key every row after it",
+            )
+        )
     return out
 
 

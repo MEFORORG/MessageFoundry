@@ -346,7 +346,7 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   **AUDIT** line + posture view keep the deviation visible.
 - **Still refused (even at `warn`):** the **no-auth-to-the-network** hard refuse (`require_sign_in = false` on
   an exposed instance — a non-loopback bind, or a loopback bind behind a declared TLS terminator) is
-  unconditional at **any** enforcement level — `enforcement = warn` does **not** open it — and the unconditional ePHI audit floor is untouched. `enforcement` is **binary** (no `off`), and **nothing silences a
+  unconditional at **any** enforcement level — `enforcement = warn` does **not** open it — and the unconditional ePHI audit floor is untouched. A declared TLS terminator whose proxy-to-engine hop is plaintext (no `[api].tls_cert_file`) also still needs `[api].plaintext_upstream_hop_acknowledged` at any enforcement level (BACKLOG #1179; [CONFIGURATION.md](CONFIGURATION.md) `[api]` table). `enforcement` is **binary** (no `off`), and **nothing silences a
   cleartext hop entirely any more**: [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)
   removed the data label from that decision and [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md) removed the label itself. The
   per-connection `cleartext_accepted` declaration is the way to cross one, recorded per hop.
@@ -604,6 +604,30 @@ This section is kept rather than deleted, because the claim it used to make is t
   permanently-true warning is read as noise.
 - **How to refuse:** the same `[store].require_least_privilege = true` refuses on this condition too.
 
+### `audit_chain_unkeyed` — the store has a key, but its audit chain is keyless
+
+> **An OBSERVATION, not a switch.** Nobody sets this. The store reports it when it opens with a key
+> (or an isolated-module MAC) onto an audit chain that has rows but no keying watermark. BACKLOG #1905.
+- **What you lose:** tamper evidence against forgery. Every existing audit row is plain SHA-256, so
+  anyone who can write `audit_log` can rewrite a row and recompute the chain, and `audit-verify`
+  reports it clean. A keyed chain would need the store key to do that.
+- **How it happens:** rows were written while no key was in hand, then a key was added. Opening with
+  a key keys a store only when its `audit_log` is empty, and never re-keys rows that already exist,
+  because that would bless a forged row. The documented install order used to produce this: run
+  `provision-admin` with the key only in the service's environment, and the first audit row is
+  keyless. `provision-admin` now refuses under the same condition `serve` refuses to start.
+- **It is never silent:** a WARNING each time the store opens, naming `messagefoundry rekey-audit`,
+  and an `audit_chain_unkeyed` entry in `GET /security/posture`. It is not in the serve-time
+  settings warning or `messagefoundry security show`, because neither opens the store.
+- **How to clear it:** stop the engine, then run `messagefoundry rekey-audit` with the key
+  configured. A running engine keeps the watermark it read at open, so it would go on appending
+  keyless rows above the new one and the next verify would report a break. `rekey-audit` verifies the
+  existing chain first, refuses a broken one, and keys every row after it. The existing rows keep
+  their SHA-256 hashes, but the first keyed row folds in the last keyless hash, so a later edit to
+  any earlier row breaks the keyed suffix.
+- **On a store with no key at all this entry never fires.** That chain is keyless by the audited
+  at-rest opt-out, which `allow_unencrypted_phi` already reports.
+
 ---
 
 ## Standards mapping (ASVS v5.0 · NIST SP 800-53r5 · HIPAA §164.312)
@@ -639,6 +663,7 @@ carried from that drive-to-pass, not re-derived here.**
 | `tls_allow_expired` (per-connection expiry-only relaxation) | V12 Secure Communication | **SC-8(1)** Cryptographic Protection · **SC-12** Cryptographic Key Establishment and Management | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
 | generic-ODBC `DATABASE` TLS unenforced (per-connection, driver-owned) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
 | `store_principal_over_granted` / `store_principal_privileges_unobserved` (observed store-principal privilege) | V13 Configuration (backend component accounts, 13.2.2) | **AC-6(5)** Privileged Accounts · **AC-6(9)** Log Use of Privileged Functions · **CM-7(5)** Authorized Software / least functionality | §164.312(a)(1) Access Control · §164.308(a)(4) Information Access Management |
+| `audit_chain_unkeyed` (observed keyless audit chain on a keyed store) | V16 Security Logging and Error Handling | **AU-9** Protection of Audit Information · **AU-9(3)** Cryptographic Protection | §164.312(b) Audit Controls · §164.312(c)(1) Integrity |
 
 > **There is no longer a synthetic-vs-PHI split to crosswalk.** It was risk-based tailoring keyed on
 > `handles_real_patient_data` — an instance carrying no ePHI being out of scope for the ePHI-specific

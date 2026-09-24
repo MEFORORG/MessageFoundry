@@ -100,7 +100,7 @@ import logging
 import os
 import sys
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -145,6 +145,8 @@ _KEY_ID_LEN = 16  # hex chars of the SHA-256 key fingerprint embedded as key_id
 # HKDF info label for the audit-chain HMAC key (#190). Versioned so a future re-derivation is an
 # additive label, never a silent change to an existing deployment's derived key.
 _AUDIT_MAC_INFO = b"mefor/audit-chain/v1"
+# Domain label for :func:`audit_key_id` -- the id a keyed range of the audit chain names its key by.
+_AUDIT_KEY_ID_INFO = b"mefor/audit-key-id/v1\x00"
 _AUDIT_MAC_LEN = 32  # bytes — HMAC-SHA256 key
 
 # HKDF info label for the secret-rotation fingerprint MAC key (ASVS 13.3.4, BACKLOG #282). A DEDICATED,
@@ -492,6 +494,8 @@ class Cipher(Protocol):
 
     def audit_mac_key(self) -> bytes | None: ...
 
+    def audit_mac_keyring(self) -> Mapping[str, bytes]: ...
+
     def audit_mac_fn(self) -> AuditMacFn | None: ...
 
 
@@ -517,6 +521,17 @@ def _derive_audit_mac_key(dek: bytes | bytearray) -> bytes:
 
     hkdf = HKDF(algorithm=hashes.SHA256(), length=_AUDIT_MAC_LEN, salt=None, info=_AUDIT_MAC_INFO)
     return hkdf.derive(bytes(dek))
+
+
+def audit_key_id(mac_key: bytes) -> str:
+    """The stable, non-secret id of one audit-chain HMAC key (BACKLOG #1904, ADR 0193).
+
+    A keyed range of the audit chain names the key its rows were MAC'd under by this id, so a verify
+    after a rotation can pick each row's key instead of trying the active one on every row. It is a
+    one-way digest of the DERIVED audit key under its own label, never of the DEK, so it is distinct
+    from the at-rest ``key_id`` in ``mfenc:`` markers and reveals nothing either key could be
+    recovered from."""
+    return hashlib.sha256(_AUDIT_KEY_ID_INFO + mac_key).hexdigest()[:_KEY_ID_LEN]
 
 
 def rotation_fingerprint_key(cipher: Cipher) -> bytes | None:
@@ -588,6 +603,10 @@ class IdentityCipher:
         the pre-#190 default). ``None`` is the signal to keep ``audit_row_hash`` unkeyed."""
         return None
 
+    def audit_mac_keyring(self) -> Mapping[str, bytes]:
+        """No DEK, so no audit keys, active or retired."""
+        return {}
+
     def audit_mac_fn(self) -> None:
         """No isolated-module MAC — the identity cipher's chain is in-process keyless SHA-256."""
         return None
@@ -623,6 +642,16 @@ class AesGcmCipher(_UnmarkedPolicy):
         # Derive the audit-chain HMAC key from the LIVE active DEK before _install_key zeroizes it (#190).
         # Only the derived key is retained; the raw DEK is never held as an attribute.
         self._audit_mac_key = _derive_audit_mac_key(active_key)
+        # BACKLOG #1904: one audit key per keyring entry, RETIRED keys included, derived the same way and
+        # at the same point (before _install_key zeroizes the DEK). A chain keyed under a key that has
+        # since been rotated to retired must still verify; deriving from the active key alone made the
+        # documented rotation read as tampering from row 1.
+        self._audit_mac_keys: dict[str, bytes] = {
+            audit_key_id(self._audit_mac_key): self._audit_mac_key
+        }
+        for key in retired_keys:
+            derived = _derive_audit_mac_key(key)
+            self._audit_mac_keys.setdefault(audit_key_id(derived), derived)
         # GCM invocation accounting (#190-F / ASVS 11.3.4). `_invocations` counts THIS process's encrypts
         # (it is also the whole bound when no store backs the counter — CLI/offline ciphers). When a store
         # enables the persisted bound, `_bound_total` is the fleet-wide RESERVED cumulative total for this
@@ -677,6 +706,12 @@ class AesGcmCipher(_UnmarkedPolicy):
         ``audit_row_hash`` chain so it cannot be forged without the DEK. Non-secret to *hold* here (it
         never leaves the process); never logged."""
         return self._audit_mac_key
+
+    def audit_mac_keyring(self) -> Mapping[str, bytes]:
+        """Every audit key this cipher can verify with, by :func:`audit_key_id` -- the active key's and
+        each retired key's (BACKLOG #1904). New rows are MAC'd only under the key of the chain's current
+        range; the retired entries exist so older ranges still verify during a rotation window."""
+        return dict(self._audit_mac_keys)
 
     def audit_mac_fn(self) -> None:
         """The in-process cipher keys the chain with :meth:`audit_mac_key` (in-heap HMAC), not an

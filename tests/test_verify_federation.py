@@ -65,6 +65,7 @@ def _mint(key: rsa.RSAPrivateKey, **over: Any) -> str:
         "sub": "S-1-5-21-fed",
         "exp": now + 600,
         "iat": now,
+        "auth_time": now,  # REQUIRED since BACKLOG #1150 (max_age is always requested)
         "nonce": NONCE,
         "preferred_username": "jdoe@corp.example",
         "amr": ["pwd", "mfa"],
@@ -334,6 +335,7 @@ def test_a_missing_exp_fails_rather_than_claiming_the_capture_is_stale(
         "aud": "mefor-console",
         "sub": "S-1-5-21-fed",
         "iat": time.time(),
+        "auth_time": time.time(),
         "nonce": NONCE,
         "preferred_username": "jdoe@corp.example",
         "amr": ["pwd", "mfa"],

@@ -26,7 +26,7 @@ import json
 import logging
 import secrets
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -65,12 +65,19 @@ GLOBAL_PENDING_CAP = 4096
 #: resolves them to the library enum at call time.
 SUPPORTED_COSE_ALGS: tuple[int, ...] = (-8, -7)
 
-#: The COSE key type (IANA COSE Key Types registry) each pinned identifier must arrive in: EdDSA as
-#: OKP (1), ES256 as EC2 (2). The library screens the IDENTIFIER at registration and never checks
-#: that the key beside it is the kind that identifier signs with, so an EdDSA-labelled EC2 key used
-#: to enrol and then fail at every assertion. A test pins that every entry of
-#: :data:`SUPPORTED_COSE_ALGS` has a row here, so widening the set forces a decision about it.
-_COSE_KTY_FOR_ALG: dict[int, int] = {-8: 1, -7: 2}
+#: The COSE key type and curve (IANA COSE Key Types and Elliptic Curves registries) each pinned
+#: identifier must arrive in: EdDSA as OKP (1) on Ed25519 (6), ES256 as EC2 (2) on P-256 (1).
+#: The library screens the IDENTIFIER at registration and never checks that the key beside it is
+#: the kind that identifier signs with, so an EdDSA-labelled EC2 key used to enrol and then fail
+#: at every assertion. A test pins that every entry of :data:`SUPPORTED_COSE_ALGS` has a row here,
+#: so widening the set forces a decision about it.
+#:
+#: **ES256 is bound to P-256 by owner ruling 2026-09-23** (BACKLOG #1166). ES256 on P-384 or
+#: P-521 verifies and clears the 128-bit floor, so this is not a strength control. It is the
+#: pairing RFC 9053 section 2.1 recommends for interoperability (SHA-256 with P-256 only), and
+#: the one the WebAuthn specification describes for -7. Registration only: see
+#: :func:`verify_assertion` for why a stored key is not re-screened.
+_COSE_KEY_SHAPE_FOR_ALG: dict[int, tuple[int, int]] = {-8: (1, 6), -7: (2, 1)}
 
 _INSTALL_HINT = (
     "WebAuthn support requires the [webauthn] extra: pip install messagefoundry[webauthn]"
@@ -162,6 +169,40 @@ def _refusal(exc: Exception, *, ceremony: str) -> WebAuthnVerificationError:
     return WebAuthnVerificationError(str(exc))
 
 
+def _require_cose_integers(fields: object) -> None:
+    """Refuse a COSE key unless it is a map with integer labels and integer kty, alg and crv.
+
+    The library indexes the decoded CBOR by label and compares each value with ``==``, and the
+    P-256 pin used ``int()``. Python lets several non-integers pass both: ``True``, ``1.0``, and
+    the ``Decimal`` and ``Fraction`` that cbor2 decodes from tags 4 and 30. So a key reading
+    ``crv: true`` or ``crv: 1.0``, or carrying its ``kty`` under the label ``true``, enrolled
+    (BACKLOG #1953). This requires the integer type itself, so no such value can stand in.
+
+    It is stricter than that bypass in two ways, both from RFC 9052 section 7. The key must be a
+    map: the library also indexes an array, reading its positions as labels. And every label must
+    be an integer or a text string, so a null, byte-string or float label is refused even where
+    it names nothing. A text label never matches an integer index, so it is let through. ``crv``
+    is read only for OKP (1) and EC2 (2), the key types where label -1 is the curve. These
+    refusals name a type, never a value, because the value is the attacker's.
+    """
+    if not isinstance(fields, Mapping):
+        raise WebAuthnVerificationError(f"COSE key must be a map, not {type(fields).__name__}")
+    for label in fields:
+        if type(label) is not int and type(label) is not str:
+            raise WebAuthnVerificationError(
+                f"COSE key label must be an integer or a text string, not {type(label).__name__}"
+            )
+    params = [("kty", 1), ("alg", 3)]
+    if fields.get(1) in (1, 2):
+        params.append(("crv", -1))
+    for name, label in params:
+        value = fields.get(label)
+        if value is not None and type(value) is not int:
+            raise WebAuthnVerificationError(
+                f"COSE key {name} must be an integer, not {type(value).__name__}"
+            )
+
+
 def _require_usable_public_key(cose_key: bytes) -> None:
     """Refuse a credential public key that no assertion could ever verify against.
 
@@ -172,20 +213,32 @@ def _require_usable_public_key(cose_key: bytes) -> None:
     became usable, but the refusal came late, and on the mismatched-curve path it came as a raw
     ``ValueError`` that escaped as a 500.
 
-    This does not pin a curve to an identifier. An ES256 credential on P-384 or P-521 still enrols,
-    because it verifies and clears the 128-bit floor; only a key that cannot verify is refused.
+    It also binds each identifier to one key type and curve (:data:`_COSE_KEY_SHAPE_FOR_ALG`),
+    so an ES256 credential on P-384 or P-521 is refused here although it would verify. That is
+    the owner's 2026-09-23 ruling, and it is a deliberate refusal, so it is not logged.
+
+    That binding compares integers, so :func:`_require_cose_integers` runs before it. Its
+    refusals are deliberate too, and not logged.
     """
-    from webauthn.helpers import decode_credential_public_key, decoded_public_key_to_cryptography
+    from webauthn.helpers import (
+        decode_credential_public_key,
+        decoded_public_key_to_cryptography,
+        parse_cbor,
+    )
 
     try:
         decoded = decode_credential_public_key(cose_key)
         decoded_public_key_to_cryptography(decoded)
-        alg, kty = int(decoded.alg), int(decoded.kty)
+        fields = parse_cbor(cose_key)
     except _invalid_input_errors() as exc:
         raise _refusal(exc, ceremony="registration") from exc
-    if _COSE_KTY_FOR_ALG.get(alg) != kty:
+    _require_cose_integers(fields)
+    alg, kty, crv = decoded.alg, decoded.kty, getattr(decoded, "crv", None)
+    shape = (kty, crv)
+    if _COSE_KEY_SHAPE_FOR_ALG.get(alg) != shape:
         raise WebAuthnVerificationError(
-            f"credential public key type {kty} cannot carry COSE algorithm {alg}"
+            f"COSE algorithm {alg} is accepted only as key type and curve "
+            f"{_COSE_KEY_SHAPE_FOR_ALG.get(alg)}, not {shape}"
         )
 
 
@@ -417,6 +470,11 @@ def verify_assertion(
     py_webauthn enforces counter increment only when both counts are >0 (synced-passkey 0/0 is
     accepted); the *service* layer applies the strict compare-and-set on top (a CAS miss is the
     clone signal — ADR 0068 §4).
+
+    The stored key is deliberately NOT re-screened against :data:`_COSE_KEY_SHAPE_FOR_ALG`. A key
+    enrolled before the 2026-09-23 P-256 pin may be ES256 on P-384 or P-521. It still verifies
+    and still clears the floor, so refusing it here would lock its owner out for no security
+    gain. A key that cannot verify still fails here, as invalid input.
     """
     _require_webauthn()
     from webauthn import verify_authentication_response

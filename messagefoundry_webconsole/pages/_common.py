@@ -16,9 +16,22 @@ this module exists to keep in one place.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from urllib.parse import quote, urlencode
 
 from .._html import Markup, el, text
+
+
+def _deadline_stamp(ts: float) -> str | None:
+    """A credential deadline as the console's usual UTC stamp, or ``None`` if it cannot render.
+
+    BACKLOG #1141. The expiry setting has no upper bound and ``fromtimestamp`` raises past year 9999
+    (year 3000 on Windows). A page that states a deadline drops the sentence rather than 500, because
+    the forced-change page is the only page a must-change holder can reach."""
+    try:
+        return datetime.fromtimestamp(ts, UTC).strftime("%Y-%m-%d %H:%M:%SZ")
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 def _pager(

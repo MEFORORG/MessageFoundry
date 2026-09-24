@@ -369,8 +369,12 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    key and decrypts with whichever configured key matches (active + any decrypt-only keys in
    `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`). **Rotation** = set the new active key, keep the prior key in
    `…_RETIRED`, run **`messagefoundry rotate-key`** (offline) to re-encrypt every value under the new
-   key, then drop the retired key. The same command re-seals the uploaded-file store, and on a first
-   key-enable it seals the plaintext uploads a keyed store refuses until then (BACKLOG #1169). An undecryptable value (corrupt blob / missing key) is contained —
+   key, then drop the retired key. `rotate-key` also opens a new range of the audit chain under the new
+   key and verifies the chain first; do not drop the retired key until it has printed its audit line
+   without an error ([ADR 0193](adr/0193-audit-chain-key-ranges-survive-a-store-key-rotation.md),
+   BACKLOG #1904). The same command re-seals the uploaded-file store, and on a first key-enable it
+   seals the plaintext uploads a keyed store refuses until then (BACKLOG #1169). An undecryptable
+   value (corrupt blob / missing key) is contained —
    the row is dead-lettered, never crashes a worker.
    **Fail-closed (secure-by-default; H3, OWASP *Fail Securely* / SDS §4.3 PW.9):** `serve` **refuses to
    start with no key on ANY instance** — the refusal is gated on **neither** a data class **nor** the
@@ -787,7 +791,7 @@ audit chain or be false.
 |---|---|---|
 | MLLP inbound/outbound | Plaintext by default; **MLLP-over-TLS (TLS 1.2+, server-cert verify + hostname, opt-in mTLS) when `tls=true`** `[BUILT — WP-13b]`. A non-loopback plaintext MLLP listener is **refused at startup** (exposed-gate, ADR 0002 §0) unless `tls=true` or `serve --allow-insecure-bind`. | — |
 | File connector | Plaintext `.hl7` on disk/share | Rely on volume/share encryption; SFTP later |
-| Engine API ↔ console | Loopback HTTP by default; off-loopback requires TLS — **in-process** (`[api].tls_cert_file`, WP-13a) **or upstream** at a trusted reverse proxy (`tls_terminated_upstream` + `trusted_proxies`, WP-15) `[BUILT]`. HSTS engages on `https`; forwarded headers are trusted only from `trusted_proxies`. | — |
+| Engine API ↔ console | Loopback HTTP by default; off-loopback requires TLS — **in-process** (`[api].tls_cert_file`, WP-13a) **or upstream** at a trusted reverse proxy (`tls_terminated_upstream` + `trusted_proxies`, WP-15) `[BUILT]`. Upstream, the proxy-to-engine hop is plaintext unless `tls_cert_file` is set; the site secures it, and `serve` requires `plaintext_upstream_hop_acknowledged` (BACKLOG #1179). HSTS engages on `https`; forwarded headers are trusted only from `trusted_proxies`. | — |
 | AD / LDAP auth | **LDAPS** with cert verification (`ad_tls_verify`) `[BUILT]` | — |
 | PostgreSQL / SQL Server backend | TLS-to-DB on by default (`[store].encrypt`), server cert **validated** (`trust_server_certificate=false`) `[BUILT]`. Trust a private/internal DB CA without disabling validation via `[store].ssl_root_cert` file-pin (Postgres CA-bundle, SQL Server ODBC 18.1+ `ServerCertificate` leaf-pin) **or** a Windows machine-store (`LocalMachine\Root`) CA import. | — |
 

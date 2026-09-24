@@ -22,6 +22,7 @@ from datetime import UTC, datetime
 from messagefoundry.api.auth_models import CurrentUser, MfaStatusResponse
 
 from .._html import Markup, el, minimal_nav, page, register_nav, wordmark
+from ._common import _deadline_stamp
 
 __all__ = [
     "account_page",
@@ -504,7 +505,8 @@ def sessions_page(sessions: Sequence[Mapping[str, object]], *, notice: str | Non
     POSTs take ``require_ui_reauth_only_action(STEP_UP_ACTION_SESSION_TERMINATE)``, so the cookie
     alone does not carry them — ``/ui/reauth`` mints a single-use grant bound to that action and each
     terminate consumes one. It is the password-only family on purpose: the full step-up would
-    deadlock an MFA-required-but-unenrolled operator out of revoking their own sessions.
+    deadlock an MFA-required-but-unenrolled operator out of revoking their own sessions. An operator
+    who HAS a factor proves it first (BACKLOG #1951).
 
     *This docstring previously said "no step-up", which stopped being true when that gate landed.
     A stale absence claim beside a control is worse than silence: it reads as a licence to remove
@@ -647,19 +649,32 @@ def _passkey_card(
     return el("div", el("h2", "Passkeys"), table, add, *caveats, class_="card")
 
 
-def password_page(*, forced: bool = False, error: str | None = None) -> Markup:
+def password_page(
+    *,
+    forced: bool = False,
+    error: str | None = None,
+    credential_expires_at: float | None = None,
+) -> Markup:
     """The change-password form (current + new twice; nothing is ever echoed back).
 
     ``forced`` renders the bare must-change variant: the account is confined here until it rotates
     (every other /ui route 303s back), so the page explains why and drops the (useless) nav.
+
+    BACKLOG #1141 (ASVS 6.4.5): the forced variant is the one surface the holder of an admin-issued
+    credential always reaches, with no address, mail relay or alert set-up needed. So it states when
+    that credential stops working. ``credential_expires_at`` is the instant the login gate refuses
+    on; ``None`` states nothing, because then there is no deadline.
     """
     banner = el("p", error, class_="banner") if error else Markup("")
-    intro = (
-        el(
-            "p",
-            "Your password must be changed before you can continue.",
-            class_="muted",
+    forced_text = "Your password must be changed before you can continue."
+    when = None if credential_expires_at is None else _deadline_stamp(credential_expires_at)
+    if forced and when is not None:
+        forced_text += (
+            f" Your temporary password stops working at {when}. "
+            "After that, ask an administrator to reset it."
         )
+    intro = (
+        el("p", forced_text, class_="muted")
         if forced
         else el("p", "Re-enter your current password, then choose a new one.", class_="muted")
     )

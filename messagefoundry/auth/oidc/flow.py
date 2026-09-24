@@ -199,10 +199,22 @@ def build_authorization_url(
     nonce: str,
     code_challenge: str,
     scopes: Sequence[str],
+    max_age: int,
     acr_values: str | None = None,
     prompt: str | None = None,
 ) -> str:
-    """Build the front-channel authorization-code + PKCE (S256) redirect URL (``response_mode=query``)."""
+    """Build the front-channel authorization-code + PKCE (S256) redirect URL (``response_mode=query``).
+
+    ``max_age`` is REQUIRED, with no default, so a caller cannot build a URL that forgets it (ASVS
+    6.8.4 / 7.6.1, BACKLOG #1150). OIDC Core's authentication-request rules make the IdP
+    re-authenticate only IF its own authentication is older than ``max_age``, and make
+    ``auth_time`` REQUIRED in the ``id_token`` whenever ``max_age`` was sent. That second half is
+    what the claims ladder then verifies. A value of 0 or less is refused: 0 forces a fresh IdP
+    login every time, which is ``prompt=login`` under another name and throws away the single
+    sign-on federation exists to deliver.
+    """
+    if max_age <= 0:
+        raise ValueError("max_age must be a positive number of seconds")
     params: dict[str, str] = {
         "response_type": "code",
         "response_mode": "query",
@@ -213,6 +225,7 @@ def build_authorization_url(
         "nonce": nonce,
         "code_challenge": code_challenge,
         "code_challenge_method": "S256",
+        "max_age": str(max_age),
     }
     if acr_values:
         params["acr_values"] = acr_values

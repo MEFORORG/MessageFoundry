@@ -739,6 +739,36 @@ def main(argv: list[str] | None = None) -> int:
     provision_admin.add_argument("--db", default=None, help="store path (overrides [store].path)")
     provision_admin.add_argument("--json", action="store_true", help="emit JSON")
 
+    # ADR 0183 Amendment A, Wave 1c (BACKLOG #1136). An Administrator provisioned without --email is
+    # refused at the next start by the ADR 0167 deliverability gate, and provision-admin then refuses
+    # too, because an enabled Administrator exists. This is the offline exit, on admin-unlock's gate.
+    admin_set_notify_email = sub.add_parser(
+        "admin-set-notify-email",
+        help="set a missing security-notice address on an enabled Administrator from the host "
+        "(offline; fills an absent address only, never clears or changes one)",
+        description="Set the engine-owned notification address (users.notify_email) on an enabled "
+        "Administrator that has none, so a PHI instance under [security].enforcement=enforce can "
+        "start. Runs against the store directly, on the same host gate as admin-unlock; run it with "
+        "the engine stopped. It refuses a blank address, a non-Administrator, a disabled account, "
+        "and an account that already has an address: change an existing address from the web "
+        "console, which notifies the old one.",
+    )
+    admin_set_notify_email.add_argument(
+        "--username", required=True, help="the enabled Administrator to address"
+    )
+    admin_set_notify_email.add_argument(
+        "--email", required=True, help="the notification address to set (must not be blank)"
+    )
+    admin_set_notify_email.add_argument(
+        "--service-config",
+        default=None,
+        help="service settings TOML (default: ./messagefoundry.toml if present)",
+    )
+    admin_set_notify_email.add_argument(
+        "--db", default=None, help="store path (overrides [store].path)"
+    )
+    admin_set_notify_email.add_argument("--json", action="store_true", help="emit JSON")
+
     audit_verify = sub.add_parser(
         "audit-verify", help="verify the audit-log hash chain (tamper-evidence)"
     )
@@ -1720,8 +1750,11 @@ def _serve(args: argparse.Namespace) -> int:
     # [store].require_encryption forces the refusal even for a synthetic instance. A DPAPI-protected key
     # file (Windows) counts as a configured key; if it's set but unreadable here, open_store fails closed
     # at startup with the DPAPI error.
-    if not (settings.store.encryption_key or settings.store.encryption_key_file):
-        if settings.store.require_encryption:
+    if not _store_key_configured(settings):
+        # The refuse-or-proceed DECISION is shared with provision-admin (BACKLOG #1905); the wording
+        # below stays serve's own, because the remedy differs by command.
+        keyless_gate = _keyless_store_gate(settings, enforcing=enforcing)
+        if keyless_gate == _GATE_REQUIRE_ENCRYPTION:
             print(
                 "error: [store].require_encryption is set but no MEFOR_STORE_ENCRYPTION_KEY (or "
                 "[store].encryption_key_file) is configured; refusing to start (PHI would be stored "
@@ -1729,7 +1762,7 @@ def _serve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
-        if not settings.store.allow_unencrypted_phi:
+        if keyless_gate == _GATE_NO_OPT_OUT:
             # Secure-by-default: any instance, in any environment, refuses to run keyless. This is
             # the H3 tightening — previously prod refused and non-prod only warned (fail-open), but
             # dev/staging routinely hold near-real PHI.
@@ -1744,7 +1777,9 @@ def _serve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
-        if enforcing and not settings.security.allow_unencrypted_phi_under_strict_enforcement:
+        if keyless_gate is not None:
+            # _GATE_NO_STRICT_ACK, and deliberately the catch-all: a refusal value this block does not
+            # name must still refuse, never fall through to the keyless start below.
             # Secure-by-default under STRICT ENFORCEMENT (ADR 0140): keyless PHI under enforcement
             # requires a SECOND acknowledgment beyond [security].allow_unencrypted_phi — the highest-
             # risk posture (real PHI + strict enforcement) is never one flag away from plaintext at
@@ -2075,7 +2110,9 @@ def _serve(args: argparse.Namespace) -> int:
     # The store is NOT open yet either, so the #1008 store-principal privilege OBSERVATION is passed as
     # None for the same reason and with the same discipline: it is reported moments later by the
     # preflight's own log line + audit row once the lifespan opens the store, and completely by
-    # GET /security/posture. None here is "not yet observed", never "observed and clean".
+    # GET /security/posture. None here is "not yet observed", never "observed and clean". The same
+    # holds for the #1905 audit-chain keying observation: the store logs its own WARNING when it opens
+    # onto a keyless chain, and GET /security/posture reports it off the live store.
     _loosenings = security_loosenings(
         settings.security,
         settings.store,
@@ -2085,6 +2122,7 @@ def _serve(args: argparse.Namespace) -> int:
         (),
         (),
         (),
+        None,
         None,
     )
     if _loosenings:
@@ -2281,7 +2319,49 @@ def _serve(args: argparse.Namespace) -> int:
     # itself, and refusing would hard-stop working deployments on upgrade. The off-loopback arm keeps
     # refusing exactly as before, so this change is additive — it can only add a warning, never a new
     # refusal.
+    # ONE EXCEPTION, and it is not dial-governed: the BACKLOG #1179 plaintext-hop acknowledgement at the
+    # top of the block refuses in EVERY mode. Do not move it under `enforcing` to match the paragraphs
+    # above; the owner ruled that hop the deploying site's to secure, whatever the dial says.
     if settings.api.tls_terminated_upstream:
+        # BACKLOG #1179: with no operator certificate the engine mints nothing here (ADR 0172 decision
+        # 3 -- serving https would break the proxy's own hop), so the proxy-to-engine hop is PLAINTEXT
+        # by design and securing it is the deploying site's job. The operator must say they have taken
+        # it on. Keyed on api_tls_source, the same branch order that decides what the listener serves:
+        # an operator tls_cert_file wins over the no-mint branch, so with one the hop is TLS and there
+        # is nothing to acknowledge. Unlike the attestations below this refuses in EVERY mode,
+        # enforcing or warn, loopback or not: it asks nothing the engine could check, only who owns a
+        # hop the engine leaves unprotected.
+        from messagefoundry.api.tls import api_tls_source
+
+        serves_plaintext = (
+            api_tls_source(
+                cert_file=settings.api.tls_cert_file,
+                tls_terminated_upstream=settings.api.tls_terminated_upstream,
+            )
+            == "upstream"
+        )
+        if serves_plaintext and not settings.api.plaintext_upstream_hop_acknowledged:
+            print(
+                "error: refusing to serve behind an upstream TLS terminator "
+                "([api].tls_terminated_upstream) without [api].plaintext_upstream_hop_acknowledged. "
+                "The reverse proxy terminates TLS and no [api].tls_cert_file is set, so the engine "
+                "serves the proxy-to-engine hop in PLAINTEXT by design and does nothing to protect "
+                "it. Securing that hop (for example a same-host loopback hop, an isolated network "
+                "segment, or a host firewall) is the deploying site's job. Set "
+                "[api].plaintext_upstream_hop_acknowledged = true to acknowledge that you have taken "
+                "it on. Or set [api].tls_cert_file so the engine serves that hop over TLS, and then "
+                "point the proxy at https and have it trust that certificate: a proxy still speaking "
+                "http to an https listener fails every request. See docs/SECURITY.md (ADR 0172).",
+                file=sys.stderr,
+            )
+            return 2
+        if serves_plaintext:
+            # The acknowledgement is the only record that someone took this hop on, so name it at
+            # every start rather than leaving it in the TOML alone.
+            logging.getLogger(__name__).info(
+                "[api].plaintext_upstream_hop_acknowledged: the proxy-to-engine hop is plaintext and "
+                "the operator has acknowledged that securing it is the deploying site's job."
+            )
         posture_b_missing = []
         if not settings.api.proxy_intra_service_declared:
             posture_b_missing.append(
@@ -2629,9 +2709,13 @@ def _serve(args: argparse.Namespace) -> int:
 
     # MFA-at-exposure posture (sec-mfa-on; WP-14, ASVS 6.3.3): an off-loopback bind serving local
     # accounts puts admin authentication on the network, where a single password factor is far weaker.
-    # [security].require_mfa adds the native TOTP second factor for the Administrator role; with it off the
-    # admin interface is single-factor over the wire. Since BACKLOG #187 require_mfa DEFAULTS ON (even
-    # on loopback), so this gate no longer catches the common "forgot to enable it" case — it now fires
+    # [security].require_mfa adds an engine second factor (TOTP or a passkey) for every account
+    # that [security].require_mfa_scope covers: every account under the default, not the
+    # Administrator role alone (AuthSettings.require_mfa_scope explains each value). Under
+    # `administrators` a directory session that proved no factor still stays MFA-pending
+    # (AuthService.mfa_satisfied). With it off, every account that has not enrolled a factor is
+    # single-factor over the wire. Since BACKLOG #187 require_mfa DEFAULTS ON (even on loopback),
+    # so this gate no longer catches the common "forgot to enable it" case — it now fires
     # only when an operator has EXPLICITLY opted out ([security].require_mfa=false) AND exposed the admin
     # interface. That explicit opt-out at exposure is exactly the posture to refuse/warn on. Mirror the
     # keyless-store / open-egress posture: refuse on a production PHI instance (the prod fail-closed
@@ -3566,12 +3650,20 @@ def _serve(args: argparse.Namespace) -> int:
     # WP-15: trust X-Forwarded-For/-Proto ONLY from the declared reverse proxies, so the audit /
     # rate-limit source IP is the real client (not the proxy). Empty list = trust nothing (the secure
     # default — the direct TCP peer is used), overriding uvicorn's loopback default.
+    # BACKLOG #1120: headers on the responses uvicorn writes itself; see api/protocol_headers.py.
+    from messagefoundry.api.protocol_headers import (
+        floored_http_protocol_class,
+        floored_ws_protocol_class,
+    )
+
     run_kwargs: dict[str, Any] = {
         "log_config": None,
         "forwarded_allow_ips": settings.api.trusted_proxies,
         # WP-L3-07 (ASVS 13.4.6): drop the `Server: uvicorn` banner so a response doesn't advertise the
         # server implementation/version to an unauthenticated caller.
         "server_header": False,
+        "http": floored_http_protocol_class(),
+        "ws": floored_ws_protocol_class(),
     }
     # BACKLOG #1276: THE ENGINE ALWAYS SERVES TLS. Owner ruling 2026-08-22 (option 3), which
     # SUPERSEDES ADR 0143's premise that the console is hardened "over a cleartext loopback
@@ -3606,11 +3698,12 @@ def _serve(args: argparse.Namespace) -> int:
         # ADR 0083 activation: only when in-process mTLS (client CA) AND a cert-identity map are BOTH
         # configured, swap in the scope-populating HTTP protocol so a verified peer cert reaches
         # resolve_client_cert_identity. Gated on both so a mutual-auth-only bind (console mTLS, no map)
-        # and every non-mTLS bind keep the stock protocol — no behaviour change without a client CA + map.
+        # and every non-mTLS bind keep the header-floored protocol without the shim.
         if settings.api.tls_client_ca_file and settings.api.tls_client_cert_identities:
             from messagefoundry.api.tls_client_cert import client_cert_http_protocol_class
 
-            run_kwargs["http"] = client_cert_http_protocol_class()
+            # Stacked ON the floored protocol, never instead of it (BACKLOG #1120).
+            run_kwargs["http"] = client_cert_http_protocol_class(base=run_kwargs["http"])
 
     # The last-resort sys/threading excepthooks are already in force here: `main()` installs them for
     # every subcommand (BACKLOG #1674). The asyncio loop handler is separate and is installed by the
@@ -3829,7 +3922,7 @@ def _snapshot_on_send_setting(service_config: str | None) -> bool:
 
 def _dryrun(args: argparse.Namespace) -> int:
     from messagefoundry.config.wiring import WiringError, load_config
-    from messagefoundry.pipeline.dryrun import dry_run, read_messages
+    from messagefoundry.pipeline.dryrun import dry_run, fixture_cap, read_messages
     from messagefoundry.redaction import safe_error
 
     resolved = _resolve_offline_anchor(args)
@@ -3841,7 +3934,7 @@ def _dryrun(args: argparse.Namespace) -> int:
     except WiringError as exc:
         return _emit_error(str(exc), as_json=args.json)
     try:
-        messages = read_messages(args.messages)
+        messages = read_messages(args.messages, cap=fixture_cap(reg))
     except (FileNotFoundError, ValueError) as exc:
         return _emit_error(str(exc), as_json=args.json)
 
@@ -4637,27 +4730,18 @@ def _resolve_expected_anchor(args: argparse.Namespace) -> tuple[int, str] | None
         return 2
 
 
-def _admin_unlock(args: argparse.Namespace) -> int:
-    """Clear a local account's lockout from the host (BACKLOG #1236, ADR 0171).
+def _host_gated_store_settings(args: argparse.Namespace) -> ServiceSettings | int:
+    """The host gate's settings for a command that acts on an EXISTING store, or an exit code.
 
-    THE GATE IS HOST ACCESS, AND IT IS A REAL ONE RATHER THAN AN ABSENT ONE. Reaching this needs the
-    service config, the store path and, on an encrypted store, the key material -- which is the
-    operator who installed the engine. Anyone holding all three already has the database and does not
-    need an unlock affordance to reach an account. So this grants no capability that the trust
-    boundary did not already imply, which is what makes it safe to ship unauthenticated.
-
-    IT DOES NOT RESET A PASSWORD, DELIBERATELY. Clearing the lockout returns the account to its
-    ordinary state and the holder still needs their credential. An unlock is the narrowest thing that
-    resolves the lockout, and a reset would hand whoever runs this a working account.
+    Shared by ``admin-unlock`` and ``admin-set-notify-email`` so the gate is stated once (ADR 0171,
+    ADR 0183 Amendment A Wave 1c). ``provision-admin`` does not use it: it legitimately creates the
+    store, so it cannot carry the M-31 guard below.
     """
-    import asyncio
-    import getpass
     from pathlib import Path
 
     from pydantic import ValidationError
 
     from messagefoundry.config.settings import StoreBackend, load_settings
-    from messagefoundry.store.base import open_store
 
     cli: dict[str, dict[str, object]] = {}
     if args.db is not None:
@@ -4677,6 +4761,30 @@ def _admin_unlock(args: argparse.Namespace) -> int:
             f"'no such user' (check --db / [store].path)",
             as_json=args.json,
         )
+    return settings
+
+
+def _admin_unlock(args: argparse.Namespace) -> int:
+    """Clear a local account's lockout from the host (BACKLOG #1236, ADR 0171).
+
+    THE GATE IS HOST ACCESS, AND IT IS A REAL ONE RATHER THAN AN ABSENT ONE. Reaching this needs the
+    service config, the store path and, on an encrypted store, the key material -- which is the
+    operator who installed the engine. Anyone holding all three already has the database and does not
+    need an unlock affordance to reach an account. So this grants no capability that the trust
+    boundary did not already imply, which is what makes it safe to ship unauthenticated.
+
+    IT DOES NOT RESET A PASSWORD, DELIBERATELY. Clearing the lockout returns the account to its
+    ordinary state and the holder still needs their credential. An unlock is the narrowest thing that
+    resolves the lockout, and a reset would hand whoever runs this a working account.
+    """
+    import asyncio
+    import getpass
+
+    from messagefoundry.store.base import open_store
+
+    settings = _host_gated_store_settings(args)
+    if isinstance(settings, int):
+        return settings
 
     async def run() -> tuple[str, float | None]:
         store = await open_store(settings.store)
@@ -4744,6 +4852,50 @@ def _read_new_password(prompt: str) -> str:
     return first
 
 
+#: The three conditions under which the at-rest gate refuses a store with no key. Values name the
+#: setting an operator changes, so a caller can say which one refused without restating the rule.
+_GATE_REQUIRE_ENCRYPTION = "[store].require_encryption"
+_GATE_NO_OPT_OUT = "[security].allow_unencrypted_phi"
+_GATE_NO_STRICT_ACK = "[security].allow_unencrypted_phi_under_strict_enforcement"
+
+
+class _KeylessProvisionRefused(RuntimeError):
+    """``provision-admin`` found its opened store keyless although a key is configured (#1905)."""
+
+
+def _store_key_configured(settings: ServiceSettings) -> bool:
+    """Is a local store key configured? The at-rest gate's one test for "keyed" (a DPAPI key file counts;
+    ``open_store`` fails closed later if it is unreadable). It does not consult ``cipher_provider`` --
+    the documented ``vault_transit`` precondition in ``docs/CONFIGURATION.md`` -- and keeping the test
+    here means that gap, when it is closed, is closed once for every command that applies the gate."""
+    return bool(settings.store.encryption_key or settings.store.encryption_key_file)
+
+
+def _keyless_store_gate(settings: ServiceSettings, *, enforcing: bool) -> str | None:
+    """Which at-rest gate refuses opening this store for writing, or ``None`` when it may be opened.
+
+    The DECISION, stated once for every command that opens a store for writing on a fresh install:
+    ``serve``, and ``provision-admin`` since BACKLOG #1905. Before that item the decision lived inline in
+    ``serve`` alone, so the documented install order -- ``provision-admin`` before the first ``serve``,
+    with the key in the service environment rather than the operator's shell -- opened the store with
+    no key, wrote the first audit row as keyless SHA-256, and left a chain that a later keyed open never
+    keys (``_load_audit_chain_meta`` auto-keys only an EMPTY ``audit_log``).
+
+    ``None`` covers two cases: a key is configured, or one of the audited opt-outs applies (the caller
+    then proceeds keyless and says so). The WORDING stays with each caller, because the remedy differs:
+    ``serve`` may point at ``gen-key`` for a new install, while ``provision-admin`` must point at the key
+    the service already holds -- a new key there keys the chain under a key the service does not have."""
+    if _store_key_configured(settings):
+        return None
+    if settings.store.require_encryption:
+        return _GATE_REQUIRE_ENCRYPTION
+    if not settings.store.allow_unencrypted_phi:
+        return _GATE_NO_OPT_OUT
+    if enforcing and not settings.security.allow_unencrypted_phi_under_strict_enforcement:
+        return _GATE_NO_STRICT_ACK
+    return None
+
+
 def _provision_admin(args: argparse.Namespace) -> int:
     """Create the first administrator offline (BACKLOG #1136, ASVS 6.3.2).
 
@@ -4778,6 +4930,38 @@ def _provision_admin(args: argparse.Namespace) -> int:
     except (FileNotFoundError, ValueError, ValidationError) as exc:
         return _emit_error(str(exc), as_json=args.json)
 
+    # BACKLOG #1905: the same at-rest gate `serve` applies, and BEFORE the password prompt and the
+    # store open, so a refusal leaves no store behind. This command writes the store's FIRST audit row,
+    # and a chain that starts keyless stays keyless: a later keyed open never re-keys existing rows. The
+    # key has to be in the environment of the shell running THIS command -- the service's NSSM
+    # environment is not visible here, which is how the documented order used to go wrong.
+    from messagefoundry.config.ai_policy import SecurityEnforcement
+
+    keyless_gate = _keyless_store_gate(
+        settings, enforcing=settings.security.enforcement is SecurityEnforcement.ENFORCE
+    )
+    if keyless_gate is not None:
+        return _emit_error(
+            "no store key is set in this shell (MEFOR_STORE_ENCRYPTION_KEY, or "
+            "[store].encryption_key_file in the service config); refusing to provision. "
+            "provision-admin opens the store and writes its first audit row, and an audit chain that "
+            "starts keyless stays keyless. Set the key the service runs with -- the one in its NSSM "
+            "environment -- in this shell and re-run. Do not generate a new key for this command: the "
+            "service would then hold a different key from the one the store was created under. If "
+            "the service deliberately runs keyless, set the same audited opt-out here that it uses. "
+            f"The deciding setting is {keyless_gate}, the same one that makes `serve` refuse to start.",
+            as_json=args.json,
+        )
+    if not _store_key_configured(settings):
+        # An audited opt-out applies, so this proceeds keyless -- and must not do so quietly, because a
+        # stale opt-out left in a shell is how a keyed production store would get a keyless first row.
+        print(
+            "WARNING: no store key is set in this shell and the audited at-rest opt-out applies, so "
+            "the store is opened KEYLESS and its audit chain starts as plain SHA-256. It stays keyless if a key is added later. If the service "
+            "runs with a key, stop now and set that key in this shell instead.",
+            file=sys.stderr,
+        )
+
     try:
         password = _read_new_password("New administrator password: ")
     except _PasswordEntryRefused as exc:
@@ -4789,6 +4973,15 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # create=True (BACKLOG #1780): this bootstrap runs before the first serve, see the note below.
         store = await open_store(settings.store, create=True)
         try:
+            if _store_key_configured(settings) and not store.cipher_info().encrypts:
+                # BACKLOG #1905: the settings name a key but the key provider resolved none (a pinned
+                # `[store].key_provider` reading a source this shell does not have). Refuse before
+                # the first audit row is written, rather than provision into a keyless chain.
+                raise _KeylessProvisionRefused(
+                    "a store key is configured, but [store].key_provider resolved no key in this "
+                    "shell, so the store opened KEYLESS; refusing to provision. Make the key the "
+                    "service runs with readable here and re-run."
+                )
             outcome = await AuthService(store, settings.auth).provision_first_administrator(
                 username=args.username,
                 password=password,
@@ -4810,7 +5003,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
 
     try:
         outcome, store_path = asyncio.run(run())
-    except FirstAdministratorRefused as exc:
+    except (FirstAdministratorRefused, _KeylessProvisionRefused) as exc:
         return _emit_error(str(exc), as_json=args.json)
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
@@ -4840,8 +5033,157 @@ def _provision_admin(args: argparse.Namespace) -> int:
     if not (args.email and args.email.strip()):
         _safe_print(
             "WARNING: no notification address. A PHI instance under [security].enforcement=enforce "
-            "refuses to start unless some enabled Administrator carries one -- re-run with --email, "
-            "or set one from the web console."
+            "refuses to start unless some enabled Administrator carries one -- set it with "
+            f"`messagefoundry admin-set-notify-email --username {outcome.username!r} --email "
+            "<address>` before the first serve."
+        )
+    return 0
+
+
+def _admin_set_notify_email(args: argparse.Namespace) -> int:
+    """Set a missing notification address on an enabled Administrator from the host (#1136).
+
+    ADR 0183 Amendment A, Wave 1c. The ADR 0167 gate refuses a PHI start under ``enforce`` unless some
+    enabled Administrator carries ``notify_email``. ``provision-admin`` without ``--email`` leaves
+    exactly that state, and then refuses to run again because an enabled Administrator exists; the
+    web console cannot be reached while the engine refuses. This is the exit that trades no control.
+
+    **The gate is host access**, the one argued on :func:`_admin_unlock` and in ADR 0171, and it runs
+    through the same :func:`_host_gated_store_settings`.
+
+    **IT FILLS AN ABSENT ADDRESS AND NOTHING ELSE.** A blank value is refused by
+    :func:`~messagefoundry.store.store.require_notify_email`, the check every write of the column
+    uses, so there is no spelling of a clear. An account that already has an address is refused too:
+    repointing it here would move where notices go without the ``EMAIL_CHANGED`` notice to the old
+    address that :meth:`AuthService.update_user` sends, because no notifier runs offline. It is also
+    refused on a non-Administrator or a disabled account, because neither counts at the gate, and a
+    success there would leave the start refused while reporting OK.
+
+    **THE AUDIT ROW IS APPENDED BEFORE THE ADDRESS IS WRITTEN.** The two are separate commits, so one
+    order or the other can leave them disagreeing. A keyed store opened from a shell without its key
+    (the key sits in the service's NSSM environment) opens fine and then refuses a keyless append;
+    written the other way round, the address would land unaudited. This order can instead leave an
+    audit row for a write that then failed; the command then appends a ``..._failed`` row and says
+    so rather than reporting OK. An unaudited change to where security notices go is the worse of
+    the two.
+
+    **Run it with the engine stopped**, as ``admin-unlock`` is. The fill-only check is a read and
+    then an unconditional write, so a live engine could change the address in between.
+
+    Re-running with the address already in place is a success that writes nothing, so an automated
+    install step can be repeated.
+    """
+    import asyncio
+    import getpass
+
+    from messagefoundry.api.auth_models import _NAME_MAX
+    from messagefoundry.auth.permissions import Role
+    from messagefoundry.store.base import open_store
+    from messagefoundry.store.crypto import StoreKeylessError
+    from messagefoundry.store.store import require_notify_email
+
+    settings = _host_gated_store_settings(args)
+    if isinstance(settings, int):
+        return settings
+    try:
+        # Validated before the store opens, so a refusal touches nothing. The same helper every
+        # write of the column uses, plus the web console's length bound, so this offline surface
+        # accepts nothing the console's user form refuses.
+        address = require_notify_email(args.email)
+    except ValueError as exc:
+        return _emit_error(str(exc), as_json=args.json)
+    if len(args.email) > _NAME_MAX:
+        return _emit_error(
+            f"the notification address is longer than {_NAME_MAX} characters", as_json=args.json
+        )
+    # Stripped as `provision_first_administrator` strips it, so the argv that created the account
+    # also finds it.
+    wanted = args.username.strip()
+    actor = f"cli:{getpass.getuser()}"
+    # Store failures a refused write can raise on SQLite. `RuntimeError` covers the audit chain's
+    # keyed-append refusal and the store's own acquire timeout.
+    store_errors = (RuntimeError, sqlite3.DatabaseError)
+
+    async def run() -> tuple[str, str, str]:
+        """``(outcome, username, extra)``: ``extra`` is the store for ``set``, else an error text."""
+        try:
+            store = await open_store(settings.store)
+        except StoreKeylessError as exc:
+            # A keyed store with encrypted rows, opened from a shell without its key, refuses at
+            # open. Nothing has been read or written.
+            return ("open-refused", wanted, str(exc))
+        try:
+            user = await store.get_user_by_username(wanted)
+            if user is None:
+                return ("no-such-user", wanted, "")
+            # The predicate the ADR 0167 gate applies, read the same way: holding the Administrator
+            # role in `user_roles`, and enabled. Role first, so a disabled Viewer is named as what it
+            # is rather than as a disabled Administrator.
+            if Role.ADMINISTRATOR.value not in await store.get_user_role_ids(user.id):
+                return ("not-admin", user.username, "")
+            if user.disabled:
+                return ("disabled", user.username, "")
+            if user.notify_email == address:
+                return ("unchanged", user.username, store.path)
+            if user.notify_email:
+                return ("has-address", user.username, "")
+            # PHI-free, and the address itself is left out, as `provision-admin` records only
+            # whether one was set. The actor names the OS user, as `admin-unlock` does.
+            detail = json.dumps({"username": user.username})
+            try:
+                await store.record_audit("auth.admin_notify_email_set", actor=actor, detail=detail)
+            except store_errors as exc:
+                # The chain refused the append (no key in this shell, the current range's key not
+                # held, or a running engine holding the write lock). Nothing has been written yet.
+                return ("audit-refused", user.username, str(exc))
+            try:
+                await store.set_user_notify_email(user.id, email=address)
+            except store_errors as exc:
+                # The row above now records a change that did not happen, so say so in the log too.
+                try:
+                    await store.record_audit(
+                        "auth.admin_notify_email_set_failed", actor=actor, detail=detail
+                    )
+                    logged = "a matching _failed audit row was appended"
+                except store_errors as follow:
+                    logged = f"appending the matching _failed audit row also failed ({follow})"
+                return ("write-failed", user.username, f"{exc}; {logged}")
+            return ("set", user.username, store.path)
+        finally:
+            await store.close()
+
+    try:
+        outcome, username, extra = asyncio.run(run())
+    except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
+        return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
+    refusals = {
+        "open-refused": f"{extra}. Nothing was written",
+        "no-such-user": f"no account named {username!r}",
+        "not-admin": f"the account {username!r} is not an Administrator; the start gate asks only "
+        "about enabled Administrators",
+        "disabled": f"the Administrator {username!r} is disabled and does not count at the start "
+        "gate. Address another enabled Administrator; if none is left, `provision-admin "
+        "--username <name> --email <address>` creates one",
+        "has-address": f"the account {username!r} already has a notification address; this command "
+        "only fills a missing one -- change it from the web console, which notifies the old address",
+        "audit-refused": f"{extra}. Nothing was written: the audit row goes first, and the store "
+        "refused it. If the engine is running, stop it and re-run",
+        "write-failed": f"the audit row for {username!r} was written, but setting the address "
+        f"failed ({extra}); the address is NOT set. Stop the engine and re-run",
+    }
+    if outcome in refusals:
+        return _emit_error(refusals[outcome], as_json=args.json)
+    changed = outcome == "set"
+    if args.json:
+        _print_json(
+            {"ok": True, "username": username, "changed": changed, "store": extra}, compact=True
+        )
+    else:
+        # `_safe_print`: both the username and the store path are operator-supplied. The path is
+        # named, as `provision-admin` names it, so a mistyped --db or config shows on screen.
+        verb = "set" if changed else "already had"
+        _safe_print(
+            f"OK: {verb} the notification address for Administrator {username!r} in {extra}"
         )
     return 0
 
@@ -5160,7 +5502,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
         )
         return 2
 
-    async def run() -> tuple[int, ResealResult]:
+    async def run() -> tuple[int, ResealResult, tuple[bool, str]]:
         import datetime
 
         from messagefoundry.pipeline.secret_rotation import fingerprints_equal
@@ -5205,12 +5547,18 @@ def _rotate_key(args: argparse.Namespace) -> int:
                             tracked_since=prior.tracked_since if prior is not None else today,
                             last_rotated=today,
                         )
-            return count, uploads
+            # BACKLOG #1904: the audit chain is the third surface the key covers. Its rows are never
+            # re-MAC'd (the off-box tee and every recorded anchor hold those values); instead the chain
+            # gets a range under the NEW key, whose first row commits to a digest of the old range, so
+            # the old range stays provable once the retired key is dropped. Verified first, and last in
+            # this command, so a refusal leaves the data rotation above intact and resumable.
+            rolled = await store.roll_audit_key_epoch()
+            return count, uploads, rolled
         finally:
             await store.close()
 
     try:
-        count, uploads = asyncio.run(run())
+        count, uploads, (rolled_ok, rolled_msg) = asyncio.run(run())
     except CipherError as exc:
         # A value couldn't be decrypted by any supplied key — the prior key is missing — or it was an
         # unmarked value the cipher refuses (#1169); the message names which, and the cell. Nothing is
@@ -5226,10 +5574,13 @@ def _rotate_key(args: argparse.Namespace) -> int:
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path)
-    print(
-        f"OK: re-encrypted {count} value(s) under the active key"
+    done = (
+        f"re-encrypted {count} value(s) under the active key"
         f" (+{uploads.resealed} uploaded-file value(s) re-sealed)"
     )
+    # "OK:" only when the whole rotation, audit chain included, is done: a wrapper reading stdout must
+    # not see OK and drop the retired key while the audit roll failed (BACKLOG #1904).
+    print(f"OK: {done}" if rolled_ok else f"PARTIAL: {done}")
     if uploads.sealed_plaintext:
         # BACKLOG #1169: these were plaintext uploads that a keyed store refused on read until now.
         # Sealing makes them readable, and it would seal a planted file just the same, so say how
@@ -5248,6 +5599,17 @@ def _rotate_key(args: argparse.Namespace) -> int:
             "BEFORE removing MEFOR_STORE_ENCRYPTION_KEYS_RETIRED.",
             file=sys.stderr,
         )
+    if not rolled_ok:
+        # The data is rotated but the audit chain is not: its current range is still under the prior
+        # key, so dropping that key now would leave the newest range unverifiable. Say so, and fail.
+        print(
+            f"error: the audit chain was not rolled to the active key — {rolled_msg}. Do NOT remove "
+            "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED until `messagefoundry rotate-key` completes "
+            "without this error.",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"OK: {rolled_msg}")
     return 0
 
 
@@ -6182,14 +6544,16 @@ def _security(args: argparse.Namespace) -> int:
 
     def _loosenings(sec: SecuritySettings) -> list[dict[str, str]]:
         # This CLI reads a SETTINGS file and never loads the connection graph — nor does it open the
-        # store — so it can see NEITHER the three per-connection declarations NOR the #1008
-        # store-principal privilege observation. It passes empty lists and None and declares BOTH gaps
+        # store — so it can see NEITHER the three per-connection declarations NOR the two store
+        # observations (#1008 privilege, #1905 audit-chain keying). It passes empty lists and None and
+        # declares BOTH gaps
         # in `loosenings_scope` below, instead of reporting a settings-only view as if it were the whole
-        # posture. `messagefoundry check` and GET /security/posture are the complete surfaces.
+        # posture. GET /security/posture is the complete surface; `messagefoundry check` adds the
+        # connection-scoped entries but opens no store either.
         return [
             {"switch": s, "risk": r}
             for s, r in security_loosenings(
-                sec, _store, _auth, _alerts, _rotation, (), (), (), None
+                sec, _store, _auth, _alerts, _rotation, (), (), (), None, None
             )
         ]
 
@@ -6210,8 +6574,9 @@ def _security(args: argparse.Namespace) -> int:
         "loosenings_scope": (
             "settings only ([security]/[store]/[auth]/[alerts]); the per-connection "
             "cleartext_accepted, tls_allow_expired and generic-ODBC DATABASE TLS declarations are NOT "
-            "included, and neither is the store-principal privilege observation (#1008 — this command "
-            "opens no store). These are the AUTHORED values, so a `serve --host` bind override on a "
+            "included, and neither are the store-principal privilege and audit-chain keying "
+            "observations (#1008, #1905 — this command opens no store, and neither does `check`; "
+            "GET /security/posture reports both). These are the AUTHORED values, so a `serve --host` bind override on a "
             "running engine is not reflected here either — see `messagefoundry check` or "
             "GET /security/posture"
         ),
@@ -6408,6 +6773,7 @@ _DISPATCH = {
     "verify": _verify,
     "support-bundle": _support_bundle,
     "service": _service,
+    "admin-set-notify-email": _admin_set_notify_email,
 }
 
 

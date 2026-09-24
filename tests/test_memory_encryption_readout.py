@@ -68,6 +68,7 @@ def _loosenings(sec: SecuritySettings) -> list[tuple[str, str]]:
         (),
         (),
         None,
+        None,
     )
 
 
@@ -99,7 +100,7 @@ def exposed_prod_phi(*security_lines: str) -> str:
         # And note WHERE it goes: before the first table header, for the reason the docstring gives.
         'security.web_console_public_address = "https://mefor.example.org"\n'
         + "".join(security_lines)
-        + '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n'
+        + '[api]\ntls_terminated_upstream = true\nplaintext_upstream_hop_acknowledged = true\ntrusted_proxies = ["10.0.0.1"]\n'
         'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n'
         "[retention]\ndead_letter_days = 30\n"
         '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n'
@@ -457,7 +458,7 @@ def test_the_recommended_loopback_behind_proxy_topology_still_starts(
         # public address. Flagged for docs/security/OFF-LOOPBACK-DEPLOYMENT.md; this test asserts the
         # topology STILL STARTS once declared, which is the property its docstring is defending.
         'security.web_console_public_address = "https://mefor.example.org"\n'
-        '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n'
+        '[api]\ntls_terminated_upstream = true\nplaintext_upstream_hop_acknowledged = true\ntrusted_proxies = ["10.0.0.1"]\n'
         'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n'
         "[retention]\ndead_letter_days = 30\n"
         '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n',

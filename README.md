@@ -107,7 +107,6 @@ deliberate — replace `<version>` with the current release shown at the top of 
 needs (each is opt-in and lazy-imported):
 
 ```bash
-pip install "messagefoundry-webconsole==<version>"   # the browser web console (/ui) — the operator UI; most operators want this
 pip install "messagefoundry[postgres]==<version>"    # PostgreSQL store backend (production server DB)
 pip install "messagefoundry[sqlserver]==<version>"   # SQL Server store backend (+ OS-level ODBC Driver 18)
 pip install "messagefoundry[sftp]==<version>"        # SFTP transport for the REMOTEFILE connector
@@ -115,11 +114,26 @@ pip install "messagefoundry[dicom]==<version>"       # DICOM codec + C-STORE SCP
 pip install "messagefoundry[harness]==<version>"     # the standalone PySide6 test harness GUI
 ```
 
+**Web console 0.3.0 is the one that pairs with engine 0.4.0.** The browser console (`/ui`) ships as
+its own wheel, `messagefoundry-webconsole`, with its own version numbers. It does not share the
+engine's version, so `messagefoundry-webconsole==0.4.0` does not exist. The engine mounts a console
+only if it was built against this engine's UI seam, the version of the interface between the two.
+Console 0.3.0 was built against engine 0.4.0's seam. It is published alongside engine 0.4.0, under
+its own `webconsole-v0.3.0` tag. Pin the pair: `messagefoundry==0.4.0` with
+`messagefoundry-webconsole==0.3.0`. Without that console, engine 0.4.0 behaves like this:
+
+- **No console installed:** the engine serves the JSON API only and prints a warning at startup. If you
+  set `[security].serve_web_console = true`, it refuses to start instead.
+- **Console 0.2.15 installed, console on:** the engine refuses to start. 0.2.15 was built for an older
+  engine, so startup stops with an import error or a seam mismatch. The console is on by default for a
+  loopback bind. Upgrade the console to 0.3.0, or set `[security].serve_web_console = false`.
+
 **What's in the `messagefoundry` package — and what isn't.** It is the **engine**; the operator UI is
-the browser **web console** served same-origin at `/ui`, which ships as a separate, version-matched
-wheel (`messagefoundry-webconsole`) the engine mounts in-process (turn it on with `[security].serve_web_console`), so
-a headless server, container, or adopter install stays lean. (The former PySide6 desktop console was
-retired in favour of the web console — BACKLOG #103; PySide6 now backs only the opt-in `[harness]` test
+the browser **web console** served same-origin at `/ui`, which ships as a separate wheel
+(`messagefoundry-webconsole`) with its own version, so a headless server, container, or adopter
+install stays lean. The engine mounts the console in-process, and the console must match the engine's
+UI seam (see above); `[security].serve_web_console` turns it on or off. (The former PySide6 desktop
+console was retired in favour of the web console — BACKLOG #103; PySide6 now backs only the opt-in `[harness]` test
 tooling.) The **VS Code extension is a separate product, not on PyPI** (a VS Code extension is a
 different ecosystem); see *VS Code extension & test harness* below for where to get it.
 
@@ -157,18 +171,32 @@ pip install -e ".[dev]"
 pytest
 ```
 
-Run the engine + localhost API (loads the bundled sample config, which ships only in a checkout):
+Run the engine + localhost API (loads the bundled sample config, which ships only in a checkout).
+It refuses to start until its secure-by-default posture is met, starting with a store encryption
+key (`messagefoundry gen-key`, set as `MEFOR_STORE_ENCRYPTION_KEY`). Each refusal names the setting
+it needs; the [User Guide](https://github.com/MEFORORG/MessageFoundry/blob/main/docs/USER-GUIDE.md)
+covers the key.
 
 ```bash
 python -m messagefoundry serve --config samples/config --db messagefoundry.db --env dev
-# API on http://127.0.0.1:8765 — GET /connections, /messages, /stats, WS /ws/stats
+# API on https://127.0.0.1:8765 — GET /connections, /messages, /stats, WS /ws/stats
 ```
 
-Then open the admin console in a browser (install the web console alongside the engine —
-`pip install -e packaging/messagefoundry-webconsole` — and set `[security].serve_web_console = true`):
+The engine always serves HTTPS. With no `[api].tls_cert_file` set, it mints a self-signed
+certificate on first run and saves it beside the store database as `api-generated-cert.pem`. A
+browser warns about that certificate, and other clients reject it, until you import it into the
+trust store or configure your own. The one exception is a declared TLS-terminating proxy in front
+(`[api].tls_terminated_upstream`): the engine then speaks plain HTTP to the proxy, and you browse to
+the proxy's address. Securing that hop is your job. So `serve` refuses to start there until you set
+`[api].plaintext_upstream_hop_acknowledged = true`. With your own certificate the hop is TLS instead,
+and the proxy must speak https to the engine. See [docs/SECURITY.md](docs/SECURITY.md).
+
+Then open the admin console in a browser (install the web console alongside the engine with
+`pip install -e packaging/messagefoundry-webconsole`; it is on by default for a loopback bind, so
+there is no switch to set):
 
 ```bash
-# browse to http://127.0.0.1:8765/ui and sign in
+# browse to https://127.0.0.1:8765/ui and sign in
 ```
 
 ### VS Code extension & test harness
