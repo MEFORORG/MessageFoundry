@@ -1694,6 +1694,59 @@ async def test_legacy_plaintext_migrated_on_keyed_reopen(store) -> None:
             await cleanup.close()
 
 
+async def test_unmarked_value_on_a_sealed_surface_is_refused_not_sealed(store) -> None:
+    """BACKLOG #1169 (ASVS 11.3.3), the ``postgres-store`` twin of
+    ``tests/test_store_strict_ciphertext.py``. Once ``messages.raw`` holds ciphertext, a keyed reopen
+    must NOT seal a planted plaintext row (that launders it), and a read of it must be REFUSED with the
+    cell named to the refusal hook -- never returned as the row's content."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.crypto import CipherError
+    from messagefoundry.store.postgres import PostgresStore
+
+    settings = load_settings(environ=os.environ).store
+    k = generate_key()
+    plant = "MSH|^~\\&|EVIL|F|R|RF|20260101||ADT^A01|PLANTED|P|2.5.1\r"
+    try:
+        keyed = await PostgresStore.open(settings, cipher=make_cipher(k))
+        try:
+            good = await keyed.enqueue_message(
+                channel_id="IB", raw=RAW, deliveries=[("OB", "p")], now=100.0
+            )
+            planted = await keyed.enqueue_message(
+                channel_id="IB", raw=RAW, deliveries=[("OB", "p")], now=101.0
+            )
+            row = await keyed._fetchone("SELECT raw AS v FROM messages WHERE id=$1", planted)
+            assert row["v"].startswith(MARKER_PREFIX)  # the surface IS sealed
+            await keyed._execute("UPDATE messages SET raw=$1 WHERE id=$2", plant, planted)
+        finally:
+            await keyed.close()
+
+        cipher = make_cipher(k)
+        refused: list[tuple[str, str]] = []
+        cipher.set_refusal_hook(lambda t, c: refused.append((t, c)))  # type: ignore[attr-defined]
+        reopened = await PostgresStore.open(settings, cipher=cipher)
+        try:
+            # The open's sweep visits the surface once and reports the planted row once (#1169
+            # round 2); the read below adds one more report for its refusal. Two events, by design.
+            assert refused == [("messages", "raw")], "the open must report the surface exactly once"
+            row = await reopened._fetchone("SELECT raw AS v FROM messages WHERE id=$1", planted)
+            assert row["v"] == plant, "the keyed reopen sealed a planted row on a sealed surface"
+            assert (await reopened.get_message(good))["raw"] == RAW
+            with pytest.raises(CipherError, match=r"messages\.raw"):
+                await reopened.get_message(planted)
+            assert refused == [("messages", "raw")] * 2  # the open's finding, then this refusal
+        finally:
+            await reopened.close()
+    finally:
+        cleanup = await PostgresStore.open(settings, cipher=make_cipher(k))
+        try:
+            async with cleanup._pool.acquire() as conn:
+                for table in ("message_events", "queue", "messages"):
+                    await conn.execute(f"DELETE FROM {table}")
+        finally:
+            await cleanup.close()
+
+
 async def test_converge_state_cache_follower_read_through(store) -> None:
     """Track B Step 6b: a FOLLOWER handle converges its transform-state cache from a write another handle
     (the writer) committed to the shared DB. Both enable convergence (the engine gate in a cluster). The

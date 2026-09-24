@@ -99,14 +99,16 @@ from messagefoundry.store.crypto import (
     CipherError,
     CipherInfo,
     IdentityCipher,
+    allows_unmarked,
     audit_key_id,
     cell_aad,
     cipher_info,
     decrypt_json_cell,
+    report_unmarked,
     rotation_fingerprint_key,
 )
 from messagefoundry.store.document_strip import StripResult, cutoff_for
-from messagefoundry.store.gcm_bound import checkpoint_invocations
+from messagefoundry.store.gcm_bound import checkpoint_invocations, reserve_invocations_ahead
 from messagefoundry.store.metadata import (
     decode_response_headers,
     encode_reference_value,
@@ -3656,7 +3658,7 @@ class MessageStore:
     def _dec(self, value: str | None, *, aad: bytes) -> str | None:
         if value is None:
             return value
-        # '' and legacy plaintext pass through unchanged; a v1 marker decrypts with None AAD (dual-read),
+        # '' passes through; any other unmarked value is refused unless allowed (#1169); a v1 marker decrypts with None AAD (dual-read),
         # a v2 marker with this `aad` — a wrong-cell v2 blob fails the tag → CipherError (fail-closed).
         return self._cipher.decrypt(value, aad=aad)
 
@@ -3797,7 +3799,8 @@ class MessageStore:
             # since on a store that is having a key enabled for the first time it is itself a large
             # burst. A no-op when the cipher carries no bound (keyless / `vault_transit`).
             await store.checkpoint_cipher_invocations()
-            await store._encrypt_existing_rows()  # one-time PHI-at-rest migration when a key is set
+            # Runs at EVERY keyed open: seals legacy plaintext on still-unsealed surfaces (#1169).
+            await store._encrypt_existing_rows()
             await store._load_audit_chain_meta()  # load/auto-init the #190 keying watermark
             await (
                 store._load_state_cache()
@@ -4176,12 +4179,24 @@ class MessageStore:
     )
 
     async def _encrypt_existing_rows(self) -> None:
-        """Encrypt any legacy plaintext values in the cipher-covered columns in place when encryption
-        is enabled (STORE-1 / WP-5).
+        """Seal legacy plaintext in the cipher-covered columns when encryption is enabled (STORE-1 /
+        WP-5), one (table, column) SURFACE at a time.
 
-        Idempotent and batched: skips rows already carrying the ciphertext prefix (and NULL / blank
-        ``''`` values — the latter is a purged/empty marker we must not turn into ciphertext), so reads
-        work throughout and re-running is a no-op. Bounded memory (processes in chunks)."""
+        Runs at EVERY keyed open, not once. That is why a surface is sealed only while it is still
+        UNSEALED -- while it holds no marked value at all (BACKLOG #1169, ASVS 11.3.3). Once one
+        ciphertext exists there, the keyed writer is the only thing that writes that column, so a
+        non-blank unmarked value beside it is a stripped marker or a planted row. Sealing it would
+        launder the plant into genuine ciphertext, so it is left in place and every read of it is
+        refused (:class:`~messagefoundry.store.crypto._UnmarkedPolicy`). The state comes from the data,
+        never from a persisted flag, so it cannot go stale. ``[store].allow_unmarked_ciphertext``
+        restores the old sweep, which seals every unmarked value.
+
+        NULL and blank ``''`` are never sealed: ``''`` is what every purge path writes.
+
+        **Each surface seals in ONE transaction.** A crash part-way through a first keyed open would
+        otherwise leave a surface half-sealed, and the next open would read that as sealed and refuse
+        the other half -- legitimate legacy rows. See :meth:`_seal_surface` for how the AES-GCM
+        invocation bound (ASVS 11.3.4) stays ahead of a burst it cannot top up mid-transaction."""
         if not self._cipher.encrypts:
             return
         # Version-agnostic anchor (M9): `mfenc:%` matches BOTH v1 and v2 ciphertext, so a v2 row is
@@ -4191,303 +4206,156 @@ class MessageStore:
         total = 0
         async with self._lock:
             for table, column in self._CIPHER_COLUMNS:
-                while True:
-                    # NOT LIKE / <> '' are both NULL (excluded) for NULL columns, so only non-null,
-                    # non-blank, not-yet-encrypted values are selected.
-                    cur = await self._db.execute(
-                        f"SELECT id, {column} FROM {table}"
-                        f" WHERE {column} NOT LIKE ? AND {column} <> '' LIMIT 500",
-                        (like,),
-                    )
-                    rows = list(await cur.fetchall())
-                    if not rows:
-                        break
-                    await self._db.executemany(
-                        f"UPDATE {table} SET {column}=? WHERE id=?",
-                        [
-                            (
-                                self._cipher.encrypt(
-                                    r[column], aad=cell_aad(table, column, r["id"])
-                                ),
-                                r["id"],
-                            )
-                            for r in rows
-                        ],
-                    )
-                    await self._commit()
-                    await self._charge_bound_batch()
-                    total += len(rows)
-            # The `state` table (composite PK, ADR 0005) can't use the id-keyed loop — migrate it
-            # separately so a key enabled on an existing DB encrypts any legacy plaintext state values.
-            while True:
-                cur = await self._db.execute(
-                    "SELECT namespace, key, value FROM state"
-                    " WHERE value NOT LIKE ? AND value <> '' LIMIT 500",
-                    (like,),
-                )
-                rows = list(await cur.fetchall())
-                if not rows:
-                    break
-                await self._db.executemany(
-                    "UPDATE state SET value=? WHERE namespace=? AND key=?",
-                    [
-                        (
-                            self._cipher.encrypt(
-                                r["value"],
-                                aad=cell_aad("state", "value", r["namespace"], r["key"]),
-                            ),
-                            r["namespace"],
-                            r["key"],
-                        )
-                        for r in rows
-                    ],
-                )
-                await self._commit()
-                await self._charge_bound_batch()
-                total += len(rows)
-            # The `reference` table (composite PK name,version,key — ADR 0006) likewise can't use the
-            # id-keyed loop; migrate any legacy plaintext snapshot values separately.
-            while True:
-                cur = await self._db.execute(
-                    "SELECT name, version, key, value FROM reference"
-                    " WHERE value NOT LIKE ? AND value <> '' LIMIT 500",
-                    (like,),
-                )
-                rows = list(await cur.fetchall())
-                if not rows:
-                    break
-                await self._db.executemany(
-                    "UPDATE reference SET value=? WHERE name=? AND version=? AND key=?",
-                    [
-                        (
-                            self._cipher.encrypt(
-                                r["value"],
-                                aad=cell_aad(
-                                    "reference", "value", r["name"], r["version"], r["key"]
-                                ),
-                            ),
-                            r["name"],
-                            r["version"],
-                            r["key"],
-                        )
-                        for r in rows
-                    ],
-                )
-                await self._commit()
-                await self._charge_bound_batch()
-                total += len(rows)
-            # The `response` table (composite PK message_id,destination_name,response_seq — ADR 0013) has
-            # encrypted columns (body, detail, resp_headers — #154) and no `id`; migrate each on its own
-            # pass. (A brand-new table, so normally a no-op — present for parity with state/reference.)
+                total += await self._seal_surface(table, column, like, aad_cols=("id",))
+            # The `state` table (composite PK, ADR 0005) binds its AAD to (namespace, key).
+            total += await self._seal_surface("state", "value", like, aad_cols=("namespace", "key"))
+            # The `reference` table (composite PK name,version,key — ADR 0006).
+            total += await self._seal_surface(
+                "reference", "value", like, aad_cols=("name", "version", "key")
+            )
+            # The `response` table (composite PK message_id,destination_name,response_seq — ADR 0013)
+            # has three encrypted columns (body, detail, resp_headers — #154), each its own surface.
             for column in ("body", "detail", "resp_headers"):
-                while True:
-                    cur = await self._db.execute(
-                        f"SELECT message_id, destination_name, response_seq, {column} FROM response"
-                        f" WHERE {column} NOT LIKE ? AND {column} <> '' LIMIT 500",
-                        (like,),
-                    )
-                    rows = list(await cur.fetchall())
-                    if not rows:
-                        break
-                    await self._db.executemany(
-                        f"UPDATE response SET {column}=?"
-                        " WHERE message_id=? AND destination_name=? AND response_seq=?",
-                        [
-                            (
-                                self._cipher.encrypt(
-                                    r[column],
-                                    aad=cell_aad(
-                                        "response",
-                                        column,
-                                        r["message_id"],
-                                        r["destination_name"],
-                                        r["response_seq"],
-                                    ),
-                                ),
-                                r["message_id"],
-                                r["destination_name"],
-                                r["response_seq"],
-                            )
-                            for r in rows
-                        ],
-                    )
-                    await self._commit()
-                    await self._charge_bound_batch()
-                    total += len(rows)
-            # The `shared_body` table (store-once-deliver-many) is keyed by `hash` (the plaintext content
-            # address), not `id`; migrate any legacy plaintext body separately. (Normally a no-op — a
-            # brand-new table — present for parity with state/reference/response.)
-            while True:
-                cur = await self._db.execute(
-                    "SELECT hash, body FROM shared_body WHERE body NOT LIKE ? AND body <> '' LIMIT 500",
-                    (like,),
+                total += await self._seal_surface(
+                    "response",
+                    column,
+                    like,
+                    aad_cols=("message_id", "destination_name", "response_seq"),
                 )
-                rows = list(await cur.fetchall())
-                if not rows:
-                    break
-                await self._db.executemany(
-                    "UPDATE shared_body SET body=? WHERE hash=?",
-                    [
-                        (
-                            self._cipher.encrypt(
-                                r["body"], aad=cell_aad("shared_body", "body", r["hash"])
-                            ),
-                            r["hash"],
-                        )
-                        for r in rows
-                    ],
-                )
-                await self._commit()
-                await self._charge_bound_batch()
-                total += len(rows)
-            # The `attachment_chunk` table (#149, ADR 0105) is cipher-covered (`ciphertext`) and keyed by
-            # the composite (attachment_id, seq); seal any legacy plaintext chunk. Normally a no-op (a
-            # brand-new table, and Phase 0 writes nothing) — present for parity with shared_body/state.
-            while True:
-                cur = await self._db.execute(
-                    "SELECT attachment_id, seq, ciphertext FROM attachment_chunk"
-                    " WHERE ciphertext NOT LIKE ? AND ciphertext <> '' LIMIT 500",
-                    (like,),
-                )
-                rows = list(await cur.fetchall())
-                if not rows:
-                    break
-                await self._db.executemany(
-                    "UPDATE attachment_chunk SET ciphertext=? WHERE attachment_id=? AND seq=?",
-                    [
-                        (
-                            self._cipher.encrypt(
-                                r["ciphertext"],
-                                aad=cell_aad(
-                                    "attachment_chunk",
-                                    "ciphertext",
-                                    r["attachment_id"],
-                                    r["seq"],
-                                ),
-                            ),
-                            r["attachment_id"],
-                            r["seq"],
-                        )
-                        for r in rows
-                    ],
-                )
-                await self._commit()
-                await self._charge_bound_batch()
-                total += len(rows)
+            # The `shared_body` table (store-once-deliver-many) is keyed by `hash`, the plaintext
+            # content address.
+            total += await self._seal_surface("shared_body", "body", like, aad_cols=("hash",))
+            # The `attachment_chunk` table (#149, ADR 0105), composite (attachment_id, seq).
+            total += await self._seal_surface(
+                "attachment_chunk", "ciphertext", like, aad_cols=("attachment_id", "seq")
+            )
             # The `message_events` (detail), `connection_event` (reason), and `alert_instance` (reason)
             # tables have an AUTOINCREMENT `id`, so their cell_aad binds to insert-time-known natural
-            # columns, not `id` — they migrate on their own composite passes (UPDATE targets `id`, but the
-            # AAD is rebuilt from the selected natural columns so it matches the write/read path exactly).
-            total += await self._encrypt_message_events(like)
-            total += await self._encrypt_connection_events(like)
-            total += await self._encrypt_alert_instances(like)
+            # columns, not `id` — the UPDATE targets `id`, but the AAD is rebuilt from the selected
+            # natural columns so it matches the write/read path exactly (ASVS 11.3.3).
+            total += await self._seal_surface(
+                "message_events",
+                "detail",
+                like,
+                aad_cols=("message_id", "ts", "event"),
+                key_cols=("id",),
+            )
+            total += await self._seal_surface(
+                "connection_event",
+                "reason",
+                like,
+                aad_cols=("connection", "ts", "kind"),
+                key_cols=("id",),
+            )
+            # alert_instance binds to (event_type, connection) — the de-dup grain the upsert keys on,
+            # so the same AAD covers the INSERT and the re-fire UPDATE that never sees the id.
+            total += await self._seal_surface(
+                "alert_instance",
+                "reason",
+                like,
+                aad_cols=("event_type", "connection"),
+                key_cols=("id",),
+            )
         if total:
             log.info("encrypted %d existing value(s) at rest", total)
 
-    async def _encrypt_message_events(self, like: str) -> int:
-        """One-time encrypt of legacy plaintext ``message_events.detail`` (caller holds the lock). The
-        cell_aad is (message_id, ts, event) — the row's insert-time-known identity — so a migrated value
-        decrypts under the same AAD ``events_for`` reads it with (ASVS 11.3.3)."""
-        migrated = 0
-        while True:
-            cur = await self._db.execute(
-                "SELECT id, message_id, ts, event, detail FROM message_events"
-                " WHERE detail NOT LIKE ? AND detail <> '' LIMIT 500",
-                (like,),
-            )
-            rows = list(await cur.fetchall())
-            if not rows:
-                break
-            await self._db.executemany(
-                "UPDATE message_events SET detail=? WHERE id=?",
-                [
-                    (
-                        self._cipher.encrypt(
-                            r["detail"],
-                            aad=cell_aad(
-                                "message_events", "detail", r["message_id"], r["ts"], r["event"]
-                            ),
-                        ),
-                        r["id"],
-                    )
-                    for r in rows
-                ],
-            )
-            await self._commit()
-            await self._charge_bound_batch()
-            migrated += len(rows)
-        return migrated
+    async def _seal_surface(
+        self,
+        table: str,
+        column: str,
+        like: str,
+        *,
+        aad_cols: tuple[str, ...],
+        key_cols: tuple[str, ...] | None = None,
+        batch: int = 500,
+    ) -> int:
+        """Seal one (table, column) surface's legacy plaintext, in ONE transaction; return the count.
 
-    async def _encrypt_connection_events(self, like: str) -> int:
-        """One-time encrypt of legacy plaintext ``connection_event.reason`` (caller holds the lock),
-        bound to (connection, ts, kind) — the row's insert-time-known identity (ASVS 11.3.3)."""
-        migrated = 0
-        while True:
-            cur = await self._db.execute(
-                "SELECT id, connection, ts, kind, reason FROM connection_event"
-                " WHERE reason NOT LIKE ? AND reason <> '' LIMIT 500",
-                (like,),
-            )
-            rows = list(await cur.fetchall())
-            if not rows:
-                break
-            await self._db.executemany(
-                "UPDATE connection_event SET reason=? WHERE id=?",
-                [
-                    (
-                        self._cipher.encrypt(
-                            r["reason"],
-                            aad=cell_aad(
-                                "connection_event", "reason", r["connection"], r["ts"], r["kind"]
-                            ),
-                        ),
-                        r["id"],
-                    )
-                    for r in rows
-                ],
-            )
-            await self._commit()
-            await self._charge_bound_batch()
-            migrated += len(rows)
-        return migrated
+        The caller holds ``self._lock``. ``aad_cols`` rebuild the cell AAD the write/read path binds;
+        ``key_cols`` (default: ``aad_cols``) are what the UPDATE targets. All identifiers are code
+        constants from :meth:`_encrypt_existing_rows`; only the marker pattern is a parameter.
 
-    async def _encrypt_alert_instances(self, like: str) -> int:
-        """One-time encrypt of legacy plaintext ``alert_instance.reason`` (caller holds the lock), bound
-        to (event_type, connection) — the de-dup grain the upsert keys on, so the same AAD covers both the
-        INSERT and the re-fire UPDATE that never sees the autoincrement id (ASVS 11.3.3)."""
-        migrated = 0
-        while True:
+        Three steps, in this order:
+
+        1. **Derive the surface's state from the data.** No unmarked non-blank value: nothing to do.
+           A marked value already present: the surface is SEALED, so its unmarked values are left in
+           place and refused at read (unless the opt-out is on).
+        2. **Reserve the whole burst on the AES-GCM bound first** (ASVS 11.3.4). On SQLite the
+           reservation commits the one writer connection, so it cannot happen once the seal's
+           transaction is open. Reserving everything up front is what lets the seal skip the per-batch
+           charge without the persisted total ever trailing an encrypt.
+        3. **Seal every batch, then commit once.** Any failure rolls the whole surface back.
+        """
+        keys = key_cols if key_cols is not None else aad_cols
+        pending_where = f"{column} NOT LIKE ? AND {column} <> ''"
+        cur = await self._db.execute(
+            f"SELECT COUNT(*) AS n FROM {table} WHERE {pending_where}", (like,)
+        )
+        row = await cur.fetchone()
+        pending = int(row["n"]) if row is not None else 0
+        if not pending:
+            return 0
+        if not allows_unmarked(self._cipher):
             cur = await self._db.execute(
-                "SELECT id, event_type, connection, reason FROM alert_instance"
-                " WHERE reason NOT LIKE ? AND reason <> '' LIMIT 500",
-                (like,),
+                f"SELECT 1 FROM {table} WHERE {column} LIKE ? LIMIT 1", (like,)
             )
-            rows = list(await cur.fetchall())
-            if not rows:
-                break
-            await self._db.executemany(
-                "UPDATE alert_instance SET reason=? WHERE id=?",
-                [
-                    (
-                        self._cipher.encrypt(
-                            r["reason"],
-                            aad=cell_aad(
-                                "alert_instance", "reason", r["event_type"], r["connection"]
+            if await cur.fetchone() is not None:
+                log.warning(
+                    "cipher column %s.%s holds %d unmarked value(s) beside sealed ones; they were NOT "
+                    "sealed and every read of them is refused (a stripped marker or a planted row). "
+                    "Set [store].allow_unmarked_ciphertext only if they are known to be legitimate",
+                    table,
+                    column,
+                    pending,
+                )
+                # Alert now, not only on a read: a planted row nobody reads would otherwise stay
+                # invisible except in the log. Names the cell only (BACKLOG #1169).
+                report_unmarked(self._cipher, table, column)
+                return 0
+        await reserve_invocations_ahead(self._cipher, self._add_cipher_invocations_locked, pending)
+        select_cols = ", ".join(dict.fromkeys((*keys, *aad_cols)))
+        where_keys = " AND ".join(f"{c}=?" for c in keys)
+        sealed = 0
+        try:
+            while True:
+                # The same connection sees its own uncommitted UPDATEs, so a sealed row stops
+                # matching NOT LIKE and the loop terminates inside the one transaction.
+                cur = await self._db.execute(
+                    f"SELECT {select_cols}, {column} AS v FROM {table}"
+                    f" WHERE {pending_where} LIMIT {int(batch)}",
+                    (like,),
+                )
+                rows = list(await cur.fetchall())
+                if not rows:
+                    break
+                await self._db.executemany(
+                    f"UPDATE {table} SET {column}=? WHERE {where_keys}",
+                    [
+                        (
+                            self._cipher.encrypt(
+                                r["v"], aad=cell_aad(table, column, *(r[c] for c in aad_cols))
                             ),
-                        ),
-                        r["id"],
-                    )
-                    for r in rows
-                ],
-            )
+                            *(r[c] for c in keys),
+                        )
+                        for r in rows
+                    ],
+                )
+                sealed += len(rows)
             await self._commit()
-            await self._charge_bound_batch()
-            migrated += len(rows)
-        return migrated
+        except BaseException as exc:
+            # Unwind the WHOLE surface: a half-sealed surface reads as sealed on the next open, which
+            # would refuse the legitimate legacy rows this pass had not reached yet.
+            await _unwind_and_raise(self._db, exc, role="writer")
+        # Top the reserve back up for whatever follows; the burst itself was reserved in step 2.
+        await self._charge_bound_batch()
+        return sealed
 
     async def reencrypt_to_active(self, *, batch: int = 500) -> int:
         """Re-encrypt every cipher-covered value under the **active** key — the key-rotation re-encrypt
-        path (ASVS 11.2.2), run offline via ``messagefoundry rotate-key``. Rewrites values that are
+        path (ASVS 11.2.2), run offline via ``messagefoundry rotate-key``. Since BACKLOG #1169 an unmarked
+        value on a sealed surface is REFUSED here, so a planted row aborts the rotation naming its cell
+        instead of being laundered into ciphertext; the open that precedes it has already sealed every
+        unsealed surface. Rewrites values that are
         plaintext or under a *retired* key; skips values already under the active key (idempotent) and
         NULL/blank ones. A value no configured key can decrypt raises (rotation needs the prior key
         supplied via ``MEFOR_STORE_ENCRYPTION_KEYS_RETIRED``) — it never silently drops PHI. Returns the
@@ -6464,8 +6332,10 @@ class MessageStore:
         except Exception as exc:
             # Same as claim_ready: an undecryptable head must not stall the lane — dead-letter it and
             # let the next poll advance to the new head, rather than re-raising into the worker (H-1).
-            # The dead-letter records the message ERROR (visible in the tracking view); a push alert
-            # for a poison ingress row is a documented follow-up (the store can't reach the AlertSink).
+            # The dead-letter records the message ERROR (visible in the tracking view). An UNMARKED
+            # payload is also pushed as an `integrity_drift` alert: the cipher's refusal hook reaches
+            # the AlertSink that this store cannot (BACKLOG #1169). A payload that fails its tag still
+            # gets no push alert -- a documented follow-up.
             log.warning("dead-lettering undecryptable queue row %s: %s", claimed["id"], exc)
             # STANDALONE (Hazard A): post-claim-commit, force an immediate inline commit (no grouping).
             await self.dead_letter_now(
@@ -10939,7 +10809,18 @@ class MessageStore:
             cutoff = cutoff_for(row["channel_id"], older_than, connection_cutoffs)
             if row["received_at"] >= cutoff:
                 continue  # not past its own (per-connection) window — skip
-            raw = self._cipher.decrypt(row["raw"], aad=cell_aad("messages", "raw", row["id"]))
+            try:
+                raw = self._cipher.decrypt(row["raw"], aad=cell_aad("messages", "raw", row["id"]))
+            except CipherError as exc:
+                # Contain ONE row, as the claim sites do: a refused (unmarked) or undecryptable body
+                # must not abort the whole retention pass. The row is left exactly as found; the
+                # message names only the cell and the message id, never the body (BACKLOG #1169).
+                log.warning(
+                    "document strip skipped message %s: its body could not be read: %s",
+                    row["id"],
+                    exc,
+                )
+                continue
             new_raw, n_docs, n_bytes = _strip_documents(
                 raw,
                 pruned_at=now,
