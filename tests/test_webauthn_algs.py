@@ -519,10 +519,11 @@ def test_a_raw_library_failure_is_logged_by_type_and_a_library_refusal_is_not(
 # --- the pin compares CBOR integers, not values that merely equal one (BACKLOG #1953) ----------
 #
 # Python's ``bool`` is a subclass of ``int`` and ``1.0 == 1``, so a COSE key decoded with ``true`` or
-# ``1.0`` where an integer belongs compares equal to the identifier it imitates. The library looks
-# its labels up in a dict and compares its values with ``==``, and the P-256 pin used ``int()``, so
-# every row below ENROLLED at engine ``5ccff7cb3``: a real key whose one defect is a stand-in for an
-# integer, either as a parameter value or as the label that names it.
+# ``1.0`` where an integer belongs compares equal to the identifier it imitates. The library indexes
+# the decoded CBOR by label and compares its values with ``==``, and the P-256 pin used ``int()``,
+# so every row below ENROLLED at engine ``5ccff7cb3``: a real key whose one defect is a stand-in
+# for an integer, as a parameter value or as the label that names it, or an array standing in for
+# the map, whose positions the library's indexing reads as labels.
 
 
 def _rekeyed(cose_key: bytes, label: int, stand_in: object) -> bytes:
@@ -530,6 +531,16 @@ def _rekeyed(cose_key: bytes, label: int, stand_in: object) -> bytes:
     fields = dict(parse_cbor(cose_key))
     fields[stand_in] = fields.pop(label)
     return encode_cbor(fields)
+
+
+def _as_array(cose_key: bytes, **changes: object) -> bytes:
+    """``cose_key`` as a CBOR array, each value at the position the library reads for its label."""
+    fields: dict[int, object] = dict(parse_cbor(_relabelled(cose_key, **changes)))
+    positive = max(label for label in fields if label >= 0) + 1
+    array: list[object] = [0] * (positive - min(label for label in fields if label < 0))
+    for label, value in fields.items():
+        array[label] = value
+    return encode_cbor(array)
 
 
 #: Every row reaches the shape check: each passed the library's own screens at ``5ccff7cb3``.
@@ -548,19 +559,35 @@ _NON_INTEGER_COSE_KEYS: dict[str, Callable[[], bytes]] = {
     "EdDSA with the kty label written true": lambda: _rekeyed(_eddsa(), 1, True),
 }
 
+#: The same keys with the map written as an array. Each also ENROLLED at ``5ccff7cb3``.
+_ARRAY_COSE_KEYS: dict[str, Callable[[], bytes]] = {
+    "ES256 as an array": lambda: _as_array(_p256()),
+    "ES256 as an array with crv true": lambda: _as_array(_p256(), crv=True),
+    "EdDSA as an array with kty true": lambda: _as_array(_eddsa(), kty=True),
+}
+
 
 @pytest.mark.parametrize(
-    "build", _NON_INTEGER_COSE_KEYS.values(), ids=_NON_INTEGER_COSE_KEYS.keys()
+    ("build", "refusal"),
+    [(build, "COSE key ") for build in _NON_INTEGER_COSE_KEYS.values()]
+    + [(build, "COSE key must be a map") for build in _ARRAY_COSE_KEYS.values()],
+    ids=[*_NON_INTEGER_COSE_KEYS, *_ARRAY_COSE_KEYS],
 )
 def test_a_stand_in_for_a_cose_integer_is_refused_at_registration(
-    build: Callable[[], bytes], caplog: pytest.LogCaptureFixture
+    build: Callable[[], bytes], refusal: str, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A deliberate refusal on the audited path, like the curve pin: no WARNING is logged."""
+    """A deliberate refusal on the audited path, like the curve pin: no WARNING is logged.
+
+    The message pins WHICH check refused: the screen's all start ``COSE key``, and the shape pin's
+    starts ``COSE algorithm``, so a row cannot pass on the pin or on a broken fixture. An array
+    row must meet the map rule itself, not the label rule, which would also refuse its byte
+    strings when iterated as labels.
+    """
     challenge = secrets.token_bytes(wa.CHALLENGE_BYTES)
     logger = "messagefoundry.auth.webauthn"
     with (
         caplog.at_level(logging.WARNING, logger=logger),
-        pytest.raises(wa.WebAuthnVerificationError),
+        pytest.raises(wa.WebAuthnVerificationError) as caught,
     ):
         wa.verify_registration(
             response_json=_registration_response(challenge, build()),
@@ -568,6 +595,7 @@ def test_a_stand_in_for_a_cose_integer_is_refused_at_registration(
             rp_id=RP,
             origin=ORIGIN,
         )
+    assert str(caught.value).startswith(refusal)
     assert not [r for r in caplog.records if r.name == logger]
 
 
@@ -582,6 +610,7 @@ def test_the_stand_in_rows_are_otherwise_well_formed() -> None:
     _assert_registers(_relabelled(_eddsa(), kty=1, alg=-8, crv=_ED25519))
     for label in (1, 3, -1, -2):
         _assert_registers(_rekeyed(_p256(), label, label))
+        _assert_registers(_rekeyed(_eddsa(), label, label))
     with_text_label = dict(parse_cbor(_p256()))
     with_text_label["note"] = "x"
     _assert_registers(encode_cbor(with_text_label))

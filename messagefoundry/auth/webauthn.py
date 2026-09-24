@@ -169,28 +169,28 @@ def _refusal(exc: Exception, *, ceremony: str) -> WebAuthnVerificationError:
     return WebAuthnVerificationError(str(exc))
 
 
-#: The COSE labels whose values the library and :data:`_COSE_KEY_SHAPE_FOR_ALG` compare as integers.
-_COSE_INT_PARAMS: tuple[tuple[str, int], ...] = (("kty", 1), ("alg", 3), ("crv", -1))
+def _require_cose_integers(fields: object, **params: object) -> None:
+    """Refuse a COSE key whose labels, or whose ``kty``, ``alg`` or ``crv``, only EQUAL integers.
 
+    ``bool`` subclasses ``int`` and ``1.0 == 1``. The library indexes the decoded CBOR by label and
+    compares each value with ``==``, and the P-256 pin used ``int()``. So a key reading ``crv: true``
+    or ``crv: 1.0``, or carrying its ``kty`` under the label ``true``, enrolled (BACKLOG #1953).
+    CBOR encodes each as a different type from the integer, so this requires the type itself.
 
-def _require_cose_integers(fields: dict[object, object]) -> None:
-    """Refuse a COSE key map whose labels, or whose ``kty``, ``alg`` or ``crv``, only EQUAL integers.
-
-    ``bool`` subclasses ``int`` and ``1.0 == 1``, and the library finds each parameter by a dict
-    lookup and compares it with ``==``. So a key reading ``crv: true`` or ``crv: 1.0``, or carrying
-    its ``kty`` under the label ``true``, passed the library's screens and the P-256 pin, and
-    enrolled (BACKLOG #1953). CBOR encodes each as a different type from the integer, so this
-    requires the integer type itself. A label may also be a text string (RFC 9052 section 7): one
-    never matches an integer lookup, so it is let through. Each refusal names a type, never a
-    value, because the value is the attacker's.
+    ``fields`` is the parsed key. It must be a map: the library's indexing also accepts an array,
+    whose positions it reads as labels. A label may be an integer or a text string (RFC 9052
+    section 7); a text label never matches an integer index, so it is let through. ``params`` are
+    the values the library decoded, with ``None`` for a parameter this key type does not carry.
+    Each refusal names a type, never a value, because the value is the attacker's.
     """
+    if not isinstance(fields, dict):
+        raise WebAuthnVerificationError(f"COSE key must be a map, not {type(fields).__name__}")
     for label in fields:
         if type(label) is not int and not isinstance(label, str):
             raise WebAuthnVerificationError(
                 f"COSE key label must be an integer or a text string, not {type(label).__name__}"
             )
-    for name, label in _COSE_INT_PARAMS:
-        value = fields.get(label)
+    for name, value in params.items():
         if value is not None and type(value) is not int:
             raise WebAuthnVerificationError(
                 f"COSE key {name} must be an integer, not {type(value).__name__}"
@@ -211,7 +211,7 @@ def _require_usable_public_key(cose_key: bytes) -> None:
     so an ES256 credential on P-384 or P-521 is refused here although it would verify. That is
     the owner's 2026-09-23 ruling, and it is a deliberate refusal, so it is not logged.
 
-    That binding compares integers, so :func:`_require_cose_integers` screens the map first. Its
+    That binding compares integers, so :func:`_require_cose_integers` runs before it. Its
     refusals are deliberate too, and not logged.
     """
     from webauthn.helpers import (
@@ -221,21 +221,14 @@ def _require_usable_public_key(cose_key: bytes) -> None:
     )
 
     try:
+        decoded = decode_credential_public_key(cose_key)
+        decoded_public_key_to_cryptography(decoded)
         fields = parse_cbor(cose_key)
     except _invalid_input_errors() as exc:
         raise _refusal(exc, ceremony="registration") from exc
-    # Not a map only for the library's legacy uncompressed-point form (a leading 0x04), which has
-    # no labels, or for a structure its decoder refuses below.
-    if isinstance(fields, dict):
-        _require_cose_integers(fields)
-    try:
-        decoded = decode_credential_public_key(cose_key)
-        decoded_public_key_to_cryptography(decoded)
-        alg, kty = int(decoded.alg), int(decoded.kty)
-        crv = getattr(decoded, "crv", None)
-        shape = (kty, None if crv is None else int(crv))
-    except _invalid_input_errors() as exc:
-        raise _refusal(exc, ceremony="registration") from exc
+    alg, kty, crv = decoded.alg, decoded.kty, getattr(decoded, "crv", None)
+    _require_cose_integers(fields, kty=kty, alg=alg, crv=crv)
+    shape = (kty, crv)
     if _COSE_KEY_SHAPE_FOR_ALG.get(alg) != shape:
         raise WebAuthnVerificationError(
             f"COSE algorithm {alg} is accepted only as key type and curve "
