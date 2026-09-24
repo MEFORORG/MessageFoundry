@@ -1299,8 +1299,8 @@ def test_lockout_auto_expires_but_re_locking_is_unbounded() -> None:
     )
 
     # --- derived: the counter has exactly the feeders the note names ------------------------------
-    # BACKLOG #1138 added ``_reproof``: the post-session re-proofs (``reauth``, which also re-binds a
-    # directory account, and ``verify_current_password``). They need a live session, so an attacker
+    # BACKLOG #1138 added ``_reproof_serialized``, the body of ``_reproof``: the post-session
+    # re-proofs (``reauth``, which also re-binds a directory account, and ``verify_current_password``). They need a live session, so an attacker
     # WITHOUT one still reaches only the two sign-in feeders, which is the scope the note states.
     feeders = {
         node.name
@@ -1309,7 +1309,7 @@ def test_lockout_auto_expires_but_re_locking_is_unbounded() -> None:
         and node.name != "_register_failure"
         and calls_to(node, {"_register_failure"})
     }
-    assert feeders == {"_login_local", "verify_mfa", "_reproof"}, (
+    assert feeders == {"_login_local", "verify_mfa", "_reproof_serialized"}, (
         f"the per-account lockout is now fed from {sorted(feeders)}; the 6.1.1 note scopes the "
         "sessionless case to LOCAL accounts, and the recovery argument below the table rests on it."
     )
@@ -1410,9 +1410,10 @@ def test_reauth_surface_feeds_the_lockout_and_the_doc_says_so() -> None:
             f"{name} no longer re-proves through _reproof, so it may have stopped feeding or "
             "honouring the lockout; the SEC-024 caveat below says it does both."
         )
-    reproof = named_func(source, "_reproof")
+    assert calls_to(named_func(source, "_reproof"), {"_reproof_serialized"})
+    reproof = named_func(source, "_reproof_serialized")
     assert calls_to(reproof, {"_register_failure"})
-    assert any(isinstance(n, ast.Attribute) and n.attr == "locked_until" for n in ast.walk(reproof))
+    assert calls_to(reproof, {"_live_lock"}), "the re-proof no longer checks the lock"
     block = _section(_H_BRUTE)
     assert "The lockout also reaches the credential re-proof surface" in block, (
         "the SEC-024 caveat must state that the lockout covers POST /me/reauth and POST /me/password."

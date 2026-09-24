@@ -331,6 +331,36 @@ async def test_a_parallel_burst_cannot_outrun_the_lock() -> None:
         await store.close()
 
 
+async def test_a_lock_set_by_another_leg_during_the_verify_refuses_the_reproof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The per-account lock orders re-proofs only. A sign-in failure can lock the account while a
+    re-proof waits on its argon2 verify; the re-proof must then be refused, and must not clear the
+    lock it never saw. The code review reproduced both before the post-verify check landed."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=3, require_mfa=False))
+        await _local_user(store)
+        identity, token = await _signed_in(service)
+        assert not (await service.login("bob", WRONG)).ok  # one earlier failure on the row
+        real_argon2 = service._argon2
+
+        async def lock_lands_mid_verify(fn: Any, *args: Any) -> Any:
+            result = await real_argon2(fn, *args)
+            await store.record_login_failure(
+                "u-bob", failed_attempts=3, locked_until=time.time() + 900
+            )
+            return result
+
+        monkeypatch.setattr(service, "_argon2", lock_lands_mid_verify)
+        out = await service.reauth(identity, GOOD, token=token)
+        assert not out.ok and out.locked, "a correct re-proof must not win against a fresh lock"
+        attempts, locked_until = await _lock_state(store, "u-bob")
+        assert locked_until is not None and attempts == 3, "the re-proof lifted a live lock"
+    finally:
+        await store.close()
+
+
 # --- (d) a directory account's failed re-bind counts toward ENGINE lockout ----------------------
 
 

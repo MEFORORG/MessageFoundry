@@ -71,9 +71,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   console's `POST /ui/reauth` and `POST /me/password` checked a password but counted no failure and
   ignored the lock. So someone holding a stolen session could keep guessing, bounded only by the
   per-actor ceremony budget. They now share the sign-in counter, threshold and window. A rejected
-  directory (AD) re-bind counts too. That locks the engine's own account row, never the directory
-  account, and a directory the engine cannot reach is not counted. The crossing attempt writes
-  `auth.account_locked`. A re-auth that succeeds after three or more failures writes
+  directory (AD) re-bind counts too. The engine lock is set on the engine's own account row and is
+  never written to the directory. Each rejected re-bind still reaches the domain controller, though,
+  so the domain's own lockout policy can still lock the domain account. A directory the engine
+  cannot reach, or one with no such account, is not counted. The crossing attempt writes
+  `auth.account_locked`. A re-auth that clears a run of three or more failures writes
   `auth.login_after_failures`. A failed current-password check at `POST /me/password` is now
   audited as `auth.password_change_failed`. That route no longer lifts a live lock: the lock ends
   when it expires, on an administrator's reset, or with `messagefoundry admin-unlock`.

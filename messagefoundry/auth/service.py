@@ -313,8 +313,8 @@ class Elevation:
 
     ``recovery_codes`` is populated only by :meth:`AuthService.confirm_mfa_enrollment` (shown once).
 
-    ``locked`` is set only by :meth:`AuthService.reauth`, on a refusal made because the account is
-    locked (BACKLOG #1138). It qualifies the wrong-proof state, so a route can say "locked" rather
+    ``locked`` is set by :meth:`AuthService.reauth` and :meth:`AuthService.verify_mfa`, on a refusal
+    made because the account is locked (BACKLOG #1138). It qualifies the wrong-proof state, so a route can say "locked" rather
     than report a correct password as incorrect.
 
     ``ok`` is DERIVED, not stored, and that is load-bearing rather than tidiness. Held as a field it
@@ -409,6 +409,11 @@ class _FederatedBindingWithdrawn(Exception):
     second transaction. The exception carries the refusal out of a method whose whole contract is
     "returns the token", without giving every other caller a ``None`` to handle.
     """
+
+
+def _live_lock(user: UserRecord, now: float) -> bool:
+    """Whether ``user`` is under a lockout that has not yet expired at ``now``."""
+    return user.locked_until is not None and now < user.locked_until
 
 
 def _directory_login_refusal(user: UserRecord, now: float) -> str | None:
@@ -3258,9 +3263,7 @@ class AuthService:
         refused, to say "locked" rather than "wrong password": the holder of the session already
         sees the lock in ``GET /me/security-events``, so the distinction discloses nothing new."""
         user = await self._store.get_user(identity.user_id)
-        return (
-            user is not None and user.locked_until is not None and time.time() < user.locked_until
-        )
+        return user is not None and _live_lock(user, time.time())
 
     async def _reproof(
         self, identity: Identity, password: str, *, directory: bool, token: str | None
@@ -3277,8 +3280,10 @@ class AuthService:
         before the verify, and the verify waits for an argon2 slot or a directory round trip. Run
         concurrently, a burst would pass the check together, have every guess verified after the
         account locked, and let a correct guess inside the burst succeed. Serializing makes the
-        pre-check see every earlier attempt's outcome. The login leg does not serialize and keeps
-        that race (recorded on BACKLOG #1138, not fixed here).
+        pre-check see every earlier attempt's outcome. It does not order re-proofs across engine
+        processes, and the login leg does not serialize at all, which is why the body re-checks the
+        lock after a good verify. A cancelled request can release the lock while its directory bind
+        still runs in a worker thread. These residuals are reported with BACKLOG #1138.
 
         ``directory`` re-proves by a live bind (:meth:`_reauth_ad`) instead of the stored hash. The
         lock it honours and feeds is the ENGINE row's ``locked_until``; nothing here writes to the
@@ -3289,7 +3294,7 @@ class AuthService:
 
         ``token`` is the session a successful re-proof clears the counter for. The counter clears
         only at FULL authentication (BACKLOG #1638's rule for the login leg), so it clears only when
-        that session owes no second factor. ``None`` never clears."""
+        that session has met its second-factor requirement. ``None`` never clears."""
         entry = self._reproof_locks.setdefault(identity.user_id, _ReproofLock())
         entry.users += 1
         try:
@@ -3305,15 +3310,18 @@ class AuthService:
     async def _reproof_serialized(
         self, identity: Identity, password: str, *, directory: bool, token: str | None
     ) -> _Reproof:
-        """The body of :meth:`_reproof`, run under its per-account lock."""
+        """The body of :meth:`_reproof`, run under its per-account lock.
+
+        The lock check runs twice, before the verify and again after a good one. The per-account lock
+        orders re-proofs, but not the sign-in leg or ``verify_mfa``, and the verify can wait on an
+        argon2 slot or a directory round trip. Without the second check a lock another leg set in
+        that gap would still grant this re-proof, and clearing the counter would lift that lock."""
         user = await self._store.get_user(identity.user_id)
         if user is None:
             return _Reproof(ok=False)
-        now = time.time()
-        if user.locked_until is not None and now < user.locked_until:
-            if not directory:
-                # Timing parity with the login leg's locked path.
-                await self._argon2(verify_password, _DUMMY_PASSWORD_HASH, password)
+        if _live_lock(user, time.time()):
+            # No dummy verify: the routes say "account locked" outright, so flat timing would hide
+            # nothing, and a refusal should not take an argon2 slot the sign-in leg shares.
             return _Reproof(ok=False, locked=True, user=user)
         verdict: bool | None
         if directory:
@@ -3324,13 +3332,23 @@ class AuthService:
             )
         if verdict is None:
             return _Reproof(ok=False, user=user)
+        # A fresh clock: the verify may have taken seconds, and a stale `now` would write a lock
+        # deadline earlier than one another leg set in the meantime.
+        now = time.time()
         if not verdict:
             attempts, just_locked = await self._register_failure(user, now)
             return _Reproof(ok=False, user=user, attempts=attempts, just_locked=just_locked)
+        current = await self._store.get_user(user.id)
+        if current is None:
+            return _Reproof(ok=False, user=user)
+        if _live_lock(current, now):
+            return _Reproof(ok=False, locked=True, user=user)
+        # Cleared only at FULL authentication, the login leg's rule (BACKLOG #1638): the session must
+        # have met its second-factor requirement, as mfa_satisfied answers it.
         cleared = (
             token is not None
-            and (user.failed_attempts > 0 or user.locked_until is not None)
-            and not await self._owes_enrolled_factor(token)
+            and (current.failed_attempts > 0 or current.locked_until is not None)
+            and await self.mfa_satisfied(token)
         )
         if cleared:
             await self._store.record_login_success(user.id, now=now)
@@ -3376,7 +3394,7 @@ class AuthService:
 
         **A failure counts toward the account lockout, and a locked account is refused, on BOTH
         providers (BACKLOG #1138).** See :meth:`_reproof`. A success clears the counter only when the
-        session owes no second factor (BACKLOG #1638's rule for the login leg), and a success that
+        session has met its second-factor requirement (BACKLOG #1638's rule for the login leg), and a success that
         clears a run of failures is labelled ``auth.login_after_failures``, as a sign-in is.
         ``Elevation.locked`` tells the route the refusal was the lock, not the password."""
         # The counter-clearing decision is made inside, against the OLD token, before the rotation
@@ -3438,7 +3456,8 @@ class AuthService:
         await self._record_reproof_lockout(proof, client=client, audit_detail=provider_detail)
         # Flagged only on the success that CLEARED the counter. On a session still owing its second
         # factor nothing clears, so flagging there would repeat the row and the notice on every
-        # re-auth; that session's sign-in was already flagged by the login leg.
+        # re-auth. That session's clear happens later in verify_mfa, which flags nothing: the gap
+        # BACKLOG #1138 already records for a success after second-factor failures.
         if (
             proof.cleared
             and proof.user is not None
@@ -3909,7 +3928,7 @@ class AuthService:
                 detail=_json({"reason": "locked"}),
                 client=client,
             )
-            return Elevation()
+            return Elevation(locked=True)
         if await self._verify_second_factor(user, code, client=client):
             # ORDER-CRITICAL: this whole three-write group lands against the OLD hash, and only then
             # does the session rotate. Moving any of them after the rotation writes NOTHING and reports
