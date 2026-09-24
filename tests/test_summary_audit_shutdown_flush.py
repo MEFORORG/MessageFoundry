@@ -42,7 +42,7 @@ async def _summary_rows(db_path: Path) -> list[Row]:
     Filtered by action in the query, not in Python: ``list_audit`` returns only the newest 50 rows
     by default, so a Python-side filter could miss the row and let the ``== []`` control pass.
     """
-    store = await open_store(sqlite_settings(db_path))
+    store = await open_store(sqlite_settings(db_path), keyless_chain_refusal=None)
     try:
         return list(await store.list_audit(action="summary_access"))
     finally:

@@ -176,7 +176,8 @@ async def _db_info(settings: ServiceSettings) -> Any:
     from messagefoundry.api.models import DbInfo
     from messagefoundry.store.base import open_store
 
-    store = await open_store(settings.store)
+    # Read-only (db_status), so it cannot start an audit chain (BACKLOG #1916).
+    store = await open_store(settings.store, keyless_chain_refusal=None)
     try:
         db = await store.db_status()
     finally:

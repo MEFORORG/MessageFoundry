@@ -380,7 +380,9 @@ async def test_the_probe_secret_redacts_the_driver_message() -> None:
 async def test_sqlite_is_not_applicable_and_says_what_it_did(tmp_path: Path) -> None:
     """SQLite must not report OBSERVED-clean: that is a clean bill of health for a check that never
     happened. It reports its own status and names the control that DOES govern access here."""
-    store = await open_store(sqlite_settings(tmp_path / "p.db"), create=True)
+    store = await open_store(
+        sqlite_settings(tmp_path / "p.db"), create=True, keyless_chain_refusal=None
+    )
     try:
         report = await run_store_privilege_preflight(
             store, require_least_privilege=True, enforcing=True
@@ -395,7 +397,9 @@ async def test_sqlite_is_not_applicable_and_says_what_it_did(tmp_path: Path) -> 
 async def test_sqlite_never_refuses_even_under_a_declared_requirement(tmp_path: Path) -> None:
     """There is genuinely no principal to over-grant, so refusing would block every single-node
     install for a condition that cannot exist. Pinned so a later 'fail closed everywhere' edit reds."""
-    store = await open_store(sqlite_settings(tmp_path / "p2.db"), create=True)
+    store = await open_store(
+        sqlite_settings(tmp_path / "p2.db"), create=True, keyless_chain_refusal=None
+    )
     try:
         await run_store_privilege_preflight(store, require_least_privilege=True, enforcing=True)
     finally:

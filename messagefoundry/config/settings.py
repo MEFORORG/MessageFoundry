@@ -118,6 +118,10 @@ __all__ = [
     "ServiceSettings",
     "load_settings",
     "settings_error_detail",
+    "keyless_opt_out_refusal",
+    "KEYLESS_REFUSED_BY_REQUIRE_ENCRYPTION",
+    "KEYLESS_REFUSED_BY_NO_OPT_OUT",
+    "KEYLESS_REFUSED_BY_NO_STRICT_ACK",
 ]
 
 #: Known config sections (used to parse ``MEFOR_<SECTION>_<KEY>`` env vars).
@@ -5739,3 +5743,33 @@ def load_settings(
             settings.cluster.vip.address,
         )
     return settings
+
+
+#: The settings that refuse running a store with NO key (BACKLOG #1905, #1916). Each value names the
+#: setting an operator changes, so a caller can say which one refused without restating the rule.
+KEYLESS_REFUSED_BY_REQUIRE_ENCRYPTION = "[store].require_encryption"
+KEYLESS_REFUSED_BY_NO_OPT_OUT = "[security].allow_unencrypted_phi"
+KEYLESS_REFUSED_BY_NO_STRICT_ACK = "[security].allow_unencrypted_phi_under_strict_enforcement"
+
+
+def keyless_opt_out_refusal(store: StoreSettings, security: SecuritySettings) -> str | None:
+    """Which setting refuses running this store with no key, or ``None`` when the audited opt-out applies.
+
+    The at-rest opt-out rule, stated once. ``serve`` and ``provision-admin`` apply it before they open
+    anything; ``open_store`` applies it to every command at the one moment it matters -- a fresh store
+    with no keying secret, whose first audit row would start a chain that stays keyless.
+
+    It does not ask whether a key is CONFIGURED, on purpose. A key named in the settings that the key
+    provider does not resolve still opens the store keyless, and that must be refused exactly as an
+    absent key is. ``[store].require_encryption`` wins over the opt-out; under
+    ``[security].enforcement = enforce`` the opt-out needs its second acknowledgment (ADR 0140)."""
+    if store.require_encryption:
+        return KEYLESS_REFUSED_BY_REQUIRE_ENCRYPTION
+    if not store.allow_unencrypted_phi:
+        return KEYLESS_REFUSED_BY_NO_OPT_OUT
+    if (
+        security.enforcement is SecurityEnforcement.ENFORCE
+        and not security.allow_unencrypted_phi_under_strict_enforcement
+    ):
+        return KEYLESS_REFUSED_BY_NO_STRICT_ACK
+    return None

@@ -1269,7 +1269,9 @@ def _full_open_check(snap: Path, settings: StoreSettings | None) -> tuple[str, s
         # unreachable key provider — must surface ITS OWN cause, not a NameError from a finally closing
         # a store that was never created, and not the temp-directory cleanup error a leaked handle
         # raises over the top of it on Windows one frame up.
-        store = await open_store(snap_settings)
+        # A throwaway snapshot copy, integrity-checked and deleted: it appends no audit row, so it
+        # cannot start a chain (BACKLOG #1916).
+        store = await open_store(snap_settings, keyless_chain_refusal=None)
         try:
             return await store.integrity_check()
         finally:

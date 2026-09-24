@@ -81,6 +81,7 @@ from messagefoundry.config.settings import (
     AuthSettings,
     SecurityEnforcement,
     SecuritySettings,
+    StoreSettings,
 )
 
 _TMP, _ARM, _CONTROL_EXIT = sys.argv[1], sys.argv[2], int(sys.argv[3])
@@ -97,7 +98,9 @@ logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s %(mess
 # mints -- created with no address, which is the genuine first-run state rather than a synthetic
 # row resembling it.
 app = create_managed_app(
-    db_path=Path(_TMP) / "phi.db",
+    # A keyless store under the audited at-rest opt-out, which BACKLOG #1916 makes the lifespan
+    # itself enforce whenever security_settings is passed, as serve always passes it.
+    store_settings=StoreSettings(path=str(Path(_TMP) / "phi.db"), allow_unencrypted_phi=True),
     poll_interval=0.05,
     auth_settings=AuthSettings(enabled=True, notify_security_events=True),
     alerts_settings=AlertsSettings(
@@ -108,7 +111,8 @@ app = create_managed_app(
     security_settings=SecuritySettings(
         enforcement=(
             SecurityEnforcement.ENFORCE if _ARM == "enforce" else SecurityEnforcement.WARN
-        )
+        ),
+        allow_unencrypted_phi_under_strict_enforcement=True,
     ),
 )
 

@@ -30,6 +30,7 @@ import pytest
 from messagefoundry.logging_setup import build_stderr_handler, configure_logging
 from messagefoundry.store import MessageStore, audit_tee
 from messagefoundry.store.audit_tee import emit_audit_tee
+from tests._phi_gate_provisions import AT_REST_OPT_OUT_TOML
 
 # A stand-in chain head for the direct-call cases. Shape only: a real one comes from `audit_row_hash`.
 _HASH = "a" * 64
@@ -400,7 +401,9 @@ def _run_backup(tmp_path: Path, *, allow_unencrypted: bool) -> subprocess.Comple
     config.mkdir()
     (config / "feed.py").write_text("# a router lives here\n", encoding="utf-8")
     toml = tmp_path / "messagefoundry.toml"
-    body = "[store]\n"
+    # A keyless box, so it takes the audited at-rest opt-out, which BACKLOG #1916 requires of every
+    # command that opens a fresh store with no key. Dotted keys, so they precede the first table.
+    body = AT_REST_OPT_OUT_TOML + "[store]\n"
     if allow_unencrypted:
         body += "\n[backup]\nallow_unencrypted = true\n"
     toml.write_text(body, encoding="utf-8")

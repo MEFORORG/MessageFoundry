@@ -31,7 +31,7 @@ def _provision_store(db: Path) -> None:
     from messagefoundry.store.base import open_store, sqlite_settings
 
     async def _make() -> None:
-        store = await open_store(sqlite_settings(db), create=True)
+        store = await open_store(sqlite_settings(db), create=True, keyless_chain_refusal=None)
         await store.close()
 
     asyncio.run(_make())

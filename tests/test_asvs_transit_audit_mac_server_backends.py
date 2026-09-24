@@ -108,7 +108,8 @@ async def test_open_store_threads_audit_mac_fn_into_the_server_backend(
     await open_store(
         StoreSettings(
             backend=backend, server="localhost", database="mefor_test", username="mefor_test"
-        )
+        ),
+        keyless_chain_refusal=None,
     )
 
     assert seen["audit_mac_key"] is None, (

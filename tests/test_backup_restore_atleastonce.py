@@ -75,7 +75,9 @@ async def test_restore_resumes_without_loss_or_double_drop(tmp_path) -> None:
 
     from messagefoundry.store.base import open_store
 
-    restored = await open_store(ss.model_copy(update={"path": str(restored_db)}))
+    restored = await open_store(
+        ss.model_copy(update={"path": str(restored_db)}), keyless_chain_refusal=None
+    )
     try:
         # The snapshot captured the row; startup reset_stale_inflight returns it to pending so a re-run
         # re-delivers (at-least-once: a tolerated duplicate to an idempotent outbound, never a drop).

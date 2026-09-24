@@ -15,6 +15,21 @@ All notable changes to MessageFoundry are documented here. The format follows
   the `id_token` `exp`, and the configured session caps. **A deploying site whose IdP does not return
   `auth_time` would have every federated sign-in refused**; that is spec-correct and deliberate.
   Federation still ships off (`oidc_enabled = false`). ([BACKLOG #296](docs/BACKLOG.md))
+- **Every command now refuses to start a keyless audit chain, not only `serve` and
+  `provision-admin`.** 0.4.0 gave those two commands a refusal to open a store with no key. Any other
+  command that opens the store could still write the first audit row of a fresh store keyless, and a
+  chain that starts keyless stays keyless. At least `backup` did (its `dr_backup` row, written even
+  when the backup fails) and `admin-unlock` did. The decision now sits in the store-open path every
+  command shares. **A command that opens a store with no key and an empty audit log now exits 2**
+  unless the audited opt-out applies (`[security].allow_unencrypted_phi`, plus
+  `allow_unencrypted_phi_under_strict_enforcement` under `enforcement = enforce`). That covers
+  `backup`, `admin-unlock`, `audit-anchor`, `audit-verify` and `rekey-audit`, and `serve` when a key is
+  named that `[store].key_provider` did not resolve. A store whose chain already has rows opens as
+  before. Two smaller fixes ride along. `provision-admin` and `admin-unlock` now refuse before their
+  first write when the store would refuse their audit row. Before, a keyed store opened from a shell
+  with no key and a leftover opt-out got the account written and then a traceback, with no audit row.
+  And `rekey-audit` no longer prints the keyless-chain warning that names `rekey-audit` as its fix.
+  ([BACKLOG #1916](docs/BACKLOG.md))
 
 ## [0.4.0] — 2026-09-23 — Early Access
 

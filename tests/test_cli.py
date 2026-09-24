@@ -11,6 +11,7 @@ import pytest
 
 from messagefoundry.__main__ import main
 from messagefoundry.config.settings import load_settings
+from tests._phi_gate_provisions import setenv_at_rest_opt_out
 
 SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
 ADT_A01 = (
@@ -2637,6 +2638,7 @@ def test_admin_unlock_clears_the_lock_without_waiting_and_leaves_the_password_al
     import time
 
     monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)  # a keyless store with no audit row yet (BACKLOG #1916)
     db = tmp_path / "unlock.db"
     _, pw_hash = _seed_locked(db, locked_until=time.time() + 86_400)  # a day out: unwaitable
 
@@ -2665,6 +2667,7 @@ def test_admin_unlock_reports_an_unknown_account_as_json(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)  # a keyless store with no audit row yet (BACKLOG #1916)
     db = tmp_path / "unlock2.db"
     _seed_locked(db, locked_until=None)
     assert main(["admin-unlock", "--username", "ghost", "--db", str(db), "--json"]) == 1
@@ -2681,6 +2684,7 @@ def test_admin_unlock_writes_an_audit_row(
     from messagefoundry.store.store import MessageStore
 
     monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)  # a keyless store with no audit row yet (BACKLOG #1916)
     db = tmp_path / "unlock3.db"
     _seed_locked(db, locked_until=time.time() + 86_400)
     assert main(["admin-unlock", "--username", "admin", "--db", str(db)]) == 0

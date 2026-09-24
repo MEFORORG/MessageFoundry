@@ -29,6 +29,7 @@ from messagefoundry.config.settings import (
     AuthSettings,
     SecurityEnforcement,
     SecuritySettings,
+    StoreSettings,
 )
 from messagefoundry.store.store import MessageStore
 
@@ -212,7 +213,9 @@ def _phi_app(tmp_path: Path, *, security: SecuritySettings) -> FastAPI:
     healthy, which is the whole of #1020 -- a green transport over an undeliverable notice.
     """
     return create_managed_app(
-        db_path=tmp_path / "phi.db",
+        # A keyless store under the audited at-rest opt-out, which BACKLOG #1916 makes the lifespan
+        # itself enforce whenever security_settings is passed, as serve always passes it.
+        store_settings=StoreSettings(path=str(tmp_path / "phi.db"), allow_unencrypted_phi=True),
         poll_interval=0.05,
         auth_settings=AuthSettings(enabled=True, notify_security_events=True),
         alerts_settings=AlertsSettings(
@@ -220,7 +223,9 @@ def _phi_app(tmp_path: Path, *, security: SecuritySettings) -> FastAPI:
             email_smtp_host="smtp.example.test",
             email_from="alerts@example.test",
         ),
-        security_settings=security,
+        security_settings=security.model_copy(
+            update={"allow_unencrypted_phi_under_strict_enforcement": True}
+        ),
     )
 
 

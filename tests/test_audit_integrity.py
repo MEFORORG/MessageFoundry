@@ -39,6 +39,7 @@ from messagefoundry.store.store import (
     read_audit_anchor_file,
     should_record_event,
 )
+from tests._phi_gate_provisions import setenv_at_rest_opt_out
 
 
 @pytest.fixture
@@ -434,8 +435,10 @@ def test_audit_cli_refuses_a_file_that_is_not_a_database(
 
 
 def test_audit_verify_cli_exits_3_on_an_empty_log(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # A fresh KEYLESS store: since BACKLOG #1916 opening one needs the audited at-rest opt-out.
+    setenv_at_rest_opt_out(monkeypatch)
     # A REAL store with a real audit_log table holding nothing. Exit 3, never 1: a job that read an
     # empty log as exit 1 would have logged a detected tamper that never happened.
     db = tmp_path / "fresh.db"
@@ -448,8 +451,10 @@ def test_audit_verify_cli_exits_3_on_an_empty_log(
 
 
 def test_audit_verify_cli_allow_empty_accepts_the_empty_log(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # A fresh KEYLESS store: since BACKLOG #1916 opening one needs the audited at-rest opt-out.
+    setenv_at_rest_opt_out(monkeypatch)
     db = tmp_path / "fresh.db"
     _empty_store(db)
 
@@ -459,8 +464,10 @@ def test_audit_verify_cli_allow_empty_accepts_the_empty_log(
 
 
 def test_audit_anchor_cli_keeps_exit_0_on_an_empty_log(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # A fresh KEYLESS store: since BACKLOG #1916 opening one needs the audited at-rest opt-out.
+    setenv_at_rest_opt_out(monkeypatch)
     # The anchor twin is deliberately NOT given the verify twin's exit 3. Anchoring a fresh instance
     # as `0:` is the supported #328 workflow, and the row it seals is the absence of rows.
     db = tmp_path / "fresh.db"
@@ -604,8 +611,10 @@ def test_expected_anchor_rejects_a_malformed_value(
 
 
 def test_expected_anchor_accepts_the_empty_log_anchor(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # A fresh KEYLESS store: since BACKLOG #1916 opening one needs the audited at-rest opt-out.
+    setenv_at_rest_opt_out(monkeypatch)
     # `audit_anchor()` returns (0, "") for an empty log, so `0:` must round-trip — otherwise a fresh
     # instance is the one state that cannot be anchored, and the parser's strictness would have
     # created a hole exactly where an operator starts.

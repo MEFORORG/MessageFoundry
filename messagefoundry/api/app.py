@@ -277,6 +277,7 @@ from messagefoundry.config.settings import (
     UpdateCheckSettings,
     hop_insecure_escape_downgrades,
     hop_posture_from_ai,
+    keyless_opt_out_refusal,
     security_loosenings,
 )
 from messagefoundry.config.tls_policy import (
@@ -6786,11 +6787,20 @@ def create_managed_app(
         # TLS refusal (connection_string / _build_ssl) clamps MEFOR_ALLOW_INSECURE_TLS — the escape can
         # never relax a production-PHI store hop. None when no [ai] (SQLite/test) → unclamped, unchanged.
         # create=True (BACKLOG #1780): serve's first run is the ordinary way a SQLite store comes to exist.
+        # keyless_chain_refusal (BACKLOG #1916): the at-rest opt-out's verdict, which `serve` already
+        # refused on before this point unless a key is named that the provider did not resolve -- this
+        # catches that case too. `serve` always passes security_settings; None is the embedding/test
+        # convenience, which declares no at-rest posture to enforce, so it opens as it did before.
         store = await open_store(
             resolved,
             create=True,
             message_events=message_events,
             posture=_hop_posture,
+            keyless_chain_refusal=(
+                keyless_opt_out_refusal(resolved, security_settings)
+                if security_settings is not None
+                else None
+            ),
         )
         # Offline uploaded-logs store (BACKLOG #125/#126, ADR 0134), on the LIVE store's cipher instance.
         # DISABLED (None) unless [store].uploads_dir is set, so no PHI-at-rest surface exists unless an

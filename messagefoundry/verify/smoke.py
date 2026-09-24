@@ -420,7 +420,8 @@ def check_store_connectivity(store: StoreSettings) -> CheckResult:
     from messagefoundry.store.base import open_store
 
     async def _open_close() -> None:
-        handle = await open_store(store)
+        # Open and close only, so it cannot start an audit chain (BACKLOG #1916).
+        handle = await open_store(store, keyless_chain_refusal=None)
         await handle.close()
 
     try:
@@ -458,7 +459,7 @@ def newest_message_id(store: StoreSettings, control_id: str) -> str | None:
     )  # below the gate — see check_store_connectivity
 
     async def _newest() -> str | None:
-        handle = await open_store(store)
+        handle = await open_store(store, keyless_chain_refusal=None)  # read-only (#1916)
         try:
             rows = await handle.list_messages(control_id=control_id, limit=1)
             return str(rows[0]["id"]) if rows else None
@@ -542,7 +543,7 @@ def check_smoke_disposition(
     }
 
     async def _poll() -> str | None:
-        handle = await open_store(store)
+        handle = await open_store(store, keyless_chain_refusal=None)  # read-only (#1916)
         try:
             loop = asyncio.get_running_loop()
             deadline = loop.time() + timeout

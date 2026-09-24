@@ -788,7 +788,8 @@ def _store_reader(node_env: Mapping[str, str], sent: int) -> StoreReader:
             if pause:
                 await asyncio.sleep(pause)
             try:
-                store = await open_store(settings)
+                # The synthetic load harness decides no at-rest posture (BACKLOG #1916).
+                store = await open_store(settings, keyless_chain_refusal=None)
                 break
             except Exception as exc:  # noqa: BLE001 - re-raised below unless it is a SQLite I/O error
                 # Extended codes are `primary | (N << 8)`, so the low byte identifies the family.

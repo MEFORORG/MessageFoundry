@@ -15,7 +15,9 @@ from messagefoundry.store import MessageStore, Store, open_store, sqlite_setting
 
 async def test_open_store_sqlite_returns_working_store(tmp_path: Path) -> None:
     store = await open_store(
-        StoreSettings(path=str(tmp_path / "s.db"), synchronous=SqliteSync.FULL), create=True
+        StoreSettings(path=str(tmp_path / "s.db"), synchronous=SqliteSync.FULL),
+        create=True,
+        keyless_chain_refusal=None,
     )
     try:
         assert isinstance(store, Store)  # runtime_checkable protocol
@@ -38,7 +40,7 @@ async def test_open_store_sqlserver_requires_extra() -> None:
     # Without the 'sqlserver' extra, opening the SQL Server backend gives a clear install error.
     settings = StoreSettings(backend=StoreBackend.SQLSERVER, server="s", database="d", username="u")
     with pytest.raises(RuntimeError, match="sqlserver"):
-        await open_store(settings)
+        await open_store(settings, keyless_chain_refusal=None)
 
 
 def test_sqlite_settings_helper() -> None:

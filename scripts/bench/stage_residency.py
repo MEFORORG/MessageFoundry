@@ -140,7 +140,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from messagefoundry.config.settings import load_settings  # noqa: E402
+from messagefoundry.config.settings import keyless_opt_out_refusal, load_settings  # noqa: E402
 from messagefoundry.store.base import open_store  # noqa: E402
 
 _EVENTS = ("received", "routed", "transformed", "delivered")
@@ -713,7 +713,10 @@ async def _collect(
     args: argparse.Namespace, expect_t: int | None, expect_d: int | None
 ) -> dict[str, Any]:
     settings = load_settings()
-    store = await open_store(settings.store)
+    store = await open_store(
+        settings.store,
+        keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+    )
     try:
         extent = await _query(store, _extent_sql())
         n_rows, ts_lo, ts_hi = (

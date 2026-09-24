@@ -57,6 +57,7 @@ from collections.abc import (
     Sequence,
 )
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 from pathlib import Path
@@ -1513,6 +1514,12 @@ def audit_row_hash(
     return hmac.new(key, data, hashlib.sha256).hexdigest()
 
 
+#: Whether :func:`warn_unkeyed_audit_chain` logs, for the open in progress (BACKLOG #1916). ``open_store``
+#: turns it off only for ``rekey-audit``: that command IS the remedy the warning names, so printing it
+#: there tells an operator to run the command they are running. The posture flag is still set.
+UNKEYED_CHAIN_WARNING: ContextVar[bool] = ContextVar("unkeyed_chain_warning", default=True)
+
+
 def warn_unkeyed_audit_chain(logger: logging.Logger, rows: int) -> None:
     """Log that a keyed-capable store opened onto a KEYLESS audit chain (BACKLOG #1905).
 
@@ -1522,6 +1529,8 @@ def warn_unkeyed_audit_chain(logger: logging.Logger, rows: int) -> None:
     open is forbidden -- it would bless a forged row into a keyed chain -- so the remedy is the
     explicit, chain-verifying ``rekey-audit``, and this line names it. The same state is reported by
     ``security_loosenings()`` as ``audit_chain_unkeyed``, so it is not only a log line."""
+    if not UNKEYED_CHAIN_WARNING.get():
+        return
     logger.warning(
         "audit chain is KEYLESS (%d existing row(s), no keying watermark) although a store encryption "
         "key or isolated-module MAC is configured: its rows are plain SHA-256 and can be forged by "
@@ -1855,6 +1864,16 @@ def _audit_secret_for(
         return (None, mac_fn) if mac_fn is not None else None
     key = mac_keys.get(key_id) if key_id is not None else None
     return (key, None) if key is not None else None
+
+
+def audit_append_refusal(append_mac: Callable[[], object]) -> str | None:
+    """The refusal ``append_mac`` raises, as text, or ``None`` when an append would proceed -- the body
+    of ``audit_append_refusal`` on all three backends (BACKLOG #1916)."""
+    try:
+        append_mac()
+    except RuntimeError as exc:
+        return str(exc)
+    return None
 
 
 def audit_append_secret(
@@ -4026,6 +4045,15 @@ class MessageStore:
     def audit_chain_unkeyed(self) -> bool:
         """True when this store can key its audit chain but the chain on disk is keyless (#1905)."""
         return self._audit_chain_unkeyed
+
+    def audit_append_refusal(self) -> str | None:
+        """Why an audit append on this handle would be refused now, or ``None`` (BACKLOG #1916).
+
+        Asks the same question :meth:`_audit_append_mac` answers on every append, without appending,
+        so a command that writes other rows BEFORE its audit row can refuse before the first write
+        rather than leave the write unaudited. The case that needed it: a keyed chain opened from a
+        shell with no key, which every append refuses."""
+        return audit_append_refusal(self._audit_append_mac)
 
     def _audit_keyed_capable(self) -> bool:
         """Is a keying secret available? — an in-heap HMAC key (``aesgcm`` mode) OR an isolated-module MAC

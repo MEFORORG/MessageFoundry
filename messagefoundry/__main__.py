@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     # Type-only, so the settings module still loads lazily per command: a quick `validate` /
     # `hl7schema` call must not pay for it (see the module docstring on deferred heavy imports).
     from messagefoundry.config.settings import ServiceSettings
+    from messagefoundry.store.base import Store
 
 
 class _VersionAction(argparse.Action):
@@ -1527,6 +1528,8 @@ def _serve(args: argparse.Namespace) -> int:
         platform_memory_encryption_readout,
     )
     from messagefoundry.config.settings import (
+        KEYLESS_REFUSED_BY_NO_OPT_OUT,
+        KEYLESS_REFUSED_BY_REQUIRE_ENCRYPTION,
         LogWriteFailurePolicy,
         StoreBackend,
         SyslogProtocol,
@@ -1723,8 +1726,8 @@ def _serve(args: argparse.Namespace) -> int:
     if not _store_key_configured(settings):
         # The refuse-or-proceed DECISION is shared with provision-admin (BACKLOG #1905); the wording
         # below stays serve's own, because the remedy differs by command.
-        keyless_gate = _keyless_store_gate(settings, enforcing=enforcing)
-        if keyless_gate == _GATE_REQUIRE_ENCRYPTION:
+        keyless_gate = _keyless_store_gate(settings)
+        if keyless_gate == KEYLESS_REFUSED_BY_REQUIRE_ENCRYPTION:
             print(
                 "error: [store].require_encryption is set but no MEFOR_STORE_ENCRYPTION_KEY (or "
                 "[store].encryption_key_file) is configured; refusing to start (PHI would be stored "
@@ -1732,7 +1735,7 @@ def _serve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
-        if keyless_gate == _GATE_NO_OPT_OUT:
+        if keyless_gate == KEYLESS_REFUSED_BY_NO_OPT_OUT:
             # Secure-by-default: any instance, in any environment, refuses to run keyless. This is
             # the H3 tightening — previously prod refused and non-prod only warned (fail-open), but
             # dev/staging routinely hold near-real PHI.
@@ -1748,7 +1751,7 @@ def _serve(args: argparse.Namespace) -> int:
             )
             return 2
         if keyless_gate is not None:
-            # _GATE_NO_STRICT_ACK, and deliberately the catch-all: a refusal value this block does not
+            # KEYLESS_REFUSED_BY_NO_STRICT_ACK, and deliberately the catch-all: a refusal value this block does not
             # name must still refuse, never fall through to the keyless start below.
             # Secure-by-default under STRICT ENFORCEMENT (ADR 0140): keyless PHI under enforcement
             # requires a SECOND acknowledgment beyond [security].allow_unencrypted_phi — the highest-
@@ -4673,8 +4676,8 @@ def _admin_unlock(args: argparse.Namespace) -> int:
 
     from pydantic import ValidationError
 
-    from messagefoundry.config.settings import StoreBackend, load_settings
-    from messagefoundry.store.base import open_store
+    from messagefoundry.config.settings import StoreBackend, keyless_opt_out_refusal, load_settings
+    from messagefoundry.store.base import KeylessAuditChainRefused, open_store
 
     cli: dict[str, dict[str, object]] = {}
     if args.db is not None:
@@ -4696,11 +4699,15 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         )
 
     async def run() -> tuple[str, float | None]:
-        store = await open_store(settings.store)
+        store = await open_store(
+            settings.store,
+            keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+        )
         try:
             user = await store.get_user_by_username(args.username)
             if user is None:
                 return ("no-such-user", None)
+            _refuse_an_unauditable_write(store)  # before the lockout write, not after it
             was = user.locked_until
             # Reuse the shipped write rather than adding a protocol method. `record_login_failure`
             # with zero attempts and no deadline is exactly "the lockout state is cleared", and it is
@@ -4718,6 +4725,9 @@ def _admin_unlock(args: argparse.Namespace) -> int:
 
     try:
         outcome, was = asyncio.run(run())
+    except (KeylessAuditChainRefused, _UnauditableWrite) as exc:  # #1916: could not start
+        _emit_error(str(exc), as_json=args.json)
+        return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
     if outcome == "no-such-user":
@@ -4761,15 +4771,27 @@ def _read_new_password(prompt: str) -> str:
     return first
 
 
-#: The three conditions under which the at-rest gate refuses a store with no key. Values name the
-#: setting an operator changes, so a caller can say which one refused without restating the rule.
-_GATE_REQUIRE_ENCRYPTION = "[store].require_encryption"
-_GATE_NO_OPT_OUT = "[security].allow_unencrypted_phi"
-_GATE_NO_STRICT_ACK = "[security].allow_unencrypted_phi_under_strict_enforcement"
-
-
 class _KeylessProvisionRefused(RuntimeError):
     """``provision-admin`` found its opened store keyless although a key is configured (#1905)."""
+
+
+class _UnauditableWrite(RuntimeError):
+    """A command's audit row would be refused, found before its first write (BACKLOG #1916)."""
+
+
+def _refuse_an_unauditable_write(store: Store) -> None:
+    """Raise :class:`_UnauditableWrite` when ``store`` would refuse this command's audit row.
+
+    For a command that writes other rows BEFORE its audit row -- ``provision-admin`` writes the
+    account, ``admin-unlock`` clears the lockout. Without this, a refused audit append lands after
+    those writes, so the change is made and nothing records who made it. The case that reaches it: a
+    keyed chain opened from a shell with no key, under a stale audited opt-out that let the open
+    through."""
+    refusal = store.audit_append_refusal()
+    if refusal is not None:
+        raise _UnauditableWrite(
+            f"refusing to write anything: this command's audit row would be refused ({refusal})"
+        )
 
 
 def _store_key_configured(settings: ServiceSettings) -> bool:
@@ -4780,7 +4802,7 @@ def _store_key_configured(settings: ServiceSettings) -> bool:
     return bool(settings.store.encryption_key or settings.store.encryption_key_file)
 
 
-def _keyless_store_gate(settings: ServiceSettings, *, enforcing: bool) -> str | None:
+def _keyless_store_gate(settings: ServiceSettings) -> str | None:
     """Which at-rest gate refuses opening this store for writing, or ``None`` when it may be opened.
 
     The DECISION, stated once for every command that opens a store for writing on a fresh install:
@@ -4793,16 +4815,16 @@ def _keyless_store_gate(settings: ServiceSettings, *, enforcing: bool) -> str | 
     ``None`` covers two cases: a key is configured, or one of the audited opt-outs applies (the caller
     then proceeds keyless and says so). The WORDING stays with each caller, because the remedy differs:
     ``serve`` may point at ``gen-key`` for a new install, while ``provision-admin`` must point at the key
-    the service already holds -- a new key there keys the chain under a key the service does not have."""
+    the service already holds -- a new key there keys the chain under a key the service does not have.
+
+    The opt-out rule itself is :func:`~messagefoundry.config.settings.keyless_opt_out_refusal`, shared
+    with ``open_store`` since BACKLOG #1916. This gate is the early, command-worded refusal for the two
+    commands that create a store; ``open_store`` is the one no command can skip."""
+    from messagefoundry.config.settings import keyless_opt_out_refusal
+
     if _store_key_configured(settings):
         return None
-    if settings.store.require_encryption:
-        return _GATE_REQUIRE_ENCRYPTION
-    if not settings.store.allow_unencrypted_phi:
-        return _GATE_NO_OPT_OUT
-    if enforcing and not settings.security.allow_unencrypted_phi_under_strict_enforcement:
-        return _GATE_NO_STRICT_ACK
-    return None
+    return keyless_opt_out_refusal(settings.store, settings.security)
 
 
 def _provision_admin(args: argparse.Namespace) -> int:
@@ -4828,8 +4850,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
         FirstAdministratorRefused,
         ProvisionedAdministrator,
     )
-    from messagefoundry.config.settings import load_settings
-    from messagefoundry.store.base import open_store
+    from messagefoundry.config.settings import keyless_opt_out_refusal, load_settings
+    from messagefoundry.store.base import KeylessAuditChainRefused, open_store
 
     cli: dict[str, dict[str, object]] = {}
     if args.db is not None:
@@ -4844,11 +4866,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
     # and a chain that starts keyless stays keyless: a later keyed open never re-keys existing rows. The
     # key has to be in the environment of the shell running THIS command -- the service's NSSM
     # environment is not visible here, which is how the documented order used to go wrong.
-    from messagefoundry.config.ai_policy import SecurityEnforcement
-
-    keyless_gate = _keyless_store_gate(
-        settings, enforcing=settings.security.enforcement is SecurityEnforcement.ENFORCE
-    )
+    keyless_gate = _keyless_store_gate(settings)
     if keyless_gate is not None:
         return _emit_error(
             "no store key is set in this shell (MEFOR_STORE_ENCRYPTION_KEY, or "
@@ -4880,7 +4898,11 @@ def _provision_admin(args: argparse.Namespace) -> int:
 
     async def run() -> tuple[ProvisionedAdministrator, str]:
         # create=True (BACKLOG #1780): this bootstrap runs before the first serve, see the note below.
-        store = await open_store(settings.store, create=True)
+        store = await open_store(
+            settings.store,
+            create=True,
+            keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+        )
         try:
             if _store_key_configured(settings) and not store.cipher_info().encrypts:
                 # BACKLOG #1905: the settings name a key but the key provider resolved none (a pinned
@@ -4891,6 +4913,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
                     "shell, so the store opened KEYLESS; refusing to provision. Make the key the "
                     "service runs with readable here and re-run."
                 )
+            # BACKLOG #1916: the account is written before its audit row, so a refused audit append
+            # used to land AFTER the account existed -- an unaudited administrator and a traceback.
+            _refuse_an_unauditable_write(store)
             outcome = await AuthService(store, settings.auth).provision_first_administrator(
                 username=args.username,
                 password=password,
@@ -4914,6 +4939,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
         outcome, store_path = asyncio.run(run())
     except (FirstAdministratorRefused, _KeylessProvisionRefused) as exc:
         return _emit_error(str(exc), as_json=args.json)
+    except (KeylessAuditChainRefused, _UnauditableWrite) as exc:  # #1916: could not start
+        _emit_error(str(exc), as_json=args.json)
+        return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
 
@@ -5014,8 +5042,8 @@ def _audit_verify(args: argparse.Namespace) -> int:
 
     from pydantic import ValidationError
 
-    from messagefoundry.config.settings import StoreBackend, load_settings
-    from messagefoundry.store.base import open_store
+    from messagefoundry.config.settings import StoreBackend, keyless_opt_out_refusal, load_settings
+    from messagefoundry.store.base import KeylessAuditChainRefused, open_store
 
     # Resolve the anchor FIRST: it is a pure argv/file error, so it should not depend on a config load
     # succeeding, and refusing it early keeps a typo from costing a store open.
@@ -5045,7 +5073,10 @@ def _audit_verify(args: argparse.Namespace) -> int:
         return refused
 
     async def run() -> tuple[bool, str | None, int]:
-        store = await open_store(settings.store)
+        store = await open_store(
+            settings.store,
+            keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+        )
         try:
             ok, message = await store.verify_audit_chain(expected_anchor=expected_anchor)
             if not ok:
@@ -5059,6 +5090,9 @@ def _audit_verify(args: argparse.Namespace) -> int:
 
     try:
         ok, message, count = asyncio.run(run())
+    except KeylessAuditChainRefused as exc:  # #1916: could not start
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         # The #1669 probe above already refuses a non-database at a SQLite `--db`, but it probes
         # ONLY SQLite; this catch is what a server backend and any error raised after the open
@@ -5099,8 +5133,8 @@ def _audit_anchor(args: argparse.Namespace) -> int:
 
     from pydantic import ValidationError
 
-    from messagefoundry.config.settings import StoreBackend, load_settings
-    from messagefoundry.store.base import open_store
+    from messagefoundry.config.settings import StoreBackend, keyless_opt_out_refusal, load_settings
+    from messagefoundry.store.base import KeylessAuditChainRefused, open_store
 
     cli: dict[str, dict[str, object]] = {}
     if args.db is not None:
@@ -5127,7 +5161,10 @@ def _audit_anchor(args: argparse.Namespace) -> int:
         return refused
 
     async def run() -> tuple[int, str]:
-        store = await open_store(settings.store)
+        store = await open_store(
+            settings.store,
+            keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+        )
         try:
             return await store.audit_anchor()
         finally:
@@ -5135,6 +5172,9 @@ def _audit_anchor(args: argparse.Namespace) -> int:
 
     try:
         count, head = asyncio.run(run())
+    except KeylessAuditChainRefused as exc:  # #1916: could not start
+        _emit_error(str(exc), as_json=args.json)
+        return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
     anchor = f"{count}:{head}"
@@ -5165,8 +5205,8 @@ def _rekey_audit(args: argparse.Namespace) -> int:
 
     from pydantic import ValidationError
 
-    from messagefoundry.config.settings import StoreBackend, load_settings
-    from messagefoundry.store.base import open_store
+    from messagefoundry.config.settings import StoreBackend, keyless_opt_out_refusal, load_settings
+    from messagefoundry.store.base import KeylessAuditChainRefused, open_store
 
     cli: dict[str, dict[str, object]] = {}
     if args.db is not None:
@@ -5188,7 +5228,12 @@ def _rekey_audit(args: argparse.Namespace) -> int:
         return refused
 
     async def run() -> tuple[bool, str]:
-        store = await open_store(settings.store)
+        # warn_unkeyed_chain=False (#1916): the keyless-chain WARNING names this command as its remedy.
+        store = await open_store(
+            settings.store,
+            keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+            warn_unkeyed_chain=False,
+        )
         try:
             return await store.rekey_audit_chain()
         finally:
@@ -5196,6 +5241,9 @@ def _rekey_audit(args: argparse.Namespace) -> int:
 
     try:
         ok, message = asyncio.run(run())
+    except KeylessAuditChainRefused as exc:  # #1916: could not start
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path)
     print(("OK: " if ok else "FAIL: ") + message)
@@ -5366,10 +5414,10 @@ def _backup(args: argparse.Namespace) -> int:
     from pydantic import ValidationError
 
     from messagefoundry import __version__
-    from messagefoundry.config.settings import load_settings
+    from messagefoundry.config.settings import keyless_opt_out_refusal, load_settings
     from messagefoundry.pipeline.dr_backup import BackupError, BackupResult
     from messagefoundry.pipeline.dr_backup import BackupRunner as _BackupRunner
-    from messagefoundry.store.base import StoreNotFoundError, open_store
+    from messagefoundry.store.base import KeylessAuditChainRefused, StoreNotFoundError, open_store
 
     cli: dict[str, dict[str, object]] = {}
     if args.db is not None:
@@ -5397,7 +5445,12 @@ def _backup(args: argparse.Namespace) -> int:
     )
 
     async def run() -> BackupResult | None:
-        store = await open_store(settings.store)
+        # #1916: a backup writes a `dr_backup` audit row, even on failure, so on a fresh store it
+        # would start the chain.
+        store = await open_store(
+            settings.store,
+            keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+        )
         try:
             runner = _BackupRunner(
                 store,
@@ -5415,7 +5468,7 @@ def _backup(args: argparse.Namespace) -> int:
         result = asyncio.run(run())
     except BackupError as exc:
         return _emit_error(f"backup failed ({exc.kind}): {exc}", as_json=args.json)
-    except StoreNotFoundError as exc:  # #1780: could not start, so exit 2 like #1670 below
+    except (StoreNotFoundError, KeylessAuditChainRefused) as exc:  # #1780, #1916: could not start
         _emit_error(str(exc), as_json=args.json)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database

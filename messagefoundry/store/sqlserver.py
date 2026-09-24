@@ -149,6 +149,7 @@ from messagefoundry.store.store import (
     _opt_float,
     _qmark_cutoff_case,
     audit_active_key_id,
+    audit_append_refusal,
     audit_append_secret,
     audit_rekey_when_keyed,
     audit_row_hash,
@@ -2649,6 +2650,10 @@ class SqlServerStore:
     def audit_chain_unkeyed(self) -> bool:
         """See :meth:`~messagefoundry.store.store.MessageStore.audit_chain_unkeyed` (#1905)."""
         return self._audit_chain_unkeyed
+
+    def audit_append_refusal(self) -> str | None:
+        """See :meth:`~messagefoundry.store.store.MessageStore.audit_append_refusal` (#1916)."""
+        return audit_append_refusal(self._audit_append_mac)
 
     def _audit_append_mac(self) -> tuple[bytes | None, AuditMacFn | None]:
         """The ``(key, mac)`` a NEW ``audit_log`` row is hashed with -- :func:`audit_append_secret`,

@@ -30,7 +30,7 @@ from messagefoundry.support.bundle import build_bundle, status_snapshot
 async def _open_then_close(target: Path, **kwargs: object) -> BaseException | None:
     """Open ``target`` through the seam and close it; return what the open raised, if anything."""
     try:
-        store = await open_store(sqlite_settings(target), **kwargs)  # type: ignore[arg-type]
+        store = await open_store(sqlite_settings(target), **kwargs, keyless_chain_refusal=None)  # type: ignore[arg-type]
     except Exception as exc:  # the outcome under test, returned so the file check runs first
         return exc
     await store.close()
@@ -76,7 +76,7 @@ async def test_open_store_default_still_opens_an_existing_store(tmp_path: Path) 
 
 async def test_open_store_memory_store_is_not_refused() -> None:
     """``:memory:`` puts nothing on disk, so there is no absent file for the default to protect."""
-    store = await open_store(sqlite_settings(":memory:"))
+    store = await open_store(sqlite_settings(":memory:"), keyless_chain_refusal=None)
     await store.close()
 
 
