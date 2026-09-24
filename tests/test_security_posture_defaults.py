@@ -74,6 +74,7 @@ def _names(
             expiry_hops,
             db_hops,
             None,
+            None,
         )
     ]
 
@@ -109,6 +110,7 @@ def test_aad_bind_off_is_a_named_loosening() -> None:
             (),
             (),
             None,
+            None,
         )
     )
     assert "aad_bind" in named
@@ -133,6 +135,7 @@ def test_aad_bind_loosening_names_its_no_op_caveat() -> None:
             (),
             (),
             None,
+            None,
         )
     )
     assert "no effect without a store key" in named["aad_bind"]
@@ -153,6 +156,7 @@ def test_recheck_zero_with_ad_enabled_is_a_named_loosening() -> None:
             (),
             (),
             (),
+            None,
             None,
         )
     )
@@ -519,6 +523,7 @@ def test_cleartext_accepted_is_a_named_loosening() -> None:
             (),
             (),
             None,
+            None,
         )
     )
     assert "cleartext_accepted" in named
@@ -554,6 +559,7 @@ def test_expiry_relaxation_is_a_named_loosening() -> None:
             ("OB_PARTNER_ADT", "OB_LAB_ORU"),
             (),
             None,
+            None,
         )
     )
     assert "tls_allow_expired" in named
@@ -580,6 +586,7 @@ def test_generic_odbc_unenforced_tls_is_a_named_loosening() -> None:
             (),
             (),
             ("OB_PG_RESULTS", "inbound:IB_PG_ORDERS"),
+            None,
             None,
         )
     )

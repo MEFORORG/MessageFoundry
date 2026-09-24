@@ -168,12 +168,26 @@ from typing import Any
 #: class as the ``UploadedFileList.scope`` entry above, and it forces a bump for the same reason.
 #: Unnumbered: the ``vN`` labels are retired as identifiers (#1220 above); the digest is the identifier.
 #:
+#: ASVS 6.4.5 / BACKLOG #1141, engine limbs: the console now imports ``api.security``'s
+#: ``pending_credential_deadline``, ``pending_credential_deadline_for`` and
+#: ``initial_credential_window_hours``, and ``UserSummary`` gained the additive
+#: ``credential_expires_at`` that ``pages/admin.py`` renders. The first three are FUNCTIONS imported at
+#: module scope, so a skew is an ImportError at mount time -- the ``enforce_phi_read_hop`` class
+#: above -- and they force a bump. Unnumbered: the ``vN`` labels are retired as identifiers (#1220
+#: above); the digest is the identifier.
+#:
+#: ASVS 13.2.1 / BACKLOG #1182: ``SecurityPosture`` gained the additive ``static_credential_hops`` (a
+#: list of the new ``StaticCredentialHopView``) and ``static_credential_hops_scope``, the inventory
+#: of backend hops that present an unchanging credential or none. The nested model joins the
+#: discovered DTO surface, which is what moves the digest. Additive with defaults, so an older
+#: console ignores them. Unnumbered: the ``vN`` labels are retired as identifiers (#1220 above).
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "1bc1dc822f023e94"
+ENGINE_UI_SEAM: str = "a6d2b141a035e5ea"
 
 
 @dataclass(frozen=True, slots=True)

@@ -75,6 +75,7 @@ from messagefoundry.api.header_floor import (
     HSTS_VALUE,
     SecurityHeaderFloorMiddleware,
     hsts_notable,
+    refuse_websocket,
 )
 from messagefoundry.api.metrics import (
     METRICS_CONTENT_TYPE,
@@ -1988,6 +1989,8 @@ def create_app(
                 expired_hops,
                 db_hops,
                 store_privilege,
+                # BACKLOG #1905: read off the LIVE store -- settings cannot know what audit_log holds.
+                engine.store.audit_chain_unkeyed(),
             )
         ]
         # BACKLOG #1182: the static-credential inventory, through its single reader. The graph half is
@@ -6187,17 +6190,31 @@ def create_app(
         if identity is None:
             identity = await authorize_ws(websocket, Permission.MONITORING_READ)
             token = ws_token(websocket)
+        # The three refusals below happen BEFORE accept, so each is the handshake's HTTP answer
+        # (BACKLOG #1120; see header_floor.refuse_websocket).
         if identity is None:
-            await websocket.close(code=1008)  # policy violation (unauthenticated/forbidden)
+            await refuse_websocket(
+                websocket,
+                JSONResponse({"detail": "not authenticated or not permitted"}, status_code=403),
+                close_code=1008,  # policy violation (unauthenticated/forbidden)
+            )
             return
         handshake_identity: Identity = identity  # non-None past the guard; used on the no-auth path
         engine_obj: Engine | None = getattr(websocket.app.state, "engine", None)
         if engine_obj is None:
-            await websocket.close(code=1011)
+            await refuse_websocket(
+                websocket,
+                JSONResponse({"detail": "engine unavailable"}, status_code=503),
+                close_code=1011,
+            )
             return
         state = websocket.app.state
         if getattr(state, "ws_count", 0) >= _MAX_WS_CONNECTIONS:
-            await websocket.close(code=1013)  # try again later — too many live monitor sockets
+            await refuse_websocket(
+                websocket,
+                JSONResponse({"detail": "too many live monitor sockets"}, status_code=503),
+                close_code=1013,  # try again later
+            )
             return
         auth: AuthService | None = getattr(state, "auth", None)
         # Server-rendered connections fragment for the browser dashboard, installed by the web console
@@ -7159,7 +7176,8 @@ def create_managed_app(
                 # transport, sent to each affected user's own address. The notifier is wired only when the
                 # [auth].notify_security_events kill-switch is on AND a transport can be built (SMTP
                 # configured): security_notifier_from_settings returns None when SMTP is unset, so we never
-                # fabricate a transport — then only the audited /me/security-events pull feed records events.
+                # fabricate a transport — then nothing is emailed; auth/notifications.py states which
+                # events the audited /me/security-events pull feed still shows.
                 # The effective-by-default guarantee (an exposed PHI instance MUST have a real push channel,
                 # or opt out in writing via [alerts].security_notifications_required) is enforced fail-closed
                 # at startup by the serve gate (messagefoundry/__main__.py), which checks these SAME two

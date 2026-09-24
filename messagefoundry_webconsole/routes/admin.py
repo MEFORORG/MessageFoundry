@@ -22,6 +22,10 @@ from messagefoundry.api.auth_models import (
     UserCreateRequest,
     UserUpdateRequest,
 )
+from messagefoundry.api.security import (
+    initial_credential_window_hours,
+    pending_credential_deadline,
+)
 from messagefoundry.auth import Identity, Permission
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.permissions import CUSTOM_ROLE_FORBIDDEN_PERMISSIONS
@@ -113,7 +117,16 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         role_ids = await service.store.get_user_role_ids(user.id)
         all_roles = await admin.list_roles(service=service, _=identity)
         return HTMLResponse(
-            pages.user_detail_page(admin.user_summary(user, role_ids), all_roles, error=error),
+            pages.user_detail_page(
+                # BACKLOG #1141: a must-change account's page states when its credential dies.
+                admin.user_summary(
+                    user,
+                    role_ids,
+                    credential_expires_at=pending_credential_deadline(service, user),
+                ),
+                all_roles,
+                error=error,
+            ),
             status_code=status_code,
         )
 
@@ -134,7 +147,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         identity: Identity = Depends(require_ui_step_up(Permission.USERS_MANAGE)),
     ) -> HTMLResponse:
         roles = await admin.list_roles(service=service, _=identity)
-        return HTMLResponse(pages.user_new_page(roles))
+        return HTMLResponse(
+            pages.user_new_page(
+                roles, credential_window_hours=initial_credential_window_hours(service)
+            )
+        )
 
     @app.get("/ui/users/{user_id}", response_class=HTMLResponse)
     async def ui_user_detail(
@@ -179,6 +196,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                     display_name=form.get("display_name", "").strip(),
                     email=form.get("email", "").strip(),
                     checked=roles,
+                    credential_window_hours=initial_credential_window_hours(service),
                 ),
                 status_code=400,
             )
