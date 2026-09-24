@@ -237,10 +237,6 @@ STEP_UP_ACTION_SESSION_TERMINATE = "session_terminate"
 # every recovery code and every passkey, on someone else's account.
 STEP_UP_ACTION_ADMIN_RESET_MFA = "admin_reset_mfa"
 STEP_UP_ACTION_ADMIN_RESET_PASSWORD = "admin_reset_password"  # nosec B105 — step-up action id, not a credential; echoed publicly in X-Step-Up-Action
-# BACKLOG #1954 (ASVS 6.3.3). NOT a step-up grant: ``POST /me/password`` proves the current password
-# itself and consumes no grant. The id exists so that route's pending-session refusal is decided by
-# the same rule as the others, through :meth:`AuthService.factor_binding_is_blocked`.
-STEP_UP_ACTION_PASSWORD_CHANGE = "password_change"  # nosec B105 — an action id, not a credential
 
 _T = TypeVar("_T")
 
@@ -3119,22 +3115,17 @@ class AuthService:
         )
         return elevation
 
-    #: The actions a pending session may NOT take once its account HAS a factor. All but
-    #: ``password_change`` are step-up actions riding a ``*_reauth_only_action`` gate
-    #: (``mfa_gate=False``), which exists so an account with no factor is not locked out of it.
-    #: ``password_change`` mints and consumes no grant; it is here so its route asks the same rule.
-    #: For an account that already has a factor:
+    #: The step-up actions a pending session may NOT be granted once its account HAS a factor. Every
+    #: one of them rides a ``*_reauth_only_action`` gate (``mfa_gate=False``), which exists so an
+    #: account with no factor is not locked out of it. For an account that already has one:
     #:
     #: - binding a new factor (``mfa_enroll``, ``mfa_confirm``, ``webauthn_enroll``) is a promotion
     #:   path, because both ceremonies mark the session MFA-satisfied on success;
     #: - ending sessions (``session_terminate``, BACKLOG #1951, ASVS 7.5.2) through the terminate
-    #:   routes would let a password holder sign the real user out without the second factor;
-    #: - changing the password (``password_change``, BACKLOG #1954) does both at once: it locks the
-    #:   real user out and revokes every session. That route rides no reauth-only gate. It is
-    #:   MFA-exempt in ``require()`` so an account with no factor can rotate, and the JSON gate and
-    #:   the console's password page both ask this rule before letting a pending session through.
-    #:   The must-change confinement lets ``POST /auth/mfa-verify`` through, so an account that is
-    #:   both must-change and pending proves its factor first and then rotates.
+    #:   routes would let a password holder sign the real user out without the second factor.
+    #:
+    #: Changing the password does both at once, but it takes no grant and rides no reauth-only gate,
+    #: so it asks the same rule through :meth:`password_change_owes_factor` instead (BACKLOG #1954).
     #:
     #: A new action on either reauth-only action gate belongs here too. A test in
     #: ``tests/test_mfa_access_gate.py`` catches at least a missing one wired in the engine or
@@ -3145,7 +3136,6 @@ class AuthService:
             STEP_UP_ACTION_MFA_CONFIRM,
             STEP_UP_ACTION_WEBAUTHN_ENROLL,
             STEP_UP_ACTION_SESSION_TERMINATE,
-            STEP_UP_ACTION_PASSWORD_CHANGE,
         }
     )
 
@@ -3164,12 +3154,19 @@ class AuthService:
 
         So: if the session has not satisfied its second factor and the account already has one, the
         existing factor must be proven first (``POST /auth/mfa-verify``). Bootstrap is untouched — an
-        account with NO factor still enrols, ends sessions and changes its password from a
-        password-only session, which is exactly the deadlock carve-out. Disable/delete actions are NOT listed: they run
+        account with NO factor still enrols, and still ends sessions, from a password-only session,
+        which is exactly the deadlock carve-out. Disable/delete actions are NOT listed: they run
         behind ``require_step_up_action``, which keeps its own ``mfa_satisfied`` check.
         """
         if purpose not in self._PENDING_REFUSED_ACTIONS:
             return False
+        return await self._owes_enrolled_factor(token)
+
+    async def _owes_enrolled_factor(self, token: str | None, *, local_only: bool = False) -> bool:
+        """Whether the session is MFA-pending on an account that already HAS a second factor.
+
+        Fails closed (True) when the session or its user cannot be found. ``local_only`` answers
+        False for any account whose password the engine does not hold."""
         if not token:
             return True  # no session to act on, so fail closed (as below)
         if await self.mfa_satisfied(token):
@@ -3180,7 +3177,20 @@ class AuthService:
         user = await self._store.get_user(session.user_id)
         if user is None:
             return True
+        if local_only and user.auth_provider != AuthProvider.LOCAL.value:
+            return False
         return await self._second_factor_enrolled(user)
+
+    async def password_change_owes_factor(self, token: str | None) -> bool:
+        """Whether this session must prove its second factor before it may change the password.
+
+        BACKLOG #1954 (ASVS 6.3.3). A change revokes every session, so a password holder on a
+        pending session must not reach it on the password alone. True only for a pending session
+        on a LOCAL account that holds a factor. An account with no factor has nothing to prove and
+        rotates as before, and a directory account is left to the route's 400, which changes
+        nothing. PUBLIC for the reason :meth:`factor_binding_is_blocked` gives: the JSON gate and
+        the web console's password and factor pages all ask it, so the planes cannot drift."""
+        return await self._owes_enrolled_factor(token, local_only=True)
 
     async def factor_binding_is_blocked(self, token: str | None, action: str) -> bool:
         """PUBLIC contract boundary over :meth:`_factor_binding_is_blocked`, for the ROUTE gates.

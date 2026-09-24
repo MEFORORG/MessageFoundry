@@ -17,14 +17,13 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from types import MappingProxyType
 from typing import Any
 
 from fastapi import HTTPException, Request, WebSocket, status
 
 from messagefoundry.api.tls_client_cert import MF_CLIENT_PEERCERT_STATE_KEY
 from messagefoundry.auth import AuthProvider, Identity, Permission, Role
-from messagefoundry.auth.service import STEP_UP_ACTION_PASSWORD_CHANGE, AuthService
+from messagefoundry.auth.service import AuthService
 from messagefoundry.config.tls_policy import HopDisposition
 
 # Re-imported, not redefined. The cert->principal mapping now lives in the neutral package-root leaf
@@ -84,7 +83,7 @@ _MUST_CHANGE_EXEMPT_PATHS = frozenset(
 # /auth/mfa-verify is HOW a session becomes satisfied, so it must gate itself out; /me/password and
 # /me/reauth are the binding deadlock carve-outs (a fresh account can be must_change AND mfa_pending
 # in the same instant). /me/password is exempt only for an account with NO factor: see
-# _MFA_EXEMPT_ONLY_WITHOUT_A_FACTOR below. Enrollment (POST /me/mfa/enroll, /confirm) is NOT listed
+# _PASSWORD_CHANGE_ROUTE below. Enrollment (POST /me/mfa/enroll, /confirm) is NOT listed
 # because it rides require_reauth_only_action, which opts out via mfa_gate=False — an un-enrolled
 # user could never satisfy a gate that stands in front of the only route that enrolls them.
 #
@@ -108,15 +107,12 @@ _MFA_EXEMPT_ROUTES: frozenset[tuple[str, str]] = frozenset(
     }
 )
 
-# The exempt routes above whose exemption serves an account with NO factor only. A pending session on
-# an account that HAS one is refused here like anywhere else, decided by the same rule the reauth-only
-# gates use (AuthService.factor_binding_is_blocked, keyed by the route's action). /me/password is the
-# one: a change revokes every session, so without this a caller holding only the password could lock
-# the real user out and sign them out everywhere (BACKLOG #1954, ASVS 6.3.3). A directory account is
-# left to the handler, whose 400 changes nothing and says where its password lives.
-_MFA_EXEMPT_ONLY_WITHOUT_A_FACTOR: Mapping[tuple[str, str], str] = MappingProxyType(
-    {("POST", "/me/password"): STEP_UP_ACTION_PASSWORD_CHANGE}
-)
+# The one exempt route above whose exemption serves an account with NO factor only. A pending
+# session on a local account that HAS one is refused here like anywhere else: a password change
+# revokes every session, so without this a caller holding only the password could lock the real
+# user out and sign them out everywhere (BACKLOG #1954, ASVS 6.3.3).
+# AuthService.password_change_owes_factor decides it; the console's password page asks it too.
+_PASSWORD_CHANGE_ROUTE = ("POST", "/me/password")
 
 # BACKLOG #195a (ASVS 16.3.2): the permissions whose authorization GRANT is worth an audit row when the
 # trail is NARROWED — the sensitive / state-changing / config / user-mgmt surface.
@@ -294,12 +290,8 @@ def require(
         route = (request.method, request.url.path)
         if mfa_gate and route not in _MFA_EXEMPT_ROUTES:
             pending = not await auth.mfa_satisfied(bearer_token(request))
-        elif (
-            mfa_gate
-            and identity.auth_provider is AuthProvider.LOCAL
-            and (action := _MFA_EXEMPT_ONLY_WITHOUT_A_FACTOR.get(route)) is not None
-        ):
-            pending = await auth.factor_binding_is_blocked(bearer_token(request), action)
+        elif mfa_gate and route == _PASSWORD_CHANGE_ROUTE:
+            pending = await auth.password_change_owes_factor(bearer_token(request))
         else:
             pending = False
         if pending:
