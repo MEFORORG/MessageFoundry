@@ -2630,12 +2630,10 @@ def _serve(args: argparse.Namespace) -> int:
     # MFA-at-exposure posture (sec-mfa-on; WP-14, ASVS 6.3.3): an off-loopback bind serving local
     # accounts puts admin authentication on the network, where a single password factor is far weaker.
     # [security].require_mfa adds an engine second factor (TOTP or a passkey) for every account that
-    # [security].require_mfa_scope covers: every account under the default `every_local_account`
-    # (directory principals included, despite the name); under `administrators`, only the Administrator
-    # role among local accounts, while a directory session that proved no factor stays MFA-pending under
-    # either scope (AuthService.mfa_satisfied). An enrolled account must always present its factor.
-    # With it off the admin interface is single-factor over the wire. Since BACKLOG #187 require_mfa DEFAULTS ON (even
-    # on loopback), so this gate no longer catches the common "forgot to enable it" case — it now fires
+    # [security].require_mfa_scope covers -- every account under the default, not the Administrator
+    # role alone (the scope's own comment in AuthSettings explains what each value covers). With it off,
+    # every account that has not enrolled a factor is single-factor over the wire. Since BACKLOG #187
+    # require_mfa DEFAULTS ON (even on loopback), so this gate no longer catches the common "forgot to enable it" case — it now fires
     # only when an operator has EXPLICITLY opted out ([security].require_mfa=false) AND exposed the admin
     # interface. That explicit opt-out at exposure is exactly the posture to refuse/warn on. Mirror the
     # keyless-store / open-egress posture: refuse on a production PHI instance (the prod fail-closed
