@@ -48,9 +48,10 @@
 
     CONFINEMENT IS CHECKED AFTER EVERY OPEN. Opening is half of the question; the other half is the
     property ADR 0163's restriction exists for. After each identity's open, every trio file may grant
-    only SYSTEM, BUILTIN\Administrators, the service account and the operator, or the arm goes RED.
-    A GREEN CAN BE CONDITIONAL, and says so: store.py only logs when icacls fails, so a restriction
-    warning in the service log or the CLI output prints GREEN (CONDITIONAL) with a warning annotation.
+    only SYSTEM, BUILTIN\Administrators, the service account and the operator, block inheritance, and
+    be owned by one of them, or the arm goes RED.
+    A GREEN CAN BE CONDITIONAL, and says so: store.py only logs when it cannot restrict a file, so a
+    restriction warning in the service log or the CLI output prints GREEN (CONDITIONAL) with a warning.
 
     The start gates are satisfied with synthetic values: a store key minted by `gen-key`, an SMTP
     relay on loopback that nothing listens on (the start gates read configuration only; nothing
@@ -100,7 +101,7 @@ $ProvisionDecline = "already has an enabled Administrator"
 $OpenErrorPattern = "unable to open database file|Access is denied|PermissionError|OperationalError"
 # store.py logs these and carries on; each means that open did not restrict the trio as it tried to
 # (a DACL it could not read falls back to the owner-only rewrite, which is the Wave 0 lockout).
-$RestrictFailPattern = "could not restrict|could not determine current user|could not read the DACL"
+$RestrictFailPattern = "could not restrict|could not determine current user|could not read the DACL|could not render the DACL"
 $EngineImages = @("python.exe", "pythonw.exe", "messagefoundry.exe")
 
 $Failures = New-Object System.Collections.ArrayList
@@ -282,14 +283,16 @@ function Show-Trio([string]$Label) {
 function Test-Resecured {
     <#
       After an identity's open, is the store still CONFINED -- the property ADR 0163's restriction
-      exists for? Every present trio file may grant only SYSTEM, BUILTIN\Administrators, the service
-      account and the operator. Any other allow entry is a RED: the store has become readable by a
-      principal outside that set.
+      exists for? Every present trio file must block inheritance, be OWNED by, and grant only, SYSTEM,
+      BUILTIN\Administrators, the service account or the operator. Anything else is a RED: an
+      outside entry makes the store readable by that principal; an outside owner keeps WRITE_DAC and
+      can grant itself access; an inheriting file takes whatever the directory is later given.
 
       This replaced a check on the MECHANISM ("the .db still inherits", "the DACL did not change"),
-      which encoded the pre-0b rewrite-to-the-opener design. Under Wave 0b a store in a hardened
-      directory inherits that directory on purpose, so the old check would have flagged the correct
-      state. A restriction warning is still a CONDITION: the open did not do what it tried to.
+      which encoded the pre-0b rewrite-to-the-opener design and would have flagged Wave 0b's
+      same-DACL-for-every-opener as a failure. Note what it cannot see: SQLite deletes -wal and -shm
+      on a clean close, and this runs after the service stops, so it measures the .db. A restriction
+      warning is still a CONDITION: the open did not do what it tried to.
       -FromServiceLog reads the service's current logs for that warning, and is passed only for the
       service's own opens, so an earlier service warning is never charged to the operator.
     #>
@@ -302,6 +305,19 @@ function Test-Resecured {
         try { $acl = Get-Acl -LiteralPath $f } catch {
             Add-Condition "after $Identity's open, $Operator could not read the DACL of $(Split-Path -Leaf $f), so its confinement is unmeasured"
             continue
+        }
+        $leaf = Split-Path -Leaf $f
+        if (-not $acl.AreAccessRulesProtected) {
+            Add-Failure ("after $Identity's open, $leaf still inherits its directory's entries, so a later " +
+                "change to the directory would reach the store")
+        }
+        $ownerSid = "$($acl.Owner)"
+        try {
+            $ownerSid = ([Security.Principal.NTAccount]$acl.Owner).Translate([Security.Principal.SecurityIdentifier]).Value
+        } catch { }
+        if ($allowed -notcontains $ownerSid) {
+            Add-Failure ("after $Identity's open, $leaf is owned by $($acl.Owner), outside SYSTEM, " +
+                "Administrators, $ServiceIdentity and $Operator; an owner keeps WRITE_DAC over it")
         }
         foreach ($rule in $acl.Access) {
             if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }

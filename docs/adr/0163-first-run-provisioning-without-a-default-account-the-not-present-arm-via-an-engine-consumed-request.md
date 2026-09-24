@@ -208,12 +208,15 @@ does resolve for `icacls`; the lockout is the design working as written, not a f
 **Decision: in a hardened data directory the trio gets the directory's principals, explicitly.**
 `_secure_store_file` (`messagefoundry/store/store.py`), called from the open path and from restore,
 reads the directory's owner and DACL as SDDL. The directory counts as HARDENED when all of these hold:
-inheritance is removed; every allow entry names SYSTEM, `BUILTIN\Administrators` or ONE per-service
-virtual account (`S-1-5-80-` plus five sub-authorities, which excludes `ALL SERVICES`); the owner is
-SYSTEM, Administrators or that service account; and no component of the path is a junction or
-symlink. That is the shape `install-service.ps1` writes. There every open sets the same explicit,
-protected DACL on each file in one `SetNamedSecurityInfoW` call: SYSTEM and Administrators full
-control, the service account Modify. It does not depend on who opens, so a second opener finds it
+inheritance is removed; every entry is an ALLOW naming SYSTEM, `BUILTIN\Administrators` or ONE
+per-service virtual account (`S-1-5-80-` plus five sub-authorities, which excludes `ALL SERVICES`), so
+a directory carrying any deny entry is refused; the owner is SYSTEM, Administrators or that service
+account; and no component of the path is a reparse point (junction, symlink, mount point). There every
+open writes the same explicit, protected DACL on each file in one `SetNamedSecurityInfoW` call, naming
+only the principals the directory allows: full control for SYSTEM and Administrators, Modify for the
+service account, as `install-service.ps1` grants them on the directory. A file owner outside that set
+is moved to Administrators where the opener may do so, because an owner keeps WRITE_DAC and could
+re-grant itself access (measured). The DACL does not depend on who opens, so a second opener finds it
 already exact and changes nothing; the service holds Modify and not WRITE_DAC, so it could not.
 Anywhere else, including any directory this code cannot read or parse, the owner-only rewrite applies
 exactly as before.
@@ -228,21 +231,34 @@ because a later edit to the directory then reached the store, and a file moved i
 still marked inherited (measured). The explicit, protected DACL closes both.
 
 **What it widens, stated plainly.** Before, a store file granted its last opener alone. Now, in a
-hardened directory, it grants SYSTEM, every ELEVATED member of `BUILTIN\Administrators`, and the one
-service account. That is wider than "the service account plus the operator who provisioned it": it
-reaches every local administrator, not only the one who ran the command. Those principals already
-hold Full Control or Modify on the data directory and on its logs, a PHI sink of the same class, and
-an Administrator can take ownership of any file, so no capability is new; but the DACL now says so.
-Because the DACL is protected, a later edit to the directory does not reach the store.
+hardened directory, it grants SYSTEM, the one service account, and `BUILTIN\Administrators` when the
+directory grants that group. That is wider than "the service account plus the operator who provisioned
+it", and the group reaches more than elevated sessions: at least every elevated local session of a
+member, the built-in Administrator account (Admin Approval Mode is off for it by default), and domain
+members of the group over a network logon, which is not UAC-filtered. Those principals already hold
+Full Control on the data directory and on its logs, a PHI sink of the same class, and an Administrator
+can take ownership of any file, so no capability is new; but the DACL now says so, and this may be an
+owner question. Because the DACL is protected, a later edit to the directory does not reach the store.
 
-**What it does not cover.** A service installed with `-ServiceAccount` naming a gMSA or a dedicated
-user holds a SID outside the allow-list, so that directory is not hardened and the old lockout remains
-for that configuration. A data directory owned by anyone other than SYSTEM, Administrators or the
-service account is refused the same way. POSIX is unchanged (`chmod 0600`). Outside a hardened
-directory, the owner-only rewrite still leaves any explicit entry for another principal in place,
-because `icacls /inheritance:r /grant:r` replaces only the principals it names (measured while
-building this); that predates this change and is not fixed by it. Consequences 3 and 4 are not
-touched here: the key half was answered by BACKLOG #1905.
+**What it does not cover, at least.** Each of these falls back to the owner-only rewrite, so the
+Wave 0 lockout returns for it:
+
+- a run-as account other than a per-service virtual account or LocalSystem: a gMSA, a dedicated user,
+  LocalService or NetworkService;
+- a data directory owned by anyone else. `install-service.ps1` sets the config directory's owner but
+  not the data directory's; an elevated installer's new directory is owned by Administrators under the
+  default owner policy, which is what the Wave 0 runners showed, but not under "Object creator";
+- a store whose directory is not itself protected, such as `-DbPath` in a subdirectory of the data
+  directory, and a path through any reparse point, including a folder-mounted volume.
+
+It also leaves these open: a `-wal` or `-shm` created later by a process that does not apply this rule
+(an administrator's `sqlite3.exe`, say) keeps an inheriting DACL the service cannot rewrite; and the
+checks resolve the path by name, so someone able to swap an ancestor for a junction between SQLite's
+create and the check could misdirect it. Outside a hardened directory, the owner-only rewrite still
+leaves any explicit entry for another principal in place, because `icacls /inheritance:r /grant:r`
+replaces only the principals it names (measured while building this); that predates this change.
+POSIX is unchanged (`chmod 0600`). Consequences 3 and 4 are not touched here: the key half was answered
+by BACKLOG #1905.
 
 ## How this was reached
 

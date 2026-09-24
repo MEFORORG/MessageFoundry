@@ -2845,40 +2845,46 @@ def _parse_sddl_dacl(sddl: str) -> _SddlDacl | None:
 def _hardened_trio_grants(directory: _SddlDacl) -> tuple[str, ...] | None:
     """The principals the trio is granted when ``directory`` is HARDENED, else ``None``.
 
-    Hardened means all of: inheritance blocked; every non-deny ACE an allow ACE naming SYSTEM,
-    Administrators, or ONE per-service account (a second one is refused: the data directory has one
-    run-as account); an owner of SYSTEM, Administrators or that service account, because an owner
-    keeps WRITE_DAC over the directory; and at least one allow ACE. A deny entry only narrows access.
-    The answer is SYSTEM, Administrators and the service account (when there is one) -- never more
-    than the directory grants, and never who happens to be opening."""
-    if not directory.protected:
+    Hardened means all of: inheritance blocked; every ACE an ALLOW ACE naming SYSTEM, Administrators,
+    or ONE per-service account (a second one is refused: the data directory has one run-as account);
+    no deny ACE, because the trio's DACL does not carry the directory's denies over, so honouring
+    them is only possible by refusing; an owner of SYSTEM, Administrators or that service account,
+    because an owner keeps WRITE_DAC over the directory; and at least one allow ACE.
+
+    The answer names only principals the directory itself allows, never who happens to be opening.
+    RIGHTS are not derived: the trio always gets full control for SYSTEM and Administrators and
+    Modify for the service, which is what install-service.ps1 grants on the directory."""
+    if not directory.protected or not directory.aces:
         return None
+    named: set[str] = set()
     services: set[str] = set()
-    allows = 0
     for ace_type, _flags, sid in directory.aces:
-        if ace_type in _SDDL_DENY_TYPES:
-            continue
         if ace_type != "A":
             return None
-        allows += 1
         if sid in _STORE_DIR_TRUSTED_SIDS:
+            named.add(sid)
             continue
         if not _SERVICE_SID.fullmatch(sid):
             return None
         services.add(sid)
-    if allows == 0 or len(services) > 1:
+    if len(services) > 1:
         return None
     if directory.owner is None or (
         directory.owner not in _STORE_DIR_TRUSTED_SIDS and directory.owner not in services
     ):
         return None
-    return (*_STORE_DIR_TRUSTED_SIDS, *sorted(services))
+    return (*(sid for sid in _STORE_DIR_TRUSTED_SIDS if sid in named), *sorted(services))
 
 
 def _trio_dacl_is_exact(dacl: _SddlDacl, grants: Sequence[str]) -> bool:
-    """Does this file DACL already carry exactly ``grants``: protected, explicit allow ACEs only, one
-    per principal? Rights are not compared; a weakened right fails the open loudly, not silently."""
+    """Does this file already carry exactly ``grants``: a protected DACL of explicit allow ACEs, one
+    per principal, and an OWNER among them? The owner matters because an owner keeps READ_CONTROL and
+    WRITE_DAC whatever the DACL says, so a file owned by anyone else could be re-granted by that owner
+    (measured). ``dacl.owner`` is ``None`` when the owner was not read, which is never exact. Rights
+    are not compared; a weakened right fails the open loudly, not silently."""
     if not dacl.protected or len(dacl.aces) != len(grants):
+        return False
+    if dacl.owner is None or dacl.owner not in grants:
         return False
     for ace_type, flags, _sid in dacl.aces:
         if ace_type != "A" or "ID" in flags:
@@ -2954,15 +2960,26 @@ def _is_windows() -> bool:
 
 
 def _reaches_through_a_link(path: Path) -> bool:
-    """Does ``path`` or any component above it resolve somewhere else (a junction or a symlink)?
+    """Is ``path``, or any directory above it, a reparse point (a junction, a symlink, a mount point)?
 
     A link has its OWN security descriptor: measured, GetNamedSecurityInfoW on a junction returns the
     junction's DACL while files created through it inherit the target's. So a hardened link over a
-    broad target would pass the test while the store landed in the broad directory. Refused outright."""
-    try:
-        return os.path.normcase(os.path.realpath(path)) != os.path.normcase(os.path.abspath(path))
-    except OSError:
-        return True
+    broad target would pass the test while the store landed in the broad directory. Read from each
+    component's own attributes rather than by comparing resolved paths, which also flagged an 8.3
+    short name as a link (measured). A component that cannot be read counts as a link."""
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    current = Path(os.path.abspath(path))
+    for component in (current, *current.parents):
+        try:
+            attributes = getattr(os.lstat(component), "st_file_attributes", 0)
+        except OSError:
+            return True
+        if attributes & reparse:
+            log.warning(
+                "%s is reached through a link, so the store there is restricted owner-only", path
+            )
+            return True
+    return False
 
 
 def _store_dir_grants(directory: Path) -> tuple[str, ...] | None:
@@ -2978,22 +2995,24 @@ def _store_dir_grants(directory: Path) -> tuple[str, ...] | None:
     return None if parsed is None else _hardened_trio_grants(parsed)
 
 
-def _write_trio_dacl(path: Path, grants: Sequence[str]) -> bool:
-    """Replace the DACL of ``path`` with a PROTECTED one naming exactly ``grants``, in one call; log and
-    return ``False`` on failure. Windows only. A seam for tests.
+def _write_trio_dacl(path: Path, grants: Sequence[str], *, owner: str | None = None) -> bool:
+    """Replace the DACL of ``path`` with a PROTECTED one naming exactly ``grants``, and its owner with
+    ``owner`` when one is given, in one call; log and return ``False`` on failure. Windows only. A
+    seam for tests.
 
     One SetNamedSecurityInfoW call rather than icacls, for two measured reasons: icacls cannot drop
     an unnamed principal's explicit entry while granting, so it takes two calls, and after the first
     of them a caller whose access was only that entry is refused by the second (exit 5). Setting the
     whole DACL at once needs only WRITE_DAC, which the owner always holds, and leaves no intermediate
-    state. It is a Win32 API, not a program on a search path, so nothing can be planted in its place."""
+    state. Setting the owner needs more (an elevated Administrator may name Administrators); when that
+    is refused the DACL alone is still written, and the refusal is logged."""
     if sys.platform != "win32":
         return False
     import ctypes
     from ctypes import wintypes
 
     aces = "".join(f"(A;;{_TRIO_RIGHTS.get(sid, _SERVICE_RIGHTS)};;;{sid})" for sid in grants)
-    sddl = f"D:P{aces}"
+    sddl = (f"O:{owner}" if owner else "") + f"D:P{aces}"
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     convert = advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW
@@ -3012,6 +3031,13 @@ def _write_trio_dacl(path: Path, grants: Sequence[str]) -> bool:
         ctypes.POINTER(wintypes.BOOL),
     ]
     get_dacl.restype = wintypes.BOOL
+    get_owner = advapi32.GetSecurityDescriptorOwner
+    get_owner.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.BOOL),
+    ]
+    get_owner.restype = wintypes.BOOL
     set_info = advapi32.SetNamedSecurityInfoW
     set_info.argtypes = [
         wintypes.LPWSTR,
@@ -3037,14 +3063,40 @@ def _write_trio_dacl(path: Path, grants: Sequence[str]) -> bool:
     try:
         present, defaulted = wintypes.BOOL(), wintypes.BOOL()
         dacl = ctypes.c_void_p()
-        if not get_dacl(
+        ok = get_dacl(
             descriptor, ctypes.byref(present), ctypes.byref(dacl), ctypes.byref(defaulted)
-        ):
-            log.warning("could not restrict %s (Win32 status %s)", path, ctypes.get_last_error())
+        )
+        # A NULL DACL grants Everyone full control, so it must never reach SetNamedSecurityInfoW.
+        if not ok or not present or not dacl.value:
+            log.warning(
+                "could not restrict %s: no DACL was built (Win32 status %s)",
+                path,
+                ctypes.get_last_error(),
+            )
             return False
         se_file_object = 1
-        info = 0x4 | 0x80000000  # DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION
-        status = set_info(str(path), se_file_object, info, None, None, dacl, None)
+        dacl_info = (
+            0x4 | 0x80000000
+        )  # DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION
+        if owner:
+            owner_sid = ctypes.c_void_p()
+            owner_defaulted = wintypes.BOOL()
+            if (
+                get_owner(descriptor, ctypes.byref(owner_sid), ctypes.byref(owner_defaulted))
+                and owner_sid.value
+            ):
+                status = set_info(
+                    str(path), se_file_object, dacl_info | 0x1, owner_sid, None, dacl, None
+                )
+                if status == 0:
+                    return True
+                log.warning(
+                    "could not restrict %s: its owner is outside the hardened directory's principals "
+                    "and could not be changed (Win32 status %s); an owner keeps WRITE_DAC",
+                    path,
+                    status,
+                )
+        status = set_info(str(path), se_file_object, dacl_info, None, None, dacl, None)
         if status != 0:
             log.warning(
                 "could not restrict %s to its hardened directory's principals (Win32 status %s)",
@@ -3052,7 +3104,7 @@ def _write_trio_dacl(path: Path, grants: Sequence[str]) -> bool:
                 status,
             )
             return False
-        return True
+        return not owner
     finally:
         kernel32.LocalFree(descriptor)
 
@@ -3064,18 +3116,21 @@ def _secure_store_file(path: Path, *, dir_grants: Sequence[str] | None) -> None:
     outside a hardened directory -- is :func:`_secure_file`, owner-only, exactly as before. Otherwise
     the file gets an explicit, protected DACL naming exactly those principals, which is the same
     whoever opens, and which drops any entry for anyone else (a moved-in or restored file can carry
-    one). A file already exact is left untouched: the service account holds Modify, not WRITE_DAC, so
-    rewriting a correct DACL it does not own would fail and warn on every start. A file reached
-    through a link is refused, as for the directory. Best-effort, like :func:`_secure_file`: it logs
-    rather than raises."""
+    one). An owner outside those principals is moved to Administrators where the opener may do that,
+    because an owner could otherwise re-grant itself access. A file already exact is left untouched:
+    the service account holds Modify, not WRITE_DAC, so rewriting a correct DACL it does not own would
+    fail and warn on every start. A file that is itself a link gets the old owner-only rewrite, as
+    before this change. Best-effort, like :func:`_secure_file`: it logs rather than raises."""
     if dir_grants is None or not _is_windows() or _reaches_through_a_link(path):
         _secure_file(path)
         return
-    current = _read_dacl_sddl(path)
+    current = _read_dacl_sddl(path, owner=True)
     parsed = _parse_sddl_dacl(current) if current is not None else None
     if parsed is not None and _trio_dacl_is_exact(parsed, dir_grants):
         return
-    _write_trio_dacl(path, dir_grants)
+    owner_ok = parsed is not None and parsed.owner is not None and parsed.owner in dir_grants
+    new_owner = None if owner_ok else ("BA" if "S-1-5-32-544" in dir_grants else None)
+    _write_trio_dacl(path, dir_grants, owner=new_owner)
 
 
 def _opt_float(value: Any) -> float | None:
@@ -4061,9 +4116,10 @@ class MessageStore:
             # completes before anything is serving, so this one is consistency rather than a fix.
             if str(path) != ":memory:":
                 main = Path(path)
-                # ADR 0183 Wave 0b: in a HARDENED data directory the trio inherits the directory, so
-                # the service account and the provisioning operator can both open it in either order;
-                # elsewhere it is rewritten owner-only as before. See _secure_store_file.
+                # ADR 0183 Wave 0b: in a HARDENED data directory each trio file gets the same explicit,
+                # protected DACL naming the directory's principals, so the service account and the
+                # provisioning operator can both open it in either order; elsewhere it is rewritten
+                # owner-only as before. See _secure_store_file.
                 grants = await asyncio.to_thread(_store_dir_grants, main.parent)
                 for f in (
                     main,

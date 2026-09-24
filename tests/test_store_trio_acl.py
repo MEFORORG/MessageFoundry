@@ -103,9 +103,15 @@ def test_a_directory_that_admits_anyone_else_is_not_hardened(label: str, sddl: s
     assert _grants(sddl) is None, label
 
 
-def test_a_deny_entry_does_not_disqualify_a_hardened_directory() -> None:
-    # A deny only narrows access, so it cannot let anybody else in.
-    assert _grants(_INSTALLER_DIR + "(D;OICI;FA;;;BG)") == (_SY, _BA, _TI)
+def test_a_directory_with_a_deny_entry_is_not_hardened() -> None:
+    # The trio's DACL does not carry the directory's denies over, so a store derived from a directory
+    # that denies somebody would be WIDER than the directory. Refusing is the only honest option.
+    assert _grants(_INSTALLER_DIR + "(D;OICI;FA;;;BG)") is None
+
+
+def test_the_grants_name_only_what_the_directory_allows() -> None:
+    # A directory that leaves Administrators out must not get them added on the store.
+    assert _grants(f"O:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;0x1301bf;;;{_TI})") == (_SY, _TI)
 
 
 def test_an_exact_trio_dacl_is_recognised_and_nothing_else_is() -> None:
@@ -116,7 +122,14 @@ def test_an_exact_trio_dacl_is_recognised_and_nothing_else_is() -> None:
     missing = store_mod._parse_sddl_dacl("D:PAI(A;;FA;;;SY)(A;;FA;;;BA)")
     # A stale entry marked inherited, as a file moved in from a broad directory keeps (measured).
     stale = store_mod._parse_sddl_dacl(f"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;ID;FR;;;{_TI})")
-    assert exact is not None and store_mod._trio_dacl_is_exact(exact, grants)
+    assert exact is not None and not store_mod._trio_dacl_is_exact(exact, grants), "owner unread"
+    owned = store_mod._parse_sddl_dacl(f"O:BAD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1301bf;;;{_TI})")
+    assert owned is not None and store_mod._trio_dacl_is_exact(owned, grants)
+    # An owner outside the set keeps WRITE_DAC and could re-grant itself read (measured).
+    user_owned = store_mod._parse_sddl_dacl(
+        f"O:S-1-5-21-1-2-3-1001D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1301bf;;;{_TI})"
+    )
+    assert user_owned is not None and not store_mod._trio_dacl_is_exact(user_owned, grants)
     for label, dacl in (
         ("inheriting", inheriting),
         ("extra", extra),
@@ -136,6 +149,49 @@ def test_without_hardened_grants_the_store_file_gets_the_owner_only_restriction(
     monkeypatch.setattr(store_mod, "_is_windows", lambda: False)
     store_mod._secure_store_file(target, dir_grants=(_SY,))
     assert seen == [target, target]
+
+
+def test_an_exact_store_file_is_left_alone(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The service account holds Modify, not WRITE_DAC, so a second opener that rewrote an already
+    # exact DACL would fail and warn on every start. It must not try. Seams only, so it runs anywhere.
+    exact = f"O:BAD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1301bf;;;{_TI})"
+    writes: list[object] = []
+    monkeypatch.setattr(store_mod, "_is_windows", lambda: True)
+    monkeypatch.setattr(store_mod, "_reaches_through_a_link", lambda _p: False)
+    monkeypatch.setattr(store_mod, "_read_dacl_sddl", lambda _p, **_kw: exact)
+    monkeypatch.setattr(store_mod, "_write_trio_dacl", lambda *a, **kw: writes.append((a, kw)))
+    store_mod._secure_store_file(tmp_path / "s.db", dir_grants=(_SY, _BA, _TI))
+    assert writes == [], writes
+    # CONTROL: the same file owned by a user is rewritten, with Administrators named as the owner.
+    monkeypatch.setattr(
+        store_mod,
+        "_read_dacl_sddl",
+        lambda _p, **_kw: exact.replace("O:BA", "O:S-1-5-21-1-2-3-1001"),
+    )
+    store_mod._secure_store_file(tmp_path / "s.db", dir_grants=(_SY, _BA, _TI))
+    assert len(writes) == 1 and writes[0][1] == {"owner": "BA"}, writes
+
+
+def test_restore_applies_the_hardened_rule_to_the_restored_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A restored store published owner-only would lock the service out of the store it is about to
+    # open. RED before the fix: _place_restored_store called _secure_file directly.
+    from messagefoundry.pipeline import dr_backup
+
+    src = tmp_path / "staged.db"
+    src.write_bytes(b"x")
+    dest = tmp_path / "restored" / "msg.db"
+    dest.parent.mkdir()
+    secured: list[tuple[Path, object]] = []
+    monkeypatch.setattr(store_mod, "_store_dir_grants", lambda directory: (_SY, str(directory)))
+    monkeypatch.setattr(
+        store_mod,
+        "_secure_store_file",
+        lambda path, *, dir_grants: secured.append((path, dir_grants)),
+    )
+    dr_backup._place_restored_store(src, dest)
+    assert secured == [(dest, (_SY, str(dest.parent)))], secured
 
 
 async def test_open_applies_the_hardened_rule_to_the_store_file(
@@ -198,7 +254,7 @@ def _sddl_of(path: Path, scratch: Path) -> str:
 
 
 def _read_back(path: Path) -> store_mod._SddlDacl:
-    sddl = store_mod._read_dacl_sddl(path)
+    sddl = store_mod._read_dacl_sddl(path, owner=True)
     assert sddl is not None, f"the owner could not read the DACL of {path} back"
     dacl = store_mod._parse_sddl_dacl(sddl)
     assert dacl is not None, sddl
@@ -251,41 +307,18 @@ def test_a_store_file_gets_exactly_the_hardened_principals(tmp_path: Path) -> No
     try:
         store_mod._secure_store_file(db, dir_grants=(_SY, _BA, _TI))
         dacl = _read_back(db)
-        assert store_mod._trio_dacl_is_exact(dacl, (_SY, _BA, _TI)), dacl
+        assert dacl.protected, dacl
+        assert all(t == "A" and "ID" not in f for t, f, _s in dacl.aces), dacl
+        assert {sid for _t, _f, sid in dacl.aces} == {_SY, _BA, _TI}, dacl
+        # The owner: an elevated token moves it to Administrators; a non-elevated one cannot, so the
+        # file keeps its user owner and the step logs the refusal instead of passing as exact.
+        if _elevated():
+            assert dacl.owner == _BA, dacl
+        else:
+            assert dacl.owner == me, dacl
+            assert not store_mod._trio_dacl_is_exact(dacl, (_SY, _BA, _TI))
     finally:
         _release(data, me)
-
-
-@_windows_only
-def test_an_exact_store_file_is_left_alone(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # The service account holds Modify, not WRITE_DAC, so a second opener that rewrote an already
-    # exact DACL would fail and warn on every start. It must not try.
-    me = _my_sid()
-    db = tmp_path / "messagefoundry.db"
-    db.write_bytes(b"")
-    _run(
-        [
-            _icacls(),
-            str(db),
-            "/inheritance:r",
-            "/grant:r",
-            "*S-1-5-18:F",
-            "*S-1-5-32-544:F",
-            f"*{_TI}:M",
-        ]
-    )
-    try:
-        calls: list[tuple[str, ...]] = []
-
-        def _record(path: Path, *args: object) -> bool:
-            calls.append(tuple(str(a) for a in args))
-            return True
-
-        monkeypatch.setattr(store_mod, "_write_trio_dacl", _record)
-        store_mod._secure_store_file(db, dir_grants=(_SY, _BA, _TI))
-        assert calls == [], f"an exact store file was rewritten: {calls}"
-    finally:
-        _release(tmp_path, me)
 
 
 @_windows_only
@@ -314,8 +347,14 @@ def test_a_store_directory_reached_through_a_junction_is_not_hardened(tmp_path: 
     _run(["cmd.exe", "/c", "mklink", "/J", str(link), str(target)])
     try:
         assert store_mod._reaches_through_a_link(link)
+        assert store_mod._reaches_through_a_link(link / "messagefoundry.db"), "an ancestor link"
         assert not store_mod._reaches_through_a_link(target)
-        assert store_mod._store_dir_grants(link) is None
+        # Isolate the link check: give both paths the installer's DACL, so the junction is refused
+        # for being a link and for nothing else. Without the check both would be hardened.
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(store_mod, "_read_dacl_sddl", lambda _p, **_kw: _INSTALLER_DIR)
+            assert store_mod._store_dir_grants(target) == (_SY, _BA, _TI)
+            assert store_mod._store_dir_grants(link) is None
     finally:
         subprocess.run(["cmd.exe", "/c", "rmdir", str(link)], check=False, capture_output=True)  # noqa: S603
 
@@ -373,6 +412,6 @@ async def test_open_in_a_hardened_directory_grants_the_directorys_principals(
         store = await store_mod.MessageStore.open(data / "messagefoundry.db")
         await store.close()
         dacl = _read_back(data / "messagefoundry.db")
-        assert store_mod._trio_dacl_is_exact(dacl, (_SY, _BA, _TI)), dacl
+        assert store_mod._trio_dacl_is_exact(dacl, (_SY, _BA, _TI)), dacl  # owner included
     finally:
         _release(data, me)
