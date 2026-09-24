@@ -17,18 +17,19 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.__main__ import main
-from messagefoundry.checks import run_checks
+from messagefoundry.checks import CheckResult, run_checks
 from tests._phi_gate_provisions import (
     PHI_GATE_PROVISIONS_NO_ALERTS_TOML,
     PHI_GATE_PROVISIONS_TOML,
 )
+from tests.test_api_tls import _ACK_MODES, _posture_b_toml, _run_posture_b, _self_signed
 
 SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
 
 # Non-security plumbing that pre-clears the OTHER exposure gates so exactly one refusal is under test at
 # a time (a real TLS-terminating proxy + bounded retention + an SMTP alert channel).
 _PROXY = (
-    '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n'
+    '[api]\ntls_terminated_upstream = true\nplaintext_upstream_hop_acknowledged = true\ntrusted_proxies = ["10.0.0.1"]\n'
     'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n'
 )
 _RETENTION_DL = "[retention]\ndead_letter_days = 30\n"
@@ -365,3 +366,127 @@ def test_checks_mirror_posture_parity_through_security_keys(tmp_path: Path) -> N
         )
     )
     assert ok.required and ok.ok and not ok.skipped  # type: ignore[attr-defined]
+
+
+# --- BACKLOG #1179: the plaintext-hop acknowledgement refuses in serve AND fails the check ---------
+# serve refuses a declared terminator with no [api].tls_cert_file and no acknowledgement, in every
+# mode. The check must fail on exactly the configs serve refuses, or the commit/CI gate passes a
+# config the engine will not start. Each arm runs BOTH on ONE messagefoundry.toml, reusing the
+# Posture-B fixture from tests/test_api_tls.py, which pre-satisfies every other exposure gate, so
+# serve's exit code is this gate's decision and not some neighbour's.
+
+#: (arm, ack, cert, expected serve exit). The refuse arm is the only one that exits 2.
+_HOP_ACK_ARMS = [
+    ("refuses-without-ack", False, False, 2),
+    ("acknowledged-starts", True, False, 0),
+    ("operator-cert-needs-no-ack", False, True, 0),
+]
+
+
+def _hop_ack_check(toml: Path) -> CheckResult:
+    report = run_checks(SAMPLES_CONFIG, run_lint=False, service_config=toml)
+    return next(r for r in report.results if r.name == "upstream-hop-ack")
+
+
+@_ACK_MODES
+@pytest.mark.parametrize("arm,ack,cert,expected", _HOP_ACK_ARMS, ids=[a[0] for a in _HOP_ACK_ARMS])
+def test_checks_mirror_hop_ack_parity_with_serve(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    loopback: bool,
+    enforcement: str,
+    arm: str,
+    ack: bool,
+    cert: bool,
+    expected: int,
+) -> None:
+    # intra="mtls" with the certificate, as the serve-side tests do: it is the attestation that
+    # goes with an engine serving the hop over TLS.
+    _posture_b_toml(
+        tmp_path,
+        intra="mtls" if cert else "network",
+        floor="1.2",
+        enforcement=enforcement,
+        loopback=loopback,
+        ack=ack,
+        cert=_self_signed(tmp_path) if cert else None,
+    )
+    rc = _run_posture_b(tmp_path, monkeypatch, env="prod")
+    err = capsys.readouterr().err
+    assert rc == expected, f"{arm}: serve exit {rc}, expected {expected}"
+    if expected == 2:
+        # Other gates also exit 2; the message pins that THIS one refused.
+        assert "without [api].plaintext_upstream_hop_acknowledged" in err
+
+    result = _hop_ack_check(tmp_path / "messagefoundry.toml")
+    assert result.required and not result.skipped
+    # The parity itself: the check fails exactly when serve refuses.
+    assert result.ok == (rc == 0), f"{arm}: serve exit {rc} but check ok={result.ok}"
+    if not result.ok:
+        assert "plaintext_upstream_hop_acknowledged" in result.detail
+
+
+def test_hop_ack_check_passes_without_a_terminator(tmp_path: Path) -> None:
+    # No terminator means the engine serves its own TLS: there is no plaintext hop to acknowledge.
+    toml = tmp_path / "messagefoundry.toml"
+    toml.write_text("[api]\n", encoding="utf-8")
+    result = _hop_ack_check(toml)
+    assert result.required and result.ok and not result.skipped
+    assert "generated" in result.detail
+
+
+def test_hop_ack_check_fails_a_stray_acknowledgement(tmp_path: Path) -> None:
+    # serve refuses this at load (the acknowledgement needs a terminator); the check must too, as a
+    # FAIL and not a SKIP (BACKLOG #1318).
+    toml = tmp_path / "messagefoundry.toml"
+    toml.write_text("[api]\nplaintext_upstream_hop_acknowledged = true\n", encoding="utf-8")
+    result = _hop_ack_check(toml)
+    assert result.required and not result.ok and not result.skipped
+    assert "plaintext_upstream_hop_acknowledged requires" in result.detail
+
+
+def test_hop_ack_check_allows_an_acknowledgement_beside_an_operator_cert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # serve allows this (test_api_tls.py); the check must not fail it.
+    _posture_b_toml(tmp_path, intra="mtls", floor="1.2", ack=True, cert=_self_signed(tmp_path))
+    assert _run_posture_b(tmp_path, monkeypatch, env="prod") == 0
+    result = _hop_ack_check(tmp_path / "messagefoundry.toml")
+    assert result.required and result.ok and not result.skipped
+    assert "operator" in result.detail
+
+
+def test_hop_ack_check_fails_through_the_default_toml_search(tmp_path: Path) -> None:
+    # The documented `check --config config` form passes no service_config: the check walks up to
+    # the repo's messagefoundry.toml. A leg that only worked with an explicit path would pass here.
+    cfg = _config_repo(
+        tmp_path, '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n'
+    )
+    result = next(
+        r for r in run_checks(cfg, run_lint=False).results if r.name == "upstream-hop-ack"
+    )
+    assert result.required and not result.ok and not result.skipped
+
+
+def test_hop_ack_check_skips_without_a_service_toml(tmp_path: Path) -> None:
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    result = next(
+        r
+        for r in run_checks(cfg, run_lint=False, suppress_service_toml_search=True).results
+        if r.name == "upstream-hop-ack"
+    )
+    assert result.required and result.ok and result.skipped
+
+
+def test_hop_ack_check_load_failure_echoes_no_secret(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A ValidationError's str() carries the section's input values, env-sourced secrets included.
+    monkeypatch.setenv("MEFOR_API_TLS_KEY_PASSWORD", "SUPERSECRET123")
+    toml = tmp_path / "messagefoundry.toml"
+    toml.write_text("[api]\nplaintext_upstream_hop_acknowledged = true\n", encoding="utf-8")
+    result = _hop_ack_check(toml)
+    assert not result.ok
+    assert "SUPERSECRET123" not in result.detail

@@ -238,6 +238,11 @@ never-clobbering (`if not channels: return user`), so replicating that rule insi
 complicate the breaker's exactness for a narrower residual. Scope still re-syncs on next login —
 a recorded, narrower residual.
 
+*Update, BACKLOG #1927:* the quoted early return is gone. A no-match login now withdraws any stored
+scope that `users.channel_scope_source` does not mark as an administrator's, so login does narrow.
+The reconciler decision above is unchanged: it still does not re-diff scope, so the scope stays in
+place until that user's next login.
+
 ### Directory load
 
 One `resolve_principal` per **distinct signed-in directory user** per pass — a service-account bind

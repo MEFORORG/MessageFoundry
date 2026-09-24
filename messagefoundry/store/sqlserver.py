@@ -81,13 +81,15 @@ from messagefoundry.store.crypto import (
     CipherError,
     CipherInfo,
     IdentityCipher,
+    allows_unmarked,
     cell_aad,
     cipher_info,
     decrypt_json_cell,
+    report_unmarked,
     rotation_fingerprint_key,
 )
 from messagefoundry.store.document_strip import StripResult, cutoff_for
-from messagefoundry.store.gcm_bound import checkpoint_invocations
+from messagefoundry.store.gcm_bound import checkpoint_invocations, reserve_invocations_ahead
 from messagefoundry.store.metadata import (
     decode_response_headers,
     encode_reference_value,
@@ -109,10 +111,13 @@ from messagefoundry.store.store import (
     MESSAGE_EVENT_KINDS,
     NOT_DEPLOYED_EVENT,
     REINGRESS_TARGET_PREFIX,
+    SCOPE_SOURCE_AD,
+    SCOPE_SOURCE_MANUAL,
     AlertInstance,
     AlertSummary,
     AuditHeadMovedError,
     CapturedResponse,
+    ChannelScopeSource,
     ClaimAbortPhase,
     ClaimedHeads,
     ClaimLockTimeout,
@@ -302,6 +307,16 @@ def _encode_proc_lanes(lanes: Sequence[str]) -> str:
     connection names. Oversized lanes are removed upstream by ``_keep_matchable_lanes``; the call
     here is idempotent and kept so this encoder is safe to use on an unfiltered list."""
     return json.dumps(_keep_matchable_lanes(lanes))
+
+
+#: The SQL Server form of ``store.WITHDRAW_AD_SCOPE_SQL`` (BACKLOG #1927). Same binds, in the same
+#: order; ``withdraw_ad_channel_scope`` says why it differs.
+_WITHDRAW_AD_SCOPE_SQL_MSSQL = (
+    "UPDATE users SET channel_scope=NULL, channel_scope_source=?, updated_at=?"
+    " WHERE id=? AND channel_scope COLLATE Latin1_General_100_BIN2"
+    " = CAST(? AS NVARCHAR(MAX)) COLLATE Latin1_General_100_BIN2"
+    " AND (channel_scope_source IS NULL OR channel_scope_source <> ?)"
+)
 
 
 def _claim_proc_param_pins() -> list[tuple[int, int, int]]:
@@ -1484,7 +1499,10 @@ _SCHEMA: list[str] = [
         -- 1700-byte nonclustered limit that shaped the oidc_* pair above is not in play. A canonical
         -- GUID is 36 characters, so the width is slack, not a bound.
         directory_object_id NVARCHAR(256) NULL,
-        password_claimed_at FLOAT NULL)""",
+        password_claimed_at FLOAT NULL,
+        -- BACKLOG #1927: who last wrote channel_scope, 'ad' or 'manual'. The rule is stated once,
+        -- on UserRecord.channel_scope_source.
+        channel_scope_source NVARCHAR(16) NULL)""",
     """IF COL_LENGTH('users','channel_scope') IS NULL
         ALTER TABLE users ADD channel_scope NVARCHAR(MAX) NULL""",
     # MFA (WP-14): TOTP columns ALTER-ed in for a pre-existing users table (idempotent).
@@ -1511,6 +1529,10 @@ _SCHEMA: list[str] = [
     # is the item. No backfill exists; nothing has ever held the directory's identifier.
     """IF COL_LENGTH('users','directory_object_id') IS NULL
         ALTER TABLE users ADD directory_object_id NVARCHAR(256) NULL""",
+    # Scope provenance (BACKLOG #1927; the rule is on UserRecord.channel_scope_source):
+    # COL_LENGTH-gated ADD on a pre-existing users table. No backfill is possible.
+    """IF COL_LENGTH('users','channel_scope_source') IS NULL
+        ALTER TABLE users ADD channel_scope_source NVARCHAR(16) NULL""",
     # BACKLOG #1256: RE-TYPE A PRE-EXISTING MAX COLUMN, WHICH THE COL_LENGTH-GATED ADDs ABOVE CANNOT
     # REACH. They fire only when the column is ABSENT, so a users table created before this change
     # keeps NVARCHAR(MAX) -- and a MAX column CANNOT BE AN INDEX KEY, so the index below would fail
@@ -2592,7 +2614,8 @@ class SqlServerStore:
             # on a store that is having a key enabled for the first time it is itself a large burst. A
             # no-op when the cipher carries no bound (keyless / `vault_transit`).
             await store.checkpoint_cipher_invocations()
-            await store._encrypt_existing_rows()  # one-time PHI-at-rest migration when a key is set
+            # Runs at EVERY keyed open: seals legacy plaintext on still-unsealed surfaces (#1169).
+            await store._encrypt_existing_rows()
             await store._load_audit_chain_meta()  # load/auto-init the #190 keying watermark
             await store._load_state_cache()  # ADR 0005 read-through cache warm-up
             await store._load_reference_cache()  # ADR 0006 reference-snapshot read cache
@@ -2745,9 +2768,10 @@ class SqlServerStore:
         return exact
 
     async def _encrypt_existing_rows(self) -> None:
-        """Re-encrypt legacy plaintext bodies in place when encryption is enabled (STORE-1).
-
-        Idempotent + batched: skips rows already carrying the ciphertext prefix."""
+        """Seal legacy plaintext in the cipher-covered columns when encryption is enabled (STORE-1),
+        one (table, column) surface at a time, each in ONE transaction. A surface that already holds
+        ciphertext is SEALED and its unmarked values are refused at read, not sealed (BACKLOG #1169).
+        The SQLite twin documents why; :meth:`_seal_surface` carries the mechanics."""
         if not self._cipher.encrypts:
             return
         # Version-agnostic anchor (M9): `mfenc:%` matches BOTH v1 and v2 ciphertext, so a v2 row is
@@ -2761,6 +2785,12 @@ class SqlServerStore:
         # entry here. Rows the migration folded in are covered by `("queue", "payload")` below: the
         # migration carries the payload over VERBATIM, so a legacy plaintext body arrives unencrypted
         # and this pass — which runs after `_ensure_schema` — seals it on the same open.
+        #
+        # Every surface now carries the blank guard (in _seal_surface). The first three used to omit it
+        # on the grounds
+        # that raw/payload are never legitimately '' -- but every purge path writes exactly
+        # `payload=''` and `raw=''`, so the unguarded loop turned a purged blank into
+        # ciphertext-of-empty (BACKLOG #1169). NULL is excluded by NOT LIKE on its own.
         for table, column in (
             ("messages", "raw"),
             ("queue", "payload"),
@@ -2768,239 +2798,69 @@ class SqlServerStore:
                 "users",
                 "totp_secret",
             ),  # MFA secret (WP-14): id-keyed, NULL rows excluded by NOT LIKE
-        ):
-            while True:
-                rows = await self._fetchall(
-                    f"SELECT TOP (500) id, {column} FROM {table} WHERE {column} NOT LIKE ?", (like,)
-                )
-                if not rows:
-                    break
-                async with self._acquire() as conn, self._cursor(conn) as cur:
-                    try:
-                        for r in rows:
-                            await cur.execute(
-                                f"UPDATE {table} SET {column}=? WHERE id=?",
-                                (
-                                    self._cipher.encrypt(
-                                        r[column], aad=cell_aad(table, column, r["id"])
-                                    ),
-                                    r["id"],
-                                ),
-                            )
-                        await self._commit(conn)
-                    except Exception:
-                        await conn.rollback()
-                        raise
-                await self._charge_bound_batch()
-                total += len(rows)
-        # Nullable id-keyed PHI text columns — each migrated on its own pass with the nullable
-        # `<> '' AND IS NOT NULL` guard so a blank/purged '' is never turned into ciphertext-of-empty
-        # (the id-keyed loop above omits that guard because raw/payload are never legitimately '').
-        #   messages.summary/metadata (id PK) — MRN + patient name (EF-3).
-        #   messages.error / queue.last_error / message_events.detail (H4) — may embed raw HL7 fragments
-        #     from exceptions; SQL Server at-rest parity with SQLite/Postgres. message_events keys on its
-        #     own INT IDENTITY `id` (an integer literal in the UPDATE, like every other id-keyed table).
-        # message_events.detail / connection_event.reason / alert_instance.reason have IDENTITY ids
-        # (unknown at INSERT; alert_instance also upserts), so they bind cell_aad to insert-time-known
-        # natural columns instead and migrate on their own composite passes below (ASVS 11.3.3, ADR 0019).
-        for table, ncol in (
+            # Nullable id-keyed PHI text columns.
+            #   messages.summary/metadata (id PK) — MRN + patient name (EF-3).
+            #   messages.error / queue.last_error (H4) — may embed raw HL7 fragments from exceptions.
             ("messages", "summary"),
             ("messages", "metadata"),
             ("messages", "error"),
             ("queue", "last_error"),
             ("search_presets", "criteria"),  # saved-search preset (ADR 0136) — id-keyed, nullable
         ):
-            while True:
-                rows = await self._fetchall(
-                    f"SELECT TOP (500) id, {ncol} AS v FROM {table}"
-                    f" WHERE {ncol} NOT LIKE ? AND {ncol} <> '' AND {ncol} IS NOT NULL",
-                    (like,),
-                )
-                if not rows:
-                    break
-                async with self._acquire() as conn, self._cursor(conn) as cur:
-                    try:
-                        for r in rows:
-                            await cur.execute(
-                                f"UPDATE {table} SET {ncol}=? WHERE id=?",
-                                (
-                                    self._cipher.encrypt(
-                                        r["v"], aad=cell_aad(table, ncol, r["id"])
-                                    ),
-                                    r["id"],
-                                ),
-                            )
-                        await self._commit(conn)
-                    except Exception:
-                        await conn.rollback()
-                        raise
-                await self._charge_bound_batch()
-                total += len(rows)
-        total += await self._encrypt_existing_identity_composite(
-            "message_events", ("message_id", "ts", "event"), "detail", like
+            total += await self._seal_surface(table, column, like, aad_cols=("id",))
+        # message_events.detail / connection_event.reason / alert_instance.reason have IDENTITY ids
+        # (unknown at INSERT; alert_instance also upserts), so they bind cell_aad to insert-time-known
+        # natural columns while the UPDATE keys on `id` (ASVS 11.3.3, ADR 0019).
+        total += await self._seal_surface(
+            "message_events",
+            "detail",
+            like,
+            aad_cols=("message_id", "ts", "event"),
+            key_cols=("id",),
         )
-        total += await self._encrypt_existing_identity_composite(
-            "connection_event", ("connection", "ts", "kind"), "reason", like
+        total += await self._seal_surface(
+            "connection_event",
+            "reason",
+            like,
+            aad_cols=("connection", "ts", "kind"),
+            key_cols=("id",),
         )
-        total += await self._encrypt_existing_identity_composite(
-            "alert_instance", ("event_type", "connection"), "reason", like
+        total += await self._seal_surface(
+            "alert_instance",
+            "reason",
+            like,
+            aad_cols=("event_type", "connection"),
+            key_cols=("id",),
         )
-        # `response` body + detail + resp_headers (#154, composite PK) — a separate pass (can't ride the
-        # id-keyed loop above). PG/SQLite migrate these too; without it a no-key -> key -> restart leaves
-        # captured reply PHI as plaintext at rest. All are nullable, so guard `<> '' AND IS NOT NULL`.
+        # `response` body + detail + resp_headers (#154, composite PK). PG/SQLite migrate these too;
+        # without it a no-key -> key -> restart leaves captured reply PHI as plaintext at rest.
         for rcol in ("body", "detail", "resp_headers"):
-            while True:
-                rows = await self._fetchall(
-                    f"SELECT TOP (500) message_id, destination_name, response_seq, {rcol} AS v"
-                    f" FROM response WHERE {rcol} NOT LIKE ? AND {rcol} <> '' AND {rcol} IS NOT NULL",
-                    (like,),
-                )
-                if not rows:
-                    break
-                async with self._acquire() as conn, self._cursor(conn) as cur:
-                    try:
-                        for r in rows:
-                            await cur.execute(
-                                f"UPDATE response SET {rcol}=?"
-                                " WHERE message_id=? AND destination_name=? AND response_seq=?",
-                                (
-                                    self._cipher.encrypt(
-                                        r["v"],
-                                        aad=cell_aad(
-                                            "response",
-                                            rcol,
-                                            r["message_id"],
-                                            r["destination_name"],
-                                            r["response_seq"],
-                                        ),
-                                    ),
-                                    r["message_id"],
-                                    r["destination_name"],
-                                    r["response_seq"],
-                                ),
-                            )
-                        await self._commit(conn)
-                    except Exception:
-                        await conn.rollback()
-                        raise
-                await self._charge_bound_batch()
-                total += len(rows)
-        # `reference` snapshot values (#235, composite PK (name, version, [key])) — a separate pass
-        # (can't ride the id-keyed loop). NOT "born encrypted": under a no-key deployment
-        # IdentityCipher writes plaintext JSON, and the no-key -> key transition is exactly what this
-        # method migrates — PG/SQLite migrate these too; values may carry PHI for patient-keyed sets.
-        # value is NOT NULL and never legitimately '' (json.dumps is non-empty), so the raw/payload
-        # non-null guard shape applies.
-        while True:
-            rows = await self._fetchall(
-                "SELECT TOP (500) name, version, [key], value FROM reference"
-                " WHERE value NOT LIKE ? AND value <> ''",
-                (like,),
+            total += await self._seal_surface(
+                "response", rcol, like, aad_cols=("message_id", "destination_name", "response_seq")
             )
-            if not rows:
-                break
-            async with self._acquire() as conn, self._cursor(conn) as cur:
-                try:
-                    for r in rows:
-                        await cur.execute(
-                            "UPDATE reference SET value=? WHERE name=? AND version=? AND [key]=?",
-                            (
-                                self._cipher.encrypt(
-                                    r["value"],
-                                    aad=cell_aad(
-                                        "reference", "value", r["name"], r["version"], r["key"]
-                                    ),
-                                ),
-                                r["name"],
-                                r["version"],
-                                r["key"],
-                            ),
-                        )
-                    await self._commit(conn)
-                except Exception:
-                    await conn.rollback()
-                    raise
-            await self._charge_bound_batch()
-            total += len(rows)
-        # `state` transform-state values (ADR 0005, composite PK (namespace, key)) — a separate pass
-        # (can't ride the id-keyed loop). SQLite (`store.py`'s dedicated state pass) and Postgres
-        # (`_encrypt_existing_composite("state", ...)`) both migrate `state.value`; without this pass a
-        # no-key -> key transition on SQL Server alone left legacy state plaintext at rest (#241 F1). Not
-        # "born encrypted": under a no-key deployment IdentityCipher writes plaintext JSON, and the
-        # no-key -> key transition is exactly what this method migrates. value is NOT NULL and never
-        # legitimately '' (json.dumps is non-empty), so the same `<> ''` guard the reference pass uses
-        # keeps a purged '' from becoming ciphertext-of-empty.
-        while True:
-            rows = await self._fetchall(
-                "SELECT TOP (500) namespace, [key], value FROM state"
-                " WHERE value NOT LIKE ? AND value <> ''",
-                (like,),
-            )
-            if not rows:
-                break
-            async with self._acquire() as conn, self._cursor(conn) as cur:
-                try:
-                    for r in rows:
-                        await cur.execute(
-                            "UPDATE state SET value=? WHERE namespace=? AND [key]=?",
-                            (
-                                self._cipher.encrypt(
-                                    r["value"],
-                                    aad=cell_aad("state", "value", r["namespace"], r["key"]),
-                                ),
-                                r["namespace"],
-                                r["key"],
-                            ),
-                        )
-                    await self._commit(conn)
-                except Exception:
-                    await conn.rollback()
-                    raise
-            await self._charge_bound_batch()
-            total += len(rows)
+        # `reference` snapshot values (#235, composite PK (name, version, [key])). NOT "born
+        # encrypted": under a no-key deployment IdentityCipher writes plaintext JSON, and the no-key ->
+        # key transition is exactly what this method migrates.
+        total += await self._seal_surface(
+            "reference", "value", like, aad_cols=("name", "version", "key")
+        )
+        # `state` transform-state values (ADR 0005, composite PK (namespace, key)). SQLite and Postgres
+        # both migrate `state.value`; without this pass a no-key -> key transition on SQL Server alone
+        # left legacy state plaintext at rest (#241 F1).
+        total += await self._seal_surface("state", "value", like, aad_cols=("namespace", "key"))
         # `attachment_chunk` detached-document slices (#149, ADR 0105, composite PK
-        # (attachment_id, seq)) — a separate pass (can't ride the id-keyed loop). Its ROTATION pass
-        # already existed here; this ON-OPEN pass did not, so a no-key -> key transition left legacy
-        # plaintext chunks unsealed on SQL Server and Postgres while SQLite sealed them
-        # (BACKLOG #1169). `ciphertext` is NOT NULL, so the `<> ''` guard alone keeps a blank from
-        # becoming ciphertext-of-empty. A SMALL batch, unlike every sibling above: each row is one
-        # DETACH_CHUNK_BYTES (1 MiB) slice, so the usual 500 would hold ~650 MiB resident in one
-        # transaction while the store is still opening. It is still a whole SLICE at a time, not a
-        # whole document — a large attachment spans many rows and is never reassembled here.
-        while True:
-            rows = await self._fetchall(
-                f"SELECT TOP ({_ATTACHMENT_CHUNK_BATCH}) attachment_id, seq, ciphertext"
-                " FROM attachment_chunk WHERE ciphertext NOT LIKE ? AND ciphertext <> ''",
-                (like,),
-            )
-            if not rows:
-                break
-            async with self._acquire() as conn, self._cursor(conn) as cur:
-                try:
-                    for r in rows:
-                        await cur.execute(
-                            "UPDATE attachment_chunk SET ciphertext=?"
-                            " WHERE attachment_id=? AND seq=?",
-                            (
-                                self._cipher.encrypt(
-                                    r["ciphertext"],
-                                    aad=cell_aad(
-                                        "attachment_chunk",
-                                        "ciphertext",
-                                        r["attachment_id"],
-                                        r["seq"],
-                                    ),
-                                ),
-                                r["attachment_id"],
-                                r["seq"],
-                            ),
-                        )
-                    await self._commit(conn)
-                except Exception:
-                    await conn.rollback()
-                    raise
-            await self._charge_bound_batch()
-            total += len(rows)
+        # (attachment_id, seq)). Its ROTATION pass already existed here; this ON-OPEN pass did not, so
+        # a no-key -> key transition left legacy plaintext chunks unsealed on SQL Server and Postgres
+        # while SQLite sealed them (BACKLOG #1169). A SMALL batch, unlike every sibling above: each row
+        # is one DETACH_CHUNK_BYTES (1 MiB) slice, so the usual 500 would hold ~650 MiB resident at
+        # once while the store is still opening.
+        total += await self._seal_surface(
+            "attachment_chunk",
+            "ciphertext",
+            like,
+            aad_cols=("attachment_id", "seq"),
+            batch=_ATTACHMENT_CHUNK_BATCH,
+        )
         if total:
             log.info(
                 "encrypted %d existing message/outbox/response/reference/state/attachment row(s) "
@@ -3008,38 +2868,93 @@ class SqlServerStore:
                 total,
             )
 
-    async def _encrypt_existing_identity_composite(
-        self, table: str, aad_cols: tuple[str, ...], value_col: str, like: str
+    async def _seal_surface(
+        self,
+        table: str,
+        column: str,
+        like: str,
+        *,
+        aad_cols: tuple[str, ...],
+        key_cols: tuple[str, ...] | None = None,
+        batch: int = 500,
     ) -> int:
-        """One-time encrypt of a legacy plaintext IDENTITY-id table's ``value_col`` (message_events.detail
-        / connection_event.reason / alert_instance.reason). The cell_aad comes from ``aad_cols`` (insert-
-        time-known natural columns) while the UPDATE keys on ``id`` — so a natural-column collision can
-        never re-write the wrong row (ASVS 11.3.3). Nullable, so the ``<> '' AND IS NOT NULL`` guard."""
-        migrated = 0
-        pk_select = ", ".join(f"[{c}]" for c in aad_cols)
-        while True:
-            rows = await self._fetchall(
-                f"SELECT TOP (500) id, {pk_select}, {value_col} AS v FROM {table}"
-                f" WHERE {value_col} NOT LIKE ? AND {value_col} <> '' AND {value_col} IS NOT NULL",
-                (like,),
+        """Seal one (table, column) surface's legacy plaintext in ONE transaction; return the count.
+
+        The SQLite twin (``MessageStore._seal_surface``) documents the three steps: derive the
+        surface's state from the data, reserve the whole burst on the AES-GCM bound first (ASVS
+        11.3.4), then seal every batch and commit once. ``aad_cols`` rebuild the cell AAD;
+        ``key_cols`` (default: ``aad_cols``) are what the UPDATE targets. Every identifier is a code
+        constant and is bracket-quoted (``key`` is a T-SQL reserved word); only the marker pattern is
+        a parameter.
+
+        The state read and the reservation run on their own pooled connections BEFORE the seal's
+        transaction opens, because a reservation must commit independently of the seal it covers."""
+        keys = key_cols if key_cols is not None else aad_cols
+        # DATALENGTH, not `<> ''`: T-SQL pads trailing spaces before comparing, so `N' ' <> N''` is
+        # FALSE and a whitespace-only value would be skipped here and then refused forever at read,
+        # where the cipher treats only a true '' as blank.
+        pending_where = f"[{column}] NOT LIKE ? AND DATALENGTH([{column}]) > 0"
+        row = await self._fetchone(
+            f"SELECT COUNT_BIG(*) AS n FROM {table} WHERE {pending_where}", (like,)
+        )
+        pending = int(row["n"]) if row is not None else 0
+        if not pending:
+            return 0
+        if not allows_unmarked(self._cipher):
+            marked = await self._fetchone(
+                f"SELECT TOP (1) 1 AS x FROM {table} WHERE [{column}] LIKE ?", (like,)
             )
-            if not rows:
-                break
-            async with self._acquire() as conn, self._cursor(conn) as cur:
-                try:
+            if marked is not None:
+                log.warning(
+                    "cipher column %s.%s holds %d unmarked value(s) beside sealed ones; they were NOT "
+                    "sealed and every read of them is refused (a stripped marker or a planted row). "
+                    "Set [store].allow_unmarked_ciphertext only if they are known to be legitimate",
+                    table,
+                    column,
+                    pending,
+                )
+                # Alert now, not only on a read: a planted row nobody reads would otherwise stay
+                # invisible except in the log. Names the cell only (BACKLOG #1169).
+                report_unmarked(self._cipher, table, column)
+                return 0
+        await reserve_invocations_ahead(self._cipher, self.add_cipher_invocations, pending)
+        select_cols = ", ".join(f"[{c}]" for c in dict.fromkeys((*keys, *aad_cols)))
+        where_keys = " AND ".join(f"[{c}]=?" for c in keys)
+        sealed = 0
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                while True:
+                    # autocommit is off, so every statement below shares one transaction, and this
+                    # connection sees its own uncommitted UPDATEs: a sealed row stops matching.
+                    await cur.execute(
+                        f"SELECT TOP ({int(batch)}) {select_cols}, [{column}] AS v FROM {table}"
+                        f" WHERE {pending_where}",
+                        (like,),
+                    )
+                    names = [c[0] for c in cur.description]
+                    rows = [dict(zip(names, r)) for r in await cur.fetchall()]  # noqa: B905
+                    if not rows:
+                        break
                     for r in rows:
-                        aad = cell_aad(table, value_col, *[r[c] for c in aad_cols])
                         await cur.execute(
-                            f"UPDATE {table} SET {value_col}=? WHERE id=?",
-                            (self._cipher.encrypt(r["v"], aad=aad), r["id"]),
+                            f"UPDATE {table} SET [{column}]=? WHERE {where_keys}",
+                            (
+                                self._cipher.encrypt(
+                                    r["v"], aad=cell_aad(table, column, *(r[c] for c in aad_cols))
+                                ),
+                                *(r[c] for c in keys),
+                            ),
                         )
-                    await self._commit(conn)
-                except Exception:
-                    await conn.rollback()
-                    raise
-            await self._charge_bound_batch()
-            migrated += len(rows)
-        return migrated
+                    sealed += len(rows)
+                await self._commit(conn)
+            except BaseException:
+                # Roll the WHOLE surface back: a half-sealed surface reads as sealed on the next open,
+                # which would refuse the legitimate legacy rows this pass had not reached yet.
+                await conn.rollback()
+                raise
+        # Top the reserve back up for whatever follows; the burst itself was reserved above.
+        await self._charge_bound_batch()
+        return sealed
 
     @staticmethod
     async def _ensure_database_options(
@@ -6629,7 +6544,18 @@ class SqlServerStore:
             cutoff = cutoff_for(row["channel_id"], older_than, connection_cutoffs)
             if row["received_at"] >= cutoff:
                 continue
-            raw = self._cipher.decrypt(row["raw"], aad=cell_aad("messages", "raw", row["id"]))
+            try:
+                raw = self._cipher.decrypt(row["raw"], aad=cell_aad("messages", "raw", row["id"]))
+            except CipherError as exc:
+                # Contain ONE row, as the claim sites do: a refused (unmarked) or undecryptable body
+                # must not abort the whole retention pass. The row is left exactly as found; the
+                # message names only the cell and the message id, never the body (BACKLOG #1169).
+                log.warning(
+                    "document strip skipped message %s: its body could not be read: %s",
+                    row["id"],
+                    exc,
+                )
+                continue
             new_raw, n_docs, n_bytes = _strip_documents(
                 raw,
                 pruned_at=now,
@@ -10355,13 +10281,43 @@ class SqlServerStore:
                 raise
 
     async def set_user_channel_scope(
-        self, user_id: str, scope_json: str | None, *, now: float | None = None
+        self,
+        user_id: str,
+        scope_json: str | None,
+        *,
+        source: ChannelScopeSource,
+        now: float | None = None,
     ) -> None:
         now = time.time() if now is None else now
         await self._execute(
-            "UPDATE users SET channel_scope=?, updated_at=? WHERE id=?",
-            (scope_json, now, user_id),
+            "UPDATE users SET channel_scope=?, channel_scope_source=?, updated_at=? WHERE id=?",
+            (scope_json, source, now, user_id),
         )
+
+    async def withdraw_ad_channel_scope(
+        self, user_id: str, expected_scope: str, *, now: float | None = None
+    ) -> bool:
+        """Withdraw a directory-derived scope to NULL (BACKLOG #1927); see ``AuthStore``.
+
+        Its own statement, not the shared ``WITHDRAW_AD_SCOPE_SQL``, for two reasons. The column
+        has no COLLATE, so a plain ``=`` would compare under the database default, usually
+        case-insensitive: a newer scope differing only in case would match and be withdrawn,
+        where SQLite and Postgres refuse it. And the bound value is CAST to NVARCHAR(MAX), so a
+        scope over 4000 characters compares as NVARCHAR(MAX) whatever long type the driver binds
+        it as."""
+        now = time.time() if now is None else now
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute(
+                    _WITHDRAW_AD_SCOPE_SQL_MSSQL,
+                    (SCOPE_SOURCE_AD, now, user_id, expected_scope, SCOPE_SOURCE_MANUAL),
+                )
+                count = cur.rowcount
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        return int(count) > 0
 
     async def set_user_username(
         self, user_id: str, username: str, *, now: float | None = None

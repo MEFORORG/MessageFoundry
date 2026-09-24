@@ -264,12 +264,14 @@ jobs:
             tests/test_crit2_inline_doc_drift.py tests/test_doc_ref_handle.py tests/test_docs_db_grants.py
             tests/test_docs_runbooks.py tests/test_docs_security_pathways.py tests/test_security_doc_drift.py
             tests/test_security_doc_rate_limits.py tests/test_threat_model_doc_drift.py
+            tests/test_security_doc_context_words.py
             tests/test_sds_rule_ids_are_stable.py
             tests/test_link_resolution.py tests/test_dast_claims.py
             tests/test_claude_section_citations.py tests/test_write_share_denominator.py
             tests/test_cutover_slug_rot.py
             tests/test_docs_cite_no_refused_config_keys.py
-            tests/test_operator_docs_no_warning_sign.py"
+            tests/test_operator_docs_no_warning_sign.py
+            tests/test_docs_upstream_hop_ack.py"
           # FIVE MEMBERS LEFT THIS LIST WITH THE LEDGER (BACKLOG #1250), and this note exists because
           # the ruling above says removing a guard is a different act from adding one. They were
           # test_backlog_status_check, test_backlog_citation_check, test_dangling_citation_check,

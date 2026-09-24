@@ -78,7 +78,9 @@ PHI at rest is protected in **two layers**, and the engine layer is made **fail-
 
 - **API / WSS:** in-process TLS (`MEFOR_API_TLS_CERT_FILE` / `MEFOR_API_TLS_KEY_FILE`), or an upstream
   TLS terminator (`tls_terminated_upstream` + `trusted_proxies`). A non-loopback API bind without TLS is
-  **refused at startup**.
+  **refused at startup**. Behind a terminator with no `tls_cert_file`, the proxy-to-engine hop is
+  **plaintext** and not encrypted by the engine. Your site must keep it private, and `serve` requires
+  `[api].plaintext_upstream_hop_acknowledged` to say so (see `docs/CONFIGURATION.md`).
 - **MLLP data plane:** **MLLP-over-TLS** (`tls=True` per connection). A non-loopback MLLP listener without
   TLS is **refused at wiring time** (`check_mllp_tls_exposure`). For partners that cross a WAN, prefer the
   **edge-relay** topology ([`CLOUD-DEPLOYMENT.md`](CLOUD-DEPLOYMENT.md) §5) so MLLP stays on the LAN and
