@@ -20,18 +20,19 @@ All notable changes to MessageFoundry are documented here. The format follows
   off-box identity provider has no `[auth].oidc_tls_crl_file` would refuse to start on first
   deployment.
 - **BREAKING — an AD login that matches no scope-mapped group now withdraws a channel scope the
-  directory granted.** In 0.4.0 that login left the stored scope as it was, so a user removed from
-  their last scope-mapped group kept those channels for as long as the account existed. Every scope
-  write now records its writer in a new column, `users.channel_scope_source` (`'ad'` or `'manual'`),
-  on all three store backends. The Postgres migration revision moves from 3 to 4. On a no-match
+  directory granted.** **A user's channel scope can now shrink at login.** In 0.4.0 that login left
+  the stored scope as it was, so a user removed from their last scope-mapped group kept those
+  channels for as long as the account existed. Every scope write now records its writer in a new
+  column, `users.channel_scope_source` (`'ad'` or `'manual'`), on all three store backends. The Postgres migration revision moves from 3 to 4. On a no-match
   login the engine keeps a scope an administrator set and withdraws any other scope to NULL, which
   denies. The withdrawal is a compare-and-set, so a scope written during the login survives. It
   revokes the user's other sessions and writes an `auth.ad_scope_resynced` audit row. A matching
   group still overwrites any scope, an administrator's included. A scope with no recorded writer is
   withdrawn, which fails closed. **Migration:** the column is added with no backfill, so every scope
-  from 0.4.0 has no recorded writer. An administrator's scope on an AD account would therefore be
-  withdrawn at that user's next unmatched login. After you upgrade, set each such scope again with
-  `PUT /users/{id}/channel-scope`, which records it as the administrator's.
+  set before the upgrade has a NULL source and counts as the directory's. An administrator's scope
+  on an AD account would therefore be withdrawn at that user's next unmatched login. After you
+  upgrade, set each such scope again with `PUT /users/{id}/channel-scope`, which records it as the
+  administrator's.
   ([BACKLOG #1927](docs/BACKLOG.md))
 ### Changed
 - **`messagefoundry dryrun` and `messagefoundry check` now refuse an oversized fixture file.** The
