@@ -138,9 +138,12 @@ for, not how it is protected before it gets there.
 > rather than a clean result. **Randomness is the whole claim that arm supports.** A third arm
 > (BACKLOG #1164) reads the same roots for every operation class. It finds the TLS floor
 > `ide/src/engineClient.ts` applies to every https request, and the console's WebAuthn ceremony in
-> `static/app.js`. That arm runs as `--non-python-operations` in the `ide` CI job. **It is not
-> merge-gating**: that job is not a required context, so the required green still says nothing about
-> non-Python crypto beyond randomness.
+> `static/app.js`. A fourth arm reads the `.ps1` files under `scripts/`, including
+> `scripts/service/import-db-ca.ps1`, which installs a trust anchor into the machine root store, and
+> `scripts/service/install-service.ps1`, which downloads the service wrapper over a TLS 1.2 floor and
+> checks a pinned SHA-256. Both arms run as `--non-python-operations` in the `ide` CI job. **They are
+> not merge-gating**: that job is not a required context, so the required green still says nothing
+> about non-Python crypto beyond randomness.
 
 | Asset | Algorithm / detail | Source / storage | Lifecycle |
 |---|---|---|---|

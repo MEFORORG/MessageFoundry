@@ -745,3 +745,102 @@ def test_the_non_python_arm_refuses_an_empty_walk_and_reports_stale_rows(
     violations, _scanned, _actual = gate.check_non_python_operations(tmp_path)
     assert any("messagefoundry_webconsole/" in v and "ZERO" in v for v in violations), violations
     assert any(v.startswith("ide/src/gone.ts: inventory lists") for v in violations), violations
+
+
+# --- BACKLOG #1164: the PowerShell operation arm (same non-gating mode, fixtures only) ------------
+
+
+def test_powershell_patterns_and_inventory_map_into_the_taxonomy() -> None:
+    gate = _gate()
+    classes = set(gate.crypto_operations.OPERATION_CLASSES)
+    assert {cls for _p, cls in gate.POWERSHELL_OPERATION_PATTERNS.values()} <= classes
+    for tokens in gate.POWERSHELL_OPERATION_INVENTORY.values():
+        for token in tokens:
+            cls, _, name = token.partition(":")
+            assert cls in classes and name in gate.POWERSHELL_OPERATION_PATTERNS, token
+
+
+@pytest.mark.parametrize(
+    ("line", "token"),
+    [
+        ("$sha = [System.Security.Cryptography.SHA256]::Create()", "hash:SHA256"),
+        ("$h = [System.Security.Cryptography.md5]::HashData($b)", "hash:MD5"),
+        ("$hash = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash", "hash:Get-FileHash"),
+        (
+            "$r = [Security.Cryptography.RandomNumberGenerator]::GetBytes(4)",
+            "csprng:RandomNumberGenerator",
+        ),
+        (
+            "$c = [Security.Cryptography.X509Certificates.X509Certificate2]::new($p)",
+            "key_cert:X509",
+        ),
+        ("Import-Certificate -FilePath $p -CertStoreLocation $s", "key_cert:Import-Certificate"),
+        (
+            "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12",
+            "tls_context:SecurityProtocolType",
+        ),
+        (
+            "Invoke-WebRequest $u -SkipCertificateCheck",
+            "tls_context:ServerCertificateValidationCallback",
+        ),
+        ("$enc = ConvertFrom-SecureString $s", "cipher:ConvertFrom-SecureString"),
+    ],
+)
+def test_each_powershell_pattern_fires(line: str, token: str) -> None:
+    assert token in _gate().powershell_operation_tokens_in(line + "\n")
+
+
+def test_powershell_help_blocks_and_comments_are_not_operations() -> None:
+    # import-db-ca.ps1 names Import-Certificate inside its <# .EXAMPLE #> help. That is prose.
+    gate = _gate()
+    text = (
+        "<#\n.EXAMPLE\n    Import-Certificate -FilePath C:\\x.crt\n#>\n"
+        "# Get-FileHash would be wrong here\n"
+        "<# one-line block: [Net.SecurityProtocolType]::Tls12 #>\n"
+        "$x = 1\n"
+    )
+    assert gate.powershell_operation_tokens_in(text) == set()
+    assert gate.powershell_operation_tokens_in(text + "Get-FileHash -Path $p\n") == {
+        "hash:Get-FileHash"
+    }
+
+
+def test_get_random_is_not_a_crypto_operation() -> None:
+    # Deliberately unmatched: Get-Random is not a CSPRNG, so it is not an instance of cryptography.
+    assert _gate().powershell_operation_tokens_in("$r = Get-Random -Maximum 36\n") == set()
+
+
+def test_a_planted_powershell_operation_reds_and_an_unbacked_row_is_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate = _gate()
+    monkeypatch.setattr(
+        gate,
+        "POWERSHELL_OPERATION_INVENTORY",
+        {
+            "scripts/a.ps1": frozenset({"hash:SHA256"}),
+            "scripts/gone.ps1": frozenset({"hash:Get-FileHash"}),
+        },
+    )
+    _write_repo(
+        tmp_path,
+        {
+            "scripts/a.ps1": (
+                "$s = [System.Security.Cryptography.SHA256]::Create()\n"
+                "$m = [System.Security.Cryptography.MD5]::Create()\n"
+            ),
+            "scripts/b.ps1": "Write-Host hi\n",
+        },
+    )
+    violations, scanned, _actual = gate.check_powershell_operations(tmp_path)
+    assert scanned == 2
+    assert violations == [
+        "scripts/a.ps1: undocumented crypto operation use ['hash:MD5'] (documented: ['hash:SHA256'])",
+        "scripts/gone.ps1: inventory lists ['hash:Get-FileHash'] but the file no longer performs it",
+    ]
+
+
+def test_the_powershell_arm_refuses_an_empty_walk(tmp_path: Path) -> None:
+    violations, scanned, _actual = _gate().check_powershell_operations(tmp_path)
+    assert scanned == 0
+    assert any("ZERO .ps1" in v for v in violations), violations

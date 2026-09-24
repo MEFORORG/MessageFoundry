@@ -1796,17 +1796,18 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # BACKLOG #1164: the TypeScript/JavaScript crypto OPERATION arm of the ASVS 11.1.3 gate. It sits
-      # HERE on purpose: this job is not a required context and ci-gate does not `needs: ide`, so a red
-      # is visible without blocking a merge. Making it count is a branch-protection change, and that is
-      # the owner's call, not this file's. Stdlib-only Python; one leg is enough, the scan is not
-      # platform-dependent.
+      # BACKLOG #1164: the TypeScript/JavaScript and PowerShell crypto OPERATION arms of the ASVS 11.1.3
+      # gate. They sit HERE on purpose: this job is not a required context and ci-gate does not
+      # `needs: ide`, so a red is visible without blocking a merge. (The `tooling` job would have run
+      # them on scripts/** changes, but ci-gate rolls `tooling` up, which would make them gating.)
+      # Making them count is a branch-protection change, and that is the owner's call, not this
+      # file's. Stdlib-only Python; one leg is enough, the scan is not platform-dependent.
       - name: Set up Python (crypto operation arm)
         if: runner.os == 'Linux'
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
-      - name: Crypto operation inventory (TypeScript/JavaScript arm, not merge-gating)
+      - name: Crypto operation inventory (TypeScript/JavaScript + PowerShell arms, not merge-gating)
         if: runner.os == 'Linux'
         working-directory: .
         run: python scripts/security/crypto_inventory_check.py --non-python-operations

@@ -94,10 +94,12 @@ properties are the point of it, and each is pinned by a test in
 This is a *randomness* inventory, and that is the whole claim it supports. The other first-party
 crypto in the non-Python roots (the TLS floor ``ide/src/engineClient.ts`` applies to every https
 request, and the console's WebAuthn ceremony in ``static/app.js``) is found by a THIRD arm,
-:func:`check_non_python_operations` (BACKLOG #1164). That arm runs only under
-``--non-python-operations``, from the ``ide`` CI job, which is not a required context: it reports,
-and it does not block a merge. So the required green still says nothing about non-Python crypto
-beyond randomness.
+:func:`check_non_python_operations` (BACKLOG #1164). A FOURTH arm,
+:func:`check_powershell_operations`, reads the ``.ps1`` files under ``scripts/``, including the
+operator deployment path that installs a trust anchor and verifies a pinned service binary. Both
+run only under ``--non-python-operations``, from the ``ide`` CI job, which is not a required
+context: they report, and they do not block a merge. So the required green still says nothing
+about non-Python crypto beyond randomness.
 
 Stdlib only (no install), like ``scripts/security/scan_forbidden.py`` — runnable as a CI step and a
 pytest. Usage::
@@ -1661,22 +1663,188 @@ def check_non_python_operations(repo: Path) -> tuple[list[str], int, dict[str, f
     return violations + undocumented + stale, scanned, actual
 
 
-def _main_non_python_operations() -> int:
-    """``--non-python-operations``: the TypeScript/JavaScript operation arm on its own."""
-    repo = Path(__file__).resolve().parents[2]
-    violations, scanned, actual = check_non_python_operations(repo)
+# --------------------------------------------------------------------------------------------
+# The POWERSHELL operation arm (BACKLOG #1164). Same mode, same non-gating CI step.
+# --------------------------------------------------------------------------------------------
+# ``scripts/`` is a Python walk root, and it also holds the repository's PowerShell: the coordination
+# tooling and, more to the point, the operator deployment path in ``scripts/service/``, which
+# installs a trust anchor into the machine root store and verifies a downloaded service binary
+# against a pinned SHA-256 over a TLS 1.2 floor. The Python walk rglobs ``*.py`` and could never see
+# any of it. This arm reads ``*.ps1`` by pattern. PowerShell is case-insensitive, so the patterns are.
+#
+# The walk is ``scripts/`` only, because that is where every tracked ``.ps1`` lives today. That is a
+# fact measured at the time of writing and NOT enforced: a ``.ps1`` added elsewhere is unread.
+#
+# NOT MATCHED ON PURPOSE: ``Get-Random``. It is not a cryptographic source, so it is not a crypto
+# operation, and the two sites that use it state why a weaker source is enough there. A reviewer
+# looking for where the tree CHOSE not to use a CSPRNG has to grep for it; this arm will not say.
+POWERSHELL_WALK_ROOTS = ("scripts",)
+
+_PS_HASHES = ("SHA1", "SHA256", "SHA384", "SHA512", "MD5")
+POWERSHELL_OPERATION_PATTERNS: dict[str, tuple[re.Pattern[str], str]] = {
+    **{
+        algo: (re.compile(rf"\b{algo}\]::(Create|HashData|HashDataAsync|new)\b", re.I), "hash")
+        for algo in _PS_HASHES
+    },
+    "Get-FileHash": (re.compile(r"\bGet-FileHash\b", re.I), "hash"),
+    "HMAC": (
+        re.compile(
+            r"\bHMAC(SHA1|SHA256|SHA384|SHA512|MD5)\]::(new|HashData)\b|New-Object\s+\S*HMAC", re.I
+        ),
+        "mac",
+    ),
+    "RandomNumberGenerator": (
+        re.compile(r"\b(RandomNumberGenerator|RNGCryptoServiceProvider)\]::", re.I),
+        "csprng",
+    ),
+    "Aes": (re.compile(r"\b(Aes|AesGcm|AesCcm)\]::(Create|new)\b", re.I), "cipher"),
+    "ProtectedData": (re.compile(r"\bProtectedData\]::(Protect|Unprotect)\b", re.I), "cipher"),
+    "ConvertFrom-SecureString": (re.compile(r"\bConvertFrom-SecureString\b", re.I), "cipher"),
+    "SignData": (
+        re.compile(
+            r"\b(RSA|ECDsa|DSA)\]::Create\b|\.(SignData|VerifyData|SignHash|VerifyHash)\(", re.I
+        ),
+        "sign_verify",
+    ),
+    "Rfc2898DeriveBytes": (re.compile(r"\bRfc2898DeriveBytes\b", re.I), "kdf"),
+    "X509": (
+        re.compile(r"\bX509Certificate2\]::new\b|New-Object\s+\S*X509Certificate2\b", re.I),
+        "key_cert",
+    ),
+    "Import-Certificate": (
+        re.compile(r"\b(Import-Certificate|Import-PfxCertificate)\b", re.I),
+        "key_cert",
+    ),
+    "New-SelfSignedCertificate": (
+        re.compile(r"\b(New-SelfSignedCertificate|Export-PfxCertificate)\b", re.I),
+        "key_cert",
+    ),
+    "SecurityProtocolType": (re.compile(r"\bSecurityProtocolType\]::", re.I), "tls_context"),
+    "ServerCertificateValidationCallback": (
+        re.compile(r"\bServerCertificateValidationCallback\b|-SkipCertificateCheck\b", re.I),
+        "tls_context",
+    ),
+}
+
+#: The maintained PowerShell operation inventory. Bidirectional, like the others.
+POWERSHELL_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
+    # --- The operator deployment path (docs/SERVICE.md). These two are the reason this arm exists. ---
+    # Parses the operator's CA certificate (so a malformed file fails before anything is touched and
+    # the operator sees what they are about to trust), then INSTALLS it into the machine root store.
+    # A trust-anchor decision for the whole host, not only for the engine.
+    "scripts/service/import-db-ca.ps1": frozenset({"key_cert:X509", "key_cert:Import-Certificate"}),
+    # Downloads the NSSM service wrapper over a TLS 1.2 floor and checks it against a pinned SHA-256
+    # before extracting it: supply-chain verification of a binary that then runs as a service.
+    "scripts/service/install-service.ps1": frozenset(
+        {"tls_context:SecurityProtocolType", "hash:Get-FileHash"}
+    ),
+    # --- Coordination tooling. Identifiers and change detection; no secret is hashed. ---
+    # A per-attempt claim token from the CSPRNG, because it must be unmintable by a concurrent
+    # claimer (the file says why Get-Random is not enough), and a SHA-256 of the host name.
+    "scripts/coord/mail-claim.ps1": frozenset({"hash:SHA256", "csprng:RandomNumberGenerator"}),
+    # A SHA-256 of a CRLF-normalized hook file, to tell an installed copy from its source.
+    "scripts/coord/install-git-hooks.ps1": frozenset({"hash:SHA256"}),
+    # The same content-hash comparison for the installed worktree gate.
+    "scripts/worktree/install-gate.ps1": frozenset({"hash:SHA256"}),
+    # A stable identifier for a lane, from its sorted member keys.
+    "scripts/coord/lane.ps1": frozenset({"hash:SHA256"}),
+    # A mailbox key from a normalized worktree path.
+    "scripts/coord/mail-key.ps1": frozenset({"hash:SHA256"}),
+    # A SHA-256 of a handoff file, recorded in the seat record so a reader knows which version it saw.
+    "scripts/coord/seat.ps1": frozenset({"hash:Get-FileHash"}),
+    # Collision-free file names for a session id and for a working-directory key.
+    "scripts/hooks/announce-session.ps1": frozenset({"hash:SHA256"}),
+    # A fallback name for a branch whose name has no safe characters left.
+    "scripts/hooks/worktree_gate.ps1": frozenset({"hash:SHA256"}),
+}
+
+
+def powershell_operation_tokens_in(text: str) -> set[str]:
+    """The ``class:token`` operations a PowerShell source performs.
+
+    Skips ``#`` comment lines and ``<# ... #>`` comment blocks, which is where a script's help text
+    lives and where ``import-db-ca.ps1`` names ``Import-Certificate`` in an example. A code line with
+    a trailing comment is scanned in full, the same conservative direction as the other arms."""
+    found: set[str] = set()
+    in_block = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if in_block:
+            if "#>" in stripped:
+                in_block = False
+            continue
+        if stripped.startswith("<#"):
+            in_block = "#>" not in stripped[2:]
+            continue
+        if stripped.startswith("#"):
+            continue
+        for name, (pattern, op_class) in POWERSHELL_OPERATION_PATTERNS.items():
+            if pattern.search(line):
+                found.add(f"{op_class}:{name}")
+    return found
+
+
+def check_powershell_operations(repo: Path) -> tuple[list[str], int, dict[str, frozenset[str]]]:
+    """Run the PowerShell operation arm. Returns ``(violations, files scanned, operations found)``."""
+    violations: list[str] = []
+    actual: dict[str, frozenset[str]] = {}
+    scanned = 0
+    for name in POWERSHELL_WALK_ROOTS:
+        root = repo / name
+        files = sorted(root.rglob("*.ps1")) if root.is_dir() else []
+        if not files:
+            violations.append(
+                f"PowerShell arm: the walk over {name}/ reached ZERO .ps1 files, so a clean result "
+                "would be VACUOUS. Fix the walk; do not read this as a clean tree"
+            )
+            continue
+        scanned += len(files)
+        for path in files:
+            tokens = powershell_operation_tokens_in(path.read_text(encoding="utf-8-sig"))
+            if tokens:
+                actual[path.relative_to(repo).as_posix()] = frozenset(tokens)
+    undocumented, stale = find_violations(
+        actual,
+        POWERSHELL_OPERATION_INVENTORY,
+        check_stale=True,
+        noun="crypto operation",
+        stale_verb="performs",
+    )
+    return violations + undocumented + stale, scanned, actual
+
+
+def _arm_line(label: str, scanned: int, what: str, actual: dict[str, frozenset[str]]) -> str:
     counts = dict.fromkeys(crypto_operations.OPERATION_CLASSES, 0)
     for tokens in actual.values():
         for token in tokens:
             counts[token.split(":", 1)[0]] += 1
     per_class = ", ".join(f"{name}={count}" for name, count in counts.items())
-    print(
-        f"crypto-inventory (non-Python operations): scanned {scanned} "
-        f"{'/'.join(NON_PYTHON_SUFFIXES)} file(s) across {len(NON_PYTHON_WALK_ROOTS)} root(s); "
+    return (
+        f"crypto-inventory ({label}): scanned {scanned} {what} file(s); "
         f"{sum(counts.values())} distinct operation token(s) in {len(actual)} file(s) [{per_class}]"
     )
+
+
+def _main_non_python_operations() -> int:
+    """``--non-python-operations``: the TypeScript/JavaScript and PowerShell operation arms."""
+    repo = Path(__file__).resolve().parents[2]
+    js_violations, js_scanned, js_actual = check_non_python_operations(repo)
+    ps_violations, ps_scanned, ps_actual = check_powershell_operations(repo)
+    # The corpus first, then the verdict.
+    print(
+        _arm_line(
+            f"TypeScript/JavaScript, {'+'.join(NON_PYTHON_WALK_ROOTS)}",
+            js_scanned,
+            "/".join(NON_PYTHON_SUFFIXES),
+            js_actual,
+        )
+    )
+    print(
+        _arm_line(f"PowerShell, {'+'.join(POWERSHELL_WALK_ROOTS)}", ps_scanned, ".ps1", ps_actual)
+    )
+    violations = js_violations + ps_violations
     if violations:
-        print("crypto-inventory: NON-PYTHON OPERATION arm (BACKLOG #1164) FAILED:")
+        print("crypto-inventory: NON-PYTHON OPERATION arms (BACKLOG #1164) FAILED:")
         for line in violations:
             print(f"  - {line}")
         return 1
