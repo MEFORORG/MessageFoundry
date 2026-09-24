@@ -106,7 +106,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   refuses that topology (exit 2) until the operator sets the acknowledgement. It refuses in every
   mode: `enforce` or `warn`, loopback bind or not. With an operator `tls_cert_file` the engine serves
   that hop over TLS, so nothing needs acknowledging. The existing proxy attestations keep their own
-  behaviour. Setting the acknowledgement without `tls_terminated_upstream` is refused at load. See
+  behaviour. Setting the acknowledgement without `tls_terminated_upstream` is refused at load.
+  `messagefoundry check` fails the same config through a new required check, `upstream-hop-ack`, so
+  a commit or CI gate that passed on 0.4.0 can now fail. See
   `docs/CONFIGURATION.md` and `docs/SECURITY.md`. **Migration:** after you upgrade, set
   `[api].plaintext_upstream_hop_acknowledged = true`. 0.4.0 refuses the key as unrecognized, so do
   not add it first. Or set `[api].tls_cert_file` and `[api].tls_key_file` so the engine serves that

@@ -54,7 +54,10 @@ setting records that the operator took the hop on; it secures nothing by itself.
 `tls_cert_file` the engine serves that hop over TLS, so nothing needs acknowledging and the setting is
 not required. The proxy must then speak https to the engine and trust that certificate, or every
 request through it fails. Setting the acknowledgement without `tls_terminated_upstream` is refused at
-load.
+load. `messagefoundry check` runs the same test as a required check, `upstream-hop-ack`, against the
+`messagefoundry.toml` it finds, so the commit/CI gate catches the refusal before `serve` does. It
+reads that file only: a terminator set through `MEFOR_API_*` environment variables alone reaches
+`serve` and not the check.
 
 ### First-run bootstrap admin
 
