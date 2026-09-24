@@ -908,9 +908,7 @@ class DbCoordinator:
         # _is_leader False and issues the same owner-scoped expiring UPDATE, which is idempotent), so
         # no interleaving of the two can leave this node reporting leader. The maintenance tick was the
         # dangerous competitor precisely because it can promote.
-        # Forced on the same predicate as a stepdown, so a SELF-FENCED node that is shut down still
-        # expires the row it owns instead of leaving it live for up to ttl - fence (BACKLOG #1508).
-        await self._release_leadership(force_write=self._may_own_lease_row())
+        await self._release_leadership()
         # Mark the row left rather than DELETE it: keeping a 'left' tombstone gives an operator a
         # visible "this node shut down cleanly" signal (vs a crashed node whose row goes stale), which
         # Step 4's election/diagnostics will distinguish. The row is re-activated by the next start().
@@ -1333,10 +1331,12 @@ class DbCoordinator:
             timeout=self._renew_timeout,
         )
         if row is None or row["owner"] != self.node_id:
-            # The DB answered, and another node holds a live lease: this node owns no row, so drop the
-            # confirmed-hold baseline _may_own_lease_row reads (BACKLOG #1508). Only here, where the row
-            # was actually read; the short-circuits above return not-held without looking at it.
+            # The DB answered, and another node holds a live lease: this node owns no row, so drop both
+            # things _may_own_lease_row reads (BACKLOG #1508). An owed release is moot too: its
+            # owner-scoped write can no longer match. Only here, where the row was actually read; the
+            # short-circuits above return not-held without looking at it.
             self._last_renew_ok = None
+            self._lease_release_owed = False
             return False
         # Cache the epoch we now hold (fresh-acquire bump or renew's unchanged value). The engine reads it
         # on promotion and pushes it into the store; a renew leaves it identical so no push churn.
@@ -1530,8 +1530,9 @@ class DbCoordinator:
 
         Three disjuncts. The gate reads True. An earlier write is owed
         (:attr:`_lease_release_owed`). Or ``_last_renew_ok`` is set: a hold was confirmed and nothing
-        has cleared it since. Two things clear it: a release, and a claim the DB answered with another
-        owner's live lease (:meth:`_claim_or_renew_lease`). So the last disjunct is the self-fence
+        has cleared it since. Two things clear the baseline: a release, and a claim the DB answered
+        with another owner's live lease (:meth:`_claim_or_renew_lease`), which clears the owed flag
+        too. So the last disjunct is the self-fence
         window, where :meth:`_check_fence` clears the gate but not the baseline and the row stays live
         on the DB clock for up to ``ttl - fence`` more. **Do not clear the baseline in**
         :meth:`_check_fence`: that would bring BACKLOG #1508 back, and the self-fence stepdown tests
@@ -1568,9 +1569,10 @@ class DbCoordinator:
         count at all — see :class:`StepdownReleaseUnconfirmed`.
 
         ``force_write`` sends the ``UPDATE`` even when this node's in-memory gate already reads False.
-        Both callers pass :meth:`_may_own_lease_row`, so a self-fenced node expires the row it still
-        owns. A follower that never held the lease, or saw a sibling take it, sends nothing, so a
-        departing follower still does not write to a pool that is closing."""
+        Only :meth:`step_down_leadership` passes it, on :meth:`_may_own_lease_row`. :meth:`stop` never
+        does: it is best-effort by design, and a self-fenced node's pool is the one most likely to
+        hang a shutdown on a write with no per-call bound. So a self-fenced node that is STOPPED still
+        leaves its row to age out; that gap is outside BACKLOG #1508, which is the stepdown."""
         was_leader = self._is_leader
         self._is_leader = False
         self._last_renew_ok = None

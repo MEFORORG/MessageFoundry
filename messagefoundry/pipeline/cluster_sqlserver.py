@@ -195,7 +195,7 @@ class SqlServerCoordinator:
         # Demote the cached gate FIRST (a concurrent is_leader() reader sees "not leader" at once), then
         # expire the lease row so a standby can take over immediately on a clean shutdown. Deliberately
         # NOT under _leadership_lock, and best-effort on a failed write — see DbCoordinator.stop().
-        await self._release_leadership(force_write=self._may_own_lease_row())
+        await self._release_leadership()
         try:
             await self._store._execute(
                 "UPDATE nodes SET status=?, last_seen=?, is_leader=0 WHERE node_id=?",
@@ -512,7 +512,9 @@ class SqlServerCoordinator:
             ),
         )
         if row is None or row["owner"] != self.node_id:
-            self._last_renew_ok = None  # the DB saw another owner; see DbCoordinator (#1508)
+            # The DB saw another owner's live lease; see DbCoordinator._claim_or_renew_lease (#1508).
+            self._last_renew_ok = None
+            self._lease_release_owed = False
             return False
         self._leader_epoch = int(row["leader_epoch"])
         return True

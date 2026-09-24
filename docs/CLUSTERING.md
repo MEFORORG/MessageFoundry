@@ -396,8 +396,8 @@ POST /cluster/stepdown        # body: {}, or {"force": true} to drain the last p
   genuinely unknown.** It has cleared its leadership flag, and this call stopped it claiming for two
   `heartbeat_seconds`. What it could not confirm is whether the write expiring its lease row
   committed, because a lost response to a committed `UPDATE` is indistinguishable here from an
-  `UPDATE` that never ran. **It does not tell you a teardown just started**: a retry of an owed write
-  finds the node already demoted, and the demotion edge fires only on the call that demotes it.
+  `UPDATE` that never ran. **It does not tell you a teardown just started**: on this `503` the demotion
+  edge fires only if this call cleared the leader flag, and a retry finds the flag already clear.
   - **The node is NOT quiescent when this `503` arrives, and no status code will tell you it is.** The
     demotion edge only wakes the graph supervisor; the teardown itself runs on that other task
     afterwards.

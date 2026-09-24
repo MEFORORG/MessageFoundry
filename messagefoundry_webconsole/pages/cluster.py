@@ -492,8 +492,9 @@ _REFUSALS: dict[int, tuple[str, tuple[Markup, ...]]] = {
                 el(
                     "li",
                     "It cleared its leadership flag but could not confirm the lease was expired: this "
-                    "node has already stood down. Retry once: a retry re-sends the write, and answers "
-                    "409 if a standby has already taken the lease. Then check the lease owner.",
+                    "node has already stood down. Once the store answers again, retry once: the retry "
+                    "re-sends the write, and answers 409 if a standby has already taken the lease. "
+                    "Then check the lease owner.",
                 ),
             ),
             el(

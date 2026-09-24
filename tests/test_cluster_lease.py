@@ -1140,20 +1140,31 @@ async def test_a_stepdown_whose_write_matches_nothing_takes_its_pause_back() -> 
     assert a._no_claim_until == 0.0, "a stepdown that released nothing left a claim pause behind"
 
 
-async def test_stop_on_a_self_fenced_node_expires_the_row_it_still_owns() -> None:
-    # stop() had the same early return #1508 removed from the stepdown: a self-fenced node that was
-    # shut down left its row live for up to ttl - fence. It now forces the write on the same
-    # predicate. CONTROL ARM, measured: call _release_leadership() unforced in stop() and this fails
-    # at the row (30.0 == 0.0).
-    db = _FakeLeaseDB(_Clock(0.0))
+async def test_a_follower_that_saw_a_sibling_take_its_lease_owes_nothing() -> None:
+    # Round-2 review case: A's stepdown write went unconfirmed (503, owed), then B took the expired
+    # lease and A's DB answered a claim with it. The owed owner-scoped write can no longer match, so
+    # the claim clears the owed flag with the baseline, and a later stepdown sends nothing: a clean
+    # 409, not a second 503 with a fresh pause. CONTROL ARM, measured: without the owed clear this
+    # fails at `a._lease_release_owed is False`.
+    db_clock = _Clock(0.0)
+    db = _FakeLeaseDB(db_clock)
+    pool = _FakeLeasePool(db)
     mono = _Clock(0.0)
-    a = _coord(_FakeLeasePool(db), mono, node="A")
+    a = _coord(pool, mono, node="A", heartbeat=10.0)
+    b = _coord(_FakeLeasePool(db), _Clock(0.0), node="B", heartbeat=10.0)
     await a._maintain_leadership()
-    mono.t = 20.1
-    a._check_fence()
-    assert a.is_leader() is False
-    await a.stop()
-    assert db.row is not None and db.row["lease_expires_at"] == 0.0
+    pool.fail = True
+    with pytest.raises(StepdownReleaseUnconfirmed):
+        await a.step_down_leadership()
+    db_clock.t = 31.0
+    await b._maintain_leadership()  # B takes the lease that aged out
+    pool.fail = False
+    mono.t = 25.0  # past A's pause, so its claim reaches the DB
+    await a._maintain_leadership()
+    assert a._lease_release_owed is False, "an owed write outlived a sibling's takeover"
+    pool.fail = True  # the store is still flaky: a write here would answer 503
+    assert await a.step_down_leadership() == (False, None, False)
+    assert a._no_claim_until == 20.0, "the 409 re-armed a pause on a follower"
 
 
 async def test_a_stepdown_on_a_node_that_never_led_sends_nothing_and_arms_no_pause() -> None:
@@ -1566,3 +1577,19 @@ async def test_sqlserver_a_handicapped_sibling_takes_over_after_a_stepdown() -> 
     mono_a.t += 25.0
     await a._maintain_leadership()
     assert a.is_leader() is False
+
+
+async def test_sqlserver_a_claim_that_sees_another_owner_clears_what_the_stepdown_reads() -> None:
+    # The SQL Server twin of the baseline and owed clear. CONTROL ARM, measured: without the two
+    # clears in SqlServerCoordinator._claim_or_renew_lease this fails at the first assertion.
+    db_clock = _Clock(0.0)
+    db = _FakeLeaseDB(db_clock)
+    a = _sql_coord(_FakeSqlLeaseStore(db), "A")
+    b = _sql_coord(_FakeSqlLeaseStore(db), "B")
+    await a._maintain_leadership()
+    a._lease_release_owed = True  # as if an earlier stepdown's write went unconfirmed
+    db_clock.t = 31.0
+    await b._maintain_leadership()
+    await a._maintain_leadership()
+    assert a._last_renew_ok is None and a._lease_release_owed is False
+    assert await a.step_down_leadership() == (False, None, False)
