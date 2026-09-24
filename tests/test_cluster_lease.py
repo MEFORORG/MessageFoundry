@@ -88,11 +88,14 @@ class _FakeLeaseDB:
             return {"owner": owner, "leader_epoch": row["leader_epoch"]}
         return None  # another node holds a live lease
 
-    def release(self, owner: object) -> None:
-        """Expire our own lease row (the release ``UPDATE ... WHERE lease_key AND owner``)."""
+    def release(self, owner: object) -> int:
+        """Expire our own lease row (the release ``UPDATE ... WHERE lease_key AND owner``), returning
+        the row count the driver would report: 1 when the row names ``owner``, else 0."""
         row = self.row
         if row is not None and row["owner"] == owner:
             row["lease_expires_at"] = 0.0
+            return 1
+        return 0
 
 
 class _FakeLeasePool:
@@ -148,7 +151,7 @@ class _FakeLeasePool:
         _lease_key, owner, ttl, delay = args
         return self._db.claim(owner, float(ttl), float(delay))  # type: ignore[arg-type]
 
-    async def execute(self, sql: str, *args: object) -> None:
+    async def execute(self, sql: str, *args: object) -> str:
         if self.yield_in_execute:
             await asyncio.sleep(0)  # the release round trip is in flight; let another task run
         if self.hang_in_execute is not None:
@@ -164,7 +167,7 @@ class _FakeLeasePool:
         # Mirrors _release_leadership's UPDATE ... SET lease_expires_at=0 WHERE lease_key AND owner.
         assert "leader_lease" in sql and "UPDATE" in sql
         _lease_key, owner = args
-        self._db.release(owner)
+        return f"UPDATE {self._db.release(owner)}"  # asyncpg's command tag
 
 
 async def _cancel_once_suspended(task: asyncio.Task[object]) -> None:
@@ -563,7 +566,8 @@ async def test_promotable_standby_takes_over_from_non_promotable_gap() -> None:
 
 
 async def test_step_down_returns_the_release_and_expires_the_lease() -> None:
-    # The public seam reports what it actually did — (was_leader, released_at) — and expires the lease
+    # The public seam reports what it actually did — (was_leader, released_at, lease_released) — and
+    # expires the lease
     # row exactly as the clean-stop release does. released_at is wall-clock (the audit trail's units),
     # not the injected monotonic clock, so it is only bracketed here.
     db_clock = _Clock(0.0)
@@ -573,10 +577,10 @@ async def test_step_down_returns_the_release_and_expires_the_lease() -> None:
     assert a.is_leader() is True
 
     before = time.time()
-    was_leader, released_at = await a.step_down_leadership()
+    was_leader, released_at, lease_released = await a.step_down_leadership()
     after = time.time()
 
-    assert was_leader is True
+    assert was_leader is True and lease_released is True
     assert released_at is not None and before <= released_at <= after
     assert a.is_leader() is False
     assert a.current_epoch() is None  # released: no longer a fenced leader (H1)
@@ -584,7 +588,7 @@ async def test_step_down_returns_the_release_and_expires_the_lease() -> None:
 
 
 async def test_step_down_on_a_non_leader_releases_nothing() -> None:
-    # The endpoint's 409 rests on this: a node that never held the lease reports (False, None) and
+    # The endpoint's 409 rests on this: a node that never held the lease reports all-false and
     # leaves a live sibling's lease untouched. This is what makes the pre-read unnecessary.
     db_clock = _Clock(0.0)
     db = _FakeLeaseDB(db_clock)
@@ -592,7 +596,7 @@ async def test_step_down_on_a_non_leader_releases_nothing() -> None:
     b = _coord(_FakeLeasePool(db), _Clock(0.0), node="B")
     await a._maintain_leadership()  # A leads
 
-    assert await b.step_down_leadership() == (False, None)
+    assert await b.step_down_leadership() == (False, None, False)
     assert a.is_leader() is True
     assert db.row is not None and db.row["owner"] == "A"
     assert db.row["lease_expires_at"] == 30.0  # untouched
@@ -710,7 +714,7 @@ async def test_step_down_fires_the_demotion_edge_and_leaves_the_node_running() -
     assert a._stop.is_set() is False  # still running; the maintenance loop keeps heartbeating
 
     # A second stepdown on the now-demoted node releases nothing and fires nothing more.
-    assert await a.step_down_leadership() == (False, None)
+    assert await a.step_down_leadership() == (False, None, False)
     assert fired == [1]
 
 
@@ -845,7 +849,7 @@ async def test_a_retry_re_sends_the_write_the_first_stepdown_could_not_confirm()
     releases: list[tuple[object, ...]] = []
     pool.fail = False
     pool.on_execute_args = releases.append
-    assert await a.step_down_leadership() == (False, None)
+    assert await a.step_down_leadership() == (False, None, True)
     assert len(releases) == 1, "the retry did not re-send the release write"
     assert db.row["lease_expires_at"] == 0.0, "the retry did not expire the lease it still owned"
 
@@ -876,8 +880,8 @@ async def test_the_retry_arms_a_fresh_pause_measured_from_the_retrys_own_clock()
     # Without a fresh pause the very next tick matches the unfenced `owner = me` renew branch and hands
     # leadership back to the node the endpoint has already reported drained.
     #
-    # VACUITY CONTROL, both legs MEASURED: delete `or owed` from `arming` in
-    # DbCoordinator.step_down_leadership and this fails at the pause (`20.0 == 120.0`); silence that
+    # VACUITY CONTROL, both legs MEASURED: delete the `_lease_release_owed` disjunct from
+    # DbCoordinator._may_own_lease_row and this fails at the pause (`20.0 == 120.0`); silence that
     # leg as well and it fails at the behavioural one (`True is False`).
     db_clock = _Clock(0.0)
     db = _FakeLeaseDB(db_clock)
@@ -894,7 +898,7 @@ async def test_the_retry_arms_a_fresh_pause_measured_from_the_retrys_own_clock()
     # PAST that first pause, which is the step no other retry test takes.
     mono.t = db_clock.t = 100.0
     pool.fail = False
-    assert await a.step_down_leadership() == (False, None)
+    assert await a.step_down_leadership() == (False, None, True)
 
     assert a._no_claim_until == 120.0, "the retry did not re-arm the claim pause"
     await a._maintain_leadership()
@@ -963,7 +967,7 @@ async def test_a_cancelled_release_still_owes_the_write_so_the_retry_re_sends_it
     releases: list[tuple[object, ...]] = []
     pool.hang_in_execute = None
     pool.on_execute_args = releases.append
-    assert await a.step_down_leadership() == (False, None)
+    assert await a.step_down_leadership() == (False, None, True)
     assert len(releases) == 1, "the retry after a cancelled release sent no write"
     assert db.row["lease_expires_at"] == 0.0, "the retry did not expire the lease it still owned"
     assert a._lease_release_owed is False, "a write that returned must clear the owed flag"
@@ -975,6 +979,77 @@ async def test_a_cancelled_release_still_owes_the_write_so_the_retry_re_sends_it
     b = _coord(_FakeLeasePool(db), _Clock(0.0), node="B")
     await b._maintain_leadership()
     assert b.is_leader() is True
+
+
+# --- BACKLOG #1508: a self-fenced node can be drained ------------------------------------------
+
+
+async def test_a_self_fenced_node_is_drained_and_says_so_truthfully() -> None:
+    # THE DEFECT. The fence cleared the gate, and the release gated its write on that gate, so a
+    # stepdown here sent nothing, armed nothing and reported (False, None): the endpoint answered 409
+    # "not the current leader" while GET /cluster/nodes still named this node as lease owner, with the
+    # row live for another ten seconds. CONTROL ARMS, both measured: against the unfixed coordinator
+    # this fails at the unpack (it returned two values); with the fix in place but the
+    # `_last_renew_ok` disjunct dropped from _may_own_lease_row, it fails at the outcome
+    # (`lease_released` False), because no write is sent.
+    db_clock = _Clock(0.0)
+    db = _FakeLeaseDB(db_clock)
+    pool = _FakeLeasePool(db)
+    mono = _Clock(0.0)
+    a = _coord(pool, mono, node="A", heartbeat=10.0, fence=20.0, ttl=30.0)
+    fired: list[int] = []
+    a.set_on_demote(lambda: fired.append(1))
+    await a._maintain_leadership()
+    # The renews stop landing; the watchdog fences on the node's own clock...
+    mono.t = 20.1
+    a._check_fence()
+    assert a.is_leader() is False and fired == [1], "the watchdog did not fence"
+    # ...while the row is still live on the DB clock (15 < 30) and still names this node.
+    db_clock.t = 15.0
+    assert db.row is not None and db.row["owner"] == "A" and db.row["lease_expires_at"] == 30.0
+
+    releases: list[tuple[object, ...]] = []
+    pool.on_execute_args = releases.append
+    was_leader, released_at, lease_released = await a.step_down_leadership()
+
+    # Both facts, each true of its own question: the gate was already clear, the row was not.
+    assert (was_leader, released_at, lease_released) == (False, None, True)
+    assert len(releases) == 1, "the self-fenced node sent no release write"
+    assert db.row["lease_expires_at"] == 0.0, "the row this node owned is still live"
+    # The pause is armed from the release, so the drained node does not renew the row straight back
+    # through the unfenced `owner = me` branch the moment its DB comes back.
+    assert a._no_claim_until == pytest.approx(20.1 + 20.0)
+    assert fired == [1, 1], "the row release fired no demotion edge"
+    await a._maintain_leadership()
+    assert a.is_leader() is False, "the drained node renewed itself back in"
+
+    # And a sibling takes the lease the stepdown expired.
+    b = _coord(_FakeLeasePool(db), _Clock(0.0), node="B")
+    await b._maintain_leadership()
+    assert b.is_leader() is True
+
+
+async def test_a_stepdown_on_a_node_whose_lease_a_sibling_took_changes_nothing() -> None:
+    # The other state `_last_renew_ok` reaches: this node led, then a sibling took the expired lease.
+    # The write is sent (the node cannot tell this case from the self-fence one without asking) and
+    # matches nothing, so the outcome is all-false and the endpoint answers 409 - and the pause the
+    # call armed is TAKEN BACK, so a mistaken call does not hold a follower out of a later failover.
+    # CONTROL ARM, measured: skip the take-back and this fails at the pause (20.0 == 0.0).
+    db_clock = _Clock(0.0)
+    db = _FakeLeaseDB(db_clock)
+    mono = _Clock(0.0)
+    a = _coord(_FakeLeasePool(db), mono, node="A", heartbeat=10.0)
+    b = _coord(_FakeLeasePool(db), _Clock(0.0), node="B", heartbeat=10.0)
+    await a._maintain_leadership()
+    db_clock.t = 31.0  # A's lease expired without a renew; B takes it
+    await b._maintain_leadership()
+    await a._maintain_leadership()  # A learns it lost the lease
+    assert (a.is_leader(), b.is_leader()) == (False, True)
+    assert a._last_renew_ok is not None  # the disjunct that makes A send the write
+
+    assert await a.step_down_leadership() == (False, None, False)
+    assert db.row is not None and db.row["owner"] == "B" and db.row["lease_expires_at"] == 61.0
+    assert a._no_claim_until == 0.0, "a stepdown that released nothing left a claim pause behind"
 
 
 async def test_a_stepdown_on_a_node_that_never_led_sends_nothing_and_arms_no_pause() -> None:
@@ -990,7 +1065,7 @@ async def test_a_stepdown_on_a_node_that_never_led_sends_nothing_and_arms_no_pau
 
     releases: list[tuple[object, ...]] = []
     b_pool.on_execute_args = releases.append
-    assert await b.step_down_leadership() == (False, None)
+    assert await b.step_down_leadership() == (False, None, False)
     assert releases == [], "a stepdown on a node that owes no release still wrote to the lease row"
     assert b._no_claim_until == 0.0, "an innocent standby was handicapped by someone else's mistake"
     assert a.is_leader() is True
@@ -1136,7 +1211,7 @@ class _FakeSqlLeaseStore:
         owner, delay, ttl = params[1], params[2], params[4]
         return self._db.claim(owner, float(ttl), float(delay))  # type: ignore[arg-type]
 
-    async def _execute(self, sql: str, params: tuple[object, ...]) -> None:
+    async def _execute(self, sql: str, params: tuple[object, ...]) -> int:
         if self.yield_in_execute:
             await asyncio.sleep(0)  # the release round trip is in flight; let another task run
         if self.hang_in_execute is not None:
@@ -1147,7 +1222,7 @@ class _FakeSqlLeaseStore:
             raise RuntimeError("partitioned from db")
         assert "leader_lease" in sql and "UPDATE" in sql, "not the release statement"
         _lease_key, owner = params
-        self._db.release(owner)
+        return self._db.release(owner)  # the store's _execute returns the driver's row count
 
 
 def _sql_coord(
@@ -1243,7 +1318,7 @@ async def test_sqlserver_release_demotes_before_it_writes_and_reports_a_failed_w
     # the refusal tells to retry gets the same outcome on SQL Server as on Postgres.
     store.fail = False
     assert db.row is not None and db.row["lease_expires_at"] != 0.0
-    assert await a.step_down_leadership() == (False, None)
+    assert await a.step_down_leadership() == (False, None, True)
     assert db.row["lease_expires_at"] == 0.0, (
         "the SQL Server retry did not re-send the release write"
     )
@@ -1273,7 +1348,7 @@ async def test_sqlserver_cancelled_release_still_owes_the_write() -> None:
     assert a._lease_release_owed is True, "a cancelled write left nothing owed"
 
     store.hang_in_execute = None
-    assert await a.step_down_leadership() == (False, None)
+    assert await a.step_down_leadership() == (False, None, True)
     assert db.row["lease_expires_at"] == 0.0, "the retry after a cancelled release sent no write"
     assert a._lease_release_owed is False
 
@@ -1332,8 +1407,28 @@ async def test_sqlserver_the_retry_arms_a_fresh_pause_from_its_own_clock() -> No
 
     mono.t = db_clock.t = 100.0  # past the first call's pause
     store.fail = False
-    assert await a.step_down_leadership() == (False, None)
+    assert await a.step_down_leadership() == (False, None, True)
 
     assert a._no_claim_until == 120.0, "the retry did not re-arm the claim pause"
     await a._maintain_leadership()
     assert a.is_leader() is False, "the drained node re-armed itself as leader after the retry"
+
+
+async def test_sqlserver_a_self_fenced_node_is_drained_and_says_so_truthfully() -> None:
+    # The twin of the Postgres self-fence test: the same early return lived in the SQL Server release,
+    # and the release's row count now comes back through SqlServerStore._execute. CONTROL ARM,
+    # measured: against the unfixed coordinator this fails at the tuple shape, and with the
+    # `_last_renew_ok` disjunct dropped it fails at `lease_released`.
+    db = _FakeLeaseDB(_Clock(0.0))
+    store = _FakeSqlLeaseStore(db)
+    mono = _Clock(0.0)
+    a = _sql_coord(store, "A", mono)
+    await a._maintain_leadership()
+    mono.t = 20.1
+    a._check_fence()
+    assert a.is_leader() is False
+    assert db.row is not None and db.row["lease_expires_at"] == 30.0  # still live and ours
+
+    assert await a.step_down_leadership() == (False, None, True)
+    assert db.row is not None and db.row["lease_expires_at"] == 0.0
+    assert a._no_claim_until == pytest.approx(20.1 + 20.0)

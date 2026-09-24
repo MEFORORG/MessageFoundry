@@ -95,8 +95,9 @@ def _control_blocker(
 
     A stepdown releases leadership on the node that SERVES the request, so the control is live only
     when that node leads by both signals (:func:`_signals_agree`). That is stricter than the engine,
-    whose ``409`` reads the in-memory flag alone: while the signals disagree, the control waits one
-    heartbeat for them to agree rather than act on either."""
+    which also drains a node whose flag is clear but whose lease row is still live (BACKLOG #1508):
+    while the signals disagree, the control waits one heartbeat for them to agree rather than act on
+    either."""
     if not cluster.clustered:
         return "Clustering is not enabled on this engine, so there is no leadership to release."
     if not can_control:

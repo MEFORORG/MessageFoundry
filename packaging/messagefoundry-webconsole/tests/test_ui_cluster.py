@@ -32,6 +32,7 @@ from messagefoundry.pipeline.cluster import (
     ClusterMember,
     NullCoordinator,
     StepdownLockTimeout,
+    StepdownOutcome,
     StepdownReleaseUnconfirmed,
     has_promotable_sibling,
     stepdown_pause_seconds,
@@ -356,7 +357,7 @@ class _Coordinator(NullCoordinator):
         *,
         clustered: bool = True,
         members: list[ClusterMember] | None = None,
-        step_down: tuple[bool, float | None] = (True, 1_700_000_000.5),
+        step_down: tuple[bool, float | None, bool] = (True, 1_700_000_000.5, True),
         raises: Exception | None = None,
     ) -> None:
         super().__init__("node-a")
@@ -366,7 +367,7 @@ class _Coordinator(NullCoordinator):
             if members is not None
             else [_member("node-a", is_leader=True), _member("node-b")]
         )
-        self._step_down = step_down
+        self._step_down = StepdownOutcome(*step_down)
         self._raises = raises
         self.step_down_calls = 0
 
@@ -379,7 +380,7 @@ class _Coordinator(NullCoordinator):
     async def leadership_lease(self) -> tuple[str | None, float | None]:
         return ("node-a", 1_700_000_030.0) if self._clustered else (self.node_id, None)
 
-    async def step_down_leadership(self) -> tuple[bool, float | None]:
+    async def step_down_leadership(self) -> StepdownOutcome:
         self.step_down_calls += 1
         if self._raises is not None:
             raise self._raises
@@ -525,7 +526,12 @@ async def test_a_forced_drain_of_the_last_node_carries_the_drain_notice(tmp_path
     ("make", "status", "headline", "calls"),
     [
         (lambda: _Coordinator(clustered=False), 400, "This engine is not clustered", 0),
-        (lambda: _Coordinator(step_down=(False, None)), 409, "This node is not the leader", 1),
+        (
+            lambda: _Coordinator(step_down=(False, None, False)),
+            409,
+            "This node is not the leader",
+            1,
+        ),
         (
             lambda: _Coordinator(
                 members=[_member("node-a", is_leader=True), _member("node-b", fresh=False)]

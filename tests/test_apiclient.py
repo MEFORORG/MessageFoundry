@@ -620,6 +620,7 @@ def test_cluster_stepdown_posts_force_in_the_body_and_decodes_the_result() -> No
         "node_id": "node-a",
         "was_leader": True,
         "released_at": 1.5,
+        "lease_released": True,
         "new_leader_eligible": False,
         "force": True,
     }
