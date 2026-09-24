@@ -17,6 +17,13 @@ Your brief comes from a Manager. Usually you are a subagent inside its process, 
 report is the channel back -- put the question there. Either way the ANSWER arrives as the next
 Builder's brief, never as a reply to you.
 
+**If a chip started you, you are a separate session and your report reaches nobody** (owner ruling
+2026-09-23). Push, then send your branch and head SHA to the Manager's `local_` id from your prompt.
+If the result says *delivered*, the Manager opens the PR. On anything else -- *queued*, an error, or
+no id -- open your own one-item PR and say in its body that you could not reach the Manager. A chip
+raised by any seat but a Manager: open your own PR. The source of record is korus `roles/MANAGER.md`,
+*A session started from your chip opens its own pull request unless it reaches you live*.
+
 ## What it must not do
 
 - **Guess at what the brief left open.** Put the question in your report and STOP. Stopping costs
