@@ -32,7 +32,8 @@ from typing import Any
 import pytest
 
 from messagefoundry.store import MessageStore
-from messagefoundry.store.store import audit_mac_bytes, audit_row_hash
+from messagefoundry.store.crypto import audit_key_id
+from messagefoundry.store.store import audit_mac_bytes, audit_row_hash, build_audit_mac_keys
 
 
 @pytest.fixture
@@ -210,7 +211,7 @@ def _rows(n: int, *, key: bytes | None = None) -> list[dict[str, Any]]:
 def _offline_server_store(module_name: str, rows: list[dict[str, Any]]) -> Any:
     """A bare Postgres/SQL Server store whose only wired collaborator is the row source.
 
-    ``verify_audit_chain`` touches exactly ``_audit_keyed_from``, ``_audit_mac_key`` and ``_fetchall``,
+    ``verify_audit_chain`` touches ``_audit_keyed_from``, the audit key attributes and ``_fetchall``,
     so this drives the REAL method (no reimplementation) with no DB, no driver and no container."""
     import importlib
 
@@ -220,6 +221,9 @@ def _offline_server_store(module_name: str, rows: list[dict[str, Any]]) -> Any:
     store._audit_keyed_from = None
     store._audit_mac_key = None
     store._audit_mac_fn = None  # ADR 0138 isolated-module MAC (the 13.3.3 rider seam); unused here
+    # BACKLOG #1904: the audit keyring and the first keyed range's key, which open would have set.
+    store._audit_mac_keys = {}
+    store._audit_first_key_id = None
 
     async def _fetchall(_sql: str, *_a: Any, **_kw: Any) -> list[dict[str, Any]]:
         return rows
@@ -316,6 +320,8 @@ async def test_server_backend_keyed_chain_verifies(backend: str) -> None:
     store = _offline_server_store(backend, rows)
     store._audit_keyed_from = 1
     store._audit_mac_key = key
+    store._audit_mac_keys = build_audit_mac_keys(None, key)
+    store._audit_first_key_id = audit_key_id(key)
     ok, message = await store.verify_audit_chain()
     assert ok, message
 

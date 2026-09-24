@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import base64
 import os
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 from messagefoundry.store.crypto import _V3_PREFIX, MARKER_PREFIX, AuditMacFn, CipherError
@@ -154,6 +155,10 @@ class TransitCipher:
         keyed, but the MAC runs inside Transit via :meth:`audit_mac_fn` / :meth:`audit_hmac`, NOT here.
         Returning ``None`` keeps this the honest signal 'no in-heap key material'."""
         return None
+
+    def audit_mac_keyring(self) -> Mapping[str, bytes]:
+        """No in-heap audit keys. Transit versions its own audit key, so the engine sees one range."""
+        return {}
 
     def audit_hmac(self, data: bytes) -> str:
         """Compute the audit-chain row MAC INSIDE Transit (``generate_hmac``) — no key ever enters heap.
