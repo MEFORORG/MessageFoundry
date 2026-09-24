@@ -73,6 +73,7 @@ from messagefoundry.config.models import (
     _check_cleartext_acceptance,
 )
 from messagefoundry.config.send_snapshot import snapshot_on_send_active
+from messagefoundry.connection_names import CONNECTION_NAME_PATTERN, is_connection_name
 from messagefoundry.parsing.message import Message, RawMessage, snapshot_payload
 from messagefoundry.secretscrub import scrub_credentials
 
@@ -2599,7 +2600,9 @@ def DICOM(
     ``calling_ae_allowlist`` AE Titles (when set) from the peers allowed by the ``inbound(...)``
     ``source_ip_allowlist`` keyword (there is no ``[inbound].source_ip_allowlist`` service key), and
     rejects an object over ``max_object_bytes`` with a DIMSE failure before it is decoded, and so before
-    the commit. A non-loopback
+    the commit. On the SCP that cap never exceeds the engine's 16 MiB binary ingress ceiling, whatever is
+    set here: the engine records a larger object ``ERROR``, so accepting it would answer Success for an
+    object that is never processed (BACKLOG #1910). A non-loopback
     cleartext SCP (no ``tls``) is refused at startup unless ``serve --allow-insecure-bind`` (PHI on the
     wire, §9).
 
@@ -4117,6 +4120,24 @@ def resolved_encoding_problems(registry: Registry, *, env_values: Mapping[str, A
     return problems
 
 
+def _require_connection_name(conn: InboundConnection | OutboundConnection, kind: str) -> None:
+    """Refuse a connection name the operator API would refuse (BACKLOG #1107, ASVS 1.2.2).
+
+    Registration is the point both authoring surfaces pass through: a code-first
+    ``inbound()``/``outbound()`` call and a ``connections.toml`` entry. Why the loader holds the
+    API's rule is in :mod:`messagefoundry.connection_names`."""
+    if is_connection_name(conn.name):
+        return
+    where = ""
+    if conn.source_file:
+        line = f":{conn.source_line}" if conn.source_line else ""
+        where = f" (declared at {conn.source_file}{line})"
+    raise WiringError(
+        f"invalid {kind} name {conn.name!r}{where}: a connection name must match "
+        f"{CONNECTION_NAME_PATTERN}"
+    )
+
+
 @dataclass
 class Registry:
     """The wired graph produced by loading config modules."""
@@ -4193,9 +4214,11 @@ class Registry:
         )
 
     def add_inbound(self, conn: InboundConnection) -> None:
+        _require_connection_name(conn, "inbound connection")
         self._add(self.inbound, conn.name, conn, "inbound connection")
 
     def add_outbound(self, conn: OutboundConnection) -> None:
+        _require_connection_name(conn, "outbound connection")
         self._add(self.outbound, conn.name, conn, "outbound connection")
 
     def add_router(self, name: str, fn: RouterFn) -> None:
