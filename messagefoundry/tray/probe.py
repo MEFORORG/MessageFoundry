@@ -220,6 +220,24 @@ def probe_ui(client: httpx.Client) -> UiProbe:
     return classify_ui(status_code)
 
 
+def _pinned_context(cacert: str) -> ssl.SSLContext:
+    """A verifying context whose ONLY trust anchor is ``cacert``. Raises if it cannot be loaded."""
+    return ssl.create_default_context(cafile=cacert)
+
+
+def pin_loads(cacert: str) -> bool:
+    """True when ``cacert`` loads as a trust anchor now. Quiet, for a caller that retries.
+
+    It tests loading rather than existence, because the engine writes the file non-atomically: a
+    file that exists can still be empty or half-written, and an unreadable one exists too.
+    """
+    try:
+        _pinned_context(cacert)
+    except (OSError, ssl.SSLError):
+        return False
+    return True
+
+
 def build_verify(engine_url: str, cacert: str | None = None) -> ssl.SSLContext | bool:
     """The ``verify=`` httpx should use for ``engine_url`` — pinned TLS, OS-trust-store TLS, or ``True``.
 
@@ -229,14 +247,14 @@ def build_verify(engine_url: str, cacert: str | None = None) -> ssl.SSLContext |
 
     ``cacert`` pins trust to exactly that PEM. **A pin that cannot be loaded falls back to the OS
     trust store, which still verifies.** The common cause is a tray started before the engine's
-    first run, when the pair is not minted yet. The poller rebuilds its client once the file
-    appears; until then the engine reads as down, and the warning names the path.
+    first run, when the pair is not minted yet. The poller rebuilds its client once the pin loads
+    (see :func:`pin_loads`); until then the engine reads as down, and the warning names the path.
     """
     if not is_tls_url(engine_url):
         return True
     if cacert is not None:
         try:
-            return ssl.create_default_context(cafile=cacert)
+            return _pinned_context(cacert)
         except (OSError, ssl.SSLError) as exc:
             log.warning(
                 "cannot load the engine certificate %s (%s); verifying against the OS trust store "

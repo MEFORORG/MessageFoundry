@@ -622,9 +622,24 @@ def test_compose_an_explicit_engine_url_drops_the_derived_pin() -> None:
     assert explicit.engine_cacert is None
 
 
-def test_compose_an_explicit_engine_cacert_wins() -> None:
-    toml: dict[str, object] = {"engine_url": "https://127.0.0.1:9999", "engine_cacert": "mine.pem"}
-    assert compose_config(toml, None, engine_cacert="derived.pem").engine_cacert == "mine.pem"
+def test_compose_an_explicit_engine_cacert_wins(tmp_path: Path) -> None:
+    mine = str(tmp_path / "mine.pem")
+    toml: dict[str, object] = {"engine_cacert": mine}
+    assert compose_config(toml, None, engine_cacert="derived.pem").engine_cacert == mine
+
+
+def test_compose_a_relative_engine_cacert_is_ignored() -> None:
+    """A relative pin would resolve against whatever directory the tray started in."""
+    toml: dict[str, object] = {"engine_cacert": "mine.pem"}
+    assert compose_config(toml, None, engine_cacert="derived.pem").engine_cacert == "derived.pem"
+
+
+def test_a_blank_cert_path_is_classified_as_the_engine_classifies_it(tmp_path: Path) -> None:
+    """The tray passes tls_cert_file raw, as the engine does, so a blank one reads as an operator
+    chain on both sides and the tray derives no pin for a pair the engine would never mint."""
+    toml: dict[str, object] = {"api": {"tls_cert_file": " "}}
+    assert engine_serves_https(toml) is True
+    assert generated_cert_path(toml, _reg(_installed(tmp_path / "mf.db"), str(tmp_path))) is None
 
 
 def test_load_config_pins_the_minted_cert_of_an_installed_service(tmp_path: Path) -> None:

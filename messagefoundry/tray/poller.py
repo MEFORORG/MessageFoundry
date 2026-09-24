@@ -33,12 +33,11 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
 
 import httpx
 
 from messagefoundry.tray.config import TrayConfig
-from messagefoundry.tray.probe import make_probe_client, probe_health, probe_ui
+from messagefoundry.tray.probe import make_probe_client, pin_loads, probe_health, probe_ui
 from messagefoundry.tray.state import (
     HealthProbe,
     ProbeInputs,
@@ -233,14 +232,13 @@ class StatusPoller:
         self._ui_probe = ui_probe
         # The default factory carries the config's certificate pin, so a caller that injects its
         # own factory owns the trust decision too.
-        self._client_factory = client_factory or functools.partial(
-            make_probe_client, cacert=config.engine_cacert
-        )
-        #: The pin the default factory uses. See :meth:`_rebuild_once_the_pin_exists`.
-        self._pin = (
-            Path(config.engine_cacert) if client_factory is None and config.engine_cacert else None
-        )
-        self._pin_missing = False
+        #: The pin the default factory uses. See :meth:`_rebuild_once_the_pin_loads`.
+        self._pin: str | None = None
+        if client_factory is None:
+            self._pin = config.engine_cacert
+            client_factory = functools.partial(make_probe_client, cacert=config.engine_cacert)
+        self._client_factory = client_factory
+        self._pin_pending = False
         self._clock = clock
         self._toast_min_interval_s = toast_min_interval_s
         self._client: httpx.Client | None = None
@@ -328,7 +326,7 @@ class StatusPoller:
 
     def poll_once(self, now: float) -> PollResult:
         """Read all probes once and produce a :class:`PollResult`. Does I/O via the injected deps."""
-        self._rebuild_once_the_pin_exists()
+        self._rebuild_once_the_pin_loads()
         reading = self._scm_reader(self._config.service_name)
         client = self._client
         health = self._health_probe(client) if client is not None else HealthProbe.DOWN
@@ -337,23 +335,29 @@ class StatusPoller:
         return self._build_result(inputs, reading, now)
 
     def _open_client(self) -> None:
-        self._pin_missing = self._pin is not None and not self._pin.is_file()
+        # Checked BEFORE the build, so a pin that appears in between costs one spare rebuild
+        # rather than leaving the client unpinned.
+        self._pin_pending = self._pin is not None and not pin_loads(self._pin)
         self._client = self._client_factory(self._config.engine_url)
 
-    def _rebuild_once_the_pin_exists(self) -> None:
-        """Pick up the engine's certificate once it is minted, without a tray restart.
+    def _rebuild_once_the_pin_loads(self) -> None:
+        """Pick up the engine's certificate once it loads, without a tray restart.
 
         The engine mints its pair on its first run, so a tray started before then builds its client
         with no pin, and the probe falls back to the OS trust store and reads the engine as down.
-        The client is otherwise built once, so this checks for the file on each tick until it
-        appears, then rebuilds the client once. It costs one stat per tick, and only while waiting.
+        The client is otherwise built once, so this retries the load on each tick and rebuilds the
+        client once it succeeds. It keys on LOADING, not on the file existing: the engine writes
+        the file non-atomically, so an empty or half-written file exists too. The pending flag
+        clears only after the rebuild, so a factory that raises is retried on the next tick.
         """
-        if not self._pin_missing or self._pin is None or not self._pin.is_file():
+        if not self._pin_pending or self._pin is None or self._stop.is_set():
             return
-        self._pin_missing = False
-        log.info("engine certificate %s now exists; rebuilding the probe client", self._pin)
+        if not pin_loads(self._pin):
+            return
+        log.info("engine certificate %s now loads; rebuilding the probe client", self._pin)
         old = self._client
         self._client = self._client_factory(self._config.engine_url)
+        self._pin_pending = False
         if old is not None:
             old.close()
 

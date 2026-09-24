@@ -331,15 +331,16 @@ def engine_serves_https(service_toml: dict[str, object] | None) -> bool:
 def _served_tls_source(service_toml: dict[str, object] | None) -> ApiTlsSource:
     """Where the engine's API material comes from, read out of a raw, untrusted service TOML.
 
-    A missing or malformed ``[api]`` reads as no settings, and a blank cert path as no cert, so
-    anything the tray cannot read falls to the engine's own default, which mints.
+    A missing or malformed ``[api]`` reads as no settings, so anything the tray cannot read falls
+    to the engine's own default, which mints. The values go in exactly as the engine passes them,
+    so the two cannot classify the same file differently.
     """
     api = (service_toml or {}).get("api")
     if not isinstance(api, dict):
         api = {}
     cert = api.get("tls_cert_file")
     return api_tls_source(
-        cert_file=cert.strip() if isinstance(cert, str) else None,
+        cert_file=cert if isinstance(cert, str) else None,
         tls_terminated_upstream=api.get("tls_terminated_upstream") is True,
     )
 
@@ -355,9 +356,9 @@ def generated_cert_path(
     ``scripts/service/install-service.ps1`` spells the same rule when it prints its health check.
 
     **It answers ``None`` rather than guess** when the engine serves an operator chain (trusted
-    through the OS store) or speaks plaintext to a proxy, when there is no service entry, and when a relative store path would be
-    anchored under a project root (``--project-root`` or ``[environments].base_dir``), whose own
-    resolution this module does not repeat. ``None`` leaves the probe on the OS trust store, and
+    through the OS store) or speaks plaintext to a proxy, when there is no service entry, and when
+    a relative store path would be anchored under a project root (``--project-root`` or
+    ``[environments].base_dir``), whose own resolution this module does not repeat. ``None`` leaves the probe on the OS trust store, and
     ``engine_cacert`` in ``tray.toml`` covers any posture this cannot see.
 
     The inputs are untrusted hints, validated by :func:`_clean_path_hint`. The result is only a
@@ -401,7 +402,8 @@ def compose_config(
     ``engine_cacert`` is the DERIVED pin (see :func:`generated_cert_path`), and it travels with the
     derived URL. An explicit ``engine_url`` drops it, because that URL may name a different engine
     whose certificate the local service's minted PEM would refuse. An explicit ``engine_cacert`` in
-    ``tray.toml`` always wins.
+    ``tray.toml`` always wins when it is an absolute path. A relative one is ignored, because it would
+    resolve against whatever working directory the tray happened to start in.
     """
     engine_url = DEFAULT_ENGINE_URL
     cacert = engine_cacert
@@ -425,7 +427,9 @@ def compose_config(
         if isinstance(raw_url, str) and raw_url:
             engine_url = raw_url
             cacert = None
-        cacert = _clean_path_hint(toml_data.get("engine_cacert")) or cacert
+        raw_cacert = _clean_path_hint(toml_data.get("engine_cacert"))
+        if raw_cacert is not None and Path(raw_cacert).is_absolute():
+            cacert = raw_cacert
         raw_name = toml_data.get("service_name")
         if isinstance(raw_name, str) and is_safe_service_name(raw_name):
             service_name = raw_name
@@ -536,8 +540,8 @@ TRAY_TOML_TEMPLATE = """\
 # certificate the engine minted beside its store database (api-generated-cert.pem) through the
 # service entry. An engine serving your own [api].tls_cert_file is verified against the Windows
 # trust store instead. Set this when the tray cannot find the minted file, or when engine_url above
-# names an engine other than the local service.
-# engine_cacert = 'C:\\ProgramData\\MessageFoundry\\data\\api-generated-cert.pem'
+# names an engine other than the local service. Use an absolute path.
+# engine_cacert = 'C:\\ProgramData\\MessageFoundry\\api-generated-cert.pem'
 
 # The NSSM Windows service name the tray shows and controls.
 # service_name = "MessageFoundry"

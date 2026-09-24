@@ -404,9 +404,8 @@ class EngineClient:
     stock engine presents a self-signed pair it minted beside its store database, and no trust store
     holds that certificate. So a client for a stock engine also passes ``cacert=`` naming that file
     (``api-generated-cert.pem``; ``messagefoundry cert inventory --service-config <toml>`` prints
-    its path). Without it the
-    first request fails certificate verification. That failure is deliberate: this client never
-    turns verification off.
+    its path). Without it the first request fails certificate verification. That failure is
+    deliberate: this client never turns verification off.
     """
 
     def __init__(

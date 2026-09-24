@@ -89,7 +89,7 @@ Settings" creates a commented template here on first use**:
 
 ```toml
 engine_url    = "https://127.0.0.1:8765"     # the engine's API base URL
-engine_cacert = 'C:\ProgramData\MessageFoundry\data\api-generated-cert.pem'  # PEM to trust (see TLS)
+engine_cacert = 'C:\ProgramData\MessageFoundry\api-generated-cert.pem'  # PEM to trust (see TLS)
 service_name  = "MessageFoundry"             # the NSSM service name
 repo_path    = 'C:\Users\me\Code\MyEstate'   # the folder "Open Repo in VS Code" opens
 poll_seconds = 5
@@ -145,17 +145,18 @@ The engine's certificate **is verified**, against one of two trust anchors:
   database as `api-generated-cert.pem`. The tray finds it from the same registry entry: `--db` in
   `AppParameters`, else `[store].path`, else `messagefoundry.db` under `AppDirectory`. It trusts that
   one file and nothing else, so a stock install works with no import step. Set `engine_cacert` in
-  `tray.toml` when the tray cannot find the file, for example under `--project-root`.
+  `tray.toml`, as an absolute path, when the tray cannot find the file, for example under
+  `--project-root`.
 - **The Windows trust store**, when the engine serves your own `[api].tls_cert_file`. An
   internal-CA / AD-CS cert then works on a domain-joined box with no extra setup. A self-signed
-  operator cert works once you import it into **Local Computer → Trusted Root Certification
-  Authorities**, or name it in `engine_cacert`.
+  operator cert works once you import it into the **Local Computer** store under **Trusted Root
+  Certification Authorities**, or name it in `engine_cacert`.
 
 An explicit `engine_url` in `tray.toml` drops the found certificate, because that URL may name a
 different engine. Set `engine_cacert` beside it if that engine needs a pin.
 
 The engine mints its pair on its first run. A tray started before then reports the engine down
-until the file appears, then picks it up on its next poll with no restart.
+until the file loads, then picks it up on its next poll with no restart.
 
 There is no option to skip verification. If the certificate does not verify, the probe fails and the
 tray reports the engine as down rather than trusting an unidentified responder — check the cert's
