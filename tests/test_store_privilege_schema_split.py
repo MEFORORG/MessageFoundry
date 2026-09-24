@@ -32,6 +32,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _live_scratch import (
+    SqlServerAdmin,
+    postgres_teardown,
+    scratch_name,
+    sqlserver_admin,
+    throwaway_password,
+)
 
 from messagefoundry.__main__ import main
 from messagefoundry.config.settings import (
@@ -500,6 +507,57 @@ async def test_postgres_auto_on_the_same_stale_marker_reaches_the_ddl_transactio
         await store._ensure_schema()
 
 
+# --- #1927's users.channel_scope_source column is provisioned, never added at runtime ------------
+
+
+class _ProvisioningPgConn:
+    """A virgin database for the provisioning run: no marker, no columns, every write recorded."""
+
+    def __init__(self) -> None:
+        self.writes: list[str] = []
+
+    async def fetchrow(self, sql: str, *args: Any) -> dict[str, Any] | None:
+        return {"present": False} if "to_regclass" in sql else None
+
+    async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
+        return []  # information_schema: nothing present yet, so every gated ADD fires
+
+    async def execute(self, sql: str, *args: Any, **kwargs: Any) -> None:
+        self.writes.append(" ".join(sql.split()))
+
+    def transaction(self) -> Any:
+        return contextlib.nullcontext()
+
+
+async def test_postgres_provisioning_adds_the_channel_scope_source_column() -> None:
+    """Under external mode (ADR 0192) the runtime role runs no DDL, so provision-schema is the ONLY
+    thing that can add #1927's column to a pre-existing ``users`` table. On PostgreSQL that ADD lives
+    in ``_migrate_lease_columns``, outside ``_SCHEMA``, so this proves the provisioning run reaches it."""
+    conn = _ProvisioningPgConn()
+    store = _postgres_store_over(conn, None)  # type: ignore[arg-type]
+    assert await store._ensure_schema(provisioning=True) is True
+    assert "ALTER TABLE users ADD COLUMN channel_scope_source TEXT" in conn.writes
+    assert any(sql.startswith("INSERT INTO schema_meta") for sql in conn.writes)
+
+
+async def test_postgres_external_refuses_a_marker_from_before_channel_scope_source() -> None:
+    """The column's ADD is invisible to the content hash (it is Python, not ``_SCHEMA``), so
+    ``_MIGRATION_REV`` carries it: 4 since #1927. A marker written at revision 3 must therefore be
+    refused under external mode rather than open onto a table missing the column."""
+    import hashlib
+
+    from messagefoundry.store import postgres
+
+    assert postgres._MIGRATION_REV >= 4
+    rev3 = hashlib.sha256(("\n".join(postgres._SCHEMA) + "\nmigration_rev=3").encode()).hexdigest()
+    assert rev3 != postgres._schema_hash()
+    conn = _FakePgConn(present=True, schema_hash=rev3)
+    store = _postgres_store_over(conn, None)
+    with pytest.raises(SchemaNotProvisionedError):
+        await store._ensure_schema()
+    assert conn.writes == []
+
+
 # --- the cluster coordinator's tables ride the batch ---------------------------------------------
 
 
@@ -834,95 +892,83 @@ def test_the_live_legs_of_this_file_are_run_by_a_server_db_ci_step(gate: str) ->
 # --- live server legs (skipped locally; CI's store-privilege steps run them) -------------------
 
 
-def _throwaway_password() -> str:
-    """Generated per run, never a literal; ``token_urlsafe`` needs no quoting inside SQL literals."""
-    return "Px9_" + secrets.token_urlsafe(24)
+@pytest.fixture
+async def sqlserver_split_scratch() -> AsyncIterator[tuple[SqlServerAdmin, StoreSettings, str]]:
+    """An EMPTY scratch database and a login name, both unique to one test and both dropped afterwards,
+    even when the test fails. Yields the admin connection, the scratch database's external-mode store
+    settings, and the login name (the test creates the login itself, at the point the flow needs it).
+
+    These were the fixed names ``mefor_schema_split_test`` and ``mefor_split_runtime`` behind an
+    ``IF SUSER_ID(...) IS NULL`` guard, so a run that died before its teardown handed the next one a
+    login holding the dead run's password. Skips (never fails) when the principal cannot create a
+    database: that is a limit of the fixture's credential, not a finding."""
+    base = load_settings(environ=os.environ).store
+    db = scratch_name("mefor_split")
+    login = scratch_name("mefor_split_rt")
+    async with sqlserver_admin(base) as admin:
+        try:
+            try:
+                await admin.run(f"CREATE DATABASE [{db}]")
+            except Exception as exc:  # noqa: BLE001 - a fixture limit, not a finding
+                pytest.skip(f"cannot create a scratch database with this principal: {exc}")
+            external = base.model_copy(
+                update={"database": db, "schema_management": SchemaManagement.EXTERNAL}
+            )
+            yield admin, external, login
+        finally:
+            await admin.teardown(databases=[db], logins=[login])
 
 
 @pytest.mark.skipif(not _SQLSERVER_ON, reason="set MEFOR_TEST_SQLSERVER=1 (+ MEFOR_STORE_* env)")
-async def test_live_sqlserver_external_refuses_then_provisions_then_runs_row_only() -> None:
-    """End to end on a real SQL Server, in a database this test creates and drops:
+async def test_live_sqlserver_external_refuses_then_provisions_then_runs_row_only(
+    sqlserver_split_scratch: tuple[SqlServerAdmin, StoreSettings, str],
+) -> None:
+    """End to end on a real SQL Server, in a database the fixture creates and drops:
 
     1. external open of an EMPTY database refuses, and the database is still empty afterwards;
     2. provision-schema builds it, and a second run is a no-op;
     3. a login holding only db_datareader + db_datawriter opens it and probes clean;
     4. the same login given db_ddladmin is named as over-granted.
     """
-    import aioodbc
+    from messagefoundry.store.sqlserver import SqlServerStore
 
-    from messagefoundry.store.sqlserver import SqlServerStore, connection_string
+    admin, external, login = sqlserver_split_scratch
+    db = external.database
+    password = throwaway_password()
 
-    base = load_settings(environ=os.environ).store
-    db = "mefor_schema_split_test"
-    login = "mefor_split_runtime"
-    password = _throwaway_password()
-    admin = await aioodbc.connect(dsn=connection_string(base), autocommit=True)
+    with pytest.raises(SchemaNotProvisionedError):
+        await SqlServerStore.open(external)
+    assert (
+        await admin.scalar(f"SELECT COUNT(*) FROM [{db}].sys.objects WHERE is_ms_shipped = 0") == 0
+    )
+
+    assert (await provision_store_schema(external)).applied is True
+    assert await admin.scalar(f"SELECT COUNT(*) FROM [{db}].sys.tables") > 0
+    assert (await provision_store_schema(external)).applied is False
+
+    # Unconditional: the name is this test's own, so an existing login is a defect to see, not reuse.
+    await admin.run(f"CREATE LOGIN [{login}] WITH PASSWORD='{password}', CHECK_POLICY=OFF")
+    await admin.run_in(db, f"CREATE USER [{login}] FOR LOGIN [{login}]")
+    for role in sorted(SQLSERVER_RUNTIME_DATABASE_ROLES):
+        await admin.run_in(db, f"ALTER ROLE {role} ADD MEMBER [{login}]")
+    runtime = external.model_copy(
+        update={"auth": SqlAuth.SQL, "username": login, "password": password}
+    )
+    store = await SqlServerStore.open(runtime)
     try:
-        cur = await admin.cursor()
-
-        async def run(sql: str) -> None:
-            await cur.execute(sql)
-
-        async def scalar(sql: str) -> Any:
-            await cur.execute(sql)
-            row = await cur.fetchone()
-            return None if row is None else row[0]
-
-        try:
-            await run(
-                f"IF DB_ID('{db}') IS NOT NULL BEGIN ALTER DATABASE [{db}] SET SINGLE_USER WITH "
-                f"ROLLBACK IMMEDIATE; DROP DATABASE [{db}]; END"
-            )
-            await run(f"CREATE DATABASE [{db}]")
-        except Exception as exc:  # noqa: BLE001 - a fixture limit, not a finding
-            pytest.skip(f"cannot create a scratch database with this principal: {exc}")
-
-        external = base.model_copy(
-            update={"database": db, "schema_management": SchemaManagement.EXTERNAL}
-        )
-        with pytest.raises(SchemaNotProvisionedError):
-            await SqlServerStore.open(external)
-        assert await scalar(f"SELECT COUNT(*) FROM [{db}].sys.objects WHERE is_ms_shipped = 0") == 0
-
-        assert (await provision_store_schema(external)).applied is True
-        assert await scalar(f"SELECT COUNT(*) FROM [{db}].sys.tables") > 0
-        assert (await provision_store_schema(external)).applied is False
-
-        await run(
-            f"IF SUSER_ID('{login}') IS NULL CREATE LOGIN {login} WITH PASSWORD='{password}',"
-            " CHECK_POLICY=OFF"
-        )
-        await run(f"USE [{db}]; CREATE USER {login} FOR LOGIN {login}")
-        for role in sorted(SQLSERVER_RUNTIME_DATABASE_ROLES):
-            await run(f"USE [{db}]; ALTER ROLE {role} ADD MEMBER {login}")
-        runtime = external.model_copy(
-            update={"auth": SqlAuth.SQL, "username": login, "password": password}
-        )
-        store = await SqlServerStore.open(runtime)
-        try:
-            clean = await store.probe_principal_privileges()
-        finally:
-            await store.close()
-        assert clean.status is StorePrivilegeStatus.OBSERVED
-        assert clean.excess == (), f"a row-only runtime login must be silent, got {clean.excess}"
-
-        await run(f"USE [{db}]; ALTER ROLE db_ddladmin ADD MEMBER {login}")
-        store = await SqlServerStore.open(runtime)
-        try:
-            over = await store.probe_principal_privileges()
-        finally:
-            await store.close()
-        assert "database role db_ddladmin" in over.excess
+        clean = await store.probe_principal_privileges()
     finally:
-        for stmt in (
-            # USE master first: the setup's USE left this connection inside the scratch database.
-            f"USE master; IF DB_ID('{db}') IS NOT NULL BEGIN ALTER DATABASE [{db}] SET SINGLE_USER "
-            f"WITH ROLLBACK IMMEDIATE; DROP DATABASE [{db}]; END",
-            f"IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN {login}",
-        ):
-            with contextlib.suppress(Exception):  # teardown is best-effort
-                await (await admin.cursor()).execute(stmt)
-        await admin.close()
+        await store.close()
+    assert clean.status is StorePrivilegeStatus.OBSERVED
+    assert clean.excess == (), f"a row-only runtime login must be silent, got {clean.excess}"
+
+    await admin.run_in(db, f"ALTER ROLE db_ddladmin ADD MEMBER [{login}]")
+    store = await SqlServerStore.open(runtime)
+    try:
+        over = await store.probe_principal_privileges()
+    finally:
+        await store.close()
+    assert "database role db_ddladmin" in over.excess
 
 
 @pytest.mark.skipif(not _POSTGRES_ON, reason="set MEFOR_TEST_POSTGRES=1 (+ MEFOR_STORE_* env)")
@@ -932,9 +978,10 @@ async def test_live_postgres_external_refuses_then_provisions_then_runs_row_only
     from messagefoundry.store.postgres import PostgresStore
 
     base = load_settings(environ=os.environ).store
-    schema = "mefor_schema_split_test"
-    role = "mefor_split_runtime"
-    password = _throwaway_password()
+    # Unique per call, so a leftover from a crashed attempt can never be the role this run logs in as.
+    schema = scratch_name("mefor_split")
+    role = scratch_name("mefor_split_rt")
+    password = throwaway_password()
     admin = await PostgresStore.open(base)
     try:
         try:
@@ -988,11 +1035,5 @@ async def test_live_postgres_external_refuses_then_provisions_then_runs_row_only
             await store.close()
         assert f"CREATE on schema {schema}" in over.excess
     finally:
-        for stmt in (
-            f"DROP SCHEMA IF EXISTS {schema} CASCADE",
-            f"REVOKE ALL ON DATABASE {base.database} FROM {role}",
-            f"DROP ROLE IF EXISTS {role}",
-        ):
-            with contextlib.suppress(Exception):  # teardown is best-effort
-                await admin._execute(stmt)
+        await postgres_teardown(admin, database=base.database, schemas=[schema], roles=[role])
         await admin.close()

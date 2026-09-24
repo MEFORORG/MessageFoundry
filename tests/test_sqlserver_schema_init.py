@@ -15,6 +15,7 @@ statement still runs after it.
 
 from __future__ import annotations
 
+import hashlib
 import types
 
 import pytest
@@ -368,3 +369,71 @@ async def test_the_external_read_is_not_counted_as_a_write_transaction() -> None
 
     assert conn.committed == 1  # the snapshot WAS released
     assert store.committed_txns == 0  # and was not counted as a write
+
+
+# --- #305 x #1927: the users.channel_scope_source column is provisioned, never added at runtime ------
+
+
+def _is_scope_source_add(statement: str) -> bool:
+    return "ALTER TABLE users ADD channel_scope_source" in " ".join(statement.split())
+
+
+def _pre_scope_source_hash() -> str:
+    """The marker a build WITHOUT the #1927 ADD would have written: the same batch minus that one
+    statement. It is a counterfactual, not a recorded hash. The property under test is that the ADD
+    is itself an element of the hashed ``_SCHEMA``: moved into Python beside the batch, which the
+    ``_schema_hash`` docstring forbids, it would change nothing the marker check can see."""
+    from messagefoundry.store import sqlserver
+
+    without = [s for s in sqlserver._SCHEMA if not _is_scope_source_add(s)]
+    assert len(without) == len(sqlserver._SCHEMA) - 1, "the ADD is not one _SCHEMA statement"
+    return hashlib.sha256("\n".join(without).encode()).hexdigest()
+
+
+class _PreScopeSourceCursor(_FakeCursor):
+    """``schema_meta`` records the batch as it stood before the #1927 column."""
+
+    async def fetchone(self) -> object:
+        if "OBJECT_ID('schema_meta'" in self._last_sql:
+            return (1,)
+        if "schema_hash" in self._last_sql:
+            return (_pre_scope_source_hash(),)
+        return await super().fetchone()
+
+
+async def test_provisioning_adds_the_channel_scope_source_column() -> None:
+    """Under external mode (ADR 0192) the runtime login runs no DDL, so ``provision-schema`` is the
+    ONLY thing that can add #1927's column to a pre-existing ``users`` table. The gated ADD must be in
+    the batch it runs, after the schema applock like every other DDL statement."""
+    executed: list[tuple[str, object]] = []
+    conn = _FakeConn(executed)
+    store = _make_store(conn)
+    store._settings = _settings(  # type: ignore[assignment]
+        command_timeout=0, mode=SchemaManagement.EXTERNAL
+    )
+
+    assert await store._ensure_schema(provisioning=True) is True
+
+    adds = [i for i, (sql, _) in enumerate(executed) if _is_scope_source_add(sql)]
+    assert adds, "provision-schema never added users.channel_scope_source"
+    assert min(adds) > _applock_index(executed)
+
+
+async def test_external_open_refuses_a_marker_from_before_channel_scope_source() -> None:
+    """The other half: a database provisioned by a build without the column must NOT open under
+    external mode, or the runtime login would reach a missing column on its first scope write. The
+    batch hash covers the ADD, so the marker check refuses and names the command, running no DDL."""
+    assert _pre_scope_source_hash() != _schema_hash()
+    executed: list[tuple[str, object]] = []
+    conn = _FakeConn(executed)
+    conn.cursor_obj = _PreScopeSourceCursor(executed)
+    store = _make_store(conn)
+    store._settings = _settings(  # type: ignore[assignment]
+        command_timeout=30, mode=SchemaManagement.EXTERNAL
+    )
+
+    with pytest.raises(SchemaNotProvisionedError) as info:
+        await store._ensure_schema()
+
+    assert PROVISION_SCHEMA_COMMAND in str(info.value)
+    assert all(_is_read(sql) for sql, _ in executed)
