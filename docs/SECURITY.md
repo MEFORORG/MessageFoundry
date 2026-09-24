@@ -945,7 +945,10 @@ The complete set, as enumerated in the [route map](#route--permission-map-engine
 Ordinary reads — listing users, the AD maps, the audit log, a single message — are **not** step-up
 gated. Four routes take the *password-only* variant (`require_reauth_only[_action]`), deliberately
 **without** the MFA gate so a required-but-unenrolled user cannot deadlock: `POST /me/mfa/enroll`,
-`POST /me/mfa/confirm`, `DELETE /me/sessions/{session_id}`, `DELETE /me/sessions`.
+`POST /me/mfa/confirm`, `DELETE /me/sessions/{session_id}`, `DELETE /me/sessions`. The skip serves
+an account with no factor only: a pending session on an account that has one gets `403` +
+`X-MFA-Required` on all four (BACKLOG #1951; see the "Binding a NEW second factor, or ending
+sessions" row).
 
 This re-proves the password (secondary verification). With **WP-14 native TOTP MFA** built, the step-up
 gate **also** requires the session's second factor: an MFA-required caller is refused with `403` +
@@ -1349,8 +1352,8 @@ slack.
 | Consecutive credential failures on one account | the account's failure counter | ≥ 5 consecutive failures locks for 15 minutes; a lapsed window restarts the counter | **DENY** before any verify + an audit row whose name is leg-specific — `auth.login_locked` on the password path, `auth.mfa_failed` / `auth.webauthn_failed` with `reason=locked` on the TOTP/recovery and assertion legs (the password path still runs a dummy argon2 verify to keep timing flat) | 5 / 15 min | `[auth].lockout_threshold`, `lockout_minutes` |
 | New client IP during a session | this request's address vs `session.client` | knob on **and** a session exists, is unrevoked, has an anchor, and the two are not the same host (both-loopback counts as one host) | **CHALLENGE** — force a fresh step-up; first sighting also writes `auth.admin_action_new_ip` + an out-of-band notice; repeats WARNING-log only. **Never** an RBAC deny | **off** | `[auth].admin_new_ip_step_up` |
 | Credential recency | age of `session.reauth_at` | `now − reauth_at > step_up_max_age_seconds`, or `reauth_at is None` | **DENY** 403 + `X-Step-Up-Required: 1` (console: 303 → `/ui/reauth`) | 300 s | `[auth].step_up_max_age_seconds` |
-| Action-bound step-up grant | a single-use grant minted only by `reauth(purpose=…)`, on the **monotonic** clock | no unconsumed grant for this route's action | **DENY** 403 + `X-Step-Up-Required` + `X-Step-Up-Action: <action>`; opting out falls back to the session window — **except on a factor bind**, see the row below | on | `[auth].require_action_step_up` |
-| Binding a NEW second factor | the session's MFA state × the account's existing factors | the action binds a factor (`mfa_enroll`, `mfa_confirm`, `webauthn_enroll`) **and** the session has not satisfied its second factor **and** the account already holds one of either kind | **DENY** — the existing factor must be proven first (`POST /auth/mfa-verify`, or the code/passkey leg of `/ui/reauth`). An account with **no** factor still enrols its first one from a password-only session; that carve-out is what the MFA gate's enrollment exemption is for | on | **no knob** — `require_action_step_up` does not reach it, deliberately |
+| Action-bound step-up grant | a single-use grant minted only by `reauth(purpose=…)`, on the **monotonic** clock | no unconsumed grant for this route's action | **DENY** 403 + `X-Step-Up-Required` + `X-Step-Up-Action: <action>`; opting out falls back to the session window — **except on a factor bind or a session terminate**, see the row below | on | `[auth].require_action_step_up` |
+| Binding a NEW second factor, or ending sessions | the session's MFA state × the account's existing factors | the action binds a factor (`mfa_enroll`, `mfa_confirm`, `webauthn_enroll`) or ends sessions (`session_terminate`, BACKLOG #1951) **and** the session has not satisfied its second factor **and** the account already holds one of either kind | **DENY** — the existing factor must be proven first (`POST /auth/mfa-verify`, or the code/passkey leg of `/ui/reauth`). An account with **no** factor still enrols its first one, and still ends its own sessions, from a password-only session; that carve-out is what the MFA gate's exemptions are for | on | **no knob** — `require_action_step_up` does not reach it, deliberately |
 | MFA state | `session.mfa_verified_at` × factor enrollment × account roles | the rule is **provider-blind** (BACKLOG #1144 — an AD account used to be exempt here, on a delegation the directory never asserted): enrolled → always required, whatever the scope says; un-enrolled → required when the knob is on **and** the scope covers the account — **`every_local_account` by default**, i.e. every account despite the value's narrower name, or the Administrator role only under `administrators`. A directory session that was minted without an engine-verified factor is refused outright while the knob is on | **DENY** 403 + `X-MFA-Required: 1` on **every** authorized route — an **access gate**, not only a step-up gate; the console twin is a 303 to `/ui/mfa`, with the account and factor-enrolment routes exempt so an un-enrolled user is not stranded. An earlier revision of this row said Administrator-only and step-up-boundary-only; both were wrong | on; scope `every_local_account` | `[security].require_mfa`, `[security].require_mfa_scope` (the `[auth]` spellings are rejected at load) |
 | Identity provider — local credential rotation | `identity.auth_provider` | the provider is AD (the credential is the directory's, not the engine's) | **DENY** `POST /me/password` with **400**; the step-up re-proof for that identity becomes a **live directory re-bind** instead of a local hash compare, so a disabled AD account cannot refresh its window, and the engine MFA gate never fires for it | n/a | `[auth].ad_enabled` |
 | Authentication ambience | how the session was minted | browser Kerberos SSO and the OIDC callback mint with `seed_reauth=False` | **CHALLENGE** — the session is born **without** step-up freshness, so its first sensitive action forces an explicit credential step-up (the *second* signal in this table whose action is a challenge rather than a hard decision) | n/a | (by design) |
@@ -1667,7 +1670,18 @@ Users and admins can see and revoke individual sessions (ASVS 7.5.2 / 7.4.5):
   suspected compromise).
 
 The two self-service terminates are **password-only** step-ups deliberately: a second-factor gate
-would deadlock an MFA-required-but-unenrolled operator out of revoking their own sessions.
+would deadlock an MFA-required-but-unenrolled operator out of revoking their own sessions. That
+carve-out serves only an account with **no** factor. A pending session on an account that has one
+must prove it first, at `POST /auth/mfa-verify` or the code/passkey leg of `/ui/reauth`. Until it
+does, `POST /me/reauth` mints no `session_terminate` grant for it, and both terminate routes refuse
+it with `X-MFA-Required` (ASVS 6.3.3, BACKLOG #1951). That closes these two routes only. **It is
+not a claim that a password-only caller cannot end the user's sessions.** `POST /me/password` stays
+reachable from a pending session and revokes every session of the account when it changes the
+password, so on a first deployment a caller holding only the password would still sign such a user
+out that way, and change the password too. Refusing it there is an open question: the must-change
+confinement does not exempt `/auth/mfa-verify`, so an account that is both must-change and pending
+would have no way forward. The console's `POST /ui/account/password` has the same shape, since it
+is reachable while pending.
 
 Every targeted revoke is audited (`auth.session_revoked`, with scope + actor). The **web console** surfaces
 this: an **Active sessions…** view in the account menu lists your sessions and offers per-session
