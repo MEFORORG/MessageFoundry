@@ -326,8 +326,8 @@ recency.
 
 | Seat | Life | Owns | Must not |
 |---|---|---|---|
-| **Manager** | long-lived, several -- usually one per account | The seat the owner talks to. Reads `docs/BACKLOG.md`, writes a disposable brief citing an item, dispatches subagent Builders in its own process, polls for state, pushes and opens PRs. | Build. Attribute a red -- nobody does that now. Enqueue or merge -- both are the Lander's. Wait on inbound messages; it polls instead. Exit with a worker's work unpushed. |
-| **Builder** | ephemeral, one per brief | The change, the commit, the push, and the PR carrying the `BACKLOG.md` update. | Guess at something the brief left open, or wait for an answer; it puts the question in its report, comments it on the PR, and stops. Plan and wait for a "go". Spawn another session. |
+| **Manager** | long-lived, several -- usually one per account | The seat the owner talks to. Reads the backlog ledger (in the vault since 2026-09-13; `docs/BACKLOG.md` here is a stub), writes a disposable brief citing an item, dispatches subagent Builders in its own process, polls for state, pushes, and **decides when to cut a PR and what goes in it**, usually one PR per wave (owner ruling 2026-09-23). | Build. Attribute a red -- nobody does that now. Enqueue or merge -- both are the Lander's. Wait on inbound messages; it polls instead. Exit with a worker's work unpushed. |
+| **Builder** | ephemeral, one per brief | The change, the commit, and the push. Under a Manager, the Manager opens the PR, usually carrying several Builders' branches. | Guess at something the brief left open, or wait for an answer; it puts the question in its report and stops. Open the PR when a Manager dispatched it; that is the Manager's. Plan and wait for a "go". Spawn another session. |
 | **Watchdog** | as needed | Watching the Lander and keeping it draining. Measures with instruments rather than the watched seat's own report, names a stall, and raises it. Added 2026-09-19. | Take the action it is watching for -- acting destroys the instrument. Drain the queue, take the claim, or drive the lane. Relay an owner grant to the seat it watches. Publish a zero with no control that fired. |
 | **Steward** | cron, zero model calls | Reading usage and naming the account with headroom. | Warn a running session. Nothing can interrupt one. |
 | **Lander** | as needed | Merging, and flipping row statuses after items merge (owner correction 2026-09-21; see the note below). Standing authority on the engine repo and the vault, with no per-action owner approval. The 2026-09-11 POSITIONAL ledger-conflict ruling is RETIRED -- read the notice below, which also covers the *what an item SAYS* half this row's Must-not column used to carry. | Merge a diff it has not read. Arm auto-merge. Resolve a conflict that touches code, or decide which of two deliberate changes to an item survives. |
@@ -574,8 +574,8 @@ gates a merge**, and no seat has to clear one.
    `scripts/coord/install-coordination.ps1`, deny the Write, Edit or
    Bash call itself. CI arrives later, when the process is gone.
 3. It runs the checks below **before** it commits, because nobody downstream can ask it to.
-4. Its process exits when it has pushed and reported. The Manager opens the PR. The worktree stays
-   behind.
+4. Its process exits when it has pushed and reported. The Manager opens the PR, often one PR for
+   several Builders' branches. The worktree stays behind.
 5. **It CAN declare its own seat, through the Bash tool.** Measured 2026-09-02: a headless `-p`
    Builder ran `seat.ps1 -Declare` and its record carries `seatSource: declared` with a real goal,
    which no hook can write. **Quote the Windows path.** Unquoted, the SHELL eats the backslashes:
@@ -630,7 +630,9 @@ gates a merge**, and no seat has to clear one.
   not pushed has produced nothing -- not a branch, not a stash, not a file anyone can find later. So
   every brief ends with push, then report; never "finish and I will push for you", never "hold this
   until I say". Check before you close the instance. **You open the PR afterwards**, verifying the
-  branch with `git ls-remote --heads origin` rather than trusting the worker's report.
+  branch with `git ls-remote --heads origin` rather than trusting the worker's report. You also
+  decide when to open it and which branches it carries; see the batching bullet under *Branch,
+  commit one layer, open the PR*.
 - **Say who else is running, in three fields that are always present, including when the answer is
   nobody:** who is working, what paths they touch, and **whether they share this worktree.** The
   third field is the whole of the collision -- two workers given one worktree each reported the
@@ -712,16 +714,17 @@ gates a merge**, and no seat has to clear one.
   **WHO may press it changed with the Console's retirement on 2026-09-10: enqueuing and merging are
   BOTH the Lander's now.** A Manager does not enqueue, and that is not a narrowing of an old
   permission -- the seat that held it no longer exists, and korus `MANAGER.md` has never granted it.
-  Talk to the Lander before you open a PR, and leave the queue to it. Reading this bullet's earlier
-  wording as *"the dispatching seat enqueues"* is exactly the Console-by-substitution error §5's
-  retirement paragraph names.
+  Hand the PR to the Lander once it is open, and leave the queue to it. Reading this bullet's
+  earlier wording as *"the dispatching seat enqueues"* is exactly the Console-by-substitution error
+  §5's retirement paragraph names. **CORRECTED 2026-09-23:** the sentence before it read *"Talk to
+  the Lander before you open a PR"*. Korus `MANAGER.md` retired that pre-open check on 2026-09-18.
 
   **Dequeue before pushing.** Whether a QUEUED entry drops a later push is unmeasured. The hazard
   this bullet was written against, and why it is kept rather than deleted, is in
   [`docs/METHOD.md`](docs/METHOD.md).
 
-- Work on a feature branch and open a PR. Commit at logical stops, **one coherent layer per commit**,
-  with clear messages. Direct pushes to `main` stay blocked by the harness.
+- Work on a feature branch. Which seat opens the PR, and when, is the batching bullet below. Commit
+  at logical stops, **one coherent layer per commit**, with clear messages. Direct pushes to `main` stay blocked by the harness.
 - Commits at logical stops are Claude's own judgment. Commit coherent, tested, one-layer changes and
   narrate each. Respect the ledger gate: never `--no-verify`, never a rename workaround.
 - **Omit the `Co-Authored-By` trailer and the PR-body byline.** Standing owner preference, restated
@@ -746,6 +749,19 @@ gates a merge**, and no seat has to clear one.
   half of the 2026-08-29 ruling is untouched, so do not read this as a return to asking permission
   to push. A Builder's final commit message carries the proposed PR title and ledger banner text, so
   the branch is self-describing if the Manager dies before opening it.
+- **THE MANAGER DECIDES WHEN TO CUT A PR, AND ONE PR USUALLY CARRIES A WHOLE WAVE (owner ruling
+  2026-09-23).** A worktree needs its own branch, not its own PR. Each extra PR runs the required
+  suite on `pull_request` and again on `merge_group`, while a feature-branch push runs one small leak
+  scan. So Builders push and stop. The Manager merges the wave's pushed branches in a throwaway
+  worktree, runs the checks once on the combined tree, and opens one PR. It cuts that PR at the
+  first of: every Builder in the wave has reported, five items are ready, or the Manager is about to
+  close. An item gets its own PR when it fixes a red `main`, changes a security control, supersedes
+  an ADR, or must land in order against another open PR. An item that is red or conflicts goes back
+  to a Builder; the Manager never writes that resolution. **No other seat decides this.** A Builder
+  cannot, because it exits first. The Lander owns the PR from the handover on and repairs it like
+  any other, but dropping an item is a re-cut, and re-cuts go back to the Manager. Every other seat
+  opens its own PR and may batch its own work the same way. The steps, the PR
+  body shape and the traps are in korus `roles/MANAGER.md`, *When to cut a pull request*.
 - **The merge is the Lander's, and NO LABEL BLOCKS IT.** What blocks a merge is branch protection and
   the required contexts, nothing else. **Reading a diff before merging it is still the job; no check
   now asks whether you did.** That asymmetry is the point: a label records that a step *happened*, not

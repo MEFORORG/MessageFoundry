@@ -20,7 +20,7 @@ import pytest
 
 from messagefoundry.api import create_app
 from messagefoundry.api.approvals import ApprovalGate
-from messagefoundry.auth import Role
+from messagefoundry.auth import Permission, Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.models import ConnectorType, RetryPolicy
@@ -350,12 +350,15 @@ async def test_a_pending_replay_with_no_captured_requester_still_releases(engine
     await _dead_letter(engine)
     service = await _service(engine)
     await _add(service, "approver", Role.ADMINISTRATOR)
+    # A REAL requester: approve() re-validates the requester at release (ASVS 8.3.2), and this
+    # test is about the missing params key, not about a requester who no longer exists.
+    op_id = await _add(service, "op", Role.OPERATOR)
     await engine.store.create_pending_approval(
         approval_id="cafebabecafebabecafebabecafebabe",
         operation="dead_letter_replay",
         params="{}",  # the pre-#1646 shape: scope keys absent, and no requester
         requester="op",
-        requester_user_id="op-id",
+        requester_user_id=op_id,
         requested_at=time.time(),
         expires_at=None,
     )
@@ -384,22 +387,31 @@ async def test_a_pending_replay_with_no_captured_requester_still_releases(engine
 # approval with no recorded outcome at all.
 
 
-async def _gate_with_failing_op(engine: Engine) -> tuple[ApprovalGate, RuntimeError]:
-    gate = ApprovalGate(engine.store, ON)
+async def _gate_with_failing_op(engine: Engine) -> tuple[ApprovalGate, RuntimeError, str]:
+    # The maker is a REAL, enabled user holding the permission, because approve() re-validates the
+    # requester (ASVS 8.3.2) before it reaches the executor these tests are about.
+    service = await _service(engine)
+    maker_id = await _add(service, "maker", Role.OPERATOR)
+    gate = ApprovalGate(engine.store, ON, resolve_identity=service.identity_for_user_id)
     boom = RuntimeError("executor exploded")
 
     async def _raises(_p: Mapping[str, Any]) -> dict[str, Any]:
         raise boom
 
-    gate.register("dead_letter_replay", "Replay dead-lettered deliveries", _raises)
-    return gate, boom
+    gate.register(
+        "dead_letter_replay",
+        "Replay dead-lettered deliveries",
+        _raises,
+        permission=Permission.MESSAGES_REPLAY,
+    )
+    return gate, boom, maker_id
 
 
 async def test_raising_executor_rolls_the_row_out_of_approved(engine: Engine) -> None:
     """The row must NOT be left at 'approved' for an operation that did not run."""
-    gate, boom = await _gate_with_failing_op(engine)
+    gate, boom, maker_id = await _gate_with_failing_op(engine)
     approval_id = await gate.guard(
-        "dead_letter_replay", {}, requester="maker", requester_user_id="maker-id"
+        "dead_letter_replay", {}, requester="maker", requester_user_id=maker_id
     )
     assert approval_id is not None
 
@@ -416,9 +428,9 @@ async def test_raising_executor_rolls_the_row_out_of_approved(engine: Engine) ->
 async def test_raising_executor_audits_the_failure_against_both_identities(
     engine: Engine,
 ) -> None:
-    gate, _ = await _gate_with_failing_op(engine)
+    gate, _, maker_id = await _gate_with_failing_op(engine)
     approval_id = await gate.guard(
-        "dead_letter_replay", {}, requester="maker", requester_user_id="maker-id"
+        "dead_letter_replay", {}, requester="maker", requester_user_id=maker_id
     )
     assert approval_id is not None
     with pytest.raises(RuntimeError):
@@ -445,9 +457,9 @@ async def test_raising_executor_audits_the_failure_against_both_identities(
 async def test_compensation_cannot_clobber_an_already_rejected_row(engine: Engine) -> None:
     """The compensating transition is guarded on 'approved', so it can only ever move a row this
     gate itself released -- never one another caller rejected or expired."""
-    gate, _ = await _gate_with_failing_op(engine)
+    gate, _, maker_id = await _gate_with_failing_op(engine)
     approval_id = await gate.guard(
-        "dead_letter_replay", {}, requester="maker", requester_user_id="maker-id"
+        "dead_letter_replay", {}, requester="maker", requester_user_id=maker_id
     )
     assert approval_id is not None
     await gate.reject(approval_id, approver="checker")

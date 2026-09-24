@@ -1735,7 +1735,10 @@ def test_routes_documented_as_unpaced_really_charge_nothing() -> None:
     # explains is paced. Presence of a token is not the same claim as membership of the list.
     enumeration = row[-1].split(". ", 1)[0]
     documented = {m.group(1) for m in _ROUTE_TOKEN_RE.finditer(enumeration)}
-    assert len(documented) >= 5, (
+    # A parse-sanity floor, not a membership count. It was 5 until BACKLOG #287 paced three of the
+    # listed routes and the row shrank to four; 3 keeps the floor below the real list while still
+    # refusing a parse that found almost nothing.
+    assert len(documented) >= 3, (
         f"the 'No limiter of any kind' enumeration parsed to {sorted(documented)}. The guard reads the "
         "leading sentence of that cell; if the row was restructured, re-point it rather than accepting "
         "a green -- a parse that finds nothing cannot find an offender either."

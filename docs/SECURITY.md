@@ -121,7 +121,8 @@ actor** (`allow_admin_write`, keyed on the acting user, `_enforce_admin_write_pa
 - **`require_paced`** — state-changing routes that warrant pacing but **not** a step-up re-proof:
   connection start/stop/restart/flag/test/test-credential, `POST /statistics/reset`, the four
   `/alerts/{id}/*` writes, approvals approve/reject, `POST /dr/activate|release`,
-  `POST /status/integrity-check`.
+  `POST /status/integrity-check`, and since BACKLOG #287 `PATCH /logging/level`,
+  `DELETE /search/presets/{preset_id}` and `POST /alerts/test-email`.
 
 Both charge **non-GET requests only**, so the step-up **GET**s are exempt from *that* limiter by design
 — they are reads, not writes — but they are not unpaced: the **four** that select PHI in bulk
@@ -242,8 +243,8 @@ apply. What each **adds** over plain `require()`:
 
 | Gate wrapper | Routes | What it adds over `require()` |
 |---|---|---|
-| `require` | 43 | nothing — the ladder itself |
-| `require_paced` | 16 | per-actor anti-automation pacing on **non-GET** requests (`allow_admin_write`), 429 + `Retry-After: 1` |
+| `require` | 40 | nothing — the ladder itself |
+| `require_paced` | 19 | per-actor anti-automation pacing on **non-GET** requests (`allow_admin_write`), 429 + `Retry-After: 1` |
 | `require_phi_read` | 7 | the ADR 0092 PHI-read hop refusal (`enforce_phi_read_hop`) **before** any identity work, then the per-actor PHI-read budget, 429 + `Retry-After: 10` |
 | `require_step_up` | 28 | the same non-GET pacing, then the **MFA gate** (403 + `X-MFA-Required: 1`), the **new-client-IP** signal, and the credential-recency window (403 + `X-Step-Up-Required: 1`) |
 | `require_step_up_action` | 4 | the same non-GET pacing (BACKLOG #1148), the **MFA gate**, then a **single-use, action-bound** step-up grant minted only by `POST /me/reauth` (403 + `X-Step-Up-Action: <action>`). Promoting a route here no longer drops the pacing floor |
@@ -449,7 +450,7 @@ tuple: they act only on the caller's own account.
 | `GET` | `/dr/status` | `monitoring:read` | `require` |
 | `GET` | `/service/status` | `monitoring:read` | `require` |
 | `GET` | `/logging/level` | `monitoring:diagnose` | `require` |
-| `PATCH` | `/logging/level` | `monitoring:diagnose` | `require` — **not** paced (see the gap note under [Brute-force & abuse protection](#brute-force--abuse-protection)) |
+| `PATCH` | `/logging/level` | `monitoring:diagnose` | `require_paced` (BACKLOG #287) |
 | `POST` | `/statistics/reset` | `monitoring:diagnose` | `require_paced` |
 | `POST` | `/status/integrity-check` | `monitoring:diagnose` | `require_paced` |
 | `GET` | `/alerts/active` | `monitoring:diagnose` | `require` |
@@ -457,7 +458,7 @@ tuple: they act only on the caller's own account.
 | `POST` | `/alerts/{alert_id}/resolve` | `monitoring:diagnose` | `require_paced` |
 | `POST` | `/alerts/{alert_id}/suspend` | `monitoring:diagnose` | `require_paced` |
 | `POST` | `/alerts/{alert_id}/resume` | `monitoring:diagnose` | `require_paced` |
-| `POST` | `/alerts/test-email` | `service:configure` | `require` — operator test-send through the configured `[alerts]` email transport (BACKLOG #118); fires a live outbound SMTP dial, so it is admin-gated rather than `monitoring:diagnose`; sends a synthetic PHI-free event and returns no addresses; audited `alert_test_email` |
+| `POST` | `/alerts/test-email` | `service:configure` | `require_paced` (BACKLOG #287) — operator test-send through the configured `[alerts]` email transport (BACKLOG #118); fires a live outbound SMTP dial, so it is admin-gated rather than `monitoring:diagnose`; sends a synthetic PHI-free event and returns no addresses; audited `alert_test_email` |
 | `WS` | `/ws/stats` | `monitoring:read` | `authorize_ws` — `Origin` validated against `[api].ws_allowed_origins` **before** `accept()`; Authorization header only, no `?token=` fallback |
 | `GET` | `/service/identity` | `monitoring:read` | `require_service_cert` — **mTLS client certificate only**; PHI-fenced at app construction; writes a `service_cert_auth` audit row |
 
@@ -505,7 +506,7 @@ tuple: they act only on the caller's own account.
 |---|---|---|---|---|
 | `GET` | `/search/presets` | `messages:read` | `require` | **owner-scoped**: a caller sees only their OWN presets. Enforced on the identity's `user_id`, not on any client-supplied field, so the permission grants the FUNCTION and the row's owner grants the DATA (ASVS 8.1.1) |
 | `POST` | `/search/presets` | `messages:read` | `require_step_up` | **owner-scoped**: a caller sees only their OWN presets. Enforced on the identity's `user_id`, not on any client-supplied field, so the permission grants the FUNCTION and the row's owner grants the DATA (ASVS 8.1.1) |
-| `DELETE` | `/search/presets/{preset_id}` | `messages:read` | `require` | **not** paced; **owner-scoped**: a caller sees only their OWN presets. Enforced on the identity's `user_id`, not on any client-supplied field, so the permission grants the FUNCTION and the row's owner grants the DATA (ASVS 8.1.1). A preset id belonging to another user is a miss, not a 403 -- ownership is part of the lookup |
+| `DELETE` | `/search/presets/{preset_id}` | `messages:read` | `require_paced` | paced since BACKLOG #287; **owner-scoped**: a caller sees only their OWN presets. Enforced on the identity's `user_id`, not on any client-supplied field, so the permission grants the FUNCTION and the row's owner grants the DATA (ASVS 8.1.1). A preset id belonging to another user is a miss, not a 403 -- ownership is part of the lookup |
 | `GET` | `/search/layered` | `messages:read` | `require_step_up` | explicit `enforce_phi_read_hop` + `enforce_phi_read_pacing` |
 
 #### Uploaded files (PHI at rest)
@@ -749,8 +750,10 @@ else would need its own authorization rule stated here.
 
 1. `require_ui_step_up` answers a stale session with a **303 to `/ui/reauth`** instead of a 403 the
    browser cannot act on.
-2. **No `/ui` route charges the per-actor admin-write pacing floor** (see the interim note under
-   [Anti-automation](#admin-password-reset-wp-l3-12-asvs-646)).
+2. **The `/ui` write path charges the per-actor admin-write floor in `require_ui` itself**, because
+   the console calls the JSON handlers in-process and their pacing `Depends` never runs (see *The
+   `/ui` write path is paced* under [Anti-automation](#admin-password-reset-wp-l3-12-asvs-646)).
+   It draws the same bucket, but its 429 carries `Retry-After: 10` where the JSON floor sends `1`.
 3. **The uploaded-logs resend-confirm GET is weaker than its JSON equivalent, and cannot be
    otherwise** (it is not the only weaker uploaded-logs GET — `GET /ui/uploaded-logs` is one too,
    under item 5, and the set of record is `_UI_WEAKER_THAN_JSON_EQUIVALENT`, not this prose).
@@ -814,7 +817,9 @@ else would need its own authorization rule stated here.
    `POST /ui/connections/{name}/flag` mirrors `POST /connections/{name}/flag` (`require_paced` — a
    deploy-flag toggle, not `POST /config/reload`'s step-up'd deploy); and
    `POST /ui/messages/search/presets/{preset_id}/delete` mirrors
-   `DELETE /search/presets/{preset_id}` (also plain `require`), deleting a saved query, not PHI.
+   `DELETE /search/presets/{preset_id}` (`require_paced`, a floor `require_ui` charges too), deleting
+   a saved query, not PHI. It is flagged because `POST /search/presets`, same method and
+   permission, carries `require_step_up`.
 
 Differences 3–5 are derived and pinned: a `/ui` route that is weaker than **any** JSON route holding
 the same permission set on the same method reds CI until it is listed here.
@@ -879,6 +884,22 @@ server-side, not a client confirmation). On release the captured operation is **
 `approval.approved` by the checker); `POST /approvals/{id}/reject` declines it (`approval.rejected`), and
 a request older than `[approvals].expiry_hours` can no longer be approved. Approvers see the open queue
 at `GET /approvals`.
+
+**The requester is re-checked at release (ASVS 8.3.2).** A request can wait hours for its second
+approver, and the requester's authority can be withdrawn in that time. So the release reads it again.
+It refuses with **409** if the requester's account is gone or disabled, or no longer holds the
+operation's permission (`messages:replay`, `messages:purge` or `config:deploy`). It also refuses if the
+requester has left the channel scope the operation needs. The refusal writes an
+`approval.stale_requester` audit row against the approver, with a reason slug, and raises the
+`approval_stale_requester` alert. The request stays **pending**, so an approver can reject it. If the
+requester's authority comes back inside the expiry window, the request can still be released.
+
+The check reads the **engine's copy** of the account: its user row, stored roles and channel scope. A
+local disable, delete, role change or scope change is seen at once. **A directory (AD) change is seen
+only after it reaches that copy.** The reconciler below revokes an absent principal's sessions but
+does not disable its row. It re-diffs roles only for principals that hold a live session. So an AD
+requester who was disabled, deleted or demoted in the directory after making a request can still pass
+this check. Probing the directory at release is not built.
 
 The gated set is configurable (`[approvals].operations`); the first cut covers the two highest-PHI-impact
 flows — **bulk dead-letter replay** and **connection purge**. (The web console's "are you
@@ -1333,7 +1354,7 @@ slack.
 | Live directory group membership vs. the session's granted roles | the AD groups returned by that same reconciliation probe, mapped through the AD-group→role map | on a **successful (PRESENT)** probe, the mapped role set differs from the account's current roles — a **single** pass, **no** strike accrual (unlike the row above) | **DENY** by revocation of every session for that account (the new roles are persisted first), `auth.ad_session_revoked` with `reason = roles_changed`; charged against the same mass-revoke breaker as an absence | **300 s** (same loop; `0` disables it) | `[auth].ad_session_recheck_seconds` |
 | Live directory mass-revoke breaker | the size of one pass's revocation set vs the probed population | the set exceeds **both** `ad_session_revoke_max` (**5**) **and** `ad_session_revoke_max_fraction` (**0.34**) — a second **binary** predicate layered on the row above, never a score (see "Directory session reconciliation") | **LOG** — the pass aborts revoking **nothing**, logs at ERROR and writes an `auth.ad_reconcile_aborted` audit row + loud alert | 5 / 0.34 | `[auth].ad_session_revoke_max`, `ad_session_revoke_max_fraction` |
 | PHI-read volume, per actor | `identity.user_id` | > 120 reads (`phi_read_rate_limit_per_actor`) per 60 s (`phi_read_rate_limit_window_seconds`); the global dimension `phi_read_rate_limit_global` defaults to `0` = **off** | **THROTTLE** 429 + `Retry-After: 10`, WARNING-logged, charged at **admission** before any store work | on, 120 / 60 s | `[auth].phi_read_rate_limit_enabled` |
-| Admin-write rate, per actor | `identity.user_id` × request method | **non-GET only**; > 12 writes (`admin_write_rate_limit_per_actor`) per 1.0 s (`admin_write_rate_limit_window_seconds`); no global dimension (`glob=0`) | **THROTTLE** 429 + `Retry-After: 1`, WARNING-logged. Charged on the JSON API and on `/ui`, which re-applies it | on, 12 writes / 1.0 s | `[auth].admin_write_rate_limit_enabled` |
+| Admin-write rate, per actor | `identity.user_id` × request method | **non-GET only**; > 12 writes (`admin_write_rate_limit_per_actor`) per 1.0 s (`admin_write_rate_limit_window_seconds`); no global dimension (`glob=0`) | **THROTTLE** 429 + `Retry-After: 1` on the JSON API and `10` on `/ui`, WARNING-logged. Charged on the JSON API and on `/ui`, which re-applies it | on, 12 writes / 1.0 s | `[auth].admin_write_rate_limit_enabled` |
 | Serve-hop security posture | `[security].enforcement` × (`api.is_loopback` **or** `exposure_protected`), via `phi_read_hop_disposition` | disposition is REFUSE — an instance under `enforcement = enforce` whose serve hop is neither loopback, nor in-process TLS, nor a declared TLS-terminating proxy. Setting `[security].enforcement = warn` turns the refusal into WARN-and-serve. **No data-class value switches it off**: BACKLOG #1279 deleted that axis | **DENY** 403 (PHI-free message) on every **JSON-API** PHI-read route (`require_phi_read`, plus the step-up bulk routes), **before** any identity work — and on the `/ui` PHI routes through `require_ui`'s `phi=True` arm, **after** identity work, so an unauthenticated visit still gets its login redirect instead of a 403 disclosing the posture (BACKLOG #1738). Two tests, and they pin different things: `test_ui_plane_states_the_phi_read_hop_gap` pins the DISCLOSURE both ways, by comparing this document against the console's call sites — it issues no request and cannot see ordering; the ORDER is pinned by the console suite's `test_the_refusal_lands_after_identity_so_a_visitor_still_gets_the_login_page` | ALLOW on loopback | `[security].enforcement`, `[api].tls_cert_file`, `tls_terminated_upstream` + `trusted_proxies` |
 | Bind / exposure posture — refusing arms | `settings.api.host` loopback-ness, `tls_terminated_upstream`, `trusted_proxies`, `settings.api.public_origin`; derived `instance_exposed` (loopback-ness **or** a declared terminator) and `admin_exposed`, plus `ui_exposed` for the `/ui` arms only; `[security].enforcement` | auth off on an exposed instance — a non-loopback bind **or** a declared terminator (`instance_exposed`); `/ui` exposed without the required origin/TLS declarations; a non-loopback bind with neither in-process TLS nor a declared terminator, where `enforce` clamps both `--allow-insecure-bind` and `[security].require_encryption_for_remote = false` shut; `admin_exposed` + `enforcing` + `require_mfa` explicitly opted out | **DENY at startup** — `serve` prints an error and exits **2**. The refuse/warn dial is `[security].enforcement` (default `enforce`), **not** `production`: the auth-off and `/ui`-exposure arms refuse **unconditionally**, and the `require_mfa` arm refuses on enforcement `enforce` alone — no data-class term narrows it, so `dev` and `staging` are gated exactly as `prod` is — and warns otherwise. `[security].allow_single_factor_admin_when_exposed = true` downgrades that one arm to permitted-but-audited. **`admin_exposed` is `instance_exposed`, and reads no console flag** (BACKLOG #326): the ADR 0143 degrade arms rewrite `settings.api.serve_ui` in place earlier in the same startup, so deriving an exposure decision from it made this arm and the dual-control arm below miss a declared-proxy instance whose console had been degraded or disabled — while the ASVS 11.7.1 arm called that same boot exposed. The same attributes force the session cookie's `Secure` flag + HSTS, and permit WebAuthn `rp_id` derivation from the request URL **only** on a loopback bind with no proxy declared | loopback, nothing declared | `[security].local_access_only`, `listen_address`, `serve_web_console`, `web_console_public_address`, `require_sign_in`, `require_mfa`, `require_encryption_for_remote`, `[api].tls_cert_file`, `tls_terminated_upstream`, `trusted_proxies`, `[security].enforcement`, `[security].allow_single_factor_admin_when_exposed` |
 | Bind / exposure posture — dual-control arm | `admin_exposed` (= `instance_exposed`: an off-loopback bind **or** a declared TLS terminator — never the console flag, BACKLOG #326) × `[approvals].enabled` | `admin_exposed` **and** `[approvals].enabled` off — high-value actions complete on one caller's authority | **LOG** — a startup **WARNING only, on every instance including production**; `serve` does **not** refuse. The refuse arm is an explicit unresolved owner fork recorded in `__main__.py`, not a shipped control | approvals off | `[approvals].enabled` |
@@ -1416,8 +1437,8 @@ The honest limits of that model, one sentence each:
   loopback session, because `127.0.0.1` and `::1` are folded into one host.
 - The operator-surface network gate is **inert** behind an undeclared proxy or NAT (see layer 1 of
   [Administrative-interface defense-in-depth](#administrative-interface-defense-in-depth-wp-l3-13-asvs-842)).
-- The per-actor admin-write floor is charged on the **JSON API only** at this release; the `/ui` write
-  path charges none.
+- The per-actor admin-write floor does not reach every write: see *The `/ui` write path is paced*
+  and the Route → limiter map's "No limiter of any kind" row for the routes that charge none.
 
 **Attributes not consumed at this release** — stated so the inventory cannot be read as claiming more
 than it does: time-of-day / hour-of-day, geolocation, device security posture or attestation,
@@ -1589,7 +1610,9 @@ attachments, `/dead-letters` — paced at `[auth].phi_read_rate_limit_per_actor`
 every directory principal still holding a live session — via the same password-free service-account
 lookup the Kerberos path uses — and revokes the sessions of accounts AD has disabled or deleted. Group
 membership is re-diffed on the same pass at no extra directory cost, so a **role demotion** takes effect
-without waiting for a login that may never happen. Revocations audit `auth.ad_session_revoked`.
+without waiting for a login that may never happen. Revocations audit `auth.ad_session_revoked` and
+raise the `ad_session_revoked` alert, one per revoked principal, once the pass completes. A pass that
+fails part-way keeps the audit rows for what it already revoked, but raises no alert for them.
 
 **The probe is keyed on the directory's immutable `objectGUID`**, the same identifier a directory login
 is identified by, and a renamed account's stored username is refreshed from the directory on the same
@@ -1608,7 +1631,9 @@ Three safety properties, because the lookup still returns one indistinguishable 
   service account that lost read rights answers "not found" for *every* user. A pass whose revocation
   set exceeds **both** `ad_session_revoke_max` (5) **and** `ad_session_revoke_max_fraction` (0.34) of
   the probed population **aborts**: nothing is revoked, nothing is written, the engine logs at ERROR
-  and audits `auth.ad_reconcile_aborted`, and the condition latches until a clean pass. Both thresholds
+  and audits `auth.ad_reconcile_aborted`, raises the `ad_reconcile_aborted` alert, and the condition
+  latches until a clean pass. A whole-directory outage audits `auth.ad_reconcile_skipped` instead and
+  raises no alert. Both thresholds
   must be exceeded — the floor alone would sign out a five-person site, the proportion alone would fire
   on a genuine 3-of-3 offboarding — so it trips only on a change that is simultaneously large and broad.
 
@@ -1926,7 +1951,7 @@ the recovery path. Controls 4–6 are covered in their own rows.
 | `POST /ui/mfa` | per-actor ceremony budget | the ASVS 6.3.3 sign-in gate: it submits the second factor for a session that has already proven its password, so it draws the same budget as `POST /ui/reauth` and carries the same `Retry-After: 30` |
 | `POST /ui/account/mfa/verify` | per-actor ceremony budget | |
 | `POST /ui/account/password` | *(inherits)* | delegates to the JSON handler, which charges once; the 429 is re-raised intact — deliberately not double-charged |
-| **No limiter of any kind** | — | `POST /auth/logout`, `POST /me/mfa/enroll`, `DELETE /me/sessions[/{id}]`, `POST /ai/chat`, `DELETE /search/presets/{preset_id}`, `PATCH /logging/level`, `POST /alerts/test-email` — the last of which dials a live outbound SMTP server per request behind a plain `service:configure` check. **Two routes left this row and the table did not follow them.** `PATCH /users/{user_id}` is the one already narrated: it lost the write pacing when it was promoted to an action-bound step-up gate, and BACKLOG #1148 made `require_step_up_action` charge the floor again. `DELETE /me/mfa` rides that same gate (`require_step_up_action(STEP_UP_ACTION_MFA_DISABLE)`), so #1148 paced it too and it was left listed here regardless. The `reauth_only` action gate (`require_reauth_only_action`) still charges none. `GET /ui/reauth` belongs here because the admin-write floor is non-GET only; the console's WebAuthn **staging** POSTs do **not** — see control 8 |
+| **No limiter of any kind** | — | `POST /auth/logout`, `POST /me/mfa/enroll`, `DELETE /me/sessions[/{id}]`, `POST /ai/chat`. BACKLOG #287 paced three routes that were listed here. They are `DELETE /search/presets/{preset_id}`, `PATCH /logging/level` and `POST /alerts/test-email`, now on `require_paced`. **Two earlier routes left this row and the table did not follow them.** `PATCH /users/{user_id}` is the one already narrated: it lost the write pacing when it was promoted to an action-bound step-up gate, and BACKLOG #1148 made `require_step_up_action` charge the floor again. `DELETE /me/mfa` rides that same gate (`require_step_up_action(STEP_UP_ACTION_MFA_DISABLE)`), so #1148 paced it too and it was left listed here regardless. The `reauth_only` action gate (`require_reauth_only_action`) still charges none. `GET /ui/reauth` belongs here because the admin-write floor is non-GET only; the console's WebAuthn **staging** POSTs do **not** — see control 8 |
 
 The console resolves the ceremony gate through a `getattr` shim because it ships as a separately
 versioned wheel: mounted on an engine that predates the method, it falls back to the **sign-in** budget.

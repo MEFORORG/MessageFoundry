@@ -114,6 +114,13 @@ class ReconcilePlan:
     #: the pass failed (a whole-directory outage). The value is a closed-set operator-facing slug.
     aborted: str | None = None
 
+    @property
+    def directory_outage(self) -> bool:
+        """True when the pass aborted because the directory, not the accounts, failed. The auth
+        service audits this as skipped rather than aborted, and the lifespan task pages nobody for
+        it. Both read this one predicate, so the audit row and the alert cannot disagree."""
+        return self.aborted == "directory_unavailable"
+
 
 def breaker_tripped(
     *, revoke_count: int, probed: int, max_absolute: int, max_fraction: float

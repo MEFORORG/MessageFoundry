@@ -165,6 +165,35 @@ class AlertSink(Protocol):
         route a first-run-credential reminder apart from a long-lived-secret rotation reminder."""
         ...
 
+    def approval_stale_requester(self, approval_id: str, *, operation: str, reason: str) -> None:
+        """A second approver tried to release a held dual-control request, and the release was
+        REFUSED because the requester no longer holds the authority it needs (ASVS 8.3.2). ``reason``
+        is a closed-set slug: ``requester_missing``, ``requester_disabled``,
+        ``requester_lacks_permission``, ``requester_out_of_scope`` or ``requester_unverifiable``.
+        Keyed on ``approval_id`` so each refused request pages on its own. Carries the id, the
+        operation key and the slug only: no username, no params, no message content (no PHI). The
+        ``approval.stale_requester`` audit row is the durable record; this is the page. Emitted by
+        :class:`~messagefoundry.api.approvals.ApprovalGate`."""
+        ...
+
+    def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
+        """A directory reconciliation pass tripped the mass-revoke circuit breaker and revoked
+        NOTHING (ADR 0079 mechanism 2). The same event as the ``auth.ad_reconcile_aborted`` audit
+        row. ``name`` labels the source (``"directory-reconciler"``); ``reason`` is the pass's
+        closed-set abort slug; ``probed`` is how many principals the pass probed; ``detail`` is the
+        operator-facing explanation the auth service latches. No PHI. Emitted by the API-lifespan
+        reconciler task, never from ``auth/``. A whole-directory outage is NOT this event: it is
+        audited as ``auth.ad_reconcile_skipped`` and pages nothing, because the accounts are fine."""
+        ...
+
+    def ad_session_revoked(self, name: str, *, reason: str) -> None:
+        """A directory reconciliation pass revoked a directory principal's live sessions, because the
+        account left the directory or its mapped roles changed (ADR 0079 mechanism 2). The same event
+        as the ``auth.ad_session_revoked`` audit row. ``name`` is the account's username, so each
+        revoked principal pages on its own; ``reason`` is ``directory_absent`` or ``roles_changed``.
+        No PHI. Emitted by the API-lifespan reconciler task, never from ``auth/``."""
+        ...
+
     def gcm_invocations(self, name: str, *, key_id: str, invocations: int, ceiling: int) -> None:
         """The active store data-encryption key has crossed the AES-GCM soft invocation threshold
         (2**31 of the 2**32 birthday ceiling) on its PERSISTED, fleet-wide cumulative count (ASVS
@@ -415,6 +444,30 @@ class LoggingAlertSink:
             name,
             hours_remaining,
             expires_at,
+        )
+
+    def approval_stale_requester(self, approval_id: str, *, operation: str, reason: str) -> None:
+        log.warning(
+            "ALERT approval_stale_requester: release of %s request %r refused (%s)",
+            operation,
+            approval_id,
+            reason,
+        )
+
+    def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
+        log.warning(
+            "ALERT ad_reconcile_aborted: %r aborted a pass of %d principal(s) (%s): %s",
+            name,
+            probed,
+            reason,
+            detail,
+        )
+
+    def ad_session_revoked(self, name: str, *, reason: str) -> None:
+        log.warning(
+            "ALERT ad_session_revoked: directory principal %r had its sessions revoked (%s)",
+            name,
+            reason,
         )
 
     def gcm_invocations(self, name: str, *, key_id: str, invocations: int, ceiling: int) -> None:

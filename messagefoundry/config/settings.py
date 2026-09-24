@@ -3126,6 +3126,13 @@ _ALERT_EVENT_TYPES = frozenset(
         # operator can page on "the engine went deaf" apart from the per-connection connection_stopped
         # events the stop also emits.
         "log_write_failed",
+        # ASVS 8.3.2: a dual-control release was refused because the requester no longer holds the
+        # authority the operation needs (deleted, disabled, permission or channel scope withdrawn).
+        "approval_stale_requester",
+        # ADR 0079 mechanism 2: the directory reconciler's two audited outcomes, each routable apart:
+        # the mass-revoke breaker tripped (nothing revoked), and one principal's sessions were revoked.
+        "ad_reconcile_aborted",
+        "ad_session_revoked",
         # NOTE: the INVERSE events (leadership_lost / dr_released) are auto-resolve-only (alert_sinks
         # _AUTO_RESOLVE), NOT rule-targetable alert types — a step-down / fail-back needs no page.
     }
@@ -3236,7 +3243,7 @@ class AlertRule(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     # --- match (all conditions must hold) ---
-    event_type: str = "any"  # "any" | connection_stopped | queue_buildup | storage_threshold | cert_expiry | secret_rotation | connection_error | message_stall | saturation | integrity_drift | update_available | backup_failed | lane_stuck | rcsi_off_degraded | bootstrap_admin_expiring
+    event_type: str = "any"  # "any" | a member of _ALERT_EVENT_TYPES (validated below)
     connection: str = "*"  # fnmatch glob over the connection name; "*" = all
     min_depth: int | None = Field(None, ge=1)  # queue_buildup: match only at/over this lane depth
     min_oldest_seconds: float | None = Field(
