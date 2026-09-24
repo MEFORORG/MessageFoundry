@@ -679,8 +679,9 @@ async def test_websocket_from_a_denied_address_is_closed_before_accept(engine: E
     await peer.run()
     assert peer.accepted is False  # refused BEFORE the handshake — the route never ran
     assert peer.frames == []
-    # 1008 = policy violation. NOTE: uvicorn maps a pre-handshake close to HTTP 403 and DISCARDS the
-    # code, so this is observable in-process (and here), not on the wire.
+    # 1008 = policy violation. This scope offers no websocket.http.response extension, so it drives
+    # the bare-close FALLBACK. Under uvicorn, which offers it, the refusal is an HTTP 403 denial:
+    # tests/test_ws_handshake_header_floor.py covers that arm.
     assert peer.close_code == 1008
     assert app.state.client_denials == 1
 

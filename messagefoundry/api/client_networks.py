@@ -47,7 +47,11 @@ from typing import Any
 from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from messagefoundry.api.header_floor import CSP_HEADER, FRAME_ANCESTORS_CSP
+from messagefoundry.api.header_floor import (
+    CSP_HEADER,
+    FRAME_ANCESTORS_CSP,
+    websocket_denial_supported,
+)
 from messagefoundry.netaddr import client_network_allowed
 
 _log = logging.getLogger(__name__)
@@ -180,11 +184,10 @@ class ClientNetworkMiddleware:
             return
 
         _record_denial(state, host)
-        if scope["type"] == "websocket":
-            # Pre-accept refusal: the socket is closed before the handshake completes, so the route
-            # never runs and no frame is ever sent. NOTE: uvicorn maps a pre-handshake websocket.close
-            # to HTTP 403 and DISCARDS the code, so 1008 is observable in-process (and in tests) but
-            # not on the wire.
+        # A WebSocket is refused BEFORE the handshake on both arms, so the route never runs. With the
+        # denial extension it gets the same 403 an HTTP request gets, marker included (BACKLOG
+        # #1120); without it, only the bare close is possible (see header_floor.refuse_websocket).
+        if scope["type"] == "websocket" and not websocket_denial_supported(scope):
             await send({"type": "websocket.close", "code": 1008})
             return
         await self._deny_http(scope, receive, send, host)
