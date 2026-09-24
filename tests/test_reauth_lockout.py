@@ -158,6 +158,7 @@ async def test_a_locked_account_is_refused_reauth_even_with_the_right_password()
 
         out = await service.reauth(identity, GOOD, token=token, purpose="mfa_enroll")
         assert not out.ok and out.token is None and not out.session_lost
+        assert out.locked, "the route must be able to say 'locked' rather than 'wrong password'"
         assert await service.identity_for_token(token) is not None, "nothing rotated"
         assert not await service.has_action_step_up(token, "mfa_enroll"), "no grant was minted"
 
@@ -191,7 +192,10 @@ async def test_a_locked_account_cannot_verify_its_current_password() -> None:
         assert await _lock_state(store, "u-bob") == state, "a refusal must not extend the lock"
 
         feed = await service.security_events_for("bob")
-        assert len(_actions(feed, "auth.account_locked")) == 1
+        locked = _actions(feed, "auth.account_locked")
+        assert len(locked) == 1
+        # No richer than the attempt's own row, which carries only its reason.
+        assert locked[0]["detail"] is None
         # Each attempt is audited once. Before this change a failed current-password check wrote
         # nothing at all, so a guessing run was invisible in the user's feed.
         failed = _actions(feed, "auth.password_change_failed")
@@ -281,22 +285,50 @@ async def test_the_json_routes_lock_the_account_and_the_feed_shows_it(engine: En
         assert r.status_code == 403
 
         # Locked: the right password is refused on both routes, and the password is not changed.
-        assert (
-            await c.post("/me/reauth", headers=headers, json={"password": GOOD})
-        ).status_code == 403
+        before = await service.store.get_user_by_username("carol")
+        assert before is not None
+        r = await c.post("/me/reauth", headers=headers, json={"password": GOOD})
+        assert r.status_code == 403 and r.json()["detail"] == "account locked"
         r = await c.post(
             "/me/password",
             headers=headers,
             json={"current_password": GOOD, "new_password": NEW_GOOD},
         )
-        assert r.status_code == 403
+        assert r.status_code == 403 and r.json()["detail"] == "account locked"
+        after = await service.store.get_user_by_username("carol")
+        assert after is not None and after.password_hash == before.password_hash
 
         feed = await c.get("/me/security-events", headers=headers)
         assert feed.status_code == 200, feed.text
         body = feed.json()
         events = body["events"] if isinstance(body, dict) else body
         assert [e["action"] for e in events].count("auth.account_locked") == 1
-    assert not (await service.login("carol", NEW_GOOD)).ok, "the locked change must not have landed"
+
+
+async def test_a_parallel_burst_cannot_outrun_the_lock() -> None:
+    """Re-proofs for one account run one at a time. Without that, a burst passes the lock check
+    together, every guess in it is verified after the account locks, and a correct guess inside the
+    burst succeeds. The code review reproduced exactly that before the serialization landed."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=3, require_mfa=False))
+        await _local_user(store)
+        identity, token = await _signed_in(service)
+        burst = [service.verify_current_password(identity, WRONG) for _ in range(8)]
+        burst.append(service.verify_current_password(identity, GOOD))
+        results = await asyncio.gather(*burst)
+        assert results[-1] is False, "a correct guess queued behind the lock must be refused"
+        attempts, locked_until = await _lock_state(store, "u-bob")
+        assert locked_until is not None
+        assert attempts == 3, "no guess may be verified or counted once the lock is set"
+
+        again = await asyncio.gather(
+            *[service.reauth(identity, GOOD, token=token) for _ in range(3)]
+        )
+        assert all(not e.ok and e.locked for e in again)
+        assert service._reproof_locks == {}, "the per-account lock entry must not leak"
+    finally:
+        await store.close()
 
 
 # --- (d) a directory account's failed re-bind counts toward ENGINE lockout ----------------------
@@ -318,15 +350,16 @@ class _FakeDirectory:
     def __init__(self) -> None:
         self.binds = 0
         self.down = False
+        self.known = True  # False = the directory has no such principal (renamed, disabled, ...)
 
     def authenticate(self, username: str, password: str) -> AdPrincipal | None:
         self.binds += 1
         if self.down:
             raise LdapError("synthetic: directory unreachable")
-        return _principal() if password == AD_GOOD else None
+        return _principal() if password == AD_GOOD and self.known else None
 
     def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
-        return _principal()
+        return _principal() if self.known else None
 
 
 async def _ad_service(store: MessageStore, directory: _FakeDirectory) -> AuthService:
@@ -363,6 +396,14 @@ async def test_a_directory_accounts_failed_rebind_counts_toward_engine_lockout()
         assert (await _lock_state(store, identity.user_id))[0] == 0
         directory.down = False
 
+        # Nor is a principal the directory cannot find: every re-bind fails whatever is typed, so
+        # counting it would lock the engine row, and so the Kerberos and OIDC sign-ins, for nothing.
+        directory.known = False
+        for _ in range(3):
+            assert not (await service.reauth(identity, AD_GOOD, token=token)).ok
+        assert (await _lock_state(store, identity.user_id))[0] == 0
+        directory.known = True
+
         for _ in range(3):
             assert not (await service.reauth(identity, WRONG, token=token)).ok
         _, locked_until = await _lock_state(store, identity.user_id)
@@ -375,8 +416,8 @@ async def test_a_directory_accounts_failed_rebind_counts_toward_engine_lockout()
         assert len(locked) == 1
         assert locked[0]["detail"] == '{"provider": "ad"}'
 
-        # Locked: the engine refuses BEFORE asking the directory, so a locked engine row never feeds
-        # guesses to the domain's own lockout counter.
+        # Locked: the engine refuses BEFORE asking the directory, so no bind reaches the DC while the
+        # engine lock lasts.
         binds_before = directory.binds
         assert not (await service.reauth(identity, AD_GOOD, token=token)).ok
         assert directory.binds == binds_before
@@ -388,7 +429,7 @@ def test_the_security_doc_says_reauth_counts_and_does_not_lock_the_directory() -
     doc = (Path(__file__).resolve().parents[1] / "docs" / "SECURITY.md").read_text(encoding="utf-8")
     assert "auth.account_locked" in doc and "auth.login_after_failures" in doc
     assert "auth.password_change_failed" in doc
-    assert "never locks the directory account" in doc
+    assert "never writes a lock to the directory account" in doc
 
 
 # --- (e) a successful re-auth after failures is labelled like a login after failures ------------

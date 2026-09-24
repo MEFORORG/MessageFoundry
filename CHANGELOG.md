@@ -66,6 +66,18 @@ All notable changes to MessageFoundry are documented here. The format follows
   path meets it. `0` means no floor. `[approvals].expiry_hours` now also refuses NaN, infinity and
   overflow, and with dual control on, startup refuses a floor at or past the expiry. Dual control
   (`[approvals].enabled`) still ships off. ([BACKLOG #287](docs/BACKLOG.md))
+- **A failed step-up re-auth or password change now counts toward the account lockout, and a locked
+  account is refused there even with the right password.** In 0.4.0, `POST /me/reauth`, the web
+  console's `POST /ui/reauth` and `POST /me/password` checked a password but counted no failure and
+  ignored the lock. So someone holding a stolen session could keep guessing, bounded only by the
+  per-actor ceremony budget. They now share the sign-in counter, threshold and window. A rejected
+  directory (AD) re-bind counts too. That locks the engine's own account row, never the directory
+  account, and a directory the engine cannot reach is not counted. The crossing attempt writes
+  `auth.account_locked`. A re-auth that succeeds after three or more failures writes
+  `auth.login_after_failures`. A failed current-password check at `POST /me/password` is now
+  audited as `auth.password_change_failed`. That route no longer lifts a live lock: the lock ends
+  when it expires, on an administrator's reset, or with `messagefoundry admin-unlock`.
+  (`BACKLOG #1138`)
 - **BREAKING: the `Http()` inbound listener now refuses any `Transfer-Encoding`, not only
   `chunked`.** The listener decodes no transfer coding. In 0.4.0 it refused the header only when its
   whole value was `chunked`. A coding list such as `gzip, chunked` got through, and so did `chunked,`

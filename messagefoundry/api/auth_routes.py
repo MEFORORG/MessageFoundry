@@ -364,11 +364,12 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST, "AD passwords are managed in Active Directory"
             )
-        # Counts toward the account lockout and refuses a locked account (BACKLOG #1138); the
-        # refusal keeps this one message, as a wrong password does at /me/reauth.
+        # Counts toward the account lockout and refuses a locked account (BACKLOG #1138).
         if not await service.verify_current_password(
             identity, body.current_password, client=_client(request)
         ):
+            if await service.account_locked(identity):
+                raise HTTPException(status.HTTP_403_FORBIDDEN, "account locked")
             raise HTTPException(status.HTTP_403_FORBIDDEN, "current password is incorrect")
         # ASVS 6.4.1: a "change" that reuses the current password is not a change — it would leave an
         # expired/temp credential in place (and defeats the must_change_password claim step).
@@ -422,6 +423,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             # password that was already correct.
             if elevation.session_lost:
                 raise HTTPException(status.HTTP_401_UNAUTHORIZED, "session ended; sign in again")
+            if elevation.locked:
+                raise HTTPException(status.HTTP_403_FORBIDDEN, "account locked")
             raise HTTPException(status.HTTP_403_FORBIDDEN, "re-verification failed")
         _no_store(response)
         return ElevatedResponse(detail="re-verified", token=elevation.token)

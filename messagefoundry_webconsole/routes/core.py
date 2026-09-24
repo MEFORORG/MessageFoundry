@@ -1252,7 +1252,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                         mfa_needed=mfa_enrolled and still_unsatisfied,
                         webauthn_options=wa_options,
                         webauthn_notice=wa_notice,
-                        error="Incorrect password.",
+                        # BACKLOG #1138: a locked account is refused before the password is checked.
+                        error=(
+                            "Account locked. Try again later."
+                            if pw_elevation.locked
+                            else "Incorrect password."
+                        ),
                     )
                 ),
                 token,
