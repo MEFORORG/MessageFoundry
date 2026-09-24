@@ -47,6 +47,16 @@ All notable changes to MessageFoundry are documented here. The format follows
   would see that partner fail to open the message after its relay has already accepted it**, so the
   failure would surface on the partner's side, not as a send error here.
   ([BACKLOG #1168](docs/BACKLOG.md))
+- **A keyed store now refuses an unmarked value in an encrypted column instead of reading it back
+  as plaintext.** Once a store key is set, every covered column holds only `mfenc:` ciphertext, so
+  a non-blank value without the marker is a stripped marker or a planted row. The cipher raises
+  `CipherError` on it. A purged `''` is never refused. The sweep that runs at each keyed open now
+  seals legacy plaintext only on a surface that holds no sealed value yet; on any other surface it
+  leaves the unmarked value in place and reports it. Each refusal raises an `integrity_drift` alert
+  under the subject `store-cipher`, naming the table and column but never the row or the value.
+  **A planted `state` or `reference` value would stop the engine from starting**, because both
+  caches load at open. The opt-out, `[store].allow_unmarked_ciphertext`, ships off and is reported
+  as a loosening when on. ([BACKLOG #1169](docs/BACKLOG.md))
 
 ## [0.4.0] — 2026-09-23 — Early Access
 

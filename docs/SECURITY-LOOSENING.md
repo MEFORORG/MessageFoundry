@@ -63,18 +63,20 @@ section reference.
 | Enforcement dial | `enforcement` | `enforce` (refuse; `warn` = loud audited loosening) |
 | Production tier | `production_instance` | *derived from environment* |
 | Outside `[security]` | `[store].aad_bind` | `true` (at-rest values bound to their cell) |
+| | `[store].allow_unmarked_ciphertext` | `false` (an unmarked value in an encrypted column is refused) |
 | | `[auth].ad_session_recheck_seconds` | `300` s (*conditional* — a loosening only once `ad_enabled`) |
 | | `[secret_rotation].enforce_store_key_expiry` | `true` (a calendar-overdue store DEK refuses to start) |
 | Per-connection | `cleartext_accepted` | `false` on every outbound / `FhirLookup` (*connection-scoped* — see below) |
 | | `tls_allow_expired` | `false` on all six outbound connectors that take it (*connection-scoped*) |
 | | generic-ODBC `DATABASE` TLS | a verifying `odbc_params` keyword (*connection-scoped*; inbound **and** outbound) |
 
-**Six of these do not live in `[security]`.** `[store].aad_bind`,
-`[auth].ad_session_recheck_seconds` and `[secret_rotation].enforce_store_key_expiry` sit in their own
+**Seven of these do not live in `[security]`.** `[store].aad_bind`,
+`[store].allow_unmarked_ciphertext`, `[auth].ad_session_recheck_seconds` and
+`[secret_rotation].enforce_store_key_expiry` sit in their own
 sections for cohesion, and the last three are per-**connection** facts, not service
 settings at all. They are listed and reported here anyway, because the rule is *one shipped
 posture, loosen only* — a deviation the registry cannot see is a second posture by the back door. The
-first three are named by `security_loosenings()` from the loaded
+first four are named by `security_loosenings()` from the loaded
 `[store]`/`[auth]`/`[secret_rotation]` sections; the last
 three are resolved from the loaded connection graph and passed in by name (see their entries below for
 exactly which surfaces see them, and which cannot).
@@ -392,6 +394,24 @@ This section is kept rather than deleted, because the claim it used to make is t
   `messagefoundry rotate-key` upgrades them `v1`→`v2` in place, so turning it back on does not strand an
   existing store. See [ADR 0019](adr/0019-pluggable-keyprovider-hsm-kms-vault.md) (2026-07-28 amendment).
 
+### `[store].allow_unmarked_ciphertext = true` — an unmarked value in an encrypted column reads back as plaintext
+- **What you lose:** the refusal that protects an encrypted column against a **downgrade**. On a keyed
+  store, a non-blank value with no `mfenc:` marker is a stripped marker or a planted plaintext row, and
+  with this off it is refused (`CipherError`) and alerted (`integrity_drift`, subject `store-cipher`).
+  With it on, that value is returned as the row's content, and the next keyed open or `rotate-key`
+  seals it into genuine ciphertext, after which no evidence of the substitution survives. Cell binding
+  (`aad_bind`) does not cover this: a moved ciphertext has a tag to fail, and a plaintext value has none
+  (ASVS 11.3.3, BACKLOG #1169).
+- **When acceptable:** a store that holds legitimate unmarked values beside ciphertext in one column —
+  for example rows written by a keyless run of a store that was keyed before. Turn it on for one keyed
+  open to seal them, then turn it back off. It is a no-op with **no `[store].encryption_key`**.
+- **Compensating controls:** database-level access control, because planting a row needs store write
+  access. Nothing in the engine detects the plant once this is on.
+- **Reversible:** yes. Turning it back off refuses unmarked values again from the next read; anything
+  it sealed while on stays sealed.
+- **Not covered either way:** the uploaded-file store, whose behaviour at first key-enable awaits an
+  owner ruling, and the DIRECT S/MIME connector's enveloped body.
+
 ### `[secret_rotation].enforce_store_key_expiry = false` — the store DEK's calendar expiry stops the engine no more
 - **What you lose:** the **hard stop** on a calendar-expired data-encryption key. With it on, a DEK past
   `store_key_max_age_days + enforce_grace_days` (365 + 30 as shipped) aborts engine start under
@@ -635,6 +655,7 @@ carried from that drive-to-pass, not re-derived here.**
 | `production_instance` (production tier) | V13 Configuration (risk-based) | **RA-2** Security Categorization | §164.308(a)(1) Risk Analysis / Management |
 | `enforcement` (refuse/warn dial) | V13 Configuration (secure defaults) | **CM-6** Configuration Settings · **CM-7** Least Functionality (secure-by-default) | §164.308(a)(1) Risk Analysis / Management |
 | `[store].aad_bind` (at-rest cell binding) | V11 Cryptography | **SC-28(1)** Cryptographic Protection · **SI-7** Software, Firmware, and Information Integrity | §164.312(c)(1) Integrity · §164.312(a)(2)(iv) Encryption and Decryption |
+| `[store].allow_unmarked_ciphertext` (unmarked-value refusal) | V11 Cryptography | **SC-28(1)** Cryptographic Protection · **SI-7** Software, Firmware, and Information Integrity | §164.312(c)(1) Integrity · §164.312(c)(2) Mechanism to Authenticate ePHI |
 | `[auth].ad_session_recheck_seconds` (directory revocation propagation) | V7 Session Management · V6 Authentication | **AC-2(3)** Disable Accounts · **AC-12** Session Termination | §164.312(a)(2)(i) Unique User Identification · §164.308(a)(3)(ii)(C) Termination Procedures |
 | `cleartext_accepted` (per-connection declared cleartext hop) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
 | `tls_allow_expired` (per-connection expiry-only relaxation) | V12 Secure Communication | **SC-8(1)** Cryptographic Protection · **SC-12** Cryptographic Key Establishment and Management | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
