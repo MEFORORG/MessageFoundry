@@ -12,19 +12,14 @@ object *before* any ``dcmread``.
 
 The raw-stream bound, :func:`bounded_inflate_or_error`, is stdlib-only (``zlib``). The Part-10 guard,
 :func:`guard_part10_deflate`, is not, on purpose (BACKLOG #1926). To bound the bytes ``dcmread`` will
-inflate, it has to know where ``dcmread`` will start and which transfer syntax ``dcmread`` will act on.
-An earlier version found both with its own walk of the file-meta group and returned "passed" on any
-header that walk could not follow. ``pydicom`` reads headers more leniently (it ignores the group
-length, keeps the last of two transfer-syntax elements, skips a command set, reads a forced object with
-no preamble), so the two readings disagreed, and every disagreement let a bomb through. The guard now
-runs ``pydicom``'s own header readers, the ones ``read_partial`` calls before its inflate, so there is
-one reading and it cannot disagree with itself. Two of those readers are private ``pydicom`` functions.
-``tests/test_dicom_deflate_guard.py`` pins that the guard bounds exactly the bytes ``pydicom`` hands to
-``zlib``, so an upgrade that moves the inflate fails there. A ``pydicom`` without those functions makes
-the guard raise :class:`RuntimeError` rather than stand aside. ``pydicom`` is imported lazily, so importing
-this module still needs no ``[dicom]`` extra. It imports nothing from ``messagefoundry.config`` /
-``pipeline`` / ``store`` / ``transports`` (the codec's purity). ``zlib`` is stdlib and **not** a
-crypto-gate import.
+inflate, it must read the header exactly as ``dcmread`` does, so it runs ``pydicom``'s own header
+readers, the ones ``read_partial`` calls before its inflate. Any second reading of the header can
+disagree with ``pydicom``'s, and each disagreement lets a bomb through. Two of those readers are
+private; :func:`~messagefoundry.parsing.dicom._deps.load_header_readers` refuses a ``pydicom`` without
+them, and ``tests/test_dicom_deflate_guard.py`` pins that the guard bounds exactly the bytes ``pydicom``
+hands to ``zlib``. ``pydicom`` is imported lazily, so importing this module still needs no ``[dicom]``
+extra. It imports nothing from ``messagefoundry.config`` / ``pipeline`` / ``store`` / ``transports``
+(the codec's purity). ``zlib`` is stdlib and **not** a crypto-gate import.
 
 Two entry points:
 
@@ -46,7 +41,7 @@ from __future__ import annotations
 import zlib
 from io import BytesIO
 
-from messagefoundry.parsing.dicom._deps import parse_error_types
+from messagefoundry.parsing.dicom._deps import load_header_readers, parse_error_types
 from messagefoundry.parsing.dicom.errors import DicomBombError
 
 __all__ = [
@@ -135,30 +130,21 @@ def _deflated_data_set(data: bytes, *, force: bool) -> bytes | None:
     Replays the header half of ``pydicom.filereader.read_partial`` with the same functions, in the same
     order, on the same bytes: preamble, file-meta group, command set. ``read_partial`` then inflates
     everything after that point when the file meta's ``TransferSyntaxUID`` equals
-    ``DeflatedExplicitVRLittleEndian``, compared as it compares it."""
-    try:
-        from pydicom.filereader import (
-            _read_command_set_elements,
-            _read_file_meta_info,
-            read_preamble,
-        )
-        from pydicom.uid import DeflatedExplicitVRLittleEndian
-    except ImportError as exc:
-        # Refuse rather than stand aside: dcmread may still be importable, and it would inflate unbounded.
-        raise RuntimeError(
-            "the DICOM deflate guard needs pydicom's file-meta readers (the optional 'dicom' extra: "
-            "pip install 'messagefoundry[dicom]'); refusing to parse a DICOM object without it"
-        ) from exc
-
+    ``DeflatedExplicitVRLittleEndian``. That constant is a plain ``str`` subclass, so comparing with
+    :data:`DEFLATED_EXPLICIT_VR_LE` is the same comparison."""
+    filereader = load_header_readers()
     fp = BytesIO(data)
     try:
-        read_preamble(fp, force)
-        file_meta = _read_file_meta_info(fp)
-        _read_command_set_elements(fp)
+        filereader.read_preamble(fp, force)
+        file_meta = filereader._read_file_meta_info(fp)
+        filereader._read_command_set_elements(fp)
+        # Inside the try: reading the element converts its raw value, which can fail too.
+        transfer_syntax = file_meta.get("TransferSyntaxUID")
     except parse_error_types():
-        # dcmread runs these same readers first and fails here too, before its inflate. The caller's
-        # own handler then turns that failure into the PHI-safe parse error it already records.
+        # dcmread runs these same steps first and fails here too, before its inflate. The caller's
+        # own handler then turns that failure into the PHI-safe parse error it already records, so no
+        # raw pydicom message escapes from here.
         return None
-    if file_meta.get("TransferSyntaxUID") != DeflatedExplicitVRLittleEndian:
+    if transfer_syntax != DEFLATED_EXPLICIT_VR_LE:
         return None
     return data[fp.tell() :]

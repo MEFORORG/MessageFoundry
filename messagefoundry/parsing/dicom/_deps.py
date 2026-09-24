@@ -19,7 +19,12 @@ from __future__ import annotations
 
 import struct
 from collections.abc import Callable
+from types import ModuleType
 from typing import Any
+
+#: The ``pydicom.filereader`` functions ``read_partial`` runs, in this order, before it inflates a
+#: Deflated Explicit VR LE Data Set. Two are private; see :func:`load_header_readers`.
+_HEADER_READERS = ("read_preamble", "_read_file_meta_info", "_read_command_set_elements")
 
 
 def _missing_extra(feature: str) -> RuntimeError:
@@ -37,6 +42,24 @@ def load_dcmread() -> Callable[..., Any]:
     except ImportError as exc:  # pragma: no cover - exercised only without the [dicom] extra
         raise _missing_extra("DICOM parsing") from exc
     return dcmread
+
+
+def load_header_readers() -> ModuleType:
+    """``pydicom.filereader``, checked to still carry the :data:`_HEADER_READERS` the deflate guard
+    replays (BACKLOG #1926). A missing extra raises the usual :class:`RuntimeError`. A ``pydicom`` that
+    renamed a reader also raises one: the guard must refuse, because ``dcmread`` would still run and
+    inflate unbounded."""
+    try:
+        from pydicom import filereader
+    except ImportError as exc:  # pragma: no cover - exercised only without the [dicom] extra
+        raise _missing_extra("The DICOM deflate guard") from exc
+    missing = [name for name in _HEADER_READERS if not hasattr(filereader, name)]
+    if missing:
+        raise RuntimeError(
+            f"the installed pydicom has no {', '.join(missing)}, which the DICOM deflate guard "
+            "replays to bound dcmread's inflate; refusing to parse DICOM with it"
+        )
+    return filereader
 
 
 def parse_error_types() -> tuple[type[BaseException], ...]:
