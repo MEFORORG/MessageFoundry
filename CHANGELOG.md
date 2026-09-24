@@ -15,6 +15,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   the `id_token` `exp`, and the configured session caps. **A deploying site whose IdP does not return
   `auth_time` would have every federated sign-in refused**; that is spec-correct and deliberate.
   Federation still ships off (`oidc_enabled = false`). ([BACKLOG #296](docs/BACKLOG.md))
+### Fixed
+- **The startup ERROR for an unusable bundled breach corpus now says a first `serve` still creates
+  the bootstrap admin, whose forced password change that corpus would refuse.** It also says
+  `provision-admin` fails for the same reason, where the deadline is, and that changing
+  `password_check_breached` needs a restart (BACKLOG #1886).
 ### Added
 - **On SQL Server and PostgreSQL the engine's runtime login no longer runs schema DDL, and
   `messagefoundry store provision-schema` does it instead.** New `[store].schema_management`
