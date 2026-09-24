@@ -205,7 +205,7 @@ async def test_leaving_the_last_mapped_group_withdraws_the_ad_derived_scope(
         rows = [a for a in await store.list_audit() if a["action"] == "auth.ad_scope_resynced"]
         assert len(rows) == 2, "the grant and the withdrawal must each write one audit row"
         # list_audit is newest first, so rows[0] is the withdrawal.
-        assert json.loads(rows[0]["detail"]) == {"channels": None}
+        assert json.loads(rows[0]["detail"]) == {"channels": None, "withdrawn": '["IB_A"]'}
     finally:
         await store.close()
 
@@ -287,6 +287,30 @@ async def test_an_admin_scope_set_during_the_login_is_not_withdrawn(tmp_path: Pa
         assert json.loads(out.channel_scope) == ["MANUAL"], "the withdrawal overwrote the admin"
         assert out.channel_scope_source == SCOPE_SOURCE_MANUAL
         assert await store.list_sessions("ada"), "a withdrawal that did not happen revoked"
+    finally:
+        await store.close()
+
+
+async def test_the_withdrawal_is_bound_to_the_scope_it_was_decided_on(tmp_path: Path) -> None:
+    """A concurrent login's fresh directory grant is not withdrawn by a login that read the old one.
+
+    Login A reads ``["IB_A"]`` and finds no mapped group. Before A writes, login B finds the user in
+    a mapped group and writes ``["IB_B"]``, also marked ``"ad"``. A's withdrawal must miss, because
+    the value it decided on is gone."""
+    store = await MessageStore.open(tmp_path / "svc11.db")
+    try:
+        service = AuthService(store, AuthSettings())
+        await service.initialize()
+        await store.set_ad_group_scope_map([("grp-a", "IB_A"), ("grp-b", "IB_B")])
+        await _ad_user(store, "ada")
+        stale = await service._sync_ad_channel_scope(
+            await store.get_user("ada"), frozenset(), ["grp-a"]
+        )
+        await service._sync_ad_channel_scope(stale, frozenset(), ["grp-b"])  # login B
+
+        out = await service._sync_ad_channel_scope(stale, frozenset(), [])  # login A, late
+
+        assert json.loads(out.channel_scope) == ["IB_B"], "a stale login withdrew a fresh grant"
     finally:
         await store.close()
 

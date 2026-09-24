@@ -1964,20 +1964,23 @@ class AuthStore(Protocol):
     ) -> None:
         """Set a user's per-channel scope and record who wrote it, in one statement.
 
-        ``source`` is REQUIRED, not defaulted (BACKLOG #1927). The AD login sync withdraws a scope
-        not marked ``"manual"`` when no mapped group matches, so a writer that forgot to say who it
-        was would either shield a directory grant from withdrawal or expose an administrator's scope
-        to it. A required keyword turns that omission into a type error at every call site."""
+        ``source`` is REQUIRED, not defaulted (BACKLOG #1927). Provenance decides whether the AD
+        login sync may later withdraw the scope (``UserRecord.channel_scope_source``), so a writer
+        that forgot to say who it was would misfile the scope one way or the other. A required
+        keyword turns that omission into a type error at every call site."""
         ...
 
-    async def withdraw_ad_channel_scope(self, user_id: str, *, now: float | None = None) -> bool:
+    async def withdraw_ad_channel_scope(
+        self, user_id: str, expected_scope: str, *, now: float | None = None
+    ) -> bool:
         """Withdraw a directory-derived scope to NULL (which denies), and report whether it did.
 
         BACKLOG #1927. A COMPARE-AND-SET, not a read-then-write: the AD login sync decides to
-        withdraw from a user row it read several awaits earlier, and an administrator may set a
-        scope in between. The WHERE clause re-checks provenance in the same statement, so a scope
-        marked ``"manual"`` by then is left alone and this returns ``False``. So is a scope that is
-        already NULL. The withdrawn row is marked ``"ad"``."""
+        withdraw from a user row it read several awaits earlier, and in between an administrator may
+        set a scope or a concurrent login may write a fresh directory grant. The WHERE clause binds
+        the withdrawal to ``expected_scope``, the value the decision was made on, and re-checks that
+        it is not marked ``"manual"``, all in one statement. If either no longer holds, nothing is
+        written and this returns ``False``. The withdrawn row is marked ``"ad"``."""
         ...
 
     async def set_user_federated_subject(

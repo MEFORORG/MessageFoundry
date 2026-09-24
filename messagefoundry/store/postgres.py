@@ -7132,18 +7132,23 @@ class PostgresStore:
             user_id,
         )
 
-    async def withdraw_ad_channel_scope(self, user_id: str, *, now: float | None = None) -> bool:
+    async def withdraw_ad_channel_scope(
+        self, user_id: str, expected_scope: str, *, now: float | None = None
+    ) -> bool:
         """Withdraw a directory-derived scope to NULL (BACKLOG #1927); see ``AuthStore``."""
         now = time.time() if now is None else now
-        result = await self._pool.execute(
-            "UPDATE users SET channel_scope=NULL, channel_scope_source=$1, updated_at=$2"
-            " WHERE id=$3 AND channel_scope IS NOT NULL"
-            " AND (channel_scope_source IS NULL OR channel_scope_source <> $4)",
-            SCOPE_SOURCE_AD,
-            now,
-            user_id,
-            SCOPE_SOURCE_MANUAL,
-        )
+        # Through _timed_acquire like _execute (BACKLOG #1052): this runs on the sign-in path.
+        async with self._timed_acquire(record=False) as conn:
+            result = await conn.execute(
+                "UPDATE users SET channel_scope=NULL, channel_scope_source=$1, updated_at=$2"
+                " WHERE id=$3 AND channel_scope = $4"
+                " AND (channel_scope_source IS NULL OR channel_scope_source <> $5)",
+                SCOPE_SOURCE_AD,
+                now,
+                user_id,
+                expected_scope,
+                SCOPE_SOURCE_MANUAL,
+            )
         return _rowcount(result) > 0
 
     async def set_user_federated_subject(

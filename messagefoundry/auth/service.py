@@ -2113,16 +2113,18 @@ class AuthService:
         if not channels:
             if user.channel_scope_source == SCOPE_SOURCE_MANUAL:
                 return user
-            if _allowed_channels(user, roles) == frozenset():
+            if user.channel_scope is None or _allowed_channels(user, roles) == frozenset():
                 return user  # already a deny; nothing to withdraw
-            # Compare-and-set: an administrator may have set a scope since ``user`` was read.
-            if not await self._store.withdraw_ad_channel_scope(user.id):
+            # Compare-and-set against the value read: an administrator or a concurrent login may
+            # have written the scope since ``user`` was read.
+            if not await self._store.withdraw_ad_channel_scope(user.id, user.channel_scope):
                 return await self._store.get_user(user.id) or user
             await self._store.revoke_user_sessions(user.id)
+            # ``withdrawn`` keeps the removed grant, which the row itself no longer holds.
             await self._audit(
                 "auth.ad_scope_resynced",
                 actor=user.username,
-                detail=_json({"channels": None}),
+                detail=_json({"channels": None, "withdrawn": user.channel_scope}),
                 client=client,
             )
             return await self._store.get_user(user.id) or user

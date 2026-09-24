@@ -10379,20 +10379,23 @@ class SqlServerStore:
             (scope_json, source, now, user_id),
         )
 
-    async def withdraw_ad_channel_scope(self, user_id: str, *, now: float | None = None) -> bool:
+    async def withdraw_ad_channel_scope(
+        self, user_id: str, expected_scope: str, *, now: float | None = None
+    ) -> bool:
         """Withdraw a directory-derived scope to NULL (BACKLOG #1927); see ``AuthStore``."""
         now = time.time() if now is None else now
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
-                    WITHDRAW_AD_SCOPE_SQL, (SCOPE_SOURCE_AD, now, user_id, SCOPE_SOURCE_MANUAL)
+                    WITHDRAW_AD_SCOPE_SQL,
+                    (SCOPE_SOURCE_AD, now, user_id, expected_scope, SCOPE_SOURCE_MANUAL),
                 )
                 count = cur.rowcount
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
                 raise
-        return bool(count) and int(count) > 0
+        return int(count) > 0
 
     async def set_user_username(
         self, user_id: str, username: str, *, now: float | None = None

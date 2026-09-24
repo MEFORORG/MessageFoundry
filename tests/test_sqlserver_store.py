@@ -743,6 +743,17 @@ async def test_channel_scope_source_roundtrip_and_upgrade(store) -> None:
     got = await store.get_user("scope-src")
     assert (got.channel_scope, got.channel_scope_source) == (None, SCOPE_SOURCE_MANUAL)
 
+    # The compare-and-set (BACKLOG #1927): a manual scope and a changed value both refuse it.
+    await store.set_user_channel_scope("scope-src", '["IB_A"]', source=SCOPE_SOURCE_MANUAL)
+    assert await store.withdraw_ad_channel_scope("scope-src", '["IB_A"]') is False
+    await store.set_user_channel_scope("scope-src", '["IB_A"]', source=SCOPE_SOURCE_AD)
+    assert await store.withdraw_ad_channel_scope("scope-src", '["IB_OLD"]') is False
+    assert (await store.get_user("scope-src")).channel_scope == '["IB_A"]'
+    assert await store.withdraw_ad_channel_scope("scope-src", '["IB_A"]') is True
+    got = await store.get_user("scope-src")
+    assert (got.channel_scope, got.channel_scope_source) == (None, SCOPE_SOURCE_AD)
+    assert await store.withdraw_ad_channel_scope("scope-src", '["IB_A"]') is False  # idempotent
+
     async with store._pool.acquire() as conn:
         cur = await conn.cursor()
         await cur.execute("ALTER TABLE users DROP COLUMN channel_scope_source")
