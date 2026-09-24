@@ -7108,7 +7108,8 @@ def create_managed_app(
                 # transport, sent to each affected user's own address. The notifier is wired only when the
                 # [auth].notify_security_events kill-switch is on AND a transport can be built (SMTP
                 # configured): security_notifier_from_settings returns None when SMTP is unset, so we never
-                # fabricate a transport — then only the audited /me/security-events pull feed records events.
+                # fabricate a transport — then nothing is emailed; auth/notifications.py states which
+                # events the audited /me/security-events pull feed still shows.
                 # The effective-by-default guarantee (an exposed PHI instance MUST have a real push channel,
                 # or opt out in writing via [alerts].security_notifications_required) is enforced fail-closed
                 # at startup by the serve gate (messagefoundry/__main__.py), which checks these SAME two

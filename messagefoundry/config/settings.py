@@ -2431,8 +2431,9 @@ class AuthSettings(_Section):
 
     # Out-of-band user notification of security events (ASVS 6.3.5/6.3.7): email the affected user on
     # lockout / first-success-after-failures / password/email/role/disable changes. Email requires the
-    # [alerts] SMTP transport to be configured (no SMTP → email is skipped); the audited
-    # /me/security-events feed records these regardless of this toggle.
+    # [alerts] SMTP transport to be configured (no SMTP means email is skipped). This toggle does not
+    # touch the audit log; which events the /me/security-events feed shows is stated once, in
+    # auth/notifications.py.
     notify_security_events: bool = True
 
     @field_validator("mfa_recovery_code_count")

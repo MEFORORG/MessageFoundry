@@ -22,7 +22,8 @@ import secrets
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, TypeVar
+from types import MappingProxyType
+from typing import Any, Final, TypeVar
 from uuid import uuid4
 
 from messagefoundry.auth import oidc, reconcile, totp, webauthn
@@ -465,6 +466,17 @@ def _json(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True)
 
 
+# BACKLOG #1138, ASVS 6.3.5: the audit action each suspicious-sign-in event is recorded under. A fixed
+# map, not ``f"auth.{event_type}"``, so the action names stay greppable and no other notice kind can
+# be passed in and double-audit an event its own call site already audits.
+_SUSPICIOUS_LOGIN_ACTIONS: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        ACCOUNT_LOCKED: "auth.account_locked",
+        LOGIN_AFTER_FAILURES: "auth.login_after_failures",
+    }
+)
+
+
 def _allowed_channels(user: UserRecord, roles: frozenset[Role]) -> frozenset[str] | None:
     """Resolve a user's stored per-channel RBAC scope to a frozenset, or ``None`` for all channels.
 
@@ -517,7 +529,8 @@ class AuthService:
         # dial cannot be read off settings here; it must be passed. Defaults enforce (fail-closed).
         self._trust_anchors_enforcing = enforcing
         # Out-of-band security-event push (ASVS 6.3.5/6.3.7), injected by the API lifespan. None = no
-        # email push (the audited /me/security-events feed still records everything). Best-effort.
+        # email push. What the /me/security-events pull feed still shows is stated once, in
+        # auth/notifications.py. Best-effort.
         self._security_notifier = security_notifier
         self._policy = PasswordPolicy.from_settings(settings)
         _warn_if_corpus_unreadable(settings.password_breach_corpus_file)
@@ -1295,12 +1308,12 @@ class AuthService:
                 client=client,
             )
             if just_locked:
-                await self._notify_security(
+                await self._record_suspicious_login(
                     ACCOUNT_LOCKED,
-                    username=user.username,
-                    email=user.notify_email,
+                    user,
                     client=client,
-                    detail={"failed_attempts": attempts},
+                    audit_detail={"provider": "local"},
+                    notice_detail={"failed_attempts": attempts},
                 )
             return LoginOutcome(ok=False, error="invalid credentials")
         # ASVS 6.4.1: an admin-issued initial/reset credential that was never claimed EXPIRES — the
@@ -1373,12 +1386,12 @@ class AuthService:
         if prior_failures >= SUSPICIOUS_LOGIN_FAILURE_THRESHOLD:
             # A successful login right after a run of failures is the classic compromised/attacked
             # signal (ASVS 6.3.5) — notify the owner out-of-band so they can react if it wasn't them.
-            await self._notify_security(
+            await self._record_suspicious_login(
                 LOGIN_AFTER_FAILURES,
-                username=user.username,
-                email=user.notify_email,
+                user,
                 client=client,
-                detail={"failed_attempts": prior_failures},
+                audit_detail={"provider": "local"},
+                notice_detail={"failed_attempts": prior_failures},
             )
         return LoginOutcome(
             ok=True,
@@ -3361,9 +3374,9 @@ class AuthService:
         """Whether ``user`` must satisfy a second factor. An enrolled user (either factor — the caller
         pre-resolves ``second_factor_enrolled`` via :meth:`_second_factor_enrolled`, keeping this hot
         boolean logic sync and the store round-trip visible at each call site) always must; an
-        un-enrolled user must when ``[auth].require_mfa`` is on and ``[auth].require_mfa_scope``
-        covers them — ``every_local_account`` (default, ASVS 6.3.3) or, under ``administrators``,
-        only the Administrator role.
+        un-enrolled user must when ``[security].require_mfa`` is on and
+        ``[security].require_mfa_scope`` covers them — ``every_local_account`` (default, ASVS
+        6.3.3) or, under ``administrators``, only the Administrator role.
 
         **THE RULE READS NO PROVIDER (BACKLOG #1144, ASVS 6.8.4),** which is what keeps it closed
         against an unrecognized value — :meth:`_identity_for_user` maps one back to ``LOCAL`` when it
@@ -3554,12 +3567,12 @@ class AuthService:
         attempts, just_locked = await self._register_failure(user, now)
         await self._audit("auth.mfa_failed", actor=user.username, client=client)
         if just_locked:
-            await self._notify_security(
+            await self._record_suspicious_login(
                 ACCOUNT_LOCKED,
-                username=user.username,
-                email=user.notify_email,
+                user,
                 client=client,
-                detail={"failed_attempts": attempts},
+                audit_detail=None,
+                notice_detail={"failed_attempts": attempts},
             )
         return Elevation()
 
@@ -4619,6 +4632,50 @@ class AuthService:
         (token-only or engine-internal) leave it NULL rather than inheriting an unrelated one."""
         await self._store.record_audit(action, actor=actor, detail=detail, client=client)
 
+    async def _record_suspicious_login(
+        self,
+        event_type: str,
+        user: UserRecord,
+        *,
+        client: str | None,
+        audit_detail: dict[str, Any] | None,
+        notice_detail: dict[str, Any],
+    ) -> None:
+        """Audit one ASVS 6.3.5 event under its own action name, then send the out-of-band notice.
+
+        The rows are ``auth.account_locked`` and ``auth.login_after_failures``, from the fixed
+        :data:`_SUSPICIOUS_LOGIN_ACTIONS` map. Each is written with the account's stored username as
+        actor, so the event reaches the user's own feed (``auth/notifications.py`` states the rule).
+
+        **WHY THE AUDIT ROW EXISTS (BACKLOG #1138).** Before it, neither event wrote a row of its own:
+        the crossing attempt left an ordinary ``auth.login_failed`` and the flagged success an ordinary
+        ``auth.login_success``. The label lived only inside the notice, which the notifier drops for an
+        account with no address and which does not exist at all without a mail relay. The feed is the
+        one channel that reaches both of those accounts, so the label has to be written where it reads.
+
+        The row is written whether or not a notifier is wired, for that reason. It is written BEFORE
+        the notice, and the action is resolved before either, so the notifier's "the event is still in
+        the audit log" is true when it says it and an unknown kind fails before any side effect.
+
+        **``audit_detail`` MIRRORS THE ATTEMPT'S OWN ROW, never ``notice_detail``.** The failure count
+        goes in the notice only. The audit row carries no more than the ``auth.login_failed``,
+        ``auth.mfa_failed`` or ``auth.login_success`` row beside it. The attempt itself stays audited
+        once, by that row; this adds the event the attempt caused."""
+        action = _SUSPICIOUS_LOGIN_ACTIONS[event_type]
+        await self._audit(
+            action,
+            actor=user.username,
+            detail=_json(audit_detail) if audit_detail is not None else None,
+            client=client,
+        )
+        await self._notify_security(
+            event_type,
+            username=user.username,
+            email=user.notify_email,
+            client=client,
+            detail=notice_detail,
+        )
+
     async def _notify_security(
         self,
         event_type: str,
@@ -4630,7 +4687,8 @@ class AuthService:
     ) -> None:
         """Best-effort out-of-band security-event push (ASVS 6.3.5/6.3.7). A missing notifier or a
         notifier failure is swallowed (logged) — a notification must never break a login or an admin
-        action. The event is also already in the audit log (the /me/security-events feed)."""
+        action. The caller writes the audit row, not this method: see
+        :meth:`_record_suspicious_login` for the two 6.3.5 events."""
         if self._security_notifier is None:
             return
         try:
