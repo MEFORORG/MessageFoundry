@@ -453,10 +453,12 @@ Do not restate it as one. §6 names what would flip it.
   `::test_the_oidc_legs_on_loopback_still_cross`,
   `::test_the_oidc_legs_cross_on_a_crl_that_really_loaded`,
   `::test_the_oidc_legs_with_no_posture_are_unchanged`,
+  `::test_an_unthreaded_oidc_posture_falls_back_to_the_ambient_one`,
   `::test_each_oidc_leg_is_guarded_on_its_own_host`,
   `::test_a_non_enforcing_oidc_instance_warns_on_both_legs`,
   `::test_the_blanket_env_does_not_cross_the_enforcing_oidc_legs`,
-  `::test_the_oidc_refusal_names_a_lever_that_exists_for_it`.
+  `::test_the_oidc_refusal_names_a_lever_that_exists_for_it`,
+  `::test_an_oidc_leg_with_no_host_is_refused_not_treated_as_loopback`.
   **The not-refused arms are the load-bearing ones**, for the same reason AC-2's untouched baseline
   is: a guard that refuses everything passes a refusal arm on its own, and the CRL arm is the only one
   that proves the finished context reached the guard rather than a setting being read. For the OIDC

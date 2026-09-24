@@ -530,16 +530,11 @@ def _refuse_idp_revocation(
     ``attested=False`` because no per-hop revocation attestation exists for these legs. There is no
     ``[auth]`` key for one, and borrowing another hop's claim is how a flag silently widens.
 
-    **Known limits, recorded rather than left for the next reader to find.** The refusal fires when
-    the API lifespan builds this service, which is after ``engine.start()`` has run, the
-    same point the LDAPS clamp (#329) fires; ``messagefoundry check`` and ``messagefoundry verify`` do
-    not build it. The token leg is checked first, so when both legs refuse only the token leg is
-    named. And the WARN arm on a non-enforcing instance logs with no audit sink, after
-    ``configure_logging`` has set the root level, so a level above WARNING would likely filter it --
-    the limit ``logging_setup._refuse_forward_revocation`` measured for its hop. Not measured here."""
-    if posture is None:
-        # Every guard below would no-op, so skip the private-attribute read `opener_tls_context` does.
-        return
+    Known limits of this placement (it fires after ``engine.start()``, and ``check``/``verify`` do
+    not reach it) are recorded once, in ADR 0173 AC-4. Two more are recorded only here: when both
+    legs refuse, only the token leg is named, because it is checked first; and the WARN arm logs with
+    no audit sink after ``configure_logging`` has set the root level, so a level above WARNING would
+    likely filter it, as ``logging_setup._refuse_forward_revocation`` measured for its hop."""
     context = opener_tls_context(opener, connector="OIDC identity provider (token + JWKS)")
     for url, leg, carries in (
         (

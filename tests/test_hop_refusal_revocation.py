@@ -1121,6 +1121,14 @@ async def test_the_oidc_legs_cross_on_a_crl_that_really_loaded(crl_bundle: str) 
     assert context_checks_revocation(ctx) is True  # the line above passed for the RIGHT reason
 
 
+async def test_an_unthreaded_oidc_posture_falls_back_to_the_ambient_one() -> None:
+    """``hop_posture=None`` means "not passed", not "no posture": like every sibling guard, the legs
+    then read the ambient posture. A caller that builds the service inside a stamped scope without
+    threading the posture must still get the guard, not skip it."""
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused, match="revocation"):
+        await _oidc_service(posture=None)
+
+
 async def test_the_oidc_legs_with_no_posture_are_unchanged() -> None:
     """The shipped ``posture is None`` no-op every hop guard has. The lifespan passes None when the
     instance declares no ``[ai]``, and every direct construction in the OIDC suite passes nothing."""
@@ -1167,8 +1175,8 @@ async def test_a_non_enforcing_oidc_instance_warns_on_both_legs(
     LEG, which is a second view of the independence above: two guards, two warnings."""
     warned = _record_guard_warnings(monkeypatch)
     await _oidc_service(posture=STAGING_PHI)
-    assert any("OIDC token endpoint" in m and "revocation" in m for m in warned)
-    assert any("OIDC JWKS endpoint" in m and "revocation" in m for m in warned)
+    assert sum("OIDC token endpoint" in m and "revocation" in m for m in warned) == 1
+    assert sum("OIDC JWKS endpoint" in m and "revocation" in m for m in warned) == 1
 
 
 async def test_the_blanket_env_does_not_cross_the_enforcing_oidc_legs(
