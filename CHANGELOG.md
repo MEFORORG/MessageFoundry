@@ -27,12 +27,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   may be 25 MiB by default, so a single message larger than the 16 MiB ingress ceiling could be
   injected into any inbound, and an HL7 message could be injected into a JSON one. Both routes now
   run the listener's checks first, at least: the size ceiling (an HL7 inbound's own lower
-  `max_message_bytes`, never above 16 MiB), the declared-type sniff, `Peek.parse` for HL7, the NUL
-  rule, and a check that the inbound's charset can hold the text. A refusal answers 413, 415 or 422,
-  writes an `upload.resend_reject` or `message_edit_resend_reject` audit row, and writes no message.
+  `max_message_bytes`, never above 16 MiB), `Peek.parse` for HL7 or the declared-type sniff for
+  another type, the NUL rule, and a check that the inbound's charset can hold the text. A refusal
+  answers 413, 415 or 422, writes an `upload.resend_reject` or `message_edit_resend_reject` audit
+  row, and writes no message.
   An admitted body is committed in the listener's form: HL7 with `\r` line endings, and a binary
   inbound's body as `mfb64:v1:` carriage. Strict `hl7apy` validation is still not run on a
-  resubmission. The edit-resend direct path (`to` set) writes an outbound row, so only the NUL rule
+  resubmission. A re-route whose origin inbound this engine does not hold (removed, or owned by
+  another engine shard) is refused with 409 rather than written unchecked. The edit-resend direct path (`to` set) writes an outbound row, so only the NUL rule
   applies there in practice; its body is already held below 16 MiB by the 1 MiB request cap. The web
   console shows an uploaded-log resend refused this way as its own notice.
   ([BACKLOG #1911](docs/BACKLOG.md))

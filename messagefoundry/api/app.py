@@ -4409,15 +4409,23 @@ def create_app(
                 "set reroute=true to re-ingress on the origin channel, or provide a target 'to'",
             )
         # BACKLOG #1911: the re-route writes an INGRESS row on the origin channel, so the origin
-        # inbound's own ceiling and declared type apply. An origin inbound that is no longer registered
-        # has no declared type, so only the engine-wide guards apply to it.
+        # inbound's own ceiling and declared type apply. With no such inbound in THIS runner's registry
+        # (no config loaded, the inbound removed, or owned by another engine shard, whose registry is
+        # filtered to its own inbounds) there is nothing to guard with, so refuse rather than fail open.
         rr = engine.registry_runner
+        origin = rr.registry.inbound.get(row["channel_id"]) if rr is not None else None
+        if origin is None:
+            raise HTTPException(
+                409,
+                f"origin inbound {row['channel_id']!r} is not registered on this engine; "
+                "re-route on the engine shard that owns it",
+            )
         admitted = await _guard_resubmission(
             engine,
             identity,
             request,
             raw=body.raw,
-            inbound=rr.registry.inbound.get(row["channel_id"]) if rr is not None else None,
+            inbound=origin,
             action="message_edit_resend_reject",
             channel_id=row["channel_id"],
             detail={"message_id": message_id, "mode": "reroute"},

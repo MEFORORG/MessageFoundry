@@ -207,13 +207,15 @@ async def test_upload_resend_that_fits_is_still_injected(engine: Engine, tmp_pat
 # --- /messages/{id}/edit-resend ---------------------------------------------------------------------
 
 
-async def _edit_resend(engine: Engine, payload: dict[str, object]) -> tuple[str, httpx.Response]:
+async def _edit_resend(
+    engine: Engine, payload: dict[str, object], *, origin_channel: str = "in1"
+) -> tuple[str, httpx.Response]:
     pytest.importorskip("psutil")
     from messagefoundry.api import create_app
 
     await engine.start()
     mid = await engine.store.enqueue_message(
-        channel_id="in1", raw=ADT, deliveries=[("OB1", TRANSFORMED)], source_type="file"
+        channel_id=origin_channel, raw=ADT, deliveries=[("OB1", TRANSFORMED)], source_type="file"
     )
     app = create_app(engine, allow_no_auth=True)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
@@ -238,8 +240,28 @@ async def test_edit_resend_reroute_of_a_mistyped_body_is_refused(
     mid, r = await _edit_resend(
         engine, {"raw": f"not an HL7 message {PHI_MARKER}", "idempotency_key": "k1"}
     )
-    assert r.status_code == 415, r.text
+    # Peek.parse is the HL7 inbound's type check, as it is the listener's, so this is a parse refusal.
+    assert r.status_code == 422, r.text
     await _assert_nothing_committed(engine, mid, r)
+
+
+async def test_edit_resend_reroute_with_no_inbound_to_guard_with_is_refused(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # An origin inbound this engine does not hold (removed, or owned by another engine shard) has no
+    # declared type or ceiling to check against, so the re-route fails closed instead of open.
+    engine.add_registry(_registry(tmp_path, _inbound(tmp_path)))
+    mid, r = await _edit_resend(
+        engine,
+        {"raw": f"not an HL7 message {PHI_MARKER}", "idempotency_key": "k1"},
+        origin_channel="IB_ELSEWHERE",
+    )
+    assert r.status_code == 409, r.text
+    assert PHI_MARKER not in r.text
+    assert await _message_count(engine, "IB_ELSEWHERE") == 1  # only the origin
+    assert not await _actions(engine, "message_edit_resend")
+    orig = await engine.store.get_message(mid)
+    assert orig is not None and orig["raw"] == ADT
 
 
 async def test_edit_resend_reroute_over_the_inbounds_ceiling_is_refused(
@@ -329,7 +351,7 @@ def test_guard_sniffs_the_declared_type() -> None:
     assert exc.value.phase == "type"
     with pytest.raises(IngressGuardError) as exc:
         admit_resubmitted_body('{"a": 1}', _ic(ContentType.HL7V2))
-    assert exc.value.phase == "type"  # the sniff names it before Peek.parse would
+    assert exc.value.phase == "parse"  # an HL7 inbound's type check is Peek.parse, not the sniff
 
 
 def test_guard_sniffs_a_binary_inbound_on_its_bytes() -> None:
@@ -388,6 +410,18 @@ def test_guard_refuses_what_peek_parse_refuses_and_the_sniff_admits(body: str) -
     with pytest.raises(IngressGuardError) as exc:
         admit_resubmitted_body(body, _ic(ContentType.HL7V2))
     assert exc.value.phase == "parse"
+
+
+@pytest.mark.parametrize("lead", ["\xa0", "\x1c", "\x85"])
+def test_guard_admits_what_peek_parse_admits_and_the_sniff_refuses(lead: str) -> None:
+    # Peek.parse strips leading whitespace with str.lstrip(); the byte sniff does not. The listener
+    # never applies the sniff to HL7, so a body it accepts must stay resendable.
+    admit_resubmitted_body(lead + ADT, _ic(ContentType.HL7V2))
+
+
+def test_guard_stores_canonical_carriage() -> None:
+    broken = carry(b"ABCDEFGHIJ")[:15] + "\r\n" + carry(b"ABCDEFGHIJ")[15:]
+    assert admit_resubmitted_body(broken, _ic(ContentType.BINARY)) == carry(b"ABCDEFGHIJ")
 
 
 def test_guard_returns_the_form_the_listener_commits() -> None:

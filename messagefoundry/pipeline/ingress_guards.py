@@ -110,21 +110,20 @@ def peek_max_bytes(ic: InboundConnection) -> int:
     return ic.max_message_bytes or DEFAULT_MAX_MESSAGE_BYTES
 
 
-def ingress_size_error(size: int, limit: int = INGRESS_MAX_BYTES) -> str | None:
+def ingress_size_error(size: int) -> str | None:
     """The listener's oversize text for a body of ``size`` units, or ``None`` when it fits.
 
     The unit is the caller's, matching the live split: raw **bytes** before base64 inflation for a
     binary content type, decoded **characters** for a text one (``enforce_size_limits`` measures
-    ``len(norm)`` the same way). ``limit`` defaults to the engine ceiling; an HL7 caller passes
-    :func:`peek_max_bytes`, which is the ceiling ``Peek.parse`` enforces for that inbound."""
-    if size > limit:
-        return f"ingress exceeds max size ({size} > {limit} bytes)"
+    ``len(norm)`` the same way)."""
+    if size > INGRESS_MAX_BYTES:
+        return f"ingress exceeds max size ({size} > {INGRESS_MAX_BYTES} bytes)"
     return None
 
 
-def _raise_if_oversize(size: int, limit: int = INGRESS_MAX_BYTES) -> None:
+def _raise_if_oversize(size: int) -> None:
     """Raise the ``size``-phase refusal when :func:`ingress_size_error` reports an overrun."""
-    oversize = ingress_size_error(size, limit)
+    oversize = ingress_size_error(size)
     if oversize is not None:
         raise IngressGuardError(oversize, phase="size")
 
@@ -264,13 +263,11 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
     * **size** -- for an HL7 inbound, the size and segment caps ``Peek.parse`` enforces at
       :func:`peek_max_bytes`, so a connection's own lower ``max_message_bytes`` holds, but never above
       the engine ceiling (see below); the engine ceiling for any other type, in the listener's units.
-    * **type** -- the declared-type magic-byte sniff the listener applies to a non-HL7 body. An HL7
-      body gets it too, so a plainly non-HL7 body is named as such.
-    * **parse** -- an HL7 body must then pass ``Peek.parse``, which is the listener's HL7 check and
-      refuses more than the sniff does (an FHS/BHS- or BOM-led body, a runaway escape expansion).
+    * **type** -- the declared-type magic-byte sniff the listener applies to a non-HL7 body.
+    * **parse** -- an HL7 body must pass ``Peek.parse``, which is the listener's only HL7 type check.
 
     The committed form is the ``\\r``-normalized text for HL7, the text verbatim for another text
-    type, and ``mfb64:v1:`` carriage for a binary type (``raw`` unchanged when it already is one).
+    type, and canonical ``mfb64:v1:`` carriage for a binary type.
 
     ``ic`` is ``None`` when there is no inbound to guard for: the edit-resend direct path writes an
     outbound row, and a re-route whose origin inbound is no longer registered has no declared type. Only
@@ -290,8 +287,7 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
         _raise_if_oversize(len(raw))
         return raw
     if ic.content_type.is_binary:
-        marked = is_marked(raw)
-        if marked:
+        if is_marked(raw):
             try:
                 data = decode_carriage(raw)
             except BinaryCarriageError as exc:
@@ -304,13 +300,17 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
         _raise_if_oversize(len(data))
         _raise_if_mistyped(ic, data)
         # A binary inbound's rows are carriage (ADR 0028); text committed bare would fail .raw_bytes.
-        return raw if marked else RawMessage.from_bytes(data, ic.content_type.value).raw
+        # Re-encoded even when it arrived marked, so a non-canonical form (a line break inside the
+        # base64) is stored as the listener's canonical, unbroken carriage.
+        return RawMessage.from_bytes(data, ic.content_type.value).raw
     _check_encodable(raw, ic)
     text = decode_ingress(raw, ic)
     if ic.content_type is ContentType.HL7V2:
-        # The listener's HL7 type check IS Peek.parse (the sniff is strictly weaker: it admits an
-        # FHS/BHS or BOM-led body Peek refuses). The size and segment caps run first, on their own,
-        # so an oversize body is told apart from a malformed one. The ceiling is capped at the engine
+        # The listener's HL7 type check IS Peek.parse, and the magic-byte sniff is NOT applied here,
+        # as the listener does not apply it: the two disagree in BOTH directions (the sniff admits an
+        # FHS/BHS- or BOM-led body Peek refuses, and refuses a body led by NBSP or \x1c that Peek's
+        # str.lstrip() accepts). The size and segment caps run first, on their own, so an oversize
+        # body is told apart from a malformed one. The ceiling is capped at the engine
         # default because a streaming inbound's raised max_message_bytes pays for a detach that this
         # path does not do.
         ceiling = min(peek_max_bytes(ic), DEFAULT_MAX_MESSAGE_BYTES)
@@ -318,9 +318,6 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
             enforce_size_limits(text, max_bytes=ceiling)
         except HL7PeekError as exc:
             raise IngressGuardError(str(exc), phase="size") from exc
-        # The sniff first, so a body that is plainly not HL7 is named a type mismatch (415) rather
-        # than a malformed message; Peek.parse then refuses what the sniff lets through.
-        _raise_if_mistyped(ic, text_sniff_head(text))
         try:
             Peek.parse(text, max_bytes=ceiling)
         except HL7PeekError as exc:
