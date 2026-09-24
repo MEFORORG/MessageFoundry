@@ -498,9 +498,14 @@ def _allowed_channels(user: UserRecord, roles: frozenset[Role]) -> frozenset[str
 #: The IdP legs' OWN way across. The connection-shaped default cannot reach this opener, which
 #: resolves no trust anchor; see :attr:`~messagefoundry.config.tls_policy.RevocationHopGuard.ways_across`.
 _IDP_WAYS_ACROSS = (
-    "Set [auth].oidc_tls_crl_file to a CRL for the identity provider's issuing CA so the engine "
-    "checks revocation on this hop."
+    "Set [auth].oidc_tls_crl_file to a PEM file holding a CRL from each CA that issues the token "
+    "and JWKS endpoint certificates, so the engine checks revocation on both legs. Put only CRLs "
+    "in it: a certificate in that file becomes a trusted root for this hop."
 )
+
+#: Stands in for a URL with no host. NOT the empty string: `is_loopback_hop_host("")` is True, so an
+#: empty host would take the on-box carve-out and a guard that cannot name its host would ALLOW.
+_NO_HOST = "(no host)"
 
 
 def _refuse_idp_revocation(
@@ -523,7 +528,18 @@ def _refuse_idp_revocation(
     leaves both guards the shipped no-op.
 
     ``attested=False`` because no per-hop revocation attestation exists for these legs. There is no
-    ``[auth]`` key for one, and borrowing another hop's claim is how a flag silently widens."""
+    ``[auth]`` key for one, and borrowing another hop's claim is how a flag silently widens.
+
+    **Known limits, recorded rather than left for the next reader to find.** The refusal fires when
+    the API lifespan builds this service, which is after ``engine.start()`` has run, the
+    same point the LDAPS clamp (#329) fires; ``messagefoundry check`` and ``messagefoundry verify`` do
+    not build it. The token leg is checked first, so when both legs refuse only the token leg is
+    named. And the WARN arm on a non-enforcing instance logs with no audit sink, after
+    ``configure_logging`` has set the root level, so a level above WARNING would likely filter it --
+    the limit ``logging_setup._refuse_forward_revocation`` measured for its hop. Not measured here."""
+    if posture is None:
+        # Every guard below would no-op, so skip the private-attribute read `opener_tls_context` does.
+        return
     context = opener_tls_context(opener, connector="OIDC identity provider (token + JWKS)")
     for url, leg, carries in (
         (
@@ -533,9 +549,9 @@ def _refuse_idp_revocation(
         ),
         (settings.oidc_jwks_uri, "JWKS endpoint", "the identity provider's signing keys"),
     ):
-        # `or ""` is reached only by unvalidated settings: the validator refuses a missing URL.
+        # _NO_HOST is reached only by unvalidated settings: the validator refuses a missing URL.
         RevocationHopGuard.capture(
-            host=urllib.parse.urlsplit(url or "").hostname or "",
+            host=urllib.parse.urlsplit(url or "").hostname or _NO_HOST,
             cell=f"[auth] OIDC {leg} (verified TLS, no revocation check)",
             description=(
                 f"carries {carries} over verified TLS but performs no certificate revocation checking"

@@ -1146,22 +1146,26 @@ async def test_each_oidc_leg_is_guarded_on_its_own_host(
         await _oidc_service(token_host=token_host, jwks_host=jwks_host)
 
 
-async def test_a_non_enforcing_oidc_instance_warns_on_both_legs(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The WARN rung. A ``warn``-dialled instance crosses, and not silently -- and it warns ONCE PER
-    LEG, which is a second view of the independence above: two guards, two warnings.
-
-    The warning call is recorded on the module logger itself rather than through ``caplog``. Measured
-    2026-09-23: a ``caplog`` version passed alone and failed once under ``-n 8`` beside the rest of the
-    auth suite. The cause was not isolated; logger state left by another test in the same worker is
-    the likely one. Recording the call does not depend on any handler or level being in place."""
+def _record_guard_warnings(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record every warning the guard module logs, on the module logger itself rather than through
+    ``caplog``. Measured 2026-09-23: a ``caplog`` version passed alone and failed once under ``-n 8``
+    beside the rest of the auth suite. The cause was not isolated; logger state left by another test
+    in the same worker is the likely one. Recording the call needs no handler or level in place."""
     from messagefoundry.config import tls_policy
 
     warned: list[str] = []
     monkeypatch.setattr(
         tls_policy.logger, "warning", lambda msg, *args: warned.append(msg % args if args else msg)
     )
+    return warned
+
+
+async def test_a_non_enforcing_oidc_instance_warns_on_both_legs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The WARN rung. A ``warn``-dialled instance crosses, and not silently -- and it warns ONCE PER
+    LEG, which is a second view of the independence above: two guards, two warnings."""
+    warned = _record_guard_warnings(monkeypatch)
     await _oidc_service(posture=STAGING_PHI)
     assert any("OIDC token endpoint" in m and "revocation" in m for m in warned)
     assert any("OIDC JWKS endpoint" in m and "revocation" in m for m in warned)
@@ -1175,9 +1179,32 @@ async def test_the_blanket_env_does_not_cross_the_enforcing_oidc_legs(
     monkeypatch.setenv(TLS_REVOCATION_ATTESTED_ENV, "1")
     with pytest.raises(InsecureHopRefused, match="revocation"):
         await _oidc_service()
-    # NEGATIVE CONTROL: on a non-enforcing posture the same env DOES cross, so the refusal above is
-    # the clamp firing rather than the env never being read.
+    # NEGATIVE CONTROL, and it must be able to fail. On a non-enforcing posture the env turns the
+    # WARN into a silent ALLOW, so the check is that NO revocation warning is logged. Merely
+    # constructing would prove nothing: without the env the same posture WARNs and still constructs,
+    # as the arm above this test shows. So this passes only if the env really is read.
+    warned = _record_guard_warnings(monkeypatch)
     await _oidc_service(posture=STAGING_PHI)
+    assert not [m for m in warned if "OIDC" in m and "revocation" in m]
+
+
+async def test_an_oidc_leg_with_no_host_is_refused_not_treated_as_loopback() -> None:
+    """FAIL-CLOSED on a host the guard cannot read. ``is_loopback_hop_host("")`` is True, so a guard
+    fed an empty host would take the on-box carve-out and ALLOW. The settings validator refuses a
+    missing URL, so only unvalidated settings reach this; ``model_copy`` builds them here."""
+    settings = _oidc_settings(
+        oidc_issuer=f"https://{REMOTE}",
+        oidc_authorization_endpoint=f"https://{REMOTE}/authorize",
+        oidc_token_endpoint=f"https://{LOOPBACK}:8443/token",
+        oidc_jwks_uri=f"https://{REMOTE}:8443/jwks",
+        oidc_allowed_endpoints=[REMOTE, LOOPBACK],
+    ).model_copy(update={"oidc_jwks_uri": None})
+    store = await MessageStore.open(":memory:")
+    try:
+        with pytest.raises(InsecureHopRefused, match="OIDC JWKS endpoint"):
+            AuthService(store, settings, ldap=_FakeLdap(), hop_posture=PROD_PHI)  # type: ignore[arg-type]
+    finally:
+        await store.close()
 
 
 async def test_the_oidc_refusal_names_a_lever_that_exists_for_it() -> None:

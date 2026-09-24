@@ -636,6 +636,7 @@ document ([SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md)).
 | `oidc_allowed_endpoints` | list[str] | `[]` | defence-in-depth host allow-list; **refused empty when enabled**; every OIDC endpoint host must be listed |
 | `oidc_tls_ca_cert_file` | str | — | the **engine's** back-channel TLS trust for the IdP (OpenSSL default trust ignores the Windows machine store) |
 | `oidc_tls_ca_cert_pin` | str | — | optional lowercase-hex SHA-256 pin over the corresponding CA anchor PEM (`oidc_tls_ca_cert_file`); a mismatch refuses at load + reload (ASVS 6.7.1); unset = no pin (dormant) |
+| `oidc_tls_crl_file` | str | — | optional PEM file of CRLs checked against the IdP's certificate on both legs (token and JWKS) (BACKLOG #299). Missing, unloadable or past `nextUpdate` refuses at start. **Put only CRLs in it**: the file is loaded as a CA file, so a certificate in it becomes a trusted root for this hop. On an enforcing instance an off-box IdP with no CRL here is refused when `serve` builds the auth service (BACKLOG #1887) |
 | `oidc_redirect_path` | str | `/ui/oidc/callback` | joined to `web_console_public_address` for the redirect URI |
 | `oidc_scopes` | list[str] | `["openid","profile"]` | no `email`, no `offline_access` |
 | `oidc_signing_algorithms` | list[str] | `["RS256"]` | coerced through the closed JWS algorithm enum |
