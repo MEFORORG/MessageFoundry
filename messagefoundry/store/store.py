@@ -3039,11 +3039,19 @@ def _store_dir_grants(directory: Path) -> tuple[str, ...] | None:
         return None
     reason = _hardening_refusal(parsed)
     if reason is not None:
-        # A directory someone deliberately locked (inheritance off) that still fails the test is the
-        # case an operator needs to hear about: the fallback brings back the Wave 0 lockout, whose
-        # only other symptom is "unable to open database file". An ordinary inheriting directory (a
-        # developer checkout, a temp directory) is the expected fallback and stays quiet.
-        if parsed.protected:
+        # A directory someone locked FOR A SERVICE that still fails the test is the case an operator
+        # needs to hear about: the fallback brings back the Wave 0 lockout, whose only other symptom
+        # is "unable to open database file". "For a service" is read from the DACL: inheritance off
+        # AND every entry naming SYSTEM, Administrators or a per-service account -- so a wrong owner,
+        # right, inheritance, a second service or a missing Administrators entry is named. Anything
+        # naming another principal is the expected fallback and stays quiet: a developer checkout,
+        # and every Python 3.13+ temp directory, which mkdtemp writes PROTECTED with an OWNER RIGHTS
+        # entry (measured) -- warning there fired on every engine start in a temp directory (CI run
+        # 36048201979, tests/test_startup_attestation.py).
+        if parsed.protected and all(
+            sid in _STORE_DIR_TRUSTED_SIDS or _SERVICE_SID.fullmatch(sid)
+            for _t, _f, _r, sid in parsed.aces
+        ):
             log.warning(
                 "%s is locked down but %s, so the store there is restricted owner-only; the service "
                 "account and an operator's provision-admin cannot then both open it (ADR 0163 note "

@@ -282,7 +282,9 @@ Wave 0 lockout returns for it:
   (`Set-DataDirOwner`), because the default-owner policy can leave the creating user as owner: under
   "Object creator", and for the hosted runners' built-in Administrator (RID 500), measured owning the
   objects it creates (CI run 36039014999). A directory made some other way can still be refused, and
-  the engine logs a WARNING naming the reason whenever it refuses a directory whose inheritance is off;
+  the engine logs a WARNING naming the reason whenever it refuses a directory whose inheritance is off
+  and whose every entry names SYSTEM, Administrators or a service account (a Python temp directory,
+  protected with an OWNER RIGHTS entry, is deliberately not warned about);
 - a store whose directory is not itself protected, such as `-DbPath` in a subdirectory of the data
   directory, and a path through any reparse point, including a folder-mounted volume.
 

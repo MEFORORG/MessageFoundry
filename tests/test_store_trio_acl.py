@@ -164,8 +164,32 @@ def test_a_refused_locked_directory_is_logged_and_an_ordinary_one_is_not(
         str(tmp_path) in r.getMessage() and "owned by" in r.getMessage() for r in caplog.records
     ), [r.getMessage() for r in caplog.records]
     caplog.clear()
-    ordinary = "O:S-1-5-21-1-2-3-1001D:AI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;S-1-5-21-1-2-3-1001)"
-    monkeypatch.setattr(store_mod, "_read_dacl_sddl", lambda _p, **_kw: ordinary)
+    # Quiet cases: an inheriting developer directory, and a Python 3.13+ temp directory, which mkdtemp
+    # writes PROTECTED with SYSTEM, Administrators and OWNER RIGHTS (measured). Warning on the second
+    # fired on every engine start in a temp directory (CI run 36048201979).
+    for label, quiet in (
+        (
+            "an inheriting directory",
+            "O:S-1-5-21-1-2-3-1001D:AI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;S-1-5-21-1-2-3-1001)",
+        ),
+        (
+            "a Python temp directory",
+            "O:S-1-5-21-1-2-3-1001D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;OW)",
+        ),
+    ):
+        caplog.clear()
+        monkeypatch.setattr(store_mod, "_read_dacl_sddl", lambda _p, _s=quiet, **_kw: _s)
+        with caplog.at_level("WARNING", logger=store_mod.log.name):
+            assert store_mod._store_dir_grants(tmp_path) is None
+        assert not caplog.records, (label, [r.getMessage() for r in caplog.records])
+
+
+@_windows_only
+def test_a_real_python_temp_directory_is_not_warned_about(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The same, on the real directory pytest hands out, read through the real reader: the shape that
+    # made tests/test_startup_attestation.py red on both hosted Windows legs.
     with caplog.at_level("WARNING", logger=store_mod.log.name):
         assert store_mod._store_dir_grants(tmp_path) is None
     assert not caplog.records, [r.getMessage() for r in caplog.records]
