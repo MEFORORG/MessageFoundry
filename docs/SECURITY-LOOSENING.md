@@ -365,12 +365,10 @@ This section is kept rather than deleted, because the claim it used to make is t
   lever reached nineteen gates and this page does not carry a heading for each of them. Two it reached
   are named here because they have no heading of their own —
   `[alerts].security_notifications_required` accepts the pull-only security-event feed instead of a
-  configured channel, and revocation is attested **process-wide** with the environment variable
-  `MEFOR_TLS_REVOCATION_ATTESTED`. **There is no per-connection revocation lever.**
-  `tls_revocation_attested` exists on the outbound model and the connectors read it, but it has no
-  factory parameter and no `connections.toml` key, so nothing can author it — and
-  [DEPLOYMENT.md](DEPLOYMENT.md)'s own maintenance rule names that field and forbids offering it as an
-  operator lever. This page offered it until [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md) prompted a re-read.
+  configured channel, and revocation is attested either **per connection** with
+  [`tls_revocation_attested`](#tls_revocation_attested--true-on-a-connection--revocation-checked-outside-the-engine)
+  or **process-wide** with the environment variable `MEFOR_TLS_REVOCATION_ATTESTED`, which no longer
+  crosses an enforcing outbound hop.
 - **Setting it now fails the start**, with a message naming those switches. See [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md).
 
 ### `[store].aad_bind = false` — at-rest values are no longer bound to their cell
@@ -473,9 +471,10 @@ This section is kept rather than deleted, because the claim it used to make is t
   **Note (accurate as of 2026-07-28):** `tls_hop_attested` has **no authoring surface on a connection**
   today — no transport factory takes it and it is not a `connections.toml` key, so an inbound/outbound
   cannot set it (the `[logging].forward_hop_attested` sibling *is* settable). `cleartext_accepted` is
-  therefore the only per-connection declaration an operator can currently write. Giving attestation an
-  authoring surface would add a **silent-ALLOW** loosening and needs its own registry entry here first;
-  it is owed, not shipped.
+  therefore the only per-connection declaration that crosses a *cleartext* hop. (`tls_revocation_attested`,
+  below, is settable, but it governs revocation on a verifying hop and never reaches a cleartext one.)
+  Giving `tls_hop_attested` an authoring surface would add a **silent-ALLOW** loosening and needs its
+  own registry entry here first; it is owed, not shipped.
 - **Compensating controls:** network segmentation and physical/link-layer controls on that specific path;
   narrow the blast radius by declaring it on the single connection that needs it rather than broadly.
 - **It is never silent:** WARN + a dedicated record at **every** connector construction, naming the
@@ -533,6 +532,33 @@ This section is kept rather than deleted, because the claim it used to make is t
   for as long as they have it set; it has no notion of *until when*, so the removal date belongs in your
   own risk register. Where it is NOT reported is the same list as `cleartext_accepted` above —
   `messagefoundry security show` and a graphless `GET /security/posture` say so in `loosenings_scope`.
+
+### `tls_revocation_attested = true` on a connection — revocation checked outside the engine
+> **Connection-scoped**, both directions: an `inbound()`/`outbound()` keyword, or a **top-level**
+> `connections.toml` key (not under `[settings]`), always paired with a mandatory
+> `tls_revocation_attested_reason`.
+> [ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)
+> §1.5 item 4. It is **not** in the switch table above, because that table lists what
+> `security_loosenings()` reports, and this does not reach it yet; see the last bullet.
+- **What you lose:** the engine's refusal of a *verifying* TLS hop that checks no certificate
+  revocation. On an outbound hop that is the `RevocationHopGuard` refusal (stdlib `ssl` fetches no
+  OCSP or CRL). On an mTLS listener it is the `check_inbound_revocation` refusal of a listener with
+  `tls_ca_file` and no `tls_crl_file`. With the attestation set, a revoked but unexpired certificate on
+  that hop is accepted **unless your PKI or terminator stops it**, because the engine will not.
+- **When acceptable:** a revocation-checking PKI or terminator really does cover this hop, and you can
+  name it. That name belongs in the reason. On a listener, prefer `tls_crl_file`, which checks
+  revocation in the engine and needs no attestation.
+- **What it cannot do:** it never reaches a cleartext or verify-off hop, which keep their own
+  refusals. It is a claim about one named hop, which is why it crosses an enforcing instance where the
+  process-wide `MEFOR_TLS_REVOCATION_ATTESTED` does not (BACKLOG #299).
+- **How it is recorded:** a flag without a reason, a blank reason, or a reason without the flag fails
+  at load, on both authoring surfaces. Each time the attestation lets a hop through that an enforcing
+  instance would otherwise refuse, the engine logs a WARNING naming the hop and your reason, at every
+  construction. That record is a log line, not an `audit` table row, for the reason given under
+  `cleartext_accepted` above.
+- **Where it is NOT reported yet:** `messagefoundry check`, `security_loosenings()` and
+  `GET /security/posture` do not list the attested set, as they do for `cleartext_accepted` and
+  `tls_allow_expired`. Until they do, find it by searching your config for `tls_revocation_attested`.
 
 ### A generic-ODBC `DATABASE` hop with TLS unenforced
 > **Connection-scoped**, and unlike the two above it is not a flag anyone sets — it is the *absence* of a

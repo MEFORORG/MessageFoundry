@@ -29,6 +29,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   time, so it runs in linear time, not quadratic. A bomb now stops at the ceiling, not up to one
   window past it. `gzip_decompress` and `zip_decompress` do not use this loop and are unchanged.
   ([BACKLOG #1964](docs/BACKLOG.md))
+- **The per-connection revocation attestation can now be set, in both directions (ADR 0173).**
+  `tls_revocation_attested` and a mandatory `tls_revocation_attested_reason` are new `inbound()` and
+  `outbound()` keywords and top-level `connections.toml` keys. The field sat on the connection models
+  with nothing that could set it, and on the inbound side the runner never filled it, so the attested
+  branch of the mTLS listener's revocation check could not fire. A flag without a reason fails at load.
+  Each time the attestation lets a hop through that an enforcing instance would refuse, the engine logs
+  a WARNING naming the hop and the reason. The revocation refusals name this lever again. It is not yet
+  listed by `messagefoundry check` or `security_loosenings()`.
 ### Changed
 - **`messagefoundry dryrun` and `messagefoundry check` now refuse an oversized fixture file.** The
   cap is `MAX_FIXTURE_FILE_BYTES`, which defaults to `DEFAULT_MAX_MESSAGE_BYTES` (16 MiB) and rises
