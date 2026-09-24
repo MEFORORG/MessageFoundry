@@ -56,6 +56,10 @@ both halves are set, a WS-Security UsernameToken only with ``ws_security`` on, a
 * Plugin connector types this module does not know. They are not guessed at.
 * A generic-ODBC database hop that sets no top-level ``username``/``password``: the credential, if
   any, sits under a driver keyword the engine cannot enumerate. See ``static_credential_db_hops``.
+* A forward-proxy URL the engine cannot read: a connection's ``proxy_url`` written as an ``env()``
+  reference, whose value is resolved only when the connector is built, and ``proxy_url='default'``,
+  where the operating system's proxy settings carry any credential. Userinfo in either is sent and
+  not listed. A ``proxy_user``/``proxy_password`` pair beside an ``env()`` URL is still listed.
 
 Pure apart from :func:`apply_static_credential_gate`, which also logs: every function reads its
 arguments and touches nothing else.
@@ -69,13 +73,13 @@ names the SETTING that holds it, never the value."""
 from __future__ import annotations
 
 import logging
-import urllib.parse
+import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
 from messagefoundry.config.ai_policy import AiMode
-from messagefoundry.config.models import ConnectorType
+from messagefoundry.config.models import ConnectorType, remote_file_protocol
 from messagefoundry.config.settings import (
     ServiceSettings,
     SqlAuth,
@@ -194,19 +198,41 @@ def _http_hop(
     return StaticCredentialHop(name, "none", f"presents no credential ({peer})", compliant_kind)
 
 
-def _url_userinfo(url: object) -> bool:
-    """Does a proxy URL carry ``user@`` or ``user:password@`` in its authority?
+#: urllib's ``_splittype`` pattern: a scheme is everything before the first ``:`` holding no ``/``.
+_URLLIB_SCHEME = re.compile(r"([^/:]+):(.*)", re.DOTALL)
 
-    urllib's ``ProxyHandler`` turns URL userinfo into a pre-emptive ``Proxy-authorization: Basic``
-    header, so userinfo is a credential on the wire even with ``proxy_user`` unset. Read after
-    unquoting, the way ``transports.rest.refuse_url_credentials`` reads an endpoint URL, because
-    ``urlsplit`` misses an ``@`` hidden behind percent-encoding. Any userinfo counts, including a
-    user with no password: that sends nothing today, but it is a credential written to be sent, and
-    the gate fails closed on it. An unresolved ``env()`` reference cannot be read, so it counts as no
-    userinfo; the proxy it names is still reported when ``proxy_user`` or ``proxy_password`` is set."""
+
+def _proxy_url_sends_userinfo(url: object) -> bool:
+    """Would urllib's ``ProxyHandler`` send a ``Proxy-authorization`` header built from this URL?
+
+    It does when the proxy URL carries a user AND a password, whether or not ``proxy_user`` is set,
+    and it sends Basic pre-emptively. This mirrors ``urllib.request._parse_proxy``, the parser that
+    handler runs, rather than ``urlsplit``: the two disagree on where the authority ends. With an
+    unencoded ``/``, ``?`` or ``#`` in the password, ``urlsplit`` stops the authority early and sees
+    no ``@``, while ``_parse_proxy`` still finds the userinfo and the password is sent. A user with no
+    password sends nothing, and a percent-encoded ``%40`` is never read as an ``@``. The copy is
+    private stdlib logic, so a test pins it to the real function over a corpus of shapes.
+
+    An unresolved ``env()`` reference cannot be read, so it answers ``False``; the module docstring
+    lists that gap. It never raises, so a malformed URL cannot crash the single reader."""
     if not isinstance(url, str):
         return False
-    return "@" in urllib.parse.unquote(urllib.parse.urlsplit(url.strip()).netloc)
+    proxy = url.strip()
+    match = _URLLIB_SCHEME.match(proxy)
+    rest = match.group(2) if match else proxy
+    if not rest.startswith("/"):
+        authority = proxy
+    elif not rest.startswith("//"):
+        return False  # urllib refuses a URL with no authority; nothing is sent
+    else:
+        at = rest.find("@")
+        end = rest.find("/", at) if at != -1 else rest.find("/", 2)
+        authority = rest[2:] if end == -1 else rest[2:end]
+    userinfo, sep, _ = authority.rpartition("@")
+    if not sep:
+        return False
+    user, _, password = userinfo.partition(":")
+    return bool(user and password)
 
 
 def _proxy_hop(
@@ -221,18 +247,19 @@ def _proxy_hop(
     caller has no settings to read; the hop is then reported, because a credential written on a
     connection is written to be used. A proxy with no credential has nothing presented to it.
 
-    The credential is either the ``proxy_user``/``proxy_password`` pair or userinfo in the proxy URL
-    itself (:func:`_url_userinfo`); the label is built from parsed parts, so the userinfo never
-    reaches it."""
+    The credential is the ``proxy_user``/``proxy_password`` pair, or a user and password in the
+    proxy URL itself (:func:`_proxy_url_sends_userinfo`). The label is built from parsed parts, so the
+    userinfo never reaches it."""
     proxy_url = settings.get("proxy_url") or site_proxy
-    keyed = bool(settings.get("proxy_user") or settings.get("proxy_password"))
-    if not keyed and not _url_userinfo(proxy_url):
+    in_url = _proxy_url_sends_userinfo(proxy_url)
+    if not in_url and not (settings.get("proxy_user") or settings.get("proxy_password")):
         return None
     if site_proxy is not None and not proxy_url:
         return None  # no proxy at all: the credential is never sent
     # From a closed set, not echoed: only a known scheme name reaches the detail. URL userinfo is
-    # always Basic: urllib's ProxyHandler sends it pre-emptively, whatever proxy_auth_type says.
-    kind = str(settings.get("proxy_auth_type") or "basic") if keyed else "basic"
+    # always Basic: the handler sends it pre-emptively and it replaces the engine's own header,
+    # whatever proxy_auth_type says. Otherwise the type is read the way the transport reads it.
+    kind = "basic" if in_url else str(settings.get("proxy_auth_type") or "basic").strip().lower()
     if kind not in ("basic", "digest"):
         kind = "static"
     return StaticCredentialHop(
@@ -249,11 +276,8 @@ def _remote_file_hop(
     """SFTP can present an SSH private key, which is compliant. FTP and FTPS cannot: the FTPS client
     certificate exists in the transport, but ``Ftp()`` exposes no setting that selects it.
 
-    The protocol is read through the transport's own normalisation (lowercased, SFTP when unset), so
+    The protocol is read through the normalisation the transport uses (lowercased, SFTP when unset), so
     the classifier cannot call a hop FTP that the transport dials as SFTP."""
-    # Lazy, for the one-way rule ``_smart`` states.
-    from messagefoundry.transports.remotefile import remote_file_protocol
-
     if remote_file_protocol(settings) == "sftp":
         if settings.get("password"):
             return StaticCredentialHop(name, "static", f"SFTP password ({peer})", True)

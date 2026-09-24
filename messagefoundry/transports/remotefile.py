@@ -61,7 +61,13 @@ from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from typing import Any, TypeVar
 
-from messagefoundry.config.models import ConnectorType, ContentType, Destination, Source
+from messagefoundry.config.models import (
+    ConnectorType,
+    ContentType,
+    Destination,
+    Source,
+    remote_file_protocol,
+)
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
     weakened_tls_escape_permitted_here,
@@ -105,15 +111,6 @@ __all__ = ["RemoteFileDestination", "RemoteFileSource"]
 logger = logging.getLogger(__name__)
 
 _PROTOCOLS = ("sftp", "ftp", "ftps")
-
-
-def remote_file_protocol(settings: Mapping[str, Any]) -> str:
-    """The wire protocol a REMOTEFILE connection speaks: ``protocol`` lowercased, SFTP when unset.
-
-    The ONE normalisation: the client factory, both construction guards and the static-credential
-    inventory (BACKLOG #1182) all read it here, so a classifier cannot call an upper-case or missing
-    ``protocol`` FTP while the transport dials SFTP. It does not validate; ``_validate_common`` does."""
-    return str(settings.get("protocol", "sftp")).lower()
 
 
 _T = TypeVar("_T")

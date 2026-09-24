@@ -506,8 +506,9 @@ async def test_the_probes_do_not_reach_the_posture_response(tmp_path: Path) -> N
 
 
 def test_the_check_reports_the_settings_half_on_an_empty_graph(tmp_path: Path) -> None:
-    """Under ``--allow-empty-config`` a connection-less graph still has a settings half. The check
-    must report it rather than skip with "config did not load" about a config that loaded."""
+    """A connection-less graph still has a settings half, so the leg loads with the empty-graph rule
+    dropped, as its siblings do. Run under ``--allow-empty-config``, where ``validate`` stops
+    reporting the empty graph: a skip there would be covered by nothing."""
     from messagefoundry.checks import run_checks
 
     cfg = tmp_path / "config"

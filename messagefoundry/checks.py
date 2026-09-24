@@ -177,14 +177,15 @@ def run_checks(
     the blocking validate leg.
 
     A leg whose SUBJECT survives an empty graph drops the rule unconditionally instead, at its own
-    ``load_config`` — ``build-check``, ``reference-backend``, ``dead-config`` and ``send-target``.
-    Each of their skip arms delegates the reporting to ``validate``, and ``--allow-empty-config`` is
+    ``load_config`` — at least ``build-check``, ``reference-backend``, ``dead-config``,
+    ``send-target`` and ``static-credentials`` (whose settings half dials out with no connection
+    declared). Each of their skip arms delegates the reporting to ``validate``, and ``--allow-empty-config`` is
     exactly when ``validate`` stops reporting it, so a leg that skipped there would be covered by
     nothing — and its "config did not load" line would be false about a config that loaded. Use that
     test when deciding for a new leg: ask whether it reads something a connection-less config still
     has (Routers, Handlers, reference sets), not whether the flag was passed.
 
-    The remaining legs still load with the rule in force and do skip on an empty dir: they report on
+    Legs that report on connections alone still load with the rule in force and do skip on an empty dir: they report on
     connections, and there are none. The skip line they print says "config did not load", which is
     inexact for this one cause; threading the keyword further was left out of scope.
     """

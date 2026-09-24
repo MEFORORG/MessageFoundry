@@ -720,3 +720,14 @@ class Validation(BaseModel):
     # slow-parse input can otherwise pin the listener; the timeout bounds it. ``None`` inherits the
     # engine default (``_STRICT_VALIDATE_TIMEOUT_SECONDS``); ``<= 0`` disables the backstop.
     strict_timeout_s: float | None = None
+
+
+def remote_file_protocol(settings: Mapping[str, Any]) -> str:
+    """The wire protocol a REMOTEFILE connection speaks: ``protocol`` lowercased, SFTP when unset.
+
+    The ONE normalisation (BACKLOG #1182). The transport's client factory and both of its
+    construction guards read it, and so does the static-credential inventory, so a classifier
+    cannot call an upper-case or missing ``protocol`` FTP while the transport dials SFTP. It lives
+    here rather than in the transport so the pure ``config`` classifier needs no transport import.
+    It does not validate the value; the transport's construction does."""
+    return str(settings.get("protocol", "sftp")).lower()

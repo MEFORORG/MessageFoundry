@@ -613,3 +613,75 @@ def test_an_upper_case_ftp_protocol_is_still_ftp() -> None:
     s = {"host": "ftp.example.invalid", "protocol": "FTPS", "username": "u", "password": "x"}
     hop = _connection_hop("OB_F", ConnectorType.REMOTEFILE, s)
     assert hop is not None and hop.detail.startswith("FTP password") and hop.compliant_kind is False
+
+
+#: Proxy URL shapes on both sides of urllib's parser. Each pairs with what the handler sends.
+_PROXY_SHAPES = [
+    "http://u:p@proxy.example.invalid:3128",
+    "http://u:p@proxy.example.invalid:3128/",
+    "http://u:pa/ss@proxy.example.invalid:3128",  # urlsplit ends the authority at the '/'
+    "http://u:pa?ss@proxy.example.invalid:3128",
+    "http://u:pa#ss@proxy.example.invalid:3128",
+    "http://u:p@x@proxy.example.invalid:3128",
+    "http://u@proxy.example.invalid:3128",  # a user with no password sends nothing
+    "http://u:@proxy.example.invalid:3128",
+    "http://:p@proxy.example.invalid:3128",
+    "http://us%40er@proxy.example.invalid:3128",  # an encoded '@' is not a separator
+    "http://proxy%40x.example.invalid:3128",
+    "http://proxy.example.invalid:3128/path@x",
+    "http://proxy.example.invalid:3128",
+    "http://[::1:3128",  # malformed: urlsplit raises, urllib parses
+    "u:p@proxy.example.invalid:3128",  # no '//': the whole string is the authority
+    "http:/u:p@proxy.example.invalid",  # no authority: urllib refuses
+    "default",
+    "",
+]
+
+
+@pytest.mark.parametrize("url", _PROXY_SHAPES)
+def test_the_userinfo_reader_mirrors_urllibs_proxy_parser(url: str) -> None:
+    """The reader is a copy of private stdlib logic, so pin it to the function the handler runs:
+    ``ProxyHandler`` sends a header exactly when ``_parse_proxy`` yields a user and a password."""
+    import urllib.request
+
+    from messagefoundry.config.static_credentials import _proxy_url_sends_userinfo
+
+    try:
+        _, user, password, _ = urllib.request._parse_proxy(url)  # type: ignore[attr-defined]
+        sent = bool(user and password)
+    except ValueError:
+        sent = False  # the handler raises; nothing is sent
+    assert _proxy_url_sends_userinfo(url) is sent
+
+
+def test_a_malformed_proxy_url_never_crashes_the_reader() -> None:
+    """``urlsplit`` raises on an unclosed IPv6 bracket. The single reader must not, or ``check``,
+    the posture view and the reload guard all fail on a URL that carries no credential."""
+    from messagefoundry.config.static_credentials import _proxy_hop
+
+    assert _proxy_hop("OB", {"proxy_url": "http://[::1:3128"}, "") is None
+
+
+def test_url_userinfo_is_basic_whatever_proxy_auth_type_says() -> None:
+    """The handler sends URL userinfo as pre-emptive Basic and it replaces the engine's own header,
+    so the detail names Basic even beside a Digest pair. Without userinfo the type is read the way
+    the transport reads it, trimmed and lowercased."""
+    from messagefoundry.config.static_credentials import _proxy_hop
+
+    both = {
+        "proxy_url": f"http://u:{_PROXY_PW}@proxy.example.invalid:3128",
+        "proxy_user": "pu",
+        "proxy_password": "pp",
+        "proxy_auth_type": "digest",
+    }
+    hop = _proxy_hop("OB", both, "")
+    assert hop is not None and "forward-proxy basic credential" in hop.detail
+    assert _PROXY_PW not in hop.detail
+    keyed = {
+        "proxy_url": "http://proxy.example.invalid:3128",
+        "proxy_user": "pu",
+        "proxy_password": "pp",
+        "proxy_auth_type": " Digest ",
+    }
+    hop = _proxy_hop("OB", keyed, "")
+    assert hop is not None and "forward-proxy digest credential" in hop.detail
