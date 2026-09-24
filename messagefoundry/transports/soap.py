@@ -412,6 +412,7 @@ class SoapDestination(DestinationConnector):
                 self.url,
                 connector="SOAP destination",
                 revocation_attested=config.tls_revocation_attested,
+                revocation_attested_reason=config.tls_revocation_attested_reason,
             )
 
         # #1180 (ADR 0093): the client trust anchor, shared by every VERIFYING branch below. Not

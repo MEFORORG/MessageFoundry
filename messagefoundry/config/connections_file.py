@@ -126,6 +126,11 @@ _INBOUND_KEYS = frozenset(
         # table without it is byte-identical. The FIRST console-settable connections.toml key (its write
         # seam rides connections_edit); display-only, no runtime effect.
         "flagged",
+        # ADR 0173: the per-connection revocation attestation for an mTLS listener. TOP-LEVEL for the
+        # same reason as the outbound cleartext pair below: a hop-policy declaration, not a transport
+        # setting the factory's schema would accept.
+        "tls_revocation_attested",
+        "tls_revocation_attested_reason",
     }
 )
 _OUTBOUND_KEYS = frozenset(
@@ -156,6 +161,10 @@ _OUTBOUND_KEYS = frozenset(
         # (see _build_spec: "the factory IS the schema"), which no factory would accept.
         "cleartext_accepted",
         "cleartext_reason",
+        # ADR 0173: the per-connection revocation attestation for a verifying TLS hop; see the inbound
+        # note above.
+        "tls_revocation_attested",
+        "tls_revocation_attested_reason",
     }
 )
 
@@ -230,6 +239,13 @@ def _inbound_from_table(table: dict[str, Any], source: str) -> InboundConnection
         deployed=_require_bool(table, "deployed", where, default=True),
         # #131: the object-of-interest flag defaults FALSE (an absent key = unflagged).
         flagged=_require_bool(table, "flagged", where, default=False),
+        # ADR 0173: absent = not attested; the flag/reason rules live in build_inbound_connection.
+        tls_revocation_attested=_require_bool(
+            table, "tls_revocation_attested", where, default=False
+        ),
+        tls_revocation_attested_reason=_optional_str(
+            table, "tls_revocation_attested_reason", where
+        ),
         source_file=source,
         source_line=None,
     )
@@ -272,6 +288,13 @@ def _outbound_from_table(table: dict[str, Any], source: str) -> OutboundConnecti
         # this surface and the code-first outbound() surface cannot drift.
         cleartext_accepted=_require_bool(table, "cleartext_accepted", where, default=False),
         cleartext_reason=_optional_str(table, "cleartext_reason", where),
+        # ADR 0173: absent = not attested; the flag/reason rules live in build_outbound_connection.
+        tls_revocation_attested=_require_bool(
+            table, "tls_revocation_attested", where, default=False
+        ),
+        tls_revocation_attested_reason=_optional_str(
+            table, "tls_revocation_attested_reason", where
+        ),
         source_file=source,
         source_line=None,
     )

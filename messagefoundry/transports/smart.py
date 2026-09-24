@@ -126,10 +126,10 @@ class SmartBackendTokenProvider:
         attested: bool = False,
         # #1498 (ADR 0173 §4.3): the per-connection `tls_revocation_attested`, DISTINCT from `attested`
         # above (which attests a cleartext/verify-off hop is secure by other means, #200). Read from the
-        # resolved settings by `token_provider_from_settings`, exactly as the delivery cells read it off
-        # their Destination. Like its siblings it has no authoring surface today, so in practice the
-        # blanket MEFOR_TLS_REVOCATION_ATTESTED is the reachable attestation.
+        # resolved settings by `token_provider_from_settings`, where the runner's `_dest_config` mirrors
+        # the connection's top-level declaration and its mandatory reason (ADR 0173).
         revocation_attested: bool = False,
+        revocation_attested_reason: str | None = None,
         cleartext_accepted: bool = False,
         cleartext_reason: str | None = None,
         connection: str | None = None,
@@ -257,6 +257,7 @@ class SmartBackendTokenProvider:
             token_url,
             connector="SMART token endpoint",
             revocation_attested=revocation_attested,
+            revocation_attested_reason=revocation_attested_reason,
             opener=self._opener,
         )
         self._proxy_auth: dict[str, str] = (
@@ -494,9 +495,12 @@ def token_provider_from_settings(
         # #200: the per-connection insecure-hop attestation keys the posture-keyed cleartext refusal in
         # __init__ (read from settings exactly as _dest_config / the OAuth2 provider do).
         attested=bool(s.get("tls_hop_attested", False)),
-        # #1498 (ADR 0173 §4.3): the revocation attestation, read the same way the runner reads it for a
-        # Destination. A DIFFERENT claim from `attested` above, so it gets its own key.
+        # #1498 (ADR 0173 §4.3): the revocation attestation `_dest_config` mirrors from the connection's
+        # top-level declaration. A DIFFERENT claim from `attested` above, so it gets its own key.
         revocation_attested=bool(s.get("tls_revocation_attested", False)),
+        revocation_attested_reason=(
+            None if (why := s.get("tls_revocation_attested_reason")) is None else str(why)
+        ),
         cleartext_accepted=accepted[0],
         cleartext_reason=accepted[1],
         connection=accepted[2],

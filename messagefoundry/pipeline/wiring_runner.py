@@ -7592,6 +7592,11 @@ def _source_config(ic: InboundConnection, bind_host: str, env_values: Mapping[st
         # secure hop. Default False → keyed purely on posture; a bad attested/reason pair fails loud here.
         tls_hop_attested=bool(settings.get("tls_hop_attested", False)),
         tls_hop_attested_reason=_hop_attested_reason(settings),
+        # ADR 0173: the mTLS listener's revocation attestation. A TOP-LEVEL inbound key, read off the
+        # InboundConnection (not the env-resolved settings), so check_inbound_revocation's attested
+        # branch is reachable from config. Default off -> byte-identical.
+        tls_revocation_attested=ic.tls_revocation_attested,
+        tls_revocation_attested_reason=ic.tls_revocation_attested_reason,
     )
 
 
@@ -7639,6 +7644,11 @@ def _dest_config(
         settings["cleartext_accepted"] = True
         settings["cleartext_reason"] = oc.cleartext_reason
         settings["cleartext_connection"] = oc.name
+    # ADR 0173: mirror the revocation attestation the same way, for the one settings-driven seam that
+    # reads it -- the SMART token-endpoint provider (transports/smart.py). Written only when set.
+    if oc.tls_revocation_attested:
+        settings["tls_revocation_attested"] = True
+        settings["tls_revocation_attested_reason"] = oc.tls_revocation_attested_reason
     return Destination(
         name=oc.name,
         type=oc.spec.type,
@@ -7662,8 +7672,10 @@ def _dest_config(
         cleartext_reason=oc.cleartext_reason,
         # #201 (ADR 0078 amendment): per-connection attestation that revocation is checked for a VERIFYING
         # outbound TLS hop, typed here so the connector's revocation gate can ALLOW it even on prod-PHI.
-        # Default False → keyed purely on posture (existing verifying outbounds byte-identical).
-        tls_revocation_attested=bool(settings.get("tls_revocation_attested", False)),
+        # A TOP-LEVEL outbound key since ADR 0173's authoring surface, so -- like cleartext_accepted --
+        # it is read off the OutboundConnection. Default False → keyed purely on posture.
+        tls_revocation_attested=oc.tls_revocation_attested,
+        tls_revocation_attested_reason=oc.tls_revocation_attested_reason,
         # #190 (ADR 0093): thread the instance-wide [tls] client trust-anchor policy onto the outbound
         # (the SINGLE choke point feeding build_check AND live construction, so the internal-outbound TLS
         # context builders resolve the same anchor both places). None → the default system/no-op policy,
@@ -8212,14 +8224,16 @@ def _inbound_insecure_bind_permitted(
     return not posture.enforcing  # the `and posture.is_phi` conjunct went with BACKLOG #1279
 
 
-def _inbound_revocation_gap_permitted(*, attested: bool, posture: HopPosture | None) -> bool:
+def _inbound_revocation_gap_permitted(*, posture: HopPosture | None) -> bool:
     """Whether a VERIFYING inbound mTLS listener that checks NO revocation may bind (warn-and-cross)
     rather than being REFUSED (BACKLOG #1005). The revocation sibling of
-    :func:`_inbound_insecure_bind_permitted`, and deliberately the same three rungs in the same order.
+    :func:`_inbound_insecure_bind_permitted`, with the same rungs in the same order; the first one,
+    the per-connection attestation, lives in the caller.
 
-    A per-connection ``tls_revocation_attested`` permits it -- the operator declaring that a
+    A per-connection ``tls_revocation_attested`` also permits it -- the operator declaring that a
     revocation-checking PKI covers these certificates outside the engine, exactly as the outbound
-    ``Destination.tls_revocation_attested`` does for a verified outbound hop.
+    ``Destination.tls_revocation_attested`` does for a verified outbound hop. The caller handles that
+    rung first, because it alone is audited rather than warned.
 
     An **unstamped** posture (``None``) permits it, for the same reason the sibling does: the check
     ran outside the ENFORCED gate, so this is a direct / embedding call and must never acquire a new
@@ -8230,8 +8244,6 @@ def _inbound_revocation_gap_permitted(*, attested: bool, posture: HopPosture | N
     weakened TLS, and a listener that verifies its peers correctly but does not check revocation is
     not a weakened-TLS hop; reusing that escape would let one env var silence a control it was never
     scoped to."""
-    if attested:
-        return True
     if posture is None:
         return True  # un-postured (direct/embedding) call: never a new refusal (see above)
     return not posture.enforcing  # the `and posture.is_phi` conjunct went with BACKLOG #1279
@@ -8246,11 +8258,10 @@ def check_inbound_revocation(
     **Measured on this tree**: the three server builders load a CA, set ``CERT_REQUIRED`` and finish
     with ``harden_verify_flags`` -- strict RFC 5280 path validation, NOT revocation -- so a client
     certificate revoked this morning keeps authenticating until its ``notAfter``. Set
-    ``tls_crl_file`` on the connection (a PEM carrying the CA and its CRL).
-
-    The messages below name no ``tls_revocation_attested``. ``Source`` carries the field, but no
-    factory parameter or ``connections.toml`` key sets it and ``_source_config`` never populates it,
-    so offering it would name a remedy the operator cannot perform (docs/DEPLOYMENT.md, SDS-3.7).
+    ``tls_crl_file`` on the connection (a PEM carrying the CA and its CRL), or declare
+    ``tls_revocation_attested = true`` with a ``tls_revocation_attested_reason`` on the connection if
+    your PKI checks revocation outside the engine (ADR 0173). An attestation that suppresses the
+    enforcing refusal is logged at WARNING with its reason, so the crossing stays on the record.
 
     **Why this refusal cannot be delegated away for two of the three listeners.**
     ``harden_verify_flags``' own docstring delegates live revocation to the deploying org -- OCSP
@@ -8270,11 +8281,25 @@ def check_inbound_revocation(
         return
     if settings.get("tls_crl_file"):
         return
-    if _inbound_revocation_gap_permitted(attested=source.tls_revocation_attested, posture=posture):
+    if source.tls_revocation_attested:
+        # Nothing to warn about: the operator took responsibility. AUDIT only the crossing the
+        # attestation actually bought (an enforcing instance would otherwise have refused), the
+        # condition RevocationHopGuard.enforce_construction audits on the outbound side. The Source
+        # validator guarantees the reason is present.
+        if posture is not None and posture.enforcing:
+            log.warning(
+                "inbound %r: mTLS listener that checks NO client-certificate revocation bound on "
+                "operator attestation (tls_revocation_attested; reason: %s)",
+                name,
+                source.tls_revocation_attested_reason,
+            )
+        return
+    if _inbound_revocation_gap_permitted(posture=posture):
         log.warning(
             "inbound %r requires and verifies a client certificate (mTLS) but checks NO revocation: "
             "a revoked partner certificate would keep authenticating until its notAfter. Set "
-            "tls_crl_file (a PEM carrying the CA and its CRL) on the connection.",
+            "tls_crl_file on the connection, or tls_revocation_attested=true with a "
+            "tls_revocation_attested_reason if your PKI checks revocation outside the engine.",
             name,
         )
         return
@@ -8282,9 +8307,11 @@ def check_inbound_revocation(
         f"inbound connection {name!r} requires and verifies a client certificate (mTLS) but checks "
         "no revocation, on an enforcing production-PHI instance; a partner certificate revoked "
         "today would keep authenticating to this interface until its notAfter. Set tls_crl_file "
-        "(a PEM carrying the CA and its CRL) on the connection. An HTTP proxy can terminate "
-        "neither MLLP nor DIMSE, so for those "
-        "listeners the documented out-of-engine delegation does not reach."
+        "(a PEM carrying the CA and its CRL) on the connection, or set "
+        "tls_revocation_attested=true with a tls_revocation_attested_reason if a "
+        "revocation-checking PKI covers these certificates outside the engine. An HTTP proxy can "
+        "terminate neither MLLP nor DIMSE, so for those listeners the documented out-of-engine "
+        "delegation does not reach."
     )
 
 

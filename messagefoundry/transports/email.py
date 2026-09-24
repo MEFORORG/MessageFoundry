@@ -266,6 +266,7 @@ class EmailDestination(DestinationConnector):
                 cell="Email destination (verified SMTP TLS, no revocation check)",
                 description="delivers over verified SMTP TLS but performs no certificate revocation checking",
                 attested=config.tls_revocation_attested,
+                attested_reason=config.tls_revocation_attested_reason,
                 context=self._tls_context,
             ).enforce_construction()
 
