@@ -93,7 +93,8 @@ This is a *randomness* inventory, and that is the whole claim it supports. The o
 crypto in the non-Python roots (the TLS floor ``ide/src/engineClient.ts`` applies to every https
 request, and the console's WebAuthn ceremony in ``static/app.js``) is found by a THIRD arm,
 :func:`check_non_python_operations` (BACKLOG #1164). A FOURTH arm,
-:func:`check_powershell_operations`, reads the ``.ps1`` files under ``scripts/``, including the
+:func:`check_powershell_operations`, reads the ``.ps1`` and ``.psm1`` files under ``scripts/``,
+including the
 operator deployment path that installs a trust anchor and verifies a pinned service binary. Both
 run only under ``--non-python-operations``, from the ``ide`` CI job, which is not a required
 context: they report, and they do not block a merge. So the required green still says nothing
@@ -910,6 +911,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:.post_handshake_auth = True",
             "tls_context:.set_ciphers()",
             "tls_context:.verify_flags |=",
+            "tls_context:.verify_flags |= VERIFY_CRL_CHECK_LEAF",
             "tls_context:.verify_mode =",
             "tls_context:.verify_mode = CERT_NONE",
             "tls_context:ssl.SSLContext",
@@ -929,7 +931,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     ),
     "messagefoundry/config/wiring.py": frozenset({"hash:hashlib.sha256"}),
     "messagefoundry/credential.py": frozenset(
-        {"compare:hmac.compare_digest", "hash:hashlib.sha256"}
+        {"compare:hmac.compare_digest[sha256]", "hash:hashlib.sha256"}
     ),
     "messagefoundry/integrity.py": frozenset({"hash:hashlib.sha256"}),
     "messagefoundry/logging_setup.py": frozenset(
@@ -986,7 +988,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "key_cert:cryptography.x509.load_pem_x509_certificate",
             "key_cert:cryptography.x509.load_pem_x509_crl",
             "key_cert:cryptography.x509.random_serial_number",
-            "sign_verify:.sign()",
+            "sign_verify:.sign()[sha256]",
         }
     ),
     "messagefoundry/redaction.py": frozenset({"hash:hashlib.sha256"}),
@@ -1161,6 +1163,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "key_cert:.public_key()",
             "key_cert:cryptography.hazmat.primitives.serialization.load_pem_private_key",
             "sign_verify:.sign()",
+            "sign_verify:.sign()[sha256]",
             "sign_verify:.verify()",
         }
     ),
@@ -1228,8 +1231,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     #   verify/federation.py -- the `verify` federation check builds the IdP opener, parses the JWKS
     #     and validates an ID token, so it exercises the whole OIDC verification path.
     #   verify/runner.py -- builds the live smoke's client TLS context (verify/smoke).
-    #   harness/load/* -- mint a per-run loopback certificate pair and build the pinned client TLS
-    #     context through harness/load/tlsmat (non-prod, loopback only, per that row in INVENTORY).
+    #   harness/load/* -- mint a per-run loopback certificate pair through harness/load/tlsmat, and
+    #     all but enginepoll.py also build the pinned client TLS context there (non-prod, loopback
+    #     only, per that row in INVENTORY).
     #   scripts/security/dast_auth_sweep.py -- runs the DAST target, which draws a throwaway password.
     "harness/load/connscale/runner.py": frozenset(
         {
@@ -1331,12 +1335,13 @@ def discover(package: Path) -> dict[str, frozenset[str]]:
 
 
 #: The operation arm's POSITIVE CONTROL, run on every gate invocation before the tree is read. A
-#: fixture package that never touches the disk and exercises every matcher the tree depends on:
-#: an exact rule, a prefix rule, an algorithm carried by an ARGUMENT, a method rule, a TLS posture
-#: assignment with its value, a tuple-target posture assignment, and a first-party provider reached
-#: three ways (absolute import, package re-export, relative import) from modules with no crypto
-#: import of their own, which is the BACKLOG #1164 shape. If the instrument does not report exactly
-#: this, one of those matchers is dead, and every clean result it gives about the tree is void.
+#: fixture that never touches the disk and exercises AT LEAST these matchers: an exact rule, a
+#: prefix rule, an algorithm carried by an ARGUMENT, a method rule, a TLS posture assignment with its
+#: value, a tuple-target, augmented and ``setattr`` posture assignment, a bare sibling import under
+#: ``scripts/``, and a first-party provider reached three ways (absolute import, package re-export,
+#: relative import) from modules with no crypto import of their own, which is the BACKLOG #1164
+#: shape. If the instrument does not report exactly this, one of those matchers is dead, and every
+#: clean result it gives about the tree is void.
 _SELF_TEST_SOURCES: dict[str, str] = {
     "selftest/__init__.py": "from .seam import build\n",
     "selftest/seam.py": (
@@ -1345,6 +1350,8 @@ _SELF_TEST_SOURCES: dict[str, str] = {
         "    ctx = ssl.create_default_context()\n"
         "    ctx.minimum_version = ssl.TLSVersion.TLSv1_2\n"
         "    ctx.check_hostname, ctx.verify_mode = True, ssl.CERT_REQUIRED\n"
+        "    ctx.options |= ssl.OP_NO_COMPRESSION\n"
+        "    setattr(ctx, 'verify_flags', ssl.VERIFY_X509_STRICT)\n"
         "    return ctx\n"
     ),
     "selftest/user.py": (
@@ -1359,6 +1366,8 @@ _SELF_TEST_SOURCES: dict[str, str] = {
     ),
     "selftest/reexported.py": "from selftest import build\n\n\ndef go():\n    build()\n",
     "selftest/relative.py": "from . import seam\n\n\ndef go():\n    seam.build()\n",
+    "scripts/st/helper.py": "import hashlib\n\n\ndef h(b):\n    return hashlib.sha1(b)\n",
+    "scripts/st/user.py": "import helper\n\n\ndef go(b):\n    return helper.h(b)\n",
 }
 _SELF_TEST_EXPECTED: dict[str, frozenset[str]] = {
     "selftest/seam.py": frozenset(
@@ -1367,6 +1376,8 @@ _SELF_TEST_EXPECTED: dict[str, frozenset[str]] = {
             "tls_context:.minimum_version = TLSv1_2",
             "tls_context:.check_hostname = True",
             "tls_context:.verify_mode = CERT_REQUIRED",
+            "tls_context:.options |= OP_NO_COMPRESSION",
+            "tls_context:.verify_flags = VERIFY_X509_STRICT",
         }
     ),
     "selftest/user.py": frozenset(
@@ -1379,6 +1390,8 @@ _SELF_TEST_EXPECTED: dict[str, frozenset[str]] = {
     ),
     "selftest/reexported.py": frozenset({"tls_context:via selftest.seam"}),
     "selftest/relative.py": frozenset({"tls_context:via selftest.seam"}),
+    "scripts/st/helper.py": frozenset({"hash:hashlib.sha1"}),
+    "scripts/st/user.py": frozenset({"hash:via scripts.st.helper"}),
 }
 
 
@@ -1639,13 +1652,16 @@ NON_PYTHON_OPERATION_PATTERNS: dict[str, tuple[re.Pattern[str], str]] = {
     ),
     "tls.connect": (re.compile(r"tls\s*\.\s*(connect|createSecureContext)\s*\("), "tls_context"),
     "https.Agent": (re.compile(r"new\s+(https\s*\.\s*)?Agent\s*\("), "tls_context"),
-    "minVersion": (re.compile(_B + r"(minVersion|maxVersion)\s*:" + _LIT), "tls_context"),
+    # A floor and a cap are different decisions, so they are different tokens.
+    "minVersion": (re.compile(_B + r"minVersion\s*:" + _LIT), "tls_context"),
+    "maxVersion": (re.compile(_B + r"maxVersion\s*:" + _LIT), "tls_context"),
     "rejectUnauthorized": (re.compile(_B + r"rejectUnauthorized\s*:"), "tls_context"),
     "checkServerIdentity": (re.compile(_B + r"checkServerIdentity\s*:"), "tls_context"),
     "secureProtocol": (
-        re.compile(_B + r"(secureProtocol|secureOptions|ecdhCurve|ciphers)\s*:" + _LIT),
+        re.compile(_B + r"(secureProtocol|secureOptions|ecdhCurve)\s*:" + _LIT),
         "tls_context",
     ),
+    "ciphers": (re.compile(_B + r"ciphers\s*:" + _LIT), "tls_context"),
     # The CSPRNG sources are the randomness arm's STRONG set, reused so the two arms cannot disagree
     # about what a draw looks like. The WEAK set stays the randomness arm's alone: it has no row here
     # to hide behind, and that arm is merge-gating.
@@ -1784,21 +1800,18 @@ POWERSHELL_OPERATION_PATTERNS: dict[str, tuple[re.Pattern[str], str]] = {
         for algo in _PS_HASHES
     },
     "HashAlgorithm": (
-        re.compile(r"\bHashAlgorithm\]::Create\(\s*['\"](?P<alg>\w+)['\"]", re.I),
+        re.compile(r"\bHashAlgorithm\]::Create\(\s*(?:['\"](?P<alg>[\w.-]+)['\"])?", re.I),
         "hash",
     ),
+    # ``-A``, ``-Alg``, ``-Algorithm`` and ``-Algorithm:X`` are all the same parameter (PowerShell
+    # accepts any unique prefix). The search stops at ``;`` or ``|`` so a later call's algorithm on
+    # the same line is not credited to this one.
     "Get-FileHash": (
-        re.compile(r"\bGet-FileHash\b(?:[^\n]*?-Algorithm\s+['\"]?(?P<alg>\w+))?", re.I),
+        re.compile(r"\bGet-FileHash\b(?:[^;|\n]*?-A\w*(?::|\s+)['\"]?(?P<alg>\w+))?", re.I),
         "hash",
     ),
-    "HMAC": (
-        re.compile(
-            r"\bHMAC(?P<alg>SHA1|SHA256|SHA384|SHA512|MD5)\]::(new|HashData)\b"
-            r"|New-Object\s+\S*HMAC",
-            re.I,
-        ),
-        "mac",
-    ),
+    # The type name, however it is reached ([...HMACSHA256]::new, New-Object ...HMACMD5).
+    "HMAC": (re.compile(r"\bHMAC(?P<alg>SHA1|SHA256|SHA384|SHA512|MD5)\b", re.I), "mac"),
     "RandomNumberGenerator": (
         re.compile(r"\b(RandomNumberGenerator|RNGCryptoServiceProvider)\]::", re.I),
         "csprng",
@@ -1837,7 +1850,10 @@ POWERSHELL_OPERATION_PATTERNS: dict[str, tuple[re.Pattern[str], str]] = {
         re.compile(r"\bSecurityProtocolType\]::(?P<alg>\w+)", re.I),
         "tls_context",
     ),
-    "SslProtocol": (re.compile(r"-SslProtocol\s+['\"]?(?P<alg>\w+)", re.I), "tls_context"),
+    "SslProtocol": (
+        re.compile(r"-SslProtocol\b(?:(?::|\s+)['\"]?(?P<alg>[A-Za-z]\w*))?", re.I),
+        "tls_context",
+    ),
     "CertificateValidation": (
         re.compile(
             r"\bServerCertificateValidationCallback\b|-SkipCertificateCheck\b"
@@ -1885,35 +1901,37 @@ POWERSHELL_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
 
 
 def _powershell_code(text: str) -> list[str]:
-    """The code of a PowerShell source, one entry per line, with ``#`` line comments and
-    ``<# ... #>`` block comments removed. Code AFTER a block's close on the same line is kept, and
-    so is code BEFORE an opening ``<#``. A ``#`` that starts a trailing comment after code is not
-    stripped, the same conservative direction as the other arms. What this cannot do is tell a
-    ``<#`` inside a string or here-string from a real one, which can hide lines until the next
-    ``#>``: a pattern instrument's limit, named here rather than silently taken."""
+    """The code of a PowerShell source, one entry per line, with comments removed.
+
+    A line whose code starts with ``#`` is a comment. A ``<#`` opens a block comment only where it
+    STARTS the remaining code on a line; code after the block's ``#>`` on the same line is kept. A
+    ``<#`` anywhere else (inside a trailing ``#`` comment, a string, or after code) never opens a
+    block, so it cannot hide the lines that follow. A single-line ``<# ... #>`` after code is left in
+    place and scanned. Every choice here errs toward scanning too much, never too little, except the
+    one the residual in crypto_operations.py names: a string that STARTS a line with ``<#``."""
     code: list[str] = []
     in_block = False
     for raw in text.splitlines():
         line = raw
-        kept = ""
-        while line:
-            if in_block:
-                end = line.find("#>")
-                if end < 0:
-                    line = ""
-                    break
-                line = line[end + 2 :]
-                in_block = False
+        if in_block:
+            end = line.find("#>")
+            if end < 0:
                 continue
-            start = line.find("<#")
-            if start < 0:
-                kept += line
+            line = line[end + 2 :]
+            in_block = False
+        while True:
+            stripped = line.lstrip()
+            if not stripped.startswith("<#"):
                 break
-            kept += line[:start]
-            line = line[start + 2 :]
-            in_block = True
-        if kept.strip() and not kept.lstrip().startswith("#"):
-            code.append(kept)
+            end = stripped.find("#>", 2)
+            if end < 0:
+                in_block = True
+                line = ""
+                break
+            line = stripped[end + 2 :]
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            code.append(line)
     return code
 
 

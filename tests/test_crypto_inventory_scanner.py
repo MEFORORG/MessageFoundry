@@ -871,7 +871,7 @@ def test_the_powershell_arm_refuses_an_empty_walk(tmp_path: Path) -> None:
         # Option bits set by augmented assignment.
         (
             "import ssl\n\ndef f(ctx):\n    ctx.options |= ssl.OP_NO_TLSv1\n",
-            "tls_context:.options |=",
+            "tls_context:.options |= OP_NO_TLSv1",
         ),
         # An algorithm named only in an ARGUMENT.
         (
@@ -924,7 +924,7 @@ def test_a_bare_sibling_import_under_scripts_is_followed() -> None:
 
 
 @pytest.mark.parametrize(
-    "rule_table", ["METHOD_RULES", "TLS_POSTURE_ATTRIBUTES", "HASH_ALGORITHMS"]
+    "rule_table", ["METHOD_RULES", "TLS_POSTURE_ATTRIBUTES", "_ALGORITHM_KEYS"]
 )
 def test_the_positive_control_covers_the_method_posture_and_algorithm_matchers(
     rule_table: str, monkeypatch: pytest.MonkeyPatch
@@ -932,7 +932,7 @@ def test_the_positive_control_covers_the_method_posture_and_algorithm_matchers(
     # The review found the first control exercised only the exact and prefix rules, so the method
     # and posture matchers, which produce most cipher and tls_context tokens, could die silently.
     gate = _gate()
-    empty = {} if rule_table == "METHOD_RULES" else frozenset()
+    empty = {} if rule_table in ("METHOD_RULES", "_ALGORITHM_KEYS") else frozenset()
     monkeypatch.setattr(gate.crypto_operations, rule_table, empty)
     assert gate.operations_self_test(), rule_table
 
@@ -984,3 +984,111 @@ def test_the_powershell_walk_reads_psm1_and_upper_case_suffixes(tmp_path: Path) 
 def test_the_non_python_mode_refuses_flags_it_would_ignore() -> None:
     with pytest.raises(SystemExit):
         _gate().main(["--non-python-operations", "--list-operations"])
+
+
+# --- Repair round 2 of the #1164 review: each pins one measured false negative or false label ---
+
+
+def test_a_weakening_bit_clear_is_not_the_same_token_as_a_hardening_bit_set() -> None:
+    ops = _gate().crypto_operations
+    sources = {
+        "pkg/a.py": "import ssl\n\ndef f(ctx):\n    ctx.options |= ssl.OP_NO_TLSv1\n",
+        "pkg/b.py": "import ssl\n\ndef f(ctx):\n    ctx.options &= ~ssl.OP_NO_TLSv1\n",
+    }
+    found = ops.aggregate(ops.discover_operations_in(sources))
+    assert found["pkg/a.py"] == frozenset({"tls_context:.options |= OP_NO_TLSv1"})
+    assert found["pkg/b.py"] == frozenset({"tls_context:.options &= ~OP_NO_TLSv1"})
+
+
+def test_an_algorithm_in_a_method_calls_nested_arguments_is_carried() -> None:
+    ops = _gate().crypto_operations
+    source = (
+        "from cryptography.hazmat.primitives import hashes\n"
+        "from cryptography.hazmat.primitives.asymmetric import ec\n\n"
+        "def f(k, d):\n    return k.sign(d, ec.ECDSA(hashes.SHA1()))\n"
+    )
+    found = ops.aggregate(ops.discover_operations_in({"pkg/m.py": source}))
+    assert found["pkg/m.py"] == frozenset({"sign_verify:.sign()[sha1]"})
+
+
+@pytest.mark.parametrize("spelling", ["SHA-256", "sha_256", "SHA2-256", "sha256"])
+def test_every_spelling_hashlib_accepts_is_one_algorithm(spelling: str) -> None:
+    ops = _gate().crypto_operations
+    source = f"import hashlib\n\ndef f(m):\n    return hashlib.new({spelling!r}, m)\n"
+    found = ops.aggregate(ops.discover_operations_in({"pkg/m.py": source}))
+    assert found["pkg/m.py"] == frozenset({"hash:hashlib.new[sha256]"})
+
+
+def test_an_init_under_scripts_does_not_turn_stdlib_imports_into_siblings() -> None:
+    # Measured in review: with scripts/tools/__init__.py present, `import hashlib` was rewritten to
+    # scripts.tools.hashlib and every operation in the file vanished.
+    ops = _gate().crypto_operations
+    sources = {
+        "scripts/tools/__init__.py": "",
+        "scripts/tools/x.py": "import hashlib, ssl\n\ndef f(b):\n    ssl.create_default_context()\n    return hashlib.md5(b)\n",
+    }
+    found = ops.aggregate(ops.discover_operations_in(sources))
+    assert found["scripts/tools/x.py"] == frozenset(
+        {"hash:hashlib.md5", "tls_context:ssl.create_default_context"}
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "# the help block uses <# syntax\n$h = [System.Security.Cryptography.MD5]::Create()\n",
+        "$x = 1 # see <# above\n$h = [System.Security.Cryptography.MD5]::Create()\n",
+        "$s = '<#'\n$h = [System.Security.Cryptography.MD5]::Create()\n",
+    ],
+)
+def test_a_mid_line_block_opener_does_not_hide_the_next_line(text: str) -> None:
+    assert "hash:MD5" in _gate().powershell_operation_tokens_in(text)
+
+
+@pytest.mark.parametrize(
+    ("line", "token"),
+    [
+        ("[System.Security.Cryptography.HashAlgorithm]::Create($name)", "hash:HashAlgorithm"),
+        (
+            "[System.Security.Cryptography.HashAlgorithm]::Create('SHA-256')",
+            "hash:HashAlgorithm[SHA-256]",
+        ),
+        ("Invoke-WebRequest $u -SslProtocol $p", "tls_context:SslProtocol"),
+        ("Invoke-WebRequest $u -SslProtocol:Tls", "tls_context:SslProtocol[TLS]"),
+        ("Get-FileHash $f -Alg MD5", "hash:Get-FileHash[MD5]"),
+        ("Get-FileHash $f -Algorithm:MD5", "hash:Get-FileHash[MD5]"),
+        ("$h = New-Object System.Security.Cryptography.HMACMD5", "mac:HMAC[MD5]"),
+    ],
+)
+def test_round_two_powershell_idioms(line: str, token: str) -> None:
+    assert token in _gate().powershell_operation_tokens_in(line + "\n")
+
+
+def test_two_get_filehash_calls_on_one_line_keep_their_own_algorithms() -> None:
+    tokens = _gate().powershell_operation_tokens_in(
+        "Get-FileHash $a; Get-FileHash $b -Algorithm MD5\n"
+    )
+    assert tokens == {"hash:Get-FileHash", "hash:Get-FileHash[MD5]"}
+
+
+def test_a_tls_floor_and_a_tls_cap_are_different_tokens() -> None:
+    gate = _gate()
+    assert gate.non_python_operation_tokens_in("x = { minVersion: 'TLSv1' };\n") == {
+        "tls_context:minVersion[TLSv1]"
+    }
+    assert gate.non_python_operation_tokens_in("x = { maxVersion: 'TLSv1' };\n") == {
+        "tls_context:maxVersion[TLSv1]"
+    }
+    assert gate.non_python_operation_tokens_in("x = { ciphers: 'NULL' };\n") == {
+        "tls_context:ciphers[NULL]"
+    }
+
+
+@pytest.mark.parametrize("rule_table", ["SIBLING_IMPORT_ROOTS", "TLS_AUGMENTED_ATTRIBUTES"])
+def test_the_positive_control_covers_sibling_and_augmented_matchers(
+    rule_table: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate = _gate()
+    empty = () if rule_table == "SIBLING_IMPORT_ROOTS" else frozenset()
+    monkeypatch.setattr(gate.crypto_operations, rule_table, empty)
+    assert gate.operations_self_test(), rule_table

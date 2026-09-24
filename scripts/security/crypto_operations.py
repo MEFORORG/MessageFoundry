@@ -23,14 +23,17 @@ What it does, in order:
    no registered seam, and it needs no seam list: a new module-level helper is followed the day it
    is written.
 
-THE RESIDUAL. This list is the one statement of it for every crypto-gate arm; the gate's docstring
-and ``docs/ASVS-L2-PHASE0-CHANGES.md`` point here rather than repeat it. Any clean result reads "at
-least", never "all", because none of these is seen:
+THE RESIDUAL. The gate's docstring and ``docs/ASVS-L2-PHASE0-CHANGES.md`` point here rather than
+repeat it, so this is the one place to extend when a new limit is found. It is a list of AT LEAST
+these, not a complete one. Any clean result reads "at least", never "all", because none of these is
+seen:
 
 * a SECOND call to a callee a file already lists. The inventory is kept per file and token, so a new
   ``hashlib.sha256`` call beside an existing one changes nothing;
 * an algorithm or TLS value held in a VARIABLE. A token carries the algorithm only when the call
-  names it, in the callee or as a literal or named constant in an argument;
+  names it, in the callee or as a literal or named constant anywhere in its arguments;
+* a plain ``ctx.options = ...`` or ``setattr(ctx, "options", ...)``. ``options`` is too common a
+  name to match outside an augmented assignment;
 * a method called on a first-party OBJECT (``self._cipher.encrypt_cell(...)``) unless its method name
   is in :data:`METHOD_RULES`. There is no type inference, so a first-party class is followed only
   through its module-level functions;
@@ -43,7 +46,12 @@ least", never "all", because none of these is seen:
 * crypto inside a third-party library the engine calls. The call is seen; the library's own
   operations are not;
 * for the non-Python arms, which are PATTERN instruments: an alias that renames the API, an idiom
-  no pattern names, and a file outside the walked roots and suffixes.
+  no pattern names, a call split across lines (a PowerShell backtick continuation, a multi-line
+  JavaScript options object whose key and value sit on different lines), and a file outside the
+  walked roots and suffixes;
+* for the PowerShell arm: a ``<#`` inside a string or here-string that opens a line with it. The
+  comment stripper cannot tell it from a real block comment and hides the lines up to the next
+  ``#>``.
 
 Stdlib only, like the gate that imports it.
 """
@@ -428,18 +436,17 @@ def _parse(relpath: str, source: str) -> ParsedModule:
 def _resolve_siblings(modules: list[ParsedModule]) -> None:
     """Rewrite a bare sibling import under :data:`SIBLING_IMPORT_ROOTS` to its real module path."""
     known = {m.mod for m in modules}
-
-    def is_known(target: str) -> bool:
-        parts = target.split(".")
-        return any(".".join(parts[:i]) in known for i in range(1, len(parts) + 1))
-
     for m in modules:
         if not m.mod.startswith(SIBLING_IMPORT_ROOTS):
             continue
         package = m.mod.rpartition(".")[0]
         for local, target in list(m.aliases.items()):
-            if not is_known(target) and is_known(candidate := f"{package}.{target}"):
-                m.aliases[local] = candidate
+            head = target.split(".", 1)[0]
+            # The SIBLING module must exist as a file. Accepting any known prefix instead would let
+            # one ``__init__.py`` in the directory rewrite ``import hashlib`` into a first-party name
+            # and silently drop every operation in the file.
+            if head not in known and f"{package}.{head}" in known:
+                m.aliases[local] = f"{package}.{target}"
 
 
 def _enclosing_functions(tree: ast.Module) -> dict[int, str]:
@@ -463,25 +470,42 @@ def _resolve_reexport(name: str, reexports: dict[str, str]) -> str:
     return name
 
 
+def _canonical_algorithm(name: str) -> str | None:
+    """``SHA-256``, ``sha_256``, ``SHA2-256`` and ``sha256`` are one algorithm; so are ``SHAKE128``
+    and ``shake_128``. Returns the :data:`HASH_ALGORITHMS` spelling, or ``None``."""
+    key = "".join(ch for ch in name.lower() if ch.isalnum())
+    return _ALGORITHM_KEYS.get(key)
+
+
+_ALGORITHM_KEYS: dict[str, str] = {
+    **{"".join(ch for ch in algo if ch.isalnum()): algo for algo in HASH_ALGORITHMS},
+    "sha2224": "sha224",
+    "sha2256": "sha256",
+    "sha2384": "sha384",
+    "sha2512": "sha512",
+}
+
+
 def _algorithms_in(call: ast.Call, m: ParsedModule) -> list[str]:
-    """Hash algorithms named in a call's ARGUMENTS, lower-cased, so the token can carry them."""
+    """Hash algorithms named anywhere in a call's ARGUMENTS, nested calls included
+    (``key.sign(data, ec.ECDSA(hashes.SHA256()))``), so the token can carry them."""
     found: set[str] = set()
     for arg in [*call.args, *(kw.value for kw in call.keywords)]:
-        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-            name = arg.value.lower().replace("-", "_")
-            if name in HASH_ALGORITHMS:
-                found.add(name)
-            continue
-        ref = arg.func if isinstance(arg, ast.Call) else arg
-        qualified = m.resolve(ref)
-        if qualified is None:
-            continue
-        last = qualified.rpartition(".")[2].lower()
-        if (
-            qualified.startswith(("hashlib.", "cryptography.hazmat.primitives.hashes."))
-            and last in HASH_ALGORITHMS
-        ):
-            found.add(last)
+        for node in ast.walk(arg):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                algo = _canonical_algorithm(node.value)
+            elif isinstance(node, (ast.Name, ast.Attribute)):
+                qualified = m.resolve(node)
+                algo = (
+                    _canonical_algorithm(qualified.rpartition(".")[2])
+                    if qualified is not None
+                    and qualified.startswith(("hashlib.", "cryptography.hazmat.primitives.hashes."))
+                    else None
+                )
+            else:
+                algo = None
+            if algo is not None:
+                found.add(algo)
     return sorted(found)
 
 
@@ -490,8 +514,20 @@ def _value_label(value: ast.expr, m: ParsedModule) -> str:
     constant (``False``, ``CERT_NONE``, ``TLSv1_2``). Empty when it is anything else."""
     if isinstance(value, ast.Constant) and isinstance(value.value, (bool, int, str)):
         return f" {value.value}"
+    if isinstance(value, ast.UnaryOp) and isinstance(value.op, ast.Invert):
+        inner = _value_label(value.operand, m)
+        return f" ~{inner.strip()}" if inner else ""
     qualified = m.resolve(value)
     return f" {qualified.rpartition('.')[2]}" if qualified else ""
+
+
+_AUG_OPERATORS: dict[type[ast.operator], str] = {
+    ast.BitOr: "|=",
+    ast.BitAnd: "&=",
+    ast.BitXor: "^=",
+    ast.Add: "+=",
+    ast.Sub: "-=",
+}
 
 
 def _posture_targets(node: ast.AST) -> list[tuple[str, ast.expr | None]]:
@@ -520,7 +556,7 @@ def _posture_targets(node: ast.AST) -> list[tuple[str, ast.expr | None]]:
         and isinstance(node.target, ast.Attribute)
         and node.target.attr in TLS_POSTURE_ATTRIBUTES | TLS_AUGMENTED_ATTRIBUTES
     ):
-        out.append((node.target.attr, None))
+        out.append((node.target.attr, node.value))
     return out
 
 
@@ -564,11 +600,19 @@ def _direct_operations(
                 if override is not None:
                     op_class = override[0]
                 if op_class is not None:
-                    found.append((node, node.lineno, op_class, f".{node.func.attr}()"))
+                    algorithms = _algorithms_in(node, m)
+                    suffix = f"[{','.join(algorithms)}]" if algorithms else ""
+                    found.append((node, node.lineno, op_class, f".{node.func.attr}(){suffix}"))
         elif isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
             for attr, value in _posture_targets(node):
                 label = _value_label(value, m) if value is not None else ""
-                sign = "|=" if isinstance(node, ast.AugAssign) else "="
+                # The REAL operator: ``&= ~FLAG`` clears a bit that ``|= FLAG`` sets, and one of
+                # them is often the weakening direction, so they must not share a token.
+                sign = (
+                    _AUG_OPERATORS.get(type(node.op), "?=")
+                    if isinstance(node, ast.AugAssign)
+                    else "="
+                )
                 found.append((node, node.lineno, "tls_context", f".{attr} {sign}{label}"))
     return found
 

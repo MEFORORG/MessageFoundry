@@ -136,8 +136,9 @@ for, not how it is protected before it gets there.
 >   presented session token (`auth/tokens.hash_token`) to look it up or revoke it.
 > - `verify/federation.py` builds the IdP opener, parses the JWKS and validates an ID token.
 > - `verify/runner.py` builds the live smoke's client TLS context.
-> - Five `harness/load/` modules mint a per-run loopback certificate pair and build the pinned client
->   TLS context through `harness/load/tlsmat.py`.
+> - Five `harness/load/` modules mint a per-run loopback certificate pair through
+>   `harness/load/tlsmat.py`. Four of them also build the pinned client TLS context there;
+>   `enginepoll.py` does not.
 > - `scripts/security/dast_auth_sweep.py` runs the DAST target, which draws a throwaway password.
 >
 > **A SECOND ARM covers the non-Python tree** (BACKLOG #1172, ASVS 11.5.1) and rides the same required
