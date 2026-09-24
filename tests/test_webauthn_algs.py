@@ -244,7 +244,7 @@ def test_the_rsa_fixture_is_well_formed_apart_from_its_key_type() -> None:
 # FIRST ASSERTION, after the credential had enrolled, and on the mismatched-curve path it arrived as
 # a raw ``ValueError`` from ``cryptography`` that ``verify_assertion`` did not catch -- a 500, not
 # the audited invalid-input path ADR 0068 decision 1 requires. These rows move the refusal to
-# registration and pin the assertion side as a backstop.
+# registration and pin that sign-in refuses the same stored keys as invalid input.
 
 _P256 = 1
 _P384 = 2
@@ -402,10 +402,9 @@ def test_a_stored_es256_key_on_a_larger_curve_is_refused_at_sign_in(
 ) -> None:
     """Sign-in re-screens the stored key with the registration rule (BACKLOG #1166).
 
-    This row used to pin the opposite: a key enrolled before the P-256 pin still signed in. That
-    carve-out protected keys that do not exist, because nothing is deployed (CLAUDE.md section 0).
-    The key is real and the signature is good (the library-alone control below), so only the
-    check can refuse it.
+    This row used to pin the opposite: a key enrolled before the P-256 pin still signed in. ADR
+    0068 records why that exception went. The key is real and the signature is good (the
+    library-alone control below), so only the check can refuse it.
     """
     respond, public_key = _stored_es256(curve, crv, size)
     caught = _refused_at_sign_in(respond, public_key, caplog)
@@ -435,9 +434,10 @@ def _assert_registers(cose_key: bytes) -> None:
 def test_an_unusable_stored_key_fails_assertion_as_invalid_input(
     stored: Callable[[SoftAuthenticator], bytes],
 ) -> None:
-    """The backstop. Registration now refuses these, but a stored key is data the assertion path
-    must not trust: a raw ``ValueError``, ``KeyError`` or ``IndexError`` here escapes the
-    service's audited refusal and becomes a 500. Each row raised one of those at ``0076e3cec``."""
+    """Registration now refuses these, but a stored key is data the assertion path must not
+    trust: a raw ``ValueError``, ``KeyError`` or ``IndexError`` here escapes the service's audited
+    refusal and becomes a 500. Each row raised one of those at ``0076e3cec``. The stored-key
+    check in ``verify_assertion`` now refuses each before the library verifies anything."""
     soft = SoftAuthenticator(rp_id=RP, origin=ORIGIN)
     challenge = secrets.token_bytes(wa.CHALLENGE_BYTES)
     with pytest.raises(wa.WebAuthnVerificationError):
@@ -625,15 +625,13 @@ def test_the_stand_in_rows_are_otherwise_well_formed() -> None:
 
 # --- sign-in re-screens the stored key with the registration rule (BACKLOG #1166) --------------
 #
-# ``verify_assertion`` used to trust the stored key. At sign-in the library checks the signature
-# and that it knows the algorithm, never the key type or curve the registration rule binds. The
-# exception for keys enrolled before the P-256 pin protected nobody: nothing is deployed
-# (CLAUDE.md section 0). Registration already refuses every key below, so this is defence in
-# depth against a store write that skipped registration, not a reachable hole.
+# ``verify_assertion`` used to trust the stored key, and the library's own sign-in checks do not
+# include the registration rule. ADR 0068 records why the exception for older keys went.
 #
 # With a real key and a good signature, the P-384, P-521, RSA, crv and kty rows SIGNED IN at
-# engine ``5ccff7cb3`` and ``9f51a2ada``. The two ``alg`` rows did not: the library refused them
-# with its own message, so they pin which layer refuses rather than a bypass.
+# engine ``5ccff7cb3`` and ``9f51a2ada``; the library-alone control below pins each signature. The
+# two ``alg`` rows did not sign in: the library refused them with its own message, so they pin
+# which layer refuses.
 
 
 def _assertion_response(challenge: bytes, sign: Callable[[bytes], bytes]) -> str:
@@ -709,8 +707,7 @@ def test_a_stored_rsa_key_is_refused_at_sign_in(
     bits: int, caplog: pytest.LogCaptureFixture
 ) -> None:
     """RS256 carries no modulus floor, and a stored 1024-bit key used to sign in."""
-    key = _rsa_key(bits)
-    caught = _refused_at_sign_in(_rsa_signer(key), _rs256(key), caplog)
+    caught = _refused_at_sign_in(*_stored_rsa(bits), caplog)
     assert str(caught) == "COSE algorithm -257 is not accepted"
 
 
@@ -727,6 +724,11 @@ def _stored_es256(
     return soft.get_response, _cose_es256(key, crv, size)
 
 
+def _stored_p256(**changes: object) -> tuple[Callable[[bytes], str], bytes]:
+    soft = SoftAuthenticator(rp_id=RP, origin=ORIGIN)
+    return soft.get_response, _relabelled(soft.cose_public_key(), **changes)
+
+
 @pytest.mark.parametrize(
     "stored",
     [
@@ -734,8 +736,19 @@ def _stored_es256(
         lambda: _stored_rsa(2048),
         lambda: _stored_es256(ec.SECP384R1(), _P384, 48),
         lambda: _stored_es256(ec.SECP521R1(), 3, 66),
+        lambda: _stored_p256(crv=True),
+        lambda: _stored_p256(crv=1.0),
+        lambda: _stored_p256(kty=2.0),
     ],
-    ids=["RS256 1024", "RS256 2048", "ES256 P-384", "ES256 P-521"],
+    ids=[
+        "RS256 1024",
+        "RS256 2048",
+        "ES256 P-384",
+        "ES256 P-521",
+        "crv true",
+        "crv 1.0",
+        "kty 2.0",
+    ],
 )
 def test_the_refused_stored_keys_verify_under_the_library_alone(
     stored: Callable[[], tuple[Callable[[bytes], str], bytes]],
@@ -802,13 +815,13 @@ def test_an_alg_given_as_a_bool_is_refused_at_registration(alg: bool) -> None:
         )
 
 
-@pytest.mark.parametrize("ceremony", ["registration", "assertion"])
-def test_the_shared_check_refuses_an_alg_of_true_at_either_ceremony(
-    ceremony: wa._Ceremony,
-) -> None:
-    """The one helper both ceremonies call refuses ``alg: true`` by its type, not by its value."""
+def test_the_shared_check_refuses_an_alg_of_true_by_its_type() -> None:
+    """The helper both ceremonies call refuses ``alg: true`` by its type, not by its value.
+
+    That sign-in calls it is pinned by the ``alg true`` row above, through ``verify_assertion``.
+    """
     with pytest.raises(wa.WebAuthnVerificationError) as caught:
-        wa._require_usable_public_key(_relabelled(_p256(), alg=True), ceremony=ceremony)
+        wa._require_usable_public_key(_relabelled(_p256(), alg=True), ceremony="registration")
     assert str(caught.value) == "COSE key alg must be an integer, not bool"
 
 

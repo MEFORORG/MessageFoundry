@@ -529,18 +529,21 @@ verifies and still clears the floor, so refusing it at assertion would lock its 
 no security gain. A test pins that such a stored key still asserts.
 
 **Superseded (2026-09-24, BACKLOG #1166): sign-in checks the stored key too.** The paragraph
-above no longer holds. Its exception was for keys enrolled before the pin, and there are none,
-because MessageFoundry has no deployments (CLAUDE.md section 0). `verify_assertion` now runs the
-same check as registration on the stored key, before it verifies the signature. At sign-in the
-library checks only the signature and that it knows the algorithm. So before this change, some
-stored keys that registration refuses still signed in. Examples are RS256 at 1024 or 2048 bits,
-ES256 on P-384 or P-521, and a curve that reads `true`.
+above no longer holds. `verify_assertion` now runs the same check as registration on the stored
+key, before it verifies the signature. The library's own sign-in checks do not include that
+rule. So before this change, some stored keys that registration refuses still signed in, among
+them RS256 at 1024 or 2048 bits, ES256 on P-384 or P-521, and a curve that reads `true`.
 
-Registration already refused all of them, so a stored one could come only from a store write
-that skipped registration. This is defence in depth, not the fix for a reachable hole: both
-ceremonies now apply one rule, and sign-in does not trust the store. A key that breaks the rule
-is refused on the audited invalid-input path with no WARNING. A key the library cannot decode at
-all still logs its raw exception type at WARNING, as before.
+Current registration refuses all of those keys. A store could still hold one: 0.3.2 registered
+RS256 and ES256 on other curves, and 0.4.0 registered a curve that reads `true` or `1.0`. The
+paragraph above kept those keys working to spare their owners a lockout. That exception
+protected nobody, because MessageFoundry has no deployments (CLAUDE.md section 0). So both
+ceremonies now apply one rule, and sign-in does not trust the store to hold only what current
+registration would write. This breaks the 0.4.0 changelog's promise that such passkeys still
+sign in, so the change needs a BREAKING changelog entry of its own.
+
+A key that breaks the rule is refused on the audited invalid-input path with no WARNING. A key
+the library cannot decode at all still logs its raw exception type at WARNING, as before.
 
 This also retires two earlier sentences. Under "Both halves, deliberately", the registration
 call is no longer the only place a credential is refused. Under "Residual closed", the

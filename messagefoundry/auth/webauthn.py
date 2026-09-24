@@ -81,7 +81,9 @@ SUPPORTED_COSE_ALGS: tuple[int, ...] = (-8, -7)
 #: P-521 verifies and clears the 128-bit floor, so this is not a strength control. It is the
 #: pairing RFC 9053 section 2.1 recommends for interoperability (SHA-256 with P-256 only), and
 #: the one the WebAuthn specification describes for -7. Both ceremonies apply it: sign-in
-#: re-screens the stored key (:func:`verify_assertion`).
+#: re-screens the stored key (:func:`verify_assertion`). So NARROWING this table, or
+#: :data:`SUPPORTED_COSE_ALGS`, also stops every enrolled credential it no longer admits from
+#: signing in. Decide that on purpose, and say so in the changelog.
 _COSE_KEY_SHAPE_FOR_ALG: dict[int, tuple[int, int]] = {-8: (1, 6), -7: (2, 1)}
 
 _INSTALL_HINT = (
@@ -487,18 +489,11 @@ def verify_assertion(
     clone signal — ADR 0068 §4).
 
     The stored key is checked first, with the same rule registration applies
-    (:func:`_require_usable_public_key`). At sign-in the library checks the signature and that it
-    knows the algorithm, and nothing else. So without this check, some stored keys that
-    registration refuses still signed in. Examples are an RSA key of any size, ES256 on P-384,
-    and a curve that reads ``true``. Such a key is now refused as invalid input, and the service
-    audits the refusal (BACKLOG #1166).
-
-    Registration already refuses these keys, so one can reach the store only by a write that
-    skipped registration. This check is defence in depth: both ceremonies apply one rule, and
-    sign-in does not trust the store to hold only what registration wrote.
-
-    There is no exception for keys enrolled before the P-256 pin. Nothing is deployed (CLAUDE.md
-    section 0), so no such key exists, and an exception would protect nobody.
+    (:func:`_require_usable_public_key`). The library's own sign-in checks do not include that
+    rule. So without this check, some stored keys that registration refuses still signed in:
+    an RSA key of any size, ES256 on P-384, and a curve that reads ``true`` among them. Such a
+    key is now refused as invalid input, and the service audits the refusal (BACKLOG #1166).
+    ADR 0068 records why no exception is kept for keys an earlier release registered.
     """
     _require_webauthn()
     from webauthn import verify_authentication_response

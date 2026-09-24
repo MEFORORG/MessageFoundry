@@ -264,7 +264,7 @@ async def test_a_p256_key_whose_curve_is_not_the_integer_1_is_refused_and_audite
 async def test_an_unusable_stored_key_fails_the_assertion_audited_not_raised(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The backstop for a key that is already stored. Enrolment now refuses this shape, so the
+    """A key that is already stored is checked again at sign-in. Enrolment refuses this shape, so the
     stored row is substituted to stand in for one enrolled before that check or damaged since. The
     assertion must come back refused and audited, never as an exception out of the service."""
     store = await MessageStore.open(":memory:")
