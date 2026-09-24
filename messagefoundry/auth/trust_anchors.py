@@ -213,12 +213,16 @@ def _is_broad_principal(principal: str) -> bool:
 
 
 def _ends_in_broad_principal(text: str) -> bool:
-    """Whether lowercased line-1 text that still carries the path echo ENDS in a broad principal.
+    """Whether lowercased line-1 text, path echo and all, ENDS in a broad principal.
 
-    The parser uses this only when it could not find where the echoed path ends, so it cannot cut
-    the principal out whole. The principal always comes last, after whitespace, so a broad one is a
-    whole-word suffix: a SID as the last word, a display name after a space, a group leaf after the
-    last ``\\``. This keeps a line-1 broad grant visible whatever the echo looked like."""
+    The parser uses this on line 1 whenever the path echo was not verbatim, so it cannot be sure
+    where the principal starts. The principal always comes last, after whitespace, so a broad one
+    is a whole-word suffix: a SID as the last word, a display name after a space, or a group leaf
+    after the last ``\\``. This keeps a line-1 broad grant visible whatever the echo looked like.
+
+    It errs toward broad on purpose. It cannot tell ``<path> Everyone`` from ``<path> CORP\\Not
+    Everyone``, and a missed broad grant is the failure to avoid. The leaf is taken after the last
+    ``\\`` only, never after the last space, so ``CORP\\Power Users`` does not read as ``Users``."""
     flat = " ".join(text.split())
     if flat and _is_broad_sid(flat.rsplit(" ", 1)[-1]):
         return True
@@ -228,20 +232,52 @@ def _ends_in_broad_principal(text: str) -> bool:
 
 
 def _echoed_path_pattern(anchor_path: str) -> re.Pattern[str]:
-    """A pattern for the path as ``icacls`` echoes it at the start of line 1.
+    """A fixed-width pattern for the path as ``icacls`` echoes it at the start of line 1.
 
     icacls writes the OEM code page, so a character outside it does not come back as itself.
     Measured on Windows 11 (OEM 437): two CJK characters echoed as ``??``, an emoji as ``??``, and
     ``l-stroke`` as a best-fit ``l``. So an ASCII character must match itself, ignoring case, and any
-    other character matches one character of any kind (one or two outside the BMP, which icacls
-    counts as two UTF-16 units). Each character has a fixed width, save that one-or-two, so the
-    match cannot land on a split far from the real one. Whitespace or the end of the line must
-    follow the path, and a principal never starts with whitespace."""
+    other character matches one character of any kind: two outside the BMP, which icacls counts as
+    two UTF-16 units. Every width is fixed, so a failed match cannot backtrack. Whitespace or the
+    end of the line must follow the path."""
     parts = [
-        re.escape(ch) if ch.isascii() else (".{1,2}" if ord(ch) > 0xFFFF else ".")
-        for ch in anchor_path
+        re.escape(ch) if ch.isascii() else (".." if ord(ch) > 0xFFFF else ".") for ch in anchor_path
     ]
     return re.compile("".join(parts) + r"(?:\s+|$)", re.IGNORECASE)
+
+
+def _continuation_indent(lines: list[str]) -> int | None:
+    """The indent of the first ACE line after line 1, or ``None`` if there is none.
+
+    icacls pads each continuation line to the width of the path it ECHOED, plus one space. Measured
+    on Windows 11: a CJK, an emoji and a best-fit path each padded to the echo, not to the path
+    passed. So this column is where line 1's principal starts, whatever the echo looked like."""
+    seen_first = False
+    for raw in lines:
+        if not raw.strip():
+            continue
+        if not seen_first:
+            seen_first = True
+            continue
+        if ":(" in raw:
+            return (len(raw) - len(raw.lstrip())) or None
+    return None
+
+
+def _path_echo_end(line: str, anchor_path: str, indent: int | None) -> tuple[int, bool] | None:
+    """Where the echoed path ends on line 1, and whether the echo was verbatim.
+
+    ``None`` when the end cannot be found reliably. A verbatim echo is trusted as it stands. A
+    lenient match (:func:`_echoed_path_pattern`) must agree with the continuation indent when there
+    is one, because an echo narrower than the path would let the pattern run into a principal that
+    contains a space, such as ``NT AUTHORITY\\INTERACTIVE``."""
+    n = len(anchor_path)
+    if line[:n].lower() == anchor_path.lower() and (len(line) == n or line[n].isspace()):
+        return n, True
+    echo = _echoed_path_pattern(anchor_path).match(line)
+    if echo is None or (indent is not None and echo.end() != indent):
+        return None
+    return echo.end(), False
 
 
 #: Bare (unqualified) principal names that are the owner, or that grant nobody anything, so a write
@@ -298,15 +334,20 @@ def owner_only_from_icacls(text: str, *, anchor_path: str) -> bool | None:
 
     The known ``anchor_path`` is stripped from line 1, and from line 1 only, so a path that
     legitimately contains ``\\Users`` (e.g. ``C:\\Users\\svc\\anchor.pem``) is never mistaken for a
-    ``BUILTIN\\Users`` ACE. icacls echoes that path in the OEM code page, so it is matched leniently
-    (:func:`_echoed_path_pattern`). Where even that fails, line 1's principal is unknown: a broad
-    principal at its end still answers ``False``, and any other write grant there answers ``None``.
-    An unmatched echo never yields ``True`` for a line-1 write."""
-    path_echo = _echoed_path_pattern(anchor_path)
+    ``BUILTIN\\Users`` ACE. icacls echoes that path in the OEM code page, so where the echo is not
+    verbatim it is matched leniently and checked against the continuation indent
+    (:func:`_path_echo_end`). On any line 1 that is not a verbatim echo, a broad principal at the
+    end of the line answers ``False``. Where the end of the echo cannot be found at all, any other
+    write grant on line 1 answers ``None``, so an unmatched echo never yields ``True`` for a write.
+
+    Lines split on ``\\n`` only. ``str.splitlines`` also splits on U+2028 and its kin, which a path
+    may contain, and that would move line 1's ACE onto a line with the path still on its front."""
+    lines = text.split("\n")
+    indent = _continuation_indent(lines)
     saw_ace = False
     unattributed_write = False
     first_line = True
-    for raw in text.splitlines():
+    for raw in lines:
         line = raw.strip()
         if not line:
             continue
@@ -314,31 +355,33 @@ def owner_only_from_icacls(text: str, *, anchor_path: str) -> bool | None:
         low = line.lower()
         if low.startswith("successfully processed") or low.startswith("failed processing"):
             continue
-        # Line 1 carries the path prefix; strip it so its characters can't be read as a principal.
+        # Line 1 carries the path prefix; skip it so its characters can't be read as a principal.
         # Only line 1: a short relative path such as "NT" would cut the front off "NT AUTHORITY\..."
         # on a later line.
+        start = 0
+        echo_verbatim = True
         path_left_on = False
         if is_first:
-            echo = path_echo.match(line)
-            if echo:
-                line = line[echo.end() :]
+            found = _path_echo_end(line, anchor_path, indent)
+            if found is None:
+                path_left_on, echo_verbatim = True, False
             else:
-                path_left_on = True
-        idx = line.find(":(")
+                start, echo_verbatim = found
+        idx = line.find(":(", start)
         if idx == -1:
             continue
-        principal = line[:idx].strip().lower()
+        principal = line[start:idx].strip().lower()
         if not principal:
             continue  # a rights blob with nothing in front of it is attributable to nobody
         rights_blob = line[idx:]
         tokens = {t.strip().upper() for t in re.split(r"[(),]", rights_blob) if t.strip()}
         # A DENY reduces access; it never grants write.
         grants_write = "(deny)" not in rights_blob.lower() and bool(tokens & _WRITE_RIGHTS)
+        if grants_write and not echo_verbatim and _ends_in_broad_principal(line[:idx].lower()):
+            return False  # the echo was not verbatim, so check the line's end as well as the split
         if path_left_on:
-            # The path echo is still on the front, and nobody knows where it ends. This ACE counts
-            # toward nothing determined; a write in it is either visibly broad or unattributable.
-            if grants_write and _ends_in_broad_principal(principal):
-                return False
+            # Nobody knows where the echo ends. This ACE counts toward nothing determined, and a
+            # write in it that is not visibly broad is unattributable.
             unattributed_write = unattributed_write or grants_write
             continue
         saw_ace = True

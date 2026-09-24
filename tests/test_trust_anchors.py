@@ -417,7 +417,7 @@ def _icacls_echo(echo: str, *aces: str) -> str:
     "principal",
     ["Everyone", r"NT AUTHORITY\INTERACTIVE", "*S-1-1-0", "S-1-1-0", r"BUILTIN\Users"],
 )
-def test_icacls_line1_broad_write_behind_an_unmatched_path_echo_is_not_owner_only(
+def test_icacls_line1_broad_write_behind_an_oem_path_echo_is_not_owner_only(
     principal: str,
 ) -> None:
     # The regression this slice's first cut introduced: the echo did not match the path passed, so
@@ -425,6 +425,68 @@ def test_icacls_line1_broad_write_behind_an_unmatched_path_echo_is_not_owner_onl
     # it. The head before this fix answered True for Everyone; the base 8d08d420c answered False.
     text = _icacls_echo(_CJK_ECHO, f"{principal}:(M)", r"DESKTOP-A\svc:(F)")
     assert owner_only_from_icacls(text, anchor_path=_CJK_PATH) is False
+
+
+@pytest.mark.parametrize(
+    "principal",
+    [
+        "Everyone",
+        r"NT AUTHORITY\INTERACTIVE",
+        "*S-1-1-0",
+        "S-1-5-21-1-2-3-513",
+        r"BUILTIN\Users",
+        r"CORP\Domain Users",
+    ],
+)
+def test_icacls_line1_broad_write_behind_an_echo_that_matches_nothing_is_not_owner_only(
+    principal: str,
+) -> None:
+    # Where not even the lenient pattern matches, nobody knows where the principal starts. A broad
+    # principal at the END of line 1 must still be seen: the principal always comes last.
+    text = _icacls_echo(r"C:\Other\place.pem", f"{principal}:(M)", r"DESKTOP-A\svc:(F)")
+    assert owner_only_from_icacls(text, anchor_path=_PATH) is False
+
+
+def test_icacls_unmatched_echo_does_not_read_a_multi_word_group_by_its_last_word() -> None:
+    # The fallback takes a group's leaf after the last backslash, never after the last space, so
+    # "Power Users" is not read as "Users". Its write is still unattributable, so None.
+    text = _icacls_echo(r"C:\Other\place.pem", r"CORP\Power Users:(M)", r"DESKTOP-A\svc:(F)")
+    assert owner_only_from_icacls(text, anchor_path=_PATH) is None
+
+
+def test_icacls_lenient_echo_match_must_agree_with_the_continuation_indent() -> None:
+    # An echo NARROWER than the path lets the lenient pattern run past it into a principal that has
+    # a space in it: five wildcards eat "?? NT", and "AUTHORITY\INTERACTIVE" is a name no set knows.
+    # The continuation indent is where icacls says the principal starts, so a disagreement is caught.
+    path = "C:\\x\\" + "\u65e5" * 5
+    echo = "C:\\x\\??"
+    text = _icacls_echo(echo, r"NT AUTHORITY\INTERACTIVE:(M)", r"DESKTOP-A\svc:(F)")
+    assert owner_only_from_icacls(text, anchor_path=path) is False
+    # The same line with no continuation line to check against: the end-of-line check catches it.
+    single = f"{echo} NT AUTHORITY\\INTERACTIVE:(M)\n"
+    assert owner_only_from_icacls(single, anchor_path=path) is False
+    # A non-broad principal behind a disagreeing indent is unattributable, never owner-only. Without
+    # the indent check this read "AUTHORITY\SYSTEM", a qualified name, and answered True.
+    text = _icacls_echo(echo, r"NT AUTHORITY\SYSTEM:(F)", r"DESKTOP-A\svc:(F)")
+    assert owner_only_from_icacls(text, anchor_path=path) is None
+
+
+@pytest.mark.parametrize("sep", ["\u2028", "\u2029", "\x85", "\x1c"])
+def test_icacls_path_holding_a_unicode_line_separator_stays_on_line_1(sep: str) -> None:
+    # str.splitlines() splits on these as well as on newline, so a path holding one split line 1
+    # in two and read its ACE as a continuation line with the path still on its front.
+    path = f"C:\\x\\a{sep}b\\anchor.pem"
+    text = _icacls_echo(path, "Everyone:(M)", r"DESKTOP-A\svc:(F)")
+    assert owner_only_from_icacls(text, anchor_path=path) is False
+
+
+def test_icacls_unmatched_echo_of_a_long_non_bmp_path_does_not_backtrack() -> None:
+    # A one-or-two quantifier per character outside the BMP backtracked through 2^n splits on a
+    # failed match: measured 2 s at 28 emoji. The pattern is fixed-width now, so this is instant;
+    # the suite's 60 s per-test timeout is the guard.
+    path = "C:\\x\\" + "\U0001f600" * 40 + "\\a.pem"
+    text = _icacls_echo("C:\\x\\" + "?" * 80 + "\\b.pem", r"DESKTOP-A\svc:(F)")
+    assert owner_only_from_icacls(text, anchor_path=path) is None
 
 
 @pytest.mark.parametrize(
@@ -466,17 +528,31 @@ def test_icacls_path_is_stripped_from_line_1_only() -> None:
 def test_dacl_read_sees_a_line1_broad_write_on_a_path_outside_the_oem_code_page(
     tmp_path: Path,
 ) -> None:
-    # The end-to-end form of the test above, on a real icacls read. An explicit ACE lists before the
-    # inherited ones, so the Everyone grant lands on line 1, behind a path echo of "??" wherever the
-    # OEM code page lacks these characters. Asserted as "not True" so a host that localizes Everyone
-    # (an indeterminate None) still passes, and an owner-only reading fails.
-    d = tmp_path / "\u65e5\u672c"
-    d.mkdir()
-    p = _pem(d, b"x")
+    # The end-to-end form of the tests above, on a real icacls read. An explicit ACE lists before
+    # the inherited ones, so the Everyone grant lands on line 1, behind a path echo of "??" wherever
+    # the OEM code page lacks these characters.
     import subprocess
 
+    name = "\u65e5\u672c"
+    try:
+        name.encode("oem")
+    except UnicodeEncodeError:
+        pass
+    else:
+        pytest.skip("this host's OEM code page holds the path, so icacls echoes it verbatim")
+    d = tmp_path / name
+    d.mkdir()
+    p = _pem(d, b"x")
     subprocess.run(["icacls", str(p), "/grant", "*S-1-1-0:(M)"], check=True, capture_output=True)
-    assert dacl_is_owner_only(p) is not True
+    listing = subprocess.run(
+        ["icacls", str(p)], capture_output=True, encoding="oem", errors="replace", check=True
+    ).stdout
+    # Where icacls prints the English name, the grant must be seen: False. A host that localizes
+    # Everyone may answer None (an unrecognised bare name), but never True.
+    if " Everyone:(M)" in listing.split("\n", 1)[0]:
+        assert dacl_is_owner_only(p) is False
+    else:
+        assert dacl_is_owner_only(p) is not True
 
 
 @_posix_only
