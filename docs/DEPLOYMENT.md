@@ -125,7 +125,7 @@ are an owner act and remain **pending**.
 | **Transport encryption** (12.x) | — *enable* the shipped native API/WSS TLS + MLLP-over-TLS | already built (Gate #4) |
 | **MFA / multi-layer admin** (6.3.3 / 8.4.2) | your **directory (AD / Entra)** — healthcare orgs are now *required* to enforce MFA there; MEFOR authenticates against it (see note below) | **native TOTP MFA is built and on by default** (ADR 0002 WP-14) — RFC 6238 for local accounts, `[security].require_mfa = true` with `require_mfa_scope = "every_local_account"` + the step-up gate; AD/Entra MFA stays delegated |
 | **TLS client-cert / mTLS** (12.3.5) | your **PKI**; MF's API mTLS is built (`tls_client_ca_file`, opt-in) | enable mTLS + a console client cert |
-| **Certificate revocation** (12.1.4) | your **proxy / PKI** (OCSP/CRL at the terminator) — **still the control for most hops**, and for a named few the engine also makes you say so | **ENFORCED on the API bind + nine outbound hops; delegated everywhere else.** An off-loopback in-process-TLS API bind is refused at `serve`, and **at least nine** verifying outbound TLS hops — MLLP-over-TLS, REST, SOAP, FHIR, DICOMweb https, SMTP/EMAIL, the **PostgreSQL** store hop, the **SMART token endpoint** and the **`[logging]` TLS syslog forwarder** (the last two added by [ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md) §4.3) — are refused at construction on an enforcing PHI instance, unless revocation is **proven in front** (an upstream TLS terminator — API gate only) or **attested** with `MEFOR_TLS_REVOCATION_ATTESTED=1` (the only lever that clears the outbound gate). **Other verifying hops are NOT gated and stay fully delegated** — the **SQL Server** store hop, DICOM C-STORE SCU over TLS, FTPS, the `dialect='sqlserver'` DATABASE destination, LDAPS, the webhook + AI-broker endpoints. "Add OCSP/CRL to the TLS contexts" is **not** an available option anywhere: stdlib `ssl` exposes no OCSP/CRL fetch and the engine deliberately attempts none. See [Revocation-guard behavior](#revocation-guard-behavior) |
+| **Certificate revocation** (12.1.4) | your **proxy / PKI** (OCSP/CRL at the terminator) — **still the control for most hops**, and for a named few the engine also makes you say so | **ENFORCED on the API bind + at least nine outbound hops; delegated everywhere else.** An off-loopback in-process-TLS API bind is refused at `serve`, and **at least nine** verifying outbound TLS hops — MLLP-over-TLS, REST, SOAP, FHIR, DICOMweb https, SMTP/EMAIL, the **PostgreSQL** store hop, the **SMART token endpoint**, the **`[logging]` TLS syslog forwarder**, and the **OIDC token and JWKS legs** (the last three added by [ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md) §4.3) — are refused at construction on an enforcing PHI instance, unless revocation is **proven in front** (an upstream TLS terminator — API gate only) or **attested** with `MEFOR_TLS_REVOCATION_ATTESTED=1`. **That env no longer clears an outbound hop on an enforcing instance.** There, an outbound hop crosses on loopback or on a CRL loaded on that hop. For the OIDC legs that CRL is `[auth].oidc_tls_crl_file`. **Other verifying hops are NOT gated and stay fully delegated** — the **SQL Server** store hop, DICOM C-STORE SCU over TLS, FTPS, the `dialect='sqlserver'` DATABASE destination, LDAPS, the webhook + AI-broker endpoints. "Add OCSP/CRL to the TLS contexts" is **not** an available option anywhere: stdlib `ssl` exposes no OCSP/CRL fetch and the engine deliberately attempts none. See [Revocation-guard behavior](#revocation-guard-behavior) |
 | **Off-box log shipping** (16.4.3) | forward the audit + operational logs to your **SIEM/syslog** | **built** — `[logging].forward_*` ships operational logs + PHI-redacted audit rows to a syslog/SIEM collector, over **native TLS** with `forward_protocol = "tls"` (RFC 5425, ADR 0080; port 6514) (residual: the transport **default** is UDP, so set TLS explicitly or front the collector with a local TLS-forwarding agent) |
 
 **Write the delegation into your deployment runbook.** "We run MEFOR inside our network behind
@@ -608,27 +608,30 @@ bind-guard ladder above:
 - **Listener** — `serve` **refuses (exit 2)** an off-loopback bind that terminates TLS **in-process**
   (`[api].tls_cert_file`). Loopback binds and proxy-terminated binds never reach this and start
   unchanged.
-- **Outbound** — **nine** verifying outbound TLS hops are **refused at construction** (`messagefoundry
+- **Outbound** — at least nine verifying outbound TLS hops are **refused at construction** (`messagefoundry
   check` / dry-run / reload / the serve pre-flight) on an instance under
   **`enforcement = enforce`**, when the hop is off-loopback: **MLLP-over-TLS, REST, SOAP, FHIR,
   DICOMweb (https), SMTP/EMAIL, the PostgreSQL store hop, the SMART token endpoint, and the
-  `[logging]` TLS syslog forwarder**. A non-enforcing instance **warns** instead, and that is the only
+  `[logging]` TLS syslog forwarder**. **The OIDC token and JWKS legs** are refused on the same terms,
+  each leg on its own host, when `serve` builds the auth service; `messagefoundry check` does not
+  build it, so it does not reach them. A non-enforcing instance **warns** instead, and that is the only
   dial left: declaring the instance synthetic used to exempt it and
   [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)
   removed that (see *The ways across*, below).
 
   **Read that as "at least these", not as an estate-wide control** (SDS-3.6). It was written as *the
-  whole gated set, not a sample* while the count was seven, and the count has since moved: the last
-  two arrived with [ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)
-  §4.3 (BACKLOG #1498). The property worth relying on is that **each gated hop names itself when it
+  whole gated set, not a sample* while the count was seven, and the count has since moved: the SMART
+  token endpoint, the syslog forwarder and the OIDC legs arrived with [ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)
+  §4.3 (BACKLOG #1498, #1887). The property worth relying on is that **each gated hop names itself when it
   refuses**; a number on this page is not a coverage guarantee, and the ungated table below is the
   half to act on.
 
-  **Each gated hop's refusal names a lever that exists for that hop.** The two non-connection hops
-  (the PostgreSQL store and the syslog forwarder) carry their own remediation text, because the
-  connection-shaped advice — `[tls].crl_file`, a per-connection attestation — cannot be applied to
-  something that is not a connection. The forwarder's refusal names
-  `[logging].forward_tls_crl_file` and the loopback topology instead; the store's names
+  **Each gated hop's refusal names a lever that exists for that hop.** The non-connection hops
+  (the PostgreSQL store, the syslog forwarder and the OIDC legs) carry their own remediation text,
+  because the connection-shaped advice — `[tls].crl_file`, a per-connection attestation — cannot be
+  applied to something that is not a connection. The forwarder's refusal names
+  `[logging].forward_tls_crl_file` and the loopback topology instead; the OIDC legs' refusal names
+  `[auth].oidc_tls_crl_file`; the store's names
   `[store].ssl_root_cert` with `[store].ssl_crl_file`, and loopback. **The store names both settings
   because its CRL only loads on the pinned-CA branch** — on the default store path asyncpg builds the
   TLS context, so there is no engine-side context for a CRL to reach and loopback is that path's only
@@ -647,7 +650,6 @@ on the shipped posture.
 | **RemoteFile FTPS** | explicit TLS, verifying by default |
 | **`dialect='sqlserver'` DATABASE destination** | `Encrypt=yes` / `TrustServerCertificate=false` defaults |
 | **LDAPS** (`[auth].ad_tls_verify`, default true) | verifying directory bind |
-| **OIDC / IdP token and JWKS legs** (`[auth].oidc_*`) | always verifying — there is no `verify_tls=false` on this hop by design, since it carries the client secret, the authorization code and the identity assertion. Named here because [ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md) §4.3 lists it as the one hop of its three still to be gated. **You can close it yourself today:** `[auth].oidc_tls_crl_file` is a real in-engine CRL on this hop, and it is the one place on this table where that is true |
 | **Webhook alert sink** and the **AI-broker endpoint** | verifying https openers |
 | **`[alerts]` SMTP sink** and the **per-user security-event notifier** | `email_tls_verify` defaults **true** ([#323](BACKLOG.md)) — one verifying context, two call sites. Deliberately carries **no** `RevocationHopGuard`: it is constructed outside the `active_hop_posture` scope those guards read, so a guard here could not see the instance posture. Its verify-off / cleartext deviations are gated by `[security].allow_unverified_alert_smtp_tls` at the serve gate instead |
 

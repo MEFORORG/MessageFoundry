@@ -261,8 +261,9 @@ duplicate name (across **any** of these files) and an inbound that binds a route
 > **refused at construction** (`messagefoundry check` / dry-run / reload / the `serve` pre-flight), not
 > merely warned. **At least nine** hops carry that gate — the connection-level ones are
 > **MLLP-over-TLS, REST, SOAP, FHIR, DICOMweb (https), EMAIL/SMTP, and a connection's SMART token
-> endpoint**, plus two that are not connections at all: the **PostgreSQL store hop** and the
-> **`[logging]` TLS syslog forwarder**. Read it as "at least these" rather than as a covered estate
+> endpoint**, plus some that are not connections at all: the **PostgreSQL store hop**, the
+> **`[logging]` TLS syslog forwarder**, and the **OIDC token and JWKS legs**, which are checked when
+> `serve` builds the auth service rather than by `messagefoundry check`. Read it as "at least these" rather than as a covered estate
 > (SDS-3.6); the count moved from seven with [ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)
 > §4.3 and each gated hop names itself when it refuses. On a stock instance that means `MLLP(..., tls=True)`, an
 > `https://` `Rest()`/`Soap()`/`FHIR()`/`DICOMweb()` destination and an `Email()` STARTTLS relay are all
