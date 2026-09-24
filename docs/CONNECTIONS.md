@@ -1607,6 +1607,11 @@ the S/MIME message to `host:port` over STARTTLS SMTP. PHI is therefore protected
 of the transport TLS. Crypto is core `cryptography` (`serialization.pkcs7`) and SMTP is stdlib `smtplib` —
 **no new dependency, no extra**.
 
+The envelope encrypts the content under **AES-256-CBC**. That is fixed in code, not a setting
+(BACKLOG #1168). The content key is wrapped to the recipient's RSA key with RSAES-PKCS1-v1_5, which the
+library offers no way to change. A partner whose S/MIME stack cannot decrypt AES-256-CBC cannot read
+these messages, and the SMTP relay accepts them before anyone tries.
+
 | Setting | Default | Meaning |
 |---------|---------|---------|
 | `host` | — (required) | the SMTP / HISP relay host (the `[egress].allowed_direct` key; use `env()`) |

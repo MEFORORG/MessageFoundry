@@ -48,9 +48,11 @@ Scope for **PR1 = outbound send only**. The following are **deferred** (named, n
 
 **Crypto = core `cryptography` (`serialization.pkcs7`), no new dependency.** SIGN via
 `PKCS7SignatureBuilder` (SHA-256, signer cert attached, `Binary` option so the body is byte-exact);
-ENCRYPT via `PKCS7EnvelopeBuilder().add_recipient(recipient_cert)`. `endesive` was evaluated and
-**rejected** (an avoidable dependency for what pkcs7 already does). SMTP is stdlib `smtplib`, reusing the
-EMAIL destination's STARTTLS-by-default + `refuse_cleartext_credentials` posture verbatim.
+ENCRYPT via `PKCS7EnvelopeBuilder().add_recipient(recipient_cert)`. *Amended 2026-09-23 (BACKLOG
+#1168):* the envelope now sets its content cipher to AES-256-CBC explicitly, where it used to take the
+library default of AES-128-CBC. `_CONTENT_CIPHER` in `transports/direct.py` records why.
+`endesive` was evaluated and **rejected** (an avoidable dependency for what pkcs7 already does). SMTP
+is stdlib `smtplib`, reusing the EMAIL destination's STARTTLS-by-default + `refuse_cleartext_credentials` posture verbatim.
 
 **All cert/key material is loaded and cross-validated at construction** (fail loud, the `RestDestination`
 pattern): signing key↔cert public-key match, recipient cert chains to the supplied trust anchor
