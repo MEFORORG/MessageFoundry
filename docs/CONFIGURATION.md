@@ -651,6 +651,7 @@ document ([SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md)).
 | `oidc_jwks_ttl_seconds` / `oidc_jwks_min_refetch_seconds` | int | `3600` / `300` | the JWKS cache TTL + the amplification (min-refetch) bound |
 | `oidc_flow_ttl_seconds` / `oidc_flow_cache_max` | int | `300` / `512` | pending-flow TTL + the **reject-when-full** bound |
 | `oidc_session_max_hours` | int | — | caps the federated session below `id_token.exp` if a tighter bound is wanted (ADR 0079 mechanism 1) |
+| `oidc_max_age_seconds` | int | `43200` | the most time allowed between the user's sign-in **at the IdP** and the end of the engine session (ASVS 6.8.4 / 7.6.1, BACKLOG #1150). Sent as `max_age` on every authorization request; the `id_token` must return `auth_time`, a missing or stale one is refused, and the session ends at `auth_time + max_age` if that is sooner. `300`..`86400`; **no off switch** (`0` would be `prompt=login`, which ends single sign-on) |
 
 > AD-group→role mappings live in the DB and are managed by an admin (`PUT /ad-group-map` or the
 > console Users page), not in this file. Federated logins reuse the **same** AD-group→role mapping —

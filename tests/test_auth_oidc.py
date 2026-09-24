@@ -83,6 +83,7 @@ def _policy(nonce: str = "n-123", **over: Any) -> oidc.OidcClaimPolicy:
         "client_id": "mefor-console",
         "signing_algorithms": [SignatureAlgorithm.RS256],
         "nonce": nonce,
+        "max_age_seconds": 43200,
         # _good_claims() carries preferred_username "jdoe@corp.example"; stripping is fail-closed
         # without an allow-list, so the suffix has to be attested here.
         "allowed_username_domains": frozenset({"corp.example"}),
@@ -99,6 +100,8 @@ def _good_claims(nonce: str = "n-123", **over: Any) -> dict[str, Any]:
         "sub": "S-1-5-21-abc",
         "exp": now + 300,
         "iat": now,
+        # REQUIRED since BACKLOG #1150: the engine always sends max_age, so auth_time must come back.
+        "auth_time": now,
         "nonce": nonce,
         "preferred_username": "jdoe@corp.example",
         "amr": ["pwd", "mfa"],
@@ -586,6 +589,7 @@ def test_authorization_url_carries_pkce_and_response_mode() -> None:
         nonce="no",
         code_challenge="ch",
         scopes=["openid", "profile"],
+        max_age=43200,
     )
     q = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
     assert q["code_challenge_method"] == ["S256"]

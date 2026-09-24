@@ -2405,6 +2405,16 @@ class AuthSettings(_Section):
     oidc_flow_ttl_seconds: int = 300  # single-use flow window; validator-capped 30..1800
     oidc_flow_cache_max: int = 512  # reject-when-full (never evict — that is a login DoS)
     oidc_session_max_hours: int | None = None  # G2: cap below id_token.exp if tighter is wanted
+    # ASVS 6.8.4 / 7.6.1, BACKLOG #296 / #1150: the most time, in seconds, that may pass between the
+    # user's authentication AT THE IdP and the end of the engine session it mints. Sent as `max_age` on
+    # every authorization request, so a conforming IdP re-authenticates only when its own SSO session
+    # is older than this (single sign-on survives for everyone inside the window) and MUST return
+    # `auth_time`. The ladder refuses a token with no `auth_time` or a stale one, and the session is
+    # capped at `auth_time + max_age`. There is deliberately NO off switch: None and 0 are refused
+    # (0 is `prompt=login` under another name, which throws away single sign-on). The default matches
+    # the shipped 12-hour absolute session cap, so a fresh IdP login changes nothing and an old one
+    # cannot buy a session reaching past 12 hours from the moment the human actually authenticated.
+    oidc_max_age_seconds: int = 43200
 
     # Login rate limiting (AUTH-RATE) — in-process sliding window in front of the per-account
     # lockout: bounds password-spray + argon2 CPU-burn. In-process only; an exposed/multi-host
@@ -2439,8 +2449,9 @@ class AuthSettings(_Section):
 
     # Out-of-band user notification of security events (ASVS 6.3.5/6.3.7): email the affected user on
     # lockout / first-success-after-failures / password/email/role/disable changes. Email requires the
-    # [alerts] SMTP transport to be configured (no SMTP → email is skipped); the audited
-    # /me/security-events feed records these regardless of this toggle.
+    # [alerts] SMTP transport to be configured (no SMTP means email is skipped). This toggle does not
+    # touch the audit log; which events the /me/security-events feed shows is stated once, in
+    # auth/notifications.py.
     notify_security_events: bool = True
 
     @field_validator("mfa_recovery_code_count")
@@ -2490,6 +2501,21 @@ class AuthSettings(_Section):
         # an unbounded value is wrong in both directions.
         if not 30 <= value <= 1800:
             raise ValueError("oidc_flow_ttl_seconds must be between 30 and 1800")
+        return value
+
+    @field_validator("oidc_max_age_seconds")
+    @classmethod
+    def _check_oidc_max_age(cls, value: int) -> int:
+        # Bounded at both ends, and the floor is what makes "no off switch" true. At 0 the IdP must
+        # re-authenticate on every sign-in, which is `prompt=login` and destroys single sign-on; a
+        # few seconds is that in practice. The 5-minute floor and the 24-hour ceiling are a JUDGMENT
+        # with no measured anchor, like the flow-TTL bounds above. The ceiling keeps the knob from
+        # quietly becoming "unbounded"; the 12-hour absolute session cap sits below it anyway.
+        if not 300 <= value <= 86400:
+            raise ValueError(
+                "oidc_max_age_seconds must be between 300 and 86400 (there is no off switch: the "
+                "IdP authentication recency bound is always enforced when oidc_enabled is set)"
+            )
         return value
 
     @field_validator("totp_skew_steps")

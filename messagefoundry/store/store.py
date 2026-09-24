@@ -35,6 +35,7 @@ independently, so overlapping id sets are reachable in normal operation. They no
 from __future__ import annotations
 
 import asyncio
+import bisect
 import functools
 import hashlib
 import hmac
@@ -1808,6 +1809,16 @@ def audit_mac_bytes(value: str | None) -> bytes:
 #: ``SELECT ... ORDER BY id`` walked it. ``0`` here silently dropped such rows from the tamper check.
 AUDIT_ALL_ROWS: Final = -(2**63)
 
+
+class AuditHeadMovedError(RuntimeError):
+    """``record_audit(expect_prev=...)`` found a different chain head from the one expected.
+
+    ``rotate-key`` seals the closing record from one read of the chain, then appends the range row.
+    A row appended in between would sit inside the closed range yet outside its digest, and once the
+    outgoing key is dropped nothing could prove it. So the append names the head it sealed, and is
+    refused -- before anything is written -- when the head has moved."""
+
+
 #: The action of the row that opens a new keyed range of the audit chain.
 AUDIT_KEY_EPOCH_ACTION: Final = "audit.key_epoch"
 
@@ -1904,12 +1915,7 @@ def audit_range_closing(
     last id, its row count, a SHA-256 digest over every row, and ``prev_hash`` -- the stored
     ``row_hash`` of the row just BEFORE the range (``""``, the chain's genesis, when there is none).
     ``rows`` are the range's rows, in id order -- everything from ``from_id`` up to (not including) the
-    new range row.
-
-    ``prev_hash`` is the range's link to everything before it. While the range's key is held, the MAC
-    on its first row carries that link; once the key is dropped, only this record does. Without it the
-    rows below a dropped range -- the keyless prefix under a ``rekey-audit`` watermark, above all --
-    could be rewritten and re-hashed and the chain would still verify (PR 1446, Lander blocker)."""
+    new range row. Why ``prev_hash`` is load-bearing: ADR 0193, Decision item 4."""
     digest = hashlib.sha256()
     last = from_id - 1
     for r in rows:
@@ -1974,10 +1980,11 @@ def parse_audit_epoch(detail: str | None) -> tuple[str, dict[str, Any], str] | N
     key_id, closes, handover = obj.get("key_id"), obj.get("closes"), obj.get("handover")
     if not isinstance(key_id, str) or not key_id or not isinstance(closes, dict):
         return None
-    # Scalars only, and only the fields a closing record has. The tag check RE-SERIALISES `closes`, and
+    # Exactly the fields a closing record has -- a record missing `prev_hash` or `digest` is malformed
+    # here, at open as in verify -- and scalars only. The tag check RE-SERIALISES `closes`, and
     # json.dumps recurses deeper than json.loads tolerates, so a nested value would raise
     # RecursionError there -- at open, and in the startup verify -- rather than read as a break.
-    if not set(closes) <= _AUDIT_CLOSES_FIELDS or not all(
+    if set(closes) != _AUDIT_CLOSES_FIELDS or not all(
         v is None or isinstance(v, (int, str)) for v in closes.values()
     ):
         return None
@@ -2053,7 +2060,8 @@ def verify_audit_rows(
             assert keyed_from is not None  # for the type checker: `keyed` implies it
             range_key, range_from = first_key_id, keyed_from
             range_last = keyed_from - 1
-            range_prev = prev  # the last keyless row's stored hash, or "" (genesis) when none
+            # The link below the range must survive its key being dropped (ADR 0193, item 4).
+            range_prev = prev
             if range_key is not None:
                 seen_keys.add(range_key)
         if keyed and r["action"] == AUDIT_KEY_EPOCH_ACTION:
@@ -2085,7 +2093,7 @@ def verify_audit_rows(
                 seen_keys.add(new_key)
                 range_key, range_from = new_key, rid
                 range_digest, range_rows, range_last = hashlib.sha256(), 0, rid - 1
-                range_prev = prev  # the stored hash of the row before this range row
+                range_prev = prev  # as above: the link that outlives this range's key
         key: bytes | None = None
         mac: AuditMacFn | None = None
         held = True
@@ -2146,8 +2154,17 @@ def verify_audit_rows(
         link_ok = hmac.compare_digest(
             audit_mac_bytes(str(claimed.get("prev_hash"))), audit_mac_bytes(actual["prev_hash"])
         )
-        if not (fields_ok and digest_ok and link_ok):
+        if not (fields_ok and digest_ok):
             breaks.append((rid, "audit key-range row does not match the range it closes"))
+        if not link_ok:
+            # Reported at the range row, which holds the proof, but naming where the tampering is.
+            breaks.append(
+                (
+                    rid,
+                    "the rows before id="
+                    f"{actual['from_id']} no longer match the link this key-range row recorded",
+                )
+            )
         out_secret = _audit_secret_for(outgoing, mac_keys, mac_fn)
         if out_secret is not None and not _audit_tag_ok(new_key, claimed, handover, out_secret):
             breaks.append(
@@ -2214,13 +2231,6 @@ class AuditRangeHost(Protocol):
         matched EXACTLY on the action (a case-insensitive collation must not widen it)."""
         ...
 
-    async def verify_audit_chain(
-        self,
-        *,
-        expected_anchor: tuple[int, str] | None = None,
-        expected_prefix: tuple[int, str] | None = None,
-    ) -> tuple[bool, str | None]: ...
-
     async def record_audit(
         self,
         action: str,
@@ -2230,6 +2240,7 @@ class AuditRangeHost(Protocol):
         detail: str | None = None,
         client: str | None = None,
         now: float | None = None,
+        expect_prev: str | None = None,
     ) -> None: ...
 
 
@@ -2402,17 +2413,18 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
         first_key_id=host._audit_first_key_id,
         mac_keys=host._audit_mac_keys,
         mac_fn=host._audit_mac_fn,
-        capable=True,  # active_id is not None, so a keying secret is in hand
+        capable=host._audit_mac_key is not None or host._audit_mac_fn is not None,
     )
     if not ok:
         return False, f"refusing to roll a broken audit chain: {msg}"
-    before = [r for r in rows if int(r["id"]) < current_from]
+    split = bisect.bisect_left([int(r["id"]) for r in rows], current_from)
     closes = audit_range_closing(
-        [r for r in rows if int(r["id"]) >= current_from],
+        rows[split:],
         key_id=current,
         from_id=current_from,
-        prev_hash=(before[-1]["row_hash"] or "") if before else "",
+        prev_hash=(rows[split - 1]["row_hash"] or "") if split else "",
     )
+    sealed_head = (rows[-1]["row_hash"] or "") if rows else ""
     handover = audit_handover_tag(active_id, closes, out_secret)
     host._audit_range_key_id = active_id  # the range row is the first row of the new range
     try:
@@ -2420,6 +2432,13 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
             AUDIT_KEY_EPOCH_ACTION,
             actor="system:rotate-key",
             detail=audit_epoch_detail(active_id, closes, handover),
+            expect_prev=sealed_head,
+        )
+    except AuditHeadMovedError:
+        host._audit_range_key_id = current
+        return False, (
+            "the audit log changed while the chain was being rolled, so nothing was written; stop "
+            "the engine and re-run `messagefoundry rotate-key`"
         )
     except BaseException:
         host._audit_range_key_id = current
@@ -9297,6 +9316,7 @@ class MessageStore:
         detail: str | None = None,
         client: str | None = None,
         now: float | None = None,
+        expect_prev: str | None = None,
     ) -> None:
         """Append a row to the general audit log — the seam for PHI-access auditing (summary
         displays, detail views, exports, …). ``detail`` is an opaque (JSON) string.
@@ -9316,6 +9336,8 @@ class MessageStore:
             cur = await self._db.execute("SELECT row_hash FROM audit_log ORDER BY id DESC LIMIT 1")
             last = await cur.fetchone()
             prev = last["row_hash"] if last and last["row_hash"] else ""
+            if expect_prev is not None and prev != expect_prev:
+                raise AuditHeadMovedError(prev)  # BACKLOG #1904: the roll sealed a different head
             _key, _mac = (
                 self._audit_append_mac()
             )  # keyed (in-heap or Transit) once watermark set, else keyless
