@@ -615,10 +615,26 @@ async def test_framing_is_decided_for_every_method_in_the_head_phase() -> None:
         # HEAD is bodyless like GET, so the same framing refusals apply to it.
         ("head te", b"HEAD / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"),
         ("head cl", b"HEAD / HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nHELLO"),
+        # A method this listener reads no body for may not declare one either; it used to be
+        # buffered in full only to be answered 405.
+        ("delete cl", b"DELETE / HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nHELLO"),
+        # str.strip() removed VT, FF, NBSP and NEL, so each of these framed three bytes.
+        ("cl trailing vt", b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 3\x0b\r\n\r\nabc"),
+        ("cl leading ff", b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length:\x0c3\r\n\r\nabc"),
+        ("cl trailing nbsp", b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 3\xa0\r\n\r\nabc"),
+        ("nul in a value", b"POST / HTTP/1.1\r\nHost: h\x00\r\nContent-Length: 3\r\n\r\nabc"),
+        # int() raises past 4300 digits, which escaped as a 500.
+        (
+            "cl too many digits",
+            b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: " + b"9" * 4400 + b"\r\n\r\nabc",
+        ),
+        # Only HTTP/1.x is parsed with HTTP/1.1 framing.
+        ("http/2.0", b"POST / HTTP/2.0\r\nHost: h\r\nContent-Length: 3\r\n\r\nabc"),
+        ("http/0.9", b"GET / HTTP/0.9\r\nHost: h\r\n\r\n"),
     ],
 )
 async def test_the_head_parse_refuses_the_rfc_9112_desync_grammar(label: str, raw: bytes) -> None:
-    """Nine shapes both library parsers reject and this one accepted (BACKLOG #1125).
+    """Shapes this parser accepted before BACKLOG #1125 and now refuses in the head phase.
 
     Every one is a desync primitive: it parses one way here and another way in a fronting proxy.
     The accept-controls live in the tests around this one -- a plain GET, a plain POST carrying a
@@ -646,12 +662,36 @@ async def test_a_body_method_with_no_framing_is_refused_411_not_read_to_eof(meth
     assert excinfo.value.kind == "framing_error"
 
 
-async def test_a_bodyless_method_needs_no_framing() -> None:
-    # Accept-control for the 411 above: GET and DELETE carry no body, so no framing is required.
-    for method in ("GET", "DELETE"):
-        reader = await _reader_from(f"{method} / HTTP/1.1\r\nHost: h\r\n\r\n".encode("ascii"))
+async def test_a_method_with_no_body_needs_no_framing() -> None:
+    # Accept-control for the 411 above: this listener reads no body for GET or DELETE, so neither
+    # needs framing, and a zero-length declaration written with leading zeros is still zero.
+    for raw in (
+        b"GET / HTTP/1.1\r\nHost: h\r\n\r\n",
+        b"DELETE / HTTP/1.1\r\nHost: h\r\n\r\n",
+        b"GET / HTTP/1.1\r\nHost: h\r\nContent-Length: 00\r\n\r\n",
+    ):
+        reader = await _reader_from(raw)
         head = await _read_head(reader, max_header_bytes=8192)
         assert await _read_body(reader, head, max_body_bytes=DEFAULT_MAX_BODY_BYTES) == b""
+
+
+async def test_a_long_but_valid_content_length_reads_normally() -> None:
+    # Accept-control for the digit cap: leading zeros do not count against it, and the value and
+    # its OWS are read exactly.
+    raw = b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: \t" + b"0" * 40 + b"3 \r\n\r\nabc"
+    req = await _read_request(
+        await _reader_from(raw), max_header_bytes=8192, max_body_bytes=DEFAULT_MAX_BODY_BYTES
+    )
+    assert req.body == b"abc"
+
+
+async def test_a_lowercase_method_is_not_folded_into_a_known_one() -> None:
+    # RFC 9110 section 9.1: methods are case-sensitive. `post` is not POST, so it gets no body
+    # rule of POST's; with no body declared it parses, and the listener answers it 405 later.
+    reader = await _reader_from(b"post / HTTP/1.1\r\nHost: h\r\n\r\n")
+    head = await _read_head(reader, max_header_bytes=8192)
+    assert head.method == "post"
+    assert await _read_body(reader, head, max_body_bytes=DEFAULT_MAX_BODY_BYTES) == b""
 
 
 @pytest.mark.parametrize(

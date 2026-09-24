@@ -641,7 +641,7 @@ HTTP twin of MLLP's AA-on-receipt. A post-ingress routing/transform/delivery fai
 disposition + the AlertSink, exactly as a post-ACK MLLP failure does. A **pre-ingress** refusal answers
 synchronously and emits an ADR 0021 `connection_event`: `403` (not in `source_ip_allowlist`), `408` (the
 request didn't fully arrive within `receive_timeout`), `413` (over `max_body_bytes` **or**
-`max_header_bytes`), `400` (malformed request line / header, or ambiguous framing: any `Transfer-Encoding`, a `Content-Length` that is not plain digits or is duplicated, a folded or non-token header line, a bare CR or LF, or a body declared on `GET`/`HEAD`), `411` (a `POST`/`PUT`/`PATCH` with no `Content-Length`; the body is never read to EOF), `503` (at
+`max_header_bytes`), `400` (a malformed request line or header, or framing this listener will not guess at -- including at least any `Transfer-Encoding`, a duplicated or non-digit `Content-Length`, whitespace before a header colon, a folded header line, a bare CR or LF, a control character in a header value, an HTTP version other than 1.x, and a non-zero body declared on a method other than `POST`/`PUT`/`PATCH`), `411` (a `POST`/`PUT`/`PATCH` with no `Content-Length`; the body is never read to EOF), `503` (at
 `max_connections` — the connection is accepted, then refused and closed at the application layer).
 `GET`/`HEAD` are static, non-PHI health probes and write **no** ingress row; any other method is `405`.
 

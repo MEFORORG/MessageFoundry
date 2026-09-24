@@ -173,20 +173,30 @@ _HEADER_VALUE_RE = re.compile(r"[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?")
 #: ``+3`` framed three -- both measured against the shipped parser (BACKLOG #1125).
 _CONTENT_LENGTH_RE = re.compile(r"[0-9]+")
 
-#: Methods that carry no request body. A ``Content-Length: 0`` from one of these is accepted -- it
-#: declares no body and desyncs nothing, and it is the shape a health checker actually sends. A
-#: NON-ZERO length is refused, because those are the declared bytes a bodyless handler would leave
-#: unread on a connection.
+#: The health-probe methods: answered with a static 200 and no ingress row (ADR 0023 D2).
 _BODYLESS_METHODS = frozenset({"GET", "HEAD"})
 
 #: Methods this listener ingests a body for. Each must declare a ``Content-Length``; with none the
-#: request is refused 411 in the head parse rather than read to EOF (BACKLOG #1125).
+#: request is refused 411 in the head parse rather than read to EOF (BACKLOG #1125). Every OTHER
+#: method, the health probes included, may declare only ``Content-Length: 0``: it declares no body
+#: and desyncs nothing, and it is the shape a health checker actually sends. A non-zero length is
+#: refused, because those are the declared bytes this listener would never read.
 _BODY_METHODS = frozenset({"POST", "PUT", "PATCH"})
 
-#: ``HTTP-version = "HTTP/" DIGIT "." DIGIT`` (RFC 9112 section 2.3). A ``startswith("HTTP/")`` test
-#: accepted ``HTTP/1.1x``; a fronting proxy that parses the version strictly and an origin that does
-#: not is one of the shapes a desync is built from.
-_HTTP_VERSION_RE = re.compile(r"HTTP/[0-9]\.[0-9]")
+#: A ``Content-Length`` longer than this many significant digits is refused before ``int()`` sees
+#: it. It is far past any body cap, and ``int()`` itself raises past 4300 digits (the CPython
+#: ``sys.int_info.default_max_str_digits`` limit), which would escape as a 500 instead of a 400.
+_MAX_CONTENT_LENGTH_DIGITS = 18
+
+#: A control character in a header field-value (RFC 9110 section 5.5 allows VCHAR, obs-text, SP and
+#: HTAB). CR and LF are already refused with the head; this catches the rest, NUL included.
+_FIELD_VALUE_CTL_RE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
+
+#: ``HTTP-version = "HTTP/" DIGIT "." DIGIT`` (RFC 9112 section 2.3), and the major version must be 1.
+#: A ``startswith("HTTP/")`` test accepted ``HTTP/1.1x``; a fronting proxy that parses the version
+#: strictly and an origin that does not is one of the shapes a desync is built from. HTTP/0.9 has no
+#: header block and HTTP/2 is not a text protocol, so neither is parsed with HTTP/1.1 framing.
+_HTTP_VERSION_RE = re.compile(r"HTTP/1\.[0-9]")
 
 
 def _validated_header(name: str, value: str) -> str:
@@ -375,9 +385,13 @@ async def _read_head(
         # `field-name = token`. Anything else is a name a proxy may read differently.
         if not _HEADER_NAME_RE.fullmatch(name):
             raise HttpRequestError(400, "malformed header line", kind="framing_error")
+        # Only OWS (SP and HTAB) is trimmed. `str.strip()` also removed VT, FF, NBSP and NEL, so
+        # `Content-Length: 3\x0b` framed three bytes here while a strict proxy refused the header.
+        if _FIELD_VALUE_CTL_RE.search(value):
+            raise HttpRequestError(400, "control character in header value", kind="framing_error")
         key = name.lower()
         header_counts[key] = header_counts.get(key, 0) + 1
-        headers[key] = value.strip()
+        headers[key] = value.strip(" \t")
 
     # Reject AMBIGUOUS framing before any Content-Length is trusted — the HTTP request-smuggling
     # defense (RFC 7230 §3.3.3). A duplicate Content-Length / Transfer-Encoding, or the two present
@@ -391,7 +405,8 @@ async def _read_head(
             400, "ambiguous framing: Content-Length with Transfer-Encoding", kind="framing_error"
         )
 
-    method = method.upper()
+    # The method is NOT case-folded: it is a case-sensitive token (RFC 9110 section 9.1), and it
+    # picks the framing rule below. Folding `post` to POST would apply a rule a proxy does not.
 
     # FRAMING IS DECIDED HERE, FOR EVERY METHOD, BEFORE ANY METHOD DISPATCH (BACKLOG #1125, ASVS
     # 4.2.1). RFC 9112 makes framing a property of the MESSAGE, not of the method, and the earlier
@@ -418,20 +433,22 @@ async def _read_head(
     if cl_raw is not None:
         # `1*DIGIT` per RFC 9112, NOT `int()`. `int()` accepts a leading plus and PEP 515
         # underscores, so `Content-Length: 1_0` framed TEN bytes and `+3` framed three -- measured.
-        if not _CONTENT_LENGTH_RE.fullmatch(cl_raw):
+        if not _CONTENT_LENGTH_RE.fullmatch(cl_raw) or (
+            len(cl_raw.lstrip("0")) > _MAX_CONTENT_LENGTH_DIGITS
+        ):
             raise HttpRequestError(400, "invalid Content-Length", kind="framing_error")
         # CARVE-OUT, and it is the one shape the tree actually exercises: `Content-Length: 0` on a
-        # bodyless method declares no body, so it desyncs nothing and a health checker that sends it
-        # stays green. A NON-ZERO length on GET/HEAD is refused -- those are the declared bytes that
-        # would be left on the wire.
-        if method in _BODYLESS_METHODS and cl_raw != "0":
-            raise HttpRequestError(400, f"{method} must not declare a body", kind="framing_error")
+        # method this listener reads no body for declares no body, so it desyncs nothing and a
+        # health checker that sends it stays green. A NON-ZERO length there is refused -- those are
+        # the declared bytes that would be left on the wire, or buffered only to answer 405.
+        if method not in _BODY_METHODS and int(cl_raw) != 0:
+            raise HttpRequestError(400, "request must not declare a body", kind="framing_error")
     elif method in _BODY_METHODS:
         # A BODY METHOD WITH NO FRAMING IS REFUSED, NOT READ TO EOF. RFC 9112 section 6.3 says such
         # a request has a ZERO-length body, so a proxy forwards the head and treats any bytes after
         # it as the next request, while the old read-to-EOF path ingested those same bytes as this
-        # request's clinical payload. 411 Length Required is the RFC 9110 answer, and the engine API
-        # already gives it for a request with no Content-Length.
+        # request's clinical payload. 411 Length Required is the RFC 9110 status for a server that
+        # refuses a request with no Content-Length.
         raise HttpRequestError(411, "Content-Length is required", kind="framing_error")
 
     return HttpRequest(method, target, headers, b"")
@@ -458,17 +475,17 @@ async def _read_body(
 
     Framing is now settled in :func:`_read_head` for EVERY method before dispatch, so by the time
     this runs a ``Transfer-Encoding`` has already been refused and a ``Content-Length`` is already
-    known to be ``1*DIGIT``, to be absent-or-zero on a bodyless method, and to be present on a body
+    known to be ``1*DIGIT``, to be present on a body method, and to be absent or zero on every other
     method. What remains here is the read itself."""
-    # Only methods that carry a body read one. A bodyless method reaching this point has already
-    # been proven to declare no body, so this discards nothing that was ever on the wire.
-    if head.method in _BODYLESS_METHODS:
+    # Only body methods read one. Any other method reaching this point has already been proven to
+    # declare no body, so this discards nothing that was ever on the wire.
+    if head.method not in _BODY_METHODS:
         return b""
 
     body = b""
     cl_raw = head.headers.get("content-length")
     if cl_raw is not None:
-        # Grammar and the bodyless rule were enforced in the head parse; this is the value read.
+        # Grammar, digit count and the no-body rule were enforced in the head parse.
         content_length = int(cl_raw)
         if max_body_bytes is not None and content_length > max_body_bytes:
             # Refuse on the DECLARED size before reading a single body byte (don't buffer to find out).
@@ -768,7 +785,7 @@ class HttpSource(SourceConnector):
         """
         if self.intake_auth not in ("api_key", "bearer"):
             return
-        if head.method in ("GET", "HEAD") and self.intake_auth_health == "allow":
+        if head.method in _BODYLESS_METHODS and self.intake_auth_health == "allow":
             return  # explicit opt-out for a load-balancer probe that cannot carry the credential
         peer = peer_host or "unknown"
         limited = self._rate_limit_refusal(peer)
@@ -948,7 +965,7 @@ class HttpSource(SourceConnector):
             return True
 
         # Health probe: GET/HEAD answer a static, non-PHI 200 WITHOUT an ingress row (ADR 0023 D2).
-        if request.method in ("GET", "HEAD"):
+        if request.method in _BODYLESS_METHODS:
             body = "" if request.method == "HEAD" else '{"status":"ok"}'
             await self._respond(writer, build_response(200, body))
             return False
