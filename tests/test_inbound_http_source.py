@@ -628,6 +628,10 @@ async def test_framing_is_decided_for_every_method_in_the_head_phase() -> None:
             "cl too many digits",
             b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: " + b"9" * 4400 + b"\r\n\r\nabc",
         ),
+        # The request-target must be visible ASCII; some recipients split a line on HTAB or VT.
+        ("target with tab", b"POST /a\tb HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nabc"),
+        ("target with nul", b"POST /a\x00b HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nabc"),
+        ("empty target", b"POST  HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nabc"),
         # Only HTTP/1.x is parsed with HTTP/1.1 framing.
         ("http/2.0", b"POST / HTTP/2.0\r\nHost: h\r\nContent-Length: 3\r\n\r\nabc"),
         ("http/0.9", b"GET / HTTP/0.9\r\nHost: h\r\n\r\n"),
@@ -669,6 +673,7 @@ async def test_a_method_with_no_body_needs_no_framing() -> None:
         b"GET / HTTP/1.1\r\nHost: h\r\n\r\n",
         b"DELETE / HTTP/1.1\r\nHost: h\r\n\r\n",
         b"GET / HTTP/1.1\r\nHost: h\r\nContent-Length: 00\r\n\r\n",
+        b"GET / HTTP/1.1\r\nHost: h\r\nContent-Length: " + b"0" * 4400 + b"\r\n\r\n",
     ):
         reader = await _reader_from(raw)
         head = await _read_head(reader, max_header_bytes=8192)
@@ -677,8 +682,9 @@ async def test_a_method_with_no_body_needs_no_framing() -> None:
 
 async def test_a_long_but_valid_content_length_reads_normally() -> None:
     # Accept-control for the digit cap: leading zeros do not count against it, and the value and
-    # its OWS are read exactly.
-    raw = b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: \t" + b"0" * 40 + b"3 \r\n\r\nabc"
+    # its OWS are read exactly. 4400 zeros is past int()'s 4300-digit limit, which counts leading
+    # zeros, so this raised ValueError and escaped as a 500 until the head parse normalised it.
+    raw = b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: \t" + b"0" * 4400 + b"3 \r\n\r\nabc"
     req = await _read_request(
         await _reader_from(raw), max_header_bytes=8192, max_body_bytes=DEFAULT_MAX_BODY_BYTES
     )
