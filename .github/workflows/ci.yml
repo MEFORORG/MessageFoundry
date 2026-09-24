@@ -1796,22 +1796,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # BACKLOG #1164: the TypeScript/JavaScript and PowerShell crypto OPERATION arms of the ASVS 11.1.3
-      # gate. They sit HERE on purpose: this job is not a required context and ci-gate does not
-      # `needs: ide`, so a red is visible without blocking a merge. (The `tooling` job would have run
-      # them on scripts/** changes, but ci-gate rolls `tooling` up, which would make them gating.)
-      # Making them count is a branch-protection change, and that is the owner's call, not this
-      # file's. Stdlib-only Python; one leg is enough, the scan is not platform-dependent.
-      - name: Set up Python (crypto operation arm)
-        if: runner.os == 'Linux'
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.14"
-      - name: Crypto operation inventory (TypeScript/JavaScript + PowerShell arms, not merge-gating)
-        if: runner.os == 'Linux'
-        working-directory: .
-        run: python scripts/security/crypto_inventory_check.py --non-python-operations
-
       - name: Set up Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -1840,6 +1824,26 @@ jobs:
       - name: Integration tests (headless VS Code)
         if: runner.os == 'Windows'
         run: npm test
+
+      # BACKLOG #1164: the TypeScript/JavaScript and PowerShell crypto OPERATION arms of the ASVS 11.1.3
+      # gate. They sit HERE on purpose: this job is not a required context and ci-gate does not
+      # `needs: ide`, so a red is visible without blocking a merge. (The `tooling` job would have run
+      # them on scripts/** changes, but ci-gate rolls `tooling` up, which would make them gating.)
+      # LAST in the job, and on `!cancelled()`, so a red here never skips the extension's own build
+      # and tests, and a red there does not hide this report. KNOWN GAP: on a pull request this job
+      # runs only when ide/** or this workflow changes, so a PR touching only the console's JS, a
+      # .ps1 or the gate script is not scanned until push-to-main. Making the arms count, or giving
+      # them their own trigger, is a branch-protection and CI-cost call for the owner, not this file.
+      # Stdlib-only Python; one leg is enough, the scan is not platform-dependent.
+      - name: Set up Python (crypto operation arms)
+        if: runner.os == 'Linux' && !cancelled()
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Crypto operation inventory (TypeScript/JavaScript + PowerShell arms, not merge-gating)
+        if: runner.os == 'Linux' && !cancelled()
+        working-directory: .
+        run: python scripts/security/crypto_inventory_check.py --non-python-operations
 
   # Path filter for the container-pulling server-DB leg(s). A docs/unrelated PR shouldn't pull the SQL
   # Server image (mcr.microsoft.com anonymous pulls are rate-limited — repeated PRs flake on

@@ -10,30 +10,40 @@ registered seam. This module is the finer instrument the gate now runs beside th
 What it does, in order:
 
 1. Parse every ``.py`` file under the walk roots and resolve each call's callee to a fully qualified
-   name through that module's imports (absolute, relative, aliased and function-local).
+   name through that module's imports (absolute, relative, aliased, function-local, re-exported
+   through a package ``__init__``, and bare sibling imports under ``scripts/``).
 2. Classify a call as a crypto OPERATION when its qualified callee, or for a method call its method
-   name, is in the taxonomy below. The result is keyed ``path:line -> operation class``.
+   name, is in the taxonomy below. A TLS posture attribute set on a context counts too. The result
+   is keyed ``path:line -> operation class``.
 3. Follow first-party helpers. A module-level function that performs an operation, directly or
    through another such function, is a PROVIDER (the spread rule is stated where it is computed, in
    :func:`discover_operations_in`). A call to a provider from a DIFFERENT module is itself an
    operation site in the caller, of the provider's classes. That is what makes
    ``pipeline/alert_sinks.py`` visible through ``build_smtp_tls_context`` with no crypto import and
-   no registered seam, and it needs no seam list: a NEW helper is followed the day it is written.
+   no registered seam, and it needs no seam list: a new module-level helper is followed the day it
+   is written.
 
-WHAT THIS DOES NOT SEE, so any clean result reads "at least", never "all":
+THE RESIDUAL. This list is the one statement of it for every crypto-gate arm; the gate's docstring
+and ``docs/ASVS-L2-PHASE0-CHANGES.md`` point here rather than repeat it. Any clean result reads "at
+least", never "all", because none of these is seen:
 
+* a SECOND call to a callee a file already lists. The inventory is kept per file and token, so a new
+  ``hashlib.sha256`` call beside an existing one changes nothing;
+* an algorithm or TLS value held in a VARIABLE. A token carries the algorithm only when the call
+  names it, in the callee or as a literal or named constant in an argument;
 * a method called on a first-party OBJECT (``self._cipher.encrypt_cell(...)``) unless its method name
   is in :data:`METHOD_RULES`. There is no type inference, so a first-party class is followed only
   through its module-level functions;
 * a chain that leaves the crypto modules for more than one call. The spread rule stops there on
-  purpose, to keep the noise down, and a crypto use at the far end of a longer chain is not reported
-  at the caller;
+  purpose, to keep the noise down;
 * a call made through ``getattr``, ``importlib`` or any other dynamic dispatch, or in a subprocess;
 * a crypto DECISION that is not a call or a TLS-attribute assignment. ``transports/database.py``
   appends ``Encrypt=`` and ``TrustServerCertificate=`` to a DSN string: a first-party TLS posture
   decision with no crypto-shaped expression for any pattern instrument to match;
 * crypto inside a third-party library the engine calls. The call is seen; the library's own
-  operations are not.
+  operations are not;
+* for the non-Python arms, which are PATTERN instruments: an alias that renames the API, an idiom
+  no pattern names, and a file outside the walked roots and suffixes.
 
 Stdlib only, like the gate that imports it.
 """
@@ -95,6 +105,9 @@ EXACT_RULES: dict[str, str] = {
     # sign_verify: library ceremonies whose primitive lives in the library
     "webauthn.verify_registration_response": "sign_verify",
     "webauthn.verify_authentication_response": "sign_verify",
+    # The COSE public-key parse at registration, which is where ES256 is bound to P-256 (#1166).
+    "webauthn.helpers.decode_credential_public_key": "key_cert",
+    "webauthn.helpers.decoded_public_key_to_cryptography": "key_cert",
     "signxml.XMLSigner": "sign_verify",
     "signxml.XMLVerifier": "sign_verify",
     "cryptography.hazmat.primitives.serialization.pkcs7.PKCS7SignatureBuilder": "sign_verify",
@@ -235,18 +248,56 @@ OPAQUE_PROVIDERS: dict[str, str] = {
 }
 
 #: Assigning one of these attributes on any object sets a TLS posture on a context. The object is
-#: not type-checked, so the names are chosen to be specific to ``ssl.SSLContext``.
+#: not type-checked, so the names are chosen to be specific to ``ssl.SSLContext``. Tuple targets
+#: (``a.check_hostname, a.verify_mode = ...``) and ``setattr(ctx, "verify_mode", ...)`` count too.
 TLS_POSTURE_ATTRIBUTES = frozenset(
-    {"minimum_version", "maximum_version", "verify_mode", "check_hostname", "verify_flags"}
+    {
+        "minimum_version",
+        "maximum_version",
+        "verify_mode",
+        "check_hostname",
+        "verify_flags",
+        "keylog_filename",
+        "post_handshake_auth",
+        "hostname_checks_common_name",
+    }
 )
 
+#: ``options`` is too common a name to match on plain assignment, so it counts only when it is
+#: AUGMENTED (``ctx.options |= ssl.OP_NO_TLSv1``), which is how an SSLContext's option bits are set.
+TLS_AUGMENTED_ATTRIBUTES = frozenset({"options"})
 
-#: Top-level package names whose calls are resolved as first-party (followed by provider
-#: propagation rather than guessed at by a method-name rule).
-_FIRST_PARTY = tuple(
-    f"{root}."
-    for root in ("messagefoundry", "messagefoundry_webconsole", "harness", "tee", "scripts")
+#: Hash algorithm names, for labelling a call whose algorithm is an ARGUMENT rather than part of the
+#: callee (``hmac.new(k, m, hashlib.sha256)``, ``hashlib.new("md5")``, ``HKDF(hashes.SHA256())``).
+HASH_ALGORITHMS = frozenset(
+    {
+        "md4",
+        "md5",
+        "sha1",
+        "sha224",
+        "sha256",
+        "sha384",
+        "sha512",
+        "sha512_224",
+        "sha512_256",
+        "sha3_224",
+        "sha3_256",
+        "sha3_384",
+        "sha3_512",
+        "shake_128",
+        "shake_256",
+        "blake2b",
+        "blake2s",
+        "sm3",
+        "ripemd160",
+    }
 )
+
+#: Roots whose files import their SIBLINGS by bare name through ``sys.path`` (``import scorecard``
+#: from ``scripts/asvs/anchor_report.py``). For these, an import that names no known module is
+#: retried against the importing file's own package. Not applied to the package roots, where a
+#: bare name that happens to match a sibling file is a stdlib or third-party module instead.
+SIBLING_IMPORT_ROOTS = ("scripts.",)
 
 
 @dataclass(frozen=True, order=True)
@@ -285,14 +336,14 @@ def _resolve_relative(mod: str, is_init: bool, level: int, target: str | None) -
     return base
 
 
-def import_aliases(tree: ast.Module, mod: str, is_init: bool) -> dict[str, str]:
+def import_aliases(nodes: list[ast.AST], mod: str, is_init: bool) -> dict[str, str]:
     """Local name -> fully qualified target, for every import anywhere in the module.
 
     Function-local imports are included and scoping is ignored: a name bound by an import anywhere
     in the file resolves the same way everywhere in it. That can over-resolve a shadowed name, which
     errs toward reporting an operation, never toward hiding one."""
     aliases: dict[str, str] = {}
-    for node in ast.walk(tree):
+    for node in nodes:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.asname:
@@ -341,30 +392,54 @@ def classify_qualified(name: str) -> str | None:
 
 
 @dataclass
-class _Module:
+class ParsedModule:
     path: str
     mod: str
     tree: ast.Module
+    nodes: list[ast.AST]  # one walk, reused by every pass over the module
     aliases: dict[str, str]
     local_defs: set[str]
+    functions: set[str]
+
+    def resolve(self, expr: ast.expr) -> str | None:
+        return dotted(expr, self.aliases, self.mod, self.local_defs)
 
 
-def _parse(relpath: str, source: str) -> _Module:
+def _parse(relpath: str, source: str) -> ParsedModule:
     tree = ast.parse(source)
+    nodes = list(ast.walk(tree))
     mod = module_name(relpath)
     is_init = relpath.endswith("__init__.py")
-    local_defs = {
-        node.name
-        for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    functions = {
+        node.name for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
-    return _Module(
+    classes = {node.name for node in tree.body if isinstance(node, ast.ClassDef)}
+    return ParsedModule(
         path=relpath,
         mod=mod,
         tree=tree,
-        aliases=import_aliases(tree, mod, is_init),
-        local_defs=local_defs,
+        nodes=nodes,
+        aliases=import_aliases(nodes, mod, is_init),
+        local_defs=functions | classes,
+        functions=functions,
     )
+
+
+def _resolve_siblings(modules: list[ParsedModule]) -> None:
+    """Rewrite a bare sibling import under :data:`SIBLING_IMPORT_ROOTS` to its real module path."""
+    known = {m.mod for m in modules}
+
+    def is_known(target: str) -> bool:
+        parts = target.split(".")
+        return any(".".join(parts[:i]) in known for i in range(1, len(parts) + 1))
+
+    for m in modules:
+        if not m.mod.startswith(SIBLING_IMPORT_ROOTS):
+            continue
+        package = m.mod.rpartition(".")[0]
+        for local, target in list(m.aliases.items()):
+            if not is_known(target) and is_known(candidate := f"{package}.{target}"):
+                m.aliases[local] = candidate
 
 
 def _enclosing_functions(tree: ast.Module) -> dict[int, str]:
@@ -388,21 +463,101 @@ def _resolve_reexport(name: str, reexports: dict[str, str]) -> str:
     return name
 
 
-def _direct_operations(m: _Module) -> list[tuple[ast.AST, int, str, str]]:
+def _algorithms_in(call: ast.Call, m: ParsedModule) -> list[str]:
+    """Hash algorithms named in a call's ARGUMENTS, lower-cased, so the token can carry them."""
+    found: set[str] = set()
+    for arg in [*call.args, *(kw.value for kw in call.keywords)]:
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            name = arg.value.lower().replace("-", "_")
+            if name in HASH_ALGORITHMS:
+                found.add(name)
+            continue
+        ref = arg.func if isinstance(arg, ast.Call) else arg
+        qualified = m.resolve(ref)
+        if qualified is None:
+            continue
+        last = qualified.rpartition(".")[2].lower()
+        if (
+            qualified.startswith(("hashlib.", "cryptography.hazmat.primitives.hashes."))
+            and last in HASH_ALGORITHMS
+        ):
+            found.add(last)
+    return sorted(found)
+
+
+def _value_label(value: ast.expr, m: ParsedModule) -> str:
+    """A short label for the value a TLS attribute is set to, when it is a literal or a named
+    constant (``False``, ``CERT_NONE``, ``TLSv1_2``). Empty when it is anything else."""
+    if isinstance(value, ast.Constant) and isinstance(value.value, (bool, int, str)):
+        return f" {value.value}"
+    qualified = m.resolve(value)
+    return f" {qualified.rpartition('.')[2]}" if qualified else ""
+
+
+def _posture_targets(node: ast.AST) -> list[tuple[str, ast.expr | None]]:
+    """``(attribute, assigned value)`` for every TLS posture attribute an assignment sets."""
+    out: list[tuple[str, ast.expr | None]] = []
+
+    def visit(target: ast.expr, value: ast.expr | None) -> None:
+        if isinstance(target, (ast.Tuple, ast.List)):
+            values = (
+                value.elts
+                if isinstance(value, (ast.Tuple, ast.List)) and len(value.elts) == len(target.elts)
+                else [None] * len(target.elts)
+            )
+            for sub, sub_value in zip(target.elts, values, strict=True):
+                visit(sub, sub_value)
+        elif isinstance(target, ast.Attribute) and target.attr in TLS_POSTURE_ATTRIBUTES:
+            out.append((target.attr, value))
+
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            visit(target, node.value)
+    elif isinstance(node, ast.AnnAssign):
+        visit(node.target, node.value)
+    elif (
+        isinstance(node, ast.AugAssign)
+        and isinstance(node.target, ast.Attribute)
+        and node.target.attr in TLS_POSTURE_ATTRIBUTES | TLS_AUGMENTED_ATTRIBUTES
+    ):
+        out.append((node.target.attr, None))
+    return out
+
+
+def _direct_operations(
+    m: ParsedModule, known_functions: set[str], reexports: dict[str, str]
+) -> list[tuple[ast.AST, int, str, str]]:
     """``(node, line, class, callee)`` for every direct operation in one module."""
     found: list[tuple[ast.AST, int, str, str]] = []
-    for node in ast.walk(m.tree):
+    for node in m.nodes:
         if isinstance(node, ast.Call):
-            qualified = dotted(node.func, m.aliases, m.mod, m.local_defs)
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "setattr"
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value in TLS_POSTURE_ATTRIBUTES
+            ):
+                label = _value_label(node.args[2], m) if len(node.args) >= 3 else ""
+                found.append((node, node.lineno, "tls_context", f".{node.args[1].value} ={label}"))
+                continue
+            qualified = m.resolve(node.func)
             if qualified is not None:
                 op = classify_qualified(qualified)
                 if op is not None:
-                    found.append((node, node.lineno, op, qualified))
+                    algorithms = _algorithms_in(node, m)
+                    label = f"{qualified}[{','.join(algorithms)}]" if algorithms else qualified
+                    found.append((node, node.lineno, op, label))
                     continue
             if isinstance(node.func, ast.Attribute) and node.func.attr in METHOD_RULES:
-                if qualified is not None and qualified.startswith(_FIRST_PARTY):
-                    # A resolvable first-party call is handled by provider propagation, which knows
-                    # whether the target really performs crypto; a method-name guess would not.
+                if (
+                    qualified is not None
+                    and _resolve_reexport(qualified, reexports) in known_functions
+                ):
+                    # A call that lands on a first-party module-level FUNCTION is handled by provider
+                    # propagation, which knows whether that function really performs crypto; a
+                    # method-name guess would not. Anything else (a first-party class's method, a
+                    # module-level instance, an unresolvable receiver) keeps the method rule.
                     continue
                 op_class: str | None = METHOD_RULES[node.func.attr]
                 override = METHOD_OVERRIDES.get((m.path, node.func.attr))
@@ -411,37 +566,54 @@ def _direct_operations(m: _Module) -> list[tuple[ast.AST, int, str, str]]:
                 if op_class is not None:
                     found.append((node, node.lineno, op_class, f".{node.func.attr}()"))
         elif isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            for target in targets:
-                if isinstance(target, ast.Attribute) and target.attr in TLS_POSTURE_ATTRIBUTES:
-                    found.append((node, node.lineno, "tls_context", f".{target.attr} ="))
+            for attr, value in _posture_targets(node):
+                label = _value_label(value, m) if value is not None else ""
+                sign = "|=" if isinstance(node, ast.AugAssign) else "="
+                found.append((node, node.lineno, "tls_context", f".{attr} {sign}{label}"))
     return found
+
+
+def parse_files(files: list[Path], repo: Path) -> list[ParsedModule]:
+    """Parse ``files`` once. The gate hands the result to BOTH Python arms, so neither re-parses."""
+    return parse_sources(
+        {path.relative_to(repo).as_posix(): path.read_text(encoding="utf-8") for path in files}
+    )
+
+
+def parse_sources(sources: dict[str, str]) -> list[ParsedModule]:
+    """Parse ``repo-relative path -> source text`` into modules with their imports resolved."""
+    modules = [_parse(relpath, source) for relpath, source in sorted(sources.items())]
+    _resolve_siblings(modules)
+    return modules
 
 
 def discover_operations(files: list[Path], repo: Path) -> list[Operation]:
     """Every crypto operation site in ``files``, direct or through a first-party provider."""
-    return discover_operations_in(
-        {path.relative_to(repo).as_posix(): path.read_text(encoding="utf-8") for path in files}
-    )
+    return discover_operations_in_modules(parse_files(files, repo))
 
 
 def discover_operations_in(sources: dict[str, str]) -> list[Operation]:
     """:func:`discover_operations` over ``repo-relative path -> source text``, so the gate's own
     positive control can run the SAME instrument over a fixture that never touches the disk."""
-    modules = [_parse(relpath, source) for relpath, source in sorted(sources.items())]
+    return discover_operations_in_modules(parse_sources(sources))
 
+
+def discover_operations_in_modules(modules: list[ParsedModule]) -> list[Operation]:
+    """:func:`discover_operations` over modules already parsed by :func:`parse_sources`."""
     # Module-level re-exports: ``pkg.name -> target`` for every name a module binds by import.
     reexports: dict[str, str] = {}
     for m in modules:
         for local, target in m.aliases.items():
             reexports.setdefault(f"{m.mod}.{local}", target)
+    # Every first-party module-level function: the only things that can become providers.
+    known_functions = {f"{m.mod}.{name}" for m in modules for name in m.functions}
 
     direct: dict[str, list[tuple[ast.AST, int, str, str]]] = {}
     owners: dict[str, dict[int, str]] = {}
     # provider qualified name -> the operation classes it performs, directly or transitively.
     providers: dict[str, set[str]] = {}
     for m in modules:
-        ops = _direct_operations(m)
+        ops = _direct_operations(m, known_functions, reexports)
         direct[m.path] = ops
         owner = _enclosing_functions(m.tree)
         owners[m.path] = owner
@@ -450,18 +622,19 @@ def discover_operations_in(sources: dict[str, str]) -> list[Operation]:
             if fn is not None:
                 providers.setdefault(f"{m.mod}.{fn}", set()).add(op)
 
-    # Calls to first-party functions, resolved once: (module, node, line, enclosing fn, target).
-    first_party_calls: list[tuple[_Module, ast.Call, str | None, str]] = []
+    # Calls that land on a first-party module-level function: (module, node, enclosing fn, target).
+    first_party_calls: list[tuple[ParsedModule, ast.Call, str | None, str]] = []
     for m in modules:
         owner = owners[m.path]
-        for node in ast.walk(m.tree):
+        for node in m.nodes:
             if not isinstance(node, ast.Call):
                 continue
-            qualified = dotted(node.func, m.aliases, m.mod, m.local_defs)
+            qualified = m.resolve(node.func)
             if qualified is None:
                 continue
             target = _resolve_reexport(qualified, reexports)
-            first_party_calls.append((m, node, owner.get(id(node)), target))
+            if target in known_functions:
+                first_party_calls.append((m, node, owner.get(id(node)), target))
 
     # Fixed point. Who BECOMES a provider is the noise budget, so it is rationed:
     #
@@ -515,10 +688,16 @@ def discover_operations_in(sources: dict[str, str]) -> list[Operation]:
 
 
 def operation_token(op: Operation) -> str:
-    """The inventory token for one operation: ``class:callee`` for a direct call, so the ALGORITHM is
-    part of what is reviewed (``hash:hashlib.sha256`` and ``hash:hashlib.md5`` are different rows),
-    and ``class:via <module>`` for a call through a first-party provider. The provider's MODULE, not
-    its function, so renaming a helper inside a seam does not ripple through every caller's row."""
+    """The inventory token for one operation: ``class:callee`` for a direct call and ``class:via
+    <module>`` for a call through a first-party provider.
+
+    The callee carries the ALGORITHM wherever the call names one, in the callee itself
+    (``hashlib.sha256`` against ``hashlib.md5``) or in an argument (``hmac.new[sha256]``,
+    ``hashlib.new[md5]``), and a TLS posture assignment carries a literal or named-constant value
+    (``.verify_mode = CERT_NONE``). So changing an algorithm, or switching verification off, changes
+    a token. An algorithm held in a VARIABLE does not; see the residual in the module docstring. The
+    provider half names the MODULE, not its function, so renaming a helper inside a seam does not
+    ripple through every caller's row."""
     if op.via is not None:
         return f"{op.op_class}:via {op.via.rpartition('.')[0]}"
     return f"{op.op_class}:{op.callee}"
