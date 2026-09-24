@@ -243,8 +243,12 @@ route handler only when all of them pass.
 3. **The `require*()` deny-by-default ladder**, in this order: **503** `authentication is not configured`
    when no enabled `AuthService` is attached and `allow_no_auth` was not set (the fail-closed embedding
    guard, SYS-1) → **401** when the bearer token resolves to no identity → **403** `password change
-   required` when the identity is flagged `must_change_password` and the path is not one of the three
-   exempt paths (`/auth/logout`, `/auth/me`, `/me/password`) → **403** `missing permission: <value>`
+   required` when the identity is flagged `must_change_password` and the path is not must-change
+   exempt (`_MUST_CHANGE_EXEMPT_PATHS`; at least `/auth/logout`, `/auth/me`, `/auth/mfa-verify` and
+   `/me/password`) → **403** + `X-MFA-Required`
+   plus an `auth.mfa_denied` audit row when the session's second factor is pending and the route is not
+   MFA-exempt (on `/me/password`, only when an account other than a directory account holds a
+   factor, BACKLOG #1954; see the "MFA state" row below) → **403** `missing permission: <value>`
    plus an `auth.permission_denied` audit row for the first unheld permission. On success it writes one
    `auth.permission_granted` row — **every satisfied route, GETs included**, since
    `[security].audit_all_authorization_decisions` defaults **on** (BACKLOG #1277). PHI-view grants are
@@ -406,9 +410,9 @@ tuple: they act only on the caller's own account.
 |---|---|---|---|
 | `POST` | `/auth/logout` | `require` | exempt from the `must_change_password` confinement |
 | `GET` | `/auth/me` | `require` | exempt from the `must_change_password` confinement |
-| `POST` | `/me/password` | `require` | per-**actor** credential-ceremony limiter; refused (400) for an AD identity; exempt from the confinement |
+| `POST` | `/me/password` | `require` | per-**actor** credential-ceremony limiter; refused (400) for an AD identity; exempt from the confinement; MFA-exempt only for an account with **no** factor: a pending session on an account that has one gets 403 + `X-MFA-Required` (BACKLOG #1954) |
 | `POST` | `/me/reauth` | `require` | per-**actor** credential-ceremony limiter; mints the action-bound grant when `purpose=` is given |
-| `POST` | `/auth/mfa-verify` | `require` | draws the **sign-in** window (per-IP + global); feeds the per-account lockout |
+| `POST` | `/auth/mfa-verify` | `require` | draws the **sign-in** window (per-IP + global); feeds the per-account lockout; exempt from the confinement, so a must-change account that has a factor can prove it before it rotates (BACKLOG #1954) |
 | `GET` | `/me/mfa` | `require` | |
 | `POST` | `/me/mfa/enroll` | `require_reauth_only_action` (action `mfa_enroll`) | password-only step-up — the MFA gate is skipped so a required-but-unenrolled user cannot deadlock |
 | `POST` | `/me/mfa/confirm` | `require_reauth_only_action` (action `mfa_confirm`) | per-actor ceremony limiter; password-only step-up |
@@ -758,7 +762,10 @@ because a gate that demanded a fresh step-up to *perform* a step-up would deadlo
 `/ui/mfa` routes (ASVS 6.3.3) are the same shape for the same reason: `require_ui` 303s every
 MFA-pending session **to** `/ui/mfa`, so gating that page would redirect it to itself. Both
 re-implement the gate's checks by hand, in the gate's order (`must_change` before the second
-factor), and neither is reachable without a live session cookie — "unauthenticated" here means
+factor), with one exception: a must-change session that still owes a factor it has enrolled stays on
+`/ui/mfa`, because the password page refuses it until then (BACKLOG #1954). `POST /ui/reauth/webauthn`
+makes the same exception, since for a passkey-only account it is the only way to prove that factor.
+None of them is reachable without a live session cookie — "unauthenticated" here means
 "carries no `Depends` gate", not "open".
 
 The `/ui/static` **mount** is the eleventh unauthenticated served path, and it is not a route at all:
@@ -1371,13 +1378,13 @@ slack.
 | New client IP during a session | this request's address vs `session.client` | knob on **and** a session exists, is unrevoked, has an anchor, and the two are not the same host (both-loopback counts as one host) | **CHALLENGE** — force a fresh step-up; first sighting also writes `auth.admin_action_new_ip` + an out-of-band notice; repeats WARNING-log only. **Never** an RBAC deny | **off** | `[auth].admin_new_ip_step_up` |
 | Credential recency | age of `session.reauth_at` | `now − reauth_at > step_up_max_age_seconds`, or `reauth_at is None` | **DENY** 403 + `X-Step-Up-Required: 1` (console: 303 → `/ui/reauth`) | 300 s | `[auth].step_up_max_age_seconds` |
 | Action-bound step-up grant | a single-use grant minted only by `reauth(purpose=…)`, on the **monotonic** clock | no unconsumed grant for this route's action | **DENY** 403 + `X-Step-Up-Required` + `X-Step-Up-Action: <action>`; opting out falls back to the session window — **except on a factor bind or a session terminate**, see the row below | on | `[auth].require_action_step_up` |
-| Binding a NEW second factor, or ending sessions | the session's MFA state × the account's existing factors | the action binds a factor (`mfa_enroll`, `mfa_confirm`, `webauthn_enroll`) or ends sessions (`session_terminate`, BACKLOG #1951) **and** the session has not satisfied its second factor **and** the account already holds one of either kind | **DENY** — the existing factor must be proven first (`POST /auth/mfa-verify`, or the code/passkey leg of `/ui/reauth`). An account with **no** factor still enrols its first one, and still ends its own sessions, from a password-only session; that carve-out is what the MFA gate's exemptions are for | on | **no knob** — `require_action_step_up` does not reach it, deliberately |
+| Binding a NEW second factor, ending sessions, or changing the password | the session's MFA state × the account's existing factors | the action binds a factor (`mfa_enroll`, `mfa_confirm`, `webauthn_enroll`), ends sessions (`session_terminate`, BACKLOG #1951) or changes the password (`POST /me/password` and `/ui/account/password`, BACKLOG #1954) **and** the session has not satisfied its second factor **and** the account already holds one of either kind | **DENY** — the existing factor must be proven first (`POST /auth/mfa-verify`, `/ui/mfa`, or the code/passkey leg of `/ui/reauth`); the password routes answer 403 + `X-MFA-Required` (console: 303 → `/ui/mfa`). An account with **no** factor still enrols its first one, ends its own sessions and changes its password from a password-only session; that carve-out is what the MFA gate's exemptions are for | on | **no knob** — `require_action_step_up` does not reach it, deliberately |
 | MFA state | `session.mfa_verified_at` × factor enrollment × account roles | the rule is **provider-blind** (BACKLOG #1144 — an AD account used to be exempt here, on a delegation the directory never asserted): enrolled → always required, whatever the scope says; un-enrolled → required when the knob is on **and** the scope covers the account — **`every_local_account` by default**, i.e. every account despite the value's narrower name, or the Administrator role only under `administrators`. A directory session that was minted without an engine-verified factor is refused outright while the knob is on | **DENY** 403 + `X-MFA-Required: 1` on **every** authorized route — an **access gate**, not only a step-up gate; the console twin is a 303 to `/ui/mfa`, with the account and factor-enrolment routes exempt so an un-enrolled user is not stranded. An earlier revision of this row said Administrator-only and step-up-boundary-only; both were wrong | on; scope `every_local_account` | `[security].require_mfa`, `[security].require_mfa_scope` (the `[auth]` spellings are rejected at load) |
 | Identity provider — local credential rotation | `identity.auth_provider` | the provider is AD (the credential is the directory's, not the engine's) | **DENY** `POST /me/password` with **400**; the step-up re-proof for that identity becomes a **live directory re-bind** instead of a local hash compare, so a disabled AD account cannot refresh its window, and the engine MFA gate never fires for it | n/a | `[auth].ad_enabled` |
 | Authentication ambience | how the session was minted | browser Kerberos SSO and the OIDC callback mint with `seed_reauth=False` | **CHALLENGE** — the session is born **without** step-up freshness, so its first sensitive action forces an explicit credential step-up (the *second* signal in this table whose action is a challenge rather than a hard decision) | n/a | (by design) |
 | Session age | `created_at` / `last_used_at` / `expires_at` vs wall clock, on **every** request | idle > 30 min; past the absolute expiry (12 h, or a tighter federated cap: the signature-verified `id_token.exp`, or `auth_time + oidc_max_age_seconds`); or a **backward** wall-clock step (NTP step-back, VM snapshot revert) | **DENY** — the session is revoked in the store, then 401. The idle clock is refreshed only by user-driven requests, so a background poll cannot keep a session alive | 30 min / 12 h | `[security].sign_out_after_idle_minutes`, `max_session_hours` (the ADR 0118 homes; `[auth].session_idle_timeout_minutes` / `session_absolute_hours` are the retired aliases), plus `[auth].oidc_session_max_hours` for a tighter federated cap and `[auth].oidc_max_age_seconds` for the IdP-authentication recency cap |
 | Account state — disabled | `user.disabled` | the account is disabled | **DENY** — no identity is built on **any** plane | n/a | (no knob — an admin action) |
-| Account state — credential rotation pending | `user.must_change_password` | the flag is set | **CONFINE** — every route but the rotation routes is refused (403 JSON / 303 console / hard WS reject) | n/a | (no knob — set by admin creation and password reset) |
+| Account state — credential rotation pending | `user.must_change_password` | the flag is set | **CONFINE** — every route but the rotation routes and the second-factor step is refused (403 JSON / 303 console / hard WS reject). An account that also owes a factor it has enrolled proves it first; one with no factor rotates first | n/a | (no knob — set by admin creation and password reset) |
 | Concurrent session count | the user's live session count at login | count would exceed the cap | **DENY** — this login proceeds; the user's **oldest** session is revoked | 5 sessions, `0` = unlimited | `[auth].max_sessions_per_user` |
 | Live directory resolvability — probe strikes | a periodic AD probe of principals that still hold sessions | interval floored at 60 s; **2 consecutive** failed passes (`ad_session_recheck_strikes`); ≤ 200 users (`ad_session_recheck_max_users`) probed per pass, least-recently-probed first. Fail-**open** on DC unavailability (an unreachable DC revokes nothing) | **DENY** by revocation, `auth.ad_session_revoked` audited | **300 s** (the shipped default); `0` disables the loop entirely and is a named loosening | `[auth].ad_session_recheck_seconds`, `ad_session_recheck_strikes`, `ad_session_recheck_max_users` |
 | Live directory group membership vs. the session's granted roles | the AD groups returned by that same reconciliation probe, mapped through the AD-group→role map | on a **successful (PRESENT)** probe, the mapped role set differs from the account's current roles — a **single** pass, **no** strike accrual (unlike the row above) | **DENY** by revocation of every session for that account (the new roles are persisted first), `auth.ad_session_revoked` with `reason = roles_changed`; charged against the same mass-revoke breaker as an absence | **300 s** (same loop; `0` disables it) | `[auth].ad_session_recheck_seconds` |
@@ -1738,14 +1745,22 @@ would deadlock an MFA-required-but-unenrolled operator out of revoking their own
 carve-out serves only an account with **no** factor. A pending session on an account that has one
 must prove it first, at `POST /auth/mfa-verify` or the code/passkey leg of `/ui/reauth`. Until it
 does, `POST /me/reauth` mints no `session_terminate` grant for it, and both terminate routes refuse
-it with `X-MFA-Required` (ASVS 6.3.3, BACKLOG #1951). That closes these two routes only. **It is
-not a claim that a password-only caller cannot end the user's sessions.** `POST /me/password` stays
-reachable from a pending session and revokes every session of the account when it changes the
-password, so on a first deployment a caller holding only the password would still sign such a user
-out that way, and change the password too. Refusing it there is an open question: the must-change
-confinement does not exempt `/auth/mfa-verify`, so an account that is both must-change and pending
-would have no way forward. The console's `POST /ui/account/password` has the same shape, since it
-is reachable while pending.
+it with `X-MFA-Required` (ASVS 6.3.3, BACKLOG #1951).
+
+Changing the password also ends every session, and it follows the same rule (BACKLOG #1954). A
+pending session on an account with a factor gets `403` + `X-MFA-Required` from `POST /me/password`,
+and the console's password page sends it to `/ui/mfa`. Both refusals are audited as
+`auth.mfa_denied`. An account with no factor still changes its password from a pending session.
+
+At least one shipped path makes an account must-change **and** leaves it a factor: an
+administrator password reset, which keeps the account's factors. That account proves its factor
+first, then rotates. The must-change confinement lets `POST /auth/mfa-verify` through for it, and the
+console sends it to `/ui/mfa` before the password page. A passkey-only account has to do this on the
+console, through `POST /ui/reauth/webauthn`, because the JSON plane has no passkey leg. So a
+JSON-only client cannot rotate it. Before this change such a client could rotate it and then do
+nothing else. Its next sign-in was pending, with no way to prove a passkey there. A directory
+account is not refused here: `POST /me/password` answers it with the usual 400 and changes nothing.
+The owner ruled on 2026-09-24 to keep this behaviour as built.
 
 Every targeted revoke is audited (`auth.session_revoked`, with scope + actor). The **web console** surfaces
 this: an **Active sessions…** view in the account menu lists your sessions and offers per-session
@@ -1999,8 +2014,8 @@ neither the successful-login write nor the login-time rehash beside it is ever r
 failed-attempt write only clears an **already lapsed** lock. Two routes reach `set_password` while an
 account is locked, both local-account-only, and **both issue a new password rather than merely lifting
 the lock**: the holder's own `POST /me/password`, reachable only while they still have a live session
-(session validation never consults `locked_until`, and that route is exempt from both the must-change
-and the MFA-pending gates), and the
+(session validation never consults `locked_until`, and that route is exempt from the must-change
+gate and, for an account with no factor, from the MFA-pending gate), and the
 [administrator's reset](#admin-password-reset-wp-l3-12-asvs-646). The one shipped command that lifts a
 lock without issuing a password is `messagefoundry admin-unlock`
 ([ADR 0171](adr/0171-offline-administrator-unlock-a-host-gated-cli-recovery-path-for-a-sole-administrator-lockout.md)),

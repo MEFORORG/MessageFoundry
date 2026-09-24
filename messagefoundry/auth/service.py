@@ -3275,8 +3275,10 @@ class AuthService:
     #: - binding a new factor (``mfa_enroll``, ``mfa_confirm``, ``webauthn_enroll``) is a promotion
     #:   path, because both ceremonies mark the session MFA-satisfied on success;
     #: - ending sessions (``session_terminate``, BACKLOG #1951, ASVS 7.5.2) through the terminate
-    #:   routes would let a password holder sign the real user out without the second factor. That
-    #:   is these routes only: ``POST /me/password`` still revokes every session from a pending one.
+    #:   routes would let a password holder sign the real user out without the second factor.
+    #:
+    #: Changing the password does both at once, but it takes no grant and rides no reauth-only gate,
+    #: so it asks the same rule through :meth:`password_change_owes_factor` instead (BACKLOG #1954).
     #:
     #: A new action on either reauth-only action gate belongs here too. A test in
     #: ``tests/test_mfa_access_gate.py`` catches at least a missing one wired in the engine or
@@ -3311,6 +3313,15 @@ class AuthService:
         """
         if purpose not in self._PENDING_REFUSED_ACTIONS:
             return False
+        return await self._owes_enrolled_factor(token)
+
+    async def _owes_enrolled_factor(self, token: str | None, *, local_only: bool = False) -> bool:
+        """Whether the session is MFA-pending on an account that already HAS a second factor.
+
+        Fails closed (True) when the session or its user cannot be found. ``local_only`` answers
+        False for a directory account, whose password the engine does not hold. It names AD rather
+        than excluding everything that is not LOCAL: ``_build_identity`` maps an unrecognized
+        provider back to LOCAL, so the password handler treats that row as local and changes it."""
         if not token:
             return True  # no session to act on, so fail closed (as below)
         if await self.mfa_satisfied(token):
@@ -3321,7 +3332,21 @@ class AuthService:
         user = await self._store.get_user(session.user_id)
         if user is None:
             return True
+        if local_only and user.auth_provider == AuthProvider.AD.value:
+            return False
         return await self._second_factor_enrolled(user)
+
+    async def password_change_owes_factor(self, token: str | None) -> bool:
+        """Whether this session must prove its second factor before it may change the password.
+
+        BACKLOG #1954 (ASVS 6.3.3). A change revokes every session, so a password holder on a
+        pending session must not reach it on the password alone. True for a pending session on
+        an account that holds a factor, unless it is a directory (AD) account, and when the session
+        or its user cannot be found. An account with no factor has nothing to prove and
+        rotates as before, and a directory account is left to the route's 400, which changes
+        nothing. PUBLIC for the reason :meth:`factor_binding_is_blocked` gives: the JSON gate and
+        the web console's password and factor pages all ask it, so the planes cannot drift."""
+        return await self._owes_enrolled_factor(token, local_only=True)
 
     async def factor_binding_is_blocked(self, token: str | None, action: str) -> bool:
         """PUBLIC contract boundary over :meth:`_factor_binding_is_blocked`, for the ROUTE gates.

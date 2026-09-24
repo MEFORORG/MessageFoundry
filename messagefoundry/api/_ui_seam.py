@@ -176,12 +176,18 @@ from typing import Any
 #: above -- and they force a bump. Unnumbered: the ``vN`` labels are retired as identifiers (#1220
 #: above); the digest is the identifier.
 #:
+#: BACKLOG #1954 (ASVS 6.3.3): ``AuthService`` gained the public ``password_change_owes_factor``,
+#: which the console's password page, ``require_ui`` and the ``/ui/login``, ``/ui/mfa``,
+#: ``/ui/reauth`` and ``/ui/reauth/webauthn`` routes call to decide where a must-change session
+#: goes. A METHOD the console calls, so it forces a bump for the reason the
+#: ``factor_binding_is_blocked`` entry above gives. Unnumbered, as above.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "65ee7bd5234eb01b"
+ENGINE_UI_SEAM: str = "37e84a155b662187"
 
 
 @dataclass(frozen=True, slots=True)

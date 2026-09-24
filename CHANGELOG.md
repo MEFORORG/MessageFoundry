@@ -136,6 +136,19 @@ All notable changes to MessageFoundry are documented here. The format follows
   would see that partner fail to open the message after its relay has already accepted it**, so the
   failure would surface on the partner's side, not as a send error here.
   ([BACKLOG #1168](docs/BACKLOG.md))
+- **BREAKING — a session that has not proved its second factor can no longer change the password of
+  an account that has one.** In 0.4.0 `POST /me/password` accepted an MFA-pending session on the
+  password alone, and a change ends every session, so a caller holding only the password could lock
+  the real user out. It now answers `403` with an `X-MFA-Required` header, and audits
+  `auth.mfa_denied`, when the account has confirmed TOTP or a registered passkey. That covers every
+  provider except a directory account, which still gets its `400`. The web console's password page
+  sends the same session to `/ui/mfa` instead. `POST /auth/mfa-verify` is now reachable while a
+  password change is required, so a must-change account with a factor, such as one an administrator
+  reset, proves the factor first and then rotates. An account with no factor rotates as before.
+  **Migration:** on that `403`, send `POST /auth/mfa-verify` with a TOTP code, adopt the token it
+  returns, and retry. The JSON API has no passkey leg, so a passkey-only account proves its factor on
+  the web console.
+  ([BACKLOG #1954](docs/BACKLOG.md))
 - **A keyed store now refuses an unmarked value in an encrypted column instead of reading it back
   as plaintext.** Once a store key is set, every covered column holds only `mfenc:` ciphertext, so
   a non-blank value without the marker is a stripped marker or a planted row. The cipher raises
