@@ -592,7 +592,9 @@ gates a merge**, and no seat has to clear one.
    Bash call itself. CI arrives later, when the process is gone.
 3. It runs the checks below **before** it commits, because nobody downstream can ask it to.
 4. Its process exits when it has pushed and reported. The Manager opens the PR, often one PR for
-   several Builders' branches. The worktree stays behind.
+   several Builders' branches. The worktree stays behind. **A Builder started from a chip is not the
+   Manager's subagent and opens its own PR** (korus `roles/MANAGER.md`, *A session started from a
+   chip opens its own pull request*).
 5. **It CAN declare its own seat, through the Bash tool.** Measured 2026-09-02: a headless `-p`
    Builder ran `seat.ps1 -Declare` and its record carries `seatSource: declared` with a real goal,
    which no hook can write. **Quote the Windows path.** Unquoted, the SHELL eats the backslashes:
@@ -777,7 +779,9 @@ gates a merge**, and no seat has to clear one.
   to a Builder; the Manager never writes that resolution. **No other seat decides this.** A Builder
   cannot, because it exits first. The Lander owns the PR from the handover on and repairs it like
   any other, but dropping an item is a re-cut, and re-cuts go back to the Manager. Every other seat
-  opens its own PR and may batch its own work the same way. The steps, the PR
+  opens its own PR and may batch its own work the same way. **"Dispatched by a Manager" means running
+  as its SUBAGENT (owner ruling 2026-09-23).** A session started from a chip is a separate session
+  whose report reaches nobody, so it opens its own PR even when a Manager raised the chip. The steps, the PR
   body shape and the traps are in korus `roles/MANAGER.md`, *When to cut a pull request*.
 - **The merge is the Lander's, and NO LABEL BLOCKS IT.** What blocks a merge is branch protection and
   the required contexts, nothing else. **Reading a diff before merging it is still the job; no check

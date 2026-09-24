@@ -18,11 +18,11 @@ report is the channel back -- put the question there. Either way the ANSWER arri
 Builder's brief, never as a reply to you.
 
 **If a chip started you, you are a separate session and your report reaches nobody** (owner ruling
-2026-09-23). Push, then send your branch and head SHA to the Manager's `local_` id from your prompt.
-If the result says *delivered*, the Manager opens the PR. On anything else -- *queued*, an error, or
-no id -- open your own one-item PR and say in its body that you could not reach the Manager. A chip
-raised by any seat but a Manager: open your own PR. The source of record is korus `roles/MANAGER.md`,
-*A session started from your chip opens its own pull request unless it reaches you live*.
+2026-09-23). So open your own one-item PR, even when a Manager raised the chip: body with your report
+and head SHA, your QA line as a comment, and the handover to the Lander. Then message the seat that
+raised the chip with the PR number if you can reach it, and do not wait. Only a Manager's SUBAGENT
+leaves the PR to the Manager. Source of record: korus `roles/MANAGER.md`, *A session started from a
+chip opens its own pull request*.
 
 ## What it must not do
 
