@@ -570,7 +570,8 @@ class SqlServerCoordinator:
             was_leader, released_at, wrote, lease_released = await self._release_leadership(
                 force_write=arming
             )
-            if arming and wrote and not (was_leader or lease_released):
+            outcome = StepdownOutcome(was_leader, released_at, lease_released)
+            if arming and wrote and not outcome.drained:
                 # Nothing to drain: the row names another node, so undo this call's arm (#1508).
                 self._no_claim_until = prior_pause
             elif arming:
@@ -581,13 +582,13 @@ class SqlServerCoordinator:
                     self._no_claim_until,
                     self._monotonic() + stepdown_pause_seconds(self._heartbeat_seconds),
                 )
-            if was_leader or lease_released:  # a row release is a demotion edge too (#1508)
+            if outcome.drained:  # a row release is a demotion edge too (#1508)
                 self._fire_on_demote()
             if not wrote:  # NOT nested under was_leader — a retry has already demoted
                 raise StepdownReleaseUnconfirmed(lease_release_unconfirmed(self.node_id))
         finally:
             self._leadership_lock.release()
-        return StepdownOutcome(was_leader, released_at, lease_released)
+        return outcome
 
     def _may_own_lease_row(self) -> bool:
         """Mirrors ``DbCoordinator._may_own_lease_row`` — read its docstring for the three disjuncts

@@ -253,6 +253,12 @@ class StepdownOutcome(NamedTuple):
     released_at: float | None
     lease_released: bool
 
+    @property
+    def drained(self) -> bool:
+        """Whether the call drained anything: the rule behind the endpoint's ``200`` versus ``409``,
+        and behind the demotion edge a stepdown fires."""
+        return self.was_leader or self.lease_released
+
 
 def _rows_affected(status: object) -> int:
     """The row count in asyncpg's command tag (``"UPDATE 1"``), or ``-1`` when there is none to read,
@@ -568,11 +574,8 @@ class ClusterCoordinator(Protocol):
         fence or a lost-lease tick can flip leadership between the read and the release, and auditing
         the pre-read would record ``was_leader=true`` for an action that released nothing.
 
-        **The two booleans are separate on purpose (BACKLOG #1508).** In the self-fence window the gate
-        is already clear while the row is still live and still ours, so a release there reports
-        ``was_leader=False, lease_released=True``: it drained a lease, from a node that had already
-        stopped leading. The endpoint answers ``200`` when either is true and ``409`` only when neither
-        is. :class:`NullCoordinator` returns all three false and ``None``.
+        The two booleans are separate on purpose; :class:`StepdownOutcome` says why (BACKLOG #1508).
+        The endpoint answers ``200`` when :attr:`StepdownOutcome.drained` and ``409`` otherwise.
 
         This is a **visibility lift** of the release the coordinators already run on a clean
         :meth:`stop`, not a new election mechanism: the lease, the self-fence and the epoch token are
@@ -1473,7 +1476,8 @@ class DbCoordinator:
             was_leader, released_at, wrote, lease_released = await self._release_leadership(
                 force_write=arming
             )
-            if arming and wrote and not (was_leader or lease_released):
+            outcome = StepdownOutcome(was_leader, released_at, lease_released)
+            if arming and wrote and not outcome.drained:
                 # NOTHING TO DRAIN: the write returned and matched no row, so the row names another
                 # node. Undo this call's arm, so a 409 leaves a follower that once led exactly as it
                 # found it; a pause here would only delay the follower's claim if the leader failed.
@@ -1500,7 +1504,7 @@ class DbCoordinator:
                 )
             # A row release counts as a demotion edge too (BACKLOG #1508). In the self-fence window
             # the watchdog already fired it; firing again only re-sets the engine's wake event.
-            if was_leader or lease_released:
+            if outcome.drained:
                 self._fire_on_demote()
             # NOT nested under `was_leader`. A retry re-sending an owed write has already demoted, so it
             # reports was_leader=False and would otherwise swallow a second failure into a 409.
@@ -1508,7 +1512,7 @@ class DbCoordinator:
                 raise StepdownReleaseUnconfirmed(lease_release_unconfirmed(self.node_id))
         finally:
             self._leadership_lock.release()
-        return StepdownOutcome(was_leader, released_at, lease_released)
+        return outcome
 
     def _may_own_lease_row(self) -> bool:
         """Whether this node may own a lease row, so a stepdown must send the expiring write

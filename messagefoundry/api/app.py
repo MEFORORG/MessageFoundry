@@ -6012,7 +6012,7 @@ def create_app(
         )
         # 200 when EITHER fact holds (BACKLOG #1508): a self-fenced node no longer holds the gate but
         # did own a live row, and releasing that row IS the drain the caller asked for.
-        if not (outcome.was_leader or outcome.lease_released):
+        if not outcome.drained:
             raise HTTPException(
                 409, f"node {c.node_id} is not the current leader and owns no lease row to release"
             )
