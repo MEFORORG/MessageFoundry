@@ -45,6 +45,7 @@ from .._auth import (
     is_unlock_action,
     login_redirect_response,
     lookup_ui_action,
+    must_change_target,
     register_ui_action,
     require_ui,
     require_ui_step_up,
@@ -1107,9 +1108,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return login_redirect_response()
         if identity.must_change_password:
             # Mirror require_ui's confinement (L4b): rotate, or first prove an owed factor (#1954).
-            if await rotation_comes_first(auth, True, token):
-                return RedirectResponse("/ui/account/password", status_code=303)
-            return RedirectResponse("/ui/mfa", status_code=303)
+            return RedirectResponse(await must_change_target(auth, token), status_code=303)
         mfa = await auth.mfa_status(identity)
         if mfa.required and not (mfa.enabled or mfa.webauthn_enrolled) and action.step_up:
             # A full-step-up action a required-but-UNENROLLED session (no factor of EITHER
@@ -1144,9 +1143,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return login_redirect_response()  # session ended mid-ceremony — see ui_reauth_form
         if identity.must_change_password:
             # Mirror require_ui's confinement (L4b): rotate, or first prove an owed factor (#1954).
-            if await rotation_comes_first(auth, True, token):
-                return RedirectResponse("/ui/account/password", status_code=303)
-            return RedirectResponse("/ui/mfa", status_code=303)
+            return RedirectResponse(await must_change_target(auth, token), status_code=303)
         form = dict(parse_qsl((await request.body()).decode("utf-8", "replace")))
         next_ = form.get("next", "")
         action = lookup_ui_action(next_)

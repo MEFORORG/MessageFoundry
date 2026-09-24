@@ -679,7 +679,11 @@ async def test_a_reset_account_with_a_factor_proves_it_and_then_rotates(
             "/auth/mfa-verify", json={"code": totp.totp(secret, now=t1)}, headers=_auth(tok)
         )
         assert r.status_code == 200, r.text
-        r = await _change_password(c, str(r.json()["token"]), current=temp)
+        tok = str(r.json()["token"])
+        # Proving the factor opens the rotation route and nothing else: still must-change.
+        still = await c.get("/messages", headers=_auth(tok))
+        assert still.status_code == 403 and still.json()["detail"] == "password change required"
+        r = await _change_password(c, tok, current=temp)
         assert r.status_code == 200, r.text
     assert (await service.login("vic", PW2)).ok
 

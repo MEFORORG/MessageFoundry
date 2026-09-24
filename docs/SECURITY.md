@@ -229,8 +229,9 @@ route handler only when all of them pass.
 3. **The `require*()` deny-by-default ladder**, in this order: **503** `authentication is not configured`
    when no enabled `AuthService` is attached and `allow_no_auth` was not set (the fail-closed embedding
    guard, SYS-1) → **401** when the bearer token resolves to no identity → **403** `password change
-   required` when the identity is flagged `must_change_password` and the path is not one of the four
-   exempt paths (`/auth/logout`, `/auth/me`, `/auth/mfa-verify`, `/me/password`) → **403** + `X-MFA-Required`
+   required` when the identity is flagged `must_change_password` and the path is not must-change
+   exempt (`_MUST_CHANGE_EXEMPT_PATHS`; at least `/auth/logout`, `/auth/me`, `/auth/mfa-verify` and
+   `/me/password`) → **403** + `X-MFA-Required`
    plus an `auth.mfa_denied` audit row when the session's second factor is pending and the route is not
    MFA-exempt (on `/me/password`, only when a local account holds a factor, BACKLOG #1954; see the
    "MFA state" row below) → **403** `missing permission: <value>`
@@ -1691,10 +1692,13 @@ At least one shipped path makes an account must-change **and** leaves it a facto
 administrator password reset, which keeps the account's factors. That account proves its factor
 first, then rotates. The must-change confinement lets `POST /auth/mfa-verify` through for it, and the
 console sends it to `/ui/mfa` before the password page. A passkey-only account has to do this on the
-console, through `POST /ui/reauth/webauthn`, because the JSON plane has no passkey leg; that is
-already true of its every sign-in. A directory account is not refused here: `POST /me/password`
-answers it with the usual 400 and changes nothing. This change was made without an owner ruling, by
-a Manager decision of 2026-09-24, because the research found no flow it strands.
+console, through `POST /ui/reauth/webauthn`, because the JSON plane has no passkey leg. Before this
+change a JSON-only client could rotate such an account's password and could then do nothing else,
+since its next sign-in is pending with no way to prove a passkey there; now it cannot rotate
+either. A directory account is not refused here: `POST /me/password` answers it with the usual 400
+and changes nothing. This change was made without an owner ruling, by
+a Manager decision of 2026-09-24, because the research found no account it leaves without a way
+forward.
 
 Every targeted revoke is audited (`auth.session_revoked`, with scope + actor). The **web console** surfaces
 this: an **Active sessions…** view in the account menu lists your sessions and offers per-session

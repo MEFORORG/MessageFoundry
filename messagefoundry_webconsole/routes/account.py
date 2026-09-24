@@ -15,7 +15,7 @@ from messagefoundry.api.auth_models import (
     PasswordChangeRequest,
 )
 from messagefoundry.api.security import pending_credential_deadline_for
-from messagefoundry.auth import AuthProvider, Identity
+from messagefoundry.auth import Identity
 from messagefoundry.auth import webauthn as webauthn_mod
 from messagefoundry.auth.service import (
     STEP_UP_ACTION_MFA_CONFIRM,
@@ -36,7 +36,6 @@ from .._auth import (
     assert_same_origin,
     clear_session_cookie,
     login_redirect_response,
-    password_change_owes_factor,
     register_ui_action,
     require_ui,
     require_ui_reauth_only,
@@ -190,19 +189,18 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         able to rotate. A pending session on an account that HAS one goes to the factor page first,
         and the refusal is audited like ``require_ui``'s own. The JSON handler this page delegates
         to is reached in-process, past its ``Depends`` gate, so the check has to live here too."""
-        if (
-            identity.auth_provider is not AuthProvider.LOCAL
-            or not await password_change_owes_factor(service, session_token(request))
-        ):
-            return None  # a directory account gets the handler's 400, as on the JSON plane
+        if not await service.password_change_owes_factor(session_token(request)):
+            return None
         await service.audit_mfa_denied(identity, request.url.path, client=_client(request))
         return RedirectResponse("/ui/mfa", status_code=303)
 
     @app.get("/ui/account/password", response_class=HTMLResponse)
     async def ui_account_password_form(
         request: Request,
-        service: AuthService = Depends(_service),
+        # identity BEFORE service: FastAPI resolves them in order, and require_ui's login redirect
+        # must answer a disabled-auth app before _service's bare 503 does.
         identity: Identity = Depends(require_ui(allow_must_change=True, allow_mfa_pending=True)),
+        service: AuthService = Depends(_service),
     ) -> Response:
         if (refused := await _factor_first(request, service, identity)) is not None:
             return refused
