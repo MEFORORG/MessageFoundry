@@ -30,12 +30,15 @@ import secrets
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:  # the [webauthn] extra is optional — the runtime import is lazy, per-call
     from webauthn.helpers.cose import COSEAlgorithmIdentifier
 
 _log = logging.getLogger(__name__)
+
+#: Which ceremony a refusal came from; it names the ceremony in the WARNING line.
+_Ceremony = Literal["registration", "assertion"]
 
 CHALLENGE_BYTES = 64
 CHALLENGE_TTL_SECONDS = 120.0
@@ -151,7 +154,7 @@ def _invalid_input_errors() -> tuple[type[Exception], ...]:
     return (WebAuthnException, LookupError, TypeError, ValueError)
 
 
-def _refusal(exc: Exception, *, ceremony: str) -> WebAuthnVerificationError:
+def _refusal(exc: Exception, *, ceremony: _Ceremony) -> WebAuthnVerificationError:
     """Turn a caught library exception into the audited refusal, and log the raw ones.
 
     A ``WebAuthnException`` is the library refusing input on purpose, and the service audits it.
@@ -206,7 +209,7 @@ def _require_cose_integers(fields: object) -> None:
             )
 
 
-def _require_usable_public_key(cose_key: bytes, *, ceremony: str) -> None:
+def _require_usable_public_key(cose_key: bytes, *, ceremony: _Ceremony) -> None:
     """Refuse a credential public key that breaks the key rule, at either ceremony.
 
     Registration runs it on the new key and sign-in on the stored one, so the two ceremonies
@@ -222,12 +225,13 @@ def _require_usable_public_key(cose_key: bytes, *, ceremony: str) -> None:
     It also binds each identifier to one key type and curve (:data:`_COSE_KEY_SHAPE_FOR_ALG`),
     so an ES256 credential on P-384 or P-521 is refused here although it would verify. That is
     the owner's 2026-09-23 ruling, and it is a deliberate refusal, so it is not logged. The same
-    table refuses every identifier outside :data:`SUPPORTED_COSE_ALGS`, which is what stops a
-    stored RSA key at sign-in: the library checks the identifier at registration only.
+    table refuses every identifier outside :data:`SUPPORTED_COSE_ALGS`. That is what stops a
+    stored RSA key at sign-in, where the library accepts any identifier it knows, RS256 included.
 
     That binding compares integers, so :func:`_require_cose_integers` runs before it. Its
     refusals are deliberate too, and not logged. Both checks sit outside the library catch: a
-    fault in our own logic must surface as a bug, not as a refusal.
+    fault in our own logic must surface as a bug, not as a refusal. One consequence: the raw
+    U2F key form, a bare ``0x04`` point, is refused at both ceremonies, because it is not a map.
     """
     from webauthn.helpers import (
         decode_credential_public_key,
@@ -244,10 +248,12 @@ def _require_usable_public_key(cose_key: bytes, *, ceremony: str) -> None:
     _require_cose_integers(fields)
     alg, kty, crv = decoded.alg, decoded.kty, getattr(decoded, "crv", None)
     shape = (kty, crv)
-    if _COSE_KEY_SHAPE_FOR_ALG.get(alg) != shape:
+    if alg not in _COSE_KEY_SHAPE_FOR_ALG:
+        raise WebAuthnVerificationError(f"COSE algorithm {alg} is not accepted")
+    if _COSE_KEY_SHAPE_FOR_ALG[alg] != shape:
         raise WebAuthnVerificationError(
             f"COSE algorithm {alg} is accepted only as key type and curve "
-            f"{_COSE_KEY_SHAPE_FOR_ALG.get(alg)}, not {shape}"
+            f"{_COSE_KEY_SHAPE_FOR_ALG[alg]}, not {shape}"
         )
 
 
@@ -480,14 +486,19 @@ def verify_assertion(
     accepted); the *service* layer applies the strict compare-and-set on top (a CAS miss is the
     clone signal — ADR 0068 §4).
 
-    The stored key is re-screened first, with the rule registration applies
-    (:func:`_require_usable_public_key`). The library checks only the signature, so without this
-    a stored key registration would refuse still signed in: an RSA key of any modulus, ES256 on
-    P-384, or a curve that reads ``true``. A non-conforming key is refused as invalid input, and
-    the service audits it (BACKLOG #1166).
+    The stored key is checked first, with the same rule registration applies
+    (:func:`_require_usable_public_key`). At sign-in the library checks the signature and that it
+    knows the algorithm, and nothing else. So without this check, some stored keys that
+    registration refuses still signed in. Examples are an RSA key of any size, ES256 on P-384,
+    and a curve that reads ``true``. Such a key is now refused as invalid input, and the service
+    audits the refusal (BACKLOG #1166).
 
-    There is no carve-out for keys enrolled before the P-256 pin. One would protect users who do
-    not exist: nothing is deployed (CLAUDE.md section 0), so no such key was ever enrolled.
+    Registration already refuses these keys, so one can reach the store only by a write that
+    skipped registration. This check is defence in depth: both ceremonies apply one rule, and
+    sign-in does not trust the store to hold only what registration wrote.
+
+    There is no exception for keys enrolled before the P-256 pin. Nothing is deployed (CLAUDE.md
+    section 0), so no such key exists, and an exception would protect nobody.
     """
     _require_webauthn()
     from webauthn import verify_authentication_response

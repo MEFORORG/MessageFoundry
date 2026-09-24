@@ -334,6 +334,21 @@ async def test_a_stored_key_registration_would_refuse_fails_sign_in_audited(
         failed = [e for e in events if e["action"] == "auth.webauthn_failed"]
         assert len(failed) == 1 and not failed[0]["detail"]
         assert "auth.webauthn_verified" not in [e["action"] for e in events]
+
+        # The witness that the signature is good, so the refusal above is the check and not a
+        # broken fixture: the library alone accepts this signer against the stored P-384 key.
+        from webauthn import verify_authentication_response
+
+        challenge = wa.new_challenge()
+        verified = verify_authentication_response(
+            credential=signer.get_response(challenge, sign_count=0),
+            expected_challenge=challenge,
+            expected_rp_id=RP,
+            expected_origin=ORIGIN,
+            credential_public_key=p384,
+            credential_current_sign_count=0,
+        )
+        assert verified.new_sign_count == 0
     finally:
         await store.close()
 

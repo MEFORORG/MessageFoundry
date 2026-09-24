@@ -523,12 +523,26 @@ enrolled past the pin. Registration now requires the integer type itself for the
 map, and any label that is not an integer or a text string (RFC 9052 section 7). These refusals
 are deliberate too, so they log no WARNING.
 
-**Sign-in re-screens the stored key (BACKLOG #1166).** This paragraph first said the pin was
-registration-only, so that a key enrolled before it would not lock its owner out. That
-carve-out protected nobody: MessageFoundry has no deployments (CLAUDE.md section 0), so no key
-was ever enrolled before the pin. It also left a real gap. The library checks only the
-signature at sign-in, so a stored key registration would refuse still signed in: an RSA key of
-any modulus, 1024-bit included, ES256 on P-384, or a curve that reads `true`. `verify_assertion`
-now runs the same check as registration on the stored key, before it verifies anything. A key
-that fails is refused on the audited invalid-input path with no WARNING, like the registration
-refusals above.
+**The pin is registration-only, by design.** `verify_assertion` does not re-screen a stored
+key's curve. A credential enrolled before the pin may be ES256 on P-384 or P-521; it still
+verifies and still clears the floor, so refusing it at assertion would lock its owner out for
+no security gain. A test pins that such a stored key still asserts.
+
+**Superseded (2026-09-24, BACKLOG #1166): sign-in checks the stored key too.** The paragraph
+above no longer holds. Its exception was for keys enrolled before the pin, and there are none,
+because MessageFoundry has no deployments (CLAUDE.md section 0). `verify_assertion` now runs the
+same check as registration on the stored key, before it verifies the signature. At sign-in the
+library checks only the signature and that it knows the algorithm. So before this change, some
+stored keys that registration refuses still signed in. Examples are RS256 at 1024 or 2048 bits,
+ES256 on P-384 or P-521, and a curve that reads `true`.
+
+Registration already refused all of them, so a stored one could come only from a store write
+that skipped registration. This is defence in depth, not the fix for a reachable hole: both
+ceremonies now apply one rule, and sign-in does not trust the store. A key that breaks the rule
+is refused on the audited invalid-input path with no WARNING. A key the library cannot decode at
+all still logs its raw exception type at WARNING, as before.
+
+This also retires two earlier sentences. Under "Both halves, deliberately", the registration
+call is no longer the only place a credential is refused. Under "Residual closed", the
+assertion-side catch is no longer the backstop for a stored key; the check above is, and the
+catch now guards the response itself.

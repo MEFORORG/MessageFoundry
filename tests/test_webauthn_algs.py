@@ -11,7 +11,9 @@ two halves fail differently and only one of them refuses anything:
 * ``verify_registration_response`` decides what is ACCEPTED. This is the refusal.
 
 A change that restricted only the first would read like a fix and admit exactly the same
-credentials, so every enforcement row here goes through ``wa.verify_registration``.
+credentials, so the registration enforcement rows go through ``wa.verify_registration``. The last
+section adds the second place a key is refused: sign-in re-checks the STORED key with the same
+rule, so its rows go through ``wa.verify_assertion`` (BACKLOG #1166).
 
 The RSA credential builder is local rather than in ``tests/_soft_webauthn.py``: that helper exists
 to produce credentials the engine ACCEPTS, and these rows need one it must refuse. ``tests/`` sits
@@ -402,11 +404,11 @@ def test_a_stored_es256_key_on_a_larger_curve_is_refused_at_sign_in(
 
     This row used to pin the opposite: a key enrolled before the P-256 pin still signed in. That
     carve-out protected keys that do not exist, because nothing is deployed (CLAUDE.md section 0).
-    The key is real and the signature is good, so only the re-screen can refuse it.
+    The key is real and the signature is good (the library-alone control below), so only the
+    check can refuse it.
     """
-    key = ec.generate_private_key(curve)
-    soft = SoftAuthenticator(rp_id=RP, origin=ORIGIN, _key=key)  # signs ECDSA over SHA-256
-    caught = _refused_at_sign_in(soft.get_response, _cose_es256(key, crv, size), caplog)
+    respond, public_key = _stored_es256(curve, crv, size)
+    caught = _refused_at_sign_in(respond, public_key, caplog)
     assert str(caught).startswith("COSE algorithm -7 is accepted only as")
 
 
@@ -623,12 +625,15 @@ def test_the_stand_in_rows_are_otherwise_well_formed() -> None:
 
 # --- sign-in re-screens the stored key with the registration rule (BACKLOG #1166) --------------
 #
-# ``verify_assertion`` used to trust the stored key: the library checks the signature and never
-# asks which identifier, key type or curve the key carries. So a stored key registration would
-# refuse still signed in, an RSA key of ANY modulus included. The carve-out that allowed it was
-# kept for keys enrolled before the P-256 pin, and there are none: nothing is deployed (CLAUDE.md
-# section 0). Every row below signed in at engine ``5ccff7cb3``, with a real key and a good
-# signature, so only the re-screen can refuse it.
+# ``verify_assertion`` used to trust the stored key. At sign-in the library checks the signature
+# and that it knows the algorithm, never the key type or curve the registration rule binds. The
+# exception for keys enrolled before the P-256 pin protected nobody: nothing is deployed
+# (CLAUDE.md section 0). Registration already refuses every key below, so this is defence in
+# depth against a store write that skipped registration, not a reachable hole.
+#
+# With a real key and a good signature, the P-384, P-521, RSA, crv and kty rows SIGNED IN at
+# engine ``5ccff7cb3`` and ``9f51a2ada``. The two ``alg`` rows did not: the library refused them
+# with its own message, so they pin which layer refuses rather than a bypass.
 
 
 def _assertion_response(challenge: bytes, sign: Callable[[bytes], bytes]) -> str:
@@ -706,24 +711,50 @@ def test_a_stored_rsa_key_is_refused_at_sign_in(
     """RS256 carries no modulus floor, and a stored 1024-bit key used to sign in."""
     key = _rsa_key(bits)
     caught = _refused_at_sign_in(_rsa_signer(key), _rs256(key), caplog)
-    assert str(caught).startswith("COSE algorithm -257 is accepted only as")
+    assert str(caught) == "COSE algorithm -257 is not accepted"
 
 
-def test_the_rsa_sign_in_fixture_verifies_under_the_library() -> None:
-    """The positive control for the RSA row: the library alone accepts this assertion.
+def _stored_rsa(bits: int) -> tuple[Callable[[bytes], str], bytes]:
+    key = _rsa_key(bits)
+    return _rsa_signer(key), _rs256(key)
 
-    If it did not, the row above would pass on a broken fixture rather than on the re-screen.
+
+def _stored_es256(
+    curve: ec.EllipticCurve, crv: int, size: int
+) -> tuple[Callable[[bytes], str], bytes]:
+    key = ec.generate_private_key(curve)
+    soft = SoftAuthenticator(rp_id=RP, origin=ORIGIN, _key=key)
+    return soft.get_response, _cose_es256(key, crv, size)
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        lambda: _stored_rsa(1024),
+        lambda: _stored_rsa(2048),
+        lambda: _stored_es256(ec.SECP384R1(), _P384, 48),
+        lambda: _stored_es256(ec.SECP521R1(), 3, 66),
+    ],
+    ids=["RS256 1024", "RS256 2048", "ES256 P-384", "ES256 P-521"],
+)
+def test_the_refused_stored_keys_verify_under_the_library_alone(
+    stored: Callable[[], tuple[Callable[[bytes], str], bytes]],
+) -> None:
+    """The positive control for the sign-in refusal rows: each signature is good.
+
+    If the library alone refused one of these, its refusal row would pass on a broken fixture
+    rather than on the check.
     """
     from webauthn import verify_authentication_response
 
-    key = _rsa_key(1024)
+    respond, public_key = stored()
     challenge = secrets.token_bytes(wa.CHALLENGE_BYTES)
     verified = verify_authentication_response(
-        credential=_rsa_signer(key)(challenge),
+        credential=respond(challenge),
         expected_challenge=challenge,
         expected_rp_id=RP,
         expected_origin=ORIGIN,
-        credential_public_key=_rs256(key),
+        credential_public_key=public_key,
         credential_current_sign_count=0,
     )
     assert verified.new_sign_count == 0
@@ -756,7 +787,11 @@ def test_a_stored_key_with_a_stand_in_integer_is_refused_at_sign_in(
 
 @pytest.mark.parametrize("alg", [True, False], ids=["alg true", "alg false"])
 def test_an_alg_given_as_a_bool_is_refused_at_registration(alg: bool) -> None:
-    """``True == 1`` in Python. At registration the library refuses these before the pin runs."""
+    """End to end, the LIBRARY refuses both, before our check runs.
+
+    ``True`` is not in the pinned set it is handed, and ``False`` fails its missing-``alg`` test.
+    So this row pins the outcome, not our check. The next row pins our check.
+    """
     challenge = secrets.token_bytes(wa.CHALLENGE_BYTES)
     with pytest.raises(wa.WebAuthnVerificationError):
         wa.verify_registration(
@@ -765,6 +800,16 @@ def test_an_alg_given_as_a_bool_is_refused_at_registration(alg: bool) -> None:
             rp_id=RP,
             origin=ORIGIN,
         )
+
+
+@pytest.mark.parametrize("ceremony", ["registration", "assertion"])
+def test_the_shared_check_refuses_an_alg_of_true_at_either_ceremony(
+    ceremony: wa._Ceremony,
+) -> None:
+    """The one helper both ceremonies call refuses ``alg: true`` by its type, not by its value."""
+    with pytest.raises(wa.WebAuthnVerificationError) as caught:
+        wa._require_usable_public_key(_relabelled(_p256(), alg=True), ceremony=ceremony)
+    assert str(caught.value) == "COSE key alg must be an integer, not bool"
 
 
 def test_p256_es256_and_ed25519_eddsa_pass_both_ceremonies() -> None:
