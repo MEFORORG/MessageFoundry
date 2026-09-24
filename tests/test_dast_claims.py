@@ -238,8 +238,7 @@ def test_signal_10_rows_are_unchanged(row: str) -> None:
     "sentence",
     [
         "Signal 10 (independent external verification) is still Absent and still not treated as passed.",
-        "An independent engagement would still add assurance that this self-attested grade does not "
-        "claim.",
+        "| 10 | Independent external verification | **Absent — designed / dated-risk-accepted**",
         "No independent third-party ASVS review, penetration test, or DAST has run.",
         "**No independent external verification** (third-party ASVS L2/L3 review + penetration test "
         "+ DAST).",
@@ -256,8 +255,9 @@ def test_scorecard_negative_claims_survive(sentence: str) -> None:
     not about its claims, and it goes stale on the next unrelated paragraph.
 
     Owner ruling 2026-09-24 re-graded the scorecard from A- to A, because signal 10 became a desired
-    state that no longer caps the grade. Two pins quoted that cap and moved to the sentences that say
-    the gap is still open. The ruling changed what the gap costs, not whether it is open.
+    state that no longer caps the grade. Two pins quoted that cap. They moved to the verdict sentence
+    and to signal 10's scored row, which both say the gap is still Absent. The ruling changed what the
+    gap costs, not whether it is open.
     """
     assert "independent" in sentence.lower(), "this guard's own fixture must contain the claim word"
     assert sentence in _read(_SCORECARD), (
