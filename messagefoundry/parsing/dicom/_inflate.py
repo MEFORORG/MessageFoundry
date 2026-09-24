@@ -41,7 +41,7 @@ from __future__ import annotations
 import zlib
 from io import BytesIO
 
-from messagefoundry.parsing.dicom._deps import load_header_readers, parse_error_types
+from messagefoundry.parsing.dicom._deps import header_error_types, load_header_readers
 from messagefoundry.parsing.dicom.errors import DicomBombError
 
 __all__ = [
@@ -145,11 +145,10 @@ def _deflated_data_set(data: bytes, *, force: bool) -> memoryview | None:
     ``DeflatedExplicitVRLittleEndian``. That constant is a plain ``str`` subclass, so comparing with
     :data:`DEFLATED_EXPLICIT_VR_LE` is the same comparison.
 
-    A failure in the replay is a failure ``dcmread`` hits at the same step, before its inflate. The
-    types in :func:`~messagefoundry.parsing.dicom._deps.parse_error_types` return ``None``, so ``dcmread``
-    raises them inside the caller's own parse-error handler. Anything else propagates from here: it
-    would have escaped ``dcmread`` the same way, and standing aside on an error nobody expected is
-    how a guard fails open."""
+    A malformed header fails in the replay at the step where ``dcmread`` fails, before its inflate.
+    Only those errors, :func:`~messagefoundry.parsing.dicom._deps.header_error_types`, return ``None``,
+    so ``dcmread`` raises them itself. Anything else, including what a pydicom API change would raise,
+    propagates from here: standing aside on an error nobody expected is how a guard fails open."""
     filereader = load_header_readers()
     fp = BytesIO(data)
     try:
@@ -158,7 +157,7 @@ def _deflated_data_set(data: bytes, *, force: bool) -> memoryview | None:
         filereader._read_command_set_elements(fp)
         # Inside the try: reading the element converts its raw value, which can fail too.
         transfer_syntax = file_meta.get("TransferSyntaxUID")
-    except parse_error_types():
+    except header_error_types():
         return None
     if transfer_syntax != DEFLATED_EXPLICIT_VR_LE:
         return None

@@ -63,6 +63,23 @@ def load_header_readers() -> ModuleType:
     return filereader
 
 
+def header_error_types() -> tuple[type[BaseException], ...]:
+    """The exceptions pydicom's header readers raise for a MALFORMED object, and nothing else. The
+    deflate guard stands aside only on these, because ``dcmread`` then fails at the same step before
+    its inflate (BACKLOG #1926).
+
+    Deliberately narrower than :func:`parse_error_types`. ``AttributeError``, ``KeyError``,
+    ``IndexError``, ``TypeError`` and ``ValueError`` are what a pydicom API change raises in the
+    replay itself, and standing aside on one of those would let ``dcmread`` inflate unbounded. So
+    they propagate, and the guard fails closed. The set was measured, not guessed: 60,000 random
+    header mutations on 2026-09-24 raised only ``InvalidDicomError``, ``BytesLengthException``,
+    ``NotImplementedError`` (an unknown VR) and ``struct.error``. ``EOFError`` is pydicom's own
+    truncation signal."""
+    from pydicom.errors import BytesLengthException, InvalidDicomError
+
+    return (InvalidDicomError, BytesLengthException, NotImplementedError, struct.error, EOFError)
+
+
 def parse_error_types() -> tuple[type[BaseException], ...]:
     """The exception tuple a ``dcmread`` of **untrusted** bytes may raise — wrapped by the codec into a
     PHI-safe :class:`~messagefoundry.parsing.dicom.errors.DicomError` so a malformed object

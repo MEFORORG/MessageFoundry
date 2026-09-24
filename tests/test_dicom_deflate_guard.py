@@ -270,3 +270,20 @@ def test_bound_stops_at_the_end_of_a_padded_stream() -> None:
     _inflate.bounded_inflate_or_error(stream, max_bytes=len(payload))
     with pytest.raises(DicomBombError):
         _inflate.bounded_inflate_or_error(stream, max_bytes=len(payload) - 1)
+
+
+@pytest.mark.parametrize("drift", [AttributeError, KeyError, IndexError, TypeError, ValueError])
+def test_guard_does_not_stand_aside_when_the_replay_itself_breaks(
+    monkeypatch: pytest.MonkeyPatch, drift: type[Exception]
+) -> None:
+    # These are what a pydicom API change raises inside the replay. If the guard treated one as "a
+    # malformed header, dcmread will fail first", it would stand aside while dcmread inflated. It must
+    # propagate instead, so the object is refused.
+    import pydicom.filereader
+
+    def broken_reader(fp: object) -> None:
+        raise drift("simulated pydicom API drift")
+
+    monkeypatch.setattr(pydicom.filereader, "_read_file_meta_info", broken_reader)
+    with pytest.raises(drift, match="simulated pydicom API drift"):
+        _inflate.guard_part10_deflate(_bomb(), force=False, max_bytes=_CAP)
