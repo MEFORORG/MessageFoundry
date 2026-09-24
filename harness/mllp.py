@@ -243,11 +243,11 @@ class MllpReceiver(QObject):
                 self.received.emit(rec)
                 self._reply(sock, text, rec.control_id, rec.seen)
         except MLLPFrameError as exc:
-            # Drop the decoder first so a late readyRead finds nothing to feed, then abort rather
-            # than disconnect: nothing queued for this peer should still be written to it.
+            # Drop the decoder first so a late readyRead finds nothing to feed. Disconnect rather
+            # than abort: an ACK already written for a valid frame earlier in this read still goes.
             self._decoders.pop(sock, None)
             self.refused.emit(f"{sock.peerAddress().toString()}:{sock.peerPort()}: {exc}")
-            sock.abort()
+            sock.disconnectFromHost()
 
     def _reply(self, sock: QTcpSocket, text: str, control_id: str, seen: int) -> None:
         """Acknowledge per the active reply mode — including faults that make the engine retry."""

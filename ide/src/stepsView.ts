@@ -207,7 +207,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
         // bounded if the file grew since.
         sample = sampleSegments(readSampleCapped(this.samplePath));
       } catch {
-        sample = []; // no/unreadable/over-cap sample → no sample union, still scoped by type
+        sample = []; // a missing, unreadable or over-cap sample adds no segments; still scoped by type
       }
     }
     return buildSegmentScope(
@@ -269,7 +269,8 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       return undefined;
     }
     // A 5.1.1 upload feature (docs/CONNECTIONS.md, BACKLOG #1127): refuse an over-cap sample here, before
-    // it is stored for reuse, with the cap dryrun applies to the same file.
+    // it is stored for reuse, with dryrun's default cap. That cap is fixed here: an inbound's
+    // max_message_bytes raises dryrun's cap but not this one.
     try {
       checkSampleSize(picks[0].fsPath);
     } catch (e) {

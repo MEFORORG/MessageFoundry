@@ -72,6 +72,8 @@ def _send_once(qapp: Any, port: int, message: str = _MSG) -> bytes:
             chunk = client.recv(4096)
         except TimeoutError:
             continue
+        except ConnectionResetError:  # a close with unread bytes can arrive as a reset
+            break
         if not chunk:  # peer closed without acknowledging
             break
         for message in decoder.feed(chunk):

@@ -14,14 +14,23 @@ import {
 // Synthetic only: every sample here is a made-up header, never real PHI.
 const MSG = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|X1|P|2.5.1\r";
 
+const dirs: string[] = [];
+
 function sample(size: number): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mefor-sample-"));
+  dirs.push(dir);
   const file = path.join(dir, "s.hl7");
   fs.writeFileSync(file, (MSG + "X".repeat(size)).slice(0, size), "utf8");
   return file;
 }
 
 suite("sampleFile: the Steps view's picked-sample read is capped (ASVS 5.1.1, BACKLOG #1127)", () => {
+  suiteTeardown(() => {
+    for (const dir of dirs) {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("the default cap is dryrun's MAX_FIXTURE_FILE_BYTES, 16 MiB", () => {
     assert.strictEqual(MAX_SAMPLE_FILE_BYTES, 16 * 1024 * 1024);
   });

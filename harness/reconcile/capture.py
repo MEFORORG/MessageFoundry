@@ -53,11 +53,13 @@ class CaptureSink:
         ports: Sequence[int] = (2800,),
         ack_mode: AckMode = AckMode.ORIGINAL,
         anonymizer: Callable[[str], str] | None = None,
+        max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
     ) -> None:
         if not ports:
             raise ValueError("the capture sink needs at least one port")
         self._out = Path(out_path)
         self._host = host
+        self._max_frame_bytes = max_frame_bytes
         self._ports = tuple(ports)
         self._ack_mode = ack_mode
         # Optional de-identifier (ADR 0030 §6): when set, each captured message is anonymized at the
@@ -70,6 +72,7 @@ class CaptureSink:
         self.captured = 0
         self.unparseable = 0
         self.anon_failed = 0
+        self.refused = 0  # connections dropped over an over-cap frame
 
     async def start(self) -> None:
         self._out.parent.mkdir(parents=True, exist_ok=True)
@@ -103,7 +106,7 @@ class CaptureSink:
         self._writers.add(writer)
         # Bounded like the engine's MLLP source: this listener takes frames from another party, so it is
         # an ASVS 5.1.1 upload feature (docs/CONNECTIONS.md, BACKLOG #1127).
-        decoder = MLLPDecoder(max_frame_bytes=DEFAULT_MAX_FRAME_BYTES)
+        decoder = MLLPDecoder(max_frame_bytes=self._max_frame_bytes)
         try:
             while True:
                 chunk = await reader.read(_READ_BYTES)
@@ -119,6 +122,8 @@ class CaptureSink:
             pass  # peer reset/closed mid-stream — expected when the sender or run stops
         except MLLPFrameError as exc:
             # Drop the connection rather than buffer, keep or ACK an over-cap frame, as the engine does.
+            # Counted, because a refused delivery is a finding to reconcile, like an unparseable one.
+            self.refused += 1
             peer = writer.get_extra_info("peername")
             log.warning("MLLP frame from %s over cap; closing connection: %s", peer, exc)
         finally:

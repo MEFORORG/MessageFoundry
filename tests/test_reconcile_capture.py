@@ -132,6 +132,7 @@ def test_capture_drops_an_over_cap_frame_and_keeps_nothing(tmp_path: Path) -> No
         finally:
             await sink.stop()
         assert sink.captured == 0 and sink.unparseable == 0
+        assert sink.refused == 1
         return got
 
     assert asyncio.run(scenario()) == b""  # no ACK: the connection was dropped

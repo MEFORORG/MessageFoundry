@@ -58,6 +58,7 @@ class CorrelationSink:
         ports: Sequence[int] = (2700,),
         ack_mode: AckMode = AckMode.ORIGINAL,
         tracker: FailoverTracker | None = None,
+        max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
     ) -> None:
         if not ports:
             raise ValueError("the sink needs at least one port")
@@ -65,6 +66,7 @@ class CorrelationSink:
         self._correlator = correlator
         self._m = metrics
         self._host = host
+        self._max_frame_bytes = max_frame_bytes
         self._ports = tuple(ports)
         self._ack_mode = ack_mode
         # Failover-only: per-destination delivery/order bookkeeping. The FIFO lane is the engine OUTBOUND
@@ -109,7 +111,7 @@ class CorrelationSink:
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         # Bounded like the engine's MLLP source: this listener takes frames from another party, so it is
         # an ASVS 5.1.1 upload feature (docs/CONNECTIONS.md, BACKLOG #1127).
-        decoder = MLLPDecoder(max_frame_bytes=DEFAULT_MAX_FRAME_BYTES)
+        decoder = MLLPDecoder(max_frame_bytes=self._max_frame_bytes)
         try:
             while True:
                 chunk = await reader.read(_READ_BYTES)

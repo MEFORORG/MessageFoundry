@@ -181,8 +181,10 @@ def harness_receivers(src: Path, root: Path) -> dict[str, list[ast.Call]]:
 def unbounded_decoders(
     receivers: dict[str, list[ast.Call]], root: Path, cap_name: str = "DEFAULT_MAX_FRAME_BYTES"
 ) -> list[str]:
-    """Receivers with an ``MLLPDecoder`` built without ``max_frame_bytes=``, or whose file does not
-    import ``cap_name`` from ``messagefoundry.transports.mllp`` and use it in that unit."""
+    """Receivers with an ``MLLPDecoder`` built without ``max_frame_bytes=`` (or with it ``None``),
+    or whose file does not import ``cap_name`` from ``messagefoundry.transports.mllp`` and use it in
+    that unit. A cap read from a setting that defaults to ``cap_name`` passes: the check is on the
+    default, and a site may raise it as the engine's own setting may."""
     bad: list[str] = []
     for key, decoders in receivers.items():
         file, unit = key.split("::")
@@ -197,11 +199,10 @@ def unbounded_decoders(
         used = any(isinstance(n, ast.Name) and n.id == cap_name for n in ast.walk(node))
         if not (imported and used):
             bad.append(f"{key} (does not bound at {cap_name})")
-        bad.extend(
-            f"{key}:{c.lineno} (MLLPDecoder without max_frame_bytes)"
-            for c in decoders
-            if not any(k.arg == "max_frame_bytes" for k in c.keywords)
-        )
+        for call in decoders:
+            cap = next((k.value for k in call.keywords if k.arg == "max_frame_bytes"), None)
+            if cap is None or (isinstance(cap, ast.Constant) and cap.value is None):
+                bad.append(f"{key}:{call.lineno} (MLLPDecoder without max_frame_bytes)")
     return bad
 
 
@@ -863,15 +864,23 @@ def test_self_test_a_harness_receiver_is_found_and_an_unbounded_one_flagged(tmp_
         "class Unbounded:\n"
         "    def __init__(self):\n        self.s = QTcpServer(self)\n"
         "    def on(self):\n        return MLLPDecoder()\n"
+        "class ExplicitNone:\n"
+        "    def run(self):\n        start_server(DEFAULT_MAX_FRAME_BYTES)\n"
+        "        return MLLPDecoder(max_frame_bytes=None)\n"
         "class ClientOnly:\n"
         "    def read_ack(self):\n        return MLLPDecoder()\n",
         encoding="utf-8",
     )
     receivers = harness_receivers(src, tmp_path)
-    assert set(receivers) == {"harness/rx.py::Bounded", "harness/rx.py::Unbounded"}
+    assert set(receivers) == {
+        "harness/rx.py::Bounded",
+        "harness/rx.py::Unbounded",
+        "harness/rx.py::ExplicitNone",
+    }
     assert unbounded_decoders(receivers, tmp_path) == [
         "harness/rx.py::Unbounded (does not bound at DEFAULT_MAX_FRAME_BYTES)",
         "harness/rx.py::Unbounded:11 (MLLPDecoder without max_frame_bytes)",
+        "harness/rx.py::ExplicitNone:15 (MLLPDecoder without max_frame_bytes)",
     ]
 
 

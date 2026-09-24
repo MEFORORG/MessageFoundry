@@ -42,6 +42,7 @@ class ReceivePanel(QWidget):
         self._receiver.received.connect(self._on_received)
         self._receiver.refused.connect(self._on_refused)
         self._count = 0
+        self._refused = 0
 
         self._port = QSpinBox()
         self._port.setRange(1, 65535)
@@ -125,8 +126,14 @@ class ReceivePanel(QWidget):
             )
 
     def _on_refused(self, reason: str) -> None:
-        # An over-cap frame drops its connection and is never a row (BACKLOG #1127); say so here.
-        self._status.setText(f"refused {reason}")
+        # An over-cap frame drops its connection and is never a row (BACKLOG #1127); say so here,
+        # beside the listening state and count rather than in place of them.
+        self._refused += 1
+        if self._receiver.is_listening():
+            self._status.setText(
+                f"listening on 127.0.0.1:{self._receiver.port()}; {self._count} received; "
+                f"{self._refused} refused (last: {reason})"
+            )
 
     def _show_detail(self) -> None:
         items = self._table.selectedItems()
