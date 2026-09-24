@@ -288,16 +288,20 @@ class _UnmarkedPolicy:
         if not stored or allow_unmarked or self._allow_unmarked:
             return stored
         table, column = aad_cell_name(aad)
+        if table == "uploaded_file":
+            # An uploaded file (BACKLOG #1169, owner ruling 2026-09-23). Usually one stored before
+            # the key was enabled, and the fix is rotate-key, never the loosening.
+            cause = "a plaintext upload stored before the key was enabled, or a planted one"
+            fix = "run 'messagefoundry rotate-key' with the engine stopped to seal it"
+        else:
+            cause = "a stripped marker or a planted row"
+            fix = "set [store].allow_unmarked_ciphertext to accept unmarked values"
         _log.warning(
-            "refused an unmarked value in cipher column %s.%s: a keyed store holds only marked "
-            "ciphertext there, so this is a stripped marker or a planted row",
-            table,
-            column,
+            "refused an unmarked value in cipher column %s.%s: %s; %s", table, column, cause, fix
         )
         self.report_unmarked(table, column)
         raise CipherError(
-            f"refused an unmarked value in cipher column {table}.{column} (a stripped marker or a "
-            "planted row); set [store].allow_unmarked_ciphertext to accept unmarked values"
+            f"refused an unmarked value in cipher column {table}.{column} ({cause}); {fix}"
         )
 
 

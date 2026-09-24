@@ -340,8 +340,8 @@ async def test_concurrent_uploads_cannot_double_book_the_quota(
 
     real_scan = store._scan_metas_sync
 
-    def _slow_scan() -> list[UploadedFileMeta]:
-        out = real_scan()
+    def _slow_scan(*, trust_unmarked: bool = False) -> list[UploadedFileMeta]:
+        out = real_scan(trust_unmarked=trust_unmarked)
         time.sleep(0.05)  # widen the window so an unlocked check-then-write WOULD lose the race
         return out
 

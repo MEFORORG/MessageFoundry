@@ -411,8 +411,7 @@ This section is kept rather than deleted, because the claim it used to make is t
   it sealed while on stays sealed.
 - **Uploads too:** on a keyed store a plaintext uploaded file is refused until `rotate-key` seals it
   (owner ruling 2026-09-23). With this on, it is served as plaintext instead. Under
-  `cipher_provider = "vault_transit"` uploads pass through either way, because `rotate-key` cannot run
-  there ([PHI.md](PHI.md) §3).
+  `cipher_provider = "vault_transit"` uploads pass through either way; [PHI.md](PHI.md) §3 says why.
 - **Not covered either way:** the DIRECT S/MIME connector's enveloped body.
 
 ### `[secret_rotation].enforce_store_key_expiry = false` — the store DEK's calendar expiry stops the engine no more

@@ -8,8 +8,9 @@ at startup, because that is unbounded boot-time work. It is fail-closed, like th
 
 **What each test pins.**
 
-* On a keyed AES-GCM store, a plaintext upload is refused on every read path, and the refusal reaches
-  the ``store-cipher`` alert naming only the upload surface.
+* On a keyed AES-GCM store, a plaintext upload is refused on every read path that serves or
+  authorizes, and the refusal reaches the ``upload-cipher`` alert naming only the upload surface. The
+  retention prune and the quota still see it, so it cannot outlive its window or dodge the quota.
 * ``rotate-key`` seals it, and it then reads normally. The CLI reports how many it sealed.
 * ``[store].allow_unmarked_ciphertext`` restores the passthrough for uploads too.
 * A keyless store is unchanged.
@@ -28,6 +29,7 @@ import pytest
 
 from messagefoundry.pipeline.alerts import (
     STORE_CIPHER_SUBJECT,
+    UPLOAD_CIPHER_SUBJECT,
     UPLOADED_FILE_TABLE,
     alert_store_cipher_refusal,
 )
@@ -95,10 +97,12 @@ async def test_a_plaintext_upload_is_refused_on_a_keyed_store(tmp_path: Path) ->
         await store.read_bytes(fid)
     with pytest.raises(CipherError):
         await store.delete(fid)
-    # The listing, the quota and the prune all skip it rather than serve it.
+    # The listing skips it rather than serve it, and a refusal never deletes.
     assert await store.list_files() == []
-    assert (await store.prune_expired(now=10**12)).pruned == []
-    assert (root / f"{fid}.meta").exists()  # a refusal never deletes
+    assert (root / f"{fid}.meta").exists()
+    # The refusal names the fix, not the loosening.
+    with pytest.raises(CipherError, match="rotate-key"):
+        await store.read_bytes(fid)
 
     # Each refusal reached the hook, naming only the upload surface.
     assert set(cells) == {(UPLOADED_FILE_TABLE, "meta"), (UPLOADED_FILE_TABLE, "body")}
@@ -109,11 +113,33 @@ def test_the_upload_alert_names_the_surface_and_the_fix_and_nothing_else() -> No
     sink = _Sink()
     alert_store_cipher_refusal(sink, UPLOADED_FILE_TABLE, "meta")  # type: ignore[arg-type]
     [(subject, reason, count)] = sink.events
-    assert (subject, count) == (STORE_CIPHER_SUBJECT, 1)
+    # Its own subject, so expected upload refusals cannot throttle or mute a planted store row.
+    assert (subject, count) == (UPLOAD_CIPHER_SUBJECT, 1)
+    assert UPLOAD_CIPHER_SUBJECT != STORE_CIPHER_SUBJECT
     assert "uploaded_file.meta" in reason and "rotate-key" in reason
-    # A store column keeps its own wording: there, a plaintext value is never legitimate.
+    # A store column keeps its own subject and wording: there, plaintext is never legitimate.
     alert_store_cipher_refusal(sink, "messages", "raw")  # type: ignore[arg-type]
+    assert sink.events[1][0] == STORE_CIPHER_SUBJECT
     assert "rotate-key" not in sink.events[1][1]
+
+
+async def test_a_refused_upload_still_ages_out_and_still_counts_against_quota(
+    tmp_path: Path,
+) -> None:
+    """Refusing to SERVE a plaintext upload must not let it escape retention or the quota. Those
+    passes count and delete; they never serve a byte, so they read the sidecar anyway."""
+    root = tmp_path / "uploads"
+    fid = await _plaintext_upload(root)
+    store = UploadStore(root, _keyed(generate_key()), max_bytes=1 << 20, max_files_per_user=1)
+    # The quota sees the legacy file: the uploader is already at their one-file cap.
+    from messagefoundry.uploads import UploadQuotaError
+
+    with pytest.raises(UploadQuotaError):
+        await store.save(data=_ADT.encode(), filename="b.hl7", uploader="op", uploader_id="u-op")
+    # And the prune removes it once it is past the window.
+    pruned = (await store.prune_expired(now=10**12)).pruned
+    assert [m.file_id for m in pruned] == [fid]
+    assert not (root / f"{fid}.meta").exists() and not (root / f"{fid}.blob").exists()
 
 
 # --- rotate-key seals it, then it reads ----------------------------------------------------------
@@ -164,6 +190,54 @@ async def test_the_reseal_counts_uploads_not_values(tmp_path: Path) -> None:
     await _plaintext_upload(root)
     result = await UploadStore(root, _keyed(generate_key()), max_bytes=1 << 20).reseal_to_active()
     assert result == ResealResult(resealed=2, skipped=0, sealed_plaintext=1)
+
+
+def test_rotate_key_with_the_same_key_does_not_reset_the_key_age_clock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The refusal makes ``rotate-key`` the fix for plaintext uploads, and an operator runs it with
+    the SAME key. It used to stamp ``last_rotated`` = today on every run, which would make an old key
+    look freshly rotated to the ASVS 13.3.4 watcher. A changed key still gets its stamp."""
+    from messagefoundry.__main__ import main
+    from messagefoundry.store.store import MessageStore
+
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "stamp.db"
+    key = generate_key()
+
+    async def seed_and_backdate() -> None:
+        store = await MessageStore.open(db, cipher=make_cipher(key))
+        try:
+            key_id = store.cipher_info().active_key_id
+            assert key_id
+            await store.upsert_secret_rotation_meta(
+                "MEFOR_STORE_ENCRYPTION_KEY",
+                fingerprint=key_id,
+                tracked_since="2025-01-01",
+                last_rotated="2025-01-01",
+            )
+        finally:
+            await store.close()
+
+    async def stamp(active: str) -> tuple[str, str]:
+        store = await MessageStore.open(db, cipher=make_cipher(active))
+        try:
+            row = (await store.get_secret_rotation_meta())["MEFOR_STORE_ENCRYPTION_KEY"]
+            return row.fingerprint, row.last_rotated
+        finally:
+            await store.close()
+
+    asyncio.run(seed_and_backdate())
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key)
+    assert main(["rotate-key", "--db", str(db)]) == 0
+    assert asyncio.run(stamp(key))[1] == "2025-01-01"  # same key: the clock is untouched
+
+    # Control: a real rotation still stamps.
+    new_key = generate_key()
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", new_key)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEYS_RETIRED", key)
+    assert main(["rotate-key", "--db", str(db)]) == 0
+    assert asyncio.run(stamp(new_key))[1] != "2025-01-01"
 
 
 # --- the opt-out and the keyless store ------------------------------------------------------------

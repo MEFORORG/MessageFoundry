@@ -1038,3 +1038,35 @@ async def test_the_RUNNER_prune_audit_row_also_names_the_system(tmp_path: Path) 
         "the owner must survive as DATA in detail -- dropping it would trade a false attribution "
         "for an unreadable row"
     )
+
+
+async def test_a_refused_plaintext_upload_answers_409_not_500(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """BACKLOG #1169, owner ruling 2026-09-23: a keyed store refuses a plaintext upload until
+    ``rotate-key`` seals it. The routes used to let that CipherError fall through to a bare 500; they
+    now answer 409 with the fix, and the body names no file."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+    from messagefoundry.store.crypto import generate_key, make_cipher
+    from messagefoundry.uploads import UploadStore
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    settings = _uploads_settings(tmp_path)
+    app = create_app(engine, auth=service, store_settings=settings)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, "op")
+        up = await c.post("/uploads", files={"file": ("acme.hl7", BATCH, "text/plain")}, headers=h)
+        fid = up.json()["file_id"]  # the test engine is keyless, so this is a plaintext upload
+        # Now enable a key: the same directory, read through a keyed cipher.
+        app.state.upload_store = UploadStore(
+            tmp_path / "uploads", make_cipher(generate_key(), write_v2=True), max_bytes=10**6
+        )
+        for r in (
+            await c.get(f"/uploads/{fid}/messages", headers=h),
+            await c.delete(f"/uploads/{fid}", headers=h),
+        ):
+            assert r.status_code == 409, r.text
+            assert "rotate-key" in r.text and "acme" not in r.text
+        assert (await c.get("/uploads", headers=h)).json()["files"] == []

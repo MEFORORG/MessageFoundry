@@ -353,6 +353,7 @@ from messagefoundry.uploads import (
     UploadRetentionRunner,
     UploadStore,
     UploadTooLargeError,
+    UploadUnreadableError,
     browse_messages,
     sanitize_filename,
     split_uploaded,
@@ -4434,6 +4435,15 @@ def create_app(
             return True
         return bool(meta.uploader_id) and meta.uploader_id == identity.user_id
 
+    # BACKLOG #1169: the store cipher refused the file. On a keyed store that is usually a plaintext
+    # upload stored before the key was enabled, which `rotate-key` seals (owner ruling 2026-09-23); it
+    # can also be a file under a key that is no longer configured. A 409 says the file exists and needs
+    # an operator, where an unhandled CipherError answered 500. No file detail is in the text.
+    _UPLOAD_UNREADABLE = (
+        "this uploaded file cannot be read under the configured store key; if it was stored before "
+        "the key was enabled, an operator must run 'messagefoundry rotate-key' to seal it"
+    )
+
     async def _authorized_upload_meta(
         request: Request, engine: Engine, us: UploadStore, identity: Identity, file_id: str, op: str
     ) -> UploadedFileMeta:
@@ -4455,6 +4465,8 @@ def create_app(
             meta = await us.get_meta(file_id)
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
+        except UploadUnreadableError:
+            raise HTTPException(409, _UPLOAD_UNREADABLE) from None
         if not _may_access_upload(identity, meta):
             await engine.store.record_audit(
                 "upload.denied",
@@ -4728,6 +4740,8 @@ def create_app(
             data = await us.read_bytes(file_id)
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
+        except UploadUnreadableError:
+            raise HTTPException(409, _UPLOAD_UNREADABLE) from None
         result = await asyncio.to_thread(
             browse_messages,
             data,
@@ -4875,6 +4889,8 @@ def create_app(
             data = await us.read_bytes(file_id)
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
+        except UploadUnreadableError:
+            raise HTTPException(409, _UPLOAD_UNREADABLE) from None
         parts = await asyncio.to_thread(split_uploaded, data)
         if body.index >= len(parts):
             raise HTTPException(

@@ -182,6 +182,16 @@ class UploadQuotaError(UploadError):
     the same transaction as it, because the body lives on the filesystem rather than in the store."""
 
 
+class UploadUnreadableError(UploadError, CipherError):
+    """The store cipher refused an uploaded file on a by-id read (BACKLOG #1169).
+
+    On a keyed store that is usually a plaintext upload stored before the key was enabled, which a
+    keyed store refuses until ``rotate-key`` seals it (owner ruling 2026-09-23). It can also be a file
+    under a key that is no longer configured. It is a :class:`CipherError` too, so any caller that
+    already catches the cipher's error still does. The API maps it to HTTP 409 without importing the
+    cipher module. The message is the cipher's own, which names only the surface and the fix."""
+
+
 class UploadNotFoundError(UploadError):
     """No uploaded file exists for the given (well-formed) file_id."""
 
@@ -508,10 +518,8 @@ class UploadStore:
         ``[store].allow_unmarked_ciphertext`` restores the passthrough for this surface too.
 
         Every other cipher keeps the passthrough. The identity cipher has no key, so nothing is
-        refused anyway. A ``vault_transit`` cipher is the named residual: ``rotate-key`` refuses to run
-        in that mode (it needs a local active key, and the store's own rotation raises there by
-        BACKLOG #1165), so no command could ever reseal a plaintext upload, and refusing it would
-        strand the file for good. ``docs/PHI.md`` §3 records it."""
+        refused anyway. ``vault_transit`` is a named residual, and ``docs/PHI.md`` §3 is where it and
+        its reason are stated."""
         return not isinstance(self._cipher, AesGcmCipher)
 
     def _decrypt_blob(self, stored: str, file_id: str) -> bytes:
@@ -527,11 +535,14 @@ class UploadStore:
             json.dumps(asdict(meta)), aad=cell_aad("uploaded_file", "meta", meta.file_id)
         )
 
-    def _decrypt_meta(self, stored: str, file_id: str) -> UploadedFileMeta:
+    def _decrypt_meta(
+        self, stored: str, file_id: str, *, trust_unmarked: bool = False
+    ) -> UploadedFileMeta:
+        # trust_unmarked: see _scan_metas_sync. Never set on a path that serves or authorizes.
         raw = self._cipher.decrypt(
             stored,
             aad=cell_aad("uploaded_file", "meta", file_id),
-            allow_unmarked=self._passes_unmarked,
+            allow_unmarked=self._passes_unmarked or trust_unmarked,
         )
         d = json.loads(raw)
         return UploadedFileMeta(
@@ -567,7 +578,7 @@ class UploadStore:
             if _FILE_ID_RE.match(fid):
                 yield fid, entry
 
-    def _scan_metas_sync(self) -> list[UploadedFileMeta]:
+    def _scan_metas_sync(self, *, trust_unmarked: bool = False) -> list[UploadedFileMeta]:
         """Walk the uploads root and decrypt every well-formed ``.meta`` sidecar (UNSORTED). A
         bad/foreign/undecryptable sidecar is skipped **with its cause named** (never a body in the
         log), so a rotated-away key can neither sink the listing nor silently drop a quota/retention
@@ -586,6 +597,15 @@ class UploadStore:
         the cipher branch below, and is left out of the listing, the quota and the retention prune
         until ``rotate-key`` reseals it.
 
+        ``trust_unmarked`` reads a plaintext sidecar that a keyed store would refuse (BACKLOG #1169).
+        Only the quota and the retention prune pass it. They COUNT and DELETE; they never serve a
+        byte or grant access, so reading the sidecar there discloses nothing. Refusing it there
+        would do harm instead: the least-protected PHI on disk would escape the retention window, and
+        an uploader's legacy files would stop counting against their quota. A planted sidecar can
+        then be pruned or consume quota, which needs write access to the directory, and that access
+        can delete the files outright anyway. The listing, the by-id reads and the ownership check
+        never pass it.
+
         The cipher's own message is safe to log — every ``CipherError`` carries only key ids,
         marker versions and algorithm names, never a decrypted value. The malformed-shape branch
         logs only the exception TYPE, because a ``ValueError`` from coercing a metadata field can
@@ -593,7 +613,11 @@ class UploadStore:
         out: list[UploadedFileMeta] = []
         for fid, entry in self._iter_sidecars():
             try:
-                out.append(self._decrypt_meta(entry.read_text(encoding="utf-8"), fid))
+                out.append(
+                    self._decrypt_meta(
+                        entry.read_text(encoding="utf-8"), fid, trust_unmarked=trust_unmarked
+                    )
+                )
             except CipherError as exc:
                 # The cipher declined the value: a wrong/rotated-away key, a blob relocated into
                 # another cell, or the refusal of an unmarked (legacy, planted or downgraded)
@@ -656,7 +680,11 @@ class UploadStore:
             # The residual the lock alone cannot cover — a sibling shard between ITS scan and ITS
             # write, invisible to this one — is covered by the ledger reservation the caller holds
             # around this whole call. See _reserve_across_shards and _on_disk_refusal.
-            mine = [m for m in self._scan_metas_sync() if m.uploader_id == uploader_id]
+            mine = [
+                m
+                for m in self._scan_metas_sync(trust_unmarked=True)
+                if m.uploader_id == uploader_id
+            ]
             refusal = self._on_disk_refusal(
                 uploader=uploader,
                 observed_files=len(mine),
@@ -811,7 +839,9 @@ class UploadStore:
     def _observed_sync(self, uploader_id: str) -> tuple[int, int]:
         """(file count, total bytes) already ON DISK for ``uploader_id`` — the fleet-visible half of
         the budget. Sync: the caller runs it off the event loop."""
-        mine = [m for m in self._scan_metas_sync() if m.uploader_id == uploader_id]
+        mine = [
+            m for m in self._scan_metas_sync(trust_unmarked=True) if m.uploader_id == uploader_id
+        ]
         return len(mine), sum(m.size for m in mine)
 
     async def list_files(self) -> list[UploadedFileMeta]:
@@ -840,6 +870,8 @@ class UploadStore:
                 return self._decrypt_meta(meta_path.read_text(encoding="utf-8"), file_id)
             except FileNotFoundError as exc:
                 raise UploadNotFoundError(file_id) from exc
+            except CipherError as exc:
+                raise UploadUnreadableError(str(exc)) from exc
 
         return await asyncio.to_thread(_read)
 
@@ -853,6 +885,8 @@ class UploadStore:
                 return self._decrypt_blob(blob_path.read_text(encoding="utf-8"), file_id)
             except FileNotFoundError as exc:
                 raise UploadNotFoundError(file_id) from exc
+            except CipherError as exc:
+                raise UploadUnreadableError(str(exc)) from exc
 
         return await asyncio.to_thread(_read)
 
@@ -866,6 +900,8 @@ class UploadStore:
                 meta = self._decrypt_meta(meta_path.read_text(encoding="utf-8"), file_id)
             except FileNotFoundError as exc:
                 raise UploadNotFoundError(file_id) from exc
+            except CipherError as exc:
+                raise UploadUnreadableError(str(exc)) from exc
             # Remove the body first, then the sidecar (best-effort on the body — the sidecar is the
             # listing key, so once it is gone the file is invisible even if the blob lingers).
             blob_path.unlink(missing_ok=True)
@@ -944,7 +980,10 @@ class UploadStore:
             had_plaintext = False
             # The sidecar carries the AAD kind "meta"; the body carries "body" (see _encrypt_meta /
             # _encrypt_blob). Re-binding the SAME cell AAD is what keeps a re-sealed value readable.
-            for path, kind in ((meta_path, "meta"), (blob_path, "body")):
+            # Body FIRST, as save() writes it: the sidecar is the listing key, and a keyed store
+            # refuses a plaintext value (BACKLOG #1169). Sealing the sidecar first would let an
+            # interrupted pass list an upload whose body is still refused.
+            for path, kind in ((blob_path, "body"), (meta_path, "meta")):
                 try:
                     # Read the MARKER first, not the file. The idempotency test is a prefix compare,
                     # and a sealed 25 MiB upload is ~44 MiB on disk — reading it whole only to skip
@@ -996,7 +1035,7 @@ class UploadStore:
         hourly retention scan already decrypts every sidecar, so this adds nothing of a new order. Runs
         off the event loop."""
         cipher = self._cipher
-        if not isinstance(cipher, AesGcmCipher):
+        if self._passes_unmarked or not isinstance(cipher, AesGcmCipher):
             return 0
         try:
             count = await asyncio.to_thread(self._count_unsealed_sync)
@@ -1063,7 +1102,8 @@ class UploadStore:
 
         def _prune() -> PruneResult:
             pruned: list[UploadedFileMeta] = []
-            for meta in self._scan_metas_sync():
+            # trust_unmarked: a plaintext upload a keyed store refuses must still age out.
+            for meta in self._scan_metas_sync(trust_unmarked=True):
                 if meta.uploaded_at >= cutoff:
                     continue
                 # A sidecar whose id somehow fails the path guard is left alone (never blindly unlinked).
