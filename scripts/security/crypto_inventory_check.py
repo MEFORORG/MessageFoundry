@@ -342,7 +342,9 @@ INVENTORY: dict[str, frozenset[str]] = {
     # engine-client verifies the engine API server cert — the OS trust store (truststore.SSLContext,
     # a CRYPTO_LIBRARY_MODULES trigger) by default, or a pinned PEM via --cacert
     # (ssl.create_default_context), plus opt-in client-cert mTLS (load_cert_chain). Builds the
-    # client-side TLS verification context.
+    # client-side TLS verification context, and on either branch pins the TLS 1.2 suites to
+    # _APPROVED_TLS12_SUITES with set_ciphers (BACKLOG #300), so it offers nothing wider than
+    # the engine listener's AEAD default.
     "messagefoundry/apiclient/client.py": frozenset({"ssl", "truststore"}),
     # BACKLOG #1276 part A: the engine always serves TLS now and mints a self-signed placeholder when
     # no operator cert is configured. This harness supplies its own certificate instead — one pair
@@ -835,6 +837,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/apiclient/client.py": frozenset(
         {
             "tls_context:.load_cert_chain()",
+            "tls_context:.set_ciphers()",
             "tls_context:ssl.create_default_context",
             "tls_context:truststore.SSLContext",
         }
