@@ -112,7 +112,6 @@ logger = logging.getLogger(__name__)
 
 _PROTOCOLS = ("sftp", "ftp", "ftps")
 
-
 _T = TypeVar("_T")
 
 #: Bytes pulled per chunk while retrieving a remote file. Only the granularity of the budget check —

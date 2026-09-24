@@ -185,7 +185,7 @@ def run_checks(
     test when deciding for a new leg: ask whether it reads something a connection-less config still
     has (Routers, Handlers, reference sets), not whether the flag was passed.
 
-    Legs that report on connections alone still load with the rule in force and do skip on an empty dir: they report on
+    The other legs still load with the rule in force and do skip on an empty dir: they report on
     connections, and there are none. The skip line they print says "config did not load", which is
     inexact for this one cause; threading the keyword further was left out of scope.
     """

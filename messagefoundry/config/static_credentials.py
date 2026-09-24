@@ -73,7 +73,6 @@ names the SETTING that holds it, never the value."""
 from __future__ import annotations
 
 import logging
-import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -198,41 +197,11 @@ def _http_hop(
     return StaticCredentialHop(name, "none", f"presents no credential ({peer})", compliant_kind)
 
 
-#: urllib's ``_splittype`` pattern: a scheme is everything before the first ``:`` holding no ``/``.
-_URLLIB_SCHEME = re.compile(r"([^/:]+):(.*)", re.DOTALL)
-
-
 def _proxy_url_sends_userinfo(url: object) -> bool:
-    """Would urllib's ``ProxyHandler`` send a ``Proxy-authorization`` header built from this URL?
+    # Lazy, like ``_smart``: the transport owns what its proxy handler sends.
+    from messagefoundry.transports.rest import proxy_url_sends_userinfo
 
-    It does when the proxy URL carries a user AND a password, whether or not ``proxy_user`` is set,
-    and it sends Basic pre-emptively. This mirrors ``urllib.request._parse_proxy``, the parser that
-    handler runs, rather than ``urlsplit``: the two disagree on where the authority ends. With an
-    unencoded ``/``, ``?`` or ``#`` in the password, ``urlsplit`` stops the authority early and sees
-    no ``@``, while ``_parse_proxy`` still finds the userinfo and the password is sent. A user with no
-    password sends nothing, and a percent-encoded ``%40`` is never read as an ``@``. The copy is
-    private stdlib logic, so a test pins it to the real function over a corpus of shapes.
-
-    An unresolved ``env()`` reference cannot be read, so it answers ``False``; the module docstring
-    lists that gap. It never raises, so a malformed URL cannot crash the single reader."""
-    if not isinstance(url, str):
-        return False
-    proxy = url.strip()
-    match = _URLLIB_SCHEME.match(proxy)
-    rest = match.group(2) if match else proxy
-    if not rest.startswith("/"):
-        authority = proxy
-    elif not rest.startswith("//"):
-        return False  # urllib refuses a URL with no authority; nothing is sent
-    else:
-        at = rest.find("@")
-        end = rest.find("/", at) if at != -1 else rest.find("/", 2)
-        authority = rest[2:] if end == -1 else rest[2:end]
-    userinfo, sep, _ = authority.rpartition("@")
-    if not sep:
-        return False
-    user, _, password = userinfo.partition(":")
-    return bool(user and password)
+    return proxy_url_sends_userinfo(url)
 
 
 def _proxy_hop(

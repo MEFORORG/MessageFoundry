@@ -615,51 +615,100 @@ def test_an_upper_case_ftp_protocol_is_still_ftp() -> None:
     assert hop is not None and hop.detail.startswith("FTP password") and hop.compliant_kind is False
 
 
-#: Proxy URL shapes on both sides of urllib's parser. Each pairs with what the handler sends.
+#: Proxy URL shapes on both sides of urllib's parser, each with whether the engine sends a
+#: credential from it.
 _PROXY_SHAPES = [
-    "http://u:p@proxy.example.invalid:3128",
-    "http://u:p@proxy.example.invalid:3128/",
-    "http://u:pa/ss@proxy.example.invalid:3128",  # urlsplit ends the authority at the '/'
-    "http://u:pa?ss@proxy.example.invalid:3128",
-    "http://u:pa#ss@proxy.example.invalid:3128",
-    "http://u:p@x@proxy.example.invalid:3128",
-    "http://u@proxy.example.invalid:3128",  # a user with no password sends nothing
-    "http://u:@proxy.example.invalid:3128",
-    "http://:p@proxy.example.invalid:3128",
-    "http://us%40er@proxy.example.invalid:3128",  # an encoded '@' is not a separator
-    "http://proxy%40x.example.invalid:3128",
-    "http://proxy.example.invalid:3128/path@x",
-    "http://proxy.example.invalid:3128",
-    "http://[::1:3128",  # malformed: urlsplit raises, urllib parses
-    "u:p@proxy.example.invalid:3128",  # no '//': the whole string is the authority
-    "http:/u:p@proxy.example.invalid",  # no authority: urllib refuses
-    "default",
-    "",
+    ("http://u:p@proxy.example.invalid:3128", True),
+    ("https://u:p@proxy.example.invalid:3128/", True),
+    ("  http://u:p@proxy.example.invalid:3128  ", True),  # the transport strips the value
+    ("http://u:pa/ss@proxy.example.invalid:3128", True),  # urlsplit ends the authority at '/'
+    ("http://u:pa?ss@proxy.example.invalid:3128", True),
+    ("http://u:pa#ss@proxy.example.invalid:3128", True),
+    ("http://u:p@x@proxy.example.invalid:3128", True),
+    ("http://u@proxy.example.invalid:3128", False),  # a user with no password sends nothing
+    ("http://u:@proxy.example.invalid:3128", False),
+    ("http://:p@proxy.example.invalid:3128", False),
+    ("http://us%40er@proxy.example.invalid:3128", False),  # an encoded '@' is not a separator
+    ("http://proxy%40x.example.invalid:3128", False),
+    # urllib reads everything before the '@' as userinfo, so it sends "proxy...:3128/path" as a
+    # password. Surprising, but it is what goes on the wire, so it is listed.
+    ("http://proxy.example.invalid:3128/path@x", True),
+    ("http://proxy.example.invalid:3128", False),
+    ("http://u:p@[::1:3128", False),  # malformed: the transport refuses it at build
+    ("u:p@proxy.example.invalid:3128", False),  # scheme 'u': refused, not http(s)
+    ("socks5://u:p@proxy.example.invalid:1080", False),
+    ("default", False),
+    ("", False),
 ]
 
 
-@pytest.mark.parametrize("url", _PROXY_SHAPES)
-def test_the_userinfo_reader_mirrors_urllibs_proxy_parser(url: str) -> None:
-    """The reader is a copy of private stdlib logic, so pin it to the function the handler runs:
-    ``ProxyHandler`` sends a header exactly when ``_parse_proxy`` yields a user and a password."""
+@pytest.mark.parametrize(("url", "sent"), _PROXY_SHAPES)
+def test_the_userinfo_reader_answers_what_the_engine_sends(url: str, sent: bool) -> None:
+    """``ProxyHandler`` sends a header exactly when ``_parse_proxy`` yields a user and a password,
+    and the transport reaches the handler only for an http(s) URL it can parse. The reader calls a
+    private stdlib function, so the shapes where it matters are pinned here."""
+    from messagefoundry.config.static_credentials import _proxy_url_sends_userinfo
+
+    assert _proxy_url_sends_userinfo(url) is sent
+
+
+def test_the_reader_pairs_with_urllibs_own_parser() -> None:
+    """The control for the pin above: on every shape the transport would build, the reader agrees
+    with ``_parse_proxy`` run on the stripped value, which is what the handler receives."""
+    import urllib.parse
     import urllib.request
 
     from messagefoundry.config.static_credentials import _proxy_url_sends_userinfo
 
-    try:
-        _, user, password, _ = urllib.request._parse_proxy(url)  # type: ignore[attr-defined]
-        sent = bool(user and password)
-    except ValueError:
-        sent = False  # the handler raises; nothing is sent
-    assert _proxy_url_sends_userinfo(url) is sent
+    for url, _ in _PROXY_SHAPES:
+        proxy = url.strip()
+        try:
+            if urllib.parse.urlsplit(proxy).scheme not in ("http", "https"):
+                continue
+        except ValueError:
+            continue
+        _, user, password, _ = urllib.request._parse_proxy(proxy)  # type: ignore[attr-defined]
+        assert _proxy_url_sends_userinfo(url) is bool(user and password), url
 
 
 def test_a_malformed_proxy_url_never_crashes_the_reader() -> None:
     """``urlsplit`` raises on an unclosed IPv6 bracket. The single reader must not, or ``check``,
-    the posture view and the reload guard all fail on a URL that carries no credential."""
+    the posture view and the reload guard all fail. With a keyed credential the hop is still listed,
+    so the label path runs on the malformed URL too, and withholds it."""
     from messagefoundry.config.static_credentials import _proxy_hop
 
     assert _proxy_hop("OB", {"proxy_url": "http://[::1:3128"}, "") is None
+    keyed = {
+        "proxy_url": f"http://u:{_PROXY_PW}@[::1:3128",
+        "proxy_user": "pu",
+        "proxy_password": "pp",
+    }
+    hop = _proxy_hop("OB", keyed, "")
+    assert hop is not None and _PROXY_PW not in hop.detail
+
+
+def test_a_site_proxy_carrying_userinfo_reaches_a_fhir_lookup(tmp_path: Path) -> None:
+    """A lookup takes no proxy of its own, so the inherited ``[egress].proxy_url`` is its only one.
+    The hop is named ``proxy:fhir_lookup:<name>``, which is the name an opt-out must use."""
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "feed.py").write_text(
+        "from messagefoundry import FhirLookup\n"
+        "FhirLookup('lk', url='https://k.example.invalid/fhir')\n",
+        encoding="utf-8",
+    )
+    site = _settings(
+        egress={
+            "proxy_url": f"http://suser:{_PROXY_PW}@site.example.invalid:3128",
+            "allowed_proxy": ["site.example.invalid"],
+        }
+    )
+    hops = {
+        h.name: h
+        for h in static_credential_hops(registry=load_config(cfg, allow_empty=True), settings=site)
+    }
+    assert hops["proxy:fhir_lookup:lk"].credential == "static"
+    assert _PROXY_PW not in hops["proxy:fhir_lookup:lk"].detail
 
 
 def test_url_userinfo_is_basic_whatever_proxy_auth_type_says() -> None:
