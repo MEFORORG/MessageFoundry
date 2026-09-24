@@ -77,7 +77,7 @@ the gate. The right topology depends on the orchestrator.
 |---|---|---|---|
 | **Plain Docker, single host** | **(a) in-process TLS** — engine binds `0.0.0.0:8443`, mount PEM cert/key, `-p 8443:8443` | in-container **MLLP-over-TLS** (`tls=true` per connection), `-p 2575:2575` | Self-contained, matches the single-binary / broker-free ethos; no extra moving parts. |
 | **Kubernetes / same-pod sidecar / `--network host`** | **(c→b) loopback + TLS-terminating sidecar** — engine binds `127.0.0.1`, sidecar terminates TLS, forwards to `127.0.0.1`; set `trusted_proxies=[127.0.0.1]` | a **TLS-terminating TCP sidecar** for MLLP, engine MLLP binds loopback (gate passes) — *or* in-container MLLP-over-TLS | A shared network namespace makes the engine genuinely loopback-bound, so the gate passes **trivially** and only the hardened proxy is exposed. Cleanest from the engine's view. |
-| **Separate proxy container on a Docker network** (not shared netns) | **(b) upstream TLS** — engine binds `0.0.0.0:8765` on the internal network, `tls_terminated_upstream=true` + `trusted_proxies=[<proxy IP/subnet>]`; do **not** publish the engine port to the host | in-container **MLLP-over-TLS** (no MLLP proxy primitive in the design unless you add a TCP/TLS sidecar) | Fits shops standardizing on nginx/Caddy/IIS or an ingress controller; the proxy is also the right place for OCSP-must-staple revocation and client-cert mTLS. |
+| **Separate proxy container on a Docker network** (not shared netns) | **(b) upstream TLS** — engine binds `0.0.0.0:8765` on the internal network, `tls_terminated_upstream=true` + `trusted_proxies=[<proxy IP/subnet>]` + `plaintext_upstream_hop_acknowledged=true`; do **not** publish the engine port to the host | in-container **MLLP-over-TLS** (no MLLP proxy primitive in the design unless you add a TCP/TLS sidecar) | Fits shops standardizing on nginx/Caddy/IIS or an ingress controller; the proxy is also the right place for OCSP-must-staple revocation and client-cert mTLS. |
 
 ### The three options, justified
 
@@ -94,7 +94,7 @@ the gate. The right topology depends on the orchestrator.
     `X-Forwarded-For`, not the proxy.
   - **Separate container, different netns:** the engine binds the internal interface (off-loopback),
     so you **must** set `tls_terminated_upstream=true` + `trusted_proxies` to pass the gate without
-    in-process TLS. Do not publish the engine's plaintext port to the host.
+    in-process TLS, plus `plaintext_upstream_hop_acknowledged=true`, because that hop is then plaintext. Do not publish the engine's plaintext port to the host.
 
 - **(c) "Loopback-only publish" — does the guard still trip? Yes (mostly).** Publishing to
   `-p 127.0.0.1:8765:8765` only narrows *who on the host* can reach the port; the engine inside the
@@ -122,7 +122,7 @@ bind host is all that matters.
 |---|---|---|---|
 | (a) in-process TLS | `0.0.0.0` (off-loopback) | **allow** — `tls_enabled` branch | `tls_cert_file` (+ `tls_key_file`); `[security].require_sign_in = true` |
 | (b) same-pod sidecar | `127.0.0.1` (loopback) | **gate not triggered** (`is_loopback`) | `trusted_proxies=[127.0.0.1]` (for correct client IP); no in-process cert needed |
-| (b) separate proxy container | `0.0.0.0` (off-loopback) | **allow** — upstream branch | `tls_terminated_upstream=true` **and** `trusted_proxies=[<proxy>]` (validator enforces the pairing); on a PHI instance also the Posture-B attestation pair `proxy_intra_service_auth` + `proxy_tls_min_version` (ladder row 1b — **refused** without them) |
+| (b) separate proxy container | `0.0.0.0` (off-loopback) | **allow** — upstream branch | `tls_terminated_upstream=true` **and** `trusted_proxies=[<proxy>]` (validator enforces the pairing) **and** `plaintext_upstream_hop_acknowledged=true` (**refused** without it, in every mode, unless an operator `tls_cert_file` makes the engine serve that hop over TLS); on a PHI instance also the Posture-B attestation pair `proxy_intra_service_auth` + `proxy_tls_min_version` (ladder row 1b — **refused** without them) |
 | (c) loopback publish, no shared netns | `0.0.0.0` (forced — see §1) | same as (a)/(b-separate); `127.0.0.1` bind would be unreachable | same as (a) or (b-separate) |
 
 MLLP gate (`check_mllp_tls_exposure`), per inbound's resolved host (`[inbound].bind_host`, typically
@@ -170,6 +170,9 @@ listen_address = "0.0.0.0"
 [api]
 port = 8765
 tls_terminated_upstream = true
+# REQUIRED in every mode with no tls_cert_file: the proxy->engine hop is plaintext, and securing it
+# is your site's job.
+plaintext_upstream_hop_acknowledged = true
 trusted_proxies = ["10.4.2.7"]                # the proxy's EXACT address(es) — see the warning below
 # Posture-B attestations. TLS terminates in the proxy container, so the engine observes neither the
 # proxy->engine hop nor the floor the proxy offers browsers; both are operator DECLARATIONS and an

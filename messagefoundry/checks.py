@@ -1384,7 +1384,7 @@ def _check_dryrun(
     suppress_search: bool = False,
 ) -> CheckResult:
     from messagefoundry.config.wiring import WiringError, load_config
-    from messagefoundry.pipeline.dryrun import dry_run, read_message_sets
+    from messagefoundry.pipeline.dryrun import dry_run, fixture_cap, read_message_sets
     from messagefoundry.redaction import safe_error
     from messagefoundry.store import MessageStatus
 
@@ -1443,7 +1443,12 @@ def _check_dryrun(
     crossproduct_inbounds = [
         n for n, ic in reg.inbound.items() if ic.deployed and not ic.content_type.is_binary
     ]
-    message_sets = read_message_sets(mpath, inbound_names)
+    try:
+        message_sets = read_message_sets(mpath, inbound_names, cap=fixture_cap(reg))
+    except ValueError as exc:
+        # An over-cap or unreadable fixture file (BACKLOG #1127) fails the gate with the reader's own
+        # message rather than escaping as a traceback.
+        return CheckResult("dryrun", ok=False, required=True, detail=str(exc))
     # #230 P4 (ADR 0104): preview under the engine's copy-on-Send posture (best-effort; fallback = the
     # Settings-model default, ON) so the gate exercises the fixtures exactly as the engine would run them.
     snapshot_on_send = _resolve_snapshot_on_send(

@@ -412,8 +412,23 @@ def test_every_batched_encrypt_burst_charges_the_bound_on_every_backend() -> Non
                 "invocation bound (ASVS 11.3.4) — an unclean exit mid-burst would permanently "
                 "under-count every value it had already encrypted"
             )
-    # The enumeration itself must not silently go empty (a rename would make the guard vacuous).
-    assert len(checked) >= 20, checked
+            if name == "_seal_surface":
+                # BACKLOG #1169: the at-open seal commits a whole surface ONCE, so a per-batch charge
+                # would come after the encrypts it should lead. It must reserve the burst up front.
+                assert "reserve_invocations_ahead(" in src, (
+                    f"{cls.__name__}._seal_surface seals a surface in one transaction but does not "
+                    "reserve the burst on the bound first, so the persisted total trails its encrypts"
+                )
+    # The enumeration itself must not silently go empty (a rename would make the guard vacuous). The
+    # floor was 20 until BACKLOG #1169 folded each backend's on-open sealing loops into ONE
+    # `_seal_surface` per backend (seven functions became three); every one of the three is required.
+    assert len(checked) >= 16, checked
+    sealers = {c for c in checked if c.endswith("._seal_surface")}
+    assert sealers == {
+        "MessageStore._seal_surface",
+        "PostgresStore._seal_surface",
+        "SqlServerStore._seal_surface",
+    }, checked
 
 
 def test_no_operation_zeroes_an_existing_keys_counter() -> None:

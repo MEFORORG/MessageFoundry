@@ -4,9 +4,11 @@
 # ADR 0173 — TLS peer revocation checking and OCSP stapling across terminating and originating surfaces
 
 - **Status:** **Accepted (2026-08-23; the accept half ratified by the owner 2026-09-22).** The original
-  change carried no code. The §4.3 build rider, tracked by BACKLOG **#1498**, is **PARTLY BUILT** as of
-  2026-09-22: the SMART token endpoint and the syslog TLS forwarder are guarded; **the OIDC token and
-  JWKS legs are not** (AC-4 carries the recipe and the reason). **Three of this document's own premises
+  change carried no code. The §4.3 build rider's **three named hops are all guarded** as of
+  2026-09-23: the SMART token endpoint and the syslog TLS forwarder under BACKLOG **#1498**
+  (2026-09-22), and the OIDC token and JWKS legs under BACKLOG **#1887**, as two independent guards.
+  **#1498 stays open** for the six further context constructions §7 lists as ungraded; guarding the
+  three named hops graded none of those. **Three of this document's own premises
   moved under that build and are corrected in place rather than rewritten** — see §4.3's amendment and
   the notice in §1.4. One of them reached a *decision* and not only evidence: §2.1 declined a
   direction-2 file CRL that BACKLOG #299 has since built. **Settled by the owner 2026-09-22. §2.1's
@@ -221,7 +223,8 @@ false-premise defect:
    `email.py:239`, and `store/postgres.py:745` via `_refuse_store_revocation` (`:763`).
    **Nine sites since BACKLOG #1498 (2026-09-22), not seven** — `transports/smart.py` (the SMART
    token endpoint) and `logging_setup.py:_refuse_forward_revocation` (the syslog forwarder) joined
-   under §4.3. Read the list as *"at least these"* and locate each by symbol: these line numbers were
+   under §4.3. `auth/service.py:_refuse_idp_revocation` (the OIDC token and JWKS legs, two guards)
+   joined under BACKLOG #1887 (2026-09-23). Read the list as *"at least these"* and locate each by symbol: these line numbers were
    written in August and the §4.3 build moved several of them.
 2. **Terminating `[api]` TLS — `in_process_tls_revocation_refused`** (`config/tls_policy.py:344`),
    wired at `__main__.py:1722`. `serve` refuses an in-process off-loopback `[api]` TLS bind unless a
@@ -445,24 +448,58 @@ Do not restate it as one. §6 names what would flip it.
   `::test_a_verify_off_syslog_forwarder_takes_no_revocation_guard`,
   `::test_a_syslog_forwarder_with_no_posture_is_unchanged`,
   `::test_the_forwarder_refusal_names_a_lever_that_exists_for_it`.
+  **The OIDC token and JWKS legs** (BACKLOG #1887):
+  `::test_the_oidc_legs_are_refused_when_they_check_no_revocation`,
+  `::test_the_oidc_legs_on_loopback_still_cross`,
+  `::test_the_oidc_legs_cross_on_a_crl_that_really_loaded`,
+  `::test_the_oidc_legs_with_no_posture_are_unchanged`,
+  `::test_an_unthreaded_oidc_posture_falls_back_to_the_ambient_one`,
+  `::test_each_oidc_leg_is_guarded_on_its_own_host`,
+  `::test_a_non_enforcing_oidc_instance_warns_on_both_legs`,
+  `::test_the_blanket_env_does_not_cross_the_enforcing_oidc_legs`,
+  `::test_the_oidc_refusal_names_a_lever_that_exists_for_it`,
+  `::test_an_oidc_leg_with_no_host_is_refused_not_treated_as_loopback`.
   **The not-refused arms are the load-bearing ones**, for the same reason AC-2's untouched baseline
   is: a guard that refuses everything passes a refusal arm on its own, and the CRL arm is the only one
-  that proves the finished context reached the guard rather than a setting being read.
+  that proves the finished context reached the guard rather than a setting being read. For the OIDC
+  legs, `::test_each_oidc_leg_is_guarded_on_its_own_host` is the arm built to tell two guards from
+  one keyed on a single host: it puts one leg on loopback and the other off-box, both ways round, and
+  asserts that the off-box leg's own cell refuses. The WARN arm also sees both legs, one warning
+  each. `::test_an_oidc_leg_with_no_host_is_refused_not_treated_as_loopback` pins that a leg whose
+  host cannot be read is refused, since the guard would otherwise treat an empty host as loopback.
 
-  **AC-4 IS PARTIAL: TWO HOPS OF THE THREE. THE OIDC TOKEN AND JWKS LEGS ARE NOT BUILT.** The wording
-  above deliberately stopped enumerating the three hops, because a criterion that names a hop is read
-  as covering it, which is the SDS-3.6 defect this ADR was careful about elsewhere. What remains is
-  small and fully specified: `auth/oidc_http.py:build_idp_opener` builds the context both legs share,
-  so the guard belongs there with `context=` (its `[auth].oidc_tls_crl_file` must relax it), and the
-  posture has to be **threaded** rather than read ambiently because `AuthService` is constructed in
-  the API lifespan, outside the `active_hop_posture` scope — the position `auth/ldap.py` and
-  `store/postgres.py` are already in. `RevocationHopGuard.capture` now takes `posture=` and
-  `ways_across=` (added by #1498) so that hop needs no new mechanism, only its call. Guard the two
-  legs **separately**: they may be different hosts with different loopback status, so one guard keyed
-  on the token host alone would let an off-box JWKS cross.
-  *It was held out of #1498 for a coordination reason and not a technical one* — the caller change
-  lands in `auth/service.py`, which another session held at the time. Recorded plainly because a
-  dormant guard plus a caveat in an operator-facing security page is worse than an honest gap.
+  **AC-4 WAS PARTIAL UNTIL 2026-09-23, AND THE OIDC LEGS ARE NOW BUILT (BACKLOG #1887).** Under #1498
+  it covered two hops of the three, and this notice said the OIDC token and JWKS legs were not built.
+  They were held out of #1498 for a coordination reason and not a technical one: the caller change
+  lands in `auth/service.py`, which another session held at the time. The wording above still
+  deliberately stops short of enumerating hops, because a criterion that names a hop is read as
+  covering it, which is the SDS-3.6 defect this ADR was careful about elsewhere.
+
+  **What was built, and where it differs from the recipe this notice used to carry.** The recipe put
+  the guard inside `auth/oidc_http.py:build_idp_opener`, where the context is built. It went instead
+  to `auth/service.py:_refuse_idp_revocation`, called from `AuthService.__init__` immediately after
+  that opener is built. It reads the finished context back out of the opener with
+  `transports/rest.py:opener_tls_context`, which #1498 added for exactly that shape, so
+  `[auth].oidc_tls_crl_file` still relaxes each leg. Two reasons. The posture is already a live
+  local there, so nothing new is threaded through the opener builder. And a concurrent change was
+  editing `build_idp_opener`'s import block and return statement, so a guard there would have
+  collided with it. The ordering constraint the recipe named is the one that binds, and it holds:
+  the context is read after the opener is finished.
+
+  The rest of the recipe stands as written. The posture is **passed** as `AuthService(hop_posture=)`
+  and never read ambiently, because the service is built in the API lifespan outside every
+  `active_hop_posture` scope. There are **two guards**, one per leg, each keyed on the host of its own
+  URL, because the legs may be different hosts with different loopback status. `ways_across=` names
+  `[auth].oidc_tls_crl_file`, the lever that exists for this hop, instead of the connection-shaped
+  default. `attested=False`, because no per-hop revocation attestation exists for these legs.
+
+  **Known limits of this placement, recorded so they are not rediscovered.** The refusal fires when
+  the API lifespan builds `AuthService`, which is after `engine.start()` has run (`api/app.py`), the
+  same point the #329 LDAPS clamp fires. `messagefoundry check` does not build the service, and the
+  `messagefoundry verify` federation check builds its own opener with no guard, so neither reports a
+  would-refuse. On a first deployment an enforcing instance with an off-box IdP and no CRL would
+  therefore start the engine and then stop. Moving the check into the lifespan's pre-listener
+  preflight, or into `verify`, is not done here.
 - **AC-5** — THE SYSTEM SHALL NOT assert in code, docstring, error text or documentation that it
   performs certificate revocation checking on either graded direction, and any prose naming the
   shipped client-certificate CRL SHALL state that it is the peer's certificate on a terminating
@@ -501,10 +538,13 @@ lands on the not-PHI ALLOW arm and gets nothing.
 
 ### 4.3 NOT accepted — the build rider
 
-> **PARTLY BUILT 2026-09-22 under BACKLOG #1498, and this section's own premises moved under it. Read
-> the amendment below before quoting anything in the original text that follows it.** Two of the three
-> hops are now guarded — the SMART token endpoint and the syslog forwarder. **The OIDC token and JWKS
-> legs are NOT**, and AC-4 carries the recipe and the reason. **The rider's number is #1498, not a
+> **BUILT FOR ITS THREE NAMED HOPS, 2026-09-22 under BACKLOG #1498 and 2026-09-23 under BACKLOG
+> #1887. This section's own premises moved under that build. Read the amendment below before quoting
+> anything in the original text that follows it.** #1498 guarded the SMART token endpoint and the
+> syslog forwarder. **#1887 guarded the OIDC token and JWKS legs**, as two independent guards called
+> from `AuthService.__init__` rather than from `build_idp_opener`. AC-4 records where that differs
+> from the recipe and why. "Built" covers the three hops this section names and nothing wider: the
+> six further context constructions §7 lists are still ungraded. **The rider's number is #1498, not a
 > fresh allocation** — the text below says to allocate one when the build starts, and it predates
 > #1498, which was filed to be this rider's tracking item.
 >
@@ -658,10 +698,12 @@ What a cell may take from here:
   not cite the total.
 - **The unguarded-hop population is LARGER THAN TWO AND UNGRADED** -- corrected 2026-08-23. Two hops are confirmed and evidenced below. A third citation, `transports/smart.py:183-184`, is **WITHDRAWN as a `ssl`-usage citation: that file has no `ssl` usage at all.** *The clause that used to follow — "and cannot carry a guard" — is RETRACTED, 2026-09-22.* It does not follow from the measurement and it was wrong: `refuse_unrevoked_verified_hop` takes a scheme and a url, never a context, so a hop riding urllib's shared opener carries the guard exactly as the four HTTP-family cells do. That hop **is** guarded as of BACKLOG #1498 (§4.3, correction 1). What the zero-`ssl` measurement correctly establishes is only that the file is not in the `harden_verify_flags` population. Separately, at least six further unguarded context constructions exist (`apiclient/client.py:214`, `store/postgres.py:729`, `rest.py:275`, `:296`, `soap.py:202`, `tls_policy.py:1218`) and **NONE of them has been graded** -- several are outbound client contexts where the answer may differ. **Do not scope this rider as a well-specified three-hop job.** The confirmed two were at
   `auth/oidc_http.py` and `logging_setup.py`; the build rider is §4.3.
-  **Of that confirmed pair, the syslog forwarder is now GUARDED (BACKLOG #1498) and the OIDC legs are
-  not** — so a cell citing this bullet must say *one confirmed hop remains ungraded-and-unguarded*,
-  not two. The six further ungraded constructions are untouched and still ungraded; #1498 graded none
-  of them.
+  **Both of that confirmed pair are now GUARDED: the syslog forwarder under BACKLOG #1498 and the
+  OIDC legs under BACKLOG #1887.** A cell citing this bullet must say *both hops of the confirmed
+  pair are guarded*, and must keep this bullet's heading beside it: the wider population is still
+  larger and ungraded, so this is not a claim that no unguarded hop is known. *It said "one confirmed
+  hop remains ungraded-and-unguarded" until 2026-09-23, when the OIDC legs were guarded.* The six further ungraded constructions are untouched and still ungraded;
+  neither #1498 nor #1887 graded any of them.
 
 Anchor these to code, not to this ADR's line numbers. **This document is prose and will be edited;
 the code is the evidence.** Nothing in this section is scorecard content, and nothing from the

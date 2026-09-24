@@ -307,7 +307,11 @@ from messagefoundry.logging_setup import LOG_LEVELS, current_log_level, set_runt
 from messagefoundry.parsing.sniff import attachment_mime_agrees, nontext_upload_reason
 from messagefoundry.pipeline import ConfigReloadDenied, Engine
 from messagefoundry.pipeline.alert_sinks import EmailTransport, notifier_from_settings
-from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
+from messagefoundry.pipeline.alerts import (
+    AlertSink,
+    LoggingAlertSink,
+    store_cipher_refusal_forwarder,
+)
 from messagefoundry.pipeline.cluster import (
     StepdownLockTimeout,
     StepdownReleaseUnconfirmed,
@@ -6833,12 +6837,53 @@ def create_managed_app(
         # TLS refusal (connection_string / _build_ssl) clamps MEFOR_ALLOW_INSECURE_TLS — the escape can
         # never relax a production-PHI store hop. None when no [ai] (SQLite/test) → unclamped, unchanged.
         # create=True (BACKLOG #1780): serve's first run is the ordinary way a SQLite store comes to exist.
-        store = await open_store(
-            resolved,
-            create=True,
-            message_events=message_events,
-            posture=_hop_posture,
+        # Operational alert notifier (webhook/email). None when no transport is configured → the
+        # engine falls back to the logging sink. Its background dispatch task is owned by this
+        # lifespan: started here, drained + stopped after the engine in the finally below.
+        # Connector SecretProvider (ADR 0019 §5, BACKLOG #196): built once from [secrets] and threaded to
+        # every credential point (SMTP password → notifier/security-notifier, AD bind password →
+        # AuthService). None = [secrets].provider unset/'none' → env-sourced credentials, byte-identical.
+        # An unknown provider / missing extra fails closed HERE (resolve_secret_provider raises), refusing
+        # startup rather than degrading to a blank credential.
+        secret_provider = (
+            resolve_secret_provider(secrets_settings) if secrets_settings is not None else None
         )
+        notifier = (
+            notifier_from_settings(
+                alerts_settings,
+                secret_provider=secret_provider,
+                # #323 layer 3: the instance [tls] internal-CA policy reaches the alerts SMTP hop too, so
+                # an estate on a private CA needs no per-alert CA path.
+                trust_anchor_policy=tls_settings.policy() if tls_settings else None,
+                # #329: clamp the webhook sink's cleartext-http escape to the derived instance posture.
+                posture=_hop_posture,
+            )
+            if alerts_settings is not None
+            else None
+        )
+        # BACKLOG #1169: the notifier is built BEFORE the store opens so the cipher's refusal hook can
+        # reach it during the open. A planted `state`/`reference` value on a sealed surface aborts the
+        # open (those tables are read eagerly), and a planted row the at-open sweep finds is left in
+        # place; both raise `integrity_drift("store-cipher")`, naming only the table and column. With no
+        # notifier the logging sink carries it, as it does for the engine.
+        try:
+            store = await open_store(
+                resolved,
+                create=True,
+                message_events=message_events,
+                posture=_hop_posture,
+                refusal_hook=store_cipher_refusal_forwarder(
+                    notifier if notifier is not None else LoggingAlertSink(),
+                    asyncio.get_running_loop(),
+                ),
+            )
+        except BaseException:
+            if notifier is not None:
+                # The open failed before the notifier would normally start. Start and drain it, or
+                # an alert raised during the open (the reason the open failed) is never sent.
+                notifier.start()
+                await notifier.aclose()
+            raise
         # Offline uploaded-logs store (BACKLOG #125/#126, ADR 0134), on the LIVE store's cipher instance.
         # DISABLED (None) unless [store].uploads_dir is set, so no PHI-at-rest surface exists unless an
         # operator opts in; every uploaded-logs route 503s when None.
@@ -6864,30 +6909,6 @@ def create_managed_app(
                 # opened — this is the serve path, so it is the one that actually runs sharded.
                 store=store,
             )
-        # Operational alert notifier (webhook/email). None when no transport is configured → the
-        # engine falls back to the logging sink. Its background dispatch task is owned by this
-        # lifespan: started here, drained + stopped after the engine in the finally below.
-        # Connector SecretProvider (ADR 0019 §5, BACKLOG #196): built once from [secrets] and threaded to
-        # every credential point (SMTP password → notifier/security-notifier, AD bind password →
-        # AuthService). None = [secrets].provider unset/'none' → env-sourced credentials, byte-identical.
-        # An unknown provider / missing extra fails closed HERE (resolve_secret_provider raises), refusing
-        # startup rather than degrading to a blank credential.
-        secret_provider = (
-            resolve_secret_provider(secrets_settings) if secrets_settings is not None else None
-        )
-        notifier = (
-            notifier_from_settings(
-                alerts_settings,
-                secret_provider=secret_provider,
-                # #323 layer 3: the instance [tls] internal-CA policy reaches the alerts SMTP hop too, so
-                # an estate on a private CA needs no per-alert CA path.
-                trust_anchor_policy=tls_settings.policy() if tls_settings else None,
-                # #329: clamp the webhook sink's cleartext-http escape to the derived instance posture.
-                posture=_hop_posture,
-            )
-            if alerts_settings is not None
-            else None
-        )
         if notifier is not None:
             # Durable operator alert-state (ADR 0044, #56): wire the open store so every emit upserts a
             # resolvable alert instance (GET /alerts/active) and an inverse signal auto-resolves it. A
