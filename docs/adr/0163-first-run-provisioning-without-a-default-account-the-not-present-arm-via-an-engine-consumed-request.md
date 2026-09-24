@@ -282,9 +282,14 @@ Wave 0 lockout returns for it:
   (`Set-DataDirOwner`), because the default-owner policy can leave the creating user as owner: under
   "Object creator", and for the hosted runners' built-in Administrator (RID 500), measured owning the
   objects it creates (CI run 36039014999). A directory made some other way can still be refused, and
-  the engine logs a WARNING naming the reason whenever it refuses a directory whose inheritance is off
-  and whose every entry names SYSTEM, Administrators or a service account (a Python temp directory,
-  protected with an OWNER RIGHTS entry, is deliberately not warned about);
+  the engine logs a WARNING naming the reason when it refuses a directory whose inheritance is off --
+  including one set up for a gMSA, a dedicated user, LocalService or NetworkService, and one carrying
+  leftover entries such as CREATOR OWNER. The one deliberate exception is a directory carrying an
+  OWNER RIGHTS entry: CPython 3.13+ `mkdtemp` writes every temp directory PROTECTED with SYSTEM,
+  Administrators and OWNER RIGHTS (measured), and warning there fired on every engine start in a temp
+  directory (CI run 36048201979). `install-service.ps1` strips OWNER RIGHTS from the data directory,
+  so no installed directory is silenced by it. Silenced and inheriting directories log the reason at
+  DEBUG;
 - a store whose directory is not itself protected, such as `-DbPath` in a subdirectory of the data
   directory, and a path through any reparse point, including a folder-mounted volume.
 

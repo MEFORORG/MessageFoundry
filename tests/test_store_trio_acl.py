@@ -154,19 +154,30 @@ def test_a_refused_locked_directory_is_logged_and_an_ordinary_one_is_not(
     # An ordinary inheriting directory (a checkout, a temp directory) must stay quiet.
     monkeypatch.setattr(store_mod, "_is_windows", lambda: True)
     monkeypatch.setattr(store_mod, "_reaches_through_a_link", lambda _p: False)
-    locked_wrong = (
-        f"O:S-1-5-21-1-2-3-1001D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;{_TI})"
-    )
-    monkeypatch.setattr(store_mod, "_read_dacl_sddl", lambda _p, **_kw: locked_wrong)
-    with caplog.at_level("WARNING", logger=store_mod.log.name):
-        assert store_mod._store_dir_grants(tmp_path) is None
-    assert any(
-        str(tmp_path) in r.getMessage() and "owned by" in r.getMessage() for r in caplog.records
-    ), [r.getMessage() for r in caplog.records]
-    caplog.clear()
-    # Quiet cases: an inheriting developer directory, and a Python 3.13+ temp directory, which mkdtemp
-    # writes PROTECTED with SYSTEM, Administrators and OWNER RIGHTS (measured). Warning on the second
-    # fired on every engine start in a temp directory (CI run 36048201979).
+    installer = "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+    service = f"(A;OICI;0x1301bf;;;{_TI})"
+    user = "S-1-5-21-1-2-3-1001"
+    # WARN: locked down (inheritance off) and refused, for any reason -- the Wave 0 lockout returns.
+    for label, loud in (
+        ("owned by a user", f"O:{user}{installer}{service}"),
+        ("owned by the RID-500 user", f"O:LA{installer}{service}"),
+        ("Administrators removed", f"O:BAD:PAI(A;OICI;FA;;;SY){service}"),
+        ("a second service", f"O:BA{installer}{service}(A;OICI;0x1301bf;;;{_OTHER_SERVICE})"),
+        ("a wrong right", f"O:BA{installer}(A;OICI;FA;;;{_TI})"),
+        ("a wrong inheritance", f"O:BA{installer}(A;CI;0x1301bf;;;{_TI})"),
+        ("a deny for the service", f"O:BA{installer}{service}(D;OICI;FA;;;{_TI})"),
+        ("a deny for Guests", f"O:BA{installer}{service}(D;OICI;FA;;;BG)"),
+        ("a gMSA run-as", f"O:BA{installer}(A;OICI;0x1301bf;;;S-1-5-21-9-9-9-4455)"),
+        ("a NetworkService run-as", f"O:BA{installer}(A;OICI;0x1301bf;;;NS)"),
+        ("CREATOR OWNER left over", f"O:{user}{installer}(A;OICIIO;GA;;;CO){service}"),
+    ):
+        caplog.clear()
+        monkeypatch.setattr(store_mod, "_read_dacl_sddl", lambda _p, _s=loud, **_kw: _s)
+        with caplog.at_level("WARNING", logger=store_mod.log.name):
+            assert store_mod._store_dir_grants(tmp_path) is None, label
+        assert any(str(tmp_path) in r.getMessage() for r in caplog.records), label
+    # QUIET: an inheriting developer directory, and CPython's temp-directory DACL (see the ADR 0163
+    # note of 2026-09-24 for why that one is exempt).
     for label, quiet in (
         (
             "an inheriting directory",
@@ -189,7 +200,12 @@ def test_a_real_python_temp_directory_is_not_warned_about(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     # The same, on the real directory pytest hands out, read through the real reader: the shape that
-    # made tests/test_startup_attestation.py red on both hosted Windows legs.
+    # made tests/test_startup_attestation.py red on both hosted Windows legs. Its premise is checked
+    # first, so the test cannot pass because tmp_path simply inherits.
+    premise = store_mod._parse_sddl_dacl(store_mod._read_dacl_sddl(tmp_path, owner=True) or "")
+    if premise is None or not premise.protected:
+        pytest.skip(f"this tmp_path is not CPython's protected temp-directory DACL: {premise}")
+    assert any(sid == "OW" for _t, _f, _r, sid in premise.aces), premise
     with caplog.at_level("WARNING", logger=store_mod.log.name):
         assert store_mod._store_dir_grants(tmp_path) is None
     assert not caplog.records, [r.getMessage() for r in caplog.records]
