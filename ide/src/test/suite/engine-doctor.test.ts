@@ -16,6 +16,7 @@ import {
   classifyForbidden,
   escapeMarkdown,
   formatEngineStatus,
+  mustChangeProblem,
   planActions,
   readVersion,
   resolveEngineStatusTarget,
@@ -244,6 +245,30 @@ suite("engine doctor — the deep probe earns (or refuses) the green check", () 
     assert.strictEqual(classifyForbidden("MFA enrolment required"), "mfa");
     assert.strictEqual(classifyForbidden("missing permission: config:deploy"), "permission");
     assert.strictEqual(classifyForbidden("something else entirely"), "forbidden");
+  });
+
+  test("BACKLOG #1141: the 403 that now names a deadline still classifies as must-change", () => {
+    assert.strictEqual(
+      classifyForbidden(
+        "password change required; the temporary password stops working at 2027-01-15T08:00:00Z",
+      ),
+      "mustChangePassword",
+    );
+  });
+
+  test("BACKLOG #1141: the must-change warning states the engine's deadline, in UTC", () => {
+    // 1_800_000_000 s is 2027-01-15T08:00:00Z. Seconds, not milliseconds: the engine sends Unix time.
+    assert.strictEqual(
+      mustChangeProblem(1_800_000_000),
+      "this account must change its password before it can do anything. " +
+        "The temporary password stops working at 2027-01-15T08:00:00Z.",
+    );
+    // An older engine omits the field, and an expiry of 0 sends null: say nothing about a deadline.
+    const bare = "this account must change its password before it can do anything.";
+    assert.strictEqual(mustChangeProblem(undefined), bare);
+    assert.strictEqual(mustChangeProblem(null), bare);
+    // Past the Date range the engine's unbounded setting can reach: no throw, no deadline sentence.
+    assert.strictEqual(mustChangeProblem(1e20), bare);
   });
 });
 

@@ -17,9 +17,10 @@ Plus the construction fail-closed refusals (key↔cert mismatch, untrusted recip
 cleartext), the DeliveryError mapping, the STARTTLS probe, and the ``[egress].allowed_direct`` gate. No
 real SMTP server is ever contacted (an in-process fake).
 
-The last section is a different kind of test: it exercises no engine code and needs no fixture. It
-watches the pinned ``cryptography`` for the CMS key-encryption seam whose absence is why ASVS 11.3.1
-cannot pass on this connector (BACKLOG #1168).
+The library-capability tripwire section is a different kind of test: it exercises no engine code and
+needs no fixture. It watches the pinned ``cryptography`` for the CMS key-encryption seam whose absence
+is why ASVS 11.3.1 cannot pass on this connector (BACKLOG #1168). The content-cipher section after it
+reads the envelope's AES-256-CBC OID out of the DER structure.
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
+from cryptography.hazmat.primitives.ciphers import algorithms
 from cryptography.hazmat.primitives.serialization import pkcs7
 from cryptography.x509.oid import NameOID
 
@@ -835,3 +837,133 @@ def test_pkcs7_add_signer_still_accepts_rsa_padding() -> None:
     param = inspect.signature(pkcs7.PKCS7SignatureBuilder.add_signer).parameters["rsa_padding"]
     assert param.kind is inspect.Parameter.KEYWORD_ONLY
     assert param.default is None
+
+
+# --- content cipher: AES-256-CBC, pinned in code (ASVS 11.3.1, BACKLOG #1168) -----------------------
+#
+# Why the cipher is pinned is recorded once, at `direct._CONTENT_CIPHER`. These tests read the OID
+# out of the envelope's structure rather than scanning bytes, so they say WHICH field carries it.
+
+#: DER content octets of the two content-encryption OIDs (NIST CSOR, RFC 3565).
+_AES128_CBC_OID = bytes.fromhex("608648016503040102")  # 2.16.840.1.101.3.4.1.2
+_AES256_CBC_OID = bytes.fromhex("60864801650304012a")  # 2.16.840.1.101.3.4.1.42
+_ID_ENVELOPED_DATA_OID = bytes.fromhex("2a864886f70d010703")  # 1.2.840.113549.1.7.3
+
+
+def _der_tlv(buf: bytes, pos: int) -> tuple[int, int, int]:
+    """Read one definite-length DER TLV at `pos`. Returns (tag, content start, content end).
+    Single-byte tags only, which is all CMS EnvelopedData uses on the path walked below."""
+    tag = buf[pos]
+    length = buf[pos + 1]
+    start = pos + 2
+    if length & 0x80:
+        n = length & 0x7F
+        assert 0 < n <= 4, "indefinite or oversized DER length -- not a DER envelope"
+        length = int.from_bytes(buf[start : start + n], "big")
+        start += n
+    return tag, start, start + length
+
+
+def _der_children(buf: bytes, start: int, end: int) -> list[tuple[int, int, int]]:
+    out = []
+    pos = start
+    while pos < end:
+        tlv = _der_tlv(buf, pos)
+        out.append(tlv)
+        pos = tlv[2]
+    assert pos == end, "DER children overran their parent"
+    return out
+
+
+def _content_encryption_oid(enveloped: bytes) -> bytes:
+    """The OID in EnvelopedData.encryptedContentInfo.contentEncryptionAlgorithm (RFC 5652 s6.1),
+    found by walking the structure, not by searching for bytes."""
+    tag, s, e = _der_tlv(enveloped, 0)
+    assert tag == 0x30  # ContentInfo SEQUENCE
+    (oid_tag, oid_s, oid_e), (ctx_tag, ctx_s, ctx_e) = _der_children(enveloped, s, e)
+    assert oid_tag == 0x06 and enveloped[oid_s:oid_e] == _ID_ENVELOPED_DATA_OID
+    assert ctx_tag == 0xA0  # [0] EXPLICIT content
+    [(env_tag, env_s, env_e)] = _der_children(enveloped, ctx_s, ctx_e)
+    assert env_tag == 0x30  # EnvelopedData SEQUENCE
+    # version INTEGER, [0] originatorInfo OPTIONAL, recipientInfos SET, encryptedContentInfo, ...
+    fields = [f for f in _der_children(enveloped, env_s, env_e) if f[0] != 0xA0]
+    assert fields[0][0] == 0x02 and fields[1][0] == 0x31, "unexpected EnvelopedData layout"
+    eci_tag, eci_s, eci_e = fields[2]
+    assert eci_tag == 0x30  # EncryptedContentInfo SEQUENCE
+    alg_tag, alg_s, alg_e = _der_children(enveloped, eci_s, eci_e)[1]
+    assert alg_tag == 0x30  # AlgorithmIdentifier SEQUENCE
+    alg_oid_tag, alg_oid_s, alg_oid_e = _der_children(enveloped, alg_s, alg_e)[0]
+    assert alg_oid_tag == 0x06
+    return enveloped[alg_oid_s:alg_oid_e]
+
+
+async def test_envelope_content_cipher_is_aes256_cbc(
+    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any]
+) -> None:
+    """The shipped envelope encrypts content under AES-256-CBC, the cipher the 2026-09-22 ruling
+    accepts, and the recipient recovers the exact body from that same envelope."""
+    _install_fake(monkeypatch)
+    await DirectDestination(_dest(pki)).send(_SYNTHETIC_HL7)
+    [smtp] = _FakeSMTP.instances
+    enveloped = _sent_smime_bytes(smtp)
+
+    oid = _content_encryption_oid(enveloped)
+    assert oid == _AES256_CBC_OID, f"content cipher OID is {oid.hex()}, not AES-256-CBC"
+
+    # Round trip on the SAME AES-256 envelope. The engine has no DIRECT receive path (ADR 0085 PR1 is
+    # outbound only), so this is the receiver's side: the recipient key through the library's CMS
+    # decrypt, which is what a HISP peer runs. The body comes back byte-exact.
+    signed = pkcs7.pkcs7_decrypt_der(enveloped, pki["recip_cert"], pki["recip_key"], [])
+    assert _SYNTHETIC_HL7.encode("utf-8") in signed
+    assert any(c == pki["signer_cert"] for c in pkcs7.load_der_pkcs7_certificates(signed))
+
+
+@pytest.mark.parametrize("signer", ["rsa-pkcs1v15", "rsa-pss", "ec"])
+async def test_envelope_content_cipher_holds_under_every_signer_choice(
+    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any], tmp_path: Path, signer: str
+) -> None:
+    # The cipher is set on the envelope builder, and the signer choices touch only the signature
+    # builder. Pinned so a later refactor that branches the builder chain per signer cannot drop the
+    # cipher on one branch.
+    overrides: dict[str, str] = {
+        "rsa-pkcs1v15": {},
+        "rsa-pss": {"signature_padding": "pss"},
+        "ec": _ec_signer(pki, tmp_path),
+    }[signer]
+    _install_fake(monkeypatch)
+    await DirectDestination(_dest(pki, **overrides)).send(_SYNTHETIC_HL7)
+    [smtp] = _FakeSMTP.instances
+    assert _content_encryption_oid(_sent_smime_bytes(smtp)) == _AES256_CBC_OID
+
+
+def _library_envelope(
+    recipient: x509.Certificate, *cipher: pkcs7.ContentEncryptionAlgorithm
+) -> bytes:
+    builder = pkcs7.PKCS7EnvelopeBuilder().set_data(b"synthetic")
+    for c in cipher:
+        builder = builder.set_content_encryption_algorithm(c)
+    return builder.add_recipient(recipient).encrypt(
+        serialization.Encoding.DER, [pkcs7.PKCS7Options.Binary]
+    )
+
+
+def test_content_encryption_oid_probe_can_read_both_ciphers(pki: dict[str, Any]) -> None:
+    # POSITIVE CONTROL for the DER probe, independent of any library default: it must report AES-128
+    # when AES-128 is asked for, so the AES-256 assertions above are not green on a probe that can
+    # only ever return one value.
+    cert = pki["recip_cert"]
+    assert _content_encryption_oid(_library_envelope(cert, algorithms.AES128)) == _AES128_CBC_OID
+    assert _content_encryption_oid(_library_envelope(cert, algorithms.AES256)) == _AES256_CBC_OID
+
+
+def test_pkcs7_envelope_default_content_cipher_is_still_aes128(pki: dict[str, Any]) -> None:
+    """Library-drift tripwire: the library default is still AES-128-CBC, which is why `direct.py`
+    sets the cipher explicitly.
+
+    If this fails, an upstream release changed the default, and what to do depends on what it moved
+    to. If the new default is AES-256-CBC, the pin in `direct.py` is redundant but harmless. If it is
+    anything else -- including something stronger, such as an authenticated mode -- the pin may now
+    hold Direct BELOW the library default. Either way, re-read BACKLOG #1168 before changing the pin
+    or this test.
+    """
+    assert _content_encryption_oid(_library_envelope(pki["recip_cert"])) == _AES128_CBC_OID

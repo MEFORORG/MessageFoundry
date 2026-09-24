@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-75c4117d21fd0b98
+65ee7bd5234eb01b
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -106,6 +106,9 @@ client_ip: (conn: 'Request | WebSocket') -> 'str | None'
 enforce_phi_read_hop: (request: 'Request') -> 'None'
 enforce_phi_read_pacing: (request: 'Request', identity: 'Identity') -> 'None'
 get_auth: (request: 'Request') -> 'AuthService | None'
+initial_credential_window_hours: (auth: 'AuthService') -> 'float | None'
+pending_credential_deadline: (auth: 'AuthService', user: 'UserRecord | None') -> 'float | None'
+pending_credential_deadline_for: (auth: 'AuthService', user_id: 'str') -> 'float | None'
 
 ## AuthService members reached by the console
 action_step_up_required: property -> 'bool'
@@ -174,7 +177,7 @@ messagefoundry.api.auth_models.RolesUpdateRequest: roles
 messagefoundry.api.auth_models.SecurityEventInfo: action, detail, ts
 messagefoundry.api.auth_models.SecurityEventsList: events
 messagefoundry.api.auth_models.UserCreateRequest: display_name, email, password, roles, username
-messagefoundry.api.auth_models.UserSummary: auth_provider, channel_scope, disabled, display_name, email, id, notify_email, roles, username
+messagefoundry.api.auth_models.UserSummary: auth_provider, channel_scope, credential_expires_at, disabled, display_name, email, id, notify_email, roles, username
 messagefoundry.api.auth_models.UserUpdateRequest: disabled, display_name, email
 messagefoundry.api.models.AlertInstanceInfo: acked_at, acked_by, connection, count, event_type, first_seen, id, last_seen, reason, resolved_at, severity, status, suspended_until
 messagefoundry.api.models.AlertInstanceList: alerts, total, worst_severity
