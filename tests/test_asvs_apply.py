@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "asvs")
 
 from scripts.asvs.apply import (  # noqa: E402
     _BANNED,
+    _ORDERED,
     _PROSE_FIELDS,
     _SUBTABLES,
     _control_keys,
@@ -2558,3 +2559,110 @@ def test_a_STATED_whole_file_re_render_is_ALLOWED(tmp_path: Path) -> None:
     )
     assert rc == 0
     assert _PRE_REPAIR in rec.read_text(encoding="utf-8"), "the stated write did not happen"
+
+
+# --- BACKLOG #1883: the two date fields were written through a raw format string ------------------
+#
+# `render()` emitted `last_verified` and `verified_at` as `f'... = "{value}"'` while every sibling
+# string went through `toml_str()`. Nothing constrains the SHAPE of either field -- `main` checks only
+# that they are non-empty -- so a quote and a newline in the value closed the string early and wrote
+# whatever followed into the record as TOML. An injected top-level key is on neither side of any
+# key-set or type comparison, so it passes them all.
+#
+# THE CONTROL ARM IS LOAD-BEARING. A writer that refuses every payload also refuses the attack, so a
+# refusal alone proves nothing. The fix is the QUOTING, and the property asserted is the one the
+# quoting buys: the hostile text lands as a VALUE, and the cell carries no key the payload did not name.
+
+_INJECTION = '2026-09-22"\ninjected = "owned'
+_CLOSURE_INJECTION = (
+    '2026-09-22"\ndecision_closed = true\ndecision_closed_verdict = "partial"\n'
+    'decision_closed_by = "not-the-owner'
+)
+
+
+def _cell_after(rec: Path, cell_id: str = "1.1.1") -> dict:
+    return next(
+        c for c in tomllib.loads(rec.read_text(encoding="utf-8"))["cell"] if c["id"] == cell_id
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param("2026-09-22", id="control-benign"),
+        pytest.param(_INJECTION, id="injection-new-key"),
+        # The escalation that set #1883's value: three injected lines made an open cell read
+        # owner-closed, attributed to whoever the payload named, and the sibling verifier agreed.
+        pytest.param(_CLOSURE_INJECTION, id="injection-owner-closure"),
+    ],
+)
+@pytest.mark.parametrize("field", ["last_verified", "verified_at"])
+def test_a_date_field_lands_as_a_VALUE_and_never_adds_a_key(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    """Before the fix both injection arms exited 0 and the cell carried keys the payload never
+    named. The fix is the quoting, not a refusal, so every arm must write and round-trip EXACTLY --
+    which is also what keeps the benign arm a real control rather than a refuse-everything pass."""
+    rec = _record(tmp_path)
+    before_keys = set(_cell_after(rec))
+    rc = main(
+        [
+            str(_payload(tmp_path, [_cell_111(**{field: value})])),
+            "--scorecard",
+            str(rec),
+            "--apply",
+        ]
+    )
+    got = _cell_after(rec)
+    assert set(got) == before_keys, f"{field} changed the cell's key set: {sorted(got)}"
+    assert rc == 0
+    assert got[field] == value
+
+
+#: Every ordered field the writer emits as a string -- DERIVED from `_ORDERED`, so the next field
+#: added there is covered without anyone remembering to list it here. `level` is the one int.
+_ORDERED_STRINGS = [k for k in _ORDERED if k != "level"]
+
+
+def _minimal_cell() -> dict:
+    return {
+        "id": "1.2.3",
+        "level": 1,
+        "verdict": "pass",
+        "residual": "r",
+        "last_verified": "2026-09-22",
+        "verified_at": "0" * 40,
+        "reviewed_by": "b",
+    }
+
+
+@pytest.mark.parametrize("field", _ORDERED_STRINGS)
+def test_every_ORDERED_string_field_is_quoted_by_the_writer_itself(field: str) -> None:
+    """`main` happens to constrain `id` and `verdict` today, so `render` never sees a hostile one.
+    This asserts the WRITER quotes them all anyway, so the next check someone relaxes upstream does
+    not reopen the hole: the choice is not made per field."""
+    cell = _minimal_cell()
+    cell[field] = _INJECTION
+    parsed = tomllib.loads(render(cell))["cell"][0]
+    assert parsed[field] == _INJECTION
+    assert "injected" not in parsed
+
+
+@pytest.mark.parametrize(
+    "value",
+    [20260922, True, 1.5, {"a": 1}, ["a"], "del\x7fchar"],
+    ids=["int", "bool", "float", "dict", "list", "DEL"],
+)
+@pytest.mark.parametrize("field", _ORDERED_STRINGS)
+def test_every_ORDERED_string_field_lands_as_a_STRING_whatever_type_it_was_given(
+    field: str, value: object
+) -> None:
+    """The f-strings this replaced coerced by accident, through `str()`. `json.dumps` alone does
+    not: it writes an int or a bool as that type, a dict as a JSON object TOML cannot parse, and DEL
+    raw, which TOML forbids. The type guard in `main` excludes `_ORDERED` on the strength of this
+    coercion, so a field that kept its non-string type would pass that guard unseen (#1884 limb 4
+    measured it on `residual`)."""
+    cell = _minimal_cell()
+    cell[field] = value
+    parsed = tomllib.loads(render(cell))["cell"][0]
+    assert parsed[field] == str(value)

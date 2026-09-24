@@ -134,9 +134,18 @@ def _introduced_banned(payload: str, live: str) -> tuple[str, int] | None:
     return None
 
 
-def toml_str(s: str) -> str:
-    """A TOML basic string. JSON escaping is a strict subset of TOML's, so json.dumps is safe."""
-    return json.dumps(s, ensure_ascii=False)
+def toml_str(s: object) -> str:
+    """A TOML basic string, ALWAYS a string, whatever type it was handed.
+
+    The ``str()`` is load-bearing. The type guard in ``main`` excludes ``_ORDERED`` because this
+    writer COERCES those fields, and ``json.dumps`` alone does not: handed an int, a bool, a list or a
+    dict it emits a TOML int, bool or array, or a JSON object that does not parse at all (BACKLOG
+    #1883, #1884 limb 4). Coercing here makes that exclusion's premise true for every caller at once.
+
+    JSON escapes every control character TOML forbids except one: DEL (U+007F), which ``json.dumps``
+    leaves raw and ``tomllib`` rejects. So it is escaped by hand.
+    """
+    return json.dumps(str(s), ensure_ascii=False).replace("\x7f", "\\u007f")
 
 
 #: Scalar keys this writer knows how to emit. ANY OTHER scalar key found on the live cell is carried
@@ -148,6 +157,9 @@ def toml_str(s: str) -> str:
 #: A green gate cannot distinguish PRESERVED from DROPPED, so the writer must never enumerate what it
 #: keeps; it enumerates only what it ORDERS, and everything else survives by default.
 _ORDERED = ("id", "level", "verdict", "residual", "last_verified", "verified_at", "reviewed_by")
+#: The ordered fields `render` omits when empty. Every other ordered field is always written, which
+#: is why `main` requires them; `reviewed_by` is required too unless the run is an anchor repair.
+_OPTIONAL_ORDERED = ("residual", "reviewed_by")
 
 #: AT LEAST these top-level keys carry free text. **NOT every field that can** -- `posture`,
 #: `decision_closed_on`, anything a payload invents, and all sub-table text (`evidence[].expect`,
@@ -296,7 +308,7 @@ def _toml_value(value: object) -> str:
         return "{ " + inner + " }" if inner else "{}"
     if isinstance(value, (list, tuple)):
         return "[" + ", ".join(_toml_value(v) for v in value) + "]"
-    return toml_str(str(value))
+    return toml_str(value)
 
 
 def _scalar(key: str, value: object) -> str:
@@ -321,14 +333,24 @@ def _carried(entry: dict[str, Any], ordered: tuple[str, ...]) -> list[str]:
 
 
 def render(cell: dict[str, Any], live: dict[str, Any] | None = None) -> str:
-    out = ["[[cell]]", f'id = "{cell["id"]}"', f"level = {int(cell['level'])}"]
-    out.append(f'verdict = "{cell["verdict"]}"')
-    if cell.get("residual"):
-        out.append(f"residual = {toml_str(cell['residual'])}")
-    out.append(f'last_verified = "{cell["last_verified"]}"')
-    out.append(f'verified_at = "{cell["verified_at"]}"')
-    if cell.get("reviewed_by"):
-        out.append(f"reviewed_by = {toml_str(cell['reviewed_by'])}")
+    # ONE EMISSION FOR EVERY ORDERED STRING, SO NO FIELD CAN CHOOSE ITS OWN QUOTING (BACKLOG #1883).
+    # Four of these were raw f-strings carrying their own quote marks, and two of them --
+    # `last_verified` (a date) and `verified_at` (a commit SHA) -- are constrained upstream only to
+    # be non-empty. A quote and a newline in either closed the string early and wrote the rest into
+    # the record as TOML: a payload could add any NEW key to the cell, `decision_closed` and its pins
+    # included, past every key-set and type guard below. A format check would not replace this; the
+    # next field added to `_ORDERED` has no format rule yet.
+    #
+    # `id` and `verdict` share the line, but `main`'s checks on them are STILL NEEDED: an id that
+    # `toml_str` had to escape would not be found again by `block_spans`'s plain regex, so the record
+    # could not be rewritten on the next run. Quoting keeps a bad id out of the TOML structure; it
+    # does not make one usable.
+    out = ["[[cell]]"]
+    for key in _ORDERED:
+        if key == "level":
+            out.append(f"level = {int(cell[key])}")
+        elif cell.get(key) or key not in _OPTIONAL_ORDERED:
+            out.append(f"{key} = {toml_str(cell[key])}")
     # Carry through every other scalar from BOTH SOURCES -- decision_closed and friends off the live
     # cell, and anything a future schema adds that this writer has never heard of, from either side.
     #
@@ -657,7 +679,8 @@ def main(argv: list[str] | None = None) -> int:
                     f"{c.get('id')}: declared anchor_repair but the verdict differs from the "
                     "record; that is a rescore, not a repair"
                 )
-        required: tuple[str, ...] = ("id", "level", "verdict", "last_verified", "verified_at")
+        # Every field `render` always writes, derived so the two cannot drift apart.
+        required = tuple(k for k in _ORDERED if k not in _OPTIONAL_ORDERED)
         if not anchor_repair:
             required = required + ("reviewed_by",)
         for field in required:
