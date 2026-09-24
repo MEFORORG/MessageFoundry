@@ -523,7 +523,12 @@ enrolled past the pin. Registration now requires the integer type itself for the
 map, and any label that is not an integer or a text string (RFC 9052 section 7). These refusals
 are deliberate too, so they log no WARNING.
 
-**The pin is registration-only, by design.** `verify_assertion` does not re-screen a stored
-key's curve. A credential enrolled before the pin may be ES256 on P-384 or P-521; it still
-verifies and still clears the floor, so refusing it at assertion would lock its owner out for
-no security gain. A test pins that such a stored key still asserts.
+**Sign-in re-screens the stored key (BACKLOG #1166).** This paragraph first said the pin was
+registration-only, so that a key enrolled before it would not lock its owner out. That
+carve-out protected nobody: MessageFoundry has no deployments (CLAUDE.md section 0), so no key
+was ever enrolled before the pin. It also left a real gap. The library checks only the
+signature at sign-in, so a stored key registration would refuse still signed in: an RSA key of
+any modulus, 1024-bit included, ES256 on P-384, or a curve that reads `true`. `verify_assertion`
+now runs the same check as registration on the stored key, before it verifies anything. A key
+that fails is refused on the audited invalid-input path with no WARNING, like the registration
+refusals above.

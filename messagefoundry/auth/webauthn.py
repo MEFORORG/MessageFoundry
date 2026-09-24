@@ -17,7 +17,9 @@ process is structural; ADR 0068 records the store-backed table as the multi-node
 Policy pins (ADR 0068 §1/§6): ``attestation=NONE`` (passkey norm — no attestation certificates are
 requested or stored, keeping ASVS 6.7.1 N/A), ``user_verification=PREFERRED`` (the knowledge
 factor is the password that accompanies every step-up; ``REQUIRED`` would brick PIN-less U2F keys
-for no factor gain), and the credential algorithm set (:data:`SUPPORTED_COSE_ALGS`).
+for no factor gain), the credential algorithm set (:data:`SUPPORTED_COSE_ALGS`), and the key type
+and curve each algorithm must arrive in (:data:`_COSE_KEY_SHAPE_FOR_ALG`), checked at registration
+and again at every sign-in.
 """
 
 from __future__ import annotations
@@ -75,8 +77,8 @@ SUPPORTED_COSE_ALGS: tuple[int, ...] = (-8, -7)
 #: **ES256 is bound to P-256 by owner ruling 2026-09-23** (BACKLOG #1166). ES256 on P-384 or
 #: P-521 verifies and clears the 128-bit floor, so this is not a strength control. It is the
 #: pairing RFC 9053 section 2.1 recommends for interoperability (SHA-256 with P-256 only), and
-#: the one the WebAuthn specification describes for -7. Registration only: see
-#: :func:`verify_assertion` for why a stored key is not re-screened.
+#: the one the WebAuthn specification describes for -7. Both ceremonies apply it: sign-in
+#: re-screens the stored key (:func:`verify_assertion`).
 _COSE_KEY_SHAPE_FOR_ALG: dict[int, tuple[int, int]] = {-8: (1, 6), -7: (2, 1)}
 
 _INSTALL_HINT = (
@@ -119,9 +121,10 @@ class ChallengeCacheFullError(RuntimeError):
 def _supported_pub_key_algs() -> list[COSEAlgorithmIdentifier]:
     """Resolve :data:`SUPPORTED_COSE_ALGS` to the library enum (lazy — the extra is optional).
 
-    Both ceremony halves call this, so the set the relying party ADVERTISES and the set it ACCEPTS
-    cannot drift apart. That is the whole control: advertisement is a hint an authenticator may
-    ignore, and ``verify_registration_response`` is the only place a credential is refused.
+    Both registration calls use this, so the set the relying party ADVERTISES and the set it
+    ACCEPTS cannot drift apart. Advertisement is a hint an authenticator may ignore, so the
+    refusal is what counts: ``verify_registration_response`` refuses a new credential, and
+    :data:`_COSE_KEY_SHAPE_FOR_ALG` refuses the same identifiers again at both ceremonies.
     """
     from webauthn.helpers.cose import COSEAlgorithmIdentifier
 
@@ -203,8 +206,11 @@ def _require_cose_integers(fields: object) -> None:
             )
 
 
-def _require_usable_public_key(cose_key: bytes) -> None:
-    """Refuse a credential public key that no assertion could ever verify against.
+def _require_usable_public_key(cose_key: bytes, *, ceremony: str) -> None:
+    """Refuse a credential public key that breaks the key rule, at either ceremony.
+
+    Registration runs it on the new key and sign-in on the stored one, so the two ceremonies
+    cannot drift apart (BACKLOG #1166). ``ceremony`` only names the one in the log line.
 
     Runs the SAME decode and key construction the assertion path runs, so a credential that passes
     here cannot fail there for a reason its key alone decides. Before this check a credential whose
@@ -215,10 +221,13 @@ def _require_usable_public_key(cose_key: bytes) -> None:
 
     It also binds each identifier to one key type and curve (:data:`_COSE_KEY_SHAPE_FOR_ALG`),
     so an ES256 credential on P-384 or P-521 is refused here although it would verify. That is
-    the owner's 2026-09-23 ruling, and it is a deliberate refusal, so it is not logged.
+    the owner's 2026-09-23 ruling, and it is a deliberate refusal, so it is not logged. The same
+    table refuses every identifier outside :data:`SUPPORTED_COSE_ALGS`, which is what stops a
+    stored RSA key at sign-in: the library checks the identifier at registration only.
 
     That binding compares integers, so :func:`_require_cose_integers` runs before it. Its
-    refusals are deliberate too, and not logged.
+    refusals are deliberate too, and not logged. Both checks sit outside the library catch: a
+    fault in our own logic must surface as a bug, not as a refusal.
     """
     from webauthn.helpers import (
         decode_credential_public_key,
@@ -231,7 +240,7 @@ def _require_usable_public_key(cose_key: bytes) -> None:
         decoded_public_key_to_cryptography(decoded)
         fields = parse_cbor(cose_key)
     except _invalid_input_errors() as exc:
-        raise _refusal(exc, ceremony="registration") from exc
+        raise _refusal(exc, ceremony=ceremony) from exc
     _require_cose_integers(fields)
     alg, kty, crv = decoded.alg, decoded.kty, getattr(decoded, "crv", None)
     shape = (kty, crv)
@@ -423,7 +432,7 @@ def verify_registration(
         # never an unhandled 500. The raw decode errors join it for the same reason (BACKLOG
         # #1166): a malformed COSE key raised them straight out of this call.
         raise _refusal(exc, ceremony="registration") from exc
-    _require_usable_public_key(verified.credential_public_key)
+    _require_usable_public_key(verified.credential_public_key, ceremony="registration")
     return RegistrationResult(
         credential_id=verified.credential_id,
         public_key=verified.credential_public_key,
@@ -471,14 +480,19 @@ def verify_assertion(
     accepted); the *service* layer applies the strict compare-and-set on top (a CAS miss is the
     clone signal — ADR 0068 §4).
 
-    The stored key is deliberately NOT re-screened against :data:`_COSE_KEY_SHAPE_FOR_ALG`. A key
-    enrolled before the 2026-09-23 P-256 pin may be ES256 on P-384 or P-521. It still verifies
-    and still clears the floor, so refusing it here would lock its owner out for no security
-    gain. A key that cannot verify still fails here, as invalid input.
+    The stored key is re-screened first, with the rule registration applies
+    (:func:`_require_usable_public_key`). The library checks only the signature, so without this
+    a stored key registration would refuse still signed in: an RSA key of any modulus, ES256 on
+    P-384, or a curve that reads ``true``. A non-conforming key is refused as invalid input, and
+    the service audits it (BACKLOG #1166).
+
+    There is no carve-out for keys enrolled before the P-256 pin. One would protect users who do
+    not exist: nothing is deployed (CLAUDE.md section 0), so no such key was ever enrolled.
     """
     _require_webauthn()
     from webauthn import verify_authentication_response
 
+    _require_usable_public_key(public_key, ceremony="assertion")
     try:
         verified = verify_authentication_response(
             credential=response_json,
@@ -492,9 +506,8 @@ def verify_assertion(
         # The BASE class, deliberately (PR-A review HIGH): malformed input raises siblings of
         # InvalidAuthenticationResponse — every rejection lands audited, never a 500. The
         # sign-count regression message ("...sign count...") still rides through for the
-        # service's clone-signal classification. The raw decode errors are the backstop for a
-        # STORED key registration would now refuse (BACKLOG #1166): one enrolled before that check,
-        # or damaged since, decodes here and used to escape as a raw ValueError or KeyError.
+        # service's clone-signal classification. The raw types stay caught although the stored
+        # key was screened above: the response itself is attacker input too.
         raise _refusal(exc, ceremony="assertion") from exc
     return verified.new_sign_count
 

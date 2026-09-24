@@ -34,7 +34,8 @@ import pytest
 
 pytest.importorskip("webauthn")
 
-from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa  # noqa: E402
+from cryptography.hazmat.primitives import hashes  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519, padding, rsa  # noqa: E402
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat  # noqa: E402
 from webauthn.helpers import bytes_to_base64url, encode_cbor, parse_cbor  # noqa: E402
 from webauthn.helpers.cose import COSEAlgorithmIdentifier  # noqa: E402
@@ -394,27 +395,19 @@ def test_es256_on_a_curve_other_than_p256_is_refused_at_registration(
 
 
 @_LARGER_CURVES
-def test_a_stored_es256_key_on_a_larger_curve_still_asserts(
-    curve: ec.EllipticCurve, crv: int, size: int
+def test_a_stored_es256_key_on_a_larger_curve_is_refused_at_sign_in(
+    curve: ec.EllipticCurve, crv: int, size: int, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The pin is registration-only, on purpose: a key enrolled before it must not lock anyone out.
+    """Sign-in re-screens the stored key with the registration rule (BACKLOG #1166).
 
-    It verifies and clears the floor, so ``verify_assertion`` does not re-screen its curve.
+    This row used to pin the opposite: a key enrolled before the P-256 pin still signed in. That
+    carve-out protected keys that do not exist, because nothing is deployed (CLAUDE.md section 0).
+    The key is real and the signature is good, so only the re-screen can refuse it.
     """
     key = ec.generate_private_key(curve)
     soft = SoftAuthenticator(rp_id=RP, origin=ORIGIN, _key=key)  # signs ECDSA over SHA-256
-    challenge = secrets.token_bytes(wa.CHALLENGE_BYTES)
-    assert (
-        wa.verify_assertion(
-            response_json=soft.get_response(challenge),
-            challenge=challenge,
-            rp_id=RP,
-            origin=ORIGIN,
-            public_key=_cose_es256(key, crv, size),
-            current_sign_count=0,
-        )
-        == 0
-    )
+    caught = _refused_at_sign_in(soft.get_response, _cose_es256(key, crv, size), caplog)
+    assert str(caught).startswith("COSE algorithm -7 is accepted only as")
 
 
 def _assert_registers(cose_key: bytes) -> None:
@@ -626,3 +619,160 @@ def test_the_stand_in_rows_are_otherwise_well_formed() -> None:
     with_text_label = dict(parse_cbor(_p256()))
     with_text_label["note"] = "x"
     _assert_registers(encode_cbor(with_text_label))
+
+
+# --- sign-in re-screens the stored key with the registration rule (BACKLOG #1166) --------------
+#
+# ``verify_assertion`` used to trust the stored key: the library checks the signature and never
+# asks which identifier, key type or curve the key carries. So a stored key registration would
+# refuse still signed in, an RSA key of ANY modulus included. The carve-out that allowed it was
+# kept for keys enrolled before the P-256 pin, and there are none: nothing is deployed (CLAUDE.md
+# section 0). Every row below signed in at engine ``5ccff7cb3``, with a real key and a good
+# signature, so only the re-screen can refuse it.
+
+
+def _assertion_response(challenge: bytes, sign: Callable[[bytes], bytes]) -> str:
+    """A well-formed ``navigator.credentials.get`` response signed by ``sign``."""
+    credential_id = secrets.token_bytes(32)
+    client_data = json.dumps(
+        {"type": "webauthn.get", "challenge": bytes_to_base64url(challenge), "origin": ORIGIN}
+    ).encode("utf-8")
+    rp_hash = hashlib.sha256(RP.encode("utf-8")).digest()
+    auth_data = rp_hash + bytes([_FLAG_UP]) + struct.pack(">I", 0)
+    signature = sign(auth_data + hashlib.sha256(client_data).digest())
+    return json.dumps(
+        {
+            "id": bytes_to_base64url(credential_id),
+            "rawId": bytes_to_base64url(credential_id),
+            "response": {
+                "clientDataJSON": bytes_to_base64url(client_data),
+                "authenticatorData": bytes_to_base64url(auth_data),
+                "signature": bytes_to_base64url(signature),
+                "userHandle": None,
+            },
+            "type": "public-key",
+            "clientExtensionResults": {},
+        }
+    )
+
+
+def _rsa_signer(key: rsa.RSAPrivateKey) -> Callable[[bytes], str]:
+    """An assertion response maker that signs RS256, the way an RSA authenticator would."""
+
+    def sign(data: bytes) -> bytes:
+        return key.sign(data, padding.PKCS1v15(), hashes.SHA256())
+
+    return lambda challenge: _assertion_response(challenge, sign)
+
+
+def _ed25519_signer(key: ed25519.Ed25519PrivateKey) -> Callable[[bytes], str]:
+    return lambda challenge: _assertion_response(challenge, key.sign)
+
+
+def _signs_in(respond: Callable[[bytes], str], stored: bytes) -> int:
+    challenge = secrets.token_bytes(wa.CHALLENGE_BYTES)
+    return wa.verify_assertion(
+        response_json=respond(challenge),
+        challenge=challenge,
+        rp_id=RP,
+        origin=ORIGIN,
+        public_key=stored,
+        current_sign_count=0,
+    )
+
+
+def _refused_at_sign_in(
+    respond: Callable[[bytes], str], stored: bytes, caplog: pytest.LogCaptureFixture
+) -> wa.WebAuthnVerificationError:
+    """Assert the audited refusal, with no WARNING: the refusal is deliberate, not a raw failure."""
+    logger = "messagefoundry.auth.webauthn"
+    with (
+        caplog.at_level(logging.WARNING, logger=logger),
+        pytest.raises(wa.WebAuthnVerificationError) as caught,
+    ):
+        _signs_in(respond, stored)
+    assert not [r for r in caplog.records if r.name == logger]
+    return caught.value
+
+
+def _rs256(key: rsa.RSAPrivateKey) -> bytes:
+    return _cose_rsa(key.public_key(), int(COSEAlgorithmIdentifier.RSASSA_PKCS1_v1_5_SHA_256))
+
+
+@pytest.mark.parametrize("bits", [1024, 2048])
+def test_a_stored_rsa_key_is_refused_at_sign_in(
+    bits: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    """RS256 carries no modulus floor, and a stored 1024-bit key used to sign in."""
+    key = _rsa_key(bits)
+    caught = _refused_at_sign_in(_rsa_signer(key), _rs256(key), caplog)
+    assert str(caught).startswith("COSE algorithm -257 is accepted only as")
+
+
+def test_the_rsa_sign_in_fixture_verifies_under_the_library() -> None:
+    """The positive control for the RSA row: the library alone accepts this assertion.
+
+    If it did not, the row above would pass on a broken fixture rather than on the re-screen.
+    """
+    from webauthn import verify_authentication_response
+
+    key = _rsa_key(1024)
+    challenge = secrets.token_bytes(wa.CHALLENGE_BYTES)
+    verified = verify_authentication_response(
+        credential=_rsa_signer(key)(challenge),
+        expected_challenge=challenge,
+        expected_rp_id=RP,
+        expected_origin=ORIGIN,
+        credential_public_key=_rs256(key),
+        credential_current_sign_count=0,
+    )
+    assert verified.new_sign_count == 0
+
+
+#: Stored P-256 keys with one stand-in for a COSE integer, each with the refusal it must meet.
+#: ``alg`` as text is the row a type check inside the library catch gets wrong: ``int("x")``
+#: raises a raw ``ValueError``, which the catch turns into a WARNING and a different message.
+#: Only sign-in can show it, because registration's library call refuses that ``alg`` first.
+_NON_INTEGER_STORED_KEYS: dict[str, tuple[Callable[[bytes], bytes], str]] = {
+    "crv true": (lambda k: _relabelled(k, crv=True), _VALUE.format("crv")),
+    "crv 1.0": (lambda k: _relabelled(k, crv=1.0), _VALUE.format("crv")),
+    "alg true": (lambda k: _relabelled(k, alg=True), _VALUE.format("alg")),
+    "alg as text": (lambda k: _relabelled(k, alg="x"), _VALUE.format("alg")),
+    "kty 2.0": (lambda k: _relabelled(k, kty=2.0), _VALUE.format("kty")),
+}
+
+
+@pytest.mark.parametrize(
+    ("rewrite", "refusal"), _NON_INTEGER_STORED_KEYS.values(), ids=_NON_INTEGER_STORED_KEYS.keys()
+)
+def test_a_stored_key_with_a_stand_in_integer_is_refused_at_sign_in(
+    rewrite: Callable[[bytes], bytes], refusal: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Sign-in runs the same integer check as registration, so a stand-in cannot sign in."""
+    soft = SoftAuthenticator(rp_id=RP, origin=ORIGIN)
+    caught = _refused_at_sign_in(soft.get_response, rewrite(soft.cose_public_key()), caplog)
+    assert str(caught).startswith(refusal)
+
+
+@pytest.mark.parametrize("alg", [True, False], ids=["alg true", "alg false"])
+def test_an_alg_given_as_a_bool_is_refused_at_registration(alg: bool) -> None:
+    """``True == 1`` in Python. At registration the library refuses these before the pin runs."""
+    challenge = secrets.token_bytes(wa.CHALLENGE_BYTES)
+    with pytest.raises(wa.WebAuthnVerificationError):
+        wa.verify_registration(
+            response_json=_registration_response(challenge, _relabelled(_p256(), alg=alg)),
+            challenge=challenge,
+            rp_id=RP,
+            origin=ORIGIN,
+        )
+
+
+def test_p256_es256_and_ed25519_eddsa_pass_both_ceremonies() -> None:
+    """The positive control: the re-screen refuses nothing the registration rule keeps."""
+    soft = SoftAuthenticator(rp_id=RP, origin=ORIGIN)
+    _assert_registers(soft.cose_public_key())
+    assert _signs_in(soft.get_response, soft.cose_public_key()) == 0
+
+    key = ed25519.Ed25519PrivateKey.generate()
+    _assert_registers(_okp(key))
+    assert _signs_in(_ed25519_signer(key), _okp(key)) == 0
