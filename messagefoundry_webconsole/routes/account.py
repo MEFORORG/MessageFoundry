@@ -14,7 +14,7 @@ from messagefoundry.api._ui_seam import UiDeps
 from messagefoundry.api.auth_models import (
     PasswordChangeRequest,
 )
-from messagefoundry.auth import Identity
+from messagefoundry.auth import AuthProvider, Identity
 from messagefoundry.auth import webauthn as webauthn_mod
 from messagefoundry.auth.service import (
     STEP_UP_ACTION_MFA_CONFIRM,
@@ -35,6 +35,7 @@ from .._auth import (
     assert_same_origin,
     clear_session_cookie,
     login_redirect_response,
+    password_change_owes_factor,
     register_ui_action,
     require_ui,
     require_ui_reauth_only,
@@ -179,10 +180,31 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             service, identity, request, notice=_ACCOUNT_NOTICES.get(m or "")
         )
 
+    async def _factor_first(
+        request: Request, service: AuthService, identity: Identity
+    ) -> Response | None:
+        """The /ui twin of the JSON gate's refusal on ``POST /me/password`` (BACKLOG #1954).
+
+        ``allow_mfa_pending`` on these two routes serves an account with NO factor, which must be
+        able to rotate. A pending session on an account that HAS one goes to the factor page first,
+        and the refusal is audited like ``require_ui``'s own. The JSON handler this page delegates
+        to is reached in-process, past its ``Depends`` gate, so the check has to live here too."""
+        if (
+            identity.auth_provider is not AuthProvider.LOCAL
+            or not await password_change_owes_factor(service, session_token(request))
+        ):
+            return None  # a directory account gets the handler's 400, as on the JSON plane
+        await service.audit_mfa_denied(identity, request.url.path, client=_client(request))
+        return RedirectResponse("/ui/mfa", status_code=303)
+
     @app.get("/ui/account/password", response_class=HTMLResponse)
     async def ui_account_password_form(
+        request: Request,
+        service: AuthService = Depends(_service),
         identity: Identity = Depends(require_ui(allow_must_change=True, allow_mfa_pending=True)),
-    ) -> HTMLResponse:
+    ) -> Response:
+        if (refused := await _factor_first(request, service, identity)) is not None:
+            return refused
         # `forced` comes from the SERVER-side flag, never a query param (unspoofable).
         return HTMLResponse(pages.password_page(forced=identity.must_change_password))
 
@@ -193,6 +215,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         identity: Identity = Depends(require_ui(allow_must_change=True, allow_mfa_pending=True)),
     ) -> Response:
         assert_same_origin(request)
+        if (refused := await _factor_first(request, service, identity)) is not None:
+            return refused
         # No throttle call here on purpose: this route DELEGATES to the JSON handler
         # (admin.change_password) below, which applies the per-actor ceremony budget and whose 429 is
         # re-raised intact. Charging here too would spend two tokens per submission.

@@ -22,7 +22,7 @@ from fastapi.responses import RedirectResponse
 
 from messagefoundry.api.security import enforce_phi_read_hop, get_auth
 from messagefoundry.auth import Identity, Permission
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import STEP_UP_ACTION_PASSWORD_CHANGE, AuthService
 
 __all__ = [
     "BROWSER_HARDENING_OPT_OUT_ENV",
@@ -49,7 +49,9 @@ __all__ = [
     "login_redirect_response",
     "lookup_ui_action",
     "oidc_flow_cookie_name",
+    "password_change_owes_factor",
     "register_ui_action",
+    "rotation_comes_first",
     "require_ui",
     "require_ui_reauth_only",
     "require_ui_reauth_only_action",
@@ -240,6 +242,29 @@ def _mfa_redirect() -> HTTPException:
     return HTTPException(status.HTTP_303_SEE_OTHER, headers={"Location": "/ui/mfa"})
 
 
+async def password_change_owes_factor(auth: AuthService, token: str | None) -> bool:
+    """Whether this session must prove its second factor before it may change the password.
+
+    True for a pending session on an account that HAS a factor (BACKLOG #1954, ASVS 6.3.3): a change
+    revokes every session, so a password holder must not reach it on the password alone. False for
+    an account with no factor, which has nothing to prove and must rotate first. The rule is the
+    engine's own, read through its public ``factor_binding_is_blocked``, so the two planes cannot
+    disagree about it."""
+    return await auth.factor_binding_is_blocked(token, STEP_UP_ACTION_PASSWORD_CHANGE)
+
+
+async def rotation_comes_first(auth: AuthService, must_change: bool, token: str | None) -> bool:
+    """Whether a session is confined to the password page (L4b) right now.
+
+    A must-change session with no factor, or with its factor proven, can only rotate. One that still
+    owes a factor it has enrolled proves it first, since the password page refuses it until then
+    (BACKLOG #1954); an administrator reset is at least one shipped way in, because it keeps
+    factors. At least ``require_ui``, ``/ui/login``, both ``/ui/mfa`` routes, both ``/ui/reauth``
+    routes and ``/ui/reauth/webauthn`` ask this. The WebSocket handshakes do not route a session,
+    they refuse it, and still refuse every must-change session."""
+    return must_change and not await password_change_owes_factor(auth, token)
+
+
 def require_ui(
     *permissions: Permission,
     phi: bool = False,
@@ -293,10 +318,15 @@ def require_ui(
             # too (14.3.1). A visitor with NO cookie never had a session — plain form, no code.
             raise _login_redirect("expired" if token else "")
         if identity.must_change_password and not allow_must_change:
-            # A flagged account can go nowhere but the change-password page (L4b) until it rotates.
-            raise HTTPException(
-                status.HTTP_303_SEE_OTHER, headers={"Location": "/ui/account/password"}
-            )
+            # A flagged account can go nowhere but the change-password page (L4b) until it rotates,
+            # or the factor page first when it still owes an enrolled factor (BACKLOG #1954).
+            if await rotation_comes_first(auth, True, token):
+                raise HTTPException(
+                    status.HTTP_303_SEE_OTHER, headers={"Location": "/ui/account/password"}
+                )
+            # The MFA refusal in all but name, so it is audited like the one below (BACKLOG #1197).
+            await auth.audit_mfa_denied(identity, request.url.path)
+            raise _mfa_redirect()
         # ASVS 6.3.3, the cookie mirror of the JSON gate. Ordering matches require(): must_change
         # above, permissions below — a pending session must not learn whether it holds a permission.
         if not allow_mfa_pending and not await auth.mfa_satisfied(token):

@@ -601,6 +601,174 @@ def test_every_reauth_only_gate_action_is_refused_to_a_pending_enrolled_session(
     assert not missing, f"reauth-only gate actions a pending enrolled session could use: {missing}"
 
 
+# --- 6.3.3 / 7.5.1: changing the password from a pending session (BACKLOG #1954) -------------
+
+PW2 = "another-strong-test-passphrase"  # the rotated password; satisfies the same policy
+
+
+async def _change_password(
+    c: httpx.AsyncClient, tok: str, *, current: str = PW, new: str = PW2
+) -> httpx.Response:
+    return await c.post(
+        "/me/password",
+        json={"current_password": current, "new_password": new},
+        headers=_auth(tok),
+    )
+
+
+async def test_a_pending_session_cannot_change_an_enrolled_accounts_password(
+    engine: Engine,
+) -> None:
+    """RED when: ``POST /me/password`` stops refusing a pending session on an account with a factor.
+
+    The chain BACKLOG #1954 records. The route is MFA-exempt so an account with NO factor can
+    rotate, and changing the password revokes every session. So a caller holding only the password
+    could, from a pending session, lock the real user out and sign them out everywhere. This account
+    has a factor, so it must prove it first.
+    """
+    service = await _service(engine)
+    await _add(service, "vic", Role.VIEWER)
+    _secret, victim_token = await _enroll_totp_out_of_band(service, "vic")
+
+    async with _client(engine, service, peer=("192.0.2.54", 40000)) as c:
+        tok = await _login(c, "vic")  # the attacker knows the password and nothing else
+        r = await _change_password(c, tok)
+        assert r.status_code == 403, "a pending session changed an enrolled account's password"
+        assert r.headers.get("X-MFA-Required") == "1"
+        assert "X-Step-Up-Required" not in r.headers
+
+    # Nothing changed: the real user's device is still signed in, and the old password still works.
+    assert await service.identity_for_token(victim_token) is not None
+    assert (await service.login("vic", PW)).ok
+    denied = [a for a in await engine.store.list_audit() if a["action"] == "auth.mfa_denied"]
+    assert any("/me/password" in (a["detail"] or "") for a in denied)
+    assert denied[-1]["client"] == "192.0.2.54"
+
+
+async def test_a_reset_account_with_a_factor_proves_it_and_then_rotates(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: ``/auth/mfa-verify`` leaves ``_MUST_CHANGE_EXEMPT_PATHS``.
+
+    The flow the refusal above must not strand. ``admin_reset_password`` sets must-change and keeps
+    the account's factors, so the next session is both must-change and pending. The password route
+    now wants the factor first, so the factor step has to be reachable under the must-change
+    confinement. Without it this account could neither rotate nor verify: the brick.
+    """
+    service = await _service(engine)
+    user_id = await _add(service, "vic", Role.VIEWER)
+    t0 = 1_000_000.0
+    pin_totp_clock(monkeypatch, t0)
+    secret, _ = await _enroll_totp_out_of_band(service, "vic", now=t0)
+    temp = (await service.admin_reset_password(user_id, actor="test")).password
+
+    async with _client(engine, service) as c:
+        r = await c.post("/auth/login", json={"username": "vic", "password": temp})
+        assert r.status_code == 200 and r.json()["must_change_password"] is True
+        tok = str(r.json()["token"])
+        # must_change still outranks the second factor on an ordinary route.
+        refused = await c.get("/messages", headers=_auth(tok))
+        assert refused.status_code == 403 and "X-MFA-Required" not in refused.headers
+        # The rotation route names the missing factor instead of refusing blind.
+        r = await _change_password(c, tok, current=temp)
+        assert r.status_code == 403 and r.headers.get("X-MFA-Required") == "1"
+
+        t1 = t0 + totp.DEFAULT_PERIOD  # a strictly later step: enrollment consumed its own
+        pin_totp_clock(monkeypatch, t1)
+        r = await c.post(
+            "/auth/mfa-verify", json={"code": totp.totp(secret, now=t1)}, headers=_auth(tok)
+        )
+        assert r.status_code == 200, r.text
+        r = await _change_password(c, str(r.json()["token"]), current=temp)
+        assert r.status_code == 200, r.text
+    assert (await service.login("vic", PW2)).ok
+
+
+async def test_a_must_change_account_with_no_factor_still_rotates_from_a_pending_session(
+    engine: Engine,
+) -> None:
+    """RED when: the refusal over-reaches and blocks an account with no factor.
+
+    Both shipped producers of a must-change account with no factor: an administrator-created user
+    and the bootstrap administrator. Each is pending under the default ``require_mfa`` and has
+    nothing to prove at ``/auth/mfa-verify``, so rotating first is the only way forward. This is
+    also why must-change stays ahead of the MFA gate in ``require()``.
+    """
+    service = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False))
+    boot = await service.initialize()  # the FIRST initialize mints the bootstrap admin
+    assert boot is not None
+    await service.create_local_user(
+        username="newbie",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=[Role.VIEWER.value],
+        actor="test",
+    )
+    async with _client(engine, service) as c:
+        for username, password in ((boot.username, boot.password), ("newbie", PW)):
+            r = await c.post("/auth/login", json={"username": username, "password": password})
+            assert r.status_code == 200 and r.json()["must_change_password"] is True
+            tok = str(r.json()["token"])
+            assert await service.mfa_satisfied(tok) is False  # pending, with nothing to prove
+            r = await _change_password(c, tok, current=password)
+            assert r.status_code == 200, f"{username}: {r.text}"
+
+
+async def test_a_satisfied_session_changes_the_password_as_before(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the refusal ignores ``mfa_satisfied`` and blocks every enrolled account."""
+    service = await _service(engine)
+    await _add(service, "vic", Role.VIEWER)
+    t0 = 1_000_000.0
+    pin_totp_clock(monkeypatch, t0)
+    secret, other_token = await _enroll_totp_out_of_band(service, "vic", now=t0)
+    async with _client(engine, service) as c:
+        tok = await _login(c, "vic")
+        t1 = t0 + totp.DEFAULT_PERIOD
+        pin_totp_clock(monkeypatch, t1)
+        r = await c.post(
+            "/auth/mfa-verify", json={"code": totp.totp(secret, now=t1)}, headers=_auth(tok)
+        )
+        assert r.status_code == 200
+        r = await _change_password(c, str(r.json()["token"]))
+        assert r.status_code == 200, r.text
+    # A real change still signs the account out everywhere.
+    assert await service.identity_for_token(other_token) is None
+
+
+@pytest.mark.parametrize(
+    ("mfa_verified", "enrolled"),
+    ((False, False), (True, False), (False, True)),
+    ids=("pending", "verified", "pending-with-a-factor"),
+)
+async def test_a_directory_account_is_still_told_its_password_lives_in_the_directory(
+    engine: Engine, mfa_verified: bool, enrolled: bool
+) -> None:
+    """RED when: the refusal pre-empts the directory 400.
+
+    A directory session with no engine factor is pending under the default ``require_mfa`` (the
+    directory floor in ``mfa_satisfied``), and it has nothing to prove. One WITH an engine factor
+    (BACKLOG #1144) is left to the handler too: its 400 changes nothing, so a 403 asking for the
+    factor would only spend a code to learn the same answer.
+    """
+    service = await _service(engine)
+    if enrolled:
+        setup = await service._complete_ad_login(_principal("aduser9"), None, mfa_verified=False)
+        assert setup.identity is not None and setup.token is not None
+        enrollment = await service.begin_mfa_enrollment(setup.identity)
+        code = fresh_totp(enrollment.secret)
+        assert (await service.confirm_mfa_enrollment(setup.identity, code, token=setup.token)).ok
+    out = await service._complete_ad_login(_principal("aduser9"), None, mfa_verified=mfa_verified)
+    assert out.ok and out.token is not None
+    assert await service.mfa_satisfied(out.token) is mfa_verified
+    async with _client(engine, service) as c:
+        r = await _change_password(c, out.token)
+        assert r.status_code == 400
+        assert "Active Directory" in r.json()["detail"]
+
+
 # --- 6.3.4: per-mechanism directory strength --------------------------------
 
 
