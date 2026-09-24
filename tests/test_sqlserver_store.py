@@ -772,10 +772,9 @@ async def test_withdraw_ad_channel_scope_matches_a_scope_over_4000_characters(st
     ``channel_scope`` is NVARCHAR(MAX) and the withdrawal compares it with a bound parameter. A
     string over 4000 characters is past the NVARCHAR(n) limit, so the driver binds it as a long
     type. If it arrived as ``ntext``, SQL Server would refuse ``nvarchar(max) = ntext`` and the
-    withdrawal would raise instead of returning True. Nobody has measured which happens; this test
-    decides it on the ``sqlserver-store`` leg."""
-    import json
-
+    withdrawal would raise instead of returning True. The statement CASTs the bound value to
+    NVARCHAR(MAX) so that cannot happen; this test is the measurement, on the ``sqlserver-store``
+    leg."""
     from messagefoundry.store.store import SCOPE_SOURCE_AD
 
     scope = json.dumps(sorted(f"IB_LONG_SCOPE_{n:04d}" for n in range(300)))
@@ -785,6 +784,15 @@ async def test_withdraw_ad_channel_scope_matches_a_scope_over_4000_characters(st
     )
     await store.set_user_channel_scope("long-scope", scope, source=SCOPE_SOURCE_AD)
     assert (await store.get_user("long-scope")).channel_scope == scope  # stored whole
+
+    # Negative arms first. A newer scope sharing the first 4000+ characters must be refused, or a
+    # prefix-only compare would pass the match below. So must one differing only in case, which a
+    # case-insensitive collation would match.
+    newer = scope[:-1] + ', "IB_EXTRA"]'
+    assert newer[:4001] == scope[:4001]  # positive control: they share the long prefix
+    assert await store.withdraw_ad_channel_scope("long-scope", newer) is False
+    assert await store.withdraw_ad_channel_scope("long-scope", scope.lower()) is False
+    assert (await store.get_user("long-scope")).channel_scope == scope  # untouched
 
     assert await store.withdraw_ad_channel_scope("long-scope", scope) is True
     got = await store.get_user("long-scope")

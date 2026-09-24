@@ -1219,8 +1219,8 @@ ChannelScopeSource = Literal["ad", "manual"]
 SCOPE_SOURCE_AD: Final[ChannelScopeSource] = "ad"
 SCOPE_SOURCE_MANUAL: Final[ChannelScopeSource] = "manual"
 
-#: The compare-and-set behind ``withdraw_ad_channel_scope`` in ``?`` form, shared by SQLite and SQL
-#: Server; Postgres carries the ``$n`` twin. Binds: new source, now, user id, the expected scope,
+#: The compare-and-set behind ``withdraw_ad_channel_scope`` on SQLite. Postgres carries a ``$n``
+#: twin and SQL Server a collation-pinned one. Binds: new source, now, user id, the expected scope,
 #: the manual marker.
 WITHDRAW_AD_SCOPE_SQL: Final = (
     "UPDATE users SET channel_scope=NULL, channel_scope_source=?, updated_at=?"

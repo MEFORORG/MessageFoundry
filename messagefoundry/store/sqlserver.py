@@ -113,7 +113,6 @@ from messagefoundry.store.store import (
     REINGRESS_TARGET_PREFIX,
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
-    WITHDRAW_AD_SCOPE_SQL,
     AlertInstance,
     AlertSummary,
     AuditHeadMovedError,
@@ -308,6 +307,16 @@ def _encode_proc_lanes(lanes: Sequence[str]) -> str:
     connection names. Oversized lanes are removed upstream by ``_keep_matchable_lanes``; the call
     here is idempotent and kept so this encoder is safe to use on an unfiltered list."""
     return json.dumps(_keep_matchable_lanes(lanes))
+
+
+#: The SQL Server form of ``store.WITHDRAW_AD_SCOPE_SQL`` (BACKLOG #1927). Same binds, in the same
+#: order; ``withdraw_ad_channel_scope`` says why it differs.
+_WITHDRAW_AD_SCOPE_SQL_MSSQL = (
+    "UPDATE users SET channel_scope=NULL, channel_scope_source=?, updated_at=?"
+    " WHERE id=? AND channel_scope COLLATE Latin1_General_100_BIN2"
+    " = CAST(? AS NVARCHAR(MAX)) COLLATE Latin1_General_100_BIN2"
+    " AND (channel_scope_source IS NULL OR channel_scope_source <> ?)"
+)
 
 
 def _claim_proc_param_pins() -> list[tuple[int, int, int]]:
@@ -10288,12 +10297,19 @@ class SqlServerStore:
     async def withdraw_ad_channel_scope(
         self, user_id: str, expected_scope: str, *, now: float | None = None
     ) -> bool:
-        """Withdraw a directory-derived scope to NULL (BACKLOG #1927); see ``AuthStore``."""
+        """Withdraw a directory-derived scope to NULL (BACKLOG #1927); see ``AuthStore``.
+
+        Its own statement, not the shared ``WITHDRAW_AD_SCOPE_SQL``, for two reasons. The column
+        has no COLLATE, so a plain ``=`` would compare under the database default, usually
+        case-insensitive: a newer scope differing only in case would match and be withdrawn,
+        where SQLite and Postgres refuse it. And the bound value is CAST to NVARCHAR(MAX), so a
+        scope over 4000 characters compares as NVARCHAR(MAX) whatever long type the driver binds
+        it as."""
         now = time.time() if now is None else now
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
-                    WITHDRAW_AD_SCOPE_SQL,
+                    _WITHDRAW_AD_SCOPE_SQL_MSSQL,
                     (SCOPE_SOURCE_AD, now, user_id, expected_scope, SCOPE_SOURCE_MANUAL),
                 )
                 count = cur.rowcount
