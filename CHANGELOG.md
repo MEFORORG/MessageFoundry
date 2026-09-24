@@ -7,14 +7,19 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Changed
-- **`[api].tls_terminated_upstream` without `[api].tls_cert_file` now requires
-  `[api].plaintext_upstream_hop_acknowledged = true` (BACKLOG #1179).** In that topology the engine
-  mints no certificate (ADR 0172 decision 3). So the proxy-to-engine hop is plaintext by design, and
-  securing it is the deploying site's job. `serve` refuses that topology (exit 2) until the operator
-  sets the acknowledgement. It refuses in every mode: `enforce` or `warn`, loopback bind or not. With
-  an operator `tls_cert_file` the engine serves that hop over TLS, so nothing needs acknowledging. The
-  existing proxy attestations keep their own behaviour. Setting the acknowledgement without
-  `tls_terminated_upstream` is refused at load. See `docs/CONFIGURATION.md` and `docs/SECURITY.md`.
+- **BREAKING — `[api].tls_terminated_upstream` without `[api].tls_cert_file` now requires
+  `[api].plaintext_upstream_hop_acknowledged = true`.** 0.4.0 asked for no such acknowledgement. In
+  that topology the engine mints no certificate (ADR 0172 decision 3). So the
+  proxy-to-engine hop is plaintext by design, and securing it is the deploying site's job. `serve`
+  refuses that topology (exit 2) until the operator sets the acknowledgement. It refuses in every
+  mode: `enforce` or `warn`, loopback bind or not. With an operator `tls_cert_file` the engine serves
+  that hop over TLS, so nothing needs acknowledging. The existing proxy attestations keep their own
+  behaviour. Setting the acknowledgement without `tls_terminated_upstream` is refused at load. See
+  `docs/CONFIGURATION.md` and `docs/SECURITY.md`. **Migration:** after you upgrade, set
+  `[api].plaintext_upstream_hop_acknowledged = true`. 0.4.0 refuses the key as unrecognized, so do
+  not add it first. Or set `[api].tls_cert_file` and `[api].tls_key_file` so the engine serves that
+  hop over TLS. The proxy must then speak https to the engine and trust that certificate, or every
+  request through it fails. ([BACKLOG #1179](docs/BACKLOG.md))
 
 ## [0.4.0] — 2026-09-23 — Early Access
 
