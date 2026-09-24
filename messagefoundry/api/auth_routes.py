@@ -364,7 +364,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST, "AD passwords are managed in Active Directory"
             )
-        if not await service.verify_current_password(identity, body.current_password):
+        # Counts toward the account lockout and refuses a locked account (BACKLOG #1138); the
+        # refusal keeps this one message, as a wrong password does at /me/reauth.
+        if not await service.verify_current_password(
+            identity, body.current_password, client=_client(request)
+        ):
             raise HTTPException(status.HTTP_403_FORBIDDEN, "current password is incorrect")
         # ASVS 6.4.1: a "change" that reuses the current password is not a change — it would leave an
         # expired/temp credential in place (and defeats the must_change_password claim step).
@@ -391,7 +395,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     ) -> ElevatedResponse:
         """Step-up re-verification (ASVS 7.5.3): re-prove the current credential to refresh this
         session's step-up window so it may perform highly sensitive operations for the configured
-        period. Rate-limited like the password change; a failure is a 403 and performs nothing.
+        period. Rate-limited like the password change; a failure is a 403 that changes no session but
+        counts toward the account lockout, which also refuses a locked account here (BACKLOG #1138).
 
         On success the session is RE-KEYED (ASVS 7.2.4) and the response carries the new bearer
         token — the one this request authenticated with is dead by the time the client reads it."""

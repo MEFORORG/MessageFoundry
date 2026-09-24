@@ -1298,7 +1298,10 @@ def test_lockout_auto_expires_but_re_locking_is_unbounded() -> None:
         "If a cross-cycle ceiling landed instead, the 6.1.1 note that re-locking is unbounded is stale."
     )
 
-    # --- derived: the counter has exactly the two LOCAL feeders the note scopes it to --------------
+    # --- derived: the counter has exactly the feeders the note names ------------------------------
+    # BACKLOG #1138 added ``_reproof``: the post-session re-proofs (``reauth``, which also re-binds a
+    # directory account, and ``verify_current_password``). They need a live session, so an attacker
+    # WITHOUT one still reaches only the two sign-in feeders, which is the scope the note states.
     feeders = {
         node.name
         for node in ast.walk(tree)
@@ -1306,9 +1309,9 @@ def test_lockout_auto_expires_but_re_locking_is_unbounded() -> None:
         and node.name != "_register_failure"
         and calls_to(node, {"_register_failure"})
     }
-    assert feeders == {"_login_local", "verify_mfa"}, (
-        f"the per-account lockout is now fed from {sorted(feeders)}; the 6.1.1 note scopes it to "
-        "LOCAL accounts, and the recovery argument below the table rests on that scope."
+    assert feeders == {"_login_local", "verify_mfa", "_reproof"}, (
+        f"the per-account lockout is now fed from {sorted(feeders)}; the 6.1.1 note scopes the "
+        "sessionless case to LOCAL accounts, and the recovery argument below the table rests on it."
     )
 
     # --- positive: the row's Threshold / window cell states BOTH halves ----------------------------
@@ -1341,9 +1344,9 @@ def test_lockout_auto_expires_but_re_locking_is_unbounded() -> None:
 
     # --- the doc's LOCAL scope, and the exact retired conclusion ----------------------------------
     block = _section(_H_SET)
-    assert "only **local** accounts can be locked" in block, (
-        "the 6.1.1 set must scope the lockout to LOCAL accounts; the recovery argument beneath the "
-        "table is only true of them."
+    assert "without a session, only **local** accounts can be locked" in block, (
+        "the 6.1.1 set must scope the SESSIONLESS lockout to LOCAL accounts; the recovery argument "
+        "beneath the table is only true of them."
     )
     assert "cannot maliciously lock an account indefinitely" not in _doc_text(), (
         "the retired clause claimed a ceiling the code does not implement."
@@ -1392,20 +1395,30 @@ def test_me_password_is_not_described_as_part_of_the_sign_in_surface() -> None:
     assert "not** the sign-in window" in row or "not" in row.lower()
 
 
-def test_reauth_surface_has_no_lockout_and_the_doc_says_so() -> None:
-    """``reauth`` verifies a password but neither checks ``locked_until`` nor registers a failure, so
-    the ceremony budget is the ONLY bound there — a fact the SEC-024 caveat must not overstate away."""
+def test_reauth_surface_feeds_the_lockout_and_the_doc_says_so() -> None:
+    """BACKLOG #1138 (owner ruling 2026-09-23): both re-proofs go through ``_reproof``, which checks
+    ``locked_until`` first and registers a failure through the login leg's counter. The global sign-in
+    ceiling still does NOT reach them, and the SEC-024 caveat must say both halves.
+
+    This test used to pin the opposite, that ``reauth`` fed nothing and the ceremony budget was the
+    only bound, and told whoever changed that to update the caveat. This is that update."""
     source = ast.parse(
         (_ROOT / "messagefoundry" / "auth" / "service.py").read_text(encoding="utf-8")
     )
-    reauth = named_func(source, "reauth")
-    assert not calls_to(reauth, {"_register_failure"}), (
-        "reauth now feeds the per-account lockout — the doc's honest caveat is stale, update it."
-    )
+    for name in ("reauth", "verify_current_password"):
+        assert calls_to(named_func(source, name), {"_reproof"}), (
+            f"{name} no longer re-proves through _reproof, so it may have stopped feeding or "
+            "honouring the lockout; the SEC-024 caveat below says it does both."
+        )
+    reproof = named_func(source, "_reproof")
+    assert calls_to(reproof, {"_register_failure"})
+    assert any(isinstance(n, ast.Attribute) and n.attr == "locked_until" for n in ast.walk(reproof))
     block = _section(_H_BRUTE)
-    assert "does **not** reach the credential re-proof surface" in block, (
-        "the SEC-024 caveat must state that neither the global ceiling nor the lockout covers "
-        "POST /me/reauth and POST /me/password."
+    assert "The lockout also reaches the credential re-proof surface" in block, (
+        "the SEC-024 caveat must state that the lockout covers POST /me/reauth and POST /me/password."
+    )
+    assert "global ceiling does **not**" in " ".join(block.split()), (
+        "the SEC-024 caveat must still state that the global sign-in ceiling does not cover them."
     )
 
 

@@ -425,6 +425,22 @@ def _directory_login_refusal(user: UserRecord, now: float) -> str | None:
 
 
 @dataclass(frozen=True)
+class _Reproof:
+    """The outcome of one post-session credential re-proof, checked under the login leg's lockout.
+
+    ``user`` is the row read BEFORE the verify, so ``user.failed_attempts`` is the count as it stood
+    at the start of the attempt -- the login leg's ``prior_failures``. ``just_locked`` and
+    ``attempts`` come from the one atomic store call; the caller audits its own row first and only
+    then records the lockout, so the order in the trail matches the login leg's."""
+
+    ok: bool
+    locked: bool = False
+    user: UserRecord | None = None
+    attempts: int = 0
+    just_locked: bool = False
+
+
+@dataclass(frozen=True)
 class ProvisionedAdministrator:
     """The outcome of an offline first-administrator provision (BACKLOG #1136).
 
@@ -3189,12 +3205,84 @@ class AuthService:
     def password_violations(self, password: str, *, username: str | None = None) -> list[str]:
         return self._policy.violations(password, username=username)
 
-    async def verify_current_password(self, identity: Identity, password: str) -> bool:
-        """True iff ``password`` matches the local user's stored hash (self-service reauth)."""
+    async def verify_current_password(
+        self, identity: Identity, password: str, *, client: str | None = None
+    ) -> bool:
+        """True iff ``password`` matches the local user's stored hash -- the current-password proof
+        ``POST /me/password`` demands before a change.
+
+        **It counts toward the account lockout and refuses a locked account (BACKLOG #1138, owner
+        ruling 2026-09-23).** It used to do neither and write no audit row, so a session holder could
+        guess here without limit and without trace. A failure is now audited once, as
+        ``auth.password_change_failed``, and the attempt that crosses the threshold adds
+        ``auth.account_locked`` exactly as a sign-in does.
+
+        It raises no ``auth.login_after_failures`` on success and leaves the counter to
+        ``set_password``: a completed change clears it and sends its own ``PASSWORD_CHANGED`` notice,
+        while a change refused by policy after a good proof would otherwise re-flag on every retry."""
+        proof = await self._reproof(identity, password, directory=False)
+        if not proof.ok:
+            reason = "locked" if proof.locked else "bad_password"
+            await self._audit(
+                "auth.password_change_failed",
+                actor=identity.username,
+                detail=_json({"reason": reason}),
+                client=client,
+            )
+            await self._record_reproof_lockout(proof, identity, client=client)
+        return proof.ok
+
+    async def _reproof(self, identity: Identity, password: str, *, directory: bool) -> _Reproof:
+        """Verify a post-session credential re-proof under the LOGIN leg's lockout policy.
+
+        BACKLOG #1138 (ASVS 6.3.5), owner ruling 2026-09-23: *"Yes, count them. Engine lockout does
+        not lock the AD account itself, and unbounded guessing behind a stolen session is the worse
+        risk."* So this is the login leg's shape, reused rather than copied: a live lock refuses
+        BEFORE any verify (so a refusal never reaches :meth:`_register_failure` and can never re-arm
+        or extend the lock), and a rejected credential goes through that same atomic counter.
+
+        ``directory`` re-proves by a live bind (:meth:`_ad_rebind`) instead of the stored hash. The
+        lock it honours and feeds is the ENGINE row's ``locked_until``; nothing here writes to the
+        directory, so the domain account is never locked by it. A locked engine row is refused
+        without binding at all, so it also stops feeding guesses to the domain's own counter. A
+        directory that cannot be asked is a refusal but NOT a failure: counting an outage would lock
+        every operator who tried to step up while a domain controller was down."""
         user = await self._store.get_user(identity.user_id)
-        if user is None or user.password_hash is None:
-            return False
-        return await self._argon2(verify_password, user.password_hash, password)
+        if user is None:
+            return _Reproof(ok=False)
+        now = time.time()
+        if user.locked_until is not None and now < user.locked_until:
+            if not directory:
+                # Timing parity with the login leg's locked path.
+                await self._argon2(verify_password, _DUMMY_PASSWORD_HASH, password)
+            return _Reproof(ok=False, locked=True, user=user)
+        verdict: bool | None
+        if directory:
+            verdict = await self._ad_rebind(identity.username, password)
+        else:
+            verdict = user.password_hash is not None and await self._argon2(
+                verify_password, user.password_hash, password
+            )
+        if verdict is None:
+            return _Reproof(ok=False, user=user)
+        if not verdict:
+            attempts, just_locked = await self._register_failure(user, now)
+            return _Reproof(ok=False, user=user, attempts=attempts, just_locked=just_locked)
+        return _Reproof(ok=True, user=user)
+
+    async def _record_reproof_lockout(
+        self, proof: _Reproof, identity: Identity, *, client: str | None
+    ) -> None:
+        """Record the lockout a failed re-proof crossed. Called AFTER the attempt's own audit row,
+        which is the order the login leg writes them in."""
+        if proof.just_locked and proof.user is not None:
+            await self._record_suspicious_login(
+                ACCOUNT_LOCKED,
+                proof.user,
+                client=client,
+                audit_detail={"provider": identity.auth_provider.value},
+                notice_detail={"failed_attempts": proof.attempts},
+            )
 
     async def reauth(
         self,
@@ -3218,14 +3306,28 @@ class AuthService:
 
         Returns an :class:`Elevation`: on success the session is re-keyed (ASVS 7.2.4) and the NEW
         token is in ``Elevation.token``. The three steps below are ORDER-CRITICAL -- see the inline
-        notes and :meth:`_rotate_session_token`."""
-        if identity.auth_provider is AuthProvider.AD:
-            ok = await self._reauth_ad(identity.username, password)
-        else:
-            ok = await self.verify_current_password(identity, password)
+        notes and :meth:`_rotate_session_token`.
+
+        **A failure counts toward the account lockout, and a locked account is refused, on BOTH
+        providers (BACKLOG #1138).** See :meth:`_reproof`. A success after a run of failures is
+        labelled ``auth.login_after_failures``, as a sign-in is, and clears the counter only when the
+        session owes no second factor (BACKLOG #1638's rule for the login leg)."""
+        proof = await self._reproof(
+            identity, password, directory=identity.auth_provider is AuthProvider.AD
+        )
+        ok = proof.ok
         elevation = Elevation()
         grant_refused = False
+        clear_failures = False
         if ok:
+            # Decided against the OLD token, before the rotation retires it; fails closed (no clear)
+            # when the session cannot be found. A password re-proof on a session still owing its
+            # second factor is not full authentication, so it must not shed a run of wrong codes.
+            clear_failures = (
+                proof.user is not None
+                and (proof.user.failed_attempts > 0 or proof.user.locked_until is not None)
+                and not await self._owes_enrolled_factor(token)
+            )
             # (1) Every stamp for this elevation, against the OLD hash. The rotation carries these
             # columns forward; a stamp issued after it would silently write nothing.
             # Re-anchor the session to the address it re-verified from, so a forced step-up triggered
@@ -3262,10 +3364,25 @@ class AuthService:
                     # A good password whose purpose grant was refused (a pending session on an
                     # account with a factor). Without it the row reads as a granted re-proof.
                     "grant_refused": grant_refused,
+                    # Refused because the account is locked, before any verify (BACKLOG #1138). The
+                    # login leg's equivalent is its own action, auth.login_locked.
+                    "locked": proof.locked,
                 }
             ),
             client=client,
         )
+        await self._record_reproof_lockout(proof, identity, client=client)
+        if ok and proof.user is not None:
+            if clear_failures:
+                await self._store.record_login_success(proof.user.id)
+            if proof.user.failed_attempts >= SUSPICIOUS_LOGIN_FAILURE_THRESHOLD:
+                await self._record_suspicious_login(
+                    LOGIN_AFTER_FAILURES,
+                    proof.user,
+                    client=client,
+                    audit_detail={"provider": identity.auth_provider.value},
+                    notice_detail={"failed_attempts": proof.user.failed_attempts},
+                )
         return elevation
 
     #: The step-up actions a pending session may NOT be granted once its account HAS a factor. Every
@@ -3399,13 +3516,21 @@ class AuthService:
         return deadline is not None and deadline > now
 
     async def _reauth_ad(self, username: str, password: str) -> bool:
-        """Re-verify an AD credential via a live directory re-bind (no session adopted)."""
+        """Re-verify an AD credential via a live directory re-bind (no session adopted). Fails
+        closed: an unreachable directory is False. :meth:`reauth` goes through :meth:`_reproof`,
+        which needs the three-way answer :meth:`_ad_rebind` gives."""
+        return await self._ad_rebind(username, password) is True
+
+    async def _ad_rebind(self, username: str, password: str) -> bool | None:
+        """True = the directory bound the credential, False = it REJECTED it, None = it could not be
+        asked (no directory configured, or an :class:`LdapError`). Only False is a guess worth
+        counting toward the engine lockout."""
         if self._ldap is None:
-            return False
+            return None
         try:
             principal = await asyncio.to_thread(self._ldap.authenticate, username, password)
         except LdapError:
-            return False
+            return None
         return principal is not None
 
     async def has_recent_step_up(self, token: str | None) -> bool:
