@@ -10,7 +10,7 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 This section lists every breaking change since 0.3.2, each marked BREAKING, and summarizes the
 non-breaking fixes rather than listing them all; the git history is the full record. A `BACKLOG #N`
-number cites the project's private planning ledger, so it has no public page.
+or bare `#N` number cites the project's private planning ledger, so it has no public page.
 
 ### Added
 - **`messagefoundry audit-anchor`, and `audit-verify --expected-anchor` / `--expected-anchor-file` to
@@ -29,17 +29,14 @@ number cites the project's private planning ledger, so it has no public page.
   engine, anchor, hold the value off-box, re-verify while the chain is still quiesced — around a
   maintenance window, a database move, a backup/restore, a hand-off. Anchoring and immediately
   re-verifying compares a value to itself; re-checking a held anchor against a **running** engine alarms
-  on every ordinary boot. For continuous coverage of a live engine the off-box log forward / tee remains
-  the control. `[integrity].audit_verify_on_start` on its own is still a bare walk and stays blind to a
-  truncated tail; `[integrity].audit_anchor_file`, also in Added, gives it an anchor.
-  (`BACKLOG #328`)
+  on every ordinary boot. For a running engine, use the next entry. (`BACKLOG #328`)
 - **`[integrity].audit_anchor_file` — the startup audit check can now hold an anchor, so it can see a
-  truncated tail.** `audit-anchor` / `audit-verify --expected-anchor`, also in Added, check an anchor
-  on demand. On its own, `[integrity].audit_verify_on_start` is a bare walk, blind to a truncated
-  tail. **With this key and `audit_verify_on_start = true` both set, the startup check can see one.**
-  Save the `COUNT:HEAD` line `messagefoundry audit-anchor` prints to a UTF-8 file, and point the new
-  key at it; every startup that runs the check compares against it. (PowerShell 5.1's `>` writes
-  UTF-16, which the engine cannot read.) The key alone arms nothing: with
+  truncated tail.** On its own, `[integrity].audit_verify_on_start` is a bare walk, blind to a
+  truncated tail. **With this key and `audit_verify_on_start = true` both set, the startup check can
+  see one.** Save the `COUNT:HEAD` line `messagefoundry audit-anchor` prints to a UTF-8 file, and point
+  the new key at it; every startup that runs the check compares against it. PowerShell 5.1's `>`
+  writes UTF-16, which the engine cannot read, so pipe the line to `Set-Content -Encoding utf8`
+  instead. The key alone arms nothing: with
   `audit_verify_on_start` left at its default of `false`, startup logs a WARNING that the anchor is
   never read. Leave the key empty (the default) and the walk is byte-identical to before.
   **It consumes the anchor as a PREFIX, not as the CLI's exact seal, and that is the whole reason a
@@ -580,19 +577,23 @@ number cites the project's private planning ledger, so it has no public page.
   (`BACKLOG #1232`)
 - **BREAKING — on a store created by 0.3.2 with a keyed audit chain, the chain now reads as broken.**
   `audit_chain_meta` gains a `key_id` column that names the key of the chain's first keyed range. The
-  upgrade adds the column empty and never fills it, because ADR 0193 reports a missing key rather than
-  guess one. A 0.3.2 chain is keyed when the store was created with a store key or the Vault Transit
-  MAC, or after `rekey-audit` ran. On such a store, `audit-verify` prints `FAIL:` with the reason
-  `the audit chain does not record which key its keyed range is under` and exits 1, and the startup
-  check under `[integrity].audit_verify_on_start` reports the same break. Every open logs an ERROR.
-  `rotate-key` still re-encrypts the data, but its audit step refuses, so it prints `PARTIAL:` and
-  exits 1 every time. Measured on SQLite with synthetic data: a store 0.3.2 created fails the verify
-  under this release, and a store this release created verifies and rolls. PostgreSQL and SQL Server
-  add the column the same way; that was read in the code, not run. A store with no key is not
-  affected.
+  upgrade adds the column empty and never fills it: ADR 0193 decision 2 built no path to fill it,
+  because no store was deployed. A 0.3.2 chain is keyed once `rekey-audit` ran. It is also keyed if a
+  store key or the Vault Transit MAC was present at an open while its audit log was empty. On such a
+  store, `audit-verify` prints `FAIL:` with the reason `the audit chain does not record which key its
+  keyed range is under` and exits 1. The startup check under `[integrity].audit_verify_on_start`
+  reports the same break, and every open logs an ERROR. The verify stops at that break, so it can no
+  longer see tampering. It checks no keyed row's MAC, and it never reaches an `--expected-anchor` or
+  `[integrity].audit_anchor_file` comparison. With a local store key, `rotate-key` still re-encrypts
+  the data, but its audit step refuses, so it prints `PARTIAL:` and exits 1 every time. The chain
+  there checks no key, so that refusal does not mean the retired key is still in use. On a Vault
+  Transit store, `rotate-key` exits 2 before it reaches the chain. Measured on SQLite with synthetic
+  data: a store 0.3.2 created fails the verify under this release, and a store this release created
+  verifies and rolls. PostgreSQL and SQL Server add the column the same way; that was read in the
+  code, not run. A store with no key is not affected.
   **Migration:** none is built. Before the upgrade, run `messagefoundry audit-verify` under 0.3.2 and
   keep its output as the record that the chain was intact up to that point.
-  (`BACKLOG #1904`, ADR 0193)
+  (`BACKLOG #1904`, `docs/adr/0193-audit-chain-key-ranges-survive-a-store-key-rotation.md`)
 - **BREAKING — the default retry limit is now 100 attempts, not unlimited.**
   `[delivery].retry_max_attempts` and `RetryPolicy.max_attempts` defaulted to `None` (retry forever)
   in 0.3.2. At 100, with the default backoff, a destination that stays down for about 7 hours 50 minutes
@@ -682,8 +683,8 @@ number cites the project's private planning ledger, so it has no public page.
     a message whose only destinations are not deployed. (`BACKLOG #1690`)
   - `messagefoundry --version` prints a second line, `package: <path>`.
     (`BACKLOG #1677`)
-  **Migration:** read each new failure as the real result it is; capture stderr (`2>&1`) or use
-  `--json`; run `serve` once before `backup` or `verify` on a new install.
+  - **Migration:** for all of the above, read each new failure as the real result it is; capture
+    stderr (`2>&1`) or use `--json`; run `serve` once before `backup` or `verify` on a new install.
 - **BREAKING — with `[integrity].fail_closed_on_drift = true`, an install the engine cannot attest
   now refuses to start.** In 0.3.2 an install with no `RECORD`, a stripped one, or code loaded from
   outside the install root was silently skipped even under fail-closed. It now raises
@@ -852,10 +853,10 @@ number cites the project's private planning ledger, so it has no public page.
     `rsa-2048`. (`BACKLOG #1166`)
   - SFTP now offers only SHA-2 ETM MACs with AES-CTR or AES-GCM; 0.3.2 passed no restriction, so
     a server offering only older MACs or CBC ciphers now fails the handshake. (`BACKLOG #1170`)
-  **Migration:** the partner or key owner must offer the stronger option: SHA-256 Digest, a key of
-  2048 bits or more, an ES256 passkey on P-256 or an EdDSA passkey (or TOTP),
-  `tls_ciphers = "ECDHE+AESGCM:ECDHE+CHACHA20"`, an AES or RSA-3072 Transit key. There is no setting
-  that re-admits them.
+  - **Migration:** for all of the above, the partner or key owner must offer the stronger option:
+    SHA-256 Digest, a key of 2048 bits or more, an ES256 passkey on P-256 or an EdDSA passkey (or
+    TOTP), `tls_ciphers = "ECDHE+AESGCM:ECDHE+CHACHA20"`, an AES or RSA-3072 Transit key. There is
+    no setting that re-admits them.
 - **BREAKING — a new ES256 passkey must use the P-256 curve.** 0.3.2 also registered an ES256
   passkey on P-384 or P-521. Registration now refuses one. This is not a strength rule: those keys
   verify and are strong enough. It follows the pairing RFC 9053 recommends, SHA-256 with P-256
@@ -930,12 +931,13 @@ number cites the project's private planning ledger, so it has no public page.
   whose audit chain is keyless is now reported.** `provision-admin`, new in this release, opens the
   store and writes its first audit row. Run in the documented order, before the first `serve` with
   the key only in the service's NSSM environment, it wrote that row keyless. A chain that starts
-  keyless stays keyless, because a keyed open keys only an empty audit log, so anyone able to write
+  keyless stays keyless, because a keyed open keys only an empty audit log. So anyone able to write
   `audit_log` could forge a row that verifies clean, and nothing said so. `provision-admin` now
-  applies the at-rest check `serve` applies, before it asks for the password. It refuses unless it
-  can see the store key (`MEFOR_STORE_ENCRYPTION_KEY` in its own shell, or
-  `[store].encryption_key_file`), and also when a key is configured but `[store].key_provider`
-  resolved none. Under an audited keyless opt-out it goes ahead, with a warning on stderr.
+  applies the at-rest check `serve` applies. Before it asks for the password, it refuses unless it
+  can see the store key: `MEFOR_STORE_ENCRYPTION_KEY` in its own shell, or
+  `[store].encryption_key_file`. Under an audited keyless opt-out it goes ahead, with a warning on
+  stderr. It also refuses when a key is configured but `[store].key_provider` resolved none. That
+  check runs after the password prompt, once the store is open (on SQLite, once it is created).
   Separately, a store that opens with a key onto a keyless chain that has rows logs a WARNING naming
   `messagefoundry rekey-audit`, and `GET /security/posture` lists the loosening
   `audit_chain_unkeyed`. A 0.3.2 store created without a key and given one later is in that state.
@@ -986,8 +988,8 @@ number cites the project's private planning ledger, so it has no public page.
   `harness/load/connscale/intake_audit.py` exists to settle per message.
   (`BACKLOG #1866`)
 - **BREAKING — `audit-verify` accepted a zero-byte database, wrote a schema into it, and reported a
-  clean chain of nothing.** The existing guard on `audit-verify`, `audit-anchor` and `rekey-audit`
-  only asked whether the `--db` path *existed*. A zero-byte file exists and is a valid, empty SQLite
+  clean chain of nothing.** The existing guard on `audit-verify` and `rekey-audit`, which the new
+  `audit-anchor` shared, only asked whether the `--db` path *existed*. A zero-byte file exists and is a valid, empty SQLite
   database —
   what a `touch` in an install script, a failed copy or a log-rotation mistake leaves behind — so it
   walked past the guard, `open_store` migrated 372,736 bytes of schema **into the file that was
@@ -1000,8 +1002,8 @@ number cites the project's private planning ledger, so it has no public page.
   **`audit-verify` also splits "verified nothing" out of its success code:** a clean walk over an
   empty log is now exit **3**, and `--allow-empty` (new) turns that back into 0, as does an expected
   anchor of `0:`, which asserts emptiness and is checked. Exit 1 stays a BROKEN CHAIN, so a job can
-  no longer read an empty log as detected tamper. `audit-anchor` keeps exit 0 on a real store whose
-  log is legitimately empty — sealing a fresh instance as `0:` is a supported workflow — and refuses
+  no longer read an empty log as detected tamper. `audit-anchor`, new in this release, exits 0 on a
+  real store whose log is legitimately empty — sealing a fresh instance as `0:` is a supported workflow — and refuses
   only the non-audit-database paths.
   **Migration:** on an empty log, a scheduled `audit-verify` job now gets exit 3 where 0.3.2 gave
   it 0. If an empty log is expected, as on a new instance, pass `--allow-empty`. Not
@@ -1011,30 +1013,28 @@ number cites the project's private planning ledger, so it has no public page.
   a database also gets exit 2. Check that each job names the live store. (`BACKLOG #1669`)
 - **BREAKING — a store key rotation broke the audit chain; `rotate-key` now carries the chain to the
   new key, and it and `rekey-audit` print and exit differently.** In 0.3.2 the audit chain's MAC key
-  came from the active store key alone, and `rotate-key` never touched the chain. So after the
-  rotation `docs/PHI.md` describes (new key active, old key retired, `rotate-key`, drop the old key),
+  came from the active store key alone, and `rotate-key` never touched the chain. Take the rotation
+  `docs/PHI.md` describes: new key active, old key retired, `rotate-key`, drop the old key. After it,
   `audit-verify` reported the chain broken at its first keyed row, for good once the old key was
-  gone, and `rekey-audit` still printed `OK`. The keyed chain is now a series of ranges, one per key.
+  gone. `rekey-audit` still printed `OK`. The keyed chain is now a series of ranges, one per key.
   `rotate-key` verifies the whole chain, then appends one `audit.key_epoch` row under the new key.
   That row records a digest of the range it closes, the link to the row before that range, and a tag
-  made with the outgoing key, so the old range stays provable after its key is dropped. No existing
+  made with the outgoing key. So the old range stays provable after its key is dropped. No existing
   row is rewritten, so the off-box tee stays consistent and an `[integrity].audit_anchor_file` prefix
   stays valid. Until `rotate-key` runs, new audit rows stay under the retired key, and each open
   warns not to drop it.
-  **What changes for a script:**
-  - `rotate-key` prints a second stdout line: `OK:` and the audit step's result. When the audit step
-    refuses, the first line starts `PARTIAL:` instead of `OK:`, stderr names the reason, no range row
-    is written, and the exit code is 1. The data re-encryption before it has still completed. It
-    refuses on a chain that does not verify, on key ranges that do not authenticate, on an active key
-    that already keyed an earlier range (rotating back to an old key), and when an audit row lands
-    during the roll because the engine was left running.
-  - `rekey-audit` on an already-keyed chain now verifies it. It prints `OK:` with the verify result,
-    or `FAIL:` and exits 1 when the chain does not verify. 0.3.2 printed `OK` without checking.
+  **Output and exit codes.** `rotate-key` now prints a second stdout line: `OK:` and the audit step's
+  result. When the audit step refuses, the first line starts `PARTIAL:` instead and stderr names the
+  reason. No range row is written, and the exit code is 1, although the data re-encryption before it
+  has completed. The audit step refuses, at least, on a chain that does not verify and on key ranges
+  that do not authenticate. It also refuses to rotate back to a key that keyed an earlier range. It
+  refuses, too, when an audit row lands during the roll because the engine was left running.
+  `rekey-audit` on an already-keyed chain now verifies it. It prints `OK:` with the result, or `FAIL:`
+  and exits 1 when the chain does not verify; 0.3.2 printed `OK` without checking.
   **Migration:** stop the engine before `rotate-key`, and rotate to a new key, never back to an
-  earlier one. Read the exit code: keep the retired key configured until `rotate-key` exits 0. A
-  keyed store created by 0.3.2 cannot reach that; see the BREAKING keyed-audit-chain entry under
-  Changed.
-  (`BACKLOG #1904`, ADR 0193)
+  earlier one. Read the exit code, and keep the retired key configured until `rotate-key` exits 0. A
+  keyed store created by 0.3.2 never reaches exit 0; see the BREAKING keyed-audit-chain entry under
+  Changed. (`BACKLOG #1904`, `docs/adr/0193-audit-chain-key-ranges-survive-a-store-key-rotation.md`)
 - **BREAKING — `verify --smoke self` reported PASS on a synthetic message the config would have
   dropped.**
   `smoke_self` failed only on `DryRunResult.error`, which `dry_run` sets for a parse failure, a
