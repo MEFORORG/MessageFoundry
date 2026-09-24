@@ -81,6 +81,7 @@ __all__ = [
     "DbCoordinator",
     "StepdownUnavailable",
     "StepdownLockTimeout",
+    "StepdownOutcome",
     "StepdownReleaseUnconfirmed",
     "build_coordinator",
     "default_node_id",
@@ -260,11 +261,15 @@ class StepdownOutcome(NamedTuple):
         return self.was_leader or self.lease_released
 
 
-def _rows_affected(status: object) -> int:
-    """The row count in asyncpg's command tag (``"UPDATE 1"``), or ``-1`` when there is none to read,
-    the DB-API spelling of "unknown". Callers test ``!= 0``, so an unknown count reads as RELEASED:
-    that keeps the stepdown's claim pause armed, which is the safe direction, at the cost of a ``200``
-    that could over-report a drain. asyncpg always returns a tag, so this is a guard, not a path."""
+def rows_affected(status: object) -> int:
+    """The row count a release write reported, for BOTH coordinators: an ``int`` from
+    ``SqlServerStore._execute``, or asyncpg's command tag (``"UPDATE 1"``). ``-1`` when there is none
+    to read, the DB-API spelling of "unknown". Callers test ``!= 0``, so an unknown count reads as
+    RELEASED: that keeps the stepdown's claim pause armed, which is the safe direction, at the cost of
+    a ``200`` that could over-report a drain. Both drivers report a count for a direct ``UPDATE``, so
+    this is a guard, not a path. Only a node that may own the row sends the write at all."""
+    if isinstance(status, int):
+        return status
     if isinstance(status, str):
         tail = status.rpartition(" ")[2]
         if tail.isdigit():
@@ -903,7 +908,9 @@ class DbCoordinator:
         # _is_leader False and issues the same owner-scoped expiring UPDATE, which is idempotent), so
         # no interleaving of the two can leave this node reporting leader. The maintenance tick was the
         # dangerous competitor precisely because it can promote.
-        await self._release_leadership()
+        # Forced on the same predicate as a stepdown, so a SELF-FENCED node that is shut down still
+        # expires the row it owns instead of leaving it live for up to ttl - fence (BACKLOG #1508).
+        await self._release_leadership(force_write=self._may_own_lease_row())
         # Mark the row left rather than DELETE it: keeping a 'left' tombstone gives an operator a
         # visible "this node shut down cleanly" signal (vs a crashed node whose row goes stale), which
         # Step 4's election/diagnostics will distinguish. The row is re-activated by the next start().
@@ -1326,6 +1333,10 @@ class DbCoordinator:
             timeout=self._renew_timeout,
         )
         if row is None or row["owner"] != self.node_id:
+            # The DB answered, and another node holds a live lease: this node owns no row, so drop the
+            # confirmed-hold baseline _may_own_lease_row reads (BACKLOG #1508). Only here, where the row
+            # was actually read; the short-circuits above return not-held without looking at it.
+            self._last_renew_ok = None
             return False
         # Cache the epoch we now hold (fresh-acquire bump or renew's unchanged value). The engine reads it
         # on promotion and pushes it into the store; a renew leaves it identical so no push churn.
@@ -1445,8 +1456,7 @@ class DbCoordinator:
         own clock while the row stays live on the DB clock, so gating the write on the gate refused
         exactly the drain an operator reaches for after a fence. The write is now gated on
         :meth:`_may_own_lease_row`, and the pause and the demotion edge follow the row as well as the
-        gate. A node that lost its lease to a sibling also sends the write; it matches nothing, the
-        endpoint answers ``409``, and the pause this call armed is taken back.
+        gate. A node that has seen a sibling take its lease sends nothing and answers ``409``.
         """
         await acquire_leadership_lock(self._leadership_lock, self._fence_timeout, self.node_id)
         try:
@@ -1519,12 +1529,15 @@ class DbCoordinator:
         (BACKLOG #1508). Pure in-memory, so it adds no round trip to the stepdown's critical section.
 
         Three disjuncts. The gate reads True. An earlier write is owed
-        (:attr:`_lease_release_owed`). Or ``_last_renew_ok`` is set: a hold was confirmed and no
-        release has cleared it since. The last one covers the self-fence window, where
-        :meth:`_check_fence` clears the gate but not the baseline, and the row stays live on the DB
-        clock for up to ``ttl - fence`` more. It also covers a lease lost to a sibling, where the
-        owner-scoped write matches nothing, the stepdown answers 409, which is true, and the pause
-        it armed is taken back."""
+        (:attr:`_lease_release_owed`). Or ``_last_renew_ok`` is set: a hold was confirmed and nothing
+        has cleared it since. Two things clear it: a release, and a claim the DB answered with another
+        owner's live lease (:meth:`_claim_or_renew_lease`). So the last disjunct is the self-fence
+        window, where :meth:`_check_fence` clears the gate but not the baseline and the row stays live
+        on the DB clock for up to ``ttl - fence`` more. **Do not clear the baseline in**
+        :meth:`_check_fence`: that would bring BACKLOG #1508 back, and the self-fence stepdown tests
+        would fail. If a sibling took the row without this node's DB seeing it, the owner-scoped write
+        matches nothing, the stepdown answers 409, which is true, and the pause it armed is taken
+        back."""
         return self._is_leader or self._lease_release_owed or self._last_renew_ok is not None
 
     async def _release_leadership(
@@ -1555,9 +1568,9 @@ class DbCoordinator:
         count at all — see :class:`StepdownReleaseUnconfirmed`.
 
         ``force_write`` sends the ``UPDATE`` even when this node's in-memory gate already reads False.
-        Only :meth:`step_down_leadership` passes it, and only when :meth:`_may_own_lease_row` says
-        this node may still own a row. :meth:`stop` never does: it is best-effort by design, and a
-        no-op ``UPDATE`` from every departing follower would log a warning on a pool that is closing."""
+        Both callers pass :meth:`_may_own_lease_row`, so a self-fenced node expires the row it still
+        owns. A follower that never held the lease, or saw a sibling take it, sends nothing, so a
+        departing follower still does not write to a pool that is closing."""
         was_leader = self._is_leader
         self._is_leader = False
         self._last_renew_ok = None
@@ -1599,7 +1612,7 @@ class DbCoordinator:
             )
             return (was_leader, released_at, False, False)
         self._lease_release_owed = False
-        return (was_leader, released_at, True, _rows_affected(status) != 0)
+        return (was_leader, released_at, True, rows_affected(status) != 0)
 
     # --- #145 leadership-transition alerts (never-raise) ---------------------
 

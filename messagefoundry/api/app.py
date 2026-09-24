@@ -5979,7 +5979,8 @@ def create_app(
             # is still not quiescent — for different reasons than the sentence gave.
             #
             # And the body must not claim a teardown started ON THIS CALL: _fire_on_demote runs only
-            # under `if was_leader`, which a retry of an owed write has already cleared.
+            # when the outcome drained something, and on this arm the write did not return, so only
+            # `was_leader` could be true, and a retry of an owed write has already cleared it.
             await _denied("release-unconfirmed", exc)
             raise HTTPException(
                 503,

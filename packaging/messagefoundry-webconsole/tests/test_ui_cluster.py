@@ -287,7 +287,7 @@ def test_each_refusal_renders_its_own_guidance() -> None:
     # ...while a 409 does, with the one case where it is the failover having worked.
     assert "open the console there" in by_status[409]
     assert "healthy successor" in by_status[409]
-    assert "Do not retry in a loop" in by_status[503]
+    assert "a retry re-sends the write" in by_status[503]
     assert "There is no leadership lease to release" in by_status[400]
 
 

@@ -60,6 +60,7 @@ from messagefoundry.pipeline.cluster import (
     default_node_id,
     lease_release_unconfirmed,
     members_from_node_rows,
+    rows_affected,
     stepdown_pause_seconds,
 )
 from messagefoundry.redaction import safe_exc
@@ -194,7 +195,7 @@ class SqlServerCoordinator:
         # Demote the cached gate FIRST (a concurrent is_leader() reader sees "not leader" at once), then
         # expire the lease row so a standby can take over immediately on a clean shutdown. Deliberately
         # NOT under _leadership_lock, and best-effort on a failed write — see DbCoordinator.stop().
-        await self._release_leadership()
+        await self._release_leadership(force_write=self._may_own_lease_row())
         try:
             await self._store._execute(
                 "UPDATE nodes SET status=?, last_seen=?, is_leader=0 WHERE node_id=?",
@@ -511,6 +512,7 @@ class SqlServerCoordinator:
             ),
         )
         if row is None or row["owner"] != self.node_id:
+            self._last_renew_ok = None  # the DB saw another owner; see DbCoordinator (#1508)
             return False
         self._leader_epoch = int(row["leader_epoch"])
         return True
@@ -632,9 +634,8 @@ class SqlServerCoordinator:
             )
             return (was_leader, released_at, False, False)
         self._lease_release_owed = False
-        # The store's _execute returns the driver's row count. -1 (unknown) reads as released, as in
-        # DbCoordinator (see cluster._rows_affected): it keeps the claim pause armed.
-        return (was_leader, released_at, True, rows != 0)
+        # The store's _execute returns the driver's row count; one rule for both backends.
+        return (was_leader, released_at, True, rows_affected(rows) != 0)
 
     # --- #145 leadership-transition alerts (never-raise; lockstep with DbCoordinator) ----
 

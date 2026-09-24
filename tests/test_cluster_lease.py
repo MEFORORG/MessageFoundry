@@ -1097,26 +1097,63 @@ async def test_a_self_fenced_node_is_drained_and_says_so_truthfully() -> None:
 
 
 async def test_a_stepdown_on_a_node_whose_lease_a_sibling_took_changes_nothing() -> None:
-    # The other state `_last_renew_ok` reaches: this node led, then a sibling took the expired lease.
-    # The write is sent (the node cannot tell this case from the self-fence one without asking) and
-    # matches nothing, so the outcome is all-false and the endpoint answers 409 - and the pause the
-    # call armed is TAKEN BACK, so a mistaken call does not hold a follower out of a later failover.
-    # CONTROL ARM, measured: skip the take-back and this fails at the pause (20.0 == 0.0).
+    # The other way a node that once led stops leading: its DB answers a claim with a sibling's live
+    # lease. That clears the confirmed-hold baseline, so a stepdown here sends NO write, arms no pause
+    # and owes nothing - a clean 409, as before #1508. CONTROL ARM, measured: without the baseline
+    # clear in _claim_or_renew_lease this fails at the baseline assertion (0.0 is None); past it
+    # the call would send a write, and a write that failed would answer 503 and pause a follower.
     db_clock = _Clock(0.0)
     db = _FakeLeaseDB(db_clock)
-    mono = _Clock(0.0)
-    a = _coord(_FakeLeasePool(db), mono, node="A", heartbeat=10.0)
+    pool = _FakeLeasePool(db)
+    a = _coord(pool, _Clock(0.0), node="A", heartbeat=10.0)
     b = _coord(_FakeLeasePool(db), _Clock(0.0), node="B", heartbeat=10.0)
     await a._maintain_leadership()
     db_clock.t = 31.0  # A's lease expired without a renew; B takes it
     await b._maintain_leadership()
-    await a._maintain_leadership()  # A learns it lost the lease
+    await a._maintain_leadership()  # A's DB answers with B's live lease
     assert (a.is_leader(), b.is_leader()) == (False, True)
-    assert a._last_renew_ok is not None  # the disjunct that makes A send the write
+    assert a._last_renew_ok is None, "a claim that saw another owner kept the hold baseline"
 
+    releases: list[tuple[object, ...]] = []
+    pool.on_execute_args = releases.append
     assert await a.step_down_leadership() == (False, None, False)
+    assert releases == [], "a follower that saw a sibling take its lease still wrote"
+    assert a._no_claim_until == 0.0 and a._lease_release_owed is False
     assert db.row is not None and db.row["owner"] == "B" and db.row["lease_expires_at"] == 61.0
+
+
+async def test_a_stepdown_whose_write_matches_nothing_takes_its_pause_back() -> None:
+    # The residue the baseline clear cannot reach: a self-fenced node whose row a sibling took while
+    # this node's DB was unreachable. It still may own the row as far as it knows, so it writes; the
+    # write matches nothing, the answer is all-false, and the pause this call armed is taken back.
+    # CONTROL ARM, measured: skip the take-back and this fails at the pause (40.1 == 0.0).
+    db_clock = _Clock(0.0)
+    db = _FakeLeaseDB(db_clock)
+    pool = _FakeLeasePool(db)
+    mono = _Clock(0.0)
+    a = _coord(pool, mono, node="A", heartbeat=10.0)
+    await a._maintain_leadership()
+    mono.t = 20.1
+    a._check_fence()  # self-fenced; its DB has not answered since
+    db.row = {"owner": "B", "lease_expires_at": 60.0, "leader_epoch": 2}  # B took it, unseen by A
+    assert await a.step_down_leadership() == (False, None, False)
     assert a._no_claim_until == 0.0, "a stepdown that released nothing left a claim pause behind"
+
+
+async def test_stop_on_a_self_fenced_node_expires_the_row_it_still_owns() -> None:
+    # stop() had the same early return #1508 removed from the stepdown: a self-fenced node that was
+    # shut down left its row live for up to ttl - fence. It now forces the write on the same
+    # predicate. CONTROL ARM, measured: call _release_leadership() unforced in stop() and this fails
+    # at the row (30.0 == 0.0).
+    db = _FakeLeaseDB(_Clock(0.0))
+    mono = _Clock(0.0)
+    a = _coord(_FakeLeasePool(db), mono, node="A")
+    await a._maintain_leadership()
+    mono.t = 20.1
+    a._check_fence()
+    assert a.is_leader() is False
+    await a.stop()
+    assert db.row is not None and db.row["lease_expires_at"] == 0.0
 
 
 async def test_a_stepdown_on_a_node_that_never_led_sends_nothing_and_arms_no_pause() -> None:

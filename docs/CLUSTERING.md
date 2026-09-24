@@ -460,8 +460,9 @@ leaderless, which is why such a call is refused with `412` unless you send `forc
 **A handicapped sibling takes over after a stepdown too.** The stepdown writes the lease expiry as
 zero, not as the current time. `acquire_delay_seconds` is added to that stored expiry, so a released
 lease is open to every promotable sibling on its next heartbeat, however large its delay
-([BACKLOG #1507](BACKLOG.md)). The delay still applies to a lease that expired on its own, which is
-the crash failover it exists for. Give every node the same `heartbeat_seconds`: the pause is two of
+([BACKLOG #1507](BACKLOG.md)). So leader preference does not steer a planned failover: whichever
+promotable sibling ticks first takes the lease. The delay still applies to a lease that expired on
+its own, which is the crash failover it exists for. Give every node the same `heartbeat_seconds`: the pause is two of
 the drained node's own heartbeats, so a sibling with a longer one can miss it.
 
 **A node that has already self-fenced can be drained.** It has given up leadership in memory but still
