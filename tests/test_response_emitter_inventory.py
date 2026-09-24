@@ -21,7 +21,8 @@ site does not bypass the floor, or what covers it instead.
 | ``asgi-response-start`` | A raw ASGI response-start or ``websocket.accept`` message literal. |
 | ``ws-close`` | A ``websocket.close`` message or a ``.close(code=...)`` call: pre-accept, it is a refusal. |
 | ``status-line`` | A literal that starts an HTTP status line: a raw writer below any ASGI stack. |
-| ``protocol-override`` | A ``send_400_response`` or ``send_500_response``: uvicorn's own responses. |
+| ``protocol-override`` | A def of, or assignment to, ``send_400_response``, ``send_500_response`` or |
+| | ``write_http_response``: the server's own responses. |
 
 **Its bound, stated so it is not read as more.** This pins the FIRST-PARTY emitter population, and
 only emitters of a shape listed above, in the literal spelling the table gives: an aliased import
@@ -51,7 +52,7 @@ _ASGI_RESPONSE_STARTS = frozenset(
     {"http.response.start", "websocket.http.response.start", "websocket.accept"}
 )
 _STATUS_LINE = re.compile(r"HTTP/\d\.\d \S")
-_PROTOCOL_METHODS = frozenset({"send_400_response", "send_500_response"})
+_PROTOCOL_METHODS = frozenset({"send_400_response", "send_500_response", "write_http_response"})
 _SERVER_CALLS = frozenset({"run", "Server", "Config"})
 _WS_NAMES = frozenset({"ws", "websocket"})
 _MESSAGE_KINDS = {
@@ -89,6 +90,13 @@ class _Collector(ast.NodeVisitor):
         self._scoped(node)
 
     visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        # A per-instance override, `cycle.send_500_response = ...`, is as much an override as a def.
+        for target in node.targets:
+            if isinstance(target, ast.Attribute) and target.attr in _PROTOCOL_METHODS:
+                self._add("protocol-override")
+        self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
         func = node.func
@@ -212,13 +220,22 @@ _REGISTERED: dict[Site, tuple[int, str]] = {
         1,
         "Registered before the floor, so inside it: the floor setdefaults the baseline onto it.",
     ),
-    Site(_PROTOCOL, "_floored_cycle_class._FlooredCycle", "protocol-override"): (
+    Site(_PROTOCOL, "_floor_the_cycle_500", "protocol-override"): (
         1,
         "Adds the headers to uvicorn's own HTTP 500; tests/test_header_floor_wire.py.",
     ),
     Site(_PROTOCOL, "floored_http_protocol_class._FlooredHTTPProtocol", "protocol-override"): (
         1,
         "Adds the headers to uvicorn's own HTTP 400; tests/test_header_floor_wire.py.",
+    ),
+    Site(
+        _PROTOCOL,
+        "floored_ws_protocol_class._FlooredLegacyWebSocketProtocol",
+        "protocol-override",
+    ): (
+        1,
+        "Adds the headers, where absent, to every handshake answer the legacy websockets server "
+        "writes; tests/test_header_floor_wire.py.",
     ),
     Site(_PROTOCOL, "floored_ws_protocol_class._FlooredWebSocketProtocol", "protocol-override"): (
         1,
@@ -294,3 +311,19 @@ def test_a_registered_emitter_that_is_gone_is_drift() -> None:
     """The other direction: an entry whose site vanished must fail, or the register rots."""
     gone = Counter({Site(_APP, "create_app._unhandled_exception", "error-handler"): 1})
     assert _drift(scan_tree() - gone)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "class P:\n    def write_http_response(self, status, headers, body=None):\n        pass\n",
+        "def hook(cycle):\n    cycle.send_500_response = None\n",
+    ],
+    ids=["write_http_response-def", "send_500_response-assignment"],
+)
+def test_the_other_override_forms_turn_the_gate_red(source: str) -> None:
+    """Positive controls for the override forms the shape table names beyond a plain def."""
+    planted = scan_source(source, "messagefoundry/api/planted.py")
+    assert [site.kind for site in planted.elements()] == ["protocol-override"]
+    problems = _drift(scan_tree() + planted)
+    assert len(problems) == 1 and "planted.py" in problems[0], problems

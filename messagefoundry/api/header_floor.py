@@ -21,9 +21,9 @@ response headers. That was false for the handshake: ``101`` on accept and a refu
 browser as HTTP responses. See :class:`SecurityHeaderFloorMiddleware` for the three messages it
 covers, and :func:`refuse_websocket` for how a route refuses a handshake.
 
-**What this floor cannot reach is the responses uvicorn writes itself**, below the ASGI app: the
-malformed-request ``400``, the ``500`` after an app error that started no response, and the
-WebSocket ``500``. :mod:`messagefoundry.api.protocol_headers` covers those at the protocol layer.
+**What this floor cannot reach is the responses the server writes itself**, below the ASGI app.
+:mod:`messagefoundry.api.protocol_headers` covers those it can at the protocol layer, and its
+docstring is where that list, and its known gaps, are kept.
 
 **Two write modes, and the difference is load-bearing.**
 

@@ -3,16 +3,22 @@
 """Security headers on the responses uvicorn writes itself, below the ASGI app (BACKLOG #1120).
 
 The header floor in :mod:`messagefoundry.api.header_floor` sees every response the ASGI app sends. It
-cannot see the ones uvicorn's protocol layer writes on its own, because no app code runs for them:
+cannot see the ones the server writes on its own, because no app code runs for them. This module
+adds ``X-Content-Type-Options: nosniff`` and ``Content-Security-Policy: frame-ancestors 'none'`` to at
+least these:
 
 * the ``400`` for a request uvicorn cannot parse (``send_400_response`` on the HTTP protocol);
 * the ``500`` when the app raised, or returned, without starting a response
-  (``send_500_response`` on uvicorn's per-request cycle object, not on the protocol); and
+  (``send_500_response`` on uvicorn's per-request cycle object, not on the protocol);
 * the ``500`` when a WebSocket app fails before the handshake is answered (``send_500_response`` on
-  the WebSocket protocol).
+  the WebSocket protocol); and
+* on the legacy websockets server that ``ws="auto"`` resolves to, every handshake answer that
+  library writes through ``write_http_response``: its own rejection of a malformed handshake (for
+  example a ``400`` for a missing ``Sec-WebSocket-Key``), its ``503`` on shutdown, and its ``500``.
 
-This module builds protocol subclasses that add ``X-Content-Type-Options: nosniff`` and
-``Content-Security-Policy: frame-ancestors 'none'`` to exactly those responses.
+**Known gaps, not covered here.** The sans-I/O WebSocket protocol builds its own handshake
+rejections through ``ServerProtocol.reject``, and wsproto writes its own ``400`` for a bad handshake
+straight to the transport. Neither is what ``ws="auto"`` resolves to at the locked versions.
 
 **Never HSTS here.** Whether HSTS belongs on a response depends on the request's host and the served
 chain (:func:`~messagefoundry.api.header_floor.hsts_notable`). On the default posture, a self-signed
@@ -20,23 +26,31 @@ pair on 127.0.0.1, it must stay absent. ``uvicorn.Config(headers=...)`` is the t
 it is wrong twice: it is unconditional, and it would stamp every app response a second time on top
 of the floor.
 
-**Adding, not rewriting.** Each override calls uvicorn's own method and adds the headers on the way
-out, so the status, body and framing stay uvicorn's. The ``400`` and the WebSocket ``500`` are written
-straight to the transport, synchronously, and the FIRST ``write`` of each carries the status line (for
-httptools and the WebSocket writers it is the only write; h11 writes head, body and end separately).
-So a transport proxy adds the header lines after that status line, for the length of that one call. The HTTP ``500``
-goes through the cycle's ``send``, which prepends the cycle's ``default_headers``, so the override
-extends those for that one response.
+**Adding, not rewriting.** Each override calls the server's own method and adds the headers on the
+way out, so the status, body and framing stay the server's. The ``400`` and the WebSocket ``500`` are
+written straight to the transport, synchronously, and the FIRST ``write`` of each carries the status
+line (for httptools and the WebSocket writers it is the only write; h11 writes head, body and end
+separately). So a transport proxy adds the header lines after that status line, for the length of
+that one call. The HTTP ``500`` goes through the cycle's ``send``, which prepends the cycle's
+``default_headers``, so the override extends those for that one response.
 
-**Measured against one uvicorn.** Both overrides lean on uvicorn internals (the cycle attribute and
-its ``default_headers``). ``tests/test_header_floor_wire.py`` pins the uvicorn version and drives every
-family on the wire, so an upgrade that moves either goes red there rather than silently.
+**Fail open, always.** A header is worth less than the response it rides on. Every step on the
+header path catches ``Exception``, logs its type once at WARNING, and falls through to the server's
+own behaviour, so no failure here can change a status or break a request.
+
+**This leans on uvicorn and websockets INTERNALS**: the protocol's ``cycle`` attribute, the cycle's
+``default_headers`` and ``send_500_response``, the protocols' ``transport``, and the legacy server's
+``write_http_response``. None is public API. ``tests/test_header_floor_wire.py`` pins the versions it
+measured, uvicorn 0.49.0 and websockets 16.0, and drives every family on the wire against a control,
+so an upgrade that moves any of them goes red there. Fail-open is what keeps such an upgrade from
+turning into an outage before the suite is re-run.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import weakref
 from collections.abc import Callable
 from functools import partial
 from typing import Any
@@ -53,6 +67,8 @@ __all__ = [
     "floored_ws_protocol_class",
 ]
 
+_log = logging.getLogger(__name__)
+
 _NOSNIFF = "X-Content-Type-Options"
 
 #: The set the protocol layer adds. Values come from the floor's own constants so the two cannot
@@ -65,16 +81,27 @@ PROTOCOL_SECURITY_HEADERS: tuple[tuple[str, str], ...] = (
 _HEADER_LINES = b"".join(
     f"{name}: {value}\r\n".encode("latin-1") for name, value in PROTOCOL_SECURITY_HEADERS
 )
-_log = logging.getLogger(__name__)
-#: One-shot latch for the warning in _floor_the_cycle_500.
-_SWAP_FAILED: list[bool] = []
-#: One floored subclass per uvicorn cycle class, built on first use.
-_FLOORED_CYCLES: dict[type[Any], type[Any]] = {}
-
 _HEADER_PAIRS = [
     (name.lower().encode("latin-1"), value.encode("latin-1"))
     for name, value in PROTOCOL_SECURITY_HEADERS
 ]
+
+#: Header-path steps that have already logged a failure, so a broken step warns once, not per request.
+_WARNED: set[str] = set()
+
+
+def _fell_open(step: str, exc: Exception) -> None:
+    """Log one header-path failure, once per step. Only the exception TYPE is logged: the message
+    could carry request bytes, and this runs on requests that may carry PHI."""
+    if step in _WARNED:
+        return
+    _WARNED.add(step)
+    _log.warning(
+        "%s failed (%s); serving the server's own response without the protocol-level security "
+        "headers (BACKLOG #1120). Re-measure uvicorn's protocol layer.",
+        step,
+        type(exc).__name__,
+    )
 
 
 def _after_status_line(data: bytes) -> bytes:
@@ -96,7 +123,10 @@ class _HeaderInjectingTransport:
     def write(self, data: bytes | bytearray | memoryview) -> None:
         if self._pending:
             self._pending = False
-            data = _after_status_line(bytes(data))
+            try:
+                data = _after_status_line(bytes(data))
+            except Exception as exc:  # fail open: write what the server meant to write
+                _fell_open("status-line header injection", exc)
         self._inner.write(data)
 
     def writelines(self, chunks: Any) -> None:
@@ -107,55 +137,51 @@ class _HeaderInjectingTransport:
 
 
 def _write_with_headers(protocol: Any, emit: Callable[[], None]) -> None:
-    """Run one synchronous protocol-level response writer with the header lines added."""
-    inner = protocol.transport
-    protocol.transport = _HeaderInjectingTransport(inner)
+    """Run one synchronous protocol-level response writer with the header lines added. Errors from
+    ``emit`` itself are the server's and propagate exactly as they would without this module."""
+    try:
+        inner = protocol.transport
+        protocol.transport = _HeaderInjectingTransport(inner)
+    except Exception as exc:
+        _fell_open("transport swap", exc)
+        emit()
+        return
     try:
         emit()
     finally:
-        protocol.transport = inner
+        try:
+            protocol.transport = inner
+        except Exception as exc:  # the proxy forwards everything, so leaving it in place is safe
+            _fell_open("transport restore", exc)
 
 
-def _floored_cycle_class(cls: type[Any]) -> type[Any]:
-    """A subclass of uvicorn's request cycle whose own ``500`` carries the headers, and nothing else.
-
-    uvicorn prepends ``default_headers`` to every response start a cycle sends. Extending it only
-    once the ``500`` is underway puts the headers on that response alone. REBIND, never mutate: the
-    list uvicorn passed in is the server-wide ``server_state.default_headers``. A class, built once
-    per cycle class, rather than a per-request closure: a closure stored on the cycle would hold the
-    cycle, and a reference cycle keeps each request's scope and body alive until a GC pass."""
-
-    floored = _FLOORED_CYCLES.get(cls)
-    if floored is None:
-
-        class _FlooredCycle(cls):  # type: ignore[misc]
-            _mf_floored = True
-
-            async def send_500_response(self) -> None:
-                cycle: Any = self
-                cycle.default_headers = [*cycle.default_headers, *_HEADER_PAIRS]
-                await super().send_500_response()
-
-        floored = _FLOORED_CYCLES[cls] = _FlooredCycle
-    return floored
+async def _send_floored_500(cycle_ref: weakref.ref[Any]) -> None:
+    """A cycle's ``500`` with the headers. uvicorn prepends ``cycle.default_headers`` to every
+    response start the cycle sends, so extending it only now puts the headers on this response
+    alone. REBIND, never mutate: the list uvicorn passed in is the server-wide
+    ``server_state.default_headers``."""
+    cycle = cycle_ref()
+    if cycle is None:
+        return
+    try:
+        cycle.default_headers = [*cycle.default_headers, *_HEADER_PAIRS]
+    except Exception as exc:
+        _fell_open("500 header extension", exc)
+    await type(cycle).send_500_response(cycle)
 
 
 def _floor_the_cycle_500(cycle: Any) -> None:
-    """Swap this cycle onto :func:`_floored_cycle_class`. If a future uvicorn makes that impossible,
-    log once and serve the request anyway: a missing header on a 500 is not worth an outage."""
-    cls = type(cycle)
-    if getattr(cls, "_mf_floored", False):
-        return
+    """Point this cycle's ``send_500_response`` at :func:`_send_floored_500`.
+
+    A per-instance attribute holding a WEAK reference, so the cycle does not hold itself and is
+    still freed by refcount. Measured on uvicorn 0.49.0's real cycles (h11 and httptools): about
+    290 bytes more per in-flight request and no change to attribute-read speed. The per-request
+    ``__class__`` swap this replaced cost about 240 bytes and made every attribute read on the
+    cycle about 45 percent slower."""
     try:
-        cycle.__class__ = _floored_cycle_class(cls)
-    except TypeError:
-        if not _SWAP_FAILED:
-            _SWAP_FAILED.append(True)
-            _log.warning(
-                "uvicorn's %s cannot be subclassed per request; its own 500 will not carry the "
-                "security headers (BACKLOG #1120). Re-measure uvicorn's protocol layer.",
-                cls.__name__,
-            )
+        cycle.send_500_response = partial(_send_floored_500, weakref.ref(cycle))
+    except Exception as exc:
+        _fell_open("500 hook", exc)
 
 
 def floored_http_protocol_class(base: type[Any] | None = None) -> type[asyncio.Protocol]:
@@ -181,19 +207,17 @@ def floored_http_protocol_class(base: type[Any] | None = None) -> type[asyncio.P
 
         @cycle.setter
         def cycle(self, value: Any) -> None:
+            self._mf_cycle = value  # first, so no failure below can lose the cycle
             if value is not None:
                 _floor_the_cycle_500(value)
-            self._mf_cycle = value
 
     return _FlooredHTTPProtocol
 
 
 def floored_ws_protocol_class(base: type[Any] | None = None) -> type[asyncio.Protocol] | None:
-    """uvicorn's WebSocket protocol with the headers on its pre-handshake ``500``, and, on the
-    legacy websockets server, on the handshake rejections that library writes itself.
-
-    NOT covered: the sans-I/O protocol's own handshake rejections, which it builds through
-    ``ServerProtocol.reject``. It is not what ``ws="auto"`` resolves to at the locked versions.
+    """uvicorn's WebSocket protocol with the headers on its pre-handshake ``500`` and, on the legacy
+    websockets server, on every handshake answer that library writes. See the module docstring for
+    what is NOT covered.
 
     ``base`` defaults to uvicorn's resolved ``AutoWebSocketsProtocol``. That is ``None`` when no
     WebSocket library is installed, and then this returns ``None`` too, which uvicorn reads exactly
@@ -212,15 +236,17 @@ def floored_ws_protocol_class(base: type[Any] | None = None) -> type[asyncio.Pro
 
     if hasattr(base, "write_http_response"):
         # The legacy websockets server writes every handshake answer through this one method: the
-        # 101, the app's denial, and its OWN rejections of a bad handshake (400 for a missing key or
-        # version, 426, 503 on shutdown, 500). Add the headers where absent, so the 101 and the
-        # denial, which the floor already covered, are not stamped twice.
+        # 101, the app's denial, and its OWN answers to a bad handshake. Add the headers where
+        # absent, so the 101 and the denial, which the floor already covered, are not stamped twice.
 
         class _FlooredLegacyWebSocketProtocol(_FlooredWebSocketProtocol):
             def write_http_response(self, status: Any, headers: Any, body: Any = None) -> None:
-                for name, value in PROTOCOL_SECURITY_HEADERS:
-                    if name not in headers:
-                        headers[name] = value
+                try:
+                    for name, value in PROTOCOL_SECURITY_HEADERS:
+                        if name not in headers:
+                            headers[name] = value
+                except Exception as exc:
+                    _fell_open("handshake header addition", exc)
                 super().write_http_response(status, headers, body)
 
         return _FlooredLegacyWebSocketProtocol

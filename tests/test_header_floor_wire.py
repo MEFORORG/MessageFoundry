@@ -12,9 +12,8 @@ ASGI app with no floor, must find the headers ABSENT. A suite whose probe cannot
 proves nothing by reporting presence.
 
 **Two families, two layers.** The WebSocket refusal is the ASGI app's response, so it carries the
-whole floor. The protocol families are responses uvicorn writes BELOW the app, which
-:mod:`messagefoundry.api.protocol_headers` covers: the malformed-request ``400``, the ``500`` after an
-app error that started no response, and the WebSocket ``500``. Those carry ``nosniff`` and
+whole floor. The protocol families are responses the server writes BELOW the app; the list,
+and its known gaps, live in :mod:`messagefoundry.api.protocol_headers`. Those carry ``nosniff`` and
 ``frame-ancestors 'none'`` only, and never HSTS: the protocol layer cannot see the HSTS gate's
 inputs, and the default posture is a self-signed pair where HSTS must stay absent.
 
@@ -28,10 +27,12 @@ below the app, extends the families here, and moves the pin.
 from __future__ import annotations
 
 import asyncio
+import logging
 import socket
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -43,7 +44,7 @@ from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol
 from uvicorn.protocols.websockets.websockets_impl import WebSocketProtocol
 from uvicorn.protocols.websockets.websockets_sansio_impl import WebSocketsSansIOProtocol
 
-from messagefoundry.api import create_app
+from messagefoundry.api import create_app, protocol_headers
 from messagefoundry.api.header_floor import (
     BASELINE_SECURITY_HEADERS,
     CSP_HEADER,
@@ -188,6 +189,7 @@ async def test_a_refused_handshake_on_the_wire_carries_the_floor(engine: Engine)
 
 _MALFORMED = b"NOT A REQUEST LINE\r\n\r\n"
 _GET = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+_GET_CLOSE = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
 
 
 async def _raises(scope: Scope, receive: Receive, send: Send) -> None:
@@ -278,3 +280,107 @@ async def test_the_legacy_websocket_handshake_rejection_carries_nosniff() -> Non
     async with _served(_raises, ws=floored_ws_protocol_class(base=WebSocketProtocol)) as port:
         shipped = await _exchange(port, request.encode())
     _assert_protocol_family(control, shipped, 400)
+
+
+# --- fail open: a failure on the header path never changes a status ---------------------------
+
+
+async def _ok(scope: Scope, receive: Receive, send: Send) -> None:
+    await send(
+        {"type": "http.response.start", "status": 200, "headers": [(b"content-length", b"2")]}
+    )
+    await send({"type": "http.response.body", "body": b"ok"})
+
+
+class _Boom:
+    """An iterable that raises a NON-TypeError, standing in for an internal a new uvicorn moved."""
+
+    def __iter__(self) -> Any:
+        raise RuntimeError("synthetic header-path failure")
+
+
+def _boom(*args: Any, **kwargs: Any) -> Any:
+    raise RuntimeError("synthetic header-path failure")
+
+
+def _one_warning(caplog: pytest.LogCaptureFixture, step: str) -> None:
+    hits = [r for r in caplog.records if r.name == protocol_headers.__name__]
+    assert len(hits) == 1, [r.getMessage() for r in hits]
+    assert step in hits[0].getMessage() and "RuntimeError" in hits[0].getMessage()
+
+
+@pytest.mark.parametrize("base", [HttpToolsProtocol, H11Protocol])
+async def test_a_broken_500_hook_still_serves_every_request_with_its_normal_status(
+    base: type[Any], monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The per-request hook raises a non-TypeError on EVERY request. A normal request must still get
+    its 200, an app error must still get uvicorn's 500, and the failure is logged once."""
+    monkeypatch.setattr(protocol_headers, "_WARNED", set())
+    monkeypatch.setattr(protocol_headers, "weakref", SimpleNamespace(ref=_boom))
+    caplog.set_level(logging.WARNING, logger=protocol_headers.__name__)
+    floored = floored_http_protocol_class(base=base)
+    async with _served(_ok, http=floored) as port:
+        first = await _exchange(port, _GET_CLOSE)
+        second = await _exchange(port, _GET_CLOSE)
+    async with _served(_raises, http=floored) as port:
+        error = await _exchange(port, _GET)
+    assert (first[0], first[2], second[0]) == (200, b"ok", 200)
+    assert error[0] == 500
+    _one_warning(caplog, "500 hook")
+
+
+@pytest.mark.parametrize(
+    ("target", "value", "step", "app", "request_bytes", "status", "config"),
+    [
+        pytest.param(
+            "_after_status_line",
+            _boom,
+            "status-line header injection",
+            _raises,
+            _MALFORMED,
+            400,
+            {"http": floored_http_protocol_class(base=HttpToolsProtocol)},
+            id="http-400",
+        ),
+        pytest.param(
+            "_HEADER_PAIRS",
+            _Boom(),
+            "500 header extension",
+            _raises,
+            _GET,
+            500,
+            {"http": floored_http_protocol_class(base=H11Protocol)},
+            id="http-500",
+        ),
+        pytest.param(
+            "PROTOCOL_SECURITY_HEADERS",
+            _Boom(),
+            "handshake header addition",
+            _raises,
+            _HANDSHAKE.format(path="/ws")
+            .replace("Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n", "")
+            .encode(),
+            400,
+            {"ws": floored_ws_protocol_class(base=WebSocketProtocol)},
+            id="legacy-handshake-400",
+        ),
+    ],
+)
+async def test_every_header_step_fails_open(
+    target: str,
+    value: Any,
+    step: str,
+    app: Any,
+    request_bytes: bytes,
+    status: int,
+    config: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(protocol_headers, "_WARNED", set())
+    monkeypatch.setattr(protocol_headers, target, value)
+    caplog.set_level(logging.WARNING, logger=protocol_headers.__name__)
+    async with _served(app, **config) as port:
+        response = await _exchange(port, request_bytes)
+    assert response[0] == status
+    _one_warning(caplog, step)
