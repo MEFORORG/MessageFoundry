@@ -219,9 +219,28 @@ MessageFoundry states the boundary and adds one opt-in precondition check (#203)
   `managed_identity_precondition` is a `StoreSettings` method, so the `[store]` service settings are all
   it can read — the four graph-declared database hops (`Database`, `DatabasePoll`, `DatabaseLookup`,
   `DatabaseRef`) are outside its reach by construction, and each defaults to a static SQL login. Setting
-  the flag therefore says nothing about them. `messagefoundry check`'s advisory `static-db-credentials`
-  line is what names that set; it reports and does not refuse. See
-  [`docs/CONNECTIONS.md`](CONNECTIONS.md) §*Static database credentials*.
+  the flag therefore says nothing about them. `messagefoundry check`'s advisory `static-credentials`
+  line names them, together with every other backend hop on a static credential or none. See
+  [`docs/CONNECTIONS.md`](CONNECTIONS.md) §*Static credentials on every backend hop*.
+- **The opt-in static-credential refusal covers the backend hops the engine dials** (ASVS 13.2.1,
+  BACKLOG #1182). `[security].require_nonstatic_credentials` ships **off** (owner decision
+  2026-09-23). Turned on, `serve` refuses to start while any hop that presents an unchanging
+  credential or none lacks an entry in `[security].static_credential_accepted`, which takes a reason
+  per hop. Each honoured opt-out is logged at start by hop name, never by secret, and is named by
+  `security_loosenings()`. The refuse/warn split is `[security].enforcement`. What it counts as a
+  hop, and what it leaves out (listeners, plugin connector types, and a generic-ODBC credential
+  hidden in a driver keyword), is stated in `messagefoundry/config/static_credentials.py`.
+  **Several hops have no compliant credential kind in the product today.** They include at least
+  the `[alerts]` webhook (no credential field), `DICOMweb`, `Tcp`, `X12`, a `File` alternate-share
+  credential, a forward-proxy credential, `Ftp`, SMTP AUTH (alerts, `Email`, `Direct`), a Postgres
+  store, the Vault tokens, the AI broker key, the OIDC client secret and the AD/LDAP bind. Each
+  listed hop carries a `compliant_kind` flag, and that flag, not this sentence, is the source of
+  record. With the refusal on, each of those can run
+  only under an opt-out. A site that turned the refusal on would, on first deployment, record an
+  opt-out for every such hop it uses. That list would then be the site's own record of its static
+  credentials; it would not make those hops compliant. See
+  [`docs/CONNECTIONS.md`](CONNECTIONS.md) §*Static credentials on every backend hop* for the full
+  table and [`docs/CONFIGURATION.md`](CONFIGURATION.md) for the two settings.
 - **Least-privilege secret access** is the operator's precondition: secrets live in the environment, the
   engine's service account is granted only what it needs (the least-privilege account + ACLs are the
   Windows-service install's job), and at-rest custody is the DPAPI / KeyProvider chain. The precondition

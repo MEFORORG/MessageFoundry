@@ -1234,7 +1234,7 @@ The Handler produces a **JSON-object** body; the connector binds its keys to the
 | `database` | — | database name — **required** for `dialect="sqlserver"`; optional for `"generic"` |
 | `statement` | — (required) | parameterized SQL / proc call with `:name` placeholders, e.g. `INSERT INTO obs (mrn, val) VALUES (:mrn, :val)` |
 | `dialect` | `sqlserver` | `sqlserver` preset · `generic` ODBC (see [*Generic ODBC*](#generic-odbc-postgresql--oracle--mysql)) |
-| `auth` | `sql` | `sql` · `integrated` (Windows) · `entra` (ActiveDirectoryDefault) — **SQL Server preset only**. On `dialect="generic"` this setting is **not read at all**: that arm emits `username`/`password` under `odbc_user_key`/`odbc_password_key`, so writing `auth="integrated"` there still produces a static login. `messagefoundry check`'s advisory `static-db-credentials` line names every DATABASE hop on an unchanging credential (ASVS 13.2.1), including that case — see [*Static database credentials*](#static-database-credentials) |
+| `auth` | `sql` | `sql` · `integrated` (Windows) · `entra` (ActiveDirectoryDefault) — **SQL Server preset only**. On `dialect="generic"` this setting is **not read at all**: that arm emits `username`/`password` under `odbc_user_key`/`odbc_password_key`, so writing `auth="integrated"` there still produces a static login. `messagefoundry check`'s advisory `static-credentials` line names every DATABASE hop on an unchanging credential (ASVS 13.2.1), including that case — see [*Static database credentials*](#static-database-credentials) |
 | `username` / `password` | — | SQL-auth credentials (`password` is a **secret** — via `env()`) |
 | `port` | `1433` | server port |
 | `encrypt` | `true` | TLS to the DB (**SQL Server preset only** — see the generic-ODBC note below). `false` is a weakened hop and is **refused at construction**; `MEFOR_ALLOW_INSECURE_TLS` relaxes it **only while `[security].enforcement` is not `enforce`** — the escape is **clamped** (#200, ADR 0092 decision 2) and is **inert on the shipped default** |
@@ -1356,6 +1356,71 @@ reads through a stored procedure — which this gate refuses anyway.
 > database MessageFoundry writes its own messages to; a `DatabaseLookup` dials a partner database under
 > a credential the operator configures per connection.
 
+#### Static credentials on every backend hop
+
+ASVS 13.2.1 asks that every backend hop authenticate with an individual service account, a short-term
+token or a certificate, not with an unchanging credential. The engine keeps one list of the hops it
+dials that do not (BACKLOG #1182). A hop is on the list when it presents a static credential (a
+password, API key, static bearer token or Vault token) or no credential at all. A hop that presents
+only a compliant credential is never on it.
+
+Three surfaces read that one list, so they cannot disagree:
+
+- `messagefoundry check` prints it on the advisory `static-credentials` line. With a
+  `messagefoundry.toml` it also reads the service-settings hops, and it says when it could not.
+- `GET /security/posture` returns it as `static_credential_hops`, one entry per hop.
+- `serve` refuses on it, but only when you turn the refusal on.
+
+The list covers the hops named in the table below. It is not a promise about hops added later, or
+about plugin connector types.
+
+**The refusal ships off.** Set `[security].require_nonstatic_credentials = true` to turn it on. `serve`
+then refuses to start while any listed hop has no opt-out. To keep a hop, name it with a reason:
+
+```toml
+[security]
+require_nonstatic_credentials = true
+static_credential_accepted = { "OB_ACME_REST" = "partner offers HTTP Basic only", "settings:alerts.webhook" = "no credential field exists" }
+```
+
+Each opt-out is logged at start with the hop's name and your reason, never a secret, and
+`security_loosenings()` names the set. The refuse/warn split is `[security].enforcement`, as it is for
+`[store].require_managed_identity`. The settings hops are checked before anything starts. The graph
+hops are checked at the first graph load and at every `/config/reload`, where a refusal leaves the
+running graph in place.
+
+**Some hops have no compliant option today.** For those, the only way through with the refusal on is an
+opt-out. That is expected, and the table says which they are.
+
+| Hop | Named as | Compliant kind in the product |
+|-----|----------|-------------------------------|
+| `Rest(...)`, `FHIR(...)` | `<name>` | yes: SMART Backend Services or OAuth2 client credentials |
+| `FhirLookup(...)` | `fhir_lookup:<name>` | yes: SMART Backend Services |
+| `Soap(...)` | `<name>` | yes: client certificate, or OAuth2 |
+| `DICOMweb(...)` | `<name>` | **no** (static bearer or Basic only) |
+| forward-proxy credential on any HTTP connection (`proxy_user`/`proxy_password`, or a user and password in the proxy URL, its own or an inherited `[egress].proxy_url`) | `proxy:<name>`, or `proxy:fhir_lookup:<name>` for a lookup | **no** (Basic or Digest only) |
+| `MLLP(...)`, `DICOM(...)` outbound | `<name>` | yes: `tls=True` with `tls_cert_file` |
+| `Tcp(...)`, `X12(...)` outbound | `<name>` | **no** (no credential of any kind) |
+| `Email(...)`, `Direct(...)` SMTP AUTH | `<name>` | **no** |
+| `Sftp(...)` | `<name>` or `inbound:<name>` | yes: SSH private key |
+| `Ftp(...)` | `<name>` or `inbound:<name>` | **no** |
+| `File(...)` alternate-share credential | `<name>` or `inbound:<name>` | **no** (drop it to run as the service identity) |
+| the four database factories | see the table below | yes: `auth="integrated"` or `"entra"` |
+| `[store]` on SQL Server or Postgres | `settings:store` | SQL Server yes; Postgres **no** |
+| Vault token (store key, Transit, secrets) | `settings:vault.store_key`, `settings:vault.store_transit`, `settings:vault.secrets` | **no** |
+| `[alerts]` webhook | `settings:alerts.webhook` | **no** (the sink has no credential field) |
+| `[alerts]` SMTP | `settings:alerts.smtp` | **no** |
+| `[ai]` broker key | `settings:ai.broker` | **no** |
+| `[auth]` OIDC client secret | `settings:auth.oidc` | **no** |
+| `[auth]` AD/LDAP bind | `settings:auth.ad_bind` | **no** |
+| `[logging]` syslog forwarder | `settings:logging.forward` | yes: `forward_protocol = "tls"` with `forward_tls_client_cert` |
+
+Listeners are **not** on the list. On an inbound MLLP, TCP, X12, DICOM or HTTP listener the partner
+presents a credential to the engine, not the other way round. A connection declared with
+`deployed=False` is not on it either, because the engine never opens it. OAuth2 counts as compliant by
+the 2026-08-22 owner ruling, although its own token request still sends a static client secret; that
+token request is not listed as a separate hop.
+
 #### Static database credentials
 
 ASVS 13.2.1 asks that a backend hop authenticate with an individual service account, a short-term token
@@ -1363,10 +1428,11 @@ or a certificate rather than an unchanging credential. On SQL Server that means 
 gMSA or Windows machine principal) or `auth="entra"`; `auth="sql"`, the shipped default, is a static
 username and password.
 
-`messagefoundry check` prints an advisory **`static-db-credentials`** line naming every declared database
-hop that presents an unchanging credential, with its peer. It is an **inventory, not a gate** — it
-refuses nothing and blocks nothing. A named hop may be entirely legitimate, and a site whose database
-offers no managed-identity mode has no compliant option to move to.
+`messagefoundry check` names every declared database hop that presents an unchanging credential, with
+its peer, on its advisory **`static-credentials`** line. That line covers every backend hop, not only
+databases; see [Static credentials on every backend hop](#static-credentials-on-every-backend-hop)
+above. The line itself refuses nothing. The refusal is the opt-in
+`[security].require_nonstatic_credentials`, which is off by default.
 
 It covers **four** factories, because four of them dial a database with a credential:
 

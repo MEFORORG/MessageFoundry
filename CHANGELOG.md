@@ -272,6 +272,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   default-credential words such as `admin` and `password`. `docs/SECURITY.md` already published the
   list in full, and a new test holds it equal to `CONTEXT_WORDS`. **Migration:** a client that
   matches the old clause in the `detail` must match the new one. (`BACKLOG #1135`, `#1132`)
+- **An opt-in refusal of backend hops on an unchanging credential, and an inventory of every such
+  hop.** `[security].require_nonstatic_credentials` ships off. When on, `serve` refuses every backend
+  hop that presents a password, API key, static token or no credential at all, unless
+  `[security].static_credential_accepted` names it with a reason. The inventory covers the connection
+  graph and six service-settings sections. It appears in `GET /security/posture` as
+  `static_credential_hops`, served `Cache-Control: no-store`, and in `messagefoundry check`. Each
+  hop's detail names its peer as scheme, host and port only. **BREAKING for anything that parses
+  `check` output:** the `static-db-credentials` check line is renamed `static-credentials`, because it
+  now covers every backend hop and not only database hops. (`BACKLOG #1182`)
 - **BREAKING — an operator resend now meets the target inbound's ingress guards.** `POST
   /uploads/{file_id}/resend` and `POST /messages/{message_id}/edit-resend` wrote the stage row
   directly, so the inbound's size ceiling and declared-type checks never ran on them. An uploaded file

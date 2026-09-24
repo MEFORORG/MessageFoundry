@@ -4629,6 +4629,28 @@ class SecuritySettings(_Section):
     # names it, so the opt-out is never silent.
     allow_unverified_alert_smtp_tls: bool = False
 
+    # ── Backend credentials (ASVS 13.2.1, BACKLOG #1182) ─────────────
+    # OPT-IN REFUSAL of every backend hop that presents an unchanging credential or none. Default
+    # FALSE by owner decision (2026-09-23): "Opt-in, off". When TRUE, `serve` refuses to start while
+    # any hop that config/static_credentials.py's static_credential_hops() names lacks an entry in
+    # static_credential_accepted below; the refuse/warn split is [security].enforcement, exactly like
+    # [store].require_managed_identity. The settings half (six sections: [store], [secrets],
+    # [alerts], [ai], [auth] and [logging]) is checked before anything starts; the graph half at every
+    # graph load and /config/reload, where a refusal is a WiringError. Several hops have NO compliant credential kind in the product today
+    # (among them the alert webhook, DICOMweb, Tcp, X12, a File alternate-share credential, a
+    # forward-proxy credential, FTP, SMTP AUTH, a Postgres store, Vault tokens, the AI broker key, OIDC
+    # client_secret and the LDAP bind; each hop's compliant_kind field is the source of record), so
+    # with this on they can only run under an opt-out. Not a loosening (it tightens).
+    # DIRECT-READ by the serve gate, not desugared: there is no legacy field it replaces.
+    require_nonstatic_credentials: bool = False
+    # The audited per-hop opt-outs: hop name -> the operator's reason, e.g.
+    # {"OB_ACME_REST" = "partner offers HTTP Basic only", "settings:alerts.webhook" = "..."}. Hop names
+    # are the ones `messagefoundry check`'s static-credentials line and GET /security/posture print.
+    # Read only when require_nonstatic_credentials is TRUE; each honoured entry is logged at startup
+    # (hop name and reason, never a secret) and named by security_loosenings(). A blank reason is
+    # refused at load: an opt-out must say why.
+    static_credential_accepted: dict[str, str] = Field(default_factory=dict)
+
     # ── Sign-in & identity ───────────────────────────────────────────
     require_sign_in: bool = True  # authenticate every request
     require_mfa: bool = True  # second factor, enforced as an ACCESS gate (ASVS 6.3.3)
@@ -4731,6 +4753,17 @@ class SecuritySettings(_Section):
                 )
             cleaned.append(item)
         return cleaned
+
+    @field_validator("static_credential_accepted", mode="after")
+    @classmethod
+    def _opt_outs_say_why(cls, value: dict[str, str]) -> dict[str, str]:
+        blank = sorted(name for name, reason in value.items() if not str(reason).strip())
+        if blank:
+            raise ValueError(
+                "[security].static_credential_accepted: every opt-out needs a reason; blank for "
+                + ", ".join(repr(name) for name in blank)
+            )
+        return value
 
     @field_validator("allowed_client_networks", mode="before")
     @classmethod
@@ -5601,6 +5634,22 @@ def security_loosenings(
                 "allow_unverified_alert_smtp_tls",
                 "an unauthenticated [alerts] SMTP hop is permitted to start an enforcing PHI instance "
                 "— the serve gate that would otherwise refuse it is acknowledged away",
+            )
+        )
+    # BACKLOG #1182: while the opt-in static-credential refusal is ON, each per-hop opt-out is a
+    # deliberate departure from it, so the opt-outs are the loosening. With the refusal OFF (the shipped
+    # default, owner decision 2026-09-23) nothing is refused and an opt-out is inert, so it is not
+    # reported; the static-credential inventory itself is GET /security/posture's
+    # `static_credential_hops` and `messagefoundry check`'s static-credentials line.
+    if sec.require_nonstatic_credentials and sec.static_credential_accepted:
+        named = ", ".join(sorted(sec.static_credential_accepted))
+        out.append(
+            (
+                "static_credential_accepted",
+                f"{len(sec.static_credential_accepted)} opt-out(s) from the static-credential refusal "
+                f"are declared ({named}) — each named hop that exists runs on an unchanging "
+                "credential or none, which ASVS 13.2.1 asks backend hops not to do (the serve log "
+                "names any opt-out that matches no hop)",
             )
         )
     # --- the CONNECTION-scoped deviations (ADR 0153 decision 2; #333). None is a [security] switch, but
