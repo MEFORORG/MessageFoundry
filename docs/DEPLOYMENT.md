@@ -445,9 +445,8 @@ nor the instance's data label — so cleartext credentials over `http`, cleartex
 cleartext HTTP family are now governed only by a per-connection `cleartext_accepted` + `cleartext_reason`
 (warn + audit) or a loopback hop. (The engine also honours a `tls_hop_attested` hop — the opposite claim,
 "secure by other means", a silent ALLOW — but that field has **no supported authoring surface on a
-connection**: no factory parameter and no `connections.toml` key. Only the unsupported raw-settings
-escape hatch, a config module writing `spec.settings` directly, reaches it. The refusal messages do not
-name it.) *(b)* Where it does still apply it is mostly
+connection**: no factory parameter and no `connections.toml` key. No refusal offers it as a
+remedy.) *(b)* Where it does still apply it is mostly
 **clamped** (ADR 0092 decision 2 / ADR 0148): it cannot relax a hop while `[security].enforcement =
 enforce`, and for the weakened-TLS / cleartext-escape cells that route through
 `weakened_tls_escape_permitted` — at least the store-TLS, MLLP/FTPS and plain-FTP cells and, since #329,
@@ -556,8 +555,9 @@ and **refuses to start** under `[security].enforcement = enforce` (it warns at `
 - **DICOM C-STORE SCP / HTTP / raw-TCP / X12 inbound** (same module): siblings of the MLLP guard —
   `check_dimse_tls_exposure`, `check_http_tls_exposure`, and `check_tcp_tls_exposure` (raw-TCP **and** X12,
   shipped in PR #558) — each refuses a non-loopback bind without TLS at wiring time. raw-TCP/X12 are
-  plaintext-only, so for them the only passes are loopback or `--allow-insecure-bind` under the clamp
-  below; OS firewall/segmentation is still worth doing but clears nothing. So every inbound
+  plaintext-only, so for them the supported passes include loopback and `--allow-insecure-bind` (or its
+  config twin `[security].require_encryption_for_remote = false`) under the clamp below. OS
+  firewall/segmentation is still worth doing, but it clears none of these gates. So every inbound
   listen type is now exposed-gated.
 - **The clamp, precisely** ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md),
   ADR 0092 decision 2): all four inbound gates and the API gate honour `--allow-insecure-bind` only while
@@ -566,8 +566,8 @@ and **refuses to start** under `[security].enforcement = enforce` (it warns at `
   removed the PHI conjunct — `wiring_runner.py` reads `return not posture.enforcing` — and `enforce` is
   the default, so on a stock instance the flag changes nothing. The recorded loosening is
   `[security].enforcement = warn`. The
-  gates also read `tls_hop_attested`, but that field has no authoring surface on a connection today,
-  so the refusals do not name it (see
+  gates also read `tls_hop_attested`, but that field has no supported authoring surface on a connection
+  today, so the bind refusals do not name it (see
   [the escape hatch](#the-mefor_allow_insecure_tls-escape-hatch)).
 - **Browser console (`/ui`)**: an off-loopback `/ui` additionally requires in-process TLS or a declared
   terminator and is refused without one — `--allow-insecure-bind` does not cover it.

@@ -1316,7 +1316,8 @@ The DSN is built as `DRIVER={odbc_driver};SERVER=<server>;[DATABASE={database};]
 > The warning above used to be the whole control, so a generic connection with no TLS keyword would
 > cross in plaintext with nothing stopping it. That arm now goes through the same cleartext-hop
 > authority every other cleartext transport uses, with the same owner-ratified precedence: an on-box
-> hop is allowed, a per-connection `tls_hop_attested` allows it (audited), `cleartext_accepted` warns
+> hop is allowed, a per-connection `tls_hop_attested` allows it (audited; no supported surface sets it),
+> `cleartext_accepted` warns
 > and audits, a non-enforcing instance warns, and an **enforcing** instance **refuses** it. The refusal
 > lands at construction, so it fails `messagefoundry check` / dry-run / reload / the `serve` pre-flight
 > before anything starts.
@@ -1324,8 +1325,8 @@ The DSN is built as `DRIVER={odbc_driver};SERVER=<server>;[DATABASE={database};]
 > What is gated is the case the classifier can judge: **no** ssl/tls/encrypt keyword, or one pinned to
 > a no-TLS value. A keyword set to anything outside that deny-list is still delegated, because the
 > engine cannot tell whether an arbitrary driver's value verifies the certificate — that residual is
-> unchanged. `cleartext_accepted` is an outbound-only declaration, so a `DatabasePoll` inbound's only
-> per-connection relaxation is `tls_hop_attested`.
+> unchanged. `cleartext_accepted` is an outbound-only declaration, so a `DatabasePoll` inbound has no
+> supported per-connection relaxation: set a verifying keyword, or run at `[security].enforcement = warn`.
 
 > **Scope / limitations.** Native async DB drivers (`asyncpg`-as-connector, `oracledb`, `mysqlclient`) are
 > **out of scope** (dep-heavy) — the generic path is ODBC-only. The `test_connection` reachability probe

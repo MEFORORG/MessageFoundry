@@ -8208,7 +8208,10 @@ def _insecure_bind_cause(source: Source) -> str:
 
     It names ``tls_hop_attested`` only when the connection carries it, so the line reports a fact
     rather than offering a field no supported surface sets (see :data:`_INSECURE_BIND_FLAG_CLAMP`)."""
-    return "tls_hop_attested" if source.tls_hop_attested else "--allow-insecure-bind"
+    if source.tls_hop_attested:
+        return "tls_hop_attested"
+    # serve folds [security].require_encryption_for_remote = false into the same flag (ADR 0118).
+    return "--allow-insecure-bind / require_encryption_for_remote = false"
 
 
 def _inbound_insecure_bind_permitted(

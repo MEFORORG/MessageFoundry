@@ -1036,8 +1036,7 @@ transport's list is set, an outbound of that transport not on it is **refused at
 > (`[security].enforcement = warn`) **warns**; everything else is **refused** (fail-closed).
 >
 > ⚠️ **`tls_hop_attested` is not an operator lever — do not plan around it.** It is a field on the
-> internal connection model that the connectors read, but there is **no supported way to set it**
-> (only the unsupported raw-settings escape hatch, a config module writing `spec.settings` directly): no
+> internal connection model that the connectors read, but there is **no supported way to set it**: no
 > connector-factory keyword (`MLLP()`, `Rest()`, `Soap()`, … — check any signature in
 > [`config/wiring.py`](../messagefoundry/config/wiring.py)) and no `connections.toml` key (that
 > loader calls the factory with your `[settings]` table, so *the factory is the schema* and an

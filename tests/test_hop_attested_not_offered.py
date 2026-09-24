@@ -230,27 +230,30 @@ def test_no_public_wiring_function_takes_the_field() -> None:
     assert "cleartext_accepted" in inspect.signature(wiring.outbound).parameters
 
 
+_TOML_TABLES = {
+    # Both directions: the four bind gates read an INBOUND, whose key set is separate from outbound's.
+    "outbound": (
+        '[[outbound]]\nname = "OB"\ntransport = "mllp"\n',
+        'host = "h.invalid"\nport = 1\n',
+    ),
+    "inbound": ('[[inbound]]\nname = "IB"\ntransport = "mllp"\nrouter = "r"\n', "port = 1\n"),
+}
+
+
+@pytest.mark.parametrize("direction", sorted(_TOML_TABLES))
 @pytest.mark.parametrize("where", ["top-level", "settings"])
-def test_connections_toml_refuses_the_field(where: str, tmp_path: Path) -> None:
+def test_connections_toml_refuses_the_field(direction: str, where: str, tmp_path: Path) -> None:
     from messagefoundry.config.connections_file import load_connections_file
     from messagefoundry.config.wiring import Registry
 
+    head, settings = _TOML_TABLES[direction]
     top = f"{RETIRED} = true\n" if where == "top-level" else ""
     inner = f"{RETIRED} = true\n" if where == "settings" else ""
+    table = f"[{direction}.settings]\n"
     path = tmp_path / "connections.toml"
-    path.write_text(
-        '[[outbound]]\nname = "OB"\ntransport = "mllp"\n'
-        + top
-        + '[outbound.settings]\nhost = "h.invalid"\nport = 1\n'
-        + inner,
-        encoding="utf-8",
-    )
+    path.write_text(head + top + table + settings + inner, encoding="utf-8")
     with pytest.raises(WiringError, match=RETIRED):
         load_connections_file(path, Registry())
     # Control: the same file without the field loads, so the refusal is about the field.
-    path.write_text(
-        '[[outbound]]\nname = "OB"\ntransport = "mllp"\n'
-        '[outbound.settings]\nhost = "h.invalid"\nport = 1\n',
-        encoding="utf-8",
-    )
+    path.write_text(head + table + settings, encoding="utf-8")
     load_connections_file(path, Registry())
