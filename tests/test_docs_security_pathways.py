@@ -7,7 +7,8 @@ scored Partial because it had three rows while five pathways shipped — OIDC fe
 service-identity plane were both live and both absent. A table that silently falls one pathway behind
 is the defect itself, so the row set is keyed on **code artefacts existing**, not on a hardcoded list:
 the interactive pathways are enumerated from the ``AuthService`` entry points that mint a
-``LoginOutcome``, and each row is additionally anchored to the settings field that turns it on.
+``LoginOutcome``, and each row is additionally anchored to the setting that turns it on: a settings
+field, or for the ingest-plane pathway a connector-factory parameter.
 
 Also pins the numbers the table quotes (lockout, MFA-claim gate, the sign-in window's two dimensions,
 the reconciler default) to the live defaults, and asserts the two corrected falsehoods cannot return.
@@ -17,8 +18,11 @@ from __future__ import annotations
 
 import ast
 import inspect
+import typing
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from _mfa_grant import mfa_grant_values
@@ -30,29 +34,51 @@ from messagefoundry.auth.permissions import Permission, Role
 from messagefoundry.auth.policy import PasswordPolicy
 from messagefoundry.auth.service import AuthProvider, AuthService
 from messagefoundry.config.settings import ApiSettings, AuthSettings
+from messagefoundry.config.wiring import Http
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DOC = _ROOT / "docs" / "SECURITY.md"
 _HEADING = "### Authentication pathways — comparative strength"
 
-#: The interactive entry points that mint a session. Derived by introspection so a SIXTH pathway
-#: landing without a comparative-strength row reds CI.
+#: The interactive entry points that mint a session. Derived by introspection so a NEW interactive
+#: pathway landing without a comparative-strength row reds CI.
 _LOGIN_ENTRY_POINTS = frozenset(
     {"login", "authenticate_kerberos", "complete_oidc_login", "authenticate_oidc"}
 )
 
-#: Row token -> the settings field whose existence proves the pathway still ships. ``None`` = always
-#: available (Local needs no switch). ``mTLS`` is the fifth, non-interactive pathway.
-_PATHWAY_ANCHORS: dict[str, tuple[type[BaseModel], str] | None] = {
+#: Row token -> the setting whose existence proves the pathway still ships: a settings-model field, or
+#: a parameter of a connector factory. ``None`` = always available (Local needs no switch). ``mTLS`` is
+#: the fifth pathway and the first non-interactive one; HTTP intake authentication is the sixth, on the
+#: ingest plane (owner ruling 2026-09-23: ``intake_auth`` IS an authentication pathway).
+_PATHWAY_ANCHORS: dict[str, tuple[Callable[..., Any], str] | None] = {
     "**Local**": None,
     "**AD**": (AuthSettings, "ad_enabled"),
     "**Kerberos / SPNEGO**": (AuthSettings, "kerberos_enabled"),
     "**OIDC federation**": (AuthSettings, "oidc_enabled"),
     "**mTLS service identity**": (ApiSettings, "tls_client_cert_identities"),
+    "**HTTP intake authentication**": (Http, "intake_auth"),
 }
 
+#: Pathways that live on the INGEST plane rather than the engine API. Neither the ``AuthService``
+#: derivation nor the ``api.security`` factory derivation can see them, so the set is checked against
+#: the ``config.wiring`` factories that take an ``intake_auth`` parameter instead (see
+#: ``test_ingest_plane_pathways_are_derived_from_the_connector_factories``).
+_INGEST_PLANE_PATHWAYS = frozenset({"**HTTP intake authentication**"})
+_INGEST_PLANE_FACTORIES = frozenset({"Http"})
+
+#: Companion-table row labels, in the primary table's order. The two tables label rows differently,
+#: so the order check needs the mapping rather than a string compare.
+_COMPANION_LABELS = (
+    "**Local**",
+    "**AD**",
+    "**Kerberos**",
+    "**OIDC**",
+    "**mTLS**",
+    "**HTTP intake**",
+)
+
 #: Tokens the numbered-6.1.3 paragraph must enumerate — it is the artefact that cites the requirement.
-_PARAGRAPH_TOKENS = ("Local", "AD", "Kerberos", "OIDC", "mTLS")
+_PARAGRAPH_TOKENS = ("Local", "AD", "Kerberos", "OIDC", "mTLS", "intake_auth")
 
 #: Every public dependency factory in ``messagefoundry.api.security``. The interactive derivation
 #: above covers ``AuthService``; this covers the NON-interactive plane, which is where a new
@@ -137,7 +163,7 @@ def test_primary_table_keeps_its_shape_and_has_one_row_per_pathway() -> None:
 
 
 def test_row_count_tracks_the_login_entry_points_in_code() -> None:
-    """The interactive pathway set is derived from the code, so a sixth one reds CI.
+    """The interactive pathway set is derived from the code, so a new one reds CI.
 
     RULE: a new ``AuthService`` coroutine returning a ``LoginOutcome`` is a new authentication pathway
     and needs a comparative-strength row.
@@ -154,9 +180,10 @@ def test_row_count_tracks_the_login_entry_points_in_code() -> None:
         "table and update this guard in the same change (ASVS 6.1.3)."
     )
     # complete_oidc_login + authenticate_oidc are two legs of ONE pathway, so 4 entry points collapse
-    # to 3 interactive pathways beyond Local; +Local +mTLS = 5 rows.
-    assert len(_PATHWAY_ANCHORS) == 5
-    # BLIND SPOT CLOSED. The public-coroutine derivation above cannot see a sixth pathway added
+    # to 3 interactive pathways beyond Local; +Local +mTLS = 5 API-plane rows, +HTTP intake on the
+    # ingest plane = 6 (owner ruling 2026-09-23).
+    assert len(_PATHWAY_ANCHORS) == 6
+    # BLIND SPOT CLOSED. The public-coroutine derivation above cannot see a new pathway added
     # through the EXISTING public entry point: ``login()`` dispatches on ``AuthProvider`` into a
     # PRIVATE ``_login_<provider>`` coroutine, so a new enum member + ``_login_saml`` would change
     # none of the three code-anchored assertions and would ship with no row and green CI.
@@ -183,21 +210,31 @@ def test_row_count_tracks_the_login_entry_points_in_code() -> None:
 
 
 def test_every_pathway_row_is_anchored_to_a_live_code_artefact() -> None:
-    block = _section()
+    # Row LABELS, in order, not a substring of the section: the lead paragraph bolds some of these
+    # names too, so a section-wide search passes with the row deleted.
+    labels = [r[0] for r in _primary_table()[1:]]
+    assert [
+        next((t for t in _PATHWAY_ANCHORS if lab.startswith(t)), lab) for lab in labels
+    ] == list(_PATHWAY_ANCHORS), (
+        f"the comparative-strength rows are {labels}; expected {list(_PATHWAY_ANCHORS)} in order"
+    )
     for token, anchor in _PATHWAY_ANCHORS.items():
-        assert token in block, f"the comparative-strength table has no {token} row"
         if anchor is None:
             continue
-        model, field = anchor
-        assert field in model.model_fields, (
-            f"{model.__name__}.{field} no longer exists, but docs/SECURITY.md still tabulates the "
+        owner, field = anchor
+        if isinstance(owner, type) and issubclass(owner, BaseModel):
+            present = field in owner.model_fields
+        else:
+            present = field in inspect.signature(owner).parameters
+        assert present, (
+            f"{owner.__name__}.{field} no longer exists, but docs/SECURITY.md still tabulates the "
             f"{token} pathway. Remove the row or fix the anchor."
         )
 
 
 def test_companion_table_covers_the_remaining_strength_dimensions() -> None:
     """The four primary columns cannot carry phishing/replay/storage/MFA/revocation, so a companion
-    table does — with the same five rows, in the same order."""
+    table does — with the same rows, in the same order."""
     tables = _tables(_section())
     companion = [
         t for t in tables if t[0][:2] == ["Pathway", "Phishing resistance"] and "Revocation" in t[0]
@@ -207,7 +244,33 @@ def test_companion_table_covers_the_remaining_strength_dimensions() -> None:
         "Credential stored by the engine | MFA support | Revocation |) is missing."
     )
     body = companion[0][1:]
-    assert len(body) == len(_PATHWAY_ANCHORS)
+    assert len(body) == len(_PATHWAY_ANCHORS) == len(_COMPANION_LABELS)
+    assert [r[0] for r in body] == list(_COMPANION_LABELS), (
+        f"the companion rows are {[r[0] for r in body]}; expected {list(_COMPANION_LABELS)}, the "
+        "primary table's pathways in the primary table's order"
+    )
+
+
+def test_ingest_plane_pathways_are_derived_from_the_connector_factories() -> None:
+    """RULE: a connector factory that takes ``intake_auth`` authenticates a submitting peer, which
+    the owner ruled (2026-09-23) is an authentication pathway. A second one needs its own row."""
+    import messagefoundry.config.wiring as wiring
+
+    factories = {
+        name
+        for name, member in inspect.getmembers(wiring, inspect.isfunction)
+        if member.__module__ == wiring.__name__
+        and "intake_auth" in inspect.signature(member).parameters
+    }
+    assert factories == _INGEST_PLANE_FACTORIES, (
+        f"the connector factories taking intake_auth changed: {sorted(factories)}. Each is an "
+        "ingest-plane authentication pathway -- give it a comparative-strength row in "
+        "docs/SECURITY.md and update _INGEST_PLANE_PATHWAYS in the same change (ASVS 6.1.3)."
+    )
+    assert len(_INGEST_PLANE_PATHWAYS) == len(_INGEST_PLANE_FACTORIES)
+    assert set(_PATHWAY_ANCHORS) >= _INGEST_PLANE_PATHWAYS, (
+        "_INGEST_PLANE_PATHWAYS names a row label that _PATHWAY_ANCHORS does not carry"
+    )
 
 
 @pytest.mark.parametrize(
@@ -279,7 +342,7 @@ def test_mtls_row_states_the_phi_fence_that_the_code_enforces() -> None:
         assert claim in notes, f"the mTLS row must state {claim!r}"
 
 
-def test_the_numbered_paragraph_enumerates_all_five_pathways() -> None:
+def test_the_numbered_paragraph_enumerates_every_pathway() -> None:
     """The paragraph citing ASVS 6.1.3 by number is the scored artefact, so it must be complete."""
     block = _section()
     marker = "ASVS 6.1.3"
@@ -288,8 +351,85 @@ def test_the_numbered_paragraph_enumerates_all_five_pathways() -> None:
     missing = [t for t in _PARAGRAPH_TOKENS if t not in paragraph]
     assert not missing, (
         f"the ASVS 6.1.3 paragraph does not enumerate {missing}; it must state which controls do and "
-        "do not cover every one of the five pathways."
+        f"do not cover every one of the {len(_PATHWAY_ANCHORS)} pathways."
     )
+
+
+def test_the_pathway_count_sentence_matches_the_row_set() -> None:
+    """The sentence that makes the count is what a reader quotes, so it must equal the rows.
+
+    It said **Five** while HTTP intake authentication shipped outside it; the owner ruled on
+    2026-09-23 that ``intake_auth`` is a sixth pathway, so a count that drifts from the row set again
+    reds here rather than going unnoticed.
+    """
+    words = {4: "Four", 5: "Five", 6: "Six", 7: "Seven", 8: "Eight", 9: "Nine", 10: "Ten"}
+    count = len(_PATHWAY_ANCHORS)
+    expected = f"**{words.get(count, str(count))}** authentication pathways ship"
+    assert expected in _section(), (
+        f"the section must open with {expected!r}: the row set has {len(_PATHWAY_ANCHORS)} pathways."
+    )
+
+
+def test_the_intake_row_states_the_modes_and_the_unauthenticated_default() -> None:
+    """The HTTP intake row is derived from ``Http()``'s signature, not typed from memory.
+
+    RULE: the modes it names are exactly the ``intake_auth`` Literal, and it states the shipped
+    default plainly, because that default admits an unauthenticated peer.
+    """
+    param = inspect.signature(Http).parameters["intake_auth"]
+    # ``wiring.py`` uses postponed annotations, so the raw annotation is a string; resolve it.
+    modes = typing.get_args(typing.get_type_hints(Http)["intake_auth"])
+    assert param.default == "none" and "none" in modes, (
+        f"Http(intake_auth=...) now defaults to {param.default!r}; restate the intake rows and the "
+        "count sentence in docs/SECURITY.md."
+    )
+    row = next(r for r in _primary_table()[1:] if r[0].startswith("**HTTP intake"))
+    joined = " ".join(row)
+    missing = [m for m in modes if f"`{m}`" not in joined]
+    assert not missing, f"the HTTP intake row does not name the intake_auth mode(s) {missing}"
+    assert "The default is `none`" in row[1], (
+        "the HTTP intake Factor cell must state the unauthenticated default in so many words"
+    )
+    for claim in ("no session", "no mfa", "no step-up"):
+        assert claim in row[3].lower(), f"the HTTP intake row must state {claim!r}"
+    lead = _section().split("| Pathway |", 1)[0]
+    assert 'intake_auth = "none"' in lead, (
+        "the count sentence above the table must state the intake default, not leave it to a cell"
+    )
+
+
+def test_the_intake_numbers_the_doc_quotes_match_the_code() -> None:
+    """The intake rows quote defaults and floors; pin each one to the code that sets it.
+
+    The budget numbers are stated once, in this section's row; Table B names the settings and links
+    to CONNECTIONS.md for the values rather than restating them (SDS-3.5).
+    """
+    from messagefoundry.pipeline.wiring_runner import (
+        _INTAKE_ALLOWLIST_MIN_PREFIX_V4,
+        _INTAKE_ALLOWLIST_MIN_PREFIX_V6,
+    )
+    from messagefoundry.transports import http_listener
+
+    params = inspect.signature(Http).parameters
+    assert params["intake_auth_rate_limit"].default == 10
+    assert params["intake_auth_rate_limit_global"].default == 60
+    assert params["intake_api_key_header"].default == "x-api-key"
+    assert params["intake_auth_health"].default == "require"
+    assert (_INTAKE_ALLOWLIST_MIN_PREFIX_V4, _INTAKE_ALLOWLIST_MIN_PREFIX_V6) == (8, 32)
+    assert '"Retry-After": "60"' in inspect.getsource(http_listener.HttpSource._rate_limit_refusal)
+    row = " ".join(next(r for r in _primary_table()[1:] if r[0].startswith("**HTTP intake")))
+    for quoted in ("`intake_auth_rate_limit` 10/min", "`intake_auth_rate_limit_global` 60/min"):
+        assert quoted in row, f"the HTTP intake row no longer quotes {quoted!r}"
+    table_b = " ".join(
+        line for line in _doc_text().splitlines() if line.startswith("| **HTTP** — ")
+    )
+    for quoted in (
+        "(default `x-api-key`)",
+        "`Retry-After: 60`",
+        "wider than a /8 (IPv4) or a /32 (IPv6)",
+        'unless `intake_auth_health = "allow"`',
+    ):
+        assert quoted in table_b, f"the Table B HTTP rows no longer quote {quoted!r}"
 
 
 def test_the_one_switch_that_flattens_three_pathways_is_named_in_each_row() -> None:
@@ -314,7 +454,7 @@ def test_the_one_switch_that_flattens_three_pathways_is_named_in_each_row() -> N
     block = _section()
     paragraph = block[block.index("ASVS 6.1.3") :]
     assert token in paragraph, (
-        "the ASVS 6.1.3 paragraph must name the switch that flattens three of the five pathways to "
+        "the ASVS 6.1.3 paragraph must name the switch that flattens three of the six pathways to "
         "directory-only defense — that is the comparative-strength answer the requirement wants."
     )
 
@@ -504,8 +644,9 @@ def test_non_interactive_authentication_planes_are_enumerated_too() -> None:
         "to _NON_BEARER_FACTORIES."
     )
     assert factories >= _NON_BEARER_FACTORIES
-    assert len(_NON_BEARER_FACTORIES) + 4 == len(_PATHWAY_ANCHORS), (
-        "the four interactive pathways plus every non-bearer plane must equal the documented row set"
+    assert len(_NON_BEARER_FACTORIES) + 4 + len(_INGEST_PLANE_PATHWAYS) == len(_PATHWAY_ANCHORS), (
+        "the four interactive pathways plus every non-bearer plane plus the ingest-plane pathways "
+        "must equal the documented row set"
     )
 
 
