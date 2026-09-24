@@ -457,9 +457,12 @@ stepdown it declines to claim or renew, so a sibling wins the expired lease rath
 just drained renewing itself straight back. On a cluster with no other promotable node that window is
 leaderless, which is why such a call is refused with `412` unless you send `force`.
 
-**One known limit, so you can plan around it rather than discover it.** A sibling whose
-`acquire_delay_seconds` is longer than two heartbeats is still handicapped out when the pause ends, and
-the node you drained then reclaims its own lease ([BACKLOG #1507](BACKLOG.md)).
+**A handicapped sibling takes over after a stepdown too.** The stepdown writes the lease expiry as
+zero, not as the current time. `acquire_delay_seconds` is added to that stored expiry, so a released
+lease is open to every promotable sibling on its next heartbeat, however large its delay
+([BACKLOG #1507](BACKLOG.md)). The delay still applies to a lease that expired on its own, which is
+the crash failover it exists for. Give every node the same `heartbeat_seconds`: the pause is two of
+the drained node's own heartbeats, so a sibling with a longer one can miss it.
 
 **A node that has already self-fenced can be drained.** It has given up leadership in memory but still
 owns a live lease row, which `GET /cluster/nodes` shows as `lease_owner`. A stepdown there expires that

@@ -224,9 +224,10 @@ def has_promotable_sibling(members: Iterable[ClusterMember], node_id: str) -> bo
     clean-shutdown ``left`` tombstone), ``promotable`` (ADR 0096) and ``fresh``. No window is chosen
     here: ``fresh`` is the rule :meth:`ClusterCoordinator.cluster_members` already applied.
 
-    **A point-in-time read, not a promise.** A sibling that dies after the read still counted, and
-    ``acquire_delay_seconds`` is not weighed, so a sibling handicapped past the stepdown pause counts
-    too and the drained node can win its own lease back (BACKLOG #1507)."""
+    **A point-in-time read, not a promise.** A sibling that dies after the read still counted.
+    ``acquire_delay_seconds`` is not weighed, and does not need to be: the release zeroes the lease
+    expiry, which cancels the handicap against a released lease (see :func:`stepdown_pause_seconds`,
+    BACKLOG #1507)."""
     return any(
         m.node_id != node_id and m.status == "active" and m.promotable and m.fresh for m in members
     )
@@ -380,11 +381,18 @@ def stepdown_pause_seconds(heartbeat_seconds: float) -> float:
 
     Two heartbeats, and read that as a floor rather than a guarantee. A sibling's acquire runs once per
     ``heartbeat_seconds`` at an unrelated phase, so a full interval can elapse before it even looks at
-    the expired lease and a second gives it one whole interval in which to look. **That holds only for
-    a sibling carrying no ADR 0096 ``acquire_delay_seconds``.** A sibling handicapped by more than this
-    pause is still refused when the pause ends, and the drained node then wins its own lease back. This
-    function reads ``heartbeat_seconds`` alone, so it cannot see the handicap it is being compared
-    against; the gap is real, unfixed, and recorded on the stepdown's backlog item.
+    the expired lease and a second gives it one whole interval in which to look.
+
+    **A sibling's ADR 0096 ``acquire_delay_seconds`` does not lengthen that wait, so this function
+    does not need to read it (BACKLOG #1507).** The release writes ``lease_expires_at = 0``, the
+    epoch, not "now". The take-over predicate adds the delay to that stored expiry, so it asks whether
+    ``0 + delay`` is before the DB clock, an epoch count in the billions. That holds for any delay a
+    setting could carry, so a handicapped sibling takes a RELEASED lease on its first tick, exactly as
+    an unhandicapped one does. The handicap still weighs against a lease that expired on its own,
+    which is the case it exists for. Two limits remain, and neither is the handicap. The pause is
+    measured in THIS node's heartbeat, so a sibling configured with a longer one can miss the window.
+    And if the release write did not commit, the row keeps its real expiry and the handicap applies;
+    that path answers ``503 release-unconfirmed``, not ``200``.
 
     **This pause covers the ticks that come AFTER the release. It does not order the release against a
     tick already in flight** — :attr:`DbCoordinator._leadership_lock` does that, and the two are not

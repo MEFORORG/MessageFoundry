@@ -90,7 +90,14 @@ class _FakeLeaseDB:
 
     def release(self, owner: object) -> int:
         """Expire our own lease row (the release ``UPDATE ... WHERE lease_key AND owner``), returning
-        the row count the driver would report: 1 when the row names ``owner``, else 0."""
+        the row count the driver would report: 1 when the row names ``owner``, else 0.
+
+        The expiry becomes 0.0 because both release statements write the epoch, and each stand-in
+        asserts that text before calling here. That value is load-bearing for ADR 0096: the take-over
+        predicate adds a sibling's delay to it. **Most tests here start the DB clock at 0.0, and
+        against that clock a zeroed expiry looks RECENT**, so a handicapped sibling appears refused.
+        A real DB clock is an epoch in the billions, where it is not. BACKLOG #1507 was filed off
+        exactly that reading; the delay tests below that care use a realistic clock."""
         row = self.row
         if row is not None and row["owner"] == owner:
             row["lease_expires_at"] = 0.0
@@ -166,6 +173,9 @@ class _FakeLeasePool:
             raise RuntimeError("partitioned from db")
         # Mirrors _release_leadership's UPDATE ... SET lease_expires_at=0 WHERE lease_key AND owner.
         assert "leader_lease" in sql and "UPDATE" in sql
+        assert "SET lease_expires_at = 0 " in sql, (
+            "the release must write the epoch (BACKLOG #1507)"
+        )
         _lease_key, owner = args
         return f"UPDATE {self._db.release(owner)}"  # asyncpg's command tag
 
@@ -509,6 +519,63 @@ async def test_delay_does_not_delay_the_current_leaders_renew() -> None:
 
 
 # --- ADR 0096: non-promotable standby (promotable=false) ---------------------
+
+
+# A realistic DB clock for the delay tests that meet a RELEASED lease: an epoch in the billions,
+# as clock_timestamp() and SYSUTCDATETIME() return. See _FakeLeaseDB.release for why 0.0 misleads.
+_EPOCH_NOW = 1_790_000_000.0
+
+
+async def test_a_handicapped_sibling_takes_over_after_a_stepdown() -> None:
+    # BACKLOG #1507 said a sibling whose acquire_delay_seconds exceeds the stepdown pause is still
+    # refused when the pause ends, so the drained node wins its own lease back. Against a real DB
+    # clock that does not happen: the release writes lease_expires_at = 0, and the handicapped
+    # take-over asks whether 0 + delay is before an epoch in the billions. B takes the lease on its
+    # first tick, well inside A's pause, and A stays drained after its pause ends.
+    #
+    # CONTROL ARMS, all measured. The behaviour pinned here already held at 29c93af98, before any
+    # #1507 or #1508 change: a probe of that tree with this clock saw B take the lease and A stay
+    # drained, because the defect was never in the code. Start the DB clock at 0.0 instead of
+    # _EPOCH_NOW and this fails at B: it is refused and A renews itself back in, which is the reading
+    # #1507 was filed off. And make the release write 1 instead of 0 and the stand-in's statement
+    # assertion fails, so the test is bound to the SQL, not only to the stand-in's arithmetic.
+    db_clock = _Clock(_EPOCH_NOW)
+    db = _FakeLeaseDB(db_clock)
+    mono_a, mono_b = _Clock(0.0), _Clock(0.0)
+    a = _coord(_FakeLeasePool(db), mono_a, node="A", heartbeat=10.0)
+    b = _coord(_FakeLeasePool(db), mono_b, node="B", heartbeat=10.0, acquire_delay_seconds=60.0)
+    await a._maintain_leadership()
+    assert a.is_leader() is True
+    assert await a.step_down_leadership() == (True, pytest.approx(time.time(), abs=60), True)
+
+    # One heartbeat later, still inside A's 20 s pause and far inside B's 60 s handicap.
+    for clock in (db_clock, mono_a, mono_b):
+        clock.t += 10.0
+    await b._maintain_leadership()
+    assert b.is_leader() is True, "the handicapped sibling was refused a released lease"
+
+    # Past A's pause: the row names B and is live, so A's renew arm cannot match.
+    for clock in (db_clock, mono_a, mono_b):
+        clock.t += 15.0
+    await a._maintain_leadership()
+    assert (a.is_leader(), b.is_leader()) == (False, True)
+
+
+async def test_the_handicap_still_holds_against_a_lease_that_expired_on_its_own() -> None:
+    # The other half, so the test above cannot be read as "the delay is ignored". A lease that ages
+    # out WITHOUT a release keeps its real expiry, and a handicapped sibling still waits the delay
+    # past it. That is the crash-failover case ADR 0096 exists for.
+    db_clock = _Clock(_EPOCH_NOW)
+    db = _FakeLeaseDB(db_clock)
+    a = _coord(_FakeLeasePool(db), _Clock(0.0), node="A", ttl=30.0)
+    b = _coord(_FakeLeasePool(db), _Clock(0.0), node="B", acquire_delay_seconds=60.0)
+    await a._maintain_leadership()  # expires at _EPOCH_NOW + 30; A then stops renewing
+    db_clock.t = _EPOCH_NOW + 31.0
+    await b._maintain_leadership()
+    assert b.is_leader() is False, "the handicap did not hold against a naturally expired lease"
+    db_clock.t = _EPOCH_NOW + 91.0
+    await b._maintain_leadership()
+    assert b.is_leader() is True
 
 
 async def test_non_promotable_never_acquires_empty_lease() -> None:
@@ -1221,6 +1288,9 @@ class _FakeSqlLeaseStore:
         if self.fail:
             raise RuntimeError("partitioned from db")
         assert "leader_lease" in sql and "UPDATE" in sql, "not the release statement"
+        assert "SET lease_expires_at = 0 " in sql, (
+            "the release must write the epoch (BACKLOG #1507)"
+        )
         _lease_key, owner = params
         return self._db.release(owner)  # the store's _execute returns the driver's row count
 
@@ -1432,3 +1502,30 @@ async def test_sqlserver_a_self_fenced_node_is_drained_and_says_so_truthfully() 
     assert await a.step_down_leadership() == (False, None, True)
     assert db.row is not None and db.row["lease_expires_at"] == 0.0
     assert a._no_claim_until == pytest.approx(20.1 + 20.0)
+
+
+async def test_sqlserver_a_handicapped_sibling_takes_over_after_a_stepdown() -> None:
+    # The twin of the Postgres #1507 test: the T-SQL release writes the same epoch, and the MERGE
+    # adds the delay to the stored expiry the same way, against a DB clock in the billions.
+    db_clock = _Clock(_EPOCH_NOW)
+    db = _FakeLeaseDB(db_clock)
+    mono_a = _Clock(0.0)
+    a = _sql_coord(_FakeSqlLeaseStore(db), "A", mono_a)
+    b = SqlServerCoordinator(
+        _FakeSqlLeaseStore(db),  # type: ignore[arg-type]
+        "B",
+        heartbeat_seconds=10.0,
+        leader_lease_ttl_seconds=30.0,
+        leader_fence_timeout_seconds=20.0,
+        acquire_delay_seconds=60.0,
+        monotonic=_Clock(0.0),
+    )
+    await a._maintain_leadership()
+    await a.step_down_leadership()
+    db_clock.t += 10.0
+    await b._maintain_leadership()
+    assert b.is_leader() is True, "the handicapped sibling was refused a released lease"
+    db_clock.t += 15.0
+    mono_a.t += 25.0
+    await a._maintain_leadership()
+    assert a.is_leader() is False
