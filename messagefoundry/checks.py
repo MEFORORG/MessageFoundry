@@ -212,6 +212,13 @@ def run_checks(
             service_config=service_config,
             suppress_search=suppress_service_toml_search,
         ),
+        # BACKLOG #1179: serve refuses a declared terminator whose plaintext hop nobody acknowledged.
+        # Required, so the gate refuses what serve refuses.
+        _check_upstream_hop_ack(
+            config_dir,
+            service_config=service_config,
+            suppress_search=suppress_service_toml_search,
+        ),
         # ADR 0153: name every outbound that declares cleartext_accepted, so the accepted set is visible
         # in review rather than discoverable only by reading each connection. Advisory — see the check.
         _check_cleartext_accepted(config_dir),
@@ -2329,6 +2336,82 @@ def _check_oidc_auth_params(
             ),
         )
     return CheckResult("oidc-auth-params", ok=True, required=False, detail="; ".join(notes))
+
+
+def _check_upstream_hop_ack(
+    config_dir: str | Path,
+    *,
+    service_config: str | Path | None = None,
+    suppress_search: bool = False,
+) -> CheckResult:
+    """Refuse a declared upstream TLS terminator with no ``[api].tls_cert_file`` and no
+    ``[api].plaintext_upstream_hop_acknowledged`` -- the BACKLOG #1179 refusal ``serve`` applies,
+    brought forward to commit/CI time.
+
+    Without it the gate passes a config that ``serve`` then refuses with exit 2. Keyed on
+    :func:`~messagefoundry.api.tls.api_tls_source`, the same branch order ``serve`` and the listener
+    use, so the two cannot disagree about when the hop is plaintext. ``serve`` refuses this in EVERY
+    enforcement mode, so this check reads no dial either.
+
+    Required, with the service-toml resolution and SKIP/FAIL arms of :func:`_check_posture`: no
+    ``messagefoundry.toml`` → SKIP (a bare config dir declares no terminator); present but refused by
+    the loader → FAIL (BACKLOG #1318)."""
+    from pydantic import ValidationError
+
+    from messagefoundry.api.tls import api_tls_source
+    from messagefoundry.config.settings import load_settings
+
+    if service_config is not None:
+        toml: Path | None = Path(service_config) if Path(service_config).is_file() else None
+    elif suppress_search:
+        candidate = Path(config_dir) / "messagefoundry.toml"
+        toml = candidate if candidate.is_file() else None
+    else:
+        toml = _find_service_toml(config_dir)
+    if toml is None:
+        return CheckResult(
+            "upstream-hop-ack",
+            ok=True,
+            required=True,
+            skipped=True,
+            detail="no messagefoundry.toml",
+        )
+    try:
+        settings = load_settings(config_path=toml)
+    except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
+        return CheckResult(
+            "upstream-hop-ack", ok=False, required=True, detail=f"settings did not load: {exc}"
+        )
+    api = settings.api
+    source = api_tls_source(
+        cert_file=api.tls_cert_file, tls_terminated_upstream=api.tls_terminated_upstream
+    )
+    if source != "upstream":
+        return CheckResult(
+            "upstream-hop-ack",
+            ok=True,
+            required=True,
+            detail=f"no plaintext proxy-to-engine hop (API TLS source: {source})",
+        )
+    if not api.plaintext_upstream_hop_acknowledged:
+        return CheckResult(
+            "upstream-hop-ack",
+            ok=False,
+            required=True,
+            detail=(
+                "[api].tls_terminated_upstream with no [api].tls_cert_file serves the "
+                "proxy-to-engine hop in plaintext, and [api].plaintext_upstream_hop_acknowledged "
+                "is not set -- serve would refuse to start (exit 2, in every enforcement mode). "
+                "Set the acknowledgement once your site secures that hop, or set "
+                "[api].tls_cert_file (see docs/SECURITY.md)"
+            ),
+        )
+    return CheckResult(
+        "upstream-hop-ack",
+        ok=True,
+        required=True,
+        detail="plaintext proxy-to-engine hop acknowledged ([api].plaintext_upstream_hop_acknowledged)",
+    )
 
 
 def _check_reference_backend(
