@@ -18,18 +18,20 @@ All notable changes to MessageFoundry are documented here. The format follows
   lasts. Its user page and forced change-password page state the time, and so does the IDE's
   must-change warning. (`BACKLOG #1141`)
 - **`messagefoundry admin-set-notify-email` sets a missing notification address on an enabled
-  Administrator, from the host.** Under `enforce`, the engine refuses to start unless an enabled
-  Administrator has a notification address. `provision-admin` run without `--email` left exactly
-  that state. It then refused to run again, because an enabled Administrator existed, and the web
-  console cannot be reached while the engine refuses to start. The new command takes `--username`
-  and `--email`, plus `--service-config`, `--db` and `--json`. It works on the store directly, on
-  the same host gate as `admin-unlock`, so run it with the engine stopped. It only fills an absent
-  address. It refuses at least a blank address, a non-Administrator, a disabled account, and an
-  account that already has an address. Change an existing address from the web console, which
-  notifies the old address. Run again with the same address, it reports success and writes
-  nothing. It appends an `auth.admin_notify_email_set` audit row before it writes the address, and
-  an `auth.admin_notify_email_set_failed` row if that write then fails. The warning
-  `provision-admin` prints for a missing `--email` now names this command. (`BACKLOG #1136`)
+  Administrator, from the host.** Under `enforce`, with `[auth].notify_security_events` and
+  `[alerts].security_notifications_required` on (both defaults), the engine refuses to start unless
+  an enabled Administrator has a notification address. `provision-admin` run without `--email`
+  left exactly that state. It then refused to run again, because an enabled Administrator existed,
+  and the web console cannot be reached while the engine refuses to start. The new command takes
+  `--username` and `--email`, plus `--service-config`, `--db` and `--json`. It works on the store
+  directly, on the same host gate as `admin-unlock`, so run it with the engine stopped. It only
+  fills an absent address. It refuses at least a blank address, a non-Administrator, a disabled
+  account, and an account that already has an address. Change an existing address from the web
+  console, which notifies the old address. Run again with the same address, it reports success and
+  writes nothing. It appends an `auth.admin_notify_email_set` audit row before it writes the
+  address, so the address never lands unaudited. If that write then fails, it does not report
+  success. The warning `provision-admin` prints for a missing `--email` now names this command.
+  (`BACKLOG #1136`)
 
 ### Changed
 - **BREAKING — the web console engine UI seam moved, so this engine no longer pairs with web
@@ -111,14 +113,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   not add it first. Or set `[api].tls_cert_file` and `[api].tls_key_file` so the engine serves that
   hop over TLS. The proxy must then speak https to the engine and trust that certificate, or every
   request through it fails. (`BACKLOG #1179`)
-- **The password-policy refusal for a context word now names the list it checks.** Engine 0.4.0
-  said `not contain application or vendor terms`. The clause now reads `not contain a word from
-  the context-word deny-list`. It appears in at least the `400` detail from `POST /users` and
-  `POST /me/password`, after `password must`, and in the refusal from
+- **BREAKING — the password-policy refusal for a context word now names the list it checks.**
+  Engine 0.4.0 said `not contain application or vendor terms`. The clause now reads `not contain a
+  word from the context-word deny-list`. It appears in at least the `400` detail from `POST /users`
+  and `POST /me/password`, after `password must`, and in the refusal from
   `messagefoundry provision-admin`. The status code is unchanged. The list is unchanged too, so the
   same passwords are refused. The old wording mis-described it, since the list also holds generic
   default-credential words such as `admin` and `password`. `docs/SECURITY.md` now publishes the
-  list in full, and a test holds it equal to `CONTEXT_WORDS`. (`BACKLOG #1135`, `#1132`)
+  list in full, and a test holds it equal to `CONTEXT_WORDS`. **Migration:** a client that matches
+  the old clause in the `detail` must match the new one. (`BACKLOG #1135`, `#1132`)
 
 ### Security
 - **BREAKING — OIDC sign-in now bounds how old the IdP's authentication may be.** A new setting,
@@ -138,16 +141,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   the request carries `max_age`, as OpenID Connect Core requires. No setting turns the check off.
   (`BACKLOG #296`)
 - **BREAKING — the OIDC token endpoint and JWKS legs now carry the posture-keyed revocation
-  guard.** Engine 0.4.0 checked no certificate revocation on either leg. Each leg is guarded on its
-  own host, so an off-box JWKS host is guarded even when the token endpoint is on loopback. With
-  OIDC on and `[security].enforcement = "enforce"`, the default, an off-box identity provider with
-  no `[auth].oidc_tls_crl_file` now stops `serve` from starting. The refusal comes after the
-  engine starts, when the API is built, and neither `messagefoundry check` nor `messagefoundry
-  verify` reports it ahead of time. See ADR 0173 section 4.3. **Migration:** with OIDC on, set
-  `[auth].oidc_tls_crl_file` to a PEM file holding a CRL from each CA that issues the token and
-  JWKS endpoint certificates. Put only CRLs in it, because a certificate in that file becomes a
-  trusted root for this hop. Or run with `[security].enforcement = "warn"`, which logs a warning
-  for each leg instead. (`BACKLOG #1887`)
+  guard.** Engine 0.4.0 checked revocation on these legs only when `[auth].oidc_tls_crl_file` was
+  set, and started without it. Each leg is guarded on its own host, so an off-box JWKS host is
+  guarded even when the token endpoint is on loopback. With OIDC on and
+  `[security].enforcement = "enforce"`, the default, an off-box identity provider with no
+  `[auth].oidc_tls_crl_file` now stops `serve`. The refusal comes when the API is built, after the
+  engine has started its listeners and workers. Neither `messagefoundry check` nor
+  `messagefoundry verify` reports it ahead of time. See ADR 0173 section 4.3. **Migration:** with
+  OIDC on, set `[auth].oidc_tls_crl_file` to a PEM file holding a CRL from each CA that issues the
+  token and JWKS endpoint certificates. Put only CRLs in it, because a certificate in that file
+  becomes a trusted root for this hop. Or run with `[security].enforcement = "warn"`, which logs a
+  warning for each leg instead. (`BACKLOG #1887`)
 - **BREAKING — the `Direct()` S/MIME envelope now encrypts its content with AES-256-CBC.** Engine
   0.4.0 set no content cipher, so the `cryptography` library chose its default, AES-128-CBC. The
   mode is still CBC, and the content key is still wrapped with RSAES-PKCS1-v1_5. Signing is
@@ -256,7 +260,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   under the subject `store-cipher`, naming the table and column but never the row or the value.
   **A planted `state` or `reference` value would stop the engine from starting**, because both
   caches load at open. The opt-out, `[store].allow_unmarked_ciphertext`, ships off and is reported
-  as a loosening when on. (`BACKLOG #1169`)
+  as a loosening when on. The uploaded-file store is not covered: it still reads an unmarked value
+  back as plaintext. (`BACKLOG #1169`)
 - **The DICOM deflate guard now bounds exactly the bytes `dcmread` inflates, and fails closed.**
   Engine 0.4.0's guard found the deflated Data Set with its own walk of the file meta. It let
   through any header it could not follow, and pydicom reads headers more leniently. So a crafted
