@@ -129,7 +129,7 @@ for, not how it is protected before it gets there.
 > `transports/database.py` builds `Encrypt=` and `TrustServerCertificate=` into a connection string,
 > and the script's `IMPORT_ONLY` table records that as an instrument limit.
 >
-> **Eleven files the import walk never saw** are crypto sites by operation. Each reaches crypto through
+> **Twelve files the import walk never saw** are crypto sites by operation. Each reaches crypto through
 > a first-party helper and imports no trigger of its own:
 >
 > - `api/auth_routes.py`, and the web console's `routes/account.py` and `routes/core.py`, hash a
@@ -140,6 +140,8 @@ for, not how it is protected before it gets there.
 >   `harness/load/tlsmat.py`. Four of them also build the pinned client TLS context there;
 >   `enginepoll.py` does not.
 > - `scripts/security/dast_auth_sweep.py` runs the DAST target, which draws a throwaway password.
+> - `tray/poller.py` builds the tray's probe client through `tray/probe.py`, and decides when the
+>   pinned engine certificate replaces the OS trust store.
 >
 > **A SECOND ARM covers the non-Python tree** (BACKLOG #1172, ASVS 11.5.1) and rides the same required
 > context. The walk above is an `import ast` pass over `*.py` and is Python-only by construction, so

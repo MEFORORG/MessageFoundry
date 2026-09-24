@@ -451,7 +451,10 @@ INVENTORY: dict[str, frozenset[str]] = {
     # row-writer without the store DEK cannot forge — and, since BACKLOG #1904, the constant-time walk
     # all three backends share (verify_audit_rows); hashlib = the keyless SHA-256 chain, the audit
     # key-range digest (ADR 0193) + delivery/body digests. The HMAC key is HKDF-derived (in crypto.py) from the DEK. store.crypto seam = the at-rest
-    # cipher (MARKER_PREFIX/cell_aad/CipherError) it drives over the PHI columns.
+    # cipher (MARKER_PREFIX/cell_aad/CipherError) it drives over the PHI columns. BACKLOG #1904
+    # (ADR 0193): it also names each audit key by store.crypto.audit_key_id, a one-way SHA-256 id of
+    # the DERIVED audit key, so a verify after a rotation picks the key each keyed range was MAC'd
+    # under. The id is non-secret: neither key can be recovered from it.
     "messagefoundry/store/store.py": frozenset({"hashlib", "hmac", "messagefoundry.store.crypto"}),
     # BACKLOG #1178 (ASVS 12.3.1): probe_tcp_reachable builds NO context -- it accepts the caller's
     # and hands it to asyncio.open_connection, so the connection test crosses the same hop the send
@@ -526,11 +529,13 @@ INVENTORY: dict[str, frozenset[str]] = {
         {"messagefoundry.config.tls_policy", "messagefoundry.transports.signing", "ssl"}
     ),
     # ADR 0113 (2026-07-22 amendment): the tray's TOKENLESS /health + /ui probes must verify the
-    # engine's server cert when [api].tls_cert_file makes the loopback bind serve https. Builds the
-    # same OS-trust-store context the engine client uses (truststore.SSLContext, lazily imported) —
-    # https only, no pinned-PEM option, and no verify=False escape at all (the tray holds no
-    # credential to protect, but an unverified probe could not tell the engine from an impostor).
-    # truststore (a CRYPTO_LIBRARY_MODULES trigger) supplies that OS-trust-store context.
+    # engine's server cert when the loopback bind serves https. BACKLOG #1276 part B: given the
+    # engine's cert, it pins trust to exactly that PEM (ssl.create_default_context with cafile=);
+    # otherwise, or while the pin cannot load yet, it builds the same OS-trust-store context the
+    # engine client uses (truststore.SSLContext, lazily imported). https only, and no verify=False
+    # escape at all (the tray holds no credential to protect, but an unverified probe could not
+    # tell the engine from an impostor). truststore (a CRYPTO_LIBRARY_MODULES trigger) supplies the
+    # OS-trust-store context.
     "messagefoundry/tray/probe.py": frozenset({"ssl", "truststore"}),
     # ADR 0134 (#125/#126): secrets = the random 32-hex uploaded-file id (secrets.token_hex, the
     # path-traversal-safe on-disk identity + tmp-file suffix); hashlib = sha256 of an uploaded file's
@@ -547,7 +552,10 @@ INVENTORY: dict[str, frozenset[str]] = {
     # --- BACKLOG #282: modules the seam / library / non-messagefoundry-root widening newly surfaces ---
     # The CLI (gen-key / rotate-key / serve): mints the store DEK (store.crypto.generate_key),
     # gates a keyless PHI start, and surfaces KeyProviderError — all delegated through the store seams,
-    # with zero direct stdlib-crypto import in the module.
+    # with zero direct stdlib-crypto import in the module. rotate-key stamps a new DEK key-id only
+    # when it CHANGED, and compares it to the stored fingerprint through
+    # pipeline.secret_rotation.fingerprints_equal: constant-time over bytes, the same compare the
+    # rotation watcher uses (ASVS 11.2.4, BACKLOG #1167), never a bare `!=`.
     "messagefoundry/__main__.py": frozenset(
         {
             "messagefoundry.config.tls_policy",
@@ -791,6 +799,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     ),
     "messagefoundry/__main__.py": frozenset(
         {
+            "compare:via messagefoundry.pipeline.secret_rotation",
             "csprng:via messagefoundry.store.crypto",
             "hash:via messagefoundry.api.tls",
             "key_cert:via messagefoundry.api.tls",
@@ -1022,7 +1031,6 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "cipher:.decrypt()",
             "cipher:.encrypt()",
             "cipher:via messagefoundry.store.crypto",
-            "compare:hmac.compare_digest",
             "compare:via messagefoundry.store.store",
             "hash:hashlib.sha256",
             "hash:via messagefoundry.store.store",
@@ -1040,7 +1048,6 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "cipher:.decrypt()",
             "cipher:.encrypt()",
             "cipher:via messagefoundry.store.crypto",
-            "compare:hmac.compare_digest",
             "compare:via messagefoundry.store.store",
             "hash:hashlib.sha256",
             "hash:via messagefoundry.store.store",
@@ -1055,6 +1062,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "cipher:via messagefoundry.store.crypto",
             "compare:hmac.compare_digest",
             "hash:hashlib.sha256",
+            "hash:via messagefoundry.store.crypto",
             "kdf:via messagefoundry.store.crypto",
             "mac:hmac.new[sha256]",
         }
@@ -1186,7 +1194,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:via messagefoundry.transports.rest",
         }
     ),
-    "messagefoundry/tray/probe.py": frozenset({"tls_context:truststore.SSLContext"}),
+    "messagefoundry/tray/probe.py": frozenset(
+        {"tls_context:ssl.create_default_context", "tls_context:truststore.SSLContext"}
+    ),
     "messagefoundry/uploads.py": frozenset(
         {
             "cipher:.decrypt()",
@@ -1236,6 +1246,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     #     all but enginepoll.py also build the pinned client TLS context there (non-prod, loopback
     #     only, per that row in INVENTORY).
     #   scripts/security/dast_auth_sweep.py -- runs the DAST target, which draws a throwaway password.
+    #   tray/poller.py -- builds the tray's probe client and tests whether the pinned engine cert
+    #     loads yet (tray/probe), so it decides when the pinned context replaces the OS trust store.
     "harness/load/connscale/runner.py": frozenset(
         {
             "key_cert:via harness.load.tlsmat",
@@ -1268,6 +1280,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         }
     ),
     "messagefoundry/api/auth_routes.py": frozenset({"hash:via messagefoundry.auth.tokens"}),
+    "messagefoundry/tray/poller.py": frozenset({"tls_context:via messagefoundry.tray.probe"}),
     "messagefoundry/verify/federation.py": frozenset(
         {
             "compare:via messagefoundry.auth.oidc.claims",
