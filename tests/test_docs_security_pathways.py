@@ -7,7 +7,8 @@ scored Partial because it had three rows while five pathways shipped — OIDC fe
 service-identity plane were both live and both absent. A table that silently falls one pathway behind
 is the defect itself, so the row set is keyed on **code artefacts existing**, not on a hardcoded list:
 the interactive pathways are enumerated from the ``AuthService`` entry points that mint a
-``LoginOutcome``, and each row is additionally anchored to the settings field that turns it on.
+``LoginOutcome``, and each row is additionally anchored to the setting that turns it on: a settings
+field, or for the ingest-plane pathway a connector-factory parameter.
 
 Also pins the numbers the table quotes (lockout, MFA-claim gate, the sign-in window's two dimensions,
 the reconciler default) to the live defaults, and asserts the two corrected falsehoods cannot return.
@@ -49,7 +50,7 @@ _LOGIN_ENTRY_POINTS = frozenset(
 #: a parameter of a connector factory. ``None`` = always available (Local needs no switch). ``mTLS`` is
 #: the fifth pathway and the first non-interactive one; HTTP intake authentication is the sixth, on the
 #: ingest plane (owner ruling 2026-09-23: ``intake_auth`` IS an authentication pathway).
-_PATHWAY_ANCHORS: dict[str, tuple[type[BaseModel], str] | tuple[Callable[..., Any], str] | None] = {
+_PATHWAY_ANCHORS: dict[str, tuple[Callable[..., Any], str] | None] = {
     "**Local**": None,
     "**AD**": (AuthSettings, "ad_enabled"),
     "**Kerberos / SPNEGO**": (AuthSettings, "kerberos_enabled"),
@@ -267,6 +268,9 @@ def test_ingest_plane_pathways_are_derived_from_the_connector_factories() -> Non
         "docs/SECURITY.md and update _INGEST_PLANE_PATHWAYS in the same change (ASVS 6.1.3)."
     )
     assert len(_INGEST_PLANE_PATHWAYS) == len(_INGEST_PLANE_FACTORIES)
+    assert set(_PATHWAY_ANCHORS) >= _INGEST_PLANE_PATHWAYS, (
+        "_INGEST_PLANE_PATHWAYS names a row label that _PATHWAY_ANCHORS does not carry"
+    )
 
 
 @pytest.mark.parametrize(
@@ -358,8 +362,9 @@ def test_the_pathway_count_sentence_matches_the_row_set() -> None:
     2026-09-23 that ``intake_auth`` is a sixth pathway, so a count that drifts from the row set again
     reds here rather than going unnoticed.
     """
-    words = {5: "Five", 6: "Six", 7: "Seven", 8: "Eight"}
-    expected = f"**{words[len(_PATHWAY_ANCHORS)]}** authentication pathways ship"
+    words = {4: "Four", 5: "Five", 6: "Six", 7: "Seven", 8: "Eight", 9: "Nine", 10: "Ten"}
+    count = len(_PATHWAY_ANCHORS)
+    expected = f"**{words.get(count, str(count))}** authentication pathways ship"
     assert expected in _section(), (
         f"the section must open with {expected!r}: the row set has {len(_PATHWAY_ANCHORS)} pathways."
     )
@@ -394,27 +399,37 @@ def test_the_intake_row_states_the_modes_and_the_unauthenticated_default() -> No
 
 
 def test_the_intake_numbers_the_doc_quotes_match_the_code() -> None:
-    """Both intake rows (this section and Table B) quote the budgets; pin them to ``Http()``."""
+    """The intake rows quote defaults and floors; pin each one to the code that sets it.
+
+    The budget numbers are stated once, in this section's row; Table B names the settings and links
+    to CONNECTIONS.md for the values rather than restating them (SDS-3.5).
+    """
+    from messagefoundry.pipeline.wiring_runner import (
+        _INTAKE_ALLOWLIST_MIN_PREFIX_V4,
+        _INTAKE_ALLOWLIST_MIN_PREFIX_V6,
+    )
     from messagefoundry.transports import http_listener
 
     params = inspect.signature(Http).parameters
     assert params["intake_auth_rate_limit"].default == 10
     assert params["intake_auth_rate_limit_global"].default == 60
     assert params["intake_api_key_header"].default == "x-api-key"
+    assert params["intake_auth_health"].default == "require"
+    assert (_INTAKE_ALLOWLIST_MIN_PREFIX_V4, _INTAKE_ALLOWLIST_MIN_PREFIX_V6) == (8, 32)
     assert '"Retry-After": "60"' in inspect.getsource(http_listener.HttpSource._rate_limit_refusal)
     row = " ".join(next(r for r in _primary_table()[1:] if r[0].startswith("**HTTP intake")))
-    table_b = next(
-        line for line in _doc_text().splitlines() if line.startswith("| **HTTP** — intake")
-    )
     for quoted in ("`intake_auth_rate_limit` 10/min", "`intake_auth_rate_limit_global` 60/min"):
         assert quoted in row, f"the HTTP intake row no longer quotes {quoted!r}"
+    table_b = " ".join(
+        line for line in _doc_text().splitlines() if line.startswith("| **HTTP** — ")
+    )
     for quoted in (
-        "(`intake_auth_rate_limit`, 10/min)",
-        "(`intake_auth_rate_limit_global`, 60/min)",
         "(default `x-api-key`)",
         "`Retry-After: 60`",
+        "wider than a /8 (IPv4) or a /32 (IPv6)",
+        'unless `intake_auth_health = "allow"`',
     ):
-        assert quoted in table_b, f"the Table B intake row no longer quotes {quoted!r}"
+        assert quoted in table_b, f"the Table B HTTP rows no longer quote {quoted!r}"
 
 
 def test_the_one_switch_that_flattens_three_pathways_is_named_in_each_row() -> None:
