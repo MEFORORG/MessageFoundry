@@ -3219,8 +3219,9 @@ class AuthService:
         """Whether this session must prove its second factor before it may change the password.
 
         BACKLOG #1954 (ASVS 6.3.3). A change revokes every session, so a password holder on a
-        pending session must not reach it on the password alone. True only for a pending session
-        on a LOCAL account that holds a factor. An account with no factor has nothing to prove and
+        pending session must not reach it on the password alone. True for a pending session on
+        an account that holds a factor, unless it is a directory (AD) account, and when the session
+        or its user cannot be found. An account with no factor has nothing to prove and
         rotates as before, and a directory account is left to the route's 400, which changes
         nothing. PUBLIC for the reason :meth:`factor_binding_is_blocked` gives: the JSON gate and
         the web console's password and factor pages all ask it, so the planes cannot drift."""

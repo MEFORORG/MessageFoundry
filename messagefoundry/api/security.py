@@ -110,7 +110,7 @@ _MFA_EXEMPT_ROUTES: frozenset[tuple[str, str]] = frozenset(
 )
 
 # The one exempt route above whose exemption serves an account with NO factor only. A pending
-# session on a local account that HAS one is refused here like anywhere else: a password change
+# session on a non-directory account that HAS one is refused here like anywhere else: a password change
 # revokes every session, so without this a caller holding only the password could lock the real
 # user out and sign them out everywhere (BACKLOG #1954, ASVS 6.3.3).
 # AuthService.password_change_owes_factor decides it; the console's password page asks it too.

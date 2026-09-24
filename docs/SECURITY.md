@@ -233,8 +233,8 @@ route handler only when all of them pass.
    exempt (`_MUST_CHANGE_EXEMPT_PATHS`; at least `/auth/logout`, `/auth/me`, `/auth/mfa-verify` and
    `/me/password`) → **403** + `X-MFA-Required`
    plus an `auth.mfa_denied` audit row when the session's second factor is pending and the route is not
-   MFA-exempt (on `/me/password`, only when a local account holds a factor, BACKLOG #1954; see the
-   "MFA state" row below) → **403** `missing permission: <value>`
+   MFA-exempt (on `/me/password`, only when an account other than a directory account holds a
+   factor, BACKLOG #1954; see the "MFA state" row below) → **403** `missing permission: <value>`
    plus an `auth.permission_denied` audit row for the first unheld permission. On success it writes one
    `auth.permission_granted` row — **every satisfied route, GETs included**, since
    `[security].audit_all_authorization_decisions` defaults **on** (BACKLOG #1277). PHI-view grants are
