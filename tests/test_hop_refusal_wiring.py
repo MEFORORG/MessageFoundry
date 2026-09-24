@@ -462,6 +462,23 @@ def test_mtls_without_a_crl_is_refused_on_an_enforcing_phi_instance() -> None:
         check_inbound_revocation(_mtls(), "IB_PARTNER", posture=_PHI_ENFORCING)
 
 
+def test_the_refusal_and_warning_name_only_a_lever_an_operator_can_set(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # SDS-3.7 on the TEXT. Both used to offer `tls_revocation_attested=true`, which no inbound()
+    # parameter or connections.toml key sets and `_source_config` never populates, so the remedy
+    # could not be performed. `tls_crl_file` is a real setting and must stay named.
+    with pytest.raises(WiringError) as exc:
+        check_inbound_revocation(_mtls(), "IB_PARTNER", posture=_PHI_ENFORCING)
+    assert "tls_crl_file" in str(exc.value)
+    assert "tls_revocation_attested" not in str(exc.value)
+    with caplog.at_level("WARNING"):
+        check_inbound_revocation(_mtls(), "IB", posture=HopPosture(enforcing=False))
+    warned = " ".join(r.getMessage() for r in caplog.records)
+    assert "tls_crl_file" in warned  # the warning fired, so the absence below means something
+    assert "tls_revocation_attested" not in warned
+
+
 def test_a_configured_crl_passes() -> None:
     # POSITIVE CONTROL: the refusal can be SATISFIED, not merely avoided. Without this the test
     # above would pass equally well against a gate that refuses every mTLS listener.

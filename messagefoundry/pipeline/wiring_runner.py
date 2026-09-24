@@ -8246,8 +8246,11 @@ def check_inbound_revocation(
     **Measured on this tree**: the three server builders load a CA, set ``CERT_REQUIRED`` and finish
     with ``harden_verify_flags`` -- strict RFC 5280 path validation, NOT revocation -- so a client
     certificate revoked this morning keeps authenticating until its ``notAfter``. Set
-    ``tls_crl_file`` on the connection (a PEM carrying the CA and its CRL), or declare
-    ``tls_revocation_attested=true`` if your PKI checks revocation outside the engine.
+    ``tls_crl_file`` on the connection (a PEM carrying the CA and its CRL).
+
+    The messages below name no ``tls_revocation_attested``. ``Source`` carries the field, but no
+    factory parameter or ``connections.toml`` key sets it and ``_source_config`` never populates it,
+    so offering it would name a remedy the operator cannot perform (docs/DEPLOYMENT.md, SDS-3.7).
 
     **Why this refusal cannot be delegated away for two of the three listeners.**
     ``harden_verify_flags``' own docstring delegates live revocation to the deploying org -- OCSP
@@ -8271,8 +8274,7 @@ def check_inbound_revocation(
         log.warning(
             "inbound %r requires and verifies a client certificate (mTLS) but checks NO revocation: "
             "a revoked partner certificate would keep authenticating until its notAfter. Set "
-            "tls_crl_file on the connection, or tls_revocation_attested=true if your PKI checks "
-            "revocation outside the engine.",
+            "tls_crl_file (a PEM carrying the CA and its CRL) on the connection.",
             name,
         )
         return
@@ -8280,9 +8282,8 @@ def check_inbound_revocation(
         f"inbound connection {name!r} requires and verifies a client certificate (mTLS) but checks "
         "no revocation, on an enforcing production-PHI instance; a partner certificate revoked "
         "today would keep authenticating to this interface until its notAfter. Set tls_crl_file "
-        "(a PEM carrying the CA and its CRL) on the connection, or set "
-        "tls_revocation_attested=true if a revocation-checking PKI covers these certificates "
-        "outside the engine. An HTTP proxy can terminate neither MLLP nor DIMSE, so for those "
+        "(a PEM carrying the CA and its CRL) on the connection. An HTTP proxy can terminate "
+        "neither MLLP nor DIMSE, so for those "
         "listeners the documented out-of-engine delegation does not reach."
     )
 

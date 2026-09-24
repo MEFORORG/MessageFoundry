@@ -1467,9 +1467,13 @@ def revocation_hop_disposition(
 #: inheriting levers it cannot use (BACKLOG #1498). Deliberately **not** annotated with how many
 #: hops consume it: that is the hardened-count liability SDS-3.6 names, and this very change moved
 #: four documents off such a count. Find the consumers by symbol.
+#:
+#: It names no per-connection ``tls_revocation_attested``. That field is read by the guard but has
+#: no factory parameter and no ``connections.toml`` key, so an operator cannot set it, and
+#: docs/DEPLOYMENT.md forbids offering such a field as a lever (SDS-3.7).
 _CONNECTION_WAYS_ACROSS = (
-    "Configure [tls].crl_file so the engine checks a CRL on this hop, terminate at a "
-    "revocation-checking egress proxy, or set tls_revocation_attested=true on this connection."
+    "Configure [tls].crl_file so the engine checks a CRL on this hop, or terminate at a "
+    "revocation-checking egress proxy."
 )
 
 
