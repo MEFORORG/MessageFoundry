@@ -19,6 +19,16 @@ All notable changes to MessageFoundry are documented here. The format follows
   #1887, ADR 0173 section 4.3).** Each leg is guarded on its own host. An enforcing instance whose
   off-box identity provider has no `[auth].oidc_tls_crl_file` would refuse to start on first
   deployment.
+- **BREAKING: `deflate_decompress` now refuses any bytes after the end of the stream, and no longer
+  hangs on them.** Its bounded loop never checked for the end of the stream. Take a stream whose
+  output needs more than one 64 KiB round, and add one byte after it. The loop spun forever and the
+  ceiling never fired. On first deployment, a Handler inflating an untrusted body would hang its
+  transform worker. A shorter stream returned its output and dropped the extra bytes without a
+  word. Both now raise `CompressionError`. Stdlib `zlib.decompress` ignores such bytes, so a Handler
+  that expects a trailer should strip it first. The loop now feeds its input one 64 KiB window at a
+  time, so it runs in linear time, not quadratic. A bomb now stops at the ceiling, not up to one
+  window past it. `gzip_decompress` and `zip_decompress` do not use this loop and are unchanged.
+  ([BACKLOG #1964](docs/BACKLOG.md))
 ### Changed
 - **`messagefoundry dryrun` and `messagefoundry check` now refuse an oversized fixture file.** The
   cap is `MAX_FIXTURE_FILE_BYTES`, which defaults to `DEFAULT_MAX_MESSAGE_BYTES` (16 MiB) and rises
