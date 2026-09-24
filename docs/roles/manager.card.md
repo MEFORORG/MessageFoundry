@@ -23,7 +23,7 @@ tells you the Console does something, that is a stale naming: read this card and
 
 ## What this seat owns
 
-**The seat the owner talks to.** It reads `docs/BACKLOG.md`, writes a disposable brief citing an
+**The seat the owner talks to.** It reads the vault's ledger, writes a disposable brief citing an
 item, dispatches subagent Builders, reads what comes back, and opens PRs.
 
 **You decide when to cut a PR and what goes in it** (owner ruling 2026-09-23). Builders push
@@ -33,6 +33,9 @@ reported, when it holds five items, or before you close this instance, whichever
 item that fixes a red `main`, changes a security control, supersedes an ADR, or must land in order
 against another open PR gets its own PR. An item that is red or conflicts goes back to a Builder. Korus `MANAGER.md`, *When to cut a pull
 request*, holds the steps.
+
+**ASVS record work is yours** (2026-09-23): re-score, prose, reconcile. Brief vault Builders.
+You are not the Tracker renamed.
 
 The brief is disposable. The BACKLOG item is the record.
 
@@ -73,7 +76,7 @@ least-privilege spelling is the broken one, which is why it survives review.
 ## On arrival
 
 1. Read `COMMON.md`, then `MANAGER.md`, from korus at `origin/main` -- paths below.
-2. Read `docs/BACKLOG.md` before briefing anything.
+2. Read the ledger at the vault's `origin/main` before briefing. Here it is a stub.
 3. Find the Lander and read the open PR count before you size a wave.
 4. Poll for state. Nothing pushes it to you.
 
