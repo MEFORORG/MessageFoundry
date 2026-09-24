@@ -8,15 +8,15 @@ before Wave 2 deletes it, so this helper must behave the same with and without t
 
 **Why the store and not the service.** ``create_local_user`` ends by running the WP-3 sweep, which
 disables the bootstrap when a second administrator appears -- so it would change the store in one
-mode only. ``provision_first_administrator`` refuses while the bootstrap exists. The store writes
-below (``create_user``, ``set_password``, ``set_user_roles``) trigger neither.
+mode only. ``provision_first_administrator`` refuses while the bootstrap exists.
 
-**Why the bootstrap row is deleted.** Left in place it is a second enabled Administrator, and every
-last-admin guard, user count and admin enumeration would then see a different store in each mode.
-Deleting it makes the user table identical either way. It does not touch the audit log, so a test
-that asserts audit rows must still filter to its own. This branch dies with the bootstrap in Wave 2.
+**Why the user row goes in BEFORE ``initialize()``.** ``initialize()`` mints the bootstrap only on
+an empty users table, so writing the row first means it is never minted. The user table and the
+audit log then come out the same in both modes, with nothing to delete afterwards. The role is
+assigned after ``initialize()``, because that is where the role rows are seeded.
 
-Call it AFTER ``initialize()``: the role rows it assigns are seeded there.
+So call :func:`create_admin` INSTEAD of ``initialize()``, not after it. It refuses a store that
+already holds the bootstrap, which is what a call after ``initialize()`` would find.
 """
 
 from __future__ import annotations
@@ -49,51 +49,42 @@ class AdminAccount:
 
 
 async def create_admin(
-    service: AuthService,
-    *,
-    username: str = ADMIN_USERNAME,
-    password: str = ADMIN_PASSWORD,
-    display_name: str | None = None,
-    email: str | None = None,
-    must_change_password: bool = True,
+    service: AuthService, *, username: str = ADMIN_USERNAME, email: str | None = None
 ) -> AdminAccount:
-    """Write an enabled local Administrator through the store, and remove any bootstrap row.
+    """Write an enabled local Administrator, then run ``initialize()``.
 
-    ``must_change_password`` defaults to True because that is the row shape of the bootstrap account
-    every moved test was written against: an admin-issued, unclaimed credential. Pass False for an
-    account whose holder already set their own password, which also stamps ``password_claimed_at``.
+    The credential is admin-issued and unclaimed (``must_change_password`` set, no
+    ``password_claimed_at``), which is how the bootstrap row was stored. It is not the bootstrap,
+    though: branches keyed on the bootstrap's NAME, such as the WP-3 gate in the login path, do not
+    fire for it. ``email`` also seeds the notification address, as ``create_user`` always does.
     """
     if username.casefold() == BOOTSTRAP_USERNAME:
         raise ValueError(f"{username!r} is the bootstrap account's name; choose another")
     store = service.store
-    boot = await store.get_user_by_username(BOOTSTRAP_USERNAME)
-    if boot is not None:
-        await store.delete_user(boot.id)
+    if await store.get_user_by_username(BOOTSTRAP_USERNAME) is not None:
+        raise RuntimeError(
+            "the bootstrap account already exists: call create_admin() instead of initialize()"
+        )
     user_id = uuid4().hex
     await store.create_user(
         user_id=user_id,
         username=username,
         auth_provider=AuthProvider.LOCAL.value,
-        display_name=display_name,
         email=email,
+        password_hash=await asyncio.to_thread(hash_password, ADMIN_PASSWORD),
+        must_change_password=True,
     )
-    await store.set_password(
-        user_id,
-        password_hash=await asyncio.to_thread(hash_password, password),
-        must_change_password=must_change_password,
-    )
+    await service.initialize()  # seeds the roles; mints no bootstrap, since the table is not empty
     await store.set_user_roles(user_id, [Role.ADMINISTRATOR.value], assigned_by="test")
-    return AdminAccount(user_id=user_id, username=username, password=password)
+    return AdminAccount(user_id=user_id, username=username, password=ADMIN_PASSWORD)
 
 
 async def login_admin(service: AuthService) -> tuple[Identity, str, str]:
-    """Initialize, create the default Administrator, sign it in, return ``(identity, token, password)``.
+    """Create the default Administrator, sign it in, and return ``(identity, token, password)``.
 
     This is what the per-file ``_bootstrap_login`` helpers did, in the same tuple shape, so a caller
-    moves by changing one name. ``initialize()`` is idempotent, so an already-initialized service is
-    fine.
+    moves by changing one name. Like :func:`create_admin`, call it instead of ``initialize()``.
     """
-    await service.initialize()
     admin = await create_admin(service)
     out = await service.login(admin.username, admin.password)
     assert out.ok and out.identity is not None and out.token is not None

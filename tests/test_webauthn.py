@@ -25,7 +25,7 @@ from messagefoundry.auth.notifications import MFA_DISABLED, SecurityEvent  # noq
 from messagefoundry.auth.service import AuthService  # noqa: E402
 from messagefoundry.config.settings import AuthSettings  # noqa: E402
 from messagefoundry.store.store import MessageStore, WebAuthnCredential  # noqa: E402
-from tests._admin_account import ADMIN_USERNAME, login_admin  # noqa: E402
+from tests._admin_account import ADMIN_USERNAME, create_admin, login_admin  # noqa: E402
 from tests._soft_webauthn import SoftAuthenticator  # noqa: E402
 
 RP = "t"
@@ -401,7 +401,7 @@ async def test_a_directory_account_can_enroll_a_passkey() -> None:
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store)
-        await login_admin(service)
+        await create_admin(service)
         principal = AdPrincipal(
             username="aduser",
             display_name="AD User",

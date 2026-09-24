@@ -46,20 +46,24 @@ async def _store() -> MessageStore:
     return await MessageStore.open(":memory:")
 
 
-async def _claim_bootstrap(service: AuthService, boot_password: str) -> str:
-    """Claim the bootstrap admin the way an operator actually would: log in with the printed one-time
-    credential, then rotate it through :meth:`AuthService.change_password`. Returns the claimed
-    password.
+async def _claim(service: AuthService, username: str, one_time_password: str) -> str:
+    """Claim an account the way an operator actually would: log in with the one-time credential,
+    then rotate it through :meth:`AuthService.change_password`. Returns the claimed password.
 
     Deliberately NOT a direct ``store.set_password``. Self-service rotation is the ONE path that
     records the claim (``users.password_claimed_at``), so a store-level shortcut produces a row that
     merely LOOKS claimed and leaves the suite blind to any later writer that moves the state it does
     set. That shortcut is why BACKLOG #1245 was invisible to a green suite.
     """
-    out = await service.login("admin", boot_password)
+    out = await service.login(username, one_time_password)
     assert out.ok and out.identity is not None
     assert await service.change_password(out.identity, NEW_PASSWORD) == []
     return NEW_PASSWORD
+
+
+async def _claim_bootstrap(service: AuthService, boot_password: str) -> str:
+    """:func:`_claim` for the bootstrap admin, whose name is fixed."""
+    return await _claim(service, "admin", boot_password)
 
 
 async def test_bootstrap_admin_created_once_and_can_log_in() -> None:
@@ -309,11 +313,8 @@ async def test_the_claim_stamp_is_write_once_across_a_second_rotation() -> None:
     store = await _store()
     try:
         service = AuthService(store, AuthSettings())
-        await service.initialize()
         admin = await create_admin(service)  # unclaimed until the holder rotates it below
-        out = await service.login(admin.username, admin.password)
-        assert out.ok and out.identity is not None
-        assert await service.change_password(out.identity, NEW_PASSWORD) == []
+        await _claim(service, admin.username, admin.password)
 
         first = await store.get_user_by_username(ADMIN_USERNAME)
         assert first is not None
@@ -364,12 +365,9 @@ async def test_the_upgrade_backfill_restores_a_claim_a_pre_column_database_canno
     db = tmp_path / "mefor.db"
     store = await MessageStore.open(str(db))
     try:
-        service = AuthService(store, AuthSettings(bootstrap_expiry_hours=72))
-        await service.initialize()
+        service = AuthService(store, AuthSettings())
         admin = await create_admin(service)  # unclaimed until the holder rotates it below
-        out = await service.login(admin.username, admin.password)
-        assert out.ok and out.identity is not None
-        assert await service.change_password(out.identity, NEW_PASSWORD) == []
+        await _claim(service, admin.username, admin.password)
         claimed = await store.get_user_by_username(ADMIN_USERNAME)
         assert claimed is not None and claimed.password_claimed_at is not None
     finally:
@@ -1454,7 +1452,6 @@ async def test_the_deliverability_gate_reads_the_notification_address() -> None:
     store = await _store()
     try:
         service = AuthService(store, AuthSettings())
-        await service.initialize()
         admin = await store.get_user((await create_admin(service)).user_id)
         assert admin is not None
         assert not await service.has_notifiable_admin()  # minted with no address at all

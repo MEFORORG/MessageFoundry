@@ -180,13 +180,12 @@ def test_ad_requires_ldaps_unless_overridden() -> None:
 
 
 async def test_must_change_password_blocks_until_rotated(engine: Engine) -> None:
-    # M2 + ASVS 6.3.3. An admin-issued admin is must_change AND (since 6.3.3) mfa_pending at the same
+    # M2 + ASVS 6.3.3. An unclaimed admin is must_change AND (since 6.3.3) mfa_pending at the same
     # instant, so this pins BOTH the refusal ORDER and the fact that the pair is escapable — the
     # bricked-fresh-account regression. Order is load-bearing: GET /me/mfa is MFA-exempt but NOT
     # must-change-exempt, so leading with MFA would send this account to /auth/mfa-verify, which it
     # cannot satisfy before rotating. The account must be told to rotate FIRST.
     service = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False))
-    await service.initialize()
     admin = await create_admin(service)
     async with _client(engine, service) as c:
         login = await _login(c, admin.username, admin.password)
@@ -304,7 +303,6 @@ async def test_ad_login_conflicting_with_local_account_is_rejected(engine: Engin
         ad_bind_password="x",
     )
     service = AuthService(engine.store, settings, ldap=_FakeLdap())  # type: ignore[arg-type]
-    await service.initialize()
     await create_admin(service)  # the LOCAL account the AD login must not adopt
     async with _client(engine, service) as c:
         r = await _login(c, ADMIN_USERNAME, "pw", provider="ad")
@@ -318,7 +316,6 @@ async def test_cannot_remove_last_administrator(engine: Engine) -> None:
     # Last-admin guard test (step-up admin CRUD), not an MFA test: pin require_mfa=False so the
     # BACKLOG #187 secure default (require_mfa now ON) doesn't 403 the roles/CRUD ops first.
     service = AuthService(engine.store, AuthSettings(require_mfa=False))
-    await service.initialize()
     admin = await create_admin(service)
     async with _client(engine, service) as c:
         h = _auth((await _login(c, admin.username, admin.password)).json()["token"])
@@ -698,7 +695,6 @@ async def test_must_change_password_blocks_websocket(engine: Engine) -> None:
     from messagefoundry.auth import Permission
 
     service = AuthService(engine.store, AuthSettings(require_mfa=False))
-    await service.initialize()
     admin = await create_admin(service)
     admin_token = (await service.login(admin.username, admin.password)).token
     # the not-yet-rotated admin (holds monitoring:read) is denied the WS

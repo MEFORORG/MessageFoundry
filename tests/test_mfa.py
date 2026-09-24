@@ -146,7 +146,6 @@ async def test_require_mfa_forces_admin_even_unenrolled() -> None:
     store = await _store()
     try:
         service = AuthService(store, AuthSettings(require_mfa=True))
-        await service.initialize()
         admin = await create_admin(service)
         out = await service.login(admin.username, admin.password)
         # Admin must MFA even though not enrolled — they can log in but can't satisfy step-up until
@@ -274,7 +273,7 @@ async def test_disable_and_admin_reset_clear_mfa(monkeypatch: pytest.MonkeyPatch
         )
         assert reenrolled.ok
         assert (await service.mfa_status(identity)).enabled is True
-        await service.admin_reset_mfa(identity.user_id, actor="admin")
+        await service.admin_reset_mfa(identity.user_id, actor=ADMIN_USERNAME)
         assert (await service.mfa_status(identity)).enabled is False
     finally:
         await store.close()
@@ -783,7 +782,6 @@ async def test_an_account_owing_no_second_factor_still_clears_at_the_password_st
     store = await _store()
     try:
         service = AuthService(store, AuthSettings(require_mfa=False))
-        await service.initialize()
         admin = await create_admin(service)
         for _ in range(3):
             assert (await service.login(ADMIN_USERNAME, "wrong-passphrase-entirely")).ok is False
