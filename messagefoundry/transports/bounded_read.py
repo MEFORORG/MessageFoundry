@@ -293,6 +293,11 @@ def drain_bounded(
 _BODYLESS_STATUSES = frozenset({204, 304})
 
 
+def _status_has_no_body(status: int) -> bool:
+    """RFC 9112 section 6.3, rule 1: a 1xx, 204 or 304 reply has no body, whatever it declares."""
+    return status in _BODYLESS_STATUSES or 100 <= status < 200
+
+
 def reply_framing_fault(reader: object) -> str | None:
     """Return why ``reader``'s body framing is refused, or ``None`` when it is unambiguous.
 
@@ -353,7 +358,7 @@ def reply_framing_fault(reader: object) -> str | None:
     te_fields: list[str] = [str(v) for v in (get_all("Transfer-Encoding") or [])]
     cl_fields: list[str] = [str(v).strip(" \t") for v in (get_all("Content-Length") or [])]
     status = getattr(reader, "status", None)
-    if isinstance(status, int) and (status in _BODYLESS_STATUSES or 100 <= status < 200):
+    if isinstance(status, int) and _status_has_no_body(status):
         return "Transfer-Encoding on a response that has no body" if te_fields else None
     if te_fields:
         if getattr(reader, "version", None) == 10:
@@ -409,10 +414,9 @@ def _read_capped(reader: _SupportsRead, limit: int, connector: str) -> bytes:
 def read_reply_body(reader: _SupportsRead, amt: int, *, connector: str) -> bytes:
     """Read at most ``amt`` bytes of a reply body, as ``reader.read(amt)`` would, but strictly.
 
-    The shared low-level read under :func:`read_bounded`, :func:`drain_bounded` and the OIDC token
-    and JWKS reads. It applies no ceiling of its own: a caller asks for one byte past its bound and
-    judges the length. It does not call :func:`reply_framing_fault` either; the caller does that
-    first where it wants the header checks.
+    The low-level read under the bounded helpers here. It applies no ceiling of its own: a caller
+    asks for one byte past its bound and judges the length. It does not call
+    :func:`reply_framing_fault` either; the caller does that first where it wants the header checks.
 
     A chunked ``http.client.HTTPResponse``, or the ``HTTPError`` that wraps one, is decoded by
     :func:`_read_chunked_strict` rather than by ``http.client``, and the response is closed after.
@@ -441,11 +445,8 @@ def read_reply_body(reader: _SupportsRead, amt: int, *, connector: str) -> bytes
         # `__context__.__cause__.partial` for any sink logging with exc_info, PHI by CLAUDE.md
         # section 9. `from None` alone does not do this: it clears `__cause__` and leaves
         # `__context__`. Leaving the handler first clears the exception being handled, so the new
-        # error references nothing.
-        #
-        # No byte count: `partial` is EMPTY for the common chunked case (`_read_chunked` appends to
-        # its accumulator only after a whole chunk arrives), so a count here would report 0 for a
-        # peer that sent real bytes and read as "the peer sent nothing".
+        # error references nothing. This arm now serves only readers other than a chunked
+        # HTTPResponse, which _read_chunked_strict decodes.
         raise _truncated_error(connector)
     return body
 
@@ -476,15 +477,14 @@ def _header_block_fault(headers: email.message.Message) -> str | None:
 
     Each reason is a fixed string that names the header block, and never echoes a field value.
     """
+    # Every line the email parser leaves unparsed also records a defect, so the defect list covers
+    # the headers lost after a malformed line as well as the malformed line itself.
     if headers.defects:
         return "a header line the HTTP reader could not parse"
-    payload = headers.get_payload()
-    if isinstance(payload, str) and payload:
-        # Belt and braces: every way the email parser leaves lines unparsed records a defect too.
-        return "header lines left unparsed after a malformed one"
     if headers.get_unixfrom() is not None:
         return "an mbox envelope line in the header block"
-    if not all(_FIELD_NAME.fullmatch(name) for name, _ in headers.items()):
+    names = headers.keys()  # the stored names; items() would also re-parse every value
+    if not all(_FIELD_NAME.fullmatch(name) for name in names):
         return "a header field name that is not a token"
     return None
 
@@ -536,10 +536,7 @@ def _read_chunked_strict(resp: http.client.HTTPResponse, amt: int, connector: st
         fp = resp.fp
         if fp is None:
             return b""  # already read or closed, which is what http.client returns too
-        status = resp.status
-        if getattr(resp, "_method", None) == "HEAD" or (
-            status in _BODYLESS_STATUSES or 100 <= status < 200
-        ):
+        if getattr(resp, "_method", None) == "HEAD" or _status_has_no_body(resp.status):
             # No body exists (RFC 9112 section 6.3), whatever the headers say. http.client would
             # try to read a chunked one here and wait on the peer for it.
             return b""
@@ -548,8 +545,15 @@ def _read_chunked_strict(resp: http.client.HTTPResponse, amt: int, connector: st
         resp.close()
 
 
+#: The most one ``read`` asks for. A chunk-size line can declare far more than the peer sends, and
+#: ``BufferedReader.read(n)`` allocates ``n`` bytes before it learns that, so a large chunk is read
+#: in pieces of this size. ``http.client._safe_read`` grows its buffer for the same reason.
+_READ_PIECE = 1024 * 1024
+
+
 def _decode_chunked(fp: _SupportsReadline, amt: int, connector: str) -> bytes:
-    body = bytearray()
+    parts: list[bytes] = []
+    got = 0
     while True:
         line = _read_chunk_line(fp, connector)
         match = _CHUNK_SIZE_LINE.fullmatch(line)
@@ -558,15 +562,18 @@ def _decode_chunked(fp: _SupportsReadline, amt: int, connector: str) -> bytes:
         size = int(match.group(1), 16)
         if size == 0:
             break
-        want = min(size, amt - len(body))
-        data = fp.read(want)
-        body += data
-        if len(data) < want:
-            raise _truncated_error(connector)
-        if len(body) >= amt:
+        want = min(size, amt - got)
+        while want:
+            data = fp.read(min(want, _READ_PIECE))
+            if not data:
+                raise _truncated_error(connector)
+            parts.append(data)
+            got += len(data)
+            want -= len(data)
+        if got >= amt:
             # The caller's count is reached. The rest of the stream is left unread, and the
             # response is closed by the caller of this function.
-            return bytes(body)
+            return b"".join(parts)
         after = fp.read(2)
         if len(after) < 2:
             raise _truncated_error(connector)
@@ -575,7 +582,7 @@ def _decode_chunked(fp: _SupportsReadline, amt: int, connector: str) -> bytes:
     for _ in range(_MAX_TRAILER_FIELDS + 1):
         line = _read_chunk_line(fp, connector)
         if not line:
-            return bytes(body)
+            return b"".join(parts)
         if _TRAILER_LINE.fullmatch(line) is None:
             raise _framing_error(connector, "a trailer line that is not a header field")
     raise _framing_error(connector, "more trailer fields than the reader allows")

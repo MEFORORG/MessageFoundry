@@ -45,7 +45,7 @@ from messagefoundry.auth.trust_anchors import AnchorSpec, enforce_anchor
 from messagefoundry.config.tls_policy import harden_cipher_suites, harden_crl_check
 from messagefoundry.transports.bounded_read import (
     AmbiguousFramingError,
-    EgressReplyError,
+    TruncatedResponseError,
     read_reply_body,
     reply_framing_fault,
 )
@@ -162,15 +162,14 @@ def jwks_fetcher(
             # floor after this see the cache's throttle, as after any failed fetch.
             if reply_framing_fault(resp) is not None:
                 raise http.client.HTTPException("JWKS response framed its body length ambiguously")
-            # BACKLOG #1979: the same strict reader as every connector reply, so a malformed
-            # chunk-size line cannot get past the bound. Its refusals are retyped to HTTPException
-            # for the reason above, outside the handler so nothing chains to them.
-            failure = ""
+            # BACKLOG #1979: the strict reader under read_bounded. Not read_bounded itself, because
+            # JwksCache judges the length and expects the extra byte. Refusals are retyped to
+            # HTTPException for the reason above, outside the handler so nothing chains to them.
             try:
                 return read_reply_body(resp, _MAX_JWKS_BYTES + 1, connector="OIDC JWKS endpoint")
             except AmbiguousFramingError:
                 failure = "JWKS response framed its body length ambiguously"
-            except EgressReplyError:
+            except TruncatedResponseError:
                 failure = "JWKS endpoint closed the connection part-way through its response"
             raise http.client.HTTPException(failure)
 

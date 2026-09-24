@@ -764,3 +764,13 @@ def test_oidc_token_exchange_maps_a_cut_chunked_body_to_flow_error() -> None:
 
     with _serve(_TE + b"50\r\n" + _TOKEN_JSON) as url, pytest.raises(oidc.FlowError):
         _exchange(url)
+
+
+def test_oidc_token_exchange_refuses_a_body_short_of_its_content_length() -> None:
+    """The token read goes through read_bounded, so it gets the declared-length check too. Before,
+    the short body reached json.loads and failed there, or parsed if the cut fell after a brace."""
+    from messagefoundry.auth import oidc
+
+    raw = _json_reply(b"Content-Length: %d\r\n" % (len(_TOKEN_JSON) + 40))
+    with _serve(raw) as url, pytest.raises(oidc.FlowError, match="part-way"):
+        _exchange(url)
