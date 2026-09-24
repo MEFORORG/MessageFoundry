@@ -34,6 +34,7 @@ __all__ = [
     "ensure_api_tls_material",
     "generated_state_dir",
     "plan_api_tls_material",
+    "plaintext_upstream_hop_unacknowledged",
 ]
 
 log = logging.getLogger(__name__)
