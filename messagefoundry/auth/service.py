@@ -117,6 +117,12 @@ def _error_if_bundled_corpus_unusable(check_breached: bool) -> None:
     on its own candidate -- see that call for why. Stated as that ONE path rather than as "nothing
     anywhere": the ``provision-first-administrator`` CLI still halts on this, and uncaught.
 
+    BACKLOG #1886: the message therefore names what a first ``serve`` now hands the operator. The
+    bootstrap admin it mints is born must-change, and that rotation is screened by this same corpus,
+    so the account cannot finish it until the corpus is repaired. This runs from ``__init__``, before
+    ``initialize`` decides whether to mint, so the sentence is conditional. It names ``serve`` and not
+    "a first run", because the CLI also constructs ``AuthService`` and there it halts instead.
+
     Skipped when the operator has turned screening off: a corpus nobody consults is not a defect.
     """
     if not check_breached:
@@ -126,8 +132,11 @@ def _error_if_bundled_corpus_unusable(check_breached: bool) -> None:
     except BreachCorpusUnavailable as exc:
         _log.error(
             "%s; local password creation and change will be REFUSED until it is repaired "
-            "(ASVS 6.2.4). Reinstall the messagefoundry wheel, or set [auth].password_check_breached "
-            "= false to accept unscreened passwords deliberately",
+            "(ASVS 6.2.4). On a first `serve` against an empty store the engine still creates the "
+            "bootstrap admin, which must change its password before it can do anything else, and "
+            "that change is screened by this same corpus, so it would be refused too. Act before "
+            "the first sign-in: reinstall the messagefoundry wheel, or set "
+            "[auth].password_check_breached = false to accept unscreened passwords deliberately",
             exc,
         )
         return
