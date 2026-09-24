@@ -15,6 +15,10 @@ All notable changes to MessageFoundry are documented here. The format follows
   the `id_token` `exp`, and the configured session caps. **A deploying site whose IdP does not return
   `auth_time` would have every federated sign-in refused**; that is spec-correct and deliberate.
   Federation still ships off (`oidc_enabled = false`). ([BACKLOG #296](docs/BACKLOG.md))
+- **The OIDC token endpoint and JWKS legs now carry the posture-keyed revocation guard (BACKLOG
+  #1887, ADR 0173 section 4.3).** Each leg is guarded on its own host. An enforcing instance whose
+  off-box identity provider has no `[auth].oidc_tls_crl_file` would refuse to start on first
+  deployment.
 ### Changed
 - **`messagefoundry dryrun` and `messagefoundry check` now refuse an oversized fixture file.** The
   cap is `MAX_FIXTURE_FILE_BYTES`, which defaults to `DEFAULT_MAX_MESSAGE_BYTES` (16 MiB) and rises
