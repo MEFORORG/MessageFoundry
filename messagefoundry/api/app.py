@@ -419,6 +419,10 @@ _NO_STORE_ROUTE_PATHS = frozenset(
         "/alerts/{alert_id}/resolve",
         "/alerts/{alert_id}/suspend",
         "/alerts/{alert_id}/resume",
+        # Not a PL-rated column: the static-credential inventory (BACKLOG #1182) names every backend
+        # hop on a weak credential and its peer, a map worth keeping out of a browser or proxy cache.
+        # Set here, not in the route, because the web console calls the route's handler directly.
+        "/security/posture",
     }
 )
 _log = logging.getLogger(__name__)
@@ -1910,7 +1914,6 @@ def create_app(
     @app.get("/security/posture", response_model=SecurityPosture)
     async def security_posture(
         request: Request,
-        response: Response,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require(Permission.MONITORING_READ)),
     ) -> SecurityPosture:
@@ -2028,10 +2031,6 @@ def create_app(
             if unseen
             else STATIC_CREDENTIAL_HOPS_COMPLETE
         )
-        # The inventory names every weak backend hop and its peer, which is a map worth not leaving in
-        # a browser or proxy cache. Set per route, as auth_routes._no_store does for a token-bearing
-        # reply, because no _NO_STORE_PREFIXES family reaches /security.
-        response.headers["Cache-Control"] = "no-store"
         store_privilege_view = (
             StorePrivilegeView(status=STORE_PRIVILEGE_NOT_PROBED)
             if store_privilege is None
