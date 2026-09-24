@@ -41,16 +41,19 @@ from scripts.asvs.scorecard import (
     _humanise_age,
     _signature,
     anchor_form,
+    audit_reviewers,
     base_spread,
     check_absences,
     check_anchors,
     check_completeness,
     check_pinning,
+    check_reviewers,
     corpus_digest,
     count,
     derive_sym_ctx,
     form_summary,
     load_corpus,
+    load_reviewer_exceptions,
     load_scorecard,
     main,
     malformed_sym_ctx,
@@ -77,6 +80,11 @@ def _scorecard_file(tmp_path: Path, body: str) -> Path:
     p = tmp_path / "asvs-scorecard.toml"
     p.write_text(body, encoding="utf-8")
     return p
+
+
+#: A graded cell fed to `verify` must record a reviewer, or `check_reviewers` refuses it (BACKLOG
+#: #1889). Fixtures about something else carry this line so that refusal stays out of their way.
+_FIXTURE_REVIEWER = 'reviewed_by = "fixture"\n'
 
 
 def _cells(*specs: tuple[str, int, str]) -> list[Cell]:
@@ -216,7 +224,8 @@ def test_the_gate_summary_line_prints_all_six_states_and_states_a_total_they_sum
         tmp_path,
         f'[scorecard]\nasvs_version = "5.0.0"\ncorpus_sha256 = "{corpus_digest(corpus)}"\n'
         '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "pass"\n'
-        "  [[cell.evidence]]\n"
+        + _FIXTURE_REVIEWER
+        + "  [[cell.evidence]]\n"
         '  path = "messagefoundry/m.py"\n  line = 1\n  expect = "SIZE = 64"\n'
         '[[cell]]\nid = "1.1.2"\nlevel = 1\nverdict = "needs-review"\n'
         '[[cell]]\nid = "2.1.1"\nlevel = 1\nverdict = "unverified"\n',
@@ -939,6 +948,7 @@ id = "1.1.1"
 level = 1
 verdict = "pass"
 last_verified = "2026-08-01"
+reviewed_by = "fixture"
 [[cell.evidence]]
 path = "messagefoundry/m.py"
 line = 1
@@ -954,6 +964,7 @@ id = "2.1.1"
 level = 3
 verdict = "partial"
 residual = "ships off"
+reviewed_by = "fixture"
 [[cell.evidence]]
 path = "messagefoundry/m.py"
 line = 1
@@ -1928,7 +1939,8 @@ def test_main_summary_says_RESOLVED_not_VERIFIED_and_carries_the_form_split(
         tmp_path,
         f'[scorecard]\nasvs_version = "5.0.0"\ncorpus_sha256 = "{corpus_digest(corpus)}"\n'
         '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "pass"\n'
-        "  [[cell.evidence]]\n"
+        + _FIXTURE_REVIEWER
+        + "  [[cell.evidence]]\n"
         '  path = "messagefoundry/m.py"\n  line = 3\n  expect = "SIZE = 64"\n'
         "  [[cell.evidence]]\n"
         '  path = "messagefoundry/m.py"\n  line = 1\n  expect = "Prose about the gate"\n',
@@ -2283,6 +2295,238 @@ def test_status_names_what_it_did_NOT_check() -> None:
     assert "NOT CHECKED here" in text
     assert "whether any anchor still resolves" in text
     assert "run verify" in text
+
+
+# --- reviewed_by: three states, reported by --status and refused by verify (BACKLOG #1889) ------
+#
+# Each state is driven through the LOADER from TOML text, not by constructing a Cell, because the
+# defect was in the loader: `raw.get("reviewed_by", "")` turned an absent key into a blank one before
+# any classifier could see the difference.
+#
+# Every id here is synthetic. Real cell ids paired with a gap are vaulted content (CLAUDE.md
+# section 12), which is also why the exception list lives in the record and not in this module.
+
+_REVIEWER_CELL = '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "pass"\n'
+
+
+def _one_loaded(tmp_path: Path, extra: str) -> Cell:
+    (cell,) = load_scorecard(_scorecard_file(tmp_path, _REVIEWER_CELL + extra))
+    return cell
+
+
+def test_reviewer_state_absent_when_the_key_is_missing(tmp_path: Path) -> None:
+    cell = _one_loaded(tmp_path, "")
+    assert cell.reviewed_by is None
+    assert cell.reviewer_state == "absent"
+
+
+@pytest.mark.parametrize("value", ["", "   "])
+def test_reviewer_state_blank_when_the_key_is_present_but_empty(tmp_path: Path, value: str) -> None:
+    """The arm a truthiness filter destroys: it would call this cell absent."""
+    cell = _one_loaded(tmp_path, f'reviewed_by = "{value}"\n')
+    assert cell.reviewed_by == value
+    assert cell.reviewer_state == "blank"
+
+
+def test_reviewer_state_present_when_the_key_carries_a_value(tmp_path: Path) -> None:
+    cell = _one_loaded(tmp_path, 'reviewed_by = "a named pass"\n')
+    assert cell.reviewer_state == "present"
+
+
+@pytest.mark.parametrize("value", ["false", "0", "[]", "{}"])
+def test_a_non_string_reviewed_by_is_refused_at_load(tmp_path: Path, value: str) -> None:
+    """`str(false)` is "False", which would read as a named reviewer and pass the gate."""
+    with pytest.raises(ScorecardError, match="`reviewed_by` must be a string"):
+        _one_loaded(tmp_path, f"reviewed_by = {value}\n")
+
+
+def test_status_reports_graded_cells_with_no_recorded_reviewer_by_state(tmp_path: Path) -> None:
+    """Counts graded cells only, splits absent from blank, and names every id.
+
+    `needs-review` and `unverified` cells with no reviewer are deliberately excluded: they carry no
+    verdict, so they are outside the population the score counts. The ids are listed in numeric
+    order, so 10.2.1 must follow 2.1.1 rather than precede it as a string sort would.
+    """
+    body = "".join(
+        f'[[cell]]\nid = "{cid}"\nlevel = 1\nverdict = "{verdict}"\n{extra}'
+        for cid, verdict, extra in (
+            ("10.2.1", "partial", ""),
+            ("2.1.1", "partial", ""),
+            ("1.1.1", "pass", 'reviewed_by = "a pass"\n'),
+            ("1.1.2", "fail", 'reviewed_by = " "\n'),
+            ("1.1.3", "needs-review", ""),
+            ("1.1.4", "unverified", ""),
+        )
+    )
+    cells = load_scorecard(_scorecard_file(tmp_path, body))
+    text = "\n".join(status_lines(cells))
+    assert (
+        "reviewer 3 of 4 graded cells record no reviewer: "
+        "2 with no reviewed_by key (2.1.1, 10.2.1), 1 with it blank (1.1.2). "
+        "Unrecorded is not unreviewed" in text
+    ), text
+
+
+def test_status_prints_the_reviewer_line_when_nothing_is_missing() -> None:
+    """A zero must print, so 'none missing' and 'the line was dropped' cannot look alike."""
+    text = "\n".join(status_lines([Cell(id="1.1.1", level=1, verdict="pass", reviewed_by="x")]))
+    assert "reviewer 0 of 1 graded cells record no reviewer: 0 with no reviewed_by key, " in text
+    assert "0 with it blank." in text
+    assert "0 verify would refuse" in text
+
+
+def _graded(cid: str, **kw: Any) -> Cell:
+    return Cell(id=cid, level=1, verdict="partial", **kw)
+
+
+def _closed(cid: str, **kw: Any) -> Cell:
+    return _graded(cid, decision_closed=True, decision_closed_by="owner", **kw)
+
+
+@pytest.mark.parametrize(
+    ("kw", "state"),
+    [({}, "absent"), ({"reviewed_by": ""}, "blank"), ({"reviewed_by": " "}, "blank")],
+)
+def test_check_reviewers_refuses_a_graded_cell_with_no_recorded_reviewer(
+    kw: dict[str, str], state: str
+) -> None:
+    findings = Findings()
+    check_reviewers([_graded("1.1.1", **kw)], findings, exceptions={})
+    assert len(findings.problems) == 1, findings.problems
+    assert findings.problems[0].startswith(
+        f"1.1.1: graded cell records no reviewer (reviewed_by {state})"
+    )
+    assert not findings.advisories
+
+
+def test_check_reviewers_ignores_ungraded_cells_and_passes_a_recorded_reviewer() -> None:
+    """Negative control for the refusal above: same classifier, cells it must NOT refuse."""
+    findings = Findings()
+    cells = [
+        _graded("1.1.1", reviewed_by="a pass"),
+        Cell(id="1.1.2", level=1, verdict="needs-review"),
+        Cell(id="1.1.3", level=1, verdict="unverified"),
+    ]
+    check_reviewers(cells, findings, exceptions={})
+    assert findings.ok and not findings.advisories
+
+
+def test_check_reviewers_passes_a_cell_on_the_exception_list() -> None:
+    findings = Findings()
+    check_reviewers([_graded("1.1.1")], findings, exceptions={"1.1.1": "known provenance"})
+    assert findings.ok and not findings.advisories
+    assert audit_reviewers([_graded("1.1.1")], {"1.1.1": "x"}).by_exception == ("1.1.1",)
+
+
+def test_check_reviewers_passes_an_owner_closed_cell_whose_decision_closed_by_names_the_grader() -> (
+    None
+):
+    """No reviewed_by, but the owner's closure records who settled it."""
+    cell = _closed("1.1.1", reviewed_by="")
+    findings = Findings()
+    check_reviewers([cell], findings, exceptions={})
+    assert findings.ok and not findings.advisories
+    assert audit_reviewers([cell], {}).by_decision == ("1.1.1",)
+
+
+def test_a_leftover_decision_closed_by_on_a_cell_that_is_not_closed_waives_nothing() -> None:
+    """A reopened cell can keep its old `decision_closed_by`. Without the closure it covers nothing."""
+    findings = Findings()
+    check_reviewers([_graded("1.1.1", decision_closed_by="owner")], findings, exceptions={})
+    assert len(findings.problems) == 1, findings.problems
+
+
+@pytest.mark.parametrize(
+    ("cells", "why"),
+    [
+        ([_graded("1.1.1", reviewed_by="a later pass")], "cell now records a reviewer"),
+        ([_closed("1.1.1")], "an owner closure already covers it"),
+        ([Cell(id="1.1.1", level=1, verdict="needs-review")], "cell is needs-review, not graded"),
+        ([], "no such cell in the record"),
+    ],
+)
+def test_a_stale_exception_entry_is_reported_and_not_fatal(cells: list[Cell], why: str) -> None:
+    """The list may only shrink. An honest re-score makes an entry stale; that must be SAID, and it
+    must not red the gate, because the re-score is the change that should land."""
+    findings = Findings()
+    check_reviewers(cells, findings, exceptions={"1.1.1": "known provenance"})
+    assert findings.ok, findings.problems
+    assert findings.advisory_kinds["reviewer"] == 1
+    assert f"1.1.1: [[reviewer_exception]] entry is stale ({why})" in findings.advisories[0]
+
+
+def test_the_exception_list_is_read_from_the_record(tmp_path: Path) -> None:
+    sc = _scorecard_file(
+        tmp_path,
+        _REVIEWER_CELL
+        + '[[reviewer_exception]]\nid = "1.1.1"\nprovenance = "graded at seed commit abc"\n',
+    )
+    assert load_reviewer_exceptions(sc) == {"1.1.1": "graded at seed commit abc"}
+    assert load_reviewer_exceptions(_scorecard_file(tmp_path, _REVIEWER_CELL)) == {}
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        '[[reviewer_exception]]\nid = "1.1.1"\n',
+        '[[reviewer_exception]]\nid = "1.1.1"\nprovenance = "  "\n',
+        '[[reviewer_exception]]\nprovenance = "graded at abc"\n',
+        '[[reviewer_exception]]\nid = "1.1.1"\nprovenance = "a"\n'
+        '[[reviewer_exception]]\nid = "1.1.1"\nprovenance = "b"\n',
+    ],
+)
+def test_a_malformed_exception_entry_fails_closed(tmp_path: Path, entries: str) -> None:
+    """An entry that names no cell, or says nothing about who graded it, must not waive a refusal."""
+    with pytest.raises(ScorecardError, match="reviewer_exception"):
+        load_reviewer_exceptions(_scorecard_file(tmp_path, _REVIEWER_CELL + entries))
+
+
+_ANCHOR = (
+    '  [[cell.evidence]]\n  path = "messagefoundry/m.py"\n  line = 1\n  expect = "SIZE = 64"\n'
+)
+
+
+def test_verify_exits_1_and_prints_FAIL_for_an_uncovered_cell(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """End to end through `main`: the refusal is a problem, so the gate goes red."""
+    sc, corpus, engine = _sibling_fixture(tmp_path, "SIZE = 64\n", _ANCHOR, reviewer="")
+    rc = main(["--scorecard", str(sc), "--corpus", str(corpus), "--root", str(engine)])
+    assert rc == 1
+    assert (
+        "FAIL 1.1.1: graded cell records no reviewer (reviewed_by absent)"
+        in capsys.readouterr().err
+    )
+
+
+def test_verify_passes_a_cell_the_record_lists_as_an_exception(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The same record plus one `[[reviewer_exception]]` entry: verify reads it and goes green."""
+    sc, corpus, engine = _sibling_fixture(
+        tmp_path,
+        "SIZE = 64\n",
+        _ANCHOR + '[[reviewer_exception]]\nid = "1.1.1"\nprovenance = "graded at seed abc"\n',
+        reviewer="",
+    )
+    rc = main(["--scorecard", str(sc), "--corpus", str(corpus), "--root", str(engine)])
+    assert rc == 0, capsys.readouterr().err
+
+
+def test_status_reports_coverage_and_what_verify_would_refuse() -> None:
+    cells = [
+        _graded("2.1.1"),
+        _closed("3.1.1"),
+        _graded("1.1.1", reviewed_by=""),
+        _graded("4.1.1", reviewed_by="a later pass"),
+    ]
+    exceptions = {"2.1.1": "graded at seed abc", "4.1.1": "graded at seed abc"}
+    text = "\n".join(status_lines(cells, exceptions))
+    assert (
+        "Covered: 1 by an owner closure (3.1.1), 1 by the record's [[reviewer_exception]] list "
+        "(2.1.1); 1 verify would refuse (1.1.1); "
+        "STALE exception entries, remove them: 4.1.1 (cell now records a reviewer)" in text
+    ), text
 
 
 def test_main_status_needs_no_corpus_and_prints_provenance_first(
@@ -2989,11 +3233,13 @@ def test_overdue_is_computed_not_asserted(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------------------------
 
 
-def _sibling_fixture(tmp_path: Path, module_body: str, cell_body: str) -> tuple[Path, Path, Path]:
+def _sibling_fixture(
+    tmp_path: Path, module_body: str, cell_body: str, *, reviewer: str = _FIXTURE_REVIEWER
+) -> tuple[Path, Path, Path]:
     """Record and engine tree as SIBLINGS, which is the production topology.
 
     The record lives in the vault; ``--root`` names a separate engine checkout. Returns
-    (scorecard, corpus, engine).
+    (scorecard, corpus, engine). ``reviewer=""`` leaves the cell's ``reviewed_by`` key out.
     """
     corpus = _corpus_file(tmp_path, {"1.1.1": 1})
     engine = tmp_path / "engine"
@@ -3002,7 +3248,7 @@ def _sibling_fixture(tmp_path: Path, module_body: str, cell_body: str) -> tuple[
     sc = _scorecard_file(
         tmp_path,
         f'[scorecard]\nasvs_version = "5.0.0"\ncorpus_sha256 = "{corpus_digest(corpus)}"\n'
-        '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "pass"\n' + cell_body,
+        '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "pass"\n' + reviewer + cell_body,
     )
     return sc, corpus, engine
 
@@ -3077,7 +3323,8 @@ def test_the_containment_guard_permits_the_shape_ci_actually_runs(tmp_path: Path
     sc.write_text(
         f'[scorecard]\nasvs_version = "5.0.0"\ncorpus_sha256 = "{corpus_digest(corpus)}"\n'
         '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "pass"\n'
-        '  [[cell.evidence]]\n  path = "messagefoundry/m.py"\n  line = 1\n  expect = "SIZE = 64"\n',
+        + _FIXTURE_REVIEWER
+        + '  [[cell.evidence]]\n  path = "messagefoundry/m.py"\n  line = 1\n  expect = "SIZE = 64"\n',
         encoding="utf-8",
     )
     assert main(["--scorecard", str(sc), "--corpus", str(corpus), "--root", str(engine)]) == 0
@@ -3367,7 +3614,8 @@ def test_the_rendered_file_is_LF_on_every_platform(tmp_path: Path) -> None:
         tmp_path,
         f'[scorecard]\nasvs_version = "5.0.0"\ncorpus_sha256 = "{corpus_digest(corpus)}"\n'
         '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "pass"\n'
-        "  [[cell.evidence]]\n"
+        + _FIXTURE_REVIEWER
+        + "  [[cell.evidence]]\n"
         '  path = "messagefoundry/m.py"\n  line = 1\n  expect = "SIZE = 64"\n',
     )
     out = tmp_path / "ASVS-CURRENT.md"

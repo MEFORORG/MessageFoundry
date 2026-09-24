@@ -31,11 +31,16 @@ import time
 import tokenize
 import tomllib
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final, Literal, get_args
 
 Verdict = Literal["pass", "partial", "fail", "na", "needs-review", "unverified"]
+
+#: The three states of a cell's ``reviewed_by``: the key is missing, the key is present but blank,
+#: or the key carries a value. See :attr:`Cell.reviewer_state`.
+ReviewerState = Literal["absent", "blank", "present"]
 
 #: What KIND of artifact an evidence anchor resolves INTO. Derived at check time from where the token
 #: lands, never authored: it is a property of the landing site, not a judgement about the cell.
@@ -314,7 +319,10 @@ class Cell:
     posture: str = "single"
     last_verified: str = ""
     verified_at: str = ""
-    reviewed_by: str = ""
+    #: ``None`` means the KEY is absent from the cell; ``""`` or whitespace means the key is present
+    #: but blank. The two used to arrive as one empty string, so the verifier could not tell them
+    #: apart. See :attr:`reviewer_state` (BACKLOG #1889).
+    reviewed_by: str | None = None
     #: Owner has closed this cell: it is excluded from surveys, sweeps and rescores, and the loader
     #: refuses it if the verdict has moved off the pin recorded alongside. Modelled on the Cell rather
     #: than left as loose TOML so the renderer can surface it — a closure nobody can see is one a pass
@@ -332,6 +340,21 @@ class Cell:
     def is_inherited(self) -> bool:
         """A verdict carried from an earlier assessment, never re-read against the requirement text."""
         return self.verdict == "unverified" or not self.last_verified
+
+    @property
+    def reviewer_state(self) -> ReviewerState:
+        """Whether the record names who reviewed this cell: key absent, key blank, or a value.
+
+        Classified on the STRUCTURAL fact, not on truthiness. A truthiness test folds absent and
+        blank into one bucket and reports the right total only while blank happens to be zero,
+        which is the state the live record was in when BACKLOG #1889 measured it.
+
+        **Absent or blank means the review is UNRECORDED, not that no review happened.** The record
+        cannot say which, and nothing that prints this state may word it as "unreviewed".
+        """
+        if self.reviewed_by is None:
+            return "absent"
+        return "present" if self.reviewed_by.strip() else "blank"
 
 
 @dataclass
@@ -361,7 +384,7 @@ class Findings:
     #: record the length and the line-drift count coincide, so no test over real data and no green CI
     #: run can tell them apart — the same shape as the anchor denominators, which agree at 2,090 only
     #: while GONE and AMBIGUOUS are both zero. Keys: ``line``, ``sym``, ``ctx``, ``unparseable``,
-    #: ``scratch``.
+    #: ``scratch``, ``reviewer`` (a stale exception entry, BACKLOG #1889).
     #:
     #: **Never append to :attr:`advisories` directly — call :meth:`advise`.** The counter and the list
     #: are two records of one event, and the pairing is what the summary divides by. Five call sites
@@ -473,6 +496,20 @@ def load_corpus(path: Path) -> dict[str, int]:
     raw: Any = json.loads(path.read_text(encoding="utf-8"))
     reqs = raw["requirements"] if isinstance(raw, dict) else raw
     return {str(r["req_id"]).lstrip("V"): int(r["L"]) for r in reqs}
+
+
+def _reviewed_by(raw: dict[str, Any]) -> str | None:
+    """``None`` for an absent key, else the string. A non-string is refused, because ``str(false)``
+    or ``str([])`` would read as a named reviewer and pass the reviewer gate (BACKLOG #1889)."""
+    if "reviewed_by" not in raw:
+        return None
+    value = raw["reviewed_by"]
+    if not isinstance(value, str):
+        raise ScorecardError(
+            f"cell {raw.get('id')!r}: `reviewed_by` must be a string naming who graded the cell, "
+            f"got {type(value).__name__} {value!r}"
+        )
+    return value
 
 
 def load_scorecard(path: Path) -> list[Cell]:
@@ -608,7 +645,9 @@ def load_scorecard(path: Path) -> list[Cell]:
                 decision_closed_by=str(raw.get("decision_closed_by", "")),
                 last_verified=str(raw.get("last_verified", "")),
                 verified_at=str(raw.get("verified_at", "")),
-                reviewed_by=str(raw.get("reviewed_by", "")),
+                # Membership, not `.get(..., "")`: TOML has no null, so `in` is the only way to keep
+                # an absent key distinguishable from a blank one (BACKLOG #1889).
+                reviewed_by=_reviewed_by(raw),
                 evidence=tuple(
                     Anchor(
                         path=str(e["path"]),
@@ -730,6 +769,138 @@ def check_completeness(cells: list[Cell], corpus: dict[str, int]) -> list[str]:
             f"which is what an unevidenced verdict actually is: {', '.join(unevidenced)}"
         )
     return problems
+
+
+def load_reviewer_exceptions(path: Path) -> dict[str, str]:
+    """The record's named list of graded cells allowed to carry NO recorded reviewer (BACKLOG #1889).
+
+    Each ``[[reviewer_exception]]`` entry names a cell ``id`` and its known ``provenance``: what git
+    history says about who graded it. Read from the RECORD, never written into this module: the
+    verifier is data-free (ADR 0156 section 7), and a list of cells with a gap is vaulted content.
+
+    The rule is a Manager decision under the owner's /driver delegation, 2026-09-23, after an
+    adversarial review. It is not an owner ruling.
+
+    **The list may only shrink.** Remove an entry in the same change that lands the cell's honest
+    re-score; :func:`check_reviewers` reports an entry the record no longer needs. **Never copy a
+    provenance string into ``reviewed_by``.** It is what history shows, not a record of a review.
+
+    An entry missing either field, or naming a cell twice, fails closed: a malformed exception must
+    not quietly waive a refusal.
+    """
+    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    out: dict[str, str] = {}
+    for e in data.get("reviewer_exception", []):
+        cid = e.get("id")
+        why = e.get("provenance")
+        if not (isinstance(cid, str) and cid.strip() and isinstance(why, str) and why.strip()):
+            raise ScorecardError(
+                f"reviewer_exception {e!r}: needs a non-blank string `id` and `provenance`. An "
+                "entry that says nothing about who graded the cell is a waiver, not an exception"
+            )
+        if cid in out:
+            raise ScorecardError(f"reviewer_exception {cid!r} is listed more than once")
+        out[cid] = why
+    return out
+
+
+@dataclass(frozen=True)
+class ReviewerAudit:
+    """Who-graded-it coverage over the graded cells. Every id tuple is in the record's numeric order.
+
+    ``absent`` and ``blank`` partition the graded cells with no recorded reviewer. Each of those is
+    then in exactly one of ``by_decision``, ``by_exception`` or ``refused``.
+    """
+
+    graded: int
+    absent: tuple[str, ...]
+    blank: tuple[str, ...]
+    by_decision: tuple[str, ...]
+    by_exception: tuple[str, ...]
+    refused: tuple[str, ...]
+    #: Exception entries the record no longer needs, as ``(id, why)``.
+    stale: tuple[tuple[str, str], ...]
+
+
+def audit_reviewers(cells: list[Cell], exceptions: Mapping[str, str]) -> ReviewerAudit:
+    """Classify every graded cell by whether the record says who graded it.
+
+    Graded means a :data:`DECIDED_VERDICTS` verdict, the population the score counts;
+    ``needs-review`` and ``unverified`` carry no verdict and are left out. A cell with no reviewer
+    is covered when the owner CLOSED it and ``decision_closed_by`` names who settled it, or when it
+    is in ``exceptions`` (see :func:`load_reviewer_exceptions`). Anything else is refused by
+    :func:`check_reviewers`.
+    """
+    # Sorted once here, so every id list below comes out in the record's numeric order.
+    graded = sorted(
+        (c for c in cells if c.verdict in DECIDED_VERDICTS), key=lambda c: _sort_key(c.id)
+    )
+    absent: list[str] = []
+    blank: list[str] = []
+    by_decision: list[str] = []
+    by_exception: list[str] = []
+    refused: list[str] = []
+    for c in graded:
+        state = c.reviewer_state
+        if state == "present":
+            continue
+        (absent if state == "absent" else blank).append(c.id)
+        # Closure AND a name: a decision_closed_by left behind on a reopened cell waives nothing.
+        if c.decision_closed and c.decision_closed_by.strip():
+            by_decision.append(c.id)
+        elif c.id in exceptions:
+            by_exception.append(c.id)
+        else:
+            refused.append(c.id)
+
+    # The list may only shrink, so an entry that prevents no refusal is reported rather than kept.
+    # "Has a reviewer" is the expected case: an honest re-score landed and the entry was not removed.
+    by_id = {c.id: c for c in cells}
+    stale: list[tuple[str, str]] = []
+    for cid in sorted(set(exceptions) - set(by_exception), key=_sort_key):
+        cell = by_id.get(cid)
+        if cell is None:
+            why = "no such cell in the record"
+        elif cell.verdict not in DECIDED_VERDICTS:
+            why = f"cell is {cell.verdict}, not graded"
+        elif cell.reviewer_state == "present":
+            why = "cell now records a reviewer"
+        else:
+            why = "an owner closure already covers it"
+        stale.append((cid, why))
+
+    return ReviewerAudit(
+        graded=len(graded),
+        absent=tuple(absent),
+        blank=tuple(blank),
+        by_decision=tuple(by_decision),
+        by_exception=tuple(by_exception),
+        refused=tuple(refused),
+        stale=tuple(stale),
+    )
+
+
+def check_reviewers(cells: list[Cell], findings: Findings, exceptions: Mapping[str, str]) -> None:
+    """Refuse a graded cell that records no reviewer and is not covered (BACKLOG #1889).
+
+    A refused cell is a PROBLEM, so verify exits 1. A stale exception entry is an ADVISORY: it is
+    printed and counted, and it does not red the gate, because the change that makes an entry stale
+    is an honest re-score, which must not fail for landing.
+    """
+    a = audit_reviewers(cells, exceptions)
+    for cid in a.refused:
+        state = "absent" if cid in a.absent else "blank"
+        findings.problems.append(
+            f"{cid}: graded cell records no reviewer (reviewed_by {state}), and neither "
+            "an owner closure nor a [[reviewer_exception]] entry covers it. Record who graded it, "
+            "from a real re-grade: unrecorded is not unreviewed, so never write a reconstructed "
+            "value, and the exception list only shrinks (BACKLOG #1889)"
+        )
+    for cid, why in a.stale:
+        findings.advise(
+            "reviewer",
+            f"{cid}: [[reviewer_exception]] entry is stale ({why}); remove it, the list only shrinks",
+        )
 
 
 #: Suffixes this module will submit to Python structural analysis. Everything else is ``foreign`` by
@@ -1771,6 +1942,7 @@ def verify(scorecard: Path, corpus: Path, root: Path) -> Findings:
     cells = load_scorecard(scorecard)
     findings.problems.extend(check_pinning(scorecard, corpus))
     findings.problems.extend(check_completeness(cells, load_corpus(corpus)))
+    check_reviewers(cells, findings, load_reviewer_exceptions(scorecard))
     check_anchors(cells, root, findings)
     check_absences(cells, root, findings)
     return findings
@@ -2276,7 +2448,37 @@ def provenance_from(sc: RepoStamp, en: RepoStamp, *, label: str) -> list[str]:
     ]
 
 
-def status_lines(cells: list[Cell]) -> list[str]:
+def reviewer_line(cells: list[Cell], exceptions: Mapping[str, str]) -> str:
+    """How many GRADED cells carry no recorded reviewer, split by absent key and blank value, and
+    how many of those the gate covers or would refuse. See :func:`audit_reviewers`.
+
+    The line is printed even when every count is zero, so "none missing" and "the line was dropped"
+    cannot look alike. Every id is named, uncapped, because a truncated list reads as a complete one.
+    """
+    a = audit_reviewers(cells, exceptions)
+
+    def named(ids: tuple[str, ...]) -> str:
+        return f" ({', '.join(ids)})" if ids else ""
+
+    line = (
+        f"reviewer {len(a.absent) + len(a.blank)} of {a.graded} graded cells record no reviewer: "
+        f"{len(a.absent)} with no reviewed_by key{named(a.absent)}, "
+        f"{len(a.blank)} with it blank{named(a.blank)}. "
+        "Unrecorded is not unreviewed; the record cannot say which. "
+        f"Covered: {len(a.by_decision)} by an owner closure{named(a.by_decision)}, "
+        f"{len(a.by_exception)} by the record's [[reviewer_exception]] list{named(a.by_exception)}; "
+        f"{len(a.refused)} verify would refuse{named(a.refused)}"
+    )
+    if a.stale:
+        line += "; STALE exception entries, remove them: " + ", ".join(
+            f"{cid} ({why})" for cid, why in a.stale
+        )
+    return line
+
+
+def status_lines(
+    cells: list[Cell], reviewer_exceptions: Mapping[str, str] | None = None
+) -> list[str]:
     """``--status`` proper: what the scorecard SAYS, computed on every call and cached nowhere.
 
     Nothing here is persisted, because a cached query result would be document number 69 in a corpus
@@ -2323,6 +2525,7 @@ def status_lines(cells: list[Cell]) -> list[str]:
         blocker_line,
         f"examined {examined} of {total} ({pct:.1f}%) against the pinned text; "
         f"{inherited} decided with no last_verified; {closed} closed by owner decision",
+        reviewer_line(cells, reviewer_exceptions or {}),
         f"evidence {anchors} anchors in {anchored_cells} cells over {len(paths)} paths; "
         f"{unevidenced} decided cells carry neither an anchor nor an absence claim",
         f"absence {absences} claims, {provable} of them carrying an observable "
@@ -2421,11 +2624,12 @@ def _run_status(scorecard: Path, root: Path) -> int:
         print(line)
     try:
         cells = load_scorecard(scorecard)
+        exceptions = load_reviewer_exceptions(scorecard)
     except ScorecardError as exc:
         # The provenance header is already out, so even this failure is attributable to a ref.
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    for line in status_lines(cells):
+    for line in status_lines(cells, exceptions):
         print(line)
     return 0
 
