@@ -5505,6 +5505,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
     async def run() -> tuple[int, ResealResult, tuple[bool, str]]:
         import datetime
 
+        from messagefoundry.pipeline.secret_rotation import fingerprints_equal
         from messagefoundry.store.store import SecretRotationMetaStore
 
         store = await open_store(settings.store)
@@ -5534,12 +5535,18 @@ def _rotate_key(args: argparse.Namespace) -> int:
                     today = datetime.datetime.now(tz=datetime.UTC).date().isoformat()
                     meta = await store.get_secret_rotation_meta()
                     prior = meta.get("MEFOR_STORE_ENCRYPTION_KEY")
-                    await store.upsert_secret_rotation_meta(
-                        "MEFOR_STORE_ENCRYPTION_KEY",
-                        fingerprint=key_id,
-                        tracked_since=prior.tracked_since if prior is not None else today,
-                        last_rotated=today,
-                    )
+                    # Stamp only a key that CHANGED. BACKLOG #1169 made rotate-key the fix for
+                    # plaintext uploads, which an operator runs with the SAME key; stamping then
+                    # would reset the key-age clock for a key that was never rotated.
+                    # Compared as the rotation watcher compares this same field (ASVS 11.2.4,
+                    # BACKLOG #1167): constant-time, over its byte form, never a bare `!=`.
+                    if prior is None or not fingerprints_equal(prior.fingerprint, key_id):
+                        await store.upsert_secret_rotation_meta(
+                            "MEFOR_STORE_ENCRYPTION_KEY",
+                            fingerprint=key_id,
+                            tracked_since=prior.tracked_since if prior is not None else today,
+                            last_rotated=today,
+                        )
             # BACKLOG #1904: the audit chain is the third surface the key covers. Its rows are never
             # re-MAC'd (the off-box tee and every recorded anchor hold those values); instead the chain
             # gets a range under the NEW key, whose first row commits to a digest of the old range, so
@@ -5574,6 +5581,15 @@ def _rotate_key(args: argparse.Namespace) -> int:
     # "OK:" only when the whole rotation, audit chain included, is done: a wrapper reading stdout must
     # not see OK and drop the retired key while the audit roll failed (BACKLOG #1904).
     print(f"OK: {done}" if rolled_ok else f"PARTIAL: {done}")
+    if uploads.sealed_plaintext:
+        # BACKLOG #1169: these were plaintext uploads that a keyed store refused on read until now.
+        # Sealing makes them readable, and it would seal a planted file just the same, so say how
+        # many. The operator can check this against the count `serve` logged at startup.
+        print(
+            f"note: sealed {uploads.sealed_plaintext} plaintext uploaded file(s) under the active "
+            "key. If serve logged a count of plaintext uploads at startup, check this number against "
+            "it; an extra one may be a file that did not come through the engine."
+        )
     if uploads.skipped:
         # Say it plainly and on stderr: a skipped file is STILL under the old key, so retiring that
         # key now destroys it. This is the one outcome where "OK" alone would mislead.

@@ -356,6 +356,7 @@ from messagefoundry.uploads import (
     UploadRetentionRunner,
     UploadStore,
     UploadTooLargeError,
+    UploadUnreadableError,
     browse_messages,
     sanitize_filename,
     split_uploaded,
@@ -4517,6 +4518,18 @@ def create_app(
             return True
         return bool(meta.uploader_id) and meta.uploader_id == identity.user_id
 
+    # BACKLOG #1169: the store cipher refused the file. On a keyed store that is usually a plaintext
+    # upload stored before the key was enabled, which `rotate-key` seals (owner ruling 2026-09-23); it
+    # can also be a file under a key that is no longer configured. 423 Locked says the file exists and
+    # needs an operator, where an unhandled CipherError answered 500. It is not 409, which the resend
+    # route already spends on "inbound not running" and the web console maps to that text. No file
+    # detail is in the body.
+    _UPLOAD_UNREADABLE_STATUS = 423
+    _UPLOAD_UNREADABLE = (
+        "this uploaded file cannot be read under the configured store key; if it was stored before "
+        "the key was enabled, an operator must run 'messagefoundry rotate-key' to seal it"
+    )
+
     async def _authorized_upload_meta(
         request: Request, engine: Engine, us: UploadStore, identity: Identity, file_id: str, op: str
     ) -> UploadedFileMeta:
@@ -4537,6 +4550,13 @@ def create_app(
         try:
             meta = await us.get_meta(file_id)
         except (UploadPathError, UploadNotFoundError):
+            raise HTTPException(404, "no such uploaded file") from None
+        except UploadUnreadableError:
+            # The owner cannot be read, so ownership cannot be checked. Keep the 404 contract above
+            # for everyone but an override holder, who may see any file anyway and is the one who
+            # can act on it; the refused sidecar is not an existence oracle for anyone else.
+            if identity.has(Permission.FILES_ACCESS_ANY):
+                raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
             raise HTTPException(404, "no such uploaded file") from None
         if not _may_access_upload(identity, meta):
             await engine.store.record_audit(
@@ -4811,6 +4831,8 @@ def create_app(
             data = await us.read_bytes(file_id)
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
+        except UploadUnreadableError:
+            raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
         result = await asyncio.to_thread(
             browse_messages,
             data,
@@ -4958,6 +4980,8 @@ def create_app(
             data = await us.read_bytes(file_id)
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
+        except UploadUnreadableError:
+            raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
         parts = await asyncio.to_thread(split_uploaded, data)
         if body.index >= len(parts):
             raise HTTPException(
@@ -5020,6 +5044,8 @@ def create_app(
             meta = await us.delete(file_id)
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
+        except UploadUnreadableError:
+            raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
         await engine.store.record_audit(
             "upload.delete",
             actor=identity.username,
@@ -7205,6 +7231,11 @@ def create_managed_app(
             # callback closes over the opened store so the leaf uploads module never imports it.
             _upload_store: UploadStore | None = getattr(app.state, "upload_store", None)
             if _upload_store is not None:
+                # BACKLOG #1169, owner ruling 2026-09-23: a keyed store refuses a plaintext upload
+                # until `rotate-key` seals it, and a refused file just drops out of the listing. Say
+                # how many are waiting (the count only, never a filename) so the operator knows to
+                # run it. Counting reads a few bytes per file; the engine never seals them here.
+                await _upload_store.warn_if_unsealed()
 
                 async def _audit_upload_prune(meta: UploadedFileMeta) -> None:
                     # BACKLOG #1224: the retention runner has no operator and no request behind it, so
