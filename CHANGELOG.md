@@ -6,6 +6,21 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+### Security
+- **BREAKING — every TLS context the engine builds now defaults to the approved AEAD TLS 1.2
+  suites, MLLP and DICOM included, and the engine's own signing key must be RSA-3072 or larger.**
+  A CBC-only TLS 1.2 peer that connected on 0.4.0 would now fail the handshake. For MLLP and DICOM
+  the owner ruled on 2026-09-23 to drop the six CBC-SHA2 suites with no peer census. There is no
+  override setting: a legacy CBC-only peer is served only by a reviewed code change to
+  `_APPROVED_TLS_SUITES`. TLS 1.3 is unaffected, and the IDE client pins the same suite list.
+  [ADR 0188](docs/adr/0188-per-connection-tls-ciphers-on-the-mllp-and-dicom-connectors.md) is
+  amended with a per-hop table. Separately, `transports/signing.py` now refuses an RSA signing key
+  below 3072 bits, for outbound detached-JWS signing and the SMART `client_assertion`; 0.4.0
+  accepted 2048. Counterparty keys, such as an IdP's JWKS key and the `Direct()` signer, keep the
+  2048-bit floor. **Migration:** generate an RSA key of at least 3072 bits, or an EC key for
+  ES256 / ES384, and register its public half with the counterparty.
+  ([BACKLOG #300](docs/BACKLOG.md))
+
 ## [0.4.0] — 2026-09-23 — Early Access
 
 This section lists every breaking change since 0.3.2, each marked BREAKING, and summarizes the
