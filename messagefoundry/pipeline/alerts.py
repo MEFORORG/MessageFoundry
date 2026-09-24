@@ -170,11 +170,14 @@ class AlertSink(Protocol):
     ) -> None:
         """An **admin-issued temporary password** (a create-user or reset credential, still
         ``must_change_password``) is UNCLAIMED and near the instant the login gate stops accepting it
-        (ASVS 6.4.5, BACKLOG #1141). ``name`` is the holder's USERNAME; ``expires_at`` is the ISO
-        instant; ``hours_remaining`` is the whole hours left (``0`` in the final hour).
+        (ASVS 6.4.5, BACKLOG #1141). ``name`` is ``user:<holder's username>``, prefixed so a rule's
+        connection glob cannot mistake an account for a connection; ``expires_at`` is the ISO instant;
+        ``hours_remaining`` is the whole hours left (``0`` in the final hour).
 
         The engine cannot reach the holder of a credential it handed to an administrator, so this goes
-        to the operator: re-send the password, or reset it again once it lapses. Carries **only** the
+        to the operator: tell the holder, or, if the credential lapses unclaimed, reset it again. The
+        alert does not resolve itself when the holder claims it, so check the account before a
+        reset. Carries **only** the
         username, the deadline and the hours: never the password, and no message content (no PHI).
         Emitted once per credential per process by the API-lifespan reminder task. Dedicated (not
         reusing :meth:`bootstrap_admin_expiring`) because that one retires with the bootstrap account

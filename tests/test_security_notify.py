@@ -218,6 +218,10 @@ def test_reset_body_states_the_deadline_in_the_api_surfaces_format() -> None:
     rendered = deadline_utc(stamp)
     assert rendered is not None
     assert f"The temporary password stops working at {rendered}." in body
+    # An administrator did the reset, so the generic "no action is needed" close would contradict
+    # the deadline line. The reset notice closes on its own sentence.
+    assert "no action is needed" not in body
+    assert "If you did not expect this reset" in body
 
 
 def test_reset_body_states_no_deadline_without_one() -> None:

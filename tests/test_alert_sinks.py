@@ -112,14 +112,17 @@ async def test_initial_credential_expiring_emits_phi_free_keyed_on_the_holder() 
     # and the alert instance key per account. The payload is the deadline and the hours only.
     t = _RecordingTransport("t")
     sink = NotifierAlertSink([t])
-    sink.initial_credential_expiring("alice", expires_at="2026-07-27T12:00:00Z", hours_remaining=5)
+    sink.initial_credential_expiring(
+        "user:alice", expires_at="2026-07-27T12:00:00Z", hours_remaining=5
+    )
     await _drain(sink)
     assert len(t.events) == 1
     ev = t.events[0]
     assert ev["type"] == "initial_credential_expiring"
-    assert ev["connection"] == "alice"
+    assert ev["connection"] == "user:alice"
     assert ev["expires_at"] == "2026-07-27T12:00:00Z"
     assert ev["hours_remaining"] == 5
+    assert "2026-07-27T12:00:00Z" in ev["reason"]  # the durable alert row carries the deadline
     assert not any(k in ev for k in ("password", "secret", "token"))
 
 

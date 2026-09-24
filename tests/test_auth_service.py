@@ -1888,3 +1888,31 @@ async def test_the_reset_notice_carries_no_deadline_when_the_expiry_setting_is_o
         assert "expires_at" not in notice.detail
     finally:
         await store.close()
+
+
+async def test_the_reset_notice_to_a_disabled_account_carries_no_deadline() -> None:
+    # The deadline line tells the holder to sign in before it, and a disabled account cannot sign
+    # in. The issuing administrator's return value still states the instant.
+    store = await _store()
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(
+            store, AuthSettings(initial_password_expiry_hours=72), security_notifier=notifier
+        )
+        await service.initialize()
+        await store.upsert_role(role_id="viewer", display_name="Viewer")
+        user_id = await service.create_local_user(
+            username="alice",
+            password="a-long-enough-original-passphrase",
+            display_name=None,
+            email=None,
+            roles=["viewer"],
+            actor="admin",
+        )
+        await store.set_user_disabled(user_id, disabled=True)
+        issued = await service.admin_reset_password(user_id, actor="admin")
+        notice = next(e for e in notifier.events if e.event_type == PASSWORD_RESET)
+        assert "expires_at" not in notice.detail
+        assert issued.expires_at is not None
+    finally:
+        await store.close()

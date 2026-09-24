@@ -6685,8 +6685,9 @@ async def _remind_expiring_initial_credentials(
 ) -> None:
     """One pass: alert once for each unclaimed admin-issued credential inside its warn window.
 
-    The deadline is :func:`pending_credential_deadline`, the function every other surface states and
-    the login gate's own test, so the reminder cannot name an instant the gate does not honour. That
+    The deadline is :func:`pending_credential_deadline`, the route-layer function the refusal and the
+    console pages read. It returns :meth:`AuthService.initial_credential_deadline` under the gate's
+    own ``must_change_password`` condition, so the reminder names the instant the gate refuses on. It
     also leaves out the never-claimed bootstrap account, which :func:`_bootstrap_expiry_reminder`
     covers against the EARLIER of its two bounds. A disabled account is skipped: it cannot sign in
     whatever the credential does.
@@ -6710,7 +6711,7 @@ async def _remind_expiring_initial_credentials(
         if expires is None:
             continue
         sink.initial_credential_expiring(
-            user.username,
+            f"user:{user.username}",
             expires_at=expires,
             hours_remaining=max(0, int((deadline - now) // 3600)),
         )
@@ -7109,11 +7110,11 @@ def create_managed_app(
         reaper: asyncio.Task[None] | None = None
         reconciler: asyncio.Task[None] | None = None
         bootstrap_reminder: asyncio.Task[None] | None = None
-        # BACKLOG #1141: hoisted with the five above, for the same teardown reason.
+        # BACKLOG #1141: hoisted with the others above, for the same teardown reason.
         credential_reminder: asyncio.Task[None] | None = None
         security_notifier = None
         # The teardown guards this ENTIRE span, not just the yield. Everything started below --
-        # the engine, both notifiers, the retention runner, the three tasks -- was otherwise
+        # the engine, both notifiers, the retention runner, the tasks -- was otherwise
         # abandoned in place on a startup failure. engine.stop() ends in store.close(), and
         # aiosqlite's connection worker is NON-DAEMON, so skipping it left the process unable to
         # exit: uvicorn refused correctly, printed 'Exiting.', and then hung forever.

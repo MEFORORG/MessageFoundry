@@ -95,7 +95,7 @@ async def test_the_reminder_names_the_instant_the_login_gate_refuses_at() -> Non
             service, sink, lead=24 * _HOUR, warned={}, now=time.time()
         )
         assert sink.events == [
-            {"name": "alice", "expires_at": deadline_utc(deadline), "hours_remaining": 1}
+            {"name": "user:alice", "expires_at": deadline_utc(deadline), "hours_remaining": 1}
         ]
 
         # Pin the stated instant against the gate: it works just before, and is refused just after.
@@ -121,7 +121,7 @@ async def test_nothing_before_the_window_and_nothing_at_the_deadline() -> None:
         await _remind_expiring_initial_credentials(
             service, sink, lead=lead, warned={}, now=deadline - lead
         )
-        assert [e["name"] for e in sink.events] == ["alice"]
+        assert [e["name"] for e in sink.events] == ["user:alice"]
     finally:
         await store.close()
 
@@ -139,14 +139,15 @@ async def test_one_reminder_per_credential_and_a_new_credential_is_reminded_agai
             )
         assert len(sink.events) == 1  # three passes inside the window, one reminder
 
-        # A second reset issues a new credential with a new deadline, so it is reminded about too.
-        await _shift_deadline_to(store, user_id, first - 10 * _HOUR)
+        # A real second reset issues a new credential with a new deadline, so it is reminded about too.
+        await service.admin_reset_password(user_id, actor="admin")
         second = await _deadline(store, service, user_id)
-        assert second != first
+        assert second > first
         await _remind_expiring_initial_credentials(
             service, sink, lead=24 * _HOUR, warned=warned, now=second - _HOUR
         )
-        assert [e["expires_at"] for e in sink.events] == [deadline_utc(first), deadline_utc(second)]
+        assert len(sink.events) == 2
+        assert sink.events[1]["expires_at"] == deadline_utc(second)
     finally:
         await store.close()
 
@@ -171,7 +172,7 @@ async def test_a_claimed_or_disabled_account_gets_no_reminder() -> None:
         )
         # Only erin. The never-claimed bootstrap "admin" is in the same window too, and is left to
         # its own reminder, which states the EARLIER of its two bounds.
-        assert [e["name"] for e in sink.events] == ["erin"]
+        assert [e["name"] for e in sink.events] == ["user:erin"]
     finally:
         await store.close()
 
@@ -198,7 +199,7 @@ async def test_the_task_reminds_on_its_first_pass_and_ends_at_once_when_off() ->
             await asyncio.sleep(0.01)
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
-        assert [e["name"] for e in sink.events] == ["alice"]
+        assert [e["name"] for e in sink.events] == ["user:alice"]
     finally:
         await store.close()
 

@@ -927,15 +927,17 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         self, name: str, *, expires_at: str, hours_remaining: int
     ) -> None:
         # ASVS 6.4.5 (BACKLOG #1141): an admin-issued temporary password is unclaimed and near its
-        # deadline. The holder's username stands in for "connection", the ad_session_revoked
-        # precedent, so the throttle and the alert instance key per account. The payload is the ISO
-        # deadline and whole hours remaining only: never the password, no PHI.
+        # deadline. `user:<username>` stands in for "connection", so the throttle and the alert
+        # instance key per account and no connection glob matches it. `reason` carries the deadline
+        # into the durable alert row. The payload is the ISO deadline and whole hours remaining only:
+        # never the password, no PHI.
         self._emit(
             {
                 "type": "initial_credential_expiring",
                 "connection": name,
                 "expires_at": expires_at,
                 "hours_remaining": hours_remaining,
+                "reason": f"unclaimed; stops working at {expires_at}",
             }
         )
 

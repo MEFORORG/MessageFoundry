@@ -150,10 +150,13 @@ def _build_body(event: SecurityEvent) -> str:
                 )
     if event.client_ip:
         lines.append(f"Source IP: {event.client_ip}")
-    lines += [
-        "",
-        "If this was you, no action is needed. If not, contact your MessageFoundry administrator.",
-    ]
+    if event.event_type == PASSWORD_RESET:
+        # An administrator did this, so "if this was you" cannot apply, and "no action is needed"
+        # would contradict the deadline line above it (BACKLOG #1141).
+        closing = "If you did not expect this reset, contact your MessageFoundry administrator."
+    else:
+        closing = "If this was you, no action is needed. If not, contact your MessageFoundry administrator."
+    lines += ["", closing]
     return "\n".join(lines)
 
 
