@@ -6,6 +6,14 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- **A new sign-in now ends the session it replaces.** A console sign-in by password,
+  Windows SSO or OIDC ends the session the browser already held, and the IDE revokes
+  the token a new sign-in replaces. The bearer `POST /auth/login` and
+  `/auth/negotiate` legs revoke nothing, because they return a token without
+  replacing one; ending the old token is the client's job there.
+  ([BACKLOG #1146](docs/BACKLOG.md))
+
 ## [0.4.0] — 2026-09-23 — Early Access
 
 This section lists every breaking change since 0.3.2, each marked BREAKING, and summarizes the
