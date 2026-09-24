@@ -305,6 +305,9 @@ def test_every_security_bool_at_its_insecure_value_is_reported() -> None:
         # loosening at either value; both are documented as such.
         "memory_encryption_operator_declared",
         "require_memory_encryption_declaration",
+        # BACKLOG #1182: the opt-in static-credential refusal TIGHTENS. Its opt-outs are what the
+        # registry names (as `static_credential_accepted`), and only while it is on.
+        "require_nonstatic_credentials",
         # ADR 0143: disabling the console SHRINKS attack surface — the opposite of a loosening.
         "serve_web_console",
         # The data-class lever has its own entry keyed on the derived posture, not a plain negation.

@@ -54,6 +54,8 @@ section reference.
 | | `require_mfa` | `true` |
 | | `allow_single_factor_admin_when_exposed` | `false` |
 | Alert transport | `allow_unverified_alert_smtp_tls` | `false` |
+| Backend credentials | `require_nonstatic_credentials` | `false` (*not* a loosening — it TIGHTENS, refusing backend hops on a static credential or none. Opt-in by owner decision, because several hops have no compliant kind in the product) |
+| | `static_credential_accepted` | `{}` (each opt-out is a loosening while `require_nonstatic_credentials` is on, and is reported as `static_credential_accepted`; with the refusal off an opt-out does nothing and is not reported) |
 | | `sign_out_after_idle_minutes` | `30` |
 | | `max_session_hours` | `12` |
 | Data handling | `block_unlisted_outbound` | `true` |

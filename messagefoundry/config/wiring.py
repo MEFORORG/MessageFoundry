@@ -4591,9 +4591,10 @@ def static_credential_db_hops(registry: Registry) -> list[tuple[str, str]]:
     than unchanging credentials. Nothing here refuses anything: a hop this function names may be
     entirely legitimate, and a site that has no managed-identity option on a given database has no
     compliant answer to move to. Read it as "which database hops present a static credential", never as
-    "which hops are misconfigured". A refusing gate is deliberately NOT built, because #1182 records
-    that a gate shipped before every hop has a reachable compliant credential kind collects an opt-out
-    on precisely the hops that made the requirement fail, which is theatre.
+    "which hops are misconfigured". It is the DATABASE ARM of the engine-wide reader,
+    :func:`messagefoundry.config.static_credentials.static_credential_hops`, which every surface calls
+    instead of this one; the opt-in refusal that reads the wide set is
+    ``[security].require_nonstatic_credentials``, off by default (owner decision 2026-09-23).
 
     **It walks FOUR tables, because there are four database-hop factories and the ledger named two.**
     ``Database()`` lands in ``outbound``; ``DatabasePoll()`` lands in ``inbound`` and crosses the same

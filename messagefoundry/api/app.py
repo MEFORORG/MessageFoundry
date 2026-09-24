@@ -39,6 +39,7 @@ import shutil
 import time
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
@@ -163,6 +164,7 @@ from messagefoundry.api.models import (
     SecurityLoosening,
     SecurityPosture,
     ServiceStatusInfo,
+    StaticCredentialHopView,
     StatsResetRequest,
     StatsResetResult,
     StatsResponse,
@@ -268,6 +270,7 @@ from messagefoundry.config.settings import (
     SecretsSettings,
     SecurityEnforcement,
     SecuritySettings,
+    ServiceSettings,
     ServiceStatusSettings,
     ShadowSettings,
     StoreBackend,
@@ -278,6 +281,7 @@ from messagefoundry.config.settings import (
     hop_posture_from_ai,
     security_loosenings,
 )
+from messagefoundry.config.static_credentials import static_credential_hops
 from messagefoundry.config.tls_policy import (
     fips_attestation,
     kex_groups_report,
@@ -1986,6 +1990,30 @@ def create_app(
                 store_privilege,
             )
         ]
+        # BACKLOG #1182: the static-credential inventory, through its single reader. The graph half is
+        # read live off the running graph, like the loosenings above; the settings half from the resolved
+        # service configuration `serve` stashed. Either may be missing, and the scope then says which.
+        cred_settings = getattr(request.app.state, "static_credential_settings", None)
+        # An opt-out is honoured only while the refusal is on; with it off every entry is inert, and
+        # reporting it as accepted would contradict security_loosenings(), which does not name it.
+        opt_outs = (
+            security.static_credential_accepted if security.require_nonstatic_credentials else {}
+        )
+        static_hops = [
+            StaticCredentialHopView(**asdict(hop), accepted=hop.name in opt_outs)
+            for hop in static_credential_hops(
+                registry=runner.registry if runner is not None else None, settings=cred_settings
+            )
+        ]
+        unseen = [
+            half
+            for half, missing in (
+                ("the connection graph (none is loaded)", runner is None),
+                ("the service settings (none were stashed by serve)", cred_settings is None),
+            )
+            if missing
+        ]
+        static_hops_scope = f"not read: {'; '.join(unseen)}" if unseen else None
         store_privilege_view = (
             StorePrivilegeView(status=STORE_PRIVILEGE_NOT_PROBED)
             if store_privilege is None
@@ -2039,6 +2067,8 @@ def create_app(
             loosenings=loosenings,
             loosenings_scope=loosenings_scope,
             store_privilege=store_privilege_view,
+            static_credential_hops=static_hops,
+            static_credential_hops_scope=static_hops_scope,
             fips_mode=fips_mode,  # interpreter ssl/_hashlib OpenSSL FIPS-provider state; None=undeterminable
             openssl_version=openssl_version,  # that OpenSSL's version string (public metadata)
             kex_groups=kex_groups,  # report-only: are the approved KEX groups pinned or inherited (#338)?
@@ -6715,6 +6745,8 @@ def create_managed_app(
     trusted_proxies: Sequence[str] = (),
     phi_read_hop_secure: bool = True,
     registry_filter: Callable[[Registry], Registry] | None = None,
+    registry_guard: Callable[[Registry], None] | None = None,
+    static_credential_settings: ServiceSettings | None = None,
     log_dir: str | None = None,
     configured_log_level: str | None = None,
     trust_anchor_specs: Sequence[AnchorSpec] = (),
@@ -6732,6 +6764,10 @@ def create_managed_app(
     ``registry_filter`` (L3 sharding) is an optional pure transform applied to the loaded graph at
     startup AND on every reload — ``serve --shard X`` passes ``filter_registry_for_shard(.., X)`` so
     this process owns only shard X's inbounds; ``None`` = the whole graph (unchanged default).
+    ``registry_guard`` refuses a graph by raising ``WiringError``; it runs on the first load and on
+    every reload (the opt-in static-credential gate, BACKLOG #1182). ``static_credential_settings`` is
+    the resolved service configuration ``GET /security/posture`` reads the static-credential
+    inventory's settings half from; ``None`` makes that route say it could not read it.
     """
     if store_settings is None:
         if db_path is None:
@@ -6986,13 +7022,28 @@ def create_managed_app(
             coordinator=coordinator,
             cluster_settings=cluster_settings,
             registry_filter=registry_filter,
+            registry_guard=registry_guard,
         )
         if config_dir is not None:
-            loaded = load_config(config_dir)
-            # L3 sharding: a `serve --shard X` process owns only shard X's inbounds (the filter is
-            # re-applied on every reload inside the engine). None = the whole graph (unchanged default).
-            if registry_filter is not None:
-                loaded = registry_filter(loaded)
+            # The first graph load, under the same teardown discipline as the preflights above: a
+            # refusal here (a bad config, the shard guard, or the BACKLOG #1182 static-credential
+            # guard) happens after the store and notifier are open and before the span below that
+            # tears them down, so they are closed here. Left open, aiosqlite's non-daemon worker keeps
+            # the process from exiting (#1257).
+            try:
+                loaded = load_config(config_dir)
+                # Before the shard filter, as the reload path does inside the engine: the guard judges
+                # the whole graph.
+                engine.guard_registry(loaded)
+                # L3 sharding: a `serve --shard X` process owns only shard X's inbounds (the filter is
+                # re-applied on every reload inside the engine). None = the whole graph.
+                if registry_filter is not None:
+                    loaded = registry_filter(loaded)
+            except BaseException:
+                if notifier is not None:
+                    await notifier.aclose()
+                await store.close()
+                raise
             engine.add_registry(loaded)
         # #1257: hoisted above the try because the finally below now guards STARTUP too, and it
         # reaches these names before it reaches engine.stop(). Left in place inside the span, a
@@ -7034,6 +7085,8 @@ def create_managed_app(
             app.state.trust_anchor_specs = tuple(trust_anchor_specs)
             app.state.trust_anchors_enforcing = trust_anchors_enforcing
             app.state.store_settings = resolved  # back GET /security/posture (M5)
+            # BACKLOG #1182: the settings half of the static-credential inventory, for the same route.
+            app.state.static_credential_settings = static_credential_settings
             app.state.alerts_settings = alerts_settings
             # #143: expose the running notifier so POST /alerts/{id}/suspend|resume can update its in-memory
             # suspend cache live (None here in a JSON-only/no-transport deployment — the durable store governs).

@@ -1210,6 +1210,24 @@ class StorePrivilegeView(BaseModel):
     detail: str = ""
 
 
+class StaticCredentialHopView(BaseModel):
+    """One backend hop that presents an unchanging credential or none (BACKLOG #1182, ASVS 13.2.1),
+    as ``config.static_credentials.static_credential_hops`` names it.
+
+    ``name`` is the key an operator opts the hop out with. ``credential`` is ``static`` or ``none``.
+    ``compliant_kind`` says whether the product offers ANY compliant credential kind for this hop; when
+    it is false no configuration clears the hop. ``accepted`` is true when the opt-in refusal is on and
+    ``[security].static_credential_accepted`` names the hop; with the refusal off no opt-out is
+    honoured, so it is false. ``detail`` names what the hop presents and
+    its peer, never a secret value."""
+
+    name: str
+    credential: str
+    compliant_kind: bool
+    accepted: bool
+    detail: str
+
+
 class SecurityPosture(BaseModel):
     """The instance's **effective** PHI-at-rest security posture (M5), behind the authenticated,
     permission-gated ``GET /security/posture`` route. Surfaces what protection is *actually* in effect
@@ -1259,6 +1277,13 @@ class SecurityPosture(BaseModel):
     store_privilege: StorePrivilegeView = Field(
         default_factory=lambda: StorePrivilegeView(status=STORE_PRIVILEGE_NOT_PROBED)
     )
+    # BACKLOG #1182 (ASVS 13.2.1): every backend hop that presents an unchanging credential or none.
+    # This is the INVENTORY, reported whether or not the opt-in refusal
+    # ([security].require_nonstatic_credentials, echoed in `security` above) is on. ``None`` scope = both
+    # halves were read; a string names the half this engine could not see (no loaded graph, or no
+    # resolved service configuration), so a partial list never reads as the whole.
+    static_credential_hops: list[StaticCredentialHopView] = Field(default_factory=list)
+    static_credential_hops_scope: str | None = None
     # `synthetic_relaxation` SAT HERE and is gone with the declaration it described (BACKLOG #1279).
     # It reported that the strict PHI controls were relaxed instance-wide. Every instance carries
     # patient data now, so there is no such state to report: a relaxed control is a per-gate switch and

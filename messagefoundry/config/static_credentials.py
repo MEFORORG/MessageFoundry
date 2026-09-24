@@ -57,25 +57,39 @@ both halves are set, a WS-Security UsernameToken only with ``ws_security`` on, a
 * A generic-ODBC database hop that sets no top-level ``username``/``password``: the credential, if
   any, sits under a driver keyword the engine cannot enumerate. See ``static_credential_db_hops``.
 
-Pure: every function here reads its arguments and touches nothing else. It never renders a secret
-value, only the NAME of the setting that holds one."""
+Pure apart from :func:`apply_static_credential_gate`, which also logs: every function reads its
+arguments and touches nothing else. None renders a secret value, only the NAME of the setting that
+holds one."""
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+import logging
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
 from messagefoundry.config.ai_policy import AiMode
 from messagefoundry.config.models import ConnectorType
-from messagefoundry.config.settings import ServiceSettings, SqlAuth, StoreBackend
-from messagefoundry.config.wiring import Registry, _peer_label, static_credential_db_hops
+from messagefoundry.config.settings import (
+    ServiceSettings,
+    SqlAuth,
+    StoreBackend,
+    SyslogProtocol,
+)
+from messagefoundry.config.wiring import (
+    Registry,
+    WiringError,
+    _peer_label,
+    static_credential_db_hops,
+)
 
 __all__ = [
     "SETTINGS_PREFIX",
     "StaticCredentialHop",
     "StaticCredentialVerdict",
+    "apply_static_credential_gate",
     "evaluate_static_credential_gate",
+    "make_static_credential_guard",
     "static_credential_hops",
 ]
 
@@ -107,6 +121,15 @@ class StaticCredentialHop:
 _HTTP_FAMILY = frozenset(
     {ConnectorType.REST, ConnectorType.FHIR, ConnectorType.SOAP, ConnectorType.DICOMWEB}
 )
+
+
+def _peer(settings: Mapping[str, Any]) -> str:
+    """``wiring._peer_label`` with any query string and fragment cut off.
+
+    The label already masks URL userinfo and renders an unresolved ``env()`` as its key. It keeps the
+    query, and a query can carry a credential (``?api_key=...``). This label reaches a startup refusal
+    and the reload log, so the query goes: the scheme, host and path are enough to name the peer."""
+    return _peer_label(settings).split("?", 1)[0].split("#", 1)[0]
 
 
 def _smart(settings: Mapping[str, Any]) -> bool:
@@ -191,7 +214,7 @@ def _proxy_hop(
     return StaticCredentialHop(
         f"proxy:{name}",
         "static",
-        f"forward-proxy {kind} credential ({_peer_label({'url': proxy_url})})",
+        f"forward-proxy {kind} credential ({_peer({'url': proxy_url})})",
         False,
     )
 
@@ -216,7 +239,7 @@ def _connection_hop(
     name: str, ctype: ConnectorType, settings: Mapping[str, Any]
 ) -> StaticCredentialHop | None:
     """Classify one dialled connection's own hop. DATABASE is not here: the database arm owns it."""
-    peer = _peer_label(settings)
+    peer = _peer(settings)
     if ctype in (ConnectorType.MLLP, ConnectorType.DIMSE):
         # The client certificate is loaded only into a TLS context; with tls off it is never sent.
         if settings.get("tls") and settings.get("tls_cert_file"):
@@ -278,9 +301,7 @@ def _graph_hops(registry: Registry, site_proxy: str | None) -> list[StaticCreden
             out.append(proxy)
     for lk in registry.fhir_lookups.values():
         name = f"fhir_lookup:{lk.name}"
-        hop = _http_hop(
-            name, ConnectorType.FHIR, lk.settings, _peer_label(lk.settings), lookup=True
-        )
+        hop = _http_hop(name, ConnectorType.FHIR, lk.settings, _peer(lk.settings), lookup=True)
         if hop is not None:
             out.append(hop)
         if proxy := _proxy_hop(name, lk.settings, site_proxy):
@@ -332,6 +353,14 @@ def _settings_hops(settings: ServiceSettings) -> list[StaticCredentialHop]:
         add("auth.ad_bind", "static", "LDAP SIMPLE bind with a static ad_bind_password", False)
     if auth.oidc_enabled:
         add("auth.oidc", "static", "OIDC token request with a static client_secret", False)
+    # The syslog/SIEM forwarder dials the collector. Only TLS with a client certificate authenticates
+    # the engine to it; UDP, TCP and server-only TLS present nothing.
+    log = settings.logging
+    if log.forward_enabled and log.forward_host:
+        protocol = log.forward_protocol
+        if not (protocol is SyslogProtocol.TLS and log.forward_tls_client_cert):
+            detail = f"syslog forwarder over {protocol.value}, no client certificate"
+            add("logging.forward", "none", detail, True)
     return out
 
 
@@ -401,3 +430,70 @@ def evaluate_static_credential_gate(
             refused.append(hop)
     unmatched = sorted(name for name in accepted if name not in seen and in_scope(name))
     return StaticCredentialVerdict(tuple(refused), tuple(taken), tuple(unmatched))
+
+
+def apply_static_credential_gate(
+    settings: ServiceSettings, *, registry: Registry | None, log: logging.Logger
+) -> str | None:
+    """Run the opt-in ``[security].require_nonstatic_credentials`` gate over one half of the set.
+
+    ``registry=None`` judges the settings half, which ``serve`` does before anything starts; a
+    registry judges that graph's hops only, which is what the registry guard does at every load.
+    Returns the refusal message when a hop in that half has no opt-out, else ``None``; the caller
+    refuses or warns on ``[security].enforcement``. Logs, at WARNING, one line per honoured opt-out
+    (hop name and the operator's reason: this is the startup audit of every opt-out) and one line per
+    opt-out that matches no hop in this half. Never logs a secret: a hop's detail names the setting,
+    not its value. Returns ``None`` without reading or logging anything when the gate is off."""
+    security = settings.security
+    if not security.require_nonstatic_credentials:
+        return None
+    verdict = evaluate_static_credential_gate(
+        static_credential_hops(registry=registry, settings=settings),
+        security.static_credential_accepted,
+        settings_half=registry is None,
+    )
+    for hop, reason in verdict.accepted:
+        log.warning(
+            "[security].static_credential_accepted: hop %s runs on a %s credential by opt-out "
+            "(compliant kind available: %s): %s",
+            hop.name,
+            hop.credential,
+            "yes" if hop.compliant_kind else "no",
+            reason,
+        )
+    for name in verdict.unmatched:
+        log.warning(
+            "[security].static_credential_accepted names %s, which is not a static-credential hop "
+            "of this instance; the opt-out does nothing",
+            name,
+        )
+    if not verdict.refused:
+        return None
+    listed = "; ".join(f"{hop.name} ({hop.detail})" for hop in verdict.refused)
+    return (
+        f"[security].require_nonstatic_credentials is set but {len(verdict.refused)} backend hop(s) "
+        f"present an unchanging credential or none, with no opt-out: {listed}. Move each to a "
+        "compliant credential kind where one exists, or name it in "
+        "[security].static_credential_accepted with the reason (see docs/SECURITY.md)"
+    )
+
+
+def make_static_credential_guard(
+    settings: ServiceSettings, *, enforcing: bool, log: logging.Logger
+) -> Callable[[Registry], None] | None:
+    """The engine registry guard for the graph half, or ``None`` when the gate is off.
+
+    It raises ``WiringError`` on a refused graph when ``enforcing`` (so a first load fails the start
+    and a ``/config/reload`` is refused with the running graph kept), and only warns otherwise."""
+    if not settings.security.require_nonstatic_credentials:
+        return None
+
+    def guard(registry: Registry) -> None:
+        reason = apply_static_credential_gate(settings, registry=registry, log=log)
+        if reason is None:
+            return
+        if enforcing:
+            raise WiringError(reason)
+        log.warning("%s", reason)
+
+    return guard

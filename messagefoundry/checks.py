@@ -230,10 +230,13 @@ def run_checks(
             service_config=service_config,
             suppress_search=suppress_service_toml_search,
         ),
-        # #1182 / ASVS 13.2.1: name every DATABASE hop on an unchanging credential. The store's own
-        # precondition is a StoreSettings method and reaches none of these. Advisory, and the refusing
-        # gate is deliberately deferred — see the check.
-        _check_static_db_credentials(config_dir),
+        # #1182 / ASVS 13.2.1: name every backend hop on an unchanging credential or none, graph and
+        # settings. Advisory; the opt-in refusal is [security].require_nonstatic_credentials at serve.
+        _check_static_credentials(
+            config_dir,
+            service_config=service_config,
+            suppress_search=suppress_service_toml_search,
+        ),
         # #323 layer 3: report whether the [alerts] SMTP hop authenticates the relay. The defect this
         # closes was invisible for exactly as long as nothing reported it. Advisory — see the check.
         _check_alert_smtp_tls(
@@ -1509,6 +1512,21 @@ def _check_dryrun(
     return CheckResult("dryrun", ok=True, required=True, detail=detail)
 
 
+def _resolve_service_toml(
+    config_dir: str | Path, *, service_config: str | Path | None, suppress_search: bool
+) -> Path | None:
+    """The ``messagefoundry.toml`` a check reads, by the ADR 0050 rules the other checks spell inline:
+    an explicit ``--service-config`` wins, ``--project-root`` confines the look to the config dir, and
+    otherwise the legacy upward walk runs. ``None`` when there is none. New checks call this; the older
+    inline copies are unchanged by BACKLOG #1182."""
+    if service_config is not None:
+        return Path(service_config) if Path(service_config).is_file() else None
+    if suppress_search:
+        candidate = Path(config_dir) / "messagefoundry.toml"
+        return candidate if candidate.is_file() else None
+    return _find_service_toml(config_dir)
+
+
 def _find_service_toml(config_dir: str | Path) -> Path | None:
     """Best-effort locate this instance's ``messagefoundry.toml`` for the posture check.
 
@@ -2045,65 +2063,97 @@ def _check_smart_scope(config_dir: str | Path) -> CheckResult:
     )
 
 
-def _check_static_db_credentials(config_dir: str | Path) -> CheckResult:
-    """Surface every declared DATABASE hop that authenticates with an unchanging credential
-    (BACKLOG #1182, ASVS 13.2.1), with its peer.
+def _check_static_credentials(
+    config_dir: str | Path,
+    *,
+    service_config: str | Path | None = None,
+    suppress_search: bool = False,
+) -> CheckResult:
+    """Surface every backend hop that presents an unchanging credential or none (BACKLOG #1182, ASVS
+    13.2.1), with whether a compliant credential kind exists for it and whether it is opted out.
 
-    ASVS 13.2.1 asks that backend component communications use individual service accounts, short-term
-    tokens or certificates rather than unchanging credentials. The engine has exactly one control on
-    that verb today — the opt-in ``[store].require_managed_identity`` — and it is a ``StoreSettings``
-    method, so it covers the store hop and, by construction, no connector, lookup or reference hop at
-    all. On a first deployment a site could run four database hops on static SQL logins with nothing
-    naming them, while the one flag whose name reads as the engine's database-credential posture
-    reported itself satisfied. This is that report.
+    ASVS 13.2.1 asks that backend component communications use individual service accounts,
+    short-term tokens or certificates rather than unchanging credentials. What counts as a hop, both
+    halves of the set and what is left out are in
+    :mod:`messagefoundry.config.static_credentials`; this check calls its single reader, the same one
+    the serve-time gate and ``GET /security/posture`` call.
 
-    **Advisory (``required=False``), and a refusing gate is deliberately NOT built here.** #1182 records
-    the reason and it is not timidity: a gate shipped before every hop has a reachable compliant
-    credential kind collects an opt-out on precisely the hops that made the requirement fail, so its
-    opt-out list becomes the static-credential inventory. The inventory has to exist and be trusted
-    first. Whether the delegated-identity precondition is then widened, and whether it is scoped per
-    backend, is an owner decision this check does not pre-empt.
+    **Advisory (``required=False``), and the refusal lives at serve.** The opt-in
+    ``[security].require_nonstatic_credentials`` refuses these hops at ``serve`` (owner decision
+    2026-09-23: opt-in, off by default). Blocking here would duplicate that refusal at the wrong
+    altitude and would block a commit on an instance that never turned it on. The line says whether
+    the gate is on, so a reader can tell "listed" from "would refuse".
 
-    **Reported is not gated**, on the standing rule ``docs/DEPLOYMENT.md`` carries for the sibling
-    connection-scoped advisories: naming a hop here changes no disposition anywhere.
+    It reads the graph and, when a ``messagefoundry.toml`` resolves (the ``alert-smtp-tls`` rules,
+    verbatim), the service settings. With no settings file it reports the graph half and SAYS so. It
+    states the clean case out loud, and SKIPs when the graph will not load."""
+    from pydantic import ValidationError
 
-    What it classifies, which table each hop lives in, and the one generic-ODBC case it deliberately
-    stays quiet on are in :func:`~messagefoundry.config.wiring.static_credential_db_hops`.
+    from messagefoundry.config.settings import SecurityEnforcement, ServiceSettings, load_settings
+    from messagefoundry.config.static_credentials import static_credential_hops
+    from messagefoundry.config.wiring import WiringError, load_config
 
-    It states the clean case out loud rather than going quiet, on the ``alert-smtp-tls`` convention, so
-    a passing line is never confused with a check that did not run. SKIPs when the graph will not load
-    — ``validate`` reports that, and a check that reported an empty set on an unloadable config would be
-    worse than one that says it could not look."""
-    from messagefoundry.config.wiring import WiringError, load_config, static_credential_db_hops
-
+    name = "static-credentials"
     try:
         registry = load_config(config_dir)
     except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
         return CheckResult(
-            "static-db-credentials",
-            ok=True,
-            required=False,
-            skipped=True,
-            detail=f"config did not load: {exc}",
+            name, ok=True, required=False, skipped=True, detail=f"config did not load: {exc}"
         )
-    hops = static_credential_db_hops(registry)
+    toml = _resolve_service_toml(
+        config_dir, service_config=service_config, suppress_search=suppress_search
+    )
+    settings: ServiceSettings | None = None
+    scope = "graph and service settings"
+    if toml is None:
+        scope = "graph only: no messagefoundry.toml, so the service-settings hops were not read"
+    else:
+        try:
+            settings = load_settings(config_path=toml)
+        except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
+            # Present-but-refused is a failure, not a skip (BACKLOG #1318, the alert-smtp-tls rule).
+            return CheckResult(
+                name, ok=False, required=False, detail=f"settings did not load: {exc}"
+            )
+    hops = static_credential_hops(registry=registry, settings=settings)
+    sec = settings.security if settings is not None else None
+    gate_on = sec is not None and sec.require_nonstatic_credentials
+    accepted = sec.static_credential_accepted if sec is not None and gate_on else {}
+    if sec is None:
+        gate = (
+            "whether [security].require_nonstatic_credentials is on is unknown: no settings file "
+            "was read"
+        )
+    elif not gate_on:
+        gate = "[security].require_nonstatic_credentials is off: nothing is refused"
+    elif sec.enforcement is SecurityEnforcement.ENFORCE:
+        gate = (
+            "[security].require_nonstatic_credentials is ON: serve refuses every hop below not "
+            "marked opted-out"
+        )
+    else:
+        gate = (
+            "[security].require_nonstatic_credentials is ON under enforcement = warn: serve warns "
+            "about every hop below not marked opted-out"
+        )
     if not hops:
         return CheckResult(
-            "static-db-credentials",
+            name,
             ok=True,
             required=False,
-            detail="no DATABASE hop authenticates with a static credential",
+            detail=f"no backend hop presents an unchanging credential or none ({scope}); {gate}",
         )
-    listed = "; ".join(f"{name}: {reason}" for name, reason in hops)
+    listed = "; ".join(
+        f"{hop.name}: {hop.credential} credential, {hop.detail}, compliant kind "
+        f"{'available' if hop.compliant_kind else 'NONE in the product'}"
+        + (" [opted out]" if hop.name in accepted else "")
+        for hop in hops
+    )
     return CheckResult(
-        "static-db-credentials",
+        name,
         ok=True,
         required=False,
-        detail=(
-            f"{len(hops)} DATABASE hop(s) authenticate with an unchanging credential — {listed}; "
-            "on SQL Server prefer auth='integrated' (gMSA) or auth='entra'. "
-            "[store].require_managed_identity does NOT cover these hops"
-        ),
+        detail=f"{len(hops)} backend hop(s) present an unchanging credential or none ({scope}) — {listed}; {gate}",
     )
 
 

@@ -1710,6 +1710,31 @@ def _serve(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
+    # Static-credential refusal (BACKLOG #1182, ASVS 13.2.1), OPT-IN and off by default (owner decision
+    # 2026-09-23). [security].require_nonstatic_credentials refuses every backend hop that presents an
+    # unchanging credential or none unless [security].static_credential_accepted names it. Two halves,
+    # one reader: the SETTINGS half ([store], [alerts], [auth], [ai], [secrets]) is checked here, before
+    # anything starts; the GRAPH half is checked by the registry guard below at the first graph load and
+    # on every /config/reload, because the graph is not loaded in this function (load_config executes
+    # operator code, so it is not run twice). Same refuse/warn split as require_managed_identity above.
+    # Each honoured opt-out is logged at WARNING, which the root lastResort handler surfaces before
+    # configure_logging runs, exactly as the egress AUDIT line below relies on.
+    from messagefoundry.config.static_credentials import (
+        apply_static_credential_gate,
+        make_static_credential_guard,
+    )
+
+    _credlog = logging.getLogger(__name__)
+    sc_reason = apply_static_credential_gate(settings, registry=None, log=_credlog)
+    if sc_reason is not None:
+        if enforcing:
+            print(f"error: {sc_reason}; refusing to start.", file=sys.stderr)
+            return 2
+        print(f"warning: {sc_reason}.", file=sys.stderr)
+    static_credential_guard = make_static_credential_guard(
+        settings, enforcing=enforcing, log=_credlog
+    )
+
     # PHI-at-rest posture (H3, OWASP *Fail Securely* / SDS §4.3 PW.9 secure-by-default): with no key
     # configured the instance REFUSES to start (fail-closed), in EVERY environment. It is not gated on
     # the environment label, and since BACKLOG #1279 it is not gated on a data class either: every
@@ -3455,6 +3480,8 @@ def _serve(args: argparse.Namespace) -> int:
         security_settings=settings.security,
         config_dir=config_dir,
         registry_filter=registry_filter,
+        registry_guard=static_credential_guard,
+        static_credential_settings=settings,
         config_reload_roots=settings.api.config_reload_roots,
         inbound_bind_host=settings.inbound.bind_host,
         allow_insecure_bind=insecure_bind_ok,

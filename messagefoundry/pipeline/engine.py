@@ -236,6 +236,7 @@ class Engine:
         coordinator: ClusterCoordinator | None = None,
         cluster_settings: ClusterSettings | None = None,
         registry_filter: Callable[[Registry], Registry] | None = None,
+        registry_guard: Callable[[Registry], None] | None = None,
         sandbox_settings: SandboxSettings | None = None,
         log_dir: str | None = None,
     ) -> None:
@@ -250,6 +251,11 @@ class Engine:
         # reload here — so a `serve --shard X` process keeps owning only shard X's inbounds across
         # reloads. None = identity (the whole graph, unchanged default).
         self._registry_filter = registry_filter
+        # An optional refusal over every graph this engine is about to run, called at the first load
+        # (by the managed app) and on every reload, dry runs included, before anything is swapped and
+        # before the shard filter, so it sees the whole graph. It raises WiringError to refuse. `serve` passes the opt-in
+        # [security].require_nonstatic_credentials gate here (BACKLOG #1182); None = no guard.
+        self._registry_guard = registry_guard
         # Cluster coordination seam (Track B Step 3). None → the no-op NullCoordinator, so single-node
         # (SQLite and single-node Postgres) is byte-identical: is_leader() is always True and
         # start()/stop() do nothing. A DbCoordinator (built by build_coordinator on an enabled [cluster]
@@ -561,6 +567,7 @@ class Engine:
         coordinator: ClusterCoordinator | None = None,
         cluster_settings: ClusterSettings | None = None,
         registry_filter: Callable[[Registry], Registry] | None = None,
+        registry_guard: Callable[[Registry], None] | None = None,
     ) -> Engine:
         """Open a SQLite-backed engine from a path (convenience for tests/embedding). The service
         path goes through :func:`~messagefoundry.store.open_store` (backend-agnostic). The SQLite
@@ -622,6 +629,7 @@ class Engine:
             coordinator=coordinator,
             cluster_settings=cluster_settings,
             registry_filter=registry_filter,
+            registry_guard=registry_guard,
         )
 
     # --- code-first wiring ---------------------------------------------------
@@ -1688,6 +1696,14 @@ class Engine:
                         rr.registry.outbound[name], flagged=flagged
                     )
 
+    def guard_registry(self, registry: Registry) -> None:
+        """Run the engine's registry guard over ``registry``; raises ``WiringError`` to refuse it.
+
+        A no-op when no guard was configured. Public because the managed app calls it on the first
+        load, which reaches ``add_registry`` directly rather than through :meth:`reload_detail`."""
+        if self._registry_guard is not None:
+            self._registry_guard(registry)
+
     async def reload(
         self,
         config_dir: str | Path | None = None,
@@ -1801,6 +1817,9 @@ class Engine:
         # Off the event loop: load_config executes user config modules (arbitrary, potentially heavy
         # imports), which would otherwise stall every listener mid-reload (review low-3).
         registry = await asyncio.to_thread(load_config, path)  # raises WiringError on a bad config
+        # Before the shard filter, so a guard judges the WHOLE graph: an engine-shard process then
+        # reaches the same verdict as its siblings, over one shared config (BACKLOG #1182).
+        self.guard_registry(registry)
         if self._registry_filter is not None:
             # Re-apply this process's shard filter so a reload keeps owning only its shard's inbounds
             # (outbound/routers/handlers stay shared). Pure + cheap (sharding.filter_registry_for_shard).

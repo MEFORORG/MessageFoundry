@@ -15,6 +15,8 @@ the firing half alone.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from messagefoundry.config.settings import ServiceSettings
@@ -341,3 +343,32 @@ def test_the_http_family_matches_the_runner() -> None:
     from messagefoundry.pipeline.wiring_runner import _HTTP_FAMILY_DEST_TYPES
 
     assert frozenset(_HTTP_FAMILY_DEST_TYPES) == static_credentials._HTTP_FAMILY
+
+
+def test_the_syslog_forwarder_is_a_hop_until_it_presents_a_client_cert() -> None:
+    plain = _settings(logging={"forward_host": "siem.example.invalid"})
+    names = {h.name: h for h in static_credential_hops(registry=None, settings=plain)}
+    assert names["settings:logging.forward"].credential == "none"
+    assert names["settings:logging.forward"].compliant_kind is True
+    mtls = _settings(
+        logging={
+            "forward_host": "siem.example.invalid",
+            "forward_protocol": "tls",
+            "forward_tls_ca_file": __file__,
+            "forward_tls_client_cert": __file__,
+        }
+    )
+    assert static_credential_hops(registry=None, settings=mtls) == []
+
+
+def test_a_query_string_never_reaches_a_detail(tmp_path: Path) -> None:
+    """A URL query can carry a credential; the detail reaches a startup refusal and the reload log."""
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "feed.py").write_text(
+        "from messagefoundry import Rest, outbound\n"
+        "outbound('OB_Q', Rest(url='https://a.example.invalid/x?api_key=SEKRIT#frag'))\n",
+        encoding="utf-8",
+    )
+    (hop,) = static_credential_hops(registry=load_config(cfg, allow_empty=True), settings=None)
+    assert "SEKRIT" not in hop.detail and "a.example.invalid/x" in hop.detail
