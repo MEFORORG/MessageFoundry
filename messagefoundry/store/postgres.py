@@ -122,10 +122,13 @@ from messagefoundry.store.store import (
     MESSAGE_EVENT_KINDS,
     NOT_DEPLOYED_EVENT,
     REINGRESS_TARGET_PREFIX,
+    SCOPE_SOURCE_AD,
+    SCOPE_SOURCE_MANUAL,
     AlertInstance,
     AlertSummary,
     AuditHeadMovedError,
     CapturedResponse,
+    ChannelScopeSource,
     ClaimedHeads,
     ClaimProcStatus,
     ConnectionEvent,
@@ -603,7 +606,10 @@ _SCHEMA: list[str] = [
         -- Unconstrained on purpose: the resolver never writes a second row for an id it has seen,
         -- and UNIQUE(username) is what refuses a racing double-create.
         directory_object_id  TEXT,
-        password_claimed_at  DOUBLE PRECISION
+        password_claimed_at  DOUBLE PRECISION,
+        -- BACKLOG #1927: who last wrote channel_scope, 'ad' or 'manual'. The rule is stated once,
+        -- on UserRecord.channel_scope_source.
+        channel_scope_source TEXT
     )""",
     # BACKLOG #1256: the atomicity the CHECK-THEN-ACT guard in auth/service.py cannot give itself --
     # its read and its write are separate awaits, so two concurrent FIRST logins for one subject can
@@ -746,7 +752,9 @@ _SCHEMA: list[str] = [
 # 3 (BACKLOG #1139): the users.notify_email ADD + its one-time seed land in the same function, for the
 # same reason and with the same caveat — the users CREATE TABLE in _SCHEMA moved too, so the hash would
 # shift without this bump, and relying on that is the trap the paragraph above names.
-_MIGRATION_REV = 3
+# 4 (BACKLOG #1927): the users.channel_scope_source ADD lands in the same function. Same contract, same
+# caveat: the CREATE TABLE moved as well, and the bump is what ties the migration body to the hash.
+_MIGRATION_REV = 4
 
 
 def _schema_hash() -> str:
@@ -1252,6 +1260,9 @@ class PostgresStore:
             # window the item exists to close. No backfill exists: nothing has ever held the
             # directory's identifier.
             ("directory_object_id", "TEXT"),
+            # Scope provenance (BACKLOG #1927; the rule is on UserRecord.channel_scope_source). No
+            # backfill: nothing recorded which writer set a scope until now.
+            ("channel_scope_source", "TEXT"),
         ):
             if column not in users_cols:
                 await conn.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
@@ -7103,13 +7114,42 @@ class PostgresStore:
                 )
 
     async def set_user_channel_scope(
-        self, user_id: str, scope_json: str | None, *, now: float | None = None
+        self,
+        user_id: str,
+        scope_json: str | None,
+        *,
+        source: ChannelScopeSource,
+        now: float | None = None,
     ) -> None:
-        """Set a user's per-channel scope (JSON list of connection names, or ``None`` = all)."""
+        """Set a user's per-channel scope (a JSON list of connection names, ``'["*"]'`` for all, or
+        ``None``, which denies) and record who wrote it (BACKLOG #1927)."""
         now = time.time() if now is None else now
         await self._execute(
-            "UPDATE users SET channel_scope=$1, updated_at=$2 WHERE id=$3", scope_json, now, user_id
+            "UPDATE users SET channel_scope=$1, channel_scope_source=$2, updated_at=$3 WHERE id=$4",
+            scope_json,
+            source,
+            now,
+            user_id,
         )
+
+    async def withdraw_ad_channel_scope(
+        self, user_id: str, expected_scope: str, *, now: float | None = None
+    ) -> bool:
+        """Withdraw a directory-derived scope to NULL (BACKLOG #1927); see ``AuthStore``."""
+        now = time.time() if now is None else now
+        # Through _timed_acquire like _execute (BACKLOG #1052): this runs on the sign-in path.
+        async with self._timed_acquire(record=False) as conn:
+            result = await conn.execute(
+                "UPDATE users SET channel_scope=NULL, channel_scope_source=$1, updated_at=$2"
+                " WHERE id=$3 AND channel_scope = $4"
+                " AND (channel_scope_source IS NULL OR channel_scope_source <> $5)",
+                SCOPE_SOURCE_AD,
+                now,
+                user_id,
+                expected_scope,
+                SCOPE_SOURCE_MANUAL,
+            )
+        return _rowcount(result) > 0
 
     async def set_user_federated_subject(
         self, user_id: str, issuer: str, subject: str, *, now: float | None = None

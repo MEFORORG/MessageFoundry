@@ -719,6 +719,53 @@ async def test_directory_id_comparison_follows_this_servers_collation(store) -> 
         )
 
 
+async def test_channel_scope_source_roundtrip_and_upgrade(store) -> None:
+    """BACKLOG #1927 on SQL Server: a scope write records its writer, and the COL_LENGTH-gated ADD
+    restores a dropped ``users.channel_scope_source`` with NULL on the existing row (no backfill).
+
+    The column is dropped and the ``schema_meta`` marker cleared first, so the ADD branch really
+    runs; with either left in place deleting the migration statement would still pass."""
+    from messagefoundry.store.store import SCOPE_SOURCE_AD, SCOPE_SOURCE_MANUAL
+
+    async def _col_length() -> int | None:
+        async with store._pool.acquire() as conn:
+            cur = await conn.cursor()
+            await cur.execute("SELECT COL_LENGTH('users','channel_scope_source')")
+            row = await cur.fetchone()
+            await cur.close()
+        return None if row[0] is None else int(row[0])
+
+    await store.create_user(user_id="scope-src", username="scope-src", auth_provider="ad", now=1.0)
+    await store.set_user_channel_scope("scope-src", '["IB_A"]', source=SCOPE_SOURCE_AD)
+    got = await store.get_user("scope-src")
+    assert (got.channel_scope, got.channel_scope_source) == ('["IB_A"]', SCOPE_SOURCE_AD)
+    await store.set_user_channel_scope("scope-src", None, source=SCOPE_SOURCE_MANUAL)
+    got = await store.get_user("scope-src")
+    assert (got.channel_scope, got.channel_scope_source) == (None, SCOPE_SOURCE_MANUAL)
+
+    # The compare-and-set (BACKLOG #1927): a manual scope and a changed value both refuse it.
+    await store.set_user_channel_scope("scope-src", '["IB_A"]', source=SCOPE_SOURCE_MANUAL)
+    assert await store.withdraw_ad_channel_scope("scope-src", '["IB_A"]') is False
+    await store.set_user_channel_scope("scope-src", '["IB_A"]', source=SCOPE_SOURCE_AD)
+    assert await store.withdraw_ad_channel_scope("scope-src", '["IB_OLD"]') is False
+    assert (await store.get_user("scope-src")).channel_scope == '["IB_A"]'
+    assert await store.withdraw_ad_channel_scope("scope-src", '["IB_A"]') is True
+    got = await store.get_user("scope-src")
+    assert (got.channel_scope, got.channel_scope_source) == (None, SCOPE_SOURCE_AD)
+    assert await store.withdraw_ad_channel_scope("scope-src", '["IB_A"]') is False  # idempotent
+
+    async with store._pool.acquire() as conn:
+        cur = await conn.cursor()
+        await cur.execute("ALTER TABLE users DROP COLUMN channel_scope_source")
+        await cur.execute("DELETE FROM schema_meta")
+        await conn.commit()
+        await cur.close()
+    assert await _col_length() is None  # positive control: the column really is gone
+    assert await store._ensure_schema() is True
+    assert await _col_length() == 32  # NVARCHAR(16): the guarded ADD ran, at its declared width
+    assert (await store.get_user("scope-src")).channel_scope_source is None
+
+
 async def test_directory_object_id_column_upgrade_is_idempotent(store) -> None:
     """The COL_LENGTH-gated ADD for ``users.directory_object_id`` (BACKLOG #1471) on a pre-#1471
     database.

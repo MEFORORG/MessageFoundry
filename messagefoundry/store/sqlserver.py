@@ -109,10 +109,14 @@ from messagefoundry.store.store import (
     MESSAGE_EVENT_KINDS,
     NOT_DEPLOYED_EVENT,
     REINGRESS_TARGET_PREFIX,
+    SCOPE_SOURCE_AD,
+    SCOPE_SOURCE_MANUAL,
+    WITHDRAW_AD_SCOPE_SQL,
     AlertInstance,
     AlertSummary,
     AuditHeadMovedError,
     CapturedResponse,
+    ChannelScopeSource,
     ClaimAbortPhase,
     ClaimedHeads,
     ClaimLockTimeout,
@@ -1484,7 +1488,10 @@ _SCHEMA: list[str] = [
         -- 1700-byte nonclustered limit that shaped the oidc_* pair above is not in play. A canonical
         -- GUID is 36 characters, so the width is slack, not a bound.
         directory_object_id NVARCHAR(256) NULL,
-        password_claimed_at FLOAT NULL)""",
+        password_claimed_at FLOAT NULL,
+        -- BACKLOG #1927: who last wrote channel_scope, 'ad' or 'manual'. The rule is stated once,
+        -- on UserRecord.channel_scope_source.
+        channel_scope_source NVARCHAR(16) NULL)""",
     """IF COL_LENGTH('users','channel_scope') IS NULL
         ALTER TABLE users ADD channel_scope NVARCHAR(MAX) NULL""",
     # MFA (WP-14): TOTP columns ALTER-ed in for a pre-existing users table (idempotent).
@@ -1511,6 +1518,10 @@ _SCHEMA: list[str] = [
     # is the item. No backfill exists; nothing has ever held the directory's identifier.
     """IF COL_LENGTH('users','directory_object_id') IS NULL
         ALTER TABLE users ADD directory_object_id NVARCHAR(256) NULL""",
+    # Scope provenance (BACKLOG #1927; the rule is on UserRecord.channel_scope_source):
+    # COL_LENGTH-gated ADD on a pre-existing users table. No backfill is possible.
+    """IF COL_LENGTH('users','channel_scope_source') IS NULL
+        ALTER TABLE users ADD channel_scope_source NVARCHAR(16) NULL""",
     # BACKLOG #1256: RE-TYPE A PRE-EXISTING MAX COLUMN, WHICH THE COL_LENGTH-GATED ADDs ABOVE CANNOT
     # REACH. They fire only when the column is ABSENT, so a users table created before this change
     # keeps NVARCHAR(MAX) -- and a MAX column CANNOT BE AN INDEX KEY, so the index below would fail
@@ -10355,13 +10366,36 @@ class SqlServerStore:
                 raise
 
     async def set_user_channel_scope(
-        self, user_id: str, scope_json: str | None, *, now: float | None = None
+        self,
+        user_id: str,
+        scope_json: str | None,
+        *,
+        source: ChannelScopeSource,
+        now: float | None = None,
     ) -> None:
         now = time.time() if now is None else now
         await self._execute(
-            "UPDATE users SET channel_scope=?, updated_at=? WHERE id=?",
-            (scope_json, now, user_id),
+            "UPDATE users SET channel_scope=?, channel_scope_source=?, updated_at=? WHERE id=?",
+            (scope_json, source, now, user_id),
         )
+
+    async def withdraw_ad_channel_scope(
+        self, user_id: str, expected_scope: str, *, now: float | None = None
+    ) -> bool:
+        """Withdraw a directory-derived scope to NULL (BACKLOG #1927); see ``AuthStore``."""
+        now = time.time() if now is None else now
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute(
+                    WITHDRAW_AD_SCOPE_SQL,
+                    (SCOPE_SOURCE_AD, now, user_id, expected_scope, SCOPE_SOURCE_MANUAL),
+                )
+                count = cur.rowcount
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        return int(count) > 0
 
     async def set_user_username(
         self, user_id: str, username: str, *, now: float | None = None
