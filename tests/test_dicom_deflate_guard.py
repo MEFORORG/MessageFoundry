@@ -26,6 +26,7 @@ pytest.importorskip("pydicom", reason="DICOM deflate-guard tests need the [dicom
 from messagefoundry.parsing.dicom import (  # noqa: E402
     DicomBombError,
     DicomDataset,
+    DicomError,
     DicomPeek,
     DicomPeekError,
     _inflate,
@@ -170,8 +171,8 @@ async def test_scu_refuses_a_bomb_behind_a_malformed_meta(mutate: Callable[[byte
 
 async def test_scu_still_dead_letters_a_header_pydicom_rejects_outside_the_parse_errors() -> None:
     # An unknown VR on (0002,0010) makes pydicom raise NotImplementedError, which is not one of the
-    # codec's parse-error types. The guard now meets it before dcmread does, and the SCU must still
-    # record it as a permanent bad-object, never let it escape as an internal error.
+    # codec's parse-error types. The guard's header replay meets it before dcmread does, so this
+    # drives the SCU's except around the guard: a permanent bad-object, never an internal error.
     from messagefoundry.transports.base import NegativeAckError
 
     obj = make_sr_part10()
@@ -225,12 +226,35 @@ def test_guard_is_a_no_op_for_a_non_deflated_object() -> None:
     _inflate.guard_part10_deflate(make_sr_part10(), force=False, max_bytes=1)
 
 
-def test_guard_leaves_an_unreadable_header_to_dcmread() -> None:
-    # pydicom runs the same header reader first and fails there, before its inflate, so the guard
-    # stands aside and the codec records dcmread's own parse error.
-    _inflate.guard_part10_deflate(b"not a DICOM object", force=False, max_bytes=1)
+def test_an_unreadable_header_is_refused_as_a_parse_error() -> None:
+    # The guard catches nothing from its replay, so pydicom's own error comes out of it. The codec runs
+    # the guard inside the handler that wraps dcmread, so the caller still sees a DicomPeekError.
+    from pydicom.errors import InvalidDicomError
+
+    with pytest.raises(InvalidDicomError):
+        _inflate.guard_part10_deflate(b"not a DICOM object", force=False, max_bytes=1)
     with pytest.raises(DicomPeekError):
         DicomPeek.parse(b"not a DICOM object")
+
+
+def _sq_transfer_syntax(obj: bytes) -> bytes:
+    """``obj`` with (0002,0010) re-encoded as an explicit SQ over 4 garbage bytes. pydicom's header
+    read raises OSError on it, which is one of the codec's parse-error types."""
+    at = obj.index(b"\x02\x00\x10\x00UI")
+    old_len = int.from_bytes(obj[at + 6 : at + 8], "little")
+    element = b"\x02\x00\x10\x00SQ\x00\x00" + (4).to_bytes(4, "little") + b"ABCD"
+    return obj[:at] + element + obj[at + 8 + old_len :]
+
+
+@pytest.mark.parametrize("base", [make_sr_part10, _bomb], ids=["plain", "deflated-bomb"])
+def test_a_malformed_sq_meta_is_a_dicom_error_on_both_parse_paths(
+    low_cap: None, base: Callable[[], bytes]
+) -> None:
+    data = _sq_transfer_syntax(base())
+    with pytest.raises(DicomPeekError):
+        DicomPeek.parse(data)
+    with pytest.raises(DicomError):
+        DicomDataset.parse(data)
 
 
 def test_guard_refuses_when_pydicom_no_longer_has_a_header_reader(
@@ -272,7 +296,10 @@ def test_bound_stops_at_the_end_of_a_padded_stream() -> None:
         _inflate.bounded_inflate_or_error(stream, max_bytes=len(payload) - 1)
 
 
-@pytest.mark.parametrize("drift", [AttributeError, KeyError, IndexError, TypeError, ValueError])
+_DRIFT = [AttributeError, KeyError, IndexError, TypeError, ValueError, OSError]
+
+
+@pytest.mark.parametrize("drift", _DRIFT)
 def test_guard_does_not_stand_aside_when_the_replay_itself_breaks(
     monkeypatch: pytest.MonkeyPatch, drift: type[Exception]
 ) -> None:
@@ -287,3 +314,31 @@ def test_guard_does_not_stand_aside_when_the_replay_itself_breaks(
     monkeypatch.setattr(pydicom.filereader, "_read_file_meta_info", broken_reader)
     with pytest.raises(drift, match="simulated pydicom API drift"):
         _inflate.guard_part10_deflate(_bomb(), force=False, max_bytes=_CAP)
+
+
+@pytest.mark.parametrize("drift", _DRIFT)
+def test_replay_drift_refuses_the_object_on_the_codec_path(
+    monkeypatch: pytest.MonkeyPatch, low_cap: None, drift: type[Exception]
+) -> None:
+    # End to end: whatever the broken replay raises, DicomDataset.parse refuses the bomb and pydicom
+    # never reaches its inflate. A parse-error type is wrapped as a DicomError; anything else propagates.
+    import pydicom.filereader
+
+    inflated: list[bytes] = []
+
+    def broken_reader(fp: object) -> None:
+        raise drift("simulated pydicom API drift")
+
+    def record_decompress(data: bytes, *args: Any) -> bytes:
+        inflated.append(data)
+        return zlib.decompress(data, *args)
+
+    monkeypatch.setattr(pydicom.filereader, "_read_file_meta_info", broken_reader)
+    monkeypatch.setattr(
+        pydicom.filereader,
+        "zlib",
+        SimpleNamespace(decompress=record_decompress, MAX_WBITS=zlib.MAX_WBITS),
+    )
+    with pytest.raises((drift, DicomError)):
+        DicomDataset.parse(_bomb())
+    assert inflated == []

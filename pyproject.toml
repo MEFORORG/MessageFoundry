@@ -165,7 +165,7 @@ fhir = ["fhir.resources>=7.1.0", "fhirpathpy>=2.2.0", "annotated-types<0.8"]
 # STOW-RS, Phase-2) is a SEPARATE extra — it drags numpy+pillow+requests, so it is added in the Phase-2 PR, never
 # folded into [dicom].
 # pydicom is capped below 3.1 because the deflate guard replays private pydicom header readers, and the
-# agreement test (tests/test_dicom_deflate_guard.py) only proves the locked minor (BACKLOG #1926).
+# agreement test (tests/test_dicom_deflate_guard.py) only proves the locked release (BACKLOG #1926).
 dicom = ["pynetdicom>=3.0.4,<4", "pydicom>=3.0.2,<3.1"]
 # Opt-in STRICT X12 validation for parsing/x12/validate.py (ADR 0012, BACKLOG #32). Lazy-imported, so
 # the tolerant X12Peek/X12Message hot path (the default) never needs it. pyx12 is the reference

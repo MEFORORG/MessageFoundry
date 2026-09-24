@@ -75,10 +75,14 @@ class DicomDataset:
         # otherwise decompress the whole deflate stream into memory unbounded). Over-cap → DicomBombError
         # (a DicomError, so it dead-letters). No-op for a non-deflated object. It gets the same `force` as
         # dcmread, because a forced read inflates an object that has no preamble (BACKLOG #1926).
-        guard_part10_deflate(data, force=force)
+        # The guard sits inside the try because it replays dcmread's own header read: a header that
+        # read rejects is refused here as a DicomError, whether the guard or dcmread meets it first.
         dcmread = load_dcmread()
         try:
+            guard_part10_deflate(data, force=force)
             ds = dcmread(BytesIO(data), stop_before_pixels=True, force=force)
+        except DicomError:
+            raise  # a DicomBombError is already the verdict; ValueError below must not rewrap it
         except parse_error_types() as exc:
             raise DicomError("body is not a parseable DICOM Part-10 object") from exc
         return cls(ds)

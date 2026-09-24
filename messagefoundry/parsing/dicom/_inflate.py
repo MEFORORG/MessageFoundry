@@ -31,9 +31,9 @@ Two entry points:
 
 Both raise :class:`~messagefoundry.parsing.dicom.errors.DicomBombError` (a ``DicomError``) for an
 over-cap deflated object. A corrupt deflate stream that stays under the cap before it breaks is left to
-``dcmread``, whose own error then goes down the normal parse/dead-letter path; ``dcmread`` fails on it
-within one :data:`_INFLATE_CHUNK` of what the guard counted. A header ``pydicom`` cannot read fails
-before any inflate; :func:`_deflated_data_set` says which of those failures surface from the guard.
+``dcmread``, which fails on it within one :data:`_INFLATE_CHUNK` of what the guard counted. The
+Part-10 guard catches nothing from its header replay: whatever ``pydicom`` raises there propagates,
+and the callers run the guard inside the same handler that wraps ``dcmread``.
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ from __future__ import annotations
 import zlib
 from io import BytesIO
 
-from messagefoundry.parsing.dicom._deps import header_error_types, load_header_readers
+from messagefoundry.parsing.dicom._deps import load_header_readers
 from messagefoundry.parsing.dicom.errors import DicomBombError
 
 __all__ = [
@@ -126,8 +126,8 @@ def guard_part10_deflate(data: bytes, *, force: bool, max_bytes: int | None = No
     Raises :class:`DicomBombError` when the deflated Data Set would inflate past the cap. A no-op when
     ``dcmread`` will not inflate: a transfer syntax other than Deflated Explicit VR LE, or no Data Set
     after the header. Raises :class:`RuntimeError` if the ``[dicom]`` extra is missing or no longer has
-    the readers. A header ``pydicom`` cannot read raises what ``pydicom`` raises for it, from here
-    rather than from ``dcmread``; see :func:`_deflated_data_set`."""
+    the readers. Anything the header replay raises propagates unchanged, so call this inside the same
+    handler that wraps the ``dcmread`` it guards; see :func:`_deflated_data_set`."""
     stream = _deflated_data_set(data, force=force)
     if stream is None:
         return
@@ -145,20 +145,15 @@ def _deflated_data_set(data: bytes, *, force: bool) -> memoryview | None:
     ``DeflatedExplicitVRLittleEndian``. That constant is a plain ``str`` subclass, so comparing with
     :data:`DEFLATED_EXPLICIT_VR_LE` is the same comparison.
 
-    A malformed header fails in the replay at the step where ``dcmread`` fails, before its inflate.
-    Only those errors, :func:`~messagefoundry.parsing.dicom._deps.header_error_types`, return ``None``,
-    so ``dcmread`` raises them itself. Anything else, including what a pydicom API change would raise,
-    propagates from here: standing aside on an error nobody expected is how a guard fails open."""
+    It catches nothing. A malformed header raises here what ``dcmread`` would raise at the same step,
+    and the caller's handler records it exactly as it would have. A pydicom API change raises here too.
+    Either way the object is refused. Standing aside on any error would mean choosing which errors are
+    "malformed input" and which are "the replay broke", and a wrong choice fails open."""
     filereader = load_header_readers()
     fp = BytesIO(data)
-    try:
-        filereader.read_preamble(fp, force)
-        file_meta = filereader._read_file_meta_info(fp)
-        filereader._read_command_set_elements(fp)
-        # Inside the try: reading the element converts its raw value, which can fail too.
-        transfer_syntax = file_meta.get("TransferSyntaxUID")
-    except header_error_types():
-        return None
-    if transfer_syntax != DEFLATED_EXPLICIT_VR_LE:
+    filereader.read_preamble(fp, force)
+    file_meta = filereader._read_file_meta_info(fp)
+    filereader._read_command_set_elements(fp)
+    if file_meta.get("TransferSyntaxUID") != DEFLATED_EXPLICIT_VR_LE:
         return None
     return memoryview(data)[fp.tell() :]  # a view: the body can be up to max_object_bytes
