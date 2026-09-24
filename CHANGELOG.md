@@ -28,6 +28,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   code-derived ASVS 5.1.1 file-surface inventory, with upload and download tables and stated
   exclusions, and a test fails when the code and the tables drift apart.
   ([BACKLOG #1127](docs/BACKLOG.md))
+- **The test harness's MLLP receivers, the IDE's Steps view sample, and `check`'s `.expect`
+  sidecars are now capped (ASVS 5.1.1).** The harness Receive tab, load sink and reconcile capture sink
+  each bound a frame at `DEFAULT_MAX_FRAME_BYTES` (16 MiB) and drop an over-cap frame's connection with
+  no ACK. The VS Code extension refuses a Steps view sample over 16 MiB when it is picked, and its own
+  read of that sample is capped. `messagefoundry check` reads each `.expect` sidecar under its
+  fixture's cap. The inventory in [`docs/CONNECTIONS.md`](docs/CONNECTIONS.md) now lists the harness
+  receivers as an upload row and the live-debug sample choice as an IDE picker, and its test derives
+  both. ([BACKLOG #1127](docs/BACKLOG.md))
 - **BREAKING — `[api].tls_terminated_upstream` without `[api].tls_cert_file` now requires
   `[api].plaintext_upstream_hop_acknowledged = true`.** 0.4.0 asked for no such acknowledgement. In
   that topology the engine mints no certificate (ADR 0172 decision 3). So the

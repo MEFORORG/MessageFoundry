@@ -22,7 +22,13 @@ from PySide6.QtNetwork import QHostAddress, QTcpServer, QTcpSocket
 
 from messagefoundry.config import AckMode
 from messagefoundry.parsing import HL7PeekError, Peek, normalize
-from messagefoundry.transports.mllp import MLLPDecoder, build_ack, frame
+from messagefoundry.transports.mllp import (
+    DEFAULT_MAX_FRAME_BYTES,
+    MLLPDecoder,
+    MLLPFrameError,
+    build_ack,
+    frame,
+)
 
 # ACK-mode label -> (build_ack code, ack_mode). "none" sends no acknowledgement.
 ACK_MODES: dict[str, tuple[str, AckMode]] = {
@@ -174,9 +180,16 @@ class SendWorker(QObject):
 
 
 class MllpReceiver(QObject):
-    """A localhost MLLP listener: emits each inbound message and replies per :attr:`ack_mode`."""
+    """A localhost MLLP listener: emits each inbound message and replies per :attr:`ack_mode`.
+
+    It bounds each frame at :attr:`max_frame_bytes`, the engine's MLLP default. The harness wheel is
+    attached to every release and this listener takes frames from another party, so it is an ASVS
+    5.1.1 upload feature (``docs/CONNECTIONS.md``, BACKLOG #1127). An over-cap frame is never handed
+    on or acknowledged: the connection is dropped, as the engine's MLLP source does, and
+    :attr:`refused` says why."""
 
     received = Signal(object)  # Received
+    refused = Signal(str)  # "<peer>: <reason>" for a connection dropped over an over-cap frame
 
     def __init__(self) -> None:
         super().__init__()
@@ -187,6 +200,7 @@ class MllpReceiver(QObject):
         self.delay_seconds = 1.0  # DELAY_AA: how long to wait before acknowledging
         self.fail_first = 1  # FAIL_THEN_AA: reject this many deliveries per control id, then accept
         self._seen: dict[str, int] = {}  # control id -> arrivals (drives duplicate detection)
+        self.max_frame_bytes = DEFAULT_MAX_FRAME_BYTES  # read per connection, when it is accepted
 
     def is_listening(self) -> bool:
         return self._server.isListening()
@@ -207,7 +221,7 @@ class MllpReceiver(QObject):
     def _on_new_connection(self) -> None:
         while self._server.hasPendingConnections():
             sock = self._server.nextPendingConnection()
-            self._decoders[sock] = MLLPDecoder()
+            self._decoders[sock] = MLLPDecoder(max_frame_bytes=self.max_frame_bytes)
             sock.readyRead.connect(lambda s=sock: self._on_ready_read(s))
             sock.disconnected.connect(lambda s=sock: self._cleanup(s))
 
@@ -219,14 +233,21 @@ class MllpReceiver(QObject):
         decoder = self._decoders.get(sock)
         if decoder is None:
             return
-        for message in decoder.feed(bytes(sock.readAll().data())):
-            text = message.decode("utf-8", "replace")
-            rec = self._describe(sock, text)
-            if rec.control_id:
-                self._seen[rec.control_id] = self._seen.get(rec.control_id, 0) + 1
-                rec.seen = self._seen[rec.control_id]
-            self.received.emit(rec)
-            self._reply(sock, text, rec.control_id, rec.seen)
+        try:
+            for message in decoder.feed(bytes(sock.readAll().data())):
+                text = message.decode("utf-8", "replace")
+                rec = self._describe(sock, text)
+                if rec.control_id:
+                    self._seen[rec.control_id] = self._seen.get(rec.control_id, 0) + 1
+                    rec.seen = self._seen[rec.control_id]
+                self.received.emit(rec)
+                self._reply(sock, text, rec.control_id, rec.seen)
+        except MLLPFrameError as exc:
+            # Drop the decoder first so a late readyRead finds nothing to feed, then abort rather
+            # than disconnect: nothing queued for this peer should still be written to it.
+            self._decoders.pop(sock, None)
+            self.refused.emit(f"{sock.peerAddress().toString()}:{sock.peerPort()}: {exc}")
+            sock.abort()
 
     def _reply(self, sock: QTcpSocket, text: str, control_id: str, seen: int) -> None:
         """Acknowledge per the active reply mode — including faults that make the engine retry."""

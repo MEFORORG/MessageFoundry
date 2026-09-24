@@ -17,6 +17,7 @@ from pathlib import Path
 
 from harness.reconcile.capture import CaptureSink
 from messagefoundry.transports.mllp import MLLPDecoder, frame
+from tests._mllp_over_cap import send_over_cap
 
 
 def _message(control_id: str) -> str:
@@ -115,3 +116,23 @@ def test_capture_records_unparseable_without_acking(tmp_path: Path) -> None:
     ]
     assert records[0]["control_id"] is None  # the unparseable one captured with no key
     assert records[1]["control_id"] == "CID9"
+
+
+def test_capture_drops_an_over_cap_frame_and_keeps_nothing(tmp_path: Path) -> None:
+    """The capture sink is an ASVS 5.1.1 upload feature (it persists what it receives), so it bounds a
+    frame at the engine's MLLP cap and drops the connection rather than buffer, keep, or ACK it
+    (BACKLOG #1127)."""
+    out = tmp_path / "cap.jsonl"
+
+    async def scenario() -> bytes:
+        sink = CaptureSink(out, host="127.0.0.1", ports=(0,))
+        await sink.start()
+        try:
+            got = await send_over_cap(sink.bound_ports[0], _message("BIG0001"))
+        finally:
+            await sink.stop()
+        assert sink.captured == 0 and sink.unparseable == 0
+        return got
+
+    assert asyncio.run(scenario()) == b""  # no ACK: the connection was dropped
+    assert out.read_text(encoding="utf-8") == ""

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import socket
 import time
 from collections.abc import Sequence
@@ -31,9 +32,17 @@ from harness.load.metrics import LiveMetrics
 from messagefoundry.config.models import AckMode
 from messagefoundry.parsing import Peek
 from messagefoundry.parsing.peek import HL7PeekError
-from messagefoundry.transports.mllp import MLLPDecoder, build_ack, frame
+from messagefoundry.transports.mllp import (
+    DEFAULT_MAX_FRAME_BYTES,
+    MLLPDecoder,
+    MLLPFrameError,
+    build_ack,
+    frame,
+)
 
 _READ_BYTES = 65536  # larger than the engine's inbound read: the sink only absorbs, never routes
+
+log = logging.getLogger(__name__)
 
 
 class CorrelationSink:
@@ -98,7 +107,9 @@ class CorrelationSink:
         if sock is not None:
             with contextlib.suppress(OSError):
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        decoder = MLLPDecoder()
+        # Bounded like the engine's MLLP source: this listener takes frames from another party, so it is
+        # an ASVS 5.1.1 upload feature (docs/CONNECTIONS.md, BACKLOG #1127).
+        decoder = MLLPDecoder(max_frame_bytes=DEFAULT_MAX_FRAME_BYTES)
         try:
             while True:
                 chunk = await reader.read(_READ_BYTES)
@@ -114,6 +125,10 @@ class CorrelationSink:
                     await writer.drain()
         except (ConnectionError, OSError):
             pass  # peer reset/closed mid-stream — expected when the engine or run stops
+        except MLLPFrameError as exc:
+            # Drop the connection rather than buffer, keep or ACK an over-cap frame, as the engine does.
+            peer = writer.get_extra_info("peername")
+            log.warning("MLLP frame from %s over cap; closing connection: %s", peer, exc)
         finally:
             self._writers.discard(writer)
             writer.close()

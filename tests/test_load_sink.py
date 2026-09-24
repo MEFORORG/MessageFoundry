@@ -18,6 +18,7 @@ from harness.load.ids import ControlIds
 from harness.load.metrics import Counters, Histogram, LiveMetrics
 from harness.load.sink import CorrelationSink
 from messagefoundry.transports.mllp import MLLPDecoder, frame
+from tests._mllp_over_cap import send_over_cap
 
 _IDS = ControlIds(prefix="LX", width=12)
 
@@ -155,3 +156,22 @@ def test_sink_requires_at_least_one_port() -> None:
         assert "at least one port" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("expected ValueError for empty ports")
+
+
+def test_sink_drops_an_over_cap_frame() -> None:
+    """The load sink takes frames from the engine under test, so it bounds a frame at the engine's
+    MLLP cap and drops the connection rather than buffer or ACK it (ASVS 5.1.1, BACKLOG #1127)."""
+    m = _metrics()
+    correlator = Correlator(capacity=64, metrics=m)
+
+    async def scenario() -> bytes:
+        sink = CorrelationSink(_IDS, correlator, m, host="127.0.0.1", ports=(0,))
+        await sink.start()
+        try:
+            return await send_over_cap(sink.bound_ports[0], _message("BIG0001"))
+        finally:
+            await sink.stop()
+
+    assert asyncio.run(scenario()) == b""  # no ACK: the connection was dropped
+    assert m.counters.sink_received == 0
+    assert m.counters.correlation_misses == 0
