@@ -682,7 +682,9 @@ async def test_a_reset_account_with_a_factor_proves_it_and_then_rotates(
         tok = str(r.json()["token"])
         # Proving the factor opens the rotation route and nothing else: still must-change.
         still = await c.get("/messages", headers=_auth(tok))
-        assert still.status_code == 403 and still.json()["detail"] == "password change required"
+        # A prefix, not equality: the detail may name the credential's deadline (BACKLOG #1141).
+        assert still.status_code == 403
+        assert still.json()["detail"].startswith("password change required")
         r = await _change_password(c, tok, current=temp)
         assert r.status_code == 200, r.text
     assert (await service.login("vic", PW2)).ok
