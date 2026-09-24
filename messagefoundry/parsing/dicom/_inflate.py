@@ -30,10 +30,10 @@ Two entry points:
   starts, and bound that stream. A no-op when ``dcmread`` will not inflate anything.
 
 Both raise :class:`~messagefoundry.parsing.dicom.errors.DicomBombError` (a ``DicomError``) for an
-over-cap deflated object. A header ``pydicom`` cannot read, and a corrupt deflate stream that stays under
-the cap before it breaks, are left to ``dcmread``, whose own error then goes down the normal
-parse/dead-letter path. Neither lets ``dcmread`` inflate much past the cap: the first fails before its
-inflate, and the second fails inside it within one :data:`_INFLATE_CHUNK` of what the guard counted.
+over-cap deflated object. A corrupt deflate stream that stays under the cap before it breaks is left to
+``dcmread``, whose own error then goes down the normal parse/dead-letter path; ``dcmread`` fails on it
+within one :data:`_INFLATE_CHUNK` of what the guard counted. A header ``pydicom`` cannot read fails
+before any inflate; :func:`_deflated_data_set` says which of those failures surface from the guard.
 """
 
 from __future__ import annotations
@@ -80,17 +80,24 @@ def bounded_inflate_or_error(compressed: bytes, *, max_bytes: int) -> None:
         return
     decompressor = zlib.decompressobj(-zlib.MAX_WBITS)  # negative wbits ⇒ raw deflate, no header
     total = 0
-    pending = compressed
+    view = memoryview(compressed)
     try:
-        while pending:
-            out = decompressor.decompress(pending, _INFLATE_CHUNK)
-            total += len(out)
-            if total > max_bytes:
-                raise DicomBombError(
-                    "deflated DICOM object exceeds the maximum uncompressed size "
-                    f"({max_bytes} bytes); refusing to decode (possible decompression bomb)"
-                )
-            pending = decompressor.unconsumed_tail
+        # Feed the input one window at a time. ``unconsumed_tail`` is a copy of the input not yet
+        # consumed, so handing the whole stream in at once copies the remainder on every round, and the
+        # guard's CPU grows with the square of the compressed size (4 s at 32 MiB, measured 2026-09-24).
+        for offset in range(0, len(view), _INFLATE_CHUNK):
+            pending: bytes | memoryview = view[offset : offset + _INFLATE_CHUNK]
+            while pending:
+                out = decompressor.decompress(pending, _INFLATE_CHUNK)
+                total += len(out)
+                if total > max_bytes:
+                    raise DicomBombError(
+                        "deflated DICOM object exceeds the maximum uncompressed size "
+                        f"({max_bytes} bytes); refusing to decode (possible decompression bomb)"
+                    )
+                pending = decompressor.unconsumed_tail
+            if decompressor.eof:
+                break  # dcmread's one-shot inflate also stops at the end of the first stream
         tail = decompressor.flush()
         total += len(tail)
         if total > max_bytes:
@@ -105,17 +112,18 @@ def bounded_inflate_or_error(compressed: bytes, *, max_bytes: int) -> None:
         return
 
 
-def guard_part10_deflate(data: bytes, *, max_bytes: int | None = None, force: bool = False) -> None:
+def guard_part10_deflate(data: bytes, *, force: bool, max_bytes: int | None = None) -> None:
     """Bound the inflate ``dcmread(BytesIO(data), force=force)`` would do, **before** it does it.
 
-    ``max_bytes`` defaults to :data:`DEFAULT_MAX_INFLATED_BYTES`, read at call time. ``force`` must be
-    the value the caller then passes to ``dcmread``: with it, ``pydicom`` reads an object that has no
-    preamble, and so inflates one.
+    ``force`` is required and must be the value the caller then passes to ``dcmread``: with it,
+    ``pydicom`` reads an object that has no preamble, and so inflates one. ``max_bytes`` defaults to
+    :data:`DEFAULT_MAX_INFLATED_BYTES`, read at call time.
 
     Raises :class:`DicomBombError` when the deflated Data Set would inflate past the cap. A no-op when
-    ``dcmread`` will not inflate: a transfer syntax other than Deflated Explicit VR LE, no Data Set
-    after the header, or a header ``pydicom`` cannot read (``dcmread`` fails on it before its inflate).
-    Raises :class:`RuntimeError` if the ``[dicom]`` extra is missing or no longer has the readers."""
+    ``dcmread`` will not inflate: a transfer syntax other than Deflated Explicit VR LE, or no Data Set
+    after the header. Raises :class:`RuntimeError` if the ``[dicom]`` extra is missing or no longer has
+    the readers. A header ``pydicom`` cannot read raises what ``pydicom`` raises for it, from here
+    rather than from ``dcmread``; see :func:`_deflated_data_set`."""
     stream = _deflated_data_set(data, force=force)
     if stream is None:
         return
@@ -131,7 +139,13 @@ def _deflated_data_set(data: bytes, *, force: bool) -> bytes | None:
     order, on the same bytes: preamble, file-meta group, command set. ``read_partial`` then inflates
     everything after that point when the file meta's ``TransferSyntaxUID`` equals
     ``DeflatedExplicitVRLittleEndian``. That constant is a plain ``str`` subclass, so comparing with
-    :data:`DEFLATED_EXPLICIT_VR_LE` is the same comparison."""
+    :data:`DEFLATED_EXPLICIT_VR_LE` is the same comparison.
+
+    A failure in the replay is a failure ``dcmread`` hits at the same step, before its inflate. The
+    types in :func:`~messagefoundry.parsing.dicom._deps.parse_error_types` return ``None``, so ``dcmread``
+    raises them inside the caller's own parse-error handler. Anything else propagates from here: it
+    would have escaped ``dcmread`` the same way, and standing aside on an error nobody expected is
+    how a guard fails open."""
     filereader = load_header_readers()
     fp = BytesIO(data)
     try:
@@ -141,9 +155,6 @@ def _deflated_data_set(data: bytes, *, force: bool) -> bytes | None:
         # Inside the try: reading the element converts its raw value, which can fail too.
         transfer_syntax = file_meta.get("TransferSyntaxUID")
     except parse_error_types():
-        # dcmread runs these same steps first and fails here too, before its inflate. The caller's
-        # own handler then turns that failure into the PHI-safe parse error it already records, so no
-        # raw pydicom message escapes from here.
         return None
     if transfer_syntax != DEFLATED_EXPLICIT_VR_LE:
         return None

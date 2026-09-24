@@ -839,8 +839,9 @@ its own policy block below):
   `parsing/dicom/_inflate.py`, called from `DicomPeek.parse` and `DicomDataset.parse`), and at
   `max_object_bytes` when an outbound C-STORE SCU forwards it. The guard finds the deflated Data Set
   with pydicom's own header readers, the ones `dcmread` runs just before it inflates. So it bounds the
-  same bytes `dcmread` inflates even when the file meta has a missing or wrong group length, a second
-  transfer-syntax element, or no preamble under a forced read. A site dropping DICOM into a watch
+  same bytes `dcmread` inflates, even behind a malformed file meta. That covers at least a missing or
+  wrong group length, a second transfer-syntax element, and a forced read with no preamble. A site
+  dropping DICOM into a watch
   directory should size those two ceilings deliberately rather than read this bullet as saying no
   unpacking happens. When
   `decompress="gzip"` is enabled it gunzips each drop **before** the content sniff, the AV scan, and the

@@ -51,8 +51,9 @@ def load_header_readers() -> ModuleType:
     inflate unbounded."""
     try:
         from pydicom import filereader
-    except ImportError as exc:  # pragma: no cover - exercised only without the [dicom] extra
-        raise _missing_extra("The DICOM deflate guard") from exc
+    except ImportError as exc:
+        # Every parse runs the guard before dcmread, so this is the error a missing extra usually meets.
+        raise _missing_extra("DICOM parsing") from exc
     missing = [name for name in _HEADER_READERS if not hasattr(filereader, name)]
     if missing:
         raise RuntimeError(

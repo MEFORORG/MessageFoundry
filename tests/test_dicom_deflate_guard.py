@@ -13,6 +13,7 @@ lowered for the test, so no test inflates more than 1 MiB.
 
 from __future__ import annotations
 
+import random
 import zlib
 from collections.abc import Callable
 from types import SimpleNamespace
@@ -91,7 +92,7 @@ _SHAPES = [
     pytest.param(lambda o: o[_META_START:], True, id="force-without-preamble"),
     pytest.param(_command_set_before_body, False, id="command-set-before-body"),
 ]
-_UNFORCED = [shape for shape in _SHAPES if not shape.values[1]]
+_UNFORCED = [pytest.param(shape.values[0], id=shape.id) for shape in _SHAPES if not shape.values[1]]
 
 
 def _bomb() -> bytes:
@@ -118,9 +119,9 @@ def test_dataset_parse_refuses_a_bomb_behind_a_malformed_meta(
         DicomDataset.parse(mutate(_bomb()), force=force)
 
 
-@pytest.mark.parametrize(("mutate", "force"), _UNFORCED)
+@pytest.mark.parametrize("mutate", _UNFORCED)
 def test_peek_refuses_a_bomb_behind_a_malformed_meta(
-    low_cap: None, mutate: Callable[[bytes], bytes], force: bool
+    low_cap: None, mutate: Callable[[bytes], bytes]
 ) -> None:
     with pytest.raises(DicomBombError):
         DicomPeek.parse(mutate(_bomb()))
@@ -133,36 +134,52 @@ def test_peek_without_force_still_reports_a_missing_preamble_as_unparseable(low_
         DicomPeek.parse(_bomb()[_META_START:])
 
 
-@pytest.mark.parametrize(("mutate", "force"), _UNFORCED)
-async def test_scu_refuses_a_bomb_behind_a_malformed_meta(
-    mutate: Callable[[bytes], bytes], force: bool
-) -> None:
-    # The outbound SCU calls the same guard with its own max_object_bytes. The refusal happens before
-    # any association, so no peer is needed and port 9 is never dialled.
+async def _scu_send(data: bytes) -> None:
+    """Send ``data`` through an outbound SCU capped at :data:`_CAP`. Every case here is refused before
+    any association, so no peer is needed and port 9 is never dialled."""
     pytest.importorskip("pynetdicom", reason="the DICOM SCU needs the [dicom] extra")
     from messagefoundry.config.models import ConnectorType, Destination
     from messagefoundry.parsing import RawMessage
-    from messagefoundry.transports.base import NegativeAckError
     from messagefoundry.transports.dicom import DicomScuDestination
+
+    settings: dict[str, object] = {
+        "ae_title": "MEFOR_SCU",
+        "host": "127.0.0.1",
+        "port": 9,
+        "called_ae_title": "PACS_SCP",
+        "max_object_bytes": _CAP,
+    }
+    scu = DicomScuDestination(
+        Destination(name="OB_SCU", type=ConnectorType.DIMSE, settings=settings)
+    )
+    await scu.send(RawMessage.from_bytes(data, "dicom").encode())
+
+
+@pytest.mark.parametrize("mutate", _UNFORCED)
+async def test_scu_refuses_a_bomb_behind_a_malformed_meta(mutate: Callable[[bytes], bytes]) -> None:
+    # The outbound SCU calls the same guard with its own max_object_bytes.
+    from messagefoundry.transports.base import NegativeAckError
 
     data = mutate(_bomb())
     assert len(data) < _CAP  # the raw object passes max_object_bytes; only its inflate is over
-    scu = DicomScuDestination(
-        Destination(
-            name="OB_SCU",
-            type=ConnectorType.DIMSE,
-            settings={
-                "ae_title": "MEFOR_SCU",
-                "host": "127.0.0.1",
-                "port": 9,
-                "called_ae_title": "PACS_SCP",
-                "max_object_bytes": _CAP,
-            },
-        )
-    )
     with pytest.raises(NegativeAckError) as exc:
-        await scu.send(RawMessage.from_bytes(data, "dicom").encode())
+        await _scu_send(data)
     assert exc.value.code == "deflate-bomb"
+    assert exc.value.permanent is True
+
+
+async def test_scu_still_dead_letters_a_header_pydicom_rejects_outside_the_parse_errors() -> None:
+    # An unknown VR on (0002,0010) makes pydicom raise NotImplementedError, which is not one of the
+    # codec's parse-error types. The guard now meets it before dcmread does, and the SCU must still
+    # record it as a permanent bad-object, never let it escape as an internal error.
+    from messagefoundry.transports.base import NegativeAckError
+
+    obj = make_sr_part10()
+    at = obj.index(b"\x02\x00\x10\x00UI")
+    data = obj[: at + 4] + b"U " + obj[at + 6 :]
+    with pytest.raises(NegativeAckError) as exc:
+        await _scu_send(data)
+    assert exc.value.code == "bad-object"
     assert exc.value.permanent is True
 
 
@@ -205,13 +222,13 @@ def test_guard_bounds_exactly_the_bytes_pydicom_inflates(
 
 
 def test_guard_is_a_no_op_for_a_non_deflated_object() -> None:
-    _inflate.guard_part10_deflate(make_sr_part10(), max_bytes=1)
+    _inflate.guard_part10_deflate(make_sr_part10(), force=False, max_bytes=1)
 
 
 def test_guard_leaves_an_unreadable_header_to_dcmread() -> None:
     # pydicom runs the same header reader first and fails there, before its inflate, so the guard
     # stands aside and the codec records dcmread's own parse error.
-    _inflate.guard_part10_deflate(b"not a DICOM object", max_bytes=1)
+    _inflate.guard_part10_deflate(b"not a DICOM object", force=False, max_bytes=1)
     with pytest.raises(DicomPeekError):
         DicomPeek.parse(b"not a DICOM object")
 
@@ -225,4 +242,17 @@ def test_guard_refuses_when_pydicom_no_longer_has_a_header_reader(
 
     monkeypatch.delattr(pydicom.filereader, "_read_file_meta_info")
     with pytest.raises(RuntimeError, match="_read_file_meta_info"):
-        _inflate.guard_part10_deflate(make_deflated_ok_part10(), max_bytes=_CAP)
+        _inflate.guard_part10_deflate(make_deflated_ok_part10(), force=False, max_bytes=_CAP)
+
+
+def test_bound_counts_a_stream_that_spans_many_input_windows() -> None:
+    # Stored (level 0) blocks do not compress, so this stream is many input windows long. The bound
+    # feeds it one window at a time, stops at the end of the stream, and ignores bytes after it.
+    payload = random.Random(1926).randbytes(8 * _CAP)
+    compressor = zlib.compressobj(0, zlib.DEFLATED, -zlib.MAX_WBITS)
+    stream = compressor.compress(payload) + compressor.flush() + b"trailing bytes after the stream"
+    assert len(stream) > 8 * _CAP
+
+    _inflate.bounded_inflate_or_error(stream, max_bytes=len(payload))
+    with pytest.raises(DicomBombError):
+        _inflate.bounded_inflate_or_error(stream, max_bytes=len(payload) - 1)

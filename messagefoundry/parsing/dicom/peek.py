@@ -82,7 +82,7 @@ class DicomPeek:
         # be read incrementally, so stop_before_pixels/specific_tags don't bound it). Pre-check the
         # inflate in bounded memory and reject an over-cap object (as a DicomBombError → dead-letter)
         # BEFORE dcmread ever touches it. A no-op for a non-deflated object.
-        guard_part10_deflate(data)
+        guard_part10_deflate(data, force=False)  # the same force as the dcmread below
         dcmread = load_dcmread()
         try:
             ds = dcmread(
