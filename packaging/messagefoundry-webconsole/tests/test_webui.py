@@ -6488,6 +6488,7 @@ async def test_oidc_full_round_trip_lands_a_session_via_meta_refresh(
                 "sub": "S-1-5-21-fed",
                 "exp": now + 600,
                 "iat": now,
+                "auth_time": now,  # REQUIRED since BACKLOG #1150 (max_age is always requested)
                 "nonce": params["nonce"],
                 "preferred_username": "jdoe@corp.example",
                 "amr": ["pwd", "mfa"],

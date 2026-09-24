@@ -6,6 +6,16 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+### Security
+- **OIDC sign-in now bounds how old the IdP's authentication may be.** A new setting,
+  `[auth].oidc_max_age_seconds`, is sent as `max_age` on every authorization request. It defaults
+  to 43200 seconds (12 hours), accepts 300 to 86400, and has no off switch. The engine now requires
+  the `auth_time` claim and refuses a sign-in whose `auth_time` is missing (`auth_time_missing`) or
+  older than `max_age` (`auth_time_stale`). The session ends at the earliest of `auth_time + max_age`,
+  the `id_token` `exp`, and the configured session caps. **A deploying site whose IdP does not return
+  `auth_time` would have every federated sign-in refused**; that is spec-correct and deliberate.
+  Federation still ships off (`oidc_enabled = false`). ([BACKLOG #296](docs/BACKLOG.md))
+
 ## [0.4.0] — 2026-09-23 — Early Access
 
 This section lists every breaking change since 0.3.2, each marked BREAKING, and summarizes the

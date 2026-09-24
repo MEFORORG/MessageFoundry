@@ -1488,6 +1488,7 @@ class AuthService:
             client_id=s.oidc_client_id or "",
             signing_algorithms=[SignatureAlgorithm(a) for a in s.oidc_signing_algorithms],
             nonce=nonce,
+            max_age_seconds=s.oidc_max_age_seconds,
             username_claim=s.oidc_username_claim,
             username_strip_domain=s.oidc_username_strip_domain,
             allowed_username_domains=frozenset(s.effective_oidc_username_domains),
@@ -1554,6 +1555,7 @@ class AuthService:
             nonce=flow.nonce,
             code_challenge=challenge,
             scopes=self._settings.oidc_scopes,
+            max_age=self._settings.oidc_max_age_seconds,
             acr_values=self._settings.oidc_acr_values,
             prompt=self._settings.oidc_prompt,
         )
@@ -1689,17 +1691,34 @@ class AuthService:
                 ok=False, error="federated sign-in failed", reason="federated_subject_conflict"
             )
 
+        now = time.time()
         max_expires_at = principal_claims.expires_at
         if self._settings.oidc_session_max_hours:
-            max_expires_at = min(
-                max_expires_at, time.time() + self._settings.oidc_session_max_hours * 3600
-            )
-        if max_expires_at <= time.time():
+            max_expires_at = min(max_expires_at, now + self._settings.oidc_session_max_hours * 3600)
+        if max_expires_at <= now:
             # The ladder accepts an exp up to clock_skew_seconds in the PAST, so a token inside the
             # grace window would otherwise mint an already-dead session: the user "logs in" and is
             # revoked on their first request, with no audited reason. Refuse loudly instead.
             await self._directory_reject_audit(username, "oidc", "expired")
             return LoginOutcome(ok=False, error="federated sign-in failed", reason="expired")
+        # BACKLOG #1150 (ASVS 6.8.4 / 7.6.1): the session also ends max_age after the user last
+        # authenticated AT THE IdP. The ladder checks recency only at login, and /ui/reauth never
+        # returns to the IdP, so without this cap the time since the IdP authentication event would
+        # grow unbounded for the session's whole life.
+        # auth_time is clamped to now first: the ladder accepts an IdP clock up to clock_skew_seconds
+        # AHEAD, and without the clamp that lead would extend the session past now + max_age. The
+        # ladder already refuses a deadline behind its own clock; this branch is the backstop for
+        # time spent between that check and here (the LDAP round trip), so a deadline already
+        # behind now is refused under its own slug rather than minted dead.
+        recency_deadline = (
+            min(principal_claims.auth_time, now) + self._settings.oidc_max_age_seconds
+        )
+        if recency_deadline <= now:
+            await self._directory_reject_audit(username, "oidc", "auth_time_stale")
+            return LoginOutcome(
+                ok=False, error="federated sign-in failed", reason="auth_time_stale"
+            )
+        max_expires_at = min(recency_deadline, max_expires_at)
 
         self.clear_oidc_unavailable()
         # ASVS 6.3.4, the one directory leg the engine can actually verify. Keyed on the SETTING, not
