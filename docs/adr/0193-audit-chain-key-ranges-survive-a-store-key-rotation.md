@@ -40,13 +40,17 @@ first is opened by a row inside the chain.**
    backends), written where the watermark is written. There is no resolution path for a row that
    lacks one: at zero deployments no such row exists (CLAUDE.md section 0), so a NULL `key_id` under
    a watermark is reported as a chain that "does not record which key its keyed range is under".
-3. **`rotate-key` opens a new range.** After re-encrypting, it verifies the whole chain (refusing on
-   any break) and appends ONE `audit.key_epoch` row, MAC'd under the NEW key. Its detail names the
-   new key, carries a `closes` record for the range it ends (key, first and last id, row count, and a
-   SHA-256 digest over every row's id, chained fields and stored MAC, and `prev_hash`, the stored
-   hash of the row just before the range, or `""` when there is none), and a **handover tag**: a MAC
-   under the OUTGOING key over the new key id and the `closes` record. It refuses, too, when the
-   active key already keyed a range.
+3. **`rotate-key` opens a new range.** After re-encrypting, it verifies the whole chain and refuses
+   on any break. It then appends ONE `audit.key_epoch` row, MAC'd under the NEW key. The row's detail
+   holds three things:
+   - the new key's id;
+   - a `closes` record for the range it ends: its key, first and last id, and row count; a SHA-256
+     digest over every row's id, chained fields and stored MAC; and `prev_hash`, the stored hash of
+     the row just before the range (`""` when there is none);
+   - a **handover tag**, a MAC under the OUTGOING key over the new key id and the `closes` record.
+
+   It seals and verifies from one read, and the append is refused if the chain head has moved since.
+   It also refuses when the active key already keyed a range.
 4. **Verify checks each row under its own range's key** (`verify_audit_rows`, one function shared by
    all three backends). A range whose key is no longer held is proved by the digest in the row that
    closes it; that row lies in the next range, so the proof chains forward to the newest range, whose
@@ -79,7 +83,10 @@ first is opened by a row inside the chain.**
   → `tests/test_audit_key_rotation.py::test_the_documented_rotation_verifies_at_every_step`
 - **AC-2** -- WHEN a row of a dropped key's range is edited, THE SYSTEM SHALL report a break.
   → `tests/test_audit_key_rotation.py::test_editing_a_row_of_a_dropped_keys_range_is_caught`
+- **AC-7** -- WHEN a row BELOW a range is edited and re-hashed after that range's key is dropped,
+  THE SYSTEM SHALL report a break naming the rows before the range.
   → `tests/test_audit_key_rotation.py::test_a_forged_keyless_prefix_is_caught_after_the_first_key_is_dropped`
+  → `tests/test_audit_key_rotation.py::test_a_key_holders_range_row_that_misstates_its_link_is_caught`
 - **AC-3** -- IF a range row's `closes` record, or `audit_chain_meta.key_id`, is altered, THEN THE
   SYSTEM SHALL report a break rather than verify under the named key.
   → `tests/test_audit_key_rotation.py::test_a_moved_range_boundary_is_caught`
