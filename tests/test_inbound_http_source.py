@@ -652,6 +652,63 @@ async def test_the_head_parse_refuses_the_rfc_9112_desync_grammar(label: str, ra
     assert excinfo.value.kind == "framing_error", label
 
 
+_CHUNKED_BODY = b"3\r\nabc\r\n0\r\n\r\n"
+
+
+@pytest.mark.parametrize(
+    ("label", "framing"),
+    [
+        ("exact", b"Transfer-Encoding: chunked\r\n"),
+        ("value title case", b"Transfer-Encoding: Chunked\r\n"),
+        ("value upper case", b"Transfer-Encoding: CHUNKED\r\n"),
+        ("name upper case", b"TRANSFER-ENCODING: chunked\r\n"),
+        ("name and value mixed", b"transfer-Encoding: cHuNkEd\r\n"),
+        ("gzip then chunked", b"Transfer-Encoding: gzip, chunked\r\n"),
+        ("gzip then upper chunked", b"Transfer-Encoding: gzip, CHUNKED\r\n"),
+        ("no space after comma", b"Transfer-Encoding: gzip,chunked\r\n"),
+        ("chunked then gzip", b"Transfer-Encoding: chunked, gzip\r\n"),
+        ("surrounding ows", b"Transfer-Encoding: \t chunked \t\r\n"),
+        ("gzip alone", b"Transfer-Encoding: gzip\r\n"),
+        ("deflate alone", b"Transfer-Encoding: Deflate\r\n"),
+        ("empty value", b"Transfer-Encoding:\r\n"),
+        ("list with empty member", b"Transfer-Encoding: ,chunked\r\n"),
+        # With a Content-Length beside it, whatever the coding: RFC 9112 section 6.1 lets TE
+        # override CL, so the two together are the CL.TE smuggling shape.
+        ("cl with gzip", b"Content-Length: 3\r\nTransfer-Encoding: gzip\r\n"),
+        ("cl with mixed-case chunked", b"Content-Length: 3\r\nTransfer-Encoding: Chunked\r\n"),
+        ("te before cl", b"Transfer-Encoding: identity\r\nContent-Length: 3\r\n"),
+    ],
+)
+async def test_any_transfer_encoding_is_refused_whatever_its_spelling(
+    label: str, framing: bytes
+) -> None:
+    """BACKLOG #1913. The listener decodes no transfer coding, so ANY Transfer-Encoding is refused
+    in the head phase, before a body byte is read.
+
+    The pre-#1125 test was exact equality on the lowered value, so a coding list such as
+    `gzip, chunked` fell through and its body was read raw. Every spelling a proxy might still
+    read as chunked is here: case in the name and the value, a coding list in either order, OWS,
+    and the empty and degenerate lists. The accept-control is the test below it.
+    """
+    raw = b"POST /ingest HTTP/1.1\r\nHost: h\r\n" + framing + b"\r\n" + _CHUNKED_BODY
+    reader = await _reader_from(raw)
+    with pytest.raises(HttpRequestError) as excinfo:
+        await _read_head(reader, max_header_bytes=8192)
+    assert excinfo.value.status == 400, label
+    assert excinfo.value.kind == "framing_error", label
+
+
+async def test_the_same_post_framed_by_content_length_alone_is_read() -> None:
+    # Accept-control for the Transfer-Encoding refusals above: the identical request line, host
+    # and reader, framed by Content-Length alone, parses and yields exactly its declared bytes. A
+    # head parse gone refuse-everything reds here rather than passing there.
+    raw = b"POST /ingest HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nabc"
+    req = await _read_request(
+        await _reader_from(raw), max_header_bytes=8192, max_body_bytes=DEFAULT_MAX_BODY_BYTES
+    )
+    assert req.method == "POST" and req.body == b"abc"
+
+
 @pytest.mark.parametrize("method", ["POST", "PUT", "PATCH"])
 async def test_a_body_method_with_no_framing_is_refused_411_not_read_to_eof(method: str) -> None:
     """BACKLOG #1125. A body method with neither Content-Length nor Transfer-Encoding used to be
@@ -704,6 +761,14 @@ async def test_a_lowercase_method_is_not_folded_into_a_known_one() -> None:
     ("raw", "status"),
     [
         (b"POST /ingest HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: gzip, chunked\r\n\r\nabc", 400),
+        # BACKLOG #1913: case does not get a coding past the refusal, and neither does pairing a
+        # non-chunked coding with a Content-Length.
+        (b"POST /ingest HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: gzip, CHUNKED\r\n\r\nabc", 400),
+        (
+            b"POST /ingest HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n"
+            b"Transfer-Encoding: Gzip\r\n\r\nabc",
+            400,
+        ),
         (b"POST /ingest HTTP/1.1\r\nHost: h\r\n\r\nabc", 411),
         (b"POST /ingest HTTP/1.1\r\nHost: h\r\n Content-Length: 3\r\n\r\nabc", 400),
         (b"GET /health HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nHELLO", 400),

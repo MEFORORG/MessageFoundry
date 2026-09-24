@@ -7,6 +7,15 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Security
+- **The `Http()` inbound listener now refuses any `Transfer-Encoding`, not only an exact
+  `chunked`.** The listener decodes no transfer coding. Until this release it refused a request only
+  when the header read exactly `chunked`, so `gzip, chunked`, `chunked,` and `identity` passed and the
+  body was read raw as the message. Every such request is now answered `400` before a body byte is
+  read, whatever the coding, its case or its spacing. A request carrying both `Transfer-Encoding` and
+  `Content-Length` was already refused and still is. The refusal is logged as a `framing_error`
+  connection event and writes no ingress row, like the listener's other framing refusals. **A
+  deploying sender that sets `Transfer-Encoding` on its POST would be refused**; send a
+  `Content-Length` instead. ([BACKLOG #1125](docs/BACKLOG.md), [BACKLOG #1913](docs/BACKLOG.md))
 - **OIDC sign-in now bounds how old the IdP's authentication may be.** A new setting,
   `[auth].oidc_max_age_seconds`, is sent as `max_age` on every authorization request. It defaults
   to 43200 seconds (12 hours), accepts 300 to 86400, and has no off switch. The engine now requires
