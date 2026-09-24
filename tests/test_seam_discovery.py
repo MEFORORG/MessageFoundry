@@ -155,12 +155,17 @@ def test_security_symbols_are_what_the_console_actually_imports(surface: Any) ->
     ``from messagefoundry.api.security import ...`` name -- the same companion edit a seam bump is.
     ``enforce_phi_read_hop`` joined with the ADR 0092 PHI serve-hop refusal on /ui (BACKLOG #1738).
     Update it to what discovery reports; never widen it to a membership check, because the whole
-    value here is that an UNNOTICED import shows up as a failure rather than as nothing."""
+    value here is that an UNNOTICED import shows up as a failure rather than as nothing.
+    ``initial_credential_window_hours`` and the two ``pending_credential_deadline`` helpers joined
+    with the initial-credential deadline surfaces (BACKLOG #1141, ASVS 6.4.5)."""
     assert surface.security_symbols == (
         "client_ip",
         "enforce_phi_read_hop",
         "enforce_phi_read_pacing",
         "get_auth",
+        "initial_credential_window_hours",
+        "pending_credential_deadline",
+        "pending_credential_deadline_for",
     )
 
 

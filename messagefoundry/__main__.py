@@ -1720,8 +1720,11 @@ def _serve(args: argparse.Namespace) -> int:
     # [store].require_encryption forces the refusal even for a synthetic instance. A DPAPI-protected key
     # file (Windows) counts as a configured key; if it's set but unreadable here, open_store fails closed
     # at startup with the DPAPI error.
-    if not (settings.store.encryption_key or settings.store.encryption_key_file):
-        if settings.store.require_encryption:
+    if not _store_key_configured(settings):
+        # The refuse-or-proceed DECISION is shared with provision-admin (BACKLOG #1905); the wording
+        # below stays serve's own, because the remedy differs by command.
+        keyless_gate = _keyless_store_gate(settings, enforcing=enforcing)
+        if keyless_gate == _GATE_REQUIRE_ENCRYPTION:
             print(
                 "error: [store].require_encryption is set but no MEFOR_STORE_ENCRYPTION_KEY (or "
                 "[store].encryption_key_file) is configured; refusing to start (PHI would be stored "
@@ -1729,7 +1732,7 @@ def _serve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
-        if not settings.store.allow_unencrypted_phi:
+        if keyless_gate == _GATE_NO_OPT_OUT:
             # Secure-by-default: any instance, in any environment, refuses to run keyless. This is
             # the H3 tightening — previously prod refused and non-prod only warned (fail-open), but
             # dev/staging routinely hold near-real PHI.
@@ -1744,7 +1747,9 @@ def _serve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
-        if enforcing and not settings.security.allow_unencrypted_phi_under_strict_enforcement:
+        if keyless_gate is not None:
+            # _GATE_NO_STRICT_ACK, and deliberately the catch-all: a refusal value this block does not
+            # name must still refuse, never fall through to the keyless start below.
             # Secure-by-default under STRICT ENFORCEMENT (ADR 0140): keyless PHI under enforcement
             # requires a SECOND acknowledgment beyond [security].allow_unencrypted_phi — the highest-
             # risk posture (real PHI + strict enforcement) is never one flag away from plaintext at
@@ -2075,7 +2080,9 @@ def _serve(args: argparse.Namespace) -> int:
     # The store is NOT open yet either, so the #1008 store-principal privilege OBSERVATION is passed as
     # None for the same reason and with the same discipline: it is reported moments later by the
     # preflight's own log line + audit row once the lifespan opens the store, and completely by
-    # GET /security/posture. None here is "not yet observed", never "observed and clean".
+    # GET /security/posture. None here is "not yet observed", never "observed and clean". The same
+    # holds for the #1905 audit-chain keying observation: the store logs its own WARNING when it opens
+    # onto a keyless chain, and GET /security/posture reports it off the live store.
     _loosenings = security_loosenings(
         settings.security,
         settings.store,
@@ -2085,6 +2092,7 @@ def _serve(args: argparse.Namespace) -> int:
         (),
         (),
         (),
+        None,
         None,
     )
     if _loosenings:
@@ -3566,12 +3574,20 @@ def _serve(args: argparse.Namespace) -> int:
     # WP-15: trust X-Forwarded-For/-Proto ONLY from the declared reverse proxies, so the audit /
     # rate-limit source IP is the real client (not the proxy). Empty list = trust nothing (the secure
     # default — the direct TCP peer is used), overriding uvicorn's loopback default.
+    # BACKLOG #1120: headers on the responses uvicorn writes itself; see api/protocol_headers.py.
+    from messagefoundry.api.protocol_headers import (
+        floored_http_protocol_class,
+        floored_ws_protocol_class,
+    )
+
     run_kwargs: dict[str, Any] = {
         "log_config": None,
         "forwarded_allow_ips": settings.api.trusted_proxies,
         # WP-L3-07 (ASVS 13.4.6): drop the `Server: uvicorn` banner so a response doesn't advertise the
         # server implementation/version to an unauthenticated caller.
         "server_header": False,
+        "http": floored_http_protocol_class(),
+        "ws": floored_ws_protocol_class(),
     }
     # BACKLOG #1276: THE ENGINE ALWAYS SERVES TLS. Owner ruling 2026-08-22 (option 3), which
     # SUPERSEDES ADR 0143's premise that the console is hardened "over a cleartext loopback
@@ -3606,11 +3622,12 @@ def _serve(args: argparse.Namespace) -> int:
         # ADR 0083 activation: only when in-process mTLS (client CA) AND a cert-identity map are BOTH
         # configured, swap in the scope-populating HTTP protocol so a verified peer cert reaches
         # resolve_client_cert_identity. Gated on both so a mutual-auth-only bind (console mTLS, no map)
-        # and every non-mTLS bind keep the stock protocol — no behaviour change without a client CA + map.
+        # and every non-mTLS bind keep the header-floored protocol without the shim.
         if settings.api.tls_client_ca_file and settings.api.tls_client_cert_identities:
             from messagefoundry.api.tls_client_cert import client_cert_http_protocol_class
 
-            run_kwargs["http"] = client_cert_http_protocol_class()
+            # Stacked ON the floored protocol, never instead of it (BACKLOG #1120).
+            run_kwargs["http"] = client_cert_http_protocol_class(base=run_kwargs["http"])
 
     # The last-resort sys/threading excepthooks are already in force here: `main()` installs them for
     # every subcommand (BACKLOG #1674). The asyncio loop handler is separate and is installed by the
@@ -4744,6 +4761,50 @@ def _read_new_password(prompt: str) -> str:
     return first
 
 
+#: The three conditions under which the at-rest gate refuses a store with no key. Values name the
+#: setting an operator changes, so a caller can say which one refused without restating the rule.
+_GATE_REQUIRE_ENCRYPTION = "[store].require_encryption"
+_GATE_NO_OPT_OUT = "[security].allow_unencrypted_phi"
+_GATE_NO_STRICT_ACK = "[security].allow_unencrypted_phi_under_strict_enforcement"
+
+
+class _KeylessProvisionRefused(RuntimeError):
+    """``provision-admin`` found its opened store keyless although a key is configured (#1905)."""
+
+
+def _store_key_configured(settings: ServiceSettings) -> bool:
+    """Is a local store key configured? The at-rest gate's one test for "keyed" (a DPAPI key file counts;
+    ``open_store`` fails closed later if it is unreadable). It does not consult ``cipher_provider`` --
+    the documented ``vault_transit`` precondition in ``docs/CONFIGURATION.md`` -- and keeping the test
+    here means that gap, when it is closed, is closed once for every command that applies the gate."""
+    return bool(settings.store.encryption_key or settings.store.encryption_key_file)
+
+
+def _keyless_store_gate(settings: ServiceSettings, *, enforcing: bool) -> str | None:
+    """Which at-rest gate refuses opening this store for writing, or ``None`` when it may be opened.
+
+    The DECISION, stated once for every command that opens a store for writing on a fresh install:
+    ``serve``, and ``provision-admin`` since BACKLOG #1905. Before that item the decision lived inline in
+    ``serve`` alone, so the documented install order -- ``provision-admin`` before the first ``serve``,
+    with the key in the service environment rather than the operator's shell -- opened the store with
+    no key, wrote the first audit row as keyless SHA-256, and left a chain that a later keyed open never
+    keys (``_load_audit_chain_meta`` auto-keys only an EMPTY ``audit_log``).
+
+    ``None`` covers two cases: a key is configured, or one of the audited opt-outs applies (the caller
+    then proceeds keyless and says so). The WORDING stays with each caller, because the remedy differs:
+    ``serve`` may point at ``gen-key`` for a new install, while ``provision-admin`` must point at the key
+    the service already holds -- a new key there keys the chain under a key the service does not have."""
+    if _store_key_configured(settings):
+        return None
+    if settings.store.require_encryption:
+        return _GATE_REQUIRE_ENCRYPTION
+    if not settings.store.allow_unencrypted_phi:
+        return _GATE_NO_OPT_OUT
+    if enforcing and not settings.security.allow_unencrypted_phi_under_strict_enforcement:
+        return _GATE_NO_STRICT_ACK
+    return None
+
+
 def _provision_admin(args: argparse.Namespace) -> int:
     """Create the first administrator offline (BACKLOG #1136, ASVS 6.3.2).
 
@@ -4778,6 +4839,38 @@ def _provision_admin(args: argparse.Namespace) -> int:
     except (FileNotFoundError, ValueError, ValidationError) as exc:
         return _emit_error(str(exc), as_json=args.json)
 
+    # BACKLOG #1905: the same at-rest gate `serve` applies, and BEFORE the password prompt and the
+    # store open, so a refusal leaves no store behind. This command writes the store's FIRST audit row,
+    # and a chain that starts keyless stays keyless: a later keyed open never re-keys existing rows. The
+    # key has to be in the environment of the shell running THIS command -- the service's NSSM
+    # environment is not visible here, which is how the documented order used to go wrong.
+    from messagefoundry.config.ai_policy import SecurityEnforcement
+
+    keyless_gate = _keyless_store_gate(
+        settings, enforcing=settings.security.enforcement is SecurityEnforcement.ENFORCE
+    )
+    if keyless_gate is not None:
+        return _emit_error(
+            "no store key is set in this shell (MEFOR_STORE_ENCRYPTION_KEY, or "
+            "[store].encryption_key_file in the service config); refusing to provision. "
+            "provision-admin opens the store and writes its first audit row, and an audit chain that "
+            "starts keyless stays keyless. Set the key the service runs with -- the one in its NSSM "
+            "environment -- in this shell and re-run. Do not generate a new key for this command: the "
+            "service would then hold a different key from the one the store was created under. If "
+            "the service deliberately runs keyless, set the same audited opt-out here that it uses. "
+            f"The deciding setting is {keyless_gate}, the same one that makes `serve` refuse to start.",
+            as_json=args.json,
+        )
+    if not _store_key_configured(settings):
+        # An audited opt-out applies, so this proceeds keyless -- and must not do so quietly, because a
+        # stale opt-out left in a shell is how a keyed production store would get a keyless first row.
+        print(
+            "WARNING: no store key is set in this shell and the audited at-rest opt-out applies, so "
+            "the store is opened KEYLESS and its audit chain starts as plain SHA-256. It stays keyless if a key is added later. If the service "
+            "runs with a key, stop now and set that key in this shell instead.",
+            file=sys.stderr,
+        )
+
     try:
         password = _read_new_password("New administrator password: ")
     except _PasswordEntryRefused as exc:
@@ -4789,6 +4882,15 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # create=True (BACKLOG #1780): this bootstrap runs before the first serve, see the note below.
         store = await open_store(settings.store, create=True)
         try:
+            if _store_key_configured(settings) and not store.cipher_info().encrypts:
+                # BACKLOG #1905: the settings name a key but the key provider resolved none (a pinned
+                # `[store].key_provider` reading a source this shell does not have). Refuse before
+                # the first audit row is written, rather than provision into a keyless chain.
+                raise _KeylessProvisionRefused(
+                    "a store key is configured, but [store].key_provider resolved no key in this "
+                    "shell, so the store opened KEYLESS; refusing to provision. Make the key the "
+                    "service runs with readable here and re-run."
+                )
             outcome = await AuthService(store, settings.auth).provision_first_administrator(
                 username=args.username,
                 password=password,
@@ -4810,7 +4912,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
 
     try:
         outcome, store_path = asyncio.run(run())
-    except FirstAdministratorRefused as exc:
+    except (FirstAdministratorRefused, _KeylessProvisionRefused) as exc:
         return _emit_error(str(exc), as_json=args.json)
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
@@ -5160,7 +5262,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
         )
         return 2
 
-    async def run() -> tuple[int, ResealResult]:
+    async def run() -> tuple[int, ResealResult, tuple[bool, str]]:
         import datetime
 
         from messagefoundry.store.store import SecretRotationMetaStore
@@ -5198,12 +5300,18 @@ def _rotate_key(args: argparse.Namespace) -> int:
                         tracked_since=prior.tracked_since if prior is not None else today,
                         last_rotated=today,
                     )
-            return count, uploads
+            # BACKLOG #1904: the audit chain is the third surface the key covers. Its rows are never
+            # re-MAC'd (the off-box tee and every recorded anchor hold those values); instead the chain
+            # gets a range under the NEW key, whose first row commits to a digest of the old range, so
+            # the old range stays provable once the retired key is dropped. Verified first, and last in
+            # this command, so a refusal leaves the data rotation above intact and resumable.
+            rolled = await store.roll_audit_key_epoch()
+            return count, uploads, rolled
         finally:
             await store.close()
 
     try:
-        count, uploads = asyncio.run(run())
+        count, uploads, (rolled_ok, rolled_msg) = asyncio.run(run())
     except CipherError as exc:
         # A value couldn't be decrypted by any supplied key — the prior key is missing — or it was an
         # unmarked value the cipher refuses (#1169); the message names which, and the cell. Nothing is
@@ -5219,10 +5327,13 @@ def _rotate_key(args: argparse.Namespace) -> int:
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path)
-    print(
-        f"OK: re-encrypted {count} value(s) under the active key"
+    done = (
+        f"re-encrypted {count} value(s) under the active key"
         f" (+{uploads.resealed} uploaded-file value(s) re-sealed)"
     )
+    # "OK:" only when the whole rotation, audit chain included, is done: a wrapper reading stdout must
+    # not see OK and drop the retired key while the audit roll failed (BACKLOG #1904).
+    print(f"OK: {done}" if rolled_ok else f"PARTIAL: {done}")
     if uploads.skipped:
         # Say it plainly and on stderr: a skipped file is STILL under the old key, so retiring that
         # key now destroys it. This is the one outcome where "OK" alone would mislead.
@@ -5232,6 +5343,17 @@ def _rotate_key(args: argparse.Namespace) -> int:
             "BEFORE removing MEFOR_STORE_ENCRYPTION_KEYS_RETIRED.",
             file=sys.stderr,
         )
+    if not rolled_ok:
+        # The data is rotated but the audit chain is not: its current range is still under the prior
+        # key, so dropping that key now would leave the newest range unverifiable. Say so, and fail.
+        print(
+            f"error: the audit chain was not rolled to the active key — {rolled_msg}. Do NOT remove "
+            "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED until `messagefoundry rotate-key` completes "
+            "without this error.",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"OK: {rolled_msg}")
     return 0
 
 
@@ -6166,14 +6288,16 @@ def _security(args: argparse.Namespace) -> int:
 
     def _loosenings(sec: SecuritySettings) -> list[dict[str, str]]:
         # This CLI reads a SETTINGS file and never loads the connection graph — nor does it open the
-        # store — so it can see NEITHER the three per-connection declarations NOR the #1008
-        # store-principal privilege observation. It passes empty lists and None and declares BOTH gaps
+        # store — so it can see NEITHER the three per-connection declarations NOR the two store
+        # observations (#1008 privilege, #1905 audit-chain keying). It passes empty lists and None and
+        # declares BOTH gaps
         # in `loosenings_scope` below, instead of reporting a settings-only view as if it were the whole
-        # posture. `messagefoundry check` and GET /security/posture are the complete surfaces.
+        # posture. GET /security/posture is the complete surface; `messagefoundry check` adds the
+        # connection-scoped entries but opens no store either.
         return [
             {"switch": s, "risk": r}
             for s, r in security_loosenings(
-                sec, _store, _auth, _alerts, _rotation, (), (), (), None
+                sec, _store, _auth, _alerts, _rotation, (), (), (), None, None
             )
         ]
 
@@ -6194,8 +6318,9 @@ def _security(args: argparse.Namespace) -> int:
         "loosenings_scope": (
             "settings only ([security]/[store]/[auth]/[alerts]); the per-connection "
             "cleartext_accepted, tls_allow_expired and generic-ODBC DATABASE TLS declarations are NOT "
-            "included, and neither is the store-principal privilege observation (#1008 — this command "
-            "opens no store). These are the AUTHORED values, so a `serve --host` bind override on a "
+            "included, and neither are the store-principal privilege and audit-chain keying "
+            "observations (#1008, #1905 — this command opens no store, and neither does `check`; "
+            "GET /security/posture reports both). These are the AUTHORED values, so a `serve --host` bind override on a "
             "running engine is not reflected here either — see `messagefoundry check` or "
             "GET /security/posture"
         ),

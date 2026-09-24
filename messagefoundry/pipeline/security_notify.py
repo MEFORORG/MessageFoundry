@@ -180,8 +180,9 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         self._trust_anchor_policy = trust_anchor_policy
 
     async def notify(self, event: SecurityEvent) -> None:
-        # No deliverable address → nothing to email; the audited /me/security-events feed still
-        # records it. Non-blocking enqueue.
+        # No deliverable address means nothing to email. The caller has audited the event; which
+        # events the /me/security-events feed shows is stated once, in auth/notifications.py.
+        # Non-blocking enqueue.
         #
         # **WHICH ADDRESS ``event.email`` HOLDS IS A CALLER'S PROPERTY, NOT AN INVARIANT THIS METHOD
         # HOLDS**, and it used to be written here as one (BACKLOG #1139). The rule and its single
@@ -208,8 +209,7 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
             # **Never ``event.detail``** -- an EMAIL_CHANGED carries the new address in it.
             log.warning(
                 "security notice %s for %s dropped: the account has no notification address on "
-                "file, so it was not told out of band (the /me/security-events feed still records "
-                "it)",
+                "file, so it was not told out of band (the event is still in the audit log)",
                 event.event_type,
                 event.username,
             )
@@ -256,7 +256,8 @@ def security_notifier_from_settings(
     trust_anchor_policy: TrustAnchorPolicy | None = None,
 ) -> SecurityEventNotifier | None:
     """Build the per-user security notifier from ``[alerts]`` SMTP settings, or ``None`` when no SMTP
-    server/sender is configured (then only the ``/me/security-events`` feed records events).
+    server/sender is configured (then nothing is emailed; ``auth/notifications.py`` states which events
+    the ``/me/security-events`` feed still shows).
 
     ``secret_provider`` (ADR 0019 §5) resolves the SMTP password from a ``[secrets].provider`` when
     ``email_password_secret`` is set (fail-closed); ``None``/no reference → the env-sourced

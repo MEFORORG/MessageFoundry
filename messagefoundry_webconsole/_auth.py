@@ -793,11 +793,13 @@ def require_ui_reauth_only_action(
 ) -> Callable[[Request], Awaitable[Identity]]:
     """Like :func:`require_ui_reauth_only` (password-only, **no MFA gate** so a required-but-unenrolled
     session can still enroll its first factor), but the step-up must be a fresh proof **bound to**
-    ``action`` (single-use, ADR 0077 / ASVS 7.5.1). Used by the browser factor-binding enroll lanes.
-    Falls back to the session window under ``[auth].require_action_step_up = false``. Same ``new_ip``-
-    first short-circuit so a forced new-IP step-up leaves the single-use grant UNCONSUMED."""
-    # allow_mfa_pending: a genuine exemption, not a re-route. These gate the ENROLLMENT path, and
-    # an un-enrolled user can never satisfy a gate standing in front of the route that enrolls them.
+    ``action`` (single-use, ADR 0077 / ASVS 7.5.1). Used by the browser factor-binding enroll lanes
+    and the session-terminate lanes. Falls back to the session window under
+    ``[auth].require_action_step_up = false``. Same ``new_ip``-first short-circuit so a forced
+    new-IP step-up leaves the single-use grant UNCONSUMED."""
+    # allow_mfa_pending: a genuine exemption, not a re-route. It serves an account with NO factor,
+    # which can never satisfy a gate standing in front of the route that enrolls it, or that ends
+    # a session it does not recognise. An account that HAS a factor is refused below (#1951).
     base = require_ui(*permissions, allow_mfa_pending=True)
 
     async def dependency(request: Request) -> Identity:
@@ -808,10 +810,15 @@ def require_ui_reauth_only_action(
         token = session_token(request)
         client = request.client.host if request.client else None
         new_ip = await auth.flag_new_client_ip(token, client, path=request.url.path)
+        nxt = reauth_next(request) if reauth_next is not None else None
+        if await auth.factor_binding_is_blocked(token, action):
+            # A pending session on an account that HAS a factor (see _PENDING_REFUSED_ACTIONS).
+            # Audited like require_ui's own MFA refusal and like the JSON twin; /ui/reauth then asks
+            # for the code before the password.
+            await auth.audit_mfa_denied(identity, request.url.path, client=client)
+            raise _reauth_redirect(request, nxt)
         if new_ip or not await _ui_action_step_up_ok(auth, token, action):
-            raise _reauth_redirect(
-                request, reauth_next(request) if reauth_next is not None else None
-            )
+            raise _reauth_redirect(request, nxt)
         return identity
 
     return dependency

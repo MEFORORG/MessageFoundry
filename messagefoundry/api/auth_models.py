@@ -52,6 +52,11 @@ class LoginResponse(BaseModel):
     # (WP-14): the client should prompt for a TOTP / recovery code and POST /auth/mfa-verify.
     mfa_required: bool = False
     user: CurrentUser
+    #: BACKLOG #1141 (ASVS 6.4.5): when ``must_change_password`` is set, the Unix instant the
+    #: temporary credential this login used stops working, so a client can tell its holder. It is
+    #: ``AuthService.initial_credential_deadline`` over the stored ``password_changed_at``, the value
+    #: the login gate refuses on. ``None`` when no change is owed or the expiry setting is 0.
+    credential_expires_at: float | None = None
 
 
 class ProvidersInfo(BaseModel):
@@ -84,6 +89,12 @@ class UserSummary(BaseModel):
     #: Per-channel RBAC, as STORED: the allowed connection names, ``["*"]`` for the explicit
     #: all-channels grant, or ``None`` when nobody has set a scope — which denies (BACKLOG #1152).
     channel_scope: list[str] | None = None
+    #: BACKLOG #1141 (ASVS 6.4.5): while the account still holds an admin-issued must-change
+    #: credential, the Unix instant it stops working. The create-user response and the console's
+    #: user page carry it, both behind users:manage, so the administrator who conveys the initial
+    #: password can convey its deadline. ``GET /users`` needs only users:read and leaves it ``None``.
+    #: Same source as the login gate. ``None`` once the holder sets their own password.
+    credential_expires_at: float | None = None
 
 
 class UserPermissions(BaseModel):

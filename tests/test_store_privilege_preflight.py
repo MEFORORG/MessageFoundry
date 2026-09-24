@@ -765,6 +765,7 @@ def _names(store_privilege: StorePrivilegePosture | None) -> dict[str, str]:
             (),
             (),
             store_privilege,
+            None,
         )
     )
 
@@ -821,6 +822,7 @@ def test_the_refusal_switch_is_a_hardening_and_is_not_itself_a_loosening() -> No
                 (),
                 (),
                 (),
+                None,
                 None,
             )
         )

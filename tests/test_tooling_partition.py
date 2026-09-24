@@ -132,6 +132,10 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # `-m 'not tooling'` on the engine legs AND unreached by the tooling job's path gate, so the
         # PR that added an unclassified dependency would face nothing, which is the one thing the
         # designation exists to prevent (BACKLOG #1189).
+        # Reads messagefoundry/** and messagefoundry_webconsole/** off disk and pins every HTTP
+        # response emitter of a known shape against a register (BACKLOG #1120). A new emitter
+        # arrives as an ENGINE diff, so as tooling it would face nothing on that change.
+        "test_response_emitter_inventory.py",
         "test_risky_component_designation.py",
         "test_sandbox_worker_logging.py",
         "test_scan_forbidden.py",

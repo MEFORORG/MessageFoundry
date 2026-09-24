@@ -34,6 +34,9 @@ item that fixes a red `main`, changes a security control, supersedes an ADR, or 
 against another open PR gets its own PR. An item that is red or conflicts goes back to a Builder. Korus `MANAGER.md`, *When to cut a pull
 request*, holds the steps.
 
+**ASVS record work is yours** (2026-09-23): re-score, prose, reconcile. Brief vault Builders.
+You are not the Tracker renamed.
+
 The brief is disposable. The BACKLOG item is the record.
 
 ## What it must not do
