@@ -793,8 +793,9 @@ def require_ui_reauth_only_action(
 ) -> Callable[[Request], Awaitable[Identity]]:
     """Like :func:`require_ui_reauth_only` (password-only, **no MFA gate** so a required-but-unenrolled
     session can still enroll its first factor), but the step-up must be a fresh proof **bound to**
-    ``action`` (single-use, ADR 0077 / ASVS 7.5.1). Used by the browser factor-binding enroll lanes.
-    Falls back to the session window under ``[auth].require_action_step_up = false``. Same ``new_ip``-
+    ``action`` (single-use, ADR 0077 / ASVS 7.5.1). Used by the browser factor-binding enroll lanes
+    and the session-terminate lanes; a pending session on an account that already has a factor is
+    refused for both (``AuthService._PENDING_REFUSED_ACTIONS``, BACKLOG #1951). Falls back to the session window under ``[auth].require_action_step_up = false``. Same ``new_ip``-
     first short-circuit so a forced new-IP step-up leaves the single-use grant UNCONSUMED."""
     # allow_mfa_pending: a genuine exemption, not a re-route. These gate the ENROLLMENT path, and
     # an un-enrolled user can never satisfy a gate standing in front of the route that enrolls them.

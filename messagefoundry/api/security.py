@@ -84,6 +84,11 @@ _MUST_CHANGE_EXEMPT_PATHS = frozenset({"/auth/logout", "/auth/me", "/me/password
 # inventory and client-IP history is reconnaissance. ASVS 7.5.2 self-service is a POST-authentication
 # clause, and neither route is on any deadlock-escape path (revocation still works: POST /me/reauth
 # then DELETE /me/sessions, both reachable).
+#
+# That revocation path serves an account with NO factor, which has nothing to prove at
+# /auth/mfa-verify. An account that HAS one proves it first before that path works (BACKLOG #1951;
+# see AuthService._PENDING_REFUSED_ACTIONS). /me/password is NOT so limited: it revokes every
+# session when it changes the password, from a pending session too.
 _MFA_EXEMPT_ROUTES: frozenset[tuple[str, str]] = frozenset(
     {
         ("POST", "/auth/logout"),
@@ -767,7 +772,11 @@ def require_reauth_only_action(
     from binding an attacker authenticator, and now that proof is tied to *this* action, not the login
     window (ADR 0077). Same ``X-Step-Up-Action`` header + org opt-out as :func:`require_step_up_action`.
 
-    Carries the same ``mfa_gate=False`` opt-out as :func:`require_reauth_only`, for the same reason."""
+    Carries the same ``mfa_gate=False`` opt-out as :func:`require_reauth_only`, for the same reason;
+    the session-terminate routes use it too. A pending session on an account that HAS a factor is
+    still refused (see ``AuthService._PENDING_REFUSED_ACTIONS``), with ``X-MFA-Required`` rather than
+    a step-up header: a password re-proof mints it nothing, so pointing it at ``POST /me/reauth``
+    would loop a client that already typed the right password (BACKLOG #1951)."""
     base = require(*permissions, mfa_gate=False)
 
     async def dependency(request: Request) -> Identity:
@@ -775,6 +784,15 @@ def require_reauth_only_action(
         auth = get_auth(request)
         if auth is not None and auth.enabled:
             token = bearer_token(request)
+            # Before the grant check, which pops: a refusal here must not burn a grant. Audited like
+            # require()'s MFA gate, since this is the same refusal reached past that gate's carve-out.
+            if await auth.factor_binding_is_blocked(token, action):
+                await auth.audit_mfa_denied(identity, request.url.path, client=client_ip(request))
+                raise HTTPException(
+                    status.HTTP_403_FORBIDDEN,
+                    "multi-factor verification required; POST /auth/mfa-verify then retry",
+                    headers={"X-MFA-Required": "1"},
+                )
             new_ip = await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
             if new_ip or not await _action_step_up_ok(auth, token, action):
                 raise HTTPException(

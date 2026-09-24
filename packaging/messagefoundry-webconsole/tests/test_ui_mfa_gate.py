@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import httpx
 import pytest
+from _ui_clients import SAME_ORIGIN
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role, totp
@@ -365,3 +366,113 @@ async def test_a_correct_code_then_a_wrong_password_leaves_a_working_cookie(
         assert await service.identity_for_token(before) is None, (
             "the old cookie still authenticates"
         )
+
+
+# --- ending sessions from a pending session (ASVS 6.3.3 / 7.5.2, BACKLOG #1951) -------------
+
+_REVOKE_OTHERS = "/ui/account/sessions/revoke-others"
+
+
+@pytest.mark.parametrize("action_step_up", (True, False), ids=("enforced", "opted-out"))
+async def test_a_pending_session_cannot_end_an_enrolled_accounts_sessions(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, action_step_up: bool
+) -> None:
+    """The /ui twin of the engine's refusal. RED when: ``session_terminate`` leaves the set that
+    ``factor_binding_is_blocked`` refuses, as seen through ``_ui_action_step_up_ok``.
+
+    ``/ui/reauth`` already demands the code before it mints, so the console's own ceremony never
+    hands a pending session this grant. The reachable chain crosses planes: the password holder
+    replays the cookie token as a Bearer to the MFA-exempt ``POST /me/reauth``. So this stamps the
+    step-up state directly and asks one question: does the route open on it? ``enforced`` plants the
+    single-use grant; ``opted-out`` stamps the window, which is that branch's whole gate.
+    """
+    from messagefoundry.auth.service import STEP_UP_ACTION_SESSION_TERMINATE
+    from messagefoundry.auth.tokens import hash_token
+
+    service = await _service(engine, require_action_step_up=action_step_up)
+    await _add(service, "op", Role.OPERATOR)
+    _pin_totp_clock(monkeypatch, 1_000_000.0)  # no step boundary between making and checking a code
+    await _enroll_totp(service)
+    other = await service.login("op", PW)  # the real user's other device
+    assert other.ok and other.token is not None
+
+    async with _client(engine, service) as c:
+        assert (await _login(c)).status_code == 303  # the attacker knows the password only
+        tok = c.cookies.get("mf_session")
+        assert tok is not None
+        assert await service.mfa_satisfied(tok) is False
+
+        for path in (f"/ui/account/sessions/{hash_token(other.token)}/revoke", _REVOKE_OTHERS):
+            if action_step_up:
+                service._grant_action_step_up(hash_token(tok), STEP_UP_ACTION_SESSION_TERMINATE)
+            else:
+                await service.store.mark_session_reauthed(hash_token(tok))
+                # The positive control: without it a refusal for a stale window would pass.
+                assert await service.has_recent_step_up(tok) is True
+            r = await c.post(path, headers=SAME_ORIGIN)
+            # A SUCCESSFUL revoke also answers 303, so the location carries the verdict.
+            assert r.status_code == 303
+            assert r.headers["location"] == f"/ui/reauth?next={path}", (
+                f"{path} ended a session from an MFA-pending session on the password alone"
+            )
+
+        assert await service.identity_for_token(other.token) is not None
+
+
+async def test_a_session_that_proved_its_code_at_reauth_can_end_sessions(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the refusal ignores ``mfa_satisfied`` and blocks every enrolled account.
+
+    The console's own path for an enrolled, pending session: ``/ui/reauth`` takes the code, then the
+    password, then mints. That must still end the other sessions.
+    """
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    t0 = 1_000_000.0
+    _pin_totp_clock(monkeypatch, t0)
+    secret = await _enroll_totp(service)
+    other = await service.login("op", PW)
+    assert other.ok and other.token is not None
+
+    async with _client(engine, service) as c:
+        assert (await _login(c)).status_code == 303
+        t1 = t0 + totp.DEFAULT_PERIOD  # a strictly later step: enrollment consumed its own
+        _pin_totp_clock(monkeypatch, t1)
+        minted = await c.post(
+            "/ui/reauth",
+            data={"next": _REVOKE_OTHERS, "code": totp.totp(secret, now=t1), "password": PW},
+            headers=SAME_ORIGIN,
+        )
+        assert minted.status_code == 200
+        r = await c.post(_REVOKE_OTHERS, headers=SAME_ORIGIN)
+        assert r.status_code == 303
+        assert r.headers["location"] == "/ui/account/sessions?m=signed_out_others"
+        assert await service.identity_for_token(other.token) is None
+
+
+async def test_an_account_with_no_factor_still_ends_sessions_from_a_pending_session(
+    engine: Engine,
+) -> None:
+    """RED when: the refusal over-reaches and blocks the un-enrolled case too.
+
+    A fresh account is pending under the default ``require_mfa`` and has no code to give. The
+    password-only re-proof is its only way to end a session it does not recognise.
+    """
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    other = await service.login("op", PW)
+    assert other.ok and other.token is not None
+
+    async with _client(engine, service) as c:
+        assert (await _login(c)).status_code == 303
+        tok = c.cookies.get("mf_session")
+        assert tok is not None and await service.mfa_satisfied(tok) is False
+        minted = await c.post(
+            "/ui/reauth", data={"next": _REVOKE_OTHERS, "password": PW}, headers=SAME_ORIGIN
+        )
+        assert minted.status_code == 200
+        r = await c.post(_REVOKE_OTHERS, headers=SAME_ORIGIN)
+        assert r.status_code == 303
+        assert r.headers["location"] == "/ui/account/sessions?m=signed_out_others"
+        assert await service.identity_for_token(other.token) is None

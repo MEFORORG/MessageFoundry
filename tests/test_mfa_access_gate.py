@@ -15,18 +15,21 @@ written carelessly — a session's ``mfa_verified_at`` column can be correct whi
 from __future__ import annotations
 
 import ast
+import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 
 import httpx
 import pytest
 from _mfa_grant import mfa_grant_values
+from _totp_clock import fresh_totp, pin_totp_clock
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role, totp
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.ldap import AdPrincipal
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import STEP_UP_ACTION_SESSION_TERMINATE, AuthService
+from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import WebAuthnCredential
@@ -403,6 +406,198 @@ async def test_the_existing_factor_is_required_whatever_the_step_up_knob_says(
         # No promotion happened: the session is still behind the 6.3.3 gate.
         assert await service.mfa_satisfied(tok) is False
         assert (await c.get("/messages", headers=h)).status_code == 403
+
+
+# --- 6.3.3 / 7.5.2: ending sessions from a pending session (BACKLOG #1951) -------------------
+
+
+async def _enroll_totp_out_of_band(
+    service: AuthService, username: str, *, now: float | None = None
+) -> tuple[str, str]:
+    """Activate TOTP on a service-level session; return ``(secret, that session's token)``.
+
+    The ceremony runs on its OWN session, which ``confirm_mfa_enrollment`` marks MFA-satisfied and
+    re-keys. That session stands in for the real user's signed-in device, so a terminate that
+    reaches it shows up as a dead token. A caller that later verifies a code pins the TOTP clock and
+    passes that instant as ``now``: enrollment consumes the activating step (BACKLOG #1021)."""
+    user = await service.store.get_user_by_username(username)
+    assert user is not None
+    identity = await service.identity_for_user_id(user.id)
+    assert identity is not None
+    setup = await service.login(username, PW)
+    assert setup.ok and setup.token is not None
+    enrollment = await service.begin_mfa_enrollment(identity)
+    code = (
+        totp.totp(enrollment.secret, now=now) if now is not None else fresh_totp(enrollment.secret)
+    )
+    confirmed = await service.confirm_mfa_enrollment(identity, code, token=setup.token)
+    assert confirmed.ok and confirmed.token is not None
+    return enrollment.secret, confirmed.token
+
+
+async def _reauth_to_terminate(c: httpx.AsyncClient, tok: str) -> str:
+    """A password re-proof bound to ``session_terminate``; asserts it succeeds, returns the new token.
+
+    It succeeds even where the grant is refused: it is still a genuine password proof, and the
+    session is re-keyed either way (ASVS 7.2.4)."""
+    r = await c.post(
+        "/me/reauth",
+        json={"password": PW, "purpose": STEP_UP_ACTION_SESSION_TERMINATE},
+        headers=_auth(tok),
+    )
+    assert r.status_code == 200
+    return str(r.json()["token"])
+
+
+@pytest.mark.parametrize("action_step_up", (True, False), ids=("enforced", "opted-out"))
+async def test_a_pending_session_cannot_end_an_enrolled_accounts_sessions(
+    engine: Engine, action_step_up: bool
+) -> None:
+    """RED when: ``session_terminate`` leaves the set ``_factor_binding_is_blocked`` refuses.
+
+    The chain BACKLOG #1951 records. ``POST /me/reauth`` is MFA-exempt, and both terminate routes
+    ride ``require_reauth_only_action`` (``mfa_gate=False``). So a caller holding only the password
+    could re-prove it from a pending session and sign an enrolled user out of every other session.
+    The exemption exists for an account with NO factor, which cannot satisfy a gate. This account
+    has one, so it must prove it first.
+
+    The ``opted-out`` arm is the one the route-side refusal carries alone. Under
+    ``require_action_step_up = false`` a re-auth refreshes the session window, and the window is the
+    whole gate. The ``enforced`` arm also pins the MINT-side refusal: the re-auth must leave no
+    ``session_terminate`` grant behind for a later request to spend.
+    """
+    service = await _service(
+        engine,
+        AuthSettings(login_rate_limit_enabled=False, require_action_step_up=action_step_up),
+    )
+    await _add(service, "vic", Role.VIEWER)
+    _secret, victim_token = await _enroll_totp_out_of_band(service, "vic")
+    assert await service.mfa_satisfied(victim_token) is True  # the real user's signed-in device
+
+    async with _client(engine, service) as c:
+        tok = await _login(c, "vic")  # the attacker knows the password and nothing else
+        assert await service.mfa_satisfied(tok) is False
+
+        for path in (f"/me/sessions/{hash_token(victim_token)}", "/me/sessions"):
+            tok = await _reauth_to_terminate(c, tok)
+            # The positive control. Without it a refusal for some OTHER reason (a stale window)
+            # would read as this guard working, and the opted-out arm would pass with the hole open.
+            assert await service.has_recent_step_up(tok) is True
+
+            ended = await c.delete(path, headers=_auth(tok))
+            assert ended.status_code == 403, (
+                f"DELETE {path} from an MFA-pending session on an ENROLLED account succeeded "
+                "with the password alone"
+            )
+            # MFA-required, not step-up: a step-up header would send the client back to
+            # POST /me/reauth, which mints nothing here, in a loop.
+            assert ended.headers.get("X-MFA-Required") == "1"
+            assert "X-Step-Up-Required" not in ended.headers
+            if action_step_up:
+                # The route refuses BEFORE it pops a grant, so a minted one would still be here.
+                assert (
+                    await service.has_action_step_up(tok, STEP_UP_ACTION_SESSION_TERMINATE) is False
+                ), "the re-auth minted a session_terminate grant for a pending session"
+
+        # The real user's device was not signed out, and nothing promoted the attacker.
+        assert await service.identity_for_token(victim_token) is not None
+        assert await service.mfa_satisfied(tok) is False
+
+    # The trail tells a refused re-proof from a granted one, and records each refused terminate.
+    audit = await engine.store.list_audit()
+    reauths = [json.loads(a["detail"]) for a in audit if a["action"] == "auth.reauth"]
+    assert [r["grant_refused"] for r in reauths] == [True, True]
+    denied = [a["detail"] or "" for a in audit if a["action"] == "auth.mfa_denied"]
+    assert any("/me/sessions" in d for d in denied)
+
+
+async def test_a_session_that_proved_its_second_factor_can_end_sessions(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the refusal ignores ``mfa_satisfied`` and blocks every enrolled account.
+
+    The other side of the test above. Proving the existing factor at ``POST /auth/mfa-verify`` is
+    the way through, so a session that did it ends other sessions exactly as before.
+    """
+    service = await _service(engine)
+    await _add(service, "vic", Role.VIEWER)
+    t0 = 1_000_000.0
+    pin_totp_clock(monkeypatch, t0)
+    secret, other_token = await _enroll_totp_out_of_band(service, "vic", now=t0)
+
+    async with _client(engine, service) as c:
+        tok = await _login(c, "vic")
+        t1 = t0 + totp.DEFAULT_PERIOD  # a strictly later step: enrollment consumed its own
+        pin_totp_clock(monkeypatch, t1)
+        r = await c.post(
+            "/auth/mfa-verify", json={"code": totp.totp(secret, now=t1)}, headers=_auth(tok)
+        )
+        assert r.status_code == 200
+        tok = await _reauth_to_terminate(c, str(r.json()["token"]))
+        r = await c.delete("/me/sessions", headers=_auth(tok))
+        assert r.status_code == 200
+        assert await service.identity_for_token(other_token) is None
+        assert await service.identity_for_token(tok) is not None
+
+
+async def test_an_account_with_no_factor_still_ends_sessions_from_a_pending_session(
+    engine: Engine,
+) -> None:
+    """RED when: the refusal over-reaches and blocks the un-enrolled case too.
+
+    This is the path the comment on ``_MFA_EXEMPT_ROUTES`` keeps on purpose. An account with no
+    factor is pending under the default ``require_mfa``, and it has nothing to prove at
+    ``/auth/mfa-verify``. A password re-proof is the only way it can end a session it does not
+    recognise. Pinned beside the refusal so a fix for one cannot silently break the other.
+    """
+    service = await _service(engine)
+    await _add(service, "fresh", Role.VIEWER)
+    other = await service.login("fresh", PW)
+    assert other.ok and other.token is not None
+
+    async with _client(engine, service) as c:
+        tok = await _login(c, "fresh")
+        assert (await c.get("/messages", headers=_auth(tok))).status_code == 403  # pending
+        tok = await _reauth_to_terminate(c, tok)
+        r = await c.delete("/me/sessions", headers=_auth(tok))
+        assert r.status_code == 200
+        assert await service.identity_for_token(other.token) is None
+
+
+def test_every_reauth_only_gate_action_is_refused_to_a_pending_enrolled_session() -> None:
+    """RED when: a route takes a ``*_reauth_only_action`` gate for an action that is not in
+    ``AuthService._PENDING_REFUSED_ACTIONS``.
+
+    Those gates skip the MFA access gate so an account with no factor is not locked out. That skip
+    is safe for an account WITH a factor only because the refusal set names the action. #1951 was
+    exactly this omission: ``session_terminate`` was wired onto the gate and never added to the set.
+    So every action either gate is called with must be in it. The scan covers every module of the
+    engine and console packages, as a bare name or an attribute call. It does not reach the
+    action-less ``require_ui_reauth_only``, which never consults the set.
+    """
+    import messagefoundry
+    import messagefoundry.auth.service as service_module
+    import messagefoundry_webconsole
+
+    gates = {"require_reauth_only_action", "require_ui_reauth_only_action"}
+    roots = [Path(messagefoundry.__file__).parent, Path(messagefoundry_webconsole.__file__).parent]
+    wired: set[str] = set()
+    for source in (f for root in roots for f in root.rglob("*.py")):
+        for node in ast.walk(ast.parse(source.read_text(encoding="utf-8"))):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            if name not in gates:
+                continue
+            arg = node.args[0]
+            assert isinstance(arg, (ast.Name, ast.Attribute)), f"{source}: {ast.dump(arg)}"
+            const = arg.id if isinstance(arg, ast.Name) else arg.attr
+            wired.add(getattr(service_module, const))
+    # The positive control: an empty or narrowed scan would make the subset check pass vacuously.
+    assert {STEP_UP_ACTION_SESSION_TERMINATE, "mfa_enroll", "webauthn_enroll"} <= wired
+    missing = wired - AuthService._PENDING_REFUSED_ACTIONS
+    assert not missing, f"reauth-only gate actions a pending enrolled session could use: {missing}"
 
 
 # --- 6.3.4: per-mechanism directory strength --------------------------------

@@ -3071,6 +3071,7 @@ class AuthService:
         else:
             ok = await self.verify_current_password(identity, password)
         elevation = Elevation()
+        grant_refused = False
         if ok:
             # (1) Every stamp for this elevation, against the OLD hash. The rotation carries these
             # columns forward; a stamp issued after it would silently write nothing.
@@ -3079,15 +3080,16 @@ class AuthService:
             await self._store.mark_session_reauthed(hash_token(token), client=client)
             # `_factor_binding_is_blocked` resolves the session BY THE OLD TOKEN and fails closed when
             # it cannot find it, so it is decided here, BEFORE the rotation retires that token --
-            # asking after would refuse every factor-binding grant on a session that is perfectly fine.
-            binding_blocked = purpose is not None and await self._factor_binding_is_blocked(
+            # asking after would refuse every such grant on a session that is perfectly fine. It covers
+            # every action in _PENDING_REFUSED_ACTIONS, session_terminate included (BACKLOG #1951).
+            grant_refused = purpose is not None and await self._factor_binding_is_blocked(
                 token, purpose
             )
             # (2) Rotate. Past this line `token` no longer authenticates.
             elevation = await self._elevated(
                 token, ceremony="reauth", actor=identity.username, client=client
             )
-            if purpose is not None and not binding_blocked and elevation.token is not None:
+            if purpose is not None and not grant_refused and elevation.token is not None:
                 # (3) Purpose-bound grants are minted AFTER, against the NEW hash -- minted against the
                 # old one they would be stranded on a hash nothing resolves any more.
                 # Bind THIS fresh proof to the single action named by `purpose` (single-use), so a broad
@@ -3104,47 +3106,65 @@ class AuthService:
                     # A good password on a session that vanished mid-ceremony is neither a success nor
                     # a credential failure; without this the audit row would read as a clean re-auth.
                     "session_lost": elevation.session_lost,
+                    # A good password whose purpose grant was refused (a pending session on an
+                    # account with a factor). Without it the row reads as a granted re-proof.
+                    "grant_refused": grant_refused,
                 }
             ),
             client=client,
         )
         return elevation
 
-    #: The step-up actions that BIND A NEW SECOND FACTOR. Reaching one from an MFA-pending session is
-    #: legitimate only while the account has no factor at all — that is the bootstrap escape the MFA
-    #: gate's carve-out exists for. For an account that already HAS a factor it is a promotion path,
-    #: because both ceremonies mark the session MFA-satisfied on success.
-    _FACTOR_BINDING_ACTIONS = frozenset(
-        {STEP_UP_ACTION_MFA_ENROLL, STEP_UP_ACTION_MFA_CONFIRM, STEP_UP_ACTION_WEBAUTHN_ENROLL}
+    #: The step-up actions a pending session may NOT be granted once its account HAS a factor. Every
+    #: one of them rides a ``*_reauth_only_action`` gate (``mfa_gate=False``), which exists so an
+    #: account with no factor is not locked out of it. For an account that already has one:
+    #:
+    #: - binding a new factor (``mfa_enroll``, ``mfa_confirm``, ``webauthn_enroll``) is a promotion
+    #:   path, because both ceremonies mark the session MFA-satisfied on success;
+    #: - ending sessions (``session_terminate``, BACKLOG #1951, ASVS 7.5.2) through the terminate
+    #:   routes would let a password holder sign the real user out without the second factor. That
+    #:   is these routes only: ``POST /me/password`` still revokes every session from a pending one.
+    #:
+    #: A new action on either reauth-only action gate belongs here too. A test in
+    #: ``tests/test_mfa_access_gate.py`` catches at least a missing one wired in the engine or console
+    #: packages. The action-less ``require_ui_reauth_only`` gate does not consult this set at all.
+    _PENDING_REFUSED_ACTIONS = frozenset(
+        {
+            STEP_UP_ACTION_MFA_ENROLL,
+            STEP_UP_ACTION_MFA_CONFIRM,
+            STEP_UP_ACTION_WEBAUTHN_ENROLL,
+            STEP_UP_ACTION_SESSION_TERMINATE,
+        }
     )
 
     async def _factor_binding_is_blocked(self, token: str | None, purpose: str) -> bool:
-        """Whether a factor-binding step-up grant must be REFUSED for this session (ASVS 6.3.3).
+        """Whether a step-up grant for ``purpose`` must be REFUSED for this session (ASVS 6.3.3).
 
+        Named for its first case, binding a factor; :data:`_PENDING_REFUSED_ACTIONS` lists them all.
         Closes a bypass the 6.3.3 access gate would otherwise leave open. The gate's carve-out
         (``mfa_gate=False`` on the ``*_reauth_only*`` factories, plus ``POST /me/reauth`` being
         MFA-exempt) is justified solely by "an un-enrolled user cannot satisfy a gate standing in
-        front of the only route that enrolls them" — a condition that is FALSE for an account that
-        already has a factor. Without this check, an attacker holding only the password could take a
-        pending session, re-auth with the password alone, enrol a NEW authenticator, and be promoted
-        to MFA-satisfied by ``confirm_mfa_enrollment`` / ``finish_webauthn_registration`` — defeating
+        front of the route it needs" — a condition that is FALSE for an account that already has a
+        factor. Without this check, an attacker holding only the password could take a pending
+        session, re-auth with the password alone, enrol a NEW authenticator, and be promoted to
+        MFA-satisfied by ``confirm_mfa_enrollment`` / ``finish_webauthn_registration`` — defeating
         the second factor entirely and durably binding an attacker-controlled authenticator.
 
         So: if the session has not satisfied its second factor and the account already has one, the
         existing factor must be proven first (``POST /auth/mfa-verify``). Bootstrap is untouched — an
-        account with NO factor still enrols freely from a password-only session, which is exactly the
-        deadlock carve-out. Disable/delete actions are NOT listed: they run behind
-        ``require_step_up_action``, which keeps its own ``mfa_satisfied`` check.
+        account with NO factor still enrols, and still ends sessions, from a password-only session,
+        which is exactly the deadlock carve-out. Disable/delete actions are NOT listed: they run
+        behind ``require_step_up_action``, which keeps its own ``mfa_satisfied`` check.
         """
-        if purpose not in self._FACTOR_BINDING_ACTIONS:
+        if purpose not in self._PENDING_REFUSED_ACTIONS:
             return False
         if not token:
-            return True  # no session to bind a factor to — fail closed, as below
+            return True  # no session to act on, so fail closed (as below)
         if await self.mfa_satisfied(token):
             return False
         session = await self._store.get_session(hash_token(token))
         if session is None:
-            return True  # no session to bind a factor to — fail closed
+            return True  # no session to act on, so fail closed
         user = await self._store.get_user(session.user_id)
         if user is None:
             return True
@@ -3161,7 +3181,7 @@ class AuthService:
 
         ``action`` is the route's step-up action, which is the same vocabulary ``POST /me/reauth``
         spells ``purpose``, so it passes straight through rather than being fixed per call site --
-        which would mean exporting :data:`_FACTOR_BINDING_ACTIONS` or shutting the non-factor lanes
+        which would mean exporting :data:`_PENDING_REFUSED_ACTIONS` or shutting the other lanes
         with it."""
         return await self._factor_binding_is_blocked(token, action)
 

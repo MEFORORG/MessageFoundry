@@ -504,7 +504,8 @@ def sessions_page(sessions: Sequence[Mapping[str, object]], *, notice: str | Non
     POSTs take ``require_ui_reauth_only_action(STEP_UP_ACTION_SESSION_TERMINATE)``, so the cookie
     alone does not carry them — ``/ui/reauth`` mints a single-use grant bound to that action and each
     terminate consumes one. It is the password-only family on purpose: the full step-up would
-    deadlock an MFA-required-but-unenrolled operator out of revoking their own sessions.
+    deadlock an MFA-required-but-unenrolled operator out of revoking their own sessions. An operator
+    who HAS a factor proves it first (BACKLOG #1951).
 
     *This docstring previously said "no step-up", which stopped being true when that gate landed.
     A stale absence claim beside a control is worse than silence: it reads as a licence to remove
