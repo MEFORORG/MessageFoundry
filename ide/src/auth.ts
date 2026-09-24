@@ -6,6 +6,7 @@
 // demand or after a 401.
 import * as vscode from "vscode";
 import { getJson, HttpError, postJson } from "./engineClient";
+import { mustChangeProblem } from "./engineStatusModel";
 import { assertBrowsableUrl, assertTargetAllowed } from "./engineTarget";
 
 const SECRET_PREFIX = "messagefoundry.token:";
@@ -36,6 +37,10 @@ interface LoginResponse {
   must_change_password: boolean;
   mfa_required?: boolean;
   user?: CurrentUser;
+  /** BACKLOG #1141 (ASVS 6.4.5): when a change is owed, the Unix instant (seconds) the temporary
+   *  credential stops working -- the instant the engine's login gate refuses on. Absent from an older
+   *  engine, and null when no change is owed or the credential never expires. */
+  credential_expires_at?: number | null;
 }
 
 /** SecretStorage key for an engine URL (trailing slashes normalized so they don't fork the cache). */
@@ -189,9 +194,10 @@ export async function signIn(ctx: vscode.ExtensionContext, url: string): Promise
     // the user can act on it, rather than letting them discover it as an opaque failure mid-promote.
     if (res.must_change_password) {
       // The engine 403s this token on every route except /auth/logout, /auth/me and /me/password.
+      // BACKLOG #1141 (ASVS 6.4.5): name the instant the temporary credential dies, when sent.
       void showConsoleFix(
         url,
-        "this account must change its password before it can do anything.",
+        mustChangeProblem(res.credential_expires_at),
         "/ui/account/password",
       );
     } else if (res.mfa_required) {

@@ -53,7 +53,7 @@ _RUNGS: tuple[tuple[str, str, frozenset[str]], ...] = (
     ),
     (
         "fed.replay.claims",
-        "token class (events) / iss / aud / azp / exp / iat / nbf / sub",
+        "token class (events) / iss / aud / azp / exp / iat / nbf / auth_time / sub",
         frozenset(
             {
                 # An ``events`` claim means an RFC 8417 SET, not an id_token. Checked at the TOP of
@@ -68,6 +68,10 @@ _RUNGS: tuple[tuple[str, str, frozenset[str]], ...] = (
                 "claim_sub_missing",
                 "not_yet_valid",
                 "issued_in_future",
+                # BACKLOG #1150: auth_time is checked inside this rung, after nbf and before the
+                # nonce compare, so both recency slugs indict THIS rung and no other.
+                "auth_time_missing",
+                "auth_time_stale",
             }
         ),
     ),
@@ -148,6 +152,24 @@ def _config_rows(settings: ServiceSettings) -> list[CheckResult]:
                 "no MFA assertion at all. This gives up the control BACKLOG #99(g) exists for",
             )
         )
+
+    # BACKLOG #1150. MANUAL for the same reason as the rows above: the validator already bounds the
+    # value, and there is no off switch to report. What an operator must confirm is the IdP side,
+    # which nothing offline can see: that the IdP honours `max_age` and returns `auth_time`.
+    rows.append(
+        CheckResult(
+            "fed.max_age",
+            "IdP authentication recency bound (max_age / auth_time)",
+            Status.MANUAL,
+            "every authorization request sends this max_age; a token with no auth_time, or one "
+            "older than this, is refused, and the session ends this long after the IdP "
+            "authentication. Confirm the identity provider honours max_age and returns auth_time: "
+            "if it does not, EVERY federated sign-in is refused as auth_time_missing. A replayed "
+            "id_token (--fed-id-token / --fed-jwks) answers this only if it was captured from a "
+            "request that sent max_age; many IdPs omit auth_time when it was not asked for",
+            evidence=f"max_age={auth.oidc_max_age_seconds}s",
+        )
+    )
 
     # AC-11. Also MANUAL (the validator refuses an empty source when stripping), but the effective
     # list is exactly what an operator needs to eyeball: it is what stops a federated principal
@@ -294,6 +316,7 @@ def _replay_rows(
         client_id=auth.oidc_client_id or "",
         signing_algorithms=[SignatureAlgorithm(a) for a in auth.oidc_signing_algorithms],
         nonce=nonce or _SENTINEL_NONCE,
+        max_age_seconds=auth.oidc_max_age_seconds,
         username_claim=auth.oidc_username_claim,
         username_strip_domain=auth.oidc_username_strip_domain,
         allowed_username_domains=frozenset(auth.effective_oidc_username_domains),
@@ -344,6 +367,23 @@ def _replay_rows(
                         "offline (it is exercised by the live lab cells)",
                     )
                 )
+            elif failed_reason == "auth_time_stale":
+                # Staleness is measured against THIS run's clock, not the token's iat, and the
+                # ladder reports only the slug. So the verifier cannot tell an aged capture (a
+                # correct IdP, replayed late) from an IdP that answered max_age with an old sign-in.
+                # SKIP says "not verified" without blaming either; a FAIL would blame the IdP for a
+                # capture that merely sat on disk. A MISSING auth_time is different and FAILs.
+                stopped_because = "the captured token's auth_time is past max_age at replay time"
+                rows.append(
+                    CheckResult(
+                        rid,
+                        title,
+                        Status.SKIP,
+                        "auth_time is older than [auth].oidc_max_age_seconds at replay time: either "
+                        "the capture has aged, or the IdP ignored max_age. Re-capture and replay "
+                        "promptly to tell the two apart",
+                    )
+                )
             elif failed_reason == "expired":
                 # A stale capture is not a deployment defect. NOTE this is now reachable ONLY for a
                 # genuinely past `exp` -- a missing or non-numeric one raises `claim_not_numeric`
@@ -386,7 +426,8 @@ def _replay_rows(
                 "from AD, never from the token)",
                 evidence=(
                     f"username={principal.username}; sub={principal.subject}; "
-                    f"amr={list(principal.amr)}; acr={principal.acr}"
+                    f"amr={list(principal.amr)}; acr={principal.acr}; "
+                    f"auth_time={principal.auth_time:.0f}"
                 ),
             )
         )

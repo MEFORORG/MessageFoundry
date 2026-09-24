@@ -206,7 +206,16 @@ def _names(**kw: Any) -> list[str]:
     return [
         n
         for n, _ in security_loosenings(
-            sec, StoreSettings(), AuthSettings(), alerts, SecretRotationSettings(), (), (), (), None
+            sec,
+            StoreSettings(),
+            AuthSettings(),
+            alerts,
+            SecretRotationSettings(),
+            (),
+            (),
+            (),
+            None,
+            None,
         )
     ]
 
@@ -251,6 +260,7 @@ def test_an_unconfigured_alert_transport_reports_no_hop_deviation() -> None:
             (),
             (),
             (),
+            None,
             None,
         )
     ]

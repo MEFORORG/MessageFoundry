@@ -882,3 +882,10 @@ def test_request_is_the_only_place_the_client_dispatches_to_the_transport() -> N
             f"{func.attr if isinstance(func, ast.Attribute) else '?'}(...)` outside `_request`, "
             "so it bypasses the MAX_RESPONSE_BYTES bound"
         )
+
+
+def test_the_default_base_url_is_https() -> None:
+    """A stock engine serves TLS (ADR 0172). Measured 2026-09-23 against a default ``serve``: the old
+    ``http://`` default failed with "Server disconnected without sending a response"."""
+    with EngineClient() as client:
+        assert client.base_url == "https://127.0.0.1:8765"

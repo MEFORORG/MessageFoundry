@@ -11,7 +11,8 @@ independent of the transport TLS. This destination does exactly that for a singl
   document, plain text),
 - wrap it in an ``EmailMessage``,
 - **SIGN** it (``pkcs7.PKCS7SignatureBuilder``) with the sender key+cert, then **ENCRYPT** the signed
-  blob (``pkcs7.PKCS7EnvelopeBuilder`` addressed to the partner's recipient cert),
+  blob (``pkcs7.PKCS7EnvelopeBuilder`` addressed to the partner's recipient cert, content cipher
+  AES-256-CBC set explicitly -- see ``_CONTENT_CIPHER``),
 - submit the resulting S/MIME message over STARTTLS SMTP off the event loop.
 
 **No new dependency** (CLAUDE.md §7, ADR 0085): crypto is core ``cryptography`` (``serialization.pkcs7``);
@@ -56,6 +57,7 @@ from cryptography import x509
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
+from cryptography.hazmat.primitives.ciphers import algorithms
 from cryptography.hazmat.primitives.serialization import pkcs7
 
 from messagefoundry.config.models import ConnectorType, Destination
@@ -78,6 +80,18 @@ from messagefoundry.transports.base import (
 __all__ = ["DirectDestination"]
 
 logger = logging.getLogger(__name__)
+
+#: The CMS content-encryption cipher for every Direct envelope: AES-256-CBC. This is the one place
+#: that states why; the docs and tests point here. Left unset, ``PKCS7EnvelopeBuilder`` uses
+#: AES-128-CBC (measured on ``cryptography`` 50.0.1), and the owner's 2026-09-22 ASVS 11.3.1 ruling
+#: accepts AES-256-CBC as this connector's recorded constraint (BACKLOG #1168). CBC because the
+#: builder offers nothing else: ``ContentEncryptionAlgorithm`` is ``type[AES128] | type[AES256]``.
+#:
+#: **What this does NOT change.** The mode is still CBC and the content key is still wrapped with
+#: RSAES-PKCS1-v1_5 (see ``_select_rsa_padding``), so this moves neither the mode nor the padding
+#: question in 11.3.1; the cell stays partial. And the message is no stronger than that RSA wrap: a
+#: 2048-bit recipient key bounds it near 112 bits of security.
+_CONTENT_CIPHER: pkcs7.ContentEncryptionAlgorithm = algorithms.AES256
 
 
 def _as_recipients(value: Any) -> list[str]:
@@ -530,9 +544,11 @@ class DirectDestination(DestinationConnector):
         # a binary HL7/DICOM payload, arbitrary bytes). Without Binary, cryptography text-canonicalizes
         # the content (lone LF → CRLF) before enveloping, which corrupts the signed structure / any
         # binary body — the recipient would recover mangled bytes and a broken signature.
+        # The content cipher is set explicitly; _CONTENT_CIPHER says why and what it does not change.
         enveloped = (
             pkcs7.PKCS7EnvelopeBuilder()
             .set_data(signed)
+            .set_content_encryption_algorithm(_CONTENT_CIPHER)
             .add_recipient(self._recipient_cert)
             .encrypt(serialization.Encoding.DER, [pkcs7.PKCS7Options.Binary])
         )

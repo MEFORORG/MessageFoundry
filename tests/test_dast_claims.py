@@ -215,14 +215,19 @@ def test_the_notice_has_exactly_two_copies() -> None:
 @pytest.mark.parametrize(
     "row",
     [
-        "Third-party source review + penetration test + DAST before production or off-loopback",
+        "The desired state is a third-party source review + penetration test + DAST. An internal or "
+        "self-run pass does not meet it.",
         'An internal "L3 verified" / self-assessment pass',
     ],
 )
 def test_signal_10_rows_are_unchanged(row: str) -> None:
     """Signal 10 and its theater-table twin are the rows this change is most likely to be mistaken for
     satisfying. Row 6 of the theater table names an internal self-assessment pass as the gameable proxy
-    — which is precisely the shape of a self-run DAST tier — so neither may be softened."""
+    — which is precisely the shape of a self-run DAST tier — so neither may be softened.
+
+    Owner ruling 2026-09-23 made signal 10 a desired state rather than a requirement, so this pin moved
+    from the old "before production or off-loopback" bar to the new row. What it guards did not move: the
+    row must still say a self-run pass does not meet it."""
     assert row in _read(_BUILD_STANDARDS), (
         f"docs/Secure_Build_Standards.md no longer contains {row!r} verbatim. A self-run DAST tier does "
         "not satisfy signal 10, and this row must not be edited to suggest otherwise."
@@ -232,8 +237,8 @@ def test_signal_10_rows_are_unchanged(row: str) -> None:
 @pytest.mark.parametrize(
     "sentence",
     [
-        "capped below a full A only by independent external verification (signal 10)",
-        "capped below a full A only by signal 10 (independent external verification)",
+        "Signal 10 (independent external verification) is still Absent and still not treated as passed.",
+        "| 10 | Independent external verification | **Absent — designed / dated-risk-accepted**",
         "No independent third-party ASVS review, penetration test, or DAST has run.",
         "**No independent external verification** (third-party ASVS L2/L3 review + penetration test "
         "+ DAST).",
@@ -248,11 +253,16 @@ def test_scorecard_negative_claims_survive(sentence: str) -> None:
 
     Asserted on the SENTENCES, never on line numbers: a line number is a fact about the file's shape,
     not about its claims, and it goes stale on the next unrelated paragraph.
+
+    Owner ruling 2026-09-24 re-graded the scorecard from A- to A, because signal 10 became a desired
+    state that no longer caps the grade. Two pins quoted that cap. They moved to the verdict sentence
+    and to signal 10's scored row, which both say the gap is still Absent. The ruling changed what the
+    gap costs, not whether it is open.
     """
     assert "independent" in sentence.lower(), "this guard's own fixture must contain the claim word"
     assert sentence in _read(_SCORECARD), (
-        f"docs/Secure_Build_Scorecard_MEFOR.md no longer contains {sentence!r}. The A- grade and its "
-        "capping gap stand; ADR 0155 must not be used to argue a re-score."
+        f"docs/Secure_Build_Scorecard_MEFOR.md no longer contains {sentence!r}. Signal 10 stays "
+        "Absent; ADR 0155 must not be used to argue that it is met."
     )
 
 

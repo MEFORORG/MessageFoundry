@@ -168,6 +168,14 @@ from typing import Any
 #: class as the ``UploadedFileList.scope`` entry above, and it forces a bump for the same reason.
 #: Unnumbered: the ``vN`` labels are retired as identifiers (#1220 above); the digest is the identifier.
 #:
+#: ASVS 6.4.5 / BACKLOG #1141, engine limbs: the console now imports ``api.security``'s
+#: ``pending_credential_deadline``, ``pending_credential_deadline_for`` and
+#: ``initial_credential_window_hours``, and ``UserSummary`` gained the additive
+#: ``credential_expires_at`` that ``pages/admin.py`` renders. The first three are FUNCTIONS imported at
+#: module scope, so a skew is an ImportError at mount time -- the ``enforce_phi_read_hop`` class
+#: above -- and they force a bump. Unnumbered: the ``vN`` labels are retired as identifiers (#1220
+#: above); the digest is the identifier.
+#:
 #: ASVS 7.2.4 / BACKLOG #1146: ``AuthService.login`` and ``.authenticate_kerberos`` gained the
 #: optional ``supersedes`` keyword the /ui/login and /ui/sso legs pass, and ``begin_oidc_login`` gained
 #: ``prior_session`` for the federated start leg, so a console sign-in ends the session the browser
@@ -180,7 +188,7 @@ from typing import Any
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "b4e4210498824a31"
+ENGINE_UI_SEAM: str = "084f74e38053a730"
 
 
 @dataclass(frozen=True, slots=True)

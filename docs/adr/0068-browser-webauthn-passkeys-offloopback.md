@@ -515,6 +515,14 @@ floor. It follows the pairing RFC 9053 section 2.1 recommends for interoperabili
 with P-256 only, which is also how the WebAuthn specification describes -7. The refusal is
 deliberate, so it reaches the audited path without the WARNING a raw library failure logs.
 
+**The pin compares CBOR integers (BACKLOG #1953).** As first built, the pin coerced the curve
+with `int()`, and the library compares every value with `==`. In Python, `True`, `1.0`,
+`Decimal(1)` and `Fraction(1)` all equal 1, so an ES256 key whose curve read `true` or `1.0`
+enrolled past the pin. Registration now requires the integer type itself for the labels and for
+`kty`, `alg` and `crv`. It also refuses a key sent as an array, which the library indexes like a
+map, and any label that is not an integer or a text string (RFC 9052 section 7). These refusals
+are deliberate too, so they log no WARNING.
+
 **The pin is registration-only, by design.** `verify_assertion` does not re-screen a stored
 key's curve. A credential enrolled before the pin may be ES256 on P-384 or P-521; it still
 verifies and still clears the floor, so refusing it at assertion would lock its owner out for

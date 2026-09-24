@@ -216,6 +216,8 @@ async def _oidc_round_trip(
             amr=("pwd", "mfa"),
             acr=None,
             expires_at=time.time() + 600,
+            # A fresh IdP authentication, inside the max_age bound (BACKLOG #296).
+            auth_time=time.time(),
         )
 
     monkeypatch.setattr(service, "_exchange_and_validate", _exchange)

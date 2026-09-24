@@ -289,6 +289,26 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    and **`messagefoundry rotate-key` upgrades them v1→v2**, so the default is safe on an existing store
    and reversible. `aad_bind` has no effect without an encryption key (the identity cipher has nothing
    to bind).
+   **An unmarked value is refused — `[store].allow_unmarked_ciphertext`, default OFF (ASVS 11.3.3,
+   BACKLOG #1169).** A keyed store reads a cipher column only as `mfenc:` ciphertext. A non-blank value
+   with no marker is refused with a `CipherError` and raises an `integrity_drift` alert under the
+   `store-cipher` subject, which names the table and column and never the row or the value. It is a
+   stripped marker or a planted row: cell binding catches a moved ciphertext because it has a tag to
+   fail, and a downgrade to plaintext has no tag, so only this refusal protects it. A purged `''` is
+   never refused. The keyed open still seals legacy plaintext, one `(table, column)` surface at a time,
+   but only while that surface holds no ciphertext yet; each surface seals in one transaction, so a
+   crash leaves it all sealed or all unsealed. Setting the switch `true` restores the old behaviour
+   (unmarked values read back as plaintext, and the open seals every one) and is a declared loosening.
+   **At least these limits remain.** The uploaded-file store is not covered: it still accepts an
+   unmarked file, pending an owner ruling. The DIRECT S/MIME enveloped body is not covered. And the
+   "sealed" evidence is the surface's own ciphertext, so a surface that holds none at the moment of a
+   keyed open is treated as unsealed and a row planted into it is sealed as legacy data. That covers a
+   table that can legally empty out (`queue.payload`, `state`, `alert_instance`) and any column that
+   has not been written yet (`users.totp_secret` before the first MFA enrolment, for example). A planted
+   row read before that open is still refused. Also note that a planted `state` or `reference` value
+   on a sealed surface stops the store from opening, since the open reads those tables eagerly. `serve`
+   arms the alert before the open, so that refusal alerts too, and so does a planted row the open
+   finds and leaves in place. The retention document-strip pass skips a refused row and carries on.
    **A third at-rest tier ships — `[store].cipher_provider = "vault_transit"` (`mfenc:v3`, ADR 0138).**
    This does not merely source the key: it **replaces the cipher object**
    ([store/crypto_transit.py](../messagefoundry/store/crypto_transit.py)), so every encrypt/decrypt runs
@@ -321,7 +341,10 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    key and decrypts with whichever configured key matches (active + any decrypt-only keys in
    `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`). **Rotation** = set the new active key, keep the prior key in
    `…_RETIRED`, run **`messagefoundry rotate-key`** (offline) to re-encrypt every value under the new
-   key, then drop the retired key. An undecryptable value (corrupt blob / missing key) is contained —
+   key, then drop the retired key. `rotate-key` also opens a new range of the audit chain under the new
+   key and verifies the chain first; do not drop the retired key until it has printed its audit line
+   without an error ([ADR 0193](adr/0193-audit-chain-key-ranges-survive-a-store-key-rotation.md),
+   BACKLOG #1904). An undecryptable value (corrupt blob / missing key) is contained —
    the row is dead-lettered, never crashes a worker.
    **Fail-closed (secure-by-default; H3, OWASP *Fail Securely* / SDS §4.3 PW.9):** `serve` **refuses to
    start with no key on ANY instance** — the refusal is gated on **neither** a data class **nor** the
@@ -738,7 +761,7 @@ audit chain or be false.
 |---|---|---|
 | MLLP inbound/outbound | Plaintext by default; **MLLP-over-TLS (TLS 1.2+, server-cert verify + hostname, opt-in mTLS) when `tls=true`** `[BUILT — WP-13b]`. A non-loopback plaintext MLLP listener is **refused at startup** (exposed-gate, ADR 0002 §0) unless `tls=true` or `serve --allow-insecure-bind`. | — |
 | File connector | Plaintext `.hl7` on disk/share | Rely on volume/share encryption; SFTP later |
-| Engine API ↔ console | Loopback HTTP by default; off-loopback requires TLS — **in-process** (`[api].tls_cert_file`, WP-13a) **or upstream** at a trusted reverse proxy (`tls_terminated_upstream` + `trusted_proxies`, WP-15) `[BUILT]`. HSTS engages on `https`; forwarded headers are trusted only from `trusted_proxies`. | — |
+| Engine API ↔ console | Loopback HTTP by default; off-loopback requires TLS — **in-process** (`[api].tls_cert_file`, WP-13a) **or upstream** at a trusted reverse proxy (`tls_terminated_upstream` + `trusted_proxies`, WP-15) `[BUILT]`. Upstream, the proxy-to-engine hop is plaintext unless `tls_cert_file` is set; the site secures it, and `serve` requires `plaintext_upstream_hop_acknowledged` (BACKLOG #1179). HSTS engages on `https`; forwarded headers are trusted only from `trusted_proxies`. | — |
 | AD / LDAP auth | **LDAPS** with cert verification (`ad_tls_verify`) `[BUILT]` | — |
 | PostgreSQL / SQL Server backend | TLS-to-DB on by default (`[store].encrypt`), server cert **validated** (`trust_server_certificate=false`) `[BUILT]`. Trust a private/internal DB CA without disabling validation via `[store].ssl_root_cert` file-pin (Postgres CA-bundle, SQL Server ODBC 18.1+ `ServerCertificate` leaf-pin) **or** a Windows machine-store (`LocalMachine\Root`) CA import. | — |
 

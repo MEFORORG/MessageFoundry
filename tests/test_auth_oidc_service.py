@@ -91,6 +91,7 @@ def _claims(**over: Any) -> dict[str, Any]:
         "sub": "S-1-5-21-federated",
         "exp": now + 3600,
         "iat": now,
+        "auth_time": now,  # REQUIRED since BACKLOG #1150 (max_age is always requested)
         "nonce": NONCE,
         "preferred_username": "jdoe@corp.example",
         "amr": ["pwd", "mfa"],

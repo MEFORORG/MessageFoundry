@@ -44,9 +44,16 @@ from __future__ import annotations
 
 import base64
 import os
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
-from messagefoundry.store.crypto import _V3_PREFIX, MARKER_PREFIX, AuditMacFn, CipherError
+from messagefoundry.store.crypto import (
+    _V3_PREFIX,
+    MARKER_PREFIX,
+    AuditMacFn,
+    CipherError,
+    _UnmarkedPolicy,
+)
 from messagefoundry.store.keyprovider import KeyProviderError
 from messagefoundry.store.keyprovider_vault import (
     _EXTRA,
@@ -83,14 +90,23 @@ _ENV_AUDIT_KEY = "MEFOR_STORE_TRANSIT_AUDIT_KEY"
 _AUDIT_HASH_ALGO = "sha2-256"
 
 
-class TransitCipher:
+class TransitCipher(_UnmarkedPolicy):
     """Bulk at-rest cipher whose crypto runs inside Vault/OpenBao Transit — the DEK never enters heap."""
 
     encrypts = True
 
-    def __init__(self, client: Any, key_name: str, audit_key: str | None = None) -> None:
+    def __init__(
+        self,
+        client: Any,
+        key_name: str,
+        audit_key: str | None = None,
+        *,
+        allow_unmarked: bool = False,
+    ) -> None:
         self._client = client
         self._key = key_name
+        # The same unmarked-value refusal as the in-process cipher (BACKLOG #1169, ASVS 11.3.3).
+        self._init_unmarked_policy(allow_unmarked)
         # The Transit key the audit-chain HMAC runs under. Defaults to the data key (Transit HMAC works
         # on any key type) so the chain is keyed-in-Transit by default; a dedicated key domain-separates.
         self._audit_key = audit_key or key_name
@@ -117,9 +133,13 @@ class TransitCipher:
             raise CipherError(f"Transit returned an empty ciphertext (key={self._key!r})")
         return f"{_V3_PREFIX}{ciphertext}"
 
-    def decrypt(self, stored: str, *, aad: bytes | None = None) -> str:
+    def decrypt(
+        self, stored: str, *, aad: bytes | None = None, allow_unmarked: bool = False
+    ) -> str:
         if not stored.startswith(MARKER_PREFIX):
-            return stored  # legacy plaintext (pre-encryption) or a purged/blank value
+            # A purged '' passes; any other unmarked value is refused unless policy allows it
+            # (BACKLOG #1169) -- the byte-identical twin of the in-process cipher's seam.
+            return self._pass_unmarked(stored, aad, allow_unmarked)
         if not stored.startswith(_V3_PREFIX):
             # An mfenc:v1/v2 value is in-process AES-GCM; Transit holds no key that can read it. Fail
             # closed (rotate the store into Transit before reading it in Transit mode) — never mis-decrypt.
@@ -154,6 +174,10 @@ class TransitCipher:
         keyed, but the MAC runs inside Transit via :meth:`audit_mac_fn` / :meth:`audit_hmac`, NOT here.
         Returning ``None`` keeps this the honest signal 'no in-heap key material'."""
         return None
+
+    def audit_mac_keyring(self) -> Mapping[str, bytes]:
+        """No in-heap audit keys. Transit versions its own audit key, so the engine sees one range."""
+        return {}
 
     def audit_hmac(self, data: bytes) -> str:
         """Compute the audit-chain row MAC INSIDE Transit (``generate_hmac``) — no key ever enters heap.
@@ -240,4 +264,6 @@ def build_transit_cipher(settings: StoreSettings) -> TransitCipher:
             f"[store].cipher_provider={PROVIDER_NAME!r} could not reach a Vault Transit key "
             f"(data={key_name!r}, audit={audit_key!r}, extra {_EXTRA!r}): {type(exc).__name__}."
         ) from exc
-    return TransitCipher(client, key_name, audit_key=audit_key)
+    return TransitCipher(
+        client, key_name, audit_key=audit_key, allow_unmarked=settings.allow_unmarked_ciphertext
+    )

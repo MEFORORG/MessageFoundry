@@ -394,7 +394,9 @@ Full references: **[SECURITY.md](SECURITY.md)**, **[PHI.md](PHI.md)**, and **[DE
 - [ ] **API off-loopback requires native TLS.** The API binds `127.0.0.1` by default. To reach it from
       another host, configure **in-process TLS** (`[api].tls_cert_file` + `[api].tls_key_file`,
       `tls_min_version` ≥ 1.2, opt-in mTLS via `tls_client_ca_file`) **or** front it with a TLS terminator
-      (`[api].tls_terminated_upstream = true` + `[api].trusted_proxies`). A non-loopback bind **without**
+      (`[api].tls_terminated_upstream = true` + `[api].trusted_proxies`, plus the required
+      `[api].plaintext_upstream_hop_acknowledged = true` when no `[api].tls_cert_file` is set: the
+      proxy-to-engine hop is then plaintext and securing it is your job). A non-loopback bind **without**
       TLS (or a trusted terminator) is **refused at startup**. **Never use `--allow-insecure-bind` for
       real PHI** — it is a loud dev-only escape that puts bearer tokens and PHI on the wire in cleartext.
       (With auth disabled, a non-loopback bind is refused unconditionally.)

@@ -74,6 +74,7 @@ from messagefoundry.api.header_floor import (
     HSTS_VALUE,
     SecurityHeaderFloorMiddleware,
     hsts_notable,
+    refuse_websocket,
 )
 from messagefoundry.api.metrics import (
     METRICS_CONTENT_TYPE,
@@ -300,7 +301,11 @@ from messagefoundry.logging_setup import LOG_LEVELS, current_log_level, set_runt
 from messagefoundry.parsing.sniff import attachment_mime_agrees, nontext_upload_reason
 from messagefoundry.pipeline import ConfigReloadDenied, Engine
 from messagefoundry.pipeline.alert_sinks import EmailTransport, notifier_from_settings
-from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
+from messagefoundry.pipeline.alerts import (
+    AlertSink,
+    LoggingAlertSink,
+    store_cipher_refusal_forwarder,
+)
 from messagefoundry.pipeline.cluster import (
     StepdownLockTimeout,
     StepdownReleaseUnconfirmed,
@@ -1984,6 +1989,8 @@ def create_app(
                 expired_hops,
                 db_hops,
                 store_privilege,
+                # BACKLOG #1905: read off the LIVE store -- settings cannot know what audit_log holds.
+                engine.store.audit_chain_unkeyed(),
             )
         ]
         store_privilege_view = (
@@ -6157,17 +6164,31 @@ def create_app(
         if identity is None:
             identity = await authorize_ws(websocket, Permission.MONITORING_READ)
             token = ws_token(websocket)
+        # The three refusals below happen BEFORE accept, so each is the handshake's HTTP answer
+        # (BACKLOG #1120; see header_floor.refuse_websocket).
         if identity is None:
-            await websocket.close(code=1008)  # policy violation (unauthenticated/forbidden)
+            await refuse_websocket(
+                websocket,
+                JSONResponse({"detail": "not authenticated or not permitted"}, status_code=403),
+                close_code=1008,  # policy violation (unauthenticated/forbidden)
+            )
             return
         handshake_identity: Identity = identity  # non-None past the guard; used on the no-auth path
         engine_obj: Engine | None = getattr(websocket.app.state, "engine", None)
         if engine_obj is None:
-            await websocket.close(code=1011)
+            await refuse_websocket(
+                websocket,
+                JSONResponse({"detail": "engine unavailable"}, status_code=503),
+                close_code=1011,
+            )
             return
         state = websocket.app.state
         if getattr(state, "ws_count", 0) >= _MAX_WS_CONNECTIONS:
-            await websocket.close(code=1013)  # try again later — too many live monitor sockets
+            await refuse_websocket(
+                websocket,
+                JSONResponse({"detail": "too many live monitor sockets"}, status_code=503),
+                close_code=1013,  # try again later
+            )
             return
         auth: AuthService | None = getattr(state, "auth", None)
         # Server-rendered connections fragment for the browser dashboard, installed by the web console
@@ -6769,12 +6790,53 @@ def create_managed_app(
         # TLS refusal (connection_string / _build_ssl) clamps MEFOR_ALLOW_INSECURE_TLS — the escape can
         # never relax a production-PHI store hop. None when no [ai] (SQLite/test) → unclamped, unchanged.
         # create=True (BACKLOG #1780): serve's first run is the ordinary way a SQLite store comes to exist.
-        store = await open_store(
-            resolved,
-            create=True,
-            message_events=message_events,
-            posture=_hop_posture,
+        # Operational alert notifier (webhook/email). None when no transport is configured → the
+        # engine falls back to the logging sink. Its background dispatch task is owned by this
+        # lifespan: started here, drained + stopped after the engine in the finally below.
+        # Connector SecretProvider (ADR 0019 §5, BACKLOG #196): built once from [secrets] and threaded to
+        # every credential point (SMTP password → notifier/security-notifier, AD bind password →
+        # AuthService). None = [secrets].provider unset/'none' → env-sourced credentials, byte-identical.
+        # An unknown provider / missing extra fails closed HERE (resolve_secret_provider raises), refusing
+        # startup rather than degrading to a blank credential.
+        secret_provider = (
+            resolve_secret_provider(secrets_settings) if secrets_settings is not None else None
         )
+        notifier = (
+            notifier_from_settings(
+                alerts_settings,
+                secret_provider=secret_provider,
+                # #323 layer 3: the instance [tls] internal-CA policy reaches the alerts SMTP hop too, so
+                # an estate on a private CA needs no per-alert CA path.
+                trust_anchor_policy=tls_settings.policy() if tls_settings else None,
+                # #329: clamp the webhook sink's cleartext-http escape to the derived instance posture.
+                posture=_hop_posture,
+            )
+            if alerts_settings is not None
+            else None
+        )
+        # BACKLOG #1169: the notifier is built BEFORE the store opens so the cipher's refusal hook can
+        # reach it during the open. A planted `state`/`reference` value on a sealed surface aborts the
+        # open (those tables are read eagerly), and a planted row the at-open sweep finds is left in
+        # place; both raise `integrity_drift("store-cipher")`, naming only the table and column. With no
+        # notifier the logging sink carries it, as it does for the engine.
+        try:
+            store = await open_store(
+                resolved,
+                create=True,
+                message_events=message_events,
+                posture=_hop_posture,
+                refusal_hook=store_cipher_refusal_forwarder(
+                    notifier if notifier is not None else LoggingAlertSink(),
+                    asyncio.get_running_loop(),
+                ),
+            )
+        except BaseException:
+            if notifier is not None:
+                # The open failed before the notifier would normally start. Start and drain it, or
+                # an alert raised during the open (the reason the open failed) is never sent.
+                notifier.start()
+                await notifier.aclose()
+            raise
         # Offline uploaded-logs store (BACKLOG #125/#126, ADR 0134), on the LIVE store's cipher instance.
         # DISABLED (None) unless [store].uploads_dir is set, so no PHI-at-rest surface exists unless an
         # operator opts in; every uploaded-logs route 503s when None.
@@ -6800,30 +6862,6 @@ def create_managed_app(
                 # opened — this is the serve path, so it is the one that actually runs sharded.
                 store=store,
             )
-        # Operational alert notifier (webhook/email). None when no transport is configured → the
-        # engine falls back to the logging sink. Its background dispatch task is owned by this
-        # lifespan: started here, drained + stopped after the engine in the finally below.
-        # Connector SecretProvider (ADR 0019 §5, BACKLOG #196): built once from [secrets] and threaded to
-        # every credential point (SMTP password → notifier/security-notifier, AD bind password →
-        # AuthService). None = [secrets].provider unset/'none' → env-sourced credentials, byte-identical.
-        # An unknown provider / missing extra fails closed HERE (resolve_secret_provider raises), refusing
-        # startup rather than degrading to a blank credential.
-        secret_provider = (
-            resolve_secret_provider(secrets_settings) if secrets_settings is not None else None
-        )
-        notifier = (
-            notifier_from_settings(
-                alerts_settings,
-                secret_provider=secret_provider,
-                # #323 layer 3: the instance [tls] internal-CA policy reaches the alerts SMTP hop too, so
-                # an estate on a private CA needs no per-alert CA path.
-                trust_anchor_policy=tls_settings.policy() if tls_settings else None,
-                # #329: clamp the webhook sink's cleartext-http escape to the derived instance posture.
-                posture=_hop_posture,
-            )
-            if alerts_settings is not None
-            else None
-        )
         if notifier is not None:
             # Durable operator alert-state (ADR 0044, #56): wire the open store so every emit upserts a
             # resolvable alert instance (GET /alerts/active) and an inverse signal auto-resolves it. A
@@ -7106,7 +7144,8 @@ def create_managed_app(
                 # transport, sent to each affected user's own address. The notifier is wired only when the
                 # [auth].notify_security_events kill-switch is on AND a transport can be built (SMTP
                 # configured): security_notifier_from_settings returns None when SMTP is unset, so we never
-                # fabricate a transport — then only the audited /me/security-events pull feed records events.
+                # fabricate a transport — then nothing is emailed; auth/notifications.py states which
+                # events the audited /me/security-events pull feed still shows.
                 # The effective-by-default guarantee (an exposed PHI instance MUST have a real push channel,
                 # or opt out in writing via [alerts].security_notifications_required) is enforced fail-closed
                 # at startup by the serve gate (messagefoundry/__main__.py), which checks these SAME two

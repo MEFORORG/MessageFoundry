@@ -41,7 +41,7 @@ from messagefoundry.store.content_search import (
     SearchTarget,
     make_spec,
 )
-from messagefoundry.store.crypto import Cipher, CipherInfo, make_cipher
+from messagefoundry.store.crypto import Cipher, CipherInfo, UnmarkedRefusalHook, make_cipher
 from messagefoundry.store.document_strip import StripResult
 from messagefoundry.store.keyprovider import resolve_key_provider
 from messagefoundry.store.pool_metrics import PoolStatus
@@ -1621,9 +1621,31 @@ class AuditStore(Protocol):
         self, *, expected_anchor: tuple[int, str] | None = None
     ) -> tuple[bool, str]:
         """Non-silent #190-D migration: enable HMAC keying of the audit chain on an existing keyless
-        store. Refuses without a DEK, is a no-op if already keyed, and verifies the existing keyless
-        chain first (refusing on any break, so a forged chain is never blessed). Sets a watermark; never
-        rewrites existing row hashes. Returns ``(ok, message)``."""
+        store. Refuses without a DEK and verifies the existing chain first (refusing on any break, so a
+        forged chain is never blessed). On an already-keyed chain it changes nothing and reports that
+        verify, so it never answers OK over a chain that does not verify (BACKLOG #1904). Sets a
+        watermark; never rewrites existing row hashes. Returns ``(ok, message)``."""
+        ...
+
+    async def roll_audit_key_epoch(self) -> tuple[bool, str]:
+        """``rotate-key``'s audit step (BACKLOG #1904, ADR 0193): open a range of the audit chain under
+        the ACTIVE key. Verifies the whole chain first and refuses on a break; then appends one range row,
+        MAC'd under the active key, carrying a digest of the range it closes, so that range stays
+        provable after its key is dropped. Rewrites no existing row. A no-op when the current range is
+        already under the active key or the chain is keyless. Run offline. Returns ``(ok, message)``."""
+        ...
+
+    def audit_chain_unkeyed(self) -> bool:
+        """True when this store holds a keying secret but its audit chain on disk is KEYLESS (#1905).
+
+        Observed once, at open, by ``_load_audit_chain_meta``: a key or isolated-module MAC is in hand,
+        no keying watermark is recorded, and ``audit_log`` already has rows. Those rows are plain
+        SHA-256, so anyone who can write the table can forge them. The open does not re-key them --
+        that would bless a forged row. A successful :meth:`rekey_audit_chain` on THIS handle clears
+        it; a rekey by another process (the ``rekey-audit`` CLI) is seen at the next open, which is
+        one reason that command is run with the engine stopped. A store with no key at all returns
+        False: that chain is keyless by the audited at-rest opt-out, which ``security_loosenings()``
+        already reports."""
         ...
 
     async def has_prior_backup_history(self) -> bool:
@@ -2165,7 +2187,12 @@ def build_store_cipher(settings: StoreSettings) -> Cipher:
             "(expected 'aesgcm' or 'vault_transit')"
         )
     retired = [k.strip() for k in settings.encryption_keys_retired.split(",") if k.strip()]
-    return make_cipher(resolve_active_key(settings), retired, write_v2=settings.aad_bind)
+    return make_cipher(
+        resolve_active_key(settings),
+        retired,
+        write_v2=settings.aad_bind,
+        allow_unmarked=settings.allow_unmarked_ciphertext,
+    )
 
 
 class StoreNotFoundError(RuntimeError):
@@ -2206,6 +2233,7 @@ async def open_store(
     create: bool = False,
     message_events: str = "all",
     posture: HopPosture | None = None,
+    refusal_hook: UnmarkedRefusalHook | None = None,
 ) -> Store:
     """Open the store for the configured backend — the single backend-selection seam.
 
@@ -2229,6 +2257,11 @@ async def open_store(
     server-DB backends so the engine<->store weakened-TLS refusal (``connection_string`` / ``_build_ssl``)
     clamps the ``MEFOR_ALLOW_INSECURE_TLS`` escape on a production-PHI hop (decision 2). ``None`` (SQLite —
     no TLS — or a backup/restore utility / test) leaves it unclamped, byte-identical to pre-#200.
+
+    ``refusal_hook`` (BACKLOG #1169) is set on the cipher BEFORE the backend opens. The open itself can
+    refuse an unmarked value -- the sweep finds a planted row, or the eager ``state``/``reference``
+    cache load reads one and aborts the open -- and only a hook armed this early can alert on those.
+    ``None`` leaves the refusal to the log, as a CLI utility's open does.
     """
     # Before the cipher, so a refusal never waits on a key provider (a Vault round trip).
     if not create and (absent := _absent_sqlite_store(settings)) is not None:
@@ -2239,6 +2272,9 @@ async def open_store(
     # aad_bind=false selects the frozen v1 writer, byte-identical at rest). `vault_transit` runs the bulk
     # crypto inside Vault/OpenBao Transit so the DEK never enters heap (ASVS 13.3.3). No key → identity.
     cipher = build_store_cipher(settings)
+    setter = getattr(cipher, "set_refusal_hook", None)
+    if refusal_hook is not None and callable(setter):
+        setter(refusal_hook)
     # #190: HKDF-derived HMAC key for the tamper-evident audit chain; None for the identity cipher (the
     # chain then stays the keyless SHA-256 chain, byte-identical to a pre-#190 store).
     audit_mac_key = cipher.audit_mac_key()

@@ -100,7 +100,7 @@ import logging
 import os
 import sys
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -145,6 +145,8 @@ _KEY_ID_LEN = 16  # hex chars of the SHA-256 key fingerprint embedded as key_id
 # HKDF info label for the audit-chain HMAC key (#190). Versioned so a future re-derivation is an
 # additive label, never a silent change to an existing deployment's derived key.
 _AUDIT_MAC_INFO = b"mefor/audit-chain/v1"
+# Domain label for :func:`audit_key_id` -- the id a keyed range of the audit chain names its key by.
+_AUDIT_KEY_ID_INFO = b"mefor/audit-key-id/v1\x00"
 _AUDIT_MAC_LEN = 32  # bytes — HMAC-SHA256 key
 
 # HKDF info label for the secret-rotation fingerprint MAC key (ASVS 13.3.4, BACKLOG #282). A DEDICATED,
@@ -206,6 +208,116 @@ def cell_aad(table: str, column: str, *pk: object) -> bytes:
         *(str(p).encode("utf-8") for p in pk),
     )
     return b"".join(len(f).to_bytes(4, "big") + f for f in fields)
+
+
+def aad_cell_name(aad: bytes | None) -> tuple[str, str]:
+    """The ``(table, column)`` a :func:`cell_aad` names, for an operator-facing message or alert.
+
+    Reads only the first three length-prefixed fields — the scheme tag, the table and the column — and
+    never the row key after them, so nothing it returns identifies a row. Table and column are code
+    constants, not data, so the pair carries no PHI. An absent or foreign AAD yields ``("?", "?")``
+    rather than raising: this names a refusal, it must never be the thing that fails."""
+    fields: list[bytes] = []
+    pos = 0
+    while aad is not None and len(fields) < 3 and pos + 4 <= len(aad):
+        size = int.from_bytes(aad[pos : pos + 4], "big")
+        fields.append(aad[pos + 4 : pos + 4 + size])
+        pos += 4 + size
+    if len(fields) < 3 or fields[0] != _AAD_SCHEME:
+        return "?", "?"
+    return fields[1].decode("utf-8", "replace"), fields[2].decode("utf-8", "replace")
+
+
+#: Called when a keyed cipher REFUSES an unmarked value, with the ``(table, column)`` from the cell
+#: AAD. Never the row key and never the value, so an implementation may forward it to an alert.
+UnmarkedRefusalHook = Callable[[str, str], None]
+
+
+class _UnmarkedPolicy:
+    """What a KEYED cipher does with a stored value that carries no ``mfenc:`` marker (BACKLOG #1169,
+    ASVS 11.3.3).
+
+    **It refuses, by default.** A keyed store writes only marked ciphertext into a cipher-covered
+    column, and the at-open sweep seals legacy plaintext only on a surface that holds no ciphertext
+    yet. So once a key is configured, a non-blank unmarked value in a covered column is a stripped
+    marker or a planted row. Returning it as plaintext -- what this seam did before -- is exactly where
+    the AEAD tag's protection against modification was lost: substitution has a tag to fail, and a
+    downgrade to plaintext has none, so only a refusal can stop it.
+
+    **Blank is not refused.** Every purge path writes a literal ``''``, and the sweep never seals one,
+    so ``''`` is the one unmarked value a keyed store legitimately holds. NULL never reaches here.
+
+    ``allow_unmarked`` is the audited opt-out, ``[store].allow_unmarked_ciphertext``. The per-call
+    ``allow_unmarked=True`` exists for exactly one caller, the uploaded-file store, whose behaviour at
+    first key-enable is an open owner question; it keeps that surface byte-identical rather than
+    deciding it here."""
+
+    _allow_unmarked: bool
+    _refusal_hook: UnmarkedRefusalHook | None
+
+    def _init_unmarked_policy(self, allow_unmarked: bool) -> None:
+        self._allow_unmarked = allow_unmarked
+        self._refusal_hook = None
+
+    @property
+    def allow_unmarked(self) -> bool:
+        """True when ``[store].allow_unmarked_ciphertext`` restored the old passthrough."""
+        return self._allow_unmarked
+
+    def set_refusal_hook(self, hook: UnmarkedRefusalHook | None) -> None:
+        """Register the callback fired on every refusal (``None`` clears it). Modelled on the refill
+        hook: it may run on whichever thread decrypted, so it MUST be thread-safe, and anything it raises
+        is swallowed -- an alert must never change what the read does."""
+        self._refusal_hook = hook
+
+    def report_unmarked(self, table: str, column: str) -> None:
+        """Fire the refusal hook for an unmarked value in ``table.column`` without reading it.
+
+        The read seam calls this on every refusal. The at-open sweep calls it too when it finds a
+        planted row it leaves in place, so a row nobody reads still reaches an alert. Anything the
+        hook raises is swallowed: an alert must never change what the caller does."""
+        hook = self._refusal_hook
+        if hook is None:
+            return
+        try:
+            hook(table, column)
+        except Exception:  # noqa: BLE001 — an alert failure must never change the read's outcome
+            _log.debug("cipher refusal hook raised; the refusal itself still stands")
+
+    def _pass_unmarked(self, stored: str, aad: bytes | None, allow_unmarked: bool) -> str:
+        """Return an unmarked ``stored`` when policy permits it, else raise :class:`CipherError`."""
+        if not stored or allow_unmarked or self._allow_unmarked:
+            return stored
+        table, column = aad_cell_name(aad)
+        _log.warning(
+            "refused an unmarked value in cipher column %s.%s: a keyed store holds only marked "
+            "ciphertext there, so this is a stripped marker or a planted row",
+            table,
+            column,
+        )
+        self.report_unmarked(table, column)
+        raise CipherError(
+            f"refused an unmarked value in cipher column {table}.{column} (a stripped marker or a "
+            "planted row); set [store].allow_unmarked_ciphertext to accept unmarked values"
+        )
+
+
+def allows_unmarked(cipher: Cipher) -> bool:
+    """True when ``cipher`` passes unmarked values through -- the opt-out, or a cipher with no policy.
+
+    The at-open sweep reads this to decide whether a surface that already holds ciphertext may still
+    have its unmarked values sealed (only under the opt-out). Duck-typed so a test double or embedder
+    cipher without the policy keeps the old seal-everything sweep."""
+    return bool(getattr(cipher, "allow_unmarked", True))
+
+
+def report_unmarked(cipher: Cipher, table: str, column: str) -> None:
+    """Report an unmarked value the at-open sweep found and left in place (BACKLOG #1169).
+
+    Duck-typed like :func:`allows_unmarked`: a cipher without the policy has no hook to fire."""
+    report = getattr(cipher, "report_unmarked", None)
+    if callable(report):
+        report(table, column)
 
 
 # --- in-use memory hygiene (ASVS 13.3.3 / 11.7.2) — all best-effort, see the module docstring -------
@@ -363,11 +475,15 @@ class Cipher(Protocol):
 
     def encrypt(self, plaintext: str, *, aad: bytes | None = None) -> str: ...
 
-    def decrypt(self, stored: str, *, aad: bytes | None = None) -> str: ...
+    def decrypt(
+        self, stored: str, *, aad: bytes | None = None, allow_unmarked: bool = False
+    ) -> str: ...
 
     def is_encrypted(self, stored: str) -> bool: ...
 
     def audit_mac_key(self) -> bytes | None: ...
+
+    def audit_mac_keyring(self) -> Mapping[str, bytes]: ...
 
     def audit_mac_fn(self) -> AuditMacFn | None: ...
 
@@ -394,6 +510,17 @@ def _derive_audit_mac_key(dek: bytes | bytearray) -> bytes:
 
     hkdf = HKDF(algorithm=hashes.SHA256(), length=_AUDIT_MAC_LEN, salt=None, info=_AUDIT_MAC_INFO)
     return hkdf.derive(bytes(dek))
+
+
+def audit_key_id(mac_key: bytes) -> str:
+    """The stable, non-secret id of one audit-chain HMAC key (BACKLOG #1904, ADR 0193).
+
+    A keyed range of the audit chain names the key its rows were MAC'd under by this id, so a verify
+    after a rotation can pick each row's key instead of trying the active one on every row. It is a
+    one-way digest of the DERIVED audit key under its own label, never of the DEK, so it is distinct
+    from the at-rest ``key_id`` in ``mfenc:`` markers and reveals nothing either key could be
+    recovered from."""
+    return hashlib.sha256(_AUDIT_KEY_ID_INFO + mac_key).hexdigest()[:_KEY_ID_LEN]
 
 
 def rotation_fingerprint_key(cipher: Cipher) -> bytes | None:
@@ -452,8 +579,10 @@ class IdentityCipher:
     def encrypt(self, plaintext: str, *, aad: bytes | None = None) -> str:
         return plaintext  # identity: no encryption, so nothing to bind (aad ignored)
 
-    def decrypt(self, stored: str, *, aad: bytes | None = None) -> str:
-        return stored
+    def decrypt(
+        self, stored: str, *, aad: bytes | None = None, allow_unmarked: bool = False
+    ) -> str:
+        return stored  # keyless: every value is stored as-is, so there is no marker to require
 
     def is_encrypted(self, stored: str) -> bool:
         return stored.startswith(MARKER_PREFIX)
@@ -463,12 +592,16 @@ class IdentityCipher:
         the pre-#190 default). ``None`` is the signal to keep ``audit_row_hash`` unkeyed."""
         return None
 
+    def audit_mac_keyring(self) -> Mapping[str, bytes]:
+        """No DEK, so no audit keys, active or retired."""
+        return {}
+
     def audit_mac_fn(self) -> None:
         """No isolated-module MAC — the identity cipher's chain is in-process keyless SHA-256."""
         return None
 
 
-class AesGcmCipher:
+class AesGcmCipher(_UnmarkedPolicy):
     """AES-256-GCM **keyring** cipher with M9 crypto-agility. Encrypts with the active key; decrypts
     with whichever configured key matches the embedded ``key_id`` (and falls back to trying every key,
     which covers legacy ``key_id='0'`` rows and in-progress rotations). Construct via :func:`make_cipher`.
@@ -487,15 +620,27 @@ class AesGcmCipher:
         retired_keys: Sequence[bytearray] = (),
         *,
         write_v2: bool = False,
+        allow_unmarked: bool = False,
     ) -> None:
         # Keys arrive as mutable bytearrays this cipher owns: _install_key fingerprints + builds each
         # AESGCM, then locks + zeroizes the plaintext key buffer (best-effort). The raw key bytearray is
         # NOT retained as an attribute — only the fingerprint (one-way) and the AESGCM (holding OpenSSL's
         # internal, unreachable copy) survive.
         self._write_v2 = write_v2
+        self._init_unmarked_policy(allow_unmarked)
         # Derive the audit-chain HMAC key from the LIVE active DEK before _install_key zeroizes it (#190).
         # Only the derived key is retained; the raw DEK is never held as an attribute.
         self._audit_mac_key = _derive_audit_mac_key(active_key)
+        # BACKLOG #1904: one audit key per keyring entry, RETIRED keys included, derived the same way and
+        # at the same point (before _install_key zeroizes the DEK). A chain keyed under a key that has
+        # since been rotated to retired must still verify; deriving from the active key alone made the
+        # documented rotation read as tampering from row 1.
+        self._audit_mac_keys: dict[str, bytes] = {
+            audit_key_id(self._audit_mac_key): self._audit_mac_key
+        }
+        for key in retired_keys:
+            derived = _derive_audit_mac_key(key)
+            self._audit_mac_keys.setdefault(audit_key_id(derived), derived)
         # GCM invocation accounting (#190-F / ASVS 11.3.4). `_invocations` counts THIS process's encrypts
         # (it is also the whole bound when no store backs the counter — CLI/offline ciphers). When a store
         # enables the persisted bound, `_bound_total` is the fleet-wide RESERVED cumulative total for this
@@ -550,6 +695,12 @@ class AesGcmCipher:
         ``audit_row_hash`` chain so it cannot be forged without the DEK. Non-secret to *hold* here (it
         never leaves the process); never logged."""
         return self._audit_mac_key
+
+    def audit_mac_keyring(self) -> Mapping[str, bytes]:
+        """Every audit key this cipher can verify with, by :func:`audit_key_id` -- the active key's and
+        each retired key's (BACKLOG #1904). New rows are MAC'd only under the key of the chain's current
+        range; the retired entries exist so older ranges still verify during a rotation window."""
+        return dict(self._audit_mac_keys)
 
     def audit_mac_fn(self) -> None:
         """The in-process cipher keys the chain with :meth:`audit_mac_key` (in-heap HMAC), not an
@@ -633,19 +784,25 @@ class AesGcmCipher:
             return self._invocations
         return self._bound_total - self._reserve_remaining
 
-    def invocation_reserve_shortfall(self) -> int:
+    def invocation_reserve_shortfall(self, ahead: int = 0) -> int:
         """How many invocations the store should reserve NOW (0 = the reserve is healthy).
 
         Rounded UP to whole ``_GCM_RESERVE_BLOCK`` blocks, so the persisted total always runs AHEAD of
         what has actually been spent — the unclean-exit-can-only-over-count guarantee. Returns 0 while
         more than half a block is left, so the refill costs one DB write per ~2**15 encrypts, not one per
-        encrypt."""
+        encrypt.
+
+        ``ahead`` is a burst the caller is ABOUT to spend without a chance to refill part-way: the
+        at-open seal of one surface runs in a single transaction, so a mid-burst reservation would
+        commit it half-sealed (BACKLOG #1169). The reserve is sized so it still holds more than half a
+        block after the whole burst, which keeps the reservation ahead of every encrypt in it."""
         with self._count_lock:
             if not self._bound_enabled:
                 return 0
-            if self._reserve_remaining > _GCM_RESERVE_REFILL_AT:
+            left_after = self._reserve_remaining - max(ahead, 0)
+            if left_after > _GCM_RESERVE_REFILL_AT:
                 return 0
-            need = _GCM_RESERVE_BLOCK - self._reserve_remaining
+            need = _GCM_RESERVE_BLOCK - left_after
             return ((need + _GCM_RESERVE_BLOCK - 1) // _GCM_RESERVE_BLOCK) * _GCM_RESERVE_BLOCK
 
     def invocation_settlement(self) -> int:
@@ -778,11 +935,15 @@ class AesGcmCipher:
             f"unknown at-rest marker version {version!r}; this build decodes mfenc:v1 and mfenc:v2 only"
         )
 
-    def decrypt(self, stored: str, *, aad: bytes | None = None) -> str:
+    def decrypt(
+        self, stored: str, *, aad: bytes | None = None, allow_unmarked: bool = False
+    ) -> str:
         from cryptography.exceptions import InvalidTag
 
         if not stored.startswith(MARKER_PREFIX):
-            return stored  # legacy plaintext (pre-encryption) or a purged/blank value
+            # A purged '' passes; any other unmarked value is refused unless policy allows it
+            # (BACKLOG #1169, ASVS 11.3.3) -- see _UnmarkedPolicy for why.
+            return self._pass_unmarked(stored, aad, allow_unmarked)
         # AAD dispatch (ASVS 11.3.3): a v1 marker was written with None AAD (frozen, legacy) so it MUST
         # decrypt with None — dual-read keeps every pre-aad_bind row readable regardless of the caller's
         # `aad`. A v2 marker was written with the cell's AAD, so it decrypts with the caller-supplied
@@ -867,18 +1028,23 @@ def _decode_key(key_b64: str, name: str) -> bytearray:
 
 
 def make_cipher(
-    key_b64: str | None, retired_b64: Sequence[str] = (), *, write_v2: bool = False
+    key_b64: str | None,
+    retired_b64: Sequence[str] = (),
+    *,
+    write_v2: bool = False,
+    allow_unmarked: bool = False,
 ) -> Cipher:
     """Build the store cipher. ``key_b64`` is the active key (base64 32-byte); ``retired_b64`` are
     decrypt-only keys to keep available during a rotation window. Empty active key → identity cipher
     (backward-compatible default). ``write_v2`` opts the cipher into writing the additive ``mfenc:v2``
     marker — wired + tested for M9 crypto-agility, but **off by default** so v1 stays the shipping
-    at-rest format (CRYPTO-1: v1 byte-identical)."""
+    at-rest format (CRYPTO-1: v1 byte-identical). ``allow_unmarked`` is
+    ``[store].allow_unmarked_ciphertext``: off, a keyed cipher refuses a non-blank unmarked value."""
     if not key_b64:
         return IdentityCipher()
     active = _decode_key(key_b64, "MEFOR_STORE_ENCRYPTION_KEY")
     retired = [_decode_key(k, "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED") for k in retired_b64 if k]
-    return AesGcmCipher(active, retired, write_v2=write_v2)
+    return AesGcmCipher(active, retired, write_v2=write_v2, allow_unmarked=allow_unmarked)
 
 
 def generate_key() -> str:

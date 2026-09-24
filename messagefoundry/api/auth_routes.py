@@ -63,6 +63,8 @@ from messagefoundry.api.security import (
     bearer_token,
     client_ip,
     get_auth,
+    pending_credential_deadline,
+    pending_credential_deadline_for,
     require,
     require_reauth_only_action,
     require_step_up,
@@ -190,13 +192,19 @@ def _current_user(identity: Identity) -> CurrentUser:
 
 
 def _login_response(
-    token: str, identity: Identity, must_change: bool, *, mfa_required: bool = False
+    token: str,
+    identity: Identity,
+    must_change: bool,
+    *,
+    mfa_required: bool = False,
+    credential_expires_at: float | None = None,
 ) -> LoginResponse:
     return LoginResponse(
         token=token,
         must_change_password=must_change,
         mfa_required=mfa_required,
         user=_current_user(identity),
+        credential_expires_at=credential_expires_at,
     )
 
 
@@ -215,7 +223,9 @@ def _parse_channel_scope(raw: str | None) -> list[str] | None:
     return [str(c) for c in value] if isinstance(value, list) else []
 
 
-def _user_summary(user: UserRecord, role_ids: list[str]) -> UserSummary:
+def _user_summary(
+    user: UserRecord, role_ids: list[str], *, credential_expires_at: float | None = None
+) -> UserSummary:
     return UserSummary(
         id=user.id,
         username=user.username,
@@ -226,6 +236,7 @@ def _user_summary(user: UserRecord, role_ids: list[str]) -> UserSummary:
         disabled=user.disabled,
         roles=sorted(role_ids),
         channel_scope=_parse_channel_scope(user.channel_scope),
+        credential_expires_at=credential_expires_at,
     )
 
 
@@ -300,6 +311,12 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             outcome.identity,
             outcome.must_change_password,
             mfa_required=outcome.mfa_required,
+            # BACKLOG #1141 (ASVS 6.4.5): the holder's own client learns when this credential dies.
+            credential_expires_at=(
+                await pending_credential_deadline_for(service, outcome.identity.user_id)
+                if outcome.must_change_password
+                else None
+            ),
         )
 
     @app.post("/auth/negotiate", response_model=LoginResponse)
@@ -550,9 +567,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         limit: int = Query(100, ge=1, le=1000),
     ) -> SecurityEventsList:
         """The caller's own security-event history (WP-L3-05, ASVS 6.3.5/6.3.7): the audited ``auth.*``
-        actions on their account (sign-ins, lockouts, password changes), most-recent-first. The
-        out-of-band email push complements this for events the user should learn of without logging in
-        (and for admin-initiated changes, whose audit actor is the admin)."""
+        actions on their account (sign-ins, lockouts, password changes), most-recent-first; which
+        events that includes is stated once, in ``auth/notifications.py``. The out-of-band email push
+        complements this for events the user should learn of without logging in (and for
+        admin-initiated changes, whose audit actor is the admin)."""
         rows = await service.security_events_for(identity.username, limit=limit)
         return SecurityEventsList(events=[SecurityEventInfo(**r) for r in rows])
 
@@ -562,9 +580,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         service: AuthService = Depends(_service),
         # 7.5.2 (ASVS): terminating a session needs a fresh PASSWORD re-proof BOUND TO THIS ACTION
         # (BACKLOG #1149) — single-use, so the login-seeded window no longer satisfies it. Still the
-        # reauth-only family and NOT the MFA gate: a no-factor user must remain able to revoke. The
-        # gate runs before the body and 403s identically for owned AND foreign ids, so it leaks no
-        # ownership.
+        # reauth-only family and NOT the MFA gate: a no-factor user must remain able to revoke; a
+        # pending session on an account WITH a factor is refused (#1951). The gate runs before the
+        # body and 403s identically for owned AND foreign ids, so it leaks no ownership.
         identity: Identity = Depends(require_reauth_only_action(STEP_UP_ACTION_SESSION_TERMINATE)),
     ) -> SimpleMessage:
         # Ownership-checked in the service: a 404 (not 403) avoids confirming another user's session id.
@@ -701,6 +719,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         summaries: list[UserSummary] = []
         for user in await service.store.list_users():
             role_ids = await service.store.get_user_role_ids(user.id)
+            # No credential_expires_at here, deliberately (BACKLOG #1141). This route needs only
+            # users:read, and which accounts hold a live admin-issued temporary password, and until
+            # when, is a target list. The users:manage surfaces state it.
             summaries.append(_user_summary(user, role_ids))
         return summaries
 
@@ -752,7 +773,14 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         )
         user = await service.store.get_user(user_id)
         assert user is not None
-        return _user_summary(user, sorted(body.roles))
+        # BACKLOG #1141 (ASVS 6.4.5): the initial password is a must-change credential the login gate
+        # expires, so the one response the issuing administrator reads states when. Read back off the
+        # stored stamp create_local_user just wrote, never a fresh clock.
+        return _user_summary(
+            user,
+            sorted(body.roles),
+            credential_expires_at=pending_credential_deadline(service, user),
+        )
 
     @app.patch("/users/{user_id}", response_model=SimpleMessage)
     async def update_user(
