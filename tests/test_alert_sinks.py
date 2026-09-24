@@ -107,6 +107,38 @@ def test_bootstrap_admin_expiring_logging_sink_states_deadline_not_password(
     assert "24 hour" in caplog.text
 
 
+async def test_initial_credential_expiring_emits_phi_free_keyed_on_the_holder() -> None:
+    # BACKLOG #1141 (ASVS 6.4.5): the holder's username stands in for "connection", so the throttle
+    # and the alert instance key per account. The payload is the deadline and the hours only.
+    t = _RecordingTransport("t")
+    sink = NotifierAlertSink([t])
+    sink.initial_credential_expiring("alice", expires_at="2026-07-27T12:00:00Z", hours_remaining=5)
+    await _drain(sink)
+    assert len(t.events) == 1
+    ev = t.events[0]
+    assert ev["type"] == "initial_credential_expiring"
+    assert ev["connection"] == "alice"
+    assert ev["expires_at"] == "2026-07-27T12:00:00Z"
+    assert ev["hours_remaining"] == 5
+    assert not any(k in ev for k in ("password", "secret", "token"))
+
+
+def test_initial_credential_expiring_logging_sink_states_holder_and_deadline(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The LoggingAlertSink fallback is what an instance with no [alerts] notifier gets.
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        LoggingAlertSink().initial_credential_expiring(
+            "alice", expires_at="2026-07-27T12:00:00Z", hours_remaining=5
+        )
+    assert "initial_credential_expiring" in caplog.text
+    assert "'alice'" in caplog.text
+    assert "2026-07-27T12:00:00Z" in caplog.text
+    assert "5 hour" in caplog.text
+
+
 async def test_suspend_gate_mutes_notification() -> None:
     # #143: a suspended (type, connection) is muted at the notification enqueue while the window is
     # active; a different, un-suspended key still delivers. NOTIFICATION-only.

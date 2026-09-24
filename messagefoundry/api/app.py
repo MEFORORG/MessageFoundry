@@ -188,9 +188,12 @@ from messagefoundry.api.request_timeout import RequestTimeoutMiddleware
 from messagefoundry.api.security import (
     authorize_ws,
     client_ip,
+    deadline_utc,
     enforce_phi_read_hop,
     enforce_phi_read_pacing,
+    initial_credential_window_hours,
     optional_identity,
+    pending_credential_deadline,
     require,
     require_paced,
     require_phi_read,
@@ -6654,6 +6657,90 @@ async def _bootstrap_expiry_reminder(auth: AuthService, sink: AlertSink) -> None
         await asyncio.sleep(_BOOTSTRAP_EXPIRY_REMINDER_INTERVAL)
 
 
+_INITIAL_CREDENTIAL_MAX_LEAD = 24 * 3600.0  # warn at most this long before the deadline
+
+
+def _initial_credential_warn_lead(auth: AuthService) -> float | None:
+    """How long before an admin-issued credential's deadline to remind an operator, in seconds.
+
+    BACKLOG #1141 (ASVS 6.4.5). The last third of the window, capped at 24 hours: 24 hours at the
+    shipped 72, and a holder never gets reminded about a credential it was handed moments ago on a
+    short window. No setting, deliberately: the reminder is advisory and a knob would be one more
+    loosening to inventory. ``None`` when ``[auth].initial_password_expiry_hours`` is 0, where
+    nothing expires and there is nothing to remind about."""
+    window_hours = initial_credential_window_hours(auth)
+    if window_hours is None:
+        return None
+    return min(_INITIAL_CREDENTIAL_MAX_LEAD, window_hours * 3600.0 / 3)
+
+
+async def _remind_expiring_initial_credentials(
+    auth: AuthService,
+    sink: AlertSink,
+    *,
+    lead: float,
+    warned: dict[str, float],
+    now: float | None = None,
+) -> None:
+    """One pass: alert once for each unclaimed admin-issued credential inside its warn window.
+
+    The deadline is :func:`pending_credential_deadline`, the function every other surface states and
+    the login gate's own test, so the reminder cannot name an instant the gate does not honour. That
+    also leaves out the never-claimed bootstrap account, which :func:`_bootstrap_expiry_reminder`
+    covers against the EARLIER of its two bounds. A disabled account is skipped: it cannot sign in
+    whatever the credential does.
+
+    ``warned`` maps a user id to the deadline already reminded about. A new credential on the same
+    account has a new deadline, so it is reminded about again. An entry is dropped once its account
+    leaves every window (claimed, lapsed, disabled or deleted), so the map stays as small as the set
+    of live reminders."""
+    now = time.time() if now is None else now
+    live: set[str] = set()
+    for user in await auth.store.list_users():
+        if user.disabled:
+            continue
+        deadline = pending_credential_deadline(auth, user)
+        if deadline is None or not (deadline - lead <= now < deadline):
+            continue
+        live.add(user.id)
+        if warned.get(user.id) == deadline:
+            continue
+        expires = deadline_utc(deadline)
+        if expires is None:
+            continue
+        sink.initial_credential_expiring(
+            user.username,
+            expires_at=expires,
+            hours_remaining=max(0, int((deadline - now) // 3600)),
+        )
+        warned[user.id] = deadline
+    for user_id in [uid for uid in warned if uid not in live]:
+        del warned[user_id]
+
+
+async def _initial_credential_expiry_reminder(auth: AuthService, sink: AlertSink) -> None:
+    """Remind an operator before an admin-issued temporary password lapses unclaimed (ASVS 6.4.5,
+    BACKLOG #1141). The engine hands that credential to an ADMINISTRATOR and has no channel to its
+    holder, so the reminder goes to the ``[alerts]`` sink as ``initial_credential_expiring``.
+
+    The poll runs at half the warn lead, capped at an hour, so every window holds at least one pass.
+    The ``_bootstrap_expiry_reminder`` shape: API-lifespan-owned, and a failed pass is logged and
+    retried rather than ending the loop."""
+    lead = _initial_credential_warn_lead(auth)
+    if lead is None:
+        return
+    interval = min(3600.0, lead / 2)
+    warned: dict[str, float] = {}
+    while True:
+        try:
+            await _remind_expiring_initial_credentials(auth, sink, lead=lead, warned=warned)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _log.exception("initial credential reminder: pass failed; will retry next interval")
+        await asyncio.sleep(interval)
+
+
 def create_managed_app(
     *,
     db_path: str | Path | None = None,
@@ -7021,6 +7108,8 @@ def create_managed_app(
         reaper: asyncio.Task[None] | None = None
         reconciler: asyncio.Task[None] | None = None
         bootstrap_reminder: asyncio.Task[None] | None = None
+        # BACKLOG #1141: hoisted with the five above, for the same teardown reason.
+        credential_reminder: asyncio.Task[None] | None = None
         security_notifier = None
         # The teardown guards this ENTIRE span, not just the yield. Everything started below --
         # the engine, both notifiers, the retention runner, the three tasks -- was otherwise
@@ -7223,6 +7312,13 @@ def create_managed_app(
                     bootstrap_reminder = asyncio.create_task(
                         _bootstrap_expiry_reminder(auth, notifier or LoggingAlertSink())
                     )
+                if _initial_credential_warn_lead(auth) is not None:
+                    # BACKLOG #1141 (ASVS 6.4.5): the same nudge for every OTHER unclaimed temporary
+                    # password an administrator issued. Gated on the predicate the task itself reads,
+                    # so the gate cannot drift from the task the way the bootstrap one did above.
+                    credential_reminder = asyncio.create_task(
+                        _initial_credential_expiry_reminder(auth, notifier or LoggingAlertSink())
+                    )
                 if auth.directory_reconcile_enabled:
                     # ADR 0079 mechanism 2: propagate an AD disable/delete to live engine sessions.
                     # ON whenever a directory is wired -- `ad_session_recheck_seconds` defaults to
@@ -7265,6 +7361,9 @@ def create_managed_app(
                 # gather(return_exceptions): absorb our cancellation + any stored exception so it can't
                 # propagate here and skip engine.stop() (the reaper precedent).
                 await asyncio.gather(bootstrap_reminder, return_exceptions=True)
+            if credential_reminder is not None:
+                credential_reminder.cancel()
+                await asyncio.gather(credential_reminder, return_exceptions=True)
             # M-5 (BACKLOG #1640): flush the open summary-access window before the store closes.
             # `_SummaryAuditCoalescer.flush` documents itself as the engine-shutdown path and NOTHING
             # called it, so every clean restart dropped the open hour's PHI-summary access audit --
