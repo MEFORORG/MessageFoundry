@@ -50,6 +50,7 @@ from messagefoundry.store.store import (
     AlertInstance,
     AlertSummary,
     CapturedResponse,
+    ChannelScopeSource,
     ClaimedHeads,
     ClaimProcStatus,
     ConnectionEvent,
@@ -1954,8 +1955,33 @@ class AuthStore(Protocol):
     ) -> None: ...
 
     async def set_user_channel_scope(
-        self, user_id: str, scope_json: str | None, *, now: float | None = None
-    ) -> None: ...
+        self,
+        user_id: str,
+        scope_json: str | None,
+        *,
+        source: ChannelScopeSource,
+        now: float | None = None,
+    ) -> None:
+        """Set a user's per-channel scope and record who wrote it, in one statement.
+
+        ``source`` is REQUIRED, not defaulted (BACKLOG #1927). Provenance decides whether the AD
+        login sync may later withdraw the scope (``UserRecord.channel_scope_source``), so a writer
+        that forgot to say who it was would misfile the scope one way or the other. A required
+        keyword turns that omission into a type error at every call site."""
+        ...
+
+    async def withdraw_ad_channel_scope(
+        self, user_id: str, expected_scope: str, *, now: float | None = None
+    ) -> bool:
+        """Withdraw a directory-derived scope to NULL (which denies), and report whether it did.
+
+        BACKLOG #1927. A COMPARE-AND-SET, not a read-then-write: the AD login sync decides to
+        withdraw from a user row it read several awaits earlier, and in between an administrator may
+        set a scope or a concurrent login may write a fresh directory grant. The WHERE clause binds
+        the withdrawal to ``expected_scope``, the value the decision was made on, and re-checks that
+        it is not marked ``"manual"``, all in one statement. If either no longer holds, nothing is
+        written and this returns ``False``. The withdrawn row is marked ``"ad"``."""
+        ...
 
     async def set_user_federated_subject(
         self, user_id: str, issuer: str, subject: str, *, now: float | None = None
