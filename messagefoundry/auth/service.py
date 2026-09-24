@@ -118,10 +118,12 @@ def _error_if_bundled_corpus_unusable(check_breached: bool) -> None:
     anywhere": the ``provision-first-administrator`` CLI still halts on this, and uncaught.
 
     BACKLOG #1886: the message therefore names what a first ``serve`` now hands the operator. The
-    bootstrap admin it mints is born must-change, and that rotation is screened by this same corpus,
-    so the account cannot finish it until the corpus is repaired. This runs from ``__init__``, before
-    ``initialize`` decides whether to mint, so the sentence is conditional. It names ``serve`` and not
-    "a first run", because the CLI also constructs ``AuthService`` and there it halts instead.
+    bootstrap admin it mints must change its password. That change is screened by this same corpus,
+    so it cannot finish until the corpus is repaired. An administrator's reset leaves its user in the
+    same state. This runs from ``__init__``, before ``initialize`` decides whether to mint, so the
+    sentence is conditional. It names ``serve`` because the CLI also builds ``AuthService`` and halts.
+    The remedies differ in timing: a repaired file recovers live, because ``_common_passwords`` does
+    not cache the exception, but the setting is read once into ``PasswordPolicy`` and needs a restart.
 
     Skipped when the operator has turned screening off: a corpus nobody consults is not a defect.
     """
@@ -131,12 +133,15 @@ def _error_if_bundled_corpus_unusable(check_breached: bool) -> None:
         entries = _common_passwords()
     except BreachCorpusUnavailable as exc:
         _log.error(
-            "%s; local password creation and change will be REFUSED until it is repaired "
-            "(ASVS 6.2.4). On a first `serve` against an empty store the engine still creates the "
-            "bootstrap admin, which must change its password before it can do anything else, and "
-            "that change is screened by this same corpus, so it would be refused too. Act before "
-            "the first sign-in: reinstall the messagefoundry wheel, or set "
-            "[auth].password_check_breached = false to accept unscreened passwords deliberately",
+            "%s; a password a person chooses will be REFUSED until it is repaired (ASVS 6.2.4). "
+            "So an account that must change its password cannot finish that change, and the "
+            "attempt fails with a server error. On a first `serve` against an empty store, that "
+            "includes the bootstrap admin the engine creates. A password reset by an administrator "
+            "leaves its user in the same state. Repair the corpus before that credential expires, "
+            "ideally before the first sign-in, and keep bootstrap-admin.txt until the change "
+            "succeeds. Reinstall the messagefoundry wheel, which takes effect at once, or set "
+            "[auth].password_check_breached = false and restart to accept unscreened passwords "
+            "deliberately",
             exc,
         )
         return

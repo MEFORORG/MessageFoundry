@@ -160,6 +160,9 @@ async def test_the_startup_error_names_the_rotation_a_first_serve_cannot_finish(
     sentence and the wording asserts fail. Change the behaviour -- the mint starts raising again, or
     the rotation stops being refused -- and the behaviour asserts fail, which is the prompt to reword.
     Why the wording names `serve` is stated on `_error_if_bundled_corpus_unusable`.
+
+    SCOPE: this drives `AuthService` directly. It does not reach the must-change gate in
+    `api/security.py` or the `serve` lifespan in `api/app.py`, so a change there cannot fail it.
     """
     bundled_corpus([])
     with caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"):
@@ -171,8 +174,9 @@ async def test_the_startup_error_names_the_rotation_a_first_serve_cannot_finish(
         "first `serve`",
         "bootstrap admin",
         "must change its password",
-        "screened by this same corpus",
-        "before the first sign-in",
+        "cannot finish that change",
+        "before that credential expires",
+        "and restart",
     ):
         assert phrase in message, f"{phrase!r} missing from the startup ERROR: {message}"
 
