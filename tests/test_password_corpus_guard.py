@@ -25,7 +25,7 @@ import pytest
 from messagefoundry.auth import PasswordPolicy
 from messagefoundry.auth import policy as policy_module
 from messagefoundry.auth.policy import ASVS_6_2_4_MIN_CORPUS_ENTRIES, BreachCorpusUnavailable
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import BOOTSTRAP_USERNAME, AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
 
@@ -145,6 +145,47 @@ def test_startup_reports_an_unusable_bundled_corpus_as_an_error(
         "an unusable bundled corpus logged nothing at startup"
     )
     assert "REFUSED" in caplog.records[0].getMessage()
+
+
+async def test_the_startup_error_names_the_rotation_a_first_serve_cannot_finish(
+    bundled_corpus: Callable[[Sequence[str] | None], None],
+    empty_store: MessageStore,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #1886: the ERROR has to say what this boot hands the operator, not only what it refuses.
+
+    #1447 let a first run on an unusable corpus mint its bootstrap admin, born must-change, whose
+    rotation is screened by the corpus just reported unusable. The message and that behaviour were
+    changed in different pull requests, so this arm pins them together on ONE service. Drop the
+    sentence and the wording asserts fail. Change the behaviour -- the mint starts raising again, or
+    the rotation stops being refused -- and the behaviour asserts fail, which is the prompt to reword.
+    Why the wording is conditional is stated on `_error_if_bundled_corpus_unusable`.
+
+    SCOPE: this drives `AuthService` directly. It does not reach the must-change gate in
+    `api/security.py` or the `serve` lifespan in `api/app.py`, so a change there cannot fail it.
+    """
+    bundled_corpus([])
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"):
+        service = AuthService(empty_store, AuthSettings())
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1, errors
+    message = errors[0]
+    for phrase in (
+        "`serve` against a store with no users still creates the bootstrap admin",
+        "cannot finish that change",
+        "`provision-admin` fails",
+        "deadline in bootstrap-admin.txt",
+        "password_check_breached = false and restart",
+    ):
+        assert phrase in message, f"{phrase!r} missing from the startup ERROR: {message}"
+
+    boot = await service.initialize()
+    assert boot is not None
+    out = await service.login(BOOTSTRAP_USERNAME, boot.password)
+    assert out.ok and out.identity is not None
+    assert out.identity.must_change_password
+    with pytest.raises(BreachCorpusUnavailable):
+        await service.change_password(out.identity, "a-human-chosen-replacement-pass")
 
 
 def test_startup_is_silent_when_screening_is_turned_off(

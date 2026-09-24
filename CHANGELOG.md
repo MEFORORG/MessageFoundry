@@ -15,6 +15,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   the `id_token` `exp`, and the configured session caps. **A deploying site whose IdP does not return
   `auth_time` would have every federated sign-in refused**; that is spec-correct and deliberate.
   Federation still ships off (`oidc_enabled = false`). ([BACKLOG #296](docs/BACKLOG.md))
+### Fixed
+- **The startup ERROR for an unusable bundled breach corpus now says a first `serve` still creates
+  the bootstrap admin, whose forced password change that corpus would refuse.** It also says
+  `provision-admin` fails for the same reason, where the deadline is, and that changing
+  `password_check_breached` needs a restart (BACKLOG #1886).
 - **The OIDC token endpoint and JWKS legs now carry the posture-keyed revocation guard (BACKLOG
   #1887, ADR 0173 section 4.3).** Each leg is guarded on its own host. An enforcing instance whose
   off-box identity provider has no `[auth].oidc_tls_crl_file` would refuse to start on first
