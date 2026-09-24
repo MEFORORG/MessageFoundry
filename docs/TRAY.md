@@ -154,9 +154,8 @@ The engine's certificate **is verified**, against one of two trust anchors:
 An explicit `engine_url` in `tray.toml` drops the found certificate, because that URL may name a
 different engine. Set `engine_cacert` beside it if that engine needs a pin.
 
-**Start the engine once before the tray.** The engine mints its pair on its first run. A tray
-started before then cannot load the pin, verifies against the Windows trust store instead, and
-reports the engine down until you restart the tray. Its log names the missing file.
+The engine mints its pair on its first run. A tray started before then reports the engine down
+until the file appears, then picks it up on its next poll with no restart.
 
 There is no option to skip verification. If the certificate does not verify, the probe fails and the
 tray reports the engine as down rather than trusting an unidentified responder — check the cert's

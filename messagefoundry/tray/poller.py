@@ -33,6 +33,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 
 import httpx
 
@@ -235,6 +236,11 @@ class StatusPoller:
         self._client_factory = client_factory or functools.partial(
             make_probe_client, cacert=config.engine_cacert
         )
+        #: The pin the default factory uses. See :meth:`_rebuild_once_the_pin_exists`.
+        self._pin = (
+            Path(config.engine_cacert) if client_factory is None and config.engine_cacert else None
+        )
+        self._pin_missing = False
         self._clock = clock
         self._toast_min_interval_s = toast_min_interval_s
         self._client: httpx.Client | None = None
@@ -247,7 +253,7 @@ class StatusPoller:
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
-        self._client = self._client_factory(self._config.engine_url)
+        self._open_client()
         self._thread = threading.Thread(target=self._run, name="mefor-tray-poller", daemon=True)
         self._thread.start()
 
@@ -322,12 +328,34 @@ class StatusPoller:
 
     def poll_once(self, now: float) -> PollResult:
         """Read all probes once and produce a :class:`PollResult`. Does I/O via the injected deps."""
+        self._rebuild_once_the_pin_exists()
         reading = self._scm_reader(self._config.service_name)
         client = self._client
         health = self._health_probe(client) if client is not None else HealthProbe.DOWN
         ui = self._ui_probe(client) if client is not None else UiProbe.UNKNOWN
         self._tracking, inputs = advance(self._tracking, reading, health, ui, now)
         return self._build_result(inputs, reading, now)
+
+    def _open_client(self) -> None:
+        self._pin_missing = self._pin is not None and not self._pin.is_file()
+        self._client = self._client_factory(self._config.engine_url)
+
+    def _rebuild_once_the_pin_exists(self) -> None:
+        """Pick up the engine's certificate once it is minted, without a tray restart.
+
+        The engine mints its pair on its first run, so a tray started before then builds its client
+        with no pin, and the probe falls back to the OS trust store and reads the engine as down.
+        The client is otherwise built once, so this checks for the file on each tick until it
+        appears, then rebuilds the client once. It costs one stat per tick, and only while waiting.
+        """
+        if not self._pin_missing or self._pin is None or not self._pin.is_file():
+            return
+        self._pin_missing = False
+        log.info("engine certificate %s now exists; rebuilding the probe client", self._pin)
+        old = self._client
+        self._client = self._client_factory(self._config.engine_url)
+        if old is not None:
+            old.close()
 
     def _unknown_result(self) -> PollResult:
         """The stand-in :class:`PollResult` for a tick that raised.

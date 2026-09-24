@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Protocol
 from urllib.parse import urlsplit
 
+from messagefoundry.api_tls_source import GENERATED_CERT_NAME, ApiTlsSource, api_tls_source
 from messagefoundry.service_status import is_safe_service_name
 
 # https because the engine serves TLS by default (ADR 0172). Plain http is right only behind a
@@ -58,10 +59,6 @@ _MAX_PATH_LEN = 4096
 _DEFAULT_SERVICE_TOML = "messagefoundry.toml"
 # The engine's default [store].path, resolved the same way. The minted pair sits beside it.
 _DEFAULT_STORE_PATH = "messagefoundry.db"
-#: The filename the engine mints its self-signed API certificate to, beside the store database.
-#: A COPY of ``messagefoundry.api.tls._GENERATED_CERT_NAME``: the tray must not import ``api/``
-#: (ADR 0113 keeps it stdlib + httpx). ``tests/test_tray_config.py`` pins the two equal.
-GENERATED_CERT_NAME = "api-generated-cert.pem"
 
 
 @dataclass(frozen=True)
@@ -263,8 +260,13 @@ def parse_service_config_arg(app_parameters: str) -> str | None:
     That TOML is where ``[api].tls_cert_file`` lives, so it is the only place the tray can learn
     that the engine's bind speaks https (there is no ``serve`` TLS *flag* to sniff).
     """
+    return _last_path_option(app_parameters, _SERVE_CONFIG_FLAGS)
+
+
+def _last_path_option(app_parameters: str, flags: frozenset[str]) -> str | None:
+    """The last plausible path given for any of ``flags``, the way argparse keeps the last one."""
     found: str | None = None
-    for _key, val in _iter_options(app_parameters, _SERVE_CONFIG_FLAGS):
+    for _key, val in _iter_options(app_parameters, flags):
         found = _clean_path_hint(val) or found
     return found
 
@@ -309,10 +311,9 @@ def engine_serves_https(service_toml: dict[str, object] | None) -> bool:
     would render a running engine as WEDGED. That is the one failure this function exists to
     prevent, and the old predicate caused it on the commonest posture.
 
-    Mirrors the three return paths of :func:`messagefoundry.api.tls.ensure_api_tls_material`, the
-    single source of the served scheme: an operator cert always wins and serves https; a DECLARED
-    upstream terminator mints nothing and speaks plaintext to the proxy; everything else mints and
-    serves https. So it is a cert path, OR not ``tls_terminated_upstream``.
+    Uses the engine's own ordering, :func:`messagefoundry.api_tls_source.api_tls_source`: an
+    operator cert always wins and serves https; a DECLARED upstream terminator mints nothing and
+    speaks plaintext to the proxy; everything else mints and serves https.
 
     **An absent, unreadable or api-less file therefore answers True**, which is why the old name
     was retired: the engine runs on its own defaults there, and those mint. A wrong guess costs the
@@ -324,29 +325,23 @@ def engine_serves_https(service_toml: dict[str, object] | None) -> bool:
     or secrets — it is operator data reached via an untrusted registry hint, and the cert path is
     tested for presence only, never read or resolved.
     """
-    api = (service_toml or {}).get("api")
-    if not isinstance(api, dict):
-        return True
-    cert = api.get("tls_cert_file")
-    if isinstance(cert, str) and cert.strip():
-        return True
-    return api.get("tls_terminated_upstream") is not True
+    return _served_tls_source(service_toml) != "upstream"
 
 
-def engine_serves_generated_cert(service_toml: dict[str, object] | None) -> bool:
-    """True when the engine's API bind presents the certificate it minted for itself.
+def _served_tls_source(service_toml: dict[str, object] | None) -> ApiTlsSource:
+    """Where the engine's API material comes from, read out of a raw, untrusted service TOML.
 
-    The narrower sibling of :func:`engine_serves_https`: of its two https arms, only the one with
-    no operator chain serves the minted pair. An operator chain is trusted through the OS store,
-    which is where an enterprise or public CA already lives, so the tray pins nothing for it.
+    A missing or malformed ``[api]`` reads as no settings, and a blank cert path as no cert, so
+    anything the tray cannot read falls to the engine's own default, which mints.
     """
     api = (service_toml or {}).get("api")
     if not isinstance(api, dict):
-        return True
+        api = {}
     cert = api.get("tls_cert_file")
-    if isinstance(cert, str) and cert.strip():
-        return False
-    return api.get("tls_terminated_upstream") is not True
+    return api_tls_source(
+        cert_file=cert.strip() if isinstance(cert, str) else None,
+        tls_terminated_upstream=api.get("tls_terminated_upstream") is True,
+    )
 
 
 def generated_cert_path(
@@ -359,8 +354,8 @@ def generated_cert_path(
     against the service's working directory, which NSSM records as ``AppDirectory``.
     ``scripts/service/install-service.ps1`` spells the same rule when it prints its health check.
 
-    **It answers ``None`` rather than guess** when the engine serves an operator chain or speaks
-    plaintext to a proxy, when there is no service entry, and when a relative store path would be
+    **It answers ``None`` rather than guess** when the engine serves an operator chain (trusted
+    through the OS store) or speaks plaintext to a proxy, when there is no service entry, and when a relative store path would be
     anchored under a project root (``--project-root`` or ``[environments].base_dir``), whose own
     resolution this module does not repeat. ``None`` leaves the probe on the OS trust store, and
     ``engine_cacert`` in ``tray.toml`` covers any posture this cannot see.
@@ -368,20 +363,19 @@ def generated_cert_path(
     The inputs are untrusted hints, validated by :func:`_clean_path_hint`. The result is only a
     path to a trust anchor for a loopback probe; nothing here reads or resolves the file.
     """
-    if reg is None or not engine_serves_generated_cert(service_toml):
+    if reg is None or _served_tls_source(service_toml) != "generated":
         return None
+    toml = service_toml or {}
     params = reg.app_parameters or ""
-    store: str | None = None
-    for _key, val in _iter_options(params, _SERVE_DB_FLAGS):
-        store = _clean_path_hint(val) or store
+    store = _last_path_option(params, _SERVE_DB_FLAGS)
     if store is None:
-        section = (service_toml or {}).get("store")
+        section = toml.get("store")
         raw = section.get("path") if isinstance(section, dict) else None
         store = _clean_path_hint(raw) or _DEFAULT_STORE_PATH
     path = Path(store)
     if not path.is_absolute():
-        envs = (service_toml or {}).get("environments")
-        rooted = any(True for _ in _iter_options(params, _SERVE_ROOT_FLAGS)) or (
+        envs = toml.get("environments")
+        rooted = _last_path_option(params, _SERVE_ROOT_FLAGS) is not None or (
             isinstance(envs, dict) and bool(envs.get("base_dir"))
         )
         base = _clean_path_hint(reg.app_directory)

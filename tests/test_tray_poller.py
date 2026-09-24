@@ -9,6 +9,7 @@ import queue
 import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
+from pathlib import Path
 
 import httpx
 import pytest
@@ -831,3 +832,39 @@ def test_the_default_client_factory_carries_the_config_pin(monkeypatch: pytest.M
     poller.start()
     poller.stop()
     assert seen == [(_ENGINE_URL, "minted.pem")]
+
+
+def test_a_pin_minted_after_start_is_picked_up_without_a_restart(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A tray started before the engine's first run rebuilds its client once the cert appears."""
+    pin = tmp_path / "api-generated-cert.pem"
+    built: list[str | None] = []
+
+    def factory(url: str, *, cacert: str | None = None) -> httpx.Client:
+        built.append(cacert)
+        return httpx.Client(base_url=url)
+
+    monkeypatch.setattr("messagefoundry.tray.poller.make_probe_client", factory)
+    poller = StatusPoller(
+        TrayConfig(engine_url=_ENGINE_URL, engine_cacert=str(pin)),
+        on_update=lambda _r: None,
+        scm_reader=lambda _n: ScmReading(ScmState.RUNNING),
+        health_probe=lambda _c: HealthProbe.OK,
+        ui_probe=lambda _c: UiProbe.ENABLED,
+    )
+    poller._open_client()  # what start() does, minus the thread
+    first = poller._client
+    try:
+        poller.poll_once(0.0)
+        assert poller._client is first  # still waiting: no file, no rebuild
+        pin.write_text("minted", encoding="utf-8")
+        poller.poll_once(1.0)
+        assert poller._client is not first  # rebuilt once the file exists
+        rebuilt = poller._client
+        poller.poll_once(2.0)
+        assert poller._client is rebuilt  # and only once
+    finally:
+        if poller._client is not None:
+            poller._client.close()
+    assert len(built) == 2

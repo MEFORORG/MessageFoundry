@@ -229,8 +229,8 @@ def build_verify(engine_url: str, cacert: str | None = None) -> ssl.SSLContext |
 
     ``cacert`` pins trust to exactly that PEM. **A pin that cannot be loaded falls back to the OS
     trust store, which still verifies.** The common cause is a tray started before the engine's
-    first run, when the pair is not minted yet. The client is built once, so that tray reads the
-    engine as down until it is restarted; the warning names the path so the cause is findable.
+    first run, when the pair is not minted yet. The poller rebuilds its client once the file
+    appears; until then the engine reads as down, and the warning names the path.
     """
     if not is_tls_url(engine_url):
         return True
@@ -240,7 +240,7 @@ def build_verify(engine_url: str, cacert: str | None = None) -> ssl.SSLContext |
         except (OSError, ssl.SSLError) as exc:
             log.warning(
                 "cannot load the engine certificate %s (%s); verifying against the OS trust store "
-                "instead. Restart the tray once the engine has minted it.",
+                "until it can be loaded.",
                 cacert,
                 exc,
             )

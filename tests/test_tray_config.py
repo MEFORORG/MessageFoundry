@@ -12,7 +12,6 @@ import pytest
 from messagefoundry.tray.config import (
     DEFAULT_ENGINE_URL,
     DEFAULT_SERVICE_NAME,
-    GENERATED_CERT_NAME,
     ServiceRegistryInfo,
     _split_command_line,
     build_engine_url,
@@ -548,13 +547,6 @@ def test_ensure_tray_toml_writes_template_then_is_idempotent(tmp_path: Path) -> 
 def test_default_engine_url_is_https() -> None:
     """A stock engine serves TLS (ADR 0172), so a plaintext default probes a socket that hangs up."""
     assert DEFAULT_ENGINE_URL == "https://127.0.0.1:8765"
-
-
-def test_generated_cert_name_matches_the_engine() -> None:
-    """The tray keeps a COPY of the filename because it must not import ``api/``; pin the two."""
-    from messagefoundry.api import tls
-
-    assert GENERATED_CERT_NAME == tls._GENERATED_CERT_NAME
 
 
 # The AppParameters shape scripts/service/install-service.ps1 writes, which always has an absolute
