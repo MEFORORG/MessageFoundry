@@ -658,3 +658,90 @@ def test_a_method_rule_is_not_guessed_on_a_resolvable_first_party_call() -> None
     }
     found = ops.aggregate(ops.discover_operations_in(sources))
     assert found == {"messagefoundry/caller.py": frozenset({"cipher:.encrypt()"})}
+
+
+# --- BACKLOG #1164: the NON-PYTHON operation arm ---------------------------------------------------
+#
+# Every test here runs over a FIXTURE repo, never the real tree. That is deliberate: this arm is not
+# merge-gating, and a real-tree assertion on this required pytest leg would make it gating by the
+# back door. These pin the instrument's mechanics; whether the tree is clean is the `ide` job's
+# report, and making that count is the owner's branch-protection decision.
+
+
+def test_non_python_operation_patterns_map_into_the_taxonomy() -> None:
+    gate = _gate()
+    classes = set(gate.crypto_operations.OPERATION_CLASSES)
+    assert {cls for _p, cls in gate.NON_PYTHON_OPERATION_PATTERNS.values()} <= classes
+    for tokens in gate.NON_PYTHON_OPERATION_INVENTORY.values():
+        for token in tokens:
+            cls, _, name = token.partition(":")
+            assert cls in classes and name in gate.NON_PYTHON_OPERATION_PATTERNS, token
+
+
+@pytest.mark.parametrize(
+    ("line", "token"),
+    [
+        ('const h = createHash("sha256");', "hash:createHash"),
+        ("const m = crypto.createHmac('sha256', key);", "mac:createHmac"),
+        ("if (timingSafeEqual(a, b)) {", "compare:timingSafeEqual"),
+        ("const c = createCipheriv('aes-256-gcm', k, iv);", "cipher:createCipheriv"),
+        ("await crypto.subtle.sign('HMAC', key, data);", "sign_verify:subtle.sign"),
+        ("pbkdf2Sync(pw, salt, 1e5, 32, 'sha256');", "kdf:pbkdf2"),
+        ("const k = createPrivateKey(pem);", "key_cert:createKey"),
+        ("return { minVersion: TLS_MIN_VERSION, ca };", "tls_context:minVersion"),
+        ("const agent = new https.Agent({ keepAlive: true });", "tls_context:https.Agent"),
+        ("opts = { rejectUnauthorized: false };", "tls_context:rejectUnauthorized"),
+        ("return randomBytes(18).toString('base64url');", "csprng:randomBytes"),
+        (
+            "var cred = await navigator.credentials.get({ publicKey: o });",
+            "sign_verify:navigator.credentials.get",
+        ),
+    ],
+)
+def test_each_non_python_operation_pattern_fires(line: str, token: str) -> None:
+    assert token in _gate().non_python_operation_tokens_in(line + "\n")
+
+
+def test_a_comment_naming_an_operation_is_not_an_operation() -> None:
+    gate = _gate()
+    text = "// we do not call createHash( here\n * rejectUnauthorized: false is refused\n"
+    assert gate.non_python_operation_tokens_in(text) == set()
+
+
+def test_a_planted_ts_operation_reds_the_non_python_arm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate = _gate()
+    monkeypatch.setattr(
+        gate, "NON_PYTHON_OPERATION_INVENTORY", {"ide/src/a.ts": frozenset({"csprng:randomBytes"})}
+    )
+    _write_repo(
+        tmp_path,
+        {
+            "ide/src/a.ts": "export const n = randomBytes(18);\nconst h = createHash('md5');\n",
+            "messagefoundry_webconsole/static/app.js": "var x = 1;\n",
+        },
+    )
+    violations, scanned, _actual = gate.check_non_python_operations(tmp_path)
+    assert scanned == 2
+    assert violations == [
+        "ide/src/a.ts: undocumented crypto operation use ['hash:createHash'] "
+        "(documented: ['csprng:randomBytes'])"
+    ]
+
+
+def test_the_non_python_arm_refuses_an_empty_walk_and_reports_stale_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A walk that reaches nothing must not render as clean, and a row the tree no longer backs is the
+    # stale direction that makes a broken walk visible even when some files were read.
+    gate = _gate()
+    monkeypatch.setattr(
+        gate,
+        "NON_PYTHON_OPERATION_INVENTORY",
+        {"ide/src/gone.ts": frozenset({"tls_context:minVersion"})},
+    )
+    _write_repo(tmp_path, {"ide/src/other.ts": "export const x = 1;\n"})
+    violations, _scanned, _actual = gate.check_non_python_operations(tmp_path)
+    assert any("messagefoundry_webconsole/" in v and "ZERO" in v for v in violations), violations
+    assert any(v.startswith("ide/src/gone.ts: inventory lists") for v in violations), violations

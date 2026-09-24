@@ -135,9 +135,12 @@ for, not how it is protected before it gets there.
 > `check_non_python_randomness` scans `ide/` and `messagefoundry_webconsole/` for randomness sources
 > by pattern and diffs them against `NON_PYTHON_INVENTORY` the same bidirectional way. A weak source
 > (`Math.random()`) fails with no inventory row to hide behind, and an empty walk is a violation
-> rather than a clean result. **Randomness is the whole claim that arm supports** — the TLS floor
-> `ide/src/engineClient.ts` applies to every https request is first-party crypto in a shipped
-> artifact and is discoverable from neither arm.
+> rather than a clean result. **Randomness is the whole claim that arm supports.** A third arm
+> (BACKLOG #1164) reads the same roots for every operation class. It finds the TLS floor
+> `ide/src/engineClient.ts` applies to every https request, and the console's WebAuthn ceremony in
+> `static/app.js`. That arm runs as `--non-python-operations` in the `ide` CI job. **It is not
+> merge-gating**: that job is not a required context, so the required green still says nothing about
+> non-Python crypto beyond randomness.
 
 | Asset | Algorithm / detail | Source / storage | Lifecycle |
 |---|---|---|---|

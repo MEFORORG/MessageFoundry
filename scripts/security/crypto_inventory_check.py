@@ -92,14 +92,20 @@ properties are the point of it, and each is pinned by a test in
   names it.
 
 This is a *randomness* inventory, and that is the whole claim it supports. The other first-party
-crypto in ``ide/`` - the TLS floor ``ide/src/engineClient.ts`` applies to every https request - is
-still not discoverable from here.
+crypto in the non-Python roots (the TLS floor ``ide/src/engineClient.ts`` applies to every https
+request, and the console's WebAuthn ceremony in ``static/app.js``) is found by a THIRD arm,
+:func:`check_non_python_operations` (BACKLOG #1164). That arm runs only under
+``--non-python-operations``, from the ``ide`` CI job, which is not a required context: it reports,
+and it does not block a merge. So the required green still says nothing about non-Python crypto
+beyond randomness.
 
 Stdlib only (no install), like ``scripts/security/scan_forbidden.py`` — runnable as a CI step and a
 pytest. Usage::
 
     python scripts/security/crypto_inventory_check.py            # scan the five real roots
     python scripts/security/crypto_inventory_check.py --package DIR   # scan an arbitrary package (tests)
+    python scripts/security/crypto_inventory_check.py --list-operations   # also print every operation
+    python scripts/security/crypto_inventory_check.py --non-python-operations   # the TS/JS arm alone
 """
 
 from __future__ import annotations
@@ -127,7 +133,8 @@ import crypto_operations  # noqa: E402
 # question this gate exists to answer is whether a tree contains cryptography. ``ide/`` does:
 # ``ide/src/cspNonce.ts`` imports ``randomBytes`` from ``node:crypto`` and draws CSPRNG bytes consumed
 # across the extension, and ``ide/src/engineClient.ts`` pins a TLS floor it applies to every https
-# request. Both are first-party crypto in a shipped artifact and NEITHER is discoverable from here.
+# request. Both are first-party crypto in a shipped artifact and NEITHER is discoverable from the
+# Python walk. The non-Python arms below find both.
 #
 # ADDING ``ide/`` TO WALK_ROOTS WOULD STILL BE A NO-OP THAT LOOKS LIKE A FIX, and that has not
 # changed: the Python AST scanner would find zero ``.py`` there, report clean, and the TypeScript
@@ -136,7 +143,8 @@ import crypto_operations  # noqa: E402
 # which reads ``.ts``/``.js`` by pattern rather than by AST and rides this same required context. So
 # this gate's green now means "no undocumented crypto in the PYTHON of five roots, AND no
 # undocumented or weak RANDOMNESS source in the non-Python roots". The randomness half is the only
-# claim the second arm supports - the extension's TLS floor is still outside both.
+# non-Python claim the REQUIRED run supports. The extension's TLS floor is found by the operation arm
+# (:func:`check_non_python_operations`, BACKLOG #1164), which is not merge-gating.
 # ``samples/`` is absent by design too, on the SAME rationale as the ``ide/`` exclusion (ASVS 11.1.3):
 # it is author-space EXAMPLE config, not shipped engine code, so its crypto (e.g. a content-fingerprint
 # ``hashlib.sha256`` in a sample Handler) is out of the deployed-system inventory scope — the gate
@@ -1515,6 +1523,170 @@ def check_non_python_randomness(repo: Path) -> tuple[list[str], int]:
     return violations, scanned
 
 
+# --------------------------------------------------------------------------------------------
+# The NON-PYTHON OPERATION arm (BACKLOG #1164, ASVS 11.1.3). NOT MERGE-GATING, on purpose.
+# --------------------------------------------------------------------------------------------
+# The randomness arm above reads the non-Python roots for ONE operation class. This arm reads them
+# for every class in the operation taxonomy, by pattern, so the extension's TLS floor and the
+# console's WebAuthn ceremony stop being invisible. It runs only under ``--non-python-operations``,
+# which CI invokes from the ``ide`` job. That job is not a required context and ``ci-gate`` does
+# not need it, so a red here is visible but does not block a merge. Making it count is a
+# branch-protection decision that belongs to the owner, not to this file.
+#
+# A PATTERN INSTRUMENT, NOT A PARSER. It cannot resolve an alias (``import * as c from "crypto"``
+# then ``c.createHash``) unless the call keeps the method name the pattern keys on, which every
+# Node crypto API does. It matches option keys (``minVersion:``) anywhere, not only inside a TLS
+# options object; that errs toward reporting. And like the Python arm it cannot see a TLS decision
+# spelled as data it does not name.
+
+#: ``token -> (pattern, operation class)``. Every class must be one in the Python arm's taxonomy.
+#: The lookbehind stops a longer identifier ending in the same word from matching.
+_B = r"(?<![A-Za-z0-9_$])"
+NON_PYTHON_OPERATION_PATTERNS: dict[str, tuple[re.Pattern[str], str]] = {
+    "createHash": (re.compile(_B + r"createHash\s*\("), "hash"),
+    "subtle.digest": (re.compile(r"subtle\s*\.\s*digest\s*\("), "hash"),
+    "createHmac": (re.compile(_B + r"createHmac\s*\("), "mac"),
+    "timingSafeEqual": (re.compile(_B + r"timingSafeEqual\s*\("), "compare"),
+    "createCipheriv": (re.compile(_B + r"createCipheriv\s*\("), "cipher"),
+    "createDecipheriv": (re.compile(_B + r"createDecipheriv\s*\("), "cipher"),
+    "publicEncrypt": (re.compile(_B + r"(publicEncrypt|privateEncrypt)\s*\("), "cipher"),
+    "privateDecrypt": (re.compile(_B + r"(privateDecrypt|publicDecrypt)\s*\("), "cipher"),
+    "subtle.encrypt": (
+        re.compile(r"subtle\s*\.\s*(encrypt|decrypt|wrapKey|unwrapKey)\s*\("),
+        "cipher",
+    ),
+    "createSign": (re.compile(_B + r"(createSign|createVerify)\s*\("), "sign_verify"),
+    "subtle.sign": (re.compile(r"subtle\s*\.\s*(sign|verify)\s*\("), "sign_verify"),
+    "navigator.credentials.create": (
+        re.compile(r"navigator\s*\.\s*credentials\s*\.\s*create\s*\("),
+        "sign_verify",
+    ),
+    "navigator.credentials.get": (
+        re.compile(r"navigator\s*\.\s*credentials\s*\.\s*get\s*\("),
+        "sign_verify",
+    ),
+    "pbkdf2": (re.compile(_B + r"(pbkdf2|pbkdf2Sync|scrypt|scryptSync|hkdf|hkdfSync)\s*\("), "kdf"),
+    "subtle.deriveKey": (re.compile(r"subtle\s*\.\s*(deriveKey|deriveBits)\s*\("), "kdf"),
+    "createKey": (
+        re.compile(
+            _B + r"(createPrivateKey|createPublicKey|createSecretKey|generateKeyPair|"
+            r"generateKeyPairSync|generateKey|generateKeySync)\s*\("
+        ),
+        "key_cert",
+    ),
+    "X509Certificate": (re.compile(_B + r"X509Certificate\s*\("), "key_cert"),
+    "subtle.importKey": (
+        re.compile(r"subtle\s*\.\s*(importKey|exportKey|generateKey)\s*\("),
+        "key_cert",
+    ),
+    "tls.connect": (re.compile(r"tls\s*\.\s*(connect|createSecureContext)\s*\("), "tls_context"),
+    "https.Agent": (re.compile(r"new\s+(https\s*\.\s*)?Agent\s*\("), "tls_context"),
+    "minVersion": (re.compile(_B + r"(minVersion|maxVersion)\s*:"), "tls_context"),
+    "rejectUnauthorized": (re.compile(_B + r"rejectUnauthorized\s*:"), "tls_context"),
+    "checkServerIdentity": (re.compile(_B + r"checkServerIdentity\s*:"), "tls_context"),
+    "secureProtocol": (
+        re.compile(_B + r"(secureProtocol|secureOptions|ecdhCurve|ciphers)\s*:"),
+        "tls_context",
+    ),
+    # The CSPRNG sources are the randomness arm's STRONG set, reused so the two arms cannot disagree
+    # about what a draw looks like. The WEAK set stays the randomness arm's alone: it has no row here
+    # to hide behind, and that arm is merge-gating.
+    **{name: (pattern, "csprng") for name, pattern in STRONG_RANDOMNESS_PATTERNS.items()},
+}
+
+#: The maintained non-Python operation inventory: repo-relative path -> ``class:token`` it performs.
+#: Bidirectional, like every inventory here, and the stale direction is again what lets it fail: a
+#: broken walk leaves these rows unbacked and reds rather than reporting a clean empty scan.
+NON_PYTHON_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
+    # The single source of CSP nonces for every webview the extension builds (see the randomness
+    # arm's row for the same file, which is where the entropy argument lives).
+    "ide/src/cspNonce.ts": frozenset({"csprng:randomBytes"}),
+    # The TLS floor the extension applies to every https request it makes to the engine:
+    # `tlsOptions` returns `{ minVersion: TLS_MIN_VERSION }` (TLSv1.2), plus the operator-pinned
+    # engine CA as `ca` when one is configured. Certificate verification is never switched off.
+    "ide/src/engineClient.ts": frozenset({"tls_context:minVersion"}),
+    # Not a TLS use: the extension test that PINS the floor above, by asserting the options object
+    # `tlsOptions` returns. Listed rather than excluded, because pruning test directories from the
+    # walk would be a scope cut the randomness arm does not make either.
+    "ide/src/test/suite/engine-trust.test.ts": frozenset({"tls_context:minVersion"}),
+    # The operator console's WebAuthn ceremonies (ADR 0068): navigator.credentials.create enrolls a
+    # passkey and navigator.credentials.get asks the authenticator to SIGN the server's challenge.
+    # The signature is checked server-side in auth/webauthn.py; this row records where the browser
+    # half of that ceremony starts.
+    "messagefoundry_webconsole/static/app.js": frozenset(
+        {"sign_verify:navigator.credentials.create", "sign_verify:navigator.credentials.get"}
+    ),
+}
+
+
+def non_python_operation_tokens_in(text: str) -> set[str]:
+    """The ``class:token`` operations a non-Python source performs. Comment-only lines are skipped
+    by the same conservative rule as the randomness arm (:func:`_is_comment_only`)."""
+    found: set[str] = set()
+    for line in text.splitlines():
+        if _is_comment_only(line):
+            continue
+        for name, (pattern, op_class) in NON_PYTHON_OPERATION_PATTERNS.items():
+            if pattern.search(line):
+                found.add(f"{op_class}:{name}")
+    return found
+
+
+def check_non_python_operations(repo: Path) -> tuple[list[str], int, dict[str, frozenset[str]]]:
+    """Run the non-Python operation arm. Returns ``(violations, files scanned, operations found)``."""
+    violations: list[str] = []
+    actual: dict[str, frozenset[str]] = {}
+    scanned = 0
+    for name in NON_PYTHON_WALK_ROOTS:
+        root = repo / name
+        files = non_python_sources(root) if root.is_dir() else []
+        if not files:
+            violations.append(
+                f"operation arm: the walk over {name}/ reached ZERO non-Python source, so a clean "
+                "result would be VACUOUS. Fix the walk; do not read this as a clean tree"
+            )
+            continue
+        scanned += len(files)
+        for path in files:
+            tokens = non_python_operation_tokens_in(path.read_text(encoding="utf-8"))
+            if tokens:
+                actual[path.relative_to(repo).as_posix()] = frozenset(tokens)
+    undocumented, stale = find_violations(
+        actual,
+        NON_PYTHON_OPERATION_INVENTORY,
+        check_stale=True,
+        noun="crypto operation",
+        stale_verb="performs",
+    )
+    return violations + undocumented + stale, scanned, actual
+
+
+def _main_non_python_operations() -> int:
+    """``--non-python-operations``: the TypeScript/JavaScript operation arm on its own."""
+    repo = Path(__file__).resolve().parents[2]
+    violations, scanned, actual = check_non_python_operations(repo)
+    counts = dict.fromkeys(crypto_operations.OPERATION_CLASSES, 0)
+    for tokens in actual.values():
+        for token in tokens:
+            counts[token.split(":", 1)[0]] += 1
+    per_class = ", ".join(f"{name}={count}" for name, count in counts.items())
+    print(
+        f"crypto-inventory (non-Python operations): scanned {scanned} "
+        f"{'/'.join(NON_PYTHON_SUFFIXES)} file(s) across {len(NON_PYTHON_WALK_ROOTS)} root(s); "
+        f"{sum(counts.values())} distinct operation token(s) in {len(actual)} file(s) [{per_class}]"
+    )
+    if violations:
+        print("crypto-inventory: NON-PYTHON OPERATION arm (BACKLOG #1164) FAILED:")
+        for line in violations:
+            print(f"  - {line}")
+        return 1
+    print(
+        "crypto-inventory (non-Python operations): OK - no undocumented or stale operation. "
+        "Pattern-level, so AT LEAST this; and NOT merge-gating (see NON_PYTHON_OPERATION_PATTERNS)."
+    )
+    return 0
+
+
 def _assert_ide_is_typescript(repo: Path) -> list[str]:
     """``ide/`` is outside the PYTHON walk because it is TypeScript with zero ``.py`` files. Enforce
     that fact so a future ``.py`` there reds the gate (and forces a WALK_ROOTS + inventory update)
@@ -1571,7 +1743,17 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="also print every operation found, one path:line -> class per line, for review",
     )
+    parser.add_argument(
+        "--non-python-operations",
+        action="store_true",
+        help=(
+            "run ONLY the TypeScript/JavaScript operation arm (BACKLOG #1164). Not part of the "
+            "default run, so the required crypto-inventory context is unchanged by it"
+        ),
+    )
     args = parser.parse_args(argv)
+    if args.non_python_operations:
+        return _main_non_python_operations()
 
     scanning_default = args.package is None
     actual: dict[str, frozenset[str]] = {}
