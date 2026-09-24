@@ -1726,12 +1726,15 @@ async def test_unmarked_value_on_a_sealed_surface_is_refused_not_sealed(store) -
         cipher.set_refusal_hook(lambda t, c: refused.append((t, c)))  # type: ignore[attr-defined]
         reopened = await PostgresStore.open(settings, cipher=cipher)
         try:
+            # The open's sweep visits the surface once and reports the planted row once (#1169
+            # round 2); the read below adds one more report for its refusal. Two events, by design.
+            assert refused == [("messages", "raw")], "the open must report the surface exactly once"
             row = await reopened._fetchone("SELECT raw AS v FROM messages WHERE id=$1", planted)
             assert row["v"] == plant, "the keyed reopen sealed a planted row on a sealed surface"
             assert (await reopened.get_message(good))["raw"] == RAW
             with pytest.raises(CipherError, match=r"messages\.raw"):
                 await reopened.get_message(planted)
-            assert refused == [("messages", "raw")]
+            assert refused == [("messages", "raw")] * 2  # the open's finding, then this refusal
         finally:
             await reopened.close()
     finally:

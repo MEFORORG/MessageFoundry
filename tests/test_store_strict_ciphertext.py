@@ -499,3 +499,26 @@ def test_the_logging_sink_does_not_call_a_store_cipher_alert_an_engine_module(
     with caplog.at_level(logging.WARNING):
         LoggingAlertSink().integrity_drift("store-cipher", reason="messages.raw", drift_count=1)
     assert "store-cipher" in caplog.text and "engine module" not in caplog.text
+
+
+async def test_the_open_reports_a_surface_once_and_each_refused_read_once(tmp_path: Path) -> None:
+    """The SQLite twin of the server-backend ``test_unmarked_value_on_a_sealed_surface_is_refused_not_
+    sealed``, and the pin behind its corrected assertion. The hook fires on two DIFFERENT events:
+    the keyed open's sweep finds the planted row once (it visits each surface once), then every read
+    that refuses it fires again. Two calls after one open plus one read is the design, not a
+    double visit."""
+    db = tmp_path / "once.db"
+    key = generate_key()
+    _good, planted = await _seed(db, 2, _keyed(key))
+    _set_raw(db, planted, _PLANT)
+    cipher = _keyed(key)
+    seen: list[tuple[str, str]] = []
+    cipher.set_refusal_hook(lambda table, column: seen.append((table, column)))
+    store = await MessageStore.open(db, cipher=cipher)
+    try:
+        assert seen == [("messages", "raw")]  # the open: one finding for the one surface
+        with pytest.raises(CipherError, match=r"messages\.raw"):
+            await store.get_message(planted)
+        assert seen == [("messages", "raw")] * 2  # plus one per refused read
+    finally:
+        await store.close()
