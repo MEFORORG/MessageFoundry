@@ -2599,7 +2599,9 @@ def DICOM(
     ``calling_ae_allowlist`` AE Titles (when set) from the peers allowed by the ``inbound(...)``
     ``source_ip_allowlist`` keyword (there is no ``[inbound].source_ip_allowlist`` service key), and
     rejects an object over ``max_object_bytes`` with a DIMSE failure before it is decoded, and so before
-    the commit. A non-loopback
+    the commit. On the SCP that cap never exceeds the engine's 16 MiB binary ingress ceiling, whatever is
+    set here: the engine records a larger object ``ERROR``, so accepting it would answer Success for an
+    object that is never processed (BACKLOG #1910). A non-loopback
     cleartext SCP (no ``tls``) is refused at startup unless ``serve --allow-insecure-bind`` (PHI on the
     wire, §9).
 

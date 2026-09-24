@@ -115,7 +115,8 @@ def resolve_poll_ceiling(value: Any, *, knob: str, transport: str) -> int | None
 
 
 # A source hands each inbound message (raw bytes, MLLP framing already stripped) to this
-# callback and sends whatever it returns back to the sender. Return ``None`` for
+# callback and sends whatever it returns back to the sender (unless the source declares
+# ``SourceConnector.wants_receipt``, when the return is a receipt instead). Return ``None`` for
 # fire-and-forget transports (e.g. file) that have no reply channel.
 InboundHandler = Callable[[bytes], Awaitable[str | None]]
 
@@ -440,6 +441,14 @@ class SourceConnector(abc.ABC):
 
     # Documentation flag (see the class docstring): True on poll sources, False on listen sources.
     polls_shared_resource: ClassVar[bool] = False
+
+    #: Which handler contract this source is started with. ``False`` (the default): the handler's
+    #: ``str`` return is a wire reply (an HL7 ACK) the source sends back, and ``None`` means "no reply".
+    #: ``True``: a RECEIPT handler -- it returns the committed message id, or ``None`` when it REFUSED
+    #: the body (recorded ``ERROR``, committed no ingress row). A source whose answer to the sender is
+    #: its own protocol status (an HTTP ``202``, a DIMSE C-STORE status) needs the receipt form, because
+    #: under the default form ``None`` means both "committed" and "refused" (BACKLOG #1910).
+    wants_receipt: ClassVar[bool] = False
 
     #: Optional connection-event sink (Corepoint-style log, #46), **injected by the runner after build**
     #: (not a builder arg, not a settings value — same runtime-injection shape as ``leader_gate`` is

@@ -6,6 +6,21 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- **The DICOM C-STORE SCP no longer answers Success for an object the engine does not accept.**
+  The SCP's `max_object_bytes` defaults to 128 MiB, but the engine's binary ingress records any
+  object over 16 MiB as `ERROR` and never processes it. So an object between 16 and 128 MiB was
+  answered Success and dropped: the modality believed it delivered and would not re-send it. Two
+  changes close this. The SCP now caps objects at the smaller of `max_object_bytes` and the 16 MiB
+  ingress ceiling, including when `max_object_bytes` is `0`/`None`, and refuses a larger one with
+  Out of Resources (`0xA700`) before any commit. Like the SCP's other pre-commit refusals, that
+  object is logged and not recorded as a message; it used to leave an `ERROR` row. And whenever the engine's ingress refuses an object
+  the SCP passed, the SCP now answers Cannot Understand (`0xC000`) instead of Success; the `ERROR`
+  record is kept. **Behaviour change for a sending modality:** an object over 16 MiB now gets a
+  failure status where it used to get Success. A `max_object_bytes` above 16 MiB no longer raises
+  the SCP's limit; the outbound SCU's use of the key, and the SCP's pre-decode inflate bound for a
+  deflated object, are unchanged. (`BACKLOG #1910`)
+
 ## [0.4.0] — 2026-09-23 — Early Access
 
 This section lists every breaking change since 0.3.2, each marked BREAKING, and summarizes the
